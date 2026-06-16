@@ -1,4 +1,7 @@
+using System;
 using System.Collections.ObjectModel;
+using System.ComponentModel;
+using System.Runtime.CompilerServices;
 using System.Text.Json.Serialization;
 
 namespace CodexLocalRetrieval.Core.Models;
@@ -13,6 +16,25 @@ public sealed class AppStoreData
 
     [JsonPropertyName("collections")]
     public Dictionary<string, ArchiveCollection> Collections { get; set; } = new();
+
+    // Incremental sync: source file path -> "mtimeTicks:size". Unchanged files are skipped on
+    // re-scan so relaunches are fast. Deletions are never propagated (chats keep accumulating).
+    [JsonPropertyName("fileStamps")]
+    public Dictionary<string, string> FileStamps { get; set; } = new();
+}
+
+// A place agent sessions are stored on disk. Defaults cover Codex + Claude; an agent or the user
+// can add non-default roots so chats in unusual locations still surface.
+public sealed class SessionSource
+{
+    [JsonPropertyName("tool")]
+    public string Tool { get; set; } = "codex"; // codex | claude
+
+    [JsonPropertyName("root")]
+    public string Root { get; set; } = "";
+
+    [JsonPropertyName("enabled")]
+    public bool Enabled { get; set; } = true;
 }
 
 public sealed class ArchiveSettings
@@ -35,17 +57,16 @@ public sealed class ArchiveSettings
     [JsonPropertyName("readOnlySourceMode")]
     public bool ReadOnlySourceMode { get; set; } = true;
 
-    [JsonPropertyName("chatRootPath")]
-    public string ChatRootPath { get; set; } = "";
+    [JsonPropertyName("bundledHistoryAbsorbed")]
+    public bool BundledHistoryAbsorbed { get; set; }
 
-    [JsonPropertyName("autoIndexOnStartup")]
-    public bool AutoIndexOnStartup { get; set; } = true;
+    [JsonPropertyName("sources")]
+    public List<SessionSource> Sources { get; set; } = new();
 
-    [JsonPropertyName("lastIndexedAt")]
-    public string LastIndexedAt { get; set; } = "";
-
-    [JsonPropertyName("lastIndexStatus")]
-    public string LastIndexStatus { get; set; } = "";
+    // Bumped whenever the parser changes so the incremental file-stamp cache is invalidated and
+    // every file is re-parsed once with the new logic.
+    [JsonPropertyName("indexVersion")]
+    public int IndexVersion { get; set; }
 
     [JsonPropertyName("panelRadius")]
     public int PanelRadius { get; set; } = 12;
@@ -99,16 +120,23 @@ public sealed class ArchiveCollection
     public string Color { get; set; } = "#fb7185";
 }
 
-public sealed class ArchiveSession
+public sealed class ArchiveSession : INotifyPropertyChanged
 {
+    public event PropertyChangedEventHandler? PropertyChanged;
+    private void Raise([CallerMemberName] string? name = null) => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
+
     [JsonPropertyName("id")]
     public string Id { get; set; } = "";
 
+    // Title / CustomTitle / Pinned / UpdatedAt change at runtime (rename, pin, bump-on-resume,
+    // re-sync), so they notify their computed display props to keep the live ListView in sync.
+    private string _title = "";
     [JsonPropertyName("title")]
-    public string Title { get; set; } = "";
+    public string Title { get => _title; set { _title = value; Raise(); Raise(nameof(DisplayTitle)); } }
 
+    private string _customTitle = "";
     [JsonPropertyName("customTitle")]
-    public string CustomTitle { get; set; } = "";
+    public string CustomTitle { get => _customTitle; set { _customTitle = value; Raise(); Raise(nameof(DisplayTitle)); } }
 
     [JsonPropertyName("sourcePath")]
     public string SourcePath { get; set; } = "";
@@ -116,8 +144,9 @@ public sealed class ArchiveSession
     [JsonPropertyName("createdAt")]
     public string CreatedAt { get; set; } = "";
 
+    private string _updatedAt = "";
     [JsonPropertyName("updatedAt")]
-    public string UpdatedAt { get; set; } = "";
+    public string UpdatedAt { get => _updatedAt; set { _updatedAt = value; Raise(); Raise(nameof(DisplayDate)); } }
 
     [JsonPropertyName("workspace")]
     public string Workspace { get; set; } = "";
@@ -127,6 +156,10 @@ public sealed class ArchiveSession
 
     [JsonPropertyName("model")]
     public string Model { get; set; } = "";
+
+    // Which agent produced this chat: "codex" or "claude". Drives parse + resume routing + the badge.
+    [JsonPropertyName("tool")]
+    public string Tool { get; set; } = "codex";
 
     [JsonPropertyName("messages")]
     public ObservableCollection<ArchiveMessage> Messages { get; set; } = new();
@@ -146,8 +179,9 @@ public sealed class ArchiveSession
     [JsonPropertyName("starred")]
     public bool Starred { get; set; }
 
+    private bool _pinned;
     [JsonPropertyName("pinned")]
-    public bool Pinned { get; set; }
+    public bool Pinned { get => _pinned; set { _pinned = value; Raise(); Raise(nameof(PinGlyph)); } }
 
     [JsonPropertyName("archived")]
     public bool Archived { get; set; }
@@ -157,6 +191,9 @@ public sealed class ArchiveSession
 
     [JsonIgnore]
     public string PinGlyph => Pinned ? "*" : "";
+
+    [JsonIgnore]
+    public string ToolShort => string.Equals(Tool, "claude", StringComparison.OrdinalIgnoreCase) ? "CL" : "CX";
 
     [JsonIgnore]
     public string DisplayDate => DateTime.TryParse(UpdatedAt, out var date) ? date.ToString("MMM d") : "";
@@ -190,6 +227,38 @@ public sealed class CodeBlock
 
     [JsonPropertyName("code")]
     public string Code { get; set; } = "";
+}
+
+// One command an outside agent writes to agent-inbox.jsonl to drive the app (see AGENTS.md).
+public sealed class AgentCommand
+{
+    public string op { get; set; } = "";          // init | addSource | favorite | addToProject | rename
+    public string? project { get; set; }           // addToProject
+    public string? localName { get; set; }          // rename (app-only title)
+    public string? canonicalName { get; set; }      // rename (write back to codex/claude)
+    public string? tool { get; set; }               // addSource / target filter: codex | claude
+    public string? root { get; set; }               // addSource
+    public string? cwd { get; set; }                // self/latest resolution by workspace
+    public string? id { get; set; }                 // explicit session id
+    public string? target { get; set; }             // "self" | "latest" | <session-id>
+}
+
+public sealed record AgentCommandResult(bool Ok, string Message);
+
+public sealed record ResumeLaunch(string Exe, string Arguments, string WorkingDirectory, string DisplayCommand);
+
+public sealed record RawEvent(string Kind, string Timestamp, string Preview);
+
+// The result of an off-thread disk scan: freshly parsed/changed sessions (Disk), one-time
+// recovered bundled history (Bundled), and the current file stamps (path -> mtime+size) used for
+// incremental sync. Merged into the store on the UI thread by MergeScanAsync.
+public sealed record DiskScan(List<ArchiveSession> Disk, List<ArchiveSession> Bundled)
+{
+    public Dictionary<string, string> Stamps { get; init; } = new();
+
+    // True when the incremental cache was ignored (parser-version migration) and every file was
+    // re-parsed — the only safe time to prune orphaned sessions whose id scheme changed.
+    public bool FullRescan { get; init; }
 }
 
 public sealed class ArchiveSearchHit

@@ -46,6 +46,7 @@
                     <ColumnDefinition Width="Auto" />
                     <ColumnDefinition Width="*" />
                     <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="Auto" />
                 </Grid.ColumnDefinitions>
                 <TextBlock
                     Width="14"
@@ -59,7 +60,16 @@
                     TextTrimming="CharacterEllipsis" />
                 <TextBlock
                     Grid.Column="2"
-                    Margin="10,0,0,0"
+                    Margin="8,0,0,0"
+                    VerticalAlignment="Center"
+                    FontSize="10"
+                    Opacity="0.65"
+                    Foreground="{StaticResource TextMutedBrush}"
+                    Text="{Binding ToolShort}" />
+                <TextBlock
+                    Grid.Column="3"
+                    Margin="8,0,0,0"
+                    VerticalAlignment="Center"
                     Foreground="{StaticResource TextMutedBrush}"
                     Text="{Binding DisplayDate}" />
             </Grid>
@@ -70,7 +80,7 @@
         <Grid.ColumnDefinitions>
             <ColumnDefinition Width="308" />
             <ColumnDefinition Width="*" />
-            <ColumnDefinition Width="292" />
+            <ColumnDefinition x:Name="RightColumn" Width="292" />
         </Grid.ColumnDefinitions>
 
         <Border
@@ -161,14 +171,23 @@
                     RightTapped="SessionList_RightTapped"
                     SelectionMode="Single" />
 
-                <StackPanel Grid.Row="4" Orientation="Horizontal" Spacing="8">
-                    <SymbolIcon
-                        Foreground="{StaticResource TextMutedBrush}"
-                        Symbol="Accept" />
+                <StackPanel Grid.Row="4" Spacing="10">
+                    <Button
+                        x:Name="SyncButton"
+                        HorizontalAlignment="Stretch"
+                        Click="Sync_Click"
+                        Style="{StaticResource PillButtonStyle}">
+                        <StackPanel Orientation="Horizontal" Spacing="10">
+                            <SymbolIcon Symbol="Sync" />
+                            <TextBlock Text="Sync sessions" />
+                        </StackPanel>
+                    </Button>
                     <TextBlock
-                        VerticalAlignment="Center"
+                        x:Name="SyncStatus"
+                        FontSize="12"
                         Foreground="{StaticResource TextMutedBrush}"
-                        Text="Source files stay untouched" />
+                        Text="Source files stay untouched."
+                        TextWrapping="Wrap" />
                 </StackPanel>
             </Grid>
         </Border>
@@ -201,15 +220,22 @@
                             FontWeight="SemiBold"
                             Foreground="{StaticResource TextStrongBrush}" />
                     </StackPanel>
-                    <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="10">
+                    <StackPanel x:Name="HeaderActions" Grid.Column="1" Orientation="Horizontal" Spacing="10">
                         <Button Click="CopyContext_Click" Style="{StaticResource PillButtonStyle}">
                             <StackPanel Orientation="Horizontal" Spacing="8">
                                 <SymbolIcon Symbol="Copy" />
                                 <TextBlock Text="Copy context" />
                             </StackPanel>
                         </Button>
-                        <Button Click="Restore_Click" Style="{StaticResource PrimaryPillButtonStyle}">
-                            <TextBlock Text="Build restore packet" />
+                        <Button Click="ResumeInTerminal_Click" Style="{StaticResource PrimaryPillButtonStyle}">
+                            <StackPanel Orientation="Horizontal" Spacing="8">
+                                <FontIcon
+                                    FontFamily="Segoe Fluent Icons"
+                                    FontSize="15"
+                                    Foreground="Black"
+                                    Glyph="&#xE756;" />
+                                <TextBlock Text="Resume in terminal" />
+                            </StackPanel>
                         </Button>
                     </StackPanel>
                 </Grid>
@@ -221,25 +247,41 @@
         </Grid>
 
         <Border
+            x:Name="RightColumnBorder"
             Grid.Column="2"
-            Margin="18,26,18,0"
-            Padding="16"
-            VerticalAlignment="Top"
+            Margin="18,26,18,18"
+            Padding="16,16,16,8"
+            VerticalAlignment="Stretch"
             BorderBrush="{StaticResource LineBrush}"
             BorderThickness="1"
             Background="{StaticResource PanelBrush}"
             CornerRadius="12">
+            <ScrollViewer
+                HorizontalScrollBarVisibility="Disabled"
+                VerticalScrollBarVisibility="Auto">
             <StackPanel x:Name="RightPanel" Spacing="12">
                 <TextBlock
                     FontSize="18"
                     FontWeight="SemiBold"
                     Foreground="{StaticResource TextStrongBrush}"
                     Text="Quick actions" />
-                <Button Click="CopyContext_Click" Style="{StaticResource PillButtonStyle}" Content="Copy resume prompt" />
-                <Button Click="CopyPath_Click" Style="{StaticResource PillButtonStyle}" Content="Copy chat path" />
-                <Button Click="CopyCode_Click" Style="{StaticResource PillButtonStyle}" Content="Copy all code" />
-                <Button Click="Source_Click" Style="{StaticResource PillButtonStyle}" Content="Inspect raw events" />
-                <Button Click="Review_Click" Style="{StaticResource PillButtonStyle}" Content="Add review-later" />
+                <Button
+                    Click="ResumeInTerminal_Click"
+                    Content="Resume in terminal"
+                    HorizontalAlignment="Stretch"
+                    Style="{StaticResource PrimaryPillButtonStyle}" />
+                <Button
+                    x:Name="AddToProjectButton"
+                    Click="AddToProject_Click"
+                    Content="Add to project"
+                    HorizontalAlignment="Stretch"
+                    Style="{StaticResource PillButtonStyle}" />
+                <Button Click="CopyContext_Click" Content="Copy resume prompt" HorizontalAlignment="Stretch" Style="{StaticResource PillButtonStyle}" />
+                <Button Click="CopyPath_Click" Content="Copy chat path" HorizontalAlignment="Stretch" Style="{StaticResource PillButtonStyle}" />
+                <Button Click="CopyCode_Click" Content="Copy all code" HorizontalAlignment="Stretch" Style="{StaticResource PillButtonStyle}" />
+                <Button Click="Restore_Click" Content="Build restore packet" HorizontalAlignment="Stretch" Style="{StaticResource PillButtonStyle}" />
+                <Button Click="Source_Click" Content="Inspect raw events" HorizontalAlignment="Stretch" Style="{StaticResource PillButtonStyle}" />
+                <Button Click="Review_Click" Content="Add review-later" HorizontalAlignment="Stretch" Style="{StaticResource PillButtonStyle}" />
                 <TextBlock
                     Margin="0,6,0,0"
                     FontSize="16"
@@ -251,6 +293,7 @@
                     MaximumRowsOrColumns="3"
                     Orientation="Horizontal" />
             </StackPanel>
+            </ScrollViewer>
         </Border>
     </Grid>
 </Page>

@@ -1,47 +1,41 @@
-# Build output
-bin/
-obj/
+# Build outputs
+**/bin/
+**/obj/
 dist/
-publish/
-artifacts/
-*.msix
-*.msixbundle
-*.appx
-*.appxbundle
-*.zip
-
-# .NET
-TestResults/
-*.user
-*.rsuser
-*.suo
-*.userosscache
-*.sln.docstates
-
-# Node/prototype leftovers
-node_modules/
-coverage/
-playwright-report/
-test-results/
-
-# Local app data and private imports
-PUBLIC_REPO_AUDIT.md
-.env
-.env.*
-!.env.example
-data/app-store.private.json
-data/imports/
-data/local/
-*.sqlite
-*.db
-*.log
-*.pfx
-*.pem
-*.key
-
-# OS/editor
 .vs/
-.vscode/
-.idea/
-.DS_Store
+*.user
+
+# Dependencies
+node_modules/
+
+# Test / QA artifacts
+test-results/
+playwright-report/
+
+# Web prototype (superseded by the WinUI app under native/)
+index.html
+src/
+server/
+tests/
+package.json
+package-lock.json
+playwright.config.ts
+vite.config.ts
+vitest.config.ts
+tsconfig.json
+
+# Local design/planning notes (kept out of the public tree)
+design/
+LOOPS.md
+TANDEM.md
+IMPLEMENTATION_TEST_PLAN.md
+PUBLIC_REPO_AUDIT.md
+watch.cmd
+
+# Dev-assist files — the app's own agent protocol is the top-level AGENTS.md
+native/CodexLocalRetrieval.Native/AGENTS.md
+native/CodexLocalRetrieval.Native/.github/
+
+# OS / editor
 Thumbs.db
+.DS_Store

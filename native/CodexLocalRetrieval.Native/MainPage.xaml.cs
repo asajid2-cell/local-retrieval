@@ -27,44 +27,35 @@ public sealed partial class MainPage : Page
     private string _askQuestion = "";
     private string _askAnswer = "";
     private string _askStatus = "Configure a provider in Settings, then ask a question about your archive.";
-    private string _indexStatus = "";
 
     public MainPage()
     {
+        Diag.Log("MP.ctor: before InitializeComponent");
         InitializeComponent();
+        Diag.Log("MP.ctor: after InitializeComponent");
         Loaded += MainPage_Loaded;
     }
 
     private async void MainPage_Loaded(object sender, RoutedEventArgs e)
     {
-        await _archive.LoadAsync();
-        ApplyThemeAndShape();
-        _storeLoaded = true;
-        SessionList.ItemsSource = _archive.Sessions;
-        SelectFirstSession();
-        RenderCurrent();
-        _ = AutoIndexAfterFirstPaint();
-        _ = RefreshTitlesAfterFirstPaint();
-    }
-
-    private async Task AutoIndexAfterFirstPaint()
-    {
-        await Task.Delay(250);
-        var progress = new Progress<string>(message =>
+        Diag.Log("MP.Loaded: start");
+        try
         {
-            _indexStatus = message;
-            if (_screen == "Settings")
-            {
-                RenderSettings();
-            }
-        });
-
-        var indexed = await _archive.AutoIndexAsync(progress);
-        if (indexed > 0)
-        {
+            await _archive.LoadAsync();
+            Diag.Log("MP.Loaded: archive loaded (" + _archive.Sessions.Count + " sessions)");
+            ApplyThemeAndShape();
+            _storeLoaded = true;
+            SessionList.ItemsSource = _archive.Sessions;
             SelectFirstSession();
             RenderCurrent();
-            _ = RefreshTitlesAfterFirstPaint();
+            Diag.Log("MP.Loaded: render done");
+            StartCaptureHarness();
+            StartAgentBridge();
+            _ = StartupResurfaceAsync();
+        }
+        catch (Exception ex)
+        {
+            Diag.Log("MP.Loaded: EXCEPTION " + ex);
         }
     }
 
@@ -168,7 +159,20 @@ public sealed partial class MainPage : Page
                 RenderArchive();
                 break;
         }
+        UpdateChrome();
         UpdateBackButton();
+    }
+
+    // The right panel (quick actions / tags) and the header actions (copy context /
+    // build restore packet) are session-specific — they only belong on screens tied to
+    // the selected chat. Hide them elsewhere and reclaim the space so each screen shows
+    // only what's relevant.
+    private void UpdateChrome()
+    {
+        bool sessionContext = _screen is "Archive" or "Source" or "Restore";
+        RightColumnBorder.Visibility = sessionContext ? Visibility.Visible : Visibility.Collapsed;
+        RightColumn.Width = sessionContext ? new GridLength(292) : new GridLength(0);
+        HeaderActions.Visibility = sessionContext ? Visibility.Visible : Visibility.Collapsed;
     }
 
     private void Back_Click(object sender, RoutedEventArgs e)
@@ -185,7 +189,9 @@ public sealed partial class MainPage : Page
 
     private void RenderArchive()
     {
-        ScreenLabel.Text = "Archive reader";
+        ScreenLabel.Text = _selected is null
+            ? "Archive reader"
+            : $"{(string.Equals(_selected.Tool, "claude", StringComparison.OrdinalIgnoreCase) ? "Claude" : "Codex")} chat - archive reader";
         TitleText.Text = _selected?.DisplayTitle ?? "No chat selected";
         MainContent.Children.Clear();
         RenderTags();
@@ -227,7 +233,8 @@ public sealed partial class MainPage : Page
         ScreenLabel.Text = "Grouped by local project path";
         TitleText.Text = "Workspaces";
         MainContent.Children.Clear();
-        var groups = _archive.Store.Sessions.Values
+        // Snapshot: a background sync may still be writing Store.Sessions on launch.
+        var groups = _archive.Store.Sessions.Values.ToList()
             .GroupBy(s => string.IsNullOrWhiteSpace(s.WorkspaceName) ? "Unknown" : s.WorkspaceName)
             .OrderByDescending(g => g.Max(s => s.UpdatedAt));
         foreach (var group in groups.Take(80))
@@ -265,7 +272,6 @@ public sealed partial class MainPage : Page
         ScreenLabel.Text = "Preferences and safety";
         TitleText.Text = "Settings";
         MainContent.Children.Clear();
-        MainContent.Children.Add(ChatSourcePanel());
         MainContent.Children.Add(SettingsPanel(
             "Theme picker",
             "Choose the palette, accent, shape, and density used by the app.",
@@ -274,6 +280,7 @@ public sealed partial class MainPage : Page
             SettingControlRow("Custom accent", AccentColorPicker()),
             SettingControlRow("Shape", ShapeCombo()),
             SettingControlRow("Density", DensityCombo())));
+        MainContent.Children.Add(AgentAccessPanel());
         MainContent.Children.Add(AiProviderPanel());
         MainContent.Children.Add(SettingRow("Read-only source mode", _archive.Store.Settings.ReadOnlySourceMode ? "On" : "Off"));
     }
@@ -292,13 +299,16 @@ public sealed partial class MainPage : Page
 
     private void RenderSource()
     {
-        ScreenLabel.Text = "Raw source";
+        ScreenLabel.Text = "Raw rollout timeline";
         TitleText.Text = "Source inspector";
         MainContent.Children.Clear();
-        if (_selected is null) return;
-        MainContent.Children.Add(InfoPanel("Source path", _selected.SourcePath));
-        MainContent.Children.Add(InfoPanel("Workspace", _selected.Workspace));
-        MainContent.Children.Add(InfoPanel("Parser mode", "Native index preview. Open the source file for full raw history."));
+        if (_selected is null)
+        {
+            MainContent.Children.Add(EmptyBlock("No chat selected", "Pick a chat to inspect its raw events."));
+            return;
+        }
+        MainContent.Children.Add(InfoPanel("Source file", _selected.SourcePath));
+        MainContent.Children.Add(SourceEventsPanel(_selected));
     }
 
     private void RenderRestore()
@@ -370,10 +380,11 @@ public sealed partial class MainPage : Page
         });
         stack.Children.Add(new TextBlock
         {
-            Text = StripCode(message.Text),
+            Text = CleanReadingText(message.Text),
             TextWrapping = TextWrapping.Wrap,
             Foreground = StrongBrush(),
-            LineHeight = 22
+            LineHeight = 22,
+            FontSize = 14
         });
         foreach (var block in message.CodeBlocks)
         {
@@ -639,18 +650,31 @@ public sealed partial class MainPage : Page
         RenderAsk();
     }
 
-    private Border ExpandableSessionGroup(string title, string subtitle, IEnumerable<ArchiveSession> sessions)
+    private UIElement ExpandableSessionGroup(string title, string subtitle, IEnumerable<ArchiveSession> sessions)
     {
-        var stack = new StackPanel { Spacing = 8 };
         var sessionList = sessions.Take(120).ToList();
+        var stack = new StackPanel { Spacing = 0 };
         if (sessionList.Count == 0)
         {
-            stack.Children.Add(new TextBlock { Text = "No chats in this group.", Foreground = MutedBrush() });
+            stack.Children.Add(new TextBlock { Text = "No chats in this group.", Foreground = MutedBrush(), Margin = new Thickness(0, 6, 0, 0) });
         }
-        foreach (var session in sessionList)
+        foreach (var session in sessionList) stack.Children.Add(SessionRow(session));
+
+        // Dense header: name + count pill on one line, path muted underneath. No oversized type.
+        var header = new Grid { ColumnDefinitions = { new ColumnDefinition(), new ColumnDefinition { Width = GridLength.Auto } } };
+        var titleRow = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8, VerticalAlignment = VerticalAlignment.Center };
+        titleRow.Children.Add(new TextBlock { Text = title, Foreground = StrongBrush(), FontSize = 15, FontWeight = Microsoft.UI.Text.FontWeights.SemiBold, VerticalAlignment = VerticalAlignment.Center, TextTrimming = TextTrimming.CharacterEllipsis });
+        header.Children.Add(titleRow);
+        var count = new Border
         {
-            stack.Children.Add(SessionRow(session));
-        }
+            Background = AccentVerySoftBrush(),
+            CornerRadius = new CornerRadius(9),
+            Padding = new Thickness(9, 1, 9, 1),
+            VerticalAlignment = VerticalAlignment.Center,
+            Child = new TextBlock { Text = subtitle, Foreground = MutedBrush(), FontSize = 11 }
+        };
+        Grid.SetColumn(count, 1);
+        header.Children.Add(count);
 
         var expander = new Expander
         {
@@ -659,62 +683,89 @@ public sealed partial class MainPage : Page
             BorderThickness = new Thickness(0),
             Padding = new Thickness(0),
             HorizontalAlignment = HorizontalAlignment.Stretch,
-            Header = new StackPanel
-            {
-                Spacing = 4,
-                Children =
-                {
-                    new TextBlock { Text = title, Foreground = StrongBrush(), FontSize = 18, FontWeight = Microsoft.UI.Text.FontWeights.SemiBold, TextWrapping = TextWrapping.Wrap },
-                    new TextBlock { Text = subtitle, Foreground = MutedBrush(), TextWrapping = TextWrapping.Wrap }
-                }
-            },
+            HorizontalContentAlignment = HorizontalAlignment.Stretch,
+            Header = header,
             Content = stack
         };
 
-        return Card(expander);
+        return new Border
+        {
+            Background = PanelBrush(),
+            BorderBrush = LineBrush(),
+            BorderThickness = new Thickness(1),
+            CornerRadius = PanelCornerRadius(),
+            Padding = new Thickness(14, 6, 14, 6),
+            Child = expander
+        };
+    }
+
+    // A compact colored badge naming the agent that produced a chat (claude / codex).
+    private Border ToolBadge(string tool)
+    {
+        var claude = string.Equals(tool, "claude", StringComparison.OrdinalIgnoreCase);
+        var tint = claude
+            ? Windows.UI.Color.FromArgb(40, 214, 153, 92)   // warm = claude
+            : Windows.UI.Color.FromArgb(40, 120, 170, 255);  // cool = codex
+        return new Border
+        {
+            Background = new SolidColorBrush(tint),
+            CornerRadius = new CornerRadius(5),
+            Padding = new Thickness(6, 1, 6, 1),
+            VerticalAlignment = VerticalAlignment.Center,
+            Child = new TextBlock { Text = claude ? "claude" : "codex", Foreground = StrongBrush(), FontSize = 10, FontWeight = Microsoft.UI.Text.FontWeights.SemiBold }
+        };
     }
 
     private UIElement SessionRow(ArchiveSession session)
     {
+        var resumeButton = new Button
+        {
+            Style = (Style)Resources["PillButtonStyle"],
+            Padding = new Thickness(12, 0, 12, 0),
+            MinHeight = 34,
+            Content = "Resume"
+        };
+        resumeButton.Click += (_, _) => ResumeInTerminal(session);
+
         var openButton = new Button
         {
             Style = (Style)Resources["PillButtonStyle"],
             Padding = new Thickness(12, 0, 12, 0),
+            MinHeight = 34,
             Content = "Open"
         };
         openButton.Click += (_, _) => OpenSession(session);
 
-        var copyButton = new Button
-        {
-            Style = (Style)Resources["PillButtonStyle"],
-            Padding = new Thickness(12, 0, 12, 0),
-            Content = "Copy path"
-        };
-        copyButton.Click += (_, _) => CopyPath(session);
-
         var grid = new Grid
         {
-            MinHeight = 44,
+            MinHeight = 40,
             ColumnDefinitions =
             {
                 new ColumnDefinition(),
                 new ColumnDefinition { Width = GridLength.Auto }
             }
         };
+
+        var meta = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8, VerticalAlignment = VerticalAlignment.Center };
+        meta.Children.Add(ToolBadge(session.Tool));
+        meta.Children.Add(new TextBlock { Text = session.DisplayDate, Foreground = MutedBrush(), FontSize = 12, VerticalAlignment = VerticalAlignment.Center });
+
         grid.Children.Add(new StackPanel
         {
             Spacing = 3,
+            VerticalAlignment = VerticalAlignment.Center,
             Children =
             {
-                new TextBlock { Text = session.DisplayTitle, Foreground = StrongBrush(), TextWrapping = TextWrapping.Wrap },
-                new TextBlock { Text = $"{session.DisplayDate} - {session.SourcePath}", Foreground = MutedBrush(), FontSize = 12, TextWrapping = TextWrapping.Wrap }
+                new TextBlock { Text = session.DisplayTitle, Foreground = StrongBrush(), TextTrimming = TextTrimming.CharacterEllipsis, MaxLines = 1 },
+                meta
             }
         });
         var actions = new StackPanel
         {
             Orientation = Orientation.Horizontal,
-            Spacing = 8,
-            Children = { openButton, copyButton }
+            Spacing = 6,
+            VerticalAlignment = VerticalAlignment.Center,
+            Children = { resumeButton, openButton }
         };
         Grid.SetColumn(actions, 1);
         grid.Children.Add(actions);
@@ -724,7 +775,7 @@ public sealed partial class MainPage : Page
             BorderBrush = LineBrush(),
             BorderThickness = new Thickness(0, 1, 0, 0),
             Background = new SolidColorBrush(Colors.Transparent),
-            Padding = new Thickness(0, 10, 0, 0),
+            Padding = new Thickness(0, 8, 0, 8),
             Child = grid
         };
     }
@@ -768,7 +819,14 @@ public sealed partial class MainPage : Page
 
     private Border SettingsPanel(string title, string body, params UIElement[] controls)
     {
-        var stack = new StackPanel { Spacing = _archive.Store.Settings.Density == "compact" ? 10 : 14 };
+        // Cap the measure so label/control pairs stay visually associated instead of being
+        // flung to opposite edges of a wide panel (the "far-right gap" the dashboard would have).
+        var stack = new StackPanel
+        {
+            Spacing = _archive.Store.Settings.Density == "compact" ? 10 : 14,
+            MaxWidth = 660,
+            HorizontalAlignment = HorizontalAlignment.Left
+        };
         stack.Children.Add(new TextBlock { Text = title, Foreground = StrongBrush(), FontSize = 18, FontWeight = Microsoft.UI.Text.FontWeights.SemiBold });
         stack.Children.Add(new TextBlock { Text = body, Foreground = MutedBrush(), TextWrapping = TextWrapping.Wrap });
         foreach (var control in controls) stack.Children.Add(control);
@@ -892,112 +950,6 @@ public sealed partial class MainPage : Page
             RenderCurrent();
         };
         return combo;
-    }
-
-    private Border ChatSourcePanel()
-    {
-        var pathBox = new TextBox
-        {
-            Text = _archive.Store.Settings.ChatRootPath,
-            PlaceholderText = @"%USERPROFILE%\.codex\sessions",
-            MinWidth = 520,
-            CornerRadius = ControlCornerRadius()
-        };
-
-        var autoCheck = new CheckBox
-        {
-            Content = "Auto-index on startup",
-            IsChecked = _archive.Store.Settings.AutoIndexOnStartup,
-            Foreground = StrongBrush()
-        };
-        autoCheck.Checked += async (_, _) =>
-        {
-            if (!_storeLoaded) return;
-            _archive.Store.Settings.AutoIndexOnStartup = true;
-            await _archive.SaveAsync();
-        };
-        autoCheck.Unchecked += async (_, _) =>
-        {
-            if (!_storeLoaded) return;
-            _archive.Store.Settings.AutoIndexOnStartup = false;
-            await _archive.SaveAsync();
-        };
-
-        var detectButton = new Button { Style = (Style)Resources["PillButtonStyle"], Content = "Auto-detect" };
-        detectButton.Click += async (_, _) =>
-        {
-            var detected = _archive.ResolveDefaultChatRoot();
-            if (string.IsNullOrWhiteSpace(detected))
-            {
-                await ShowInfoAsync("No local sessions found", "Set the folder that contains your Codex JSONL chat files, usually .codex\\sessions.");
-                return;
-            }
-
-            pathBox.Text = detected;
-            await IndexChatRootAsync(detected);
-        };
-
-        var indexButton = new Button { Style = (Style)Resources["PrimaryPillButtonStyle"], Content = "Index folder" };
-        indexButton.Click += async (_, _) => await IndexChatRootAsync(pathBox.Text);
-
-        var candidates = _archive.CandidateChatRoots()
-            .Where(Directory.Exists)
-            .Take(4)
-            .ToList();
-        var candidatesText = candidates.Count == 0
-            ? "No default Codex folders found yet."
-            : "Detected: " + string.Join(" | ", candidates);
-
-        var statusText = string.IsNullOrWhiteSpace(_indexStatus)
-            ? _archive.Store.Settings.LastIndexStatus
-            : _indexStatus;
-
-        var stack = new StackPanel { Spacing = _archive.Store.Settings.Density == "compact" ? 10 : 14 };
-        stack.Children.Add(new TextBlock { Text = "Chat source", Foreground = StrongBrush(), FontSize = 18, FontWeight = Microsoft.UI.Text.FontWeights.SemiBold });
-        stack.Children.Add(new TextBlock { Text = "Point the app at your local Codex sessions folder. Source files are read-only; the app stores its own index and metadata separately.", Foreground = MutedBrush(), TextWrapping = TextWrapping.Wrap });
-        stack.Children.Add(pathBox);
-        stack.Children.Add(new StackPanel
-        {
-            Orientation = Orientation.Horizontal,
-            Spacing = 8,
-            Children = { indexButton, detectButton, autoCheck }
-        });
-        stack.Children.Add(new TextBlock { Text = candidatesText, Foreground = MutedBrush(), FontSize = 12, TextWrapping = TextWrapping.Wrap });
-        if (!string.IsNullOrWhiteSpace(statusText))
-        {
-            stack.Children.Add(new TextBlock { Text = statusText, Foreground = MutedBrush(), FontSize = 12, TextWrapping = TextWrapping.Wrap });
-        }
-
-        return Card(stack);
-    }
-
-    private async Task IndexChatRootAsync(string rootPath)
-    {
-        rootPath = Environment.ExpandEnvironmentVariables(rootPath.Trim());
-        if (string.IsNullOrWhiteSpace(rootPath) || !Directory.Exists(rootPath))
-        {
-            await ShowInfoAsync("Folder not found", "Enter an existing folder that contains Codex chat JSONL files.");
-            return;
-        }
-
-        _indexStatus = $"Indexing {rootPath}";
-        RenderSettings();
-        var progress = new Progress<string>(message =>
-        {
-            _indexStatus = message;
-            if (_screen == "Settings")
-            {
-                RenderSettings();
-            }
-        });
-
-        var indexed = await _archive.IndexRootAsync(rootPath, progress);
-        if (indexed > 0)
-        {
-            await _archive.EnrichTitlesFromLocalStateAsync();
-            SelectFirstSession();
-        }
-        RenderCurrent();
     }
 
     private Border AiProviderPanel()
@@ -1603,6 +1555,14 @@ public sealed partial class MainPage : Page
     }
 
     private static string StripCode(string text) => Regex.Replace(text, "```[\\s\\S]*?```", "").Trim();
+
+    // Reading-mode cleanup (logic lives in Core.ArchiveService.ForReading so it's unit-tested):
+    // drop fenced code + machine-context noise; show a marker when a message was pure context.
+    private static string CleanReadingText(string text)
+    {
+        var value = ArchiveService.ForReading(text);
+        return value.Length == 0 ? "(IDE / environment context)" : value;
+    }
     private static string FormatDate(string value) => DateTime.TryParse(value, out var date) ? date.ToString("MMM d") : "";
     private static string HexFromColor(Windows.UI.Color color) => $"#{color.R:X2}{color.G:X2}{color.B:X2}".ToLowerInvariant();
     private SolidColorBrush StrongBrush() => (SolidColorBrush)Application.Current.Resources["TextStrongBrush"];

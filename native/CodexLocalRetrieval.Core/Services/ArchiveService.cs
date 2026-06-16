@@ -9,116 +9,65 @@ namespace CodexLocalRetrieval.Core.Services;
 
 public sealed class ArchiveService
 {
+    private const int CurrentIndexVersion = 4; // bump on any parser change to force a full re-parse
+    private const int MaxIndexedFiles = 4000;
     private const int MaxMessagesPerSession = 220;
     private const int MaxLinesPerSession = 18_000;
     private const int MaxLineChars = 512_000;
 
-    private readonly string _contentRootPath;
-    private readonly string _seedStorePath;
+    private readonly string _rootPath;
     private readonly string _storePath;
+    private readonly string _bundledStorePath;
     private readonly JsonSerializerOptions _jsonOptions = new() { PropertyNameCaseInsensitive = true, WriteIndented = true };
+    private readonly SemaphoreSlim _saveGate = new(1, 1);
 
     public AppStoreData Store { get; private set; } = new();
     public ObservableCollection<ArchiveSession> Sessions { get; } = new();
 
-    public ArchiveService(string? storePath = null, string? contentRootPath = null)
+    public ArchiveService(string? storePath = null, bool useBundledStore = false)
     {
-        _contentRootPath = contentRootPath ?? FindProjectRoot();
-        _seedStorePath = Path.Combine(_contentRootPath, "data", "app-store.json");
-        _storePath = storePath ?? DefaultStorePath();
+        _rootPath = FindProjectRoot();
+        _bundledStorePath = Path.Combine(_rootPath, "data", "app-store.json");
+        _storePath = useBundledStore
+            ? _bundledStorePath
+            : storePath ?? Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "CodexLocalRetrieval",
+            "app-store.json");
     }
 
     public async Task LoadAsync()
     {
-        if (File.Exists(_storePath))
+        var loadPath = File.Exists(_storePath) ? _storePath : _bundledStorePath;
+        if (File.Exists(loadPath))
         {
-            var json = await File.ReadAllTextAsync(_storePath);
-            Store = JsonSerializer.Deserialize<AppStoreData>(json, _jsonOptions) ?? new AppStoreData();
-        }
-        else if (File.Exists(_seedStorePath))
-        {
-            var json = await File.ReadAllTextAsync(_seedStorePath);
+            var json = await File.ReadAllTextAsync(loadPath);
             Store = JsonSerializer.Deserialize<AppStoreData>(json, _jsonOptions) ?? new AppStoreData();
         }
         NormalizeSettings();
         RefreshSessions(OrderedVisibleSessions(Store.Sessions.Values));
     }
 
-    public string ResolveDefaultChatRoot()
-    {
-        if (!string.IsNullOrWhiteSpace(Store.Settings.ChatRootPath) && Directory.Exists(Store.Settings.ChatRootPath))
-        {
-            return Store.Settings.ChatRootPath;
-        }
-
-        return CandidateChatRoots().FirstOrDefault(root => Directory.Exists(root) && ContainsSessionJsonl(root)) ?? "";
-    }
-
-    public IReadOnlyList<string> CandidateChatRoots()
-    {
-        var roots = new List<string>();
-        var codexHome = Environment.GetEnvironmentVariable("CODEX_HOME");
-        if (!string.IsNullOrWhiteSpace(codexHome))
-        {
-            AddIfUnique(roots, Path.Combine(codexHome, "sessions"));
-            AddIfUnique(roots, Path.Combine(codexHome, "archived_sessions"));
-            AddIfUnique(roots, codexHome);
-        }
-
-        var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        var userCodex = Path.Combine(home, ".codex");
-        AddIfUnique(roots, Path.Combine(userCodex, "sessions"));
-        AddIfUnique(roots, Path.Combine(userCodex, "archived_sessions"));
-        AddIfUnique(roots, Path.Combine(userCodex, "repair-backups"));
-        AddIfUnique(roots, userCodex);
-        return roots;
-    }
-
-    public async Task<int> AutoIndexAsync(IProgress<string>? progress = null)
-    {
-        if (!Store.Settings.AutoIndexOnStartup)
-        {
-            progress?.Report("Auto-index is off.");
-            return 0;
-        }
-
-        var root = ResolveDefaultChatRoot();
-        if (string.IsNullOrWhiteSpace(root))
-        {
-            Store.Settings.LastIndexStatus = "No local Codex sessions were found. Set a chat folder in Settings.";
-            progress?.Report(Store.Settings.LastIndexStatus);
-            await SaveAsync();
-            return 0;
-        }
-
-        if (!HasOnlyDemoSessions()
-            && !string.IsNullOrWhiteSpace(Store.Settings.LastIndexedAt)
-            && string.Equals(Store.Settings.ChatRootPath, root, StringComparison.OrdinalIgnoreCase))
-        {
-            Store.Settings.LastIndexStatus = $"Using existing index from {Store.Settings.ChatRootPath}. Use Index folder to refresh.";
-            progress?.Report(Store.Settings.LastIndexStatus);
-            return 0;
-        }
-
-        progress?.Report($"Indexing {root}");
-        return await IndexRootAsync(root, progress);
-    }
-
     public async Task<bool> EnrichTitlesFromLocalStateAsync()
     {
-        var changed = await Task.Run(EnrichTitlesFromLocalState);
-        if (changed)
-        {
-            RefreshSessions(Store.Sessions.Values);
-        }
+        // Read the (potentially slow) sqlite/jsonl off-thread, but APPLY the changes on the caller
+        // (UI) thread — mutating bound sessions raises INotifyPropertyChanged, which must not fire
+        // from a worker.
+        var titles = await Task.Run(LoadThreadTitles);
+        var changed = ApplyThreadTitles(titles);
+        if (changed) RefreshSessions(Store.Sessions.Values);
         return changed;
     }
 
     public async Task SaveAsync()
     {
+        // Serialize a synchronous snapshot, then gate the file write so overlapping saves
+        // (a background sync finishing while the user pins/files a chat) can't clobber each other.
         Directory.CreateDirectory(Path.GetDirectoryName(_storePath)!);
         var json = JsonSerializer.Serialize(Store, _jsonOptions);
-        await File.WriteAllTextAsync(_storePath, json);
+        await _saveGate.WaitAsync();
+        try { await File.WriteAllTextAsync(_storePath, json); }
+        finally { _saveGate.Release(); }
     }
 
     public void RefreshSessions(IEnumerable<ArchiveSession> sessions)
@@ -213,6 +162,129 @@ public sealed class ArchiveService
         await SaveAsync();
     }
 
+    // Apply one command from an outside agent (see AGENTS.md). Lets a user point any Claude/Codex
+    // chat at the app and say "set yourself up / favorite yourself / file yourself into project X".
+    public async Task<AgentCommandResult> ApplyAgentCommandAsync(AgentCommand cmd)
+    {
+        switch ((cmd.op ?? "").Trim().ToLowerInvariant())
+        {
+            case "init":
+                EnsureDefaultSources();
+                await SaveAsync();
+                return new AgentCommandResult(true, "Initialized default sources (Codex + Claude).");
+
+            case "addsource":
+                if (string.IsNullOrWhiteSpace(cmd.root) || string.IsNullOrWhiteSpace(cmd.tool))
+                    return new AgentCommandResult(false, "addSource needs both 'tool' and 'root'.");
+                EnsureDefaultSources();
+                if (!Store.Settings.Sources.Any(s => string.Equals(s.Root, cmd.root, StringComparison.OrdinalIgnoreCase)
+                                                     && string.Equals(s.Tool, cmd.tool, StringComparison.OrdinalIgnoreCase)))
+                    Store.Settings.Sources.Add(new SessionSource { Tool = cmd.tool!.ToLowerInvariant(), Root = cmd.root! });
+                await SaveAsync();
+                return new AgentCommandResult(true, $"Added {cmd.tool} source: {cmd.root}");
+
+            case "favorite":
+            case "pin":
+            {
+                var s = ResolveTargetSession(cmd);
+                if (s is null) return new AgentCommandResult(false, "No matching session to favorite.");
+                s.Pinned = true;
+                await SaveAsync();
+                RefreshSessions(Store.Sessions.Values);
+                return new AgentCommandResult(true, $"Favorited \"{s.DisplayTitle}\".");
+            }
+
+            case "addtoproject":
+            case "addtocollection":
+            {
+                if (string.IsNullOrWhiteSpace(cmd.project)) return new AgentCommandResult(false, "addToProject needs 'project'.");
+                var s = ResolveTargetSession(cmd);
+                if (s is null) return new AgentCommandResult(false, "No matching session to add to a project.");
+                await AddToCollectionAsync(s, cmd.project!);
+                RefreshSessions(Store.Sessions.Values);
+                return new AgentCommandResult(true, $"Added \"{s.DisplayTitle}\" to project \"{cmd.project}\".");
+            }
+
+            case "rename":
+            {
+                var s = ResolveTargetSession(cmd);
+                if (s is null) return new AgentCommandResult(false, "No matching session to rename.");
+                if (!string.IsNullOrWhiteSpace(cmd.localName)) s.CustomTitle = CleanTitle(cmd.localName!);
+                var canonical = await TryWriteCanonicalNameAsync(s, cmd.canonicalName);
+                await SaveAsync();
+                RefreshSessions(Store.Sessions.Values);
+                return new AgentCommandResult(true, $"Renamed to \"{s.DisplayTitle}\".{(canonical is null ? "" : " " + canonical)}");
+            }
+
+            default:
+                return new AgentCommandResult(false, $"Unknown op: '{cmd.op}'.");
+        }
+    }
+
+    private void EnsureDefaultSources()
+    {
+        if (Store.Settings.Sources.Count == 0) Store.Settings.Sources.AddRange(DefaultSources());
+    }
+
+    // Resolve which session a command targets: an explicit id, or "self"/"latest" = the newest
+    // session in the agent's workspace (cwd), optionally filtered by tool.
+    public ArchiveSession? ResolveTargetSession(AgentCommand cmd)
+    {
+        var explicitId = cmd.id;
+        if (string.IsNullOrWhiteSpace(explicitId) && !string.IsNullOrWhiteSpace(cmd.target)
+            && cmd.target != "self" && cmd.target != "latest")
+            explicitId = cmd.target;
+        if (!string.IsNullOrWhiteSpace(explicitId) && Store.Sessions.TryGetValue(explicitId!, out var byId))
+            return byId;
+
+        if (string.IsNullOrWhiteSpace(cmd.cwd)) return null;
+        var norm = NormalizePath(cmd.cwd!);
+        return Store.Sessions.Values
+            .Where(s => NormalizePath(s.Workspace) == norm)
+            .Where(s => string.IsNullOrWhiteSpace(cmd.tool) || string.Equals(s.Tool, cmd.tool, StringComparison.OrdinalIgnoreCase))
+            .OrderByDescending(s => s.UpdatedAt)
+            .FirstOrDefault();
+    }
+
+    private static string NormalizePath(string p)
+    {
+        if (string.IsNullOrWhiteSpace(p)) return "";
+        try { return Path.GetFullPath(p).Replace('/', '\\').TrimEnd('\\').ToLowerInvariant(); }
+        catch { return p.Replace('/', '\\').TrimEnd('\\').ToLowerInvariant(); }
+    }
+
+    // L11: write the canonical name back to the agent's own store so the rename shows up in
+    // Codex/Claude's native resume picker too — not just inside this app.
+    public async Task<string?> TryWriteCanonicalNameAsync(ArchiveSession session, string? canonicalName)
+    {
+        if (string.IsNullOrWhiteSpace(canonicalName)) return null;
+        if (string.Equals(session.Tool, "codex", StringComparison.OrdinalIgnoreCase))
+            return await Task.Run(() => WriteCodexThreadTitle(session.Id, canonicalName!));
+        return "Claude has no external rename API yet, so the canonical name stays app-only.";
+    }
+
+    private static string WriteCodexThreadTitle(string id, string title)
+    {
+        try
+        {
+            var path = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".codex", "state_5.sqlite");
+            if (!File.Exists(path)) return "Codex title DB not found; local name updated.";
+            var builder = new SqliteConnectionStringBuilder { DataSource = path, Mode = SqliteOpenMode.ReadWrite };
+            using var connection = new SqliteConnection(builder.ToString());
+            connection.Open();
+            using (var busy = connection.CreateCommand()) { busy.CommandText = "PRAGMA busy_timeout=2000;"; busy.ExecuteNonQuery(); }
+            using var command = connection.CreateCommand();
+            command.CommandText = "update threads set title = $t where id = $id";
+            command.Parameters.AddWithValue("$t", title);
+            command.Parameters.AddWithValue("$id", id);
+            return command.ExecuteNonQuery() > 0 ? "Canonical name written to Codex." : "No matching Codex thread; local name updated.";
+        }
+        catch (Exception ex)
+        {
+            return "Codex canonical rename failed (" + ex.Message + "); local name updated.";
+        }
+    }
+
     public AiProviderSettings EnsureAiProvider(string name, string baseUrl, string model)
     {
         var id = Slug(name);
@@ -272,54 +344,359 @@ public sealed class ArchiveService
         });
     }
 
-    public async Task<int> IndexRootAsync(string rootPath, IProgress<string>? progress = null)
+    // Index one folder as Codex rollouts (kept for callers/tests that target a single codex root).
+    public async Task<int> IndexRootAsync(string rootPath, IProgress<string>? progress = null, bool refreshList = true)
     {
-        rootPath = Environment.ExpandEnvironmentVariables(rootPath.Trim());
         if (!Directory.Exists(rootPath))
         {
             progress?.Report("Root does not exist.");
             return 0;
         }
+        var (parsed, stamps) = await ParseSourceAsync(new SessionSource { Tool = "codex", Root = rootPath },
+            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase), progress);
+        return await MergeScanAsync(new DiskScan(parsed, new List<ArchiveSession>()) { Stamps = stamps }, refreshList);
+    }
 
-        Store.Settings.ChatRootPath = rootPath;
-        var files = EnumerateSessionFiles(rootPath).Take(5000).ToList();
-        var indexed = 0;
-        if (files.Count > 0 && HasOnlyDemoSessions())
+    // Default on-disk stores. Codex rollouts and Claude transcripts both land under the home dir.
+    public static string DefaultCodexSessionsRoot =>
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".codex", "sessions");
+    public static string DefaultClaudeSessionsRoot =>
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".claude", "projects");
+
+    public static List<SessionSource> DefaultSources() => new()
+    {
+        new SessionSource { Tool = "codex", Root = DefaultCodexSessionsRoot },
+        new SessionSource { Tool = "claude", Root = DefaultClaudeSessionsRoot },
+    };
+
+    // The roots to scan: whatever the user/agent configured, else the codex + claude defaults.
+    public IReadOnlyList<SessionSource> EffectiveSources() =>
+        Store.Settings.Sources.Count > 0 ? Store.Settings.Sources : DefaultSources();
+
+    // Resurface everything in one call (tests + simple callers). UI callers split this across
+    // threads: ScanDiskAsync on a worker (no shared state) then MergeScanAsync on the UI thread.
+    public async Task<int> SyncFromDiskAsync(IProgress<string>? progress = null, bool refreshList = true)
+    {
+        var scan = await ScanDiskAsync(progress);
+        return await MergeScanAsync(scan, refreshList);
+    }
+
+    // OFF-THREAD SAFE: reads files only and returns parsed/changed sessions + current file stamps.
+    // Iterates every configured source (codex + claude), skips files whose stamp is unchanged
+    // (incremental), and routes parsing by the source's tool. Touches no shared mutable state.
+    public async Task<DiskScan> ScanDiskAsync(IProgress<string>? progress = null)
+    {
+        var bundled = Store.Settings.BundledHistoryAbsorbed ? new List<ArchiveSession>() : LoadBundledHistory(progress);
+        // Honor the incremental cache only when the parser version matches; otherwise re-parse all.
+        var fullRescan = Store.Settings.IndexVersion != CurrentIndexVersion;
+        var known = fullRescan
+            ? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            : new Dictionary<string, string>(Store.FileStamps, StringComparer.OrdinalIgnoreCase);
+        var disk = new List<ArchiveSession>();
+        var stamps = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var anyRoot = false;
+        foreach (var src in EffectiveSources())
         {
-            RemoveDemoSessions();
+            if (!src.Enabled || string.IsNullOrWhiteSpace(src.Root) || !Directory.Exists(src.Root)) continue;
+            anyRoot = true;
+            var (parsed, srcStamps) = await ParseSourceAsync(src, known, progress);
+            disk.AddRange(parsed);
+            foreach (var kv in srcStamps) stamps[kv.Key] = kv.Value;
         }
+        if (!anyRoot) progress?.Report("No session folders found.");
+        return new DiskScan(disk, bundled) { Stamps = stamps, FullRescan = fullRescan };
+    }
 
+    // Enumerate one source, skip unchanged files (incremental), parse the rest by tool.
+    private async Task<(List<ArchiveSession> Parsed, Dictionary<string, string> Stamps)> ParseSourceAsync(
+        SessionSource src, IReadOnlyDictionary<string, string> known, IProgress<string>? progress)
+    {
+        var files = Directory.EnumerateFiles(src.Root, "*.jsonl", SearchOption.AllDirectories)
+            .Select(path => new FileInfo(path))
+            .OrderByDescending(file => file.LastWriteTimeUtc)
+            .Take(MaxIndexedFiles)
+            .ToList();
+        var parsed = new List<ArchiveSession>();
+        var stamps = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         foreach (var file in files)
         {
+            var stamp = file.LastWriteTimeUtc.Ticks + ":" + file.Length;
+
+            // Claude workflow/subagent journals collide on the filename "journal" and aren't chats.
+            // Stamp them (so they're "scanned" -> any old orphan entry prunes + we skip them next
+            // time) but don't parse them into a session.
+            if (src.Tool == "claude" && (file.Name == "journal.jsonl"
+                || file.FullName.Contains("\\subagents\\", StringComparison.OrdinalIgnoreCase)))
+            {
+                stamps[file.FullName] = stamp;
+                continue;
+            }
+
+            if (known.TryGetValue(file.FullName, out var old) && old == stamp)
+            {
+                stamps[file.FullName] = stamp; // unchanged: carry the stamp forward, skip the parse
+                continue;
+            }
             try
             {
-                var session = await ParseJsonlAsync(file);
-                if (session.Messages.Count == 0)
-                {
-                    continue;
-                }
-                Store.Sessions[session.Id] = session;
-                indexed++;
-                if (indexed % 25 == 0) progress?.Report($"Indexed {indexed}/{files.Count}");
+                var session = await ParseSessionAsync(file.FullName, src.Tool);
+                if (session is not null) parsed.Add(session);
+                stamps[file.FullName] = stamp; // stamp only after a successful parse (or intentional sidechain skip)
             }
             catch (Exception ex)
             {
-                progress?.Report($"Skipped {Path.GetFileName(file)}: {ex.Message}");
+                // Do NOT stamp a failed parse, so a transient/locked read is retried next scan.
+                progress?.Report($"Skipped {file.Name}: {ex.Message}");
             }
         }
+        progress?.Report($"{src.Tool}: {parsed.Count} new/changed of {files.Count}");
+        return (parsed, stamps);
+    }
 
-        Store.Settings.LastIndexedAt = DateTime.UtcNow.ToString("O");
-        Store.Settings.LastIndexStatus = indexed == 0
-            ? $"No chat sessions found under {rootPath}."
-            : $"Indexed {indexed} chats from {rootPath}.";
-        if (indexed > 0)
+    // Route by tool; auto-detect when a source's tool is unknown.
+    private async Task<ArchiveSession?> ParseSessionAsync(string path, string tool)
+    {
+        var resolved = string.IsNullOrWhiteSpace(tool) || tool == "auto" ? DetectTool(path) : tool;
+        return resolved == "claude" ? await ParseClaudeSessionAsync(path) : await ParseJsonlAsync(path);
+    }
+
+    // Peek the first useful line: claude transcripts carry a sessionId; codex rollouts carry a payload.
+    private static string DetectTool(string path)
+    {
+        try
         {
+            foreach (var line in File.ReadLines(path))
+            {
+                if (string.IsNullOrWhiteSpace(line)) continue;
+                if (line.Contains("\"sessionId\"")) return "claude";
+                if (line.Contains("\"payload\"") || line.Contains("session_meta")) return "codex";
+                break;
+            }
+        }
+        catch { }
+        return "codex";
+    }
+
+    // UI-THREAD: merge scanned sessions into the store. Disk content always refreshes a session,
+    // but app-owned organization (custom title, pin, archive, review, star, user tags) is preserved
+    // so a re-sync never wipes how you've filed your chats. Bundled history only fills genuine gaps.
+    public async Task<int> MergeScanAsync(DiskScan scan, bool refreshList = true)
+    {
+        var imported = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var incoming in scan.Disk)
+        {
+            if (Store.Sessions.TryGetValue(incoming.Id, out var existing)) PreserveAppFields(existing, incoming);
+            Store.Sessions[incoming.Id] = incoming;
+            imported.Add(incoming.Id);
+        }
+        var recovered = 0;
+        foreach (var bundled in scan.Bundled)
+        {
+            if (string.IsNullOrWhiteSpace(bundled.Id) || Store.Sessions.ContainsKey(bundled.Id)) continue;
+            Store.Sessions[bundled.Id] = bundled;
+            imported.Add(bundled.Id);
+            recovered++;
+        }
+        if (imported.Count > 0)
+        {
+            RemoveBundledSampleSessions(imported);
             EnrichTitlesFromLocalState();
         }
+        // On a parser-version migration every file was re-parsed: prune sessions whose file WAS
+        // scanned but no longer yields that id (old id scheme, or the file is now a skipped sidechain).
+        if (scan.FullRescan)
+        {
+            var scannedPaths = new HashSet<string>(scan.Stamps.Keys, StringComparer.OrdinalIgnoreCase);
+            var orphans = Store.Sessions.Values
+                .Where(s => scannedPaths.Contains(s.SourcePath) && !imported.Contains(s.Id))
+                .Select(s => s.Id)
+                .ToList();
+            foreach (var id in orphans) Store.Sessions.Remove(id);
+        }
+        foreach (var kv in scan.Stamps) Store.FileStamps[kv.Key] = kv.Value;
+        Store.Settings.BundledHistoryAbsorbed = true;
+        Store.Settings.IndexVersion = CurrentIndexVersion;
         await SaveAsync();
-        RefreshSessions(Store.Sessions.Values.OrderByDescending(s => s.UpdatedAt));
-        progress?.Report(Store.Settings.LastIndexStatus);
-        return indexed;
+        if (refreshList) RefreshSessions(Store.Sessions.Values.OrderByDescending(s => s.UpdatedAt));
+        return scan.Disk.Count + recovered;
+    }
+
+    // Refresh a session's content from disk while keeping the user's organization intact.
+    private static void PreserveAppFields(ArchiveSession existing, ArchiveSession incoming)
+    {
+        incoming.CustomTitle = existing.CustomTitle;
+        incoming.Pinned = existing.Pinned;
+        incoming.Archived = existing.Archived;
+        incoming.Reviewed = existing.Reviewed;
+        incoming.Starred = existing.Starred;
+        foreach (var tag in existing.Tags)
+        {
+            if (!incoming.Tags.Contains(tag, StringComparer.OrdinalIgnoreCase)) incoming.Tags.Add(tag);
+        }
+    }
+
+    private List<ArchiveSession> LoadBundledHistory(IProgress<string>? progress)
+    {
+        var list = new List<ArchiveSession>();
+        try
+        {
+            if (string.Equals(_storePath, _bundledStorePath, StringComparison.OrdinalIgnoreCase)) return list;
+            if (!File.Exists(_bundledStorePath)) return list;
+            var bundled = JsonSerializer.Deserialize<AppStoreData>(File.ReadAllText(_bundledStorePath), _jsonOptions);
+            if (bundled is null) return list;
+            foreach (var pair in bundled.Sessions)
+            {
+                if (IsSampleSource(pair.Value.SourcePath)) continue;
+                list.Add(pair.Value);
+            }
+            if (list.Count > 0) progress?.Report($"Recovering {list.Count} archived chats from local history...");
+        }
+        catch
+        {
+            // History recovery is best-effort; a missing or partial snapshot must not block a sync.
+        }
+        return list;
+    }
+
+    private static bool IsSampleSource(string sourcePath) =>
+        sourcePath.Contains("sample-sessions", StringComparison.OrdinalIgnoreCase)
+        || sourcePath.Contains("data\\fixtures", StringComparison.OrdinalIgnoreCase)
+        || sourcePath.Contains("data/fixtures", StringComparison.OrdinalIgnoreCase);
+
+    // Everything the UI needs to actually resume a chat in a terminal, routed by which agent owns
+    // it: Claude uses `claude --resume <id>`; Codex uses `codex resume --include-non-interactive
+    // <id>` (options before the positional id; include-non-interactive so exec rollouts qualify).
+    // Both start in the chat's original workspace cwd.
+    // A session id is only ever a UUID or a rollout/file token. Anything else (e.g. a crafted
+    // filename `x & calc` from a malicious source root) is refused so it can't be injected into the
+    // terminal command line.
+    public static bool IsResumableId(string id) =>
+        !string.IsNullOrWhiteSpace(id) && id.Length <= 200 && Regex.IsMatch(id, "^[A-Za-z0-9._-]+$");
+
+    public ResumeLaunch BuildResumeLaunch(ArchiveSession session, string? exeOverride = null)
+    {
+        var id = string.IsNullOrWhiteSpace(session.Id) ? Path.GetFileNameWithoutExtension(session.SourcePath) : session.Id;
+        var cwd = ResolveWorkingDirectory(session);
+        if (!IsResumableId(id))
+            return new ResumeLaunch("", "", cwd, "Refused: session id is not a safe token.");
+        if (string.Equals(session.Tool, "claude", StringComparison.OrdinalIgnoreCase))
+        {
+            var claude = string.IsNullOrWhiteSpace(exeOverride) ? ResolveClaudeExe() : exeOverride!;
+            var claudeArgs = $"--resume {id}";
+            return new ResumeLaunch(claude, claudeArgs, cwd, $"\"{claude}\" {claudeArgs}");
+        }
+        var exe = string.IsNullOrWhiteSpace(exeOverride) ? ResolveCodexExe() : exeOverride!;
+        var args = $"resume --include-non-interactive {id}";
+        return new ResumeLaunch(exe, args, cwd, $"\"{exe}\" {args}");
+    }
+
+    public static string ResolveClaudeExe()
+    {
+        var local = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".local", "bin", "claude.exe");
+        return File.Exists(local) ? local : "claude";
+    }
+
+    private static string ResolveWorkingDirectory(ArchiveSession session)
+    {
+        if (!string.IsNullOrWhiteSpace(session.Workspace) && Directory.Exists(session.Workspace)) return session.Workspace;
+        var sourceDir = Path.GetDirectoryName(session.SourcePath);
+        if (!string.IsNullOrWhiteSpace(sourceDir) && Directory.Exists(sourceDir)) return sourceDir;
+        return Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+    }
+
+    public static string ResolveCodexExe()
+    {
+        var local = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "OpenAI", "Codex", "bin", "codex.exe");
+        return File.Exists(local) ? local : "codex";
+    }
+
+    // The raw rollout timeline: one entry per recorded event (messages, tool/function calls,
+    // command runs, reasoning) so the Source inspector shows what actually happened, not a path.
+    public IReadOnlyList<RawEvent> ReadEvents(ArchiveSession session, int limit = 400)
+    {
+        var events = new List<RawEvent>();
+        if (string.IsNullOrWhiteSpace(session.SourcePath) || !File.Exists(session.SourcePath)) return events;
+        try
+        {
+            using var stream = new FileStream(session.SourcePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            using var reader = new StreamReader(stream, Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
+            string? line;
+            while (events.Count < limit && (line = reader.ReadLine()) is not null)
+            {
+                if (string.IsNullOrWhiteSpace(line) || line.Length > MaxLineChars) continue;
+                JsonDocument doc;
+                try { doc = JsonDocument.Parse(line); } catch { continue; }
+                using (doc)
+                {
+                    try
+                    {
+                        var root = doc.RootElement;
+                        var timestamp = root.TryGetProperty("timestamp", out var ts) ? ts.GetString() ?? "" : "";
+                        if (!root.TryGetProperty("payload", out var payload)) continue;
+                        // Prefer payload.type; fall back to the line's root type (e.g. session_meta).
+                        var kind =
+                            payload.TryGetProperty("type", out var typeProp) && typeProp.GetString() is { Length: > 0 } pt ? pt :
+                            root.TryGetProperty("type", out var rootType) ? rootType.GetString() ?? "event" : "event";
+                        if (kind == "message" && payload.TryGetProperty("role", out var roleProp))
+                            kind = "message:" + (roleProp.GetString() ?? "");
+                        events.Add(new RawEvent(kind, timestamp, EventPreview(kind, payload)));
+                    }
+                    catch
+                    {
+                        // One malformed event must not abort the rest of the timeline.
+                    }
+                }
+            }
+        }
+        catch
+        {
+            // Source files are read-only previews; a locked or partial file just yields fewer events.
+        }
+        return events;
+    }
+
+    // Best-effort human preview across the many rollout payload shapes (messages, tool calls,
+    // command runs, patch/mcp results). Never throws and never returns raw JSON for the common cases.
+    private static string EventPreview(string kind, JsonElement payload)
+    {
+        string raw =
+            Field(payload, "message") is { Length: > 0 } msg ? msg :
+            payload.TryGetProperty("content", out _) ? ExtractContent(payload) :
+            CommandText(payload) is { Length: > 0 } cmd ? cmd :
+            Field(payload, "output") is { Length: > 0 } outp ? outp :
+            Field(payload, "stdout") is { Length: > 0 } so ? so :
+            Field(payload, "stderr") is { Length: > 0 } se ? se :
+            Field(payload, "input") is { Length: > 0 } inp ? inp :
+            Field(payload, "arguments") is { Length: > 0 } argp ? argp :
+            Field(payload, "result") is { Length: > 0 } res ? res :
+            Field(payload, "last_agent_message") is { Length: > 0 } lam ? lam :
+            Field(payload, "name") is { Length: > 0 } nm ? nm :
+            Field(payload, "text") is { Length: > 0 } tx ? tx :
+            "";
+        raw = Regex.Replace(raw.Trim(), "\\s+", " ");
+        return raw.Length > 200 ? raw[..200] + "..." : raw;
+    }
+
+    private static string Field(JsonElement payload, string prop)
+    {
+        if (!payload.TryGetProperty(prop, out var v)) return "";
+        return v.ValueKind switch
+        {
+            JsonValueKind.String => v.GetString() ?? "",
+            JsonValueKind.Number or JsonValueKind.True or JsonValueKind.False => v.ToString(),
+            JsonValueKind.Object or JsonValueKind.Array => v.ToString(),
+            _ => ""
+        };
+    }
+
+    private static string CommandText(JsonElement payload)
+    {
+        if (!payload.TryGetProperty("command", out var c)) return "";
+        return c.ValueKind == JsonValueKind.Array
+            ? string.Join(" ", c.EnumerateArray().Select(e => e.ValueKind == JsonValueKind.String ? e.GetString() : e.ToString()))
+            : c.ToString();
     }
 
     private async Task<ArchiveSession> ParseJsonlAsync(string filePath)
@@ -330,6 +707,7 @@ public sealed class ArchiveService
         var cwd = "";
         var created = "";
         var updated = "";
+
         var seen = new HashSet<string>(StringComparer.Ordinal);
         var info = new FileInfo(filePath);
         updated = info.LastWriteTimeUtc.ToString("O");
@@ -344,31 +722,38 @@ public sealed class ArchiveService
             if (messages.Count >= MaxMessagesPerSession) break;
             if (string.IsNullOrWhiteSpace(line)) continue;
             if (line.Length > MaxLineChars) continue;
-            using var doc = JsonDocument.Parse(line);
-            var root = doc.RootElement;
-            var timestamp = root.TryGetProperty("timestamp", out var ts) ? ts.GetString() ?? "" : "";
-            if (string.IsNullOrWhiteSpace(created)) created = timestamp;
-            if (!string.IsNullOrWhiteSpace(timestamp)) updated = timestamp;
-
-            if (root.TryGetProperty("payload", out var payload))
+            JsonDocument doc;
+            // A partial/malformed line — common at the tail of an in-progress rollout, i.e. the
+            // very session you most want to resume — must not discard the whole file. Skip the line.
+            try { doc = JsonDocument.Parse(line); } catch { continue; }
+            using (doc)
             {
-                if (payload.TryGetProperty("id", out var idProp)) id = idProp.GetString() ?? id;
-                if (payload.TryGetProperty("cwd", out var cwdProp)) cwd = cwdProp.GetString() ?? cwd;
-                if (payload.TryGetProperty("type", out var typeProp) && typeProp.GetString() == "message")
+                var root = doc.RootElement;
+                var timestamp = root.TryGetProperty("timestamp", out var ts) ? ts.GetString() ?? "" : "";
+                if (string.IsNullOrWhiteSpace(created)) created = timestamp;
+                if (!string.IsNullOrWhiteSpace(timestamp)) updated = timestamp;
+
+                if (root.TryGetProperty("payload", out var payload))
                 {
-                    var role = payload.TryGetProperty("role", out var roleProp) ? roleProp.GetString() ?? "message" : "message";
-                    if (!IsIndexedRole(role)) continue;
-                    var text = ExtractContent(payload);
-                    AddMessage(messages, codeBlocks, role, text, timestamp, seen);
-                }
-                else if (payload.TryGetProperty("type", out var eventTypeProp))
-                {
-                    var eventType = eventTypeProp.GetString();
-                    if (eventType is "user_message" or "agent_message")
+                    if (payload.TryGetProperty("id", out var idProp)) id = idProp.GetString() ?? id;
+                    if (payload.TryGetProperty("cwd", out var cwdProp)) cwd = cwdProp.GetString() ?? cwd;
+
+                    if (payload.TryGetProperty("type", out var typeProp) && typeProp.GetString() == "message")
                     {
-                        var role = eventType == "agent_message" ? "assistant" : "user";
-                        var text = payload.TryGetProperty("message", out var messageProp) ? messageProp.GetString() ?? "" : "";
+                        var role = payload.TryGetProperty("role", out var roleProp) ? roleProp.GetString() ?? "message" : "message";
+                        if (!IsIndexedRole(role)) continue;
+                        var text = ExtractContent(payload);
                         AddMessage(messages, codeBlocks, role, text, timestamp, seen);
+                    }
+                    else if (payload.TryGetProperty("type", out var eventTypeProp))
+                    {
+                        var eventType = eventTypeProp.GetString();
+                        if (eventType is "user_message" or "agent_message")
+                        {
+                            var role = eventType == "agent_message" ? "assistant" : "user";
+                            var text = payload.TryGetProperty("message", out var messageProp) ? messageProp.GetString() ?? "" : "";
+                            AddMessage(messages, codeBlocks, role, text, timestamp, seen);
+                        }
                     }
                 }
             }
@@ -388,11 +773,120 @@ public sealed class ArchiveService
             Workspace = string.IsNullOrWhiteSpace(cwd) ? "Unknown workspace" : cwd,
             WorkspaceName = string.IsNullOrWhiteSpace(cwd) ? "Unknown" : Path.GetFileName(cwd.TrimEnd('\\', '/')),
             Model = "codex",
+            Tool = "codex",
             Messages = messages,
             CodeBlocks = codeBlocks,
             Text = string.Join("\n\n", messages.Select(m => m.Text)),
             Tags = new ObservableCollection<string>(codeBlocks.Count > 0 ? new[] { "archive", "code" } : new[] { "archive" })
         };
+    }
+
+    // Claude Code transcript: one JSON object per line with sessionId/cwd/timestamp and a
+    // message{role,content[]}. content is an array of {type:"text",text} blocks (plus tool_use/
+    // tool_result we skip for the reader). Mirrors ParseJsonlAsync but for Claude's shape.
+    private async Task<ArchiveSession?> ParseClaudeSessionAsync(string filePath)
+    {
+        var messages = new ObservableCollection<ArchiveMessage>();
+        var codeBlocks = new ObservableCollection<CodeBlock>();
+        // The filename IS Claude's resumable session id; the in-line sessionId is shared by a
+        // session's sidechain (subagent) files, so we never key off it.
+        var id = Path.GetFileNameWithoutExtension(filePath);
+        var cwd = "";
+        var created = "";
+        var summary = "";
+        var isSidechain = false;
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var info = new FileInfo(filePath);
+        var updated = info.LastWriteTimeUtc.ToString("O");
+
+        using var stream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        using var reader = new StreamReader(stream, Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
+        var lineCount = 0;
+        while (await reader.ReadLineAsync() is { } line)
+        {
+            lineCount++;
+            if (lineCount > MaxLinesPerSession) break;
+            if (messages.Count >= MaxMessagesPerSession) break;
+            if (string.IsNullOrWhiteSpace(line)) continue;
+            if (line.Length > MaxLineChars) continue;
+            JsonDocument doc;
+            try { doc = JsonDocument.Parse(line); } catch { continue; }
+            using (doc)
+            {
+                try
+                {
+                    var root = doc.RootElement;
+                    if (root.TryGetProperty("isSidechain", out var scProp) && scProp.ValueKind == JsonValueKind.True) isSidechain = true;
+                    if (root.TryGetProperty("cwd", out var cwdProp) && cwdProp.GetString() is { Length: > 0 } cw) cwd = cw;
+                    var timestamp = root.TryGetProperty("timestamp", out var ts) ? ts.GetString() ?? "" : "";
+                    if (string.IsNullOrWhiteSpace(created) && !string.IsNullOrWhiteSpace(timestamp)) created = timestamp;
+                    if (!string.IsNullOrWhiteSpace(timestamp)) updated = timestamp;
+
+                    var type = root.TryGetProperty("type", out var typeProp) ? typeProp.GetString() : null;
+                    if (type == "summary" && root.TryGetProperty("summary", out var sumProp))
+                    {
+                        summary = sumProp.GetString() ?? summary;
+                        continue;
+                    }
+                    if (type != "user" && type != "assistant") continue;
+                    if (!root.TryGetProperty("message", out var message)) continue;
+                    var role = message.TryGetProperty("role", out var roleProp) ? roleProp.GetString() ?? type : type;
+                    if (!IsIndexedRole(role)) continue;
+                    var text = ExtractClaudeContent(message);
+                    AddMessage(messages, codeBlocks, role, text, timestamp, seen);
+                }
+                catch
+                {
+                    // One bad line never discards the session.
+                }
+            }
+        }
+
+        // Sidechain (subagent) transcripts aren't independently resumable conversations — skip them
+        // so the list shows one entry per real chat instead of hundreds of subagent fragments.
+        if (isSidechain) return null;
+
+        if (string.IsNullOrWhiteSpace(created)) created = info.CreationTimeUtc.ToString("O");
+        var title = !string.IsNullOrWhiteSpace(summary)
+            ? CleanTitle(summary)
+            : CleanTitle(FirstMeaningfulUserText(messages) ?? Path.GetFileNameWithoutExtension(filePath));
+        return new ArchiveSession
+        {
+            Id = id,
+            Title = title,
+            SourcePath = filePath,
+            CreatedAt = created,
+            UpdatedAt = updated,
+            Workspace = string.IsNullOrWhiteSpace(cwd) ? "Unknown workspace" : cwd,
+            WorkspaceName = string.IsNullOrWhiteSpace(cwd) ? "Unknown" : Path.GetFileName(cwd.TrimEnd('\\', '/')),
+            Model = "claude",
+            Tool = "claude",
+            Messages = messages,
+            CodeBlocks = codeBlocks,
+            Text = string.Join("\n\n", messages.Select(m => m.Text)),
+            Tags = new ObservableCollection<string>(codeBlocks.Count > 0 ? new[] { "archive", "code" } : new[] { "archive" })
+        };
+    }
+
+    // Claude message.content is usually an array of typed blocks; keep the readable text ones.
+    private static string ExtractClaudeContent(JsonElement message)
+    {
+        if (!message.TryGetProperty("content", out var content)) return "";
+        if (content.ValueKind == JsonValueKind.String) return content.GetString() ?? "";
+        if (content.ValueKind != JsonValueKind.Array) return "";
+        var builder = new StringBuilder();
+        foreach (var item in content.EnumerateArray())
+        {
+            if (item.ValueKind == JsonValueKind.String) { builder.AppendLine(item.GetString()); continue; }
+            if (item.ValueKind != JsonValueKind.Object) continue;
+            var itemType = item.TryGetProperty("type", out var it) ? it.GetString() : null;
+            if (itemType == "text" && item.TryGetProperty("text", out var text)) builder.AppendLine(text.GetString());
+            else if (itemType == "tool_result" && item.TryGetProperty("content", out var tr))
+            {
+                if (tr.ValueKind == JsonValueKind.String) builder.AppendLine(tr.GetString());
+            }
+        }
+        return builder.ToString();
     }
 
     private static bool IsIndexedRole(string role)
@@ -419,6 +913,23 @@ public sealed class ArchiveService
         });
     }
 
+    private void RemoveBundledSampleSessions(HashSet<string> importedIds)
+    {
+        var sampleIds = Store.Sessions.Values
+            .Where(session => !importedIds.Contains(session.Id))
+            .Where(session =>
+                session.SourcePath.Contains("sample-sessions", StringComparison.OrdinalIgnoreCase)
+                || session.SourcePath.Contains("data\\fixtures", StringComparison.OrdinalIgnoreCase)
+                || session.SourcePath.Contains("data/fixtures", StringComparison.OrdinalIgnoreCase))
+            .Select(session => session.Id)
+            .ToList();
+
+        foreach (var id in sampleIds)
+        {
+            Store.Sessions.Remove(id);
+        }
+    }
+
     private static string ExtractContent(JsonElement payload)
     {
         if (!payload.TryGetProperty("content", out var content)) return "";
@@ -427,11 +938,42 @@ public sealed class ArchiveService
         var builder = new StringBuilder();
         foreach (var item in content.EnumerateArray())
         {
+            // Array items can be primitives, not just objects — TryGetProperty would throw on those.
+            if (item.ValueKind == JsonValueKind.String) { builder.AppendLine(item.GetString()); continue; }
+            if (item.ValueKind != JsonValueKind.Object) continue;
             if (item.TryGetProperty("text", out var text)) builder.AppendLine(text.GetString());
             else if (item.TryGetProperty("input_text", out var input)) builder.AppendLine(input.GetString());
             else if (item.TryGetProperty("output_text", out var output)) builder.AppendLine(output.GetString());
         }
         return builder.ToString();
+    }
+
+    private static readonly Regex NoiseBlocks = new(
+        "<(environment_context|goal_context|ide_selection|ide_opened_file|ide_diagnostics|system-reminder|user_instructions|context|command-message|command-name|command-args|local-command-stdout|local-command-stderr)>[\\s\\S]*?</\\1>",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    // First user message that reads like a real prompt (machine-context noise stripped) — used for
+    // the chat title so the list shows what the chat is about, not an IDE/context preamble.
+    private static string? FirstMeaningfulUserText(IEnumerable<ArchiveMessage> messages)
+    {
+        foreach (var message in messages.Where(m => m.Role == "user"))
+        {
+            var clean = ForReading(message.Text);
+            if (clean.Length >= 8 && !clean.StartsWith("<")) return clean;
+        }
+        return null;
+    }
+
+    // Strip the machine-context noise (IDE/environment/goal/system-reminder blocks) and fenced
+    // code from a message so the readable human conversation is what surfaces in the reader.
+    public static string ForReading(string text)
+    {
+        if (string.IsNullOrEmpty(text)) return "";
+        var value = Regex.Replace(text, "```[\\s\\S]*?```", "").Trim();
+        value = NoiseBlocks.Replace(value, "");
+        value = Regex.Replace(value, "(?im)^#\\s*Context from my IDE setup:.*$", "");
+        value = Regex.Replace(value, "\\n{3,}", "\n\n").Trim();
+        return value;
     }
 
     private static List<CodeBlock> ExtractCodeBlocks(string text)
@@ -470,67 +1012,6 @@ public sealed class ArchiveService
     private static string SearchText(ArchiveSession session)
     {
         return $"{session.Id}\n{session.DisplayTitle}\n{session.Title}\n{session.Text}\n{session.SourcePath}\n{session.Workspace}\n{string.Join(' ', session.Tags)}";
-    }
-
-    private static IEnumerable<string> EnumerateSessionFiles(string rootPath)
-    {
-        try
-        {
-            return Directory.EnumerateFiles(rootPath, "*.jsonl", SearchOption.AllDirectories)
-                .Where(file => !IsKnownNonSessionJsonl(file))
-                .OrderByDescending(file => File.GetLastWriteTimeUtc(file))
-                .ToList();
-        }
-        catch
-        {
-            return [];
-        }
-    }
-
-    private static bool ContainsSessionJsonl(string rootPath)
-    {
-        return EnumerateSessionFiles(rootPath).Take(25).Any();
-    }
-
-    private static bool IsKnownNonSessionJsonl(string filePath)
-    {
-        var name = Path.GetFileName(filePath);
-        return name.Equals("session_index.jsonl", StringComparison.OrdinalIgnoreCase)
-               || name.Equals("history.jsonl", StringComparison.OrdinalIgnoreCase)
-               || name.Equals("responses.jsonl", StringComparison.OrdinalIgnoreCase);
-    }
-
-    private static void AddIfUnique(List<string> roots, string path)
-    {
-        if (!roots.Any(existing => string.Equals(existing, path, StringComparison.OrdinalIgnoreCase)))
-        {
-            roots.Add(path);
-        }
-    }
-
-    private bool HasOnlyDemoSessions()
-    {
-        return Store.Sessions.Count > 0 && Store.Sessions.Values.All(IsDemoSession);
-    }
-
-    private void RemoveDemoSessions()
-    {
-        foreach (var id in Store.Sessions.Values.Where(IsDemoSession).Select(session => session.Id).ToList())
-        {
-            Store.Sessions.Remove(id);
-        }
-
-        foreach (var collection in Store.Collections.Values)
-        {
-            collection.SessionIds.RemoveAll(id => !Store.Sessions.ContainsKey(id));
-        }
-    }
-
-    private static bool IsDemoSession(ArchiveSession session)
-    {
-        return session.Model == "local-demo"
-               || session.SourcePath.StartsWith("data/fixtures/", StringComparison.OrdinalIgnoreCase)
-               || session.SourcePath.StartsWith("data\\fixtures\\", StringComparison.OrdinalIgnoreCase);
     }
 
     private static IEnumerable<ArchiveSearchHit> DeepHitsForSession(ArchiveSession session, string[] terms)
@@ -766,9 +1247,10 @@ public sealed class ArchiveService
         return changed;
     }
 
-    private bool EnrichTitlesFromLocalState()
+    private bool EnrichTitlesFromLocalState() => ApplyThreadTitles(LoadThreadTitles());
+
+    private bool ApplyThreadTitles(Dictionary<string, ThreadTitle> titles)
     {
-        var titles = LoadThreadTitles();
         if (titles.Count == 0) return false;
 
         var changed = false;
@@ -891,12 +1373,6 @@ public sealed class ArchiveService
     }
 
     private sealed record ThreadTitle(string Name, string UpdatedAt);
-
-    private static string DefaultStorePath()
-    {
-        var local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-        return Path.Combine(local, "CodexLocalRetrieval", "app-store.json");
-    }
 
     private static string FindProjectRoot()
     {

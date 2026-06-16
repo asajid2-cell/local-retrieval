@@ -1,114 +1,125 @@
-# Codex Local Retrieval
+# Codex Local Retrieval — your Codex & Claude chat archive
 
-Codex Local Retrieval is an unofficial Windows desktop app for browsing local Codex session archives without modifying the source files. It is built with WinUI 3, auto-detects local Codex chat folders, and keeps user metadata in a separate local app store. The repository includes sanitized demo data for tests and screenshots.
+**A Windows desktop app that indexes every Codex and Claude session on your machine, so a
+months-old conversation is one click from being read, filed into a project, and resumed in a
+terminal — and any agent can file itself in.** Built from scratch in WinUI 3 / .NET 8, local-first
+and read-only toward your session files.
 
-This project is not affiliated with OpenAI. It is intended for developers who keep local Codex session files and want a safer way to search, review, copy code, and build restore packets from older conversations.
+![Codex Local Retrieval — a tour of the app](docs/media/hero.gif)
 
-## Status
+*Real app screens: read an archived chat, browse chats grouped by project, inspect the raw event
+timeline, organize into projects, and configure sources.*
 
-First public release candidate. The native app builds, the service tests pass on Windows with the .NET 8 SDK, and the release ships as a portable Windows x64 ZIP. The app is local-first and read-only toward source session files. MSIX signing and fresh public screenshots are still future release work.
+| Chats grouped by project (Codex + Claude) | Reading a Claude chat, noise stripped |
+|---|---|
+| ![Workspaces](docs/media/workspaces.png) | ![Claude chat](docs/media/claude-chat.png) |
 
-![Codex Local Retrieval archive reader](docs/assets/hero-screenshot.png)
+## Why it's hard
 
-## Features
+Agent CLIs scatter their history across machine-specific stores in two different formats: Codex
+writes `rollout-*.jsonl` files under `~/.codex/sessions`, while Claude Code writes one transcript
+per session under `~/.claude/projects/<encoded-cwd>/<id>.jsonl` — plus a *fan-out of sidechain
+subagent transcripts* that share a parent id. Indexing both means streaming JSONL that is often
+half-written (the live session you most want to resume), auto-detecting which format a file is,
+keying Claude chats on the filename (their resumable id) while skipping the subagent noise, and
+doing it incrementally so a relaunch re-reads a handful of changed files instead of fifteen hundred.
+Every chat then carries app-owned organization (pins, projects, renames) that a re-sync must
+preserve, not clobber — all off the UI thread so the window never stalls on a large scan.
 
-| feature | status | proof | demo/docs |
-|---|---|---|---|
-| Read local archive index | works and verified | `dotnet test` | `docs/tutorials/getting-started.md` |
-| Browse chat transcripts | works and verified | WinUI build + sample screenshot | `docs/assets/hero-screenshot.png` |
-| Filter sidebar chats | works and verified | native app manual check | README quickstart |
-| Deep fuzzy/content search | works and verified | `DeepSearch_ReturnsContentSnippetsAndPathPayload` | `docs/how-to/common-tasks.md` |
-| Workspace and collection groups | works and verified | native build | `docs/reference/project-reference.md` |
-| Copy restore packet, code, or chat path | works and verified | `CopyPayload_BuildsRestorePacketAndCodePayload` | `docs/how-to/common-tasks.md` |
-| Theme/accent/shape settings | works and verified | native build | `docs/reference/project-reference.md` |
-| Optional OpenAI-compatible AI providers | works and verified | native build + DeepSeek live check | `docs/how-to/common-tasks.md` |
-| Auto-detect or set chat source path | works and verified | `IndexRootAsync_StoresConfiguredChatRootAndSkipsIndexes` | `docs/how-to/common-tasks.md` |
-| Portable Windows x64 ZIP | works and verified | package script + launcher smoke test | release notes |
-| Signing guidance | documented | signing guide | `docs/how-to/signing.md` |
+## What you can do
 
-## Download
+- **Resurface old chats.** The app re-scans your live session stores on launch, so a conversation
+  from months ago is back in the list — not lost after a month.
+- **Read them cleanly.** The reader strips the IDE/environment/system-reminder boilerplate that
+  buries the actual conversation (above).
+- **Organize.** Chats auto-group by project path under *Workspaces*; file any chat into a named
+  *Project*; pin favorites to the top. Organization survives every re-sync.
+- **Resume in a terminal.** One action reopens a chat in a real terminal — `codex resume …` for a
+  Codex chat, `claude --resume …` for a Claude chat — in its original working directory.
+- **Inspect the raw timeline.** The Source inspector shows the real rollout events (messages, tool
+  calls, commands, reasoning), not just a file path.
+- **Let an agent set itself up.** Point any Claude/Codex chat at [`AGENTS.md`](AGENTS.md) and it can
+  favorite itself, file itself into a project, rename itself, or register a chat folder in a
+  non-default location — over a small JSON inbox.
 
-The first release is a portable Windows x64 ZIP:
-
-```text
-codex-local-retrieval-win-x64.zip
-```
-
-Extract the ZIP and run:
-
-```text
-Codex Local Retrieval.exe
-```
-
-The ZIP opens to a top-level launcher and an `app` folder. Keep the `app` folder next to `Codex Local Retrieval.exe`. The ZIP is self-contained for Windows x64. It is not code signed, so Windows may show a SmartScreen warning.
-
-On startup, the app tries to index local chats from common Codex folders such as `%USERPROFILE%\.codex\sessions`. To set a different folder, open `Settings`, use `Chat source`, and choose `Index folder`.
-
-## Signing
-
-The current ZIP is unsigned. A warning-free Windows release needs a trusted code-signing certificate or Microsoft Trusted Signing. A self-signed development certificate can be used for local testing, but it will not remove SmartScreen warnings for public users.
-
-## Quickstart
-
-Prerequisites:
-
-- Windows 10 or Windows 11
-- .NET 8 SDK
-
-Build the native app:
+## Run it
 
 ```powershell
-dotnet build .\native\CodexLocalRetrieval.Native\CodexLocalRetrieval.Native.csproj -p:Platform=x64
+git clone https://github.com/asajid2-cell/codex-local-retrieval
+cd codex-local-retrieval/native/CodexLocalRetrieval.Native
+dotnet run -c Debug
 ```
 
-Run it from the build output:
+On first launch the app indexes `~/.codex/sessions` and `~/.claude/projects`. Add another folder in
+**Settings → Sources**.
+
+---
+*Everything below is engineering detail.*
+
+## Feature highlights
+
+- **Two agents, one archive.** Codex rollouts and Claude transcripts are parsed by format and tagged
+  with a `CX`/`CL` source badge throughout the UI.
+- **Resume routing.** Each chat resumes with the right CLI and flags, in its own workspace cwd.
+- **Incremental sync.** A per-file stamp cache skips unchanged files; a parser-version guard forces a
+  full, orphan-pruning re-parse only when the parser itself changes.
+- **Organization that sticks.** Pins, renames, and project membership are app-owned metadata kept in
+  a separate local store and preserved across re-sync; source `.jsonl` files are never modified.
+- **Canonical rename.** A rename can optionally write back to Codex's own thread title, so it shows
+  up in `codex resume` too.
+- **Agent inbox.** A polled `agent-inbox.jsonl` applies a fixed set of ops (init / addSource /
+  favorite / addToProject / rename) and acks each to an outbox; unsafe session ids are refused.
+
+## Architecture
+
+```
+~/.codex/sessions, ~/.claude/projects        (your real session files — read-only)
+            |  scan (off-thread, incremental, format-routed)
+            v
+   ArchiveService  --->  app store (%LocalAppData%, pins/projects/renames)
+            |                     ^
+            | merge (UI thread, app-fields preserved, orphans pruned)
+            v                     |
+       WinUI 3 UI  <--- agent-inbox.jsonl (outside agents drive the app)
+```
+
+### Where to look in the code
+
+| Area | Path |
+|---|---|
+| Indexing, parsing, sync, resume, agent ops | [`native/CodexLocalRetrieval.Core/Services/ArchiveService.cs`](native/CodexLocalRetrieval.Core/Services/ArchiveService.cs) |
+| Session / settings / command models | [`native/CodexLocalRetrieval.Core/Models/ArchiveModels.cs`](native/CodexLocalRetrieval.Core/Models/ArchiveModels.cs) |
+| App shell, navigation, rendering | [`native/CodexLocalRetrieval.Native/MainPage.xaml.cs`](native/CodexLocalRetrieval.Native/MainPage.xaml.cs) |
+| Resume-in-terminal, projects, bump | [`native/CodexLocalRetrieval.Native/MainPage.Sessions.cs`](native/CodexLocalRetrieval.Native/MainPage.Sessions.cs) |
+| Agent self-service bridge | [`native/CodexLocalRetrieval.Native/MainPage.Agent.cs`](native/CodexLocalRetrieval.Native/MainPage.Agent.cs) |
+| Agent protocol reference | [`AGENTS.md`](AGENTS.md) |
+| Service tests | [`native/CodexLocalRetrieval.Native.Tests/ArchiveServiceTests.cs`](native/CodexLocalRetrieval.Native.Tests/ArchiveServiceTests.cs) |
+
+## Build & test
+
+Prerequisites: Windows 10/11 and the .NET 8 SDK.
 
 ```powershell
-.\native\CodexLocalRetrieval.Native\bin\x64\Debug\net8.0-windows10.0.26100.0\win-x64\CodexLocalRetrieval.Native.exe
+dotnet build CodexLocalRetrieval.sln -c Debug
+dotnet test native/CodexLocalRetrieval.Native.Tests   # service tests: parsing, sync, resume, agent ops
 ```
 
-Run tests:
+A portable Windows x64 release is produced by [`tools/release/package-win-x64.ps1`](tools/release/package-win-x64.ps1).
 
-```powershell
-dotnet test .\native\CodexLocalRetrieval.Native.Tests\CodexLocalRetrieval.Native.Tests.csproj -p:Platform=x64
-```
+## Known limits
 
-The checked-in `data/app-store.json` is sanitized sample data. User metadata is written to:
-
-```text
-%LocalAppData%\CodexLocalRetrieval\app-store.json
-```
-
-Package a portable Windows x64 ZIP:
-
-```powershell
-.\tools\release\package-win-x64.ps1
-```
-
-The package script builds the app into `artifacts/codex-local-retrieval-package/app`, builds the top-level `Codex Local Retrieval.exe` launcher, and creates `artifacts/codex-local-retrieval-win-x64.zip`.
-
-No environment variables are required for normal use. Optional AI provider keys are entered in the app under Settings and stored through Windows credentials, not in `data/app-store.json`.
-
-## Documentation
-
-- Tutorial: `docs/tutorials/getting-started.md`
-- How-to: `docs/how-to/common-tasks.md`
-- Signing: `docs/how-to/signing.md`
-- Reference: `docs/reference/project-reference.md`
-- Explanation: `docs/explanation/project-overview.md`
-
-## Limitations
-
-- The app is designed for local files and does not sync data across machines.
-- Auto-detection is aimed at standard Codex folders. If your chats live elsewhere, set the folder manually in Settings.
-- AI features are optional and use OpenAI-compatible chat completions. Ask Archive sends only retrieved excerpts by default, not the full archive.
-- Public screenshots must use sanitized demo data. Do not publish screenshots that show private local paths, usernames, session titles, or conversation text.
-- The release ZIP is not signed. MSIX packaging/signing is not complete.
-
-## Safety
-
-The app should not rewrite live Codex session files, `state_5.sqlite`, or `session_index.jsonl`. It reads source files and stores app-specific metadata separately. If you test with real archives, review copied paths and screenshots before sharing them.
+- **Windows only.** The UI is WinUI 3 / Windows App SDK; the indexing core is plain .NET but the app
+  targets `net8.0-windows`.
+- **Resume needs the CLI installed.** Resume launches the real `codex` / `claude` binary; if neither
+  is found it falls back to the name on `PATH`.
+- **Canonical rename is Codex-only.** Renames always apply in-app; the write-back to the agent's own
+  store is implemented for Codex's thread DB — Claude has no external rename API, so a Claude rename
+  stays app-only (surfaced in the result message).
+- **The agent inbox is a trusted local channel.** Any process running as you can append commands; the
+  app runs only the fixed ops above and never arbitrary commands. See the trust note in `AGENTS.md`.
+- **Not code-signed.** The portable ZIP is unsigned, so Windows SmartScreen may warn. This project is
+  unofficial and not affiliated with OpenAI or Anthropic.
 
 ## License
 
-MIT. See `LICENSE`.
+See [LICENSE](LICENSE).

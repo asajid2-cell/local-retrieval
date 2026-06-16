@@ -29,7 +29,12 @@ public partial class App : Application
     /// </summary>
     public App()
     {
+        Diag.Log("App.ctor: before InitializeComponent");
         InitializeComponent();
+        Diag.Log("App.ctor: after InitializeComponent");
+        UnhandledException += (s, e) => Diag.Log("App.UnhandledException: " + e.Message + " | " + e.Exception);
+        AppDomain.CurrentDomain.UnhandledException += (s, e) => Diag.Log("AppDomain.Unhandled: " + e.ExceptionObject);
+        System.Threading.Tasks.TaskScheduler.UnobservedTaskException += (s, e) => { Diag.Log("UnobservedTask: " + e.Exception); e.SetObserved(); };
     }
 
     /// <summary>
@@ -38,7 +43,10 @@ public partial class App : Application
     /// <param name="args">Details about the launch request and process.</param>
     protected override void OnLaunched(Microsoft.UI.Xaml.LaunchActivatedEventArgs args)
     {
+        Diag.Log("OnLaunched: start");
         _window = new MainWindow();
+        Diag.Log("OnLaunched: MainWindow created");
         _window.Activate();
+        Diag.Log("OnLaunched: activated");
     }
 }
