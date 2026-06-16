@@ -1,18 +1,18 @@
 # Codex Local Retrieval — your Codex & Claude chat archive
 
-**A Windows desktop app that indexes every Codex and Claude session on your machine, so a
-months-old conversation is one click from being read, filed into a project, and resumed in a
-terminal — and any agent can file itself in.** Built from scratch in WinUI 3 / .NET 8, local-first
-and read-only toward your session files.
+**A WinUI 3 / .NET 8 Windows desktop app that indexes your local Codex and Claude sessions into one
+archive — so a months-old chat resurfaces, reads cleanly, files into a project, and relaunches its
+`codex resume` / `claude --resume` command in a terminal.** A Claude or Codex session can even file
+itself in through a local JSON inbox; the app never edits your source transcript files.
 
 ![Codex Local Retrieval — a tour of the app](docs/media/hero.gif)
 
-*Real app screens: read an archived chat, browse chats grouped by project, inspect the raw event
-timeline, organize into projects, and configure sources.*
+*Real app screens: browse chats grouped by project, read a Claude chat with the noise stripped,
+inspect the raw event timeline, organize into projects, and open the theme picker.*
 
-| Chats grouped by project (Codex + Claude) | Reading a Claude chat, noise stripped |
+| Chats grouped by project (Codex + Claude badges) | A project an agent filed itself into |
 |---|---|
-| ![Workspaces](docs/media/workspaces.png) | ![Claude chat](docs/media/claude-chat.png) |
+| ![Chats grouped by project](docs/media/workspaces.png) | ![Agent-created project](docs/media/projects.png) |
 
 ## Why it's hard
 
