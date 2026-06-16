@@ -1,3 +1,24 @@
+# v0.2.0
+
+Multi-agent archive: index Codex and Claude, resume in a terminal, and let agents file themselves in.
+
+## Highlights
+
+- Indexes both Codex (`~/.codex/sessions`) and Claude (`~/.claude/projects`) sessions in one archive, each tagged with a `CX`/`CL` source badge. Claude sidechain/subagent transcripts are skipped; every chat keys on its resumable id.
+- Resume any chat in a real terminal — `codex resume` for a Codex chat, `claude --resume` for a Claude chat — in its original working directory.
+- Months-old chats resurface on launch via an off-thread, incremental scan that re-reads only changed files; a parser-version guard forces a full, orphan-pruning re-parse only when the parser changes.
+- The reader strips the IDE/environment/system-reminder boilerplate that buries the actual conversation.
+- Organize: auto-group by project under Workspaces, file chats into Projects, and pin favorites. Pins, projects, and renames survive every re-sync; source `.jsonl` files are never modified.
+- Rename in-app, and optionally write the canonical name back to Codex's own thread title.
+- Source inspector shows the real rollout event timeline (messages, tool calls, commands, reasoning).
+- Agent self-service: point any Claude/Codex chat at `AGENTS.md` and it can favorite itself, file itself into a project, rename itself, or register a non-default chat folder over a local JSON inbox (`agent-inbox.jsonl`).
+- Configurable session sources in Settings.
+
+## Notes
+
+- Resume launches the installed `codex` / `claude` CLI; unsafe session ids are refused before any terminal launch.
+- The portable build is unsigned, so Windows SmartScreen may warn on first launch. Unofficial; not affiliated with OpenAI or Anthropic.
+
 # v0.1.3
 
 Patch release for small icon proportions.
