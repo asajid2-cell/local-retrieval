@@ -39,3 +39,6 @@ native/CodexLocalRetrieval.Native/.github/
 # OS / editor
 Thumbs.db
 .DS_Store
+
+# Release build outputs
+artifacts/
