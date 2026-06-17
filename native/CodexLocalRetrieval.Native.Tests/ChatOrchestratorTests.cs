@@ -205,6 +205,50 @@ public sealed class ChatOrchestratorTests
         finally { if (File.Exists(store)) File.Delete(store); }
     }
 
+    // resume_chat is a confirmed tool that hands the session id to the resume-in-terminal callback.
+    [TestMethod]
+    public async Task ResumeChat_ConfirmedTool_InvokesResumeCallback()
+    {
+        var svc = new ArchiveService(useBundledStore: true);
+        await svc.LoadAsync();
+        var fixture = svc.Search("fixture-b").First();
+        string? resumed = null;
+        var tools = new ArchiveToolService(svc, resumeChat: id => resumed = id).Tools();
+        var backend = new FakeBackend(new[]
+        {
+            new BackendReply { Message = new ChatMessage { Role = "assistant", ToolCalls = new() { Call("c1", "resume_chat", $"{{\"id\":\"{fixture.Id}\"}}") } } },
+            new BackendReply { Message = new ChatMessage { Role = "assistant", Content = "Resuming it." } }
+        });
+        var orchestrator = new ChatOrchestrator(backend, tools, confirm: (_, _) => Task.FromResult(true));
+
+        var result = await orchestrator.RunAsync(new List<ChatMessage> { ChatMessage.User("resume fixture-b") });
+
+        Assert.AreEqual(fixture.Id, resumed, "the resume callback ran with the session id after confirmation");
+        Assert.IsTrue(result.Activity.Any(a => a.Tool == "resume_chat" && a.Ok));
+    }
+
+    // The Claude CLI fallback is text-only (no tool-calling) and flattens the conversation cleanly.
+    [TestMethod]
+    public void ClaudexBackend_IsTextOnly_AndFlattensPrompt()
+    {
+        var backend = new ClaudexBackend("claude.exe");
+        Assert.IsFalse(backend.SupportsTools, "the claude CLI fallback is text-only");
+
+        var prompt = ClaudexBackend.FlattenPrompt(new[]
+        {
+            ChatMessage.System("You are a co-pilot."),
+            ChatMessage.User("hi"),
+            new ChatMessage { Role = "assistant", Content = "hello" },
+            ChatMessage.User("summarize")
+        });
+
+        StringAssert.Contains(prompt, "You are a co-pilot.");
+        StringAssert.Contains(prompt, "User: hi");
+        StringAssert.Contains(prompt, "Assistant: hello");
+        StringAssert.Contains(prompt, "User: summarize");
+        Assert.IsTrue(prompt.TrimEnd().EndsWith("Assistant:"));
+    }
+
     // read_chat returns a summary + paged messages (ids-first, capped), never the whole conversation raw.
     [TestMethod]
     public async Task ReadChat_ReturnsSummaryAndPagedMessages()

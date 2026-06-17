@@ -22,12 +22,14 @@ public sealed partial class MainPage
     private readonly List<Window> _previewWindows = new();
     private bool _copilotBusy;
     private string _copilotStatus = "";
+    private string _copilotBackend = "deepseek"; // deepseek | claude-cli
 
     private static readonly string[] CopilotSuggestions =
     {
         "Summarize my most recent chat",
         "Find chats about VENPOD and list them",
         "Open my most recent chat in a preview window",
+        "Resume my most recent chat in a terminal",
         "Make a restore packet for my latest chat"
     };
 
@@ -40,6 +42,9 @@ public sealed partial class MainPage
 
     private IChatBackend? BuildCopilotBackend()
     {
+        if (_copilotBackend == "claude-cli")
+            return new ClaudexBackend(ArchiveService.ResolveClaudeExe());
+
         var provider = _archive.ActiveAiProvider()
                        ?? _archive.EnsureAiProvider("DeepSeek", "https://api.deepseek.com", "deepseek-v4-flash");
         var key = LoadApiKey(provider.Id);
@@ -111,16 +116,34 @@ public sealed partial class MainPage
         var reset = new Button { Style = (Style)Resources["PillButtonStyle"], Content = "New chat" };
         reset.Click += (_, _) => { ResetCopilot(); RenderCopilot(); };
 
-        var keyNote = new TextBlock
+        var backendCombo = new ComboBox { MinWidth = 140, CornerRadius = ControlCornerRadius(), VerticalAlignment = VerticalAlignment.Center, IsEnabled = !_copilotBusy };
+        backendCombo.Items.Add(new ComboBoxItem { Content = "DeepSeek", Tag = "deepseek" });
+        backendCombo.Items.Add(new ComboBoxItem { Content = "Claude (CLI)", Tag = "claude-cli" });
+        backendCombo.SelectedIndex = _copilotBackend == "claude-cli" ? 1 : 0;
+        backendCombo.SelectionChanged += (_, _) =>
         {
-            Text = "DeepSeek key: " + ApiKeySource("deepseek"),
-            Foreground = MutedBrush(),
-            FontSize = 11,
-            VerticalAlignment = VerticalAlignment.Center
+            if (backendCombo.SelectedItem is ComboBoxItem item && item.Tag is string tag && tag != _copilotBackend)
+            {
+                _copilotBackend = tag;
+                RenderCopilot();
+            }
         };
 
+        var note = new TextBlock
+        {
+            Text = _copilotBackend == "claude-cli"
+                ? "Claude CLI — experimental, plain chat (no archive tools)"
+                : "DeepSeek key: " + ApiKeySource("deepseek"),
+            Foreground = MutedBrush(),
+            FontSize = 11,
+            VerticalAlignment = VerticalAlignment.Center,
+            TextWrapping = TextWrapping.Wrap
+        };
+
+        var left = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 12, VerticalAlignment = VerticalAlignment.Center, Children = { backendCombo, note } };
+
         var buttons = new Grid { Margin = new Thickness(0, 10, 0, 0), ColumnDefinitions = { new ColumnDefinition(), new ColumnDefinition { Width = GridLength.Auto } } };
-        buttons.Children.Add(keyNote);
+        buttons.Children.Add(left);
         var right = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8 };
         right.Children.Add(reset);
         right.Children.Add(send);
@@ -163,7 +186,7 @@ public sealed partial class MainPage
 
         try
         {
-            var tools = new ArchiveToolService(_archive, showChat: OpenChatPreview).Tools();
+            var tools = new ArchiveToolService(_archive, showChat: OpenChatPreview, resumeChat: ResumeChatFromCopilot).Tools();
             var orchestrator = new ChatOrchestrator(backend, tools, confirm: ConfirmCopilotActionAsync);
             var result = await orchestrator.RunAsync(_copilotApi);
             if (string.IsNullOrWhiteSpace(result.Answer) && !string.IsNullOrWhiteSpace(result.Error))
@@ -183,6 +206,7 @@ public sealed partial class MainPage
 
     private async Task<bool> ConfirmCopilotActionAsync(ChatTool tool, JsonElement args)
     {
+        Diag.Log($"Copilot confirm requested for tool: {tool.Name} {args}");
         var dialog = new ContentDialog
         {
             Title = "Allow this action?",
@@ -193,6 +217,12 @@ public sealed partial class MainPage
             XamlRoot = XamlRoot
         };
         return await dialog.ShowAsync() == ContentDialogResult.Primary;
+    }
+
+    private void ResumeChatFromCopilot(string id)
+    {
+        var session = _archive.GetSession(id);
+        if (session is not null) DispatcherQueue.TryEnqueue(() => ResumeInTerminal(session));
     }
 
     private void OpenChatPreview(string id)

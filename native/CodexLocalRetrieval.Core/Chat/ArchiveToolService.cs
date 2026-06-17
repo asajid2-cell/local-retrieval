@@ -12,11 +12,13 @@ public sealed class ArchiveToolService
 {
     private readonly ArchiveService _archive;
     private readonly Action<string>? _showChat;
+    private readonly Action<string>? _resumeChat;
 
-    public ArchiveToolService(ArchiveService archive, Action<string>? showChat = null)
+    public ArchiveToolService(ArchiveService archive, Action<string>? showChat = null, Action<string>? resumeChat = null)
     {
         _archive = archive;
         _showChat = showChat;
+        _resumeChat = resumeChat;
     }
 
     public const string SystemPrompt =
@@ -35,6 +37,7 @@ public sealed class ArchiveToolService
             SetFavorite(), AddToProject(), RenameLocal()
         };
         if (_showChat is not null) tools.Add(ShowChat());
+        if (_resumeChat is not null) tools.Add(ResumeChat());
         return tools;
     }
 
@@ -152,6 +155,29 @@ public sealed class ArchiveToolService
         {
             var ok = await _archive.RenameLocalAsync(Arg(args, "id"), Arg(args, "title"));
             return new { ok, message = ok ? "Renamed in the app." : "No chat with that id." };
+        });
+
+    // ---- terminal action (confirmed: it launches an external agent CLI) ----
+
+    private ChatTool ResumeChat() => Write("resume_chat",
+        "Resume a chat in a NEW terminal so the user can continue it: runs `codex resume` or " +
+        "`claude --resume` in the chat's original workspace. Use the id from search_chats.",
+        Obj(("id", Str("session id"))), new[] { "id" },
+        args =>
+        {
+            var session = _archive.GetSession(Arg(args, "id"));
+            if (session is null) return Task.FromResult<object>(new { ok = false, message = "No chat with that id." });
+            var launch = _archive.BuildResumeLaunch(session);
+            if (string.IsNullOrEmpty(launch.Exe))
+                return Task.FromResult<object>(new { ok = false, message = "That chat can't be resumed safely." });
+            _resumeChat?.Invoke(session.Id);
+            return Task.FromResult<object>(new
+            {
+                ok = true,
+                tool = session.Tool,
+                command = launch.DisplayCommand,
+                message = $"Opening a terminal to resume \"{session.DisplayTitle}\"."
+            });
         });
 
     // ---- UI side-effect ----
