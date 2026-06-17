@@ -33,7 +33,7 @@ public sealed class ArchiveToolService
     {
         var tools = new List<ChatTool>
         {
-            SearchChats(), ReadChat(), ListProjects(), ListWorkspaces(), RestorePacket(),
+            SearchChats(), ReadChat(), ArchiveStats(), ListProjects(), ListWorkspaces(), RestorePacket(),
             SetFavorite(), AddToProject(), RenameLocal()
         };
         if (_showChat is not null) tools.Add(ShowChat());
@@ -54,11 +54,12 @@ public sealed class ArchiveToolService
             var results = _archive.DeepSearch(query, limit).Select(h => new
             {
                 id = h.Session.Id,
-                title = h.Session.DisplayTitle,
-                workspace = h.Session.WorkspaceName,
+                // Title is derived from the first user message, so it can carry a pasted secret too.
+                title = SecretRedactor.Scrub(h.Session.DisplayTitle),
+                workspace = SecretRedactor.Scrub(h.Session.WorkspaceName),
                 tool = h.Session.Tool,
                 updatedAt = h.Session.UpdatedAt,
-                snippet = Cap(h.Snippet, 240)
+                snippet = SecretRedactor.Scrub(Cap(h.Snippet, 240))
             }).ToList();
             return new { query, count = results.Count, results };
         });
@@ -77,20 +78,49 @@ public sealed class ArchiveToolService
             var slice = all.Skip(page * size).Take(size).Select(m => new
             {
                 role = m.Role,
-                untrusted_text = Cap(ArchiveService.ForReading(m.Text), 700)
+                untrusted_text = SecretRedactor.Scrub(Cap(ArchiveService.ForReading(m.Text), 700))
             }).ToList();
             return new
             {
                 id = session.Id,
-                title = session.DisplayTitle,
+                title = SecretRedactor.Scrub(session.DisplayTitle),
                 tool = session.Tool,
-                workspace = session.Workspace,
+                workspace = SecretRedactor.Scrub(session.Workspace),
                 updatedAt = session.UpdatedAt,
                 totalMessages = all.Count,
                 codeBlocks = session.CodeBlocks.Count,
                 page,
                 hasMore = (page + 1) * size < all.Count,
                 messages = slice
+            };
+        });
+
+    private ChatTool ArchiveStats() => Read("archive_stats",
+        "High-level overview of the whole archive: total chats, breakdown by agent (codex/claude), " +
+        "favorites, project count, distinct workspaces, top workspaces, and the date range. Use this " +
+        "for 'how many chats do I have' / 'what's in my archive' instead of paging through search.",
+        Obj(), Array.Empty<string>(),
+        _ =>
+        {
+            var sessions = _archive.Store.Sessions.Values.Where(s => !s.Archived).ToList();
+            var byTool = sessions
+                .GroupBy(s => string.IsNullOrWhiteSpace(s.Tool) ? "codex" : s.Tool.ToLowerInvariant())
+                .ToDictionary(g => g.Key, g => g.Count());
+            var topWorkspaces = sessions
+                .GroupBy(s => string.IsNullOrWhiteSpace(s.WorkspaceName) ? "Unknown" : s.WorkspaceName)
+                .OrderByDescending(g => g.Count()).Take(8)
+                .Select(g => new { name = g.Key, chats = g.Count() }).ToList();
+            var dates = sessions.Select(s => s.UpdatedAt).Where(d => !string.IsNullOrWhiteSpace(d)).OrderBy(d => d, StringComparer.Ordinal).ToList();
+            return new
+            {
+                totalChats = sessions.Count,
+                byTool,
+                favorites = sessions.Count(s => s.Pinned),
+                projects = _archive.Store.Collections.Count,
+                workspaces = sessions.Select(s => s.WorkspaceName).Where(w => !string.IsNullOrWhiteSpace(w)).Distinct().Count(),
+                topWorkspaces,
+                oldestUpdated = dates.FirstOrDefault(),
+                newestUpdated = dates.LastOrDefault()
             };
         });
 
@@ -123,7 +153,7 @@ public sealed class ArchiveToolService
         {
             var session = _archive.GetSession(Arg(args, "id"));
             if (session is null) return new { error = "No chat with that id." };
-            return new { id = session.Id, restore_packet = Cap(_archive.RestorePacket(session), 4000) };
+            return new { id = session.Id, restore_packet = SecretRedactor.Scrub(Cap(_archive.RestorePacket(session), 4000)) };
         });
 
     // ---- mutations (IsMutation => orchestrator requires confirmation) ----

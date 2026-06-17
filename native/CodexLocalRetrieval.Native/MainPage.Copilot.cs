@@ -23,6 +23,7 @@ public sealed partial class MainPage
     private bool _copilotBusy;
     private string _copilotStatus = "";
     private string _copilotBackend = "deepseek"; // deepseek | claude-cli
+    private System.Threading.CancellationTokenSource? _copilotCts;
 
     private static readonly string[] CopilotSuggestions =
     {
@@ -113,6 +114,10 @@ public sealed partial class MainPage
         var send = new Button { Style = (Style)Resources["PrimaryPillButtonStyle"], Content = "Send", IsEnabled = !_copilotBusy };
         send.Click += async (_, _) => { var t = input.Text; input.Text = ""; await SendCopilotAsync(t); };
 
+        // While a turn is running, Send is replaced by Stop so the user can abort a long round.
+        var stop = new Button { Style = (Style)Resources["PillButtonStyle"], Content = "Stop" };
+        stop.Click += (_, _) => CancelCopilot();
+
         var reset = new Button { Style = (Style)Resources["PillButtonStyle"], Content = "New chat", IsEnabled = !_copilotBusy };
         reset.Click += (_, _) => { if (!_copilotBusy) { ResetCopilot(); RenderCopilot(); } };
 
@@ -146,7 +151,7 @@ public sealed partial class MainPage
         buttons.Children.Add(left);
         var right = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8 };
         right.Children.Add(reset);
-        right.Children.Add(send);
+        right.Children.Add(_copilotBusy ? stop : send);
         Grid.SetColumn(right, 1);
         buttons.Children.Add(right);
 
@@ -183,15 +188,20 @@ public sealed partial class MainPage
         TrimCopilotContext();
         _copilotBusy = true;
         _copilotStatus = "";
+        _copilotCts = new System.Threading.CancellationTokenSource();
         RenderCopilot();
 
         try
         {
             var tools = new ArchiveToolService(_archive, showChat: OpenChatPreview, resumeChat: ResumeChatFromCopilot).Tools();
             var orchestrator = new ChatOrchestrator(backend, tools, confirm: ConfirmCopilotActionAsync);
-            var result = await orchestrator.RunAsync(_copilotApi);
+            var result = await orchestrator.RunAsync(_copilotApi, _copilotCts.Token);
             if (string.IsNullOrWhiteSpace(result.Answer) && !string.IsNullOrWhiteSpace(result.Error))
                 _copilotStatus = result.Error!;
+        }
+        catch (OperationCanceledException)
+        {
+            _copilotStatus = "Stopped."; // user hit Stop — not an error
         }
         catch (Exception ex)
         {
@@ -201,8 +211,18 @@ public sealed partial class MainPage
         finally
         {
             _copilotBusy = false;
+            _copilotCts?.Dispose();
+            _copilotCts = null;
             RenderCopilot();
         }
+    }
+
+    // Cancels the in-flight turn. The orchestrator threads this token into the backend call, so a
+    // long DeepSeek round (or a retry/backoff wait) aborts promptly. Guarded because the CTS is
+    // disposed+nulled in SendCopilotAsync's finally (a late click could otherwise race it).
+    private void CancelCopilot()
+    {
+        try { _copilotCts?.Cancel(); } catch (ObjectDisposedException) { }
     }
 
     // Keep the system message + the most recent whole turns, so a long session can't grow the context

@@ -20,14 +20,19 @@ public sealed class DeepSeekBackend : IChatBackend
     private readonly string _model;
     private readonly string _apiKey;
     private readonly int _maxTokens;
+    private readonly int _maxAttempts;
+    private readonly Func<TimeSpan, CancellationToken, Task> _delay;
 
-    public DeepSeekBackend(string baseUrl, string model, string apiKey, HttpClient? http = null, int maxTokens = 2000)
+    public DeepSeekBackend(string baseUrl, string model, string apiKey, HttpClient? http = null, int maxTokens = 2000,
+        int maxAttempts = 3, Func<TimeSpan, CancellationToken, Task>? delay = null)
     {
         _http = http ?? new HttpClient { Timeout = TimeSpan.FromSeconds(90) };
         _baseUrl = baseUrl;
         _model = model;
         _apiKey = apiKey;
         _maxTokens = maxTokens;
+        _maxAttempts = Math.Max(1, maxAttempts);
+        _delay = delay ?? ((d, ct) => Task.Delay(d, ct)); // injectable so tests don't actually sleep
     }
 
     public string Name => "deepseek";
@@ -54,19 +59,73 @@ public sealed class DeepSeekBackend : IChatBackend
             payload["tool_choice"] = "auto";
         }
 
-        using var request = new HttpRequestMessage(HttpMethod.Post, BuildEndpoint(_baseUrl));
-        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _apiKey);
-        request.Content = new StringContent(JsonSerializer.Serialize(payload, Wire), Encoding.UTF8, "application/json");
+        // Serialize once; each attempt needs a fresh request/content (a sent one can't be reused).
+        var json = JsonSerializer.Serialize(payload, Wire);
+        InvalidOperationException? lastTransient = null;
 
-        using var response = await _http.SendAsync(request, cancellationToken);
-        var body = await response.Content.ReadAsStringAsync(cancellationToken);
-        if (!response.IsSuccessStatusCode)
-            throw new InvalidOperationException($"DeepSeek returned {(int)response.StatusCode}: {Trim(body)}");
+        for (var attempt = 1; attempt <= _maxAttempts; attempt++)
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Post, BuildEndpoint(_baseUrl));
+            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _apiKey);
+            request.Content = new StringContent(json, Encoding.UTF8, "application/json");
 
-        return Parse(body);
+            HttpResponseMessage response;
+            try
+            {
+                response = await _http.SendAsync(request, cancellationToken);
+            }
+            catch (HttpRequestException ex) // connection refused / DNS / TLS — transient, worth a retry
+            {
+                lastTransient = new InvalidOperationException("Network error talking to DeepSeek: " + ex.Message, ex);
+                if (attempt < _maxAttempts) { await Backoff(attempt, null, cancellationToken); continue; }
+                throw lastTransient;
+            }
+            catch (TaskCanceledException) when (!cancellationToken.IsCancellationRequested) // HttpClient timeout, not a user cancel
+            {
+                lastTransient = new InvalidOperationException("DeepSeek request timed out.");
+                if (attempt < _maxAttempts) { await Backoff(attempt, null, cancellationToken); continue; }
+                throw lastTransient;
+            }
+
+            using (response)
+            {
+                var body = await response.Content.ReadAsStringAsync(cancellationToken);
+                if (response.IsSuccessStatusCode) return Parse(body);
+
+                // Retry rate-limit / transient server errors; fail fast on other 4xx (bad key, bad request).
+                if (IsTransient(response.StatusCode) && attempt < _maxAttempts)
+                {
+                    lastTransient = new InvalidOperationException($"DeepSeek returned {(int)response.StatusCode}: {Trim(body)}");
+                    await Backoff(attempt, response.Headers.RetryAfter, cancellationToken);
+                    continue;
+                }
+                throw new InvalidOperationException($"DeepSeek returned {(int)response.StatusCode}: {Trim(body)}");
+            }
+        }
+
+        throw lastTransient ?? new InvalidOperationException("DeepSeek request failed.");
     }
 
-    internal static BackendReply Parse(string body)
+    private static bool IsTransient(System.Net.HttpStatusCode code) => (int)code switch
+    {
+        408 or 429 or 500 or 502 or 503 or 504 => true,
+        _ => false
+    };
+
+    // Exponential backoff, but honor a server Retry-After when present. Bounded so a hostile header
+    // can't park the UI on "Thinking..." indefinitely.
+    private async Task Backoff(int attempt, System.Net.Http.Headers.RetryConditionHeaderValue? retryAfter, CancellationToken ct)
+    {
+        TimeSpan delay;
+        if (retryAfter?.Delta is TimeSpan d) delay = d;
+        else if (retryAfter?.Date is DateTimeOffset when) delay = when - DateTimeOffset.UtcNow;
+        else delay = TimeSpan.FromMilliseconds(400 * Math.Pow(2, attempt - 1));
+        if (delay < TimeSpan.Zero) delay = TimeSpan.Zero;
+        if (delay > TimeSpan.FromSeconds(20)) delay = TimeSpan.FromSeconds(20);
+        await _delay(delay, ct);
+    }
+
+    public static BackendReply Parse(string body) // public so it can be unit-tested directly
     {
         using var doc = JsonDocument.Parse(body);
         var root = doc.RootElement;

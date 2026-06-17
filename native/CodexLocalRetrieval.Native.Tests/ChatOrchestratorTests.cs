@@ -97,6 +97,36 @@ public sealed class ChatOrchestratorTests
     private static ToolCall Call(string id, string name, string args) =>
         new() { Id = id, Function = new ToolCallFunction { Name = name, Arguments = args } };
 
+    // Honors the cancellation token (throws if cancelled) so we can prove the orchestrator propagates it.
+    private sealed class CancelAwareBackend : IChatBackend
+    {
+        public string Name => "cancel";
+        public bool SupportsTools => true;
+        public Task<BackendReply> CompleteAsync(IReadOnlyList<ChatMessage> m, IReadOnlyList<ChatToolSpec> t, CancellationToken ct)
+        {
+            ct.ThrowIfCancellationRequested();
+            return Task.FromResult(new BackendReply { Message = new ChatMessage { Role = "assistant", Content = "ok" } });
+        }
+    }
+
+    // Never returns a final answer: each call asks for a *distinct* search (so the repeat-guard never
+    // trips first), which is how we isolate the tool-round limit.
+    private sealed class LoopingBackend : IChatBackend
+    {
+        private int _n;
+        public string Name => "loop";
+        public bool SupportsTools => true;
+        public int Calls => _n;
+        public Task<BackendReply> CompleteAsync(IReadOnlyList<ChatMessage> m, IReadOnlyList<ChatToolSpec> t, CancellationToken ct)
+        {
+            var q = _n++;
+            return Task.FromResult(new BackendReply
+            {
+                Message = new ChatMessage { Role = "assistant", ToolCalls = new() { Call("c" + q, "search_chats", "{\"query\":\"q" + q + "\"}") } }
+            });
+        }
+    }
+
     // The whole point: ask -> model calls search_chats -> tool runs against the real archive ->
     // result is fed back as a role:tool message -> model gives a final answer.
     [TestMethod]
@@ -289,5 +319,141 @@ public sealed class ChatOrchestratorTests
 
         Assert.IsFalse(ran, "a mutation must not run without a confirmation gate");
         Assert.IsFalse(result.Activity[0].Ok);
+    }
+
+    // The repeat-guard stops the loop if the model keeps making the identical call (a stuck model
+    // shouldn't burn the whole round budget on the same no-op).
+    [TestMethod]
+    public async Task Orchestrator_RepeatedIdenticalCall_StopsWithError()
+    {
+        var archive = new ArchiveService(useBundledStore: true);
+        await archive.LoadAsync();
+        var same = Call("c", "search_chats", "{\"query\":\"x\"}");
+        var backend = new FakeBackend(new[]
+        {
+            new BackendReply { Message = new ChatMessage { Role = "assistant", ToolCalls = new() { same } } },
+            new BackendReply { Message = new ChatMessage { Role = "assistant", ToolCalls = new() { same } } },
+            new BackendReply { Message = new ChatMessage { Role = "assistant", ToolCalls = new() { same } } }
+        });
+        var orchestrator = new ChatOrchestrator(backend, new ArchiveToolService(archive).Tools());
+
+        var result = await orchestrator.RunAsync(new List<ChatMessage> { ChatMessage.User("search x") });
+
+        Assert.IsTrue(result.Stopped);
+        StringAssert.Contains(result.Error!, "repeated");
+    }
+
+    // A side-effecting tool (resume_chat, limit 1/message) is rate-limited if the model calls it
+    // twice in one assistant turn — only the first runs, the second is refused back to the model.
+    [TestMethod]
+    public async Task Orchestrator_SideEffectQuota_RateLimitsSecondResume()
+    {
+        var svc = new ArchiveService(useBundledStore: true);
+        await svc.LoadAsync();
+        var fixture = svc.Search("fixture-b").First();
+        var resumes = 0;
+        var tools = new ArchiveToolService(svc, resumeChat: _ => resumes++).Tools();
+        var twoResumes = new ChatMessage
+        {
+            Role = "assistant",
+            ToolCalls = new() { Call("c1", "resume_chat", $"{{\"id\":\"{fixture.Id}\"}}"), Call("c2", "resume_chat", $"{{\"id\":\"{fixture.Id}\"}}") }
+        };
+        var backend = new FakeBackend(new[]
+        {
+            new BackendReply { Message = twoResumes },
+            new BackendReply { Message = new ChatMessage { Role = "assistant", Content = "done" } }
+        });
+        var orchestrator = new ChatOrchestrator(backend, tools, confirm: (_, _) => Task.FromResult(true));
+
+        var result = await orchestrator.RunAsync(new List<ChatMessage> { ChatMessage.User("resume it twice") });
+
+        Assert.AreEqual(1, resumes, "only the first resume actually ran");
+        Assert.IsTrue(result.Activity.Any(a => a.Tool == "resume_chat" && !a.Ok), "the second was rate limited");
+    }
+
+    // Invalid JSON arguments are fed back to the model as a structured error (so it can retry), not thrown.
+    [TestMethod]
+    public async Task Orchestrator_InvalidJsonArgs_FedBackAsError()
+    {
+        var archive = new ArchiveService(useBundledStore: true);
+        await archive.LoadAsync();
+        var backend = new FakeBackend(new[]
+        {
+            new BackendReply { Message = new ChatMessage { Role = "assistant", ToolCalls = new() { Call("c1", "search_chats", "{not valid json") } } },
+            new BackendReply { Message = new ChatMessage { Role = "assistant", Content = "let me try again" } }
+        });
+        var orchestrator = new ChatOrchestrator(backend, new ArchiveToolService(archive).Tools());
+
+        var result = await orchestrator.RunAsync(new List<ChatMessage> { ChatMessage.User("search") });
+
+        Assert.IsFalse(result.Activity[0].Ok);
+        var toolMsg = backend.Seen[1].Messages.LastOrDefault(m => m.Role == "tool");
+        StringAssert.Contains(toolMsg!.Content!, "valid JSON");
+    }
+
+    // If the model never stops calling tools, the loop bails out at the round limit instead of running forever.
+    [TestMethod]
+    public async Task Orchestrator_NeverStops_HitsRoundLimit()
+    {
+        var archive = new ArchiveService(useBundledStore: true);
+        await archive.LoadAsync();
+        var backend = new LoopingBackend();
+        var orchestrator = new ChatOrchestrator(backend, new ArchiveToolService(archive).Tools());
+
+        var result = await orchestrator.RunAsync(new List<ChatMessage> { ChatMessage.User("loop forever") });
+
+        Assert.IsTrue(result.Stopped);
+        StringAssert.Contains(result.Error!, "tool-round limit");
+        Assert.AreEqual(ChatOrchestrator.MaxToolRounds, backend.Calls);
+    }
+
+    // When a guardrail stops mid-turn, EVERY tool_call in the assistant message must still get a
+    // role:tool reply — otherwise the shared history has an unanswered tool_call_id and the provider
+    // rejects the NEXT request, bricking the co-pilot until "New chat".
+    [TestMethod]
+    public async Task Orchestrator_GuardrailStop_LeavesNoUnansweredToolCall()
+    {
+        var archive = new ArchiveService(useBundledStore: true);
+        await archive.LoadAsync();
+        // Four identical calls: the repeat-guard trips on the 3rd, leaving the 3rd and 4th unanswered
+        // unless the orchestrator backfills replies for them.
+        var fourCalls = new ChatMessage
+        {
+            Role = "assistant",
+            ToolCalls = new()
+            {
+                Call("c0", "search_chats", "{\"query\":\"x\"}"),
+                Call("c1", "search_chats", "{\"query\":\"x\"}"),
+                Call("c2", "search_chats", "{\"query\":\"x\"}"),
+                Call("c3", "search_chats", "{\"query\":\"x\"}")
+            }
+        };
+        var backend = new FakeBackend(new[] { new BackendReply { Message = fourCalls } });
+        var orchestrator = new ChatOrchestrator(backend, new ArchiveToolService(archive).Tools());
+        var messages = new List<ChatMessage> { ChatMessage.User("x") };
+
+        var result = await orchestrator.RunAsync(messages);
+
+        Assert.IsTrue(result.Stopped);
+        var demanded = messages.Where(m => m.Role == "assistant" && m.ToolCalls is { Count: > 0 })
+            .SelectMany(m => m.ToolCalls!).Select(c => c.Id).ToHashSet();
+        var answered = messages.Where(m => m.Role == "tool").Select(m => m.ToolCallId).ToHashSet();
+        Assert.IsTrue(demanded.IsSubsetOf(answered), "every assistant tool_call must have a role:tool reply");
+        Assert.AreEqual(4, demanded.Count);
+    }
+
+    // A user Stop (cancelled token) propagates as OperationCanceledException, not a swallowed
+    // result.Error — so the UI can show "Stopped." rather than a model-error message.
+    [TestMethod]
+    public async Task Orchestrator_Cancellation_Propagates()
+    {
+        var archive = new ArchiveService(useBundledStore: true);
+        await archive.LoadAsync();
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+        var orchestrator = new ChatOrchestrator(new CancelAwareBackend(), new ArchiveToolService(archive).Tools());
+
+        await Assert.ThrowsExactlyAsync<OperationCanceledException>(() =>
+            orchestrator.RunAsync(new List<ChatMessage> { ChatMessage.User("hi") }, cts.Token));
     }
 }

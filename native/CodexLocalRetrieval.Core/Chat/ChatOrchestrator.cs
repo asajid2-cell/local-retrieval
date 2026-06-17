@@ -40,6 +40,7 @@ public sealed class ChatOrchestrator
         {
             BackendReply reply;
             try { reply = await _backend.CompleteAsync(messages, specs, cancellationToken); }
+            catch (OperationCanceledException) { throw; } // a user Stop is not a model error — let it propagate
             catch (Exception ex) { result.Error = ex.Message; return result; }
 
             var assistant = reply.Message;
@@ -51,10 +52,18 @@ public sealed class ChatOrchestrator
                 return result;
             }
 
-            foreach (var call in assistant.ToolCalls)
+            // Every tool_call in this assistant turn MUST get a role:tool reply before we stop, or the
+            // history is invalid (the provider rejects an unanswered tool_call_id on the next request,
+            // which would brick the shared conversation). So on a guardrail trip we answer the current
+            // call and every remaining one with an error, then return.
+            var calls = assistant.ToolCalls;
+            for (var ci = 0; ci < calls.Count; ci++)
             {
+                var call = calls[ci];
+
                 if (++totalCalls > MaxToolCallsTotal)
                 {
+                    AnswerRemaining(messages, calls, ci, "Stopped: too many tool calls in one turn.");
                     result.Stopped = true;
                     result.Error = "Too many tool calls in one turn.";
                     return result;
@@ -77,6 +86,7 @@ public sealed class ChatOrchestrator
                 callSignatureCounts[signature] = seen + 1;
                 if (seen + 1 > MaxSameCallRepeats)
                 {
+                    AnswerRemaining(messages, calls, ci, $"Stopped: '{call.Function.Name}' was repeated too many times.");
                     result.Stopped = true;
                     result.Error = $"The assistant repeated the same '{call.Function.Name}' call too many times.";
                     return result;
@@ -91,6 +101,13 @@ public sealed class ChatOrchestrator
         result.Stopped = true;
         result.Error = "Reached the tool-round limit before a final answer.";
         return result;
+    }
+
+    // Append a role:tool error reply for calls[from..] so no tool_call_id is left unanswered.
+    private static void AnswerRemaining(List<ChatMessage> messages, IReadOnlyList<ToolCall> calls, int from, string reason)
+    {
+        for (var j = from; j < calls.Count; j++)
+            messages.Add(ChatMessage.Tool(calls[j].Id, Err(reason)));
     }
 
     private async Task<(bool ok, string summary, string json)> ExecuteToolAsync(ToolCall call, CancellationToken cancellationToken)
@@ -124,6 +141,7 @@ public sealed class ChatOrchestrator
             var output = await tool.Execute(args, cancellationToken);
             return (true, name, JsonSerializer.Serialize(output));
         }
+        catch (OperationCanceledException) { throw; } // a cancelable tool's stop must propagate, not become a tool error
         catch (Exception ex)
         {
             return (false, "tool error", Err(ex.Message));
