@@ -259,11 +259,32 @@ public sealed partial class MainPage : Page
                 .OrderByDescending(session => session.Pinned)
                 .ThenByDescending(session => session.UpdatedAt)
                 .ToList();
-            MainContent.Children.Add(ExpandableSessionGroup(collection.Name, $"{sessions.Count} chats", sessions));
+            var id = collection.Id;
+            var name = collection.Name;
+            MainContent.Children.Add(ExpandableSessionGroup(name, $"{sessions.Count} chats", sessions,
+                onDelete: () => _ = DeleteCollectionAsync(id, name)));
         }
         if (_archive.Store.Collections.Count == 0)
         {
-            MainContent.Children.Add(EmptyBlock("No collections yet", "Collections are native app metadata only."));
+            MainContent.Children.Add(EmptyBlock("No projects yet", "Right-click a chat and choose \"Add to collection\" to start one."));
+        }
+    }
+
+    private async Task DeleteCollectionAsync(string id, string name)
+    {
+        var dialog = new ContentDialog
+        {
+            Title = "Delete project",
+            Content = $"Remove the \"{name}\" project? The chats themselves stay in your archive — only the grouping is removed.",
+            PrimaryButtonText = "Delete",
+            CloseButtonText = "Cancel",
+            DefaultButton = ContentDialogButton.Close,
+            XamlRoot = XamlRoot
+        };
+        if (await dialog.ShowAsync() == ContentDialogResult.Primary)
+        {
+            await _archive.RemoveCollectionAsync(id);
+            RenderCollections();
         }
     }
 
@@ -650,7 +671,7 @@ public sealed partial class MainPage : Page
         RenderAsk();
     }
 
-    private UIElement ExpandableSessionGroup(string title, string subtitle, IEnumerable<ArchiveSession> sessions)
+    private UIElement ExpandableSessionGroup(string title, string subtitle, IEnumerable<ArchiveSession> sessions, Action? onDelete = null)
     {
         var sessionList = sessions.Take(120).ToList();
         var stack = new StackPanel { Spacing = 0 };
@@ -665,16 +686,33 @@ public sealed partial class MainPage : Page
         var titleRow = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8, VerticalAlignment = VerticalAlignment.Center };
         titleRow.Children.Add(new TextBlock { Text = title, Foreground = StrongBrush(), FontSize = 15, FontWeight = Microsoft.UI.Text.FontWeights.SemiBold, VerticalAlignment = VerticalAlignment.Center, TextTrimming = TextTrimming.CharacterEllipsis });
         header.Children.Add(titleRow);
-        var count = new Border
+
+        var rightActions = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8, VerticalAlignment = VerticalAlignment.Center };
+        rightActions.Children.Add(new Border
         {
             Background = AccentVerySoftBrush(),
             CornerRadius = new CornerRadius(9),
             Padding = new Thickness(9, 1, 9, 1),
             VerticalAlignment = VerticalAlignment.Center,
             Child = new TextBlock { Text = subtitle, Foreground = MutedBrush(), FontSize = 11 }
-        };
-        Grid.SetColumn(count, 1);
-        header.Children.Add(count);
+        });
+        if (onDelete is not null)
+        {
+            var delete = new Button
+            {
+                Style = (Style)Resources["IconButtonStyle"],
+                Width = 32,
+                Height = 32,
+                MinWidth = 32,
+                MinHeight = 32,
+                Content = new FontIcon { FontFamily = new FontFamily("Segoe Fluent Icons"), FontSize = 14, Glyph = "" }
+            };
+            ToolTipService.SetToolTip(delete, "Delete project (keeps the chats)");
+            delete.Click += (_, _) => onDelete();
+            rightActions.Children.Add(delete);
+        }
+        Grid.SetColumn(rightActions, 1);
+        header.Children.Add(rightActions);
 
         var expander = new Expander
         {

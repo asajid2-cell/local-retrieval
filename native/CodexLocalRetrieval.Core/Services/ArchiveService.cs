@@ -162,6 +162,19 @@ public sealed class ArchiveService
         await SaveAsync();
     }
 
+    // Delete a project/collection — only the grouping; the chats themselves stay in the archive.
+    public async Task RemoveCollectionAsync(string collectionId)
+    {
+        if (Store.Collections.Remove(collectionId)) await SaveAsync();
+    }
+
+    // Remove a single chat from a project without deleting the project or the chat.
+    public async Task RemoveFromCollectionAsync(string collectionId, string sessionId)
+    {
+        if (Store.Collections.TryGetValue(collectionId, out var collection) && collection.SessionIds.Remove(sessionId))
+            await SaveAsync();
+    }
+
     // Apply one command from an outside agent (see AGENTS.md). Lets a user point any Claude/Codex
     // chat at the app and say "set yourself up / favorite yourself / file yourself into project X".
     public async Task<AgentCommandResult> ApplyAgentCommandAsync(AgentCommand cmd)

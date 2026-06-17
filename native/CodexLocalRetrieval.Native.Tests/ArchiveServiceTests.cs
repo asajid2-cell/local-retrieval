@@ -282,6 +282,25 @@ public sealed class ArchiveServiceTests
         return new ArchiveService(storePath: store);
     }
 
+    // Deleting a project removes only the grouping; the chats stay in the archive.
+    [TestMethod]
+    public async Task RemoveCollection_DropsGroupingKeepsChats()
+    {
+        var svc = TempService(out var store);
+        try
+        {
+            svc.Store.Sessions["s1"] = new ArchiveSession { Id = "s1" };
+            await svc.AddToCollectionAsync(svc.Store.Sessions["s1"], "Temp");
+            var id = svc.Store.Collections.Keys.First();
+
+            await svc.RemoveCollectionAsync(id);
+
+            Assert.IsFalse(svc.Store.Collections.ContainsKey(id), "the collection is removed");
+            Assert.IsTrue(svc.Store.Sessions.ContainsKey("s1"), "the chat itself is kept");
+        }
+        finally { if (File.Exists(store)) File.Delete(store); }
+    }
+
     // N4: an agent favorites "self" — resolved as the newest session in its workspace.
     [TestMethod]
     public async Task AgentCommand_FavoriteSelf_ResolvesNewestByCwd()
