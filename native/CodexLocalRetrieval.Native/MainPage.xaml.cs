@@ -51,6 +51,7 @@ public sealed partial class MainPage : Page
             Diag.Log("MP.Loaded: render done");
             StartCaptureHarness();
             StartAgentBridge();
+            Diag.Log("DeepSeek key source: " + ApiKeySource("deepseek"));
             _ = StartupResurfaceAsync();
         }
         catch (Exception ex)
@@ -1548,6 +1549,10 @@ public sealed partial class MainPage : Page
 
     private static string LoadApiKey(string providerId)
     {
+        // Autograb from the environment FIRST (the "set it once" canonical source the user asked
+        // for); fall back to a key saved in the app's credential vault if no env var is set.
+        var env = EnvApiKey(providerId);
+        if (!string.IsNullOrWhiteSpace(env)) return env;
         try
         {
             var vault = new PasswordVault();
@@ -1559,6 +1564,39 @@ public sealed partial class MainPage : Page
         {
             return "";
         }
+    }
+
+    // Autograb: read the key from a standard env var so it can be set once
+    // (DEEPSEEK_API_KEY / OPENAI_API_KEY / else CLR_<ID>_API_KEY) and never pasted into the app or
+    // written to the store. A key saved in the credential vault still takes precedence.
+    private static string EnvApiKey(string providerId)
+    {
+        string[] names = providerId.ToLowerInvariant() switch
+        {
+            "deepseek" => new[] { "DEEPSEEK_API_KEY" },
+            "openai" => new[] { "OPENAI_API_KEY" },
+            _ => new[] { $"CLR_{providerId.ToUpperInvariant()}_API_KEY" }
+        };
+        foreach (var name in names)
+        {
+            var value = Environment.GetEnvironmentVariable(name);
+            if (!string.IsNullOrWhiteSpace(value)) return value.Trim();
+        }
+        return "";
+    }
+
+    public static string ApiKeySource(string providerId)
+    {
+        if (!string.IsNullOrWhiteSpace(EnvApiKey(providerId))) return "environment variable";
+        try
+        {
+            var vault = new PasswordVault();
+            var credential = vault.Retrieve(CredentialResource(providerId), Environment.UserName);
+            credential.RetrievePassword();
+            if (!string.IsNullOrWhiteSpace(credential.Password)) return "saved in app";
+        }
+        catch { }
+        return "none";
     }
 
     private static void SaveApiKey(string providerId, string apiKey)
