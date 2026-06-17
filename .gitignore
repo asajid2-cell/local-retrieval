@@ -16,6 +16,8 @@ playwright-report/
 index.html
 src/
 server/
+# ...but the remote server's web UI is real and must be tracked:
+!native/CodexLocalRetrieval.Server/wwwroot/index.html
 tests/
 package.json
 package-lock.json
@@ -42,3 +44,7 @@ Thumbs.db
 
 # Release build outputs
 artifacts/
+
+# remote server: battery fixtures and publish output
+_battery*.html
+publish/

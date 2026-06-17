@@ -11,6 +11,8 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "CodexLocalRetrieval.Native"
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "CodexLocalRetrieval.Native.Tests", "native\CodexLocalRetrieval.Native.Tests\CodexLocalRetrieval.Native.Tests.csproj", "{585B547D-A653-4701-9AD6-E0E745CDBE5B}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "CodexLocalRetrieval.Server", "native\CodexLocalRetrieval.Server\CodexLocalRetrieval.Server.csproj", "{006E5531-8DA6-42A9-BC1C-CB1723CB2E36}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -57,6 +59,18 @@ Global
 		{585B547D-A653-4701-9AD6-E0E745CDBE5B}.Release|x64.Build.0 = Release|Any CPU
 		{585B547D-A653-4701-9AD6-E0E745CDBE5B}.Release|x86.ActiveCfg = Release|Any CPU
 		{585B547D-A653-4701-9AD6-E0E745CDBE5B}.Release|x86.Build.0 = Release|Any CPU
+		{006E5531-8DA6-42A9-BC1C-CB1723CB2E36}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{006E5531-8DA6-42A9-BC1C-CB1723CB2E36}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{006E5531-8DA6-42A9-BC1C-CB1723CB2E36}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{006E5531-8DA6-42A9-BC1C-CB1723CB2E36}.Debug|x64.Build.0 = Debug|Any CPU
+		{006E5531-8DA6-42A9-BC1C-CB1723CB2E36}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{006E5531-8DA6-42A9-BC1C-CB1723CB2E36}.Debug|x86.Build.0 = Debug|Any CPU
+		{006E5531-8DA6-42A9-BC1C-CB1723CB2E36}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{006E5531-8DA6-42A9-BC1C-CB1723CB2E36}.Release|Any CPU.Build.0 = Release|Any CPU
+		{006E5531-8DA6-42A9-BC1C-CB1723CB2E36}.Release|x64.ActiveCfg = Release|Any CPU
+		{006E5531-8DA6-42A9-BC1C-CB1723CB2E36}.Release|x64.Build.0 = Release|Any CPU
+		{006E5531-8DA6-42A9-BC1C-CB1723CB2E36}.Release|x86.ActiveCfg = Release|Any CPU
+		{006E5531-8DA6-42A9-BC1C-CB1723CB2E36}.Release|x86.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
@@ -65,5 +79,6 @@ Global
 		{9DB9F013-8752-43B5-AF03-14FDFCCF88A2} = {2F2BA0B1-8447-348E-8DA4-622F0257D38B}
 		{7419DB9D-EF44-41C0-BA6E-2D14F7DD390B} = {2F2BA0B1-8447-348E-8DA4-622F0257D38B}
 		{585B547D-A653-4701-9AD6-E0E745CDBE5B} = {2F2BA0B1-8447-348E-8DA4-622F0257D38B}
+		{006E5531-8DA6-42A9-BC1C-CB1723CB2E36} = {2F2BA0B1-8447-348E-8DA4-622F0257D38B}
 	EndGlobalSection
 EndGlobal

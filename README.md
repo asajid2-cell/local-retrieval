@@ -51,6 +51,11 @@ preserve, not clobber — all off the UI thread so the window never stalls on a 
 - **Let an agent set itself up.** Point any Claude/Codex chat at [`AGENTS.md`](AGENTS.md) and it can
   favorite itself, file itself into a project, rename itself, or register a chat folder in a
   non-default location — over a small JSON inbox.
+- **Reach your archive from anywhere.** A small headless server
+  ([`CodexLocalRetrieval.Server`](native/CodexLocalRetrieval.Server)) exposes the archive and the
+  co-pilot over an authenticated web UI, so you can browse, read rollouts, chat, pin, and resume a
+  chat in a terminal from your phone — proxied through your own VPS, with chats and keys staying on
+  your machine. See [`REMOTE.md`](REMOTE.md).
 
 ## Run it
 
@@ -89,6 +94,13 @@ On first launch the app indexes `~/.codex/sessions` and `~/.claude/projects`. Ad
   `key = value` secrets) — so a key pasted into an old chat isn't exfiltrated to the model API.
 - **Resilient model calls.** Transient errors (429 / 5xx / timeouts) are retried with bounded
   exponential backoff that honors `Retry-After`; a Stop button cancels an in-flight turn promptly.
+- **Remote access, data stays home.** A headless ASP.NET Core server reuses the Core engine to serve
+  a bearer-authenticated, mobile-first web UI (browse / read rollouts / co-pilot / pin / resume). It
+  binds localhost and is published through your own reverse proxy, so the archive and the model key
+  never leave your machine; the co-pilot stays read-only over the wire and state changes are explicit
+  taps.
+
+![The remote web UI on a phone — chat list and co-pilot](docs/media/remote-chats.png)
 
 ## Architecture
 
@@ -114,6 +126,8 @@ On first launch the app indexes `~/.codex/sessions` and `~/.claude/projects`. Ad
 | Agent self-service bridge | [`native/CodexLocalRetrieval.Native/MainPage.Agent.cs`](native/CodexLocalRetrieval.Native/MainPage.Agent.cs) |
 | Co-pilot: tool loop, tools, backends | [`native/CodexLocalRetrieval.Core/Chat/`](native/CodexLocalRetrieval.Core/Chat/) (ChatOrchestrator, ArchiveToolService, DeepSeekBackend, ClaudexBackend) |
 | Co-pilot UI + confirm + floating preview | [`native/CodexLocalRetrieval.Native/MainPage.Copilot.cs`](native/CodexLocalRetrieval.Native/MainPage.Copilot.cs) |
+| Remote API + bearer gate (transport-agnostic) | [`native/CodexLocalRetrieval.Core/Remote/`](native/CodexLocalRetrieval.Core/Remote/) (RemoteApi, RemoteAuth) |
+| Remote server host + web UI | [`native/CodexLocalRetrieval.Server/`](native/CodexLocalRetrieval.Server/) · recipe in [`REMOTE.md`](REMOTE.md) |
 | Agent protocol reference | [`AGENTS.md`](AGENTS.md) |
 | Service tests | [`native/CodexLocalRetrieval.Native.Tests/ArchiveServiceTests.cs`](native/CodexLocalRetrieval.Native.Tests/ArchiveServiceTests.cs) |
 
