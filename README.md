@@ -2,8 +2,9 @@
 
 **A WinUI 3 / .NET 8 Windows desktop app that indexes your local Codex and Claude sessions into one
 archive — so a months-old chat resurfaces, reads cleanly, files into a project, and relaunches its
-`codex resume` / `claude --resume` command in a terminal.** A Claude or Codex session can even file
-itself in through a local JSON inbox; the app never edits your source transcript files.
+`codex resume` / `claude --resume` command in a terminal.** A built-in DeepSeek **co-pilot** can
+search, organize, and resume your chats by tool-calling over the archive; a Claude or Codex session
+can even file itself in through a local JSON inbox. The app never edits your source transcript files.
 
 ![Codex Local Retrieval — a tour of the app](docs/media/hero.gif)
 
@@ -13,6 +14,11 @@ inspect the raw event timeline, organize into projects, and open the theme picke
 | Chats grouped by project (Codex + Claude badges) | A project an agent filed itself into |
 |---|---|
 | ![Chats grouped by project](docs/media/workspaces.png) | ![Agent-created project](docs/media/projects.png) |
+
+![The co-pilot finding and organizing chats](docs/media/copilot.png)
+
+*The DeepSeek co-pilot answering "find chats about VENPOD" — it called `search_chats` over the
+real archive and grouped the results itself.*
 
 ## Why it's hard
 
@@ -38,6 +44,9 @@ preserve, not clobber — all off the UI thread so the window never stalls on a 
   Codex chat, `claude --resume …` for a Claude chat — in its original working directory.
 - **Inspect the raw timeline.** The Source inspector shows the real rollout events (messages, tool
   calls, commands, reasoning), not just a file path.
+- **Ask a co-pilot.** A built-in chat (DeepSeek by default, set `DEEPSEEK_API_KEY` in your
+  environment) tool-calls over the archive to find, summarize, organize, open a chat in a floating
+  window, or resume one in a terminal — with a confirmation step before any change or launch.
 - **Let an agent set itself up.** Point any Claude/Codex chat at [`AGENTS.md`](AGENTS.md) and it can
   favorite itself, file itself into a project, rename itself, or register a chat folder in a
   non-default location — over a small JSON inbox.
@@ -69,6 +78,11 @@ On first launch the app indexes `~/.codex/sessions` and `~/.claude/projects`. Ad
   up in `codex resume` too.
 - **Agent inbox.** A polled `agent-inbox.jsonl` applies a fixed set of ops (init / addSource /
   favorite / addToProject / rename) and acks each to an outbox; unsafe session ids are refused.
+- **Co-pilot with tools.** An orchestrator runs an OpenAI-style tool loop (DeepSeek primary, a
+  degraded Claude-CLI fallback) over a narrow, typed tool surface — read-only retrieval returns
+  ids/snippets first to protect the context, mutations are two-phase confirmed, and the model can
+  never pass file paths or raw commands. Guardrails: round/call caps, per-message side-effect quotas,
+  and a trusted-exe check before any terminal launch.
 
 ## Architecture
 
@@ -92,6 +106,8 @@ On first launch the app indexes `~/.codex/sessions` and `~/.claude/projects`. Ad
 | App shell, navigation, rendering | [`native/CodexLocalRetrieval.Native/MainPage.xaml.cs`](native/CodexLocalRetrieval.Native/MainPage.xaml.cs) |
 | Resume-in-terminal, projects, bump | [`native/CodexLocalRetrieval.Native/MainPage.Sessions.cs`](native/CodexLocalRetrieval.Native/MainPage.Sessions.cs) |
 | Agent self-service bridge | [`native/CodexLocalRetrieval.Native/MainPage.Agent.cs`](native/CodexLocalRetrieval.Native/MainPage.Agent.cs) |
+| Co-pilot: tool loop, tools, backends | [`native/CodexLocalRetrieval.Core/Chat/`](native/CodexLocalRetrieval.Core/Chat/) (ChatOrchestrator, ArchiveToolService, DeepSeekBackend, ClaudexBackend) |
+| Co-pilot UI + confirm + floating preview | [`native/CodexLocalRetrieval.Native/MainPage.Copilot.cs`](native/CodexLocalRetrieval.Native/MainPage.Copilot.cs) |
 | Agent protocol reference | [`AGENTS.md`](AGENTS.md) |
 | Service tests | [`native/CodexLocalRetrieval.Native.Tests/ArchiveServiceTests.cs`](native/CodexLocalRetrieval.Native.Tests/ArchiveServiceTests.cs) |
 
@@ -112,6 +128,9 @@ A portable Windows x64 release is produced by [`tools/release/package-win-x64.ps
   targets `net8.0-windows`.
 - **Resume needs the CLI installed.** Resume launches the real `codex` / `claude` binary; if neither
   is found it falls back to the name on `PATH`.
+- **The co-pilot needs a key (and a CLI for resume).** Set `DEEPSEEK_API_KEY` in your environment;
+  the Claude-CLI fallback is text-only (no tools) and experimental. Resume/launch tools require the
+  real `codex`/`claude` CLI at a trusted path, or they refuse.
 - **Canonical rename is Codex-only.** Renames always apply in-app; the write-back to the agent's own
   store is implemented for Codex's thread DB — Claude has no external rename API, so a Claude rename
   stays app-only (surfaced in the result message).
