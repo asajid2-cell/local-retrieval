@@ -136,7 +136,7 @@
                     <Button Click="Nav_Click" Style="{StaticResource PillButtonStyle}" Tag="Ask">
                         <StackPanel Orientation="Horizontal" Spacing="10">
                             <SymbolIcon Symbol="Message" />
-                            <TextBlock Text="Ask archive" />
+                            <TextBlock Text="Co-pilot" />
                         </StackPanel>
                     </Button>
                     <Button Click="Nav_Click" Style="{StaticResource PillButtonStyle}" Tag="Workspaces">

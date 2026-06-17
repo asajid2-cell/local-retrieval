@@ -1,5 +1,7 @@
 using System.Net;
+using System.Text.Json;
 using CodexLocalRetrieval.Core.Chat;
+using CodexLocalRetrieval.Core.Models;
 using CodexLocalRetrieval.Core.Services;
 
 namespace CodexLocalRetrieval.Native.Tests;
@@ -150,6 +152,75 @@ public sealed class ChatOrchestratorTests
         Assert.IsFalse(result.Activity[0].Ok);
         var toolMsg = backend.Seen[1].Messages.LastOrDefault(m => m.Role == "tool");
         StringAssert.Contains(toolMsg!.Content!, "Unknown tool");
+    }
+
+    // A confirmed write actually mutates: set_favorite through an approving confirm gate pins the chat.
+    [TestMethod]
+    public async Task Orchestrator_ConfirmedWrite_FavoritesSession()
+    {
+        var store = Path.Combine(Path.GetTempPath(), "clr-chat-" + Guid.NewGuid().ToString("N") + ".json");
+        try
+        {
+            var svc = new ArchiveService(storePath: store);
+            svc.Store.Sessions["s1"] = new ArchiveSession { Id = "s1", Title = "t" };
+            var tools = new ArchiveToolService(svc).Tools();
+            var backend = new FakeBackend(new[]
+            {
+                new BackendReply { Message = new ChatMessage { Role = "assistant", ToolCalls = new() { Call("c1", "set_favorite", "{\"id\":\"s1\",\"favorite\":true}") } } },
+                new BackendReply { Message = new ChatMessage { Role = "assistant", Content = "Favorited it." } }
+            });
+            var confirmed = false;
+            var orchestrator = new ChatOrchestrator(backend, tools, confirm: (_, _) => { confirmed = true; return Task.FromResult(true); });
+
+            var result = await orchestrator.RunAsync(new List<ChatMessage> { ChatMessage.User("favorite s1") });
+
+            Assert.IsTrue(confirmed, "the confirm gate was invoked for the mutation");
+            Assert.IsTrue(svc.Store.Sessions["s1"].Pinned, "the chat is favorited after approval");
+            Assert.IsTrue(result.Activity[0].Ok);
+        }
+        finally { if (File.Exists(store)) File.Delete(store); }
+    }
+
+    // A declined write does not mutate.
+    [TestMethod]
+    public async Task Orchestrator_DeclinedWrite_DoesNotMutate()
+    {
+        var store = Path.Combine(Path.GetTempPath(), "clr-chat-" + Guid.NewGuid().ToString("N") + ".json");
+        try
+        {
+            var svc = new ArchiveService(storePath: store);
+            svc.Store.Sessions["s1"] = new ArchiveSession { Id = "s1" };
+            var tools = new ArchiveToolService(svc).Tools();
+            var backend = new FakeBackend(new[]
+            {
+                new BackendReply { Message = new ChatMessage { Role = "assistant", ToolCalls = new() { Call("c1", "rename_local", "{\"id\":\"s1\",\"title\":\"Nope\"}") } } },
+                new BackendReply { Message = new ChatMessage { Role = "assistant", Content = "Okay, left it." } }
+            });
+            var orchestrator = new ChatOrchestrator(backend, tools, confirm: (_, _) => Task.FromResult(false));
+
+            await orchestrator.RunAsync(new List<ChatMessage> { ChatMessage.User("rename s1") });
+
+            Assert.AreEqual("", svc.Store.Sessions["s1"].CustomTitle, "declined rename did not apply");
+        }
+        finally { if (File.Exists(store)) File.Delete(store); }
+    }
+
+    // read_chat returns a summary + paged messages (ids-first, capped), never the whole conversation raw.
+    [TestMethod]
+    public async Task ReadChat_ReturnsSummaryAndPagedMessages()
+    {
+        var svc = new ArchiveService(useBundledStore: true);
+        await svc.LoadAsync();
+        var fixture = svc.Search("fixture-b").First();
+        var readChat = new ArchiveToolService(svc).Tools().First(t => t.Name == "read_chat");
+
+        var args = JsonSerializer.Deserialize<JsonElement>($"{{\"id\":\"{fixture.Id}\"}}");
+        var output = await readChat.Execute(args, default);
+        var json = JsonSerializer.Serialize(output);
+
+        StringAssert.Contains(json, "totalMessages");
+        StringAssert.Contains(json, "untrusted_text");
+        StringAssert.Contains(json, fixture.Id);
     }
 
     // A mutation tool with no confirmation gate is refused (write tools require explicit approval).

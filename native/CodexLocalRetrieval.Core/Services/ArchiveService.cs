@@ -175,6 +175,34 @@ public sealed class ArchiveService
             await SaveAsync();
     }
 
+    // Narrow by-id operations for the co-pilot tools. App metadata only — these never write the
+    // canonical agent store and never touch source .jsonl files.
+    public ArchiveSession? GetSession(string sessionId) =>
+        Store.Sessions.TryGetValue(sessionId, out var session) ? session : null;
+
+    public async Task<bool> SetFavoriteAsync(string sessionId, bool favorite)
+    {
+        if (!Store.Sessions.TryGetValue(sessionId, out var session)) return false;
+        session.Pinned = favorite;
+        await SaveAsync();
+        RefreshSessions(Store.Sessions.Values);
+        return true;
+    }
+
+    public async Task<bool> RenameLocalAsync(string sessionId, string title)
+    {
+        if (!Store.Sessions.TryGetValue(sessionId, out var session)) return false;
+        await RenameSessionAsync(session, title); // CustomTitle only; no canonical write-back
+        return true;
+    }
+
+    public async Task<bool> AddToProjectByIdAsync(string sessionId, string project)
+    {
+        if (!Store.Sessions.TryGetValue(sessionId, out var session)) return false;
+        await AddToCollectionAsync(session, project);
+        return true;
+    }
+
     // Apply one command from an outside agent (see AGENTS.md). Lets a user point any Claude/Codex
     // chat at the app and say "set yourself up / favorite yourself / file yourself into project X".
     public async Task<AgentCommandResult> ApplyAgentCommandAsync(AgentCommand cmd)

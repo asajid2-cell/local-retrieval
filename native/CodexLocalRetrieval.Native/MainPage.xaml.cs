@@ -139,7 +139,7 @@ public sealed partial class MainPage : Page
                 RenderSearch(SearchBox.Text);
                 break;
             case "Ask":
-                RenderAsk();
+                RenderCopilot();
                 break;
             case "Workspaces":
                 RenderWorkspaces();
