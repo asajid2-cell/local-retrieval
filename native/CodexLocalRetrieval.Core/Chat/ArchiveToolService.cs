@@ -144,7 +144,9 @@ public sealed class ArchiveToolService
         Obj(("id", Str("session id")), ("project", Str("project name"))), new[] { "id", "project" },
         async args =>
         {
-            var ok = await _archive.AddToProjectByIdAsync(Arg(args, "id"), Arg(args, "project"));
+            var project = Arg(args, "project");
+            if (string.IsNullOrWhiteSpace(project)) return new { ok = false, message = "A non-empty project name is required." };
+            var ok = await _archive.AddToProjectByIdAsync(Arg(args, "id"), project);
             return new { ok, message = ok ? "Added to project." : "No chat with that id." };
         });
 
@@ -153,7 +155,9 @@ public sealed class ArchiveToolService
         Obj(("id", Str("session id")), ("title", Str("new display title"))), new[] { "id", "title" },
         async args =>
         {
-            var ok = await _archive.RenameLocalAsync(Arg(args, "id"), Arg(args, "title"));
+            var title = Arg(args, "title");
+            if (string.IsNullOrWhiteSpace(title)) return new { ok = false, message = "A non-empty title is required." };
+            var ok = await _archive.RenameLocalAsync(Arg(args, "id"), title);
             return new { ok, message = ok ? "Renamed in the app." : "No chat with that id." };
         });
 
@@ -167,17 +171,10 @@ public sealed class ArchiveToolService
         {
             var session = _archive.GetSession(Arg(args, "id"));
             if (session is null) return Task.FromResult<object>(new { ok = false, message = "No chat with that id." });
-            var launch = _archive.BuildResumeLaunch(session);
-            if (string.IsNullOrEmpty(launch.Exe))
-                return Task.FromResult<object>(new { ok = false, message = "That chat can't be resumed safely." });
+            // The Native handler builds the resume command (with the trusted-exe safety check) and
+            // launches the terminal; refusals surface there.
             _resumeChat?.Invoke(session.Id);
-            return Task.FromResult<object>(new
-            {
-                ok = true,
-                tool = session.Tool,
-                command = launch.DisplayCommand,
-                message = $"Opening a terminal to resume \"{session.DisplayTitle}\"."
-            });
+            return Task.FromResult<object>(new { ok = true, tool = session.Tool, message = $"Opening a terminal to resume \"{session.DisplayTitle}\"." });
         });
 
     // ---- UI side-effect ----

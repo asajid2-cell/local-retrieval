@@ -34,6 +34,7 @@ public sealed class ChatOrchestrator
         var specs = _backend.SupportsTools ? ToolSpecs : Array.Empty<ChatToolSpec>();
         var totalCalls = 0;
         var callSignatureCounts = new Dictionary<string, int>(StringComparer.Ordinal);
+        var perToolCounts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
 
         for (var round = 0; round < MaxToolRounds; round++)
         {
@@ -59,7 +60,19 @@ public sealed class ChatOrchestrator
                     return result;
                 }
 
-                var signature = call.Function.Name + "|" + call.Function.Arguments;
+                // Per-tool quota for side-effecting tools (a model shouldn't open 20 windows or
+                // launch many terminals in one message).
+                perToolCounts.TryGetValue(call.Function.Name, out var toolUsed);
+                perToolCounts[call.Function.Name] = toolUsed + 1;
+                if (SideEffectLimit(call.Function.Name) is int limit && toolUsed + 1 > limit)
+                {
+                    result.Activity.Add(new ToolActivity(call.Function.Name, call.Function.Arguments, "rate limited", false));
+                    messages.Add(ChatMessage.Tool(call.Id, Err($"'{call.Function.Name}' may run at most {limit} time(s) per message. Ask the user.")));
+                    continue;
+                }
+
+                // Repeat guard keyed on canonicalized arguments (so whitespace/order can't bypass it).
+                var signature = call.Function.Name + "|" + Canonicalize(call.Function.Arguments);
                 callSignatureCounts.TryGetValue(signature, out var seen);
                 callSignatureCounts[signature] = seen + 1;
                 if (seen + 1 > MaxSameCallRepeats)
@@ -115,6 +128,20 @@ public sealed class ChatOrchestrator
         {
             return (false, "tool error", Err(ex.Message));
         }
+    }
+
+    // Side-effecting tools get a per-message quota; read-only tools are unlimited (only the global cap).
+    private static int? SideEffectLimit(string name) => name switch
+    {
+        "resume_chat" => 1,
+        "show_chat" => 3,
+        _ => null
+    };
+
+    private static string Canonicalize(string argsJson)
+    {
+        try { return JsonSerializer.Serialize(JsonSerializer.Deserialize<JsonElement>(string.IsNullOrWhiteSpace(argsJson) ? "{}" : argsJson)); }
+        catch { return argsJson; }
     }
 
     private static string Err(string message) => JsonSerializer.Serialize(new { error = message });

@@ -113,8 +113,8 @@ public sealed partial class MainPage
         var send = new Button { Style = (Style)Resources["PrimaryPillButtonStyle"], Content = "Send", IsEnabled = !_copilotBusy };
         send.Click += async (_, _) => { var t = input.Text; input.Text = ""; await SendCopilotAsync(t); };
 
-        var reset = new Button { Style = (Style)Resources["PillButtonStyle"], Content = "New chat" };
-        reset.Click += (_, _) => { ResetCopilot(); RenderCopilot(); };
+        var reset = new Button { Style = (Style)Resources["PillButtonStyle"], Content = "New chat", IsEnabled = !_copilotBusy };
+        reset.Click += (_, _) => { if (!_copilotBusy) { ResetCopilot(); RenderCopilot(); } };
 
         var backendCombo = new ComboBox { MinWidth = 140, CornerRadius = ControlCornerRadius(), VerticalAlignment = VerticalAlignment.Center, IsEnabled = !_copilotBusy };
         backendCombo.Items.Add(new ComboBoxItem { Content = "DeepSeek", Tag = "deepseek" });
@@ -180,6 +180,7 @@ public sealed partial class MainPage
         }
 
         _copilotApi.Add(ChatMessage.User(text.Trim()));
+        TrimCopilotContext();
         _copilotBusy = true;
         _copilotStatus = "";
         RenderCopilot();
@@ -204,16 +205,56 @@ public sealed partial class MainPage
         }
     }
 
+    // Keep the system message + the most recent whole turns, so a long session can't grow the context
+    // (or the cost) without bound. Trimming by whole user-turns avoids leaving a tool message dangling
+    // without its assistant tool_call (which the API rejects).
+    private void TrimCopilotContext()
+    {
+        const int maxTurns = 12;
+        var userIndices = new List<int>();
+        for (var i = 1; i < _copilotApi.Count; i++)
+            if (_copilotApi[i].Role == "user") userIndices.Add(i);
+        if (userIndices.Count <= maxTurns) return;
+        var keepFrom = userIndices[userIndices.Count - maxTurns];
+        _copilotApi.RemoveRange(1, keepFrom - 1); // keep index 0 (system) + everything from keepFrom
+    }
+
     private async Task<bool> ConfirmCopilotActionAsync(ChatTool tool, JsonElement args)
     {
         Diag.Log($"Copilot confirm requested for tool: {tool.Name} {args}");
+
+        string body;
+        var defaultButton = ContentDialogButton.Primary;
+        if (tool.Name == "resume_chat")
+        {
+            var id = args.TryGetProperty("id", out var idEl) && idEl.ValueKind == JsonValueKind.String ? idEl.GetString() ?? "" : "";
+            var session = _archive.GetSession(id);
+            if (session is null)
+            {
+                body = "Resume a chat in a new terminal?";
+            }
+            else
+            {
+                var launch = _archive.BuildResumeLaunch(session);
+                body = $"Open a NEW terminal and resume “{session.DisplayTitle}”?\n\n" +
+                       "This launches an external agent CLI:\n" +
+                       $"  {launch.DisplayCommand}\n" +
+                       $"in {launch.WorkingDirectory}";
+            }
+            defaultButton = ContentDialogButton.Close; // a terminal launch should default to Skip
+        }
+        else
+        {
+            body = $"Let the co-pilot run “{tool.Name}”?\n\n{args}\n\nThis changes app metadata only — your chat files are never modified.";
+        }
+
         var dialog = new ContentDialog
         {
             Title = "Allow this action?",
-            Content = $"The co-pilot wants to run \"{tool.Name}\":\n\n{args}\n\nThis changes app metadata only — your chat files are never modified.",
+            Content = body,
             PrimaryButtonText = "Allow",
             CloseButtonText = "Skip",
-            DefaultButton = ContentDialogButton.Primary,
+            DefaultButton = defaultButton,
             XamlRoot = XamlRoot
         };
         return await dialog.ShowAsync() == ContentDialogResult.Primary;

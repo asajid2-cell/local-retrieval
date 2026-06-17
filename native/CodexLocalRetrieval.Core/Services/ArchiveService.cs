@@ -620,14 +620,18 @@ public sealed class ArchiveService
         var cwd = ResolveWorkingDirectory(session);
         if (!IsResumableId(id))
             return new ResumeLaunch("", "", cwd, "Refused: session id is not a safe token.");
-        if (string.Equals(session.Tool, "claude", StringComparison.OrdinalIgnoreCase))
-        {
-            var claude = string.IsNullOrWhiteSpace(exeOverride) ? ResolveClaudeExe() : exeOverride!;
-            var claudeArgs = $"--resume {id}";
-            return new ResumeLaunch(claude, claudeArgs, cwd, $"\"{claude}\" {claudeArgs}");
-        }
-        var exe = string.IsNullOrWhiteSpace(exeOverride) ? ResolveCodexExe() : exeOverride!;
-        var args = $"resume --include-non-interactive {id}";
+
+        var isClaude = string.Equals(session.Tool, "claude", StringComparison.OrdinalIgnoreCase);
+        var exe = !string.IsNullOrWhiteSpace(exeOverride) ? exeOverride!
+            : isClaude ? ResolveClaudeExe() : ResolveCodexExe();
+
+        // The terminal opens in the chat's workspace, and cmd resolves a bare command against the
+        // current directory before PATH — so a workspace that contains a planted codex.exe/claude.bat
+        // could be run. Require a trusted ABSOLUTE existing exe (overrides are caller-trusted, e.g. tests).
+        if (string.IsNullOrWhiteSpace(exeOverride) && (!Path.IsPathRooted(exe) || !File.Exists(exe)))
+            return new ResumeLaunch("", "", cwd, $"Refused: the {(isClaude ? "claude" : "codex")} CLI was not found at a trusted path.");
+
+        var args = isClaude ? $"--resume {id}" : $"resume --include-non-interactive {id}";
         return new ResumeLaunch(exe, args, cwd, $"\"{exe}\" {args}");
     }
 

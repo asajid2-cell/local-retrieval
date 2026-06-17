@@ -21,7 +21,7 @@ public sealed class DeepSeekBackend : IChatBackend
     private readonly string _apiKey;
     private readonly int _maxTokens;
 
-    public DeepSeekBackend(string baseUrl, string model, string apiKey, HttpClient? http = null, int maxTokens = 1200)
+    public DeepSeekBackend(string baseUrl, string model, string apiKey, HttpClient? http = null, int maxTokens = 2000)
     {
         _http = http ?? new HttpClient { Timeout = TimeSpan.FromSeconds(90) };
         _baseUrl = baseUrl;
@@ -69,8 +69,18 @@ public sealed class DeepSeekBackend : IChatBackend
     internal static BackendReply Parse(string body)
     {
         using var doc = JsonDocument.Parse(body);
-        var choice = doc.RootElement.GetProperty("choices")[0];
-        var message = choice.GetProperty("message");
+        var root = doc.RootElement;
+
+        // Some OpenAI-compatible providers return an error-shaped body with HTTP 200.
+        if (root.TryGetProperty("error", out var error))
+            throw new InvalidOperationException("Provider error: " +
+                (error.TryGetProperty("message", out var em) ? em.GetString() : error.ToString()));
+
+        if (!root.TryGetProperty("choices", out var choices) || choices.ValueKind != JsonValueKind.Array || choices.GetArrayLength() == 0)
+            throw new InvalidOperationException("Provider returned no choices.");
+        var choice = choices[0];
+        if (!choice.TryGetProperty("message", out var message))
+            throw new InvalidOperationException("Provider returned no message.");
 
         string? content = message.TryGetProperty("content", out var c) && c.ValueKind == JsonValueKind.String ? c.GetString() : null;
 
@@ -80,20 +90,25 @@ public sealed class DeepSeekBackend : IChatBackend
             toolCalls = new List<ToolCall>();
             foreach (var t in tc.EnumerateArray())
             {
-                var fn = t.GetProperty("function");
+                if (!t.TryGetProperty("function", out var fn)) continue; // skip malformed tool calls
                 toolCalls.Add(new ToolCall
                 {
                     Id = t.TryGetProperty("id", out var id) ? id.GetString() ?? "" : "",
                     Function = new ToolCallFunction
                     {
                         Name = fn.TryGetProperty("name", out var n) ? n.GetString() ?? "" : "",
-                        Arguments = fn.TryGetProperty("arguments", out var a) ? a.GetString() ?? "{}" : "{}"
+                        Arguments = fn.TryGetProperty("arguments", out var a) && a.ValueKind == JsonValueKind.String ? a.GetString() ?? "{}" : "{}"
                     }
                 });
             }
+            if (toolCalls.Count == 0) toolCalls = null;
         }
 
         var finish = choice.TryGetProperty("finish_reason", out var f) ? f.GetString() : null;
+        // A truncated final answer (no tool calls) should not silently read as complete.
+        if (finish == "length" && toolCalls is null && !string.IsNullOrEmpty(content))
+            content += "\n\n_[Response was cut off — ask me to continue.]_";
+
         return new BackendReply
         {
             Message = new ChatMessage { Role = "assistant", Content = content, ToolCalls = toolCalls },

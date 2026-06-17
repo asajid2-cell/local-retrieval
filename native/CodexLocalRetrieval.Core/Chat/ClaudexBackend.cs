@@ -23,9 +23,13 @@ public sealed class ClaudexBackend : IChatBackend
     public string Name => "claude-cli";
     public bool SupportsTools => false;
 
+    private const int MaxPromptChars = 48_000;
+    private const int MaxOutputChars = 24_000;
+
     public async Task<BackendReply> CompleteAsync(IReadOnlyList<ChatMessage> messages, IReadOnlyList<ChatToolSpec> tools, CancellationToken cancellationToken)
     {
         var prompt = FlattenPrompt(messages);
+        if (prompt.Length > MaxPromptChars) prompt = prompt[..MaxPromptChars];
 
         var psi = new ProcessStartInfo
         {
@@ -43,17 +47,23 @@ public sealed class ClaudexBackend : IChatBackend
         if (!string.IsNullOrWhiteSpace(_model)) { psi.ArgumentList.Add("--model"); psi.ArgumentList.Add(_model!); }
 
         using var process = new Process { StartInfo = psi };
-        if (!process.Start()) throw new InvalidOperationException("Could not start the Claude CLI.");
-
-        try { await process.StandardInput.WriteAsync(prompt); }
-        finally { process.StandardInput.Close(); }
-
-        var stdoutTask = process.StandardOutput.ReadToEndAsync(cancellationToken);
-        var stderrTask = process.StandardError.ReadToEndAsync(cancellationToken);
-
         using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         timeoutCts.CancelAfter(_timeoutMs);
-        try { await process.WaitForExitAsync(timeoutCts.Token); }
+        var token = timeoutCts.Token;
+
+        if (!process.Start()) throw new InvalidOperationException("Could not start the Claude CLI.");
+
+        // Start draining stdout/stderr BEFORE writing stdin: if the child fills its output pipe while
+        // we're still writing the prompt, an unread pipe would deadlock. The whole exchange is under
+        // the timeout so a child that never reads stdin can't hang us.
+        var stdoutTask = process.StandardOutput.ReadToEndAsync(token);
+        var stderrTask = process.StandardError.ReadToEndAsync(token);
+        try
+        {
+            await process.StandardInput.WriteAsync(prompt.AsMemory(), token);
+            process.StandardInput.Close();
+            await process.WaitForExitAsync(token);
+        }
         catch (OperationCanceledException)
         {
             try { process.Kill(entireProcessTree: true); } catch { }
@@ -66,6 +76,7 @@ public sealed class ClaudexBackend : IChatBackend
             throw new InvalidOperationException($"Claude CLI failed ({process.ExitCode}): {Trim(stderr)}");
 
         var answer = stdout.Trim();
+        if (answer.Length > MaxOutputChars) answer = answer[..MaxOutputChars] + "...(truncated)";
         return new BackendReply
         {
             Message = new ChatMessage { Role = "assistant", Content = string.IsNullOrWhiteSpace(answer) ? "(no response)" : answer },

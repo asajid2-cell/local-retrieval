@@ -56,10 +56,19 @@ public sealed class ArchiveServiceTests
             var indexed = await service.SyncFromDiskAsync();
 
             Assert.IsTrue(indexed >= 400, $"expected >=400 on-disk sessions resurfaced, got {indexed}");
-            var cutoff = DateTime.UtcNow.AddDays(-30);
-            var oldOnes = service.Store.Sessions.Values.Count(s =>
-                DateTime.TryParse(s.UpdatedAt, CultureInfo.InvariantCulture, DateTimeStyles.AdjustToUniversal, out var d) && d < cutoff);
-            Assert.IsTrue(oldOnes >= 1, "expected at least one chat older than 30 days to resurface");
+
+            // "Months ago" proof, robust to date drift: the OLDEST codex rollout file on disk must
+            // resurface as a session. (We assert on the file, not UpdatedAt, because
+            // EnrichTitlesFromLocalState legitimately overrides UpdatedAt with Codex's own index dates.)
+            var oldestFile = Directory.EnumerateFiles(ArchiveService.DefaultCodexSessionsRoot, "*.jsonl", SearchOption.AllDirectories)
+                .Select(f => new FileInfo(f))
+                .OrderBy(f => f.LastWriteTimeUtc)
+                .First();
+            var oldestAgeDays = (DateTime.UtcNow - oldestFile.LastWriteTimeUtc).TotalDays;
+            Assert.IsTrue(oldestAgeDays >= 30, $"sanity: oldest on-disk chat should be months old (got {oldestAgeDays:F0}d)");
+            Assert.IsTrue(
+                service.Store.Sessions.Values.Any(s => string.Equals(s.SourcePath, oldestFile.FullName, StringComparison.OrdinalIgnoreCase)),
+                $"the oldest on-disk chat ({oldestAgeDays:F0} days old) should resurface");
         }
         finally { if (File.Exists(store)) File.Delete(store); }
     }
