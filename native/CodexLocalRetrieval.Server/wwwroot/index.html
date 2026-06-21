@@ -186,11 +186,14 @@ const esc = s => (s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;
 const fmtDate = s => { if(!s) return ''; const d=new Date(s); return isNaN(d)?'':d.toLocaleDateString(undefined,{month:'short',day:'numeric'}); };
 const toolBadge = t => el('span',{class:'badge '+(t==='claude'?'cl':'cx')}, t==='claude'?'CL':'CX');
 
+// Base path = the directory this page is served from, so /api calls work whether the app is at
+// localhost:8765/ or behind a reverse proxy at harmonizerlabs.cc/remote/.
+const BASE = location.pathname.replace(/\/[^/]*$/, '');
 async function api(path, opts={}){
   const headers = Object.assign({'Authorization':'Bearer '+App.token}, opts.headers||{});
   if(opts.body){ headers['Content-Type']='application/json'; opts.body=JSON.stringify(opts.body); }
-  const res = await fetch(path, Object.assign({}, opts, {headers}));
-  if(res.status===401){ openGate('That token was rejected.'); throw new Error('unauthorized'); }
+  const res = await fetch(BASE+path, Object.assign({}, opts, {headers}));
+  if(res.status===401){ openGate(App.token?'That token was rejected.':null); throw new Error('unauthorized'); }
   if(!res.ok){ let m; try{m=(await res.json()).error;}catch{m=res.statusText;} throw new Error(m||('HTTP '+res.status)); }
   return res.json();
 }
@@ -243,7 +246,14 @@ async function loadChats(q){
 }
 async function openDetail(id){
   try{
-    App.detail=await api('/api/chats/'+encodeURIComponent(id)); App.showRollout=false; App.events=null; render();
+    App.detail=await api('/api/chats/'+encodeURIComponent(id)); App.showRollout=false; App.events=null; App.resumeResult=null; render();
+  }catch(e){ renderError(e.message); }
+}
+async function loadMoreMessages(){
+  const d=App.detail; if(!d) return;
+  try{
+    const next=await api('/api/chats/'+encodeURIComponent(d.id)+'?page='+(d.page+1)+'&pageSize='+d.pageSize);
+    d.messages=d.messages.concat(next.messages); d.page=next.page; d.hasMore=next.hasMore; render();
   }catch(e){ renderError(e.message); }
 }
 async function loadRollout(){
@@ -253,9 +263,10 @@ async function loadRollout(){
   catch(e){ renderError(e.message); }
 }
 async function doResume(id){
-  try{ const r=await api('/api/chats/'+encodeURIComponent(id)+'/resume',{method:'POST',body:{launch:true}});
-    alert(r.launched ? 'Launched on the host.' : (r.note? r.note+'\n\n'+r.command : r.command));
-  }catch(e){ alert('Resume failed: '+e.message); }
+  App.resumeResult={loading:true}; render();
+  try{ App.resumeResult=await api('/api/chats/'+encodeURIComponent(id)+'/resume',{method:'POST',body:{launch:true}}); }
+  catch(e){ App.resumeResult={error:e.message}; }
+  render();
 }
 async function togglePin(d){
   try{ const r=await api('/api/chats/'+encodeURIComponent(d.id)+'/favorite',{method:'POST',body:{favorite:!d.pinned}});
@@ -267,15 +278,16 @@ const SUGGEST=['Summarize my most recent chat','How many chats do I have and wha
 async function sendCopilot(text){
   text=(text||'').trim(); if(!text||App.copilotBusy) return;
   App.copilot.push({role:'user',content:text});
-  App.copilotBusy=true; App.copilotErr=null; render();
+  App.copilotBusy=true; App.copilotErr=null; App.copilotCtl=new AbortController(); render();
   const history=App.copilot.filter(m=>m.role==='user'||m.role==='assistant').slice(-20).map(m=>({role:m.role,content:m.content}));
   try{
-    const r=await api('/api/copilot',{method:'POST',body:{message:text,history:history.slice(0,-1)}});
+    const r=await api('/api/copilot',{method:'POST',body:{message:text,history:history.slice(0,-1)},signal:App.copilotCtl.signal});
     App.copilot.push({role:'assistant',content:r.answer||r.error||'(no answer)',activity:r.activity});
     if(r.error&&!r.answer) App.copilotErr=r.error;
-  }catch(e){ App.copilotErr=e.message; }
-  finally{ App.copilotBusy=false; render(); }
+  }catch(e){ App.copilotErr=(e.name==='AbortError')?'Stopped.':e.message; }
+  finally{ App.copilotBusy=false; App.copilotCtl=null; render(); }
 }
+function stopCopilot(){ if(App.copilotCtl) App.copilotCtl.abort(); }
 
 /* ---------- render ---------- */
 function render(){
@@ -319,6 +331,7 @@ function renderDetail(v){
       el('button',{class:'btn sm'+(App.showRollout?' primary':''),onclick:()=>App.showRollout?(App.showRollout=false,render()):loadRollout()}, App.showRollout?'Messages':'Rollout'))
   );
   v.append(head);
+  if(App.resumeResult) v.append(resumeCard(App.resumeResult));
   if(App.showRollout){
     if(!App.events){ v.append(el('div',{class:'note'}, el('span',{class:'spin'}),' loading rollout…')); return; }
     if(!App.events.events.length){ v.append(el('div',{class:'empty'},'No raw events for this chat.')); return; }
@@ -331,10 +344,27 @@ function renderDetail(v){
   for(const m of d.messages){
     v.append(el('div',{class:'msg'}, el('div',{class:'who'}, m.role), el('div',{class:'body'}, m.text)));
   }
-  if(d.hasMore) v.append(el('div',{class:'note'},'Showing the first '+d.messages.length+' messages.'));
+  if(d.hasMore) v.append(el('button',{class:'btn ghost',style:'width:100%;margin-top:4px',onclick:()=>loadMoreMessages()},
+    'Load more — '+(d.totalMessages-d.messages.length)+' of '+d.totalMessages+' left'));
 }
 
-function md(s){ return esc(s).replace(/\*\*(.+?)\*\*/g,'<b>$1</b>').replace(/`([^`]+?)`/g,'<code>$1</code>'); }
+function resumeCard(r){
+  if(r.loading) return el('div',{class:'note'}, el('span',{class:'spin'}),' starting…');
+  if(r.error) return el('div',{class:'err'}, 'Resume failed: '+r.error);
+  return el('div',{class:'msg'},
+    el('div',{class:'who'}, r.launched ? 'Launched a terminal on the host ✓' : 'Run this to resume:'),
+    el('div',{class:'evt',style:'margin:6px 0 0'}, r.command||'(no command)'),
+    r.note ? el('div',{class:'meta',style:'margin-top:6px'}, r.note) : null);
+}
+
+function inlineMd(s){ return esc(s).replace(/\*\*(.+?)\*\*/g,'<b>$1</b>').replace(/`([^`]+?)`/g,'<code>$1</code>'); }
+function md(s){
+  return (s||'').replace(/\r/g,'').split('\n').map(function(line){
+    var h=line.match(/^(#{1,3})\s+(.*)/); if(h) return '<b>'+inlineMd(h[2])+'</b>';
+    var b=line.match(/^\s*[-*]\s+(.*)/);  if(b) return '  •  '+inlineMd(b[1]);
+    return inlineMd(line);
+  }).join('\n');
+}
 function renderCopilot(v){
   if(!App.copilot.length){
     v.append(el('div',{class:'note'},'Ask about your archive — the co-pilot can search, summarize, and pull up stats (read-only over here).'));
@@ -355,13 +385,16 @@ function renderCopilot(v){
 
   const ta=el('textarea',{class:'txt',rows:'1',placeholder:'Ask about your chats…','aria-label':'Message',disabled:App.copilotBusy?'':null});
   ta.addEventListener('keydown',e=>{ if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();const t=ta.value;ta.value='';sendCopilot(t);} });
-  const send=el('button',{class:'btn primary',disabled:App.copilotBusy?'':null,onclick:()=>{const t=ta.value;ta.value='';sendCopilot(t);}}, App.copilotBusy?'…':'Send');
-  v.append(el('div',{class:'composer'}, ta, send));
+  const send=el('button',{class:'btn primary',onclick:()=>{const t=ta.value;ta.value='';sendCopilot(t);}}, 'Send');
+  const stop=el('button',{class:'btn',onclick:()=>stopCopilot()}, 'Stop');
+  v.append(el('div',{class:'composer'}, ta, App.copilotBusy?stop:send));
   if(App.tab==='copilot'&&!App.copilotBusy) setTimeout(()=>ta.focus(),30);
 }
 
 /* ---------- start ---------- */
-if(!App.token){ openGate(); } else { setDot('idle'); boot(); }
+// Always try to load: in hl-auth/SSO mode the cookie authenticates and no token is needed; in
+// bearer mode the first call 401s and api() opens the token gate.
+setDot('idle'); boot();
 </script>
 </body>
 </html>

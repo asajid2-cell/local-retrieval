@@ -83,6 +83,36 @@ way — they just publish your localhost:8765 under a hostname.)
 > Tip: keep the token in a password manager. To revoke remote access, change `CLR_REMOTE_TOKEN` and
 > restart — every stored browser session is invalidated.
 
+## Behind hl-auth at `harmonizerlabs.cc/remote` (per-account login)
+
+Instead of the bearer token, the server can gate itself with your hl-auth SSO — visitors sign in on
+your existing `/auth/login` page, and only accounts granted the `remote` page get in. The check is
+app-level (the server reads the `hl_session` cookie and asks `/auth/api/access`), so nginx just
+forwards. Three steps:
+
+**1. Register the page in hl-auth** (`/auth/admin`): add a page `remote` with path-prefix `/remote`,
+access `restricted`, then grant it to your account (and anyone else who should have it).
+
+**2. nginx** — paste [`deploy/nginx-remote.conf`](native/CodexLocalRetrieval.Server/deploy/nginx-remote.conf)
+into the `harmonizerlabs.cc` server block, `nginx -t`, reload. (It proxies `/remote/` to the
+reverse-tunnel port `127.0.0.1:8765`.)
+
+**3. Run the server in hl-auth mode** (on your PC; no bearer token needed):
+
+```powershell
+$env:CLR_REMOTE_HLAUTH       = "1"
+$env:CLR_REMOTE_HLAUTH_BASE  = "https://harmonizerlabs.cc"
+$env:CLR_REMOTE_HLAUTH_PAGE  = "remote"     # the page id from step 1; omit to allow any signed-in account
+$env:CLR_REMOTE_PUBLIC_PATH  = "/remote"    # where /auth/login returns you after sign-in
+$env:DEEPSEEK_API_KEY        = "<your key>"
+$env:CLR_REMOTE_ALLOW_LAUNCH = "1"          # optional: let Resume open a terminal on your PC
+dotnet run --project native/CodexLocalRetrieval.Server -c Release
+```
+
+Then start the reverse tunnel (`ssh -N -R 127.0.0.1:8765:127.0.0.1:8765 you@vps`). Now
+`https://harmonizerlabs.cc/remote` bounces to your hl-auth sign-in, and signed-in allowed accounts
+land on the archive. The decision is cached ~30s per session; it fails closed (auth down → no access).
+
 ## API (for scripts / your own clients)
 
 All require `Authorization: Bearer <token>` except `/healthz`.

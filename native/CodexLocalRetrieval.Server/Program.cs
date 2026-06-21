@@ -3,13 +3,28 @@ using CodexLocalRetrieval.Core.Remote;
 using CodexLocalRetrieval.Core.Services;
 
 // ---- config (env only; nothing secret is ever read from disk or args) ----
-var token = Environment.GetEnvironmentVariable("CLR_REMOTE_TOKEN");
-if (!RemoteAuth.IsValidConfiguredToken(token))
+var token = Environment.GetEnvironmentVariable("CLR_REMOTE_TOKEN")?.Trim();
+
+// hl-auth (SSO) mode: gate by the harmonizerlabs.cc account system instead of the bearer token.
+var hlAuthOn = Environment.GetEnvironmentVariable("CLR_REMOTE_HLAUTH") == "1";
+var hlBase = (Environment.GetEnvironmentVariable("CLR_REMOTE_HLAUTH_BASE") ?? "").TrimEnd('/');
+var hlPage = Environment.GetEnvironmentVariable("CLR_REMOTE_HLAUTH_PAGE");          // page id to require (empty = any signed-in account)
+var hlCookie = Environment.GetEnvironmentVariable("CLR_REMOTE_HLAUTH_COOKIE") ?? "hl_session";
+var hlReturn = Environment.GetEnvironmentVariable("CLR_REMOTE_PUBLIC_PATH") ?? "/";  // where /auth/login sends you back
+
+if (hlAuthOn)
 {
-    Console.Error.WriteLine($"refusing to start: set CLR_REMOTE_TOKEN to a secret of at least {RemoteAuth.MinTokenLength} chars.");
+    if (string.IsNullOrWhiteSpace(hlBase))
+    {
+        Console.Error.WriteLine("refusing to start: CLR_REMOTE_HLAUTH=1 requires CLR_REMOTE_HLAUTH_BASE (e.g. https://harmonizerlabs.cc).");
+        return 1;
+    }
+}
+else if (!RemoteAuth.IsValidConfiguredToken(token))
+{
+    Console.Error.WriteLine($"refusing to start: set CLR_REMOTE_TOKEN to a secret of at least {RemoteAuth.MinTokenLength} chars (or enable CLR_REMOTE_HLAUTH).");
     return 1;
 }
-token = token!.Trim();
 
 var port = int.TryParse(Environment.GetEnvironmentVariable("CLR_REMOTE_PORT"), out var p) ? p : 8765;
 var bind = Environment.GetEnvironmentVariable("CLR_REMOTE_BIND") ?? "127.0.0.1"; // localhost only; nginx is the edge
@@ -53,22 +68,59 @@ builder.WebHost.UseUrls($"http://{bind}:{port}");
 builder.Logging.AddSimpleConsole(o => o.SingleLine = true);
 var app = builder.Build();
 
-// Token gate on everything under /api. The static SPA shell (/, /index.html) is open — it carries no
-// data and asks for the token itself, then sends it as a Bearer header on API calls.
-app.Use(async (ctx, next) =>
+if (hlAuthOn)
 {
-    if (ctx.Request.Path.StartsWithSegments("/api"))
+    // hl-auth SSO gate: every request (except /healthz) must carry an hl_session cookie that the
+    // hl-auth account system says can open this page. Not signed in -> bounce to the hl-auth login
+    // page; signed in but not allowed -> 403. Decision cached ~30s per cookie. Fails closed.
+    var http = new HttpClient { Timeout = TimeSpan.FromSeconds(10) };
+    var gate = new HlAuthGate(async (cookieVal, ct) =>
     {
-        var presented = RemoteAuth.Extract(ctx.Request.Headers.Authorization, ctx.Request.Headers["X-Auth-Token"]);
-        if (!RemoteAuth.Matches(presented, token))
+        using var req = new HttpRequestMessage(HttpMethod.Get, $"{hlBase}/auth/api/access");
+        req.Headers.TryAddWithoutValidation("Cookie", $"{hlCookie}={cookieVal}");
+        using var resp = await http.SendAsync(req, ct);
+        return resp.IsSuccessStatusCode ? await resp.Content.ReadAsStringAsync(ct) : null;
+    }, hlPage);
+    var cache = new System.Collections.Concurrent.ConcurrentDictionary<string, (DateTime exp, GateOutcome outcome)>();
+
+    app.Use(async (ctx, next) =>
+    {
+        if (ctx.Request.Path.StartsWithSegments("/healthz")) { await next(); return; }
+        var cookie = ctx.Request.Cookies[hlCookie];
+        GateOutcome outcome;
+        if (string.IsNullOrEmpty(cookie)) outcome = GateOutcome.Login;
+        else if (cache.TryGetValue(cookie, out var hit) && hit.exp > DateTime.UtcNow) outcome = hit.outcome;
+        else { outcome = await gate.CheckAsync(cookie, ctx.RequestAborted); cache[cookie] = (DateTime.UtcNow.AddSeconds(30), outcome); }
+
+        if (outcome == GateOutcome.Allow) { await next(); return; }
+        if (outcome == GateOutcome.Login)
         {
-            ctx.Response.StatusCode = StatusCodes.Status401Unauthorized;
-            await ctx.Response.WriteAsJsonAsync(new { error = "unauthorized" });
+            ctx.Response.Redirect($"{hlBase}/auth/login?next={Uri.EscapeDataString(hlReturn)}");
             return;
         }
-    }
-    await next();
-});
+        ctx.Response.StatusCode = StatusCodes.Status403Forbidden;
+        await ctx.Response.WriteAsync("Forbidden — your account isn't allowed to open this page.");
+    });
+}
+else
+{
+    // Bearer-token gate on everything under /api. The static SPA shell (/, /index.html) is open — it
+    // carries no data and asks for the token itself, then sends it as a Bearer header on API calls.
+    app.Use(async (ctx, next) =>
+    {
+        if (ctx.Request.Path.StartsWithSegments("/api"))
+        {
+            var presented = RemoteAuth.Extract(ctx.Request.Headers.Authorization, ctx.Request.Headers["X-Auth-Token"]);
+            if (!RemoteAuth.Matches(presented, token))
+            {
+                ctx.Response.StatusCode = StatusCodes.Status401Unauthorized;
+                await ctx.Response.WriteAsJsonAsync(new { error = "unauthorized" });
+                return;
+            }
+        }
+        await next();
+    });
+}
 
 app.UseDefaultFiles();
 app.UseStaticFiles();
@@ -84,6 +136,7 @@ app.MapPost("/api/copilot", async (CopilotRequest req, CancellationToken ct) => 
 app.MapPost("/api/chats/{id}/resume", (string id, ResumeRequest? req) => Results.Json(api.ResumeCommand(id, req?.Launch ?? false)));
 app.MapPost("/api/chats/{id}/favorite", async (string id, FavoriteRequest? req) => Results.Json(await api.FavoriteAsync(id, req?.Favorite ?? true)));
 
-Console.WriteLine($"codex-local-retrieval remote server on http://{bind}:{port}  (chats: {archive.Store.Sessions.Count}, launch: {(allowLaunch ? "on" : "off")}, redact-reads: {(redactReads ? "on" : "off")})");
+var authMode = hlAuthOn ? $"hl-auth ({hlBase}, page:{hlPage ?? "any"})" : "bearer token";
+Console.WriteLine($"codex-local-retrieval remote server on http://{bind}:{port}  (chats: {archive.Store.Sessions.Count}, auth: {authMode}, launch: {(allowLaunch ? "on" : "off")}, redact-reads: {(redactReads ? "on" : "off")})");
 app.Run();
 return 0;
