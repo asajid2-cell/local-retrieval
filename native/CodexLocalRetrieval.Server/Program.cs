@@ -150,6 +150,11 @@ var defaultWs = Environment.GetEnvironmentVariable("CLR_AGENT_DEFAULT_WS") ?? En
 var agentHub = new CodexAgentHub(codexExe);
 var claudeStore = new ClaudeSessionStore(Environment.GetEnvironmentVariable("CLR_CLAUDE_PROJECTS"));
 var claudeDriver = new ClaudeLiveDriver(Environment.GetEnvironmentVariable("CLR_CLAUDE_EXE"));
+// Owner-signing for "auto" (no-approval) turns: an owner-held key authorizes each auto command (HMAC,
+// fresh, non-replayed). Auto-generated + saved on the PC if unset; the owner reads it off the machine
+// (out-of-band) and enters it in the browser. Never transmitted.
+var signingKeyFile = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "CodexArchiveRemote", "signing.key");
+var commandSigner = CommandSigner.LoadOrCreate(Environment.GetEnvironmentVariable("CLR_REMOTE_SIGNING_KEY"), signingKeyFile, m => Console.WriteLine("[signing] " + m));
 
 // One merged, time-sorted list of BOTH tools' sessions: source "codex" (drivable) or "claude" (history).
 app.MapGet("/api/agent/sessions", async (string? cursor, int? pageSize, CancellationToken ct) =>
@@ -161,11 +166,14 @@ app.MapGet("/api/agent/sessions", async (string? cursor, int? pageSize, Cancella
     return Results.Json(codex.Concat(claude).OrderByDescending(x => x.UpdatedAt).ToList());
 });
 
+// Whether owner-signed "auto" mode is available (a signing key is configured on this server).
+app.MapGet("/api/agent/config", () => Results.Json(new { autoAvailable = commandSigner.Enabled }));
+
 app.Map("/api/agent", async (HttpContext ctx) =>
 {
     if (!ctx.WebSockets.IsWebSocketRequest) { ctx.Response.StatusCode = StatusCodes.Status400BadRequest; return; }
     using var sock = await ctx.WebSockets.AcceptWebSocketAsync();
-    await AgentWebSocket.HandleAsync(sock, agentHub, claudeStore, claudeDriver, defaultWs, ctx.RequestAborted);
+    await AgentWebSocket.HandleAsync(sock, agentHub, claudeStore, claudeDriver, commandSigner, defaultWs, ctx.RequestAborted);
 });
 
 var authMode = hlAuthOn ? $"hl-auth ({hlBase}, page:{hlPage ?? "any"})" : "bearer token";

@@ -3,6 +3,7 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using CodexLocalRetrieval.Core.Agents;
+using CodexLocalRetrieval.Core.Remote;
 
 namespace CodexLocalRetrieval.Server;
 
@@ -17,11 +18,12 @@ public static class AgentWebSocket
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
     };
 
-    public static async Task HandleAsync(WebSocket ws, CodexAgentHub hub, ClaudeSessionStore claude, ClaudeLiveDriver claudeDriver, string defaultWorkspace, CancellationToken ct)
+    public static async Task HandleAsync(WebSocket ws, CodexAgentHub hub, ClaudeSessionStore claude, ClaudeLiveDriver claudeDriver, CommandSigner signer, string defaultWorkspace, CancellationToken ct)
     {
         var send = new SemaphoreSlim(1, 1);
         string? openThreadId = null;
         var openSource = "codex";
+        string? openedId = null;           // the id the client opened (stable; used to bind signatures)
         string? claudeSid = null;          // current Claude session id (updated each turn)
         var claudeCwd = defaultWorkspace;
         System.Diagnostics.Process? claudeProc = null;
@@ -57,6 +59,7 @@ public static class AgentWebSocket
                         var id = Str(root, "id");
                         if (id is null) break;
                         openSource = Str(root, "source") ?? "codex";
+                        openedId = id;
                         if (openThreadId is not null) { hub.CloseThread(openThreadId); openThreadId = null; }
                         try
                         {
@@ -84,6 +87,7 @@ public static class AgentWebSocket
                         openSource = "codex";
                         if (openThreadId is not null) hub.CloseThread(openThreadId);
                         openThreadId = await hub.NewThreadAsync(Str(root, "cwd") ?? defaultWorkspace, OnNote, OnReq, ct, Str(root, "approvalPolicy") ?? "on-request", Str(root, "sandbox") ?? "workspace-write");
+                        openedId = openThreadId;
                         await SendJson(ws, send, new { kind = "Opened", threadId = openThreadId, isNew = true, live = true }, ct);
                         await SendJson(ws, send, new { kind = "HistoryEnd" }, ct);
                         break;
@@ -92,6 +96,33 @@ public static class AgentWebSocket
                     {
                         var text = Str(root, "text");
                         if (string.IsNullOrWhiteSpace(text)) break;
+
+                        // "auto" = run without per-command approval. Allowed ONLY for an owner-signed command:
+                        // HMAC over (op,source,openedId,mode,ts,nonce,text), fresh + non-replayed. Tamper or
+                        // injection breaks the MAC; an unsigned/invalid auto request is refused (never downgraded
+                        // silently). Plain (unsigned) sends always run in the safe mode (approvals / acceptEdits).
+                        var auto = Str(root, "mode") == "auto";
+                        if (auto)
+                        {
+                            var nonce = Str(root, "nonce") ?? "";
+                            var sig = Str(root, "sig") ?? "";
+                            var ts = root.TryGetProperty("ts", out var tsEl) && tsEl.TryGetInt64(out var tv) ? tv : 0L;
+                            var msgThread = Str(root, "threadId") ?? "";
+                            var msgSource = Str(root, "source") ?? openSource;
+                            if (msgThread != (openedId ?? "") || msgSource != openSource)
+                            {
+                                await SendJson(ws, send, AgentEvent.Err("auto rejected: command is not bound to the open session."), ct);
+                                break;
+                            }
+                            var canonical = CommandSigner.Canonical("send", msgSource, msgThread, "auto", ts, nonce, text!);
+                            var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                            if (!signer.Verify(canonical, nonce, ts, sig, now, out var reason))
+                            {
+                                await SendJson(ws, send, AgentEvent.Err("auto rejected: " + reason + ". Check your owner key."), ct);
+                                break;
+                            }
+                        }
+
                         if (openSource == "claude")
                         {
                             await SendJson(ws, send, AgentEvent.Stat("turn-start"), ct);
@@ -99,15 +130,16 @@ public static class AgentWebSocket
                             {
                                 if (ev.Kind == AgentEventKind.SessionStarted) { claudeSid = ev.SessionId; return; } // track id, don't render
                                 await SendJson(ws, send, ev, ct);
-                            }, ct);
+                            }, ct, auto ? "bypassPermissions" : "acceptEdits");
                         }
                         else if (openThreadId is not null)
                         {
                             var tid = openThreadId;
+                            var policy = auto ? "never" : null; // never = autonomous (owner-signed); else inherit session policy (approvals)
                             // fire-and-forget so the receive loop stays free for interrupt; surface failures.
                             _ = Task.Run(async () =>
                             {
-                                try { await hub.StartTurnAsync(tid, text!, ct); }
+                                try { await hub.StartTurnAsync(tid, text!, ct, policy); }
                                 catch (Exception ex) { await SendJson(ws, send, AgentEvent.Err("send failed: " + ex.Message), ct); }
                             }, ct);
                         }

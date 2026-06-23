@@ -105,12 +105,15 @@ public sealed class CodexAgentHub : IAsyncDisposable
         return id;
     }
 
-    public async Task StartTurnAsync(string threadId, string text, CancellationToken ct)
+    public async Task StartTurnAsync(string threadId, string text, CancellationToken ct, string? approvalPolicy = null)
     {
         var s = await EnsureAsync(ct);
         // turn/start takes UserInput[]; the text variant is {type:"text", text, text_elements:[]}.
         var input = new object[] { new { type = "text", text, text_elements = Array.Empty<object>() } };
-        await s.RequestAsync("turn/start", new { threadId, input }, ct);
+        object prms = approvalPolicy is null
+            ? new { threadId, input }
+            : new { threadId, input, approvalPolicy }; // "never" = autonomous (owner-signed auto turn)
+        await s.RequestAsync("turn/start", prms, ct);
     }
 
     public async Task InterruptAsync(string threadId, CancellationToken ct)

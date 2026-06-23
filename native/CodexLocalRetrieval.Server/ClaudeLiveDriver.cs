@@ -13,8 +13,11 @@ public sealed class ClaudeLiveDriver
 
     public bool Available => File.Exists(_exe) || _exe == "claude";
 
-    public Process StartTurn(string? sessionId, string cwd, string prompt, Func<AgentEvent, Task> onEvent, CancellationToken ct)
+    public Process StartTurn(string? sessionId, string cwd, string prompt, Func<AgentEvent, Task> onEvent, CancellationToken ct, string permissionMode = "acceptEdits")
     {
+        // only the known-safe set; default acceptEdits. "bypassPermissions" is reachable only for an
+        // owner-signed auto command (the WS gates it on CommandSigner.Verify), never for an unsigned one.
+        if (permissionMode is not ("acceptEdits" or "bypassPermissions" or "default" or "plan")) permissionMode = "acceptEdits";
         var psi = new ProcessStartInfo
         {
             FileName = _exe,
@@ -31,7 +34,7 @@ public sealed class ClaudeLiveDriver
         psi.ArgumentList.Add("stream-json");
         psi.ArgumentList.Add("--verbose");
         psi.ArgumentList.Add("--permission-mode");
-        psi.ArgumentList.Add("acceptEdits");
+        psi.ArgumentList.Add(permissionMode);
         if (!string.IsNullOrEmpty(sessionId))
         {
             psi.ArgumentList.Add("--resume");
