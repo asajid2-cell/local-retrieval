@@ -14,6 +14,7 @@ namespace CodexLocalRetrieval.Core.Remote;
 public sealed class CommandSigner
 {
     private const long WindowMs = 120_000;
+    private const int MaxNonces = 100_000; // bound memory; only owner-signed commands ever add a nonce
     private readonly byte[]? _key;
     private readonly ConcurrentDictionary<string, long> _seen = new(); // nonce -> expiry (unix ms)
 
@@ -43,6 +44,7 @@ public sealed class CommandSigner
 
         // Only burn the nonce AFTER the MAC checks out, so junk can't flush the replay cache.
         Evict(nowMs);
+        if (_seen.Count >= MaxNonces) { reason = "too many recent commands"; return false; }
         if (!_seen.TryAdd(nonce, nowMs + WindowMs)) { reason = "replayed command"; return false; }
         return true;
     }

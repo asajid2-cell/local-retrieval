@@ -43,6 +43,26 @@ public static class AgentWebSocket
             await SendJson(ws, send, new { kind = "PermissionRequest", requestId = id, tool = method, text = ApprovalText(method, p) }, ct);
         }
 
+        // Owner-signature gate for execution-causing ops (send, approve). When a signing key is configured,
+        // EVERY such command must carry a valid HMAC bound to the open session — closes injection on any hop
+        // (incl. the plaintext LAN leg): forged/tampered/replayed/cross-session commands are refused. With no
+        // key configured the server accepts unsigned commands (safe mode only; auto is gated separately).
+        async Task<bool> RequireSig(JsonElement m, string op, string field5, string field8)
+        {
+            if (!signer.Enabled) return true;
+            var nonce = Str(m, "nonce") ?? "";
+            var sig = Str(m, "sig") ?? "";
+            var ts = m.TryGetProperty("ts", out var e) && e.TryGetInt64(out var v) ? v : 0L;
+            var msgThread = Str(m, "threadId") ?? "";
+            var msgSource = Str(m, "source") ?? openSource;
+            if (msgThread != (openedId ?? "") || msgSource != openSource)
+            { await SendJson(ws, send, AgentEvent.Err("rejected: command is not bound to the open session."), ct); return false; }
+            var canonical = CommandSigner.Canonical(op, msgSource, msgThread, field5, ts, nonce, field8);
+            if (!signer.Verify(canonical, nonce, ts, sig, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), out var reason))
+            { await SendJson(ws, send, AgentEvent.Err("rejected: " + reason + ". Check your owner key."), ct); return false; }
+            return true;
+        }
+
         try
         {
             while (ws.State == WebSocketState.Open && !ct.IsCancellationRequested)
@@ -97,31 +117,17 @@ public static class AgentWebSocket
                         var text = Str(root, "text");
                         if (string.IsNullOrWhiteSpace(text)) break;
 
-                        // "auto" = run without per-command approval. Allowed ONLY for an owner-signed command:
-                        // HMAC over (op,source,openedId,mode,ts,nonce,text), fresh + non-replayed. Tamper or
-                        // injection breaks the MAC; an unsigned/invalid auto request is refused (never downgraded
-                        // silently). Plain (unsigned) sends always run in the safe mode (approvals / acceptEdits).
+                        // mode controls the AGENT's autonomy: "auto" = no per-command approval, "safe" = approvals
+                        // (codex) / edits-only (claude). When a signing key is configured BOTH require a valid owner
+                        // signature (the canonical binds the mode, so a safe signature can't be reused as auto).
+                        // auto is only available when signing is configured.
                         var auto = Str(root, "mode") == "auto";
-                        if (auto)
+                        if (auto && !signer.Enabled)
                         {
-                            var nonce = Str(root, "nonce") ?? "";
-                            var sig = Str(root, "sig") ?? "";
-                            var ts = root.TryGetProperty("ts", out var tsEl) && tsEl.TryGetInt64(out var tv) ? tv : 0L;
-                            var msgThread = Str(root, "threadId") ?? "";
-                            var msgSource = Str(root, "source") ?? openSource;
-                            if (msgThread != (openedId ?? "") || msgSource != openSource)
-                            {
-                                await SendJson(ws, send, AgentEvent.Err("auto rejected: command is not bound to the open session."), ct);
-                                break;
-                            }
-                            var canonical = CommandSigner.Canonical("send", msgSource, msgThread, "auto", ts, nonce, text!);
-                            var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-                            if (!signer.Verify(canonical, nonce, ts, sig, now, out var reason))
-                            {
-                                await SendJson(ws, send, AgentEvent.Err("auto rejected: " + reason + ". Check your owner key."), ct);
-                                break;
-                            }
+                            await SendJson(ws, send, AgentEvent.Err("rejected: auto mode needs a signing key configured on the server."), ct);
+                            break;
                         }
+                        if (!await RequireSig(root, "send", auto ? "auto" : "safe", text!)) break;
 
                         if (openSource == "claude")
                         {
@@ -151,7 +157,12 @@ public static class AgentWebSocket
                         break;
                     case "approve":
                         if (root.TryGetProperty("requestId", out var ridEl) && ridEl.TryGetInt32(out var rid))
-                            await hub.RespondApprovalAsync(rid, Str(root, "decision") == "allow", ct);
+                        {
+                            var decision = Str(root, "decision") ?? "deny";
+                            // an approval also bypasses the human gate, so it must be owner-signed too.
+                            if (!await RequireSig(root, "approve", decision, rid.ToString())) break;
+                            await hub.RespondApprovalAsync(rid, decision == "allow", ct);
+                        }
                         break;
                 }
             }

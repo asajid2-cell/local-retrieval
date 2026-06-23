@@ -76,4 +76,46 @@ public sealed class CommandSignerTests
         Assert.IsFalse(s.Verify("x", "n", 1, "sig", 1, out var why));
         StringAssert.Contains(why, "not configured");
     }
+
+    [TestMethod]
+    public void ModeSwap_SafeSignatureCannotRunAsAuto()
+    {
+        var s = new CommandSigner(Key);
+        var ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        var nonce = "n-mode";
+        // owner signs a "safe" command; attacker flips the mode field to "auto" and reuses the sig.
+        var safeCanon = CommandSigner.Canonical("send", "claude", "tid-1", "safe", ts, nonce, "edit a file");
+        using var h = new HMACSHA256(Encoding.UTF8.GetBytes(Key));
+        var sig = Convert.ToHexString(h.ComputeHash(Encoding.UTF8.GetBytes(safeCanon))).ToLowerInvariant();
+        var autoCanon = CommandSigner.Canonical("send", "claude", "tid-1", "auto", ts, nonce, "edit a file");
+        Assert.IsFalse(s.Verify(autoCanon, nonce, ts, sig, ts, out _)); // safe sig != auto canonical (MAC fails, nonce not burned)
+        Assert.IsTrue(s.Verify(safeCanon, nonce, ts, sig, ts, out _));  // the legitimate safe command verifies
+    }
+
+    [TestMethod]
+    public void CrossOp_SendSignatureCannotApprove()
+    {
+        var s = new CommandSigner(Key);
+        var ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        var nonce = "n-cross";
+        var sendCanon = CommandSigner.Canonical("send", "codex", "tid-1", "safe", ts, nonce, "echo");
+        using var h = new HMACSHA256(Encoding.UTF8.GetBytes(Key));
+        var sig = Convert.ToHexString(h.ComputeHash(Encoding.UTF8.GetBytes(sendCanon))).ToLowerInvariant();
+        // attacker reuses that signature on an approve canonical
+        var approveCanon = CommandSigner.Canonical("approve", "codex", "tid-1", "allow", ts, nonce, "42");
+        Assert.IsFalse(s.Verify(approveCanon, nonce, ts, sig, ts, out _));
+        // and the legitimate send still verifies
+        Assert.IsTrue(s.Verify(sendCanon, nonce, ts, sig, ts, out _));
+    }
+
+    [TestMethod]
+    public void Boundary_JustInsideWindowPasses_JustOutsideFails()
+    {
+        var s = new CommandSigner(Key);
+        var (c1, n1, t1, sig1) = Sign(Key, "edge-in", nonce: "n-in");
+        Assert.IsTrue(s.Verify(c1, n1, t1, sig1, t1 + 119_000, out _));   // 119s later: inside ±120s
+        var (c2, n2, t2, sig2) = Sign(Key, "edge-out", nonce: "n-out");
+        Assert.IsFalse(s.Verify(c2, n2, t2, sig2, t2 + 121_000, out var why)); // 121s later: outside
+        StringAssert.Contains(why, "stale");
+    }
 }

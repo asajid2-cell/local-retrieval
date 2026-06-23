@@ -477,20 +477,36 @@ async function hmacHex(key, msg){
   return [...new Uint8Array(s)].map(b=>b.toString(16).padStart(2,'0')).join('');
 }
 async function loadAgentConfig(){ try{ const c=await api('/api/agent/config'); App.autoAvailable=!!c.autoAvailable; }catch{ App.autoAvailable=false; } if(App.tab==='agent') render(); }
+// Sign an op (send/approve) with the owner key, binding it to the open session. Returns the extra fields.
+async function signOp(op, f5, f8){
+  const ts=Date.now(), nonce=randHex(16), source=App.agentSource, threadId=App.agentThreadId||'';
+  const canonical='clrsig-v1\n'+op+'\n'+source+'\n'+threadId+'\n'+f5+'\n'+ts+'\n'+nonce+'\n'+f8;
+  const sig=await hmacHex(App.signKey, canonical);
+  return {source, threadId, ts, nonce, sig};
+}
 async function sendAgent(text){
   text=(text||'').trim(); if(!text||!App.agentWs||App.agentBusy) return;
   let msg={op:'send',text};
-  if(App.agentMode==='auto'){
-    if(!App.signKey){ App.askKey=true; render(); return; }            // need the owner key first
-    const ts=Date.now(), nonce=randHex(16), source=App.agentSource, threadId=App.agentThreadId||'';
-    const canonical='clrsig-v1\n'+'send'+'\n'+source+'\n'+threadId+'\n'+'auto'+'\n'+ts+'\n'+nonce+'\n'+text;
-    let sig; try{ sig=await hmacHex(App.signKey, canonical); }catch(e){ App.agentItems.push({t:'error',text:'could not sign command: '+e.message}); render(); return; }
-    msg={op:'send',text,mode:'auto',source,threadId,ts,nonce,sig};
+  if(App.autoAvailable){                                   // this server requires owner-signed commands
+    if(!App.signKey){ App.askKey=true; render(); return; }  // prompt for the key first
+    const mode = App.agentMode==='auto' ? 'auto' : 'safe';
+    let extra; try{ extra=await signOp('send', mode, text); }catch(e){ App.agentItems.push({t:'error',text:'could not sign command: '+e.message}); render(); return; }
+    msg={op:'send', text, mode, ...extra};
   }
   App.agentBusy=true; App.agentWs.send(JSON.stringify(msg)); render();
 }
 function interruptAgent(){ if(App.agentWs) App.agentWs.send(JSON.stringify({op:'interrupt'})); }
-function resolveApproval(it,allow){ if(App.agentWs) App.agentWs.send(JSON.stringify({op:'approve',requestId:it.requestId,decision:allow?'allow':'deny'})); it.resolved=allow; render(); }
+async function resolveApproval(it,allow){
+  const decision=allow?'allow':'deny';
+  let msg={op:'approve',requestId:it.requestId,decision};
+  if(App.autoAvailable){
+    if(!App.signKey){ App.askKey=true; render(); return; }
+    let extra; try{ extra=await signOp('approve', decision, String(it.requestId)); }catch(e){ App.agentItems.push({t:'error',text:'could not sign approval: '+e.message}); render(); return; }
+    msg={op:'approve', requestId:it.requestId, decision, ...extra};
+  }
+  if(App.agentWs) App.agentWs.send(JSON.stringify(msg));
+  it.resolved=allow; render();
+}
 
 function agentUpsert(t,id){ let it=id!=null&&App.agentItems.find(x=>x.id===id&&x.t===t); if(!it){ it={t,id}; App.agentItems.push(it);} return it; }
 function onAgentEvent(ev){
@@ -562,18 +578,23 @@ function renderAgent(v){
     v.append(el('div',{class:'note'},'Viewing a Claude session (read-only).'));
     return;
   }
-  // mode control: Approve each (safe) vs Auto (no approvals; each command owner-signed)
+  // mode control: Approve each (safe autonomy) vs Auto (no approvals). When the server enforces signing,
+  // BOTH modes sign every command with your owner key; mode only changes how much the agent asks.
   if(App.autoAvailable===null) loadAgentConfig();
   const seg=el('div',{class:'modeseg'});
-  const mk=(key,label,title)=>el('button',{class:'mbtn'+(App.agentMode===key?' on':''),title,onclick:()=>{ App.agentMode=key; if(key==='auto'&&!App.signKey) App.askKey=true; render(); }}, label);
+  const mk=(key,label,title)=>el('button',{class:'mbtn'+(App.agentMode===key?' on':''),title,onclick:()=>{ App.agentMode=key; render(); }}, label);
   seg.append(mk('safe','Approve each', App.agentSource==='claude'?'Edits + safe commands run; risky ones are declined':'You approve each command'));
   const autoBtn=mk('auto','Auto','Run without approval — every command is signed with your owner key');
   if(App.autoAvailable===false){ autoBtn.disabled=true; autoBtn.title='Set a signing key on the server to enable auto mode'; }
   seg.append(autoBtn);
   v.append(seg);
-  if(App.agentMode==='auto' && App.autoAvailable!==false){
-    v.append(el('div',{class:'note autonote'}, App.signKey?'⚡ Auto — runs without approval; each command is signed with your owner key.':'Auto needs your owner key (shown once in the PC server log / signing.key).'));
-    if(App.askKey || !App.signKey){
+  if(App.autoAvailable){
+    const needKey=!App.signKey;
+    v.append(el('div',{class:'note autonote'},
+      needKey ? 'This server requires your owner key to drive sessions — paste it once (it’s shown on the PC in signing.key).'
+              : (App.agentMode==='auto' ? '⚡ Auto — runs without approval; every command is signed with your owner key.'
+                                        : '🔒 Signed — every command is signed with your owner key; this session asks before risky actions.')));
+    if(needKey || App.askKey){
       const ki=el('input',{class:'txt',type:'password',placeholder:'Paste owner key','aria-label':'Owner key',value:App.signKey});
       ki.addEventListener('keydown',e=>{ if(e.key==='Enter'){ saveSignKey(ki.value); } });
       v.append(el('div',{class:'search'}, ki, el('button',{class:'btn primary',onclick:()=>saveSignKey(ki.value)},'Save key')));
