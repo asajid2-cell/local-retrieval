@@ -117,7 +117,7 @@ public sealed class RolloutAndLiveMappingTests
                 ev.Select(e => e.Kind).ToArray());
             Assert.AreEqual("fix the bug", ev[0].Text);            // boilerplate user text dropped
             Assert.AreEqual("Bash", ev[3].ToolName);
-            Assert.AreEqual("ls", ev[3].ToolInput);
+            StringAssert.Contains(ev[3].ToolInput!, "\"command\":\"ls\"");  // full raw input JSON (client renders it)
             Assert.AreEqual("t1", ev[4].ItemId);
             StringAssert.Contains(ev[4].Output!, "a.txt");
         }
@@ -132,7 +132,7 @@ public sealed class RolloutAndLiveMappingTests
 
         var asst = ClaudeStreamMapper.Map("{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"thinking\",\"thinking\":\"hmm\"},{\"type\":\"text\",\"text\":\"hi\"},{\"type\":\"tool_use\",\"id\":\"t9\",\"name\":\"Bash\",\"input\":{\"command\":\"echo x\"}}]}}").ToList();
         CollectionAssert.AreEqual(new[] { AgentEventKind.Thinking, AgentEventKind.AssistantText, AgentEventKind.ToolCall }, asst.Select(e => e.Kind).ToArray());
-        Assert.AreEqual("echo x", asst[2].ToolInput);
+        StringAssert.Contains(asst[2].ToolInput!, "echo x");  // full raw input JSON
 
         var tr = ClaudeStreamMapper.Map("{\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"t9\",\"content\":\"x\"}]}}").Single();
         Assert.AreEqual(AgentEventKind.ToolOutput, tr.Kind);

@@ -33,7 +33,7 @@ public static class ClaudeStreamMapper
                                     yield return new AgentEvent { Kind = AgentEventKind.Thinking, Text = th };
                                 break;
                             case "tool_use":
-                                yield return new AgentEvent { Kind = AgentEventKind.ToolCall, ItemId = Str(c, "id"), ToolName = Str(c, "name") ?? "tool", ToolInput = ClaudeSessionStore.SummarizeInput(c), State = "in_progress" };
+                                yield return new AgentEvent { Kind = AgentEventKind.ToolCall, ItemId = Str(c, "id"), ToolName = Str(c, "name") ?? "tool", ToolInput = ClaudeSessionStore.RawToolInput(c), State = "in_progress" };
                                 break;
                         }
                 break;

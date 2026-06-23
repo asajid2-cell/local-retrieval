@@ -95,7 +95,7 @@ public sealed class ClaudeSessionStore
                         if (th.Length > 0) events.Add(new AgentEvent { Kind = AgentEventKind.Thinking, Text = th });
                         break;
                     case "tool_use":
-                        events.Add(new AgentEvent { Kind = AgentEventKind.ToolCall, ItemId = Str(b, "id"), ToolName = Str(b, "name") ?? "tool", ToolInput = SummarizeInput(b), State = "completed" });
+                        events.Add(new AgentEvent { Kind = AgentEventKind.ToolCall, ItemId = Str(b, "id"), ToolName = Str(b, "name") ?? "tool", ToolInput = RawToolInput(b), State = "completed" });
                         break;
                     case "tool_result":
                         events.Add(new AgentEvent { Kind = AgentEventKind.ToolOutput, ItemId = Str(b, "tool_use_id"), Output = Cap(FlattenResult(b), maxOutputChars), State = "completed" });
@@ -152,12 +152,14 @@ public sealed class ClaudeSessionStore
             || s.StartsWith("Caveat:") || s.StartsWith("This session is being continued");
     }
 
-    internal static string SummarizeInput(JsonElement b)
+    // The full tool input as JSON, so the client can render each tool richly (a todo checklist, a file
+    // path, a command, a diff…). Capped so a huge Write payload can't bloat the stream; if the cap trims
+    // it past valid JSON the client falls back to showing the raw text.
+    internal static string RawToolInput(JsonElement b)
     {
-        if (!b.TryGetProperty("input", out var inp) || inp.ValueKind != JsonValueKind.Object) return "";
-        foreach (var key in new[] { "command", "file_path", "path", "pattern", "url", "query", "prompt", "description" })
-            if (inp.TryGetProperty(key, out var v) && v.ValueKind == JsonValueKind.String) return v.GetString() ?? "";
-        return inp.GetRawText();
+        if (!b.TryGetProperty("input", out var inp)) return "";
+        var s = inp.ValueKind == JsonValueKind.String ? inp.GetString() ?? "" : inp.GetRawText();
+        return s.Length <= 12000 ? s : s[..12000];
     }
 
     internal static string FlattenResult(JsonElement b)
