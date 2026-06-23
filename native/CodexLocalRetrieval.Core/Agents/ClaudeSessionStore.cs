@@ -116,7 +116,7 @@ public sealed class ClaudeSessionStore
             using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
             using var sr = new StreamReader(fs);
             string? line; int n = 0;
-            while ((line = sr.ReadLine()) is not null && n++ < 80)
+            while ((line = sr.ReadLine()) is not null && n++ < 250)   // scan deeper so continued sessions find a real first task
             {
                 JsonElement root;
                 try { using var d = JsonDocument.Parse(line); root = d.RootElement.Clone(); } catch { continue; }
@@ -143,13 +143,23 @@ public sealed class ClaudeSessionStore
         return null;
     }
 
+    // Injected context + bare "continue" stubs aren't real titles — Claude's own resume list skips them too.
+    private static readonly string[] Stubs =
+        { "continue", "continue.", "continue from where you left off.", "go on", "go ahead", "keep going",
+          "keep working", "proceed", "resume", "next", "carry on" };
+
     private static bool IsBoilerplate(string? t)
     {
         if (string.IsNullOrWhiteSpace(t)) return true;
         var s = t.TrimStart();
-        return s.StartsWith("<system-reminder") || s.StartsWith("<ide_") || s.StartsWith("<command-")
+        if (s.StartsWith("<system-reminder") || s.StartsWith("<ide_") || s.StartsWith("<command-")
             || s.StartsWith("<local-command") || s.StartsWith("<user-prompt-submit-hook")
-            || s.StartsWith("Caveat:") || s.StartsWith("This session is being continued");
+            || s.StartsWith("Caveat:") || s.StartsWith("This session is being continued"))
+            return true;
+        var trimmed = t.Trim();
+        if (trimmed.Length < 3) return true;                       // "y", "ok"
+        var lower = trimmed.ToLowerInvariant().TrimEnd('.', '!');
+        return Array.IndexOf(Stubs, lower) >= 0 || Array.IndexOf(Stubs, lower + ".") >= 0;
     }
 
     // The full tool input as JSON, so the client can render each tool richly (a todo checklist, a file
