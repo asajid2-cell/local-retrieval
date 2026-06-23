@@ -1,6 +1,7 @@
 using CodexLocalRetrieval.Core.Chat;
 using CodexLocalRetrieval.Core.Remote;
 using CodexLocalRetrieval.Core.Services;
+using CodexLocalRetrieval.Server;
 
 // ---- config (env only; nothing secret is ever read from disk or args) ----
 var token = Environment.GetEnvironmentVariable("CLR_REMOTE_TOKEN")?.Trim();
@@ -68,6 +69,8 @@ builder.WebHost.UseUrls($"http://{bind}:{port}");
 builder.Logging.AddSimpleConsole(o => o.SingleLine = true);
 var app = builder.Build();
 
+app.UseWebSockets(); // live agent sessions stream over /api/agent
+
 if (hlAuthOn)
 {
     // hl-auth SSO gate: every request (except /healthz) must carry an hl_session cookie that the
@@ -110,7 +113,10 @@ else
     {
         if (ctx.Request.Path.StartsWithSegments("/api"))
         {
-            var presented = RemoteAuth.Extract(ctx.Request.Headers.Authorization, ctx.Request.Headers["X-Auth-Token"]);
+            // Browsers can't set an Authorization header on a WebSocket, so the WS upgrade may carry
+            // the token as ?token= instead. (hl-auth mode uses the cookie and never hits this branch.)
+            var presented = RemoteAuth.Extract(ctx.Request.Headers.Authorization, ctx.Request.Headers["X-Auth-Token"])
+                            ?? (ctx.WebSockets.IsWebSocketRequest ? ctx.Request.Query["token"].ToString() : null);
             if (!RemoteAuth.Matches(presented, token))
             {
                 ctx.Response.StatusCode = StatusCodes.Status401Unauthorized;
@@ -135,6 +141,16 @@ app.MapGet("/api/chats/{id}/events", (string id, int? limit) =>
 app.MapPost("/api/copilot", async (CopilotRequest req, CancellationToken ct) => Results.Json(await api.CopilotAsync(req.Message, req.History, ct)));
 app.MapPost("/api/chats/{id}/resume", (string id, ResumeRequest? req) => Results.Json(api.ResumeCommand(id, req?.Launch ?? false)));
 app.MapPost("/api/chats/{id}/favorite", async (string id, FavoriteRequest? req) => Results.Json(await api.FavoriteAsync(id, req?.Favorite ?? true)));
+
+// Live agent session over a WebSocket: drive codex in a workspace, stream reasoning/commands/output.
+var codexExe = Environment.GetEnvironmentVariable("CLR_CODEX_EXE") ?? ArchiveService.ResolveCodexExe();
+var defaultWs = Environment.GetEnvironmentVariable("CLR_AGENT_DEFAULT_WS") ?? Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+app.Map("/api/agent", async (HttpContext ctx) =>
+{
+    if (!ctx.WebSockets.IsWebSocketRequest) { ctx.Response.StatusCode = StatusCodes.Status400BadRequest; return; }
+    using var sock = await ctx.WebSockets.AcceptWebSocketAsync();
+    await AgentWebSocket.HandleAsync(sock, archive, codexExe, defaultWs, ctx.RequestAborted);
+});
 
 var authMode = hlAuthOn ? $"hl-auth ({hlBase}, page:{hlPage ?? "any"})" : "bearer token";
 Console.WriteLine($"codex-local-retrieval remote server on http://{bind}:{port}  (chats: {archive.Store.Sessions.Count}, auth: {authMode}, launch: {(allowLaunch ? "on" : "off")}, redact-reads: {(redactReads ? "on" : "off")})");

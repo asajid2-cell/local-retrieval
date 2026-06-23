@@ -112,6 +112,21 @@
   .note{color:var(--ink-mid);font-size:12.5px;margin:8px 0}
   .err{color:var(--danger);font-size:13px;margin:8px 0;overflow-wrap:anywhere}
 
+  /* live agent */
+  .agenthead{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:12px;padding-bottom:10px;border-bottom:1px solid var(--line)}
+  .agenthead .meta{overflow-wrap:anywhere;min-width:0}
+  .agenthead .btn{margin-left:auto}
+  details.reason{margin:6px 0;border-left:2px solid var(--line);padding-left:10px}
+  details.reason summary{color:var(--ink-dim);font-size:12px;cursor:pointer;list-style:none}
+  details.reason .rbody{color:var(--ink-mid);font-size:12.5px;white-space:pre-wrap;overflow-wrap:anywhere;margin-top:5px}
+  .toolblock{border:1px solid var(--line);border-radius:9px;margin:8px 0;overflow:hidden;background:#0e0e12}
+  .cmdhead{display:flex;gap:8px;align-items:center;padding:8px 10px;font-family:var(--mono);font-size:12px;border-bottom:1px solid transparent}
+  .cmdhead .cmdk{color:var(--accent);flex:none}
+  .cmdhead .cmd{color:var(--ink);min-width:0;overflow-wrap:anywhere;white-space:pre-wrap}
+  .cmdhead .exit{margin-left:auto;flex:none;font-size:10.5px;color:var(--danger)}
+  .cmdhead .exit.ok{color:#5fd08a}
+  .cmdout{margin:0;padding:8px 10px;border-top:1px solid var(--line);font-family:var(--mono);font-size:11.5px;color:var(--ink-mid);white-space:pre-wrap;overflow-wrap:anywhere;max-height:340px;overflow-y:auto}
+
   /* bottom tab bar */
   .tabbar{
     flex:none; z-index:20; display:flex;
@@ -152,7 +167,8 @@
   </header>
 
   <nav class="tabbar" role="tablist" aria-label="Sections">
-    <button role="tab" id="tab-chats" aria-selected="true"><span class="gl">▤</span>Chats</button>
+    <button role="tab" id="tab-agent" aria-selected="true"><span class="gl">▸</span>Agent</button>
+    <button role="tab" id="tab-chats" aria-selected="false"><span class="gl">▤</span>Chats</button>
     <button role="tab" id="tab-copilot" aria-selected="false"><span class="gl">✦</span>Co-pilot</button>
   </nav>
 
@@ -174,14 +190,17 @@
 <script>
 const App = {
   token: localStorage.getItem('clr_token') || '',
-  tab: 'chats',
+  tab: 'agent',
   chats: [], stats: null, q: '',
   detail: null, showRollout: false,
   copilot: [], copilotBusy: false, copilotCtl: null,
+  // live agent session
+  agentWs: null, agentItems: [], agentBusy: false, agentStarted: false, agentStatus: '',
+  agentWorkspace: localStorage.getItem('clr_agent_ws') || '',
 };
 
 const $ = (s,r=document)=>r.querySelector(s);
-const el = (t,p={},...kids)=>{const e=document.createElement(t);for(const k in p){if(k==='class')e.className=p[k];else if(k==='html')e.innerHTML=p[k];else if(k.startsWith('on'))e.addEventListener(k.slice(2),p[k]);else e.setAttribute(k,p[k]);}for(const c of kids.flat()){if(c!=null)e.append(c.nodeType?c:document.createTextNode(c));}return e;};
+const el = (t,p={},...kids)=>{const e=document.createElement(t);for(const k in p){const val=p[k];if(val==null)continue;if(k==='class')e.className=val;else if(k==='html')e.innerHTML=val;else if(k.startsWith('on'))e.addEventListener(k.slice(2),val);else e.setAttribute(k,val);}for(const c of kids.flat()){if(c!=null)e.append(c.nodeType?c:document.createTextNode(c));}return e;};
 const esc = s => (s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const fmtDate = s => { if(!s) return ''; const d=new Date(s); return isNaN(d)?'':d.toLocaleDateString(undefined,{month:'short',day:'numeric'}); };
 const toolBadge = t => el('span',{class:'badge '+(t==='claude'?'cl':'cx')}, t==='claude'?'CL':'CX');
@@ -218,10 +237,12 @@ function setDot(state){
 }
 
 /* ---------- tabs ---------- */
+$('#tab-agent').addEventListener('click',()=>switchTab('agent'));
 $('#tab-chats').addEventListener('click',()=>switchTab('chats'));
 $('#tab-copilot').addEventListener('click',()=>switchTab('copilot'));
 function switchTab(t){
   App.tab=t; App.detail=null;
+  $('#tab-agent').setAttribute('aria-selected', t==='agent');
   $('#tab-chats').setAttribute('aria-selected', t==='chats');
   $('#tab-copilot').setAttribute('aria-selected', t==='copilot');
   render();
@@ -292,6 +313,7 @@ function stopCopilot(){ if(App.copilotCtl) App.copilotCtl.abort(); }
 /* ---------- render ---------- */
 function render(){
   const v=$('#view'); v.innerHTML='';
+  if(App.tab==='agent') return renderAgent(v);
   if(App.tab==='copilot') return renderCopilot(v);
   if(App.detail) return renderDetail(v);
   return renderChats(v);
@@ -391,10 +413,94 @@ function renderCopilot(v){
   if(App.tab==='copilot'&&!App.copilotBusy) setTimeout(()=>ta.focus(),30);
 }
 
+/* ---------- live agent ---------- */
+function agentWsUrl(){
+  const proto = location.protocol==='https:'?'wss':'ws';
+  const q = App.token ? ('?token='+encodeURIComponent(App.token)) : '';
+  return proto+'://'+location.host+BASE+'/api/agent'+q;
+}
+function startAgent(workspace){
+  if(App.agentWs) return;
+  App.agentWorkspace=(workspace||App.agentWorkspace||'').trim(); localStorage.setItem('clr_agent_ws',App.agentWorkspace);
+  App.agentItems=[]; App.agentStarted=false; App.agentBusy=false; App.agentStatus='connecting…'; render();
+  let ws; try{ ws=new WebSocket(agentWsUrl()); }catch(e){ App.agentStatus='cannot connect: '+e.message; render(); return; }
+  App.agentWs=ws;
+  ws.onopen=()=>ws.send(JSON.stringify({op:'start',workspace:App.agentWorkspace}));
+  ws.onmessage=(e)=>{ try{ onAgentEvent(JSON.parse(e.data)); }catch{} };
+  ws.onclose=()=>{ App.agentWs=null; App.agentBusy=false; if(!App.agentStarted)App.agentStatus='disconnected'; if(App.tab==='agent') render(); };
+  ws.onerror=()=>{ App.agentStatus='connection error'; if(App.tab==='agent') render(); };
+}
+function endAgent(){ if(App.agentWs){ try{App.agentWs.close();}catch{} } App.agentWs=null; App.agentStarted=false; App.agentBusy=false; }
+function sendAgent(text){ text=(text||'').trim(); if(!text||!App.agentWs||App.agentBusy) return; App.agentBusy=true; App.agentWs.send(JSON.stringify({op:'send',text})); render(); }
+function interruptAgent(){ if(App.agentWs) App.agentWs.send(JSON.stringify({op:'interrupt'})); }
+
+function onAgentEvent(ev){
+  switch(ev.kind){
+    case 'Ready': App.agentStarted=true; App.agentStatus='ready'; break;
+    case 'SessionStarted': App.agentSessionId=ev.sessionId; return;
+    case 'Status': App.agentStatus=ev.text; if(ev.text==='idle'||ev.text==='interrupted') App.agentBusy=false; break;
+    case 'UserMessage': App.agentItems.push({t:'user',text:ev.text}); break;
+    case 'AssistantText': App.agentItems.push({t:'assistant',text:ev.text}); break;
+    case 'Thinking': App.agentItems.push({t:'thinking',text:ev.text}); break;
+    case 'ToolCall': App.agentItems.push({t:'tool',id:ev.itemId,name:ev.toolName,input:ev.toolInput,output:'',state:ev.state}); break;
+    case 'ToolOutput': { const it=[...App.agentItems].reverse().find(x=>x.t==='tool'&&x.id===ev.itemId);
+      if(it){ if(ev.output!=null)it.output=ev.output; it.exit=ev.exitCode; it.state=ev.state; }
+      else App.agentItems.push({t:'tool',id:ev.itemId,name:'output',output:ev.output,exit:ev.exitCode,state:ev.state}); break; }
+    case 'TurnResult': App.agentBusy=false; break;
+    case 'Error': App.agentItems.push({t:'error',text:ev.text}); App.agentBusy=false; break;
+    case 'SessionEnded': App.agentStatus='ended'; App.agentBusy=false; break;
+    default: return;
+  }
+  if(App.tab==='agent') render();
+}
+
+function renderAgent(v){
+  if(!App.agentStarted){
+    v.append(el('div',{class:'note'},'Start a live agent session in a workspace on this PC — Codex runs here, you drive it from anywhere: send tasks, watch its reasoning, commands, and edits stream in real time.'));
+    const inp=el('input',{class:'txt',placeholder:'workspace path, e.g. C:\\\\code\\\\myproject',value:App.agentWorkspace,'aria-label':'workspace path'});
+    inp.addEventListener('keydown',e=>{ if(e.key==='Enter'){ startAgent(inp.value); } });
+    const go=el('button',{class:'btn primary',onclick:()=>startAgent(inp.value)}, App.agentWs?'connecting…':'Start session');
+    v.append(el('div',{class:'search'}, inp, go));
+    if(App.agentStatus) v.append(el('div',{class:App.agentStatus.includes('error')||App.agentStatus.includes('cannot')?'err':'meta'}, App.agentStatus));
+    return;
+  }
+  v.append(el('div',{class:'agenthead'},
+    el('span',{class:'badge cx'},'CODEX'),
+    el('span',{class:'meta'}, App.agentWorkspace),
+    el('span',{class:'meta'}, '· '+(App.agentStatus||'ready')),
+    el('button',{class:'btn ghost sm',onclick:()=>{endAgent();render();}},'End')));
+  const thread=el('div',{});
+  for(const it of App.agentItems) thread.append(agentItem(it));
+  if(App.agentBusy) thread.append(el('div',{class:'note'}, el('span',{class:'spin'}),' working…'));
+  v.append(thread);
+  const ta=el('textarea',{class:'txt',rows:'1',placeholder:'Tell the agent what to do…','aria-label':'Message to agent',disabled:App.agentBusy?'':null});
+  ta.addEventListener('keydown',e=>{ if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();const t=ta.value;ta.value='';sendAgent(t);} });
+  const send=el('button',{class:'btn primary',onclick:()=>{const t=ta.value;ta.value='';sendAgent(t);}},'Send');
+  const stop=el('button',{class:'btn',onclick:()=>interruptAgent()},'Stop');
+  v.append(el('div',{class:'composer'}, ta, App.agentBusy?stop:send));
+  if(App.tab==='agent'&&!App.agentBusy) setTimeout(()=>ta.focus(),30);
+}
+function agentItem(it){
+  if(it.t==='user') return el('div',{class:'turn'}, el('div',{class:'who'},'You'), el('div',{class:'bubble me'}, it.text));
+  if(it.t==='assistant') return el('div',{class:'turn'}, el('div',{class:'who'},'Codex'), el('div',{class:'bubble ai',html:md(it.text)}));
+  if(it.t==='thinking'){ const d=el('details',{class:'reason'}); d.append(el('summary',{},'reasoning'), el('div',{class:'rbody',html:esc(it.text)})); return d; }
+  if(it.t==='error') return el('div',{class:'err'}, it.text);
+  if(it.t==='tool'){
+    const running = it.state==='in_progress' && it.exit==null;
+    const head=el('div',{class:'cmdhead'},
+      el('span',{class:'cmdk'}, it.name==='command'?'$':(it.name||'tool')),
+      el('span',{class:'cmd'}, it.input||''),
+      it.exit!=null?el('span',{class:'exit'+(it.exit===0?' ok':' bad')},'exit '+it.exit):(running?el('span',{class:'spin'}):null));
+    return el('div',{class:'toolblock'}, head, it.output?el('pre',{class:'cmdout'}, it.output):null);
+  }
+  return document.createComment('');
+}
+
 /* ---------- start ---------- */
 // Always try to load: in hl-auth/SSO mode the cookie authenticates and no token is needed; in
-// bearer mode the first call 401s and api() opens the token gate.
-setDot('idle'); boot();
+// bearer mode the first call 401s and api() opens the token gate. render() first so the current
+// tab (Agent by default) shows immediately; boot() loads chat/stats data in the background.
+setDot('idle'); render(); boot();
 </script>
 </body>
 </html>
