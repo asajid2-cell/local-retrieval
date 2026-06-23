@@ -123,4 +123,23 @@ public sealed class RolloutAndLiveMappingTests
         }
         finally { Directory.Delete(root, true); }
     }
+
+    [TestMethod]
+    public void ClaudeStream_MapsInitMessagesToolsAndResult()
+    {
+        Assert.AreEqual(AgentEventKind.SessionStarted,
+            ClaudeStreamMapper.Map("{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"sid-1\"}").Single().Kind);
+
+        var asst = ClaudeStreamMapper.Map("{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"thinking\",\"thinking\":\"hmm\"},{\"type\":\"text\",\"text\":\"hi\"},{\"type\":\"tool_use\",\"id\":\"t9\",\"name\":\"Bash\",\"input\":{\"command\":\"echo x\"}}]}}").ToList();
+        CollectionAssert.AreEqual(new[] { AgentEventKind.Thinking, AgentEventKind.AssistantText, AgentEventKind.ToolCall }, asst.Select(e => e.Kind).ToArray());
+        Assert.AreEqual("echo x", asst[2].ToolInput);
+
+        var tr = ClaudeStreamMapper.Map("{\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"t9\",\"content\":\"x\"}]}}").Single();
+        Assert.AreEqual(AgentEventKind.ToolOutput, tr.Kind);
+        Assert.AreEqual("t9", tr.ItemId);
+
+        var res = ClaudeStreamMapper.Map("{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"done\"}").ToList();
+        Assert.AreEqual(AgentEventKind.TurnResult, res[0].Kind);
+        Assert.AreEqual("idle", res[1].Text);
+    }
 }

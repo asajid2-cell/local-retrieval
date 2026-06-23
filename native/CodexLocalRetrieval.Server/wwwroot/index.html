@@ -476,7 +476,7 @@ function onAgentEvent(ev){
 
 function renderAgent(v){
   if(App.agentView!=='session'){
-    v.append(el('div',{class:'note'},'All your coding sessions — Codex and Claude, old and new. Open any to read it; Codex sessions you can continue live (the agent runs on this PC and streams its reasoning, commands, and edits here).'));
+    v.append(el('div',{class:'note'},'All your coding sessions — Codex and Claude, old and new. Open any to read it, then continue it live: send a task and watch the reasoning, commands, and edits stream as the agent works on this PC.'));
     const ws=el('input',{class:'txt',placeholder:'new session workspace, e.g. z:\\\\proj','aria-label':'new session workspace',value:App.agentWorkspace});
     v.append(el('div',{class:'search'}, ws, el('button',{class:'btn primary',onclick:()=>newSession(ws.value)},'+ New')));
     if(App.agentStatus&&App.agentSessions) v.append(el('div',{class:'meta'}, App.agentStatus));

@@ -17,10 +17,14 @@ public static class AgentWebSocket
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
     };
 
-    public static async Task HandleAsync(WebSocket ws, CodexAgentHub hub, ClaudeSessionStore claude, string defaultWorkspace, CancellationToken ct)
+    public static async Task HandleAsync(WebSocket ws, CodexAgentHub hub, ClaudeSessionStore claude, ClaudeLiveDriver claudeDriver, string defaultWorkspace, CancellationToken ct)
     {
         var send = new SemaphoreSlim(1, 1);
         string? openThreadId = null;
+        var openSource = "codex";
+        string? claudeSid = null;          // current Claude session id (updated each turn)
+        var claudeCwd = defaultWorkspace;
+        System.Diagnostics.Process? claudeProc = null;
         var buf = new byte[16 * 1024];
 
         async Task OnNote(JsonElement note)
@@ -52,14 +56,15 @@ public static class AgentWebSocket
                     {
                         var id = Str(root, "id");
                         if (id is null) break;
-                        var source = Str(root, "source") ?? "codex";
+                        openSource = Str(root, "source") ?? "codex";
                         if (openThreadId is not null) { hub.CloseThread(openThreadId); openThreadId = null; }
                         try
                         {
-                            if (source == "claude")
+                            if (openSource == "claude")
                             {
-                                // Claude sessions are read-only history (no live driving yet).
-                                await SendJson(ws, send, new { kind = "Opened", threadId = id, live = false }, ct);
+                                claudeSid = id;
+                                claudeCwd = Str(root, "cwd") is { Length: > 0 } cc ? cc : defaultWorkspace;
+                                await SendJson(ws, send, new { kind = "Opened", threadId = id, live = claudeDriver.Available }, ct);
                                 foreach (var ev in claude.ReadHistory(id)) await SendJson(ws, send, ev, ct);
                             }
                             else
@@ -76,6 +81,7 @@ public static class AgentWebSocket
                     }
                     case "new":
                     {
+                        openSource = "codex";
                         if (openThreadId is not null) hub.CloseThread(openThreadId);
                         openThreadId = await hub.NewThreadAsync(Str(root, "cwd") ?? defaultWorkspace, OnNote, OnReq, ct, Str(root, "approvalPolicy") ?? "on-request", Str(root, "sandbox") ?? "workspace-write");
                         await SendJson(ws, send, new { kind = "Opened", threadId = openThreadId, isNew = true, live = true }, ct);
@@ -85,7 +91,17 @@ public static class AgentWebSocket
                     case "send":
                     {
                         var text = Str(root, "text");
-                        if (openThreadId is not null && !string.IsNullOrWhiteSpace(text))
+                        if (string.IsNullOrWhiteSpace(text)) break;
+                        if (openSource == "claude")
+                        {
+                            await SendJson(ws, send, AgentEvent.Stat("turn-start"), ct);
+                            claudeProc = claudeDriver.StartTurn(claudeSid, claudeCwd, text!, async ev =>
+                            {
+                                if (ev.Kind == AgentEventKind.SessionStarted) { claudeSid = ev.SessionId; return; } // track id, don't render
+                                await SendJson(ws, send, ev, ct);
+                            }, ct);
+                        }
+                        else if (openThreadId is not null)
                         {
                             var tid = openThreadId;
                             // fire-and-forget so the receive loop stays free for interrupt; surface failures.
@@ -98,7 +114,8 @@ public static class AgentWebSocket
                         break;
                     }
                     case "interrupt":
-                        if (openThreadId is not null) await hub.InterruptAsync(openThreadId, ct);
+                        if (openSource == "claude") { try { claudeProc?.Kill(true); } catch { } await SendJson(ws, send, AgentEvent.Stat("idle"), ct); }
+                        else if (openThreadId is not null) await hub.InterruptAsync(openThreadId, ct);
                         break;
                     case "approve":
                         if (root.TryGetProperty("requestId", out var ridEl) && ridEl.TryGetInt32(out var rid))
@@ -112,6 +129,7 @@ public static class AgentWebSocket
         finally
         {
             if (openThreadId is not null) hub.CloseThread(openThreadId);
+            try { if (claudeProc is { HasExited: false }) claudeProc.Kill(true); } catch { }
             try { if (ws.State == WebSocketState.Open) await ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "bye", CancellationToken.None); } catch { }
         }
     }

@@ -149,6 +149,7 @@ var codexExe = Environment.GetEnvironmentVariable("CLR_CODEX_EXE") ?? ArchiveSer
 var defaultWs = Environment.GetEnvironmentVariable("CLR_AGENT_DEFAULT_WS") ?? Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
 var agentHub = new CodexAgentHub(codexExe);
 var claudeStore = new ClaudeSessionStore(Environment.GetEnvironmentVariable("CLR_CLAUDE_PROJECTS"));
+var claudeDriver = new ClaudeLiveDriver(Environment.GetEnvironmentVariable("CLR_CLAUDE_EXE"));
 
 // One merged, time-sorted list of BOTH tools' sessions: source "codex" (drivable) or "claude" (history).
 app.MapGet("/api/agent/sessions", async (string? cursor, int? pageSize, CancellationToken ct) =>
@@ -164,7 +165,7 @@ app.Map("/api/agent", async (HttpContext ctx) =>
 {
     if (!ctx.WebSockets.IsWebSocketRequest) { ctx.Response.StatusCode = StatusCodes.Status400BadRequest; return; }
     using var sock = await ctx.WebSockets.AcceptWebSocketAsync();
-    await AgentWebSocket.HandleAsync(sock, agentHub, claudeStore, defaultWs, ctx.RequestAborted);
+    await AgentWebSocket.HandleAsync(sock, agentHub, claudeStore, claudeDriver, defaultWs, ctx.RequestAborted);
 });
 
 var authMode = hlAuthOn ? $"hl-auth ({hlBase}, page:{hlPage ?? "any"})" : "bearer token";

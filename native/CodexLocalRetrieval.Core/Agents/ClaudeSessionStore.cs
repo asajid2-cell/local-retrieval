@@ -152,7 +152,7 @@ public sealed class ClaudeSessionStore
             || s.StartsWith("Caveat:") || s.StartsWith("This session is being continued");
     }
 
-    private static string SummarizeInput(JsonElement b)
+    internal static string SummarizeInput(JsonElement b)
     {
         if (!b.TryGetProperty("input", out var inp) || inp.ValueKind != JsonValueKind.Object) return "";
         foreach (var key in new[] { "command", "file_path", "path", "pattern", "url", "query", "prompt", "description" })
@@ -160,7 +160,7 @@ public sealed class ClaudeSessionStore
         return inp.GetRawText();
     }
 
-    private static string FlattenResult(JsonElement b)
+    internal static string FlattenResult(JsonElement b)
     {
         if (!b.TryGetProperty("content", out var c)) return "";
         if (c.ValueKind == JsonValueKind.String) return c.GetString() ?? "";
