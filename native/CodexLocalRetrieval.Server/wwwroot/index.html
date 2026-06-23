@@ -120,9 +120,12 @@
   .err{color:var(--danger);font-size:13px;margin:8px 0;overflow-wrap:anywhere}
 
   /* live agent */
-  .agenthead{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:12px;padding-bottom:10px;border-bottom:1px solid var(--line)}
-  .agenthead .meta{overflow-wrap:anywhere;min-width:0}
-  .agenthead .btn{margin-left:auto}
+  .agenthead{display:flex;align-items:center;gap:8px;margin-bottom:6px;padding-bottom:10px;border-bottom:1px solid var(--line)}
+  .agenthead .sesstitle{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600;font-size:13.5px}
+  .agenthead .rename{flex:none;padding:0 9px;color:var(--ink-dim)}
+  .agenthead .rename:hover{color:var(--accent);border-color:var(--accent)}
+  .agenthead input.txt.sm{flex:1;min-width:0;min-height:34px;padding:6px 10px}
+  .substatus{margin:0 0 10px 2px}
   /* reasoning (collapsible, muted) */
   details.reason{margin:8px 0}
   details.reason summary{display:flex;align-items:center;gap:6px;color:var(--ink-dim);font-size:12px;cursor:pointer;list-style:none}
@@ -249,6 +252,7 @@ const App = {
   agentItems: [], agentBusy: false, agentLive: true, agentStatus: '', agentHistoryLoading: false,
   agentQuery: '', agentFilter: 'all', agentStick: true,
   agentMode: 'safe', autoAvailable: null, askKey: false,
+  agentTitle: '', agentRenaming: false,
   signKey: localStorage.getItem('clr_sign_key') || '',
   agentWorkspace: localStorage.getItem('clr_agent_ws') || '',
 };
@@ -504,10 +508,19 @@ async function loadAgentSessions(){
   catch(e){ App.agentSessions=[]; App.agentStatus=e.message; }
   if(App.tab==='agent'&&App.agentView==='list') render();
 }
-async function openSession(id, source){
-  App.agentView='session'; App.agentItems=[]; App.agentBusy=false; App.agentLive=true; App.agentSource=source||'codex'; App.agentHistoryLoading=true; App.agentStatus='connecting…'; render();
+async function openSession(id, source, title){
+  App.agentView='session'; App.agentItems=[]; App.agentBusy=false; App.agentLive=true; App.agentSource=source||'codex'; App.agentTitle=title||''; App.agentRenaming=false; App.agentHistoryLoading=true; App.agentStatus='connecting…'; render();
   try{ await agentConnect(); App.agentWs.send(JSON.stringify({op:'open',id,source:App.agentSource})); }
   catch(e){ App.agentStatus='connect failed: '+e.message; render(); }
+}
+async function renameAgentSession(newTitle){
+  newTitle=(newTitle||'').trim(); if(!newTitle||!App.agentThreadId) { App.agentRenaming=false; render(); return; }
+  try{
+    await api('/api/agent/sessions/'+encodeURIComponent(App.agentThreadId)+'/rename', { method:'POST', body:{title:newTitle, source:App.agentSource} });
+    App.agentTitle=newTitle; App.agentRenaming=false;
+    const s=(App.agentSessions||[]).find(x=>x.id===App.agentThreadId); if(s) s.name=newTitle;   // update the list cache
+  }catch(e){ App.agentStatus='rename failed: '+e.message; }
+  render();
 }
 async function newSession(cwd){
   App.agentWorkspace=(cwd||'').trim(); localStorage.setItem('clr_agent_ws',App.agentWorkspace);
@@ -599,7 +612,7 @@ function renderAgent(v){
     const list=el('div',{class:'list'});
     for(const s of rows){
       const cl = s.source==='claude';
-      list.append(el('button',{class:'card',onclick:()=>openSession(s.id, s.source)},
+      list.append(el('button',{class:'card',onclick:()=>openSession(s.id, s.source, s.name)},
         el('div',{class:'row'}, el('span',{class:'title'}, s.name||s.preview||'(untitled)')),
         (s.name&&s.preview&&s.name!==s.preview)?el('div',{class:'snip'}, s.preview.length>150?s.preview.slice(0,150)+'…':s.preview):null,
         el('div',{class:'sub'}, el('span',{class:'badge '+(cl?'cl':'cx')}, cl?'CLAUDE':'CODEX'), el('span',{class:'meta'}, s.cwd||'—'),
@@ -610,10 +623,20 @@ function renderAgent(v){
   }
   // open session: a real conversation (Codex = drivable live, Claude = history)
   const cl = App.agentSource==='claude';
-  v.append(el('div',{class:'agenthead'},
+  const head=el('div',{class:'agenthead'},
     el('button',{class:'btn ghost sm',onclick:()=>{App.agentView='list';App.agentSessions=null;render();}},'‹ Sessions'),
-    el('span',{class:'badge '+(cl?'cl':'cx')}, cl?'CLAUDE':'CODEX'),
-    el('span',{class:'meta'}, App.agentStatus||'')));
+    el('span',{class:'badge '+(cl?'cl':'cx')}, cl?'CLAUDE':'CODEX'));
+  if(App.agentRenaming){
+    const ti=el('input',{class:'txt sm',value:App.agentTitle,placeholder:'Session name','aria-label':'Session name'});
+    ti.addEventListener('keydown',e=>{ if(e.key==='Enter') renameAgentSession(ti.value); if(e.key==='Escape'){App.agentRenaming=false;render();} });
+    head.append(ti, el('button',{class:'btn primary sm',onclick:()=>renameAgentSession(ti.value)},'Save'), el('button',{class:'btn ghost sm',onclick:()=>{App.agentRenaming=false;render();}},'✕'));
+    setTimeout(()=>ti.focus(),30);
+  } else {
+    head.append(el('span',{class:'sesstitle',title:App.agentTitle||''}, App.agentTitle||(cl?'Claude session':'Codex session')));
+    if(cl) head.append(el('button',{class:'btn ghost sm rename','aria-label':'Rename session',title:'Rename',onclick:()=>{App.agentRenaming=true;render();}},'✎'));
+  }
+  v.append(head);
+  if(App.agentStatus) v.append(el('div',{class:'meta substatus'}, App.agentStatus));
   if(App.agentHistoryLoading) v.append(el('div',{class:'note'}, el('span',{class:'spin'}),' loading conversation…'));
   const thread=el('div',{});
   for(const it of App.agentItems) thread.append(agentItem(it));

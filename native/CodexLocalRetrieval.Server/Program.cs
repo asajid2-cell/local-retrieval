@@ -169,6 +169,19 @@ app.MapGet("/api/agent/sessions", async (string? cursor, int? pageSize, Cancella
 // Whether owner-signed "auto" mode is available (a signing key is configured on this server).
 app.MapGet("/api/agent/config", () => Results.Json(new { autoAvailable = commandSigner.Enabled }));
 
+// Rename a session. For Claude this appends a custom-title to its rollout (same mechanism + shared with
+// the Claude Code sidebar). Codex titles itself; renaming codex sessions isn't supported here.
+app.MapPost("/api/agent/sessions/{id}/rename", (string id, RenameRequest req) =>
+{
+    var title = (req?.Title ?? "").Trim();
+    if (title.Length == 0) return Results.BadRequest(new { error = "title required" });
+    if (title.Length > 120) title = title[..120];
+    if (req?.Source == "codex") return Results.BadRequest(new { error = "Codex titles its own sessions; rename is available for Claude sessions." });
+    return claudeStore.RenameSession(id, title)
+        ? Results.Json(new { ok = true, title })
+        : Results.NotFound(new { error = "session not found" });
+});
+
 app.Map("/api/agent", async (HttpContext ctx) =>
 {
     if (!ctx.WebSockets.IsWebSocketRequest) { ctx.Response.StatusCode = StatusCodes.Status400BadRequest; return; }

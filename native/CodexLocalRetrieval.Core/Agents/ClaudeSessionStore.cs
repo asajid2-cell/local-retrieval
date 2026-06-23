@@ -107,30 +107,73 @@ public sealed class ClaudeSessionStore
         return events;
     }
 
-    // Read the first lines to get cwd + the first real (non-injected) user prompt as the title.
+    // The session's real title, exactly as Claude Code resolves it: a user-set custom-title wins, else
+    // Claude's generated ai-title, else the first real user prompt. Custom/ai titles are appended to the
+    // .jsonl (so they live in the tail); the first prompt is in the head.
     private static (string cwd, string title) Peek(string path)
     {
-        string cwd = "", title = "";
+        string cwd = "", firstPrompt = "";
         try
         {
             using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
             using var sr = new StreamReader(fs);
             string? line; int n = 0;
-            while ((line = sr.ReadLine()) is not null && n++ < 250)   // scan deeper so continued sessions find a real first task
+            while ((line = sr.ReadLine()) is not null && n++ < 250)
             {
                 JsonElement root;
                 try { using var d = JsonDocument.Parse(line); root = d.RootElement.Clone(); } catch { continue; }
                 if (cwd.Length == 0 && Str(root, "cwd") is { Length: > 0 } c) cwd = c;
-                if (title.Length == 0 && Str(root, "type") == "user" && root.TryGetProperty("message", out var m) && m.TryGetProperty("content", out var ct))
+                if (firstPrompt.Length == 0 && Str(root, "type") == "user" && root.TryGetProperty("message", out var m) && m.TryGetProperty("content", out var ct))
                 {
                     var u = FirstUserText(ct);
-                    if (u is { Length: > 0 }) title = u.Length > 90 ? u[..90] : u;
+                    if (u is { Length: > 0 }) firstPrompt = u.Length > 90 ? u[..90] : u;
                 }
-                if (cwd.Length > 0 && title.Length > 0) break;
+                if (cwd.Length > 0 && firstPrompt.Length > 0) break;
             }
         }
         catch { }
-        return (cwd, title.Length > 0 ? title : "(Claude session)");
+        var (custom, ai) = TailTitle(path);
+        var title = !string.IsNullOrWhiteSpace(custom) ? custom!
+                  : !string.IsNullOrWhiteSpace(ai) ? ai!
+                  : firstPrompt.Length > 0 ? firstPrompt : "(Claude session)";
+        return (cwd, title);
+    }
+
+    // Scan the file tail (where renames/titles are appended) for the latest custom-title / ai-title.
+    private static (string? custom, string? ai) TailTitle(string path)
+    {
+        try
+        {
+            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            var n = (int)Math.Min(fs.Length, 96 * 1024);
+            fs.Seek(-n, SeekOrigin.End);
+            var buf = new byte[n];
+            int read = fs.Read(buf, 0, n);
+            string? custom = null, ai = null;
+            foreach (var line in Encoding.UTF8.GetString(buf, 0, read).Split('\n'))
+            {
+                if (line.IndexOf("Title", StringComparison.Ordinal) < 0) continue;
+                try { using var d = JsonDocument.Parse(line); var r = d.RootElement;
+                    if (Str(r, "customTitle") is { Length: > 0 } cu) custom = cu;     // latest wins
+                    else if (Str(r, "aiTitle") is { Length: > 0 } at) ai = at;
+                } catch { }
+            }
+            return (custom, ai);
+        }
+        catch { return (null, null); }
+    }
+
+    // Rename a session the same way Claude Code does: append a custom-title record to its .jsonl. The
+    // Claude Code sidebar reads the same record, so the name is shared. Returns false if the file is gone.
+    public bool RenameSession(string id, string title)
+    {
+        var path = PathOf(id);
+        if (path is null || !File.Exists(path)) return false;
+        var rec = JsonSerializer.Serialize(new { type = "custom-title", sessionId = id, customTitle = title });
+        using var fs = new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite);
+        using var sw = new StreamWriter(fs);
+        sw.Write(rec + "\n");
+        return true;
     }
 
     private static string? FirstUserText(JsonElement content)

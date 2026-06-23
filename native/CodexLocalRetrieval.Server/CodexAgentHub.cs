@@ -144,6 +144,8 @@ public sealed class CodexAgentHub : IAsyncDisposable
 // The unified row the sidebar renders, merged across tools. Source is "codex" (drivable live) or "claude" (history).
 public sealed record AgentSessionDto(string Id, string Name, string Preview, string Cwd, string Source, long UpdatedAt);
 
+public sealed record RenameRequest(string? Title, string? Source);
+
 // What the sidebar renders for each session (from thread/list).
 public sealed record SessionInfo(string Id, string Name, string Preview, string Cwd, string Source, long UpdatedAt)
 {

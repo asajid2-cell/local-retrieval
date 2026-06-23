@@ -54,6 +54,39 @@ public sealed class RolloutAndLiveMappingTests
         finally { File.Delete(path); }
     }
 
+    [TestMethod]
+    public void Claude_Title_CustomBeatsAi_BeatsFirstPrompt_AndRenamePersists()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "clr-rename-" + Guid.NewGuid().ToString("N"));
+        var proj = Path.Combine(root, "z--proj");
+        Directory.CreateDirectory(proj);
+        var id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        var path = Path.Combine(proj, id + ".jsonl");
+        File.WriteAllLines(path, new[]
+        {
+            "{\"type\":\"user\",\"cwd\":\"z:\\\\proj\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"the original first task\"}]}}"
+        });
+        try
+        {
+            // 1) no title record -> first prompt is the title
+            Assert.AreEqual("the original first task", new ClaudeSessionStore(root).List()[0].Title);
+
+            // 2) an ai-title record wins over the first prompt
+            File.AppendAllText(path, "{\"type\":\"ai-title\",\"sessionId\":\"" + id + "\",\"aiTitle\":\"Claude generated title\"}\n");
+            Assert.AreEqual("Claude generated title", new ClaudeSessionStore(root).List()[0].Title);
+
+            // 3) rename (custom-title) wins over the ai-title, persists, and is shared via the .jsonl
+            var store = new ClaudeSessionStore(root);
+            store.List(); // cache the path
+            Assert.IsTrue(store.RenameSession(id, "claude-remote maker"));
+            Assert.AreEqual("claude-remote maker", new ClaudeSessionStore(root).List()[0].Title);
+            var disk = File.ReadAllText(path);
+            StringAssert.Contains(disk, "\"type\":\"custom-title\"");
+            StringAssert.Contains(disk, "\"customTitle\":\"claude-remote maker\"");
+        }
+        finally { Directory.Delete(root, true); }
+    }
+
     private static IEnumerable<AgentEvent> Note(string method, string paramsJson)
     {
         using var d = JsonDocument.Parse(paramsJson);
