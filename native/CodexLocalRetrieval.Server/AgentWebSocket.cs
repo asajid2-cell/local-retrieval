@@ -3,27 +3,40 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using CodexLocalRetrieval.Core.Agents;
-using CodexLocalRetrieval.Core.Services;
 
 namespace CodexLocalRetrieval.Server;
 
-// Bridges one browser WebSocket <-> one live agent session. Client sends {op:start|send|interrupt};
-// the agent's normalized events stream back as JSON. One session per connection (P0); the session is
-// disposed when the socket closes.
+// Bridges one browser WebSocket to the codex app-server (via the hub). The browser opens a session
+// (resume + history), goes live (turn/start), interrupts, and answers approvals; the thread's events
+// stream back as AgentEvents. One open thread per socket.
 public static class AgentWebSocket
 {
     private static readonly JsonSerializerOptions Wire = new(JsonSerializerDefaults.Web)
     {
-        Converters = { new JsonStringEnumConverter() }, // AgentEventKind as "AssistantText", not a number
+        Converters = { new JsonStringEnumConverter() },
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
     };
 
-    public static async Task HandleAsync(WebSocket ws, ArchiveService archive, string codexExe, string defaultWorkspace, CancellationToken ct)
+    public static async Task HandleAsync(WebSocket ws, CodexAgentHub hub, string defaultWorkspace, CancellationToken ct)
     {
-        IAgentSession? session = null;
-        Task? forward = null;
         var send = new SemaphoreSlim(1, 1);
+        string? openThreadId = null;
         var buf = new byte[16 * 1024];
+
+        async Task OnNote(JsonElement note)
+        {
+            var method = note.TryGetProperty("method", out var mEl) ? mEl.GetString() ?? "" : "";
+            var p = note.TryGetProperty("params", out var pp) ? pp : default;
+            foreach (var ev in CodexItemMapper.MapNotification(method, p)) await SendJson(ws, send, ev, ct);
+        }
+        async Task OnReq(JsonElement req)
+        {
+            if (!req.TryGetProperty("id", out var idEl) || !idEl.TryGetInt32(out var id)) return;
+            var method = req.TryGetProperty("method", out var mEl) ? mEl.GetString() ?? "" : "";
+            var p = req.TryGetProperty("params", out var pp) ? pp : default;
+            await SendJson(ws, send, new { kind = "PermissionRequest", requestId = id, tool = method, text = ApprovalText(method, p) }, ct);
+        }
+
         try
         {
             while (ws.State == WebSocketState.Open && !ct.IsCancellationRequested)
@@ -31,28 +44,55 @@ public static class AgentWebSocket
                 var msg = await ReceiveText(ws, buf, ct);
                 if (msg is null) break;
                 JsonElement root;
-                try { using var doc = JsonDocument.Parse(msg); root = doc.RootElement.Clone(); }
-                catch { continue; }
+                try { using var d = JsonDocument.Parse(msg); root = d.RootElement.Clone(); } catch { continue; }
+
                 switch (Str(root, "op"))
                 {
-                    case "start":
-                        if (session is not null) break;
-                        var (workspace, resumeId) = ResolveTarget(root, archive, defaultWorkspace);
-                        var cs = new CodexAgentSession(codexExe, workspace);
-                        if (resumeId is not null) cs.AdoptSession(resumeId);
-                        session = cs;
-                        forward = ForwardEvents(session, ws, send, ct);
-                        await SendJson(ws, send, new { kind = "Ready", agent = "codex", workspace, resume = resumeId }, ct);
+                    case "open":
+                    {
+                        var id = Str(root, "id");
+                        if (id is null) break;
+                        if (openThreadId is not null) hub.CloseThread(openThreadId);
+                        try
+                        {
+                            await hub.OpenThreadAsync(id, Str(root, "cwd"), OnNote, OnReq, ct);
+                            openThreadId = id;
+                            await SendJson(ws, send, new { kind = "Opened", threadId = id }, ct);
+                            foreach (var ev in await hub.ReadHistoryAsync(id, ct)) await SendJson(ws, send, ev, ct);
+                        }
+                        catch (Exception ex) { await SendJson(ws, send, AgentEvent.Err("open failed: " + ex.Message), ct); }
+                        await SendJson(ws, send, new { kind = "HistoryEnd" }, ct);
                         break;
-
+                    }
+                    case "new":
+                    {
+                        if (openThreadId is not null) hub.CloseThread(openThreadId);
+                        openThreadId = await hub.NewThreadAsync(Str(root, "cwd") ?? defaultWorkspace, OnNote, OnReq, ct, Str(root, "approvalPolicy") ?? "on-request", Str(root, "sandbox") ?? "workspace-write");
+                        await SendJson(ws, send, new { kind = "Opened", threadId = openThreadId, isNew = true }, ct);
+                        await SendJson(ws, send, new { kind = "HistoryEnd" }, ct);
+                        break;
+                    }
                     case "send":
+                    {
                         var text = Str(root, "text");
-                        if (session is not null && !string.IsNullOrWhiteSpace(text) && !session.Busy)
-                            _ = Task.Run(() => session.SendUserAsync(text!, ct), ct);
+                        if (openThreadId is not null && !string.IsNullOrWhiteSpace(text))
+                        {
+                            var tid = openThreadId;
+                            // fire-and-forget so the receive loop stays free for interrupt; surface failures.
+                            _ = Task.Run(async () =>
+                            {
+                                try { await hub.StartTurnAsync(tid, text!, ct); }
+                                catch (Exception ex) { await SendJson(ws, send, AgentEvent.Err("send failed: " + ex.Message), ct); }
+                            }, ct);
+                        }
                         break;
-
+                    }
                     case "interrupt":
-                        session?.Interrupt();
+                        if (openThreadId is not null) await hub.InterruptAsync(openThreadId, ct);
+                        break;
+                    case "approve":
+                        if (root.TryGetProperty("requestId", out var ridEl) && ridEl.TryGetInt32(out var rid))
+                            await hub.RespondApprovalAsync(rid, Str(root, "decision") == "allow", ct);
                         break;
                 }
             }
@@ -61,31 +101,17 @@ public static class AgentWebSocket
         catch (WebSocketException) { }
         finally
         {
-            if (session is not null) await session.DisposeAsync();
-            try { if (forward is not null) await forward; } catch { }
+            if (openThreadId is not null) hub.CloseThread(openThreadId);
             try { if (ws.State == WebSocketState.Open) await ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "bye", CancellationToken.None); } catch { }
         }
     }
 
-    // chatId -> resume that on-disk codex session in its workspace; else a fresh session in {workspace|default}.
-    private static (string workspace, string? resumeId) ResolveTarget(JsonElement root, ArchiveService archive, string def)
+    private static string ApprovalText(string method, JsonElement p)
     {
-        var chatId = Str(root, "chatId");
-        if (!string.IsNullOrWhiteSpace(chatId))
-        {
-            var s = archive.GetSession(chatId!);
-            if (s is not null && string.Equals(s.Tool, "codex", StringComparison.OrdinalIgnoreCase))
-                return (string.IsNullOrWhiteSpace(s.Workspace) ? def : s.Workspace, s.Id);
-        }
-        var w = Str(root, "workspace");
-        return (string.IsNullOrWhiteSpace(w) ? def : w!, null);
-    }
-
-    private static async Task ForwardEvents(IAgentSession session, WebSocket ws, SemaphoreSlim send, CancellationToken ct)
-    {
-        try { await foreach (var ev in session.Events.ReadAllAsync(ct)) await SendJson(ws, send, ev, ct); }
-        catch (OperationCanceledException) { }
-        catch (Exception) { }
+        var cmd = Str(p, "command");
+        if (!string.IsNullOrEmpty(cmd)) return "run: " + cmd;
+        if (p.ValueKind == JsonValueKind.Object && p.TryGetProperty("changes", out _)) return "apply file changes";
+        return method;
     }
 
     private static async Task SendJson(WebSocket ws, SemaphoreSlim send, object payload, CancellationToken ct)

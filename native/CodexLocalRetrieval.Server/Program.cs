@@ -142,14 +142,20 @@ app.MapPost("/api/copilot", async (CopilotRequest req, CancellationToken ct) => 
 app.MapPost("/api/chats/{id}/resume", (string id, ResumeRequest? req) => Results.Json(api.ResumeCommand(id, req?.Launch ?? false)));
 app.MapPost("/api/chats/{id}/favorite", async (string id, FavoriteRequest? req) => Results.Json(await api.FavoriteAsync(id, req?.Favorite ?? true)));
 
-// Live agent session over a WebSocket: drive codex in a workspace, stream reasoning/commands/output.
+// Live agent: our server is a client of `codex app-server` (the desktop-app protocol). The hub owns
+// the one app-server and multiplexes it. /api/agent/sessions lists ALL sessions; the WS opens/drives one.
 var codexExe = Environment.GetEnvironmentVariable("CLR_CODEX_EXE") ?? ArchiveService.ResolveCodexExe();
 var defaultWs = Environment.GetEnvironmentVariable("CLR_AGENT_DEFAULT_WS") ?? Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+var agentHub = new CodexAgentHub(codexExe);
+
+app.MapGet("/api/agent/sessions", async (string? cursor, int? pageSize, CancellationToken ct) =>
+    Results.Json(await agentHub.ListSessionsAsync(cursor, pageSize ?? 60, ct)));
+
 app.Map("/api/agent", async (HttpContext ctx) =>
 {
     if (!ctx.WebSockets.IsWebSocketRequest) { ctx.Response.StatusCode = StatusCodes.Status400BadRequest; return; }
     using var sock = await ctx.WebSockets.AcceptWebSocketAsync();
-    await AgentWebSocket.HandleAsync(sock, archive, codexExe, defaultWs, ctx.RequestAborted);
+    await AgentWebSocket.HandleAsync(sock, agentHub, defaultWs, ctx.RequestAborted);
 });
 
 var authMode = hlAuthOn ? $"hl-auth ({hlBase}, page:{hlPage ?? "any"})" : "bearer token";

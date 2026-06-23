@@ -126,6 +126,9 @@
   .cmdhead .exit{margin-left:auto;flex:none;font-size:10.5px;color:var(--danger)}
   .cmdhead .exit.ok{color:#5fd08a}
   .cmdout{margin:0;padding:8px 10px;border-top:1px solid var(--line);font-family:var(--mono);font-size:11.5px;color:var(--ink-mid);white-space:pre-wrap;overflow-wrap:anywhere;max-height:340px;overflow-y:auto}
+  .approval{border:1px solid #5a4a1e;background:#1a1408;border-radius:9px;padding:11px 13px;margin:8px 0}
+  .approval .cmd{font-family:var(--mono);font-size:12px;color:var(--ink);margin:5px 0;overflow-wrap:anywhere;white-space:pre-wrap}
+  .approval .actions{margin-top:8px}
 
   /* bottom tab bar */
   .tabbar{
@@ -194,8 +197,9 @@ const App = {
   chats: [], stats: null, q: '',
   detail: null, showRollout: false,
   copilot: [], copilotBusy: false, copilotCtl: null,
-  // live agent session
-  agentWs: null, agentItems: [], agentBusy: false, agentStarted: false, agentStatus: '',
+  // live agent: a browser of all codex sessions + an open conversation you can drive
+  agentWs: null, agentSessions: null, agentView: 'list', agentThreadId: null,
+  agentItems: [], agentBusy: false, agentStatus: '', agentHistoryLoading: false,
   agentWorkspace: localStorage.getItem('clr_agent_ws') || '',
 };
 
@@ -413,78 +417,112 @@ function renderCopilot(v){
   if(App.tab==='copilot'&&!App.copilotBusy) setTimeout(()=>ta.focus(),30);
 }
 
-/* ---------- live agent ---------- */
+/* ---------- live agent: browse all sessions + drive any one live ---------- */
 function agentWsUrl(){
   const proto = location.protocol==='https:'?'wss':'ws';
   const q = App.token ? ('?token='+encodeURIComponent(App.token)) : '';
   return proto+'://'+location.host+BASE+'/api/agent'+q;
 }
-function startAgent(workspace){
-  if(App.agentWs) return;
-  App.agentWorkspace=(workspace||App.agentWorkspace||'').trim(); localStorage.setItem('clr_agent_ws',App.agentWorkspace);
-  App.agentItems=[]; App.agentStarted=false; App.agentBusy=false; App.agentStatus='connecting…'; render();
-  let ws; try{ ws=new WebSocket(agentWsUrl()); }catch(e){ App.agentStatus='cannot connect: '+e.message; render(); return; }
-  App.agentWs=ws;
-  ws.onopen=()=>ws.send(JSON.stringify({op:'start',workspace:App.agentWorkspace}));
-  ws.onmessage=(e)=>{ try{ onAgentEvent(JSON.parse(e.data)); }catch{} };
-  ws.onclose=()=>{ App.agentWs=null; App.agentBusy=false; if(!App.agentStarted)App.agentStatus='disconnected'; if(App.tab==='agent') render(); };
-  ws.onerror=()=>{ App.agentStatus='connection error'; if(App.tab==='agent') render(); };
+function agentConnect(){
+  if(App.agentWs && App.agentWs.readyState<=1) return Promise.resolve();
+  return new Promise((resolve,reject)=>{
+    let ws; try{ ws=new WebSocket(agentWsUrl()); }catch(e){ reject(e); return; }
+    App.agentWs=ws;
+    ws.onopen=()=>resolve();
+    ws.onmessage=(e)=>{ try{ onAgentEvent(JSON.parse(e.data)); }catch{} };
+    ws.onclose=()=>{ App.agentWs=null; App.agentBusy=false; if(App.tab==='agent'&&App.agentView==='session') render(); };
+    ws.onerror=()=>reject(new Error('connection error'));
+  });
 }
-function endAgent(){ if(App.agentWs){ try{App.agentWs.close();}catch{} } App.agentWs=null; App.agentStarted=false; App.agentBusy=false; }
+async function loadAgentSessions(){
+  try{ App.agentSessions = await api('/api/agent/sessions?pageSize=80'); }
+  catch(e){ App.agentSessions=[]; App.agentStatus=e.message; }
+  if(App.tab==='agent'&&App.agentView==='list') render();
+}
+async function openSession(id){
+  App.agentView='session'; App.agentItems=[]; App.agentBusy=false; App.agentHistoryLoading=true; App.agentStatus='connecting…'; render();
+  try{ await agentConnect(); App.agentWs.send(JSON.stringify({op:'open',id})); }
+  catch(e){ App.agentStatus='connect failed: '+e.message; render(); }
+}
+async function newSession(cwd){
+  App.agentWorkspace=(cwd||'').trim(); localStorage.setItem('clr_agent_ws',App.agentWorkspace);
+  if(!App.agentWorkspace){ App.agentStatus='enter a workspace path first'; render(); return; }
+  App.agentView='session'; App.agentItems=[]; App.agentBusy=false; App.agentStatus='connecting…'; render();
+  try{ await agentConnect(); App.agentWs.send(JSON.stringify({op:'new',cwd:App.agentWorkspace})); }
+  catch(e){ App.agentStatus='connect failed: '+e.message; render(); }
+}
 function sendAgent(text){ text=(text||'').trim(); if(!text||!App.agentWs||App.agentBusy) return; App.agentBusy=true; App.agentWs.send(JSON.stringify({op:'send',text})); render(); }
 function interruptAgent(){ if(App.agentWs) App.agentWs.send(JSON.stringify({op:'interrupt'})); }
+function resolveApproval(it,allow){ if(App.agentWs) App.agentWs.send(JSON.stringify({op:'approve',requestId:it.requestId,decision:allow?'allow':'deny'})); it.resolved=allow; render(); }
 
+function agentUpsert(t,id){ let it=id!=null&&App.agentItems.find(x=>x.id===id&&x.t===t); if(!it){ it={t,id}; App.agentItems.push(it);} return it; }
 function onAgentEvent(ev){
   switch(ev.kind){
-    case 'Ready': App.agentStarted=true; App.agentStatus='ready'; break;
-    case 'SessionStarted': App.agentSessionId=ev.sessionId; return;
-    case 'Status': App.agentStatus=ev.text; if(ev.text==='idle'||ev.text==='interrupted') App.agentBusy=false; break;
-    case 'UserMessage': App.agentItems.push({t:'user',text:ev.text}); break;
-    case 'AssistantText': App.agentItems.push({t:'assistant',text:ev.text}); break;
-    case 'Thinking': App.agentItems.push({t:'thinking',text:ev.text}); break;
-    case 'ToolCall': App.agentItems.push({t:'tool',id:ev.itemId,name:ev.toolName,input:ev.toolInput,output:'',state:ev.state}); break;
-    case 'ToolOutput': { const it=[...App.agentItems].reverse().find(x=>x.t==='tool'&&x.id===ev.itemId);
-      if(it){ if(ev.output!=null)it.output=ev.output; it.exit=ev.exitCode; it.state=ev.state; }
-      else App.agentItems.push({t:'tool',id:ev.itemId,name:'output',output:ev.output,exit:ev.exitCode,state:ev.state}); break; }
+    case 'Opened': App.agentThreadId=ev.threadId; App.agentItems=[]; App.agentView='session'; App.agentHistoryLoading=true; App.agentStatus=ev.isNew?'new session':'loading…'; break;
+    case 'HistoryEnd': App.agentHistoryLoading=false; App.agentStatus='ready'; break;
+    case 'UserMessage': App.agentItems.push({t:'user',id:ev.itemId||('u'+App.agentItems.length),text:ev.text||''}); break;
+    case 'AssistantText': { const it=agentUpsert('assistant',ev.itemId||('a'+App.agentItems.length)); it.text = ev.delta ? (it.text||'')+(ev.text||'') : (ev.text||''); break; }
+    case 'Thinking': { const it=agentUpsert('thinking',ev.itemId||('r'+App.agentItems.length)); it.text = ev.delta ? (it.text||'')+(ev.text||'') : (ev.text||''); break; }
+    case 'ToolCall': { const it=agentUpsert('tool',ev.itemId); it.name=ev.toolName; it.input=ev.toolInput; it.state=ev.state; if(it.output==null)it.output=''; break; }
+    case 'ToolOutput': { const it=agentUpsert('tool',ev.itemId); if(ev.delta){ it.output=(it.output||'')+(ev.output||''); } else if(ev.output!=null){ it.output=ev.output; } if(ev.exitCode!=null)it.exit=ev.exitCode; it.state=ev.state; break; }
+    case 'Status': App.agentStatus=ev.text; if(ev.text==='turn-start')App.agentBusy=true; if(ev.text==='idle'||ev.text==='interrupted')App.agentBusy=false; break;
     case 'TurnResult': App.agentBusy=false; break;
     case 'Error': App.agentItems.push({t:'error',text:ev.text}); App.agentBusy=false; break;
-    case 'SessionEnded': App.agentStatus='ended'; App.agentBusy=false; break;
+    case 'PermissionRequest': App.agentItems.push({t:'approval',requestId:ev.requestId,tool:ev.tool,text:ev.text,resolved:null}); break;
     default: return;
   }
   if(App.tab==='agent') render();
 }
 
 function renderAgent(v){
-  if(!App.agentStarted){
-    v.append(el('div',{class:'note'},'Start a live agent session in a workspace on this PC — Codex runs here, you drive it from anywhere: send tasks, watch its reasoning, commands, and edits stream in real time.'));
-    const inp=el('input',{class:'txt',placeholder:'workspace path, e.g. C:\\\\code\\\\myproject',value:App.agentWorkspace,'aria-label':'workspace path'});
-    inp.addEventListener('keydown',e=>{ if(e.key==='Enter'){ startAgent(inp.value); } });
-    const go=el('button',{class:'btn primary',onclick:()=>startAgent(inp.value)}, App.agentWs?'connecting…':'Start session');
-    v.append(el('div',{class:'search'}, inp, go));
-    if(App.agentStatus) v.append(el('div',{class:App.agentStatus.includes('error')||App.agentStatus.includes('cannot')?'err':'meta'}, App.agentStatus));
+  if(App.agentView!=='session'){
+    v.append(el('div',{class:'note'},'Your codex sessions — open any to read it and continue it live (the agent runs on this PC and streams its reasoning, commands, and edits here).'));
+    const ws=el('input',{class:'txt',placeholder:'new session workspace, e.g. z:\\\\proj','aria-label':'new session workspace',value:App.agentWorkspace});
+    v.append(el('div',{class:'search'}, ws, el('button',{class:'btn primary',onclick:()=>newSession(ws.value)},'+ New')));
+    if(App.agentStatus&&App.agentSessions) v.append(el('div',{class:'meta'}, App.agentStatus));
+    if(App.agentSessions==null){ v.append(el('div',{class:'note'}, el('span',{class:'spin'}),' loading sessions…')); loadAgentSessions(); return; }
+    if(!App.agentSessions.length){ v.append(el('div',{class:'empty'},'No codex sessions found.')); return; }
+    const list=el('div',{class:'list'});
+    for(const s of App.agentSessions){
+      list.append(el('button',{class:'card',onclick:()=>openSession(s.id)},
+        el('div',{class:'row'}, el('span',{class:'title'}, s.name||s.preview||'(untitled)')),
+        (s.name&&s.preview)?el('div',{class:'snip'}, s.preview.length>150?s.preview.slice(0,150)+'…':s.preview):null,
+        el('div',{class:'sub'}, el('span',{class:'badge cx'},'CX'), el('span',{class:'meta'}, s.cwd||'—'),
+           el('span',{class:'meta'}, s.updatedAt?fmtDate(new Date(s.updatedAt*1000).toISOString()):''))));
+    }
+    v.append(list);
     return;
   }
+  // open session: a real conversation you can drive
   v.append(el('div',{class:'agenthead'},
+    el('button',{class:'btn ghost sm',onclick:()=>{App.agentView='list';App.agentSessions=null;render();}},'‹ Sessions'),
     el('span',{class:'badge cx'},'CODEX'),
-    el('span',{class:'meta'}, App.agentWorkspace),
-    el('span',{class:'meta'}, '· '+(App.agentStatus||'ready')),
-    el('button',{class:'btn ghost sm',onclick:()=>{endAgent();render();}},'End')));
+    el('span',{class:'meta'}, App.agentStatus||'')));
+  if(App.agentHistoryLoading) v.append(el('div',{class:'note'}, el('span',{class:'spin'}),' loading conversation…'));
   const thread=el('div',{});
   for(const it of App.agentItems) thread.append(agentItem(it));
-  if(App.agentBusy) thread.append(el('div',{class:'note'}, el('span',{class:'spin'}),' working…'));
+  const awaiting = App.agentItems.some(x=>x.t==='approval'&&x.resolved==null);
+  if(App.agentBusy && !awaiting) thread.append(el('div',{class:'note'}, el('span',{class:'spin'}),' working…'));
   v.append(thread);
-  const ta=el('textarea',{class:'txt',rows:'1',placeholder:'Tell the agent what to do…','aria-label':'Message to agent',disabled:App.agentBusy?'':null});
+  const ta=el('textarea',{class:'txt',rows:'1',placeholder:'Continue — tell the agent what to do next…','aria-label':'Message to agent',disabled:App.agentBusy?'':null});
   ta.addEventListener('keydown',e=>{ if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();const t=ta.value;ta.value='';sendAgent(t);} });
   const send=el('button',{class:'btn primary',onclick:()=>{const t=ta.value;ta.value='';sendAgent(t);}},'Send');
   const stop=el('button',{class:'btn',onclick:()=>interruptAgent()},'Stop');
   v.append(el('div',{class:'composer'}, ta, App.agentBusy?stop:send));
-  if(App.tab==='agent'&&!App.agentBusy) setTimeout(()=>ta.focus(),30);
 }
 function agentItem(it){
   if(it.t==='user') return el('div',{class:'turn'}, el('div',{class:'who'},'You'), el('div',{class:'bubble me'}, it.text));
-  if(it.t==='assistant') return el('div',{class:'turn'}, el('div',{class:'who'},'Codex'), el('div',{class:'bubble ai',html:md(it.text)}));
-  if(it.t==='thinking'){ const d=el('details',{class:'reason'}); d.append(el('summary',{},'reasoning'), el('div',{class:'rbody',html:esc(it.text)})); return d; }
+  if(it.t==='assistant') return el('div',{class:'turn'}, el('div',{class:'who'},'Codex'), el('div',{class:'bubble ai',html:md(it.text||'')}));
+  if(it.t==='thinking'){ const d=el('details',{class:'reason'}); d.append(el('summary',{},'reasoning'), el('div',{class:'rbody',html:esc(it.text||'')})); return d; }
   if(it.t==='error') return el('div',{class:'err'}, it.text);
+  if(it.t==='approval'){
+    const box=el('div',{class:'approval'}, el('div',{class:'who'},'⚠ Approve action?'), el('div',{class:'cmd'}, it.text));
+    if(it.resolved==null) box.append(el('div',{class:'actions'},
+      el('button',{class:'btn primary sm',onclick:()=>resolveApproval(it,true)},'Approve'),
+      el('button',{class:'btn sm',onclick:()=>resolveApproval(it,false)},'Deny')));
+    else box.append(el('div',{class:'meta'}, it.resolved?'✓ approved':'✗ denied'));
+    return box;
+  }
   if(it.t==='tool'){
     const running = it.state==='in_progress' && it.exit==null;
     const head=el('div',{class:'cmdhead'},
