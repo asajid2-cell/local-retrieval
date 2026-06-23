@@ -17,7 +17,7 @@ public static class AgentWebSocket
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
     };
 
-    public static async Task HandleAsync(WebSocket ws, CodexAgentHub hub, string defaultWorkspace, CancellationToken ct)
+    public static async Task HandleAsync(WebSocket ws, CodexAgentHub hub, ClaudeSessionStore claude, string defaultWorkspace, CancellationToken ct)
     {
         var send = new SemaphoreSlim(1, 1);
         string? openThreadId = null;
@@ -52,13 +52,23 @@ public static class AgentWebSocket
                     {
                         var id = Str(root, "id");
                         if (id is null) break;
-                        if (openThreadId is not null) hub.CloseThread(openThreadId);
+                        var source = Str(root, "source") ?? "codex";
+                        if (openThreadId is not null) { hub.CloseThread(openThreadId); openThreadId = null; }
                         try
                         {
-                            await hub.OpenThreadAsync(id, Str(root, "cwd"), OnNote, OnReq, ct);
-                            openThreadId = id;
-                            await SendJson(ws, send, new { kind = "Opened", threadId = id }, ct);
-                            foreach (var ev in await hub.ReadHistoryAsync(id, ct)) await SendJson(ws, send, ev, ct);
+                            if (source == "claude")
+                            {
+                                // Claude sessions are read-only history (no live driving yet).
+                                await SendJson(ws, send, new { kind = "Opened", threadId = id, live = false }, ct);
+                                foreach (var ev in claude.ReadHistory(id)) await SendJson(ws, send, ev, ct);
+                            }
+                            else
+                            {
+                                await hub.OpenThreadAsync(id, Str(root, "cwd"), OnNote, OnReq, ct);
+                                openThreadId = id;
+                                await SendJson(ws, send, new { kind = "Opened", threadId = id, live = true }, ct);
+                                foreach (var ev in await hub.ReadHistoryAsync(id, ct)) await SendJson(ws, send, ev, ct);
+                            }
                         }
                         catch (Exception ex) { await SendJson(ws, send, AgentEvent.Err("open failed: " + ex.Message), ct); }
                         await SendJson(ws, send, new { kind = "HistoryEnd" }, ct);
@@ -68,7 +78,7 @@ public static class AgentWebSocket
                     {
                         if (openThreadId is not null) hub.CloseThread(openThreadId);
                         openThreadId = await hub.NewThreadAsync(Str(root, "cwd") ?? defaultWorkspace, OnNote, OnReq, ct, Str(root, "approvalPolicy") ?? "on-request", Str(root, "sandbox") ?? "workspace-write");
-                        await SendJson(ws, send, new { kind = "Opened", threadId = openThreadId, isNew = true }, ct);
+                        await SendJson(ws, send, new { kind = "Opened", threadId = openThreadId, isNew = true, live = true }, ct);
                         await SendJson(ws, send, new { kind = "HistoryEnd" }, ct);
                         break;
                     }

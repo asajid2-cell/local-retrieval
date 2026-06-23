@@ -439,9 +439,9 @@ async function loadAgentSessions(){
   catch(e){ App.agentSessions=[]; App.agentStatus=e.message; }
   if(App.tab==='agent'&&App.agentView==='list') render();
 }
-async function openSession(id){
-  App.agentView='session'; App.agentItems=[]; App.agentBusy=false; App.agentHistoryLoading=true; App.agentStatus='connecting…'; render();
-  try{ await agentConnect(); App.agentWs.send(JSON.stringify({op:'open',id})); }
+async function openSession(id, source){
+  App.agentView='session'; App.agentItems=[]; App.agentBusy=false; App.agentLive=true; App.agentSource=source||'codex'; App.agentHistoryLoading=true; App.agentStatus='connecting…'; render();
+  try{ await agentConnect(); App.agentWs.send(JSON.stringify({op:'open',id,source:App.agentSource})); }
   catch(e){ App.agentStatus='connect failed: '+e.message; render(); }
 }
 async function newSession(cwd){
@@ -458,7 +458,7 @@ function resolveApproval(it,allow){ if(App.agentWs) App.agentWs.send(JSON.string
 function agentUpsert(t,id){ let it=id!=null&&App.agentItems.find(x=>x.id===id&&x.t===t); if(!it){ it={t,id}; App.agentItems.push(it);} return it; }
 function onAgentEvent(ev){
   switch(ev.kind){
-    case 'Opened': App.agentThreadId=ev.threadId; App.agentItems=[]; App.agentView='session'; App.agentHistoryLoading=true; App.agentStatus=ev.isNew?'new session':'loading…'; break;
+    case 'Opened': App.agentThreadId=ev.threadId; App.agentItems=[]; App.agentView='session'; App.agentLive=ev.live!==false; App.agentHistoryLoading=true; App.agentStatus=ev.isNew?'new session':'loading…'; break;
     case 'HistoryEnd': App.agentHistoryLoading=false; App.agentStatus='ready'; break;
     case 'UserMessage': App.agentItems.push({t:'user',id:ev.itemId||('u'+App.agentItems.length),text:ev.text||''}); break;
     case 'AssistantText': { const it=agentUpsert('assistant',ev.itemId||('a'+App.agentItems.length)); it.text = ev.delta ? (it.text||'')+(ev.text||'') : (ev.text||''); break; }
@@ -476,27 +476,29 @@ function onAgentEvent(ev){
 
 function renderAgent(v){
   if(App.agentView!=='session'){
-    v.append(el('div',{class:'note'},'Your codex sessions — open any to read it and continue it live (the agent runs on this PC and streams its reasoning, commands, and edits here).'));
+    v.append(el('div',{class:'note'},'All your coding sessions — Codex and Claude, old and new. Open any to read it; Codex sessions you can continue live (the agent runs on this PC and streams its reasoning, commands, and edits here).'));
     const ws=el('input',{class:'txt',placeholder:'new session workspace, e.g. z:\\\\proj','aria-label':'new session workspace',value:App.agentWorkspace});
     v.append(el('div',{class:'search'}, ws, el('button',{class:'btn primary',onclick:()=>newSession(ws.value)},'+ New')));
     if(App.agentStatus&&App.agentSessions) v.append(el('div',{class:'meta'}, App.agentStatus));
     if(App.agentSessions==null){ v.append(el('div',{class:'note'}, el('span',{class:'spin'}),' loading sessions…')); loadAgentSessions(); return; }
-    if(!App.agentSessions.length){ v.append(el('div',{class:'empty'},'No codex sessions found.')); return; }
+    if(!App.agentSessions.length){ v.append(el('div',{class:'empty'},'No sessions found.')); return; }
     const list=el('div',{class:'list'});
     for(const s of App.agentSessions){
-      list.append(el('button',{class:'card',onclick:()=>openSession(s.id)},
+      const cl = s.source==='claude';
+      list.append(el('button',{class:'card',onclick:()=>openSession(s.id, s.source)},
         el('div',{class:'row'}, el('span',{class:'title'}, s.name||s.preview||'(untitled)')),
-        (s.name&&s.preview)?el('div',{class:'snip'}, s.preview.length>150?s.preview.slice(0,150)+'…':s.preview):null,
-        el('div',{class:'sub'}, el('span',{class:'badge cx'},'CX'), el('span',{class:'meta'}, s.cwd||'—'),
+        (s.name&&s.preview&&s.name!==s.preview)?el('div',{class:'snip'}, s.preview.length>150?s.preview.slice(0,150)+'…':s.preview):null,
+        el('div',{class:'sub'}, el('span',{class:'badge '+(cl?'cl':'cx')}, cl?'CLAUDE':'CODEX'), el('span',{class:'meta'}, s.cwd||'—'),
            el('span',{class:'meta'}, s.updatedAt?fmtDate(new Date(s.updatedAt*1000).toISOString()):''))));
     }
     v.append(list);
     return;
   }
-  // open session: a real conversation you can drive
+  // open session: a real conversation (Codex = drivable live, Claude = history)
+  const cl = App.agentSource==='claude';
   v.append(el('div',{class:'agenthead'},
     el('button',{class:'btn ghost sm',onclick:()=>{App.agentView='list';App.agentSessions=null;render();}},'‹ Sessions'),
-    el('span',{class:'badge cx'},'CODEX'),
+    el('span',{class:'badge '+(cl?'cl':'cx')}, cl?'CLAUDE':'CODEX'),
     el('span',{class:'meta'}, App.agentStatus||'')));
   if(App.agentHistoryLoading) v.append(el('div',{class:'note'}, el('span',{class:'spin'}),' loading conversation…'));
   const thread=el('div',{});
@@ -504,6 +506,10 @@ function renderAgent(v){
   const awaiting = App.agentItems.some(x=>x.t==='approval'&&x.resolved==null);
   if(App.agentBusy && !awaiting) thread.append(el('div',{class:'note'}, el('span',{class:'spin'}),' working…'));
   v.append(thread);
+  if(App.agentLive===false){
+    v.append(el('div',{class:'note'},'Viewing a Claude session (read-only). Live driving for Claude is coming next.'));
+    return;
+  }
   const ta=el('textarea',{class:'txt',rows:'1',placeholder:'Continue — tell the agent what to do next…','aria-label':'Message to agent',disabled:App.agentBusy?'':null});
   ta.addEventListener('keydown',e=>{ if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();const t=ta.value;ta.value='';sendAgent(t);} });
   const send=el('button',{class:'btn primary',onclick:()=>{const t=ta.value;ta.value='';sendAgent(t);}},'Send');

@@ -88,4 +88,39 @@ public sealed class RolloutAndLiveMappingTests
         Assert.AreEqual("c2", e.ItemId);
         StringAssert.Contains(e.Output!, "line");
     }
+
+    [TestMethod]
+    public void Claude_ParsesMessagesThinkingAndTools_SkipsInjectedContext()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "clr-claude-" + Guid.NewGuid().ToString("N"));
+        var proj = Path.Combine(root, "z--proj");
+        Directory.CreateDirectory(proj);
+        var id = "11111111-2222-3333-4444-555555555555";
+        File.WriteAllLines(Path.Combine(proj, id + ".jsonl"), new[]
+        {
+            "{\"type\":\"user\",\"cwd\":\"z:\\\\proj\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"<system-reminder>noise</system-reminder>\"}]}}",
+            "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"fix the bug\"}]}}",
+            "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"hmm\"},{\"type\":\"text\",\"text\":\"on it\"},{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"Bash\",\"input\":{\"command\":\"ls\"}}]}}",
+            "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"t1\",\"content\":\"a.txt\"}]}}"
+        });
+        try
+        {
+            var store = new ClaudeSessionStore(root);
+            var list = store.List();
+            Assert.AreEqual(1, list.Count);
+            Assert.AreEqual("fix the bug", list[0].Title);        // injected <system-reminder> skipped for the title
+            Assert.AreEqual("z:\\proj", list[0].Cwd);
+
+            var ev = store.ReadHistory(id);
+            CollectionAssert.AreEqual(
+                new[] { AgentEventKind.UserMessage, AgentEventKind.Thinking, AgentEventKind.AssistantText, AgentEventKind.ToolCall, AgentEventKind.ToolOutput },
+                ev.Select(e => e.Kind).ToArray());
+            Assert.AreEqual("fix the bug", ev[0].Text);            // boilerplate user text dropped
+            Assert.AreEqual("Bash", ev[3].ToolName);
+            Assert.AreEqual("ls", ev[3].ToolInput);
+            Assert.AreEqual("t1", ev[4].ItemId);
+            StringAssert.Contains(ev[4].Output!, "a.txt");
+        }
+        finally { Directory.Delete(root, true); }
+    }
 }
