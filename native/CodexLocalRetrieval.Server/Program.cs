@@ -154,9 +154,9 @@ var claudeDriver = new ClaudeLiveDriver(Environment.GetEnvironmentVariable("CLR_
 // One merged, time-sorted list of BOTH tools' sessions: source "codex" (drivable) or "claude" (history).
 app.MapGet("/api/agent/sessions", async (string? cursor, int? pageSize, CancellationToken ct) =>
 {
-    var codex = (await agentHub.ListSessionsAsync(cursor, pageSize ?? 60, ct))
+    var codex = (await agentHub.ListSessionsAsync(cursor, pageSize ?? 200, ct))
         .Select(c => new AgentSessionDto(c.Id, string.IsNullOrEmpty(c.Name) ? c.Preview : c.Name, c.Preview, c.Cwd, "codex", c.UpdatedAt));
-    var claude = claudeStore.List(120)
+    var claude = claudeStore.List(250)
         .Select(c => new AgentSessionDto(c.Id, c.Title, "", c.Cwd, "claude", c.UpdatedAt));
     return Results.Json(codex.Concat(claude).OrderByDescending(x => x.UpdatedAt).ToList());
 });

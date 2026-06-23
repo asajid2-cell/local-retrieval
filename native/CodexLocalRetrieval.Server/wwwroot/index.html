@@ -126,6 +126,10 @@
   .cmdhead .exit{margin-left:auto;flex:none;font-size:10.5px;color:var(--danger)}
   .cmdhead .exit.ok{color:#5fd08a}
   .cmdout{margin:0;padding:8px 10px;border-top:1px solid var(--line);font-family:var(--mono);font-size:11.5px;color:var(--ink-mid);white-space:pre-wrap;overflow-wrap:anywhere;max-height:340px;overflow-y:auto}
+  .filters{display:flex;gap:6px;flex-wrap:wrap;margin:-4px 0 12px}
+  .fchip{font:inherit;font-size:12.5px;padding:5px 12px;min-height:30px;border:1px solid var(--line);border-radius:999px;background:transparent;color:var(--ink-mid);cursor:pointer}
+  .fchip:hover{color:var(--ink);border-color:var(--ink-dim)}
+  .fchip.on{background:var(--accent);color:var(--accent-ink);border-color:var(--accent)}
   .approval{border:1px solid #5a4a1e;background:#1a1408;border-radius:9px;padding:11px 13px;margin:8px 0}
   .approval .cmd{font-family:var(--mono);font-size:12px;color:var(--ink);margin:5px 0;overflow-wrap:anywhere;white-space:pre-wrap}
   .approval .actions{margin-top:8px}
@@ -191,15 +195,19 @@
   </div>
 
 <script>
+// Accept a bearer token from ?token= (shareable link / e2e) and persist it; else use the saved one.
+const _urlToken = new URLSearchParams(location.search).get('token');
+if(_urlToken){ try{ localStorage.setItem('clr_token', _urlToken); }catch{} }
 const App = {
-  token: localStorage.getItem('clr_token') || '',
+  token: _urlToken || localStorage.getItem('clr_token') || '',
   tab: 'agent',
   chats: [], stats: null, q: '',
   detail: null, showRollout: false,
   copilot: [], copilotBusy: false, copilotCtl: null,
-  // live agent: a browser of all codex sessions + an open conversation you can drive
-  agentWs: null, agentSessions: null, agentView: 'list', agentThreadId: null,
-  agentItems: [], agentBusy: false, agentStatus: '', agentHistoryLoading: false,
+  // live agent: a browser of all codex+claude sessions + an open conversation you can drive
+  agentWs: null, agentSessions: null, agentView: 'list', agentThreadId: null, agentSource: 'codex',
+  agentItems: [], agentBusy: false, agentLive: true, agentStatus: '', agentHistoryLoading: false,
+  agentQuery: '', agentFilter: 'all', agentStick: true,
   agentWorkspace: localStorage.getItem('clr_agent_ws') || '',
 };
 
@@ -481,9 +489,22 @@ function renderAgent(v){
     v.append(el('div',{class:'search'}, ws, el('button',{class:'btn primary',onclick:()=>newSession(ws.value)},'+ New')));
     if(App.agentStatus&&App.agentSessions) v.append(el('div',{class:'meta'}, App.agentStatus));
     if(App.agentSessions==null){ v.append(el('div',{class:'note'}, el('span',{class:'spin'}),' loading sessions…')); loadAgentSessions(); return; }
-    if(!App.agentSessions.length){ v.append(el('div',{class:'empty'},'No sessions found.')); return; }
+    // search + tool filter (client-side over the loaded set)
+    const all=App.agentSessions;
+    const nCx=all.filter(s=>s.source!=='claude').length, nCl=all.filter(s=>s.source==='claude').length;
+    const q=App.agentQuery.trim().toLowerCase();
+    const find=el('input',{class:'txt',type:'search',placeholder:'Search sessions by title or folder…','aria-label':'Search sessions',value:App.agentQuery});
+    find.addEventListener('input',()=>{ App.agentQuery=find.value; const cur=document.activeElement; render(); const f=document.querySelector('input[type=search]'); if(f){f.focus(); f.setSelectionRange(f.value.length,f.value.length);} });
+    v.append(el('div',{class:'search'}, find));
+    const chip=(key,label)=>el('button',{class:'fchip'+(App.agentFilter===key?' on':''),onclick:()=>{App.agentFilter=key;render();}}, label);
+    v.append(el('div',{class:'filters'}, chip('all','All '+all.length), chip('codex','Codex '+nCx), chip('claude','Claude '+nCl)));
+    let rows=all;
+    if(App.agentFilter==='codex') rows=rows.filter(s=>s.source!=='claude');
+    else if(App.agentFilter==='claude') rows=rows.filter(s=>s.source==='claude');
+    if(q) rows=rows.filter(s=>((s.name||'')+' '+(s.preview||'')+' '+(s.cwd||'')).toLowerCase().includes(q));
+    if(!rows.length){ v.append(el('div',{class:'empty'}, all.length?'No sessions match your search.':'No sessions found.')); return; }
     const list=el('div',{class:'list'});
-    for(const s of App.agentSessions){
+    for(const s of rows){
       const cl = s.source==='claude';
       list.append(el('button',{class:'card',onclick:()=>openSession(s.id, s.source)},
         el('div',{class:'row'}, el('span',{class:'title'}, s.name||s.preview||'(untitled)')),
@@ -506,8 +527,10 @@ function renderAgent(v){
   const awaiting = App.agentItems.some(x=>x.t==='approval'&&x.resolved==null);
   if(App.agentBusy && !awaiting) thread.append(el('div',{class:'note'}, el('span',{class:'spin'}),' working…'));
   v.append(thread);
+  agentScrollHook();
+  requestAnimationFrame(()=>{ if(App.agentView==='session'&&App.agentStick){ const se=document.scrollingElement||document.documentElement; se.scrollTop=se.scrollHeight; } });
   if(App.agentLive===false){
-    v.append(el('div',{class:'note'},'Viewing a Claude session (read-only). Live driving for Claude is coming next.'));
+    v.append(el('div',{class:'note'},'Viewing a Claude session (read-only).'));
     return;
   }
   const ta=el('textarea',{class:'txt',rows:'1',placeholder:'Continue — tell the agent what to do next…','aria-label':'Message to agent',disabled:App.agentBusy?'':null});
@@ -516,9 +539,15 @@ function renderAgent(v){
   const stop=el('button',{class:'btn',onclick:()=>interruptAgent()},'Stop');
   v.append(el('div',{class:'composer'}, ta, App.agentBusy?stop:send));
 }
+// keep the conversation pinned to the newest output unless the user scrolls up to read.
+function agentScrollHook(){
+  if(App._scrollHooked) return; App._scrollHooked=true;
+  window.addEventListener('scroll',()=>{ const se=document.scrollingElement||document.documentElement;
+    App.agentStick = (se.scrollHeight - se.scrollTop - se.clientHeight) < 140; }, {passive:true});
+}
 function agentItem(it){
   if(it.t==='user') return el('div',{class:'turn'}, el('div',{class:'who'},'You'), el('div',{class:'bubble me'}, it.text));
-  if(it.t==='assistant') return el('div',{class:'turn'}, el('div',{class:'who'},'Codex'), el('div',{class:'bubble ai',html:md(it.text||'')}));
+  if(it.t==='assistant') return el('div',{class:'turn'}, el('div',{class:'who'}, App.agentSource==='claude'?'Claude':'Codex'), el('div',{class:'bubble ai',html:md(it.text||'')}));
   if(it.t==='thinking'){ const d=el('details',{class:'reason'}); d.append(el('summary',{},'reasoning'), el('div',{class:'rbody',html:esc(it.text||'')})); return d; }
   if(it.t==='error') return el('div',{class:'err'}, it.text);
   if(it.t==='approval'){
