@@ -112,7 +112,26 @@ nginx `/remote` already forwards `Upgrade` headers, so WebSockets work. WS upgra
 3. `--resume` semantics: does it replay prior turns or just continue? (affects P1/P2).
 4. Process lifecycle / partial-line JSON framing / reconnect.
 
-## Status
+## THE REAL DRIVER (supersedes P0's exec-per-turn): codex app-server client
+
+P0 drove `codex exec --json` per turn — too low-fidelity. The real thing is a client of **`codex
+app-server`** (the JSON-RPC protocol the Codex desktop app uses), proven against the real CLI:
+- Transport: spawn `codex app-server -c service_tier=fast`, newline-delimited JSON-RPC over stdio.
+  Responses `{id,result}`, notifications `{method,params}`, server-requests (approvals) `{id,method,params}`.
+- `thread/list` → ALL sessions (id, name, preview, cwd, rollout path, timestamps) — verified, returned
+  the user's real sessions. `thread/read` → full history. `thread/resume` + `turn/start` → go live.
+  `turn/steer` (mid-turn steering), `turn/interrupt`. ServerNotifications stream `item/*` deltas
+  (agentMessage, reasoning, commandExecution output, fileChange patches) + `turn/*`. ServerRequests =
+  approvals (execCommandApproval / applyPatchApproval / item/*/requestApproval).
+- This makes OUR server a real codex client → /remote shows all sessions as real conversations you
+  open and drive, generally (no per-session manual remote). This is what the user actually wants.
+
+Milestones: **M0 (DONE)** `CodexAppServer` JSON-RPC client (Core) + live test (initialize + thread/list
+returns real sessions). M1 sidebar of all sessions (thread/list) + open any as a conversation
+(thread/read). M2 go live (resume + turn/start + streaming item/* deltas). M3 approvals + steer. M4
+Claude adapter + ship through /remote.
+
+## Status (P0 — the earlier low-fidelity slice, kept as a fallback path)
 
 **P0 — DONE + verified (codex-first).** Live codex session over a WebSocket, driven from the web:
 - `Core/Agents/`: `AgentEvent` (unified model), `IAgentSession`, `CodexEventMapper` (pure, 9 tests),
