@@ -41,8 +41,13 @@ public sealed class ArchiveService
         var loadPath = File.Exists(_storePath) ? _storePath : _bundledStorePath;
         if (File.Exists(loadPath))
         {
-            var json = await File.ReadAllTextAsync(loadPath);
-            Store = JsonSerializer.Deserialize<AppStoreData>(json, _jsonOptions) ?? new AppStoreData();
+            // The store can be tens of MB. Read + deserialize OFF the calling (UI) thread, straight from
+            // the file stream (no giant intermediate string), so launch never blocks the UI.
+            Store = await Task.Run(() =>
+            {
+                using var fs = File.OpenRead(loadPath);
+                return JsonSerializer.Deserialize<AppStoreData>(fs, _jsonOptions) ?? new AppStoreData();
+            }) ?? new AppStoreData();
         }
         NormalizeSettings();
         RefreshSessions(OrderedVisibleSessions(Store.Sessions.Values));

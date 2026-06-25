@@ -46,7 +46,9 @@ public sealed partial class MainPage : Page
             ApplyThemeAndShape();
             _storeLoaded = true;
             SessionList.ItemsSource = _archive.Sessions;
+            Diag.Log("MP.Loaded: list bound");
             SelectFirstSession();
+            Diag.Log("MP.Loaded: first selected");
             RenderCurrent();
             Diag.Log("MP.Loaded: render done");
             StartCaptureHarness();
