@@ -192,7 +192,7 @@ public sealed partial class MainPage : Page
 
     private int _archiveShown;
     private ArchiveSession? _lastArchiveSession;
-    private const int ArchivePageSize = 60;
+    private const int ArchivePageSize = 25;
 
     private void RenderArchive()
     {
@@ -431,6 +431,9 @@ public sealed partial class MainPage : Page
         };
     }
 
+    private static string CapDisplay(string s, int max) =>
+        string.IsNullOrEmpty(s) || s.Length <= max ? s : s[..max] + "\n\n…(truncated — reopen the chat to see the full message)";
+
     private Border MessageBubble(ArchiveMessage message)
     {
         var stack = new StackPanel { Spacing = 10 };
@@ -442,7 +445,10 @@ public sealed partial class MainPage : Page
         });
         stack.Children.Add(new TextBlock
         {
-            Text = CleanReadingText(message.Text),
+            // A single message can carry a 500KB tool dump; laying that out in a wrapping TextBlock is what
+            // made opening a chat hitch. Cap the DISPLAYED text (full content stays in the source file —
+            // "Resume in terminal" / "Open in VS Code" shows it all).
+            Text = CapDisplay(CleanReadingText(message.Text), 4000),
             TextWrapping = TextWrapping.Wrap,
             Foreground = StrongBrush(),
             LineHeight = 22,
@@ -481,7 +487,7 @@ public sealed partial class MainPage : Page
                 Children =
                 {
                     new TextBlock { Text = block.Language, Foreground = MutedBrush(), FontSize = 12 },
-                    new TextBlock { Text = block.Code, Foreground = StrongBrush(), FontFamily = new FontFamily("Consolas"), TextWrapping = TextWrapping.Wrap }
+                    new TextBlock { Text = CapDisplay(block.Code, 4000), Foreground = StrongBrush(), FontFamily = new FontFamily("Consolas"), TextWrapping = TextWrapping.Wrap }
                 }
             }
         };
