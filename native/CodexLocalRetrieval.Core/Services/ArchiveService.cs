@@ -66,12 +66,27 @@ public sealed class ArchiveService
 
     public async Task SaveAsync()
     {
-        // Serialize a synchronous snapshot, then gate the file write so overlapping saves
-        // (a background sync finishing while the user pins/files a chat) can't clobber each other.
+        // The store can be tens of MB, and SaveAsync runs on the UI thread from many actions (pin, rename,
+        // sync). Snapshot the top-level dictionaries on the caller's thread (cheap — references only, and the
+        // merge REPLACES session objects rather than mutating them, so the snapshot stays stable), then
+        // serialize + write entirely OFF the UI thread so a save never freezes the app.
         Directory.CreateDirectory(Path.GetDirectoryName(_storePath)!);
-        var json = JsonSerializer.Serialize(Store, _jsonOptions);
+        var snapshot = new AppStoreData
+        {
+            Settings = Store.Settings,
+            Sessions = new Dictionary<string, ArchiveSession>(Store.Sessions),
+            Collections = new Dictionary<string, ArchiveCollection>(Store.Collections),
+            FileStamps = new Dictionary<string, string>(Store.FileStamps),
+        };
         await _saveGate.WaitAsync();
-        try { await File.WriteAllTextAsync(_storePath, json); }
+        try
+        {
+            await Task.Run(async () =>
+            {
+                var json = JsonSerializer.Serialize(snapshot, _jsonOptions);
+                await File.WriteAllTextAsync(_storePath, json);
+            });
+        }
         finally { _saveGate.Release(); }
     }
 
