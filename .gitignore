@@ -48,3 +48,6 @@ artifacts/
 # remote server: battery fixtures and publish output
 _battery*.html
 publish/
+
+# Build-generated launcher shortcut (machine-specific absolute path)
+Chat Hub.lnk

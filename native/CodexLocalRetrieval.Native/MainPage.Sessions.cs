@@ -122,7 +122,7 @@ public sealed partial class MainPage
 
     private void ShowAddToProjectFlyout(FrameworkElement anchor, ArchiveSession session)
     {
-        var flyout = new MenuFlyout();
+        var flyout = new MenuFlyout { AreOpenCloseAnimationsEnabled = false };
         foreach (var collection in _archive.Store.Collections.Values.OrderBy(c => c.Name))
         {
             var item = new MenuFlyoutItem { Text = collection.Name, Tag = collection.Name };
@@ -144,13 +144,12 @@ public sealed partial class MainPage
     }
 
     // L4: the Source inspector, rebuilt as a real event timeline read straight from the rollout.
-    private UIElement SourceEventsPanel(ArchiveSession session)
+    private UIElement SourceEventsPanel(ArchiveSession session, IReadOnlyList<RawEvent> events)
     {
-        var events = _archive.ReadEvents(session);
         var stack = new StackPanel { Spacing = 0 };
         stack.Children.Add(new TextBlock
         {
-            Text = $"{events.Count} events - {session.Messages.Count} messages - {session.CodeBlocks.Count} code blocks",
+            Text = $"{events.Count} events - {session.MessageCount} messages - {session.CodeBlocks.Count} code blocks",
             Foreground = MutedBrush(),
             FontSize = 12,
             Margin = new Thickness(0, 0, 0, 12)

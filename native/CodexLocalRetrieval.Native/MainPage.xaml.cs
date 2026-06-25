@@ -194,6 +194,10 @@ public sealed partial class MainPage : Page
     private ArchiveSession? _lastArchiveSession;
     private const int ArchivePageSize = 25;
 
+    private int _searchShown;
+    private string _lastSearchQuery = "";
+    private const int SearchPageSize = 25;
+
     private void RenderArchive()
     {
         ScreenLabel.Text = _selected is null
@@ -263,9 +267,21 @@ public sealed partial class MainPage : Page
             return;
         }
 
-        foreach (var hit in hits)
+        // New query -> start paging fresh (Show more keeps the same query, so it won't reset).
+        if (!string.Equals(_deepSearchQuery, _lastSearchQuery, StringComparison.Ordinal)) { _searchShown = 0; _lastSearchQuery = _deepSearchQuery; }
+        var shown = Math.Min(_searchShown <= 0 ? SearchPageSize : _searchShown, hits.Count);
+        for (var i = 0; i < shown; i++) MainContent.Children.Add(SearchHitResult(hits[i]));
+
+        if (shown < hits.Count)
         {
-            MainContent.Children.Add(SearchHitResult(hit));
+            var more = new Button
+            {
+                Content = $"Show {Math.Min(SearchPageSize, hits.Count - shown)} more  ({hits.Count - shown} left)",
+                Margin = new Thickness(0, 8, 0, 16),
+                HorizontalAlignment = HorizontalAlignment.Center
+            };
+            more.Click += (_, _) => { _searchShown = shown + SearchPageSize; RenderSearch(query); };
+            MainContent.Children.Add(more);
         }
     }
 
@@ -370,7 +386,20 @@ public sealed partial class MainPage : Page
             return;
         }
         MainContent.Children.Add(InfoPanel("Source file", _selected.SourcePath));
-        MainContent.Children.Add(SourceEventsPanel(_selected));
+        // Read + parse the rollout OFF the UI thread (up to 400 lines) so opening Source never hitches.
+        MainContent.Children.Add(EmptyBlock("Reading source...", _selected.WorkspaceName));
+        _ = LoadSourceThenRenderAsync(_selected);
+    }
+
+    private async Task LoadSourceThenRenderAsync(ArchiveSession session)
+    {
+        IReadOnlyList<RawEvent> events;
+        try { events = await _archive.ReadEventsAsync(session); }
+        catch (Exception ex) { Diag.Log("ReadEvents: " + ex.Message); events = Array.Empty<RawEvent>(); }
+        if (!ReferenceEquals(_selected, session) || _screen != "Source") return;
+        MainContent.Children.Clear();
+        MainContent.Children.Add(InfoPanel("Source file", session.SourcePath));
+        MainContent.Children.Add(SourceEventsPanel(session, events));
     }
 
     private void RenderRestore()
@@ -1341,11 +1370,13 @@ public sealed partial class MainPage : Page
     private void CopyCode_Click(object sender, RoutedEventArgs e) => Copy("code");
     private void CopyPath_Click(object sender, RoutedEventArgs e) => Copy("path");
 
-    private void Copy(string mode)
+    private async void Copy(string mode)
     {
         if (_selected is null) return;
+        var session = _selected;
+        if (mode is not ("path" or "paths")) await _archive.EnsureContentAsync(session); // off-thread, no UI block
         var package = new DataPackage();
-        package.SetText(_archive.CopyPayload(_selected, mode));
+        package.SetText(_archive.CopyPayload(session, mode));
         Clipboard.SetContent(package);
     }
 
@@ -1383,7 +1414,7 @@ public sealed partial class MainPage : Page
         _selected = session;
         SessionList.SelectedItem = session;
 
-        var flyout = new MenuFlyout();
+        var flyout = new MenuFlyout { AreOpenCloseAnimationsEnabled = false }; // snap open instantly (no fade-in lag)
         var pinItem = new MenuFlyoutItem { Text = session.Pinned ? "Unpin chat" : "Pin chat" };
         pinItem.Click += async (_, _) => await TogglePinSelected();
         flyout.Items.Add(pinItem);

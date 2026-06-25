@@ -419,7 +419,7 @@ public sealed class ArchiveService
 
     public string CopyPayload(ArchiveSession session, string mode)
     {
-        EnsureContent(session); // restore/code/resume need the messages + code blocks (lazy-loaded)
+        if (mode is not ("path" or "paths")) EnsureContent(session); // restore/code/resume need content (lazy)
         return mode switch
         {
             "code" => session.CodeBlocks.Count == 0
@@ -602,7 +602,11 @@ public sealed class ArchiveService
         if (imported.Count > 0)
         {
             RemoveBundledSampleSessions(imported);
-            EnrichTitlesFromLocalState();
+            // Read the (slow) sqlite/jsonl titles OFF the UI thread; apply on this (UI) thread so the
+            // INotifyPropertyChanged raised by ApplyThreadTitles never fires from a worker. The final
+            // RefreshSessions below repaints the list, so we don't refresh here.
+            var titles = await Task.Run(LoadThreadTitles);
+            ApplyThreadTitles(titles);
         }
         // On a parser-version migration every file was re-parsed: prune sessions whose file WAS
         // scanned but no longer yields that id (old id scheme, or the file is now a skipped sidechain).
@@ -720,6 +724,11 @@ public sealed class ArchiveService
 
     // The raw rollout timeline: one entry per recorded event (messages, tool/function calls,
     // command runs, reasoning) so the Source inspector shows what actually happened, not a path.
+    // Off-thread variant: the Source inspector reads + JSON-parses up to `limit` lines, which must
+    // not happen on the UI thread for a large rollout.
+    public Task<IReadOnlyList<RawEvent>> ReadEventsAsync(ArchiveSession session, int limit = 400)
+        => Task.Run(() => ReadEvents(session, limit));
+
     public IReadOnlyList<RawEvent> ReadEvents(ArchiveSession session, int limit = 400)
     {
         var events = new List<RawEvent>();
@@ -1356,8 +1365,6 @@ public sealed class ArchiveService
         Store.Settings.ReadOnlySourceMode = true;
         return changed;
     }
-
-    private bool EnrichTitlesFromLocalState() => ApplyThreadTitles(LoadThreadTitles());
 
     private bool ApplyThreadTitles(Dictionary<string, ThreadTitle> titles)
     {

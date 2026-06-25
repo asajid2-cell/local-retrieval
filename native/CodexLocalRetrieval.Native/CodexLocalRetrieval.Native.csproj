@@ -77,4 +77,14 @@
     <PublishTrimmed Condition="'$(Configuration)' == 'Debug'">False</PublishTrimmed>
     <PublishTrimmed Condition="'$(Configuration)' != 'Debug'">False</PublishTrimmed>
   </PropertyGroup>
+
+  <!--
+    After every build, refresh "Chat Hub.lnk" at the repo root so there's always a
+    double-clickable launcher pointing at the freshest exe. Best-effort: the helper
+    swallows its own errors and the step never fails the build.
+  -->
+  <Target Name="CreateRootShortcut" AfterTargets="Build" Condition="'$(OS)' == 'Windows_NT'">
+    <Exec ContinueOnError="true"
+          Command="powershell -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildProjectDirectory)\make-shortcut.ps1&quot; -Exe &quot;$(TargetDir)$(AssemblyName).exe&quot; -Out &quot;$(MSBuildProjectDirectory)\..\..\Chat Hub.lnk&quot;" />
+  </Target>
 </Project>
