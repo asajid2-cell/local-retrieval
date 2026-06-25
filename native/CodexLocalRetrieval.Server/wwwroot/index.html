@@ -76,9 +76,19 @@
   .list{display:flex;flex-direction:column;gap:8px}
   .card{
     background:var(--panel); border:1px solid var(--line); border-radius:var(--r-card);
-    padding:13px 14px; text-align:left; width:100%; display:block;
+    text-align:left; width:100%; overflow:hidden;
   }
-  button.card:hover{border-color:#39394a;background:var(--panel-2)}
+  .card:hover{border-color:#39394a}
+  .cardmain{padding:13px 14px;cursor:pointer;display:block}
+  .cardmain:hover{background:var(--panel-2)}
+  .cardmain:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+  .cardacts{display:flex;gap:6px;padding:7px 12px;border-top:1px solid var(--line);background:#0e0e12}
+  .btn.ghost.xs,.btn.xs{min-height:30px;padding:0 11px;font-size:11.5px;font-weight:500;background:transparent}
+  .reopenbar{display:flex;align-items:center;gap:8px;margin:0 0 10px 2px;flex-wrap:wrap}
+  .reopenbar .meta{margin-right:2px}
+  .toast{position:fixed;left:50%;bottom:calc(20px + env(safe-area-inset-bottom));transform:translateX(-50%);z-index:60;
+    background:var(--panel-2);color:var(--ink);border:1px solid var(--accent);border-radius:999px;padding:9px 16px;font-size:13px;
+    box-shadow:0 6px 24px rgba(0,0,0,.5);max-width:90vw;text-align:center}
   .card .row{display:flex;align-items:center;gap:8px;min-width:0}
   .card .title{font-weight:600;font-size:14px;min-width:0;overflow-wrap:anywhere;flex:1 1 auto}
   .card .snip{color:var(--ink-mid);font-size:12.5px;margin-top:5px;overflow-wrap:anywhere}
@@ -252,7 +262,7 @@ const App = {
   agentItems: [], agentBusy: false, agentLive: true, agentStatus: '', agentHistoryLoading: false,
   agentQuery: '', agentFilter: 'all', agentStick: true,
   agentMode: 'safe', autoAvailable: null, askKey: false,
-  agentTitle: '', agentRenaming: false,
+  agentTitle: '', agentCwd: '', agentRenaming: false, toast: '',
   signKey: localStorage.getItem('clr_sign_key') || '',
   agentWorkspace: localStorage.getItem('clr_agent_ws') || '',
 };
@@ -508,10 +518,17 @@ async function loadAgentSessions(){
   catch(e){ App.agentSessions=[]; App.agentStatus=e.message; }
   if(App.tab==='agent'&&App.agentView==='list') render();
 }
-async function openSession(id, source, title){
-  App.agentView='session'; App.agentItems=[]; App.agentBusy=false; App.agentLive=true; App.agentSource=source||'codex'; App.agentTitle=title||''; App.agentRenaming=false; App.agentHistoryLoading=true; App.agentStatus='connecting…'; render();
+async function openSession(id, source, title, cwd){
+  App.agentView='session'; App.agentItems=[]; App.agentBusy=false; App.agentLive=true; App.agentSource=source||'codex'; App.agentTitle=title||''; App.agentCwd=cwd||''; App.agentRenaming=false; App.agentHistoryLoading=true; App.agentStatus='connecting…'; render();
   try{ await agentConnect(); App.agentWs.send(JSON.stringify({op:'open',id,source:App.agentSource})); }
   catch(e){ App.agentStatus='connect failed: '+e.message; render(); }
+}
+function showToast(msg){ App.toast=msg; render(); clearTimeout(showToast._t); showToast._t=setTimeout(()=>{ App.toast=''; if(App.tab==='agent') render(); }, 3500); }
+// reopen a chat where you work: in VS Code (the same session) or a terminal — launches on the PC.
+async function reopen(sess, target){
+  try{ const r=await api('/api/agent/sessions/'+encodeURIComponent(sess.id)+'/open', { method:'POST', body:{target, source:sess.source, cwd:sess.cwd} });
+    showToast(r.message || 'opening…');
+  }catch(e){ showToast('couldn’t reopen: '+e.message); }
 }
 async function renameAgentSession(newTitle){
   newTitle=(newTitle||'').trim(); if(!newTitle||!App.agentThreadId) { App.agentRenaming=false; render(); return; }
@@ -589,6 +606,7 @@ function onAgentEvent(ev){
 }
 
 function renderAgent(v){
+  if(App.toast) v.append(el('div',{class:'toast'}, App.toast));
   if(App.agentView!=='session'){
     v.append(el('div',{class:'note'},'All your coding sessions — Codex and Claude, old and new. Open any to read it, then continue it live: send a task and watch the reasoning, commands, and edits stream as the agent works on this PC.'));
     const ws=el('input',{class:'txt',placeholder:'new session workspace, e.g. z:\\\\proj','aria-label':'new session workspace',value:App.agentWorkspace});
@@ -612,11 +630,16 @@ function renderAgent(v){
     const list=el('div',{class:'list'});
     for(const s of rows){
       const cl = s.source==='claude';
-      list.append(el('button',{class:'card',onclick:()=>openSession(s.id, s.source, s.name)},
+      const main=el('div',{class:'cardmain',role:'button',tabindex:'0',onclick:()=>openSession(s.id, s.source, s.name, s.cwd)},
         el('div',{class:'row'}, el('span',{class:'title'}, s.name||s.preview||'(untitled)')),
         (s.name&&s.preview&&s.name!==s.preview)?el('div',{class:'snip'}, s.preview.length>150?s.preview.slice(0,150)+'…':s.preview):null,
         el('div',{class:'sub'}, el('span',{class:'badge '+(cl?'cl':'cx')}, cl?'CLAUDE':'CODEX'), el('span',{class:'meta'}, s.cwd||'—'),
-           el('span',{class:'meta'}, s.updatedAt?fmtDate(new Date(s.updatedAt*1000).toISOString()):''))));
+           el('span',{class:'meta'}, s.updatedAt?fmtDate(new Date(s.updatedAt*1000).toISOString()):'')));
+      main.addEventListener('keydown',e=>{ if(e.key==='Enter'||e.key===' '){e.preventDefault();openSession(s.id,s.source,s.name);} });
+      const acts=el('div',{class:'cardacts'},
+        el('button',{class:'btn ghost xs',title:'Open this chat in VS Code',onclick:()=>reopen(s,'vscode')},'↗ VS Code'),
+        el('button',{class:'btn ghost xs',title:'Resume this chat in a terminal',onclick:()=>reopen(s,'terminal')},'❯ Terminal'));
+      list.append(el('div',{class:'card'}, main, acts));
     }
     v.append(list);
     return;
@@ -636,6 +659,12 @@ function renderAgent(v){
     if(cl) head.append(el('button',{class:'btn ghost sm rename','aria-label':'Rename session',title:'Rename',onclick:()=>{App.agentRenaming=true;render();}},'✎'));
   }
   v.append(head);
+  // reopen this chat where you work
+  const me={id:App.agentThreadId, source:App.agentSource, cwd:App.agentCwd};
+  v.append(el('div',{class:'reopenbar'},
+    el('span',{class:'meta'},'Reopen:'),
+    el('button',{class:'btn ghost xs',title:'Open in VS Code',onclick:()=>reopen(me,'vscode')},'↗ VS Code'),
+    el('button',{class:'btn ghost xs',title:'Resume in a terminal',onclick:()=>reopen(me,'terminal')},'❯ Terminal')));
   if(App.agentStatus) v.append(el('div',{class:'meta substatus'}, App.agentStatus));
   if(App.agentHistoryLoading) v.append(el('div',{class:'note'}, el('span',{class:'spin'}),' loading conversation…'));
   const thread=el('div',{});

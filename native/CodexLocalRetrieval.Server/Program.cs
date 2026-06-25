@@ -182,6 +182,16 @@ app.MapPost("/api/agent/sessions/{id}/rename", (string id, RenameRequest req) =>
         : Results.NotFound(new { error = "session not found" });
 });
 
+// Reopen a chat where you work: in VS Code (the same session) or a fresh terminal. Launches on this PC.
+var claudeExeForLaunch = Environment.GetEnvironmentVariable("CLR_CLAUDE_EXE")
+    ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".local", "bin", "claude.exe");
+var launcher = new SessionLauncher(claudeExeForLaunch, codexExe, allowLaunch);
+app.MapPost("/api/agent/sessions/{id}/open", (string id, OpenRequest req) =>
+{
+    var (ok, msg) = launcher.Open(req?.Source ?? "codex", id, req?.Target ?? "terminal", req?.Cwd);
+    return ok ? Results.Json(new { ok = true, message = msg }) : Results.BadRequest(new { error = msg });
+});
+
 app.Map("/api/agent", async (HttpContext ctx) =>
 {
     if (!ctx.WebSockets.IsWebSocketRequest) { ctx.Response.StatusCode = StatusCodes.Status400BadRequest; return; }

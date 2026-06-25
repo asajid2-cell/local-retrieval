@@ -145,6 +145,7 @@ public sealed class CodexAgentHub : IAsyncDisposable
 public sealed record AgentSessionDto(string Id, string Name, string Preview, string Cwd, string Source, long UpdatedAt);
 
 public sealed record RenameRequest(string? Title, string? Source);
+public sealed record OpenRequest(string? Target, string? Source, string? Cwd);
 
 // What the sidebar renders for each session (from thread/list).
 public sealed record SessionInfo(string Id, string Name, string Preview, string Cwd, string Source, long UpdatedAt)
