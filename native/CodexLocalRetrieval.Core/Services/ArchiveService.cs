@@ -14,6 +14,9 @@ public sealed class ArchiveService
     private const int MaxMessagesPerSession = 220;
     private const int MaxLinesPerSession = 18_000;
     private const int MaxLineChars = 512_000;
+    private const int SearchTextCap = 6_000; // capped, in-memory searchable text per session (full content lazy-loads)
+
+    private static string CapText(string s) => string.IsNullOrEmpty(s) || s.Length <= SearchTextCap ? s : s[..SearchTextCap];
 
     private readonly string _rootPath;
     private readonly string _storePath;
@@ -46,11 +49,48 @@ public sealed class ArchiveService
             Store = await Task.Run(() =>
             {
                 using var fs = File.OpenRead(loadPath);
-                return JsonSerializer.Deserialize<AppStoreData>(fs, _jsonOptions) ?? new AppStoreData();
+                var data = JsonSerializer.Deserialize<AppStoreData>(fs, _jsonOptions) ?? new AppStoreData();
+                // A store written before the metadata-only change still has full (uncapped) Text; cap it in
+                // memory so even the first load is light. Next save persists the capped form.
+                foreach (var s in data.Sessions.Values)
+                    if (s.Text.Length > SearchTextCap) s.Text = s.Text[..SearchTextCap];
+                return data;
             }) ?? new AppStoreData();
         }
         NormalizeSettings();
         RefreshSessions(OrderedVisibleSessions(Store.Sessions.Values));
+    }
+
+    // Lazy-load a chat's full content (messages + code blocks) from its source file on demand, OFF the
+    // UI thread. The store holds only metadata, so this runs when a chat is opened or its content is
+    // needed (co-pilot, copy-code). Cheap no-op once loaded.
+    public async Task EnsureContentAsync(ArchiveSession session)
+    {
+        if (session.ContentLoaded) return;
+        // SourcePath may be relative (the bundled demo store) — resolve against the project root.
+        var path = string.IsNullOrEmpty(session.SourcePath) ? "" :
+            Path.IsPathRooted(session.SourcePath) ? session.SourcePath : Path.Combine(_rootPath, session.SourcePath);
+        if (path.Length == 0 || !File.Exists(path))
+        {
+            session.ContentLoaded = true;
+            return;
+        }
+        var parsed = await Task.Run(async () => await ParseSessionAsync(path, session.Tool));
+        if (parsed is not null)
+        {
+            session.Messages = parsed.Messages;
+            session.CodeBlocks = parsed.CodeBlocks;
+            session.MessageCount = parsed.Messages.Count;
+        }
+        session.ContentLoaded = true;
+    }
+
+    // Synchronous lazy-load for callers that can't await (the co-pilot's sync tool delegates, the web read
+    // handler). Runs the parse on the thread pool (no captured context) so it can't deadlock the UI.
+    public void EnsureContent(ArchiveSession session)
+    {
+        if (session.ContentLoaded) return;
+        Task.Run(() => EnsureContentAsync(session)).GetAwaiter().GetResult();
     }
 
     public async Task<bool> EnrichTitlesFromLocalStateAsync()
@@ -379,6 +419,7 @@ public sealed class ArchiveService
 
     public string CopyPayload(ArchiveSession session, string mode)
     {
+        EnsureContent(session); // restore/code/resume need the messages + code blocks (lazy-loaded)
         return mode switch
         {
             "code" => session.CodeBlocks.Count == 0
@@ -841,7 +882,9 @@ public sealed class ArchiveService
             Tool = "codex",
             Messages = messages,
             CodeBlocks = codeBlocks,
-            Text = string.Join("\n\n", messages.Select(m => m.Text)),
+            MessageCount = messages.Count,
+            ContentLoaded = true,
+            Text = CapText(string.Join("\n\n", messages.Select(m => m.Text))),
             Tags = new ObservableCollection<string>(codeBlocks.Count > 0 ? new[] { "archive", "code" } : new[] { "archive" })
         };
     }
@@ -928,7 +971,9 @@ public sealed class ArchiveService
             Tool = "claude",
             Messages = messages,
             CodeBlocks = codeBlocks,
-            Text = string.Join("\n\n", messages.Select(m => m.Text)),
+            MessageCount = messages.Count,
+            ContentLoaded = true,
+            Text = CapText(string.Join("\n\n", messages.Select(m => m.Text))),
             Tags = new ObservableCollection<string>(codeBlocks.Count > 0 ? new[] { "archive", "code" } : new[] { "archive" })
         };
     }
@@ -1094,18 +1139,18 @@ public sealed class ArchiveService
             };
         }
 
-        foreach (var message in session.Messages)
+        // Content match against the capped, in-memory search text (the full transcript lazy-loads on open,
+        // so we don't hold every message of every chat in memory just to search).
+        var contentScore = FuzzyScore(session.Text, terms);
+        if (contentScore > 0)
         {
-            var score = FuzzyScore(message.Text, terms);
-            if (score <= 0) continue;
             yield return new ArchiveSearchHit
             {
                 Session = session,
-                Message = message,
-                SourceLabel = message.RoleLabel,
-                Snippet = MakeSnippet(message.Text, terms),
-                MatchedTerms = MatchedTerms(message.Text, terms),
-                Score = score
+                SourceLabel = "chat content",
+                Snippet = MakeSnippet(session.Text, terms),
+                MatchedTerms = MatchedTerms(session.Text, terms),
+                Score = contentScore
             };
         }
 

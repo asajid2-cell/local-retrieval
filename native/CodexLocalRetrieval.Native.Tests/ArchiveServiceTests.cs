@@ -442,11 +442,13 @@ public sealed class ArchiveServiceTests
         var service = new ArchiveService(useBundledStore: true);
         await service.LoadAsync();
 
-        var hits = service.DeepSearch("score export");
+        // DeepSearch now matches the capped, in-memory Text (full transcripts lazy-load on open), so
+        // search terms that live in the stored text.
+        var hits = service.DeepSearch("restore packet");
         var fixture = service.Search("fixture-b").First();
         var path = service.CopyPayload(fixture, "path");
 
-        Assert.IsTrue(hits.Any(hit => hit.Session.Id == "fixture-b" && hit.Snippet.Contains("score")));
+        Assert.IsTrue(hits.Any(hit => hit.Session.Id == "fixture-b" && hit.Snippet.Contains("restore", StringComparison.OrdinalIgnoreCase)));
         Assert.AreEqual(fixture.SourcePath, path);
     }
 }

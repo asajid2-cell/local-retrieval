@@ -190,6 +190,10 @@ public sealed partial class MainPage : Page
         BackButton.Opacity = _backStack.Count > 0 ? 1 : 0.45;
     }
 
+    private int _archiveShown;
+    private ArchiveSession? _lastArchiveSession;
+    private const int ArchivePageSize = 60;
+
     private void RenderArchive()
     {
         ScreenLabel.Text = _selected is null
@@ -205,9 +209,43 @@ public sealed partial class MainPage : Page
             return;
         }
 
-        foreach (var message in _selected.Messages.Take(80))
+        // New chat selected -> start its pagination fresh (Load more keeps the same session, so it won't reset).
+        if (!ReferenceEquals(_selected, _lastArchiveSession)) { _archiveShown = 0; _lastArchiveSession = _selected; }
+
+        // Content lazy-loads from the source file the first time you open a chat (the store holds only
+        // metadata), then paginates so a huge transcript never renders all at once.
+        if (!_selected.ContentLoaded)
         {
-            MainContent.Children.Add(MessageBubble(message));
+            MainContent.Children.Add(EmptyBlock("Loading conversation...", _selected.WorkspaceName));
+            _ = EnsureContentThenRenderAsync(_selected);
+            return;
+        }
+
+        var messages = _selected.Messages;
+        var shown = Math.Min(_archiveShown <= 0 ? ArchivePageSize : _archiveShown, messages.Count);
+        for (var i = 0; i < shown; i++) MainContent.Children.Add(MessageBubble(messages[i]));
+
+        if (shown < messages.Count)
+        {
+            var more = new Button
+            {
+                Content = $"Load {Math.Min(ArchivePageSize, messages.Count - shown)} more  ({messages.Count - shown} left)",
+                Margin = new Thickness(0, 8, 0, 16),
+                HorizontalAlignment = HorizontalAlignment.Center
+            };
+            more.Click += (_, _) => { _archiveShown = shown + ArchivePageSize; RenderArchive(); };
+            MainContent.Children.Add(more);
+        }
+    }
+
+    private async Task EnsureContentThenRenderAsync(ArchiveSession session)
+    {
+        try { await _archive.EnsureContentAsync(session); }
+        catch (Exception ex) { Diag.Log("EnsureContent: " + ex.Message); }
+        if (ReferenceEquals(_selected, session) && _screen == "Archive")
+        {
+            _archiveShown = ArchivePageSize;
+            RenderArchive();
         }
     }
 

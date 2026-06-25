@@ -63,6 +63,7 @@ public sealed class RemoteApi
     {
         var session = _archive.GetSession(id);
         if (session is null) return null;
+        _archive.EnsureContent(session); // content lazy-loads from the source file
         page = Math.Max(0, page);
         pageSize = Math.Clamp(pageSize, 1, 50);
         var all = session.Messages;

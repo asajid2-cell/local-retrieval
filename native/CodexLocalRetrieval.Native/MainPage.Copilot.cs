@@ -286,10 +286,11 @@ public sealed partial class MainPage
         if (session is not null) DispatcherQueue.TryEnqueue(() => ResumeInTerminal(session));
     }
 
-    private void OpenChatPreview(string id)
+    private async void OpenChatPreview(string id)
     {
         var session = _archive.GetSession(id);
         if (session is null) return;
+        await _archive.EnsureContentAsync(session); // content lazy-loads from the source file
         var snapshot = session.Messages
             .Take(80)
             .Select(m => (m.RoleLabel, ArchiveService.ForReading(m.Text)))

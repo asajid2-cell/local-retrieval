@@ -161,12 +161,23 @@ public sealed class ArchiveSession : INotifyPropertyChanged
     [JsonPropertyName("tool")]
     public string Tool { get; set; } = "codex";
 
-    [JsonPropertyName("messages")]
+    // Heavy content is NOT persisted or kept in memory at rest — it's lazy-loaded from SourcePath on open
+    // (ArchiveService.EnsureContentAsync) and paginated in the reader. The store keeps only metadata +
+    // a capped Text for fast in-memory search. This is what keeps the app light (was ~1GB resident).
+    [JsonIgnore]
     public ObservableCollection<ArchiveMessage> Messages { get; set; } = new();
 
-    [JsonPropertyName("codeBlocks")]
+    [JsonIgnore]
     public ObservableCollection<CodeBlock> CodeBlocks { get; set; } = new();
 
+    [JsonPropertyName("messageCount")]
+    public int MessageCount { get; set; }
+
+    [JsonIgnore]
+    public bool ContentLoaded { get; set; }
+
+    // Capped, searchable text (user+assistant+tool text, truncated). Serialized so search works without
+    // holding full transcripts in memory.
     [JsonPropertyName("text")]
     public string Text { get; set; } = "";
 

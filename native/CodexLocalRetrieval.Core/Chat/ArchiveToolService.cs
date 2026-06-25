@@ -72,6 +72,7 @@ public sealed class ArchiveToolService
         {
             var session = _archive.GetSession(Arg(args, "id"));
             if (session is null) return new { error = "No chat with that id. Use search_chats first." };
+            _archive.EnsureContent(session); // content lazy-loads from the source file
             var page = IntArg(args, "page", 0, 0, 1000);
             var size = IntArg(args, "pageSize", 8, 1, 15);
             var all = session.Messages;
