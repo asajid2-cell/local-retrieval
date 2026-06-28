@@ -431,6 +431,37 @@ public sealed class ArchiveServiceTests
         finally { if (File.Exists(store)) File.Delete(store); }
     }
 
+    // The agent resume prompt must point a fresh agent at the transcript as the source of truth and
+    // frame the snippets as a preview only - so it reconstructs the real task instead of acting on an excerpt.
+    [TestMethod]
+    public void ResumePrompt_TreatsTranscriptAsAuthoritative()
+    {
+        var svc = TempService(out var store);
+        try
+        {
+            var s = new ArchiveSession
+            {
+                Id = "x",
+                Title = "Check current date",
+                SourcePath = @"C:\Users\Ahmed\.claude\projects\p\abc.jsonl",
+                Workspace = @"z:\proj",
+                ContentLoaded = true   // skip the file load; we set the preview messages directly
+            };
+            s.Messages.Add(new ArchiveMessage { Role = "user", Text = "do the actual thing" });
+            s.Messages.Add(new ArchiveMessage { Role = "assistant", Text = "finished step one" });
+            svc.Store.Sessions["x"] = s;
+
+            var prompt = svc.CopyPayload(s, "resume");
+
+            Assert.IsTrue(prompt.Contains(s.SourcePath), "includes the source transcript path");
+            Assert.IsTrue(prompt.Contains("Read the archived transcript"), "tells the agent to read the file first");
+            Assert.IsTrue(prompt.Contains("authoritative"), "marks the transcript as authoritative");
+            Assert.IsTrue(prompt.Contains("preview"), "labels the snippets as only a preview");
+            Assert.IsTrue(prompt.Contains("do the actual thing"), "includes a recent message preview");
+        }
+        finally { if (File.Exists(store)) File.Delete(store); }
+    }
+
     // N4: an agent favorites "self" — resolved as the newest session in its workspace.
     [TestMethod]
     public async Task AgentCommand_FavoriteSelf_ResolvesNewestByCwd()

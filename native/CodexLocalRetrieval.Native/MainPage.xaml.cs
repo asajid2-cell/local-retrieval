@@ -1111,6 +1111,15 @@ public sealed partial class MainPage : Page
         copyPath.Click += (_, _) => { SetClipboardText(session.SourcePath); SyncStatus.Text = "Copied chat path."; };
         flyout.Items.Add(copyPath);
 
+        var copyResume = new MenuFlyoutItem { Text = "Copy agent resume prompt" };
+        copyResume.Click += async (_, _) =>
+        {
+            await _archive.EnsureContentAsync(session);
+            SetClipboardText(_archive.CopyPayload(session, "resume"));
+            SyncStatus.Text = "Copied a resume prompt - paste it into a fresh Claude/Codex agent.";
+        };
+        flyout.Items.Add(copyResume);
+
         if (onRemove is not null)
         {
             flyout.Items.Add(new MenuFlyoutSeparator());

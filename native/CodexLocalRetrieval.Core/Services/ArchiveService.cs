@@ -1533,10 +1533,32 @@ public sealed class ArchiveService
         return score;
     }
 
+    // A prompt you paste into a fresh Claude/Codex agent to pick this chat back up. The source
+    // transcript is treated as AUTHORITATIVE and the snippets as a mere preview, so the agent reads
+    // the full file and reconstructs the real task instead of acting on a truncated excerpt.
     private string ResumePrompt(ArchiveSession session)
     {
-        return $"Continue this archived work from local context.\n\nChat title: {session.DisplayTitle}\nSource path: {session.SourcePath}\nWorkspace: {session.Workspace}\n\nImportant context:\n" +
-               string.Join("\n", session.Messages.TakeLast(6).Select(m => $"- {m.Role}: {Regex.Replace(m.Text, "\\s+", " ")[..Math.Min(260, Regex.Replace(m.Text, "\\s+", " ").Length)]}"));
+        var preview = string.Join("\n", session.Messages.TakeLast(6).Select(m =>
+        {
+            var clean = Regex.Replace(m.Text ?? "", "\\s+", " ").Trim();
+            return $"- {m.Role}: {clean[..Math.Min(260, clean.Length)]}";
+        }));
+
+        return
+            "Continue this archived work from local context.\n\n" +
+            "Your first step:\n" +
+            $"Read the archived transcript at:\n{session.SourcePath}\n\n" +
+            $"Workspace:\n{session.Workspace}\n\n" +
+            $"Chat title:\n{session.DisplayTitle}\n\n" +
+            "Goal:\n" +
+            "Resume the previous conversation from that transcript. Reconstruct the latest user request, the " +
+            "current task state, the relevant files and commands, and any unresolved next steps before you act.\n\n" +
+            "Important:\n" +
+            "The snippets below are only a recent preview and may be truncated or incomplete. The source " +
+            "transcript above is authoritative - read it first, do not act on the preview alone.\n\n" +
+            "Preview of recent context:\n" +
+            (string.IsNullOrWhiteSpace(preview) ? "- (no preview available - read the transcript)" : preview) +
+            "\n\nAfter reading the transcript, briefly state what you believe the active task is, then continue from there.";
     }
 
     private bool NormalizeSettings()
