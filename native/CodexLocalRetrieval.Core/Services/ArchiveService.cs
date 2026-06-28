@@ -9,16 +9,17 @@ namespace CodexLocalRetrieval.Core.Services;
 
 public sealed class ArchiveService
 {
-    private const int CurrentIndexVersion = 7; // bump on any parser change to force a full re-parse
+    private const int CurrentIndexVersion = 8; // bump on any parser change to force a full re-parse
     private const int MaxIndexedFiles = 4000;
     // The reader keeps the MOST RECENT messages (not the oldest), so a long chat opens on its latest
     // turns. The first prompt is still captured for the title before this window is applied.
     private const int RecentMessageWindow = 600;
     private const int MaxLinesPerSession = 18_000;
     private const int MaxLineChars = 512_000;
+    private const int ClaudeTailBytes = 32 * 1024 * 1024;
     private const int SearchTextCap = 6_000; // capped, in-memory searchable text per session (full content lazy-loads)
 
-    private static string CapText(string s) => string.IsNullOrEmpty(s) || s.Length <= SearchTextCap ? s : s[..SearchTextCap];
+    private static string CapText(string s) => string.IsNullOrEmpty(s) || s.Length <= SearchTextCap ? s : s[^SearchTextCap..];
 
     private readonly string _rootPath;
     private readonly string _storePath;
@@ -463,12 +464,14 @@ public sealed class ArchiveService
                 var inputId = ExplicitId(cmd);
                 if (s is null) return new AgentCommandResult(false, ResolveFailureHelp("addToCollection"), inputId, Project: cmd.project);
                 await AddToCollectionAsync(s, cmd.project!);
+                var named = ApplyOptionalName(s, cmd);  // optional app-local name in the same call
+                if (named) await SaveAsync();
                 RefreshSessions(Store.Sessions.Values);
                 var persisted = Store.Collections.TryGetValue(Slug(cmd.project!), out var collection)
                                 && collection.SessionIds.Contains(s.Id);
                 return new AgentCommandResult(
                     true,
-                    $"Added \"{s.DisplayTitle}\" to project \"{cmd.project}\".",
+                    $"Added \"{s.DisplayTitle}\" to project \"{cmd.project}\".{(named ? " Named it in the app." : "")}",
                     inputId,
                     s.Id,
                     cmd.project,
@@ -480,7 +483,8 @@ public sealed class ArchiveService
                 var s = await ResolveOrIndexTargetAsync(cmd);
                 var inputId = ExplicitId(cmd);
                 if (s is null) return new AgentCommandResult(false, ResolveFailureHelp("rename"), inputId);
-                if (!string.IsNullOrWhiteSpace(cmd.localName)) s.CustomTitle = CleanTitle(cmd.localName!);
+                if (!ApplyOptionalName(s, cmd) && string.IsNullOrWhiteSpace(cmd.canonicalName))
+                    return new AgentCommandResult(false, "rename/setName needs a 'name' (app-only) and/or 'canonicalName'.", inputId, s.Id);
                 var canonical = await TryWriteCanonicalNameAsync(s, cmd.canonicalName);
                 await SaveAsync();
                 RefreshSessions(Store.Sessions.Values);
@@ -511,9 +515,20 @@ public sealed class ArchiveService
         return value switch
         {
             "addtoproject" or "addtocollection" or "addselftoproject" or "addselftocollection" => "addselftoproject",
+            "setname" or "name" or "label" or "setlabel" => "rename",
             "pin" => "pin",
             _ => value
         };
+    }
+
+    // Optional app-LOCAL chat name (cmd.name, falling back to cmd.localName). Never touches the
+    // agent's own global title - that's canonicalName's job. Returns true if a name was applied.
+    private bool ApplyOptionalName(ArchiveSession session, AgentCommand cmd)
+    {
+        var name = !string.IsNullOrWhiteSpace(cmd.name) ? cmd.name : cmd.localName;
+        if (string.IsNullOrWhiteSpace(name)) return false;
+        session.CustomTitle = CleanTitle(name!);
+        return true;
     }
 
     private void EnsureDefaultSources()
@@ -1361,10 +1376,11 @@ public sealed class ArchiveService
         using var stream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
         using var reader = new StreamReader(stream, Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
         var lineCount = 0;
+        var hitLineCap = false;
         while (await reader.ReadLineAsync() is { } line)
         {
             lineCount++;
-            if (lineCount > MaxLinesPerSession) break;
+            if (lineCount > MaxLinesPerSession) { hitLineCap = true; break; }
             if (string.IsNullOrWhiteSpace(line)) continue;
             if (line.Length > MaxLineChars) continue;
             JsonDocument doc;
@@ -1403,6 +1419,20 @@ public sealed class ArchiveService
         // so the list shows one entry per real chat instead of hundreds of subagent fragments.
         if (isSidechain) return null;
 
+        var titleSeed = FirstMeaningfulUserText(messages);
+        if (hitLineCap)
+        {
+            var tail = ParseClaudeTail(filePath, info);
+            if (tail.messages.Count > 0)
+            {
+                messages = tail.messages;
+                codeBlocks = tail.codeBlocks;
+                if (!string.IsNullOrWhiteSpace(tail.cwd)) cwd = tail.cwd;
+                if (!string.IsNullOrWhiteSpace(tail.summary)) summary = tail.summary;
+                if (!string.IsNullOrWhiteSpace(tail.updated)) updated = tail.updated;
+            }
+        }
+
         if (string.IsNullOrWhiteSpace(created)) created = info.CreationTimeUtc.ToString("O");
         // The session's real name: a user/agent custom-title wins, then Claude's ai-title, then a
         // summary record, then the first prompt. Custom/ai titles are appended at the file TAIL (often
@@ -1412,7 +1442,7 @@ public sealed class ArchiveService
             !string.IsNullOrWhiteSpace(tailCustom) ? tailCustom! :
             !string.IsNullOrWhiteSpace(tailAi) ? tailAi! :
             !string.IsNullOrWhiteSpace(summary) ? summary :
-            FirstMeaningfulUserText(messages) ?? Path.GetFileNameWithoutExtension(filePath);
+            titleSeed ?? FirstMeaningfulUserText(messages) ?? Path.GetFileNameWithoutExtension(filePath);
         var title = CleanTitle(titleSource);
         var total = messages.Count;
         (messages, codeBlocks) = KeepRecentWindow(messages, codeBlocks);
@@ -1434,6 +1464,71 @@ public sealed class ArchiveService
             Text = CapText(string.Join("\n\n", messages.Select(m => m.Text))),
             Tags = new ObservableCollection<string>(codeBlocks.Count > 0 ? new[] { "archive", "code" } : new[] { "archive" })
         };
+    }
+
+    private static (ObservableCollection<ArchiveMessage> messages, ObservableCollection<CodeBlock> codeBlocks, string cwd, string summary, string updated)
+        ParseClaudeTail(string path, FileInfo info)
+    {
+        var messages = new ObservableCollection<ArchiveMessage>();
+        var codeBlocks = new ObservableCollection<CodeBlock>();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var toolUseById = new Dictionary<string, ArchiveMessage>(StringComparer.Ordinal);
+        var cwd = "";
+        var summary = "";
+        var updated = info.LastWriteTimeUtc.ToString("O");
+
+        try
+        {
+            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            var n = (int)Math.Min(fs.Length, ClaudeTailBytes);
+            if (n <= 0) return (messages, codeBlocks, cwd, summary, updated);
+            var offset = fs.Length - n;
+            fs.Seek(offset, SeekOrigin.Begin);
+            var buf = new byte[n];
+            var read = fs.Read(buf, 0, n);
+            var lines = Encoding.UTF8.GetString(buf, 0, read).Replace("\r\n", "\n").Split('\n');
+            var usable = lines.Skip(offset > 0 ? 1 : 0).ToList(); // first line is partial when starting mid-file
+            if (usable.Count > MaxLinesPerSession) usable = usable.Skip(usable.Count - MaxLinesPerSession).ToList();
+
+            foreach (var line in usable)
+            {
+                if (string.IsNullOrWhiteSpace(line) || line.Length > MaxLineChars) continue;
+                JsonDocument doc;
+                try { doc = JsonDocument.Parse(line); } catch { continue; }
+                using (doc)
+                {
+                    try
+                    {
+                        var root = doc.RootElement;
+                        if (root.TryGetProperty("cwd", out var cwdProp) && cwdProp.GetString() is { Length: > 0 } cw) cwd = cw;
+                        var timestamp = root.TryGetProperty("timestamp", out var ts) ? ts.GetString() ?? "" : "";
+                        if (!string.IsNullOrWhiteSpace(timestamp)) updated = timestamp;
+
+                        var type = root.TryGetProperty("type", out var typeProp) ? typeProp.GetString() : null;
+                        if (type == "summary" && root.TryGetProperty("summary", out var sumProp))
+                        {
+                            summary = sumProp.GetString() ?? summary;
+                            continue;
+                        }
+                        if (type != "user" && type != "assistant") continue;
+                        if (!root.TryGetProperty("message", out var message)) continue;
+                        var role = message.TryGetProperty("role", out var roleProp) ? roleProp.GetString() ?? type : type;
+                        if (!IsIndexedRole(role)) continue;
+                        ProcessClaudeMessage(message, role, timestamp, messages, codeBlocks, seen, toolUseById);
+                    }
+                    catch
+                    {
+                        // One bad line never discards the tail window.
+                    }
+                }
+            }
+        }
+        catch
+        {
+            // Tail parsing is best-effort; the head parse remains usable if this fails.
+        }
+
+        return (messages, codeBlocks, cwd, summary, updated);
     }
 
     // Claude message.content is usually an array of typed blocks; keep the readable text ones.

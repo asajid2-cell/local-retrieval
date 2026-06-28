@@ -206,11 +206,14 @@ Commands (one JSON object per line):
   {{""op"":""addSource"",""tool"":""claude"",""root"":""<path>"",""requestId"":""...""}}              register a non-default chat folder
   {{""op"":""favorite"",""id"":""<runtime-id>"",""tool"":""codex"",""requestId"":""...""}}            pin this chat to the top
   {{""op"":""bump"",""id"":""<runtime-id>"",""tool"":""codex"",""requestId"":""...""}}                float this chat to the top of your own resume list
-  {{""op"":""addSelfToProject"",""project"":""X"",""id"":""<runtime-id>"",""tool"":""codex"",""requestId"":""...""}} file into project X
+  {{""op"":""addSelfToProject"",""project"":""X"",""name"":""<optional>"",""id"":""<runtime-id>"",""tool"":""codex"",""requestId"":""...""}} file into project X (+ optional in-app name)
+  {{""op"":""setName"",""name"":""<in-app name>"",""id"":""<runtime-id>"",""tool"":""codex"",""requestId"":""...""}}  set this chat's app-only name (no project needed)
   {{""op"":""rename"",""id"":""<runtime-id>"",""tool"":""codex"",""localName"":""..."",""canonicalName"":""..."",""requestId"":""...""}}
 
 `addToProject` and `addToCollection` are accepted as legacy aliases for `addSelfToProject`.
-`canonicalName` also writes back to Codex's own thread title (shows in `codex resume`).
+`setName`/`name`/`label` are aliases for `rename`. The optional ""name"" on addSelfToProject (or
+setName) sets this chat's APP-ONLY name - it never changes your global/native title.
+`canonicalName` on rename also writes back to Codex's own thread title (shows in `codex resume`).
 
 Each ack echoes requestId, line, op, inputId, resolvedSessionId, project, and persisted. Treat
 `ok:true` plus `persisted:true` as success for project filing. Acks file: {outbox}

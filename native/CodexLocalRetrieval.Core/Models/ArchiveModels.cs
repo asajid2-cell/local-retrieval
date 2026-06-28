@@ -295,9 +295,10 @@ public sealed class CodeBlock
 // One command an outside agent writes to agent-inbox.jsonl to drive the app (see AGENTS.md).
 public sealed class AgentCommand
 {
-    public string op { get; set; } = "";          // init | addSource | favorite | addToProject/addSelfToProject | rename
+    public string op { get; set; } = "";          // init | addSource | favorite | addToProject/addSelfToProject | rename | setName | bump
     public string? requestId { get; set; }         // echoed in outbox so callers can match acks
     public string? project { get; set; }           // addToProject/addSelfToProject
+    public string? name { get; set; }               // optional app-only chat name (addSelfToProject / setName); alias of localName
     public string? localName { get; set; }          // rename (app-only title)
     public string? canonicalName { get; set; }      // rename (write back to codex/claude)
     public string? tool { get; set; }               // addSource / target filter: codex | claude

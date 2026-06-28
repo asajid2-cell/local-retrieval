@@ -513,18 +513,21 @@ public sealed partial class MainPage : Page
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             "CodexLocalRetrieval", "agent-inbox.jsonl");
         return
-            $"Add THIS chat to my \"Codex Local Retrieval\" app under the project \"{projectName}\".\n\n" +
+            $"Add THIS chat to my \"Codex Local Retrieval\" app under the project \"{projectName}\".\n" +
+            "If I gave this chat a name (e.g. \"add yourself as codex-claude-local\"), set that as its " +
+            "in-app name too. The name is app-only - it does NOT change your global/native title.\n\n" +
             "1. Get YOUR exact session id from your environment (you already have it):\n" +
             "   - Codex:  the CODEX_THREAD_ID environment variable\n" +
             "   - Claude: the CLAUDE_CODE_SESSION_ID environment variable\n" +
             "2. Generate a requestId, then append exactly one line (then a newline) to this file:\n" +
             $"   {inbox}\n" +
-            "   The line (put your real id, tool, and requestId in):\n" +
-            $"   {{\"op\":\"addSelfToProject\",\"project\":\"{projectName}\",\"id\":\"<your session id>\",\"tool\":\"codex|claude\",\"requestId\":\"<uuid>\"}}\n\n" +
-            "The app resolves your runtime id to its stored chat key, verifies the project membership, and " +
-            "acks with the same requestId plus resolvedSessionId and persisted. If the id cannot be resolved " +
-            "it returns an error rather than adding a different chat. Only if your runtime truly has no " +
-            "session-id variable, fall back to \"target\":\"self\" with your real \"cwd\" and \"tool\". " +
+            "   The line (put your real id, tool, requestId, and optional name in):\n" +
+            $"   {{\"op\":\"addSelfToProject\",\"project\":\"{projectName}\",\"name\":\"<optional in-app name, omit to keep the auto title>\",\"id\":\"<your session id>\",\"tool\":\"codex|claude\",\"requestId\":\"<uuid>\"}}\n\n" +
+            "The app resolves your runtime id to its stored chat key, files it into the project, sets the " +
+            "optional in-app name, and acks with the same requestId plus resolvedSessionId and persisted. " +
+            "If the id cannot be resolved it returns an error rather than adding a different chat. Only if " +
+            "your runtime truly has no session-id variable, fall back to \"target\":\"self\" with your real " +
+            "\"cwd\" and \"tool\". (To only rename, omit project and use \"op\":\"setName\".) " +
             "Full protocol: AGENTS.md next to the inbox file.";
     }
 

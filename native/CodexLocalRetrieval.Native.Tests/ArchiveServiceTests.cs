@@ -234,6 +234,39 @@ public sealed class ArchiveServiceTests
         finally { Directory.Delete(claudeDir, true); }
     }
 
+    [TestMethod]
+    public async Task Sync_ParsesLargeClaudeSource_FromTailForDisplay()
+    {
+        var claudeDir = Path.Combine(Path.GetTempPath(), "clr-claude-tail-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(claudeDir);
+        var path = Path.Combine(claudeDir, "cl-tail.jsonl");
+        using (var writer = new StreamWriter(path))
+        {
+            writer.WriteLine("{\"type\":\"user\",\"sessionId\":\"cl-tail\",\"cwd\":\"z:\\\\proj\",\"timestamp\":\"2026-06-16T00:00:00Z\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"old stale front content\"}]}}");
+            for (var i = 0; i < 18020; i++)
+            {
+                writer.WriteLine("{\"type\":\"assistant\",\"sessionId\":\"cl-tail\",\"cwd\":\"z:\\\\proj\",\"timestamp\":\"2026-06-16T00:00:01Z\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"filler " + i + "\"}]}}");
+            }
+            writer.WriteLine("{\"type\":\"user\",\"sessionId\":\"cl-tail\",\"cwd\":\"z:\\\\proj\",\"timestamp\":\"2026-06-28T10:00:00Z\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"fresh donor-binding tail question\"}]}}");
+            writer.WriteLine("{\"type\":\"assistant\",\"sessionId\":\"cl-tail\",\"cwd\":\"z:\\\\proj\",\"timestamp\":\"2026-06-28T10:01:00Z\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"fresh donor-binding tail answer\"}]}}");
+        }
+
+        try
+        {
+            var service = new ArchiveService(storePath: Path.Combine(claudeDir, "store.json"));
+            service.Store.Settings.BundledHistoryAbsorbed = true;
+            service.Store.Settings.Sources.Add(new SessionSource { Tool = "claude", Root = claudeDir });
+
+            await service.SyncFromDiskAsync(refreshList: false);
+
+            var s = service.Store.Sessions["cl-tail"];
+            StringAssert.Contains(s.Text, "fresh donor-binding tail answer");
+            Assert.IsFalse(s.Text.Contains("old stale front content"), "display/search text must come from the live tail, not the stale front cap");
+            Assert.AreEqual("2026-06-28T10:01:00Z", s.UpdatedAt);
+        }
+        finally { Directory.Delete(claudeDir, true); }
+    }
+
     // N3: a second scan with no file changes parses nothing (incremental skip).
     [TestMethod]
     public async Task Scan_IsIncremental_SkipsUnchangedFiles()
@@ -699,6 +732,65 @@ public sealed class ArchiveServiceTests
             var col = svc.Store.Collections.Values.First(c => c.Name == "Venpod");
             Assert.IsTrue(col.SessionIds.Contains("mine"), "the exact id was filed");
             Assert.IsFalse(col.SessionIds.Contains("decoy"), "the decoy was NOT filed");
+        }
+        finally { if (File.Exists(store)) File.Delete(store); }
+    }
+
+    // Filing into a project can carry an optional in-app name in the same command - the chat lands
+    // in the project AND gets that app-only title (the agent's global title is untouched).
+    [TestMethod]
+    public async Task AgentCommand_AddSelfToProject_WithName_FilesAndNamesAppLocal()
+    {
+        var svc = TempService(out var store);
+        try
+        {
+            svc.Store.Sessions["mine"] = new ArchiveSession { Id = "mine", Title = "raw auto title", Tool = "codex" };
+
+            var r = await svc.ApplyAgentCommandAsync(new AgentCommand
+            {
+                op = "addSelfToProject", project = "Local Retrieval", name = "codex-claude-local", id = "mine", tool = "codex"
+            });
+
+            Assert.IsTrue(r.Ok, r.Message);
+            Assert.AreEqual("codex-claude-local", svc.Store.Sessions["mine"].DisplayTitle, "the in-app name is set");
+            Assert.AreEqual("raw auto title", svc.Store.Sessions["mine"].Title, "the raw/global title is untouched");
+            var col = svc.Store.Collections.Values.First(c => c.Name == "Local Retrieval");
+            Assert.IsTrue(col.SessionIds.Contains("mine"), "and it's filed into the project");
+        }
+        finally { if (File.Exists(store)) File.Delete(store); }
+    }
+
+    // Omitting name keeps the chat's existing (auto) title - name is strictly optional.
+    [TestMethod]
+    public async Task AgentCommand_AddSelfToProject_WithoutName_KeepsAutoTitle()
+    {
+        var svc = TempService(out var store);
+        try
+        {
+            svc.Store.Sessions["mine"] = new ArchiveSession { Id = "mine", Title = "auto title", Tool = "codex" };
+
+            var r = await svc.ApplyAgentCommandAsync(new AgentCommand { op = "addSelfToProject", project = "P", id = "mine", tool = "codex" });
+
+            Assert.IsTrue(r.Ok, r.Message);
+            Assert.AreEqual("auto title", svc.Store.Sessions["mine"].DisplayTitle, "no name given -> auto title kept");
+        }
+        finally { if (File.Exists(store)) File.Delete(store); }
+    }
+
+    // setName (alias of rename) sets the app-only name with no project, reading the friendly 'name' field.
+    [TestMethod]
+    public async Task AgentCommand_SetName_RenamesAppLocalOnly()
+    {
+        var svc = TempService(out var store);
+        try
+        {
+            svc.Store.Sessions["mine"] = new ArchiveSession { Id = "mine", Title = "auto", Tool = "codex" };
+
+            var r = await svc.ApplyAgentCommandAsync(new AgentCommand { op = "setName", name = "codex-claude-local", id = "mine", tool = "codex" });
+
+            Assert.IsTrue(r.Ok, r.Message);
+            Assert.AreEqual("codex-claude-local", svc.Store.Sessions["mine"].DisplayTitle);
+            Assert.AreEqual(0, svc.Store.Collections.Count, "setName files into no project");
         }
         finally { if (File.Exists(store)) File.Delete(store); }
     }
