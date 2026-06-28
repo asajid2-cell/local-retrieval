@@ -79,12 +79,8 @@
   </PropertyGroup>
 
   <!--
-    After every build, refresh "Chat Hub.lnk" at the repo root so there's always a
-    double-clickable launcher pointing at the freshest exe. Best-effort: the helper
-    swallows its own errors and the step never fails the build.
+    The app is installed (not run from the build output): scripts\install.ps1 publishes a
+    Release build into %LOCALAPPDATA%\Programs\CodexLocalRetrieval and creates Start Menu +
+    Desktop shortcuts there. bin/ and dist/ stay disposable build artifacts.
   -->
-  <Target Name="CreateRootShortcut" AfterTargets="Build" Condition="'$(OS)' == 'Windows_NT'">
-    <Exec ContinueOnError="true"
-          Command="powershell -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildProjectDirectory)\make-shortcut.ps1&quot; -Exe &quot;$(TargetDir)$(AssemblyName).exe&quot; -Out &quot;$(MSBuildProjectDirectory)\..\..\Chat Hub.lnk&quot;" />
-  </Target>
 </Project>
