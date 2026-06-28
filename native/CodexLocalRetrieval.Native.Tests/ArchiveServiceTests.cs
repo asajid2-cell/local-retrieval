@@ -48,6 +48,33 @@ public sealed class ArchiveServiceTests
         }
     }
 
+    [TestMethod]
+    public async Task Codex_SessionMetaForkedFromId_IsStoredAsAlias()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "clr-codexalias-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        const string runtimeId = "019f0d62-b2e5-70a1-8e81-4ff2722ca865";
+        const string forkedFrom = "019f0d3e-1d12-7cc3-b892-94652a2f95ee";
+        File.WriteAllLines(Path.Combine(dir, "rollout-2026-06-28T02-00-00-" + runtimeId + ".jsonl"), new[]
+        {
+            "{\"timestamp\":\"2026-06-28T02:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"session_id\":\"" + runtimeId + "\",\"id\":\"" + runtimeId + "\",\"forked_from_id\":\"" + forkedFrom + "\",\"cwd\":\"z:/proj\"}}",
+            "{\"timestamp\":\"2026-06-28T02:00:01Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"hi\"}}"
+        });
+        var svc = TempService(out var store);
+        try
+        {
+            await svc.IndexRootAsync(dir);
+
+            Assert.IsTrue(svc.Store.Sessions.ContainsKey(runtimeId));
+            Assert.IsTrue(svc.Store.Sessions[runtimeId].Aliases.Contains(forkedFrom), "forked_from_id should resolve as a strong alias");
+        }
+        finally
+        {
+            if (Directory.Exists(dir)) Directory.Delete(dir, true);
+            if (File.Exists(store)) File.Delete(store);
+        }
+    }
+
     // L1: indexing the rollout store resurfaces every session on disk, old and new alike.
     [TestMethod]
     public async Task IndexRoot_ResurfacesOldAndNewRollouts()
@@ -576,6 +603,74 @@ public sealed class ArchiveServiceTests
             var col = svc.Store.Collections.Values.First(c => c.Name == "Venpod");
             Assert.IsTrue(col.SessionIds.Contains("mine"), "the exact id was filed");
             Assert.IsFalse(col.SessionIds.Contains("decoy"), "the decoy was NOT filed");
+        }
+        finally { if (File.Exists(store)) File.Delete(store); }
+    }
+
+    // Codex resume/fork sessions can expose CODEX_THREAD_ID as the rollout filename while the app's
+    // stored key is a canonical parent id. The agent should still pass the runtime id, and the app
+    // should resolve it to the stored key without falling back to cwd/latest.
+    [TestMethod]
+    public async Task AgentCommand_AddSelfToProject_RuntimeIdInSourcePath_ResolvesStoredKey()
+    {
+        var svc = TempService(out var store);
+        try
+        {
+            const string runtimeId = "019f0d62-b2e5-70a1-8e81-4ff2722ca865";
+            const string storedId = "019f0d3e-1d12-7cc3-b892-94652a2f95ee";
+            svc.Store.Sessions[storedId] = new ArchiveSession
+            {
+                Id = storedId,
+                Title = "Review VENPOD history",
+                Tool = "codex",
+                Workspace = "z:\\proj",
+                SourcePath = "C:\\Users\\Ahmed\\.codex\\sessions\\2026\\06\\28\\rollout-2026-06-28T02-39-59-" + runtimeId + ".jsonl",
+                UpdatedAt = "2026-06-28T00:00:00Z"
+            };
+
+            var r = await svc.ApplyAgentCommandAsync(new AgentCommand
+            {
+                op = "addSelfToProject",
+                project = "Venpod",
+                id = runtimeId,
+                tool = "codex",
+                requestId = "req-1"
+            });
+
+            Assert.IsTrue(r.Ok, r.Message);
+            Assert.AreEqual(runtimeId, r.InputId);
+            Assert.AreEqual(storedId, r.ResolvedSessionId);
+            Assert.AreEqual(true, r.Persisted);
+            Assert.IsTrue(svc.Store.Collections.Values.First(c => c.Name == "Venpod").SessionIds.Contains(storedId));
+        }
+        finally { if (File.Exists(store)) File.Delete(store); }
+    }
+
+    [TestMethod]
+    public async Task AgentCommand_AddSelfToProject_ForkAlias_ResolvesWithoutGuessing()
+    {
+        var svc = TempService(out var store);
+        try
+        {
+            const string runtimeId = "runtime-session";
+            const string forkedFrom = "parent-session";
+            svc.Store.Sessions[runtimeId] = new ArchiveSession
+            {
+                Id = runtimeId,
+                Tool = "codex",
+                Workspace = "z:\\proj",
+                UpdatedAt = "2026-06-28T00:00:00Z",
+                Aliases = new System.Collections.ObjectModel.ObservableCollection<string> { forkedFrom }
+            };
+            svc.Store.Sessions["decoy"] = new ArchiveSession { Id = "decoy", Tool = "codex", Workspace = "z:\\proj", UpdatedAt = "2026-06-29T00:00:00Z" };
+
+            var r = await svc.ApplyAgentCommandAsync(new AgentCommand { op = "addSelfToProject", project = "Venpod", id = forkedFrom, tool = "codex" });
+
+            Assert.IsTrue(r.Ok, r.Message);
+            Assert.AreEqual(runtimeId, r.ResolvedSessionId);
+            var col = svc.Store.Collections.Values.First(c => c.Name == "Venpod");
+            Assert.IsTrue(col.SessionIds.Contains(runtimeId));
+            Assert.IsFalse(col.SessionIds.Contains("decoy"), "alias resolution must not choose latest/cwd decoys");
         }
         finally { if (File.Exists(store)) File.Delete(store); }
     }

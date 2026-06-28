@@ -9,7 +9,7 @@ namespace CodexLocalRetrieval.Core.Services;
 
 public sealed class ArchiveService
 {
-    private const int CurrentIndexVersion = 6; // bump on any parser change to force a full re-parse
+    private const int CurrentIndexVersion = 7; // bump on any parser change to force a full re-parse
     private const int MaxIndexedFiles = 4000;
     // The reader keeps the MOST RECENT messages (not the oldest), so a long chat opens on its latest
     // turns. The first prompt is still captured for the title before this window is applied.
@@ -94,6 +94,16 @@ public sealed class ArchiveService
         if (session.ContentLoaded) return;
         Task.Run(() => EnsureContentAsync(session)).GetAwaiter().GetResult();
     }
+
+    // Force a fresh re-parse from disk (the live tail of an open chat as the agent keeps writing it).
+    public async Task ReloadContentAsync(ArchiveSession session)
+    {
+        session.ContentLoaded = false;
+        await EnsureContentAsync(session);
+    }
+
+    // The last-write time of a session's source transcript, for cheap "did it change?" polling.
+    public DateTime SourceWriteTimeUtc(ArchiveSession session) => SourceFileWriteTimeUtc(session);
 
     public async Task<bool> EnrichTitlesFromLocalStateAsync()
     {
@@ -416,7 +426,8 @@ public sealed class ArchiveService
     // chat at the app and say "set yourself up / favorite yourself / file yourself into project X".
     public async Task<AgentCommandResult> ApplyAgentCommandAsync(AgentCommand cmd)
     {
-        switch ((cmd.op ?? "").Trim().ToLowerInvariant())
+        var op = NormalizeAgentOp(cmd.op);
+        switch (op)
         {
             case "init":
                 EnsureDefaultSources();
@@ -437,38 +448,59 @@ public sealed class ArchiveService
             case "pin":
             {
                 var s = await ResolveOrIndexTargetAsync(cmd);
-                if (s is null) return new AgentCommandResult(false, ResolveFailureHelp("favorite"));
+                var inputId = ExplicitId(cmd);
+                if (s is null) return new AgentCommandResult(false, ResolveFailureHelp("favorite"), inputId);
                 s.Pinned = true;
                 await SaveAsync();
                 RefreshSessions(Store.Sessions.Values);
-                return new AgentCommandResult(true, $"Favorited \"{s.DisplayTitle}\".");
+                return new AgentCommandResult(true, $"Favorited \"{s.DisplayTitle}\".", inputId, s.Id, Persisted: true);
             }
 
-            case "addtoproject":
-            case "addtocollection":
+            case "addselftoproject":
             {
                 if (string.IsNullOrWhiteSpace(cmd.project)) return new AgentCommandResult(false, "addToProject needs 'project'.");
                 var s = await ResolveOrIndexTargetAsync(cmd);
-                if (s is null) return new AgentCommandResult(false, ResolveFailureHelp("addToCollection"));
+                var inputId = ExplicitId(cmd);
+                if (s is null) return new AgentCommandResult(false, ResolveFailureHelp("addToCollection"), inputId, Project: cmd.project);
                 await AddToCollectionAsync(s, cmd.project!);
                 RefreshSessions(Store.Sessions.Values);
-                return new AgentCommandResult(true, $"Added \"{s.DisplayTitle}\" to project \"{cmd.project}\".");
+                var persisted = Store.Collections.TryGetValue(Slug(cmd.project!), out var collection)
+                                && collection.SessionIds.Contains(s.Id);
+                return new AgentCommandResult(
+                    true,
+                    $"Added \"{s.DisplayTitle}\" to project \"{cmd.project}\".",
+                    inputId,
+                    s.Id,
+                    cmd.project,
+                    persisted);
             }
 
             case "rename":
             {
                 var s = await ResolveOrIndexTargetAsync(cmd);
-                if (s is null) return new AgentCommandResult(false, ResolveFailureHelp("rename"));
+                var inputId = ExplicitId(cmd);
+                if (s is null) return new AgentCommandResult(false, ResolveFailureHelp("rename"), inputId);
                 if (!string.IsNullOrWhiteSpace(cmd.localName)) s.CustomTitle = CleanTitle(cmd.localName!);
                 var canonical = await TryWriteCanonicalNameAsync(s, cmd.canonicalName);
                 await SaveAsync();
                 RefreshSessions(Store.Sessions.Values);
-                return new AgentCommandResult(true, $"Renamed to \"{s.DisplayTitle}\".{(canonical is null ? "" : " " + canonical)}");
+                return new AgentCommandResult(true, $"Renamed to \"{s.DisplayTitle}\".{(canonical is null ? "" : " " + canonical)}", inputId, s.Id, Persisted: true);
             }
 
             default:
                 return new AgentCommandResult(false, $"Unknown op: '{cmd.op}'.");
         }
+    }
+
+    public static string NormalizeAgentOp(string? op)
+    {
+        var value = (op ?? "").Trim().ToLowerInvariant();
+        return value switch
+        {
+            "addtoproject" or "addtocollection" or "addselftoproject" or "addselftocollection" => "addselftoproject",
+            "pin" => "pin",
+            _ => value
+        };
     }
 
     private void EnsureDefaultSources()
@@ -479,10 +511,17 @@ public sealed class ArchiveService
     // The id an agent supplied for a per-chat op, if any (cmd.id, or cmd.target when it is a concrete id).
     private static string? ExplicitId(AgentCommand cmd)
     {
-        if (!string.IsNullOrWhiteSpace(cmd.id)) return cmd.id;
-        if (!string.IsNullOrWhiteSpace(cmd.target) && cmd.target != "self" && cmd.target != "latest") return cmd.target;
+        if (!string.IsNullOrWhiteSpace(cmd.id)) return cmd.id.Trim();
+        if (!string.IsNullOrWhiteSpace(cmd.target) && !IsSelfTarget(cmd.target)) return cmd.target.Trim();
         return null;
     }
+
+    private static bool IsSelfTarget(string? target) =>
+        string.Equals(target, "self", StringComparison.OrdinalIgnoreCase)
+        || string.Equals(target, "latest", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsSelfOp(AgentCommand cmd) =>
+        NormalizeAgentOp(cmd.op) is "addselftoproject" or "addselftocollection";
 
     // Resolve the target session, and if an exact id was given but isn't in the store yet, index just
     // that one file from disk (a brand-new session adding itself before a full sync has seen it).
@@ -491,25 +530,26 @@ public sealed class ArchiveService
         var s = ResolveTargetSession(cmd);
         if (s is not null) return s;
         var id = ExplicitId(cmd);
-        return string.IsNullOrWhiteSpace(id) ? null : await EnsureSessionIndexedAsync(id!);
+        return string.IsNullOrWhiteSpace(id) ? null : await EnsureSessionIndexedAsync(id!, cmd.tool);
     }
 
     // Find and index the single transcript whose id matches, across the configured sources, so an
     // exact-id command works for a session the store hasn't scanned yet. Returns null if no such file
     // exists (then the caller fails closed - never a different chat).
-    private async Task<ArchiveSession?> EnsureSessionIndexedAsync(string id)
+    private async Task<ArchiveSession?> EnsureSessionIndexedAsync(string id, string? tool)
     {
-        if (Store.Sessions.TryGetValue(id, out var existing)) return existing;
+        if (ResolveSessionByIdOrAlias(id, tool) is { } existing) return existing;
         var sources = Store.Settings.Sources.Count > 0 ? Store.Settings.Sources : DefaultSources();
         foreach (var src in sources)
         {
+            if (!string.IsNullOrWhiteSpace(tool) && !string.Equals(src.Tool, tool, StringComparison.OrdinalIgnoreCase)) continue;
             if (string.IsNullOrWhiteSpace(src.Root) || !Directory.Exists(src.Root)) continue;
             string? file = null;
             try { file = Directory.EnumerateFiles(src.Root, "*" + id + "*.jsonl", SearchOption.AllDirectories).FirstOrDefault(); }
             catch { }
             if (file is null) continue;
             var parsed = await ParseSessionAsync(file, src.Tool);
-            if (parsed is null || !string.Equals(parsed.Id, id, StringComparison.OrdinalIgnoreCase)) continue;
+            if (parsed is null || !SessionHasIdOrAlias(parsed, id)) continue;
             Store.Sessions[parsed.Id] = parsed;
             await SaveAsync();
             return parsed;
@@ -517,17 +557,18 @@ public sealed class ArchiveService
         return null;
     }
 
-    // Shown to an agent when nothing matched - steers it to its exact env-provided id (fail closed).
+    // Shown to an agent when nothing matched - steers it to its env-provided runtime id (fail closed).
     private static string ResolveFailureHelp(string op) =>
-        $"Could not identify your chat for '{op}'. Send your EXACT session id: Codex uses the CODEX_THREAD_ID " +
-        "environment variable, Claude uses CLAUDE_CODE_SESSION_ID. Example: " +
+        $"Could not identify your chat for '{op}'. Send your runtime session id: Codex uses the CODEX_THREAD_ID " +
+        "environment variable, Claude uses CLAUDE_CODE_SESSION_ID. The app resolves that id to its stored chat key. Example: " +
         $"{{\"op\":\"{op}\",\"project\":\"...\",\"id\":\"<that id>\",\"tool\":\"codex\"}}. " +
         "(target:\"self\" only matches an already-indexed chat in the exact same folder + tool, and never guesses another chat.)";
 
-    // FAIL CLOSED. An agent's only strong identity is its exact session id, which it gets from its
-    // environment (Codex: CODEX_THREAD_ID, Claude: CLAUDE_CODE_SESSION_ID) - the same value this app
-    // keys sessions by. So:
-    //   1. If an id is supplied, it must match an indexed session EXACTLY, or we return null. We never
+    // FAIL CLOSED. An agent's only strong identity is its runtime session id, which it gets from its
+    // environment (Codex: CODEX_THREAD_ID, Claude: CLAUDE_CODE_SESSION_ID). The store may key a
+    // resumed/forked chat by another canonical id, so id matching accepts exact aliases from the
+    // transcript header/path. So:
+    //   1. If an id is supplied, it must match an indexed session id/alias, or we return null. We never
     //      "fall through" to a heuristic - guessing is what filed a random old chat before.
     //   2. "self"/"latest" is a fallback only, and only with BOTH a tool and a cwd; it matches within
     //      that exact workspace+tool. There is NO global "most recent" fallback.
@@ -535,15 +576,11 @@ public sealed class ArchiveService
     // rather than the app silently picking the wrong conversation.
     public ArchiveSession? ResolveTargetSession(AgentCommand cmd)
     {
-        var explicitId = cmd.id;
-        if (string.IsNullOrWhiteSpace(explicitId) && !string.IsNullOrWhiteSpace(cmd.target)
-            && cmd.target != "self" && cmd.target != "latest")
-            explicitId = cmd.target;
+        var explicitId = ExplicitId(cmd);
         if (!string.IsNullOrWhiteSpace(explicitId))
-            return Store.Sessions.TryGetValue(explicitId!, out var byId) ? byId : null;   // exact or nothing
+            return ResolveSessionByIdOrAlias(explicitId!, cmd.tool);   // strong id/alias or nothing
 
-        var isSelf = string.Equals(cmd.target, "self", StringComparison.OrdinalIgnoreCase)
-                  || string.Equals(cmd.target, "latest", StringComparison.OrdinalIgnoreCase);
+        var isSelf = IsSelfTarget(cmd.target) || IsSelfOp(cmd);
         if (!isSelf) return null;
         if (string.IsNullOrWhiteSpace(cmd.tool) || string.IsNullOrWhiteSpace(cmd.cwd)) return null; // self needs tool+cwd
 
@@ -555,6 +592,43 @@ public sealed class ArchiveService
             .ThenByDescending(s => s.UpdatedAt)
             .FirstOrDefault();   // null if nothing in that exact workspace+tool
     }
+
+    private ArchiveSession? ResolveSessionByIdOrAlias(string id, string? tool)
+    {
+        var input = id.Trim();
+        if (Store.Sessions.TryGetValue(input, out var byKey) && ToolMatches(byKey, tool)) return byKey;
+
+        var exact = Store.Sessions.Values
+            .Where(s => ToolMatches(s, tool))
+            .Where(s => string.Equals(s.Id, input, StringComparison.OrdinalIgnoreCase))
+            .GroupBy(s => s.Id, StringComparer.OrdinalIgnoreCase)
+            .Select(g => g.First())
+            .ToList();
+        if (exact.Count == 1) return exact[0];
+        if (exact.Count > 1) return null;
+
+        var aliases = Store.Sessions.Values
+            .Where(s => ToolMatches(s, tool))
+            .Where(s => SessionHasIdOrAlias(s, input))
+            .GroupBy(s => s.Id, StringComparer.OrdinalIgnoreCase)
+            .Select(g => g.First())
+            .ToList();
+        return aliases.Count == 1 ? aliases[0] : null;
+    }
+
+    private static bool ToolMatches(ArchiveSession session, string? tool) =>
+        string.IsNullOrWhiteSpace(tool) || string.Equals(session.Tool, tool, StringComparison.OrdinalIgnoreCase);
+
+    private static bool SessionHasIdOrAlias(ArchiveSession session, string id)
+    {
+        if (string.Equals(session.Id, id, StringComparison.OrdinalIgnoreCase)) return true;
+        if (session.Aliases.Any(a => string.Equals(a, id, StringComparison.OrdinalIgnoreCase))) return true;
+        return IsAliasToken(id)
+               && !string.IsNullOrWhiteSpace(session.SourcePath)
+               && session.SourcePath.Contains(id, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsAliasToken(string id) => id.Length >= 8 && IsResumableId(id);
 
     // The last-write time of a session's source transcript on disk (resolving a stored relative path
     // against the root). This is what makes "self" pick the chat that's live right now; if the file
@@ -859,6 +933,10 @@ public sealed class ArchiveService
         incoming.Archived = existing.Archived;
         incoming.Reviewed = existing.Reviewed;
         incoming.Starred = existing.Starred;
+        foreach (var alias in existing.Aliases)
+        {
+            if (!incoming.Aliases.Contains(alias, StringComparer.OrdinalIgnoreCase)) incoming.Aliases.Add(alias);
+        }
         foreach (var tag in existing.Tags)
         {
             if (!incoming.Tags.Contains(tag, StringComparer.OrdinalIgnoreCase)) incoming.Tags.Add(tag);
@@ -1042,14 +1120,20 @@ public sealed class ArchiveService
     {
         var messages = new ObservableCollection<ArchiveMessage>();
         var codeBlocks = new ObservableCollection<CodeBlock>();
+        var fallbackMessages = new ObservableCollection<ArchiveMessage>();
+        var fallbackCodeBlocks = new ObservableCollection<CodeBlock>();
         var id = Path.GetFileNameWithoutExtension(filePath);
         var cwd = "";
         var created = "";
         var updated = "";
 
+        var aliases = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var seen = new HashSet<string>(StringComparer.Ordinal);
+        var fallbackSeen = new HashSet<string>(StringComparer.Ordinal);
+        var sawEventMessages = false;
         var info = new FileInfo(filePath);
         updated = info.LastWriteTimeUtc.ToString("O");
+        ArchiveMessage? lastTool = null;   // the function_call awaiting its function_call_output
 
         using var stream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
         using var reader = new StreamReader(stream, Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
@@ -1080,30 +1164,71 @@ public sealed class ArchiveService
                     var rootType = root.TryGetProperty("type", out var rtProp) ? rtProp.GetString() : null;
                     if (rootType == "session_meta")
                     {
-                        if (payload.TryGetProperty("session_id", out var sidProp) && sidProp.GetString() is { Length: > 0 } sid) id = sid;
-                        else if (payload.TryGetProperty("id", out var midProp) && midProp.GetString() is { Length: > 0 } mid) id = mid;
+                        var sessionMetaAssigned = false;
+                        if (payload.TryGetProperty("session_id", out var sidProp) && sidProp.GetString() is { Length: > 0 } sid)
+                        {
+                            id = sid;
+                            sessionMetaAssigned = true;
+                            AddAlias(aliases, sid);
+                        }
+                        if (payload.TryGetProperty("id", out var midProp) && midProp.GetString() is { Length: > 0 } mid)
+                        {
+                            if (!sessionMetaAssigned) id = mid;
+                            AddAlias(aliases, mid);
+                        }
+                        if (payload.TryGetProperty("forked_from_id", out var forkProp) && forkProp.GetString() is { Length: > 0 } fork)
+                        {
+                            AddAlias(aliases, fork);
+                        }
                     }
                     if (payload.TryGetProperty("cwd", out var cwdProp)) cwd = cwdProp.GetString() ?? cwd;
 
-                    if (payload.TryGetProperty("type", out var typeProp) && typeProp.GetString() == "message")
+                    var pType = payload.TryGetProperty("type", out var typeProp) ? typeProp.GetString() : null;
+                    if (rootType == "event_msg")
                     {
-                        var role = payload.TryGetProperty("role", out var roleProp) ? roleProp.GetString() ?? "message" : "message";
-                        if (!IsIndexedRole(role)) continue;
-                        var text = ExtractContent(payload);
-                        AddMessage(messages, codeBlocks, role, text, timestamp, seen);
-                    }
-                    else if (payload.TryGetProperty("type", out var eventTypeProp))
-                    {
-                        var eventType = eventTypeProp.GetString();
-                        if (eventType is "user_message" or "agent_message")
+                        // Clean turn-level text. We take user/assistant text ONLY from event_msg; the
+                        // parallel response_item "message" lines are the same text again (different
+                        // timestamps) and are what made every turn show up twice.
+                        if (pType is "user_message" or "agent_message")
                         {
-                            var role = eventType == "agent_message" ? "assistant" : "user";
+                            sawEventMessages = true;
+                            var role = pType == "agent_message" ? "assistant" : "user";
                             var text = payload.TryGetProperty("message", out var messageProp) ? messageProp.GetString() ?? "" : "";
                             AddMessage(messages, codeBlocks, role, text, timestamp, seen);
                         }
                     }
+                    else if (rootType == "response_item")
+                    {
+                        // Tool calls become one compact, collapsible step (command + its output), not a
+                        // wall of separate bubbles. response_item "message"/"reasoning" are skipped.
+                        if (pType == "function_call")
+                        {
+                            var name = payload.TryGetProperty("name", out var np) ? np.GetString() ?? "tool" : "tool";
+                            lastTool = AddToolStep(messages, name, ExtractToolCommand(payload), timestamp);
+                        }
+                        else if (pType == "function_call_output" && lastTool is not null)
+                        {
+                            var output = payload.TryGetProperty("output", out var op) ? op.GetString() ?? "" : "";
+                            lastTool.ToolOutput = CapDisplayText(output, 4000);
+                        }
+                        else if (pType == "message")
+                        {
+                            var role = payload.TryGetProperty("role", out var roleProp) ? roleProp.GetString() ?? "message" : "message";
+                            if (IsIndexedRole(role)) AddMessage(fallbackMessages, fallbackCodeBlocks, role, ExtractContent(payload), timestamp, fallbackSeen);
+                        }
+                    }
                 }
             }
+        }
+
+        if (!sawEventMessages && fallbackMessages.Count > 0)
+        {
+            var merged = fallbackMessages
+                .Concat(messages.Where(m => m.EffectiveKind == "tool"))
+                .OrderBy(m => m.Timestamp, StringComparer.Ordinal)
+                .ToList();
+            messages = new ObservableCollection<ArchiveMessage>(merged);
+            codeBlocks = new ObservableCollection<CodeBlock>(fallbackCodeBlocks.Concat(merged.SelectMany(m => m.CodeBlocks)));
         }
 
         if (string.IsNullOrWhiteSpace(created)) created = info.CreationTimeUtc.ToString("O");
@@ -1119,6 +1244,7 @@ public sealed class ArchiveService
             Id = id,
             Title = title,
             SourcePath = filePath,
+            Aliases = new ObservableCollection<string>(aliases.Where(a => !string.Equals(a, id, StringComparison.OrdinalIgnoreCase))),
             CreatedAt = created,
             UpdatedAt = updated,
             Workspace = string.IsNullOrWhiteSpace(cwd) ? "Unknown workspace" : cwd,
@@ -1132,6 +1258,13 @@ public sealed class ArchiveService
             Text = CapText(string.Join("\n\n", messages.Select(m => m.Text))),
             Tags = new ObservableCollection<string>(codeBlocks.Count > 0 ? new[] { "archive", "code" } : new[] { "archive" })
         };
+    }
+
+    private static void AddAlias(HashSet<string> aliases, string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value)) return;
+        var trimmed = value.Trim();
+        if (IsAliasToken(trimmed)) aliases.Add(trimmed);
     }
 
     // Claude Code transcript: one JSON object per line with sessionId/cwd/timestamp and a
@@ -1149,6 +1282,7 @@ public sealed class ArchiveService
         var summary = "";
         var isSidechain = false;
         var seen = new HashSet<string>(StringComparer.Ordinal);
+        var toolUseById = new Dictionary<string, ArchiveMessage>(StringComparer.Ordinal);  // tool_use id -> step (output attached from the later tool_result)
         var info = new FileInfo(filePath);
         var updated = info.LastWriteTimeUtc.ToString("O");
 
@@ -1184,8 +1318,7 @@ public sealed class ArchiveService
                     if (!root.TryGetProperty("message", out var message)) continue;
                     var role = message.TryGetProperty("role", out var roleProp) ? roleProp.GetString() ?? type : type;
                     if (!IsIndexedRole(role)) continue;
-                    var text = ExtractClaudeContent(message);
-                    AddMessage(messages, codeBlocks, role, text, timestamp, seen);
+                    ProcessClaudeMessage(message, role, timestamp, messages, codeBlocks, seen, toolUseById);
                 }
                 catch
                 {
@@ -1252,6 +1385,79 @@ public sealed class ArchiveService
         return builder.ToString();
     }
 
+    // Parse one Claude message into clean chat entries: text becomes a bubble; each tool_use becomes a
+    // compact tool step (with its output attached from the later tool_result); a message that is only a
+    // tool_result is NOT shown as a bubble (its output rides on the tool step). This is what turns a
+    // wall of tool dumps into a readable conversation.
+    private static void ProcessClaudeMessage(JsonElement message, string role, string timestamp,
+        ObservableCollection<ArchiveMessage> messages, ObservableCollection<CodeBlock> codeBlocks,
+        HashSet<string> seen, Dictionary<string, ArchiveMessage> toolUseById)
+    {
+        if (!message.TryGetProperty("content", out var content)) return;
+        if (content.ValueKind == JsonValueKind.String)
+        {
+            AddMessage(messages, codeBlocks, role, content.GetString() ?? "", timestamp, seen);
+            return;
+        }
+        if (content.ValueKind != JsonValueKind.Array) return;
+
+        var textSb = new StringBuilder();
+        void FlushText()
+        {
+            if (textSb.Length == 0) return;
+            AddMessage(messages, codeBlocks, role, textSb.ToString(), timestamp, seen);
+            textSb.Clear();
+        }
+
+        foreach (var item in content.EnumerateArray())
+        {
+            if (item.ValueKind == JsonValueKind.String) { textSb.AppendLine(item.GetString()); continue; }
+            if (item.ValueKind != JsonValueKind.Object) continue;
+            var itemType = item.TryGetProperty("type", out var it) ? it.GetString() : null;
+            if (itemType == "text" && item.TryGetProperty("text", out var t))
+            {
+                textSb.AppendLine(t.GetString());
+            }
+            else if (itemType == "tool_use")
+            {
+                FlushText();   // keep order: any text before the call shows first
+                var name = item.TryGetProperty("name", out var nm) ? nm.GetString() ?? "tool" : "tool";
+                var step = AddToolStep(messages, name, ClaudeToolCommand(item), timestamp);
+                if (item.TryGetProperty("id", out var idp) && idp.GetString() is { Length: > 0 } tid) toolUseById[tid] = step;
+            }
+            else if (itemType == "tool_result")
+            {
+                var outText = ExtractToolResultText(item);
+                if (item.TryGetProperty("tool_use_id", out var tup) && tup.GetString() is { Length: > 0 } tuid
+                    && toolUseById.TryGetValue(tuid, out var step))
+                    step.ToolOutput = CapDisplayText(outText, 4000);
+                // a tool_result with no matching call is dropped (it's noise, not a chat turn)
+            }
+        }
+        FlushText();
+    }
+
+    // A short label for a Claude tool call from its input (the command / file / pattern it acted on).
+    private static string ClaudeToolCommand(JsonElement toolUse)
+    {
+        if (!toolUse.TryGetProperty("input", out var input) || input.ValueKind != JsonValueKind.Object) return "";
+        foreach (var key in new[] { "command", "file_path", "path", "pattern", "url", "query", "prompt" })
+            if (input.TryGetProperty(key, out var v) && v.ValueKind == JsonValueKind.String && v.GetString() is { Length: > 0 } s)
+                return s;
+        return CapDisplayText(input.ToString(), 400);
+    }
+
+    private static string ExtractToolResultText(JsonElement item)
+    {
+        if (!item.TryGetProperty("content", out var c)) return "";
+        if (c.ValueKind == JsonValueKind.String) return c.GetString() ?? "";
+        if (c.ValueKind != JsonValueKind.Array) return "";
+        var sb = new StringBuilder();
+        foreach (var b in c.EnumerateArray())
+            if (b.ValueKind == JsonValueKind.Object && b.TryGetProperty("text", out var t)) sb.AppendLine(t.GetString());
+        return sb.ToString();
+    }
+
     private static bool IsIndexedRole(string role)
     {
         return role.Equals("user", StringComparison.OrdinalIgnoreCase)
@@ -1275,6 +1481,56 @@ public sealed class ArchiveService
             CodeBlocks = new ObservableCollection<CodeBlock>(blocks)
         });
     }
+
+    // A consolidated tool step: one command + (later) its output, rendered as a single collapsible line
+    // instead of separate bubbles.
+    private static ArchiveMessage AddToolStep(ObservableCollection<ArchiveMessage> messages, string name, string command, string timestamp)
+    {
+        var step = new ArchiveMessage
+        {
+            Id = Guid.NewGuid().ToString("N")[..12],
+            Role = "tool",
+            Kind = "tool",
+            ToolName = FriendlyToolName(name),
+            Text = CapDisplayText(command, 1200),
+            Timestamp = timestamp
+        };
+        messages.Add(step);
+        return step;
+    }
+
+    private static string FriendlyToolName(string name) => name switch
+    {
+        "shell_command" or "shell" or "exec_command" or "local_shell" => "shell",
+        "apply_patch" or "edit_file" or "write_file" => "edit",
+        "read_file" or "view" => "read",
+        "update_plan" => "plan",
+        _ => string.IsNullOrWhiteSpace(name) ? "tool" : name
+    };
+
+    // Codex tool args arrive as a JSON string, e.g. {"command":["bash","-lc","..."]} or {"path":"..."}.
+    private static string ExtractToolCommand(JsonElement payload)
+    {
+        if (!payload.TryGetProperty("arguments", out var argsProp)) return "";
+        var raw = argsProp.GetString() ?? "";
+        try
+        {
+            using var d = JsonDocument.Parse(raw);
+            var r = d.RootElement;
+            if (r.TryGetProperty("command", out var c))
+            {
+                if (c.ValueKind == JsonValueKind.Array)
+                    return string.Join(" ", c.EnumerateArray().Select(e => e.ValueKind == JsonValueKind.String ? e.GetString() : e.ToString()));
+                if (c.ValueKind == JsonValueKind.String) return c.GetString() ?? raw;
+            }
+            if (r.TryGetProperty("path", out var p) && p.ValueKind == JsonValueKind.String) return p.GetString() ?? raw;
+        }
+        catch { }
+        return raw;
+    }
+
+    private static string CapDisplayText(string s, int max) =>
+        string.IsNullOrEmpty(s) || s.Length <= max ? s : s[..max] + "\n…(truncated)";
 
     // Trim a parsed transcript to its most recent messages so a long chat opens on its latest turns
     // (memory stays bounded). Code blocks follow the kept messages. The caller captures the title from

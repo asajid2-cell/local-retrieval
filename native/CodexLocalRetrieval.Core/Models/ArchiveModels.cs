@@ -173,6 +173,12 @@ public sealed class ArchiveSession : INotifyPropertyChanged
     [JsonPropertyName("sourcePath")]
     public string SourcePath { get; set; } = "";
 
+    // Alternate strong ids found in the transcript header/path. Agents pass their runtime env id;
+    // the store may key a resumed/forked chat by a canonical parent id, so exact-id operations
+    // resolve through these aliases without falling back to heuristics.
+    [JsonPropertyName("aliases")]
+    public ObservableCollection<string> Aliases { get; set; } = new();
+
     [JsonPropertyName("createdAt")]
     public string CreatedAt { get; set; } = "";
 
@@ -259,6 +265,20 @@ public sealed class ArchiveMessage
     [JsonPropertyName("codeBlocks")]
     public ObservableCollection<CodeBlock> CodeBlocks { get; set; } = new();
 
+    // What this entry is, for the reader: "user" | "assistant" | "tool" | "reasoning". Falls back to Role.
+    [JsonIgnore]
+    public string Kind { get; set; } = "";
+
+    // For Kind == "tool": a short label (e.g. the command/tool name) and its (collapsible) output.
+    [JsonIgnore]
+    public string ToolName { get; set; } = "";
+
+    [JsonIgnore]
+    public string ToolOutput { get; set; } = "";
+
+    [JsonIgnore]
+    public string EffectiveKind => string.IsNullOrWhiteSpace(Kind) ? Role : Kind;
+
     [JsonIgnore]
     public string RoleLabel => string.IsNullOrWhiteSpace(Role) ? "Message" : char.ToUpper(Role[0]) + Role[1..];
 }
@@ -275,8 +295,9 @@ public sealed class CodeBlock
 // One command an outside agent writes to agent-inbox.jsonl to drive the app (see AGENTS.md).
 public sealed class AgentCommand
 {
-    public string op { get; set; } = "";          // init | addSource | favorite | addToProject | rename
-    public string? project { get; set; }           // addToProject
+    public string op { get; set; } = "";          // init | addSource | favorite | addToProject/addSelfToProject | rename
+    public string? requestId { get; set; }         // echoed in outbox so callers can match acks
+    public string? project { get; set; }           // addToProject/addSelfToProject
     public string? localName { get; set; }          // rename (app-only title)
     public string? canonicalName { get; set; }      // rename (write back to codex/claude)
     public string? tool { get; set; }               // addSource / target filter: codex | claude
@@ -286,7 +307,13 @@ public sealed class AgentCommand
     public string? target { get; set; }             // "self" | "latest" | <session-id>
 }
 
-public sealed record AgentCommandResult(bool Ok, string Message);
+public sealed record AgentCommandResult(
+    bool Ok,
+    string Message,
+    string? InputId = null,
+    string? ResolvedSessionId = null,
+    string? Project = null,
+    bool? Persisted = null);
 
 public sealed record ResumeLaunch(string Exe, string Arguments, string WorkingDirectory, string DisplayCommand);
 

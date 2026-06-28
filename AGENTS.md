@@ -1,68 +1,66 @@
-# Codex Local Retrieval — Agent Protocol
+# Codex Local Retrieval - Agent Protocol
 
-You are an AI coding agent (Claude or Codex) running in a terminal. The human you're working with
-uses **Codex Local Retrieval**, a desktop app that indexes every Claude/Codex chat on this machine
-so old conversations are never lost and can be reopened, organized, and resumed.
+You are an AI coding agent (Claude or Codex) running in a terminal. The human uses
+Codex Local Retrieval to index local Claude/Codex chats so they can be organized,
+searched, and resumed.
 
-You can drive that app from here. The human will say things like *"set yourself up in my app"*,
-*"favorite yourself"*, or *"add yourself to my VENPOD project"*. This file tells you how.
+The app watches an inbox file and applies one JSON command per complete line.
 
-## How it works
+- Inbox: `%LOCALAPPDATA%\CodexLocalRetrieval\agent-inbox.jsonl`
+- Acks: `%LOCALAPPDATA%\CodexLocalRetrieval\agent-outbox.jsonl`
 
-The app watches an **inbox file** and applies one command per line (JSONL). Append a line, and the
-app picks it up within a couple of seconds while it's running (or on its next launch).
+## Identify Yourself
 
-- Inbox:  `%LOCALAPPDATA%\CodexLocalRetrieval\agent-inbox.jsonl`  (this file's folder; create it if missing)
-- Acks:   `%LOCALAPPDATA%\CodexLocalRetrieval\agent-outbox.jsonl`  (the app writes one line back per command)
+For per-chat operations, pass your runtime session id:
 
-To append on Windows PowerShell:
+- Codex: `$env:CODEX_THREAD_ID`
+- Claude: `$env:CLAUDE_CODE_SESSION_ID`
+
+Send it as `id` with `tool:"codex"` or `tool:"claude"`. The app resolves that
+runtime id to the stored chat key using exact aliases from the transcript
+header/path, including resumed/forked Codex ids. Unknown ids fail closed; the app
+does not fall back to a different chat.
+
+If your runtime truly has no session id variable, use `target:"self"` with your
+real `cwd` and `tool`. That fallback only matches an already-indexed chat in that
+exact workspace and tool.
+
+Always include a `requestId` so you can find the matching ack without guessing
+from the outbox tail.
+
+## PowerShell
+
+Codex:
 
 ```powershell
-$cmd = '{"op":"favorite","target":"self","cwd":"<YOUR-CWD>"}'
+$rid = [guid]::NewGuid().ToString()
+$cmd = @{op="addSelfToProject";project="X";id=$env:CODEX_THREAD_ID;tool="codex";requestId=$rid} | ConvertTo-Json -Compress
 Add-Content -Path "$env:LOCALAPPDATA\CodexLocalRetrieval\agent-inbox.jsonl" -Value $cmd -Encoding utf8
+Get-Content "$env:LOCALAPPDATA\CodexLocalRetrieval\agent-outbox.jsonl" | Select-String $rid
 ```
 
-## Identifying yourself ("self")
+Claude:
 
-For per-chat ops, the app resolves `"target":"self"` to **the newest session whose workspace is
-the cwd you provide**. So always include your current working directory:
-
-- Find it: run `pwd` (or `echo %cd%`), e.g. `z:\328\CMPUT328-A2\codexworks\301`.
-- Put that exact path in the `cwd` field. Forward or back slashes are both fine.
-- Optionally add `"tool":"claude"` or `"tool":"codex"` to disambiguate if both ran in that folder.
-
-Because you are the chat actively running in this cwd, "newest session here" is you.
+```powershell
+$rid = [guid]::NewGuid().ToString()
+$cmd = @{op="addSelfToProject";project="X";id=$env:CLAUDE_CODE_SESSION_ID;tool="claude";requestId=$rid} | ConvertTo-Json -Compress
+Add-Content -Path "$env:LOCALAPPDATA\CodexLocalRetrieval\agent-inbox.jsonl" -Value $cmd -Encoding utf8
+Get-Content "$env:LOCALAPPDATA\CodexLocalRetrieval\agent-outbox.jsonl" | Select-String $rid
+```
 
 ## Commands
 
-| op | fields | does |
-|----|--------|------|
-| `init` | — | Registers the default Codex + Claude session folders so all chats show up. |
-| `addSource` | `tool`, `root` | Registers a **non-default** session folder (e.g. chats stored somewhere unusual). |
-| `favorite` | `target`/`cwd` | Pins the chat to the top of the app. |
-| `addToProject` | `project`, `target`/`cwd` | Files the chat into a project (created if new). |
-| `rename` | `target`/`cwd`, `localName`, `canonicalName?` | Renames the chat in the app (`localName`); `canonicalName` also writes back to Codex's own title so it shows in `codex resume`. |
-
-Instead of `cwd`+`self` you may target an exact chat with `"id":"<session-id>"`.
-
-## Examples (the usual asks)
-
 ```jsonl
-{"op":"init"}
-{"op":"favorite","target":"self","cwd":"z:\\328\\CMPUT328-A2\\codexworks\\301"}
-{"op":"addToProject","project":"VENPOD","target":"self","cwd":"z:\\328\\CMPUT328-A2\\codexworks\\301","tool":"claude"}
-{"op":"rename","target":"self","cwd":"z:\\328\\CMPUT328-A2\\codexworks\\301","localName":"Voxel renderer perf hunt","canonicalName":"Voxel renderer perf hunt"}
-{"op":"addSource","tool":"claude","root":"d:\\work\\.claude\\projects"}
+{"op":"init","requestId":"..."}
+{"op":"addSource","tool":"claude","root":"<path>","requestId":"..."}
+{"op":"favorite","id":"<runtime-id>","tool":"codex","requestId":"..."}
+{"op":"addSelfToProject","project":"X","id":"<runtime-id>","tool":"codex","requestId":"..."}
+{"op":"rename","id":"<runtime-id>","tool":"codex","localName":"...","canonicalName":"...","requestId":"..."}
 ```
 
-Set yourself up end to end in one go: append `init`, then `favorite self`, then `addToProject`.
-The app re-scans before applying per-chat ops, so your own session is indexed first. Check
-`agent-outbox.jsonl` to confirm each command's result.
+`addToProject` and `addToCollection` are accepted as legacy aliases for
+`addSelfToProject`.
 
-## Trust model
-
-The inbox is a **trusted local control channel**: any process running as you can append commands,
-and they run with your permissions (organize chats, register source folders, write Codex's own
-thread title). That is the same trust any local app you run already has. The app never executes
-arbitrary commands from the inbox — only the fixed ops above — and refuses to resume a chat whose
-id isn't a safe token. If you don't want agents driving it, don't share this file.
+Each ack echoes `requestId`, `line`, `op`, `inputId`, `resolvedSessionId`,
+`project`, and `persisted`. For project filing, treat `ok:true` plus
+`persisted:true` as success.

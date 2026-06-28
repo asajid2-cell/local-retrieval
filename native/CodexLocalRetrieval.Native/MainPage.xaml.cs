@@ -53,6 +53,7 @@ public sealed partial class MainPage : Page
             Diag.Log("MP.Loaded: render done");
             StartCaptureHarness();
             StartAgentBridge();
+            StartLiveReader();
             Diag.Log("DeepSeek key source: " + ApiKeySource("deepseek"));
             _ = StartupResurfaceAsync();
         }
@@ -60,6 +61,53 @@ public sealed partial class MainPage : Page
         {
             Diag.Log("MP.Loaded: EXCEPTION " + ex);
         }
+    }
+
+    // Live reader: while a chat is open, poll its source transcript and tail new turns as the agent
+    // writes them - so you watch a rollout fill in. We only auto-follow when you're at the bottom; if
+    // you scroll up to read history, we leave you there until you return to the latest.
+    private Microsoft.UI.Dispatching.DispatcherQueueTimer? _liveTimer;
+    private DateTime _liveMtime = DateTime.MinValue;
+    private ArchiveSession? _liveSession;
+    private bool _liveBusy;
+
+    private void StartLiveReader()
+    {
+        _liveTimer = DispatcherQueue.CreateTimer();
+        _liveTimer.Interval = TimeSpan.FromMilliseconds(1500);
+        _liveTimer.Tick += async (_, _) => await LiveTickAsync();
+        _liveTimer.Start();
+    }
+
+    private async Task LiveTickAsync()
+    {
+        if (_liveBusy || _screen != "Archive" || _selected is null || !_selected.ContentLoaded) return;
+
+        // First sight of this chat -> set the baseline, don't repaint.
+        if (!ReferenceEquals(_selected, _liveSession))
+        {
+            _liveSession = _selected;
+            _liveMtime = _archive.SourceWriteTimeUtc(_selected);
+            return;
+        }
+
+        var mtime = _archive.SourceWriteTimeUtc(_selected);
+        if (mtime <= _liveMtime) return;                                   // nothing new on disk
+        if (MainScroller.ScrollableHeight - MainScroller.VerticalOffset > 120) return;  // reading history; don't yank
+
+        _liveBusy = true;
+        try
+        {
+            _liveMtime = mtime;
+            await _archive.ReloadContentAsync(_selected);
+            if (_screen == "Archive" && ReferenceEquals(_selected, _liveSession))
+            {
+                _scrollArchiveToBottom = true;
+                RenderArchive();
+            }
+        }
+        catch (Exception ex) { Diag.Log("Live tick: " + ex.Message); }
+        finally { _liveBusy = false; }
     }
 
     private async Task RefreshTitlesAfterFirstPaint()
@@ -458,7 +506,7 @@ public sealed partial class MainPage : Page
     }
 
     // The self-file instruction a user pastes into any Claude/Codex chat. The agent appends one line
-    // to the inbox the app already polls; "self" resolves to the latest chat from that working folder.
+    // to the inbox the app already polls; the app resolves the runtime id to its stored chat key.
     private static string CollectionAgentInstruction(string projectName)
     {
         var inbox = System.IO.Path.Combine(
@@ -469,14 +517,15 @@ public sealed partial class MainPage : Page
             "1. Get YOUR exact session id from your environment (you already have it):\n" +
             "   - Codex:  the CODEX_THREAD_ID environment variable\n" +
             "   - Claude: the CLAUDE_CODE_SESSION_ID environment variable\n" +
-            "2. Append exactly one line (then a newline) to this file:\n" +
+            "2. Generate a requestId, then append exactly one line (then a newline) to this file:\n" +
             $"   {inbox}\n" +
-            "   The line (put your real id in, and your tool):\n" +
-            $"   {{\"op\":\"addToCollection\",\"project\":\"{projectName}\",\"id\":\"<your session id>\",\"tool\":\"codex|claude\"}}\n\n" +
-            "The app files THAT exact chat - it never guesses. If the id can't be found it returns an error " +
-            "rather than adding the wrong chat, so check the ack in agent-outbox.jsonl. (Only if your runtime " +
-            "truly has no session-id variable, fall back to \"target\":\"self\" with your real \"cwd\" and " +
-            "\"tool\".) Full protocol: AGENTS.md next to the inbox file.";
+            "   The line (put your real id, tool, and requestId in):\n" +
+            $"   {{\"op\":\"addSelfToProject\",\"project\":\"{projectName}\",\"id\":\"<your session id>\",\"tool\":\"codex|claude\",\"requestId\":\"<uuid>\"}}\n\n" +
+            "The app resolves your runtime id to its stored chat key, verifies the project membership, and " +
+            "acks with the same requestId plus resolvedSessionId and persisted. If the id cannot be resolved " +
+            "it returns an error rather than adding a different chat. Only if your runtime truly has no " +
+            "session-id variable, fall back to \"target\":\"self\" with your real \"cwd\" and \"tool\". " +
+            "Full protocol: AGENTS.md next to the inbox file.";
     }
 
     private async Task DeleteCollectionAsync(string id, string name)
@@ -615,14 +664,18 @@ public sealed partial class MainPage : Page
     private static string CapDisplay(string s, int max) =>
         string.IsNullOrEmpty(s) || s.Length <= max ? s : s[..max] + "\n\n...(truncated - reopen the chat to see the full message)";
 
-    private Border MessageBubble(ArchiveMessage message)
+    private UIElement MessageBubble(ArchiveMessage message)
     {
-        var stack = new StackPanel { Spacing = 10 };
+        if (message.EffectiveKind == "tool") return ToolStepView(message);
+
+        var isUser = message.EffectiveKind == "user";
+        var stack = new StackPanel { Spacing = 8 };
         stack.Children.Add(new TextBlock
         {
-            Text = $"{message.RoleLabel} - {FormatDate(message.Timestamp)}",
-            Foreground = MutedBrush(),
-            FontSize = 12
+            Text = (isUser ? "You" : "Assistant") + "  -  " + FormatDate(message.Timestamp),
+            Foreground = isUser ? AccentBrush() : MutedBrush(),
+            FontSize = 12,
+            FontWeight = Microsoft.UI.Text.FontWeights.SemiBold
         });
         stack.Children.Add(new TextBlock
         {
@@ -642,15 +695,84 @@ public sealed partial class MainPage : Page
 
         return new Border
         {
-            Background = message.Role == "user" ? AccentVerySoftBrush() : PanelBrush(),
+            Background = isUser ? AccentVerySoftBrush() : PanelBrush(),
             BorderBrush = LineBrush(),
             BorderThickness = new Thickness(1),
             CornerRadius = PanelCornerRadius(),
             Padding = new Thickness(18),
-            MaxWidth = 860,
-            HorizontalAlignment = HorizontalAlignment.Left,
+            MaxWidth = 900,
+            HorizontalAlignment = isUser ? HorizontalAlignment.Right : HorizontalAlignment.Left,
             Child = stack
         };
+    }
+
+    // A tool call rendered as a single compact, collapsible step: badge + command on one line; expand
+    // for the full command and its output. Keeps the transcript reading like a chat, not a data dump.
+    private UIElement ToolStepView(ArchiveMessage m)
+    {
+        var header = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8, VerticalAlignment = VerticalAlignment.Center };
+        header.Children.Add(new Border
+        {
+            Background = new SolidColorBrush(Windows.UI.Color.FromArgb(40, 120, 170, 255)),
+            CornerRadius = new CornerRadius(5),
+            Padding = new Thickness(7, 1, 7, 1),
+            VerticalAlignment = VerticalAlignment.Center,
+            Child = new TextBlock { Text = m.ToolName, Foreground = StrongBrush(), FontSize = 11, FontWeight = Microsoft.UI.Text.FontWeights.SemiBold }
+        });
+        header.Children.Add(new TextBlock
+        {
+            Text = FirstLine(m.Text),
+            Foreground = MutedBrush(),
+            FontSize = 12,
+            FontFamily = new FontFamily("Consolas"),
+            TextTrimming = TextTrimming.CharacterEllipsis,
+            MaxLines = 1,
+            VerticalAlignment = VerticalAlignment.Center
+        });
+
+        var body = new StackPanel { Spacing = 8 };
+        if (!string.IsNullOrWhiteSpace(m.Text)) body.Children.Add(MonoBlock(m.Text, muted: false));
+        if (!string.IsNullOrWhiteSpace(m.ToolOutput)) body.Children.Add(MonoBlock(m.ToolOutput, muted: true));
+
+        var expander = new Expander
+        {
+            Header = header,
+            Content = body,
+            Background = new SolidColorBrush(Colors.Transparent),
+            BorderBrush = LineBrush(),
+            BorderThickness = new Thickness(1),
+            CornerRadius = ControlCornerRadius(),
+            Padding = new Thickness(10, 2, 10, 2),
+            HorizontalAlignment = HorizontalAlignment.Left,
+            HorizontalContentAlignment = HorizontalAlignment.Stretch,
+            MaxWidth = 900
+        };
+        return expander;
+    }
+
+    private UIElement MonoBlock(string text, bool muted) => new Border
+    {
+        Background = new SolidColorBrush(Colors.Black),
+        BorderBrush = LineBrush(),
+        BorderThickness = new Thickness(1),
+        CornerRadius = ControlCornerRadius(),
+        Padding = new Thickness(10),
+        Child = new TextBlock
+        {
+            Text = CapDisplay(text, 4000),
+            FontFamily = new FontFamily("Consolas"),
+            FontSize = 12,
+            Foreground = muted ? MutedBrush() : StrongBrush(),
+            TextWrapping = TextWrapping.Wrap
+        }
+    };
+
+    private static string FirstLine(string s)
+    {
+        if (string.IsNullOrEmpty(s)) return "";
+        var i = s.IndexOfAny(new[] { '\n', '\r' });
+        var line = i < 0 ? s : s[..i];
+        return line.Length > 200 ? line[..200] : line;
     }
 
     private UIElement CodeBlockPanel(CodeBlock block)
@@ -1997,6 +2119,7 @@ public sealed partial class MainPage : Page
     private SolidColorBrush LineBrush() => (SolidColorBrush)Application.Current.Resources["LineBrush"];
     private SolidColorBrush AccentSoftBrush() => new(Windows.UI.Color.FromArgb(90, _accentColor.R, _accentColor.G, _accentColor.B));
     private SolidColorBrush AccentVerySoftBrush() => new(Windows.UI.Color.FromArgb(30, _accentColor.R, _accentColor.G, _accentColor.B));
+    private SolidColorBrush AccentBrush() => new(_accentColor);
     private CornerRadius PanelCornerRadius() => new(_panelRadius);
     private CornerRadius ControlCornerRadius() => new(_controlRadius);
     private sealed record AccentPreset(string Name, string Hex);

@@ -5,6 +5,7 @@ using System.Linq;
 using System.Text.Json;
 using System.Threading.Tasks;
 using CodexLocalRetrieval.Core.Models;
+using CodexLocalRetrieval.Core.Services;
 using Microsoft.UI.Text;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
@@ -22,6 +23,7 @@ public sealed partial class MainPage
     private Microsoft.UI.Dispatching.DispatcherQueueTimer? _agentTimer;
     private int _agentProcessed;
     private bool _agentBusy;
+    private sealed record PendingAgentLine(int LineNumber, AgentCommand? Command, string? ParseError);
 
     private static string AgentDir =>
         Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "CodexLocalRetrieval");
@@ -65,16 +67,27 @@ public sealed partial class MainPage
         try
         {
             var fresh = lines.Skip(_agentProcessed).Take(complete - _agentProcessed).ToList();
-            var cmds = new List<AgentCommand>();
-            foreach (var line in fresh)
+            var pending = new List<PendingAgentLine>();
+            for (var i = 0; i < fresh.Count; i++)
             {
+                var line = fresh[i];
+                var lineNumber = _agentProcessed + i + 1;
                 if (string.IsNullOrWhiteSpace(line)) continue;
-                try { if (JsonSerializer.Deserialize<AgentCommand>(line) is { } cmd) cmds.Add(cmd); }
-                catch (Exception ex) { Diag.Log("Agent cmd parse skip: " + ex.Message); }
+                try
+                {
+                    pending.Add(JsonSerializer.Deserialize<AgentCommand>(line) is { } cmd
+                        ? new PendingAgentLine(lineNumber, cmd, null)
+                        : new PendingAgentLine(lineNumber, null, "Invalid agent command JSON."));
+                }
+                catch (Exception ex)
+                {
+                    Diag.Log("Agent cmd parse error: " + ex.Message);
+                    pending.Add(new PendingAgentLine(lineNumber, null, "Invalid agent command JSON: " + ex.Message));
+                }
             }
-            if (cmds.Count == 0)
+            if (pending.Count == 0)
             {
-                // Blank/unparseable lines: consume them so they don't re-read every poll.
+                // Blank lines: consume them so they don't re-read every poll.
                 _agentProcessed = complete;
                 try { File.WriteAllText(AgentCursor, _agentProcessed.ToString()); } catch { }
                 return;
@@ -82,16 +95,40 @@ public sealed partial class MainPage
 
             // Source-changing ops first, then re-scan (so the agent's own session + any new root are
             // indexed), then the per-chat ops that need those sessions to exist.
-            bool IsSourceOp(AgentCommand c) { var o = (c.op ?? "").Trim().ToLowerInvariant(); return o is "init" or "addsource"; }
-            var results = new List<(string op, AgentCommandResult res)>();
-            foreach (var c in cmds.Where(IsSourceOp)) results.Add((c.op, await _archive.ApplyAgentCommandAsync(c)));
-            await SyncNowAsync(initial: false);
-            foreach (var c in cmds.Where(c => !IsSourceOp(c))) results.Add((c.op, await _archive.ApplyAgentCommandAsync(c)));
+            bool IsSourceOp(AgentCommand c) => ArchiveService.NormalizeAgentOp(c.op) is "init" or "addsource";
+            var results = new List<(PendingAgentLine item, AgentCommandResult res)>();
+            foreach (var item in pending.Where(p => p.ParseError is not null))
+                results.Add((item, new AgentCommandResult(false, item.ParseError!)));
 
-            foreach (var (op, res) in results)
+            var commandLines = pending.Where(p => p.Command is not null).ToList();
+            foreach (var item in commandLines.Where(p => IsSourceOp(p.Command!)))
+                results.Add((item, await _archive.ApplyAgentCommandAsync(item.Command!)));
+
+            if (commandLines.Count > 0) await SyncNowAsync(initial: false);
+
+            foreach (var item in commandLines.Where(p => !IsSourceOp(p.Command!)))
+                results.Add((item, await _archive.ApplyAgentCommandAsync(item.Command!)));
+
+            foreach (var (item, res) in results)
             {
-                Diag.Log($"Agent op '{op}': ok={res.Ok} {res.Message}");
-                try { File.AppendAllText(AgentOutbox, JsonSerializer.Serialize(new { op, ok = res.Ok, message = res.Message }) + "\n"); }
+                var cmd = item.Command;
+                var op = cmd is null ? "parse" : ArchiveService.NormalizeAgentOp(cmd.op);
+                Diag.Log($"Agent op '{op}' line {item.LineNumber}: ok={res.Ok} {res.Message}");
+                try
+                {
+                    File.AppendAllText(AgentOutbox, JsonSerializer.Serialize(new
+                    {
+                        requestId = cmd?.requestId,
+                        line = item.LineNumber,
+                        op,
+                        ok = res.Ok,
+                        message = res.Message,
+                        inputId = res.InputId,
+                        resolvedSessionId = res.ResolvedSessionId,
+                        project = res.Project,
+                        persisted = res.Persisted
+                    }) + "\n");
+                }
                 catch { }
             }
             if (results.Count > 0) SyncStatus.Text = "Agent: " + results[^1].res.Message;
@@ -148,27 +185,34 @@ Claude/Codex chat on this machine. You can drive it by appending JSON commands (
   inbox:  {inbox}
   acks:   {outbox}
 
-IDENTIFY YOURSELF BY EXACT ID. Your only strong identity is your session id, which is in your
-environment - the SAME id this app keys chats by:
+IDENTIFY YOURSELF BY RUNTIME ID. Your strongest identity is your live session id, which is in your
+environment:
   - Codex:  $env:CODEX_THREAD_ID
   - Claude: $env:CLAUDE_CODE_SESSION_ID
-Pass it as ""id"" (plus ""tool"":""codex""|""claude""). The app files THAT exact chat and never
-guesses. If the id can't be found it returns an error in the acks file - it will NOT add a different
-chat. Only if your runtime has no session-id variable, fall back to ""target"":""self"" with your
-real ""cwd"" and ""tool"" (matches the live chat in that exact folder; still never guesses globally).
+Pass it as ""id"" (plus ""tool"":""codex""|""claude""). The app resolves that runtime id to the
+stored chat key using exact aliases from the transcript header/path, including resumed/forked Codex
+ids. It never falls back to a different chat when an id is unknown. Only if your runtime truly has
+no session-id variable, use ""target"":""self"" with your real ""cwd"" and ""tool"".
+
+Use a requestId so you can find the matching ack instead of guessing from the outbox tail.
 
 PowerShell (Codex example):
-  Add-Content -Path '{inbox}' -Value (""{{""""op"""":""""addToProject"""",""""project"""":""""X"""",""""id"""":"""""" + $env:CODEX_THREAD_ID + """""",""""tool"""":""""codex""""}}"") -Encoding utf8
+  $rid = [guid]::NewGuid().ToString()
+  $cmd = @{{op=""addSelfToProject"";project=""X"";id=$env:CODEX_THREAD_ID;tool=""codex"";requestId=$rid}} | ConvertTo-Json -Compress
+  Add-Content -Path '{inbox}' -Value $cmd -Encoding utf8
 
 Commands (one JSON object per line):
-  {{""op"":""init""}}                                              register default Codex+Claude folders
-  {{""op"":""addSource"",""tool"":""claude"",""root"":""<path>""}}     register a non-default chat folder
-  {{""op"":""favorite"",""id"":""<your-id>"",""tool"":""codex""}}     pin this chat to the top
-  {{""op"":""addToProject"",""project"":""X"",""id"":""<your-id>"",""tool"":""codex""}}   file into project X
-  {{""op"":""rename"",""id"":""<your-id>"",""tool"":""codex"",""localName"":""..."",""canonicalName"":""...""}}
+  {{""op"":""init"",""requestId"":""...""}}                                                       register default Codex+Claude folders
+  {{""op"":""addSource"",""tool"":""claude"",""root"":""<path>"",""requestId"":""...""}}              register a non-default chat folder
+  {{""op"":""favorite"",""id"":""<runtime-id>"",""tool"":""codex"",""requestId"":""...""}}            pin this chat to the top
+  {{""op"":""addSelfToProject"",""project"":""X"",""id"":""<runtime-id>"",""tool"":""codex"",""requestId"":""...""}} file into project X
+  {{""op"":""rename"",""id"":""<runtime-id>"",""tool"":""codex"",""localName"":""..."",""canonicalName"":""..."",""requestId"":""...""}}
 
-`canonicalName` also writes back to Codex's own thread title (shows in `codex resume`). Check the
-acks file ({outbox}) for the result of every command.
+`addToProject` and `addToCollection` are accepted as legacy aliases for `addSelfToProject`.
+`canonicalName` also writes back to Codex's own thread title (shows in `codex resume`).
+
+Each ack echoes requestId, line, op, inputId, resolvedSessionId, project, and persisted. Treat
+`ok:true` plus `persisted:true` as success for project filing. Acks file: {outbox}
 ";
     }
 }
