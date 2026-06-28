@@ -9,7 +9,7 @@ namespace CodexLocalRetrieval.Core.Services;
 
 public sealed class ArchiveService
 {
-    private const int CurrentIndexVersion = 5; // bump on any parser change to force a full re-parse
+    private const int CurrentIndexVersion = 6; // bump on any parser change to force a full re-parse
     private const int MaxIndexedFiles = 4000;
     // The reader keeps the MOST RECENT messages (not the oldest), so a long chat opens on its latest
     // turns. The first prompt is still captured for the title before this window is applied.
@@ -436,8 +436,8 @@ public sealed class ArchiveService
             case "favorite":
             case "pin":
             {
-                var s = ResolveTargetSession(cmd);
-                if (s is null) return new AgentCommandResult(false, "No matching session to favorite.");
+                var s = await ResolveOrIndexTargetAsync(cmd);
+                if (s is null) return new AgentCommandResult(false, ResolveFailureHelp("favorite"));
                 s.Pinned = true;
                 await SaveAsync();
                 RefreshSessions(Store.Sessions.Values);
@@ -448,8 +448,8 @@ public sealed class ArchiveService
             case "addtocollection":
             {
                 if (string.IsNullOrWhiteSpace(cmd.project)) return new AgentCommandResult(false, "addToProject needs 'project'.");
-                var s = ResolveTargetSession(cmd);
-                if (s is null) return new AgentCommandResult(false, "No matching session to add to a project.");
+                var s = await ResolveOrIndexTargetAsync(cmd);
+                if (s is null) return new AgentCommandResult(false, ResolveFailureHelp("addToCollection"));
                 await AddToCollectionAsync(s, cmd.project!);
                 RefreshSessions(Store.Sessions.Values);
                 return new AgentCommandResult(true, $"Added \"{s.DisplayTitle}\" to project \"{cmd.project}\".");
@@ -457,8 +457,8 @@ public sealed class ArchiveService
 
             case "rename":
             {
-                var s = ResolveTargetSession(cmd);
-                if (s is null) return new AgentCommandResult(false, "No matching session to rename.");
+                var s = await ResolveOrIndexTargetAsync(cmd);
+                if (s is null) return new AgentCommandResult(false, ResolveFailureHelp("rename"));
                 if (!string.IsNullOrWhiteSpace(cmd.localName)) s.CustomTitle = CleanTitle(cmd.localName!);
                 var canonical = await TryWriteCanonicalNameAsync(s, cmd.canonicalName);
                 await SaveAsync();
@@ -476,39 +476,84 @@ public sealed class ArchiveService
         if (Store.Settings.Sources.Count == 0) Store.Settings.Sources.AddRange(DefaultSources());
     }
 
-    // Resolve which session a command targets. Priority:
-    //   1. an explicit session id (cmd.id, or cmd.target when it's a concrete id);
-    //   2. "self"/"latest"/no target -> the session whose SOURCE TRANSCRIPT was most recently written.
-    // The agent issuing the command is, at that moment, the one actively appending to its own
-    // transcript, so file mtime is the reliable "which chat is live" signal. We prefer chats in the
-    // agent's working directory (cwd) to disambiguate a folder with many chats, and fall back to all
-    // chats if cwd matches nothing (e.g. the agent didn't send one, or it's a sub/parent dir).
-    // NOTE: parsed UpdatedAt is NOT used to pick — it reflects an in-transcript timestamp that can be
-    // stale or wrong (a long chat can report a months-old time), which used to grab the wrong sibling.
+    // The id an agent supplied for a per-chat op, if any (cmd.id, or cmd.target when it is a concrete id).
+    private static string? ExplicitId(AgentCommand cmd)
+    {
+        if (!string.IsNullOrWhiteSpace(cmd.id)) return cmd.id;
+        if (!string.IsNullOrWhiteSpace(cmd.target) && cmd.target != "self" && cmd.target != "latest") return cmd.target;
+        return null;
+    }
+
+    // Resolve the target session, and if an exact id was given but isn't in the store yet, index just
+    // that one file from disk (a brand-new session adding itself before a full sync has seen it).
+    private async Task<ArchiveSession?> ResolveOrIndexTargetAsync(AgentCommand cmd)
+    {
+        var s = ResolveTargetSession(cmd);
+        if (s is not null) return s;
+        var id = ExplicitId(cmd);
+        return string.IsNullOrWhiteSpace(id) ? null : await EnsureSessionIndexedAsync(id!);
+    }
+
+    // Find and index the single transcript whose id matches, across the configured sources, so an
+    // exact-id command works for a session the store hasn't scanned yet. Returns null if no such file
+    // exists (then the caller fails closed - never a different chat).
+    private async Task<ArchiveSession?> EnsureSessionIndexedAsync(string id)
+    {
+        if (Store.Sessions.TryGetValue(id, out var existing)) return existing;
+        var sources = Store.Settings.Sources.Count > 0 ? Store.Settings.Sources : DefaultSources();
+        foreach (var src in sources)
+        {
+            if (string.IsNullOrWhiteSpace(src.Root) || !Directory.Exists(src.Root)) continue;
+            string? file = null;
+            try { file = Directory.EnumerateFiles(src.Root, "*" + id + "*.jsonl", SearchOption.AllDirectories).FirstOrDefault(); }
+            catch { }
+            if (file is null) continue;
+            var parsed = await ParseSessionAsync(file, src.Tool);
+            if (parsed is null || !string.Equals(parsed.Id, id, StringComparison.OrdinalIgnoreCase)) continue;
+            Store.Sessions[parsed.Id] = parsed;
+            await SaveAsync();
+            return parsed;
+        }
+        return null;
+    }
+
+    // Shown to an agent when nothing matched - steers it to its exact env-provided id (fail closed).
+    private static string ResolveFailureHelp(string op) =>
+        $"Could not identify your chat for '{op}'. Send your EXACT session id: Codex uses the CODEX_THREAD_ID " +
+        "environment variable, Claude uses CLAUDE_CODE_SESSION_ID. Example: " +
+        $"{{\"op\":\"{op}\",\"project\":\"...\",\"id\":\"<that id>\",\"tool\":\"codex\"}}. " +
+        "(target:\"self\" only matches an already-indexed chat in the exact same folder + tool, and never guesses another chat.)";
+
+    // FAIL CLOSED. An agent's only strong identity is its exact session id, which it gets from its
+    // environment (Codex: CODEX_THREAD_ID, Claude: CLAUDE_CODE_SESSION_ID) - the same value this app
+    // keys sessions by. So:
+    //   1. If an id is supplied, it must match an indexed session EXACTLY, or we return null. We never
+    //      "fall through" to a heuristic - guessing is what filed a random old chat before.
+    //   2. "self"/"latest" is a fallback only, and only with BOTH a tool and a cwd; it matches within
+    //      that exact workspace+tool. There is NO global "most recent" fallback.
+    // Returning null is correct - the caller turns it into an error so the agent re-sends an exact id,
+    // rather than the app silently picking the wrong conversation.
     public ArchiveSession? ResolveTargetSession(AgentCommand cmd)
     {
         var explicitId = cmd.id;
         if (string.IsNullOrWhiteSpace(explicitId) && !string.IsNullOrWhiteSpace(cmd.target)
             && cmd.target != "self" && cmd.target != "latest")
             explicitId = cmd.target;
-        if (!string.IsNullOrWhiteSpace(explicitId) && Store.Sessions.TryGetValue(explicitId!, out var byId))
-            return byId;
+        if (!string.IsNullOrWhiteSpace(explicitId))
+            return Store.Sessions.TryGetValue(explicitId!, out var byId) ? byId : null;   // exact or nothing
 
-        IEnumerable<ArchiveSession> candidates = Store.Sessions.Values;
-        if (!string.IsNullOrWhiteSpace(cmd.tool))
-            candidates = candidates.Where(s => string.Equals(s.Tool, cmd.tool, StringComparison.OrdinalIgnoreCase));
+        var isSelf = string.Equals(cmd.target, "self", StringComparison.OrdinalIgnoreCase)
+                  || string.Equals(cmd.target, "latest", StringComparison.OrdinalIgnoreCase);
+        if (!isSelf) return null;
+        if (string.IsNullOrWhiteSpace(cmd.tool) || string.IsNullOrWhiteSpace(cmd.cwd)) return null; // self needs tool+cwd
 
-        if (!string.IsNullOrWhiteSpace(cmd.cwd))
-        {
-            var norm = NormalizePath(cmd.cwd!);
-            var scoped = candidates.Where(s => NormalizePath(s.Workspace) == norm).ToList();
-            if (scoped.Count > 0) candidates = scoped; // else fall through to the global newest-written chat
-        }
-
-        return candidates
+        var norm = NormalizePath(cmd.cwd!);
+        return Store.Sessions.Values
+            .Where(s => string.Equals(s.Tool, cmd.tool, StringComparison.OrdinalIgnoreCase))
+            .Where(s => NormalizePath(s.Workspace) == norm)
             .OrderByDescending(SourceFileWriteTimeUtc)
             .ThenByDescending(s => s.UpdatedAt)
-            .FirstOrDefault();
+            .FirstOrDefault();   // null if nothing in that exact workspace+tool
     }
 
     // The last-write time of a session's source transcript on disk (resolving a stored relative path
@@ -1028,7 +1073,16 @@ public sealed class ArchiveService
 
                 if (root.TryGetProperty("payload", out var payload))
                 {
-                    if (payload.TryGetProperty("id", out var idProp)) id = idProp.GetString() ?? id;
+                    // The session id (== Codex thread id, i.e. CODEX_THREAD_ID, which agents pass as "id")
+                    // comes ONLY from the session_meta header line. Later payload lines carry per-item
+                    // "id" values (rs_... response ids) that must NOT overwrite it - that mis-keyed every
+                    // session and is why exact-id self-add could never match.
+                    var rootType = root.TryGetProperty("type", out var rtProp) ? rtProp.GetString() : null;
+                    if (rootType == "session_meta")
+                    {
+                        if (payload.TryGetProperty("session_id", out var sidProp) && sidProp.GetString() is { Length: > 0 } sid) id = sid;
+                        else if (payload.TryGetProperty("id", out var midProp) && midProp.GetString() is { Length: > 0 } mid) id = mid;
+                    }
                     if (payload.TryGetProperty("cwd", out var cwdProp)) cwd = cwdProp.GetString() ?? cwd;
 
                     if (payload.TryGetProperty("type", out var typeProp) && typeProp.GetString() == "message")

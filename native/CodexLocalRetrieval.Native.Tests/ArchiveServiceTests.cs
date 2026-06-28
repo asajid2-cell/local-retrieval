@@ -20,6 +20,34 @@ public sealed class ArchiveServiceTests
         return path;
     }
 
+    // A Codex session must be keyed by its THREAD id (session_meta), not a later rs_... response id.
+    // This mis-keying is why CODEX_THREAD_ID self-add never matched the indexed chat.
+    [TestMethod]
+    public async Task Codex_SessionKeyedByThreadId_NotLaterResponseId()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "clr-codexid-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        const string threadId = "019f0d3e-aaaa-bbbb-cccc-deadbeef0001";
+        File.WriteAllLines(Path.Combine(dir, "rollout-2026-06-28T02-00-00-" + threadId + ".jsonl"), new[]
+        {
+            "{\"timestamp\":\"2026-06-28T02:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"session_id\":\"" + threadId + "\",\"id\":\"" + threadId + "\",\"cwd\":\"z:/proj\"}}",
+            "{\"timestamp\":\"2026-06-28T02:00:01Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"hi\"}}",
+            "{\"timestamp\":\"2026-06-28T02:00:02Z\",\"type\":\"response_item\",\"payload\":{\"id\":\"rs_deadbeefdeadbeef\",\"type\":\"message\",\"role\":\"assistant\",\"content\":\"done\"}}",
+        });
+        var svc = TempService(out var store);
+        try
+        {
+            await svc.IndexRootAsync(dir);
+            Assert.IsTrue(svc.Store.Sessions.ContainsKey(threadId), "keyed by the session_meta thread id");
+            Assert.IsFalse(svc.Store.Sessions.ContainsKey("rs_deadbeefdeadbeef"), "NOT keyed by a later response id");
+        }
+        finally
+        {
+            if (Directory.Exists(dir)) Directory.Delete(dir, true);
+            if (File.Exists(store)) File.Delete(store);
+        }
+    }
+
     // L1: indexing the rollout store resurfaces every session on disk, old and new alike.
     [TestMethod]
     public async Task IndexRoot_ResurfacesOldAndNewRollouts()
@@ -339,7 +367,7 @@ public sealed class ArchiveServiceTests
             svc.Store.Sessions["live"] = new ArchiveSession { Id = "live", Workspace = ws, SourcePath = live, Tool = "claude", UpdatedAt = "2026-01-01T00:00:00Z" };
             svc.Store.Sessions["old"] = new ArchiveSession { Id = "old", Workspace = ws, SourcePath = old, Tool = "claude", UpdatedAt = "2026-06-27T00:00:00Z" };
 
-            var target = svc.ResolveTargetSession(new AgentCommand { op = "addToCollection", project = "X", target = "self", cwd = ws });
+            var target = svc.ResolveTargetSession(new AgentCommand { op = "addToCollection", project = "X", target = "self", tool = "claude", cwd = ws });
 
             Assert.IsNotNull(target);
             Assert.AreEqual("live", target!.Id, "resolves to the freshly-written transcript, not the newest timestamp");
@@ -472,7 +500,7 @@ public sealed class ArchiveServiceTests
             svc.Store.Sessions["old"] = new ArchiveSession { Id = "old", Workspace = "z:\\proj", UpdatedAt = "2026-06-01T00:00:00Z", Tool = "claude" };
             svc.Store.Sessions["new"] = new ArchiveSession { Id = "new", Workspace = "z:\\proj", UpdatedAt = "2026-06-15T00:00:00Z", Tool = "claude" };
 
-            var r = await svc.ApplyAgentCommandAsync(new AgentCommand { op = "favorite", target = "self", cwd = "z:/proj/" });
+            var r = await svc.ApplyAgentCommandAsync(new AgentCommand { op = "favorite", target = "self", tool = "claude", cwd = "z:/proj/" });
 
             Assert.IsTrue(r.Ok, r.Message);
             Assert.IsTrue(svc.Store.Sessions["new"].Pinned, "newest session in the cwd is 'self'");
@@ -488,9 +516,9 @@ public sealed class ArchiveServiceTests
         var svc = TempService(out var store);
         try
         {
-            svc.Store.Sessions["s"] = new ArchiveSession { Id = "s", Workspace = "z:\\proj", UpdatedAt = "2026-06-15T00:00:00Z" };
+            svc.Store.Sessions["s"] = new ArchiveSession { Id = "s", Workspace = "z:\\proj", UpdatedAt = "2026-06-15T00:00:00Z", Tool = "codex" };
 
-            var r = await svc.ApplyAgentCommandAsync(new AgentCommand { op = "addToProject", project = "VENPOD", cwd = "z:\\proj" });
+            var r = await svc.ApplyAgentCommandAsync(new AgentCommand { op = "addToProject", project = "VENPOD", target = "self", tool = "codex", cwd = "z:\\proj" });
 
             Assert.IsTrue(r.Ok, r.Message);
             Assert.IsTrue(svc.Store.Collections.Values.Any(c => c.Name == "VENPOD" && c.SessionIds.Contains("s")));
@@ -521,14 +549,111 @@ public sealed class ArchiveServiceTests
         var svc = TempService(out var store);
         try
         {
-            svc.Store.Sessions["s"] = new ArchiveSession { Id = "s", Title = "orig", Workspace = "z:\\proj", UpdatedAt = "2026-06-15T00:00:00Z" };
+            svc.Store.Sessions["s"] = new ArchiveSession { Id = "s", Title = "orig", Workspace = "z:\\proj", UpdatedAt = "2026-06-15T00:00:00Z", Tool = "codex" };
 
-            var r = await svc.ApplyAgentCommandAsync(new AgentCommand { op = "rename", target = "self", cwd = "z:\\proj", localName = "My cool chat" });
+            var r = await svc.ApplyAgentCommandAsync(new AgentCommand { op = "rename", target = "self", tool = "codex", cwd = "z:\\proj", localName = "My cool chat" });
 
             Assert.IsTrue(r.Ok, r.Message);
             Assert.AreEqual("My cool chat", svc.Store.Sessions["s"].DisplayTitle);
         }
         finally { if (File.Exists(store)) File.Delete(store); }
+    }
+
+    // An exact id (from CODEX_THREAD_ID / CLAUDE_CODE_SESSION_ID) files THAT chat, ignoring a
+    // newer-looking decoy in the same folder.
+    [TestMethod]
+    public async Task AgentCommand_AddToProject_ByExactId_AddsThatChat()
+    {
+        var svc = TempService(out var store);
+        try
+        {
+            svc.Store.Sessions["decoy"] = new ArchiveSession { Id = "decoy", Tool = "codex", Workspace = "z:\\proj", UpdatedAt = "2026-06-28T00:00:00Z" };
+            svc.Store.Sessions["mine"]  = new ArchiveSession { Id = "mine",  Tool = "codex", Workspace = "z:\\proj", UpdatedAt = "2026-01-01T00:00:00Z" };
+
+            var r = await svc.ApplyAgentCommandAsync(new AgentCommand { op = "addToProject", project = "Venpod", id = "mine", tool = "codex" });
+
+            Assert.IsTrue(r.Ok, r.Message);
+            var col = svc.Store.Collections.Values.First(c => c.Name == "Venpod");
+            Assert.IsTrue(col.SessionIds.Contains("mine"), "the exact id was filed");
+            Assert.IsFalse(col.SessionIds.Contains("decoy"), "the decoy was NOT filed");
+        }
+        finally { if (File.Exists(store)) File.Delete(store); }
+    }
+
+    // The bug that started this: self + a cwd that matches nothing must FAIL, never grab another chat.
+    [TestMethod]
+    public async Task AgentCommand_SelfWithUnmatchedCwd_FailsClosed()
+    {
+        var svc = TempService(out var store);
+        try
+        {
+            svc.Store.Sessions["unrelated"] = new ArchiveSession { Id = "unrelated", Tool = "claude", Workspace = "z:\\elsewhere", UpdatedAt = "2026-06-28T00:00:00Z" };
+
+            var r = await svc.ApplyAgentCommandAsync(new AgentCommand { op = "addToCollection", project = "Venpod", target = "self", tool = "codex", cwd = "z:/nowhere/that/matches" });
+
+            Assert.IsFalse(r.Ok, "must not add a chat when nothing matches");
+            Assert.AreEqual(0, svc.Store.Collections.Count, "nothing was filed");
+            Assert.IsFalse(svc.Store.Sessions["unrelated"].Pinned);
+        }
+        finally { if (File.Exists(store)) File.Delete(store); }
+    }
+
+    // self without a tool can't disambiguate codex vs claude -> fail closed.
+    [TestMethod]
+    public async Task AgentCommand_SelfWithoutTool_FailsClosed()
+    {
+        var svc = TempService(out var store);
+        try
+        {
+            svc.Store.Sessions["a"] = new ArchiveSession { Id = "a", Tool = "codex", Workspace = "z:\\proj" };
+            var r = await svc.ApplyAgentCommandAsync(new AgentCommand { op = "addToCollection", project = "P", target = "self", cwd = "z:\\proj" });
+            Assert.IsFalse(r.Ok, "self requires a tool");
+            Assert.AreEqual(0, svc.Store.Collections.Count);
+        }
+        finally { if (File.Exists(store)) File.Delete(store); }
+    }
+
+    // An unknown exact id fails closed - it never falls through to some other indexed chat.
+    [TestMethod]
+    public async Task AgentCommand_UnknownId_FailsClosed_AddsNoOtherChat()
+    {
+        var svc = TempService(out var store);
+        try
+        {
+            svc.Store.Sessions["other"] = new ArchiveSession { Id = "other", Tool = "codex", Workspace = "z:\\proj", UpdatedAt = "2026-06-28T00:00:00Z" };
+            var r = await svc.ApplyAgentCommandAsync(new AgentCommand { op = "addToCollection", project = "P", id = "does-not-exist-anywhere", tool = "codex" });
+            Assert.IsFalse(r.Ok, "unknown id must error");
+            Assert.AreEqual(0, svc.Store.Collections.Count, "no other chat was filed");
+        }
+        finally { if (File.Exists(store)) File.Delete(store); }
+    }
+
+    // A brand-new session that isn't indexed yet is found + indexed on demand by its exact id, then filed.
+    [TestMethod]
+    public async Task AgentCommand_AddToProject_IndexesFreshSessionByExactId()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "clr-fresh-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        var id = "fresh" + Guid.NewGuid().ToString("N").Substring(0, 8);
+        File.WriteAllText(Path.Combine(root, id + ".jsonl"),
+            "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"a brand new chat\"}]},\"timestamp\":\"2026-06-28T02:00:00Z\"}\n");
+        var svc = TempService(out var store);
+        try
+        {
+            await svc.ApplyAgentCommandAsync(new AgentCommand { op = "addSource", tool = "claude", root = root });
+            Assert.IsFalse(svc.Store.Sessions.ContainsKey(id), "not indexed before the command");
+
+            var r = await svc.ApplyAgentCommandAsync(new AgentCommand { op = "addToProject", project = "Fresh", id = id, tool = "claude" });
+
+            Assert.IsTrue(r.Ok, r.Message);
+            Assert.IsTrue(svc.Store.Sessions.ContainsKey(id), "indexed on demand from disk");
+            Assert.IsTrue(svc.Store.Collections.Values.First(c => c.Name == "Fresh").SessionIds.Contains(id));
+        }
+        finally
+        {
+            if (File.Exists(store)) File.Delete(store);
+            if (Directory.Exists(root)) Directory.Delete(root, true);
+        }
     }
 
     // L4: the Source inspector reads the real rollout event timeline, not a placeholder.

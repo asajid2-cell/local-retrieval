@@ -465,15 +465,18 @@ public sealed partial class MainPage : Page
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             "CodexLocalRetrieval", "agent-inbox.jsonl");
         return
-            $"Add THIS chat to my \"Codex Local Retrieval\" app under the project \"{projectName}\".\n" +
-            "Append exactly one line (then a newline) to this file:\n" +
-            $"  {inbox}\n" +
-            "The line - set \"cwd\" to YOUR current working directory (forward slashes), which you already know:\n" +
-            $"  {{\"op\":\"addToCollection\",\"project\":\"{projectName}\",\"target\":\"self\",\"cwd\":\"C:/your/current/working/dir\"}}\n" +
-            "How it resolves: the app re-scans and files the chat whose transcript is being written right " +
-            "now in that folder (i.e. you) - so it always picks the live chat, not an old sibling. If you " +
-            "truly don't know your cwd, omit it and the app uses the most recently active chat. Full " +
-            "protocol: AGENTS.md next to that file.";
+            $"Add THIS chat to my \"Codex Local Retrieval\" app under the project \"{projectName}\".\n\n" +
+            "1. Get YOUR exact session id from your environment (you already have it):\n" +
+            "   - Codex:  the CODEX_THREAD_ID environment variable\n" +
+            "   - Claude: the CLAUDE_CODE_SESSION_ID environment variable\n" +
+            "2. Append exactly one line (then a newline) to this file:\n" +
+            $"   {inbox}\n" +
+            "   The line (put your real id in, and your tool):\n" +
+            $"   {{\"op\":\"addToCollection\",\"project\":\"{projectName}\",\"id\":\"<your session id>\",\"tool\":\"codex|claude\"}}\n\n" +
+            "The app files THAT exact chat - it never guesses. If the id can't be found it returns an error " +
+            "rather than adding the wrong chat, so check the ack in agent-outbox.jsonl. (Only if your runtime " +
+            "truly has no session-id variable, fall back to \"target\":\"self\" with your real \"cwd\" and " +
+            "\"tool\".) Full protocol: AGENTS.md next to the inbox file.";
     }
 
     private async Task DeleteCollectionAsync(string id, string name)

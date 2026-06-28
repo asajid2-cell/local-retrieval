@@ -148,24 +148,27 @@ Claude/Codex chat on this machine. You can drive it by appending JSON commands (
   inbox:  {inbox}
   acks:   {outbox}
 
-PowerShell:
-  Add-Content -Path '{inbox}' -Value '{{""op"":""favorite"",""target"":""self"",""cwd"":""<YOUR-CWD>""}}' -Encoding utf8
+IDENTIFY YOURSELF BY EXACT ID. Your only strong identity is your session id, which is in your
+environment - the SAME id this app keys chats by:
+  - Codex:  $env:CODEX_THREAD_ID
+  - Claude: $env:CLAUDE_CODE_SESSION_ID
+Pass it as ""id"" (plus ""tool"":""codex""|""claude""). The app files THAT exact chat and never
+guesses. If the id can't be found it returns an error in the acks file - it will NOT add a different
+chat. Only if your runtime has no session-id variable, fall back to ""target"":""self"" with your
+real ""cwd"" and ""tool"" (matches the live chat in that exact folder; still never guesses globally).
 
-Identify yourself: for per-chat ops pass ""target"":""self"" plus ""cwd"" = your working directory
-(run `pwd`). The app re-scans and resolves that to the chat whose transcript was most recently
-written in that folder — i.e. you, since you're actively writing right now (not an old sibling chat
-that merely has a newer in-transcript timestamp). Add ""tool"":""claude"" or ""codex"" to narrow
-further, or omit ""cwd"" to mean the most recently active chat anywhere.
+PowerShell (Codex example):
+  Add-Content -Path '{inbox}' -Value (""{{""""op"""":""""addToProject"""",""""project"""":""""X"""",""""id"""":"""""" + $env:CODEX_THREAD_ID + """""",""""tool"""":""""codex""""}}"") -Encoding utf8
 
 Commands (one JSON object per line):
   {{""op"":""init""}}                                              register default Codex+Claude folders
   {{""op"":""addSource"",""tool"":""claude"",""root"":""<path>""}}     register a non-default chat folder
-  {{""op"":""favorite"",""target"":""self"",""cwd"":""<cwd>""}}        pin this chat to the top
-  {{""op"":""addToProject"",""project"":""X"",""target"":""self"",""cwd"":""<cwd>""}}   file into project X
-  {{""op"":""rename"",""target"":""self"",""cwd"":""<cwd>"",""localName"":""..."",""canonicalName"":""...""}}
+  {{""op"":""favorite"",""id"":""<your-id>"",""tool"":""codex""}}     pin this chat to the top
+  {{""op"":""addToProject"",""project"":""X"",""id"":""<your-id>"",""tool"":""codex""}}   file into project X
+  {{""op"":""rename"",""id"":""<your-id>"",""tool"":""codex"",""localName"":""..."",""canonicalName"":""...""}}
 
-`canonicalName` also writes back to Codex's own thread title (shows in `codex resume`). Instead of
-self+cwd you can target an exact chat with ""id"":""<session-id>"". Check the acks file for results.
+`canonicalName` also writes back to Codex's own thread title (shows in `codex resume`). Check the
+acks file ({outbox}) for the result of every command.
 ";
     }
 }
