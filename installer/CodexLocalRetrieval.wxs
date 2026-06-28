@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Per-user MSI for Codex Local Retrieval.
+
+  Installs the Release build output to %LOCALAPPDATA%\Programs\CodexLocalRetrieval (no admin,
+  no code signing), creates Start Menu + Desktop shortcuts, and registers in Add/Remove Programs.
+  The package contents are harvested from the build output via the BuildDir bind variable; the
+  version comes from the Version variable. Both are passed by scripts\build-msi.ps1:
+    wix build ... -d BuildDir=<staged build output> -d Version=1.0.0
+
+  UpgradeCode must never change - it is what lets a new version replace an old one in place.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+      Name="Codex Local Retrieval"
+      Manufacturer="Ahmed Sajid"
+      Version="$(var.Version)"
+      UpgradeCode="7B2C9E14-3A6D-4F58-9C21-0E5A7D8B4F33"
+      Scope="perUser"
+      Compressed="yes">
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Codex Local Retrieval is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <!-- Add/Remove Programs metadata -->
+    <Icon Id="AppIcon.ico" SourceFile="$(var.BuildDir)\Assets\AppIcon.ico" />
+    <Property Id="ARPPRODUCTICON" Value="AppIcon.ico" />
+    <Property Id="ARPNOREPAIR" Value="1" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/asajid2-cell" />
+
+    <!-- Per-user install root: %LOCALAPPDATA%\Programs\CodexLocalRetrieval -->
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="ProgramsFolder" Name="Programs">
+        <Directory Id="INSTALLFOLDER" Name="CodexLocalRetrieval" />
+      </Directory>
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder" />
+    <StandardDirectory Id="DesktopFolder" />
+
+    <Feature Id="Main" Title="Codex Local Retrieval" Level="1">
+      <ComponentGroupRef Id="AppFiles" />
+      <ComponentRef Id="StartMenuShortcut" />
+      <ComponentRef Id="DesktopShortcut" />
+    </Feature>
+
+    <!-- Every file in the build output, preserving its subfolders. -->
+    <ComponentGroup Id="AppFiles" Directory="INSTALLFOLDER">
+      <Files Include="$(var.BuildDir)\**" />
+    </ComponentGroup>
+
+    <Component Id="StartMenuShortcut" Directory="ProgramMenuFolder" Guid="6F1B2D90-9C44-4E22-8A77-1B0E3F5C6A21">
+      <Shortcut Id="StartMenuLnk"
+                Name="Codex Local Retrieval"
+                Description="Your local Claude/Codex chat hub"
+                Target="[INSTALLFOLDER]CodexLocalRetrieval.Native.exe"
+                WorkingDirectory="INSTALLFOLDER"
+                Icon="AppIcon.ico" />
+      <RegistryValue Root="HKCU" Key="Software\CodexLocalRetrieval" Name="startMenu" Type="integer" Value="1" KeyPath="yes" />
+    </Component>
+
+    <Component Id="DesktopShortcut" Directory="DesktopFolder" Guid="C3E8A45B-7D12-49F6-B0A9-2F6D8C1E4B70">
+      <Shortcut Id="DesktopLnk"
+                Name="Codex Local Retrieval"
+                Description="Your local Claude/Codex chat hub"
+                Target="[INSTALLFOLDER]CodexLocalRetrieval.Native.exe"
+                WorkingDirectory="INSTALLFOLDER"
+                Icon="AppIcon.ico" />
+      <RegistryValue Root="HKCU" Key="Software\CodexLocalRetrieval" Name="desktop" Type="integer" Value="1" KeyPath="yes" />
+    </Component>
+  </Package>
+</Wix>
