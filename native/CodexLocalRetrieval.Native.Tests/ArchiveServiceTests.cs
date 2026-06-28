@@ -370,6 +370,67 @@ public sealed class ArchiveServiceTests
         finally { if (File.Exists(store)) File.Delete(store); }
     }
 
+    // A deleted collection lands in Recently Deleted and can be restored exactly as it was.
+    [TestMethod]
+    public async Task DeleteCollection_GoesToRecentlyDeleted_AndRestores()
+    {
+        var svc = TempService(out var store);
+        try
+        {
+            svc.Store.Sessions["s1"] = new ArchiveSession { Id = "s1" };
+            await svc.AddToCollectionAsync(svc.Store.Sessions["s1"], "Renderer");
+            var id = svc.Store.Collections.Keys.First();
+
+            await svc.RemoveCollectionAsync(id);
+            Assert.IsFalse(svc.Store.Collections.ContainsKey(id), "removed from active");
+            Assert.AreEqual(1, svc.Store.DeletedCollections.Count, "moved to recently deleted");
+
+            await svc.RestoreDeletedCollectionAsync(id);
+            Assert.IsTrue(svc.Store.Collections.ContainsKey(id), "restored to active");
+            Assert.AreEqual(0, svc.Store.DeletedCollections.Count, "no longer in recently deleted");
+            Assert.IsTrue(svc.Store.Collections[id].SessionIds.Contains("s1"), "its chats came back");
+        }
+        finally { if (File.Exists(store)) File.Delete(store); }
+    }
+
+    // Export then import rebuilds collections from a lightweight backup; re-import is non-destructive.
+    [TestMethod]
+    public async Task ExportImport_RoundTripsCollections()
+    {
+        var svc = TempService(out var store);
+        try
+        {
+            svc.Store.Sessions["s1"] = new ArchiveSession { Id = "s1" };
+            svc.Store.Sessions["s2"] = new ArchiveSession { Id = "s2" };
+            await svc.AddToCollectionAsync(svc.Store.Sessions["s1"], "Alpha");
+            await svc.AddToCollectionAsync(svc.Store.Sessions["s2"], "Beta");
+            var json = svc.ExportCollectionsJson();
+
+            svc.Store.Collections.Clear();   // simulate accidental loss / a fresh machine
+
+            var added = await svc.ImportCollectionsJsonAsync(json);
+            Assert.AreEqual(2, added, "both collections restored from backup");
+            Assert.IsTrue(svc.Store.Collections.Values.Any(c => c.Name == "Alpha" && c.SessionIds.Contains("s1")));
+            Assert.IsTrue(svc.Store.Collections.Values.Any(c => c.Name == "Beta" && c.SessionIds.Contains("s2")));
+
+            var again = await svc.ImportCollectionsJsonAsync(json);
+            Assert.AreEqual(0, again, "re-importing an existing backup adds nothing");
+        }
+        finally { if (File.Exists(store)) File.Delete(store); }
+    }
+
+    // A malformed backup file is rejected, never partially applied.
+    [TestMethod]
+    public async Task ImportCollections_RejectsInvalidJson()
+    {
+        var svc = TempService(out var store);
+        try
+        {
+            Assert.AreEqual(-1, await svc.ImportCollectionsJsonAsync("this is not json"));
+        }
+        finally { if (File.Exists(store)) File.Delete(store); }
+    }
+
     // N4: an agent favorites "self" — resolved as the newest session in its workspace.
     [TestMethod]
     public async Task AgentCommand_FavoriteSelf_ResolvesNewestByCwd()

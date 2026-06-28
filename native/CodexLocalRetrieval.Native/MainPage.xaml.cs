@@ -167,7 +167,7 @@ public sealed partial class MainPage : Page
     }
 
     // The right panel (quick actions / tags) and the header actions (copy context /
-    // build restore packet) are session-specific â€” they only belong on screens tied to
+    // build restore packet) are session-specific - they only belong on screens tied to
     // the selected chat. Hide them elsewhere and reclaim the space so each screen shows
     // only what's relevant.
     private void UpdateChrome()
@@ -356,24 +356,27 @@ public sealed partial class MainPage : Page
         {
             MainContent.Children.Add(EmptyBlock("No collections yet",
                 "Make one with \"+ New collection\" above. Then add chats from a chat's right-click menu, or use a collection's \"Agent cmd\" button and paste it into any Claude/Codex chat to have it file itself in."));
-            return;
+        }
+        else
+        {
+            foreach (var collection in collections)
+            {
+                var sessions = collection.SessionIds
+                    .Select(id => _archive.Store.Sessions.TryGetValue(id, out var session) ? session : null)
+                    .OfType<ArchiveSession>()
+                    .OrderByDescending(session => session.Pinned)
+                    .ThenByDescending(session => session.UpdatedAt)
+                    .ToList();
+                var id = collection.Id;
+                var name = collection.Name;
+                MainContent.Children.Add(ExpandableSessionGroup(name, $"{sessions.Count} chats", sessions,
+                    onDelete: () => _ = DeleteCollectionAsync(id, name),
+                    onCopyAgentCommand: () => CopyCollectionAgentCommand(name),
+                    onRemoveSession: s => _ = RemoveSessionFromCollectionAsync(id, s.Id)));
+            }
         }
 
-        foreach (var collection in collections)
-        {
-            var sessions = collection.SessionIds
-                .Select(id => _archive.Store.Sessions.TryGetValue(id, out var session) ? session : null)
-                .OfType<ArchiveSession>()
-                .OrderByDescending(session => session.Pinned)
-                .ThenByDescending(session => session.UpdatedAt)
-                .ToList();
-            var id = collection.Id;
-            var name = collection.Name;
-            MainContent.Children.Add(ExpandableSessionGroup(name, $"{sessions.Count} chats", sessions,
-                onDelete: () => _ = DeleteCollectionAsync(id, name),
-                onCopyAgentCommand: () => CopyCollectionAgentCommand(name),
-                onRemoveSession: s => _ = RemoveSessionFromCollectionAsync(id, s.Id)));
-        }
+        RenderRecentlyDeleted();   // a safety net for accidental deletes (renders nothing when empty)
     }
 
     // The control panel header for Collections: create a project + explain the two ways chats get in.
@@ -395,8 +398,11 @@ public sealed partial class MainPage : Page
             FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
             VerticalAlignment = VerticalAlignment.Center
         });
-        Grid.SetColumn(newButton, 1);
-        header.Children.Add(newButton);
+        var headerActions = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8, VerticalAlignment = VerticalAlignment.Center };
+        headerActions.Children.Add(BackupMenuButton());
+        headerActions.Children.Add(newButton);
+        Grid.SetColumn(headerActions, 1);
+        header.Children.Add(headerActions);
 
         var explain = new TextBlock
         {
@@ -462,7 +468,7 @@ public sealed partial class MainPage : Page
             $"Add THIS chat to my \"Codex Local Retrieval\" app under the project \"{projectName}\".\n" +
             "Append exactly one line (then a newline) to this file:\n" +
             $"  {inbox}\n" +
-            "The line â€” set \"cwd\" to YOUR current working directory (forward slashes), which you already know:\n" +
+            "The line - set \"cwd\" to YOUR current working directory (forward slashes), which you already know:\n" +
             $"  {{\"op\":\"addToCollection\",\"project\":\"{projectName}\",\"target\":\"self\",\"cwd\":\"C:/your/current/working/dir\"}}\n" +
             "How it resolves: the app re-scans and files the chat whose transcript is being written right " +
             "now in that folder (i.e. you) - so it always picks the live chat, not an old sibling. If you " +
@@ -475,7 +481,7 @@ public sealed partial class MainPage : Page
         var dialog = new ContentDialog
         {
             Title = "Delete project",
-            Content = $"Remove the \"{name}\" project? The chats themselves stay in your archive â€” only the grouping is removed.",
+            Content = $"Remove the \"{name}\" project? The chats themselves stay in your archive - only the grouping is removed.",
             PrimaryButtonText = "Delete",
             CloseButtonText = "Cancel",
             DefaultButton = ContentDialogButton.Close,
@@ -604,7 +610,7 @@ public sealed partial class MainPage : Page
     }
 
     private static string CapDisplay(string s, int max) =>
-        string.IsNullOrEmpty(s) || s.Length <= max ? s : s[..max] + "\n\nâ€¦(truncated â€” reopen the chat to see the full message)";
+        string.IsNullOrEmpty(s) || s.Length <= max ? s : s[..max] + "\n\n...(truncated - reopen the chat to see the full message)";
 
     private Border MessageBubble(ArchiveMessage message)
     {
@@ -618,7 +624,7 @@ public sealed partial class MainPage : Page
         stack.Children.Add(new TextBlock
         {
             // A single message can carry a 500KB tool dump; laying that out in a wrapping TextBlock is what
-            // made opening a chat hitch. Cap the DISPLAYED text (full content stays in the source file â€”
+            // made opening a chat hitch. Cap the DISPLAYED text (full content stays in the source file -
             // "Resume in terminal" / "Open in VS Code" shows it all).
             Text = CapDisplay(CleanReadingText(message.Text), 4000),
             TextWrapping = TextWrapping.Wrap,

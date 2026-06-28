@@ -118,6 +118,7 @@ public sealed class ArchiveService
             Settings = Store.Settings,
             Sessions = new Dictionary<string, ArchiveSession>(Store.Sessions),
             Collections = new Dictionary<string, ArchiveCollection>(Store.Collections),
+            DeletedCollections = new List<DeletedCollection>(Store.DeletedCollections),
             FileStamps = new Dictionary<string, string>(Store.FileStamps),
         };
         await _saveGate.WaitAsync();
@@ -235,14 +236,145 @@ public sealed class ArchiveService
             collection = new ArchiveCollection { Id = id, Name = collectionName, Color = Store.Settings.AccentHex };
             Store.Collections[id] = collection;
             await SaveAsync();
+            WriteAutoBackup();   // keep the latest app backup reflecting the new project
         }
         return collection;
     }
 
+    private const int MaxDeletedCollections = 100;
+
     // Delete a project/collection — only the grouping; the chats themselves stay in the archive.
+    // Soft delete: the grouping moves to Recently Deleted (and an app backup is written first), so an
+    // accidental delete is fully recoverable.
     public async Task RemoveCollectionAsync(string collectionId)
     {
-        if (Store.Collections.Remove(collectionId)) await SaveAsync();
+        if (!Store.Collections.TryGetValue(collectionId, out var col)) return;
+        WriteAutoBackup();                       // capture a restore point that still includes this collection
+        Store.Collections.Remove(collectionId);
+        Store.DeletedCollections.Insert(0, new DeletedCollection { Collection = col, DeletedAt = DateTime.UtcNow.ToString("O") });
+        while (Store.DeletedCollections.Count > MaxDeletedCollections)
+            Store.DeletedCollections.RemoveAt(Store.DeletedCollections.Count - 1);
+        await SaveAsync();
+    }
+
+    // Bring a soft-deleted collection back. If a collection with the same id now exists, its chats are
+    // merged in rather than overwritten.
+    public async Task RestoreDeletedCollectionAsync(string collectionId)
+    {
+        var idx = Store.DeletedCollections.FindIndex(d => d.Collection.Id == collectionId);
+        if (idx < 0) return;
+        var col = Store.DeletedCollections[idx].Collection;
+        Store.DeletedCollections.RemoveAt(idx);
+        if (Store.Collections.TryGetValue(col.Id, out var existing))
+        {
+            foreach (var sid in col.SessionIds)
+                if (!existing.SessionIds.Contains(sid)) existing.SessionIds.Add(sid);
+        }
+        else
+        {
+            Store.Collections[col.Id] = col;
+        }
+        await SaveAsync();
+    }
+
+    // Permanently drop a collection from Recently Deleted (app backups may still hold it).
+    public async Task PurgeDeletedCollectionAsync(string collectionId)
+    {
+        var idx = Store.DeletedCollections.FindIndex(d => d.Collection.Id == collectionId);
+        if (idx >= 0) { Store.DeletedCollections.RemoveAt(idx); await SaveAsync(); }
+    }
+
+    public async Task EmptyRecentlyDeletedAsync()
+    {
+        if (Store.DeletedCollections.Count == 0) return;
+        Store.DeletedCollections.Clear();
+        await SaveAsync();
+    }
+
+    // ---- Backup / export / import (lightweight metadata only) -------------------------------------
+
+    private const int MaxAutoBackups = 30;
+    public string CollectionBackupsDir => Path.Combine(Path.GetDirectoryName(_storePath)!, "collection-backups");
+
+    // Serialize the current collections to a portable JSON backup (no chat content).
+    public string ExportCollectionsJson()
+    {
+        var backup = new CollectionsBackup
+        {
+            ExportedAt = DateTime.UtcNow.ToString("O"),
+            Collections = Store.Collections.Values.ToList()
+        };
+        return JsonSerializer.Serialize(backup, _jsonOptions);
+    }
+
+    // Merge a backup into the current collections: new ones are added, existing ones gain any missing
+    // chats. Never destructive. Returns the number of collections added, or -1 if the file isn't valid.
+    public async Task<int> ImportCollectionsJsonAsync(string json)
+    {
+        CollectionsBackup? backup;
+        try { backup = JsonSerializer.Deserialize<CollectionsBackup>(json, _jsonOptions); }
+        catch { return -1; }
+        if (backup?.Collections is null) return -1;
+
+        var added = 0;
+        foreach (var col in backup.Collections)
+        {
+            if (string.IsNullOrWhiteSpace(col.Id)) col.Id = Slug(col.Name);
+            if (string.IsNullOrWhiteSpace(col.Id)) continue;
+            if (Store.Collections.TryGetValue(col.Id, out var existing))
+            {
+                foreach (var sid in col.SessionIds)
+                    if (!existing.SessionIds.Contains(sid)) existing.SessionIds.Add(sid);
+            }
+            else
+            {
+                Store.Collections[col.Id] = col;
+                added++;
+            }
+        }
+        await SaveAsync();
+        return added;
+    }
+
+    // App-side automatic backup: a timestamped snapshot of collections, keeping the most recent N.
+    public void WriteAutoBackup()
+    {
+        try
+        {
+            Directory.CreateDirectory(CollectionBackupsDir);
+            var name = "collections-" + DateTime.UtcNow.ToString("yyyyMMdd-HHmmss") + ".json";
+            File.WriteAllText(Path.Combine(CollectionBackupsDir, name), ExportCollectionsJson());
+            foreach (var old in Directory.GetFiles(CollectionBackupsDir, "collections-*.json")
+                         .OrderByDescending(f => f).Skip(MaxAutoBackups))
+                try { File.Delete(old); } catch { }
+        }
+        catch { /* backups are best-effort; never block the app */ }
+    }
+
+    // The app's automatic backups, newest first.
+    public IReadOnlyList<(string Path, DateTime When, int Count)> ListAppBackups()
+    {
+        try
+        {
+            if (!Directory.Exists(CollectionBackupsDir)) return Array.Empty<(string, DateTime, int)>();
+            return Directory.GetFiles(CollectionBackupsDir, "collections-*.json")
+                .Select(f =>
+                {
+                    var count = 0;
+                    try { count = JsonSerializer.Deserialize<CollectionsBackup>(File.ReadAllText(f), _jsonOptions)?.Collections.Count ?? 0; }
+                    catch { }
+                    return (f, File.GetLastWriteTime(f), count);
+                })
+                .OrderByDescending(x => x.Item2)
+                .ToList();
+        }
+        catch { return Array.Empty<(string, DateTime, int)>(); }
+    }
+
+    public async Task<int> RestoreAppBackupAsync(string path)
+    {
+        if (!File.Exists(path)) return -1;
+        return await ImportCollectionsJsonAsync(File.ReadAllText(path));
     }
 
     // Remove a single chat from a project without deleting the project or the chat.

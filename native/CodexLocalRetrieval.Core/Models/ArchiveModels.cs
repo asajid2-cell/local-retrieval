@@ -17,6 +17,10 @@ public sealed class AppStoreData
     [JsonPropertyName("collections")]
     public Dictionary<string, ArchiveCollection> Collections { get; set; } = new();
 
+    // Soft-deleted collections kept so an accidental delete can be undone (Recently Deleted).
+    [JsonPropertyName("deletedCollections")]
+    public List<DeletedCollection> DeletedCollections { get; set; } = new();
+
     // Incremental sync: source file path -> "mtimeTicks:size". Unchanged files are skipped on
     // re-scan so relaunches are fast. Deletions are never propagated (chats keep accumulating).
     [JsonPropertyName("fileStamps")]
@@ -118,6 +122,34 @@ public sealed class ArchiveCollection
 
     [JsonPropertyName("color")]
     public string Color { get; set; } = "#fb7185";
+}
+
+// A collection moved to "Recently Deleted" - the full grouping plus when it was removed, so it can
+// be restored exactly as it was. Chats themselves are never deleted; this is metadata only.
+public sealed class DeletedCollection
+{
+    [JsonPropertyName("collection")]
+    public ArchiveCollection Collection { get; set; } = new();
+
+    [JsonPropertyName("deletedAt")]
+    public string DeletedAt { get; set; } = "";
+}
+
+// The shape of an exported/downloaded collections backup - lightweight metadata only (no chat
+// content), so it stays tiny and portable and can rebuild your projects on any machine.
+public sealed class CollectionsBackup
+{
+    [JsonPropertyName("kind")]
+    public string Kind { get; set; } = "codex-local-retrieval/collections";
+
+    [JsonPropertyName("version")]
+    public int Version { get; set; } = 1;
+
+    [JsonPropertyName("exportedAt")]
+    public string ExportedAt { get; set; } = "";
+
+    [JsonPropertyName("collections")]
+    public List<ArchiveCollection> Collections { get; set; } = new();
 }
 
 public sealed class ArchiveSession : INotifyPropertyChanged
