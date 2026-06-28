@@ -2,6 +2,7 @@ using System.Collections.ObjectModel;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using CodexLocalRetrieval.Core.Memory;
 using CodexLocalRetrieval.Core.Models;
 using Microsoft.Data.Sqlite;
 
@@ -429,6 +430,9 @@ public sealed class ArchiveService
 
     private const int MaxAutoBackups = 30;
     public string CollectionBackupsDir => Path.Combine(Path.GetDirectoryName(_storePath)!, "collection-backups");
+
+    // Per-collection Memory Bank / Project Brain vaults live here, a sibling of the backups dir.
+    public string BrainsDir => Path.Combine(Path.GetDirectoryName(_storePath)!, "brains");
 
     // Serialize the current collections to a portable JSON backup (no chat content).
     public string ExportCollectionsJson()
@@ -1256,7 +1260,10 @@ public sealed class ArchiveService
             progress?.Report("Root does not exist.");
             return 0;
         }
-        var (parsed, stamps) = await ParseSourceAsync(new SessionSource { Tool = "codex", Root = rootPath },
+        // Auto-detect per file so a root holding Claude transcripts (or a mix) is routed correctly
+        // instead of being force-parsed as Codex — otherwise a Claude .jsonl yields zero messages and
+        // is mis-tagged tool=codex (which then breaks ParseFullAsync / the brain source layer).
+        var (parsed, stamps) = await ParseSourceAsync(new SessionSource { Tool = "auto", Root = rootPath },
             new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase), progress);
         return await MergeScanAsync(new DiskScan(parsed, new List<ArchiveSession>()) { Stamps = stamps }, refreshList);
     }
@@ -1362,6 +1369,38 @@ public sealed class ArchiveService
     {
         var resolved = string.IsNullOrWhiteSpace(tool) || tool == "auto" ? DetectTool(path) : tool;
         return resolved == "claude" ? await ParseClaudeSessionAsync(path) : await ParseJsonlAsync(path);
+    }
+
+    // The shared, FULL-history result of parsing one transcript, BEFORE the recent-message window is
+    // applied. The normal indexing path (ParseJsonlAsync/ParseClaudeSessionAsync) wraps this and trims
+    // to the window; the brain wants the untrimmed list for stable anchoring. ONE source of truth for
+    // message extraction — a drift-guard test asserts the windowed tail equals this list's tail.
+    private sealed record ParsedTranscript(
+        ObservableCollection<ArchiveMessage> Messages,
+        ObservableCollection<CodeBlock> CodeBlocks,
+        string Id, string Title, string Created, string Updated,
+        string Cwd, HashSet<string> Aliases, int Total, string Tool);
+
+    // Brain source layer: re-parse a session's raw transcript WITHOUT the 600-message window, yielding
+    // the full ordered message list with a stable per-message Index (0-based over the whole transcript)
+    // — the basis for source blocks and anchors. Reuses the exact same extraction core as indexing.
+    public async Task<IReadOnlyList<FullMessage>> ParseFullAsync(ArchiveSession session)
+    {
+        if (session is null || string.IsNullOrWhiteSpace(session.SourcePath) || !File.Exists(session.SourcePath))
+            return Array.Empty<FullMessage>();
+        var tool = string.IsNullOrWhiteSpace(session.Tool) || session.Tool == "auto"
+            ? DetectTool(session.SourcePath) : session.Tool;
+        var core = tool == "claude"
+            ? await ParseClaudeCoreAsync(session.SourcePath)
+            : await ParseCodexCoreAsync(session.SourcePath);
+        if (core is null) return Array.Empty<FullMessage>();
+        var list = new List<FullMessage>(core.Messages.Count);
+        for (var i = 0; i < core.Messages.Count; i++)
+        {
+            var m = core.Messages[i];
+            list.Add(new FullMessage(i, m.Role, m.Text, m.Timestamp, m.EffectiveKind == "tool" ? m.ToolName : null));
+        }
+        return list;
     }
 
     // Peek the first useful line: claude transcripts carry a sessionId; codex rollouts carry a payload.
@@ -1488,11 +1527,13 @@ public sealed class ArchiveService
     public ResumeLaunch BuildResumeLaunch(ArchiveSession session, string? exeOverride = null)
     {
         var id = string.IsNullOrWhiteSpace(session.Id) ? Path.GetFileNameWithoutExtension(session.SourcePath) : session.Id;
-        var cwd = ResolveWorkingDirectory(session);
+        var isClaude = string.Equals(session.Tool, "claude", StringComparison.OrdinalIgnoreCase);
+        // Claude resume is directory-scoped (it only finds the session under the launch dir's encoded
+        // project folder), so it needs the recovered launch dir — not the recorded workspace subdir.
+        var cwd = isClaude ? ResolveClaudeResumeDirectory(session) : ResolveWorkingDirectory(session);
         if (!IsResumableId(id))
             return new ResumeLaunch("", "", cwd, "Refused: session id is not a safe token.");
 
-        var isClaude = string.Equals(session.Tool, "claude", StringComparison.OrdinalIgnoreCase);
         var exe = !string.IsNullOrWhiteSpace(exeOverride) ? exeOverride!
             : isClaude ? ResolveClaudeExe() : ResolveCodexExe();
 
@@ -1519,6 +1560,38 @@ public sealed class ArchiveService
         if (!string.IsNullOrWhiteSpace(sourceDir) && Directory.Exists(sourceDir)) return sourceDir;
         return Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
     }
+
+    // Claude Code files a transcript under a project folder named by DASH-ENCODING the directory that
+    // `claude` was launched from (each \ / : . and whitespace becomes '-'). `claude --resume <id>`
+    // only finds the session when run from THAT directory. The cwd recorded inside the transcript can
+    // be a SUBDIR of the launch dir (e.g. launched in …\301, cwd later moved to …\301\graphics), so
+    // resuming from the recorded workspace fails with "No conversation found with session ID". Recover
+    // the real launch dir by climbing from the workspace until a directory's encoding matches the
+    // transcript's project-folder name. Falls back to the recorded workspace if nothing matches.
+    private static string ResolveClaudeResumeDirectory(ArchiveSession session)
+    {
+        var fallback = ResolveWorkingDirectory(session);
+        var projectFolder = Path.GetFileName(Path.GetDirectoryName(session.SourcePath) ?? "");
+        if (string.IsNullOrWhiteSpace(projectFolder)) return fallback;
+
+        foreach (var start in new[] { session.Workspace, fallback })
+        {
+            var dir = string.IsNullOrWhiteSpace(start) ? null : start;
+            for (var guard = 0; guard < 64 && !string.IsNullOrWhiteSpace(dir); guard++)
+            {
+                if (string.Equals(EncodeClaudeProjectFolder(dir!), projectFolder, StringComparison.OrdinalIgnoreCase)
+                    && Directory.Exists(dir!))
+                    return dir!;
+                dir = Path.GetDirectoryName(dir!.TrimEnd('\\', '/'));
+            }
+        }
+        return fallback;
+    }
+
+    // Mirror Claude Code's project-folder encoding: every path separator, drive colon, dot, or
+    // whitespace char becomes '-', preserving case and any literal dashes already in the path.
+    private static string EncodeClaudeProjectFolder(string path) =>
+        Regex.Replace(path.TrimEnd('\\', '/'), @"[\\/:.\s]", "-");
 
     public static string ResolveCodexExe()
     {
@@ -1626,7 +1699,7 @@ public sealed class ArchiveService
             : c.ToString();
     }
 
-    private async Task<ArchiveSession> ParseJsonlAsync(string filePath)
+    private async Task<ParsedTranscript> ParseCodexCoreAsync(string filePath)
     {
         var messages = new ObservableCollection<ArchiveMessage>();
         var codeBlocks = new ObservableCollection<CodeBlock>();
@@ -1749,23 +1822,29 @@ public sealed class ArchiveService
         // Title comes from the first prompt, captured from the FULL message list before we trim to the
         // recent window (so a long chat keeps its real opening title).
         var title = CleanFallbackTitle(messages.FirstOrDefault(m => m.Role == "user" && IsTitleCandidate(m.Text))?.Text ?? Path.GetFileNameWithoutExtension(filePath));
-        var total = messages.Count;
-        (messages, codeBlocks) = KeepRecentWindow(messages, codeBlocks);
+        return new ParsedTranscript(messages, codeBlocks, id, title, created, updated, cwd, aliases, messages.Count, "codex");
+    }
+
+    // Thin wrapper: full Codex parse, then trim to the recent-message window for the in-app reader.
+    private async Task<ArchiveSession> ParseJsonlAsync(string filePath)
+    {
+        var p = await ParseCodexCoreAsync(filePath);
+        var (messages, codeBlocks) = KeepRecentWindow(p.Messages, p.CodeBlocks);
         return new ArchiveSession
         {
-            Id = id,
-            Title = title,
+            Id = p.Id,
+            Title = p.Title,
             SourcePath = filePath,
-            Aliases = new ObservableCollection<string>(aliases.Where(a => !string.Equals(a, id, StringComparison.OrdinalIgnoreCase))),
-            CreatedAt = created,
-            UpdatedAt = updated,
-            Workspace = string.IsNullOrWhiteSpace(cwd) ? "Unknown workspace" : cwd,
-            WorkspaceName = string.IsNullOrWhiteSpace(cwd) ? "Unknown" : Path.GetFileName(cwd.TrimEnd('\\', '/')),
+            Aliases = new ObservableCollection<string>(p.Aliases.Where(a => !string.Equals(a, p.Id, StringComparison.OrdinalIgnoreCase))),
+            CreatedAt = p.Created,
+            UpdatedAt = p.Updated,
+            Workspace = string.IsNullOrWhiteSpace(p.Cwd) ? "Unknown workspace" : p.Cwd,
+            WorkspaceName = string.IsNullOrWhiteSpace(p.Cwd) ? "Unknown" : Path.GetFileName(p.Cwd.TrimEnd('\\', '/')),
             Model = "codex",
             Tool = "codex",
             Messages = messages,
             CodeBlocks = codeBlocks,
-            MessageCount = total,
+            MessageCount = p.Total,
             ContentLoaded = true,
             Text = CapText(string.Join("\n\n", messages.Select(m => m.Text))),
             Tags = new ObservableCollection<string>(codeBlocks.Count > 0 ? new[] { "archive", "code" } : new[] { "archive" })
@@ -1782,7 +1861,7 @@ public sealed class ArchiveService
     // Claude Code transcript: one JSON object per line with sessionId/cwd/timestamp and a
     // message{role,content[]}. content is an array of {type:"text",text} blocks (plus tool_use/
     // tool_result we skip for the reader). Mirrors ParseJsonlAsync but for Claude's shape.
-    private async Task<ArchiveSession?> ParseClaudeSessionAsync(string filePath)
+    private async Task<ParsedTranscript?> ParseClaudeCoreAsync(string filePath)
     {
         var messages = new ObservableCollection<ArchiveMessage>();
         var codeBlocks = new ObservableCollection<CodeBlock>();
@@ -1869,22 +1948,30 @@ public sealed class ArchiveService
             !string.IsNullOrWhiteSpace(summary) ? summary :
             titleSeed ?? FirstMeaningfulUserText(messages) ?? Path.GetFileNameWithoutExtension(filePath);
         var title = CleanTitle(titleSource);
-        var total = messages.Count;
-        (messages, codeBlocks) = KeepRecentWindow(messages, codeBlocks);
+        return new ParsedTranscript(messages, codeBlocks, id, title, created, updated, cwd,
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase), messages.Count, "claude");
+    }
+
+    // Thin wrapper: full Claude parse (null = sidechain/subagent file), then trim to the reader window.
+    private async Task<ArchiveSession?> ParseClaudeSessionAsync(string filePath)
+    {
+        var p = await ParseClaudeCoreAsync(filePath);
+        if (p is null) return null;
+        var (messages, codeBlocks) = KeepRecentWindow(p.Messages, p.CodeBlocks);
         return new ArchiveSession
         {
-            Id = id,
-            Title = title,
+            Id = p.Id,
+            Title = p.Title,
             SourcePath = filePath,
-            CreatedAt = created,
-            UpdatedAt = updated,
-            Workspace = string.IsNullOrWhiteSpace(cwd) ? "Unknown workspace" : cwd,
-            WorkspaceName = string.IsNullOrWhiteSpace(cwd) ? "Unknown" : Path.GetFileName(cwd.TrimEnd('\\', '/')),
+            CreatedAt = p.Created,
+            UpdatedAt = p.Updated,
+            Workspace = string.IsNullOrWhiteSpace(p.Cwd) ? "Unknown workspace" : p.Cwd,
+            WorkspaceName = string.IsNullOrWhiteSpace(p.Cwd) ? "Unknown" : Path.GetFileName(p.Cwd.TrimEnd('\\', '/')),
             Model = "claude",
             Tool = "claude",
             Messages = messages,
             CodeBlocks = codeBlocks,
-            MessageCount = total,
+            MessageCount = p.Total,
             ContentLoaded = true,
             Text = CapText(string.Join("\n\n", messages.Select(m => m.Text))),
             Tags = new ObservableCollection<string>(codeBlocks.Count > 0 ? new[] { "archive", "code" } : new[] { "archive" })

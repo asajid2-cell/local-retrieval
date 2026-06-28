@@ -231,6 +231,48 @@ public sealed class ArchiveServiceTests
         Assert.AreEqual(cwd, launch.WorkingDirectory);
     }
 
+    // REGRESSION (real bug, session 3b7b7fbc "Cortex Engine AAA Push"): Claude files a transcript
+    // under the DASH-ENCODED launch dir. This session was launched in …\301 (project folder
+    // z--…-301) but its recorded workspace was the subdir …\301\graphics. Resuming from the workspace
+    // made `claude --resume` look in z--…-301-graphics and fail "No conversation found with session
+    // ID". The launch dir must be recovered from the transcript's project folder, not the workspace.
+    [TestMethod]
+    public void BuildResumeLaunch_Claude_RecoversLaunchDirFromProjectFolder_NotSubdirWorkspace()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "clr-resume-" + Guid.NewGuid().ToString("N"));
+        var launchDir = Path.Combine(root, "301");
+        var subDir = Path.Combine(launchDir, "graphics");   // the recorded (wrong-for-resume) workspace
+        Directory.CreateDirectory(subDir);
+
+        static string Encode(string p) =>
+            p.TrimEnd('\\', '/').Replace('\\', '-').Replace('/', '-').Replace(':', '-').Replace('.', '-').Replace(' ', '-');
+        var projDir = Path.Combine(root, "projects", Encode(launchDir));   // mirrors ~/.claude/projects/<encoded-launch-dir>
+        Directory.CreateDirectory(projDir);
+        var sourcePath = Path.Combine(projDir, "3b7b7fbc-c196-4129-a86a-8d68460b8ca5.jsonl");
+        File.WriteAllText(sourcePath, "{}");
+
+        var session = new ArchiveSession
+        {
+            Id = "3b7b7fbc-c196-4129-a86a-8d68460b8ca5",
+            Tool = "claude",
+            Workspace = subDir,
+            SourcePath = sourcePath,
+        };
+        var svc = TempService(out var store);
+        try
+        {
+            var launch = svc.BuildResumeLaunch(session, exeOverride: "claude");
+            Assert.AreEqual(launchDir, launch.WorkingDirectory,
+                "resume must run from the launch dir (whose encoding == project folder), not the subdir workspace");
+            Assert.AreEqual("--resume 3b7b7fbc-c196-4129-a86a-8d68460b8ca5", launch.Arguments);
+        }
+        finally
+        {
+            if (Directory.Exists(root)) Directory.Delete(root, true);
+            if (File.Exists(store)) File.Delete(store);
+        }
+    }
+
     private static string WriteClaudeSession(string dir, string fileName, string sessionId, string cwd, string isoTs, string userText)
     {
         Directory.CreateDirectory(dir);
