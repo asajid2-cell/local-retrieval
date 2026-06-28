@@ -291,6 +291,32 @@ public sealed class ArchiveServiceTests
         return new ArchiveService(storePath: store);
     }
 
+    // The control panel can create an empty collection (no chat needed); creating the same name
+    // twice (by slug) returns the existing one so a later agent self-file lands in the same place.
+    [TestMethod]
+    public async Task CreateCollection_MakesEmptyAndDedupesBySlug()
+    {
+        var svc = TempService(out var store);
+        try
+        {
+            var a = await svc.CreateCollectionAsync("Renderer Work");
+            Assert.IsTrue(svc.Store.Collections.ContainsKey(a.Id), "the empty collection exists");
+            Assert.AreEqual(0, a.SessionIds.Count, "it starts with no chats");
+
+            // Same display name (same slug) -> same collection, not a duplicate.
+            var b = await svc.CreateCollectionAsync("renderer work");
+            Assert.AreEqual(a.Id, b.Id, "same slug returns the same collection");
+            Assert.AreEqual(1, svc.Store.Collections.Count, "no duplicate collection is created");
+
+            // An agent self-filing into the same name lands in that collection.
+            svc.Store.Sessions["s1"] = new ArchiveSession { Id = "s1" };
+            await svc.AddToCollectionAsync(svc.Store.Sessions["s1"], "Renderer Work");
+            Assert.AreEqual(1, svc.Store.Collections.Count, "still one collection");
+            Assert.IsTrue(svc.Store.Collections[a.Id].SessionIds.Contains("s1"), "the chat joins the existing collection");
+        }
+        finally { if (File.Exists(store)) File.Delete(store); }
+    }
+
     // Deleting a project removes only the grouping; the chats stay in the archive.
     [TestMethod]
     public async Task RemoveCollection_DropsGroupingKeepsChats()

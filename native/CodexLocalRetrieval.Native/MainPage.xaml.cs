@@ -305,10 +305,23 @@ public sealed partial class MainPage : Page
 
     private void RenderCollections()
     {
-        ScreenLabel.Text = "Manual organization";
+        ScreenLabel.Text = "Your hub - group chats into projects you can reopen";
         TitleText.Text = "Collections";
         MainContent.Children.Clear();
-        foreach (var collection in _archive.Store.Collections.Values)
+
+        MainContent.Children.Add(CollectionsControlBar());
+
+        var collections = _archive.Store.Collections.Values
+            .OrderBy(c => c.Name, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        if (collections.Count == 0)
+        {
+            MainContent.Children.Add(EmptyBlock("No collections yet",
+                "Make one with \"+ New collection\" above. Then add chats from a chat's right-click menu, or use a collection's \"Agent cmd\" button and paste it into any Claude/Codex chat to have it file itself in."));
+            return;
+        }
+
+        foreach (var collection in collections)
         {
             var sessions = collection.SessionIds
                 .Select(id => _archive.Store.Sessions.TryGetValue(id, out var session) ? session : null)
@@ -319,12 +332,102 @@ public sealed partial class MainPage : Page
             var id = collection.Id;
             var name = collection.Name;
             MainContent.Children.Add(ExpandableSessionGroup(name, $"{sessions.Count} chats", sessions,
-                onDelete: () => _ = DeleteCollectionAsync(id, name)));
+                onDelete: () => _ = DeleteCollectionAsync(id, name),
+                onCopyAgentCommand: () => CopyCollectionAgentCommand(name),
+                onRemoveSession: s => _ = RemoveSessionFromCollectionAsync(id, s.Id)));
         }
-        if (_archive.Store.Collections.Count == 0)
+    }
+
+    // The control panel header for Collections: create a project + explain the two ways chats get in.
+    private Border CollectionsControlBar()
+    {
+        var newButton = new Button
         {
-            MainContent.Children.Add(EmptyBlock("No projects yet", "Right-click a chat and choose \"Add to collection\" to start one."));
+            Style = (Style)Resources["PrimaryPillButtonStyle"],
+            Content = "+ New collection"
+        };
+        newButton.Click += async (_, _) => await NewCollectionAsync();
+
+        var header = new Grid { ColumnDefinitions = { new ColumnDefinition(), new ColumnDefinition { Width = GridLength.Auto } } };
+        header.Children.Add(new TextBlock
+        {
+            Text = "Projects",
+            Foreground = StrongBrush(),
+            FontSize = 16,
+            FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
+            VerticalAlignment = VerticalAlignment.Center
+        });
+        Grid.SetColumn(newButton, 1);
+        header.Children.Add(newButton);
+
+        var explain = new TextBlock
+        {
+            Foreground = MutedBrush(),
+            TextWrapping = TextWrapping.Wrap,
+            FontSize = 13,
+            Text = "A collection is a project folder for chats. Add chats from their right-click menu, or hit \"Agent cmd\" " +
+                   "on a collection and paste it into a chat so it files itself in. Expand a collection to open any chat or " +
+                   "resume it in a fresh terminal in its original folder - so you can close VS Code and pick work back up from here."
+        };
+
+        return Card(new StackPanel { Spacing = 12, Children = { header, explain } });
+    }
+
+    private async Task NewCollectionAsync()
+    {
+        var input = new TextBox
+        {
+            PlaceholderText = "e.g. Renderer work, Job search, VENPOD",
+            MinWidth = 420,
+            CornerRadius = ControlCornerRadius()
+        };
+        var dialog = new ContentDialog
+        {
+            Title = "New collection",
+            Content = input,
+            PrimaryButtonText = "Create",
+            CloseButtonText = "Cancel",
+            DefaultButton = ContentDialogButton.Primary,
+            XamlRoot = XamlRoot
+        };
+        if (await dialog.ShowAsync() == ContentDialogResult.Primary && !string.IsNullOrWhiteSpace(input.Text))
+        {
+            var name = input.Text.Trim();
+            await _archive.CreateCollectionAsync(name);
+            RenderCollections();
+            SyncStatus.Text = $"Created collection \"{name}\".";
         }
+    }
+
+    private async Task RemoveSessionFromCollectionAsync(string collectionId, string sessionId)
+    {
+        await _archive.RemoveFromCollectionAsync(collectionId, sessionId);
+        RenderCollections();
+    }
+
+    private void CopyCollectionAgentCommand(string name)
+    {
+        var package = new DataPackage();
+        package.SetText(CollectionAgentInstruction(name));
+        Clipboard.SetContent(package);
+        SyncStatus.Text = $"Copied the agent command for \"{name}\" - paste it into a chat.";
+    }
+
+    // The self-file instruction a user pastes into any Claude/Codex chat. The agent appends one line
+    // to the inbox the app already polls; "self" resolves to the latest chat from that working folder.
+    private static string CollectionAgentInstruction(string projectName)
+    {
+        var inbox = System.IO.Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "CodexLocalRetrieval", "agent-inbox.jsonl");
+        return
+            $"Add this chat to my \"Codex Local Retrieval\" app under the project \"{projectName}\".\n" +
+            "Append exactly one line (then a newline) to this file:\n" +
+            $"  {inbox}\n" +
+            "The line to append (use FORWARD slashes in the path, replace it with your real working directory):\n" +
+            $"  {{\"op\":\"addToCollection\",\"project\":\"{projectName}\",\"target\":\"self\",\"cwd\":\"C:/path/to/this/project\"}}\n" +
+            $"The app polls that file every couple seconds and files this chat under \"{projectName}\". " +
+            "Full protocol: AGENTS.md next to that file.";
     }
 
     private async Task DeleteCollectionAsync(string id, string name)
@@ -747,15 +850,17 @@ public sealed partial class MainPage : Page
         RenderAsk();
     }
 
-    private UIElement ExpandableSessionGroup(string title, string subtitle, IEnumerable<ArchiveSession> sessions, Action? onDelete = null)
+    private UIElement ExpandableSessionGroup(string title, string subtitle, IEnumerable<ArchiveSession> sessions,
+        Action? onDelete = null, Action? onCopyAgentCommand = null, Action<ArchiveSession>? onRemoveSession = null)
     {
         var sessionList = sessions.Take(120).ToList();
         var stack = new StackPanel { Spacing = 0 };
         if (sessionList.Count == 0)
         {
-            stack.Children.Add(new TextBlock { Text = "No chats in this group.", Foreground = MutedBrush(), Margin = new Thickness(0, 6, 0, 0) });
+            stack.Children.Add(new TextBlock { Text = "No chats yet - add some from a chat's right-click menu, or paste this collection's Agent cmd into a chat.", Foreground = MutedBrush(), TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 6, 0, 0) });
         }
-        foreach (var session in sessionList) stack.Children.Add(SessionRow(session));
+        foreach (var session in sessionList)
+            stack.Children.Add(SessionRow(session, onRemoveSession is null ? null : () => onRemoveSession(session)));
 
         // Dense header: name + count pill on one line, path muted underneath. No oversized type.
         var header = new Grid { ColumnDefinitions = { new ColumnDefinition(), new ColumnDefinition { Width = GridLength.Auto } } };
@@ -772,6 +877,20 @@ public sealed partial class MainPage : Page
             VerticalAlignment = VerticalAlignment.Center,
             Child = new TextBlock { Text = subtitle, Foreground = MutedBrush(), FontSize = 11 }
         });
+        if (onCopyAgentCommand is not null)
+        {
+            var agentCmd = new Button
+            {
+                Style = (Style)Resources["PillButtonStyle"],
+                Padding = new Thickness(10, 0, 10, 0),
+                MinHeight = 32,
+                Height = 32,
+                Content = new TextBlock { Text = "Agent cmd", FontSize = 12 }
+            };
+            ToolTipService.SetToolTip(agentCmd, "Copy a command to paste into a chat so it files itself into this collection");
+            agentCmd.Click += (_, _) => onCopyAgentCommand();
+            rightActions.Children.Add(agentCmd);
+        }
         if (onDelete is not null)
         {
             var delete = new Button
@@ -830,7 +949,7 @@ public sealed partial class MainPage : Page
         };
     }
 
-    private UIElement SessionRow(ArchiveSession session)
+    private UIElement SessionRow(ArchiveSession session, Action? onRemove = null)
     {
         var resumeButton = new Button
         {
@@ -881,6 +1000,21 @@ public sealed partial class MainPage : Page
             VerticalAlignment = VerticalAlignment.Center,
             Children = { resumeButton, openButton }
         };
+        if (onRemove is not null)
+        {
+            var remove = new Button
+            {
+                Style = (Style)Resources["IconButtonStyle"],
+                Width = 34,
+                Height = 34,
+                MinWidth = 34,
+                MinHeight = 34,
+                Content = new FontIcon { FontFamily = new FontFamily("Segoe Fluent Icons"), FontSize = 13, Glyph = "" }
+            };
+            ToolTipService.SetToolTip(remove, "Remove from this collection (keeps the chat)");
+            remove.Click += (_, _) => onRemove();
+            actions.Children.Add(remove);
+        }
         Grid.SetColumn(actions, 1);
         grid.Children.Add(actions);
 

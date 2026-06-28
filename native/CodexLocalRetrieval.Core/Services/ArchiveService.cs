@@ -222,6 +222,21 @@ public sealed class ArchiveService
         await SaveAsync();
     }
 
+    // Create an empty collection from the Collections control panel (no chat needed yet). Returns
+    // the collection, whether it was newly created or already existed under the same slug — so an
+    // agent self-filing into the same name later lands in this exact collection.
+    public async Task<ArchiveCollection> CreateCollectionAsync(string collectionName)
+    {
+        var id = Slug(collectionName);
+        if (!Store.Collections.TryGetValue(id, out var collection))
+        {
+            collection = new ArchiveCollection { Id = id, Name = collectionName, Color = Store.Settings.AccentHex };
+            Store.Collections[id] = collection;
+            await SaveAsync();
+        }
+        return collection;
+    }
+
     // Delete a project/collection — only the grouping; the chats themselves stay in the archive.
     public async Task RemoveCollectionAsync(string collectionId)
     {
