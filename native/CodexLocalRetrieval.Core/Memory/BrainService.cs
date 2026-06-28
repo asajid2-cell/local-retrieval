@@ -38,6 +38,10 @@ public sealed class BrainService
     public BrainPaths PathsFor(string collectionId) => new(_archive.BrainsDir, collectionId);
     public GitHistory Git => _git;
 
+    // Whether a brain has been built for this collection (manifest has a BuiltAt timestamp).
+    public bool PathsForBuilt(string collectionId)
+        => !string.IsNullOrWhiteSpace(_vault.ReadManifest(PathsFor(collectionId)).BuiltAt);
+
     // chat -> blocks (full-history parse + deterministic blocking), plus the file stamp per chat.
     public async Task<(List<SourceBlock> blocks, Dictionary<string, string> stamps)> BuildBlocksAsync(
         IEnumerable<ArchiveSession> chats, CancellationToken ct = default)

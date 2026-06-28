@@ -652,9 +652,36 @@ public sealed class ArchiveService
                 return new AgentCommandResult(true, $"{verb} \"{s.DisplayTitle}\" ({changed} change{(changed == 1 ? "" : "s")}).", inputId, s.Id, Persisted: changed > 0);
             }
 
+            case "handoff":
+            {
+                // Return the collection's brain as a compact, sparse handoff bundle (current state +
+                // canonical truths + open loops + working notes, each with a source link). No LLM, no
+                // key — reads the canonical vault. Optional cmd.name carries the task to orient on.
+                if (string.IsNullOrWhiteSpace(cmd.project))
+                    return new AgentCommandResult(false, "handoff needs 'project' (the collection name).");
+                var colId = ResolveCollectionIdByName(cmd.project!, cmd.deck);
+                if (colId is null) return new AgentCommandResult(false, $"No collection named \"{cmd.project}\".", Project: cmd.project);
+                var brain = new BrainService(this);
+                if (!brain.PathsForBuilt(colId))
+                    return new AgentCommandResult(false, $"No brain built yet for \"{cmd.project}\" — build it in the app first.", Project: cmd.project);
+                var bundle = brain.GetAgentContext(colId, cmd.name ?? "");
+                return new AgentCommandResult(true, bundle, Project: cmd.project, Persisted: true);
+            }
+
             default:
                 return new AgentCommandResult(false, $"Unknown op: '{cmd.op}'.");
         }
+    }
+
+    // Resolve a collection by the agent-supplied project name: first the deck-scoped id, then a
+    // case-insensitive name match across decks. Null if no such collection exists.
+    private string? ResolveCollectionIdByName(string name, string? deckRef)
+    {
+        var deck = ResolveDeckId(deckRef);
+        var colId = DeckCollectionId(name, deck);
+        if (Store.Collections.ContainsKey(colId)) return colId;
+        var match = Store.Collections.Values.FirstOrDefault(c => string.Equals(c.Name, name, StringComparison.OrdinalIgnoreCase));
+        return match?.Id;
     }
 
     public static string NormalizeAgentOp(string? op)
@@ -664,6 +691,7 @@ public sealed class ArchiveService
         {
             "addtoproject" or "addtocollection" or "addselftoproject" or "addselftocollection" => "addselftoproject",
             "setname" or "name" or "label" or "setlabel" => "rename",
+            "handoff" or "agentcontext" or "brainhandoff" or "context" => "handoff",
             "pin" => "pin",
             _ => value
         };
@@ -1401,6 +1429,20 @@ public sealed class ArchiveService
             list.Add(new FullMessage(i, m.Role, m.Text, m.Timestamp, m.EffectiveKind == "tool" ? m.ToolName : null));
         }
         return list;
+    }
+
+    // Brain "open source span": the messages of a transcript in the inclusive index range a card's
+    // anchor points at (optionally with N messages of context on each side). Indices are over the FULL
+    // history, matching the anchors SourceBlocker produced. Clamped, so a stale anchor never throws.
+    public async Task<IReadOnlyList<FullMessage>> ParseFullRangeAsync(ArchiveSession session, int startIndex, int endIndex, int context = 0)
+    {
+        var full = await ParseFullAsync(session);
+        if (full.Count == 0) return full;
+        var lo = Math.Max(0, Math.Min(startIndex, endIndex) - Math.Max(0, context));
+        var hi = Math.Min(full.Count - 1, Math.Max(startIndex, endIndex) + Math.Max(0, context));
+        var slice = new List<FullMessage>(Math.Max(0, hi - lo + 1));
+        for (var i = lo; i <= hi; i++) slice.Add(full[i]);
+        return slice;
     }
 
     // Peek the first useful line: claude transcripts carry a sessionId; codex rollouts carry a payload.

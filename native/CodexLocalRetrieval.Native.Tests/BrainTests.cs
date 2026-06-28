@@ -1,4 +1,5 @@
 using CodexLocalRetrieval.Core.Memory;
+using CodexLocalRetrieval.Core.Models;
 using CodexLocalRetrieval.Core.Services;
 
 namespace CodexLocalRetrieval.Native.Tests;
@@ -663,6 +664,72 @@ public sealed class BrainTests
         var card = BrainBuilder.ToCard(cands[0], new Dictionary<string, SourceBlock> { { blk.Id, blk } }, Now);
         var patch = new MemoryPatchService().BuildPatch("col", Array.Empty<MemoryCard>(), new[] { card }, "deepseek", "p1", Now);
         Assert.AreEqual(Lanes.Canonical, patch.Adds[0].Lane, "anchored + result_backed => canonical");
+    }
+
+    // ---- BL4 (core-testable): open-source-span resolver + handoff agent op ----
+
+    // The reader-jump resolver returns exactly the anchored message range (with optional context),
+    // clamped so a stale anchor never throws.
+    [TestMethod]
+    public async Task ParseFullRange_ReturnsAnchoredSpan_WithContext_Clamped()
+    {
+        var (dir, id) = WriteBigCodexRollout(50);  // 100 messages, indices 0..99
+        var svc = TempService(out var store);
+        try
+        {
+            await svc.IndexRootAsync(dir);
+            var session = svc.Store.Sessions[id];
+
+            var span = await svc.ParseFullRangeAsync(session, 10, 12);
+            Assert.AreEqual(3, span.Count);
+            Assert.AreEqual("user turn number 5", span[0].Text);       // index 10
+            Assert.AreEqual("assistant reply number 5", span[1].Text); // index 11
+            Assert.AreEqual("user turn number 6", span[2].Text);       // index 12
+
+            var withCtx = await svc.ParseFullRangeAsync(session, 10, 10, context: 2);
+            Assert.AreEqual(5, withCtx.Count, "±2 context around a single message");
+
+            var clamped = await svc.ParseFullRangeAsync(session, -5, 100000);
+            Assert.AreEqual(100, clamped.Count, "out-of-range clamps to the whole transcript");
+        }
+        finally { Cleanup(dir, store); }
+    }
+
+    // The `handoff` agent op returns the collection's brain as a sparse bundle (no LLM/key), and fails
+    // clearly when the collection has no brain.
+    [TestMethod]
+    public async Task HandoffAgentOp_ReturnsBundle_OrFailsWhenUnbuilt()
+    {
+        var (dir, id) = WriteBigCodexRollout(5);
+        var root = Path.Combine(Path.GetTempPath(), "clr-bsvc-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        var svc = new ArchiveService(storePath: Path.Combine(root, "store.json"));
+        try
+        {
+            await svc.IndexRootAsync(dir);
+            var session = svc.Store.Sessions[id];
+            await svc.AddToCollectionAsync(session, "Graphics");
+            var colId = svc.Store.Collections.Values.First(c => c.Name == "Graphics").Id;
+
+            // not built yet -> clear failure
+            var notBuilt = await svc.ApplyAgentCommandAsync(new AgentCommand { op = "handoff", project = "Graphics" });
+            Assert.IsFalse(notBuilt.Ok);
+            StringAssert.Contains(notBuilt.Message, "No brain built");
+
+            // build, then handoff returns the bundle with the task echoed
+            var brain = new BrainService(svc);
+            await brain.BuildAndApplyAsync(colId, "Graphics", new[] { session },
+                new IBrainAnalyst[] { new MockAnalyst() }, new BrainBuildOptions(), Now);
+
+            var res = await svc.ApplyAgentCommandAsync(new AgentCommand { op = "handoff", project = "Graphics", name = "fix the renderer" });
+            Assert.IsTrue(res.Ok, res.Message);
+            StringAssert.Contains(res.Message, "Agent handoff");
+            StringAssert.Contains(res.Message, "fix the renderer");
+
+            var missing = await svc.ApplyAgentCommandAsync(new AgentCommand { op = "handoff", project = "Nonexistent" });
+            Assert.IsFalse(missing.Ok);
+        }
+        finally { TryDeleteDir(dir); TryDeleteDir(root); }
     }
 
     private sealed class CannedBackend : CodexLocalRetrieval.Core.Chat.IChatBackend
