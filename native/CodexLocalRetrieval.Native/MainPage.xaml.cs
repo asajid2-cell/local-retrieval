@@ -193,6 +193,8 @@ public sealed partial class MainPage : Page
     private int _archiveShown;
     private ArchiveSession? _lastArchiveSession;
     private const int ArchivePageSize = 25;
+    private bool _scrollArchiveToBottom;   // jump to newest after the first render of a chat
+    private bool _loadingOlder;            // re-entrancy guard while prepending older messages on scroll-up
 
     private int _searchShown;
     private string _lastSearchQuery = "";
@@ -213,11 +215,12 @@ public sealed partial class MainPage : Page
             return;
         }
 
-        // New chat selected -> start its pagination fresh (Load more keeps the same session, so it won't reset).
-        if (!ReferenceEquals(_selected, _lastArchiveSession)) { _archiveShown = 0; _lastArchiveSession = _selected; }
+        // New chat selected -> start fresh and jump to the newest messages once it renders.
+        if (!ReferenceEquals(_selected, _lastArchiveSession)) { _archiveShown = 0; _lastArchiveSession = _selected; _scrollArchiveToBottom = true; }
 
         // Content lazy-loads from the source file the first time you open a chat (the store holds only
-        // metadata), then paginates so a huge transcript never renders all at once.
+        // metadata). The reader shows the MOST RECENT messages at the bottom; scrolling up auto-loads
+        // older ones, so a long chat opens where the conversation actually is.
         if (!_selected.ContentLoaded)
         {
             MainContent.Children.Add(EmptyBlock("Loading conversation...", _selected.WorkspaceName));
@@ -227,19 +230,54 @@ public sealed partial class MainPage : Page
 
         var messages = _selected.Messages;
         var shown = Math.Min(_archiveShown <= 0 ? ArchivePageSize : _archiveShown, messages.Count);
-        for (var i = 0; i < shown; i++) MainContent.Children.Add(MessageBubble(messages[i]));
+        var start = messages.Count - shown;   // render the last `shown` messages, oldest-of-page first
 
-        if (shown < messages.Count)
+        if (start > 0)
         {
-            var more = new Button
+            MainContent.Children.Add(new TextBlock
             {
-                Content = $"Load {Math.Min(ArchivePageSize, messages.Count - shown)} more  ({messages.Count - shown} left)",
-                Margin = new Thickness(0, 8, 0, 16),
-                HorizontalAlignment = HorizontalAlignment.Center
-            };
-            more.Click += (_, _) => { _archiveShown = shown + ArchivePageSize; RenderArchive(); };
-            MainContent.Children.Add(more);
+                Text = $"Scroll up to load {start} earlier message{(start == 1 ? "" : "s")}",
+                Foreground = MutedBrush(),
+                FontSize = 12,
+                HorizontalAlignment = HorizontalAlignment.Center,
+                Margin = new Thickness(0, 2, 0, 8)
+            });
         }
+        for (var i = start; i < messages.Count; i++) MainContent.Children.Add(MessageBubble(messages[i]));
+
+        if (_scrollArchiveToBottom && messages.Count > 0)
+        {
+            _scrollArchiveToBottom = false;
+            // Force layout so ScrollableHeight is known, then jump to the newest message.
+            MainScroller.UpdateLayout();
+            MainScroller.ChangeView(null, MainScroller.ScrollableHeight, null, disableAnimation: true);
+        }
+    }
+
+    // Auto-paginate older messages when the user scrolls near the top - no manual "load more".
+    private void MainScroller_ViewChanged(object sender, Microsoft.UI.Xaml.Controls.ScrollViewerViewChangedEventArgs e)
+    {
+        if (e.IsIntermediate || _loadingOlder) return;
+        if (_screen != "Archive" || _selected is null || !_selected.ContentLoaded) return;
+        if (MainScroller.VerticalOffset > 48) return;   // only fire when near the top
+
+        var count = _selected.Messages.Count;
+        var shown = Math.Min(_archiveShown <= 0 ? ArchivePageSize : _archiveShown, count);
+        if (shown >= count) return;                       // nothing older to load
+
+        _loadingOlder = true;
+        try
+        {
+            var oldExtent = MainScroller.ExtentHeight;
+            var oldOffset = MainScroller.VerticalOffset;
+            _archiveShown = shown + ArchivePageSize;
+            RenderArchive();                              // re-renders with more older messages at the top
+            MainScroller.UpdateLayout();
+            // Keep the user's view anchored on the same message by absorbing the height added above.
+            var delta = MainScroller.ExtentHeight - oldExtent;
+            MainScroller.ChangeView(null, oldOffset + delta, null, disableAnimation: true);
+        }
+        finally { _loadingOlder = false; }
     }
 
     private async Task EnsureContentThenRenderAsync(ArchiveSession session)
@@ -923,13 +961,14 @@ public sealed partial class MainPage : Page
             Content = stack
         };
 
+        // No surrounding panel box - the group sits flat on the page (just a hairline under the header
+        // row), so Workspaces and Collections read as a clean list rather than nested grey cards.
         return new Border
         {
-            Background = PanelBrush(),
+            Background = new SolidColorBrush(Colors.Transparent),
             BorderBrush = LineBrush(),
-            BorderThickness = new Thickness(1),
-            CornerRadius = PanelCornerRadius(),
-            Padding = new Thickness(14, 6, 14, 6),
+            BorderThickness = new Thickness(0, 0, 0, 1),
+            Padding = new Thickness(2, 2, 2, 6),
             Child = expander
         };
     }

@@ -241,7 +241,7 @@
                 </Grid>
             </Border>
 
-            <ScrollViewer Grid.Row="1">
+            <ScrollViewer x:Name="MainScroller" Grid.Row="1" ViewChanged="MainScroller_ViewChanged">
                 <StackPanel x:Name="MainContent" Padding="28,26" Spacing="18" />
             </ScrollViewer>
         </Grid>

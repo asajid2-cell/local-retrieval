@@ -9,9 +9,11 @@ namespace CodexLocalRetrieval.Core.Services;
 
 public sealed class ArchiveService
 {
-    private const int CurrentIndexVersion = 4; // bump on any parser change to force a full re-parse
+    private const int CurrentIndexVersion = 5; // bump on any parser change to force a full re-parse
     private const int MaxIndexedFiles = 4000;
-    private const int MaxMessagesPerSession = 220;
+    // The reader keeps the MOST RECENT messages (not the oldest), so a long chat opens on its latest
+    // turns. The first prompt is still captured for the title before this window is applied.
+    private const int RecentMessageWindow = 600;
     private const int MaxLinesPerSession = 18_000;
     private const int MaxLineChars = 512_000;
     private const int SearchTextCap = 6_000; // capped, in-memory searchable text per session (full content lazy-loads)
@@ -879,7 +881,6 @@ public sealed class ArchiveService
         {
             lineCount++;
             if (lineCount > MaxLinesPerSession) break;
-            if (messages.Count >= MaxMessagesPerSession) break;
             if (string.IsNullOrWhiteSpace(line)) continue;
             if (line.Length > MaxLineChars) continue;
             JsonDocument doc;
@@ -922,7 +923,11 @@ public sealed class ArchiveService
         if (string.IsNullOrWhiteSpace(created)) created = info.CreationTimeUtc.ToString("O");
         if (string.IsNullOrWhiteSpace(updated)) updated = info.LastWriteTimeUtc.ToString("O");
 
+        // Title comes from the first prompt, captured from the FULL message list before we trim to the
+        // recent window (so a long chat keeps its real opening title).
         var title = CleanFallbackTitle(messages.FirstOrDefault(m => m.Role == "user" && IsTitleCandidate(m.Text))?.Text ?? Path.GetFileNameWithoutExtension(filePath));
+        var total = messages.Count;
+        (messages, codeBlocks) = KeepRecentWindow(messages, codeBlocks);
         return new ArchiveSession
         {
             Id = id,
@@ -936,7 +941,7 @@ public sealed class ArchiveService
             Tool = "codex",
             Messages = messages,
             CodeBlocks = codeBlocks,
-            MessageCount = messages.Count,
+            MessageCount = total,
             ContentLoaded = true,
             Text = CapText(string.Join("\n\n", messages.Select(m => m.Text))),
             Tags = new ObservableCollection<string>(codeBlocks.Count > 0 ? new[] { "archive", "code" } : new[] { "archive" })
@@ -968,7 +973,6 @@ public sealed class ArchiveService
         {
             lineCount++;
             if (lineCount > MaxLinesPerSession) break;
-            if (messages.Count >= MaxMessagesPerSession) break;
             if (string.IsNullOrWhiteSpace(line)) continue;
             if (line.Length > MaxLineChars) continue;
             JsonDocument doc;
@@ -1009,9 +1013,18 @@ public sealed class ArchiveService
         if (isSidechain) return null;
 
         if (string.IsNullOrWhiteSpace(created)) created = info.CreationTimeUtc.ToString("O");
-        var title = !string.IsNullOrWhiteSpace(summary)
-            ? CleanTitle(summary)
-            : CleanTitle(FirstMeaningfulUserText(messages) ?? Path.GetFileNameWithoutExtension(filePath));
+        // The session's real name: a user/agent custom-title wins, then Claude's ai-title, then a
+        // summary record, then the first prompt. Custom/ai titles are appended at the file TAIL (often
+        // far past the message window), so scan the tail for them rather than relying on the forward parse.
+        var (tailCustom, tailAi) = ClaudeTailTitle(filePath);
+        var titleSource =
+            !string.IsNullOrWhiteSpace(tailCustom) ? tailCustom! :
+            !string.IsNullOrWhiteSpace(tailAi) ? tailAi! :
+            !string.IsNullOrWhiteSpace(summary) ? summary :
+            FirstMeaningfulUserText(messages) ?? Path.GetFileNameWithoutExtension(filePath);
+        var title = CleanTitle(titleSource);
+        var total = messages.Count;
+        (messages, codeBlocks) = KeepRecentWindow(messages, codeBlocks);
         return new ArchiveSession
         {
             Id = id,
@@ -1025,7 +1038,7 @@ public sealed class ArchiveService
             Tool = "claude",
             Messages = messages,
             CodeBlocks = codeBlocks,
-            MessageCount = messages.Count,
+            MessageCount = total,
             ContentLoaded = true,
             Text = CapText(string.Join("\n\n", messages.Select(m => m.Text))),
             Tags = new ObservableCollection<string>(codeBlocks.Count > 0 ? new[] { "archive", "code" } : new[] { "archive" })
@@ -1075,6 +1088,49 @@ public sealed class ArchiveService
             Timestamp = timestamp,
             CodeBlocks = new ObservableCollection<CodeBlock>(blocks)
         });
+    }
+
+    // Trim a parsed transcript to its most recent messages so a long chat opens on its latest turns
+    // (memory stays bounded). Code blocks follow the kept messages. The caller captures the title from
+    // the full list BEFORE calling this, so trimming never loses the opening prompt.
+    private static (ObservableCollection<ArchiveMessage> messages, ObservableCollection<CodeBlock> codeBlocks)
+        KeepRecentWindow(ObservableCollection<ArchiveMessage> messages, ObservableCollection<CodeBlock> codeBlocks)
+    {
+        if (messages.Count <= RecentMessageWindow) return (messages, codeBlocks);
+        var keep = messages.Skip(messages.Count - RecentMessageWindow).ToList();
+        return (new ObservableCollection<ArchiveMessage>(keep),
+                new ObservableCollection<CodeBlock>(keep.SelectMany(m => m.CodeBlocks)));
+    }
+
+    // Read the last 96KB of a Claude transcript for the latest custom-title / ai-title record. Renames
+    // are appended at the file TAIL (often far past the message window), so the forward parse misses
+    // them; this is how the reader and list show the real session name instead of the first prompt.
+    private static (string? custom, string? ai) ClaudeTailTitle(string path)
+    {
+        try
+        {
+            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            var n = (int)Math.Min(fs.Length, 96 * 1024);
+            if (n <= 0) return (null, null);
+            fs.Seek(-n, SeekOrigin.End);
+            var buf = new byte[n];
+            var read = fs.Read(buf, 0, n);
+            string? custom = null, ai = null;
+            foreach (var line in Encoding.UTF8.GetString(buf, 0, read).Split('\n'))
+            {
+                if (line.IndexOf("Title", StringComparison.Ordinal) < 0) continue;
+                try
+                {
+                    using var d = JsonDocument.Parse(line);
+                    var r = d.RootElement;
+                    if (r.TryGetProperty("customTitle", out var cu) && cu.GetString() is { Length: > 0 } cuv) custom = cuv;       // latest wins
+                    else if (r.TryGetProperty("aiTitle", out var at) && at.GetString() is { Length: > 0 } atv) ai = atv;
+                }
+                catch { }
+            }
+            return (custom, ai);
+        }
+        catch { return (null, null); }
     }
 
     private void RemoveBundledSampleSessions(HashSet<string> importedIds)
