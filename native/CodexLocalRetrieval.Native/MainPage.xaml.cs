@@ -960,15 +960,27 @@ public sealed partial class MainPage : Page
             Header = header,
             Content = stack
         };
+        // Kill the Expander's own grey header/content chrome (the inner box that held the title) so the
+        // black panel container shows through cleanly. Expander.Background doesn't cover these - they're
+        // driven by theme resources, overridden per-instance here.
+        var clear = new SolidColorBrush(Colors.Transparent);
+        foreach (var key in new[]
+                 {
+                     "ExpanderHeaderBackground", "ExpanderHeaderBorderBrush",
+                     "ExpanderHeaderPointerOverBackground", "ExpanderHeaderPressedBackground",
+                     "ExpanderHeaderDisabledBackground", "ExpanderContentBackground", "ExpanderContentBorderBrush"
+                 })
+            expander.Resources[key] = clear;
+        expander.Resources["ExpanderHeaderBorderThickness"] = new Thickness(0);
 
-        // No surrounding panel box - the group sits flat on the page (just a hairline under the header
-        // row), so Workspaces and Collections read as a clean list rather than nested grey cards.
+        // Keep the black panel container; only the inner grey box was the problem.
         return new Border
         {
-            Background = new SolidColorBrush(Colors.Transparent),
+            Background = PanelBrush(),
             BorderBrush = LineBrush(),
-            BorderThickness = new Thickness(0, 0, 0, 1),
-            Padding = new Thickness(2, 2, 2, 6),
+            BorderThickness = new Thickness(1),
+            CornerRadius = PanelCornerRadius(),
+            Padding = new Thickness(14, 6, 14, 6),
             Child = expander
         };
     }
