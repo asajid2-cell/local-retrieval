@@ -421,13 +421,15 @@ public sealed partial class MainPage : Page
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             "CodexLocalRetrieval", "agent-inbox.jsonl");
         return
-            $"Add this chat to my \"Codex Local Retrieval\" app under the project \"{projectName}\".\n" +
+            $"Add THIS chat to my \"Codex Local Retrieval\" app under the project \"{projectName}\".\n" +
             "Append exactly one line (then a newline) to this file:\n" +
             $"  {inbox}\n" +
-            "The line to append (use FORWARD slashes in the path, replace it with your real working directory):\n" +
-            $"  {{\"op\":\"addToCollection\",\"project\":\"{projectName}\",\"target\":\"self\",\"cwd\":\"C:/path/to/this/project\"}}\n" +
-            $"The app polls that file every couple seconds and files this chat under \"{projectName}\". " +
-            "Full protocol: AGENTS.md next to that file.";
+            "The line — set \"cwd\" to YOUR current working directory (forward slashes), which you already know:\n" +
+            $"  {{\"op\":\"addToCollection\",\"project\":\"{projectName}\",\"target\":\"self\",\"cwd\":\"C:/your/current/working/dir\"}}\n" +
+            "How it resolves: the app re-scans and files the chat whose transcript is being written right " +
+            "now in that folder (i.e. you) - so it always picks the live chat, not an old sibling. If you " +
+            "truly don't know your cwd, omit it and the app uses the most recently active chat. Full " +
+            "protocol: AGENTS.md next to that file.";
     }
 
     private async Task DeleteCollectionAsync(string id, string name)

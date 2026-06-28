@@ -152,8 +152,10 @@ PowerShell:
   Add-Content -Path '{inbox}' -Value '{{""op"":""favorite"",""target"":""self"",""cwd"":""<YOUR-CWD>""}}' -Encoding utf8
 
 Identify yourself: for per-chat ops pass ""target"":""self"" plus ""cwd"" = your working directory
-(run `pwd`). The app resolves that to the newest session in that folder — which is you. Add
-""tool"":""claude"" or ""codex"" to disambiguate.
+(run `pwd`). The app re-scans and resolves that to the chat whose transcript was most recently
+written in that folder — i.e. you, since you're actively writing right now (not an old sibling chat
+that merely has a newer in-transcript timestamp). Add ""tool"":""claude"" or ""codex"" to narrow
+further, or omit ""cwd"" to mean the most recently active chat anywhere.
 
 Commands (one JSON object per line):
   {{""op"":""init""}}                                              register default Codex+Claude folders

@@ -342,8 +342,15 @@ public sealed class ArchiveService
         if (Store.Settings.Sources.Count == 0) Store.Settings.Sources.AddRange(DefaultSources());
     }
 
-    // Resolve which session a command targets: an explicit id, or "self"/"latest" = the newest
-    // session in the agent's workspace (cwd), optionally filtered by tool.
+    // Resolve which session a command targets. Priority:
+    //   1. an explicit session id (cmd.id, or cmd.target when it's a concrete id);
+    //   2. "self"/"latest"/no target -> the session whose SOURCE TRANSCRIPT was most recently written.
+    // The agent issuing the command is, at that moment, the one actively appending to its own
+    // transcript, so file mtime is the reliable "which chat is live" signal. We prefer chats in the
+    // agent's working directory (cwd) to disambiguate a folder with many chats, and fall back to all
+    // chats if cwd matches nothing (e.g. the agent didn't send one, or it's a sub/parent dir).
+    // NOTE: parsed UpdatedAt is NOT used to pick — it reflects an in-transcript timestamp that can be
+    // stale or wrong (a long chat can report a months-old time), which used to grab the wrong sibling.
     public ArchiveSession? ResolveTargetSession(AgentCommand cmd)
     {
         var explicitId = cmd.id;
@@ -353,13 +360,36 @@ public sealed class ArchiveService
         if (!string.IsNullOrWhiteSpace(explicitId) && Store.Sessions.TryGetValue(explicitId!, out var byId))
             return byId;
 
-        if (string.IsNullOrWhiteSpace(cmd.cwd)) return null;
-        var norm = NormalizePath(cmd.cwd!);
-        return Store.Sessions.Values
-            .Where(s => NormalizePath(s.Workspace) == norm)
-            .Where(s => string.IsNullOrWhiteSpace(cmd.tool) || string.Equals(s.Tool, cmd.tool, StringComparison.OrdinalIgnoreCase))
-            .OrderByDescending(s => s.UpdatedAt)
+        IEnumerable<ArchiveSession> candidates = Store.Sessions.Values;
+        if (!string.IsNullOrWhiteSpace(cmd.tool))
+            candidates = candidates.Where(s => string.Equals(s.Tool, cmd.tool, StringComparison.OrdinalIgnoreCase));
+
+        if (!string.IsNullOrWhiteSpace(cmd.cwd))
+        {
+            var norm = NormalizePath(cmd.cwd!);
+            var scoped = candidates.Where(s => NormalizePath(s.Workspace) == norm).ToList();
+            if (scoped.Count > 0) candidates = scoped; // else fall through to the global newest-written chat
+        }
+
+        return candidates
+            .OrderByDescending(SourceFileWriteTimeUtc)
+            .ThenByDescending(s => s.UpdatedAt)
             .FirstOrDefault();
+    }
+
+    // The last-write time of a session's source transcript on disk (resolving a stored relative path
+    // against the root). This is what makes "self" pick the chat that's live right now; if the file
+    // is gone we fall back to the parsed UpdatedAt so ordering still degrades sanely.
+    private DateTime SourceFileWriteTimeUtc(ArchiveSession s)
+    {
+        try
+        {
+            var path = string.IsNullOrEmpty(s.SourcePath) ? ""
+                : Path.IsPathRooted(s.SourcePath) ? s.SourcePath : Path.Combine(_rootPath, s.SourcePath);
+            if (path.Length > 0 && File.Exists(path)) return File.GetLastWriteTimeUtc(path);
+        }
+        catch { }
+        return DateTime.TryParse(s.UpdatedAt, out var d) ? d.ToUniversalTime() : DateTime.MinValue;
     }
 
     private static string NormalizePath(string p)

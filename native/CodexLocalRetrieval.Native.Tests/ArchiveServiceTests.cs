@@ -317,6 +317,40 @@ public sealed class ArchiveServiceTests
         finally { if (File.Exists(store)) File.Delete(store); }
     }
 
+    // "self" must resolve to the chat that's LIVE (its transcript was just written), not the chat
+    // with the newest in-transcript timestamp - that mismatch filed a random sibling before.
+    [TestMethod]
+    public void ResolveSelf_PicksMostRecentlyWrittenTranscript_NotNewestTimestamp()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "clr-resolve-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        var live = Path.Combine(root, "live.jsonl");
+        var old = Path.Combine(root, "old.jsonl");
+        File.WriteAllText(live, "{}");
+        File.WriteAllText(old, "{}");
+        File.SetLastWriteTimeUtc(old, DateTime.UtcNow.AddHours(-3));   // sibling's file is old on disk...
+        File.SetLastWriteTimeUtc(live, DateTime.UtcNow);              // ...the live chat is being written now
+
+        var svc = TempService(out var store);
+        try
+        {
+            const string ws = @"C:\proj\app";
+            // The live chat has a STALE parsed timestamp; the sibling has a NEWER one. Old code picked the sibling.
+            svc.Store.Sessions["live"] = new ArchiveSession { Id = "live", Workspace = ws, SourcePath = live, Tool = "claude", UpdatedAt = "2026-01-01T00:00:00Z" };
+            svc.Store.Sessions["old"] = new ArchiveSession { Id = "old", Workspace = ws, SourcePath = old, Tool = "claude", UpdatedAt = "2026-06-27T00:00:00Z" };
+
+            var target = svc.ResolveTargetSession(new AgentCommand { op = "addToCollection", project = "X", target = "self", cwd = ws });
+
+            Assert.IsNotNull(target);
+            Assert.AreEqual("live", target!.Id, "resolves to the freshly-written transcript, not the newest timestamp");
+        }
+        finally
+        {
+            if (File.Exists(store)) File.Delete(store);
+            if (Directory.Exists(root)) Directory.Delete(root, true);
+        }
+    }
+
     // Deleting a project removes only the grouping; the chats stay in the archive.
     [TestMethod]
     public async Task RemoveCollection_DropsGroupingKeepsChats()
