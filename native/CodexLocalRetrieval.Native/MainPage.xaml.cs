@@ -1,4 +1,4 @@
-using System.Collections.ObjectModel;
+﻿using System.Collections.ObjectModel;
 using System.Text.RegularExpressions;
 using CodexLocalRetrieval.Core.Models;
 using CodexLocalRetrieval.Core.Services;
@@ -940,7 +940,7 @@ public sealed partial class MainPage : Page
                 Height = 32,
                 MinWidth = 32,
                 MinHeight = 32,
-                Content = new FontIcon { FontFamily = new FontFamily("Segoe Fluent Icons"), FontSize = 14, Glyph = "î" }
+                Content = new FontIcon { FontFamily = new FontFamily("Segoe Fluent Icons"), FontSize = 14, Glyph = "\uE74D" }
             };
             ToolTipService.SetToolTip(delete, "Delete project (keeps the chats)");
             delete.Click += (_, _) => onDelete();
@@ -1077,7 +1077,7 @@ public sealed partial class MainPage : Page
             Height = 34,
             MinWidth = 34,
             MinHeight = 34,
-            Content = new FontIcon { FontFamily = new FontFamily("Segoe Fluent Icons"), FontSize = 16, Glyph = "" } // More (...)
+            Content = new FontIcon { FontFamily = new FontFamily("Segoe Fluent Icons"), FontSize = 16, Glyph = "\uE712" } // More (...)
         };
         ToolTipService.SetToolTip(button, "More actions");
 
