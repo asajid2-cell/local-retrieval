@@ -436,12 +436,15 @@ public sealed partial class MainPage : Page
         TitleText.Text = "Collections";
         MainContent.Children.Clear();
 
+        MainContent.Children.Add(DeckPickerBar());
         MainContent.Children.Add(CollectionsControlBar());
 
         var pills = CollectionFilterPills();
         if (pills is not null) MainContent.Children.Add(pills);
 
-        var collections = FilteredCollections();
+        // Only the active deck's collections (scoped), then the compound tag filter.
+        var activeDeck = _archive.ActiveDeckId;
+        var collections = FilteredCollections().Where(c => string.Equals(ArchiveService.CollectionDeck(c), activeDeck, StringComparison.OrdinalIgnoreCase)).ToList();
         if (collections.Count == 0)
         {
             var filtering = AnyCollectionFilterActive();
@@ -463,14 +466,17 @@ public sealed partial class MainPage : Page
                 var resolvedTotal = collection.SessionIds.Count(sid => _archive.Store.Sessions.ContainsKey(sid));
                 var chatFilterActive = _collChatInclude.Count > 0 || _collChatExclude.Count > 0;
                 var subtitle = chatFilterActive ? $"{sessions.Count} of {resolvedTotal} chats" : $"{sessions.Count} chats";
+                var deckName = _archive.Decks.FirstOrDefault(d => string.Equals(d.Id, ArchiveService.CollectionDeck(collection), StringComparison.OrdinalIgnoreCase))?.Name ?? "Main";
                 MainContent.Children.Add(ExpandableSessionGroup(name, subtitle, sessions,
                     onDelete: () => _ = DeleteCollectionAsync(id, name),
-                    onCopyAgentCommand: () => CopyCollectionAgentCommand(name),
+                    onCopyAgentCommand: () => CopyCollectionAgentCommand(name, deckName),
                     onRemoveSession: s => _ = RemoveSessionFromCollectionAsync(id, s.Id),
                     tags: collection.Tags.OrderBy(t => t, StringComparer.OrdinalIgnoreCase).ToList(),
                     onAddTag: () => _ = ShowAddCollectionTagDialogAsync(id, name),
                     onRemoveTag: t => _ = RemoveCollectionTagAndRefreshAsync(id, t),
-                    onMoveSession: (s, delta, toEnd) => _ = ReorderInCollectionAndRefreshAsync(id, s.Id, delta, toEnd)));
+                    onMoveSession: (s, delta, toEnd) => _ = ReorderInCollectionAndRefreshAsync(id, s.Id, delta, toEnd),
+                    moveTargets: _archive.Decks.Where(d => !string.Equals(d.Id, ArchiveService.CollectionDeck(collection), StringComparison.OrdinalIgnoreCase)).Select(d => (d.Id, d.Name)).ToList(),
+                    onMoveToDeck: deckId => _ = MoveCollectionToDeckAndRefreshAsync(id, deckId)));
             }
         }
 
@@ -560,23 +566,23 @@ public sealed partial class MainPage : Page
         RenderCollections();
     }
 
-    private void CopyCollectionAgentCommand(string name)
+    private void CopyCollectionAgentCommand(string name, string deckName)
     {
         var package = new DataPackage();
-        package.SetText(CollectionAgentInstruction(name));
+        package.SetText(CollectionAgentInstruction(name, deckName));
         Clipboard.SetContent(package);
-        SyncStatus.Text = $"Copied the agent command for \"{name}\" - paste it into a chat.";
+        SyncStatus.Text = $"Copied the agent command for \"{name}\" (deck: {deckName}) - paste it into a chat.";
     }
 
     // The self-file instruction a user pastes into any Claude/Codex chat. The agent appends one line
     // to the inbox the app already polls; the app resolves the runtime id to its stored chat key.
-    private static string CollectionAgentInstruction(string projectName)
+    private static string CollectionAgentInstruction(string projectName, string deckName)
     {
         var inbox = System.IO.Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             "CodexLocalRetrieval", "agent-inbox.jsonl");
         return
-            $"Add THIS chat to my \"Codex Local Retrieval\" app under the project \"{projectName}\".\n" +
+            $"Add THIS chat to my \"Codex Local Retrieval\" app under the project \"{projectName}\" on deck \"{deckName}\".\n" +
             "If I gave this chat a name (e.g. \"add yourself as codex-claude-local\"), set that as its " +
             "in-app name too. The name is app-only - it does NOT change your global/native title.\n\n" +
             "1. Get YOUR exact session id from your environment (you already have it):\n" +
@@ -585,7 +591,7 @@ public sealed partial class MainPage : Page
             "2. Generate a requestId, then append exactly one line (then a newline) to this file:\n" +
             $"   {inbox}\n" +
             "   The line (put your real id, tool, requestId, and optional name in):\n" +
-            $"   {{\"op\":\"addSelfToProject\",\"project\":\"{projectName}\",\"name\":\"<optional in-app name, omit to keep the auto title>\",\"id\":\"<your session id>\",\"tool\":\"codex|claude\",\"requestId\":\"<uuid>\"}}\n\n" +
+            $"   {{\"op\":\"addSelfToProject\",\"project\":\"{projectName}\",\"deck\":\"{deckName}\",\"name\":\"<optional in-app name, omit to keep the auto title>\",\"id\":\"<your session id>\",\"tool\":\"codex|claude\",\"requestId\":\"<uuid>\"}}\n\n" +
             "The app resolves your runtime id to its stored chat key, files it into the project, sets the " +
             "optional in-app name, and acks with the same requestId plus resolvedSessionId and persisted. " +
             "If the id cannot be resolved it returns an error rather than adding a different chat. Only if " +
@@ -1041,7 +1047,8 @@ public sealed partial class MainPage : Page
     private UIElement ExpandableSessionGroup(string title, string subtitle, IEnumerable<ArchiveSession> sessions,
         Action? onDelete = null, Action? onCopyAgentCommand = null, Action<ArchiveSession>? onRemoveSession = null,
         IReadOnlyList<string>? tags = null, Action? onAddTag = null, Action<string>? onRemoveTag = null,
-        string? pathLabel = null, Action<ArchiveSession, int, bool>? onMoveSession = null)
+        string? pathLabel = null, Action<ArchiveSession, int, bool>? onMoveSession = null,
+        IReadOnlyList<(string Id, string Name)>? moveTargets = null, Action<string>? onMoveToDeck = null)
     {
         var sessionList = sessions.Take(120).ToList();
         var stack = new StackPanel { Spacing = 0 };
@@ -1087,6 +1094,29 @@ public sealed partial class MainPage : Page
             ToolTipService.SetToolTip(agentCmd, "Copy a command to paste into a chat so it files itself into this collection");
             agentCmd.Click += (_, _) => onCopyAgentCommand();
             rightActions.Children.Add(agentCmd);
+        }
+        if (onMoveToDeck is not null && moveTargets is { Count: > 0 })
+        {
+            var moveBtn = new Button
+            {
+                Style = (Style)Resources["IconButtonStyle"],
+                Width = 32,
+                Height = 32,
+                MinWidth = 32,
+                MinHeight = 32,
+                Content = new FontIcon { FontFamily = new FontFamily("Segoe Fluent Icons"), FontSize = 14, Glyph = "" } // Move to folder
+            };
+            ToolTipService.SetToolTip(moveBtn, "Move this project to another deck");
+            var moveFlyout = new MenuFlyout { AreOpenCloseAnimationsEnabled = false };
+            foreach (var (tid, tname) in moveTargets)
+            {
+                var id = tid;
+                var item = new MenuFlyoutItem { Text = "Move to " + tname };
+                item.Click += (_, _) => onMoveToDeck(id);
+                moveFlyout.Items.Add(item);
+            }
+            moveBtn.Flyout = moveFlyout;
+            rightActions.Children.Add(moveBtn);
         }
         if (onDelete is not null)
         {

@@ -61,6 +61,7 @@ public sealed class ArchiveService
             }) ?? new AppStoreData();
         }
         NormalizeSettings();
+        EnsureDecks();
         RefreshSessions(OrderedVisibleSessions(Store.Sessions.Values));
     }
 
@@ -147,6 +148,7 @@ public sealed class ArchiveService
             Settings = Store.Settings,
             Sessions = new Dictionary<string, ArchiveSession>(Store.Sessions),
             Collections = new Dictionary<string, ArchiveCollection>(Store.Collections),
+            Decks = new List<Deck>(Store.Decks),
             DeletedCollections = new List<DeletedCollection>(Store.DeletedCollections),
             FileStamps = new Dictionary<string, string>(Store.FileStamps),
             TagColors = new Dictionary<string, string>(Store.TagColors),
@@ -244,14 +246,16 @@ public sealed class ArchiveService
         RefreshSessions(Store.Sessions.Values);
     }
 
-    public async Task AddToCollectionAsync(ArchiveSession session, string collectionName)
+    public async Task AddToCollectionAsync(ArchiveSession session, string collectionName, string? deckId = null)
     {
-        var id = Slug(collectionName);
+        var deck = ResolveDeckId(deckId ?? MainDeckId);
+        var id = DeckCollectionId(collectionName, deck);
         if (!Store.Collections.TryGetValue(id, out var collection))
         {
-            collection = new ArchiveCollection { Id = id, Name = collectionName, Color = Store.Settings.AccentHex };
+            collection = new ArchiveCollection { Id = id, Name = collectionName, Color = Store.Settings.AccentHex, DeckId = deck };
             Store.Collections[id] = collection;
         }
+        else if (string.IsNullOrWhiteSpace(collection.DeckId)) collection.DeckId = deck;
         if (!collection.SessionIds.Contains(session.Id)) collection.SessionIds.Add(session.Id);
         await SaveAsync();
     }
@@ -259,17 +263,116 @@ public sealed class ArchiveService
     // Create an empty collection from the Collections control panel (no chat needed yet). Returns
     // the collection, whether it was newly created or already existed under the same slug — so an
     // agent self-filing into the same name later lands in this exact collection.
-    public async Task<ArchiveCollection> CreateCollectionAsync(string collectionName)
+    public async Task<ArchiveCollection> CreateCollectionAsync(string collectionName, string? deckId = null)
     {
-        var id = Slug(collectionName);
+        var deck = ResolveDeckId(deckId ?? ActiveDeckId);
+        var id = DeckCollectionId(collectionName, deck);
         if (!Store.Collections.TryGetValue(id, out var collection))
         {
-            collection = new ArchiveCollection { Id = id, Name = collectionName, Color = Store.Settings.AccentHex };
+            collection = new ArchiveCollection { Id = id, Name = collectionName, Color = Store.Settings.AccentHex, DeckId = deck };
             Store.Collections[id] = collection;
             await SaveAsync();
             WriteAutoBackup();   // keep the latest app backup reflecting the new project
         }
         return collection;
+    }
+
+    // Add a chat to an EXISTING collection by its id (used by the "Add to collection" menus, which
+    // already know the collection - avoids any name/deck ambiguity).
+    public async Task AddToCollectionByIdAsync(ArchiveSession session, string collectionId)
+    {
+        if (!Store.Collections.TryGetValue(collectionId, out var col)) return;
+        if (!col.SessionIds.Contains(session.Id)) col.SessionIds.Add(session.Id);
+        await SaveAsync();
+    }
+
+    // ---- Decks (top-level groupings of collections) --------------------------------------------
+    public const string MainDeckId = "main";
+
+    public void EnsureDecks()
+    {
+        if (!Store.Decks.Any(d => string.Equals(d.Id, MainDeckId, StringComparison.OrdinalIgnoreCase)))
+            Store.Decks.Insert(0, new Deck { Id = MainDeckId, Name = "Main" });
+        if (string.IsNullOrWhiteSpace(Store.Settings.ActiveDeckId)
+            || !Store.Decks.Any(d => string.Equals(d.Id, Store.Settings.ActiveDeckId, StringComparison.OrdinalIgnoreCase)))
+            Store.Settings.ActiveDeckId = MainDeckId;
+    }
+
+    public IReadOnlyList<Deck> Decks => Store.Decks;
+    public string ActiveDeckId => string.IsNullOrWhiteSpace(Store.Settings.ActiveDeckId) ? MainDeckId : Store.Settings.ActiveDeckId;
+    public static string CollectionDeck(ArchiveCollection c) => string.IsNullOrWhiteSpace(c.DeckId) ? MainDeckId : c.DeckId;
+
+    public IReadOnlyList<ArchiveCollection> CollectionsInDeck(string deckId) =>
+        Store.Collections.Values.Where(c => string.Equals(CollectionDeck(c), deckId, StringComparison.OrdinalIgnoreCase)).ToList();
+
+    public int CollectionCountInDeck(string deckId) =>
+        Store.Collections.Values.Count(c => string.Equals(CollectionDeck(c), deckId, StringComparison.OrdinalIgnoreCase));
+
+    // Resolve a deck reference (id OR name, case-insensitive) to a deck id; null/unknown -> main.
+    public string ResolveDeckId(string? deckRef)
+    {
+        if (string.IsNullOrWhiteSpace(deckRef)) return MainDeckId;
+        var d = Store.Decks.FirstOrDefault(x =>
+            string.Equals(x.Id, deckRef, StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(x.Name, deckRef, StringComparison.OrdinalIgnoreCase));
+        return d?.Id ?? MainDeckId;
+    }
+
+    private string DeckCollectionId(string name, string deckId) =>
+        string.Equals(deckId, MainDeckId, StringComparison.OrdinalIgnoreCase) ? Slug(name) : $"{Slug(deckId)}--{Slug(name)}";
+
+    public async Task<Deck> CreateDeckAsync(string name)
+    {
+        var id = UniqueDeckId(name);
+        var deck = new Deck { Id = id, Name = name.Trim(), CreatedAt = DateTime.UtcNow.ToString("O") };
+        Store.Decks.Add(deck);
+        await SaveAsync();
+        return deck;
+    }
+
+    private string UniqueDeckId(string name)
+    {
+        var baseId = Slug(name);
+        if (string.Equals(baseId, MainDeckId, StringComparison.OrdinalIgnoreCase)) baseId = "deck-" + baseId;
+        var id = baseId;
+        var n = 2;
+        while (Store.Decks.Any(d => string.Equals(d.Id, id, StringComparison.OrdinalIgnoreCase))) id = $"{baseId}-{n++}";
+        return id;
+    }
+
+    public async Task RenameDeckAsync(string deckId, string name)
+    {
+        var d = Store.Decks.FirstOrDefault(x => string.Equals(x.Id, deckId, StringComparison.OrdinalIgnoreCase));
+        if (d is null || string.IsNullOrWhiteSpace(name)) return;
+        d.Name = name.Trim();
+        await SaveAsync();
+    }
+
+    // Delete a deck (never Main) - its collections move to Main so nothing is orphaned.
+    public async Task DeleteDeckAsync(string deckId)
+    {
+        if (string.Equals(deckId, MainDeckId, StringComparison.OrdinalIgnoreCase)) return;
+        foreach (var c in Store.Collections.Values.Where(c => string.Equals(CollectionDeck(c), deckId, StringComparison.OrdinalIgnoreCase)))
+            c.DeckId = MainDeckId;
+        Store.Decks.RemoveAll(d => string.Equals(d.Id, deckId, StringComparison.OrdinalIgnoreCase));
+        if (string.Equals(Store.Settings.ActiveDeckId, deckId, StringComparison.OrdinalIgnoreCase))
+            Store.Settings.ActiveDeckId = MainDeckId;
+        await SaveAsync();
+    }
+
+    public async Task SetActiveDeckAsync(string deckId)
+    {
+        if (!Store.Decks.Any(d => string.Equals(d.Id, deckId, StringComparison.OrdinalIgnoreCase))) return;
+        Store.Settings.ActiveDeckId = deckId;
+        await SaveAsync();
+    }
+
+    public async Task MoveCollectionToDeckAsync(string collectionId, string deckId)
+    {
+        if (!Store.Collections.TryGetValue(collectionId, out var c)) return;
+        if (!Store.Decks.Any(d => string.Equals(d.Id, deckId, StringComparison.OrdinalIgnoreCase))) return;
+        c.DeckId = ResolveDeckId(deckId);
+        await SaveAsync();
     }
 
     private const int MaxDeletedCollections = 100;
@@ -483,15 +586,18 @@ public sealed class ArchiveService
                 var s = await ResolveOrIndexTargetAsync(cmd);
                 var inputId = ExplicitId(cmd);
                 if (s is null) return new AgentCommandResult(false, ResolveFailureHelp("addToCollection"), inputId, Project: cmd.project);
-                await AddToCollectionAsync(s, cmd.project!);
+                var deck = ResolveDeckId(cmd.deck);
+                await AddToCollectionAsync(s, cmd.project!, deck);
                 var named = ApplyOptionalName(s, cmd);  // optional app-local name in the same call
                 if (named) await SaveAsync();
                 RefreshSessions(Store.Sessions.Values);
-                var persisted = Store.Collections.TryGetValue(Slug(cmd.project!), out var collection)
+                var colId = DeckCollectionId(cmd.project!, deck);
+                var persisted = Store.Collections.TryGetValue(colId, out var collection)
                                 && collection.SessionIds.Contains(s.Id);
+                var deckName = Store.Decks.FirstOrDefault(d => string.Equals(d.Id, deck, StringComparison.OrdinalIgnoreCase))?.Name ?? "Main";
                 return new AgentCommandResult(
                     true,
-                    $"Added \"{s.DisplayTitle}\" to project \"{cmd.project}\".{(named ? " Named it in the app." : "")}",
+                    $"Added \"{s.DisplayTitle}\" to project \"{cmd.project}\" on deck \"{deckName}\".{(named ? " Named it in the app." : "")}",
                     inputId,
                     s.Id,
                     cmd.project,

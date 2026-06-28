@@ -772,6 +772,64 @@ public sealed class ArchiveServiceTests
         finally { if (File.Exists(store)) File.Delete(store); }
     }
 
+    // Decks: a Main deck is ensured; create scopes collections per deck; delete reparents to Main.
+    [TestMethod]
+    public async Task Decks_CreateScopeAndDelete()
+    {
+        var svc = TempService(out var store);
+        try
+        {
+            svc.EnsureDecks();
+            Assert.IsTrue(svc.Decks.Any(d => d.Id == "main"), "a Main deck is ensured");
+            Assert.AreEqual("main", svc.ActiveDeckId);
+
+            var ctx = await svc.CreateDeckAsync("Context Archive");
+            Assert.AreNotEqual("main", ctx.Id);
+
+            // Same collection NAME on two different decks = two distinct collections.
+            var s1 = new ArchiveSession { Id = "s1" }; var s2 = new ArchiveSession { Id = "s2" };
+            svc.Store.Sessions["s1"] = s1; svc.Store.Sessions["s2"] = s2;
+            await svc.AddToCollectionAsync(s1, "Active", "main");
+            await svc.AddToCollectionAsync(s2, "Active", ctx.Id);
+            Assert.AreEqual(2, svc.Store.Collections.Values.Count(c => c.Name == "Active"), "same name on two decks => two collections");
+            Assert.AreEqual(1, svc.CollectionsInDeck("main").Count(c => c.Name == "Active"));
+            Assert.AreEqual(1, svc.CollectionsInDeck(ctx.Id).Count(c => c.Name == "Active"));
+
+            // Delete the deck -> its collections move to Main; Main can't be deleted.
+            await svc.DeleteDeckAsync(ctx.Id);
+            Assert.IsFalse(svc.Decks.Any(d => d.Id == ctx.Id), "deck removed");
+            Assert.AreEqual(2, svc.CollectionsInDeck("main").Count(c => c.Name == "Active"), "orphaned collection reparented to Main");
+            await svc.DeleteDeckAsync("main");
+            Assert.IsTrue(svc.Decks.Any(d => d.Id == "main"), "Main is never deleted");
+        }
+        finally { if (File.Exists(store)) File.Delete(store); }
+    }
+
+    // The agent files itself into a project on the deck named in the command; persists across reload.
+    [TestMethod]
+    public async Task Decks_AgentFilesIntoNamedDeck()
+    {
+        var svc = TempService(out var store);
+        try
+        {
+            svc.EnsureDecks();
+            var ctx = await svc.CreateDeckAsync("Context");
+            svc.Store.Sessions["mine"] = new ArchiveSession { Id = "mine", Tool = "codex" };
+
+            var r = await svc.ApplyAgentCommandAsync(new AgentCommand { op = "addSelfToProject", project = "Archive", deck = "Context", id = "mine", tool = "codex" });
+            Assert.IsTrue(r.Ok, r.Message);
+            var col = svc.CollectionsInDeck(ctx.Id).FirstOrDefault(c => c.Name == "Archive");
+            Assert.IsNotNull(col, "project created on the named deck");
+            Assert.IsTrue(col!.SessionIds.Contains("mine"));
+            Assert.IsFalse(svc.CollectionsInDeck("main").Any(c => c.Name == "Archive"), "not on Main");
+
+            var reader = new ArchiveService(storePath: store);
+            await reader.LoadAsync();
+            Assert.IsTrue(reader.CollectionsInDeck(ctx.Id).Any(c => c.Name == "Archive"), "deck membership persists");
+        }
+        finally { if (File.Exists(store)) File.Delete(store); }
+    }
+
     // Layer rules group a collection's chats (active up, context down) over the manual order; persists.
     [TestMethod]
     public async Task TagLayers_GroupChatsAndPersist()

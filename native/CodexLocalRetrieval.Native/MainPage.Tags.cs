@@ -503,6 +503,97 @@ public sealed partial class MainPage
     private bool AnyCollectionFilterActive() =>
         _collInclude.Count > 0 || _collExclude.Count > 0 || _collChatInclude.Count > 0 || _collChatExclude.Count > 0;
 
+    // ---- Decks (Task-View-style picker) ------------------------------------------------------
+    // A horizontal row of deck cards; click to switch the active deck, right-click to rename/delete,
+    // plus a "+ New deck" card. Decks are top-level groupings of collections (virtual desktops).
+    private UIElement DeckPickerBar()
+    {
+        var row = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 10, VerticalAlignment = VerticalAlignment.Center };
+        foreach (var deck in _archive.Decks)
+        {
+            var d = deck;
+            var active = string.Equals(d.Id, _archive.ActiveDeckId, StringComparison.OrdinalIgnoreCase);
+            var count = _archive.CollectionCountInDeck(d.Id);
+            var card = new Button
+            {
+                CornerRadius = new CornerRadius(10),
+                Padding = new Thickness(16, 9, 16, 9),
+                MinWidth = 120,
+                Background = active ? AccentVerySoftBrush() : PanelBrush(),
+                BorderBrush = active ? new SolidColorBrush(_accentColor) : LineBrush(),
+                BorderThickness = new Thickness(active ? 2 : 1),
+                HorizontalContentAlignment = HorizontalAlignment.Left,
+                Content = new StackPanel
+                {
+                    Spacing = 1,
+                    Children =
+                    {
+                        new TextBlock { Text = d.Name, Foreground = StrongBrush(), FontSize = 14, FontWeight = FontWeights.SemiBold },
+                        new TextBlock { Text = $"{count} project{(count == 1 ? "" : "s")}", Foreground = MutedBrush(), FontSize = 11 }
+                    }
+                }
+            };
+            card.Click += async (_, _) => { await _archive.SetActiveDeckAsync(d.Id); RenderCollections(); };
+
+            var menu = new MenuFlyout { AreOpenCloseAnimationsEnabled = false };
+            var rename = new MenuFlyoutItem { Text = "Rename deck" };
+            rename.Click += async (_, _) => await RenameDeckByAsync(d.Id, d.Name);
+            menu.Items.Add(rename);
+            if (!string.Equals(d.Id, CodexLocalRetrieval.Core.Services.ArchiveService.MainDeckId, StringComparison.OrdinalIgnoreCase))
+            {
+                var del = new MenuFlyoutItem { Text = "Delete deck (projects move to Main)" };
+                del.Click += async (_, _) => { await _archive.DeleteDeckAsync(d.Id); RenderCollections(); };
+                menu.Items.Add(del);
+            }
+            card.ContextFlyout = menu;
+            row.Children.Add(card);
+        }
+
+        var add = new Button
+        {
+            CornerRadius = new CornerRadius(10),
+            Padding = new Thickness(16, 9, 16, 9),
+            Background = new SolidColorBrush(Windows.UI.Color.FromArgb(0, 0, 0, 0)),
+            BorderBrush = LineBrush(),
+            BorderThickness = new Thickness(1),
+            Content = new TextBlock { Text = "+ New deck", Foreground = MutedBrush(), FontSize = 13, VerticalAlignment = VerticalAlignment.Center }
+        };
+        ToolTipService.SetToolTip(add, "Create a new deck (a separate set of collections)");
+        add.Click += async (_, _) => await NewDeckAsync();
+        row.Children.Add(add);
+
+        return new ScrollViewer
+        {
+            HorizontalScrollBarVisibility = ScrollBarVisibility.Auto,
+            VerticalScrollBarVisibility = ScrollBarVisibility.Disabled,
+            Content = row,
+            Margin = new Thickness(0, 0, 0, 6)
+        };
+    }
+
+    private async Task NewDeckAsync()
+    {
+        var input = new TextBox { PlaceholderText = "e.g. Context archives, Agent loop", MinWidth = 360, CornerRadius = ControlCornerRadius() };
+        var dialog = new ContentDialog { Title = "New deck", Content = input, PrimaryButtonText = "Create", CloseButtonText = "Cancel", DefaultButton = ContentDialogButton.Primary, XamlRoot = XamlRoot };
+        if (await dialog.ShowAsync() == ContentDialogResult.Primary && !string.IsNullOrWhiteSpace(input.Text))
+        {
+            var d = await _archive.CreateDeckAsync(input.Text.Trim());
+            await _archive.SetActiveDeckAsync(d.Id);
+            RenderCollections();
+        }
+    }
+
+    private async Task RenameDeckByAsync(string deckId, string current)
+    {
+        var input = new TextBox { Text = current, MinWidth = 360, CornerRadius = ControlCornerRadius() };
+        var dialog = new ContentDialog { Title = "Rename deck", Content = input, PrimaryButtonText = "Save", CloseButtonText = "Cancel", DefaultButton = ContentDialogButton.Primary, XamlRoot = XamlRoot };
+        if (await dialog.ShowAsync() == ContentDialogResult.Primary && !string.IsNullOrWhiteSpace(input.Text))
+        {
+            await _archive.RenameDeckAsync(deckId, input.Text.Trim());
+            RenderCollections();
+        }
+    }
+
     // A collection card's tag row: chips (click cycles the project filter) + × remove + "+ tag".
     private UIElement CollectionTagsRow(IReadOnlyList<string> tags, Action onAddTag, Action<string>? onRemoveTag)
     {
@@ -613,6 +704,13 @@ public sealed partial class MainPage
     private async Task ReorderInCollectionAndRefreshAsync(string collectionId, string sessionId, int delta, bool toEnd)
     {
         await _archive.ReorderInCollectionAsync(collectionId, sessionId, delta, toEnd);
+        RenderCollections();
+    }
+
+    private async Task MoveCollectionToDeckAndRefreshAsync(string collectionId, string deckId)
+    {
+        await _archive.MoveCollectionToDeckAsync(collectionId, deckId);
+        SyncStatus.Text = "Moved project to another deck.";
         RenderCollections();
     }
 

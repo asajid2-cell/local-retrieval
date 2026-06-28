@@ -48,6 +48,15 @@ public sealed partial class MainPage
         _agentTimer.Tick += async (_, _) => await PollAgentInboxAsync();
         _agentTimer.Start();
         Diag.Log("Agent bridge ENABLED, inbox=" + AgentInbox);
+
+        // Durable queue: commands an agent appended while the app was CLOSED sit in the inbox past the
+        // saved cursor, so they resolve (and get acked) on the next open. Drain them as soon as the
+        // store is ready instead of waiting a full poll tick, so reopening the app catches up instantly.
+        DispatcherQueue.TryEnqueue(async () =>
+        {
+            for (var i = 0; i < 60 && !_storeLoaded; i++) await Task.Delay(100);
+            await PollAgentInboxAsync();
+        });
     }
 
     private async Task PollAgentInboxAsync()
@@ -206,7 +215,7 @@ Commands (one JSON object per line):
   {{""op"":""addSource"",""tool"":""claude"",""root"":""<path>"",""requestId"":""...""}}              register a non-default chat folder
   {{""op"":""favorite"",""id"":""<runtime-id>"",""tool"":""codex"",""requestId"":""...""}}            pin this chat to the top
   {{""op"":""bump"",""id"":""<runtime-id>"",""tool"":""codex"",""requestId"":""...""}}                float this chat to the top of your own resume list
-  {{""op"":""addSelfToProject"",""project"":""X"",""name"":""<optional>"",""id"":""<runtime-id>"",""tool"":""codex"",""requestId"":""...""}} file into project X (+ optional in-app name)
+  {{""op"":""addSelfToProject"",""project"":""X"",""deck"":""<deck name, default Main>"",""name"":""<optional>"",""id"":""<runtime-id>"",""tool"":""codex"",""requestId"":""...""}} file into project X on a deck
   {{""op"":""setName"",""name"":""<in-app name>"",""id"":""<runtime-id>"",""tool"":""codex"",""requestId"":""...""}}  set this chat's app-only name (no project needed)
   {{""op"":""tag"",""tags"":[""bug"",""urgent""],""id"":""<runtime-id>"",""tool"":""codex"",""requestId"":""...""}}     add app-only tags to this chat (untag removes)
   {{""op"":""rename"",""id"":""<runtime-id>"",""tool"":""codex"",""localName"":""..."",""canonicalName"":""..."",""requestId"":""...""}}

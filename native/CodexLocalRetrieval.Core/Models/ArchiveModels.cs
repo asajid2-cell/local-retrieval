@@ -17,6 +17,10 @@ public sealed class AppStoreData
     [JsonPropertyName("collections")]
     public Dictionary<string, ArchiveCollection> Collections { get; set; } = new();
 
+    // Top-level decks (virtual desktops for collections). A "main" deck is ensured on load.
+    [JsonPropertyName("decks")]
+    public List<Deck> Decks { get; set; } = new();
+
     // Soft-deleted collections kept so an accidental delete can be undone (Recently Deleted).
     [JsonPropertyName("deletedCollections")]
     public List<DeletedCollection> DeletedCollections { get; set; } = new();
@@ -92,6 +96,10 @@ public sealed class ArchiveSettings
     [JsonPropertyName("activeAiProviderId")]
     public string ActiveAiProviderId { get; set; } = "deepseek";
 
+    // The deck currently shown on the Collections screen (defaults to Main).
+    [JsonPropertyName("activeDeckId")]
+    public string ActiveDeckId { get; set; } = "main";
+
     [JsonPropertyName("aiProviders")]
     public List<AiProviderSettings> AiProviders { get; set; } = new();
 }
@@ -138,6 +146,25 @@ public sealed class ArchiveCollection
     // Part of the serialized store, so they ride along in every backup/export and survive restore.
     [JsonPropertyName("tags")]
     public List<string> Tags { get; set; } = new();
+
+    // Which deck this collection lives on (empty = the Main deck). Decks are top-level groupings of
+    // collections - like virtual desktops - so you can keep e.g. active projects and context archives
+    // on separate decks.
+    [JsonPropertyName("deckId")]
+    public string DeckId { get; set; } = "";
+}
+
+// A top-level grouping of collections (a "virtual desktop" for projects).
+public sealed class Deck
+{
+    [JsonPropertyName("id")]
+    public string Id { get; set; } = "";
+
+    [JsonPropertyName("name")]
+    public string Name { get; set; } = "";
+
+    [JsonPropertyName("createdAt")]
+    public string CreatedAt { get; set; } = "";
 }
 
 // A tag with how many chats/collections carry it - drives the filter strips (sorted by use).
@@ -332,6 +359,7 @@ public sealed class AgentCommand
     public string op { get; set; } = "";          // init | addSource | favorite | addToProject/addSelfToProject | rename | setName | bump | tag/untag
     public string? requestId { get; set; }         // echoed in outbox so callers can match acks
     public string? project { get; set; }           // addToProject/addSelfToProject
+    public string? deck { get; set; }               // deck id/name to file the project into (default: main)
     public string? name { get; set; }               // optional app-only chat name (addSelfToProject / setName); alias of localName
     public List<string>? tags { get; set; }         // tag/untag: labels to add/remove (also accepts a single via name)
     public string? localName { get; set; }          // rename (app-only title)
