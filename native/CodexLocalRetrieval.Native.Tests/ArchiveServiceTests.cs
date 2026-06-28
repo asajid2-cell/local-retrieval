@@ -1,6 +1,7 @@
 using System.Globalization;
 using CodexLocalRetrieval.Core.Models;
 using CodexLocalRetrieval.Core.Services;
+using Microsoft.Data.Sqlite;
 
 namespace CodexLocalRetrieval.Native.Tests;
 
@@ -338,6 +339,101 @@ public sealed class ArchiveServiceTests
                 "collection membership must survive a reload");
         }
         finally { if (File.Exists(store)) File.Delete(store); }
+    }
+
+    // Bump (Codex): floats a chat to the top of `codex resume` by writing threads.updated_at_ms = now
+    // in state_5.sqlite - no message sent. The picker sorts by updated_at_ms, so this is the lever.
+    [TestMethod]
+    public void Bump_CodexThread_SetsUpdatedAtMsToNow()
+    {
+        var dbPath = Path.Combine(Path.GetTempPath(), "clr-bumpdb-" + Guid.NewGuid().ToString("N") + ".sqlite");
+        const string id = "019f0d3e-aaaa-bbbb-cccc-deadbeef0001";
+        const string other = "019f0000-0000-0000-0000-000000000099";
+        try
+        {
+            using (var conn = new SqliteConnection(new SqliteConnectionStringBuilder { DataSource = dbPath }.ToString()))
+            {
+                conn.Open();
+                using var create = conn.CreateCommand();
+                create.CommandText = "create table threads (id text primary key, updated_at_ms integer, updated_at integer);" +
+                                     "insert into threads values ('" + id + "', 1000, 1);" +
+                                     "insert into threads values ('" + other + "', 2000, 2);";
+                create.ExecuteNonQuery();
+            }
+
+            const long nowMs = 1782639989248;
+            var changed = ArchiveService.BumpCodexThreadUpdatedAt(dbPath, new[] { id }, nowMs);
+            Assert.AreEqual(1, changed, "exactly the one matching thread is bumped");
+
+            using (var conn = new SqliteConnection(new SqliteConnectionStringBuilder { DataSource = dbPath, Mode = SqliteOpenMode.ReadOnly }.ToString()))
+            {
+                conn.Open();
+                using var read = conn.CreateCommand();
+                read.CommandText = "select updated_at_ms, updated_at from threads where id = $id";
+                read.Parameters.AddWithValue("$id", id);
+                using var r = read.ExecuteReader();
+                Assert.IsTrue(r.Read());
+                Assert.AreEqual(nowMs, r.GetInt64(0), "updated_at_ms is set to now (millis)");
+                Assert.AreEqual(nowMs / 1000, r.GetInt64(1), "updated_at is set to now (seconds)");
+
+                using var read2 = conn.CreateCommand();
+                read2.CommandText = "select updated_at_ms from threads where id = '" + other + "'";
+                Assert.AreEqual(2000L, (long)read2.ExecuteScalar()!, "the sibling thread is untouched");
+            }
+        }
+        finally { SqliteConnection.ClearAllPools(); if (File.Exists(dbPath)) File.Delete(dbPath); }
+    }
+
+    // Bump (Codex): an unknown id changes nothing - never bumps a different chat.
+    [TestMethod]
+    public void Bump_CodexThread_UnknownId_ChangesNothing()
+    {
+        var dbPath = Path.Combine(Path.GetTempPath(), "clr-bumpdb-" + Guid.NewGuid().ToString("N") + ".sqlite");
+        try
+        {
+            using (var conn = new SqliteConnection(new SqliteConnectionStringBuilder { DataSource = dbPath }.ToString()))
+            {
+                conn.Open();
+                using var create = conn.CreateCommand();
+                create.CommandText = "create table threads (id text primary key, updated_at_ms integer, updated_at integer);" +
+                                     "insert into threads values ('real', 1000, 1);";
+                create.ExecuteNonQuery();
+            }
+            var changed = ArchiveService.BumpCodexThreadUpdatedAt(dbPath, new[] { "does-not-exist" }, 9999);
+            Assert.AreEqual(0, changed, "no thread matched, nothing bumped");
+        }
+        finally { SqliteConnection.ClearAllPools(); if (File.Exists(dbPath)) File.Delete(dbPath); }
+    }
+
+    // Bump (Claude): floats a chat in Claude's recent list by touching the transcript file mtime
+    // (the picker sorts transcripts by mtime), and floats it in this app's list too.
+    [TestMethod]
+    public async Task Bump_ClaudeSession_TouchesTranscriptMtimeAndOurOrder()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "clr-bumpclaude-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        var transcript = Path.Combine(dir, "session.jsonl");
+        File.WriteAllText(transcript, "{}");
+        var oldStamp = DateTime.UtcNow.AddHours(-5);
+        File.SetLastWriteTimeUtc(transcript, oldStamp);
+
+        var svc = TempService(out var store);
+        try
+        {
+            var session = new ArchiveSession { Id = "claude-1", Tool = "claude", SourcePath = transcript, UpdatedAt = "2020-01-01T00:00:00.0000000Z" };
+            svc.Store.Sessions[session.Id] = session;
+
+            var native = await svc.BumpSessionAsync(session);
+
+            Assert.IsTrue(native, "the transcript file existed, so the native mtime was touched");
+            Assert.IsTrue(File.GetLastWriteTimeUtc(transcript) > oldStamp.AddHours(1), "transcript mtime moved to ~now");
+            Assert.IsTrue(DateTime.Parse(session.UpdatedAt, CultureInfo.InvariantCulture, DateTimeStyles.AdjustToUniversal) > DateTime.UtcNow.AddMinutes(-5), "our list order is bumped too");
+        }
+        finally
+        {
+            if (Directory.Exists(dir)) Directory.Delete(dir, true);
+            if (File.Exists(store)) File.Delete(store);
+        }
     }
 
     private static ArchiveService TempService(out string store)

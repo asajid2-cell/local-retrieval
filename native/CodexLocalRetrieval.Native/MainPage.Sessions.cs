@@ -114,6 +114,33 @@ public sealed partial class MainPage
         }
     }
 
+    private static string BumpTooltip(ArchiveSession session) =>
+        string.Equals(session.Tool, "codex", StringComparison.OrdinalIgnoreCase)
+            ? "Move this chat to the top of `codex resume` (no message sent)."
+            : "Move this chat to the top of Claude's recent chats (no message sent).";
+
+    // "Bump": float a chat to the top of Codex/Claude's OWN resume picker without sending a message.
+    // ArchiveService refreshes the recency signal each picker reads (Codex threads.updated_at_ms /
+    // Claude transcript mtime) and floats it in our list too.
+    private async Task BumpSession(ArchiveSession session)
+    {
+        try
+        {
+            var native = await _archive.BumpSessionAsync(session);
+            SessionList.SelectedItem = session;
+            RenderCurrent();
+            var where = string.Equals(session.Tool, "codex", StringComparison.OrdinalIgnoreCase) ? "codex resume" : "Claude's recent chats";
+            SyncStatus.Text = native
+                ? $"Bumped \"{Trim(session.DisplayTitle, 40)}\" to the top of {where}."
+                : $"Bumped \"{Trim(session.DisplayTitle, 40)}\" here - couldn't find it in {where}.";
+        }
+        catch (Exception ex)
+        {
+            Diag.Log("Bump FAILED " + ex);
+            SyncStatus.Text = "Could not bump chat - see log.";
+        }
+    }
+
     private void AddToProject_Click(object sender, RoutedEventArgs e)
     {
         if (_selected is null || sender is not FrameworkElement anchor) return;

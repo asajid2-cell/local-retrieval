@@ -1222,6 +1222,14 @@ public sealed partial class MainPage : Page
         resume.Click += (_, _) => ResumeInTerminal(session);
         flyout.Items.Add(resume);
 
+        var bump = new MenuFlyoutItem
+        {
+            Text = "Bump to top of resume list",
+        };
+        ToolTipService.SetToolTip(bump, BumpTooltip(session));
+        bump.Click += async (_, _) => await BumpSession(session);
+        flyout.Items.Add(bump);
+
         flyout.Items.Add(new MenuFlyoutSeparator());
 
         var rename = new MenuFlyoutItem { Text = "Rename" };
@@ -1813,6 +1821,11 @@ public sealed partial class MainPage : Page
         var pinItem = new MenuFlyoutItem { Text = session.Pinned ? "Unpin chat" : "Pin chat" };
         pinItem.Click += async (_, _) => await TogglePinSelected();
         flyout.Items.Add(pinItem);
+
+        var bumpItem = new MenuFlyoutItem { Text = "Bump to top of resume list" };
+        ToolTipService.SetToolTip(bumpItem, BumpTooltip(session));
+        bumpItem.Click += async (_, _) => await BumpSession(session);
+        flyout.Items.Add(bumpItem);
 
         var renameItem = new MenuFlyoutItem { Text = "Rename chat" };
         renameItem.Click += async (_, _) => await RenameSelected();

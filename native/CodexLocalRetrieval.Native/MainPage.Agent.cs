@@ -205,6 +205,7 @@ Commands (one JSON object per line):
   {{""op"":""init"",""requestId"":""...""}}                                                       register default Codex+Claude folders
   {{""op"":""addSource"",""tool"":""claude"",""root"":""<path>"",""requestId"":""...""}}              register a non-default chat folder
   {{""op"":""favorite"",""id"":""<runtime-id>"",""tool"":""codex"",""requestId"":""...""}}            pin this chat to the top
+  {{""op"":""bump"",""id"":""<runtime-id>"",""tool"":""codex"",""requestId"":""...""}}                float this chat to the top of your own resume list
   {{""op"":""addSelfToProject"",""project"":""X"",""id"":""<runtime-id>"",""tool"":""codex"",""requestId"":""...""}} file into project X
   {{""op"":""rename"",""id"":""<runtime-id>"",""tool"":""codex"",""localName"":""..."",""canonicalName"":""..."",""requestId"":""...""}}
 

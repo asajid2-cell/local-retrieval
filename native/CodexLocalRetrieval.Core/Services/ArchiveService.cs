@@ -487,6 +487,19 @@ public sealed class ArchiveService
                 return new AgentCommandResult(true, $"Renamed to \"{s.DisplayTitle}\".{(canonical is null ? "" : " " + canonical)}", inputId, s.Id, Persisted: true);
             }
 
+            case "bump":
+            {
+                var s = await ResolveOrIndexTargetAsync(cmd);
+                var inputId = ExplicitId(cmd);
+                if (s is null) return new AgentCommandResult(false, ResolveFailureHelp("bump"), inputId);
+                var native = await BumpSessionAsync(s);
+                var where = string.Equals(s.Tool, "codex", StringComparison.OrdinalIgnoreCase) ? "codex resume" : "Claude's recent chats";
+                return new AgentCommandResult(
+                    true,
+                    native ? $"Bumped \"{s.DisplayTitle}\" to the top of {where}." : $"Bumped \"{s.DisplayTitle}\" in the app (native list unchanged — chat not found in {where}).",
+                    inputId, s.Id, Persisted: native);
+            }
+
             default:
                 return new AgentCommandResult(false, $"Unknown op: '{cmd.op}'.");
         }
@@ -682,6 +695,65 @@ public sealed class ArchiveService
         {
             return "Codex canonical rename failed (" + ex.Message + "); local name updated.";
         }
+    }
+
+    // "Bump": float a chat to the top of Codex/Claude's OWN resume picker without sending a message.
+    // Each picker sorts by recency, so we just refresh the recency signal it reads:
+    //   - Codex orders by threads.updated_at_ms in ~/.codex/state_5.sqlite (keyed by the thread id).
+    //   - Claude lists transcript .jsonl files by file mtime.
+    // Also floats the chat to the top of THIS app's list. Returns true if the native signal was updated.
+    public async Task<bool> BumpSessionAsync(ArchiveSession session)
+    {
+        var nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        var native = await Task.Run(() =>
+        {
+            if (string.Equals(session.Tool, "codex", StringComparison.OrdinalIgnoreCase))
+            {
+                var dbPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".codex", "state_5.sqlite");
+                var ids = new List<string> { session.Id };
+                ids.AddRange(session.Aliases);
+                return BumpCodexThreadUpdatedAt(dbPath, ids, nowMs) > 0;
+            }
+            try
+            {
+                var path = string.IsNullOrEmpty(session.SourcePath) ? ""
+                    : Path.IsPathRooted(session.SourcePath) ? session.SourcePath : Path.Combine(_rootPath, session.SourcePath);
+                if (path.Length > 0 && File.Exists(path)) { File.SetLastWriteTimeUtc(path, DateTime.UtcNow); return true; }
+            }
+            catch { }
+            return false;
+        });
+
+        session.UpdatedAt = DateTime.UtcNow.ToString("O");   // top of our list too
+        await SaveAsync();
+        RefreshSessions(Store.Sessions.Values);
+        return native;
+    }
+
+    // Set updated_at_ms (+ updated_at seconds) = now for the given thread ids in Codex's state DB,
+    // so `codex resume` shows the chat first. Returns rows changed. Takes an explicit path for tests.
+    public static int BumpCodexThreadUpdatedAt(string dbPath, IEnumerable<string> ids, long nowMs)
+    {
+        if (!File.Exists(dbPath)) return 0;
+        try
+        {
+            var builder = new SqliteConnectionStringBuilder { DataSource = dbPath, Mode = SqliteOpenMode.ReadWrite };
+            using var connection = new SqliteConnection(builder.ToString());
+            connection.Open();
+            using (var busy = connection.CreateCommand()) { busy.CommandText = "PRAGMA busy_timeout=2000;"; busy.ExecuteNonQuery(); }
+            var changed = 0;
+            foreach (var id in ids.Where(x => !string.IsNullOrWhiteSpace(x)).Distinct(StringComparer.OrdinalIgnoreCase))
+            {
+                using var cmd = connection.CreateCommand();
+                cmd.CommandText = "update threads set updated_at_ms = $ms, updated_at = $s where id = $id";
+                cmd.Parameters.AddWithValue("$ms", nowMs);
+                cmd.Parameters.AddWithValue("$s", nowMs / 1000);
+                cmd.Parameters.AddWithValue("$id", id);
+                changed += cmd.ExecuteNonQuery();
+            }
+            return changed;
+        }
+        catch { return 0; }
     }
 
     public AiProviderSettings EnsureAiProvider(string name, string baseUrl, string model)
