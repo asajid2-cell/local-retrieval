@@ -76,6 +76,39 @@ public sealed class ArchiveServiceTests
         }
     }
 
+    [TestMethod]
+    public async Task Codex_EventMessageArray_DoesNotAbortContentLoad()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "clr-codexarray-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        const string threadId = "019f0d62-array-message-test";
+        var path = Path.Combine(dir, "rollout-2026-06-28T02-00-00-" + threadId + ".jsonl");
+        File.WriteAllLines(path, new[]
+        {
+            "{\"timestamp\":\"2026-06-28T02:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"session_id\":\"" + threadId + "\",\"id\":\"" + threadId + "\",\"cwd\":\"z:/proj\"}}",
+            "{\"timestamp\":\"2026-06-28T02:00:01Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":[{\"type\":\"text\",\"text\":\"array-backed user message\"}]}}",
+            "{\"timestamp\":\"2026-06-28T02:00:02Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"array handled\"}}",
+        });
+        var svc = TempService(out var store);
+        try
+        {
+            await svc.IndexRootAsync(dir);
+
+            var session = svc.Store.Sessions[threadId];
+            session.ContentLoaded = false;
+            session.Messages.Clear();
+            await svc.EnsureContentAsync(session);
+
+            Assert.IsTrue(session.ContentLoaded);
+            Assert.IsTrue(session.Messages.Any(m => m.Text.Contains("array-backed user message")));
+        }
+        finally
+        {
+            if (Directory.Exists(dir)) Directory.Delete(dir, true);
+            if (File.Exists(store)) File.Delete(store);
+        }
+    }
+
     // L1: indexing the rollout store resurfaces every session on disk, old and new alike.
     [TestMethod]
     public async Task IndexRoot_ResurfacesOldAndNewRollouts()
@@ -615,6 +648,118 @@ public sealed class ArchiveServiceTests
         finally { if (File.Exists(store)) File.Delete(store); }
     }
 
+    // ---- Tagging & filtering -----------------------------------------------------------------
+
+    // Chat tags add/remove, normalize (trim + collapse whitespace), dedupe case-insensitively, and
+    // refuse the reserved auto-tags so user tags stay clean.
+    [TestMethod]
+    public async Task ChatTags_AddRemoveNormalizeDedupeAndReserved()
+    {
+        var svc = TempService(out var store);
+        try
+        {
+            var s = new ArchiveSession { Id = "s" };
+            svc.Store.Sessions["s"] = s;
+
+            Assert.IsTrue(await svc.AddChatTagAsync(s, "  Job   Search "), "normalized + added");
+            Assert.IsFalse(await svc.AddChatTagAsync(s, "job search"), "case/space-insensitive duplicate rejected");
+            Assert.IsFalse(await svc.AddChatTagAsync(s, "archive"), "reserved tag rejected");
+            Assert.IsFalse(await svc.AddChatTagAsync(s, "   "), "blank rejected");
+
+            CollectionAssert.AreEqual(new[] { "Job Search" }, ArchiveService.UserTags(s).ToArray());
+
+            Assert.IsTrue(await svc.RemoveChatTagAsync(s, "JOB SEARCH"), "removed case-insensitively");
+            Assert.AreEqual(0, ArchiveService.UserTags(s).Count);
+        }
+        finally { if (File.Exists(store)) File.Delete(store); }
+    }
+
+    // UserTags hides the reserved auto-tags (archive/code) that the indexer attaches.
+    [TestMethod]
+    public void UserTags_HidesReservedAutoTags()
+    {
+        var s = new ArchiveSession { Id = "s" };
+        s.Tags.Add("archive"); s.Tags.Add("code"); s.Tags.Add("renderer");
+        CollectionAssert.AreEqual(new[] { "renderer" }, ArchiveService.UserTags(s).ToArray());
+    }
+
+    // Filtering by tag returns only visible chats carrying a selected tag (ANY-match), archived excluded.
+    [TestMethod]
+    public void Filter_ByTag_ReturnsOnlyMatchingVisibleChats()
+    {
+        var svc = TempService(out var store);
+        try
+        {
+            var a = new ArchiveSession { Id = "a", UpdatedAt = "2026-06-01T00:00:00Z" };
+            a.Tags.Add("bug");
+            var b = new ArchiveSession { Id = "b", UpdatedAt = "2026-06-02T00:00:00Z" };
+            b.Tags.Add("idea");
+            var c = new ArchiveSession { Id = "c", UpdatedAt = "2026-06-03T00:00:00Z", Archived = true };
+            c.Tags.Add("bug");
+            svc.Store.Sessions["a"] = a; svc.Store.Sessions["b"] = b; svc.Store.Sessions["c"] = c;
+
+            var bugs = svc.Filter("", new[] { "bug" });
+            Assert.AreEqual(1, bugs.Count, "only the visible bug chat (archived excluded)");
+            Assert.AreEqual("a", bugs[0].Id);
+
+            var either = svc.Filter("", new[] { "bug", "idea" });
+            Assert.AreEqual(2, either.Count, "ANY-match returns both visible tagged chats");
+
+            Assert.AreEqual(2, svc.Filter("", System.Array.Empty<string>()).Count, "no tags -> all visible");
+        }
+        finally { if (File.Exists(store)) File.Delete(store); }
+    }
+
+    // Collection tags add/remove and ride along in the export/import backup.
+    [TestMethod]
+    public async Task CollectionTags_AddRemoveAndSurviveBackup()
+    {
+        var svc = TempService(out var store);
+        try
+        {
+            svc.Store.Sessions["s1"] = new ArchiveSession { Id = "s1" };
+            await svc.AddToCollectionAsync(svc.Store.Sessions["s1"], "Renderer");
+            var col = svc.Store.Collections.Values.First(c => c.Name == "Renderer");
+
+            Assert.IsTrue(await svc.AddCollectionTagAsync(col.Id, "graphics"));
+            Assert.IsFalse(await svc.AddCollectionTagAsync(col.Id, "GRAPHICS"), "dupe rejected");
+            CollectionAssert.Contains(col.Tags, "graphics");
+
+            var json = svc.ExportCollectionsJson();
+            svc.Store.Collections.Clear();
+            await svc.ImportCollectionsJsonAsync(json);
+
+            var restored = svc.Store.Collections.Values.First(c => c.Name == "Renderer");
+            CollectionAssert.Contains(restored.Tags, "graphics", "collection tags survive a backup round-trip");
+
+            Assert.IsTrue(await svc.RemoveCollectionTagAsync(restored.Id, "graphics"));
+            Assert.AreEqual(0, restored.Tags.Count);
+        }
+        finally { if (File.Exists(store)) File.Delete(store); }
+    }
+
+    // An agent can tag itself by runtime id (app-only), and untag removes.
+    [TestMethod]
+    public async Task AgentCommand_Tag_AddsAndUntagRemoves_AppLocal()
+    {
+        var svc = TempService(out var store);
+        try
+        {
+            svc.Store.Sessions["mine"] = new ArchiveSession { Id = "mine", Tool = "codex" };
+
+            var r = await svc.ApplyAgentCommandAsync(new AgentCommand { op = "tag", tags = new List<string> { "bug", "urgent" }, id = "mine", tool = "codex" });
+            Assert.IsTrue(r.Ok, r.Message);
+            var tags = ArchiveService.UserTags(svc.Store.Sessions["mine"]);
+            CollectionAssert.Contains(tags.ToArray(), "bug");
+            CollectionAssert.Contains(tags.ToArray(), "urgent");
+
+            var u = await svc.ApplyAgentCommandAsync(new AgentCommand { op = "untag", tags = new List<string> { "urgent" }, id = "mine", tool = "codex" });
+            Assert.IsTrue(u.Ok, u.Message);
+            CollectionAssert.DoesNotContain(ArchiveService.UserTags(svc.Store.Sessions["mine"]).ToArray(), "urgent");
+        }
+        finally { if (File.Exists(store)) File.Delete(store); }
+    }
+
     // The agent resume prompt must point a fresh agent at the transcript as the source of truth and
     // frame the snippets as a preview only - so it reconstructs the real task instead of acting on an excerpt.
     [TestMethod]
@@ -931,6 +1076,45 @@ public sealed class ArchiveServiceTests
             Assert.IsTrue(r.Ok, r.Message);
             Assert.IsTrue(svc.Store.Sessions.ContainsKey(id), "indexed on demand from disk");
             Assert.IsTrue(svc.Store.Collections.Values.First(c => c.Name == "Fresh").SessionIds.Contains(id));
+        }
+        finally
+        {
+            if (File.Exists(store)) File.Delete(store);
+            if (Directory.Exists(root)) Directory.Delete(root, true);
+        }
+    }
+
+    [TestMethod]
+    public async Task AgentCommand_AddToProject_RefreshesExistingStaleClaudeSession()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "clr-refresh-existing-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        var id = "claude" + Guid.NewGuid().ToString("N").Substring(0, 8);
+        var path = WriteClaudeSession(root, id + ".jsonl", id, "z:\\proj", "2026-06-28T10:13:30Z", "fresh donor-binding status answer");
+        var svc = TempService(out var store);
+        try
+        {
+            svc.Store.Sessions[id] = new ArchiveSession
+            {
+                Id = id,
+                Tool = "claude",
+                SourcePath = path,
+                Workspace = "z:\\proj",
+                UpdatedAt = "2026-06-16T00:00:00Z",
+                Text = "old stale front content",
+                CustomTitle = "kept local title"
+            };
+
+            var r = await svc.ApplyAgentCommandAsync(new AgentCommand { op = "addSelfToProject", project = "T6 Modding", id = id, tool = "claude" });
+
+            Assert.IsTrue(r.Ok, r.Message);
+            var refreshed = svc.Store.Sessions[id];
+            StringAssert.Contains(refreshed.Text, "fresh donor-binding status answer");
+            Assert.IsFalse(refreshed.Text.Contains("old stale front content"), "exact-id filing must refresh stale display/search text first");
+            Assert.AreEqual("2026-06-28T10:13:30Z", refreshed.UpdatedAt);
+            Assert.AreEqual("kept local title", refreshed.CustomTitle, "app-local naming is still user metadata");
+            Assert.IsTrue(svc.Store.Collections.Values.First(c => c.Name == "T6 Modding").SessionIds.Contains(id));
+            Assert.IsTrue(svc.Store.FileStamps.ContainsKey(path), "the refreshed file stamp is recorded");
         }
         finally
         {

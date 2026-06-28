@@ -110,15 +110,40 @@
                         Glyph="&#xE72B;" />
                 </Button>
 
-                <TextBox
-                    x:Name="SearchBox"
-                    Grid.Row="1"
-                    Height="42"
-                    Margin="0,22,0,14"
-                    CornerRadius="12"
-                    KeyDown="SearchBox_KeyDown"
-                    PlaceholderText="Search chats"
-                    TextChanged="SearchBox_TextChanged" />
+                <StackPanel Grid.Row="1" Margin="0,22,0,14" Spacing="8">
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+                        <TextBox
+                            x:Name="SearchBox"
+                            Height="42"
+                            CornerRadius="12"
+                            KeyDown="SearchBox_KeyDown"
+                            PlaceholderText="Search chats"
+                            TextChanged="SearchBox_TextChanged" />
+                        <Button
+                            x:Name="TagFilterButton"
+                            Grid.Column="1"
+                            Width="42"
+                            Height="42"
+                            Margin="8,0,0,0"
+                            Click="TagFilter_Click"
+                            Style="{StaticResource IconButtonStyle}"
+                            ToolTipService.ToolTip="Filter chats by tag">
+                            <FontIcon FontFamily="Segoe Fluent Icons" FontSize="16" Glyph="&#xE71C;" />
+                        </Button>
+                    </Grid>
+                    <ScrollViewer
+                        x:Name="TagFilterScroller"
+                        HorizontalScrollBarVisibility="Auto"
+                        HorizontalScrollMode="Auto"
+                        VerticalScrollBarVisibility="Disabled"
+                        Visibility="Collapsed">
+                        <StackPanel x:Name="TagFilterBar" Orientation="Horizontal" Spacing="6" />
+                    </ScrollViewer>
+                </StackPanel>
 
                 <StackPanel Grid.Row="2" Spacing="8">
                     <Button x:Name="ArchiveButton" Click="Nav_Click" Style="{StaticResource PrimaryPillButtonStyle}" Tag="Archive">
@@ -282,16 +307,28 @@
                 <Button Click="Restore_Click" Content="Build restore packet" HorizontalAlignment="Stretch" Style="{StaticResource PillButtonStyle}" />
                 <Button Click="Source_Click" Content="Inspect raw events" HorizontalAlignment="Stretch" Style="{StaticResource PillButtonStyle}" />
                 <Button Click="Review_Click" Content="Add review-later" HorizontalAlignment="Stretch" Style="{StaticResource PillButtonStyle}" />
-                <TextBlock
-                    Margin="0,6,0,0"
-                    FontSize="16"
-                    FontWeight="SemiBold"
-                    Foreground="{StaticResource TextStrongBrush}"
-                    Text="Tags" />
-                <VariableSizedWrapGrid
-                    x:Name="TagsItems"
-                    MaximumRowsOrColumns="3"
-                    Orientation="Horizontal" />
+                <Grid Margin="0,6,0,0">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+                    <TextBlock
+                        VerticalAlignment="Center"
+                        FontSize="16"
+                        FontWeight="SemiBold"
+                        Foreground="{StaticResource TextStrongBrush}"
+                        Text="Tags" />
+                    <Button
+                        x:Name="AddTagButton"
+                        Grid.Column="1"
+                        Padding="10,4"
+                        Click="AddTag_Click"
+                        Style="{StaticResource PillButtonStyle}"
+                        ToolTipService.ToolTip="Add a tag to this chat">
+                        <TextBlock FontSize="12" Text="+ Tag" />
+                    </Button>
+                </Grid>
+                <StackPanel x:Name="TagsItems" Spacing="6" />
             </StackPanel>
             </ScrollViewer>
         </Border>

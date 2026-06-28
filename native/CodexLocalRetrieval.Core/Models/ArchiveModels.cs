@@ -122,7 +122,15 @@ public sealed class ArchiveCollection
 
     [JsonPropertyName("color")]
     public string Color { get; set; } = "#fb7185";
+
+    // User labels to organize collections themselves (filterable on the Collections screen).
+    // Part of the serialized store, so they ride along in every backup/export and survive restore.
+    [JsonPropertyName("tags")]
+    public List<string> Tags { get; set; } = new();
 }
+
+// A tag with how many chats/collections carry it - drives the filter strips (sorted by use).
+public sealed record TagCount(string Tag, int Count);
 
 // A collection moved to "Recently Deleted" - the full grouping plus when it was removed, so it can
 // be restored exactly as it was. Chats themselves are never deleted; this is metadata only.
@@ -295,10 +303,11 @@ public sealed class CodeBlock
 // One command an outside agent writes to agent-inbox.jsonl to drive the app (see AGENTS.md).
 public sealed class AgentCommand
 {
-    public string op { get; set; } = "";          // init | addSource | favorite | addToProject/addSelfToProject | rename | setName | bump
+    public string op { get; set; } = "";          // init | addSource | favorite | addToProject/addSelfToProject | rename | setName | bump | tag/untag
     public string? requestId { get; set; }         // echoed in outbox so callers can match acks
     public string? project { get; set; }           // addToProject/addSelfToProject
     public string? name { get; set; }               // optional app-only chat name (addSelfToProject / setName); alias of localName
+    public List<string>? tags { get; set; }         // tag/untag: labels to add/remove (also accepts a single via name)
     public string? localName { get; set; }          // rename (app-only title)
     public string? canonicalName { get; set; }      // rename (write back to codex/claude)
     public string? tool { get; set; }               // addSource / target filter: codex | claude

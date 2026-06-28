@@ -9,7 +9,7 @@ namespace CodexLocalRetrieval.Core.Services;
 
 public sealed class ArchiveService
 {
-    private const int CurrentIndexVersion = 8; // bump on any parser change to force a full re-parse
+    private const int CurrentIndexVersion = 10; // bump on any parser change to force a full re-parse
     private const int MaxIndexedFiles = 4000;
     // The reader keeps the MOST RECENT messages (not the oldest), so a long chat opens on its latest
     // turns. The first prompt is still captured for the title before this window is applied.
@@ -78,12 +78,30 @@ public sealed class ArchiveService
             session.ContentLoaded = true;
             return;
         }
-        var parsed = await Task.Run(async () => await ParseSessionAsync(path, session.Tool));
-        if (parsed is not null)
+        try
         {
-            session.Messages = parsed.Messages;
-            session.CodeBlocks = parsed.CodeBlocks;
-            session.MessageCount = parsed.Messages.Count;
+            var parsed = await Task.Run(async () => await ParseSessionAsync(path, session.Tool));
+            if (parsed is not null)
+            {
+                session.Messages = parsed.Messages;
+                session.CodeBlocks = parsed.CodeBlocks;
+                session.MessageCount = parsed.Messages.Count;
+            }
+        }
+        catch (Exception ex)
+        {
+            session.Messages = new ObservableCollection<ArchiveMessage>
+            {
+                new()
+                {
+                    Id = "load-error",
+                    Role = "assistant",
+                    Timestamp = session.UpdatedAt,
+                    Text = $"Could not load the full transcript from disk.\n\n{ex.Message}\n\nSource: {path}"
+                }
+            };
+            session.CodeBlocks = new ObservableCollection<CodeBlock>();
+            session.MessageCount = session.Messages.Count;
         }
         session.ContentLoaded = true;
     }
@@ -504,6 +522,24 @@ public sealed class ArchiveService
                     inputId, s.Id, Persisted: native);
             }
 
+            case "tag":
+            case "untag":
+            {
+                var s = await ResolveOrIndexTargetAsync(cmd);
+                var inputId = ExplicitId(cmd);
+                if (s is null) return new AgentCommandResult(false, ResolveFailureHelp(op), inputId);
+                var tags = (cmd.tags ?? new List<string>()).ToList();
+                if (!string.IsNullOrWhiteSpace(cmd.name)) tags.Add(cmd.name!);
+                tags = tags.Where(t => !string.IsNullOrWhiteSpace(t)).ToList();
+                if (tags.Count == 0) return new AgentCommandResult(false, $"{op} needs 'tags' (array) or 'name'.", inputId, s.Id);
+                var changed = 0;
+                foreach (var t in tags)
+                    changed += (op == "tag" ? AddTagTo(s.Tags, t, reserved: true) : RemoveTagFrom(s.Tags, t)) ? 1 : 0;
+                if (changed > 0) { await SaveAsync(); RefreshSessions(Store.Sessions.Values); }
+                var verb = op == "tag" ? "Tagged" : "Untagged";
+                return new AgentCommandResult(true, $"{verb} \"{s.DisplayTitle}\" ({changed} change{(changed == 1 ? "" : "s")}).", inputId, s.Id, Persisted: changed > 0);
+            }
+
             default:
                 return new AgentCommandResult(false, $"Unknown op: '{cmd.op}'.");
         }
@@ -556,9 +592,41 @@ public sealed class ArchiveService
     private async Task<ArchiveSession?> ResolveOrIndexTargetAsync(AgentCommand cmd)
     {
         var s = ResolveTargetSession(cmd);
-        if (s is not null) return s;
+        if (s is not null) return await RefreshIndexedSessionAsync(s, ExplicitId(cmd), cmd.tool);
         var id = ExplicitId(cmd);
         return string.IsNullOrWhiteSpace(id) ? null : await EnsureSessionIndexedAsync(id!, cmd.tool);
+    }
+
+    // Exact-id/self commands must not act on stale metadata. A long Claude session can keep the same
+    // resumable id while new turns are appended far past the original indexed window, so refresh the
+    // matched source file before filing/favoriting/naming it.
+    private async Task<ArchiveSession?> RefreshIndexedSessionAsync(ArchiveSession existing, string? expectedId, string? tool)
+    {
+        try
+        {
+            var path = string.IsNullOrWhiteSpace(existing.SourcePath) ? ""
+                : Path.IsPathRooted(existing.SourcePath) ? existing.SourcePath : Path.Combine(_rootPath, existing.SourcePath);
+            if (string.IsNullOrWhiteSpace(path) || !File.Exists(path)) return existing;
+
+            var parsed = await ParseSessionAsync(path, string.IsNullOrWhiteSpace(tool) ? existing.Tool : tool!);
+            if (parsed is null) return existing;
+
+            var targetId = !string.IsNullOrWhiteSpace(expectedId) ? expectedId! : existing.Id;
+            if (!SessionHasIdOrAlias(parsed, targetId) && !string.Equals(parsed.Id, existing.Id, StringComparison.OrdinalIgnoreCase))
+                return existing;
+
+            PreserveAppFields(existing, parsed);
+            if (!string.Equals(parsed.Id, existing.Id, StringComparison.OrdinalIgnoreCase)) Store.Sessions.Remove(existing.Id);
+            Store.Sessions[parsed.Id] = parsed;
+
+            var info = new FileInfo(path);
+            Store.FileStamps[path] = info.LastWriteTimeUtc.Ticks + ":" + info.Length;
+            return parsed;
+        }
+        catch
+        {
+            return existing;
+        }
     }
 
     // Find and index the single transcript whose id matches, across the configured sources, so an
@@ -769,6 +837,109 @@ public sealed class ArchiveService
             return changed;
         }
         catch { return 0; }
+    }
+
+    // ---- Tagging & filtering -------------------------------------------------------------------
+    // Reserved tags are auto-managed (archive = "lives in the archive", code = "has code blocks") and
+    // are hidden from the tag UI/filters so user tags stay clean. Everything else is a user tag.
+    public static readonly IReadOnlyCollection<string> ReservedTags =
+        new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "archive", "code" };
+
+    public static bool IsReservedTag(string? tag) => !string.IsNullOrWhiteSpace(tag) && ReservedTags.Contains(tag.Trim());
+
+    public static string NormalizeTag(string? tag)
+    {
+        var t = Regex.Replace((tag ?? "").Trim(), "\\s+", " ");
+        return t.Length > 40 ? t[..40].Trim() : t;
+    }
+
+    // The user-facing tags on a chat (reserved tags removed), sorted, de-duped case-insensitively.
+    public static IReadOnlyList<string> UserTags(ArchiveSession session) =>
+        session.Tags
+            .Where(t => !string.IsNullOrWhiteSpace(t) && !IsReservedTag(t))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(t => t, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+    public async Task<bool> AddChatTagAsync(ArchiveSession session, string tag)
+    {
+        if (!AddTagTo(session.Tags, tag, reserved: true)) return false;
+        await SaveAsync();
+        RefreshSessions(Store.Sessions.Values);
+        return true;
+    }
+
+    public async Task<bool> RemoveChatTagAsync(ArchiveSession session, string tag)
+    {
+        if (!RemoveTagFrom(session.Tags, tag)) return false;
+        await SaveAsync();
+        RefreshSessions(Store.Sessions.Values);
+        return true;
+    }
+
+    public async Task<bool> AddCollectionTagAsync(string collectionId, string tag)
+    {
+        if (!Store.Collections.TryGetValue(collectionId, out var c)) return false;
+        if (!AddTagTo(c.Tags, tag, reserved: false)) return false;
+        await SaveAsync();
+        return true;
+    }
+
+    public async Task<bool> RemoveCollectionTagAsync(string collectionId, string tag)
+    {
+        if (!Store.Collections.TryGetValue(collectionId, out var c)) return false;
+        if (!RemoveTagFrom(c.Tags, tag)) return false;
+        await SaveAsync();
+        return true;
+    }
+
+    // All user chat tags with counts (most-used first, then alpha) - drives the chat filter strip.
+    public IReadOnlyList<TagCount> AllChatTags() =>
+        Store.Sessions.Values
+            .Where(s => !s.Archived)
+            .SelectMany(UserTags)
+            .GroupBy(t => t, StringComparer.OrdinalIgnoreCase)
+            .Select(g => new TagCount(g.Key, g.Count()))
+            .OrderByDescending(x => x.Count).ThenBy(x => x.Tag, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+    public IReadOnlyList<TagCount> AllCollectionTags() =>
+        Store.Collections.Values
+            .SelectMany(c => c.Tags.Where(t => !string.IsNullOrWhiteSpace(t)))
+            .GroupBy(t => t, StringComparer.OrdinalIgnoreCase)
+            .Select(g => new TagCount(g.Key, g.Count()))
+            .OrderByDescending(x => x.Count).ThenBy(x => x.Tag, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+    // Text search (if any) intersected with a tag filter. matchAll=false => chats with ANY of the tags.
+    public IReadOnlyList<ArchiveSession> Filter(string query, IReadOnlyCollection<string>? tags, bool matchAll = false)
+    {
+        IEnumerable<ArchiveSession> baseSet = string.IsNullOrWhiteSpace(query)
+            ? OrderedVisibleSessions(Store.Sessions.Values)
+            : Search(query);
+        if (tags is null || tags.Count == 0) return baseSet.ToList();
+        bool Has(ArchiveSession s, string tag) => s.Tags.Any(x => string.Equals(x, tag, StringComparison.OrdinalIgnoreCase));
+        return baseSet
+            .Where(s => matchAll ? tags.All(t => Has(s, t)) : tags.Any(t => Has(s, t)))
+            .ToList();
+    }
+
+    // Generic add/remove against either tag store (ObservableCollection for chats, List for collections).
+    private static bool AddTagTo(ICollection<string> store, string tag, bool reserved)
+    {
+        var t = NormalizeTag(tag);
+        if (t.Length == 0 || (reserved && IsReservedTag(t))) return false;
+        if (store.Any(x => string.Equals(x, t, StringComparison.OrdinalIgnoreCase))) return false;
+        store.Add(t);
+        return true;
+    }
+
+    private static bool RemoveTagFrom(ICollection<string> store, string tag)
+    {
+        var match = store.FirstOrDefault(x => string.Equals(x, (tag ?? "").Trim(), StringComparison.OrdinalIgnoreCase));
+        if (match is null) return false;
+        store.Remove(match);
+        return true;
     }
 
     public AiProviderSettings EnsureAiProvider(string name, string baseUrl, string model)
@@ -1186,14 +1357,20 @@ public sealed class ArchiveService
     private static string Field(JsonElement payload, string prop)
     {
         if (!payload.TryGetProperty(prop, out var v)) return "";
-        return v.ValueKind switch
+        return ElementText(v);
+    }
+
+    private static string ElementText(JsonElement v) =>
+        v.ValueKind switch
         {
             JsonValueKind.String => v.GetString() ?? "",
             JsonValueKind.Number or JsonValueKind.True or JsonValueKind.False => v.ToString(),
             JsonValueKind.Object or JsonValueKind.Array => v.ToString(),
             _ => ""
         };
-    }
+
+    private static string ElementString(JsonElement v) =>
+        v.ValueKind == JsonValueKind.String ? v.GetString() ?? "" : "";
 
     private static string CommandText(JsonElement payload)
     {
@@ -1248,29 +1425,29 @@ public sealed class ArchiveService
                     // comes ONLY from the session_meta header line. Later payload lines carry per-item
                     // "id" values (rs_... response ids) that must NOT overwrite it - that mis-keyed every
                     // session and is why exact-id self-add could never match.
-                    var rootType = root.TryGetProperty("type", out var rtProp) ? rtProp.GetString() : null;
+                    var rootType = root.TryGetProperty("type", out var rtProp) ? ElementString(rtProp) : null;
                     if (rootType == "session_meta")
                     {
                         var sessionMetaAssigned = false;
-                        if (payload.TryGetProperty("session_id", out var sidProp) && sidProp.GetString() is { Length: > 0 } sid)
+                        if (payload.TryGetProperty("session_id", out var sidProp) && ElementString(sidProp) is { Length: > 0 } sid)
                         {
                             id = sid;
                             sessionMetaAssigned = true;
                             AddAlias(aliases, sid);
                         }
-                        if (payload.TryGetProperty("id", out var midProp) && midProp.GetString() is { Length: > 0 } mid)
+                        if (payload.TryGetProperty("id", out var midProp) && ElementString(midProp) is { Length: > 0 } mid)
                         {
                             if (!sessionMetaAssigned) id = mid;
                             AddAlias(aliases, mid);
                         }
-                        if (payload.TryGetProperty("forked_from_id", out var forkProp) && forkProp.GetString() is { Length: > 0 } fork)
+                        if (payload.TryGetProperty("forked_from_id", out var forkProp) && ElementString(forkProp) is { Length: > 0 } fork)
                         {
                             AddAlias(aliases, fork);
                         }
                     }
-                    if (payload.TryGetProperty("cwd", out var cwdProp)) cwd = cwdProp.GetString() ?? cwd;
+                    if (payload.TryGetProperty("cwd", out var cwdProp) && ElementString(cwdProp) is { Length: > 0 } cw) cwd = cw;
 
-                    var pType = payload.TryGetProperty("type", out var typeProp) ? typeProp.GetString() : null;
+                    var pType = payload.TryGetProperty("type", out var typeProp) ? ElementString(typeProp) : null;
                     if (rootType == "event_msg")
                     {
                         // Clean turn-level text. We take user/assistant text ONLY from event_msg; the
@@ -1280,7 +1457,7 @@ public sealed class ArchiveService
                         {
                             sawEventMessages = true;
                             var role = pType == "agent_message" ? "assistant" : "user";
-                            var text = payload.TryGetProperty("message", out var messageProp) ? messageProp.GetString() ?? "" : "";
+                            var text = Field(payload, "message");
                             AddMessage(messages, codeBlocks, role, text, timestamp, seen);
                         }
                     }
@@ -1290,17 +1467,19 @@ public sealed class ArchiveService
                         // wall of separate bubbles. response_item "message"/"reasoning" are skipped.
                         if (pType == "function_call")
                         {
-                            var name = payload.TryGetProperty("name", out var np) ? np.GetString() ?? "tool" : "tool";
+                            var name = Field(payload, "name");
+                            if (string.IsNullOrWhiteSpace(name)) name = "tool";
                             lastTool = AddToolStep(messages, name, ExtractToolCommand(payload), timestamp);
                         }
                         else if (pType == "function_call_output" && lastTool is not null)
                         {
-                            var output = payload.TryGetProperty("output", out var op) ? op.GetString() ?? "" : "";
+                            var output = Field(payload, "output");
                             lastTool.ToolOutput = CapDisplayText(output, 4000);
                         }
                         else if (pType == "message")
                         {
-                            var role = payload.TryGetProperty("role", out var roleProp) ? roleProp.GetString() ?? "message" : "message";
+                            var role = Field(payload, "role");
+                            if (string.IsNullOrWhiteSpace(role)) role = "message";
                             if (IsIndexedRole(role)) AddMessage(fallbackMessages, fallbackCodeBlocks, role, ExtractContent(payload), timestamp, fallbackSeen);
                         }
                     }
@@ -1679,7 +1858,7 @@ public sealed class ArchiveService
     private static string ExtractToolCommand(JsonElement payload)
     {
         if (!payload.TryGetProperty("arguments", out var argsProp)) return "";
-        var raw = argsProp.GetString() ?? "";
+        var raw = ElementText(argsProp);
         try
         {
             using var d = JsonDocument.Parse(raw);

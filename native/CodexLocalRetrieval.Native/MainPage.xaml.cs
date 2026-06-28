@@ -142,7 +142,7 @@ public sealed partial class MainPage : Page
     {
         if (e.Key == Windows.System.VirtualKey.Enter)
         {
-            ApplySearch(SearchBox.Text);
+            ApplyFilters();
         }
     }
 
@@ -150,19 +150,13 @@ public sealed partial class MainPage : Page
     {
         if (SearchBox.Text.Length == 0)
         {
-            _archive.RefreshSessions(_archive.Search(""));
-            SelectFirstSession();
-            RenderCurrent();
+            ApplyFilters();
         }
     }
 
-    private void ApplySearch(string query)
-    {
-        var results = _archive.Search(query);
-        _archive.RefreshSessions(results);
-        SelectFirstSession();
-        RenderCurrent();
-    }
+    // Kept for callers that pre-set SearchBox.Text (e.g. capture replay); routes through the unified
+    // text + tag filter so an active tag filter is always respected.
+    private void ApplySearch(string query) => ApplyFilters();
 
     private void Nav_Click(object sender, RoutedEventArgs e)
     {
@@ -243,6 +237,7 @@ public sealed partial class MainPage : Page
     private const int ArchivePageSize = 25;
     private bool _scrollArchiveToBottom;   // jump to newest after the first render of a chat
     private bool _loadingOlder;            // re-entrancy guard while prepending older messages on scroll-up
+    private ArchiveSession? _contentLoadingSession;
 
     private int _searchShown;
     private string _lastSearchQuery = "";
@@ -272,11 +267,20 @@ public sealed partial class MainPage : Page
         if (!_selected.ContentLoaded)
         {
             MainContent.Children.Add(EmptyBlock("Loading conversation...", _selected.WorkspaceName));
-            _ = EnsureContentThenRenderAsync(_selected);
+            if (!ReferenceEquals(_contentLoadingSession, _selected))
+            {
+                _contentLoadingSession = _selected;
+                _ = EnsureContentThenRenderAsync(_selected);
+            }
             return;
         }
 
         var messages = _selected.Messages;
+        if (messages.Count == 0)
+        {
+            MainContent.Children.Add(EmptyBlock("No conversation messages parsed", _selected.SourcePath));
+            return;
+        }
         var shown = Math.Min(_archiveShown <= 0 ? ArchivePageSize : _archiveShown, messages.Count);
         var start = messages.Count - shown;   // render the last `shown` messages, oldest-of-page first
 
@@ -332,6 +336,10 @@ public sealed partial class MainPage : Page
     {
         try { await _archive.EnsureContentAsync(session); }
         catch (Exception ex) { Diag.Log("EnsureContent: " + ex.Message); }
+        finally
+        {
+            if (ReferenceEquals(_contentLoadingSession, session)) _contentLoadingSession = null;
+        }
         if (ReferenceEquals(_selected, session) && _screen == "Archive")
         {
             _archiveShown = ArchivePageSize;
@@ -397,13 +405,21 @@ public sealed partial class MainPage : Page
 
         MainContent.Children.Add(CollectionsControlBar());
 
+        var filterBar = CollectionTagFilterBar();
+        if (filterBar is not null) MainContent.Children.Add(filterBar);
+
         var collections = _archive.Store.Collections.Values
+            .Where(c => _activeCollectionTagFilters.Count == 0
+                        || _activeCollectionTagFilters.Any(t => c.Tags.Any(ct => string.Equals(ct, t, StringComparison.OrdinalIgnoreCase))))
             .OrderBy(c => c.Name, StringComparer.OrdinalIgnoreCase)
             .ToList();
         if (collections.Count == 0)
         {
-            MainContent.Children.Add(EmptyBlock("No collections yet",
-                "Make one with \"+ New collection\" above. Then add chats from a chat's right-click menu, or use a collection's \"Agent cmd\" button and paste it into any Claude/Codex chat to have it file itself in."));
+            MainContent.Children.Add(EmptyBlock(
+                _activeCollectionTagFilters.Count > 0 ? "No collections match this tag filter" : "No collections yet",
+                _activeCollectionTagFilters.Count > 0
+                    ? "Clear the filter above, or tag a collection with one of the selected tags."
+                    : "Make one with \"+ New collection\" above. Then add chats from a chat's right-click menu, or use a collection's \"Agent cmd\" button and paste it into any Claude/Codex chat to have it file itself in."));
         }
         else
         {
@@ -420,7 +436,10 @@ public sealed partial class MainPage : Page
                 MainContent.Children.Add(ExpandableSessionGroup(name, $"{sessions.Count} chats", sessions,
                     onDelete: () => _ = DeleteCollectionAsync(id, name),
                     onCopyAgentCommand: () => CopyCollectionAgentCommand(name),
-                    onRemoveSession: s => _ = RemoveSessionFromCollectionAsync(id, s.Id)));
+                    onRemoveSession: s => _ = RemoveSessionFromCollectionAsync(id, s.Id),
+                    tags: collection.Tags.OrderBy(t => t, StringComparer.OrdinalIgnoreCase).ToList(),
+                    onAddTag: () => _ = ShowAddCollectionTagDialogAsync(id, name),
+                    onRemoveTag: t => _ = RemoveCollectionTagAndRefreshAsync(id, t)));
             }
         }
 
@@ -613,55 +632,6 @@ public sealed partial class MainPage : Page
         MainContent.Children.Clear();
         if (_selected is null) return;
         MainContent.Children.Add(TextPanel(_archive.RestorePacket(_selected)));
-    }
-
-    private void RenderTags()
-    {
-        TagsItems.Children.Clear();
-        if (_selected is null) return;
-
-        var tags = _selected.Tags
-            .Where(tag => !string.IsNullOrWhiteSpace(tag))
-            .Where(tag => !string.Equals(tag, "archive", StringComparison.OrdinalIgnoreCase) || _selected.Tags.Count == 1)
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .ToList();
-
-        if (tags.Count == 0)
-        {
-            TagsItems.Children.Add(new TextBlock
-            {
-                Text = "No tags",
-                Foreground = MutedBrush(),
-                FontSize = 12
-            });
-            return;
-        }
-
-        foreach (var tag in tags)
-        {
-            TagsItems.Children.Add(TagChip(tag));
-        }
-    }
-
-    private Border TagChip(string tag)
-    {
-        return new Border
-        {
-            Background = new SolidColorBrush(Windows.UI.Color.FromArgb(0, 0, 0, 0)),
-            BorderBrush = AccentSoftBrush(),
-            BorderThickness = new Thickness(2, 0, 0, 0),
-            CornerRadius = new CornerRadius(0),
-            Padding = new Thickness(8, 2, 10, 2),
-            Margin = new Thickness(0, 0, 10, 8),
-            HorizontalAlignment = HorizontalAlignment.Left,
-            Child = new TextBlock
-            {
-                Text = tag,
-                Foreground = MutedBrush(),
-                FontSize = 12,
-                VerticalAlignment = VerticalAlignment.Center
-            }
-        };
     }
 
     private static string CapDisplay(string s, int max) =>
@@ -1025,7 +995,8 @@ public sealed partial class MainPage : Page
     }
 
     private UIElement ExpandableSessionGroup(string title, string subtitle, IEnumerable<ArchiveSession> sessions,
-        Action? onDelete = null, Action? onCopyAgentCommand = null, Action<ArchiveSession>? onRemoveSession = null)
+        Action? onDelete = null, Action? onCopyAgentCommand = null, Action<ArchiveSession>? onRemoveSession = null,
+        IReadOnlyList<string>? tags = null, Action? onAddTag = null, Action<string>? onRemoveTag = null)
     {
         var sessionList = sessions.Take(120).ToList();
         var stack = new StackPanel { Spacing = 0 };
@@ -1038,9 +1009,12 @@ public sealed partial class MainPage : Page
 
         // Dense header: name + count pill on one line, path muted underneath. No oversized type.
         var header = new Grid { ColumnDefinitions = { new ColumnDefinition(), new ColumnDefinition { Width = GridLength.Auto } } };
+        var titleArea = new StackPanel { Spacing = 6, VerticalAlignment = VerticalAlignment.Center };
         var titleRow = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8, VerticalAlignment = VerticalAlignment.Center };
         titleRow.Children.Add(new TextBlock { Text = title, Foreground = StrongBrush(), FontSize = 15, FontWeight = Microsoft.UI.Text.FontWeights.SemiBold, VerticalAlignment = VerticalAlignment.Center, TextTrimming = TextTrimming.CharacterEllipsis });
-        header.Children.Add(titleRow);
+        titleArea.Children.Add(titleRow);
+        if (onAddTag is not null) titleArea.Children.Add(CollectionTagsRow(tags ?? Array.Empty<string>(), onAddTag, onRemoveTag));
+        header.Children.Add(titleArea);
 
         var rightActions = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8, VerticalAlignment = VerticalAlignment.Center };
         rightActions.Children.Add(new Border

@@ -208,6 +208,7 @@ Commands (one JSON object per line):
   {{""op"":""bump"",""id"":""<runtime-id>"",""tool"":""codex"",""requestId"":""...""}}                float this chat to the top of your own resume list
   {{""op"":""addSelfToProject"",""project"":""X"",""name"":""<optional>"",""id"":""<runtime-id>"",""tool"":""codex"",""requestId"":""...""}} file into project X (+ optional in-app name)
   {{""op"":""setName"",""name"":""<in-app name>"",""id"":""<runtime-id>"",""tool"":""codex"",""requestId"":""...""}}  set this chat's app-only name (no project needed)
+  {{""op"":""tag"",""tags"":[""bug"",""urgent""],""id"":""<runtime-id>"",""tool"":""codex"",""requestId"":""...""}}     add app-only tags to this chat (untag removes)
   {{""op"":""rename"",""id"":""<runtime-id>"",""tool"":""codex"",""localName"":""..."",""canonicalName"":""..."",""requestId"":""...""}}
 
 `addToProject` and `addToCollection` are accepted as legacy aliases for `addSelfToProject`.
