@@ -150,6 +150,7 @@ public sealed class ArchiveService
             DeletedCollections = new List<DeletedCollection>(Store.DeletedCollections),
             FileStamps = new Dictionary<string, string>(Store.FileStamps),
             TagColors = new Dictionary<string, string>(Store.TagColors),
+            TagLayers = new Dictionary<string, int>(Store.TagLayers),
         };
         await _saveGate.WaitAsync();
         try
@@ -940,6 +941,78 @@ public sealed class ArchiveService
                             : f.IncludeTags.Any(t => SessionHasTag(s, t))))
             .Where(s => f.ExcludeTags.Count == 0 || !f.ExcludeTags.Any(t => SessionHasTag(s, t)))
             .ToList();
+    }
+
+    // ---- Collection (project) filtering + demote ordering --------------------------------------
+    private static bool CollectionHasTag(ArchiveCollection c, string tag) =>
+        c.Tags.Any(x => string.Equals(x, tag, StringComparison.OrdinalIgnoreCase));
+
+    // Filter collections by their own tags (compound): keep those satisfying the include set (ANY or
+    // ALL) and carrying NONE of the exclude set. "active + graphics, not web-dev" -> include both, exclude web-dev.
+    public IReadOnlyList<ArchiveCollection> FilterCollections(IReadOnlyCollection<string> include, IReadOnlyCollection<string> exclude, bool matchAll = false)
+    {
+        return Store.Collections.Values
+            .Where(c => include.Count == 0
+                        || (matchAll ? include.All(t => CollectionHasTag(c, t)) : include.Any(t => CollectionHasTag(c, t))))
+            .Where(c => exclude.Count == 0 || !exclude.Any(t => CollectionHasTag(c, t)))
+            .OrderBy(c => c.Name, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    // Layer rules: a tag can be assigned a layer (LOWER number = HIGHER in the list). Unassigned tags
+    // use DefaultLayer, so layered tags can float above (e.g. active=1) or sink below (e.g. context=900).
+    public const int DefaultLayer = 100;
+
+    public int TagLayer(string tag) =>
+        Store.TagLayers.TryGetValue(TagColorKey(tag), out var n) ? n : DefaultLayer;
+
+    // A chat's layer = the strongest (lowest) EXPLICITLY-assigned layer among its tags; DefaultLayer
+    // if none of its tags has a layer rule. (Unlayered tags don't pull a context chat back to the middle.)
+    public int SessionLayer(ArchiveSession s)
+    {
+        int? best = null;
+        foreach (var t in UserTags(s))
+            if (Store.TagLayers.TryGetValue(TagColorKey(t), out var l))
+                best = best is null ? l : Math.Min(best.Value, l);
+        return best ?? DefaultLayer;
+    }
+
+    public async Task SetTagLayerAsync(string tag, int? layer)
+    {
+        var key = TagColorKey(tag);
+        if (key.Length == 0) return;
+        if (layer is null || layer == DefaultLayer) Store.TagLayers.Remove(key);
+        else Store.TagLayers[key] = layer.Value;
+        await SaveAsync();
+        RefreshSessions(Store.Sessions.Values);
+    }
+
+    // Order a collection's chats: pinned first, then by layer (active up / context down), then by the
+    // collection's MANUAL order (its SessionIds sequence), then recency. So manual drags persist and
+    // layer rules group on top of them.
+    public IReadOnlyList<ArchiveSession> OrderCollectionChats(ArchiveCollection col, IEnumerable<ArchiveSession> sessions)
+    {
+        var manual = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        for (var i = 0; i < col.SessionIds.Count; i++) manual.TryAdd(col.SessionIds[i], i);
+        return sessions
+            .OrderByDescending(s => s.Pinned)
+            .ThenBy(s => SessionLayer(s))
+            .ThenBy(s => manual.TryGetValue(s.Id, out var i) ? i : int.MaxValue)
+            .ThenByDescending(s => s.UpdatedAt)
+            .ToList();
+    }
+
+    // Move a chat within a collection's manual order by delta (negative = up). toEnd jumps to top/bottom.
+    public async Task ReorderInCollectionAsync(string collectionId, string sessionId, int delta, bool toEnd = false)
+    {
+        if (!Store.Collections.TryGetValue(collectionId, out var col)) return;
+        var i = col.SessionIds.FindIndex(x => string.Equals(x, sessionId, StringComparison.OrdinalIgnoreCase));
+        if (i < 0) return;
+        var target = toEnd ? (delta < 0 ? 0 : col.SessionIds.Count - 1) : Math.Clamp(i + delta, 0, col.SessionIds.Count - 1);
+        if (target == i) return;
+        col.SessionIds.RemoveAt(i);
+        col.SessionIds.Insert(target, sessionId);
+        await SaveAsync();
     }
 
     // ---- Tag colors ----------------------------------------------------------------------------

@@ -742,6 +742,96 @@ public sealed class ArchiveServiceTests
         finally { if (File.Exists(store)) File.Delete(store); }
     }
 
+    // Collections filter by their own tags, compound: "active + graphics, not web-dev".
+    [TestMethod]
+    public async Task FilterCollections_IncludeExcludeMatchAll()
+    {
+        var svc = TempService(out var store);
+        try
+        {
+            async Task<ArchiveCollection> Mk(string name, params string[] tags)
+            {
+                var s = new ArchiveSession { Id = name + "-s" }; svc.Store.Sessions[s.Id] = s;
+                await svc.AddToCollectionAsync(s, name);
+                var c = svc.Store.Collections.Values.First(x => x.Name == name);
+                foreach (var t in tags) await svc.AddCollectionTagAsync(c.Id, t);
+                return c;
+            }
+            await Mk("Cortex", "active", "graphics");
+            await Mk("WebApp", "active", "graphics", "web-dev");
+            await Mk("Idle", "graphics");
+
+            // active AND graphics, NOT web-dev
+            var r = svc.FilterCollections(new[] { "active", "graphics" }, new[] { "web-dev" }, matchAll: true);
+            CollectionAssert.AreEquivalent(new[] { "Cortex" }, r.Select(c => c.Name).ToArray());
+
+            // ANY active or graphics, minus web-dev
+            var any = svc.FilterCollections(new[] { "active", "graphics" }, new[] { "web-dev" }, matchAll: false);
+            CollectionAssert.AreEquivalent(new[] { "Cortex", "Idle" }, any.Select(c => c.Name).ToArray());
+        }
+        finally { if (File.Exists(store)) File.Delete(store); }
+    }
+
+    // Layer rules group a collection's chats (active up, context down) over the manual order; persists.
+    [TestMethod]
+    public async Task TagLayers_GroupChatsAndPersist()
+    {
+        var svc = TempService(out var store);
+        try
+        {
+            var a = new ArchiveSession { Id = "a", UpdatedAt = "2026-06-01T00:00:00Z" }; a.Tags.Add("active");
+            var b = new ArchiveSession { Id = "b", UpdatedAt = "2026-06-05T00:00:00Z" }; b.Tags.Add("context"); // newest but context
+            var c = new ArchiveSession { Id = "c", UpdatedAt = "2026-06-03T00:00:00Z" };                       // plain
+            svc.Store.Sessions["a"] = a; svc.Store.Sessions["b"] = b; svc.Store.Sessions["c"] = c;
+            await svc.AddToCollectionAsync(a, "P"); await svc.AddToCollectionAsync(b, "P"); await svc.AddToCollectionAsync(c, "P");
+            var col = svc.Store.Collections.Values.First(x => x.Name == "P");
+
+            // No layers: manual order (a, b, c, the add order).
+            CollectionAssert.AreEqual(new[] { "a", "b", "c" }, svc.OrderCollectionChats(col, new[] { a, b, c }).Select(s => s.Id).ToArray());
+
+            await svc.SetTagLayerAsync("active", 1);     // active -> top
+            await svc.SetTagLayerAsync("context", 900);  // context -> bottom
+            Assert.AreEqual(1, svc.TagLayer("ACTIVE"), "layer lookup is case-insensitive");
+            Assert.AreEqual(900, svc.SessionLayer(b), "a context chat sinks even though context's layer is above default");
+            // active(a) floats up, context(b) sinks, c default in the middle: a, c, b.
+            CollectionAssert.AreEqual(new[] { "a", "c", "b" }, svc.OrderCollectionChats(col, new[] { a, b, c }).Select(s => s.Id).ToArray());
+
+            var reader = new ArchiveService(storePath: store);
+            await reader.LoadAsync();
+            Assert.AreEqual(900, reader.TagLayer("context"), "layers persist across reload");
+
+            await svc.SetTagLayerAsync("active", null);
+            Assert.AreEqual(ArchiveService.DefaultLayer, svc.TagLayer("active"), "clearing returns to default");
+        }
+        finally { if (File.Exists(store)) File.Delete(store); }
+    }
+
+    // Manual reorder moves a chat within a collection's order and persists.
+    [TestMethod]
+    public async Task ReorderInCollection_MovesAndPersists()
+    {
+        var svc = TempService(out var store);
+        try
+        {
+            var a = new ArchiveSession { Id = "a" }; var b = new ArchiveSession { Id = "b" }; var c = new ArchiveSession { Id = "c" };
+            svc.Store.Sessions["a"] = a; svc.Store.Sessions["b"] = b; svc.Store.Sessions["c"] = c;
+            await svc.AddToCollectionAsync(a, "P"); await svc.AddToCollectionAsync(b, "P"); await svc.AddToCollectionAsync(c, "P");
+            var col = svc.Store.Collections.Values.First(x => x.Name == "P");
+            CollectionAssert.AreEqual(new[] { "a", "b", "c" }, col.SessionIds.ToArray());
+
+            await svc.ReorderInCollectionAsync(col.Id, "c", -1);          // c up one -> a, c, b
+            CollectionAssert.AreEqual(new[] { "a", "c", "b" }, col.SessionIds.ToArray());
+
+            await svc.ReorderInCollectionAsync(col.Id, "a", +1, toEnd: true); // a to bottom -> c, b, a
+            CollectionAssert.AreEqual(new[] { "c", "b", "a" }, col.SessionIds.ToArray());
+
+            var reader = new ArchiveService(storePath: store);
+            await reader.LoadAsync();
+            CollectionAssert.AreEqual(new[] { "c", "b", "a" }, reader.Store.Collections[col.Id].SessionIds.ToArray());
+        }
+        finally { if (File.Exists(store)) File.Delete(store); }
+    }
+
     // The compound filter can also restrict to a collection's members (filter-by-project).
     [TestMethod]
     public async Task FilterChats_RestrictsToCollection()

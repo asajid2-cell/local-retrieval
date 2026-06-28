@@ -438,41 +438,39 @@ public sealed partial class MainPage : Page
 
         MainContent.Children.Add(CollectionsControlBar());
 
-        var filterBar = CollectionTagFilterBar();
-        if (filterBar is not null) MainContent.Children.Add(filterBar);
+        var pills = CollectionFilterPills();
+        if (pills is not null) MainContent.Children.Add(pills);
 
-        var collections = _archive.Store.Collections.Values
-            .Where(c => _activeCollectionTagFilters.Count == 0
-                        || _activeCollectionTagFilters.Any(t => c.Tags.Any(ct => string.Equals(ct, t, StringComparison.OrdinalIgnoreCase))))
-            .OrderBy(c => c.Name, StringComparer.OrdinalIgnoreCase)
-            .ToList();
+        var collections = FilteredCollections();
         if (collections.Count == 0)
         {
+            var filtering = AnyCollectionFilterActive();
             MainContent.Children.Add(EmptyBlock(
-                _activeCollectionTagFilters.Count > 0 ? "No collections match this tag filter" : "No collections yet",
-                _activeCollectionTagFilters.Count > 0
-                    ? "Clear the filter above, or tag a collection with one of the selected tags."
+                filtering ? "No projects match this filter" : "No collections yet",
+                filtering
+                    ? "Clear the filter (top-right funnel), or tag a collection with the selected tags."
                     : "Make one with \"+ New collection\" above. Then add chats from a chat's right-click menu, or use a collection's \"Agent cmd\" button and paste it into any Claude/Codex chat to have it file itself in."));
         }
         else
         {
             foreach (var collection in collections)
             {
-                var sessions = collection.SessionIds
-                    .Select(id => _archive.Store.Sessions.TryGetValue(id, out var session) ? session : null)
-                    .OfType<ArchiveSession>()
-                    .OrderByDescending(session => session.Pinned)
-                    .ThenByDescending(session => session.UpdatedAt)
-                    .ToList();
+                var sessions = CollectionChatsFiltered(collection);   // chat-tag filter + layer sort
                 var id = collection.Id;
                 var name = collection.Name;
-                MainContent.Children.Add(ExpandableSessionGroup(name, $"{sessions.Count} chats", sessions,
+                // Count only chats that actually resolve to a stored session (stale ids are ignored),
+                // and only show "N of M" when a chat-tag filter is hiding some.
+                var resolvedTotal = collection.SessionIds.Count(sid => _archive.Store.Sessions.ContainsKey(sid));
+                var chatFilterActive = _collChatInclude.Count > 0 || _collChatExclude.Count > 0;
+                var subtitle = chatFilterActive ? $"{sessions.Count} of {resolvedTotal} chats" : $"{sessions.Count} chats";
+                MainContent.Children.Add(ExpandableSessionGroup(name, subtitle, sessions,
                     onDelete: () => _ = DeleteCollectionAsync(id, name),
                     onCopyAgentCommand: () => CopyCollectionAgentCommand(name),
                     onRemoveSession: s => _ = RemoveSessionFromCollectionAsync(id, s.Id),
                     tags: collection.Tags.OrderBy(t => t, StringComparer.OrdinalIgnoreCase).ToList(),
                     onAddTag: () => _ = ShowAddCollectionTagDialogAsync(id, name),
-                    onRemoveTag: t => _ = RemoveCollectionTagAndRefreshAsync(id, t)));
+                    onRemoveTag: t => _ = RemoveCollectionTagAndRefreshAsync(id, t),
+                    onMoveSession: (s, delta, toEnd) => _ = ReorderInCollectionAndRefreshAsync(id, s.Id, delta, toEnd)));
             }
         }
 
@@ -498,7 +496,20 @@ public sealed partial class MainPage : Page
             FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
             VerticalAlignment = VerticalAlignment.Center
         });
+        var filterButton = new Button
+        {
+            Style = (Style)Resources["IconButtonStyle"],
+            Width = 40,
+            Height = 40,
+            MinWidth = 40,
+            MinHeight = 40,
+            Content = new FontIcon { FontFamily = new FontFamily("Segoe Fluent Icons"), FontSize = 16, Glyph = "" }
+        };
+        ToolTipService.SetToolTip(filterButton, "Filter projects by tag, and chats within them");
+        filterButton.Click += CollectionFilter_Click;
+
         var headerActions = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8, VerticalAlignment = VerticalAlignment.Center };
+        headerActions.Children.Add(filterButton);
         headerActions.Children.Add(BackupMenuButton());
         headerActions.Children.Add(newButton);
         Grid.SetColumn(headerActions, 1);
@@ -1030,7 +1041,7 @@ public sealed partial class MainPage : Page
     private UIElement ExpandableSessionGroup(string title, string subtitle, IEnumerable<ArchiveSession> sessions,
         Action? onDelete = null, Action? onCopyAgentCommand = null, Action<ArchiveSession>? onRemoveSession = null,
         IReadOnlyList<string>? tags = null, Action? onAddTag = null, Action<string>? onRemoveTag = null,
-        string? pathLabel = null)
+        string? pathLabel = null, Action<ArchiveSession, int, bool>? onMoveSession = null)
     {
         var sessionList = sessions.Take(120).ToList();
         var stack = new StackPanel { Spacing = 0 };
@@ -1039,7 +1050,9 @@ public sealed partial class MainPage : Page
             stack.Children.Add(new TextBlock { Text = "No chats yet - add some from a chat's right-click menu, or paste this collection's Agent cmd into a chat.", Foreground = MutedBrush(), TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 6, 0, 0) });
         }
         foreach (var session in sessionList)
-            stack.Children.Add(SessionRow(session, onRemoveSession is null ? null : () => onRemoveSession(session)));
+            stack.Children.Add(SessionRow(session,
+                onRemoveSession is null ? null : () => onRemoveSession(session),
+                onMoveSession is null ? null : (delta, toEnd) => onMoveSession(session, delta, toEnd)));
 
         // Dense header: name + count pill on one line, path muted underneath. No oversized type.
         var header = new Grid { ColumnDefinitions = { new ColumnDefinition(), new ColumnDefinition { Width = GridLength.Auto } } };
@@ -1146,7 +1159,7 @@ public sealed partial class MainPage : Page
         };
     }
 
-    private UIElement SessionRow(ArchiveSession session, Action? onRemove = null)
+    private UIElement SessionRow(ArchiveSession session, Action? onRemove = null, Action<int, bool>? onMove = null)
     {
         var resumeButton = new Button
         {
@@ -1197,7 +1210,7 @@ public sealed partial class MainPage : Page
             Orientation = Orientation.Horizontal,
             Spacing = 6,
             VerticalAlignment = VerticalAlignment.Center,
-            Children = { resumeButton, openButton, SessionMoreMenu(session, onRemove) }
+            Children = { resumeButton, openButton, SessionMoreMenu(session, onRemove, onMove) }
         };
         Grid.SetColumn(actions, 1);
         grid.Children.Add(actions);
@@ -1214,7 +1227,8 @@ public sealed partial class MainPage : Page
 
     // The per-chat "..." menu on a Workspaces/Collections row. Replaces the bare remove button (which
     // read like a more-actions affordance yet deleted on a single click) with an explicit menu.
-    private Button SessionMoreMenu(ArchiveSession session, Action? onRemove)
+    // onMove (collections only): (delta, toEnd) manual reorder within the collection.
+    private Button SessionMoreMenu(ArchiveSession session, Action? onRemove, Action<int, bool>? onMove = null)
     {
         var button = new Button
         {
@@ -1244,6 +1258,17 @@ public sealed partial class MainPage : Page
         ToolTipService.SetToolTip(bump, BumpTooltip(session));
         bump.Click += async (_, _) => await BumpSession(session);
         flyout.Items.Add(bump);
+
+        if (onMove is not null)
+        {
+            var move = new MenuFlyoutSubItem { Text = "Move in collection" };
+            void MoveItem(string text, int delta, bool toEnd) { var it = new MenuFlyoutItem { Text = text }; it.Click += (_, _) => onMove(delta, toEnd); move.Items.Add(it); }
+            MoveItem("Move to top", -1, true);
+            MoveItem("Move up", -1, false);
+            MoveItem("Move down", +1, false);
+            MoveItem("Move to bottom", +1, true);
+            flyout.Items.Add(move);
+        }
 
         flyout.Items.Add(new MenuFlyoutSeparator());
 

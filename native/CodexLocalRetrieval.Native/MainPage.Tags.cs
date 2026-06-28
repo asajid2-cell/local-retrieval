@@ -209,6 +209,31 @@ public sealed partial class MainPage
         auto.Click += async (_, _) => { flyout.Hide(); await _archive.SetTagColorAsync(tag, null); after(); };
         panel.Children.Add(auto);
 
+        // Layer rule: where this tag's chats sit in a collection. Lower = higher; presets cover the
+        // common cases (active -> Top, context -> Bottom), with a number for fine control.
+        panel.Children.Add(new Border { Height = 1, Background = LineBrush() });
+        panel.Children.Add(new TextBlock { Text = "List layer (lower = higher)", Foreground = new SolidColorBrush(ChipText), FontSize = 12 });
+        var layerBox = new NumberBox { Value = _archive.TagLayer(tag), Minimum = 1, Maximum = 999, SpinButtonPlacementMode = NumberBoxSpinButtonPlacementMode.Inline, SmallChange = 1, MinWidth = 130, HorizontalAlignment = HorizontalAlignment.Left };
+        var presets = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 6 };
+        void Preset(string label, int value)
+        {
+            var b = new Button { Style = (Style)Resources["PillButtonStyle"], Padding = new Thickness(10, 2, 10, 2), MinHeight = 0, Content = new TextBlock { Text = label, FontSize = 11 } };
+            b.Click += async (_, _) => { layerBox.Value = value; await _archive.SetTagLayerAsync(tag, value == ArchiveService.DefaultLayer ? (int?)null : value); after(); };
+            presets.Children.Add(b);
+        }
+        Preset("Top", 1);
+        Preset("Normal", ArchiveService.DefaultLayer);
+        Preset("Bottom", 900);
+        layerBox.ValueChanged += async (_, args) =>
+        {
+            if (double.IsNaN(args.NewValue)) return;
+            var v = (int)args.NewValue;
+            await _archive.SetTagLayerAsync(tag, v == ArchiveService.DefaultLayer ? (int?)null : v);
+            after();
+        };
+        panel.Children.Add(presets);
+        panel.Children.Add(layerBox);
+
         flyout.Content = panel;
         flyout.ShowAt(anchor);
     }
@@ -292,7 +317,7 @@ public sealed partial class MainPage
         }
 
         var list = new StackPanel { Spacing = 4 };
-        foreach (var tc in all) list.Children.Add(FilterTagRow(tc));
+        foreach (var tc in all) list.Children.Add(TriStateTagRow(tc, _includeTags, _excludeTags, () => { RefreshFilterFlyout(); ApplyFilters(); }));
         root.Children.Add(new ScrollViewer { Content = list, VerticalScrollBarVisibility = ScrollBarVisibility.Auto, MaxHeight = 320, HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled });
 
         // Project (collection) scope: restrict the whole filter to one project's chats.
@@ -329,28 +354,6 @@ public sealed partial class MainPage
         return root;
     }
 
-    // One filter row: dot + name + count, then include/exclude toggle buttons.
-    private FrameworkElement FilterTagRow(TagCount tc)
-    {
-        var tag = tc.Tag;
-        var inc = _includeTags.Contains(tag);
-        var exc = _excludeTags.Contains(tag);
-
-        var grid = new Grid { ColumnDefinitions = { new ColumnDefinition(), new ColumnDefinition { Width = GridLength.Auto } }, Padding = new Thickness(2, 1, 2, 1) };
-        var left = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 7, VerticalAlignment = VerticalAlignment.Center };
-        left.Children.Add(new Border { Width = 7, Height = 7, CornerRadius = new CornerRadius(4), Background = new SolidColorBrush(ColorFromHex(_archive.TagColor(tag))), VerticalAlignment = VerticalAlignment.Center });
-        left.Children.Add(new TextBlock { Text = tag, Foreground = inc ? StrongBrush() : exc ? MutedBrush() : new SolidColorBrush(ChipText), FontSize = 12, VerticalAlignment = VerticalAlignment.Center, TextDecorations = exc ? Windows.UI.Text.TextDecorations.Strikethrough : Windows.UI.Text.TextDecorations.None });
-        left.Children.Add(new TextBlock { Text = $"({tc.Count})", Foreground = MutedBrush(), FontSize = 11, VerticalAlignment = VerticalAlignment.Center });
-        grid.Children.Add(left);
-
-        var toggles = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 6, VerticalAlignment = VerticalAlignment.Center };
-        toggles.Children.Add(FilterToggle("Include", "", inc, () => new SolidColorBrush(_accentColor), () => { if (!_includeTags.Remove(tag)) { _excludeTags.Remove(tag); _includeTags.Add(tag); } RefreshFilterFlyout(); ApplyFilters(); }));
-        toggles.Children.Add(FilterToggle("Exclude", "", exc, () => new SolidColorBrush(Windows.UI.Color.FromArgb(255, 0xF8, 0x71, 0x71)), () => { if (!_excludeTags.Remove(tag)) { _includeTags.Remove(tag); _excludeTags.Add(tag); } RefreshFilterFlyout(); ApplyFilters(); }));
-        Grid.SetColumn(toggles, 1);
-        grid.Children.Add(toggles);
-        return grid;
-    }
-
     private Button FilterToggle(string tip, string glyph, bool on, Func<Brush> onBrush, Action click)
     {
         var b = new Button
@@ -369,6 +372,30 @@ public sealed partial class MainPage
         ToolTipService.SetToolTip(b, tip);
         b.Click += (_, _) => click();
         return b;
+    }
+
+    // Generic tri-state filter row used by both the chat funnel and the collections funnel: dot +
+    // name + count, then include/exclude toggles operating on the GIVEN sets (none/include/exclude
+    // are mutually exclusive). onChange rebuilds the flyout + applies.
+    private FrameworkElement TriStateTagRow(TagCount tc, HashSet<string> include, HashSet<string> exclude, Action onChange)
+    {
+        var tag = tc.Tag;
+        var inc = include.Contains(tag);
+        var exc = exclude.Contains(tag);
+
+        var grid = new Grid { ColumnDefinitions = { new ColumnDefinition(), new ColumnDefinition { Width = GridLength.Auto } }, Padding = new Thickness(2, 1, 2, 1) };
+        var left = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 7, VerticalAlignment = VerticalAlignment.Center };
+        left.Children.Add(new Border { Width = 7, Height = 7, CornerRadius = new CornerRadius(4), Background = new SolidColorBrush(ColorFromHex(_archive.TagColor(tag))), VerticalAlignment = VerticalAlignment.Center });
+        left.Children.Add(new TextBlock { Text = tag, Foreground = inc ? StrongBrush() : exc ? MutedBrush() : new SolidColorBrush(ChipText), FontSize = 12, VerticalAlignment = VerticalAlignment.Center, TextDecorations = exc ? Windows.UI.Text.TextDecorations.Strikethrough : Windows.UI.Text.TextDecorations.None });
+        left.Children.Add(new TextBlock { Text = $"({tc.Count})", Foreground = MutedBrush(), FontSize = 11, VerticalAlignment = VerticalAlignment.Center });
+        grid.Children.Add(left);
+
+        var toggles = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 6, VerticalAlignment = VerticalAlignment.Center };
+        toggles.Children.Add(FilterToggle("Include", "", inc, () => new SolidColorBrush(_accentColor), () => { if (!include.Remove(tag)) { exclude.Remove(tag); include.Add(tag); } onChange(); }));
+        toggles.Children.Add(FilterToggle("Exclude", "", exc, () => new SolidColorBrush(Windows.UI.Color.FromArgb(255, 0xF8, 0x71, 0x71)), () => { if (!exclude.Remove(tag)) { include.Remove(tag); exclude.Add(tag); } onChange(); }));
+        Grid.SetColumn(toggles, 1);
+        grid.Children.Add(toggles);
+        return grid;
     }
 
     private void RefreshFilterFlyout()
@@ -448,18 +475,43 @@ public sealed partial class MainPage
         if (_selected is not null) await ShowAddTagDialogAsync(_selected);
     }
 
-    // ---- Collection tags (Collections screen) ------------------------------------------------
-    private readonly HashSet<string> _activeCollectionTagFilters = new(StringComparer.OrdinalIgnoreCase);
+    // ---- Collections screen: compound filter (project tags + chat tags) ----------------------
+    // Project tags decide WHICH collections show; chat tags filter the chats WITHIN each. Both are
+    // tri-state include/exclude, so "active + graphics, not web-dev" works at the project level too.
+    private readonly HashSet<string> _collInclude = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _collExclude = new(StringComparer.OrdinalIgnoreCase);
+    private bool _collMatchAll;
+    private readonly HashSet<string> _collChatInclude = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _collChatExclude = new(StringComparer.OrdinalIgnoreCase);
+    private Flyout? _collFilterFlyout;
 
-    // A collection card's tag row: unified chips (click to filter, × to remove) + an "+ tag" chip.
+    // Collections that pass the project-tag filter (compound).
+    public IReadOnlyList<ArchiveCollection> FilteredCollections() =>
+        _archive.FilterCollections(_collInclude.ToList(), _collExclude.ToList(), _collMatchAll);
+
+    // A collection's chats after the chat-tag filter, ordered with demoted ("background") chats last.
+    public IReadOnlyList<ArchiveSession> CollectionChatsFiltered(ArchiveCollection col)
+    {
+        var sessions = col.SessionIds
+            .Select(id => _archive.Store.Sessions.TryGetValue(id, out var s) ? s : null)
+            .OfType<ArchiveSession>()
+            .Where(s => _collChatInclude.Count == 0 || _collChatInclude.Any(t => s.Tags.Any(x => string.Equals(x, t, StringComparison.OrdinalIgnoreCase))))
+            .Where(s => _collChatExclude.Count == 0 || !_collChatExclude.Any(t => s.Tags.Any(x => string.Equals(x, t, StringComparison.OrdinalIgnoreCase))));
+        return _archive.OrderCollectionChats(col, sessions);
+    }
+
+    private bool AnyCollectionFilterActive() =>
+        _collInclude.Count > 0 || _collExclude.Count > 0 || _collChatInclude.Count > 0 || _collChatExclude.Count > 0;
+
+    // A collection card's tag row: chips (click cycles the project filter) + × remove + "+ tag".
     private UIElement CollectionTagsRow(IReadOnlyList<string> tags, Action onAddTag, Action<string>? onRemoveTag)
     {
         var row = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 6, VerticalAlignment = VerticalAlignment.Center };
         foreach (var tag in tags)
         {
             var t = tag;
-            row.Children.Add(TagChip(t, active: _activeCollectionTagFilters.Contains(t),
-                onTap: () => ToggleCollectionFilter(t),
+            row.Children.Add(TagChip(t, active: _collInclude.Contains(t),
+                onTap: () => { if (!_collInclude.Remove(t)) { _collExclude.Remove(t); _collInclude.Add(t); } RenderCollections(); },
                 onRemove: onRemoveTag is null ? null : () => onRemoveTag(t),
                 dotColor: _archive.TagColor(t),
                 onColorPick: anchor => ShowTagColorFlyout(anchor, t, RenderCollections)));
@@ -474,42 +526,93 @@ public sealed partial class MainPage
         };
     }
 
-    private void ToggleCollectionFilter(string tag)
+    private void CollectionFilter_Click(object sender, RoutedEventArgs e)
     {
-        if (!_activeCollectionTagFilters.Remove(tag)) _activeCollectionTagFilters.Add(tag);
-        RenderCollections();
+        if (sender is not FrameworkElement anchor) return;
+        _collFilterFlyout = new Flyout { Placement = FlyoutPlacementMode.Bottom };
+        _collFilterFlyout.Content = BuildCollectionFilterFlyout();
+        _collFilterFlyout.ShowAt(anchor);
     }
 
-    // The filter strip shown above the collection list (null when no collection tags exist yet).
-    private UIElement? CollectionTagFilterBar()
+    private void RefreshCollFilterFlyout()
     {
-        var all = _archive.AllCollectionTags();
-        _activeCollectionTagFilters.RemoveWhere(t => !all.Any(x => string.Equals(x.Tag, t, StringComparison.OrdinalIgnoreCase)));
-        if (all.Count == 0) return null;
+        if (_collFilterFlyout is not null) _collFilterFlyout.Content = BuildCollectionFilterFlyout();
+    }
+
+    private FrameworkElement BuildCollectionFilterFlyout()
+    {
+        var projTags = _archive.AllCollectionTags();
+        var chatTags = _archive.AllChatTags();
+        var root = new StackPanel { Spacing = 8, Padding = new Thickness(2), MinWidth = 280 };
+
+        void Section(string title, IReadOnlyList<TagCount> tags, HashSet<string> inc, HashSet<string> exc, bool showMatch)
+        {
+            var head = new Grid { ColumnDefinitions = { new ColumnDefinition(), new ColumnDefinition { Width = GridLength.Auto } } };
+            head.Children.Add(new TextBlock { Text = title, Foreground = StrongBrush(), FontSize = 13, FontWeight = FontWeights.SemiBold, VerticalAlignment = VerticalAlignment.Center });
+            if (showMatch && inc.Count > 1)
+            {
+                var mode = new Button { Style = (Style)Resources["PillButtonStyle"], Padding = new Thickness(10, 2, 10, 2), MinHeight = 0, Content = new TextBlock { Text = _collMatchAll ? "Match: all" : "Match: any", FontSize = 11 } };
+                mode.Click += (_, _) => { _collMatchAll = !_collMatchAll; RefreshCollFilterFlyout(); RenderCollections(); };
+                Grid.SetColumn(mode, 1);
+                head.Children.Add(mode);
+            }
+            root.Children.Add(head);
+            if (tags.Count == 0)
+            {
+                root.Children.Add(new TextBlock { Text = "None yet.", Foreground = MutedBrush(), FontSize = 12 });
+                return;
+            }
+            var list = new StackPanel { Spacing = 4 };
+            foreach (var tc in tags) list.Children.Add(TriStateTagRow(tc, inc, exc, () => { RefreshCollFilterFlyout(); RenderCollections(); }));
+            root.Children.Add(new ScrollViewer { Content = list, VerticalScrollBarVisibility = ScrollBarVisibility.Auto, MaxHeight = 200, HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled });
+        }
+
+        Section("Project tags", projTags, _collInclude, _collExclude, showMatch: true);
+        root.Children.Add(new Border { Height = 1, Background = LineBrush(), Margin = new Thickness(0, 2, 0, 2) });
+        Section("Chat tags (within projects)", chatTags, _collChatInclude, _collChatExclude, showMatch: false);
+
+        if (AnyCollectionFilterActive())
+        {
+            var clear = new Button { Style = (Style)Resources["PillButtonStyle"], HorizontalAlignment = HorizontalAlignment.Stretch, Content = new TextBlock { Text = "Clear filters", FontSize = 12 } };
+            clear.Click += (_, _) => { _collInclude.Clear(); _collExclude.Clear(); _collChatInclude.Clear(); _collChatExclude.Clear(); RefreshCollFilterFlyout(); RenderCollections(); };
+            root.Children.Add(clear);
+        }
+        return root;
+    }
+
+    // Active-filter pills for the Collections screen (project includes/excludes + chat includes/excludes).
+    private UIElement? CollectionFilterPills()
+    {
+        var known = new HashSet<string>(_archive.AllCollectionTags().Select(t => t.Tag), StringComparer.OrdinalIgnoreCase);
+        _collInclude.RemoveWhere(t => !known.Contains(t));
+        _collExclude.RemoveWhere(t => !known.Contains(t));
+        var chatKnown = new HashSet<string>(_archive.AllChatTags().Select(t => t.Tag), StringComparer.OrdinalIgnoreCase);
+        _collChatInclude.RemoveWhere(t => !chatKnown.Contains(t));
+        _collChatExclude.RemoveWhere(t => !chatKnown.Contains(t));
+        if (!AnyCollectionFilterActive()) return null;
 
         var row = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 6, VerticalAlignment = VerticalAlignment.Center };
-        row.Children.Add(new TextBlock { Text = "Filter", Foreground = MutedBrush(), FontSize = 12, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 4, 0) });
-        foreach (var tc in all)
-        {
-            var tag = tc.Tag;
-            row.Children.Add(TagChip(tag, active: _activeCollectionTagFilters.Contains(tag),
-                onTap: () => ToggleCollectionFilter(tag), onRemove: null, suffix: tc.Count.ToString(),
-                dotColor: _archive.TagColor(tag)));
-        }
-        if (_activeCollectionTagFilters.Count > 0)
-            row.Children.Add(AddChip("clear", () => { _activeCollectionTagFilters.Clear(); RenderCollections(); }));
-        return new ScrollViewer
-        {
-            HorizontalScrollBarVisibility = ScrollBarVisibility.Auto,
-            VerticalScrollBarVisibility = ScrollBarVisibility.Disabled,
-            Content = row,
-            Margin = new Thickness(0, 10, 0, 0)
-        };
+        foreach (var tag in _collInclude.OrderBy(t => t, StringComparer.OrdinalIgnoreCase))
+        { var t = tag; row.Children.Add(TagChip(t, active: true, onTap: () => { _collInclude.Remove(t); RenderCollections(); }, onRemove: () => { _collInclude.Remove(t); RenderCollections(); }, dotColor: _archive.TagColor(t))); }
+        foreach (var tag in _collExclude.OrderBy(t => t, StringComparer.OrdinalIgnoreCase))
+        { var t = tag; row.Children.Add(TagChip("not " + t, active: false, onTap: () => { _collExclude.Remove(t); RenderCollections(); }, onRemove: () => { _collExclude.Remove(t); RenderCollections(); })); }
+        foreach (var tag in _collChatInclude.OrderBy(t => t, StringComparer.OrdinalIgnoreCase))
+        { var t = tag; row.Children.Add(TagChip("chat: " + t, active: true, onTap: () => { _collChatInclude.Remove(t); RenderCollections(); }, onRemove: () => { _collChatInclude.Remove(t); RenderCollections(); }, dotColor: _archive.TagColor(t))); }
+        foreach (var tag in _collChatExclude.OrderBy(t => t, StringComparer.OrdinalIgnoreCase))
+        { var t = tag; row.Children.Add(TagChip("chat: not " + t, active: false, onTap: () => { _collChatExclude.Remove(t); RenderCollections(); }, onRemove: () => { _collChatExclude.Remove(t); RenderCollections(); })); }
+        row.Children.Add(AddChip("clear", () => { _collInclude.Clear(); _collExclude.Clear(); _collChatInclude.Clear(); _collChatExclude.Clear(); RenderCollections(); }));
+        return new ScrollViewer { HorizontalScrollBarVisibility = ScrollBarVisibility.Auto, VerticalScrollBarVisibility = ScrollBarVisibility.Disabled, Content = row, Margin = new Thickness(0, 10, 0, 0) };
     }
 
     private async Task RemoveCollectionTagAndRefreshAsync(string collectionId, string tag)
     {
         await _archive.RemoveCollectionTagAsync(collectionId, tag);
+        RenderCollections();
+    }
+
+    private async Task ReorderInCollectionAndRefreshAsync(string collectionId, string sessionId, int delta, bool toEnd)
+    {
+        await _archive.ReorderInCollectionAsync(collectionId, sessionId, delta, toEnd);
         RenderCollections();
     }
 

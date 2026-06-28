@@ -30,6 +30,12 @@ public sealed class AppStoreData
     // auto-color so every tag is colored with zero setup; an entry here is a user's explicit choice.
     [JsonPropertyName("tagColors")]
     public Dictionary<string, string> TagColors { get; set; } = new();
+
+    // Layer rules (lowercased tag -> layer number, LOWER = HIGHER in the list). Chats in a collection
+    // are grouped by their tags' layer, so e.g. `active`=1 floats to the top and `context`=900 sinks
+    // to the bottom. Unlisted tags use the default layer. Sorting only - never hides anything.
+    [JsonPropertyName("tagLayers")]
+    public Dictionary<string, int> TagLayers { get; set; } = new();
 }
 
 // A place agent sessions are stored on disk. Defaults cover Codex + Claude; an agent or the user
