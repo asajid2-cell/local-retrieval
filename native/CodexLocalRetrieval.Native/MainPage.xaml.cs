@@ -34,7 +34,19 @@ public sealed partial class MainPage : Page
         InitializeComponent();
         Diag.Log("MP.ctor: after InitializeComponent");
         Loaded += MainPage_Loaded;
+        // Responsive: below this width the right rail + chat reader can't both fit, so the right
+        // panel (secondary actions, all reachable from the header + ... menu) folds away.
+        SizeChanged += (_, _) =>
+        {
+            var narrow = ActualWidth > 0 && ActualWidth < RightPanelMinWidth;
+            if (narrow == _narrowLayout) return;
+            _narrowLayout = narrow;
+            UpdateChrome();
+        };
     }
+
+    private const double RightPanelMinWidth = 1120;
+    private bool _narrowLayout;
 
     private async void MainPage_Loaded(object sender, RoutedEventArgs e)
     {
@@ -215,9 +227,29 @@ public sealed partial class MainPage : Page
     private void UpdateChrome()
     {
         bool sessionContext = _screen is "Archive" or "Source" or "Restore";
-        RightColumnBorder.Visibility = sessionContext ? Visibility.Visible : Visibility.Collapsed;
-        RightColumn.Width = sessionContext ? new GridLength(292) : new GridLength(0);
+        bool showRight = sessionContext && !_narrowLayout;   // fold the right rail when too narrow to fit
+        RightColumnBorder.Visibility = showRight ? Visibility.Visible : Visibility.Collapsed;
+        RightColumn.Width = showRight ? new GridLength(292) : new GridLength(0);
         HeaderActions.Visibility = sessionContext ? Visibility.Visible : Visibility.Collapsed;
+    }
+
+    // Header overflow menu: the same secondary actions as the right "Quick actions" rail, reachable
+    // at ALL widths - critical once the right rail folds away on a narrow window.
+    private void HeaderMore_Click(object sender, RoutedEventArgs e)
+    {
+        if (_selected is null) return;
+        var flyout = new MenuFlyout { AreOpenCloseAnimationsEnabled = false, Placement = Microsoft.UI.Xaml.Controls.Primitives.FlyoutPlacementMode.BottomEdgeAlignedRight };
+        void Add(string text, Action act) { var item = new MenuFlyoutItem { Text = text }; item.Click += (_, _) => act(); flyout.Items.Add(item); }
+        Add("Add to project", () => ShowAddToProjectFlyout(HeaderMoreButton, _selected!));
+        Add("Bump to top of resume list", () => _ = BumpSession(_selected!));
+        flyout.Items.Add(new MenuFlyoutSeparator());
+        Add("Copy resume prompt", () => Copy("resume"));
+        Add("Copy chat path", () => Copy("path"));
+        Add("Copy all code", () => Copy("code"));
+        flyout.Items.Add(new MenuFlyoutSeparator());
+        Add("Build restore packet", () => Navigate("Restore"));
+        Add("Inspect raw events", () => Navigate("Source"));
+        flyout.ShowAt(HeaderMoreButton);
     }
 
     private void Back_Click(object sender, RoutedEventArgs e)
@@ -392,8 +424,9 @@ public sealed partial class MainPage : Page
         {
             MainContent.Children.Add(ExpandableSessionGroup(
                 group.Key,
-                $"{group.Count()} chats - {group.First().Workspace}",
-                group.OrderByDescending(session => session.Pinned).ThenByDescending(session => session.UpdatedAt)));
+                $"{group.Count()} chats",
+                group.OrderByDescending(session => session.Pinned).ThenByDescending(session => session.UpdatedAt),
+                pathLabel: group.First().Workspace));
         }
     }
 
@@ -996,7 +1029,8 @@ public sealed partial class MainPage : Page
 
     private UIElement ExpandableSessionGroup(string title, string subtitle, IEnumerable<ArchiveSession> sessions,
         Action? onDelete = null, Action? onCopyAgentCommand = null, Action<ArchiveSession>? onRemoveSession = null,
-        IReadOnlyList<string>? tags = null, Action? onAddTag = null, Action<string>? onRemoveTag = null)
+        IReadOnlyList<string>? tags = null, Action? onAddTag = null, Action<string>? onRemoveTag = null,
+        string? pathLabel = null)
     {
         var sessionList = sessions.Take(120).ToList();
         var stack = new StackPanel { Spacing = 0 };
@@ -1013,6 +1047,8 @@ public sealed partial class MainPage : Page
         var titleRow = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8, VerticalAlignment = VerticalAlignment.Center };
         titleRow.Children.Add(new TextBlock { Text = title, Foreground = StrongBrush(), FontSize = 15, FontWeight = Microsoft.UI.Text.FontWeights.SemiBold, VerticalAlignment = VerticalAlignment.Center, TextTrimming = TextTrimming.CharacterEllipsis });
         titleArea.Children.Add(titleRow);
+        if (!string.IsNullOrWhiteSpace(pathLabel))
+            titleArea.Children.Add(new TextBlock { Text = pathLabel, Foreground = MutedBrush(), FontSize = 12, TextTrimming = TextTrimming.CharacterEllipsis, TextWrapping = TextWrapping.NoWrap });
         if (onAddTag is not null) titleArea.Children.Add(CollectionTagsRow(tags ?? Array.Empty<string>(), onAddTag, onRemoveTag));
         header.Children.Add(titleArea);
 
@@ -1391,13 +1427,17 @@ public sealed partial class MainPage : Page
 
     private ColorPicker AccentColorPicker()
     {
+        // Compact: hide the bulky RGB/HSV text inputs (the "More" toggle clipped to "Mo"), keeping the
+        // spectrum + sliders + hex so the picker stays short and nothing clips in the Settings viewport.
         var picker = new ColorPicker
         {
             Width = 280,
             Color = _accentColor,
             IsAlphaEnabled = false,
             IsAlphaSliderVisible = false,
-            IsAlphaTextInputVisible = false
+            IsAlphaTextInputVisible = false,
+            IsColorChannelTextInputVisible = false,
+            IsHexInputVisible = true
         };
         picker.ColorChanged += async (_, args) =>
         {
@@ -2103,9 +2143,23 @@ public sealed partial class MainPage : Page
     }
     private static string FormatDate(string value) => DateTime.TryParse(value, out var date) ? date.ToString("MMM d") : "";
     private static string HexFromColor(Windows.UI.Color color) => $"#{color.R:X2}{color.G:X2}{color.B:X2}".ToLowerInvariant();
+
+    private static Windows.UI.Color ColorFromHex(string hex)
+    {
+        try
+        {
+            var h = hex.TrimStart('#');
+            return Windows.UI.Color.FromArgb(255,
+                Convert.ToByte(h.Substring(0, 2), 16),
+                Convert.ToByte(h.Substring(2, 2), 16),
+                Convert.ToByte(h.Substring(4, 2), 16));
+        }
+        catch { return Windows.UI.Color.FromArgb(255, 0x60, 0xA5, 0xFA); }
+    }
     private SolidColorBrush StrongBrush() => (SolidColorBrush)Application.Current.Resources["TextStrongBrush"];
     private SolidColorBrush MutedBrush() => (SolidColorBrush)Application.Current.Resources["TextMutedBrush"];
     private SolidColorBrush PanelBrush() => (SolidColorBrush)Application.Current.Resources["PanelBrush"];
+    private SolidColorBrush RaisedBrush() => (SolidColorBrush)Application.Current.Resources["RaisedBrush"];
     private SolidColorBrush LineBrush() => (SolidColorBrush)Application.Current.Resources["LineBrush"];
     private SolidColorBrush AccentSoftBrush() => new(Windows.UI.Color.FromArgb(90, _accentColor.R, _accentColor.G, _accentColor.B));
     private SolidColorBrush AccentVerySoftBrush() => new(Windows.UI.Color.FromArgb(30, _accentColor.R, _accentColor.G, _accentColor.B));

@@ -25,6 +25,11 @@ public sealed class AppStoreData
     // re-scan so relaunches are fast. Deletions are never propagated (chats keep accumulating).
     [JsonPropertyName("fileStamps")]
     public Dictionary<string, string> FileStamps { get; set; } = new();
+
+    // Per-tag-name color overrides (lowercased tag -> hex). Absent tags fall back to a deterministic
+    // auto-color so every tag is colored with zero setup; an entry here is a user's explicit choice.
+    [JsonPropertyName("tagColors")]
+    public Dictionary<string, string> TagColors { get; set; } = new();
 }
 
 // A place agent sessions are stored on disk. Defaults cover Codex + Claude; an agent or the user

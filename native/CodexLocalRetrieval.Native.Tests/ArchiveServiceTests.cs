@@ -760,6 +760,35 @@ public sealed class ArchiveServiceTests
         finally { if (File.Exists(store)) File.Delete(store); }
     }
 
+    // Tag colors: auto-color is deterministic (same name -> same palette color, case-insensitive) and
+    // a user override wins until cleared, persisting in the store.
+    [TestMethod]
+    public async Task TagColors_AutoDeterministicAndOverridable()
+    {
+        var svc = TempService(out var store);
+        try
+        {
+            var auto1 = ArchiveService.AutoTagColor("bug");
+            var auto2 = ArchiveService.AutoTagColor("BUG");
+            Assert.AreEqual(auto1, auto2, "auto-color is case-insensitive + deterministic");
+            CollectionAssert.Contains(ArchiveService.TagPalette.ToArray(), auto1, "auto-color comes from the palette");
+            Assert.AreEqual(auto1, svc.TagColor("bug"), "no override -> auto-color");
+            Assert.IsFalse(svc.HasCustomTagColor("bug"));
+
+            await svc.SetTagColorAsync("bug", "#123456");
+            Assert.AreEqual("#123456", svc.TagColor("BUG"), "override wins, case-insensitive");
+            Assert.IsTrue(svc.HasCustomTagColor("bug"));
+
+            var reader = new ArchiveService(storePath: store);
+            await reader.LoadAsync();
+            Assert.AreEqual("#123456", reader.TagColor("bug"), "override persists across reload");
+
+            await svc.SetTagColorAsync("bug", null);
+            Assert.AreEqual(auto1, svc.TagColor("bug"), "clearing returns to auto");
+        }
+        finally { if (File.Exists(store)) File.Delete(store); }
+    }
+
     // The agent resume prompt must point a fresh agent at the transcript as the source of truth and
     // frame the snippets as a preview only - so it reconstructs the real task instead of acting on an excerpt.
     [TestMethod]

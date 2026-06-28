@@ -134,6 +134,8 @@ public sealed partial class MainPage
             }
         };
 
+        // The backend note lives on its OWN line below the controls so it never gets crushed between
+        // the dropdown and the action buttons (it was truncating at narrow widths).
         var note = new TextBlock
         {
             Text = _copilotBackend == "claude-cli"
@@ -141,21 +143,20 @@ public sealed partial class MainPage
                 : "DeepSeek key: " + ApiKeySource("deepseek"),
             Foreground = MutedBrush(),
             FontSize = 11,
-            VerticalAlignment = VerticalAlignment.Center,
+            Margin = new Thickness(2, 8, 0, 0),
             TextWrapping = TextWrapping.Wrap
         };
 
-        var left = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 12, VerticalAlignment = VerticalAlignment.Center, Children = { backendCombo, note } };
-
         var buttons = new Grid { Margin = new Thickness(0, 10, 0, 0), ColumnDefinitions = { new ColumnDefinition(), new ColumnDefinition { Width = GridLength.Auto } } };
-        buttons.Children.Add(left);
+        backendCombo.VerticalAlignment = VerticalAlignment.Center;
+        buttons.Children.Add(backendCombo);
         var right = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8 };
         right.Children.Add(reset);
         right.Children.Add(_copilotBusy ? stop : send);
         Grid.SetColumn(right, 1);
         buttons.Children.Add(right);
 
-        return Card(new StackPanel { Spacing = 0, Children = { input, buttons } });
+        return Card(new StackPanel { Spacing = 0, Children = { input, buttons, note } });
     }
 
     private UIElement CopilotSuggestionsCard()

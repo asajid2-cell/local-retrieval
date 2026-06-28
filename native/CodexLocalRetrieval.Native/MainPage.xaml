@@ -252,6 +252,13 @@
                                 <TextBlock Text="Copy context" />
                             </StackPanel>
                         </Button>
+                        <Button
+                            x:Name="HeaderMoreButton"
+                            Click="HeaderMore_Click"
+                            Style="{StaticResource IconButtonStyle}"
+                            ToolTipService.ToolTip="More actions">
+                            <FontIcon FontFamily="Segoe Fluent Icons" FontSize="16" Glyph="&#xE712;" />
+                        </Button>
                         <Button Click="ResumeInTerminal_Click" Style="{StaticResource PrimaryPillButtonStyle}">
                             <StackPanel Orientation="Horizontal" Spacing="8">
                                 <FontIcon
@@ -306,7 +313,6 @@
                 <Button Click="CopyCode_Click" Content="Copy all code" HorizontalAlignment="Stretch" Style="{StaticResource PillButtonStyle}" />
                 <Button Click="Restore_Click" Content="Build restore packet" HorizontalAlignment="Stretch" Style="{StaticResource PillButtonStyle}" />
                 <Button Click="Source_Click" Content="Inspect raw events" HorizontalAlignment="Stretch" Style="{StaticResource PillButtonStyle}" />
-                <Button Click="Review_Click" Content="Add review-later" HorizontalAlignment="Stretch" Style="{StaticResource PillButtonStyle}" />
                 <Grid Margin="0,6,0,0">
                     <Grid.ColumnDefinitions>
                         <ColumnDefinition Width="*" />

@@ -4,8 +4,10 @@ using System.Linq;
 using System.Threading.Tasks;
 using CodexLocalRetrieval.Core.Models;
 using CodexLocalRetrieval.Core.Services;
+using Microsoft.UI.Text;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
+using Microsoft.UI.Xaml.Controls.Primitives;
 using Microsoft.UI.Xaml.Media;
 
 namespace CodexLocalRetrieval_Native;
@@ -28,10 +30,172 @@ public sealed partial class MainPage
         RenderTagFilterBar();
     }
 
+    // ---- Unified tag chip --------------------------------------------------------------------
+    // ONE chip for every tag context (chat tags, collection tags, filter pills). Operational/AMOLED:
+    // tags read as METADATA, not buttons - a quiet raised label carrying a small colored DOT for
+    // identity (auto-assigned per name, user-overridable), NOT a colored fill (which looks noisy on
+    // black). Rose tint is reserved for the active-filter state. Body tap = onTap (filter); the x =
+    // onRemove (null hides it) with a small quiet glyph + hover. Converged with an independent design pass.
+    private static readonly Windows.UI.Color ChipText = Windows.UI.Color.FromArgb(255, 0xD9, 0xDA, 0xE0);
+    private static readonly Windows.UI.Color ChipXIdle = Windows.UI.Color.FromArgb(255, 0x8B, 0x8D, 0x96);
+    private SolidColorBrush ChipNeutralHover() => new(Windows.UI.Color.FromArgb(255, 0x18, 0x1A, 0x1F));
+
+    private FrameworkElement TagChip(string text, bool active, Action? onTap, Action? onRemove, string? suffix = null, string? dotColor = null, Action<FrameworkElement>? onColorPick = null)
+    {
+        var inner = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 6, VerticalAlignment = VerticalAlignment.Center };
+        if (dotColor is not null)
+            inner.Children.Add(new Border
+            {
+                Width = 6,
+                Height = 6,
+                CornerRadius = new CornerRadius(3),
+                Background = new SolidColorBrush(ColorFromHex(dotColor)),
+                VerticalAlignment = VerticalAlignment.Center
+            });
+        inner.Children.Add(new TextBlock
+        {
+            Text = text,
+            FontSize = 12,
+            FontWeight = FontWeights.Medium,
+            Foreground = active ? StrongBrush() : new SolidColorBrush(ChipText),
+            VerticalAlignment = VerticalAlignment.Center,
+            TextTrimming = TextTrimming.CharacterEllipsis,
+            MaxWidth = 188
+        });
+        if (suffix is not null)
+            inner.Children.Add(new TextBlock { Text = $"({suffix})", FontSize = 11, Foreground = MutedBrush(), VerticalAlignment = VerticalAlignment.Center });
+        if (onRemove is not null)
+        {
+            // 22px hit target, but a small quiet glyph (Codex: the x must not dominate a tiny chip).
+            var glyph = new FontIcon { FontFamily = new FontFamily("Segoe Fluent Icons"), Glyph = "", FontSize = 10, Foreground = new SolidColorBrush(ChipXIdle) };
+            var x = new Button
+            {
+                Width = 22,
+                Height = 22,
+                MinWidth = 22,
+                MinHeight = 22,
+                Padding = new Thickness(0),
+                Margin = new Thickness(2, 0, -3, 0),
+                CornerRadius = new CornerRadius(11),
+                Background = new SolidColorBrush(Windows.UI.Color.FromArgb(0, 0, 0, 0)),
+                BorderThickness = new Thickness(0),
+                Content = glyph
+            };
+            x.PointerEntered += (_, _) => { glyph.Foreground = StrongBrush(); x.Background = LineBrush(); };
+            x.PointerExited += (_, _) => { glyph.Foreground = new SolidColorBrush(ChipXIdle); x.Background = new SolidColorBrush(Windows.UI.Color.FromArgb(0, 0, 0, 0)); };
+            ToolTipService.SetToolTip(x, "Remove");
+            x.Click += (_, _) => onRemove();
+            inner.Children.Add(x);
+        }
+
+        var neutral = RaisedBrush();
+        var activeBg = AccentVerySoftBrush();
+        var activeBorder = new SolidColorBrush(Windows.UI.Color.FromArgb(180, _accentColor.R, _accentColor.G, _accentColor.B));
+        var chip = new Border
+        {
+            Background = active ? activeBg : neutral,
+            BorderBrush = active ? activeBorder : LineBrush(),
+            BorderThickness = new Thickness(1),
+            CornerRadius = new CornerRadius(6),
+            Padding = onRemove is null ? new Thickness(9, 4, 9, 4) : new Thickness(9, 4, 4, 4),
+            MinHeight = 27,
+            VerticalAlignment = VerticalAlignment.Center,
+            Child = inner
+        };
+        if (onTap is not null)
+        {
+            chip.Tapped += (_, e) => { e.Handled = true; onTap(); };
+            chip.PointerEntered += (_, _) => chip.Background = active ? AccentSoftBrush() : ChipNeutralHover();
+            chip.PointerExited += (_, _) => chip.Background = active ? activeBg : neutral;
+        }
+        if (onColorPick is not null)
+            chip.RightTapped += (s, e) => { e.Handled = true; onColorPick((FrameworkElement)s); };
+        return chip;
+    }
+
+    // Right-click a tag chip -> a curated swatch menu to recolor it (or reset to auto). Per the
+    // independent design pass: manual colors come from a fixed palette, not a freeform picker.
+    private void ShowTagColorFlyout(FrameworkElement anchor, string tag, Action after)
+    {
+        var current = _archive.TagColor(tag);
+        var flyout = new Flyout { Placement = FlyoutPlacementMode.Bottom };
+        var panel = new StackPanel { Spacing = 10, Padding = new Thickness(2) };
+        panel.Children.Add(new TextBlock { Text = $"Color · {tag}", Foreground = StrongBrush(), FontSize = 13, FontWeight = FontWeights.SemiBold });
+
+        var grid = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8 };
+        foreach (var hex in ArchiveService.TagPalette)
+        {
+            var selected = string.Equals(hex, current, StringComparison.OrdinalIgnoreCase);
+            var sw = new Button
+            {
+                Width = 26,
+                Height = 26,
+                MinWidth = 26,
+                MinHeight = 26,
+                Padding = new Thickness(0),
+                CornerRadius = new CornerRadius(13),
+                Background = new SolidColorBrush(ColorFromHex(hex)),
+                BorderBrush = StrongBrush(),
+                BorderThickness = new Thickness(selected ? 2 : 0)
+            };
+            var h = hex;
+            sw.Click += async (_, _) => { flyout.Hide(); await _archive.SetTagColorAsync(tag, h); after(); };
+            grid.Children.Add(sw);
+        }
+        panel.Children.Add(grid);
+
+        var auto = new Button { Style = (Style)Resources["PillButtonStyle"], Content = new TextBlock { Text = "Reset to auto", FontSize = 12 }, HorizontalAlignment = HorizontalAlignment.Stretch };
+        auto.Click += async (_, _) => { flyout.Hide(); await _archive.SetTagColorAsync(tag, null); after(); };
+        panel.Children.Add(auto);
+
+        flyout.Content = panel;
+        flyout.ShowAt(anchor);
+    }
+
+    // An outlined "add" chip matching the tag chips (lowercase, transparent, hairline border).
+    private FrameworkElement AddChip(string text, Action onClick)
+    {
+        var b = new Button
+        {
+            Background = new SolidColorBrush(Windows.UI.Color.FromArgb(0, 0, 0, 0)),
+            BorderBrush = LineBrush(),
+            BorderThickness = new Thickness(1),
+            CornerRadius = new CornerRadius(7),
+            Padding = new Thickness(11, 4, 11, 4),
+            MinHeight = 28,
+            MinWidth = 0,
+            Content = new TextBlock { Text = text, FontSize = 12, Foreground = MutedBrush() }
+        };
+        b.Click += (_, _) => onClick();
+        return b;
+    }
+
+    // Greedy wrap: pack chips into rows by measured width so they flow within a narrow panel.
+    private StackPanel WrapChips(IEnumerable<FrameworkElement> chips, double maxWidth, double spacing = 6)
+    {
+        var outer = new StackPanel { Spacing = spacing };
+        StackPanel? row = null;
+        double used = 0;
+        foreach (var chip in chips)
+        {
+            chip.Measure(new Windows.Foundation.Size(double.PositiveInfinity, double.PositiveInfinity));
+            var w = chip.DesiredSize.Width;
+            if (row is null || (used > 0 && used + w > maxWidth))
+            {
+                row = new StackPanel { Orientation = Orientation.Horizontal, Spacing = spacing };
+                outer.Children.Add(row);
+                used = 0;
+            }
+            row.Children.Add(chip);
+            used += w + spacing;
+        }
+        return outer;
+    }
+
     private void TagFilter_Click(object sender, RoutedEventArgs e)
     {
         var all = _archive.AllChatTags();
-        var flyout = new MenuFlyout { AreOpenCloseAnimationsEnabled = false };
+        var flyout = new MenuFlyout { AreOpenCloseAnimationsEnabled = false, Placement = FlyoutPlacementMode.BottomEdgeAlignedRight };
         if (all.Count == 0)
         {
             flyout.Items.Add(new MenuFlyoutItem { Text = "No tags yet - add one from a chat's Tags panel", IsEnabled = false });
@@ -74,36 +238,14 @@ public sealed partial class MainPage
         }
         TagFilterScroller.Visibility = Visibility.Visible;
         foreach (var tag in _activeTagFilters.OrderBy(t => t, StringComparer.OrdinalIgnoreCase))
-            TagFilterBar.Children.Add(ActiveFilterChip(tag));
-
-        var clear = new Button
         {
-            Style = (Style)Resources["PillButtonStyle"],
-            Padding = new Thickness(10, 3, 10, 3),
-            Content = new TextBlock { Text = "Clear", FontSize = 12 }
-        };
-        clear.Click += (_, _) => { _activeTagFilters.Clear(); ApplyFilters(); };
-        TagFilterBar.Children.Add(clear);
-    }
-
-    // A pill showing an active filter; clicking it removes that filter.
-    private Button ActiveFilterChip(string tag)
-    {
-        var content = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 6 };
-        content.Children.Add(new TextBlock { Text = tag, FontSize = 12, Foreground = StrongBrush(), VerticalAlignment = VerticalAlignment.Center });
-        content.Children.Add(new TextBlock { Text = "×", FontSize = 13, Foreground = MutedBrush(), VerticalAlignment = VerticalAlignment.Center });
-        var b = new Button
-        {
-            Padding = new Thickness(10, 3, 10, 3),
-            CornerRadius = new CornerRadius(14),
-            Background = AccentVerySoftBrush(),
-            BorderBrush = AccentSoftBrush(),
-            BorderThickness = new Thickness(1),
-            Content = content
-        };
-        ToolTipService.SetToolTip(b, $"Remove filter: {tag}");
-        b.Click += (_, _) => { _activeTagFilters.Remove(tag); ApplyFilters(); };
-        return b;
+            var t = tag;
+            TagFilterBar.Children.Add(TagChip(t, active: true,
+                onTap: () => { _activeTagFilters.Remove(t); ApplyFilters(); },
+                onRemove: () => { _activeTagFilters.Remove(t); ApplyFilters(); },
+                dotColor: _archive.TagColor(t)));
+        }
+        TagFilterBar.Children.Add(AddChip("clear", () => { _activeTagFilters.Clear(); ApplyFilters(); }));
     }
 
     // ---- Per-chat tag editor (right panel) ---------------------------------------------------
@@ -116,65 +258,16 @@ public sealed partial class MainPage
         var tags = ArchiveService.UserTags(_selected);
         if (tags.Count == 0)
         {
-            TagsItems.Children.Add(new TextBlock { Text = "No tags yet - use + Tag", Foreground = MutedBrush(), FontSize = 12 });
+            TagsItems.Children.Add(new TextBlock { Text = "No tags yet", Foreground = MutedBrush(), FontSize = 12 });
             return;
         }
-        foreach (var tag in tags) TagsItems.Children.Add(EditableTagRow(_selected, tag));
-    }
-
-    // One tag row: click the label to filter the chat list by it; × removes it from the chat.
-    private Border EditableTagRow(ArchiveSession session, string tag)
-    {
-        var grid = new Grid();
-        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-
-        var label = new Button
-        {
-            Background = new SolidColorBrush(Windows.UI.Color.FromArgb(0, 0, 0, 0)),
-            BorderThickness = new Thickness(0),
-            Padding = new Thickness(0),
-            HorizontalAlignment = HorizontalAlignment.Stretch,
-            HorizontalContentAlignment = HorizontalAlignment.Left,
-            VerticalAlignment = VerticalAlignment.Center,
-            Content = new TextBlock { Text = "# " + tag, Foreground = StrongBrush(), FontSize = 13, TextTrimming = TextTrimming.CharacterEllipsis }
-        };
-        ToolTipService.SetToolTip(label, $"Filter chats tagged \"{tag}\"");
-        label.Click += (_, _) =>
-        {
-            _activeTagFilters.Clear();
-            _activeTagFilters.Add(tag);
-            Navigate("Archive");
-            ApplyFilters();
-        };
-        grid.Children.Add(label);
-
-        var remove = new Button
-        {
-            Style = (Style)Resources["IconButtonStyle"],
-            Width = 26,
-            Height = 26,
-            MinWidth = 26,
-            MinHeight = 26,
-            Content = new TextBlock { Text = "×", FontSize = 14, Foreground = MutedBrush() }
-        };
-        ToolTipService.SetToolTip(remove, "Remove tag");
-        remove.Click += async (_, _) =>
-        {
-            await _archive.RemoveChatTagAsync(session, tag);
-            RenderTags();
-            RenderTagFilterBar();
-        };
-        Grid.SetColumn(remove, 1);
-        grid.Children.Add(remove);
-
-        return new Border
-        {
-            BorderBrush = AccentSoftBrush(),
-            BorderThickness = new Thickness(2, 0, 0, 0),
-            Padding = new Thickness(8, 1, 2, 1),
-            Child = grid
-        };
+        var sel = _selected;
+        var chips = tags.Select(tag => TagChip(tag, active: false,
+            onTap: () => { _activeTagFilters.Clear(); _activeTagFilters.Add(tag); Navigate("Archive"); ApplyFilters(); },
+            onRemove: async () => { await _archive.RemoveChatTagAsync(sel, tag); RenderTags(); RenderTagFilterBar(); },
+            dotColor: _archive.TagColor(tag),
+            onColorPick: anchor => ShowTagColorFlyout(anchor, tag, () => { RenderTags(); RenderTagFilterBar(); })));
+        TagsItems.Children.Add(WrapChips(chips, 244));
     }
 
     private async void AddTag_Click(object sender, RoutedEventArgs e)
@@ -185,65 +278,26 @@ public sealed partial class MainPage
     // ---- Collection tags (Collections screen) ------------------------------------------------
     private readonly HashSet<string> _activeCollectionTagFilters = new(StringComparer.OrdinalIgnoreCase);
 
-    // A collection card's tag row: chips (click to filter, × to remove) + an "+ tag" button.
+    // A collection card's tag row: unified chips (click to filter, × to remove) + an "+ tag" chip.
     private UIElement CollectionTagsRow(IReadOnlyList<string> tags, Action onAddTag, Action<string>? onRemoveTag)
     {
         var row = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 6, VerticalAlignment = VerticalAlignment.Center };
-        foreach (var tag in tags) row.Children.Add(CollectionTagChip(tag, onRemoveTag));
-        var add = new Button
+        foreach (var tag in tags)
         {
-            Style = (Style)Resources["PillButtonStyle"],
-            Padding = new Thickness(8, 1, 8, 1),
-            MinHeight = 26,
-            Height = 26,
-            Content = new TextBlock { Text = tags.Count == 0 ? "+ tag" : "+", FontSize = 11 }
-        };
-        ToolTipService.SetToolTip(add, "Add a tag to this collection");
-        add.Click += (_, _) => onAddTag();
-        row.Children.Add(add);
+            var t = tag;
+            row.Children.Add(TagChip(t, active: _activeCollectionTagFilters.Contains(t),
+                onTap: () => ToggleCollectionFilter(t),
+                onRemove: onRemoveTag is null ? null : () => onRemoveTag(t),
+                dotColor: _archive.TagColor(t),
+                onColorPick: anchor => ShowTagColorFlyout(anchor, t, RenderCollections)));
+        }
+        row.Children.Add(AddChip("+ tag", onAddTag));
         return new ScrollViewer
         {
             HorizontalScrollBarVisibility = ScrollBarVisibility.Auto,
             VerticalScrollBarVisibility = ScrollBarVisibility.Disabled,
             HorizontalScrollMode = ScrollMode.Auto,
             Content = row
-        };
-    }
-
-    private Border CollectionTagChip(string tag, Action<string>? onRemoveTag)
-    {
-        var active = _activeCollectionTagFilters.Contains(tag);
-        var inner = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 5, VerticalAlignment = VerticalAlignment.Center };
-        var label = new Button
-        {
-            Background = new SolidColorBrush(Windows.UI.Color.FromArgb(0, 0, 0, 0)),
-            BorderThickness = new Thickness(0),
-            Padding = new Thickness(0),
-            Content = new TextBlock { Text = tag, FontSize = 11, Foreground = StrongBrush() }
-        };
-        ToolTipService.SetToolTip(label, active ? "Filtering by this tag - click to clear" : $"Show only collections tagged \"{tag}\"");
-        label.Click += (_, _) => ToggleCollectionFilter(tag);
-        inner.Children.Add(label);
-        if (onRemoveTag is not null)
-        {
-            var x = new Button
-            {
-                Background = new SolidColorBrush(Windows.UI.Color.FromArgb(0, 0, 0, 0)),
-                BorderThickness = new Thickness(0),
-                Padding = new Thickness(0),
-                MinWidth = 0,
-                Content = new TextBlock { Text = "×", FontSize = 12, Foreground = MutedBrush() }
-            };
-            ToolTipService.SetToolTip(x, "Remove tag from collection");
-            x.Click += (_, _) => onRemoveTag(tag);
-            inner.Children.Add(x);
-        }
-        return new Border
-        {
-            Background = active ? AccentSoftBrush() : AccentVerySoftBrush(),
-            CornerRadius = new CornerRadius(12),
-            Padding = new Thickness(9, 2, 7, 2),
-            Child = inner
         };
     }
 
@@ -261,27 +315,16 @@ public sealed partial class MainPage
         if (all.Count == 0) return null;
 
         var row = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 6, VerticalAlignment = VerticalAlignment.Center };
-        row.Children.Add(new TextBlock { Text = "Filter:", Foreground = MutedBrush(), FontSize = 12, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 2, 0) });
+        row.Children.Add(new TextBlock { Text = "Filter", Foreground = MutedBrush(), FontSize = 12, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 4, 0) });
         foreach (var tc in all)
         {
             var tag = tc.Tag;
-            var active = _activeCollectionTagFilters.Contains(tag);
-            var chip = new Button
-            {
-                Padding = new Thickness(10, 3, 10, 3),
-                CornerRadius = new CornerRadius(13),
-                Background = active ? AccentSoftBrush() : AccentVerySoftBrush(),
-                Content = new TextBlock { Text = $"{tag} ({tc.Count})", FontSize = 12, Foreground = StrongBrush() }
-            };
-            chip.Click += (_, _) => ToggleCollectionFilter(tag);
-            row.Children.Add(chip);
+            row.Children.Add(TagChip(tag, active: _activeCollectionTagFilters.Contains(tag),
+                onTap: () => ToggleCollectionFilter(tag), onRemove: null, suffix: tc.Count.ToString(),
+                dotColor: _archive.TagColor(tag)));
         }
         if (_activeCollectionTagFilters.Count > 0)
-        {
-            var clear = new Button { Style = (Style)Resources["PillButtonStyle"], Padding = new Thickness(10, 3, 10, 3), Content = new TextBlock { Text = "Clear", FontSize = 12 } };
-            clear.Click += (_, _) => { _activeCollectionTagFilters.Clear(); RenderCollections(); };
-            row.Children.Add(clear);
-        }
+            row.Children.Add(AddChip("clear", () => { _activeCollectionTagFilters.Clear(); RenderCollections(); }));
         return new ScrollViewer
         {
             HorizontalScrollBarVisibility = ScrollBarVisibility.Auto,

@@ -149,6 +149,7 @@ public sealed class ArchiveService
             Collections = new Dictionary<string, ArchiveCollection>(Store.Collections),
             DeletedCollections = new List<DeletedCollection>(Store.DeletedCollections),
             FileStamps = new Dictionary<string, string>(Store.FileStamps),
+            TagColors = new Dictionary<string, string>(Store.TagColors),
         };
         await _saveGate.WaitAsync();
         try
@@ -922,6 +923,55 @@ public sealed class ArchiveService
         return baseSet
             .Where(s => matchAll ? tags.All(t => Has(s, t)) : tags.Any(t => Has(s, t)))
             .ToList();
+    }
+
+    // ---- Tag colors ----------------------------------------------------------------------------
+    // A curated palette that reads on pure-black AMOLED and coexists with the rose accent (Tailwind-400
+    // family). Tags get a deterministic auto-color from this by name hash; users can override per tag.
+    // Rose (#FB7185) is deliberately excluded - it's reserved for the accent / active-filter state.
+    public static readonly IReadOnlyList<string> TagPalette = new[]
+    {
+        "#60A5FA", "#38BDF8", "#22D3EE", "#2DD4BF", "#34D399",
+        "#A3E635", "#FBBF24", "#FB923C", "#F87171", "#A78BFA"
+    };
+
+    private static string TagColorKey(string tag) => NormalizeTag(tag).ToLowerInvariant();
+
+    // Stable across runs (string.GetHashCode is randomized in .NET, so use FNV-1a).
+    private static uint Fnv1a(string s)
+    {
+        uint hash = 2166136261;
+        foreach (var ch in s) { hash ^= ch; hash *= 16777619; }
+        return hash;
+    }
+
+    public static string AutoTagColor(string tag)
+    {
+        var key = NormalizeTag(tag).ToLowerInvariant();
+        if (key.Length == 0) return TagPalette[0];
+        return TagPalette[(int)(Fnv1a(key) % (uint)TagPalette.Count)];
+    }
+
+    // The effective color for a tag: a user override if set, else the deterministic auto-color.
+    public string TagColor(string tag)
+    {
+        var key = TagColorKey(tag);
+        return Store.TagColors.TryGetValue(key, out var hex) && !string.IsNullOrWhiteSpace(hex)
+            ? hex
+            : AutoTagColor(tag);
+    }
+
+    public bool HasCustomTagColor(string tag) => Store.TagColors.ContainsKey(TagColorKey(tag));
+
+    // Set (or clear, when hex is null/blank) a tag's color override; clearing returns it to auto.
+    public async Task SetTagColorAsync(string tag, string? hex)
+    {
+        var key = TagColorKey(tag);
+        if (key.Length == 0) return;
+        if (string.IsNullOrWhiteSpace(hex)) Store.TagColors.Remove(key);
+        else Store.TagColors[key] = hex.Trim();
+        await SaveAsync();
+        RefreshSessions(Store.Sessions.Values);
     }
 
     // Generic add/remove against either tag store (ObservableCollection for chats, List for collections).
