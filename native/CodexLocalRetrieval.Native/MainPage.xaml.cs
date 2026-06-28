@@ -212,6 +212,9 @@ public sealed partial class MainPage : Page
             case "Restore":
                 RenderRestore();
                 break;
+            case "Brain":
+                RenderBrainPage();
+                break;
             default:
                 RenderArchive();
                 break;
@@ -493,6 +496,11 @@ public sealed partial class MainPage : Page
         };
         newButton.Click += async (_, _) => await NewCollectionAsync();
 
+        // Project Brain entry point — opens the per-collection memory screen.
+        var brainButton = new Button { Style = (Style)Resources["PillButtonStyle"], Content = "Brain" };
+        ToolTipService.SetToolTip(brainButton, "Build a durable, source-linked memory brain for a project");
+        brainButton.Click += (_, _) => Navigate("Brain");
+
         var header = new Grid { ColumnDefinitions = { new ColumnDefinition(), new ColumnDefinition { Width = GridLength.Auto } } };
         header.Children.Add(new TextBlock
         {
@@ -517,6 +525,7 @@ public sealed partial class MainPage : Page
         var headerActions = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8, VerticalAlignment = VerticalAlignment.Center };
         headerActions.Children.Add(filterButton);
         headerActions.Children.Add(BackupMenuButton());
+        headerActions.Children.Add(brainButton);
         headerActions.Children.Add(newButton);
         Grid.SetColumn(headerActions, 1);
         header.Children.Add(headerActions);

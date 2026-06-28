@@ -42,6 +42,9 @@ public sealed class BrainService
     public bool PathsForBuilt(string collectionId)
         => !string.IsNullOrWhiteSpace(_vault.ReadManifest(PathsFor(collectionId)).BuiltAt);
 
+    // All cards in a collection's canonical vault (the read path the UI previews).
+    public List<MemoryCard> ReadCards(string collectionId) => _vault.ReadAllCards(PathsFor(collectionId));
+
     // chat -> blocks (full-history parse + deterministic blocking), plus the file stamp per chat.
     public async Task<(List<SourceBlock> blocks, Dictionary<string, string> stamps)> BuildBlocksAsync(
         IEnumerable<ArchiveSession> chats, CancellationToken ct = default)
