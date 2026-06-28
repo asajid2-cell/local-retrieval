@@ -452,6 +452,234 @@ public sealed class BrainTests
         finally { TryDeleteDir(brains); }
     }
 
+    // ---- BL3: extraction -> patch -> apply ----
+
+    private const string Now = "2026-06-28T00:00:00Z";
+
+    private static SourceBlock MakeBlock(string id, string sid) => new()
+    {
+        Id = id, SessionId = sid, SourcePath = "z:/proj/x.jsonl", Tool = "codex",
+        MsgStartIndex = 0, MsgEndIndex = 3, TsStart = "t0", TsEnd = "t1", MessageCount = 4,
+        ApproxTokens = 200, SourceHash = "hash-" + id, QuoteHash = "hash-" + id, FileStamp = "1:2",
+        Excerpt = "user: did the thing", Roles = new List<string> { "user", "assistant" },
+    };
+
+    private static MemoryCard Candidate(string title, string createdBy, string truth, IReadOnlyDictionary<string, SourceBlock> byId, params string[] blockIds)
+    {
+        var cand = new CandidateCard
+        {
+            Title = title, Type = CardTypes.WinOrBreakthrough, Lane = Lanes.Working,
+            TruthEvidence = truth, Importance = 5, Body = "method X led to a working servant FX",
+            BlockIds = blockIds.ToList(), CreatedBy = createdBy,
+        };
+        return BrainBuilder.ToCard(cand, byId, Now);
+    }
+
+    // GG9: a card with NO source anchor can never be canonical — even with the strongest truth claim.
+    [TestMethod]
+    public void Lane_NoAnchorCannotBeCanonical()
+    {
+        var byId = new Dictionary<string, SourceBlock>();
+        var noAnchor = Candidate("Bold claim with no source", CreatedBy.DeepSeek, TruthEvidence.UserConfirmed, byId /* no blocks */);
+        Assert.IsFalse(noAnchor.HasSourceAnchor);
+
+        var patch = new MemoryPatchService().BuildPatch("col", Array.Empty<MemoryCard>(), new[] { noAnchor }, "deepseek", "p1", Now);
+        Assert.AreEqual(1, patch.Adds.Count);
+        Assert.AreEqual(Lanes.Working, patch.Adds[0].Lane, "no anchor => working");
+        Assert.AreEqual(SourceCoverage.ManualUnverified, patch.Adds[0].SourceCoverage);
+        Assert.IsFalse(MemoryPatchService.CanBeCanonical(patch.Adds[0]));
+    }
+
+    // GG9: an anchored, result-backed card IS canonical; an anchored but weak card stays working until promoted.
+    [TestMethod]
+    public void Lane_AnchorAndStrongTruthIsCanonical_WeakStaysWorkingUntilPromoted()
+    {
+        var blk = MakeBlock("chat_s:block_0", "s");
+        var byId = new Dictionary<string, SourceBlock> { { blk.Id, blk } };
+        var svc = new MemoryPatchService();
+
+        var strong = Candidate("X led to working FX", CreatedBy.DeepSeek, TruthEvidence.ResultBacked, byId, blk.Id);
+        var pStrong = svc.BuildPatch("col", Array.Empty<MemoryCard>(), new[] { strong }, "deepseek", "p1", Now);
+        Assert.AreEqual(Lanes.Canonical, pStrong.Adds[0].Lane);
+
+        var weak = Candidate("Maybe X helps", CreatedBy.DeepSeek, TruthEvidence.SingleSource, byId, blk.Id);
+        var pWeak = svc.BuildPatch("col", Array.Empty<MemoryCard>(), new[] { weak }, "deepseek", "p2", Now);
+        var card = pWeak.Adds[0];
+        Assert.AreEqual(Lanes.Working, card.Lane, "anchored but single_source stays working");
+        Assert.IsFalse(svc.TryPromote(card), "cannot promote while truth is weak");
+
+        card.TruthEvidence = TruthEvidence.ResultBacked;
+        Assert.IsTrue(svc.TryPromote(card), "promotes once truth rises");
+        Assert.AreEqual(Lanes.Canonical, card.Lane);
+    }
+
+    // GG11: multi-agent agreement raises EXTRACTION confidence only — never TRUTH evidence.
+    [TestMethod]
+    public void MultiAgent_AgreementRaisesExtractionNotTruth()
+    {
+        var blk = MakeBlock("chat_s:block_0", "s");
+        var byId = new Dictionary<string, SourceBlock> { { blk.Id, blk } };
+        var svc = new MemoryPatchService();
+
+        var fromDeepseek = Candidate("X led to working FX", CreatedBy.DeepSeek, TruthEvidence.ResultBacked, byId, blk.Id);
+        var fromClaude = Candidate("X led to working FX", CreatedBy.Claude, TruthEvidence.ResultBacked, byId, blk.Id);
+
+        var single = svc.BuildPatch("col", Array.Empty<MemoryCard>(), new[] { fromDeepseek }, "deepseek", "p1", Now);
+        Assert.AreEqual(ExtractionConfidence.Low, single.Adds[0].ExtractionConfidence);
+
+        var both = svc.BuildPatch("col", Array.Empty<MemoryCard>(), new[] { fromDeepseek, fromClaude }, "deepseek+claude", "p2", Now);
+        Assert.AreEqual(1, both.Adds.Count, "the two agree -> one merged card");
+        Assert.AreEqual(ExtractionConfidence.Medium, both.Adds[0].ExtractionConfidence, "agreement raised EXTRACTION confidence");
+        Assert.AreEqual(TruthEvidence.ResultBacked, both.Adds[0].TruthEvidence, "agreement did NOT bump truth_evidence");
+    }
+
+    // GG10: supersede flips status + reason but KEEPS the old card (audit/rollback); the replacement is added.
+    [TestMethod]
+    public void Supersede_NeverDeletes()
+    {
+        var blk = MakeBlock("chat_s:block_0", "s");
+        var byId = new Dictionary<string, SourceBlock> { { blk.Id, blk } };
+        var svc = new MemoryPatchService();
+        var original = svc.BuildPatch("col", Array.Empty<MemoryCard>(),
+            new[] { Candidate("Old truth", CreatedBy.DeepSeek, TruthEvidence.ResultBacked, byId, blk.Id) }, "deepseek", "p1", Now).Adds[0];
+
+        var replacement = svc.BuildPatch("col", Array.Empty<MemoryCard>(),
+            new[] { Candidate("New corrected truth", CreatedBy.DeepSeek, TruthEvidence.ResultBacked, byId, blk.Id) }, "deepseek", "p2", Now).Adds[0];
+
+        var patch = svc.SupersedePatch("col", original, replacement, "reversed by a later result", "p3", Now);
+        var merged = svc.Apply(new[] { original }, patch);
+
+        var oldCard = merged.First(c => c.Id == original.Id);
+        Assert.AreEqual(CardStatuses.Superseded, oldCard.Status, "old card kept, not deleted");
+        Assert.AreEqual("reversed by a later result", oldCard.SupersededReason);
+        Assert.IsTrue(merged.Any(c => c.Id == replacement.Id), "replacement present");
+    }
+
+    // GG10: a build only yields a patch — the canonical vault is untouched until ApplyPatch.
+    [TestMethod]
+    public async Task Build_YieldsPatch_VaultUntouchedUntilApply()
+    {
+        var (dir, id) = WriteBigCodexRollout(5);
+        var root = Path.Combine(Path.GetTempPath(), "clr-bsvc-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        var svc = new ArchiveService(storePath: Path.Combine(root, "store.json"));
+        try
+        {
+            await svc.IndexRootAsync(dir);
+            var brain = new BrainService(svc);
+            var session = svc.Store.Sessions[id];
+            var paths = brain.PathsFor("col1");
+
+            var build = await brain.BuildAsync("col1", new[] { session }, new IBrainAnalyst[] { new MockAnalyst() }, new BrainBuildOptions(), Now);
+            Assert.IsTrue(build.Patch.Adds.Count > 0, "build proposed cards");
+            Assert.IsFalse(Directory.Exists(paths.Vault), "build must NOT write the canonical vault");
+
+            var res = brain.ApplyPatch("col1", "Col One", build.Patch, build.Blocks, build.ChatStamps, Now);
+            Assert.IsTrue(File.Exists(Path.Combine(paths.Vault, "00 Atlas.md")), "apply wrote the vault");
+            Assert.IsTrue(res.CardCount > 0);
+        }
+        finally { TryDeleteDir(dir); TryDeleteDir(root); }
+    }
+
+    // GG12: a full build->apply with the keyless MockAnalyst produces a usable vault + index, all honest
+    // working-lane cards (the mock never fabricates canonical truth).
+    [TestMethod]
+    public async Task MockBuild_EndToEnd_NoKeyNeeded()
+    {
+        var (dir, id) = WriteBigCodexRollout(6);
+        var root = Path.Combine(Path.GetTempPath(), "clr-bsvc-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        var svc = new ArchiveService(storePath: Path.Combine(root, "store.json"));
+        try
+        {
+            await svc.IndexRootAsync(dir);
+            var brain = new BrainService(svc);
+            var session = svc.Store.Sessions[id];
+
+            var res = await brain.BuildAndApplyAsync("col2", "Col Two", new[] { session },
+                new IBrainAnalyst[] { new MockAnalyst() }, new BrainBuildOptions(), Now);
+
+            Assert.IsTrue(res.CardCount > 0, "mock produced cards");
+            Assert.AreEqual(0, res.CanonicalCount, "mock is honest: nothing canonical without judged truth");
+            Assert.IsTrue(res.WorkingCount > 0);
+
+            var idx = new BrainIndex(brain.PathsFor("col2").Db);
+            Assert.IsTrue(idx.CardCount() > 0, "derived index populated");
+
+            var status = brain.Status("col2", new[] { session });
+            Assert.IsTrue(status.Built);
+            Assert.AreEqual(0, status.StaleChats, "fresh build is not stale");
+
+            var ctx = brain.GetAgentContext("col2", "fix the renderer");
+            StringAssert.Contains(ctx, "Agent handoff");
+            StringAssert.Contains(ctx, "fix the renderer");
+        }
+        finally { TryDeleteDir(dir); TryDeleteDir(root); }
+    }
+
+    // Staleness flips when an incorporated chat changes on disk.
+    [TestMethod]
+    public async Task Staleness_FlipsAfterChatChanges()
+    {
+        var (dir, id) = WriteBigCodexRollout(4);
+        var root = Path.Combine(Path.GetTempPath(), "clr-bsvc-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        var svc = new ArchiveService(storePath: Path.Combine(root, "store.json"));
+        try
+        {
+            await svc.IndexRootAsync(dir);
+            var brain = new BrainService(svc);
+            var session = svc.Store.Sessions[id];
+            await brain.BuildAndApplyAsync("col3", "Col Three", new[] { session },
+                new IBrainAnalyst[] { new MockAnalyst() }, new BrainBuildOptions(), Now);
+
+            Assert.AreEqual(0, brain.StaleCount("col3", new[] { session }));
+
+            File.AppendAllText(session.SourcePath,
+                "\n{\"timestamp\":\"2026-06-28T03:00:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"a new turn after the build\"}}");
+            Assert.AreEqual(1, brain.StaleCount("col3", new[] { session }), "changed chat is stale");
+        }
+        finally { TryDeleteDir(dir); TryDeleteDir(root); }
+    }
+
+    // The real-LLM analyst parses a (fenced) JSON reply into candidates, and a canonical-worthy reply
+    // classifies canonical once its cited block resolves to an anchor.
+    [TestMethod]
+    public async Task BackendAnalyst_ParsesAndClassifies()
+    {
+        var fenced = "```json\n[{\"title\":\"X led to working FX\",\"type\":\"win_or_breakthrough\"," +
+                     "\"lane\":\"canonical\",\"truth_evidence\":\"result_backed\",\"importance\":5," +
+                     "\"body\":\"method X produced a working servant fx\",\"topics\":[\"fx\"]," +
+                     "\"block_ids\":[\"chat_s:block_0\"]}]\n```";
+        var parsed = BackendAnalyst.ParseCards(fenced, CreatedBy.DeepSeek, 40);
+        Assert.AreEqual(1, parsed.Count);
+        Assert.AreEqual("X led to working FX", parsed[0].Title);
+        Assert.AreEqual(CreatedBy.DeepSeek, parsed[0].CreatedBy);
+        CollectionAssert.Contains(parsed[0].BlockIds, "chat_s:block_0");
+
+        var blk = MakeBlock("chat_s:block_0", "s");
+        var analyst = new BackendAnalyst(new CannedBackend("deepseek", fenced));
+        var cands = await analyst.ExtractAsync(new[] { blk }, new BrainBuildOptions(), default);
+        var card = BrainBuilder.ToCard(cands[0], new Dictionary<string, SourceBlock> { { blk.Id, blk } }, Now);
+        var patch = new MemoryPatchService().BuildPatch("col", Array.Empty<MemoryCard>(), new[] { card }, "deepseek", "p1", Now);
+        Assert.AreEqual(Lanes.Canonical, patch.Adds[0].Lane, "anchored + result_backed => canonical");
+    }
+
+    private sealed class CannedBackend : CodexLocalRetrieval.Core.Chat.IChatBackend
+    {
+        private readonly string _content;
+        public CannedBackend(string name, string content) { Name = name; _content = content; }
+        public string Name { get; }
+        public bool SupportsTools => false;
+        public Task<CodexLocalRetrieval.Core.Chat.BackendReply> CompleteAsync(
+            IReadOnlyList<CodexLocalRetrieval.Core.Chat.ChatMessage> messages,
+            IReadOnlyList<CodexLocalRetrieval.Core.Chat.ChatToolSpec> tools, CancellationToken ct)
+            => Task.FromResult(new CodexLocalRetrieval.Core.Chat.BackendReply
+            {
+                Message = new CodexLocalRetrieval.Core.Chat.ChatMessage { Role = "assistant", Content = _content }
+            });
+    }
+
     private static void TryDeleteDir(string dir)
     {
         try { if (Directory.Exists(dir)) Directory.Delete(dir, true); } catch { }
