@@ -1179,6 +1179,8 @@ public sealed partial class MainPage : Page
         var meta = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8, VerticalAlignment = VerticalAlignment.Center };
         meta.Children.Add(ToolBadge(session.Tool));
         meta.Children.Add(new TextBlock { Text = session.DisplayDate, Foreground = MutedBrush(), FontSize = 12, VerticalAlignment = VerticalAlignment.Center });
+        var dots = TagDots(session);
+        if (dots is not null) meta.Children.Add(dots);
 
         grid.Children.Add(new StackPanel
         {
@@ -1242,6 +1244,40 @@ public sealed partial class MainPage : Page
         ToolTipService.SetToolTip(bump, BumpTooltip(session));
         bump.Click += async (_, _) => await BumpSession(session);
         flyout.Items.Add(bump);
+
+        flyout.Items.Add(new MenuFlyoutSeparator());
+
+        // Add to collection (multi-membership: a chat can live in several collections at once).
+        var addToCol = new MenuFlyoutSubItem { Text = "Add to collection" };
+        foreach (var col in _archive.Store.Collections.Values.OrderBy(c => c.Name, StringComparer.OrdinalIgnoreCase))
+        {
+            var name = col.Name;
+            var already = col.SessionIds.Contains(session.Id);
+            var ci = new MenuFlyoutItem { Text = already ? "✓  " + name : name, IsEnabled = !already };
+            ci.Click += async (_, _) => { await _archive.AddToCollectionAsync(session, name); SyncStatus.Text = $"Added to \"{name}\"."; RenderCurrent(); };
+            addToCol.Items.Add(ci);
+        }
+        if (addToCol.Items.Count > 0) addToCol.Items.Add(new MenuFlyoutSeparator());
+        var newCol = new MenuFlyoutItem { Text = "New collection..." };
+        newCol.Click += async (_, _) => await AddSessionToNewCollectionAsync(session);
+        addToCol.Items.Add(newCol);
+        flyout.Items.Add(addToCol);
+
+        // Tags: toggle the chat's current tags off, or add a new one - taggable from inside a collection.
+        var tagsSub = new MenuFlyoutSubItem { Text = "Tags" };
+        var userTags = ArchiveService.UserTags(session);
+        foreach (var t in userTags)
+        {
+            var tag = t;
+            var ti = new ToggleMenuFlyoutItem { Text = tag, IsChecked = true };
+            ti.Click += async (_, _) => { await _archive.RemoveChatTagAsync(session, tag); RenderCurrent(); };
+            tagsSub.Items.Add(ti);
+        }
+        if (userTags.Count > 0) tagsSub.Items.Add(new MenuFlyoutSeparator());
+        var addTag = new MenuFlyoutItem { Text = "Add tag..." };
+        addTag.Click += async (_, _) => { await ShowAddTagDialogAsync(session); RenderCurrent(); };
+        tagsSub.Items.Add(addTag);
+        flyout.Items.Add(tagsSub);
 
         flyout.Items.Add(new MenuFlyoutSeparator());
 

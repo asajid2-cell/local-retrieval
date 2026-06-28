@@ -17,18 +17,44 @@ namespace CodexLocalRetrieval_Native;
 // active tags combined with the text search. See ArchiveService tag API.
 public sealed partial class MainPage
 {
-    // Active chat-list tag filter (ANY-match). Empty => no tag filter applied.
-    private readonly HashSet<string> _activeTagFilters = new(StringComparer.OrdinalIgnoreCase);
+    // Compound chat-list filter: tags you must have (include) + tags you must NOT have (exclude) +
+    // ANY/ALL for the includes. Empty => no tag filter. This is the "active but not cpp" machinery.
+    private readonly HashSet<string> _includeTags = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _excludeTags = new(StringComparer.OrdinalIgnoreCase);
+    private bool _matchAllIncludes;
+    private string? _filterCollectionId;   // scope the chat list to one project (collection), or null
 
-    // ---- Chat list: unified text + tag filter ------------------------------------------------
+    private ChatFilter CurrentChatFilter() => new()
+    {
+        Query = SearchBox.Text,
+        IncludeTags = _includeTags.ToList(),
+        ExcludeTags = _excludeTags.ToList(),
+        MatchAllIncludes = _matchAllIncludes,
+        CollectionId = _filterCollectionId
+    };
+
+    private string? FilterCollectionName() =>
+        _filterCollectionId is not null && _archive.Store.Collections.TryGetValue(_filterCollectionId, out var c) ? c.Name : null;
+
+    // ---- Chat list: unified text + compound tag filter ---------------------------------------
     private void ApplyFilters()
     {
-        var results = _archive.Filter(SearchBox.Text, _activeTagFilters.ToList());
+        var results = _archive.FilterChats(CurrentChatFilter());
         _archive.RefreshSessions(results);
         SelectFirstSession();
         RenderCurrent();
         RenderTagFilterBar();
     }
+
+    // Cycle a tag through the filter: none -> include -> exclude -> none (include & exclude are exclusive).
+    private void CycleTagFilter(string tag)
+    {
+        if (_includeTags.Remove(tag)) { _excludeTags.Add(tag); }
+        else if (_excludeTags.Remove(tag)) { /* -> none */ }
+        else { _includeTags.Add(tag); }
+        ApplyFilters();
+    }
+    private void SetTagInclude(string tag) { _excludeTags.Remove(tag); _includeTags.Add(tag); }
 
     // ---- Unified tag chip --------------------------------------------------------------------
     // ONE chip for every tag context (chat tags, collection tags, filter pills). Operational/AMOLED:
@@ -113,6 +139,41 @@ public sealed partial class MainPage
         return chip;
     }
 
+    // A compact strip of a chat's tag colors for a list row (dots only, capped). Null when no tags,
+    // so callers can skip adding it. Hover/tooltip names them.
+    private FrameworkElement? TagDots(ArchiveSession session)
+    {
+        var tags = ArchiveService.UserTags(session);
+        if (tags.Count == 0) return null;
+        var row = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 4, VerticalAlignment = VerticalAlignment.Center };
+        foreach (var tag in tags.Take(6))
+            row.Children.Add(new Border { Width = 7, Height = 7, CornerRadius = new CornerRadius(4), Background = new SolidColorBrush(ColorFromHex(_archive.TagColor(tag))), VerticalAlignment = VerticalAlignment.Center });
+        ToolTipService.SetToolTip(row, string.Join(", ", tags));
+        return row;
+    }
+
+    // Create a new collection (prompt for a name) and add this chat to it - used from any chat's menu.
+    private async Task AddSessionToNewCollectionAsync(ArchiveSession session)
+    {
+        var input = new TextBox { PlaceholderText = "e.g. Renderer work, Job search", MinWidth = 360, CornerRadius = ControlCornerRadius() };
+        var dialog = new ContentDialog
+        {
+            Title = "Add to new collection",
+            Content = input,
+            PrimaryButtonText = "Create & add",
+            CloseButtonText = "Cancel",
+            DefaultButton = ContentDialogButton.Primary,
+            XamlRoot = XamlRoot
+        };
+        if (await dialog.ShowAsync() == ContentDialogResult.Primary && !string.IsNullOrWhiteSpace(input.Text))
+        {
+            var name = input.Text.Trim();
+            await _archive.AddToCollectionAsync(session, name);
+            SyncStatus.Text = $"Added to new collection \"{name}\".";
+            RenderCurrent();
+        }
+    }
+
     // Right-click a tag chip -> a curated swatch menu to recolor it (or reset to auto). Per the
     // independent design pass: manual colors come from a fixed palette, not a freeform picker.
     private void ShowTagColorFlyout(FrameworkElement anchor, string tag, Action after)
@@ -192,60 +253,172 @@ public sealed partial class MainPage
         return outer;
     }
 
+    private Flyout? _filterFlyout;
+
     private void TagFilter_Click(object sender, RoutedEventArgs e)
     {
-        var all = _archive.AllChatTags();
-        var flyout = new MenuFlyout { AreOpenCloseAnimationsEnabled = false, Placement = FlyoutPlacementMode.BottomEdgeAlignedRight };
-        if (all.Count == 0)
-        {
-            flyout.Items.Add(new MenuFlyoutItem { Text = "No tags yet - add one from a chat's Tags panel", IsEnabled = false });
-        }
-        else
-        {
-            foreach (var tc in all)
-            {
-                var tag = tc.Tag;
-                var item = new ToggleMenuFlyoutItem { Text = $"{tag}  ({tc.Count})", IsChecked = _activeTagFilters.Contains(tag) };
-                item.Click += (_, _) =>
-                {
-                    if (!_activeTagFilters.Remove(tag)) _activeTagFilters.Add(tag);
-                    ApplyFilters();
-                };
-                flyout.Items.Add(item);
-            }
-            if (_activeTagFilters.Count > 0)
-            {
-                flyout.Items.Add(new MenuFlyoutSeparator());
-                var clear = new MenuFlyoutItem { Text = "Clear all filters" };
-                clear.Click += (_, _) => { _activeTagFilters.Clear(); ApplyFilters(); };
-                flyout.Items.Add(clear);
-            }
-        }
-        flyout.ShowAt(TagFilterButton);
+        _filterFlyout = new Flyout { Placement = FlyoutPlacementMode.BottomEdgeAlignedRight };
+        _filterFlyout.Content = BuildFilterFlyout();
+        _filterFlyout.ShowAt(TagFilterButton);
     }
 
-    // The strip of active-filter pills under the search box (hidden when nothing is filtered).
+    // A tri-state filter menu: each tag is none / include (✓ accent) / exclude (⊘). Rebuilt in place
+    // after every toggle so the row states + the result stay live. "Match all/any" governs includes.
+    private FrameworkElement BuildFilterFlyout()
+    {
+        var all = _archive.AllChatTags();
+        var root = new StackPanel { Spacing = 10, Padding = new Thickness(2), MinWidth = 268 };
+        var header = new Grid { ColumnDefinitions = { new ColumnDefinition(), new ColumnDefinition { Width = GridLength.Auto } } };
+        header.Children.Add(new TextBlock { Text = "Filter by tags", Foreground = StrongBrush(), FontSize = 13, FontWeight = FontWeights.SemiBold, VerticalAlignment = VerticalAlignment.Center });
+        if (_includeTags.Count > 1)
+        {
+            var mode = new Button
+            {
+                Style = (Style)Resources["PillButtonStyle"],
+                Padding = new Thickness(10, 2, 10, 2),
+                MinHeight = 0,
+                Content = new TextBlock { Text = _matchAllIncludes ? "Match: all" : "Match: any", FontSize = 11 }
+            };
+            mode.Click += (_, _) => { _matchAllIncludes = !_matchAllIncludes; RefreshFilterFlyout(); ApplyFilters(); };
+            Grid.SetColumn(mode, 1);
+            header.Children.Add(mode);
+        }
+        root.Children.Add(header);
+
+        if (all.Count == 0)
+        {
+            root.Children.Add(new TextBlock { Text = "No tags yet - add tags from a chat's Tags panel.", Foreground = MutedBrush(), FontSize = 12, TextWrapping = TextWrapping.Wrap });
+            return root;
+        }
+
+        var list = new StackPanel { Spacing = 4 };
+        foreach (var tc in all) list.Children.Add(FilterTagRow(tc));
+        root.Children.Add(new ScrollViewer { Content = list, VerticalScrollBarVisibility = ScrollBarVisibility.Auto, MaxHeight = 320, HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled });
+
+        // Project (collection) scope: restrict the whole filter to one project's chats.
+        if (_archive.Store.Collections.Count > 0)
+        {
+            root.Children.Add(new Border { Height = 1, Background = LineBrush(), Margin = new Thickness(0, 2, 0, 2) });
+            var projRow = new Grid { ColumnDefinitions = { new ColumnDefinition(), new ColumnDefinition { Width = GridLength.Auto } } };
+            projRow.Children.Add(new TextBlock { Text = "Project", Foreground = new SolidColorBrush(ChipText), FontSize = 12, VerticalAlignment = VerticalAlignment.Center });
+            var projBtn = new DropDownButton { Content = new TextBlock { Text = FilterCollectionName() ?? "Any", FontSize = 12 }, MinHeight = 30 };
+            var projFlyout = new MenuFlyout { AreOpenCloseAnimationsEnabled = false };
+            var anyItem = new MenuFlyoutItem { Text = "Any project" };
+            anyItem.Click += (_, _) => { _filterCollectionId = null; RefreshFilterFlyout(); ApplyFilters(); };
+            projFlyout.Items.Add(anyItem);
+            projFlyout.Items.Add(new MenuFlyoutSeparator());
+            foreach (var col in _archive.Store.Collections.Values.OrderBy(c => c.Name, StringComparer.OrdinalIgnoreCase))
+            {
+                var id = col.Id;
+                var item = new MenuFlyoutItem { Text = col.Name };
+                item.Click += (_, _) => { _filterCollectionId = id; RefreshFilterFlyout(); ApplyFilters(); };
+                projFlyout.Items.Add(item);
+            }
+            projBtn.Flyout = projFlyout;
+            Grid.SetColumn(projBtn, 1);
+            projRow.Children.Add(projBtn);
+            root.Children.Add(projRow);
+        }
+
+        if (_includeTags.Count > 0 || _excludeTags.Count > 0 || _filterCollectionId is not null)
+        {
+            var clear = new Button { Style = (Style)Resources["PillButtonStyle"], HorizontalAlignment = HorizontalAlignment.Stretch, Content = new TextBlock { Text = "Clear filters", FontSize = 12 } };
+            clear.Click += (_, _) => { _includeTags.Clear(); _excludeTags.Clear(); _filterCollectionId = null; RefreshFilterFlyout(); ApplyFilters(); };
+            root.Children.Add(clear);
+        }
+        return root;
+    }
+
+    // One filter row: dot + name + count, then include/exclude toggle buttons.
+    private FrameworkElement FilterTagRow(TagCount tc)
+    {
+        var tag = tc.Tag;
+        var inc = _includeTags.Contains(tag);
+        var exc = _excludeTags.Contains(tag);
+
+        var grid = new Grid { ColumnDefinitions = { new ColumnDefinition(), new ColumnDefinition { Width = GridLength.Auto } }, Padding = new Thickness(2, 1, 2, 1) };
+        var left = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 7, VerticalAlignment = VerticalAlignment.Center };
+        left.Children.Add(new Border { Width = 7, Height = 7, CornerRadius = new CornerRadius(4), Background = new SolidColorBrush(ColorFromHex(_archive.TagColor(tag))), VerticalAlignment = VerticalAlignment.Center });
+        left.Children.Add(new TextBlock { Text = tag, Foreground = inc ? StrongBrush() : exc ? MutedBrush() : new SolidColorBrush(ChipText), FontSize = 12, VerticalAlignment = VerticalAlignment.Center, TextDecorations = exc ? Windows.UI.Text.TextDecorations.Strikethrough : Windows.UI.Text.TextDecorations.None });
+        left.Children.Add(new TextBlock { Text = $"({tc.Count})", Foreground = MutedBrush(), FontSize = 11, VerticalAlignment = VerticalAlignment.Center });
+        grid.Children.Add(left);
+
+        var toggles = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 6, VerticalAlignment = VerticalAlignment.Center };
+        toggles.Children.Add(FilterToggle("Include", "", inc, () => new SolidColorBrush(_accentColor), () => { if (!_includeTags.Remove(tag)) { _excludeTags.Remove(tag); _includeTags.Add(tag); } RefreshFilterFlyout(); ApplyFilters(); }));
+        toggles.Children.Add(FilterToggle("Exclude", "", exc, () => new SolidColorBrush(Windows.UI.Color.FromArgb(255, 0xF8, 0x71, 0x71)), () => { if (!_excludeTags.Remove(tag)) { _includeTags.Remove(tag); _excludeTags.Add(tag); } RefreshFilterFlyout(); ApplyFilters(); }));
+        Grid.SetColumn(toggles, 1);
+        grid.Children.Add(toggles);
+        return grid;
+    }
+
+    private Button FilterToggle(string tip, string glyph, bool on, Func<Brush> onBrush, Action click)
+    {
+        var b = new Button
+        {
+            Width = 28,
+            Height = 26,
+            MinWidth = 28,
+            MinHeight = 26,
+            Padding = new Thickness(0),
+            CornerRadius = new CornerRadius(6),
+            Background = on ? AccentVerySoftBrush() : new SolidColorBrush(Windows.UI.Color.FromArgb(0, 0, 0, 0)),
+            BorderBrush = on ? onBrush() : LineBrush(),
+            BorderThickness = new Thickness(1),
+            Content = new FontIcon { FontFamily = new FontFamily("Segoe Fluent Icons"), Glyph = glyph, FontSize = 12, Foreground = on ? onBrush() : MutedBrush() }
+        };
+        ToolTipService.SetToolTip(b, tip);
+        b.Click += (_, _) => click();
+        return b;
+    }
+
+    private void RefreshFilterFlyout()
+    {
+        if (_filterFlyout is not null) _filterFlyout.Content = BuildFilterFlyout();
+    }
+
+    // The strip of active-filter pills under the search box: include pills (accent dot) + exclude
+    // pills (struck "not tag"). Clicking a pill removes that filter. Hidden when nothing is filtered.
     private void RenderTagFilterBar()
     {
         var known = new HashSet<string>(_archive.AllChatTags().Select(t => t.Tag), StringComparer.OrdinalIgnoreCase);
-        _activeTagFilters.RemoveWhere(t => !known.Contains(t));   // drop filters whose tag is gone
+        _includeTags.RemoveWhere(t => !known.Contains(t));
+        _excludeTags.RemoveWhere(t => !known.Contains(t));
+
+        if (_filterCollectionId is not null && !_archive.Store.Collections.ContainsKey(_filterCollectionId))
+            _filterCollectionId = null;   // collection was deleted
 
         TagFilterBar.Children.Clear();
-        if (_activeTagFilters.Count == 0)
+        if (_includeTags.Count == 0 && _excludeTags.Count == 0 && _filterCollectionId is null)
         {
             TagFilterScroller.Visibility = Visibility.Collapsed;
             return;
         }
         TagFilterScroller.Visibility = Visibility.Visible;
-        foreach (var tag in _activeTagFilters.OrderBy(t => t, StringComparer.OrdinalIgnoreCase))
+
+        if (FilterCollectionName() is { } projName)
+            TagFilterBar.Children.Add(TagChip("in: " + projName, active: true,
+                onTap: () => { _filterCollectionId = null; ApplyFilters(); },
+                onRemove: () => { _filterCollectionId = null; ApplyFilters(); }));
+
+        if (_includeTags.Count > 1)
+            TagFilterBar.Children.Add(AddChip(_matchAllIncludes ? "all of" : "any of", () => { _matchAllIncludes = !_matchAllIncludes; ApplyFilters(); }));
+
+        foreach (var tag in _includeTags.OrderBy(t => t, StringComparer.OrdinalIgnoreCase))
         {
             var t = tag;
             TagFilterBar.Children.Add(TagChip(t, active: true,
-                onTap: () => { _activeTagFilters.Remove(t); ApplyFilters(); },
-                onRemove: () => { _activeTagFilters.Remove(t); ApplyFilters(); },
+                onTap: () => { _includeTags.Remove(t); ApplyFilters(); },
+                onRemove: () => { _includeTags.Remove(t); ApplyFilters(); },
                 dotColor: _archive.TagColor(t)));
         }
-        TagFilterBar.Children.Add(AddChip("clear", () => { _activeTagFilters.Clear(); ApplyFilters(); }));
+        foreach (var tag in _excludeTags.OrderBy(t => t, StringComparer.OrdinalIgnoreCase))
+        {
+            var t = tag;
+            TagFilterBar.Children.Add(TagChip("not " + t, active: false,
+                onTap: () => { _excludeTags.Remove(t); ApplyFilters(); },
+                onRemove: () => { _excludeTags.Remove(t); ApplyFilters(); }));
+        }
+        TagFilterBar.Children.Add(AddChip("clear", () => { _includeTags.Clear(); _excludeTags.Clear(); _filterCollectionId = null; ApplyFilters(); }));
     }
 
     // ---- Per-chat tag editor (right panel) ---------------------------------------------------
@@ -263,7 +436,7 @@ public sealed partial class MainPage
         }
         var sel = _selected;
         var chips = tags.Select(tag => TagChip(tag, active: false,
-            onTap: () => { _activeTagFilters.Clear(); _activeTagFilters.Add(tag); Navigate("Archive"); ApplyFilters(); },
+            onTap: () => { _includeTags.Clear(); _excludeTags.Clear(); _includeTags.Add(tag); Navigate("Archive"); ApplyFilters(); },
             onRemove: async () => { await _archive.RemoveChatTagAsync(sel, tag); RenderTags(); RenderTagFilterBar(); },
             dotColor: _archive.TagColor(tag),
             onColorPick: anchor => ShowTagColorFlyout(anchor, tag, () => { RenderTags(); RenderTagFilterBar(); })));

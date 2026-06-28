@@ -912,16 +912,33 @@ public sealed class ArchiveService
             .OrderByDescending(x => x.Count).ThenBy(x => x.Tag, StringComparer.OrdinalIgnoreCase)
             .ToList();
 
-    // Text search (if any) intersected with a tag filter. matchAll=false => chats with ANY of the tags.
+    // Back-compat thin wrapper: text + an ANY/ALL include-tag filter.
     public IReadOnlyList<ArchiveSession> Filter(string query, IReadOnlyCollection<string>? tags, bool matchAll = false)
+        => FilterChats(new ChatFilter { Query = query ?? "", IncludeTags = (tags ?? Array.Empty<string>()).ToList(), MatchAllIncludes = matchAll });
+
+    private static bool SessionHasTag(ArchiveSession s, string tag) =>
+        s.Tags.Any(x => string.Equals(x, tag, StringComparison.OrdinalIgnoreCase));
+
+    // The compound filter: text search, then restrict to a collection (if set), then keep chats that
+    // satisfy the include set (ANY or ALL) and carry NONE of the exclude set.
+    public IReadOnlyList<ArchiveSession> FilterChats(ChatFilter f)
     {
-        IEnumerable<ArchiveSession> baseSet = string.IsNullOrWhiteSpace(query)
+        IEnumerable<ArchiveSession> baseSet = string.IsNullOrWhiteSpace(f.Query)
             ? OrderedVisibleSessions(Store.Sessions.Values)
-            : Search(query);
-        if (tags is null || tags.Count == 0) return baseSet.ToList();
-        bool Has(ArchiveSession s, string tag) => s.Tags.Any(x => string.Equals(x, tag, StringComparison.OrdinalIgnoreCase));
+            : Search(f.Query);
+
+        if (!string.IsNullOrEmpty(f.CollectionId) && Store.Collections.TryGetValue(f.CollectionId, out var col))
+        {
+            var ids = new HashSet<string>(col.SessionIds, StringComparer.OrdinalIgnoreCase);
+            baseSet = baseSet.Where(s => ids.Contains(s.Id));
+        }
+
         return baseSet
-            .Where(s => matchAll ? tags.All(t => Has(s, t)) : tags.Any(t => Has(s, t)))
+            .Where(s => f.IncludeTags.Count == 0
+                        || (f.MatchAllIncludes
+                            ? f.IncludeTags.All(t => SessionHasTag(s, t))
+                            : f.IncludeTags.Any(t => SessionHasTag(s, t))))
+            .Where(s => f.ExcludeTags.Count == 0 || !f.ExcludeTags.Any(t => SessionHasTag(s, t)))
             .ToList();
     }
 

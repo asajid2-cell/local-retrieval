@@ -710,6 +710,57 @@ public sealed class ArchiveServiceTests
         finally { if (File.Exists(store)) File.Delete(store); }
     }
 
+    // The compound filter: include + exclude + match-all. The user's case: "active chats that aren't cpp".
+    [TestMethod]
+    public void FilterChats_IncludeExcludeAndMatchAll()
+    {
+        var svc = TempService(out var store);
+        try
+        {
+            ArchiveSession Mk(string id, params string[] tags) { var s = new ArchiveSession { Id = id, UpdatedAt = "2026-06-01T00:00:00Z" }; foreach (var t in tags) s.Tags.Add(t); svc.Store.Sessions[id] = s; return s; }
+            Mk("x", "active", "cpp");           // active but cpp -> excluded
+            Mk("y", "active", "rust");          // active, not cpp -> kept
+            Mk("z", "idea");                    // not active
+            Mk("w", "active", "rust", "urgent");// active, not cpp, also urgent
+
+            // "active chats that aren't cpp"
+            var r = svc.FilterChats(new ChatFilter { IncludeTags = { "active" }, ExcludeTags = { "cpp" } });
+            CollectionAssert.AreEquivalent(new[] { "y", "w" }, r.Select(s => s.Id).ToArray());
+
+            // match-ANY include: active OR idea
+            var any = svc.FilterChats(new ChatFilter { IncludeTags = { "active", "idea" } });
+            Assert.AreEqual(4, any.Count);
+
+            // match-ALL include: active AND urgent
+            var all = svc.FilterChats(new ChatFilter { IncludeTags = { "active", "urgent" }, MatchAllIncludes = true });
+            CollectionAssert.AreEquivalent(new[] { "w" }, all.Select(s => s.Id).ToArray());
+
+            // exclude-only
+            var notCpp = svc.FilterChats(new ChatFilter { ExcludeTags = { "cpp" } });
+            CollectionAssert.AreEquivalent(new[] { "y", "z", "w" }, notCpp.Select(s => s.Id).ToArray());
+        }
+        finally { if (File.Exists(store)) File.Delete(store); }
+    }
+
+    // The compound filter can also restrict to a collection's members (filter-by-project).
+    [TestMethod]
+    public async Task FilterChats_RestrictsToCollection()
+    {
+        var svc = TempService(out var store);
+        try
+        {
+            var a = new ArchiveSession { Id = "a" }; a.Tags.Add("active");
+            var b = new ArchiveSession { Id = "b" }; b.Tags.Add("active");
+            svc.Store.Sessions["a"] = a; svc.Store.Sessions["b"] = b;
+            await svc.AddToCollectionAsync(a, "Renderer");
+            var col = svc.Store.Collections.Values.First(c => c.Name == "Renderer");
+
+            var r = svc.FilterChats(new ChatFilter { IncludeTags = { "active" }, CollectionId = col.Id });
+            CollectionAssert.AreEquivalent(new[] { "a" }, r.Select(s => s.Id).ToArray());
+        }
+        finally { if (File.Exists(store)) File.Delete(store); }
+    }
+
     // Collection tags add/remove and ride along in the export/import backup.
     [TestMethod]
     public async Task CollectionTags_AddRemoveAndSurviveBackup()

@@ -137,6 +137,21 @@ public sealed class ArchiveCollection
 // A tag with how many chats/collections carry it - drives the filter strips (sorted by use).
 public sealed record TagCount(string Tag, int Count);
 
+// A compound chat filter: text query + tags you must have (include) + tags you must NOT have
+// (exclude) + an optional project (collection) restriction. This is what lets you ask for
+// "active chats that aren't cpp" (include=active, exclude=cpp).
+public sealed class ChatFilter
+{
+    public string Query { get; set; } = "";
+    public List<string> IncludeTags { get; set; } = new();
+    public List<string> ExcludeTags { get; set; } = new();
+    public bool MatchAllIncludes { get; set; }     // false = ANY include tag; true = must have ALL of them
+    public string? CollectionId { get; set; }       // restrict to this collection's members
+
+    public bool IsEmpty => string.IsNullOrWhiteSpace(Query) && IncludeTags.Count == 0
+        && ExcludeTags.Count == 0 && string.IsNullOrEmpty(CollectionId);
+}
+
 // A collection moved to "Recently Deleted" - the full grouping plus when it was removed, so it can
 // be restored exactly as it was. Chats themselves are never deleted; this is metadata only.
 public sealed class DeletedCollection
