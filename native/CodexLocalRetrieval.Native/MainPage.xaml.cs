@@ -167,7 +167,7 @@ public sealed partial class MainPage : Page
     }
 
     // The right panel (quick actions / tags) and the header actions (copy context /
-    // build restore packet) are session-specific — they only belong on screens tied to
+    // build restore packet) are session-specific â€” they only belong on screens tied to
     // the selected chat. Hide them elsewhere and reclaim the space so each screen shows
     // only what's relevant.
     private void UpdateChrome()
@@ -462,7 +462,7 @@ public sealed partial class MainPage : Page
             $"Add THIS chat to my \"Codex Local Retrieval\" app under the project \"{projectName}\".\n" +
             "Append exactly one line (then a newline) to this file:\n" +
             $"  {inbox}\n" +
-            "The line — set \"cwd\" to YOUR current working directory (forward slashes), which you already know:\n" +
+            "The line â€” set \"cwd\" to YOUR current working directory (forward slashes), which you already know:\n" +
             $"  {{\"op\":\"addToCollection\",\"project\":\"{projectName}\",\"target\":\"self\",\"cwd\":\"C:/your/current/working/dir\"}}\n" +
             "How it resolves: the app re-scans and files the chat whose transcript is being written right " +
             "now in that folder (i.e. you) - so it always picks the live chat, not an old sibling. If you " +
@@ -475,7 +475,7 @@ public sealed partial class MainPage : Page
         var dialog = new ContentDialog
         {
             Title = "Delete project",
-            Content = $"Remove the \"{name}\" project? The chats themselves stay in your archive — only the grouping is removed.",
+            Content = $"Remove the \"{name}\" project? The chats themselves stay in your archive â€” only the grouping is removed.",
             PrimaryButtonText = "Delete",
             CloseButtonText = "Cancel",
             DefaultButton = ContentDialogButton.Close,
@@ -604,7 +604,7 @@ public sealed partial class MainPage : Page
     }
 
     private static string CapDisplay(string s, int max) =>
-        string.IsNullOrEmpty(s) || s.Length <= max ? s : s[..max] + "\n\n…(truncated — reopen the chat to see the full message)";
+        string.IsNullOrEmpty(s) || s.Length <= max ? s : s[..max] + "\n\nâ€¦(truncated â€” reopen the chat to see the full message)";
 
     private Border MessageBubble(ArchiveMessage message)
     {
@@ -618,7 +618,7 @@ public sealed partial class MainPage : Page
         stack.Children.Add(new TextBlock
         {
             // A single message can carry a 500KB tool dump; laying that out in a wrapping TextBlock is what
-            // made opening a chat hitch. Cap the DISPLAYED text (full content stays in the source file —
+            // made opening a chat hitch. Cap the DISPLAYED text (full content stays in the source file â€”
             // "Resume in terminal" / "Open in VS Code" shows it all).
             Text = CapDisplay(CleanReadingText(message.Text), 4000),
             TextWrapping = TextWrapping.Wrap,
@@ -940,7 +940,7 @@ public sealed partial class MainPage : Page
                 Height = 32,
                 MinWidth = 32,
                 MinHeight = 32,
-                Content = new FontIcon { FontFamily = new FontFamily("Segoe Fluent Icons"), FontSize = 14, Glyph = "" }
+                Content = new FontIcon { FontFamily = new FontFamily("Segoe Fluent Icons"), FontSize = 14, Glyph = "î" }
             };
             ToolTipService.SetToolTip(delete, "Delete project (keeps the chats)");
             delete.Click += (_, _) => onDelete();
@@ -1051,23 +1051,8 @@ public sealed partial class MainPage : Page
             Orientation = Orientation.Horizontal,
             Spacing = 6,
             VerticalAlignment = VerticalAlignment.Center,
-            Children = { resumeButton, openButton }
+            Children = { resumeButton, openButton, SessionMoreMenu(session, onRemove) }
         };
-        if (onRemove is not null)
-        {
-            var remove = new Button
-            {
-                Style = (Style)Resources["IconButtonStyle"],
-                Width = 34,
-                Height = 34,
-                MinWidth = 34,
-                MinHeight = 34,
-                Content = new FontIcon { FontFamily = new FontFamily("Segoe Fluent Icons"), FontSize = 13, Glyph = "" }
-            };
-            ToolTipService.SetToolTip(remove, "Remove from this collection (keeps the chat)");
-            remove.Click += (_, _) => onRemove();
-            actions.Children.Add(remove);
-        }
         Grid.SetColumn(actions, 1);
         grid.Children.Add(actions);
 
@@ -1079,6 +1064,89 @@ public sealed partial class MainPage : Page
             Padding = new Thickness(0, 8, 0, 8),
             Child = grid
         };
+    }
+
+    // The per-chat "..." menu on a Workspaces/Collections row. Replaces the bare remove button (which
+    // read like a more-actions affordance yet deleted on a single click) with an explicit menu.
+    private Button SessionMoreMenu(ArchiveSession session, Action? onRemove)
+    {
+        var button = new Button
+        {
+            Style = (Style)Resources["IconButtonStyle"],
+            Width = 34,
+            Height = 34,
+            MinWidth = 34,
+            MinHeight = 34,
+            Content = new FontIcon { FontFamily = new FontFamily("Segoe Fluent Icons"), FontSize = 16, Glyph = "" } // More (...)
+        };
+        ToolTipService.SetToolTip(button, "More actions");
+
+        var flyout = new MenuFlyout { AreOpenCloseAnimationsEnabled = false };
+
+        var open = new MenuFlyoutItem { Text = "Open" };
+        open.Click += (_, _) => OpenSession(session);
+        flyout.Items.Add(open);
+
+        var resume = new MenuFlyoutItem { Text = "Resume in terminal" };
+        resume.Click += (_, _) => ResumeInTerminal(session);
+        flyout.Items.Add(resume);
+
+        flyout.Items.Add(new MenuFlyoutSeparator());
+
+        var rename = new MenuFlyoutItem { Text = "Rename" };
+        rename.Click += async (_, _) => await RenameSessionByAsync(session);
+        flyout.Items.Add(rename);
+
+        var pin = new MenuFlyoutItem { Text = session.Pinned ? "Unpin" : "Pin to top" };
+        pin.Click += async (_, _) => { await _archive.TogglePinAsync(session); RenderCurrent(); };
+        flyout.Items.Add(pin);
+
+        var copyPath = new MenuFlyoutItem { Text = "Copy chat path" };
+        copyPath.Click += (_, _) => { SetClipboardText(session.SourcePath); SyncStatus.Text = "Copied chat path."; };
+        flyout.Items.Add(copyPath);
+
+        if (onRemove is not null)
+        {
+            flyout.Items.Add(new MenuFlyoutSeparator());
+            var remove = new MenuFlyoutItem { Text = "Remove from collection" };
+            remove.Click += (_, _) => onRemove();
+            flyout.Items.Add(remove);
+        }
+
+        flyout.Items.Add(new MenuFlyoutSeparator());
+        var archive = new MenuFlyoutItem { Text = "Archive (hide from lists)" };
+        archive.Click += async (_, _) => { await _archive.ArchiveSessionAsync(session); RenderCurrent(); };
+        flyout.Items.Add(archive);
+
+        button.Flyout = flyout;
+        return button;
+    }
+
+    // Rename any chat (not just the selected one) - app-local custom title, persisted to the store.
+    private async Task RenameSessionByAsync(ArchiveSession session)
+    {
+        var input = new TextBox { Text = session.DisplayTitle, MinWidth = 420, CornerRadius = ControlCornerRadius() };
+        var dialog = new ContentDialog
+        {
+            Title = "Rename chat",
+            Content = input,
+            PrimaryButtonText = "Save",
+            CloseButtonText = "Cancel",
+            DefaultButton = ContentDialogButton.Primary,
+            XamlRoot = XamlRoot
+        };
+        if (await dialog.ShowAsync() == ContentDialogResult.Primary && !string.IsNullOrWhiteSpace(input.Text))
+        {
+            await _archive.RenameSessionAsync(session, input.Text);
+            RenderCurrent();
+        }
+    }
+
+    private static void SetClipboardText(string text)
+    {
+        var package = new DataPackage();
+        package.SetText(text ?? "");
+        Clipboard.SetContent(package);
     }
 
     private Border InfoPanel(string title, string body)
