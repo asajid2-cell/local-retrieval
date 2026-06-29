@@ -109,16 +109,49 @@ public sealed class BackendAnalyst : IBrainAnalyst
 
     public string Id => _createdBy;
 
+    // Cap the excerpt text sent in one request so a long project doesn't overflow the model's context.
+    public const int MaxExcerptCharsPerBatch = 40_000;
+
     public async Task<List<CandidateCard>> ExtractAsync(IReadOnlyList<SourceBlock> blocks, BrainBuildOptions opts, CancellationToken ct)
     {
         if (blocks.Count == 0) return new List<CandidateCard>();
-        var messages = new[]
+        var all = new List<CandidateCard>();
+        // Map over batches of blocks (a real multi-session project has far more than one request can hold);
+        // accumulate cards across batches, stop once we have enough.
+        foreach (var batch in Batch(blocks, MaxExcerptCharsPerBatch))
         {
-            ChatMessage.System(MemoryPrompts.ExtractionSystem),
-            ChatMessage.User(MemoryPrompts.BlocksUserMessage(blocks)),
-        };
-        var reply = await _backend.CompleteAsync(messages, Array.Empty<ChatToolSpec>(), ct);
-        return ParseCards(reply.Message.Content ?? "", _createdBy, opts.MaxCardsPerAnalyst);
+            ct.ThrowIfCancellationRequested();
+            var messages = new[]
+            {
+                ChatMessage.System(MemoryPrompts.ExtractionSystem),
+                ChatMessage.User(MemoryPrompts.BlocksUserMessage(batch)),
+            };
+            var reply = await _backend.CompleteAsync(messages, Array.Empty<ChatToolSpec>(), ct);
+            all.AddRange(ParseCards(reply.Message.Content ?? "", _createdBy, opts.MaxCardsPerAnalyst));
+            if (all.Count >= opts.MaxCardsPerAnalyst) break;
+        }
+        return all;
+    }
+
+    // Group blocks so the total excerpt length per batch stays under maxChars (each block is its own
+    // minimum unit). Deterministic given the block order.
+    public static IEnumerable<IReadOnlyList<SourceBlock>> Batch(IReadOnlyList<SourceBlock> blocks, int maxChars)
+    {
+        var cur = new List<SourceBlock>();
+        var chars = 0;
+        foreach (var b in blocks)
+        {
+            var len = (b.Excerpt?.Length ?? 0) + 120; // + header overhead per block
+            if (cur.Count > 0 && chars + len > maxChars)
+            {
+                yield return cur;
+                cur = new List<SourceBlock>();
+                chars = 0;
+            }
+            cur.Add(b);
+            chars += len;
+        }
+        if (cur.Count > 0) yield return cur;
     }
 
     public static List<CandidateCard> ParseCards(string content, string createdBy, int max)
@@ -228,7 +261,7 @@ public sealed class BrainBuilder
         var card = new MemoryCard
         {
             Id = Slugify(cand.Title),
-            Title = cand.Title.Trim(),
+            Title = SecretRedactor.StripLoneSurrogates(cand.Title.Trim()),
             Lane = cand.Lane,
             Type = cand.Type,
             Status = CardStatuses.Active,
@@ -243,7 +276,7 @@ public sealed class BrainBuilder
             Topics = cand.Topics.Where(t => !string.IsNullOrWhiteSpace(t)).Distinct().ToList(),
             Sources = anchors,
             SourceCoverage = anchors.Count > 0 ? SourceCoverage.ExactSpan : SourceCoverage.ManualUnverified,
-            Body = SecretRedactor.Redact(cand.Body),
+            Body = SecretRedactor.Clean(cand.Body),
         };
         return card;
     }

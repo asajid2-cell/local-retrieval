@@ -82,7 +82,7 @@ public static class SourceBlocker
         var hash = Sha256(sb.ToString());
 
         var roles = slice.Select(m => m.Role).Distinct().ToList();
-        var excerpt = SecretRedactor.Redact(BuildExcerpt(slice));
+        var excerpt = SecretRedactor.Clean(BuildExcerpt(slice));
         var approx = slice.Sum(m => ApproxTokens(m.Text));
 
         return new SourceBlock

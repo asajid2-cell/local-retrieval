@@ -22,6 +22,12 @@ namespace CodexLocalRetrieval_Native;
 public sealed partial class MainPage
 {
     private string? _brainCollectionId;
+    // A built-but-not-applied patch, held so the review renders IN-PAGE (visual tree, not a modal
+    // popup) - the user sees "what changed, why, from where" alongside the preview and Applies or Discards.
+    private MemoryPatch? _brainPendingPatch;
+    private BrainBuildResult? _brainPendingBuild;
+    private string? _brainPendingFor;
+    private string? _brainPendingNow;
 
     private List<ArchiveSession> BrainChatsOf(ArchiveCollection col)
         => col.SessionIds.Where(id => _archive.Store.Sessions.ContainsKey(id))
@@ -47,6 +53,8 @@ public sealed partial class MainPage
         var col = _archive.Store.Collections[_brainCollectionId];
         MainContent.Children.Add(BrainConnectionsCard(col));
         MainContent.Children.Add(BrainStatusActionsCard(col));
+        if (_brainPendingPatch is not null && _brainPendingFor == col.Id)
+            MainContent.Children.Add(BrainReviewCard(col, _brainPendingPatch));
         MainContent.Children.Add(BrainPreviewCard(col));
     }
 
@@ -219,46 +227,64 @@ public sealed partial class MainPage
             : new IBrainAnalyst[] { new MockAnalyst() };
         var now = DateTime.UtcNow.ToString("O");
 
+        var agentLabel = backend is not null ? backend.Name : "mock";
+        Diag.Log($"Brain build start: collection={col.Id} chats={chats.Count} agent={agentLabel}");
         BrainBuildResult build;
         try { build = await brain.BuildAsync(col.Id, chats, analysts, new BrainBuildOptions(), now); }
-        catch (Exception ex) { SyncStatus.Text = ""; await InfoAsync("Build failed", ex.Message); return; }
+        catch (Exception ex) { SyncStatus.Text = "Build failed: " + ex.Message; Diag.Log("Brain build EX: " + ex); return; }
+
+        Diag.Log($"Brain build done: blocks={build.Blocks.Count} adds={build.Patch.Adds.Count} updates={build.Patch.Updates.Count}");
+
+        // Resilience: if a real backend produced nothing (e.g. an invalid/expired key or a quota error),
+        // fall back to the offline deterministic mock so the user still gets a starting brain rather than
+        // a dead end. The cards are honestly created_by=mock / working-lane.
+        var usedMockFallback = false;
+        if (build.Patch.Adds.Count == 0 && build.Patch.Updates.Count == 0 && backend is not null && build.Blocks.Count > 0)
+        {
+            Diag.Log("Brain build: backend returned no cards -> falling back to offline mock");
+            build = await brain.BuildAsync(col.Id, chats, new IBrainAnalyst[] { new MockAnalyst() }, new BrainBuildOptions(), now);
+            usedMockFallback = true;
+        }
 
         if (build.Patch.Adds.Count == 0 && build.Patch.Updates.Count == 0)
         {
-            SyncStatus.Text = "";
-            await InfoAsync("Nothing new", "The build produced no new or changed cards.");
+            SyncStatus.Text = build.Blocks.Count == 0
+                ? "No content parsed from this project's chats."
+                : $"Built {build.Blocks.Count} source blocks but no cards were produced.";
             return;
         }
+        if (usedMockFallback)
+            SyncStatus.Text = $"The {agentLabel} agent returned nothing (check the API key) - used the offline mock instead. Review below.";
 
-        var apply = await ShowPatchReviewAsync(col, build.Patch);
-        if (!apply) { SyncStatus.Text = "Build discarded - nothing was written."; return; }
-
-        try
-        {
-            var res = brain.ApplyPatch(col.Id, col.Name, build.Patch, build.Blocks, build.ChatStamps, now);
-            SyncStatus.Text = $"Brain updated: {res.CanonicalCount} canonical, {res.WorkingCount} working" +
-                              (string.IsNullOrEmpty(res.Commit) ? " (git not available - no history)" : $" - committed {Shorten(res.Commit, 8)}");
-        }
-        catch (Exception ex) { SyncStatus.Text = ""; await InfoAsync("Apply failed", ex.Message); return; }
+        // Hold the patch and render the review IN-PAGE (not a modal) so it sits with the preview and
+        // can be Applied/Discarded from the visual tree. Nothing is written to the vault until Apply.
+        _brainPendingPatch = build.Patch;
+        _brainPendingBuild = build;
+        _brainPendingFor = col.Id;
+        _brainPendingNow = now;
+        SyncStatus.Text = $"Built a patch from {patch_count(build.Patch)} card(s) - review it below, then Apply.";
         RenderBrainPage();
     }
 
-    // The centerpiece: "what changed, why, and from where" before anything canonical is written.
-    private async Task<bool> ShowPatchReviewAsync(ArchiveCollection col, MemoryPatch patch)
+    private static int patch_count(MemoryPatch p) => p.Adds.Count + p.Updates.Count + p.Supersedes.Count;
+
+    // The centerpiece, rendered in-page: "what changed, why, and from where" before anything is written.
+    private Border BrainReviewCard(ArchiveCollection col, MemoryPatch patch)
     {
-        var body = new StackPanel { Spacing = 10 };
-        body.Children.Add(new TextBlock { Text = patch.Summary, Foreground = StrongBrush(), TextWrapping = TextWrapping.Wrap });
-        body.Children.Add(new TextBlock { Text = $"Built by {patch.CreatedBy} from {patch.SourceChatIds.Count} chat(s). Nothing is written until you Apply.", Foreground = MutedBrush(), FontSize = 12, TextWrapping = TextWrapping.Wrap });
+        var stack = new StackPanel { Spacing = 10 };
+        stack.Children.Add(SectionHeader("Review patch - nothing is written until you Apply"));
+        stack.Children.Add(new TextBlock { Text = patch.Summary, Foreground = StrongBrush(), TextWrapping = TextWrapping.Wrap });
+        stack.Children.Add(new TextBlock { Text = $"Built by {patch.CreatedBy} from {patch.SourceChatIds.Count} chat(s).", Foreground = MutedBrush(), FontSize = 12, TextWrapping = TextWrapping.Wrap });
 
         void Section(string title, List<MemoryCard> cards)
         {
             if (cards.Count == 0) return;
-            body.Children.Add(new TextBlock { Text = title, Foreground = StrongBrush(), FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 6, 0, 0) });
+            stack.Children.Add(new TextBlock { Text = title, Foreground = StrongBrush(), FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 6, 0, 0) });
             foreach (var c in cards)
             {
                 var sp = new StackPanel { Spacing = 2, Margin = new Thickness(0, 0, 0, 6) };
                 var h = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 6 };
-                h.Children.Add(new TextBlock { Text = c.Title, Foreground = StrongBrush(), TextWrapping = TextWrapping.Wrap, MaxWidth = 520, FontSize = 13 });
+                h.Children.Add(new TextBlock { Text = c.Title, Foreground = StrongBrush(), TextWrapping = TextWrapping.Wrap, MaxWidth = 560, FontSize = 13 });
                 h.Children.Add(MiniChip(c.Lane));
                 h.Children.Add(MiniChip(c.Type));
                 sp.Children.Add(h);
@@ -268,7 +294,7 @@ public sealed partial class MainPage
                     Text = $"truth: {c.TruthEvidence} · extraction: {c.ExtractionConfidence} · " +
                            (c.Sources.Count > 0 ? $"from {c.Sources[0].SessionId} msg {c.Sources[0].MsgStartIndex}-{c.Sources[0].MsgEndIndex}" : "no source anchor (stays working)")
                 });
-                body.Children.Add(sp);
+                stack.Children.Add(sp);
             }
         }
         Section($"Add ({patch.Adds.Count})", patch.Adds);
@@ -276,21 +302,44 @@ public sealed partial class MainPage
         Section($"Supersede ({patch.Supersedes.Count})", patch.Supersedes);
         if (patch.Conflicts.Count > 0)
         {
-            body.Children.Add(new TextBlock { Text = "Disputed", Foreground = StrongBrush(), FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 6, 0, 0) });
-            foreach (var x in patch.Conflicts) body.Children.Add(new TextBlock { Text = "· " + x, Foreground = MutedBrush(), FontSize = 12, TextWrapping = TextWrapping.Wrap });
+            stack.Children.Add(new TextBlock { Text = "Disputed", Foreground = StrongBrush(), FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 6, 0, 0) });
+            foreach (var x in patch.Conflicts) stack.Children.Add(new TextBlock { Text = "· " + x, Foreground = MutedBrush(), FontSize = 12, TextWrapping = TextWrapping.Wrap });
         }
 
-        var dialog = new ContentDialog
-        {
-            Title = $"Review patch for \"{col.Name}\"",
-            Content = new ScrollViewer { Content = body, MaxHeight = 460, HorizontalScrollMode = ScrollMode.Disabled },
-            PrimaryButtonText = "Apply",
-            CloseButtonText = "Discard",
-            DefaultButton = ContentDialogButton.Primary,
-            XamlRoot = XamlRoot
-        };
-        return await dialog.ShowAsync() == ContentDialogResult.Primary;
+        var actions = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8, Margin = new Thickness(0, 6, 0, 0) };
+        var applyBtn = new Button { Style = (Style)Resources["PrimaryPillButtonStyle"], Content = "Apply patch" };
+        applyBtn.Click += (_, _) => ApplyPendingPatch(col);
+        var discardBtn = PillButton("Discard");
+        discardBtn.Click += (_, _) => { ClearPending(); SyncStatus.Text = "Build discarded - nothing was written."; RenderBrainPage(); };
+        actions.Children.Add(applyBtn);
+        actions.Children.Add(discardBtn);
+        stack.Children.Add(actions);
+
+        return Card(stack);
     }
+
+    private async void ApplyPendingPatch(ArchiveCollection col)
+    {
+        if (_brainPendingPatch is null || _brainPendingBuild is null || _brainPendingNow is null) return;
+        var patch = _brainPendingPatch;
+        var build = _brainPendingBuild;
+        var now = _brainPendingNow;
+        SyncStatus.Text = "Applying patch (writing the vault, committing, indexing)...";
+        try
+        {
+            // File I/O + a git subprocess + a SQLite rebuild - keep it OFF the UI thread so the app
+            // never freezes (the git step in particular can block).
+            var brain = new BrainService(_archive);
+            var res = await Task.Run(() => brain.ApplyPatch(col.Id, col.Name, patch, build.Blocks, build.ChatStamps, now));
+            SyncStatus.Text = $"Brain updated: {res.CanonicalCount} canonical, {res.WorkingCount} working" +
+                              (string.IsNullOrEmpty(res.Commit) ? " (git not available - no history)" : $" - committed {Shorten(res.Commit, 8)}");
+        }
+        catch (Exception ex) { SyncStatus.Text = "Apply failed: " + ex.Message; }
+        ClearPending();
+        RenderBrainPage();
+    }
+
+    private void ClearPending() { _brainPendingPatch = null; _brainPendingBuild = null; _brainPendingFor = null; _brainPendingNow = null; }
 
     private async Task OpenSourceSpanAsync(SourceAnchor a)
     {

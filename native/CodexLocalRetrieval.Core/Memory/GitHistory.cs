@@ -52,6 +52,7 @@ public sealed class GitHistory
     {
         if (!IsAvailable()) return "";
         if (!InitIfNeeded(vaultDir)) return "";
+        ClearStaleLock(vaultDir);
         Run(vaultDir, "add -A");
         // -c on the commit guards the rare case init-time config didn't take.
         var commit = Run(vaultDir,
@@ -97,26 +98,56 @@ public sealed class GitHistory
             var psi = new ProcessStartInfo
             {
                 FileName = "git",
-                Arguments = args,
+                // -c core.pager=cat: never invoke a pager (a pager waits for a TTY -> hangs reading output).
+                Arguments = "-c core.pager=cat " + args,
                 WorkingDirectory = workingDir,
                 UseShellExecute = false,
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
+                RedirectStandardInput = true,   // closed immediately so git never blocks waiting for input
                 CreateNoWindow = true,
                 StandardOutputEncoding = Encoding.UTF8,
                 StandardErrorEncoding = Encoding.UTF8,
             };
-            using var p = Process.Start(psi);
-            if (p is null) return new GitResult(false, -1, "", "could not start git");
-            var so = p.StandardOutput.ReadToEnd();
-            var se = p.StandardError.ReadToEnd();
-            if (!p.WaitForExit(20000)) { try { p.Kill(true); } catch { } return new GitResult(false, -1, so, "git timed out"); }
-            return new GitResult(p.ExitCode == 0, p.ExitCode, so, se);
+            // Disable any interactive prompts (credentials/editors) so a subprocess can never block.
+            psi.EnvironmentVariables["GIT_TERMINAL_PROMPT"] = "0";
+            psi.EnvironmentVariables["GIT_PAGER"] = "cat";
+            psi.EnvironmentVariables["GIT_OPTIONAL_LOCKS"] = "0";
+
+            using var p = new Process { StartInfo = psi };
+            var sbOut = new StringBuilder();
+            var sbErr = new StringBuilder();
+            // Read output via events (NOT ReadToEnd before WaitForExit, which deadlocks if a pipe fills).
+            p.OutputDataReceived += (_, e) => { if (e.Data is not null) sbOut.AppendLine(e.Data); };
+            p.ErrorDataReceived += (_, e) => { if (e.Data is not null) sbErr.AppendLine(e.Data); };
+            if (!p.Start()) return new GitResult(false, -1, "", "could not start git");
+            p.BeginOutputReadLine();
+            p.BeginErrorReadLine();
+            try { p.StandardInput.Close(); } catch { }
+            if (!p.WaitForExit(15000))
+            {
+                try { p.Kill(true); } catch { }
+                return new GitResult(false, -1, sbOut.ToString(), "git timed out");
+            }
+            p.WaitForExit(); // let the async readers flush
+            return new GitResult(p.ExitCode == 0, p.ExitCode, sbOut.ToString(), sbErr.ToString());
         }
         catch (Exception ex)
         {
             return new GitResult(false, -1, "", ex.Message);
         }
+    }
+
+    // A crashed/killed git can leave .git/index.lock behind, which blocks every later add/commit.
+    // Best-effort remove it before staging (we only ever run git serially per vault).
+    private static void ClearStaleLock(string vaultDir)
+    {
+        try
+        {
+            var lockPath = Path.Combine(vaultDir, ".git", "index.lock");
+            if (File.Exists(lockPath)) File.Delete(lockPath);
+        }
+        catch { }
     }
 
     private static string Quote(string s) => "\"" + s.Replace("\\", "\\\\").Replace("\"", "\\\"") + "\"";

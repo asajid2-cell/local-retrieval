@@ -39,4 +39,28 @@ public static class SecretRedactor
         foreach (var (rx, _) in Patterns) if (rx.IsMatch(text)) return true;
         return false;
     }
+
+    // Drop lone/orphaned surrogate halves. The app caps message text at a fixed char count, which can
+    // split an emoji's surrogate PAIR — leaving an invalid lone surrogate that throws when the text is
+    // later serialized (JSON patch / git commit). Removing it keeps stored text valid UTF-16/UTF-8.
+    public static string StripLoneSurrogates(string? text)
+    {
+        if (string.IsNullOrEmpty(text)) return text ?? "";
+        var sb = new System.Text.StringBuilder(text.Length);
+        for (var i = 0; i < text.Length; i++)
+        {
+            var c = text[i];
+            if (char.IsHighSurrogate(c))
+            {
+                if (i + 1 < text.Length && char.IsLowSurrogate(text[i + 1])) { sb.Append(c); sb.Append(text[i + 1]); i++; }
+                // else: lone high surrogate -> drop
+            }
+            else if (char.IsLowSurrogate(c)) { /* lone low surrogate -> drop */ }
+            else sb.Append(c);
+        }
+        return sb.ToString();
+    }
+
+    // Convenience: redact secrets AND strip invalid surrogates in one pass for anything stored.
+    public static string Clean(string? text) => StripLoneSurrogates(Redact(text));
 }

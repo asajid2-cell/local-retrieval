@@ -732,6 +732,43 @@ public sealed class BrainTests
         finally { TryDeleteDir(dir); TryDeleteDir(root); }
     }
 
+    // A fixed char-cap can split an emoji's surrogate pair; the leftover lone surrogate breaks JSON/git
+    // serialization. StripLoneSurrogates removes orphan halves but keeps valid pairs.
+    [TestMethod]
+    public void SecretRedactor_StripsLoneSurrogates()
+    {
+        var lone = "before\uD83Cafter";            // lone high surrogate (no low partner)
+        var cleaned = SecretRedactor.StripLoneSurrogates(lone);
+        Assert.IsFalse(cleaned.Contains('\uD83C'), "lone surrogate removed");
+        Assert.AreEqual("beforeafter", cleaned);
+
+        var trophy = "win 🏆 now";        // valid surrogate pair (🏆)
+        Assert.AreEqual(trophy, SecretRedactor.StripLoneSurrogates(trophy), "valid emoji preserved");
+
+        // Clean = Redact + strip, so a truncated-emoji excerpt with a key is both masked and valid.
+        var cleanedSecret = SecretRedactor.Clean("key sk-abcdefghijklmnop123456 tail\uD83C");
+        Assert.IsTrue(cleanedSecret.Contains("[redacted-key]"));
+        Assert.IsFalse(cleanedSecret.Contains('\uD83C'));
+    }
+
+    // A real project has far more blocks than one request can hold; Batch splits them under a char cap.
+    [TestMethod]
+    public void BackendAnalyst_BatchesLargeBlockSets()
+    {
+        var blocks = Enumerable.Range(0, 60).Select(i => new SourceBlock
+        {
+            Id = $"chat_s:block_{i}", SessionId = "s", Excerpt = new string('x', 1000),
+        }).ToList();
+
+        var batches = BackendAnalyst.Batch(blocks, BackendAnalyst.MaxExcerptCharsPerBatch).ToList();
+
+        Assert.IsTrue(batches.Count > 1, "60 large blocks split across batches");
+        Assert.AreEqual(60, batches.Sum(b => b.Count), "every block is covered exactly once");
+        foreach (var b in batches)
+            Assert.IsTrue(b.Count == 1 || b.Sum(x => x.Excerpt.Length + 120) <= BackendAnalyst.MaxExcerptCharsPerBatch,
+                "each batch stays under the char cap (single oversized block excepted)");
+    }
+
     private sealed class CannedBackend : CodexLocalRetrieval.Core.Chat.IChatBackend
     {
         private readonly string _content;
