@@ -20,6 +20,11 @@ public sealed partial class MainPage
     // screenful of windows. Anchored by this window name; the first tab creates it, the rest join it.
     private const string MultiplexWtWindow = "multiplex";
 
+    private void ResumeInMultiplex_Click(object sender, RoutedEventArgs e)
+    {
+        if (_selected is not null) StartRemoteSession(_selected);
+    }
+
     private async void StartRemoteSession(ArchiveSession session)
     {
         var settings = _archive.Store.Settings;
@@ -43,6 +48,17 @@ public sealed partial class MainPage
 
         try
         {
+            // Already in a multiplex on the VPS? Attach its window instead of injecting a SECOND resume
+            // into a session that's already running the agent.
+            if (await RemoteSessionExistsAsync(target, settings.MultiplexApiPort, name))
+            {
+                OpenMultiplexTab(target, settings.MultiplexSessionLauncher, name);
+                SyncStatus.Text = $"\"{title}\" is already in a multiplex - opened its window.";
+                return;
+            }
+            // Running locally (or elsewhere) right now? Don't let two copies fight over the transcript.
+            if (!await ConfirmRunOrKillAsync(session)) { SyncStatus.Text = "Cancelled - already running."; return; }
+
             var created = await CreateRemoteSessionAsync(target, settings.MultiplexApiPort, name, command);
             if (!created.ok)
             {
@@ -91,7 +107,11 @@ public sealed partial class MainPage
         var target = (settings.MultiplexSshTarget ?? "").Trim();
         if (string.IsNullOrEmpty(target)) return;
         string json;
-        try { json = _archive.BuildProjectsProjectionJson(); }
+        try
+        {
+            var running = await Task.Run(() => new System.Collections.Generic.HashSet<string>(GetRunningChats().Keys));
+            json = _archive.BuildProjectsProjectionJson(running);
+        }
         catch (Exception ex) { Diag.Log("BuildProjects failed: " + ex.Message); return; }
         _syncPushing = true;
         try

@@ -357,7 +357,21 @@ public sealed class ArchiveServiceTests
             var cmd = ch.GetProperty("muxCommand").GetString()!;
             StringAssert.StartsWith(cmd, "cd '");
             StringAssert.Contains(cmd, "resume");
+            Assert.IsFalse(ch.GetProperty("running").GetBoolean());   // no running set passed
         }
+    }
+
+    // The "is this chat already running?" guard reads the resumed session id off a claude/codex process
+    // command line (local OR multiplex). Must match BuildMultiplexCommand's shapes and ignore non-resumes.
+    [TestMethod]
+    public void ParseResumedSessionId_ExtractsClaudeAndCodexIds()
+    {
+        Assert.AreEqual("3b7b7fbc", ArchiveService.ParseResumedSessionId(@"C:\x\claude.exe --resume 3b7b7fbc"));
+        Assert.AreEqual("9f2a", ArchiveService.ParseResumedSessionId(@"codex.exe --profile http_sse resume --include-non-interactive 9f2a"));
+        Assert.AreEqual("ab12", ArchiveService.ParseResumedSessionId("codex resume ab12"));
+        Assert.AreEqual("", ArchiveService.ParseResumedSessionId(@"C:\x\claude.exe"));   // fresh, not a resume
+        Assert.AreEqual("", ArchiveService.ParseResumedSessionId("codex resume"));        // picker, no id
+        Assert.AreEqual("", ArchiveService.ParseResumedSessionId(""));
     }
 
     // REGRESSION (real bug, session 3b7b7fbc "Cortex Engine AAA Push"): Claude files a transcript

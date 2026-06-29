@@ -77,10 +77,14 @@ public sealed partial class MainPage
     // Open a real terminal and run `codex resume <id>` in the chat's original workspace, so the
     // agent session continues with the right cwd. This is the difference between an archive you
     // read and one you can pick back up.
-    private void ResumeInTerminal(ArchiveSession session)
+    private async void ResumeInTerminal(ArchiveSession session)
     {
         try
         {
+            // Guard against resuming a chat that's already running (locally or in a multiplex) - two
+            // runs corrupt the transcript. Offers to kill the running copy first.
+            if (!await ConfirmRunOrKillAsync(session)) { SyncStatus.Text = "Cancelled - already running."; return; }
+
             var launch = _archive.BuildResumeLaunch(session);
             if (string.IsNullOrEmpty(launch.Exe))
             {

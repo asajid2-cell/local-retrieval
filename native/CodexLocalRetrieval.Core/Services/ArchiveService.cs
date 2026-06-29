@@ -1628,11 +1628,27 @@ public sealed class ArchiveService
         return string.IsNullOrEmpty(name) ? tool : name;
     }
 
+    // Extract the resumed session id from a claude/codex process command line (or "" if it isn't a
+    // resume). Mirrors BuildMultiplexCommand's shapes — `claude --resume <id>` and `codex [--profile
+    // ..] resume [--include-non-interactive] <id>` — so we can detect which chats are already running
+    // (locally OR inside a multiplex, which runs the agent on this PC too) before launching a second
+    // copy. Two runs of one chat fight over the same transcript/rollout, so this is the guard.
+    public static string ParseResumedSessionId(string commandLine)
+    {
+        if (string.IsNullOrWhiteSpace(commandLine)) return "";
+        var m = Regex.Match(commandLine, @"--resume\s+([A-Za-z0-9._-]+)");
+        if (m.Success && IsResumableId(m.Groups[1].Value)) return m.Groups[1].Value;
+        m = Regex.Match(commandLine, @"\bresume\b(?:\s+--[A-Za-z-]+)*\s+([A-Za-z0-9._-]+)");
+        if (m.Success && IsResumableId(m.Groups[1].Value)) return m.Groups[1].Value;
+        return "";
+    }
+
     // A compact JSON projection of every collection + its resumable chats, pushed to the VPS so the
     // web (harmonizerlabs.cc/multiplex → Projects) can list your projects and resume any chat into a
     // multiplex from anywhere. Each chat carries the multiplex session name + the resume command the
-    // web POSTs to /api/sessions. Only chats with a safe, resumable command are included.
-    public string BuildProjectsProjectionJson()
+    // web POSTs to /api/sessions, and a `running` flag (from a live process scan) so the web can warn
+    // before starting a second copy. Only chats with a safe, resumable command are included.
+    public string BuildProjectsProjectionJson(ISet<string>? runningIds = null)
     {
         var collections = Store.Collections.Values
             .OrderBy(c => c.Name, StringComparer.OrdinalIgnoreCase)
@@ -1650,6 +1666,7 @@ public sealed class ArchiveService
                         tool = s.Tool,
                         muxName = MultiplexSessionName(s),
                         muxCommand = BuildMultiplexCommand(s),
+                        running = runningIds is not null && !string.IsNullOrEmpty(s.Id) && runningIds.Contains(s.Id),
                     })
                     .Where(c => !string.IsNullOrEmpty(c.muxCommand))
                     .ToList(),

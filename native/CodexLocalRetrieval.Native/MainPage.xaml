@@ -303,6 +303,12 @@
                     HorizontalAlignment="Stretch"
                     Style="{StaticResource PrimaryPillButtonStyle}" />
                 <Button
+                    Click="ResumeInMultiplex_Click"
+                    Content="Resume in multiplex"
+                    ToolTipService.ToolTip="Resume in a multiplex you can also drive from your phone (harmonizerlabs.cc/multiplex)."
+                    HorizontalAlignment="Stretch"
+                    Style="{StaticResource PillButtonStyle}" />
+                <Button
                     x:Name="AddToProjectButton"
                     Click="AddToProject_Click"
                     Content="Add to project"
