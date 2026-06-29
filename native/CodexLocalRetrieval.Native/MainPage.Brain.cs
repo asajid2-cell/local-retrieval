@@ -28,10 +28,29 @@ public sealed partial class MainPage
     private BrainBuildResult? _brainPendingBuild;
     private string? _brainPendingFor;
     private string? _brainPendingNow;
+    private bool _brainDeepSearch;   // build scope: whole-archive deep search vs project chats only
 
     private List<ArchiveSession> BrainChatsOf(ArchiveCollection col)
         => col.SessionIds.Where(id => _archive.Store.Sessions.ContainsKey(id))
                          .Select(id => _archive.Store.Sessions[id]).ToList();
+
+    // Pick the extraction analysts. Preference: the local Claude + Codex CLIs together (multi-agent,
+    // no API key needed) -> agreement raises extraction confidence. Else a configured key backend.
+    // Else the offline deterministic mock so the flow never dead-ends.
+    private (List<IBrainAnalyst> analysts, string label, bool usingReal) SelectBrainAnalysts()
+    {
+        var list = new List<IBrainAnalyst>();
+        // Generous per-call timeouts: a large batch of blocks can take a CLI model a few minutes.
+        var claudeExe = ArchiveService.ResolveClaudeExe();
+        if (IsRootedExisting(claudeExe)) list.Add(new BackendAnalyst(new ClaudexBackend(claudeExe, model: null, timeoutMs: 300_000), 18_000));
+        var codexExe = ArchiveService.ResolveCodexExe();
+        if (IsRootedExisting(codexExe)) list.Add(new BackendAnalyst(new CodexCliBackend(codexExe, timeoutMs: 300_000), 16_000));
+        if (list.Count > 0) return (list, string.Join("+", list.Select(a => a.Id).Distinct()), true);
+
+        var key = BuildCopilotBackend();
+        if (key is not null) return (new List<IBrainAnalyst> { new BackendAnalyst(key) }, key.Name, true);
+        return (new List<IBrainAnalyst> { new MockAnalyst() }, "mock", false);
+    }
 
     private void RenderBrainPage()
     {
@@ -98,16 +117,16 @@ public sealed partial class MainPage
         var stack = new StackPanel { Spacing = 8 };
         stack.Children.Add(SectionHeader("Connections"));
 
-        var provider = _archive.ActiveAiProvider();
-        var hasKey = provider is not null && HasApiKey(provider.Id);
         var gitOk = new GitHistory().IsAvailable();
         var claudeExe = ArchiveService.ResolveClaudeExe();
         var codexExe = ArchiveService.ResolveCodexExe();
         var vault = new BrainService(_archive).PathsFor(col.Id).Vault;
+        var (_, agentLabel, usingReal) = SelectBrainAnalysts();
 
-        stack.Children.Add(BrainStatusRow("Build agent (AI key)",
-            hasKey ? $"{provider!.Name} - key found; real extraction available" : "No key - builds use the deterministic mock (working-lane placeholders)",
-            hasKey));
+        stack.Children.Add(BrainStatusRow("Build agents",
+            usingReal ? $"{agentLabel} - real extraction" + (agentLabel.Contains("+") ? " (multi-agent: agreement raises confidence)" : "")
+                      : "offline mock only - no Claude/Codex CLI or key found",
+            usingReal));
         stack.Children.Add(BrainStatusRow("Git history",
             gitOk ? "git found - every build/apply is committed locally" : "git not found - the vault still builds, just without history", gitOk));
         stack.Children.Add(BrainStatusRow("Claude CLI", IsRootedExisting(claudeExe) ? claudeExe : "not found (optional)", IsRootedExisting(claudeExe)));
@@ -137,6 +156,16 @@ public sealed partial class MainPage
         stack.Children.Add(new TextBlock { Text = summary, Foreground = StrongBrush(), TextWrapping = TextWrapping.Wrap });
         if (status.Built && !string.IsNullOrEmpty(status.LastCommit))
             stack.Children.Add(new TextBlock { Text = $"Last commit {Shorten(status.LastCommit, 10)} · built {status.BuiltAt}", Foreground = MutedBrush(), FontSize = 12 });
+
+        var deepToggle = new CheckBox
+        {
+            Content = "Deep Search: also pull in topically-related chats from the whole archive (not just this project)",
+            IsChecked = _brainDeepSearch,
+            Foreground = MutedBrush(),
+        };
+        deepToggle.Checked += (_, _) => _brainDeepSearch = true;
+        deepToggle.Unchecked += (_, _) => _brainDeepSearch = false;
+        stack.Children.Add(deepToggle);
 
         var actions = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8 };
         var buildBtn = new Button
@@ -219,27 +248,24 @@ public sealed partial class MainPage
         var chats = BrainChatsOf(col);
         if (chats.Count == 0) { await InfoAsync("No chats", "Add chats to this collection first."); return; }
 
-        SyncStatus.Text = "Building brain (reading full transcripts)...";
         var brain = new BrainService(_archive);
-        var backend = BuildCopilotBackend();
-        IReadOnlyList<IBrainAnalyst> analysts = backend is not null
-            ? new IBrainAnalyst[] { new BackendAnalyst(backend) }
-            : new IBrainAnalyst[] { new MockAnalyst() };
+        var (analysts, agentLabel, usingReal) = SelectBrainAnalysts();
+        SyncStatus.Text = $"Building brain (reading full transcripts; extracting with {agentLabel})...";
         var now = DateTime.UtcNow.ToString("O");
+        var opts = new BrainBuildOptions { Scope = _brainDeepSearch ? BuildScope.DeepSearch : BuildScope.ProjectOnly };
 
-        var agentLabel = backend is not null ? backend.Name : "mock";
-        Diag.Log($"Brain build start: collection={col.Id} chats={chats.Count} agent={agentLabel}");
+        Diag.Log($"Brain build start: collection={col.Id} chats={chats.Count} agents={agentLabel} scope={opts.Scope}");
         BrainBuildResult build;
-        try { build = await brain.BuildAsync(col.Id, chats, analysts, new BrainBuildOptions(), now); }
+        try { build = await brain.BuildAsync(col.Id, chats, analysts, opts, now); }
         catch (Exception ex) { SyncStatus.Text = "Build failed: " + ex.Message; Diag.Log("Brain build EX: " + ex); return; }
 
         Diag.Log($"Brain build done: blocks={build.Blocks.Count} adds={build.Patch.Adds.Count} updates={build.Patch.Updates.Count}");
 
-        // Resilience: if a real backend produced nothing (e.g. an invalid/expired key or a quota error),
+        // Resilience: if the real analysts produced nothing (e.g. an offline CLI / invalid key / quota),
         // fall back to the offline deterministic mock so the user still gets a starting brain rather than
         // a dead end. The cards are honestly created_by=mock / working-lane.
         var usedMockFallback = false;
-        if (build.Patch.Adds.Count == 0 && build.Patch.Updates.Count == 0 && backend is not null && build.Blocks.Count > 0)
+        if (build.Patch.Adds.Count == 0 && build.Patch.Updates.Count == 0 && usingReal && build.Blocks.Count > 0)
         {
             Diag.Log("Brain build: backend returned no cards -> falling back to offline mock");
             build = await brain.BuildAsync(col.Id, chats, new IBrainAnalyst[] { new MockAnalyst() }, new BrainBuildOptions(), now);

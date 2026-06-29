@@ -769,6 +769,92 @@ public sealed class BrainTests
                 "each batch stays under the char cap (single oversized block excepted)");
     }
 
+    // ---- BL6: Deep Search whole-archive scope ----
+
+    private static void WriteCodexChat(string dir, string id, string firstUserText, string cwd = "z:/proj")
+    {
+        Directory.CreateDirectory(dir);
+        File.WriteAllLines(Path.Combine(dir, $"rollout-2026-06-28T02-00-00-{id}.jsonl"), new[]
+        {
+            "{\"timestamp\":\"2026-06-28T02:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"session_id\":\"" + id + "\",\"id\":\"" + id + "\",\"cwd\":\"" + cwd + "\"}}",
+            "{\"timestamp\":\"2026-06-28T02:00:01Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"" + firstUserText + "\"}}",
+            "{\"timestamp\":\"2026-06-28T02:00:02Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"acknowledged\"}}",
+        });
+    }
+
+    [TestMethod]
+    public async Task DeepSearch_PullsRelatedChatFromWholeArchive()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "clr-deep-" + Guid.NewGuid().ToString("N"));
+        var root = Path.Combine(Path.GetTempPath(), "clr-bsvc-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        const string idA = "019f0d3e-aaaa-0000-0000-servantfxaaa";
+        const string idB = "019f0d3e-bbbb-0000-0000-servantfxbbb";
+        WriteCodexChat(dir, idA, "servantfx breakthrough in the renderer");
+        WriteCodexChat(dir, idB, "more servantfx tuning notes elsewhere");
+        var svc = new ArchiveService(storePath: Path.Combine(root, "store.json"));
+        try
+        {
+            await svc.IndexRootAsync(dir);
+            var a = svc.Store.Sessions[idA];
+            var b = svc.Store.Sessions[idB];
+            var brain = new BrainService(svc);
+
+            // topic derivation finds the distinctive shared word
+            CollectionAssert.Contains(BrainService.DeriveTopics(new[] { a }), "servantfx");
+
+            // deep-search expansion of just A pulls in B (same topic), but not A itself
+            var extra = brain.ExpandWithDeepSearch(new[] { a }, 25);
+            Assert.IsTrue(extra.Any(s => s.Id == idB), "deep search found the related chat in the wider archive");
+            Assert.IsFalse(extra.Any(s => s.Id == idA), "the member chat is not duplicated");
+
+            // a project-only build incorporates 1 chat; a deep-search build incorporates both
+            var projectOnly = await brain.BuildAndApplyAsync("colP", "Project Only", new[] { a },
+                new IBrainAnalyst[] { new MockAnalyst() }, new BrainBuildOptions { Scope = BuildScope.ProjectOnly }, Now);
+            Assert.AreEqual(1, brain.Status("colP", new[] { a }).IncorporatedChats);
+
+            var deep = await brain.BuildAndApplyAsync("colD", "Deep", new[] { a },
+                new IBrainAnalyst[] { new MockAnalyst() }, new BrainBuildOptions { Scope = BuildScope.DeepSearch }, Now);
+            Assert.IsTrue(brain.Status("colD", new[] { a }).IncorporatedChats >= 2, "deep search incorporated the related chat too");
+        }
+        finally { TryDeleteDir(dir); TryDeleteDir(root); }
+    }
+
+    // ---- BL7: full graphable mind vault (wikilinks) ----
+
+    [TestMethod]
+    public void Vault_CardsCarryWikilinks_ForObsidianGraph()
+    {
+        var brains = TempBrains();
+        try
+        {
+            var paths = new BrainPaths(brains, "col-graph");
+            var vw = new VaultWriter();
+            vw.EnsureScaffold(paths, new BrainManifest { CollectionId = "col-graph" });
+
+            var card = SampleCard("decision-x", "Method X", Lanes.Canonical, "Chose X.", true);
+            card.Related = new() { "other-card" };
+            card.LedTo = new() { "win-servant-fx" };
+            card.CausedBy = new() { "rejected-y" };
+            card.Topics = new() { "t6-modding", "servant-fx" };
+            vw.WriteCard(paths, card);
+
+            var md = File.ReadAllText(Path.Combine(paths.CardsCanonical, "decision-x.md"));
+            StringAssert.Contains(md, "## Links");
+            StringAssert.Contains(md, "[[other-card]]");
+            StringAssert.Contains(md, "[[win-servant-fx]]");
+            StringAssert.Contains(md, "[[rejected-y]]");
+            StringAssert.Contains(md, "[[t6-modding]]");
+            // rewriting the card must not stack duplicate Links/Sources sections
+            var reread = CardMarkdown.Parse(md);
+            vw.WriteCard(paths, reread);
+            var md2 = File.ReadAllText(Path.Combine(paths.CardsCanonical, "decision-x.md"));
+            var occurrences = md2.Split("## Sources").Length - 1;
+            Assert.AreEqual(1, occurrences, "no stacked Sources sections after re-write");
+        }
+        finally { TryDeleteDir(brains); }
+    }
+
     private sealed class CannedBackend : CodexLocalRetrieval.Core.Chat.IChatBackend
     {
         private readonly string _content;

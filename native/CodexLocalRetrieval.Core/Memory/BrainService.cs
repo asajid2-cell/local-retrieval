@@ -66,7 +66,14 @@ public sealed class BrainService
     public async Task<BrainBuildResult> BuildAsync(string collectionId, IEnumerable<ArchiveSession> chats,
         IReadOnlyList<IBrainAnalyst> analysts, BrainBuildOptions opts, string nowIso, CancellationToken ct = default)
     {
-        var (blocks, stamps) = await BuildBlocksAsync(chats, ct);
+        var chatList = chats.ToList();
+        // Deep Search: sweep the WHOLE archive for chats topically related to this project's chats (old,
+        // buried, in other collections) and fold them in so the brain captures the full arc, not just
+        // the chats already filed here.
+        if (opts.Scope == BuildScope.DeepSearch)
+            chatList.AddRange(ExpandWithDeepSearch(chatList, opts.DeepSearchMaxExtra));
+
+        var (blocks, stamps) = await BuildBlocksAsync(chatList, ct);
         var candidates = await _builder.RunAnalystsAsync(blocks, analysts, opts, nowIso, ct);
 
         var paths = PathsFor(collectionId);
@@ -185,6 +192,47 @@ public sealed class BrainService
         Section("Working / exploratory (NOT settled)", cards.Where(c => c.Lane == Lanes.Working && c.Type != CardTypes.OpenLoop));
         return sb.ToString();
     }
+
+    // Deep Search: find chats across the WHOLE archive that are topically related to the given members,
+    // excluding those already present. Deterministic (keyword-driven, no clock/randomness).
+    public List<ArchiveSession> ExpandWithDeepSearch(IReadOnlyList<ArchiveSession> members, int maxExtra)
+    {
+        var have = new HashSet<string>(members.Select(m => m.Id), StringComparer.Ordinal);
+        var extra = new List<ArchiveSession>();
+        foreach (var term in DeriveTopics(members))
+        {
+            foreach (var hit in _archive.DeepSearch(term, 30))
+            {
+                if (extra.Count >= maxExtra) break;
+                if (hit.Session is { } s && have.Add(s.Id)) extra.Add(s);
+            }
+            if (extra.Count >= maxExtra) break;
+        }
+        return extra;
+    }
+
+    // The salient topic words of a chat set: frequent, non-trivial tokens from titles + workspace names.
+    public static List<string> DeriveTopics(IReadOnlyList<ArchiveSession> members)
+    {
+        var freq = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        void Add(string? s)
+        {
+            if (string.IsNullOrWhiteSpace(s)) return;
+            foreach (var w in Tokenize(s))
+                if (w.Length >= 4 && !StopWords.Contains(w)) freq[w] = freq.GetValueOrDefault(w) + 1;
+        }
+        foreach (var m in members) { Add(m.DisplayTitle); Add(m.WorkspaceName); }
+        return freq.OrderByDescending(k => k.Value).ThenBy(k => k.Key, StringComparer.Ordinal).Take(6).Select(k => k.Key).ToList();
+    }
+
+    private static IEnumerable<string> Tokenize(string s)
+        => System.Text.RegularExpressions.Regex.Split(s.ToLowerInvariant(), "[^a-z0-9]+").Where(x => x.Length > 0);
+
+    private static readonly HashSet<string> StopWords = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "the", "and", "for", "with", "this", "that", "chat", "session", "unknown", "workspace",
+        "from", "into", "your", "you", "claude", "codex", "project", "code", "test", "tests", "work",
+    };
 
     private static string AnalystLabel(IReadOnlyList<IBrainAnalyst> analysts)
         => analysts.Count == 0 ? "none" : string.Join("+", analysts.Select(a => a.Id).Distinct());
