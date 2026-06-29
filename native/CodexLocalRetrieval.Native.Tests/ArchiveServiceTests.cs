@@ -231,6 +231,49 @@ public sealed class ArchiveServiceTests
         Assert.AreEqual(cwd, launch.WorkingDirectory);
     }
 
+    // Optional per-tool launch args are inserted in the PREFIX position (after the exe, before the
+    // subcommand) so global flags like Codex's --profile apply (codex --profile X resume ...). This is
+    // how the app lets you force the stable HTTP/SSE transport without rebuilding the default command.
+    [TestMethod]
+    public void BuildResumeLaunch_Codex_PrefixesConfiguredLaunchArgs()
+    {
+        var service = new ArchiveService(useBundledStore: true);
+        service.Store.Settings.CodexLaunchArgs = "--profile http_sse";
+        var cwd = Path.GetTempPath().TrimEnd('\\', '/');
+        var session = new ArchiveSession { Id = "cx-7", Tool = "codex", Workspace = cwd, SourcePath = Path.Combine(cwd, "cx-7.jsonl") };
+
+        var launch = service.BuildResumeLaunch(session, exeOverride: "C:\\codex.exe");
+
+        Assert.AreEqual("--profile http_sse resume --include-non-interactive cx-7", launch.Arguments);
+        StringAssert.Contains(launch.DisplayCommand, "--profile http_sse resume");
+    }
+
+    // Default path must be untouched when no launch args are set.
+    [TestMethod]
+    public void BuildResumeLaunch_EmptyLaunchArgs_LeavesDefaultPathUntouched()
+    {
+        var service = new ArchiveService(useBundledStore: true);
+        var cwd = Path.GetTempPath().TrimEnd('\\', '/');
+        var session = new ArchiveSession { Id = "cx-8", Tool = "codex", Workspace = cwd, SourcePath = Path.Combine(cwd, "cx-8.jsonl") };
+
+        var launch = service.BuildResumeLaunch(session, exeOverride: "C:\\codex.exe");
+
+        Assert.AreEqual("resume --include-non-interactive cx-8", launch.Arguments);
+    }
+
+    [TestMethod]
+    public void BuildResumeLaunch_Claude_PrefixesClaudeLaunchArgs()
+    {
+        var service = new ArchiveService(useBundledStore: true);
+        service.Store.Settings.ClaudeLaunchArgs = "--mcp-debug";
+        var cwd = Path.GetTempPath().TrimEnd('\\', '/');
+        var session = new ArchiveSession { Id = "cl-7", Tool = "claude", Workspace = cwd, SourcePath = Path.Combine(cwd, "cl-7.jsonl") };
+
+        var launch = service.BuildResumeLaunch(session, exeOverride: "C:\\claude.exe");
+
+        Assert.AreEqual("--mcp-debug --resume cl-7", launch.Arguments);
+    }
+
     // REGRESSION (real bug, session 3b7b7fbc "Cortex Engine AAA Push"): Claude files a transcript
     // under the DASH-ENCODED launch dir. This session was launched in …\301 (project folder
     // z--…-301) but its recorded workspace was the subdir …\301\graphics. Resuming from the workspace

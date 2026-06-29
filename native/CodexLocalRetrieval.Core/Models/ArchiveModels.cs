@@ -102,6 +102,15 @@ public sealed class ArchiveSettings
 
     [JsonPropertyName("aiProviders")]
     public List<AiProviderSettings> AiProviders { get; set; } = new();
+
+    // Optional extra arguments inserted right AFTER the CLI exe (before the resume subcommand) when a
+    // chat is resumed in a terminal — e.g. "--profile http_sse" to force Codex onto the stable HTTP/SSE
+    // transport. Empty = the default launch is untouched. Per-tool because Codex/Claude differ.
+    [JsonPropertyName("codexLaunchArgs")]
+    public string CodexLaunchArgs { get; set; } = "";
+
+    [JsonPropertyName("claudeLaunchArgs")]
+    public string ClaudeLaunchArgs { get; set; } = "";
 }
 
 public sealed class AiProviderSettings
