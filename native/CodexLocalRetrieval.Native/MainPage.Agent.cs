@@ -178,6 +178,38 @@ public sealed partial class MainPage
             SyncStatus.Text = "Protocol path copied — paste it into a chat.";
         };
         stack.Children.Add(copy);
+
+        // Optional resume launch arguments — inserted right after the CLI when you Resume a chat in a
+        // terminal. e.g. set Codex to "--profile http_sse" to force the stable HTTP/SSE transport (the
+        // websocket transport drops long Windows sessions). Blank = the default launch is untouched.
+        stack.Children.Add(new TextBlock { Text = "Resume launch arguments (optional)", Foreground = StrongBrush(), FontSize = 15, FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 10, 0, 0) });
+        stack.Children.Add(new TextBlock
+        {
+            Text = "Inserted right after the CLI when you Resume a chat in a terminal. Example: Codex “--profile http_sse” launches \"codex --profile http_sse resume …\" so the session rides the stable HTTP/SSE transport. Leave blank for the default.",
+            Foreground = MutedBrush(),
+            TextWrapping = TextWrapping.Wrap
+        });
+
+        stack.Children.Add(new TextBlock { Text = "Codex", Foreground = StrongBrush() });
+        var codexArgs = new TextBox { Text = _archive.Store.Settings.CodexLaunchArgs, Width = 360, CornerRadius = ControlCornerRadius(), PlaceholderText = "--profile http_sse" };
+        codexArgs.LostFocus += async (_, _) =>
+        {
+            _archive.Store.Settings.CodexLaunchArgs = (codexArgs.Text ?? "").Trim();
+            await _archive.SaveAsync();
+            SyncStatus.Text = "Codex launch args saved.";
+        };
+        stack.Children.Add(codexArgs);
+
+        stack.Children.Add(new TextBlock { Text = "Claude", Foreground = StrongBrush() });
+        var claudeArgs = new TextBox { Text = _archive.Store.Settings.ClaudeLaunchArgs, Width = 360, CornerRadius = ControlCornerRadius() };
+        claudeArgs.LostFocus += async (_, _) =>
+        {
+            _archive.Store.Settings.ClaudeLaunchArgs = (claudeArgs.Text ?? "").Trim();
+            await _archive.SaveAsync();
+            SyncStatus.Text = "Claude launch args saved.";
+        };
+        stack.Children.Add(claudeArgs);
+
         return Card(stack);
     }
 

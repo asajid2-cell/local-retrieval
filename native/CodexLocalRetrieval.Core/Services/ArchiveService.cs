@@ -1566,7 +1566,7 @@ public sealed class ArchiveService
     public static bool IsResumableId(string id) =>
         !string.IsNullOrWhiteSpace(id) && id.Length <= 200 && Regex.IsMatch(id, "^[A-Za-z0-9._-]+$");
 
-    public ResumeLaunch BuildResumeLaunch(ArchiveSession session, string? exeOverride = null)
+    public ResumeLaunch BuildResumeLaunch(ArchiveSession session, string? exeOverride = null, string? extraArgsOverride = null)
     {
         var id = string.IsNullOrWhiteSpace(session.Id) ? Path.GetFileNameWithoutExtension(session.SourcePath) : session.Id;
         var isClaude = string.Equals(session.Tool, "claude", StringComparison.OrdinalIgnoreCase);
@@ -1585,7 +1585,14 @@ public sealed class ArchiveService
         if (string.IsNullOrWhiteSpace(exeOverride) && (!Path.IsPathRooted(exe) || !File.Exists(exe)))
             return new ResumeLaunch("", "", cwd, $"Refused: the {(isClaude ? "claude" : "codex")} CLI was not found at a trusted path.");
 
-        var args = isClaude ? $"--resume {id}" : $"resume --include-non-interactive {id}";
+        var baseArgs = isClaude ? $"--resume {id}" : $"resume --include-non-interactive {id}";
+        // Optional user-configured launch args (e.g. "--profile http_sse" for Codex) go in the PREFIX
+        // position — right after the exe, before the subcommand — so global flags apply (Codex requires
+        // --profile before `resume`). Empty leaves the default command exactly as it was. Newlines are
+        // stripped so a stray paste can't break the cmd line; this is the user's own local config.
+        var extra = (extraArgsOverride ?? (isClaude ? Store.Settings.ClaudeLaunchArgs : Store.Settings.CodexLaunchArgs) ?? "")
+            .Replace("\r", " ").Replace("\n", " ").Trim();
+        var args = string.IsNullOrEmpty(extra) ? baseArgs : $"{extra} {baseArgs}";
         return new ResumeLaunch(exe, args, cwd, $"\"{exe}\" {args}");
     }
 
