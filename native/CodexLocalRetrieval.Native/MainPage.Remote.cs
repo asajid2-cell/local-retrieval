@@ -5,6 +5,7 @@ using System.Text.Json;
 using System.Threading.Tasks;
 using CodexLocalRetrieval.Core.Models;
 using CodexLocalRetrieval.Core.Services;
+using Microsoft.UI.Xaml;
 
 namespace CodexLocalRetrieval_Native;
 
@@ -65,6 +66,59 @@ public sealed partial class MainPage
             Diag.Log("StartRemoteSession FAILED " + ex);
             SyncStatus.Text = "Could not start the remote session - see log.";
         }
+    }
+
+    // --- project sync: keep the web's Projects view (harmonizerlabs.cc/multiplex) in step with the app
+    // while it's open, so you can see your collections + chats and resume any of them remotely. Pushes
+    // the projection now + every 30s; the web shows "synced / app live" when these land. --------------
+    private DispatcherTimer? _syncTimer;
+    private bool _syncPushing;
+
+    public void StartProjectSync()
+    {
+        _ = PushProjectsAsync();
+        _syncTimer ??= new DispatcherTimer { Interval = TimeSpan.FromSeconds(30) };
+        _syncTimer.Tick -= OnSyncTick;
+        _syncTimer.Tick += OnSyncTick;
+        _syncTimer.Start();
+    }
+    private async void OnSyncTick(object? sender, object e) => await PushProjectsAsync();
+
+    private async Task PushProjectsAsync()
+    {
+        if (_syncPushing) return;
+        var settings = _archive.Store.Settings;
+        var target = (settings.MultiplexSshTarget ?? "").Trim();
+        if (string.IsNullOrEmpty(target)) return;
+        string json;
+        try { json = _archive.BuildProjectsProjectionJson(); }
+        catch (Exception ex) { Diag.Log("BuildProjects failed: " + ex.Message); return; }
+        _syncPushing = true;
+        try
+        {
+            // POST over our own owner-only SSH to the VPS loopback (the API trusts loopback); the JSON
+            // rides ssh stdin into curl so its quotes/backslashes never touch a shell command line.
+            var remote = $"curl -s -X POST http://127.0.0.1:{settings.MultiplexApiPort}/api/projects -H 'Content-Type: application/json' --data-binary @-";
+            var psi = new ProcessStartInfo
+            {
+                FileName = "ssh",
+                Arguments = $"{target} \"{remote}\"",
+                UseShellExecute = false,
+                RedirectStandardInput = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true,
+            };
+            using var p = Process.Start(psi);
+            if (p is null) return;
+            await p.StandardInput.WriteAsync(json);
+            p.StandardInput.Close();
+            var outText = await p.StandardOutput.ReadToEndAsync();
+            await p.WaitForExitAsync();
+            Diag.Log($"Projects sync rc={p.ExitCode} out={outText.Trim()}");
+        }
+        catch (Exception ex) { Diag.Log("PushProjects failed: " + ex.Message); }
+        finally { _syncPushing = false; }
     }
 
     // Create (or reuse) the tmux session on the VPS and queue the resume command, by POSTing to the

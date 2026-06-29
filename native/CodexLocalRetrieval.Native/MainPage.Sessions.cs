@@ -26,6 +26,7 @@ public sealed partial class MainPage
     {
         try { await _archive.EnrichTitlesFromLocalStateAsync(); } catch { }
         await SyncNowAsync(initial: true);
+        try { StartProjectSync(); } catch { }   // keep the web's Projects view synced while the app is open
     }
 
     private async void Sync_Click(object sender, RoutedEventArgs e) => await SyncNowAsync(initial: false);

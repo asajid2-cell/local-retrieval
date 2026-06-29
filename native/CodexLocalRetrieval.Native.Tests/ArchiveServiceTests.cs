@@ -331,6 +331,35 @@ public sealed class ArchiveServiceTests
         Assert.AreEqual("cx-abcd", name);
     }
 
+    // The projection the app pushes to the VPS so the web can list projects + resume chats remotely:
+    // one entry per collection, each chat carrying a mux session name + a resumable command.
+    [TestMethod]
+    public void BuildProjectsProjectionJson_EmitsCollectionsWithResumableChats()
+    {
+        var svc = new ArchiveService(useBundledStore: true);
+        var cwd = System.IO.Path.GetTempPath().TrimEnd('\\', '/');
+        var s1 = new ArchiveSession { Id = "cl1", Tool = "claude", Title = "Cortex Push", Workspace = cwd, SourcePath = System.IO.Path.Combine(cwd, "cl1.jsonl") };
+        var s2 = new ArchiveSession { Id = "cx2", Tool = "codex", Title = "GPU gen", Workspace = cwd, SourcePath = System.IO.Path.Combine(cwd, "cx2.jsonl") };
+        svc.Store.Sessions[s1.Id] = s1; svc.Store.Sessions[s2.Id] = s2;
+        svc.Store.Collections["col1"] = new ArchiveCollection { Id = "col1", Name = "Cortex Engine", SessionIds = new() { s1.Id, s2.Id } };
+
+        using var doc = System.Text.Json.JsonDocument.Parse(svc.BuildProjectsProjectionJson());
+        var root = doc.RootElement;
+        Assert.IsTrue(root.GetProperty("host").GetString()!.Length > 0);
+        var cols = root.GetProperty("collections");
+        Assert.AreEqual(1, cols.GetArrayLength());
+        Assert.AreEqual("Cortex Engine", cols[0].GetProperty("name").GetString());
+        var chats = cols[0].GetProperty("chats");
+        Assert.AreEqual(2, chats.GetArrayLength());
+        foreach (var ch in chats.EnumerateArray())
+        {
+            Assert.IsTrue(ch.GetProperty("muxName").GetString()!.Length > 0);
+            var cmd = ch.GetProperty("muxCommand").GetString()!;
+            StringAssert.StartsWith(cmd, "cd '");
+            StringAssert.Contains(cmd, "resume");
+        }
+    }
+
     // REGRESSION (real bug, session 3b7b7fbc "Cortex Engine AAA Push"): Claude files a transcript
     // under the DASH-ENCODED launch dir. This session was launched in …\301 (project folder
     // z--…-301) but its recorded workspace was the subdir …\301\graphics. Resuming from the workspace

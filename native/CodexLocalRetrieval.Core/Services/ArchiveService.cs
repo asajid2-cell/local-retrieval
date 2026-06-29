@@ -1628,6 +1628,37 @@ public sealed class ArchiveService
         return string.IsNullOrEmpty(name) ? tool : name;
     }
 
+    // A compact JSON projection of every collection + its resumable chats, pushed to the VPS so the
+    // web (harmonizerlabs.cc/multiplex → Projects) can list your projects and resume any chat into a
+    // multiplex from anywhere. Each chat carries the multiplex session name + the resume command the
+    // web POSTs to /api/sessions. Only chats with a safe, resumable command are included.
+    public string BuildProjectsProjectionJson()
+    {
+        var collections = Store.Collections.Values
+            .OrderBy(c => c.Name, StringComparer.OrdinalIgnoreCase)
+            .Select(col => new
+            {
+                id = col.Id,
+                name = col.Name,
+                chats = col.SessionIds
+                    .Select(sid => Store.Sessions.TryGetValue(sid, out var s) ? s : null)
+                    .Where(s => s is not null)
+                    .Select(s => new
+                    {
+                        id = s!.Id,
+                        title = s.DisplayTitle,
+                        tool = s.Tool,
+                        muxName = MultiplexSessionName(s),
+                        muxCommand = BuildMultiplexCommand(s),
+                    })
+                    .Where(c => !string.IsNullOrEmpty(c.muxCommand))
+                    .ToList(),
+            })
+            .Where(c => c.chats.Count > 0)
+            .ToList();
+        return JsonSerializer.Serialize(new { host = Environment.MachineName, collections });
+    }
+
     public static string ResolveClaudeExe()
     {
         var local = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".local", "bin", "claude.exe");

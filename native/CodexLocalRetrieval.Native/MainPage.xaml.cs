@@ -1290,7 +1290,7 @@ public sealed partial class MainPage : Page
         resume.Click += (_, _) => ResumeInTerminal(session);
         flyout.Items.Add(resume);
 
-        var remote = new MenuFlyoutItem { Text = "Start remote session" };
+        var remote = new MenuFlyoutItem { Text = "Resume in multiplex" };
         ToolTipService.SetToolTip(remote, "Resume in a multiplex you can also drive from your phone (harmonizerlabs.cc/multiplex).");
         remote.Click += (_, _) => StartRemoteSession(session);
         flyout.Items.Add(remote);
