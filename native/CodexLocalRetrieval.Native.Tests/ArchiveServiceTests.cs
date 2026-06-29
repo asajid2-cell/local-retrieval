@@ -274,6 +274,63 @@ public sealed class ArchiveServiceTests
         Assert.AreEqual("--mcp-debug --resume cl-7", launch.Arguments);
     }
 
+    // The multiplex resume command runs over SSH-into-Windows where `codex` is the shim that already
+    // adds --profile http_sse, so the command must use the BARE tool name and must NOT re-add the
+    // local launch-args (a doubled --profile would break codex's arg parser). The cd uses forward
+    // slashes so the Windows path survives JSON+shell nesting on the way to the API.
+    [TestMethod]
+    public void BuildMultiplexCommand_Codex_BareToolForwardSlashCd_NoDoubledProfile()
+    {
+        var service = new ArchiveService(useBundledStore: true);
+        service.Store.Settings.CodexLaunchArgs = "--profile http_sse";
+        var cwd = Path.GetTempPath().TrimEnd('\\', '/');
+        var session = new ArchiveSession { Id = "cx-9", Tool = "codex", Workspace = cwd, SourcePath = Path.Combine(cwd, "cx-9.jsonl") };
+
+        var cmd = service.BuildMultiplexCommand(session);
+
+        Assert.AreEqual($"cd '{cwd.Replace('\\', '/')}'; codex resume --include-non-interactive cx-9", cmd);
+        Assert.IsFalse(cmd.Contains("--profile"), "shim adds the profile; the command must not double it");
+        Assert.IsFalse(cmd.Contains("\\"), "the cd path must use forward slashes");
+    }
+
+    [TestMethod]
+    public void BuildMultiplexCommand_Claude_UsesClaudeResume()
+    {
+        var service = new ArchiveService(useBundledStore: true);
+        var cwd = Path.GetTempPath().TrimEnd('\\', '/');
+        var session = new ArchiveSession { Id = "cl-9", Tool = "claude", Workspace = cwd, SourcePath = Path.Combine(cwd, "cl-9.jsonl") };
+
+        var cmd = service.BuildMultiplexCommand(session);
+
+        Assert.AreEqual($"cd '{cwd.Replace('\\', '/')}'; claude --resume cl-9", cmd);
+    }
+
+    [TestMethod]
+    public void BuildMultiplexCommand_RefusesUnsafeSessionId()
+    {
+        var service = new ArchiveService(useBundledStore: true);
+        var cmd = service.BuildMultiplexCommand(new ArchiveSession { Id = "x & calc", Tool = "codex", Workspace = Path.GetTempPath() });
+        Assert.AreEqual("", cmd);
+    }
+
+    // The tmux/tab name is a legible slug of the title plus a short id tail, so two same-titled chats
+    // still get distinct sessions and the phone tab is readable.
+    [TestMethod]
+    public void MultiplexSessionName_SlugifiesTitleWithIdTail()
+    {
+        var session = new ArchiveSession { Id = "3b7b7fbc-c196", Tool = "claude", Title = "Cortex Engine AAA Push" };
+        var name = ArchiveService.MultiplexSessionName(session);
+        Assert.AreEqual("cortex-engine-aaa-push-3b7b", name);
+    }
+
+    [TestMethod]
+    public void MultiplexSessionName_FallsBackToToolAndIdWhenNoTitle()
+    {
+        var session = new ArchiveSession { Id = "abcd1234", Tool = "codex", Title = "" };
+        var name = ArchiveService.MultiplexSessionName(session);
+        Assert.AreEqual("cx-abcd", name);
+    }
+
     // REGRESSION (real bug, session 3b7b7fbc "Cortex Engine AAA Push"): Claude files a transcript
     // under the DASH-ENCODED launch dir. This session was launched in …\301 (project folder
     // z--…-301) but its recorded workspace was the subdir …\301\graphics. Resuming from the workspace

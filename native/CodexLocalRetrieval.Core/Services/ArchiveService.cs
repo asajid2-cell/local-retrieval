@@ -1596,6 +1596,38 @@ public sealed class ArchiveService
         return new ResumeLaunch(exe, args, cwd, $"\"{exe}\" {args}");
     }
 
+    // The shell command injected into a multiplex (tmux → SSH-into-Windows) session so it resumes THIS
+    // chat: cd into the recovered launch dir, then run the resume by BARE tool name. claude/codex
+    // resolve on the Windows SSH PATH — codex via the ~/.local/bin shim, which already injects
+    // --profile http_sse — so we deliberately omit the local launch-args here to avoid a doubled flag.
+    // Forward slashes in the cd path (PowerShell accepts them) sidestep JSON/backslash escaping when
+    // this is POSTed to the multiplex API. Returns "" if the session id isn't a safe token.
+    public string BuildMultiplexCommand(ArchiveSession session)
+    {
+        var id = string.IsNullOrWhiteSpace(session.Id) ? Path.GetFileNameWithoutExtension(session.SourcePath) : session.Id;
+        if (!IsResumableId(id)) return "";
+        var isClaude = string.Equals(session.Tool, "claude", StringComparison.OrdinalIgnoreCase);
+        var cwd = (isClaude ? ResolveClaudeResumeDirectory(session) : ResolveWorkingDirectory(session)).Replace('\\', '/');
+        var tool = isClaude ? "claude" : "codex";
+        var args = isClaude ? $"--resume {id}" : $"resume --include-non-interactive {id}";
+        return $"cd '{cwd}'; {tool} {args}";
+    }
+
+    // A readable, collision-resistant tmux session name for a chat: a slug of its title plus a short
+    // id tail so two chats that happen to share a title still get distinct sessions/tabs. The server
+    // re-sanitizes to [A-Za-z0-9_.-]; we pre-shape it here so the tab label is legible on a phone.
+    public static string MultiplexSessionName(ArchiveSession session)
+    {
+        var id = string.IsNullOrWhiteSpace(session.Id) ? Path.GetFileNameWithoutExtension(session.SourcePath) : session.Id;
+        var slug = Regex.Replace((session.DisplayTitle ?? "").ToLowerInvariant(), "[^a-z0-9]+", "-").Trim('-');
+        if (slug.Length > 28) slug = slug.Substring(0, 28).Trim('-');
+        var tail = Regex.Replace(id ?? "", "[^A-Za-z0-9]", "");
+        tail = tail.Length > 4 ? tail.Substring(0, 4) : tail;
+        var tool = string.Equals(session.Tool, "claude", StringComparison.OrdinalIgnoreCase) ? "cl" : "cx";
+        var name = string.IsNullOrEmpty(slug) ? $"{tool}-{tail}" : $"{slug}-{tail}";
+        return string.IsNullOrEmpty(name) ? tool : name;
+    }
+
     public static string ResolveClaudeExe()
     {
         var local = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".local", "bin", "claude.exe");
