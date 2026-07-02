@@ -45,6 +45,7 @@ ENV = loadenv()
 TOKEN = ENV.get("MUX_HOST_TOKEN", "")
 RELAYS = [u for u in [ENV.get("RELAY_LAN", ""), ENV.get("RELAY_PUBLIC", "")] if u]
 DEFAULT_CWD = ENV.get("DEFAULT_CWD", r"Z:\328\CMPUT328-A2\codexworks\301")
+LOCAL_PORT = int(ENV.get("LOCAL_PORT", "7699"))   # muxctl local-attach loopback port
 RING_CAP = 800_000           # per-session scrollback bytes kept
 SB_SEND = 260_000            # bytes replayed to a newly-attached viewer
 
@@ -58,6 +59,7 @@ class Session:
         self.deaths = []
         self.loop, self.outq = loop, outq
         self.pending = bytearray(); self.plock = threading.Lock()   # output coalescing (flushed by the pump)
+        self.local = set()                                          # local (muxctl) viewer queues — fanned the same output
         self.wq = queue.Queue()                                     # input write queue → serialized, chunked writes
         threading.Thread(target=self._writer, daemon=True).start()
         self.spawn()
@@ -130,10 +132,14 @@ class Session:
             if n >= SB_SEND: break
         return b"".join(reversed(out))
 
-    def tail_text(self, nbytes=1600):
-        raw = b"".join(list(self.ring)[-8:])[-nbytes:]
-        s = raw.decode("utf-8", "replace")
+    def tail_text(self, nbytes=1600, lines=0):
+        raw = bytearray()
+        for b in reversed(self.ring):
+            raw[:0] = b
+            if len(raw) >= nbytes: break
+        s = bytes(raw[-nbytes:]).decode("utf-8", "replace")
         s = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07\x1b]*(\x07|\x1b\\)|[\x00-\x08\x0b\x0c\x0e-\x1f]", "", s)
+        if lines: return "\n".join(s.split("\n")[-lines:]).rstrip()
         return s[-900:]
 
     def alive(self):
@@ -201,8 +207,52 @@ async def main():
             await asyncio.sleep(0.012)
             for s in list(sessions.values()):
                 chunk = s.drain()
-                if chunk: outq.put_nowait(("o", s.name, chunk))
+                if chunk:
+                    outq.put_nowait(("o", s.name, chunk))
+                    for lq in list(s.local):
+                        try: lq.put_nowait(chunk)
+                        except Exception: pass
     asyncio.create_task(flush_out())
+
+    # ---- LOCAL attach server (muxctl): loopback-only, no token — a raw console client streams a session
+    # exactly like a web viewer, so you get `tmux attach`-style parity from a Windows Terminal on the PC.
+    async def local_serve():
+        import websockets as _ws
+        async def handler(ws):
+            try:
+                first = json.loads(await ws.recv())
+            except Exception:
+                return
+            if first.get("t") == "ls":
+                await ws.send(json.dumps({"t": "ls", "list": sess_list()})); return
+            name = SAFE(first.get("s", ""))
+            if name not in sessions:
+                await ws.send(json.dumps({"t": "err", "m": "no such session: " + name})); return
+            s = sessions[name]
+            lq = asyncio.Queue(); s.local.add(lq)
+            if first.get("cols"): s.resize(int(first.get("cols")), int(first.get("rows") or 40))
+            try:
+                await ws.send(json.dumps({"t": "o", "d": base64.b64encode(s.scrollback()).decode()}))
+                async def pump():
+                    while True:
+                        data = await lq.get()
+                        await ws.send(json.dumps({"t": "o", "d": base64.b64encode(data).decode()}))
+                pt = asyncio.create_task(pump())
+                try:
+                    async for raw in ws:
+                        try: m = json.loads(raw)
+                        except Exception: continue
+                        if m.get("t") == "i": s.write(base64.b64decode(m.get("d", "")))
+                        elif m.get("t") == "resize": s.resize(m.get("cols", 140), m.get("rows", 40))
+                finally: pt.cancel()
+            finally:
+                s.local.discard(lq)
+        try:
+            async with _ws.serve(handler, "127.0.0.1", LOCAL_PORT):
+                await asyncio.Future()
+        except Exception as e:
+            log(f"local attach server failed on :{LOCAL_PORT}: {e}")
+    asyncio.create_task(local_serve())
 
     import websockets
     backoff = 1
@@ -239,9 +289,13 @@ async def main():
                                 if name in sessions and sessions[name].alive():
                                     pass                                    # already hosted + alive
                                 else:
-                                    if name in sessions: sessions[name].kill(by_user=False)
-                                    sessions[name] = Session(name, m.get("cmd", ""), m.get("cwd", ""),
-                                                             int(m.get("cols") or 140), int(m.get("rows") or 40), loop, outq)
+                                    prev = sessions.get(name)               # reviving a DEAD session → keep its cmd/cwd/size (don't wipe the resume)
+                                    cmd = m.get("cmd", "") or (prev.cmd if prev else "")
+                                    cwd = m.get("cwd", "") or (prev.cwd if prev else "")
+                                    cols = int(m.get("cols") or (prev.cols if prev else 140))
+                                    rows = int(m.get("rows") or (prev.rows if prev else 40))
+                                    if prev: prev.kill(by_user=False)
+                                    sessions[name] = Session(name, cmd, cwd, cols, rows, loop, outq)
                                     manifest_save()
                                 await ws.send(json.dumps({"t": "sessions", "list": sess_list()}))
                             elif t == "i" and name in sessions:
@@ -251,6 +305,14 @@ async def main():
                             elif t == "sb" and name in sessions:
                                 await ws.send(json.dumps({"t": "sb", "s": name,
                                                           "d": base64.b64encode(sessions[name].scrollback()).decode()}))
+                            elif t == "rename" and name in sessions:
+                                to = SAFE(m.get("to", ""))
+                                if to and to not in sessions:
+                                    s = sessions.pop(name); s.name = to; sessions[to] = s; manifest_save()
+                                    await ws.send(json.dumps({"t": "sessions", "list": sess_list()}))
+                            elif t == "tail" and name in sessions:
+                                await ws.send(json.dumps({"t": "tailr", "rid": m.get("rid", ""),
+                                                          "text": sessions[name].tail_text(nbytes=200000, lines=int(m.get("lines") or 40))}))
                             elif t == "kill" and name in sessions:
                                 sessions[name].kill(by_user=True)
                                 del sessions[name]; manifest_save()
