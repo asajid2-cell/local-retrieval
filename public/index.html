@@ -1,0 +1,1376 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0a0a0c">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>multiplex</title>
+<link rel="stylesheet" href="vendor/xterm.css">
+<style>
+  /* Operational terminal control surface, harmonizer black-rose. One clean top bar (brand + tabs +
+     borderless control icons), the terminal, a thin workbench status strip, and a moded touch keybar.
+     One rose accent; emerald=live/attached, amber=activity/reconnecting. 4px scale. >=44px on touch. */
+  :root {
+    --bg:#0a0a0c; --panel:#101014; --panel-2:#16161b; --raised:#20202a; --raised-2:#282833;
+    --line:#23232b; --line-soft:#1b1b22;
+    --txt:#ededf0; --muted:#9494a0; --faint:#6a6a76;
+    --rose:#fb7185; --rose-dim:rgba(251,113,133,.14);
+    --live:#34d399; --warn:#fbbf24;
+    --sp1:4px; --sp2:8px; --sp3:12px; --sp4:16px;
+    --r-s:7px; --r-m:9px; --r-l:14px;
+  }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  :focus-visible { outline:2px solid var(--rose); outline-offset:2px; border-radius:var(--r-s); }
+  html, body {
+    margin:0; height:100%; background:var(--bg); color:var(--txt);
+    font:500 14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+    overscroll-behavior:none; -webkit-text-size-adjust:100%;
+  }
+  body { position:fixed; inset:0; }
+  #app {
+    display:grid; height:100dvh; min-height:0;
+    grid-template-columns: minmax(0,1fr);
+    grid-template-rows: auto auto minmax(0,1fr) auto auto;
+    grid-template-areas: "topbar" "tabs" "term" "status" "keys";
+  }
+  #app.zen #tabwrap { display:none; }   /* zen hides the tab strip; the topbar (with the exit button) STAYS, so you can always get out */
+
+  /* ---- top bar ---- */
+  #topbar {
+    grid-area:topbar; display:flex; align-items:center; gap:var(--sp2);
+    padding:var(--sp2) var(--sp3); padding-top:max(var(--sp2),env(safe-area-inset-top));
+    background:var(--panel); border-bottom:1px solid var(--line);
+  }
+  .brand { display:flex; align-items:center; gap:var(--sp2); flex:0 0 auto; }
+  .brand .glyph { width:19px; height:19px; }
+  .brand .wordmark { font-weight:600; font-size:15px; letter-spacing:.2px; }
+  .hdot { border:none; background:none; cursor:pointer; font-size:10px; line-height:1; padding:2px 3px; color:#4a4a54; transition:color .3s; }
+  .hdot.ok { color:#34d399; } .hdot.warn { color:#fbbf24; } .hdot.bad { color:#fb7185; }
+  .spacer { flex:1 1 auto; }
+  /* shrink + wrap so the icon row never overflows the header, no matter how many icons show
+     (e.g. desktop-only controls appearing at 400% zoom / very narrow desktop widths). */
+  .top-actions { display:flex; align-items:center; justify-content:flex-end; flex-wrap:wrap; gap:2px; flex:0 1 auto; min-width:0; }
+  .icon {
+    height:38px; min-width:38px; padding:0 var(--sp2); display:inline-grid; place-items:center;
+    border:none; border-radius:var(--r-m); background:transparent; color:var(--muted);
+    font:600 14px/1 ui-monospace,SFMono-Regular,Menlo,monospace; cursor:pointer; user-select:none;
+  }
+  .icon:hover { background:var(--panel-2); color:var(--txt); }
+  .icon:active { background:var(--raised); }
+  .icon.on { color:var(--rose); }
+  .icon svg { width:17px; height:17px; display:block; }
+  .compose-desktop { display:none; }
+  @media (hover:hover) and (pointer:fine) { .compose-desktop { display:inline-grid; } }
+
+  /* ---- session tabs ---- */
+  #tabwrap {
+    grid-area:tabs; display:flex; align-items:center; gap:var(--sp2);
+    padding:var(--sp2) var(--sp3); background:var(--panel); border-bottom:1px solid var(--line);
+  }
+  #tabs { display:flex; align-items:center; gap:var(--sp2); flex:0 1 auto; min-width:0; overflow-x:auto; scrollbar-width:none; }
+  #tabs::-webkit-scrollbar { display:none; }
+  #tabs:empty::before { content:"no sessions — tap + to start one"; color:var(--muted); font-size:13px; padding:0 var(--sp1); white-space:nowrap; }
+  .tab {
+    position:relative; display:flex; align-items:center; gap:var(--sp2); flex:0 0 auto; max-width:54vw;
+    height:38px; padding:0 var(--sp1) 0 var(--sp3); border-radius:var(--r-m);
+    background:transparent; color:var(--muted); cursor:pointer;
+  }
+  .tab:hover { background:var(--panel-2); color:var(--txt); }
+  /* active = filled + a crisp rose left accent (not a floating bead) */
+  .tab.active { background:var(--raised); color:var(--txt); box-shadow:inset 2px 0 0 var(--rose); padding-left:calc(var(--sp3) + 2px); }
+  /* the dot is a STATE signal for non-active tabs only: emerald=attached elsewhere, rose=unread */
+  /* persistent agent-status dot: white=neutral shell · green=working · yellow=idle/waiting · red=agent gone */
+  .tab .dot { width:8px; height:8px; border-radius:50%; background:#9aa0a6; flex:0 0 auto; transition:background .25s, box-shadow .25s; }
+  .tab[data-state="white"]  .dot { background:#e8eaed; }
+  .tab[data-state="green"]  .dot { background:var(--live);  box-shadow:0 0 0 3px rgba(52,211,153,.16); }
+  .tab[data-state="yellow"] .dot { background:var(--warn);  box-shadow:0 0 0 3px rgba(251,191,36,.16); }
+  .tab[data-state="red"]    .dot { background:var(--rose);  box-shadow:0 0 0 3px var(--rose-dim); }
+  .tab.unread .dot { animation: dotpulse 1.4s ease-in-out infinite; }   /* changed-while-away: pulse, any color */
+  @keyframes dotpulse { 0%,100%{ opacity:1 } 50%{ opacity:.4 } }
+  .tab .nm { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:13.5px; font-weight:500; }
+  .tab.autoheal .nm::before { content:'⟳'; margin-right:3px; opacity:.65; font-size:.85em; }   /* per-tab auto-resume ON */
+  .tab .kebab {
+    flex:0 0 auto; width:24px; height:24px; display:grid; place-items:center; border:none;
+    background:transparent; border-radius:var(--r-s); color:var(--faint); font-size:16px; line-height:1; cursor:pointer; opacity:.65;
+  }
+  .tab .kebab:hover { background:var(--raised-2); color:var(--txt); opacity:1; }
+  .newtab {
+    flex:0 0 auto; height:34px; min-width:34px; padding:0 var(--sp2); display:inline-grid; place-items:center;
+    border:none; border-radius:var(--r-m); background:transparent; color:var(--rose);
+    font:600 20px/1 ui-monospace,monospace; cursor:pointer;
+  }
+  .newtab:hover { background:var(--rose-dim); }
+
+  /* ---- terminal ---- */
+  #term { grid-area:term; position:relative; min-height:0; min-width:0; background:#000; padding:var(--sp1) var(--sp2); overflow:hidden; }
+  /* "pan" = the shared window is bigger than this screen (a phone following a desktop): let the user
+     drag horizontally to see the full width. xterm renders at its natural cols/rows; we scroll the host. */
+  #term.pan { overflow:auto; touch-action:pan-x pan-y; }
+  #term.pan .xterm, #term.pan .xterm-viewport, #term.pan .xterm-screen { width:max-content !important; }
+  #empty {
+    position:absolute; inset:0; z-index:5; display:flex; flex-direction:column; gap:var(--sp3);
+    align-items:center; justify-content:center; text-align:center; padding:var(--sp4); color:var(--muted);
+    background:#000;   /* sits above xterm's layer so the Start buttons are on top + clickable when no session is open */
+  }
+  #empty .big { color:var(--txt); font-size:17px; font-weight:600; }
+  #empty .sub { font-size:13.5px; max-width:34ch; line-height:1.5; }
+  #empty .quick { display:flex; flex-wrap:wrap; gap:var(--sp2); justify-content:center; }
+  #empty .quick button {
+    height:40px; padding:0 var(--sp3); border-radius:var(--r-m); border:1px solid var(--line);
+    background:var(--panel-2); color:var(--txt); font:600 13.5px/1 inherit; cursor:pointer; display:flex; align-items:center; gap:6px;
+  }
+  #empty .quick button:hover { border-color:var(--rose); }
+  #empty .quick .rose { color:var(--rose); font-size:16px; }
+  /* jump-to-live pill, anchored in the terminal (not floating chrome) */
+  #jumplive {
+    position:absolute; right:14px; bottom:14px; display:none; align-items:center; gap:6px;
+    height:34px; padding:0 var(--sp3); border-radius:999px; border:1px solid var(--rose);
+    background:var(--rose); color:#1a0a0e; font:600 13px/1 inherit; cursor:pointer; box-shadow:0 6px 20px rgba(0,0,0,.5);
+  }
+  #jumplive.show { display:inline-flex; }
+
+  /* ---- workbench status strip ---- */
+  #status {
+    grid-area:status; display:flex; align-items:center; gap:var(--sp2); min-width:0;
+    padding:6px var(--sp3); font-size:12.5px; color:var(--muted);
+    background:var(--panel); border-top:1px solid var(--line-soft);
+  }
+  #status .sdot { width:7px; height:7px; border-radius:50%; background:var(--faint); flex:0 0 auto; }
+  #status.live .sdot { background:var(--live); box-shadow:0 0 0 3px rgba(52,211,153,.15); }
+  #status.busy .sdot { background:var(--warn); }
+  #status.err  .sdot { background:var(--warn); }
+  #status #statustext { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:1 1 auto; }
+  #status .name { color:var(--txt); font-weight:600; }
+  #status .meta { flex:0 0 auto; color:var(--muted); font-variant-numeric:tabular-nums; }
+
+  /* ---- moded touch keybar ---- */
+  #keybar {
+    grid-area:keys; display:flex; align-items:center; gap:var(--sp2); overflow-x:auto; scrollbar-width:none;
+    padding:var(--sp2) var(--sp3); padding-bottom:max(var(--sp2),env(safe-area-inset-bottom));
+    background:var(--panel-2); border-top:1px solid var(--line);
+  }
+  #keybar::-webkit-scrollbar { display:none; }
+  /* ---- Select & copy overlay: a frozen, natively-selectable copy of the terminal text ---- */
+  #copyview { position:fixed; inset:0; z-index:60; background:#000; display:flex; flex-direction:column; }
+  #copyview[hidden] { display:none; }
+  #copybar { display:flex; align-items:center; gap:.5rem; flex-wrap:wrap; padding:.55rem .75rem;
+    background:#15151a; border-bottom:1px solid #2a2a33; color:#c9c9d2; font-size:13px; }
+  #copybar .spring { flex:1 1 auto; }
+  #copyhint b { color:#ededf0; font-weight:600; }
+  #copyview .cvbtn { min-height:38px; padding:.35rem .9rem; border-radius:9px; border:1px solid #3a3a44;
+    background:#1e1e26; color:#ededf0; font:inherit; cursor:pointer; }
+  #copyview .cvbtn.primary { background:#fb7185; border-color:#fb7185; color:#000; font-weight:600; }
+  #copytext { flex:1; margin:0; padding:.75rem 1rem; overflow:auto; white-space:pre; tab-size:4;
+    color:#ededf0; background:#000; -webkit-user-select:text; user-select:text; -webkit-overflow-scrolling:touch;
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"Roboto Mono",monospace; font-size:13px; line-height:1.35; }
+  #copytext::selection { background:#7c3f4a; color:#fff; }
+  #copytext::-moz-selection { background:#7c3f4a; color:#fff; }
+  .kmodes { display:flex; gap:2px; flex:0 0 auto; background:var(--panel); border:1px solid var(--line); border-radius:var(--r-m); padding:2px; }
+  .kmode {
+    height:40px; min-width:40px; padding:0 10px; display:grid; place-items:center; border:none; appearance:none;
+    background:transparent; color:var(--muted); border-radius:var(--r-s); font:600 13px/1 inherit; cursor:pointer;
+  }
+  .kmode.active { background:var(--raised); color:var(--txt); }
+  .kdiv { flex:0 0 auto; width:1px; height:28px; background:var(--line); }
+  .kkeys { display:flex; gap:var(--sp2); flex:0 0 auto; }
+  .key {
+    flex:0 0 auto; min-width:46px; height:44px; padding:0 var(--sp3); display:grid; place-items:center;
+    border:1px solid var(--line); border-radius:var(--r-m); background:var(--panel); appearance:none;
+    color:var(--txt); font:600 14px/1 ui-monospace,SFMono-Regular,Menlo,monospace; cursor:pointer; user-select:none;
+  }
+  .key:active { background:var(--raised); }
+  .key.mod.active { background:var(--rose); color:#1a0a0e; border-color:var(--rose); }
+  .key.active { background:var(--rose); color:#1a0a0e; border-color:var(--rose); }   /* Sel toggle when ON */
+  .key.accent { background:var(--raised); border-color:var(--line); }
+  .key.core { min-width:44px; }
+  #term.selecting { cursor:text; }
+  #term.selecting .xterm-screen { cursor:text; }
+
+  /* ---- projects view (synced from the desktop app) ---- */
+  #projects { grid-area:term; display:none; flex-direction:column; min-height:0; min-width:0; background:var(--bg); }
+  #app.projects #term { display:none; }
+  #app.projects #projects { display:flex; }
+  #app.projects #tabwrap, #app.projects #status, #app.projects #keybar { display:none; }
+  #syncbar {
+    display:flex; align-items:center; gap:var(--sp2); padding:var(--sp2) var(--sp3);
+    background:var(--panel); border-bottom:1px solid var(--line); font-size:12.5px; color:var(--muted); flex:0 0 auto;
+  }
+  #syncbar .sdot { width:8px; height:8px; border-radius:50%; background:var(--faint); flex:0 0 auto; }
+  #syncbar.live .sdot { background:var(--live); box-shadow:0 0 0 3px rgba(52,211,153,.15); }
+  #syncbar.stale .sdot { background:var(--warn); }
+  #syncbar #synctext { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  #syncbar .grow { flex:1 1 auto; }
+  #syncbar .b { color:var(--txt); font-weight:600; }
+  #projsearch { flex:0 0 auto; padding:var(--sp2) var(--sp3); background:var(--panel); border-bottom:1px solid var(--line); }
+  #projfilter { width:100%; height:38px; padding:0 var(--sp3); border-radius:var(--r-m); border:1px solid var(--line);
+    background:var(--panel-2); color:var(--txt); font:500 14px -apple-system,Segoe UI,Roboto,sans-serif; }
+  #projfilter:focus { outline:none; border-color:var(--rose); }
+  #projlist { flex:1 1 auto; overflow-y:auto; padding:var(--sp3); display:flex; flex-direction:column; gap:var(--sp2); }
+  .collection { border:1px solid var(--line); border-radius:var(--r-m); background:var(--panel); overflow:hidden; }
+  .collection .chead { display:flex; align-items:center; gap:var(--sp2); width:100%; padding:var(--sp3);
+    background:transparent; border:none; color:var(--txt); font:inherit; cursor:pointer; text-align:left; min-height:48px; }
+  .collection .chead:hover { background:var(--panel-2); }
+  .collection .chev { width:15px; height:15px; flex:0 0 auto; color:var(--faint); transition:transform .15s ease; }
+  .collection.open .chev { transform:rotate(90deg); }
+  .collection .cname { font-weight:600; font-size:14px; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .collection .crun { flex:0 0 auto; width:7px; height:7px; border-radius:50%; background:var(--warn); box-shadow:0 0 0 3px rgba(251,191,36,.14); }
+  .collection .ccount { color:var(--faint); font-size:12px; flex:0 0 auto; margin-left:auto; white-space:nowrap; }
+  .cbody { border-top:1px solid var(--line-soft); display:none; }
+  .collection.open .cbody, #projlist.searching .cbody { display:block; }
+  .chat { display:flex; align-items:center; gap:var(--sp2); padding:var(--sp2) var(--sp3); padding-left:34px; }
+  .chat + .chat { border-top:1px solid var(--line-soft); }
+  .chat .tool { flex:0 0 auto; font:600 10px/1 ui-monospace,monospace; padding:3px 5px; border-radius:5px; background:var(--raised); color:var(--muted); }
+  .chat .ctitle { flex:1 1 auto; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:13.5px; }
+  .chat .resume {
+    flex:0 0 auto; height:34px; padding:0 var(--sp3); border-radius:var(--r-s); border:1px solid var(--rose);
+    background:var(--rose-dim); color:var(--rose); font:600 12.5px/1 inherit; cursor:pointer;
+  }
+  .chat .resume:hover { background:var(--rose); color:#1a0a0e; }
+  .chat .resume.running { border-color:var(--live); background:rgba(52,211,153,.12); color:var(--live); }
+  .chat .resume.running:hover { background:var(--live); color:#0a1a12; }
+  .chat .resume.warn { border-color:var(--warn); background:rgba(251,191,36,.12); color:var(--warn); }
+  .chat .resume.warn:hover { background:var(--warn); color:#1a1206; }
+  .chat .rdot { display:none; width:7px; height:7px; border-radius:50%; background:var(--warn); box-shadow:0 0 0 3px rgba(251,191,36,.14); flex:0 0 auto; }
+  .chat.run .rdot { display:block; }
+  #projempty, .projempty { margin:auto; text-align:center; color:var(--muted); font-size:13.5px; line-height:1.6; padding:var(--sp4); }
+
+  /* ---- popover menu (tab kebab) ---- */
+  #menu {
+    position:fixed; z-index:50; min-width:180px; padding:var(--sp1); border:1px solid var(--line);
+    border-radius:var(--r-m); background:var(--panel-2); box-shadow:0 16px 44px rgba(0,0,0,.6); display:none;
+  }
+  #menu.show { display:block; }
+  #menu .mtitle { padding:6px var(--sp3) 2px; font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.6px; }
+  #menu .msync { padding:0 var(--sp3) 6px; font-size:11px; font-weight:600; }
+  #menu .msync.ok { color:var(--live,#34d399); }
+  #menu .msync.off { color:var(--muted); }
+  #menu button:disabled { opacity:.45; cursor:not-allowed; }
+  #menu button:disabled:hover { background:transparent; }
+  .addcollist { display:flex; flex-direction:column; gap:6px; max-height:40dvh; overflow:auto; margin:0 0 var(--sp2); }
+  .act.wide { width:100%; text-align:left; justify-content:flex-start; }
+  #menu button {
+    display:flex; align-items:center; gap:var(--sp2); width:100%; height:40px; padding:0 var(--sp3); border:none;
+    background:transparent; color:var(--txt); font:500 14px/1 inherit; text-align:left; cursor:pointer; border-radius:var(--r-s);
+  }
+  #menu button:hover { background:var(--raised); }
+  #menu button.danger { color:var(--rose); }
+  #menu button.on { color:var(--live,#34d399); font-weight:600; }   /* auto-resume ON label */
+
+  /* ---- dialogs (new session / rename / compose) ---- */
+  dialog {
+    background:var(--panel); color:var(--txt); border:1px solid var(--line); border-radius:var(--r-l);
+    padding:var(--sp4); width:min(94vw,420px); box-shadow:0 24px 60px rgba(0,0,0,.6);
+  }
+  dialog::backdrop { background:rgba(0,0,0,.6); }
+  dialog h3 { margin:0 0 var(--sp1); font-size:16px; font-weight:600; }
+  dialog p.hint { margin:0 0 var(--sp3); font-size:13px; color:var(--muted); line-height:1.5; }
+  dialog code { background:var(--panel-2); padding:1px 5px; border-radius:6px; font-size:12px; }
+  dialog label { display:block; font-size:12px; color:var(--muted); margin:0 0 6px; }
+  dialog input, dialog textarea {
+    width:100%; padding:11px var(--sp3); border-radius:var(--r-m);
+    border:1px solid var(--line); background:var(--panel-2); color:var(--txt);
+    font:500 16px ui-monospace,monospace; margin-bottom:var(--sp3);
+  }
+  dialog textarea { min-height:120px; resize:vertical; line-height:1.5; }
+  dialog input:focus, dialog textarea:focus { outline:none; border-color:var(--rose); }
+  /* file workspace = mini file explorer (grid + detail) */
+  #uploaddlg { width:min(96vw,620px); }
+  .wshead { display:flex; align-items:center; justify-content:space-between; gap:var(--sp2); flex-wrap:wrap; margin:0 0 var(--sp2); }
+  .wshead h3 { margin:0; }
+  .wstabs { display:flex; gap:6px; }
+  .wstab { height:34px; min-width:0; padding:0 12px; border-radius:var(--r-s); border:1px solid var(--line); background:var(--panel-2); color:var(--muted); font:600 12px/1 inherit; cursor:pointer; }
+  .wstab.active { border-color:var(--rose); color:var(--rose); background:var(--rose-dim); }
+  #wsbody { min-height:180px; max-height:56dvh; overflow:auto; margin:0 0 var(--sp3); }
+  .wsgrid { display:grid; grid-template-columns:repeat(auto-fill, minmax(min(120px,100%),1fr)); gap:var(--sp2); }
+  .wstile { position:relative; display:flex; flex-direction:column; align-items:stretch; gap:4px; min-width:0; padding:var(--sp2);
+            border:1px solid var(--line); border-radius:var(--r-m); background:var(--panel-2); color:var(--txt); cursor:pointer; text-align:left; font:inherit; }
+  .wstile:hover, .wstile:focus-visible { border-color:var(--rose); outline:none; }
+  .wstthumb { width:100%; aspect-ratio:4/3; border-radius:var(--r-s); object-fit:cover; background:var(--bg); display:grid; place-items:center; }
+  .wstthumb.wsticon, .wsticon { color:var(--muted); font:700 13px/1 ui-monospace,monospace; letter-spacing:.5px; }
+  .wstname { font-size:12.5px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-width:0; }
+  .wstsub { font-size:11px; color:var(--muted); }
+  .wstkeep { position:absolute; top:6px; right:8px; color:var(--rose); font-size:13px; line-height:1; }
+  .wsdetail { display:flex; flex-direction:column; gap:var(--sp2); min-width:0; }
+  .wsback { align-self:flex-start; background:none; border:none; color:var(--muted); font:600 13px/1 inherit; cursor:pointer; padding:4px 2px; }
+  .wsback:hover { color:var(--rose); }
+  .wspreview { display:grid; place-items:center; background:var(--bg); border:1px solid var(--line); border-radius:var(--r-m); min-height:160px; max-height:38dvh; overflow:hidden; padding:var(--sp2); }
+  .wspreview img { max-width:100%; max-height:36dvh; object-fit:contain; border-radius:var(--r-s); }
+  .wsbigicon { color:var(--muted); font:700 26px/1 ui-monospace,monospace; letter-spacing:1px; }
+  .wsdname { font-size:14px; font-weight:600; word-break:break-all; min-width:0; }
+  .wsdmeta { font-size:12px; color:var(--muted); }
+  .wsdacts { display:flex; flex-wrap:wrap; align-items:center; gap:8px; }
+  .wsbtn { height:38px; padding:0 14px; border-radius:var(--r-s); border:1px solid var(--line); background:var(--panel-2); color:var(--txt); font:600 13px/1 inherit; cursor:pointer; }
+  .wsbtn:hover { border-color:var(--rose); }
+  .wsbtn.primary { background:var(--rose); color:#1a0a0e; border-color:var(--rose); }   /* dark text on rose — visible (fixes pink-on-pink) */
+  .wsbtn.del { color:var(--rose); }
+  .wsbtn.del:hover { border-color:var(--rose); }
+  .wskeep { display:inline-flex; align-items:center; gap:6px; font-size:13px; color:var(--muted); }
+  .wskeep input { width:auto; margin:0; }
+  dialog label.ck { display:inline-flex; align-items:center; gap:6px; margin:0; font-size:13px; color:var(--txt); }
+  dialog label.ck input { width:auto; margin:0; }
+  @media (pointer:coarse) { .wsbtn, .wstab { height:42px; } }
+  .chips { display:flex; gap:var(--sp2); margin-bottom:var(--sp3); flex-wrap:wrap; }
+  .chip {
+    height:40px; padding:0 var(--sp3); border-radius:var(--r-m); border:1px solid var(--line);
+    background:var(--panel-2); color:var(--txt); font:600 13px/1 inherit; cursor:pointer; display:flex; align-items:center; gap:6px;
+  }
+  .chip.active { border-color:var(--rose); background:var(--rose-dim); }
+  .chip .rose { color:var(--rose); }
+  /* ? help + custom-button creator */
+  #helpdlg { width:min(96vw,560px); }
+  #helpbody { max-height:68dvh; overflow:auto; margin:0 0 var(--sp3); }
+  .helpsec { margin:0 0 var(--sp3); }
+  .helpsec h3 { margin:0 0 var(--sp2); font-size:14px; }
+  .helplist { margin:0; padding-left:18px; font-size:13px; color:var(--muted); line-height:1.7; }
+  .helplist b { color:var(--txt); font-weight:600; }
+  .cblist { display:flex; flex-direction:column; gap:6px; margin:0 0 var(--sp2); }
+  .cbrow { display:flex; align-items:center; gap:8px; padding:6px var(--sp2); border:1px solid var(--line); border-radius:var(--r-m); }
+  .cbrow .cblabel { flex:0 0 auto; font-weight:600; font-size:13px; }
+  .cbrow .cbseq { flex:1 1 auto; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:12px; color:var(--muted); }
+  .cbbtn { flex:0 0 auto; width:34px; height:34px; border-radius:8px; border:1px solid var(--line); background:var(--panel-2); color:var(--txt); font:600 14px/1 inherit; cursor:pointer; }
+  .cbbtn:disabled { opacity:.4; }
+  .cbbtn.del { color:var(--rose); border-color:var(--rose); }
+  .cbform { display:flex; flex-wrap:wrap; align-items:center; gap:8px; }
+  .cbform input, .cbform select { width:auto; flex:0 0 auto; margin:0; padding:9px var(--sp2);
+    border:1px solid var(--line); border-radius:var(--r-m); background:var(--panel-2); color:var(--txt); font:500 14px ui-monospace,monospace; }
+  .cbform #cblabelin { flex:1 1 110px; min-width:88px; }
+  .cbform .cbchar { width:52px; }
+  .cbform .ck { display:inline-flex; align-items:center; gap:4px; margin:0; font-size:13px; color:var(--txt); }
+  .cbform .ck input { width:auto; margin:0; }
+  .cbform .act { height:40px; }
+  #cbprev { flex:1 1 100%; font-size:12px; color:var(--muted); margin:0; min-height:16px; }
+  dialog .row { display:flex; gap:var(--sp2); justify-content:flex-end; align-items:center; }
+  dialog .row .grow { flex:1 1 auto; }
+  dialog button.act {
+    height:44px; padding:0 var(--sp4); border-radius:var(--r-m); border:1px solid var(--line);
+    background:var(--panel-2); color:var(--txt); font:600 14px/1 inherit; cursor:pointer;
+  }
+  dialog button.primary { background:var(--rose); color:#1a0a0e; border-color:var(--rose); }
+
+  /* ---- desktop: one header row; status a bottom strip; keybar hidden (hardware kb) ---- */
+  @media (min-width:60rem) {
+    #app {
+      grid-template-columns: auto minmax(0,1fr) auto;
+      grid-template-rows: 50px minmax(0,1fr) auto auto;
+      grid-template-areas: "brand tabs actions" "term term term" "status status status" "keys keys keys";
+    }
+    #topbar { display:contents; }
+    .brand { grid-area:brand; align-self:stretch; padding-inline:var(--sp4); background:var(--panel); border-bottom:1px solid var(--line); }
+    .spacer { display:none; }
+    #tabwrap { grid-area:tabs; border-bottom:1px solid var(--line); padding-inline:0; }
+    .top-actions { grid-area:actions; align-self:stretch; padding-inline:var(--sp3); background:var(--panel); border-bottom:1px solid var(--line); }
+    .tab { max-width:clamp(9rem,16vw,15rem); }
+  }
+  @media (hover:hover) and (pointer:fine) { #keybar { display:none; } }
+  @media (pointer:coarse) {
+    .icon, .newtab { height:44px; min-width:44px; }
+    .tab { height:44px; }
+    .tab .kebab { width:32px; height:32px; }
+  }
+  @media (max-width:23rem) { .brand .wordmark { display:none; } }   /* keep the icon row from crowding the brand on tiny phones */
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="topbar">
+    <div class="brand">
+      <svg class="glyph" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+        <rect x="2.5" y="4.5" width="19" height="15" rx="3" stroke="#fb7185" stroke-width="1.6"/>
+        <path d="M6.5 9.5l3 2.5-3 2.5" stroke="#fb7185" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+        <path d="M12.5 15h5" stroke="#9494a0" stroke-width="1.6" stroke-linecap="round"/>
+      </svg>
+      <span class="wordmark">multiplex</span>
+      <button id="health" class="hdot" title="System health" aria-label="System health">&#9679;</button>
+    </div>
+    <div class="spacer"></div>
+    <div class="top-actions">
+      <button class="icon" id="projbtn" title="Projects (synced from the app)" aria-label="Projects">
+        <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M3 7a2 2 0 012-2h3.6a2 2 0 011.5.7L12 7.5h7a2 2 0 012 2V17a2 2 0 01-2 2H5a2 2 0 01-2-2V7z" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></svg>
+      </button>
+      <button class="icon compose-desktop" id="composebtn" title="Compose &amp; send a prompt" aria-label="Compose and send">
+        <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M4 20h16M4 16l9-9 4 4-9 9H4v-4z" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </button>
+      <button class="icon compose-desktop" id="uploadbtn" title="Upload &amp; attach a file (pictures, PDFs, zips)" aria-label="Upload and attach a file">
+        <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M21 11.5l-8.6 8.6a5 5 0 01-7.1-7.1l8.6-8.6a3.5 3.5 0 014.9 4.9l-8.5 8.5a2 2 0 01-2.8-2.8l7.8-7.8" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </button>
+      <button class="icon" id="zen" title="Zen / fullscreen (F11)" aria-label="Zen / fullscreen">
+        <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M4 9V5a1 1 0 011-1h4M20 9V5a1 1 0 00-1-1h-4M4 15v4a1 1 0 001 1h4M20 15v4a1 1 0 01-1 1h-4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+      </button>
+      <button class="icon" id="fontdown" title="Smaller text" aria-label="Smaller text">A&minus;</button>
+      <button class="icon" id="fontup" title="Larger text" aria-label="Larger text">A+</button>
+      <button class="icon" id="refresh" title="Refresh sessions" aria-label="Refresh sessions">
+        <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M20 11a8 8 0 10-.6 4M20 5v6h-6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </button>
+      <button class="icon" id="copybtn" title="Select &amp; copy terminal text" aria-label="Select and copy terminal text">
+        <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><rect x="8" y="8" width="12" height="13" rx="2" stroke="currentColor" stroke-width="1.7"/><path d="M15 5.5A1.5 1.5 0 0013.5 4h-8A1.5 1.5 0 004 5.5v9A1.5 1.5 0 005.5 16" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+      </button>
+    </div>
+  </div>
+
+  <div id="tabwrap">
+    <nav id="tabs" role="tablist" aria-label="Sessions" data-destruct-ignore></nav>
+    <button id="new" class="newtab" title="New session (Alt+N)" aria-label="New session">+</button>
+  </div>
+
+  <main id="term">
+    <div id="empty">
+      <span class="big">No session open</span>
+      <span class="sub">Start one — it runs on the VPS and mirrors your desktop, so you can pick it up from anywhere.</span>
+      <span class="quick">
+        <button data-profile="claude"><span class="rose">✳</span> Start Claude</button>
+        <button data-profile="codex"><span class="rose">▢</span> Start Codex</button>
+        <button data-profile="shell"><span class="rose">›</span> Start shell</button>
+      </span>
+    </div>
+    <button id="jumplive" aria-label="Jump to live"><span id="jlcount">new</span> ↓</button>
+  </main>
+
+  <div id="status"><span class="sdot"></span><span id="statustext">connecting&hellip;</span><span class="meta" id="statusmeta"></span></div>
+  <div id="keybar"></div>
+</div>
+
+<div id="copyview" hidden role="dialog" aria-modal="true" aria-label="Select and copy terminal text">
+  <div id="copybar">
+    <span id="copyhint">Drag to select (long-press on phone) &middot; <b>Copy</b> or <b>Ctrl/&#8984;+C</b> &middot; <b>Esc</b> to close</span>
+    <span class="spring"></span>
+    <button id="copyall" class="cvbtn">Copy all</button>
+    <button id="copyclose" class="cvbtn primary">Done</button>
+  </div>
+  <pre id="copytext" tabindex="0"></pre>
+</div>
+
+<div id="menu" role="menu" aria-label="Session actions"></div>
+
+<dialog id="newdlg">
+  <h3>New session</h3>
+  <p class="hint">Runs on the VPS (SSH back into this PC). Pick what to start; name is auto-suggested.</p>
+  <div class="chips" id="profilechips">
+    <button class="chip" data-profile="shell"><span class="rose">›</span> Shell</button>
+    <button class="chip" data-profile="claude"><span class="rose">✳</span> Claude</button>
+    <button class="chip" data-profile="codex"><span class="rose">▢</span> Codex</button>
+  </div>
+  <label for="newname">Session name <code>a-z 0-9 _ . -</code></label>
+  <input id="newname" placeholder="e.g. cortex" autocapitalize="off" autocomplete="off" spellcheck="false" inputmode="text">
+  <div class="row"><button class="act" id="cancelnew">Cancel</button><button class="act primary" id="createnew">Create</button></div>
+</dialog>
+
+<dialog id="renamedlg">
+  <h3>Rename session</h3>
+  <p class="hint">Renames the tmux session on the VPS (it keeps running).</p>
+  <input id="renameinput" autocapitalize="off" autocomplete="off" spellcheck="false">
+  <div class="row"><button class="act" id="cancelrename">Cancel</button><button class="act primary" id="dorename">Rename</button></div>
+</dialog>
+<dialog id="addcoldlg">
+  <h3>Add to collection</h3>
+  <p class="hint">Adds this session’s chat to a deck. Works only while the desktop app is open — it owns your collections, so this can’t drift out of sync.</p>
+  <div id="addcollist" class="addcollist"></div>
+  <div class="row"><input id="addcolnew" placeholder="new collection name…" autocapitalize="off" autocomplete="off" spellcheck="false"><button class="act primary" id="addcolcreate">Create &amp; add</button></div>
+  <div class="row"><div class="grow"></div><button class="act" id="addcolcancel">Cancel</button></div>
+</dialog>
+
+<dialog id="composedlg">
+  <h3>Compose &amp; send</h3>
+  <p class="hint">Write a longer prompt, then send it into the terminal (handy on a phone).</p>
+  <textarea id="composetext" placeholder="Type a prompt or command…" autocapitalize="sentences" spellcheck="true"></textarea>
+  <div class="row">
+    <button class="act" id="cancelcompose">Cancel</button>
+    <div class="grow"></div>
+    <button class="act" id="sendcompose">Send</button>
+    <button class="act primary" id="sendcomposeenter">Send + Enter</button>
+  </div>
+</dialog>
+
+<dialog id="helpdlg">
+  <h3>Keys &amp; custom buttons</h3>
+  <div id="helpbody"></div>
+  <div class="row"><div class="grow"></div><button class="act primary" id="closehelp" type="button">Done</button></div>
+</dialog>
+
+<input type="file" id="fileinput" multiple hidden>
+<dialog id="uploaddlg">
+  <div class="wshead">
+    <h3>Files</h3>
+    <div class="wstabs" role="tablist">
+      <button class="wstab active" data-scope="session" type="button" role="tab">This session</button>
+      <button class="wstab" data-scope="all" type="button" role="tab">All files</button>
+    </div>
+  </div>
+  <p class="hint">Upload a picture, PDF, zip — anything; it lands here. Tap a file to open it, then <b>Add to prompt</b> (the agent reads the real file from its PC path) or copy it as a path/element to Paste. <b>Keep</b> persists a file; otherwise it's cleared when the PC restarts.</p>
+  <div id="wsbody"></div>
+  <div class="row">
+    <button class="act" id="wsupload" type="button">＋ Upload</button>
+    <label class="ck"><input type="checkbox" id="wskeepnew"> Keep new uploads</label>
+    <div class="grow"></div>
+    <button class="act primary" id="wsdone" type="button">Done</button>
+  </div>
+</dialog>
+
+<script src="vendor/xterm.js"></script>
+<script src="vendor/addon-fit.js"></script>
+<script>
+const $ = s => document.querySelector(s);
+const base = location.pathname.replace(/\/[^/]*$/, '') || '';
+const api = p => fetch(base + '/api/' + p, { headers:{'Content-Type':'application/json'} });
+const LS = { get:(k,d)=>{ try{ return JSON.parse(localStorage.getItem(k)) ?? d; }catch(e){ return d; } }, set:(k,v)=>{ try{ localStorage.setItem(k, JSON.stringify(v)); }catch(e){} } };
+
+let fontSize = Math.min(20, Math.max(11, LS.get('mux_font', 14)));
+const term = new Terminal({
+  cursorBlink:true, fontSize, scrollback:8000, allowProposedApi:true,
+  fontFamily:'ui-monospace,SFMono-Regular,Menlo,Consolas,"Roboto Mono",monospace',
+  theme:{ background:'#000000', foreground:'#ededf0', cursor:'#fb7185', cursorAccent:'#000000',
+          selectionBackground:'#3a2b30', black:'#15151a', red:'#fb7185', green:'#34d399',
+          yellow:'#fbbf24', blue:'#60a5fa', magenta:'#c084fc', cyan:'#22d3ee', white:'#ededf0', brightBlack:'#6a6a76' }
+});
+const fit = new FitAddon.FitAddon();
+term.loadAddon(fit);
+term.open($('#term'));
+const helper = $('#term').querySelector('.xterm-helper-textarea');
+if (helper) helper.setAttribute('data-destruct-ignore', '');
+if (location.search.includes('demo')) { window.__term = term; window.__dropws = ()=>{ if(ws) ws.close(); }; }
+
+// ---- DESKTOP text selection: make "select → copy" just work. A live TUI (codex/claude) repaints every
+// second and wipes any highlight, so the instant a drag/selection starts we FREEZE incoming output (buffer
+// it) and flush it back the moment the selection is cleared — no need to press "Sel" first. Touch keeps the
+// explicit Sel toggle (a touch-drag means "scroll"). If the app has grabbed the mouse, hold Shift to select.
+function copySelectionNow(){
+  const t = term.getSelection ? term.getSelection() : '';
+  if(!t) return;
+  (navigator.clipboard?navigator.clipboard.writeText(t):Promise.reject())
+    .then(()=>flash('Copied selection'),()=>flash('Copy failed — clipboard blocked (needs HTTPS)'));
+}
+(function(){
+  const scr = $('#term');
+  // freeze as soon as the mouse goes down, so the drag-select can't be repainted away mid-gesture
+  scr.addEventListener('mousedown', e=>{ if(e.button===0 && !selectMode) autoFreeze=true; }, true);
+  // a click that makes no selection (just focusing) must go live again + replay whatever was buffered
+  scr.addEventListener('mouseup', ()=>{ setTimeout(()=>{ if(autoFreeze && !selectMode && !(term.hasSelection&&term.hasSelection())){ autoFreeze=false; flushFrozen(); } }, 0); }, true);
+  // clearing the selection (click away / new click) → live again + replay
+  term.onSelectionChange(()=>{
+    const has = term.hasSelection && term.hasSelection();
+    if(has){ if(!selectMode) autoFreeze=true; }
+    else if(autoFreeze && !selectMode){ autoFreeze=false; flushFrozen(); }
+  });
+})();
+
+// ---- IMAGE PASTE: a terminal can't take inline image bytes (codex/claude then say "no image found, try
+// scp"). So intercept a pasted image, upload it, transfer it to the PC, and drop its real FILE PATH into the
+// prompt — the agent reads the image from disk. Text paste falls through to the normal terminal paste.
+$('#term').addEventListener('paste', (e)=>{
+  const items = e.clipboardData && e.clipboardData.items;
+  if(!items) return;
+  for(const it of items){
+    if(it.type && it.type.indexOf('image')===0){
+      e.preventDefault(); e.stopPropagation();
+      const blob = it.getAsFile();
+      if(blob) pasteImageToPrompt(blob, it.type);
+      return;
+    }
+  }
+}, true);
+async function pasteImageToPrompt(blob, type){
+  if(!current){ flash('Open a session first'); return; }
+  try{
+    flash('Uploading pasted image…');
+    const ext = ((type.split('/')[1]||'png')).replace('jpeg','jpg').replace('svg+xml','svg');
+    const name = 'paste-'+Date.now()+'.'+ext;
+    const up = await fetch(base+'/api/upload?session='+encodeURIComponent(current)+'&keep=0&name='+encodeURIComponent(name),
+      { method:'POST', headers:{'Content-Type':'application/octet-stream'}, body: blob });
+    if(!up.ok) throw new Error('upload HTTP '+up.status);
+    const list = await (await fetch(base+'/api/uploads?session='+encodeURIComponent(current))).json();
+    const f = (Array.isArray(list)?list:[]).find(x=>x.name===name);
+    if(!f || !f.id) throw new Error('upload not registered');
+    const path = await ensureOnPc({ id:f.id, name, keep:false });    // transfer to the PC (needs the app open, like file upload)
+    send('i', path);
+    term.focus();
+    flash('Pasted image → its PC path is in your prompt');
+  }catch(err){ flash('Image paste failed: '+(err.message||err)); }
+}
+
+let ws=null, current=null, intentional=false, reconnectDelay=1000, reconnectTimer=null;
+const mods = { ctrl:false, alt:false, shift:false };   // sticky touch-keybar modifiers (combine, one-shot)
+let read = LS.get('mux_read', {});
+const send = (t,d) => { if (ws && ws.readyState===1) ws.send(t+d); };
+
+// ---- shared-window sizing (client side) ----
+// The server holds every attached client at ONE size (the widest viewport by default, or a pinned one).
+// We REPORT our own viewport fit ('v') and RENDER at whatever window size the server sends back ('d').
+// When the window is bigger than our screen (we're a phone following a desktop), we PAN.
+let viewportFit = null;            // {cols,rows} our screen can show at the current font
+let winSize = null;                // {cols,rows} the shared window the server told us to render
+let sizeModeLabel = '';            // e.g. "auto · 100×30" / "pinned · 40×80"
+let selectMode = false;            // when ON, the terminal FREEZES so text can be selected (a live repaint clears it)
+let _frozenBuf = [];               // output that arrived while frozen, buffered so the highlight survives; flushed on unfreeze
+let autoFreeze = false;            // desktop: auto-frozen because a mouse selection is in progress (no "Sel" press needed)
+const isFrozen = ()=> selectMode || autoFreeze;
+function flushFrozen(){ const buf=_frozenBuf; _frozenBuf=[]; for(const chunk of buf){ try{ term.write(chunk); }catch(e){} } }
+function cellMetrics(){
+  try { const d = term._core._renderService.dimensions.css.cell; if (d && d.height) return { w:d.width, h:d.height }; } catch(e){}
+  return { w: fontSize*0.6, h: fontSize*1.2 };
+}
+function applyPan(){
+  const host=$('#term');
+  if(!winSize || !viewportFit){ host.classList.remove('pan'); return; }
+  const panning = winSize.cols > viewportFit.cols+1 || winSize.rows > viewportFit.rows+1;
+  host.classList.toggle('pan', panning);
+}
+function onControl(s){
+  if(s[0]!=='d') return;
+  let m; try{ m=JSON.parse(s.slice(1)); }catch(e){ return; }
+  winSize={cols:m.cols, rows:m.rows}; sizeModeLabel=m.modeLabel||'';
+  if(term.cols!==m.cols || term.rows!==m.rows){ try{ term.resize(m.cols, m.rows); }catch(e){} }
+  applyPan(); updateMeta(); updateSizeBtn();
+}
+function cycleSize(){ send('s',''); }
+function updateSizeBtn(){ const b=$('#sizebtn'); if(b) b.textContent='⇲ '+(sizeModeLabel? sizeModeLabel.replace(/ · .*/,'') : 'size'); if(b) b.title='Window size: '+(sizeModeLabel||'auto')+' — tap to cycle through connected devices'; }
+
+// Measure (don't apply) what our screen can show, report it as 'v'; the server's 'd' drives term size.
+function doFit(){
+  let dim=null; try{ dim=fit.proposeDimensions(); }catch(e){}
+  if(dim && dim.cols && dim.rows){ viewportFit={cols:dim.cols, rows:dim.rows}; if(ws && ws.readyState===1 && current) send('v', JSON.stringify(viewportFit)); }
+  applyPan(); updateMeta();
+}
+function applyViewport(){ const vv=window.visualViewport; if(vv) $('#app').style.height = vv.height+'px'; doFit(); }
+if (window.visualViewport){ visualViewport.addEventListener('resize', applyViewport); visualViewport.addEventListener('scroll', applyViewport); }
+new ResizeObserver(doFit).observe($('#term'));
+window.addEventListener('orientationchange', ()=>setTimeout(applyViewport,250));
+
+// ---- touch: drag to scroll terminal HISTORY (vertical) and PAN the wider-than-screen view (horizontal).
+// A stationary tap still focuses xterm + opens the soft keyboard; only a real drag scrolls (and then we
+// preventDefault so it doesn't get mis-read as a selection or page scroll).
+(function(){
+  const host=$('#term'); let active=false,lastX=0,lastY=0,moved=false,accY=0;
+  host.addEventListener('touchstart', e=>{ if(e.touches.length!==1){ active=false; return; } active=true; moved=false; accY=0; lastX=e.touches[0].clientX; lastY=e.touches[0].clientY; }, {passive:true});
+  host.addEventListener('touchmove', e=>{
+    if(!active || e.touches.length!==1) return;
+    if(selectMode) return;   // let the drag fall through to xterm's text selection (no scroll/pan)
+    const t=e.touches[0], dx=t.clientX-lastX, dy=t.clientY-lastY;
+    if(!moved && Math.abs(dx)+Math.abs(dy)<6) return;
+    moved=true;
+    if(Math.abs(dy)>=Math.abs(dx)){
+      const ch=cellMetrics().h||18; accY+=dy; const lines=Math.trunc(accY/ch);
+      if(lines){
+        // Normal buffer (shell, claude transcript): scroll xterm's own scrollback.
+        // Alternate buffer (codex / claude full-screen TUI) has NO scrollback, so scrollLines is a silent
+        // no-op there ("can't read up"). Forward a wheel event instead and let xterm hand the app its
+        // mouse-wheel / alternate-scroll sequence — the app scrolls its own transcript.
+        if(term.buffer.active.type==='alternate'){
+          const we=host.querySelector('.xterm-screen')||host.querySelector('.xterm')||host;
+          try{ we.dispatchEvent(new WheelEvent('wheel',{deltaY:-lines*ch, deltaMode:0, bubbles:true, cancelable:true})); }catch(e){}
+        } else {
+          try{ term.scrollLines(-lines); }catch(e){}
+        }
+        accY-=lines*ch;
+      }
+      e.preventDefault();
+    } else if(host.classList.contains('pan')){ host.scrollLeft-=dx; e.preventDefault(); }
+    lastX=t.clientX; lastY=t.clientY;
+  }, {passive:false});
+  host.addEventListener('touchend', ()=>{ active=false; }, {passive:true});
+})();
+
+function setFont(px){ fontSize=Math.min(20,Math.max(11,px)); term.options.fontSize=fontSize; LS.set('mux_font',fontSize); doFit(); }
+function updateMeta(){ $('#statusmeta').textContent = current ? `${term.cols}×${term.rows}${$('#term').classList.contains('pan')?' · pan':''}` : ''; }
+
+term.onData(d => {
+  if (autoFreeze && !selectMode) { autoFreeze=false; try{ term.clearSelection(); }catch(e){} flushFrozen(); }   // typing = you're done selecting → go live
+  // a sticky modifier (tapped on the keybar) applies to the next char you type on the phone keyboard
+  if ((mods.ctrl||mods.alt||mods.shift) && d.length===1) { d = applyModsToChar(d); clearMods(); }
+  send('i', d);
+});
+
+// ---- status ----
+function setStatus(state, text){ const s=$('#status'); s.className=''; if(state) s.classList.add(state); $('#statustext').innerHTML=text; }
+
+// ---- jump-to-live ----
+let newLines=0;
+const atBottom = ()=> term.buffer.active.viewportY >= term.buffer.active.baseY;
+function showJump(){ const j=$('#jumplive'); if(newLines>0 && !atBottom()){ $('#jlcount').textContent = newLines>99?'99+ new':newLines+' new'; j.classList.add('show'); } else j.classList.remove('show'); }
+term.onScroll(()=>{ if(atBottom()){ newLines=0; showJump(); } });
+$('#jumplive').onclick = ()=>{ term.scrollToBottom(); newLines=0; showJump(); term.focus(); };
+
+// ---- connection + auto-reconnect ----
+function clearReconnect(){ if(reconnectTimer){ clearTimeout(reconnectTimer); reconnectTimer=null; } }
+function scheduleReconnect(name){
+  clearReconnect();
+  if (document.visibilityState!=='visible') return;
+  setStatus('busy', `<span class="name">${esc(name)}</span> &middot; reconnecting&hellip;`);
+  reconnectTimer = setTimeout(()=>{ if(current===name) connect(name, true); }, reconnectDelay);
+  reconnectDelay = Math.min(10000, reconnectDelay*1.7);
+}
+function connect(name, isRetry){
+  clearReconnect();
+  intentional = true;
+  if (ws) { try{ ws.onclose=null; ws.close(); }catch(e){} ws=null; }
+  intentional = false;
+  current = name; LS.set('mux_last', name); markRead(name);
+  $('#empty').style.display='none';
+  if (!isRetry) term.reset();
+  autoFreeze=false; _frozenBuf=[];   // never carry a frozen selection across a session switch
+  newLines=0; showJump();
+  const proto = location.protocol==='https:'?'wss:':'ws:';
+  setStatus('busy', `connecting to <span class="name">${esc(name)}</span>&hellip;`);
+  doFit();
+  // per-socket token: a stale socket from a rapid switch/reconnect must never write or set status
+  const sock = ws = new WebSocket(`${proto}//${location.host}${base}/ws?session=${encodeURIComponent(name)}&cols=${(viewportFit&&viewportFit.cols)||term.cols}&rows=${(viewportFit&&viewportFit.rows)||term.rows}`);
+  sock.binaryType='arraybuffer';
+  const fresh = ()=> ws===sock && current===name;
+  sock.onopen = () => { if(!fresh()) return; reconnectDelay=1000; setStatus('live', `<span class="name">${esc(name)}</span> &middot; live`); doFit(); term.focus(); };
+  sock.onmessage = e => { if(!fresh()) return;
+    if(typeof e.data==='string'){ onControl(e.data); return; }     // control frame: shared window size
+    if(isFrozen()){ _frozenBuf.push(new Uint8Array(e.data)); if(_frozenBuf.length>6000) _frozenBuf.splice(0, _frozenBuf.length-6000); return; }   // FROZEN for selection: buffer output; a repaint would wipe the highlight
+    const wasBottom=atBottom(); term.write(new Uint8Array(e.data)); markReadLive();
+    if(!wasBottom){ newLines += 1; showJump(); } };
+  sock.onclose = () => { if(ws===sock && current===name && !intentional){ scheduleReconnect(name); } };
+  sock.onerror = () => {};
+  renderTabs();
+}
+document.addEventListener('visibilitychange', ()=>{ if(document.visibilityState==='visible' && current && (!ws || ws.readyState>1)){ reconnectDelay=1000; connect(current, true); } });
+window.addEventListener('online', ()=>{ if(current && (!ws || ws.readyState>1)){ reconnectDelay=1000; connect(current, true); } });
+
+// ---- sessions / unread ----
+function markRead(name){ const s=(window._sessions||[]).find(x=>x.name===name); read[name] = s ? s.activity : Date.now(); LS.set('mux_read', read); }
+let lastReadWrite=0;
+function markReadLive(){ if(!current) return; read[current]=Date.now(); const t=Date.now(); if(t-lastReadWrite>2000){ LS.set('mux_read',read); lastReadWrite=t; } }   // current session output is seen
+function esc(s){ return String(s).replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+async function loadSessions(select){
+  let list=null;
+  try{ const r=await api('sessions'); if(r.ok) list = await r.json(); }catch(e){}
+  if(!Array.isArray(list)){
+    // Transient fetch failure (server timeout / hiccup) — DON'T wipe the tabs to empty. Keep the
+    // last-known sessions so the tab strip stays put; the next 4s poll retries. Honor an explicit select.
+    list = (window._sessions||[]).slice();
+    if (select && !list.find(s=>s.name===select)) list.push({name:select, attached:false, activity:Date.now()});
+    window._sessions = list;
+    list.forEach(s => s.unread = (s.activity > (read[s.name]||0)) && s.name!==current);
+    renderTabs();
+    if (select) connect(select);
+    return;
+  }
+  window._sessions = list;
+  if (current) { const cs=list.find(s=>s.name===current); if(cs){ read[current]=cs.activity; LS.set('mux_read',read); } }
+  list.forEach(s => s.unread = (s.activity > (read[s.name]||0)) && s.name!==current);
+  if (select && !list.find(s=>s.name===select)) list.push({name:select, attached:false, activity:Date.now()});
+  renderTabs();
+  if (select) { connect(select); return; }
+  if (!current && list.length) { const last=LS.get('mux_last',null); connect(list.find(s=>s.name===last)?last:list[0].name); return; }
+  if (!current && !list.length) setStatus('', 'No sessions &mdash; tap + to start one');
+}
+function renderTabs(){
+  const list = window._sessions||[];
+  const el = $('#tabs'); el.innerHTML='';
+  list.forEach(s => {
+    const t = document.createElement('div');
+    t.className = 'tab'+(s.name===current?' active':'')+(s.attached?' attached':'')+(s.unread?' unread':'')+(s.autoheal?' autoheal':'');
+    t.dataset.state = s.state || 'white';   // green=working · yellow=idle/waiting · red=agent gone · white=neutral shell
+    t.setAttribute('role','tab'); t.tabIndex=0; t.setAttribute('aria-selected', s.name===current?'true':'false');
+    const st = {green:'agent working',yellow:'agent idle — waiting for your prompt',red:'agent stopped/exited',white:'neutral shell — no agent'}[s.state||'white'];
+    t.title = s.name + (st?' · '+st:'');
+    t.innerHTML = `<span class="dot"></span><span class="nm"></span><button class="kebab" tabindex="-1">⋯</button>`;
+    t.querySelector('.nm').textContent = s.name;
+    t.querySelector('.kebab').setAttribute('aria-label', 'Actions for '+s.name);
+    t.onclick = (ev)=>{ if(!ev.target.closest('.kebab')) connect(s.name); };
+    t.onkeydown = (ev)=>{
+      if((ev.key==='Enter'||ev.key===' ') && !ev.target.closest('.kebab')){ ev.preventDefault(); connect(s.name); }
+      else if(ev.key==='Delete'||ev.key==='Backspace'||ev.key==='ContextMenu'){ ev.preventDefault(); openMenu(s, t.querySelector('.kebab')); }   // keyboard route to actions
+    };
+    t.querySelector('.kebab').onclick = (ev)=>{ ev.stopPropagation(); openMenu(s, ev.currentTarget); };
+    let lp; t.addEventListener('touchstart', ()=>{ lp=setTimeout(()=>openMenu(s, t.querySelector('.kebab')),500); }, {passive:true});
+    t.addEventListener('touchend', ()=>clearTimeout(lp));
+    if (s.name===current) setTimeout(()=>t.scrollIntoView({inline:'nearest',block:'nearest'}),0);
+    el.appendChild(t);
+  });
+}
+
+// ---- tab action menu ----
+let menuFor=null, menuOpener=null;
+function openMenu(s, anchor){
+  menuFor=s; menuOpener=anchor; const m=$('#menu');
+  m.innerHTML = `<div class="mtitle"></div>`+
+    `<div class="msync"></div>`+
+    `<button data-a="open">↗ Open</button>`+
+    `<button data-a="addcol">➕ Add to collection</button>`+
+    `<button data-a="relaunch">↻ Relaunch agent</button>`+
+    `<button data-a="autoheal"></button>`+
+    `<button data-a="opencmd">⌨ Copy local-open command</button>`+
+    `<button data-a="rename">✎ Rename</button>`+
+    `<button data-a="copy">⧉ Copy link</button>`+
+    `<button data-a="kill" class="danger">🗑 Kill session</button>`;
+  m.querySelector('.mtitle').textContent = s.name;
+  const sync=m.querySelector('.msync');                                   // app-synced indicator (avoid drifting state)
+  sync.textContent = _appLive ? '● desktop app synced' : '○ app offline — Add to collection disabled';
+  sync.className = 'msync '+(_appLive?'ok':'off');
+  const addB=m.querySelector('[data-a="addcol"]');
+  if(!_appLive){ addB.disabled=true; addB.title='Open the desktop app to add to a collection (it owns your collections, so this can’t drift out of sync)'; }
+  const ahB=m.querySelector('[data-a="autoheal"]');
+  ahB.textContent = s.autoheal ? '⟳ Auto-resume: ON' : '⟳ Auto-resume: off';
+  ahB.classList.toggle('on', !!s.autoheal);
+  ahB.title = s.autoheal ? 'This tab auto-restarts its agent if it dies while working (max 3×/10min). Tap to turn off.'
+                         : 'Turn on to auto-restart this tab’s agent if it dies while working.';
+  m.querySelectorAll('button').forEach(b=> b.onclick=()=>{ menuAction(b.dataset.a, s); closeMenu(); });
+  const r=anchor.getBoundingClientRect(); const mw=Math.min(220, window.innerWidth-16);
+  m.style.width=mw+'px'; m.style.left=Math.max(8, Math.min(r.left, window.innerWidth-mw-8))+'px';
+  m.style.top='-9999px'; m.classList.add('show');                       // render off-screen to measure
+  const mh=m.offsetHeight;
+  let top=r.bottom+6; if(top+mh>window.innerHeight) top=Math.max(8, r.top-mh-6); m.style.top=top+'px';
+  setTimeout(()=>m.querySelector('button')?.focus(), 0);   // move focus in for keyboard
+}
+function closeMenu(){ const o=menuOpener; $('#menu').classList.remove('show'); menuFor=null; menuOpener=null; if(o && o.isConnected) try{ o.focus(); }catch(e){} }
+document.addEventListener('click', e=>{ if(menuFor && !e.target.closest('#menu') && !e.target.closest('.kebab')) closeMenu(); });
+document.addEventListener('keydown', e=>{ if(e.key==='Escape') closeMenu(); });
+function menuAction(a, s){
+  if(a==='open') connect(s.name);
+  else if(a==='addcol') addToCollection(s);
+  else if(a==='autoheal') toggleAutoheal(s);
+  else if(a==='relaunch') relaunchSession(s);
+  else if(a==='opencmd'){ navigator.clipboard?.writeText('multiplex '+s.name).then(()=>flash('Open command copied — paste it in a fresh local terminal')).catch(()=>{}); }
+  else if(a==='rename'){ $('#renameinput').value=s.name; renameTarget=s.name; openDialog('#renamedlg'); setTimeout(()=>$('#renameinput').select(),50); }
+  else if(a==='copy'){ const url=location.origin+location.pathname+'?s='+encodeURIComponent(s.name); navigator.clipboard?.writeText(url).then(()=>flash('Link copied')).catch(()=>{}); }
+  else if(a==='kill'){ if(confirm('Kill session "'+s.name+'"? This ENDS it on the VPS (any running agent stops).')){ killSession(s.name); } }
+}
+// ---- app-sync state + Add-to-collection --------------------------------------------------------------
+// Collections are OWNED by the desktop app; the web must NOT create them independently or state drifts. So
+// we only allow "Add to collection" while the app is live (POST'd its projection within ~45s), and the add
+// itself goes through the app (an app-command it files on its next sync). Poll the sync state for the menu.
+let _appLive=false, _appCollections=[], addColTarget=null;
+async function pollAppSync(){
+  try{ const p=await (await fetch(base+'/api/projects',{headers:{'Content-Type':'application/json'}})).json();
+       _appLive=!!p.live; _appCollections=Array.isArray(p.collections)?p.collections:[]; }
+  catch(e){ _appLive=false; }
+}
+pollAppSync(); setInterval(pollAppSync, 8000);
+function addToCollection(s){
+  if(!_appLive){ flash('Desktop app is closed — open it to add to a collection (so states don’t drift)'); return; }
+  addColTarget=s;
+  const list=$('#addcollist'); list.innerHTML='';
+  if(!_appCollections.length){ const p=document.createElement('div'); p.className='hint'; p.textContent='No collections yet — type a name below to make one.'; list.appendChild(p); }
+  _appCollections.forEach(c=>{ const b=document.createElement('button'); b.type='button'; b.className='act wide';
+    b.textContent=(c.name||'Untitled')+' · '+((c.chats||[]).length)+' chat'+(((c.chats||[]).length)!==1?'s':'');
+    b.onclick=()=>submitAddCol(c.name||'Untitled'); list.appendChild(b); });
+  $('#addcolnew').value=''; openDialog('#addcoldlg'); setTimeout(()=>$('#addcolnew').focus(),60);
+}
+function submitAddCol(name){
+  const s=addColTarget; if(!s) return; name=(name||'').trim();
+  if(!name){ flash('Pick a collection or type a new name'); return; }
+  if(!_appLive){ flash('App went offline — can’t add now'); $('#addcoldlg').close(); return; }
+  fetch(base+'/api/app-commands',{ method:'POST', headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({ type:'addtocollection', muxName:s.name, sessionName:s.name, collection:name }) })
+    .then(r=>{ if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); })
+    .then(()=>{ $('#addcoldlg').close(); flash('Queued “'+s.name+'” → “'+name+'” — the app files it on its next sync'); })
+    .catch(e=>flash('Couldn’t queue: '+(e.message||e)));
+}
+// Per-tab auto-resume toggle: when ON, the VPS watchdog re-runs this tab's resume command if its agent
+// dies while working. Persisted server-side by session name (survives restarts + relaunches).
+function toggleAutoheal(s){
+  const on = !s.autoheal;
+  fetch(base+'/api/sessions/'+encodeURIComponent(s.name)+'/autoheal',{ method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({on}) })
+    .then(r=>{ if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); })
+    .then(()=>{ s.autoheal=on; const t=(window._sessions||[]).find(x=>x.name===s.name); if(t) t.autoheal=on; renderTabs();
+      flash(on?'⟳ Auto-resume ON for “'+s.name+'” — it’ll relaunch if the agent dies while working':'Auto-resume off for “'+s.name+'”'); })
+    .catch(e=>flash('Toggle failed: '+(e.message||e)));
+}
+async function killSession(name){
+  await fetch(base+'/api/sessions/'+encodeURIComponent(name),{method:'DELETE'});
+  if(current===name){ intentional=true; current=null; if(ws){try{ws.close();}catch(e){}} term.reset(); $('#empty').style.display='flex'; setStatus('','Session ended'); }
+  loadSessions();
+}
+// Relaunch a session's AGENT. After a reboot the tmux tab survives but its `ssh -t win` died (you land at
+// the VPS bash prompt). This recreates the session fresh so it SSHes back into the PC and re-runs the
+// chat's resume command — the workspace comes back identically. The command is matched from the projects
+// projection by session name, so it works for any session tied to a synced chat (no desktop app needed).
+async function relaunchSession(s){
+  let cmd=null, chObj=null, pj=null;
+  try{
+    pj=await (await fetch(base+'/api/projects',{headers:{'Content-Type':'application/json'}})).json();
+    for(const c of (pj.collections||[])){ for(const ch of (c.chats||[])){ if(ch.muxName===s.name && ch.muxCommand){ cmd=ch.muxCommand; chObj=ch; break; } } if(cmd) break; }
+  }catch(e){}
+  if(!cmd){ flash('No resume command for “'+s.name+'” — it isn’t tied to a synced chat (open it once from the desktop app to link it).'); return; }
+  // GUARD against the branch glitch: if this chat already has a LIVE agent elsewhere, relaunching starts a
+  // 2nd `claude --resume` of the same id → two writers fork the transcript and the new work hides in a
+  // branch. Block it; the user must kill the running copy first (single-writer rule).
+  if(chObj && pj && Array.isArray(pj.runningSessions) && pj.runningSessions.some(r=>String(r.sessionId||'')===String(chObj.id||''))){
+    flash('“'+s.name+'” is still running on your PC — relaunching would FORK its transcript (lost work). Kill the running copy first (Projects → running → Kill), then relaunch.');
+    return;
+  }
+  if(!confirm('Relaunch the agent for “'+s.name+'”?\n\nRe-runs its resume command on your PC (claude/codex --resume) — best after a reboot. The dead scrollback in this tab is cleared.')) return;
+  flash('Relaunching '+s.name+'…');
+  try{
+    await fetch(base+'/api/sessions/'+encodeURIComponent(s.name),{method:'DELETE'});   // drop the dead session
+    await new Promise(r=>setTimeout(r,500));
+    const res=await fetch(base+'/api/sessions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:s.name, command:cmd})});
+    if(!res.ok) throw new Error('HTTP '+res.status);
+    await new Promise(r=>setTimeout(r,700));
+    connect(s.name);                                  // attach the fresh session (connect tears down the old socket)
+    setTimeout(loadSessions, 800);
+    flash('Relaunched '+s.name+' — agent restarting');
+  }catch(e){ flash('Relaunch failed: '+(e.message||e)); loadSessions(); }
+}
+function flash(msg){ setStatus('', msg); setTimeout(()=>{ if(current) setStatus(ws&&ws.readyState===1?'live':'busy', `<span class="name">${esc(current)}</span> &middot; ${ws&&ws.readyState===1?'live':'reconnecting…'}`); }, 1400); }
+
+// ---- dialogs ----
+function openDialog(sel){ $('#app').inert=true; const d=$(sel); d.showModal(); }
+document.querySelectorAll('dialog').forEach(d=> d.addEventListener('close', ()=>{ if(!document.querySelector('dialog[open]')) $('#app').inert=false; }));
+
+// new session w/ profile
+let newProfile='shell';
+function profileCmd(p){ return p==='claude'?'claude':(p==='codex'?'codex':''); }
+function suggestName(p){ const base=p==='shell'?'shell':p; const names=(window._sessions||[]).map(s=>s.name); let n=base,i=1; while(names.includes(n)){ i++; n=base+i; } return n; }
+function setProfile(p){ newProfile=p; document.querySelectorAll('#profilechips .chip').forEach(c=>c.classList.toggle('active', c.dataset.profile===p)); $('#newname').value=suggestName(p); }
+$('#profilechips').querySelectorAll('.chip').forEach(c=> c.onclick=()=>setProfile(c.dataset.profile));
+function openNew(profile){ setProfile(profile||'shell'); openDialog('#newdlg'); setTimeout(()=>{ $('#newname').focus(); $('#newname').select(); },50); }
+$('#new').onclick = ()=>openNew('shell');
+$('#cancelnew').onclick = ()=>$('#newdlg').close();
+$('#closehelp').onclick = ()=>$('#helpdlg').close();
+$('#newname').addEventListener('keydown', e=>{ if(e.key==='Enter'){ e.preventDefault(); $('#createnew').click(); } });
+$('#createnew').onclick = async ()=>{
+  const name=($('#newname').value||'').replace(/[^A-Za-z0-9_.-]/g,'').slice(0,40);
+  const cmd=profileCmd(newProfile); $('#newdlg').close(); if(!name) return;
+  await fetch(base+'/api/sessions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name, command:cmd})});
+  loadSessions(name);
+};
+document.querySelectorAll('#empty .quick button').forEach(b=> b.onclick=()=>openNew(b.dataset.profile));
+
+// rename
+let renameTarget=null;
+$('#cancelrename').onclick = ()=>$('#renamedlg').close();
+$('#addcolcancel').onclick = ()=>$('#addcoldlg').close();
+$('#addcolcreate').onclick = ()=>submitAddCol($('#addcolnew').value);
+$('#addcolnew').addEventListener('keydown', e=>{ if(e.key==='Enter'){ e.preventDefault(); submitAddCol($('#addcolnew').value); } });
+$('#renameinput').addEventListener('keydown', e=>{ if(e.key==='Enter'){ e.preventDefault(); $('#dorename').click(); } });
+$('#dorename').onclick = async ()=>{
+  const to=($('#renameinput').value||'').replace(/[^A-Za-z0-9_.-]/g,'').slice(0,40); const from=renameTarget;
+  $('#renamedlg').close(); if(!to||!from||to===from) return;
+  let ok=false; try{ const r=await fetch(base+'/api/sessions/'+encodeURIComponent(from),{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:to})}); ok=r.ok; }catch(e){}
+  if(!ok){ flash('Rename failed'); return; }
+  if(read[from]!=null){ read[to]=read[from]; delete read[from]; LS.set('mux_read',read); }   // migrate read-state
+  if(LS.get('mux_last',null)===from) LS.set('mux_last', to);
+  if(current===from) connect(to);   // re-attach under the new name (only on confirmed rename)
+  else loadSessions();
+};
+
+// compose
+$('#cancelcompose').onclick = ()=>$('#composedlg').close();
+function openCompose(){ openDialog('#composedlg'); setTimeout(()=>$('#composetext').focus(),50); }
+// Send composed/pasted text through xterm's OWN paste path (term.paste) — it wraps the block in bracketed
+// paste (when the agent supports it) so codex/claude ingest it as ONE paste. The old raw send('i',t) dumped
+// the whole burst at once; the agent mis-parsed a big/multiline burst and dropped its HEAD ("first half cut").
+$('#sendcompose').onclick = ()=>{ const t=$('#composetext').value; $('#composedlg').close(); if(t) term.paste(t); term.focus(); };
+$('#sendcomposeenter').onclick = ()=>{ const t=$('#composetext').value; $('#composedlg').close(); if(t){ term.paste(t); send('i','\r'); } term.focus(); };
+
+// ---- file workspace: a mini file explorer for per-session uploads. Browse a thumbnail GRID,
+// tap a file to OPEN it (big preview + all its actions), and switch scope between THIS session and
+// ALL files. The bytes go to the VPS; the desktop app pulls the file down to THIS PC (where the
+// agent runs) and we hand the agent the PC PATH (it reads the real file there). "keep" persists a
+// file; otherwise it's swept on restart. Copy-as-path / copy-as-element put a reference on the
+// clipboard for Paste.
+function fmtSize(n){ return n>=1e6 ? (n/1e6).toFixed(1)+' MB' : Math.max(1,Math.round(n/1024))+' KB'; }
+function fileExt(n){ const m=/\.([A-Za-z0-9]{1,6})$/.exec(n||''); return m?m[1].toUpperCase():'FILE'; }
+function fileIcon(f){ return f.image ? 'IMG' : fileExt(f.name); }
+let wsScope = LS.get('mux_wsscope','session');   // 'session' | 'all'
+let wsFiles = [];                                 // current scope's files
+let wsSel = null;                                 // selected file id (detail view) or null (grid)
+
+function openUpload(){ if(!current){ flash('Open a session first'); return; } wsSel=null; openDialog('#uploaddlg'); loadWorkspace(); }
+$('#fileinput').addEventListener('change', e=>{ const files=[...e.target.files]; e.target.value=''; if(files.length) wsUploadFiles(files); });
+$('#wsupload').onclick = ()=>{ $('#fileinput').value=''; $('#fileinput').click(); };
+$('#wsdone').onclick = ()=> $('#uploaddlg').close();
+document.querySelectorAll('.wstab').forEach(t=> t.onclick=()=>{ if(wsScope===t.dataset.scope) return; wsScope=t.dataset.scope; LS.set('mux_wsscope',wsScope); wsSel=null; loadWorkspace(); });
+
+async function loadWorkspace(){
+  const body=$('#wsbody'); body.innerHTML='<div class="hint">loading…</div>';
+  const q = wsScope==='all' ? '' : ('?session='+encodeURIComponent(current||''));
+  try{ const r=await (await fetch(base+'/api/uploads'+q)).json(); wsFiles=Array.isArray(r)?r:[]; }catch(e){ wsFiles=[]; }
+  renderWorkspace();
+}
+function iconEl(f){ const s=document.createElement('span'); s.className='wstthumb wsticon'; s.textContent=fileIcon(f); return s; }
+function thumbEl(f){
+  if(!f.image) return iconEl(f);
+  const img=document.createElement('img'); img.className='wstthumb'; img.loading='lazy'; img.alt='';
+  img.src=base+'/api/uploads/'+encodeURIComponent(f.id)+'/raw';
+  img.onerror=()=>{ img.replaceWith(iconEl(f)); };   // broken image -> file-type badge, never a broken-img glyph
+  return img;
+}
+function renderWorkspace(){
+  document.querySelectorAll('.wstab').forEach(t=> t.classList.toggle('active', t.dataset.scope===wsScope));
+  const body=$('#wsbody'); body.innerHTML='';
+  if(wsSel) return renderWsDetail(body);
+  if(!wsFiles.length){
+    const e=document.createElement('div'); e.className='hint';
+    e.textContent = wsScope==='all' ? 'No files uploaded yet — tap “Upload” to add one (image, PDF, zip, anything).'
+                                    : 'No files for this session yet — tap “Upload” (image, PDF, zip, anything).';
+    body.appendChild(e); return;
+  }
+  const grid=document.createElement('div'); grid.className='wsgrid';
+  for(const f of wsFiles){
+    const tile=document.createElement('button'); tile.type='button'; tile.className='wstile'; tile.title=f.name;
+    tile.appendChild(thumbEl(f));
+    const nm=document.createElement('span'); nm.className='wstname'; nm.textContent=f.name; tile.appendChild(nm);
+    const sub=document.createElement('span'); sub.className='wstsub'; sub.textContent=fmtSize(f.size); tile.appendChild(sub);
+    if(f.keep){ const k=document.createElement('span'); k.className='wstkeep'; k.textContent='★'; k.title='kept'; tile.appendChild(k); }
+    tile.onclick=()=>{ wsSel=f.id; renderWorkspace(); };
+    grid.appendChild(tile);
+  }
+  body.appendChild(grid);
+}
+function renderWsDetail(body){
+  const f = wsFiles.find(x=>x.id===wsSel);
+  if(!f){ wsSel=null; return renderWorkspace(); }
+  const d=document.createElement('div'); d.className='wsdetail';
+  const back=document.createElement('button'); back.type='button'; back.className='wsback'; back.textContent='‹ All files';
+  back.onclick=()=>{ wsSel=null; renderWorkspace(); };
+  const preview=document.createElement('div'); preview.className='wspreview';
+  if(f.image){
+    const img=document.createElement('img'); img.src=base+'/api/uploads/'+encodeURIComponent(f.id)+'/raw'; img.alt=f.name;
+    img.onerror=()=>{ preview.innerHTML=''; const s=document.createElement('span'); s.className='wsbigicon'; s.textContent=fileIcon(f); preview.appendChild(s); };
+    preview.appendChild(img);
+  } else { const s=document.createElement('span'); s.className='wsbigicon'; s.textContent=fileIcon(f); preview.appendChild(s); }
+  const name=document.createElement('div'); name.className='wsdname'; name.textContent=f.name;
+  const meta=document.createElement('div'); meta.className='wsdmeta';
+  const setMeta=()=>{ meta.textContent=fmtSize(f.size)+' · '+fileExt(f.name)+((f.onPc||f.pcPath)?' · on this PC':'')+(f.keep?' · kept':''); };
+  setMeta();
+  const acts=document.createElement('div'); acts.className='wsdacts';
+  const mk=(label,cls,on)=>{ const b=document.createElement('button'); b.type='button'; b.className='wsbtn'+(cls?' '+cls:''); b.textContent=label; b.onclick=on; return b; };
+  acts.appendChild(mk('Add to prompt','primary', ()=>wsAdd(f)));
+  acts.appendChild(mk('⧉ path','', ()=>wsCopy(f,'path')));
+  if(f.image) acts.appendChild(mk('⧉ element','', ()=>wsCopy(f,'el')));
+  const keepL=document.createElement('label'); keepL.className='wskeep'; keepL.title='Keep this file (otherwise it’s cleared when the PC restarts)';
+  const kc=document.createElement('input'); kc.type='checkbox'; kc.checked=!!f.keep; kc.onchange=ev=>{ wsKeep(f, ev.target.checked); setMeta(); };
+  keepL.appendChild(kc); keepL.appendChild(document.createTextNode(' keep')); acts.appendChild(keepL);
+  acts.appendChild(mk('Delete','del', ()=>wsDelete(f)));
+  d.appendChild(back); d.appendChild(preview); d.appendChild(name); d.appendChild(meta); d.appendChild(acts);
+  body.appendChild(d);
+}
+async function wsUploadFiles(files){
+  const keep = $('#wskeepnew').checked ? '1':'0';
+  if(!$('#uploaddlg').open){ wsSel=null; openDialog('#uploaddlg'); }
+  for(const f of files){
+    try{ await fetch(base+'/api/upload?session='+encodeURIComponent(current||'')+'&keep='+keep+'&name='+encodeURIComponent(f.name),
+      { method:'POST', headers:{'Content-Type':'application/octet-stream'}, body:f }); }
+    catch(e){ flash('Upload failed: '+(e.message||e)); }
+  }
+  wsSel=null; loadWorkspace();   // back to the grid so the new file is visible
+}
+async function pollUploadCmd(id, timeoutMs){
+  const t0=Date.now();
+  while(Date.now()-t0<timeoutMs){
+    await new Promise(r=>setTimeout(r,1200));
+    let c=null; try{ c=await (await fetch(base+'/api/app-commands/'+encodeURIComponent(id))).json(); }catch(e){}
+    if(c && c.status==='done') return c.detail||'';
+    if(c && c.status==='failed') throw new Error(c.detail||'failed on the PC');
+  }
+  return null;
+}
+// Pull the file to the PC (once) and return its PC path; the agent reads the real file from there.
+async function ensureOnPc(f){
+  if(f.pcPath) return f.pcPath;
+  flash('Transferring “'+f.name+'” to the PC…');
+  const cmd=await fetch(base+'/api/app-commands',{ method:'POST', headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({ type:'fetchfile', uploadId:f.id, filename:f.name, keep:!!f.keep }) });
+  if(!cmd.ok) throw new Error('queue HTTP '+cmd.status);
+  const id=(await cmd.json()).id;
+  const path=await pollUploadCmd(id, 60000);
+  if(!path) throw new Error('no response from the PC app — is it open?');
+  f.pcPath=path; return path;
+}
+async function wsAdd(f){
+  try{ const path=await ensureOnPc(f); send('i', path); $('#uploaddlg').close(); term.focus(); flash('Added the file path to your prompt'); }
+  catch(e){ flash('Couldn’t add: '+(e.message||e)); }
+}
+async function wsCopy(f,kind){
+  try{
+    const path=await ensureOnPc(f);
+    const text = kind==='el' ? (f.image?`![${f.name}](${path})`:`[${f.name}](${path})`) : path;
+    await (navigator.clipboard?navigator.clipboard.writeText(text):Promise.reject());
+    flash(kind==='el'?'Copied as element — Paste into your prompt':'Copied path — Paste into your prompt');
+  }catch(e){ flash('Copy failed: '+(e.message||e)); }
+}
+async function wsKeep(f, keep){ f.keep=keep; try{ await fetch(base+'/api/uploads/'+encodeURIComponent(f.id),{ method:'PATCH', headers:{'Content-Type':'application/json'}, body:JSON.stringify({keep}) }); }catch(e){} }
+async function wsDelete(f){ try{ await fetch(base+'/api/uploads/'+encodeURIComponent(f.id),{ method:'DELETE' }); }catch(e){} wsFiles=wsFiles.filter(x=>x.id!==f.id); wsSel=null; renderWorkspace(); }
+
+// ---- expanded touch keybar -------------------------------------------------------------------------
+// Phones can't do key combos or navigation from the soft keyboard, so the bar provides: sticky
+// Ctrl/Alt/Shift that COMBINE and apply to the next bar key OR the next char you type; always-reachable
+// Esc / Tab / ⇧Tab / Enter / arrows; and moded extras (ctrl-shortcuts, navigation, function keys, symbols).
+function reflectMods(){ ['ctrl','alt','shift'].forEach(m=> document.querySelectorAll('.key.mod-'+m).forEach(k=>k.classList.toggle('active', mods[m]))); }
+function clearMods(){ mods.ctrl=mods.alt=mods.shift=false; reflectMods(); }
+function toggleMod(m){ mods[m]=!mods[m]; reflectMods(); }
+function applyModsToChar(ch){
+  let out=ch;
+  if(mods.shift && /^[a-z]$/.test(out)) out=out.toUpperCase();
+  if(mods.ctrl){ const c=out.toUpperCase().charCodeAt(0); if(c>=64&&c<=95) out=String.fromCharCode(c-64); }   // Ctrl+letter -> control byte
+  if(mods.alt) out='\x1b'+out;                                                                                // Alt+x -> ESC x
+  return out;
+}
+function modParam(){ return 1 + (mods.shift?1:0) + (mods.alt?2:0) + (mods.ctrl?4:0); }   // xterm modifyOtherKeys param
+function seqForKey(k){
+  const csi='\x1b[', p=modParam();
+  const arrow={up:'A',down:'B',right:'C',left:'D',home:'H',end:'F'};
+  const tilde={ins:'2',del:'3',pgup:'5',pgdn:'6',f5:'15',f6:'17',f7:'18',f8:'19',f9:'20',f10:'21',f11:'23',f12:'24'};
+  const ss3={f1:'P',f2:'Q',f3:'R',f4:'S'};
+  if(k in arrow) return p===1 ? csi+arrow[k] : csi+'1;'+p+arrow[k];
+  if(k in tilde) return p===1 ? csi+tilde[k]+'~' : csi+tilde[k]+';'+p+'~';
+  if(k in ss3)   return p===1 ? '\x1bO'+ss3[k] : csi+'1;'+p+ss3[k];
+  if(k==='backtab') return '\x1b[Z';                              // ⇧Tab (Claude/Codex mode cycle)
+  if(k==='tab')  return mods.shift ? '\x1b[Z' : (mods.alt?'\x1b\t':'\t');
+  if(k==='enter')return mods.alt ? '\x1b\r' : '\r';
+  if(k==='esc')  return '\x1b';
+  if(k==='bksp') return mods.alt ? '\x1b\x7f' : '\x7f';
+  return '';
+}
+function sendKey(k){ const s=seqForKey(k); clearMods(); if(s) send('i',s); term.focus(); }
+function sendChar(ch){ const out=applyModsToChar(ch); clearMods(); send('i',out); term.focus(); }
+function sendRaw(seq){ clearMods(); send('i',seq); term.focus(); }   // a ctrl-shortcut that already IS the combo
+
+const KEYMODES = {
+  ctl: { kind:'raw',  items:[['^C','\x03'],['^D','\x04'],['^R','\x12'],['^L','\x0c'],['^Z','\x1a'],['^A','\x01'],['^E','\x05'],['^U','\x15'],['^K','\x0b'],['^W','\x17'],['^P','\x10'],['^N','\x0e']] },
+  nav: { kind:'key',  items:[['Home','home'],['End','end'],['PgUp','pgup'],['PgDn','pgdn'],['Ins','ins'],['Del','del'],['⌫','bksp']] },
+  fn:  { kind:'key',  items:[['F1','f1'],['F2','f2'],['F3','f3'],['F4','f4'],['F5','f5'],['F6','f6'],['F7','f7'],['F8','f8'],['F9','f9'],['F10','f10'],['F11','f11'],['F12','f12']] },
+  sym: { kind:'char', items:['|','~','/','\\','-','_','=','+',':',';','"',"'",'`','*','&','#','@','$','%','(',')','[',']','{','}','<','>'] },
+};
+let kmode = LS.get('mux_kmode','ctl'); if(kmode!=='custom' && !KEYMODES[kmode]) kmode='ctl';
+async function pasteToTerm(){ try{ const t=await navigator.clipboard.readText(); if(t) term.paste(t); }catch(e){ openCompose(); } term.focus(); }
+function termVisibleText(){
+  try{
+    const b=term.buffer.active, start=b.viewportY, out=[];
+    for(let y=0;y<term.rows;y++){ const ln=b.getLine(start+y); if(ln) out.push(ln.translateToString(true)); }
+    return out.join('\n').replace(/[ \t]+\n/g,'\n').replace(/\n+$/,'');
+  }catch(e){ return ''; }
+}
+function copyFromTerm(){
+  const hasSel = term.getSelection && term.getSelection().trim();
+  const text = hasSel ? term.getSelection() : termVisibleText();   // no manual selection → copy the whole visible screen (needs no selection, always works)
+  if(text){ (navigator.clipboard?navigator.clipboard.writeText(text):Promise.reject())
+      .then(()=>flash(hasSel?'Copied selection':'Copied visible output'),()=>flash('Copy failed — clipboard blocked (needs HTTPS)')); }
+  else flash('Nothing to copy');
+  term.focus();
+}
+// Select mode = FREEZE the terminal so a highlight survives (a live TUI repaints every frame, wiping any
+// selection). While frozen: drag to select (desktop: hold Shift if the app is capturing the mouse), then Copy.
+function toggleSelect(){
+  selectMode=!selectMode;
+  $('#term').classList.toggle('selecting', selectMode);
+  buildKeybar();
+  if(selectMode){ flash('FROZEN — drag to select (hold Shift if the app grabs the mouse), then Copy'); }
+  else {
+    autoFreeze=false; flushFrozen();                  // unfreeze: replay the output that arrived while frozen
+    try{ term.scrollToBottom(); }catch(e){}
+    term.focus(); flash('Live again');
+  }
+}
+function kdivEl(){ const d=document.createElement('span'); d.className='kdiv'; return d; }
+
+// ---- custom buttons: your own key-combo buttons, shown in the ★ keybar mode ----
+function customButtons(){ const a=LS.get('mux_custom',[]); return Array.isArray(a)?a:[]; }
+function saveCustom(a){ LS.set('mux_custom', a); }
+function comboSeq(c){   // build the byte sequence for a {ctrl,alt,shift,named,key,ch} combo (reuses keybar logic)
+  const save={ctrl:mods.ctrl,alt:mods.alt,shift:mods.shift};
+  mods.ctrl=!!c.ctrl; mods.alt=!!c.alt; mods.shift=!!c.shift;
+  let seq='';
+  if(c.named) seq=seqForKey(c.key);
+  else if(c.ch && c.ch.length>=1) seq=applyModsToChar(c.ch[0]);
+  mods.ctrl=save.ctrl; mods.alt=save.alt; mods.shift=save.shift;
+  return seq;
+}
+function seqDesc(seq){ return (seq||'').replace(/\x1b\[Z/g,'⇧Tab').replace(/\x1b/g,'ESC').replace(/\r/g,'⏎').replace(/\t/g,'Tab').replace(/\x7f/g,'⌫').replace(/[\x00-\x1a]/g, ch=>'^'+String.fromCharCode(ch.charCodeAt(0)+64)); }
+const _keyName={tab:'Tab',backtab:'⇧Tab',enter:'⏎',esc:'Esc',bksp:'⌫',up:'↑',down:'↓',left:'←',right:'→',home:'Home',end:'End',pgup:'PgUp',pgdn:'PgDn'};
+function defaultLabel(c){ let s=(c.ctrl?'^':'')+(c.alt?'⌥':'')+(c.shift?'⇧':''); s+= c.named ? (_keyName[c.key]||c.key) : (c.ch||'?'); return s.slice(0,12); }
+
+// ---- ? help + settings: what every button does, + a creator/re-orderer for your own ★ buttons ----
+function openHelp(){
+  const body=$('#helpbody'); body.innerHTML='';
+  const help=document.createElement('div'); help.className='helpsec';
+  help.innerHTML = `<h3>What the buttons do</h3>
+    <ul class="helplist">
+      <li><b>⌨</b> compose a long message &nbsp;·&nbsp; <b>📎</b> upload a file &nbsp;·&nbsp; <b>Copy/Paste</b> clipboard</li>
+      <li><b>⇲ size</b> cycle the shared window size across connected devices — <i>auto</i> = the biggest screen (so a phone next to a desktop follows the desktop and pans); tap to pin a specific one (e.g. work phone-sized).</li>
+      <li><b>Ctrl Alt Shift</b> are <i>sticky</i> — tap one, then a key or a typed letter, and they combine.</li>
+      <li><b>Esc Tab ⇧Tab ⏎ ↑↓←→</b> core keys. <b>⇧Tab</b> cycles Claude/Codex auto-mode.</li>
+      <li><b>^</b> ctrl-shortcuts (^C ^R ^L…) &nbsp;·&nbsp; <b>nav</b> Home/End/PgUp… &nbsp;·&nbsp; <b>Fn</b> F-keys &nbsp;·&nbsp; <b>{ }</b> symbols &nbsp;·&nbsp; <b>★</b> your custom buttons.</li>
+      <li>On the terminal: <b>drag up/down</b> to scroll history, <b>drag sideways</b> to pan when a bigger screen is connected.</li>
+    </ul>`;
+  body.appendChild(help);
+
+  const cs=document.createElement('div'); cs.className='helpsec';
+  const h=document.createElement('h3'); h.textContent='Custom buttons (★)'; cs.appendChild(h);
+  const list=document.createElement('div'); list.className='cblist'; cs.appendChild(list);
+  function renderList(){
+    list.innerHTML=''; const cbs=customButtons();
+    if(!cbs.length){ const e=document.createElement('div'); e.className='hint'; e.textContent='None yet — make one below (e.g. label “Auto”, key ⇧Tab).'; list.appendChild(e); }
+    cbs.forEach((c,i)=>{
+      const row=document.createElement('div'); row.className='cbrow';
+      const lab=document.createElement('span'); lab.className='cblabel'; lab.textContent=c.label; row.appendChild(lab);
+      const sq=document.createElement('span'); sq.className='cbseq'; sq.textContent=c.desc||seqDesc(c.seq); row.appendChild(sq);
+      const mkb=(t,on,dis)=>{ const b=document.createElement('button'); b.type='button'; b.className='cbbtn'; b.textContent=t; b.disabled=!!dis; b.onclick=on; return b; };
+      row.appendChild(mkb('↑',()=>{ const a=customButtons(); [a[i-1],a[i]]=[a[i],a[i-1]]; saveCustom(a); renderList(); buildKeybar(); }, i===0));
+      row.appendChild(mkb('↓',()=>{ const a=customButtons(); [a[i+1],a[i]]=[a[i],a[i+1]]; saveCustom(a); renderList(); buildKeybar(); }, i===cbs.length-1));
+      const del=mkb('✕',()=>{ const a=customButtons(); a.splice(i,1); saveCustom(a); renderList(); buildKeybar(); }, false); del.classList.add('del'); row.appendChild(del);
+      list.appendChild(row);
+    });
+  }
+  renderList();
+
+  const form=document.createElement('div'); form.className='cbform';
+  form.innerHTML = `
+    <input id="cblabelin" class="txt" placeholder="Label" maxlength="12" autocapitalize="off" spellcheck="false">
+    <label class="ck"><input type="checkbox" id="cbctrl">Ctrl</label>
+    <label class="ck"><input type="checkbox" id="cballt">Alt</label>
+    <label class="ck"><input type="checkbox" id="cbshift">Shift</label>
+    <select id="cbkey" class="txt">
+      <option value="ch">letter/char…</option>
+      <option value="tab">Tab</option><option value="backtab">⇧Tab</option><option value="enter">Enter</option><option value="esc">Esc</option><option value="bksp">Backspace</option>
+      <option value="up">↑</option><option value="down">↓</option><option value="left">←</option><option value="right">→</option>
+      <option value="home">Home</option><option value="end">End</option><option value="pgup">PgUp</option><option value="pgdn">PgDn</option>
+    </select>
+    <input id="cbchar" class="txt cbchar" placeholder="x" maxlength="1" autocapitalize="off" spellcheck="false">
+    <button id="cbadd" class="act primary" type="button">Add</button>
+    <div class="hint" id="cbprev"></div>`;
+  cs.appendChild(form); body.appendChild(cs);
+
+  const readCreator=()=>{ const key=$('#cbkey').value; return { ctrl:$('#cbctrl').checked, alt:$('#cballt').checked, shift:$('#cbshift').checked, named:key!=='ch', key:key!=='ch'?key:null, ch:key==='ch'?$('#cbchar').value:'' }; };
+  const upd=()=>{ const seq=comboSeq(readCreator()); $('#cbprev').textContent = seq ? ('sends  '+seqDesc(seq)) : 'pick a key or type a char'; $('#cbchar').style.display = $('#cbkey').value==='ch'?'':'none'; };
+  ['cbctrl','cballt','cbshift','cbkey','cbchar'].forEach(id=>$('#'+id).addEventListener('input',upd));
+  $('#cbadd').onclick=()=>{ const c=readCreator(); const seq=comboSeq(c); if(!seq){ flash('Pick a key first'); return; }
+    const label=($('#cblabelin').value||'').trim()||defaultLabel(c); const a=customButtons(); a.push({label, seq, desc:seqDesc(seq)}); saveCustom(a); renderList(); buildKeybar(); $('#cblabelin').value=''; flash('Added “'+label+'”'); };
+  upd();
+  openDialog('#helpdlg');
+}
+function buildKeybar(){
+  const kb=$('#keybar'); kb.innerHTML='';
+  const mk=(label,cls,on)=>{ const b=document.createElement('button'); b.type='button'; b.className='key'+(cls?' '+cls:''); b.textContent=label; if(on) b.onclick=on; return b; };
+  kb.appendChild(mk('?','accent', openHelp));
+  kb.appendChild(mk('⌨','accent', openCompose));
+  kb.appendChild(mk('📎','accent', openUpload));
+  const selB=mk('Sel','accent', openCopyView); selB.id='selbtn'; kb.appendChild(selB);   // opens the reliable select/copy overlay
+  kb.appendChild(mk('Copy','accent', copyFromTerm));
+  kb.appendChild(mk('Paste','accent', pasteToTerm));
+  const sb=mk('⇲ size','accent', cycleSize); sb.id='sizebtn'; kb.appendChild(sb);
+  kb.appendChild(kdivEl());
+  // sticky modifiers (combine; apply to the next key OR typed char)
+  const modg=document.createElement('div'); modg.className='kkeys';
+  modg.appendChild(mk('Ctrl','mod mod-ctrl',()=>toggleMod('ctrl')));
+  modg.appendChild(mk('Alt','mod mod-alt',()=>toggleMod('alt')));
+  modg.appendChild(mk('Shift','mod mod-shift',()=>toggleMod('shift')));
+  kb.appendChild(modg);
+  kb.appendChild(kdivEl());
+  // always-reachable core keys
+  const core=document.createElement('div'); core.className='kkeys';
+  [['Esc','esc'],['Tab','tab'],['⇧Tab','backtab'],['⏎','enter'],['↑','up'],['↓','down'],['←','left'],['→','right']]
+    .forEach(([l,k])=> core.appendChild(mk(l,'core',()=>sendKey(k))));
+  kb.appendChild(core);
+  kb.appendChild(kdivEl());
+  // mode tabs (★ = your custom buttons)
+  const modes=document.createElement('div'); modes.className='kmodes';
+  [['^','ctl'],['nav','nav'],['Fn','fn'],['{ }','sym'],['★','custom']].forEach(([lbl,id])=>{
+    const b=document.createElement('button'); b.type='button'; b.className='kmode'+(kmode===id?' active':''); b.textContent=lbl;
+    b.onclick=()=>{ kmode=id; LS.set('mux_kmode',id); buildKeybar(); }; modes.appendChild(b);
+  });
+  kb.appendChild(modes);
+  // mode keys
+  const keys=document.createElement('div'); keys.className='kkeys';
+  if(kmode==='custom'){
+    const cbs=customButtons();
+    if(!cbs.length){ const h=mk('+ create in ?','',openHelp); h.style.opacity='.75'; keys.appendChild(h); }
+    cbs.forEach(c=> keys.appendChild(mk(c.label, null, ()=>sendRaw(c.seq))));
+  } else {
+    const mode=KEYMODES[kmode];
+    mode.items.forEach(item=>{
+      if(mode.kind==='raw'){ const [l,seq]=item; keys.appendChild(mk(l,null,()=>sendRaw(seq))); }
+      else if(mode.kind==='key'){ const [l,k]=item; keys.appendChild(mk(l,null,()=>sendKey(k))); }
+      else { keys.appendChild(mk(item,null,()=>sendChar(item))); }
+    });
+  }
+  kb.appendChild(keys);
+  reflectMods(); updateSizeBtn();
+}
+
+// ---- top controls ----
+$('#fontdown').onclick=()=>setFont(fontSize-1);
+$('#fontup').onclick=()=>setFont(fontSize+1);
+$('#refresh').onclick=()=>loadSessions();
+function toggleZen(){ const z=$('#app').classList.toggle('zen'); $('#zen').classList.toggle('on',z);
+  if(z && document.documentElement.requestFullscreen) document.documentElement.requestFullscreen().catch(()=>{});
+  else if(!z && document.fullscreenElement) document.exitFullscreen().catch(()=>{});
+  setTimeout(doFit,60);
+}
+$('#zen').onclick=toggleZen;
+$('#composebtn').onclick=openCompose;
+$('#uploadbtn').onclick=openUpload;
+// exiting fullscreen by any means (Esc / F11 / browser) must drop zen so the chrome can't get stuck hidden
+document.addEventListener('fullscreenchange', ()=>{
+  if(!document.fullscreenElement && $('#app').classList.contains('zen')){ $('#app').classList.remove('zen'); $('#zen').classList.remove('on'); }
+  setTimeout(doFit,60);
+});
+
+// ---- desktop keyboard shortcuts (app-level; xterm ignores these) ----
+term.attachCustomKeyEventHandler(e=>{
+  if(e.type!=='keydown') return true;
+  // Alt+1..9 = switch session — the native terminal-multiplexer convention (GNOME Terminal/Tilix).
+  // It deliberately shadows readline's rarely-used digit-argument; we keep ONLY this + F11 so we don't
+  // swallow Alt-letter / Esc-bracket sequences that shells, vim, and tmux rely on.
+  if(e.altKey && !e.ctrlKey && !e.metaKey && /^[1-9]$/.test(e.key)){ const s=(window._sessions||[])[+e.key-1]; if(s){ connect(s.name); return false; } }
+  // Ctrl/Cmd+C copies the selection (like every terminal) instead of only sending ^C; Ctrl+Shift+C always copies.
+  const _isC = (e.key==='c'||e.key==='C');
+  if(_isC && e.ctrlKey && e.shiftKey){ copySelectionNow(); return false; }
+  if(_isC && (e.ctrlKey||e.metaKey) && !e.altKey && !e.shiftKey && term.hasSelection && term.hasSelection()){ copySelectionNow(); return false; }
+  if(e.key==='F11'){ toggleZen(); return false; }
+  return true;
+});
+
+// ---- projects view ----
+// The projects browser lives on its OWN page (projects.html), deliberately free of xterm so the
+// terminal's render loop can't corrupt the list's compositing. The button just navigates there.
+$('#projbtn').onclick = ()=>{ location.href = 'projects.html'; };
+
+// ---- SELECT & COPY overlay -------------------------------------------------------------------------
+// Fighting xterm for a selection is a loser: a live TUI repaints every second (wiping the highlight) and
+// grabs the mouse (so a drag never becomes a selection without Shift). Instead, snapshot the terminal text
+// (incl. scrollback) into a plain <pre> that's frozen and natively selectable — drag on desktop, long-press
+// on phone, native Ctrl/⌘+C copies with no clipboard-permission dance. This is the reliable "copy output".
+function termBufferText(maxLines=6000){
+  try{
+    const b=term.buffer.active, total=b.length, start=Math.max(0, total-maxLines), out=[];
+    for(let i=start;i<total;i++){ const ln=b.getLine(i); out.push(ln?ln.translateToString(true):''); }
+    return out.join('\n').replace(/[ \t]+$/gm,'').replace(/\n{3,}/g,'\n\n').replace(/\s+$/,'');
+  }catch(e){ return termVisibleText(); }
+}
+function openCopyView(){
+  const pre=$('#copytext');
+  pre.textContent = termBufferText() || '(nothing on screen yet — open a session first)';
+  $('#copyview').hidden=false; $('#app').setAttribute('inert','');   // proper modal: background inert while open
+  requestAnimationFrame(()=>{ pre.scrollTop=pre.scrollHeight; try{ pre.focus(); }catch(e){} });   // jump to latest + focus so Ctrl+C works
+}
+function closeCopyView(){ $('#copyview').hidden=true; $('#app').removeAttribute('inert'); try{ term.focus(); }catch(e){} }
+$('#copybtn').onclick = openCopyView;
+$('#copyclose').onclick = closeCopyView;
+$('#copyall').onclick = ()=>{
+  const t=$('#copytext').textContent||'';
+  (navigator.clipboard?navigator.clipboard.writeText(t):Promise.reject())
+    .then(()=>flash('Copied all output'),()=>{ // clipboard blocked → select all so a native Ctrl/⌘+C works
+      const r=document.createRange(); r.selectNodeContents($('#copytext'));
+      const s=getSelection(); s.removeAllRanges(); s.addRange(r); flash('Selected all — press Ctrl/⌘+C'); });
+};
+document.addEventListener('keydown', e=>{ if(e.key==='Escape' && !$('#copyview').hidden){ e.preventDefault(); closeCopyView(); } });
+
+// ---- boot ----
+buildKeybar();
+applyViewport();
+loadSessions(new URLSearchParams(location.search).get('s') || undefined);
+setInterval(()=>{ if(document.visibilityState==='visible') loadSessions(); }, 4000);
+
+// ---- system health dot (P0 observability): polls /api/health → green ok / amber degraded / red down ----
+async function pollHealth(){
+  const dot=$('#health'); if(!dot) return;
+  try{
+    const h = await (await fetch(base+'/api/health')).json();
+    dot.className = 'hdot ' + (!h.tmux ? 'bad' : (h.degraded ? 'warn' : 'ok'));
+    const up = h.uptimeSec>=3600 ? Math.round(h.uptimeSec/3600)+'h' : Math.round(h.uptimeSec/60)+'m';
+    const pc = (h.pc && h.pc.reachable) ? ('PC '+h.pc.rttMs+'ms') : ((h.pc && h.pc.reachable===false) ? 'PC UNREACHABLE' : 'PC …');
+    dot.title = (h.degraded?'DEGRADED':'healthy')+` · ${h.sessions} sessions · ${pc} · ${h.armed} armed`
+      + (h.gaveUp?` · ${h.gaveUp} gave-up`:'') + ` · up ${up} · node ${h.node}`;
+  }catch(e){ dot.className='hdot bad'; dot.title='relay unreachable'; }
+}
+pollHealth(); setInterval(pollHealth, 20000);
+</script>
+</body>
+</html>

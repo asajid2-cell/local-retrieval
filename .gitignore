@@ -1,0 +1,9 @@
+node_modules/
+uploads/
+uploads-meta.json
+projects.json
+app-commands.json
+autoheal.json
+*.log
+*.bak-*
+server.js.bak*
