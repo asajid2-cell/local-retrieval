@@ -11,7 +11,7 @@
 #
 # State: sessions.json manifest (resume commands) -> muxd restart / PC reboot auto-recreates and
 # re-runs each session's resume, so even the "PC reboot" failure self-heals.
-import asyncio, base64, collections, json, os, re, sys, threading, time, traceback
+import asyncio, base64, collections, json, os, queue, re, sys, threading, time, traceback
 import faulthandler
 try: faulthandler.enable(open(os.path.join(os.path.expanduser("~"), "muxd", "muxd.crash"), "a"))
 except Exception: pass
@@ -57,6 +57,9 @@ class Session:
         self.dead = False; self.user_killed = False
         self.deaths = []
         self.loop, self.outq = loop, outq
+        self.pending = bytearray(); self.plock = threading.Lock()   # output coalescing (flushed by the pump)
+        self.wq = queue.Queue()                                     # input write queue → serialized, chunked writes
+        threading.Thread(target=self._writer, daemon=True).start()
         self.spawn()
 
     def spawn(self):
@@ -87,11 +90,31 @@ class Session:
             self.ring.append(b); self.ring_len += len(b); self.last_out = time.time()
             while self.ring_len > RING_CAP:
                 old = self.ring.popleft(); self.ring_len -= len(old)
-            self.loop.call_soon_threadsafe(self.outq.put_nowait, ("o", self.name, b))
+            with self.plock: self.pending += b        # coalesced; the pump flushes on a ~12ms timer
+
+    def drain(self):
+        if not self.pending: return None
+        with self.plock:
+            chunk = bytes(self.pending); self.pending = bytearray()
+        return chunk
+
+    def _writer(self):
+        # serialize input; slice large pastes into <=1KB writes so a big paste can't stall/garble ConPTY input.
+        while True:
+            s = self.wq.get()
+            if s is None: return
+            try:
+                if len(s) <= 1024:
+                    self.pty.write(s)
+                else:
+                    for i in range(0, len(s), 1024):
+                        if self.dead: break
+                        self.pty.write(s[i:i+1024]); time.sleep(0.004)
+            except Exception as e: log(f"[{self.name}] write failed: {e}")
 
     def write(self, data: bytes):
-        try: self.pty.write(data.decode("utf-8", "replace"))
-        except Exception as e: log(f"[{self.name}] write failed: {e}")
+        try: self.wq.put(data.decode("utf-8", "replace"))
+        except Exception as e: log(f"[{self.name}] enqueue failed: {e}")
 
     def resize(self, cols, rows):
         cols, rows = max(20, int(cols)), max(8, int(rows))
@@ -170,6 +193,16 @@ async def main():
                     try: s.spawn(); log(f"[heal] {s.name} shell died -> respawned + resume queued")
                     except Exception as e: log(f"[heal] {s.name} respawn failed: {e}")
     asyncio.create_task(self_heal_tick())
+
+    async def flush_out():
+        # coalesce each session's output into ONE ws frame per ~12ms tick — far fewer frames/less b64+JSON
+        # overhead, smoother phone rendering, and a natural place to add backpressure.
+        while True:
+            await asyncio.sleep(0.012)
+            for s in list(sessions.values()):
+                chunk = s.drain()
+                if chunk: outq.put_nowait(("o", s.name, chunk))
+    asyncio.create_task(flush_out())
 
     import websockets
     backoff = 1
