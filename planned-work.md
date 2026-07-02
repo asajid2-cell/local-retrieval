@@ -20,6 +20,39 @@ XAML crash — tracked in full-review.md, unchanged.
 
 ---
 
+## STATUS — ALL FIVE MILESTONES LANDED + VERIFIED (2026-07-02)
+
+Every milestone was deployed to the live stack and proven with a scripted verifier (in
+`scratchpad/mux/m*_verify.js`), then re-run as a regression sweep against the final build.
+Committed to the two local git repos (VPS `~/multiplex-app`, PC `C:\Users\Ahmed\muxd`).
+
+- **M1 (correctness)** ✅ — 20× create+attach burst → **zero tmux twins**; reconnect replay is
+  CLEAR-prefixed → **no dup screen**; size re-asserts on muxd reconnect.
+- **M2 (device pinning)** ✅ — pin follows the DEVICE (survives reconnect + relay restart via
+  `pins.json`), **last-writer-wins**, auto weighs only recently-active viewers (ghost-exclusion
+  proven on a short-window relay); size chip = tap pin-this-device / long-press pin-another.
+- **M3 (desktop keybar + I/O)** ✅ — `⌨` toggle brings the full keybar to desktop (compact);
+  6000-char paste survives intact (chunked ConPTY writes); coalesced output streams smoothly;
+  TCP_NODELAY on both socket legs.
+- **M4 (hosted parity)** ✅ — rename (muxd op + migrates autoheal/pin state, A2#8), deep on-demand
+  tail (61 rows vs the ~11-line cache), attach-to-dead **revives** the shell, `muxctl ls`/`attach`
+  local terminal parity, `PC` badge on hosted tabs.
+- **M5 (hardening)** ✅ — atomic state writes; constant-time `/host` token **rejected
+  pre-handshake**; degraded health when the PC host is down with armed hosted sessions; muxd
+  per-session output backpressure (~2MB) + auto-return to the LAN relay when it recovers.
+
+**Invariant held throughout:** a hosted session stays **continuous across a relay restart**
+(26 ticks, max gap 1.02 s) — the ownership flip never regressed.
+
+Two plan items intentionally not coded (documented instead): **A2 #11 muxd-on-logoff** — behaves
+like a PC reboot (the manifest auto-resumes sessions at next logon), so it's no worse than the
+already-handled reboot case; running headless would risk ConPTY spawning without an interactive
+desktop and needs a real logoff spike. **A2 #10 cross-path collision** — already prevented by the
+routing + hello ghost-kill + `hostedHas` guards (M1 proved zero twins), so no separate reject path
+was added.
+
+---
+
 ## A. Parity & correctness sweep
 
 ### A1. Parity matrix (legacy tmux+ssh vs PC-hosted muxd)
