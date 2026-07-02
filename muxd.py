@@ -92,7 +92,10 @@ class Session:
             self.ring.append(b); self.ring_len += len(b); self.last_out = time.time()
             while self.ring_len > RING_CAP:
                 old = self.ring.popleft(); self.ring_len -= len(old)
-            with self.plock: self.pending += b        # coalesced; the pump flushes on a ~12ms timer
+            with self.plock:                           # coalesced; the pump flushes on a ~12ms timer
+                self.pending += b                       # backpressure: if a flood outruns a slow link, keep the
+                if len(self.pending) > 2_000_000:       # last ~2MB unsent (the ring still holds full history for reattach)
+                    del self.pending[:len(self.pending) - 2_000_000]
 
     def drain(self):
         if not self.pending: return None
@@ -279,7 +282,24 @@ async def main():
                             await asyncio.sleep(5)
                             await ws.send(json.dumps({"t": "sessions", "list": sess_list()}))
 
+                    async def lan_return():
+                        # A2 #5: we're on a FALLBACK link (e.g. public wss) — periodically check if the
+                        # preferred (LAN) relay is reachable again; if so, drop this link so the outer loop
+                        # reconnects starting at RELAYS[0] and we stop paying the fallback latency tax.
+                        while True:
+                            await asyncio.sleep(180)
+                            try:
+                                lan = RELAYS[0] + ("&" if "?" in RELAYS[0] else "?") + "token=" + TOKEN
+                                async with websockets.connect(lan, open_timeout=6) as p:
+                                    await p.close()
+                                log("preferred (LAN) relay reachable again → switching back")
+                                await ws.close(); return
+                            except Exception:
+                                pass
+
                     tasks = [asyncio.create_task(pump_out()), asyncio.create_task(pump_status())]
+                    if cand != RELAYS[0]:
+                        tasks.append(asyncio.create_task(lan_return()))
                     try:
                         async for raw in ws:
                             try: m = json.loads(raw)
