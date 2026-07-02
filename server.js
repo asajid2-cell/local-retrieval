@@ -71,6 +71,14 @@ const HOST_TOKEN = process.env.MUX_HOST_TOKEN || '';
 let hostWs = null;                 // the PC's muxd link (one at a time; newest wins)
 let hostLabel = '';
 const hostSessions = new Map();    // name -> { alive, created, lastOut, tail }
+// A just-created hosted session muxd hasn't reported back yet. A muxd status push (built before it
+// processed our `create`) must NOT evict this optimistic entry — otherwise the imminent /ws attach or a
+// boot-recreate sees no hosted session, makes a tmux TWIN, and two agents resume one transcript (A2 #1).
+const pendingCreates = new Map();  // name -> expiry ts
+function markPending(name) { pendingCreates.set(name, Date.now() + 8000); }
+// Clear-scrollback + clear-screen + home: prefixes a scrollback replay so a reconnecting viewer that
+// still shows the pre-drop screen doesn't get the replay stacked ON TOP of it (A2 #2/#3).
+const CLEAR_SCREEN = Buffer.from('\x1b[3J\x1b[2J\x1b[H');
 const hostUp = () => !!(hostWs && hostWs.readyState === 1);
 function sendHost(obj) { if (hostUp()) { try { hostWs.send(JSON.stringify(obj)); return true; } catch {} } return false; }
 const hostedHas = name => hostUp() && hostSessions.has(name);
@@ -157,6 +165,7 @@ app.post('/api/sessions', (req, res) => {
   if (hostUp() && !tmuxHas(name)) {
     const created = !hostSessions.has(name);
     sendHost({ t: 'create', s: name, cmd, cols: 140, rows: 40 });
+    markPending(name);
     if (created) hostSessions.set(name, { alive: true, created: Date.now(), lastOut: Date.now(), tail: '' });  // optimistic: routes the imminent /ws attach to the host
     return res.json({ ok: true, name, created, hosted: true });
   }
@@ -574,9 +583,20 @@ wssHost.on('connection', (ws, req) => {
     if (m.t === 'hello' || m.t === 'sessions') {
       if (m.t === 'hello') { hostLabel = String(m.host || 'pc'); console.log(`[host] hello from ${hostLabel} (${(m.sessions || []).length} session(s))`); }
       const list = m.t === 'hello' ? m.sessions : m.list;
+      const reported = new Set(), incoming = new Map();
+      for (const s of (list || [])) { const n = SAFE(s.name); if (n) { reported.add(n); incoming.set(n, { alive: !!s.alive, created: s.created || 0, lastOut: s.lastOut || 0, tail: String(s.tail || ''), cols: s.cols || 0, rows: s.rows || 0 }); } }
+      // A2 #1: don't let a status push evict an optimistic create muxd hasn't reported yet; confirm/expire pendings.
+      for (const [n, exp] of [...pendingCreates]) {
+        if (Date.now() > exp || reported.has(n)) pendingCreates.delete(n);
+        else if (hostSessions.has(n) && !incoming.has(n)) incoming.set(n, hostSessions.get(n));
+      }
       hostSessions.clear();
-      for (const s of (list || [])) { const n = SAFE(s.name); if (n) hostSessions.set(n, { alive: !!s.alive, created: s.created || 0, lastOut: s.lastOut || 0, tail: String(s.tail || '') }); }
+      for (const [n, v] of incoming) hostSessions.set(n, v);
       if (m.t === 'hello') {
+        // A2 #4: muxd (re)connected — its ptys were re-spawned at their own size, so our per-session
+        // resize dedup (st.cur) is stale. Clear it and re-assert sizes so viewers aren't stuck at old dims.
+        for (const st of sessions.values()) st.cur = null;
+        for (const n of hostSessions.keys()) recompute(n);
         // a hosted session's tmux twin (e.g. from a pre-flip boot-recreate) is a stale ghost that could
         // double-resume the same transcript — kill the twin, the PC copy is the truth.
         for (const n of hostSessions.keys()) {
@@ -596,9 +616,9 @@ wssHost.on('connection', (ws, req) => {
       const n = SAFE(m.s); const st = sessions.get(n); if (!st) return;
       const buf = Buffer.from(m.d || '', 'base64');
       for (const c of st.clients.values()) {
-        if (!c.hosted || !c.sbWait) continue;
+        if (!c.hosted || !c.sbWait) continue;                          // late/duplicate sb after a client went live → dropped (A2 #3)
         c.sbWait = false;
-        try { c.ws.send(buf); for (const q of (c.q || [])) c.ws.send(q); } catch {}
+        try { c.ws.send(CLEAR_SCREEN); c.ws.send(buf); for (const q of (c.q || [])) c.ws.send(q); } catch {}  // clear → replay → queued-live (A2 #2)
         c.q = [];
       }
     } else if (m.t === 'killed') { hostSessions.delete(SAFE(m.s)); }
@@ -671,17 +691,20 @@ wss.on('connection', async (ws, req) => {
 
   // ---- PC-HOSTED attach: bridge this viewer to muxd (no tmux, no ssh — the session lives on the PC).
   // An unknown name while the host link is up is created THERE, so new sessions default to the PC.
-  if (hostUp() && (hostSessions.has(name) || !tmuxHas(name))) {
+  if (hostUp() && (hostSessions.has(name) || pendingCreates.has(name) || !tmuxHas(name))) {
     if (!hostSessions.has(name)) {
       sendHost({ t: 'create', s: name, cmd: '', cols: vcols, rows: vrows });
+      markPending(name);
       hostSessions.set(name, { alive: true, created: Date.now(), lastOut: Date.now(), tail: '' });
     }
     const id = 'c' + (++_cid);
     const st = sessionState(name);
-    const client = { id, ws, term: null, hosted: true, vcols, vrows, sbWait: true, q: [] };
+    const client = { id, ws, term: null, hosted: true, vcols, vrows, sbWait: true, sbTok: ++_cid, q: [] };
     st.clients.set(id, client);
     sendHost({ t: 'sb', s: name });                                    // scrollback replay first, live bytes queue behind it
-    setTimeout(() => { if (client.sbWait) { client.sbWait = false; try { for (const q of client.q) ws.send(q); } catch {} client.q = []; } }, 4000);
+    // sb didn't arrive in time (muxd slow) → go live, but CLEAR first so a reconnect's stale screen
+    // doesn't collide with the incoming live bytes.
+    setTimeout(() => { if (client.sbWait) { client.sbWait = false; try { ws.send(CLEAR_SCREEN); for (const q of client.q) ws.send(q); } catch {} client.q = []; } }, 4000);
     recompute(name);
     ws.on('message', m => {
       const s = m.toString(); const t = s[0];
