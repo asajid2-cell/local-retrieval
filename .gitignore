@@ -1,0 +1,5 @@
+muxd.env
+muxd.log*
+muxd.crash
+sessions.json
+.token.tmp
