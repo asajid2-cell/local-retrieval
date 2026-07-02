@@ -142,7 +142,8 @@ SAFE = lambda s: re.sub(r"[^A-Za-z0-9_.-]", "", str(s or ""))[:48]
 
 def sess_list():
     return [{"name": n, "alive": s.alive(), "created": int(s.created * 1000),
-             "lastOut": int(s.last_out * 1000), "tail": s.tail_text()} for n, s in sessions.items()]
+             "lastOut": int(s.last_out * 1000), "cols": s.cols, "rows": s.rows,
+             "tail": s.tail_text()} for n, s in sessions.items()]
 
 async def main():
     loop = asyncio.get_running_loop()
