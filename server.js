@@ -7,7 +7,12 @@ const http = require('http');
 const { WebSocketServer } = require('ws');
 const pty = require('node-pty');
 const fs = require('fs');
+const crypto = require('crypto');
 const { execSync, execFile } = require('child_process');
+// crash-safe state writes: write a temp then rename (rename is atomic) so an unclean VPS reboot can't
+// leave a half-written pins/autoheal/projects/commands file (those reboots happen — see full-review.md).
+function atomicWrite(file, data) { try { fs.writeFileSync(file + '.tmp', data); fs.renameSync(file + '.tmp', file); } catch {} }
+function hostTokenOk(t) { if (!HOST_TOKEN || !t || t.length !== HOST_TOKEN.length) return false; try { return crypto.timingSafeEqual(Buffer.from(t), Buffer.from(HOST_TOKEN)); } catch { return false; } }
 
 const app = express();
 app.use(express.json({ limit: '6mb' }));   // the desktop app pushes its whole projects projection
@@ -260,7 +265,7 @@ app.post('/api/projects', (req, res) => {
     runningSessions: Array.isArray(b.runningSessions) ? b.runningSessions : [],
     host: String(b.host || ''), syncedAt: Date.now(),
   };
-  try { fs.writeFileSync(PROJECTS_FILE, JSON.stringify(_projects)); } catch {}
+  atomicWrite(PROJECTS_FILE, JSON.stringify(_projects));
   res.json({ ok: true, syncedAt: _projects.syncedAt });
 });
 app.get('/api/projects', (req, res) => {
@@ -279,7 +284,7 @@ app.post('/api/running', (req, res) => {
   _projects.runningSessions = Array.isArray(b.runningSessions) ? b.runningSessions : [];
   if (b.host) _projects.host = String(b.host);
   _projects.syncedAt = Date.now();   // bump so GET's `live` stays true and the web enables Open/Kill
-  try { fs.writeFileSync(PROJECTS_FILE, JSON.stringify(_projects)); } catch {}
+  atomicWrite(PROJECTS_FILE, JSON.stringify(_projects));
   res.json({ ok: true, syncedAt: _projects.syncedAt });
 });
 
@@ -295,7 +300,7 @@ const _heal = new Map();   // name -> { lastTail, lastChange, lastGreen, deaths[
 const AUTOHEAL_FILE = __dirname + '/autoheal.json';
 let _healOn = new Set();    // session names OPTED IN to auto-resume (per-tab, persisted across restarts)
 try { _healOn = new Set(JSON.parse(fs.readFileSync(AUTOHEAL_FILE, 'utf8'))); } catch {}
-function saveHealOn() { try { fs.writeFileSync(AUTOHEAL_FILE, JSON.stringify([..._healOn])); } catch {} }
+function saveHealOn() { atomicWrite(AUTOHEAL_FILE, JSON.stringify([..._healOn])); }
 function muxCommandFor(name) {
   let found = null;
   const scan = (o) => {
@@ -466,8 +471,11 @@ app.get('/api/health', (req, res) => {
   let tmuxOk = false, sessions = 0;
   try { const o = execSync(`tmux list-sessions -F x 2>/dev/null`, { encoding: 'utf8', timeout: 1500 }).trim(); sessions = o ? o.split('\n').length : 0; tmuxOk = true; } catch {}
   let gaveUp = 0; for (const h of _heal.values()) if (h.gaveUp) gaveUp++;
-  const degraded = !tmuxOk || _pcHealth.reachable === false || gaveUp > 0;
-  res.json({ ok: !degraded, degraded, uptimeSec: Math.round(process.uptime()), tmux: tmuxOk, sessions, armed: _healOn.size, gaveUp, pc: _pcHealth,
+  // A2 #9: if the PC host is down but armed sessions exist that have NO tmux twin, they're hosted-and
+  // unreachable (can't be healed) → surface that as degraded instead of a falsely-green dot.
+  let hostedArmedDown = 0; if (!hostUp()) for (const n of _healOn) { if (!tmuxHas(n)) hostedArmedDown++; }
+  const degraded = !tmuxOk || _pcHealth.reachable === false || gaveUp > 0 || hostedArmedDown > 0;
+  res.json({ ok: !degraded, degraded, uptimeSec: Math.round(process.uptime()), tmux: tmuxOk, sessions, armed: _healOn.size, gaveUp, hostedArmedDown, pc: _pcHealth,
              host: { connected: hostUp(), name: hostLabel, sessions: hostSessions.size }, node: process.version, at: Date.now() });
 });
 
@@ -477,7 +485,7 @@ app.get('/api/health', (req, res) => {
 const COMMANDS_FILE = __dirname + '/app-commands.json';
 let _commands = [];
 try { _commands = JSON.parse(fs.readFileSync(COMMANDS_FILE, 'utf8')); } catch {}
-function saveCommands() { try { fs.writeFileSync(COMMANDS_FILE, JSON.stringify(_commands)); } catch {} }
+function saveCommands() { atomicWrite(COMMANDS_FILE, JSON.stringify(_commands)); }
 function pruneCommands() { const cut = Date.now() - 10 * 60 * 1000; _commands = _commands.filter(c => (c.ts || 0) > cut); }
 let _cmdSeq = 0;
 const ALLOWED_CMDS = new Set(['kill', 'transcript', 'fetchfile', 'rename', 'addtocollection']);
@@ -531,7 +539,7 @@ try { fs.mkdirSync(UPLOADS_DIR, { recursive: true }); } catch {}
 const UPLOADS_META = __dirname + '/uploads-meta.json';
 let _uploads = [];
 try { _uploads = JSON.parse(fs.readFileSync(UPLOADS_META, 'utf8')); } catch {}
-function saveUploadsMeta() { try { fs.writeFileSync(UPLOADS_META, JSON.stringify(_uploads)); } catch {} }
+function saveUploadsMeta() { atomicWrite(UPLOADS_META, JSON.stringify(_uploads)); }
 const uploadDir = id => UPLOADS_DIR + '/' + String(id).replace(/[^A-Za-z0-9_.-]/g, '');
 const isImage = n => /\.(png|jpe?g|gif|webp|bmp|svg|heic)$/i.test(n || '');
 function dropUpload(u) { try { fs.rmSync(uploadDir(u.id), { recursive: true, force: true }); } catch {} }
@@ -594,14 +602,18 @@ const wssHost = new WebSocketServer({ noServer: true });
 server.on('upgrade', (req, socket, head) => {
   const p = (req.url || '').split('?')[0];
   if (p === '/ws') wss.handleUpgrade(req, socket, head, ws => wss.emit('connection', ws, req));
-  else if (p === '/host') wssHost.handleUpgrade(req, socket, head, ws => wssHost.emit('connection', ws, req));
-  else socket.destroy();
+  else if (p === '/host') {
+    // reject a bad /host token BEFORE completing the handshake (constant-time) — no 101, no 'open'
+    let ok = false; try { ok = hostTokenOk(new URL(req.url, 'http://x').searchParams.get('token')); } catch {}
+    if (!ok) { try { socket.destroy(); } catch {} return; }
+    wssHost.handleUpgrade(req, socket, head, ws => wssHost.emit('connection', ws, req));
+  } else socket.destroy();
 });
 
 // ---- the PC session host's inbound link (muxd dials US — no inbound port on the PC) ---------------
 wssHost.on('connection', (ws, req) => {
   const u = new URL(req.url, 'http://x');
-  if (!HOST_TOKEN || u.searchParams.get('token') !== HOST_TOKEN) { try { ws.close(1008, 'bad token'); } catch {} return; }
+  if (!hostTokenOk(u.searchParams.get('token'))) { try { ws.close(1008, 'bad token'); } catch {} return; }
   try { req.socket.setNoDelay(true); } catch {}                       // low-latency: no Nagle on the host link
   if (hostWs && hostWs !== ws) { try { hostWs.close(); } catch {} }   // newest link wins (old zombie replaced)
   hostWs = ws;
