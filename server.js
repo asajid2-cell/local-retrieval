@@ -575,6 +575,7 @@ server.on('upgrade', (req, socket, head) => {
 wssHost.on('connection', (ws, req) => {
   const u = new URL(req.url, 'http://x');
   if (!HOST_TOKEN || u.searchParams.get('token') !== HOST_TOKEN) { try { ws.close(1008, 'bad token'); } catch {} return; }
+  try { req.socket.setNoDelay(true); } catch {}                       // low-latency: no Nagle on the host link
   if (hostWs && hostWs !== ws) { try { hostWs.close(); } catch {} }   // newest link wins (old zombie replaced)
   hostWs = ws;
   console.log('[host] PC session host connected');
@@ -715,6 +716,7 @@ function handleClientMsg(name, client, s) {
 
 wss.on('connection', async (ws, req) => {
   if (!isTrustedLocal(req) && !(await isOwner(cookieVal(req, HL_COOKIE)))) { try { ws.close(1008, 'unauthorized'); } catch {} return; }
+  try { req.socket.setNoDelay(true); } catch {}                       // low-latency keystrokes: no Nagle on the viewer link
   const u = new URL(req.url, 'http://x');
   const name = SAFE(u.searchParams.get('session'));
   if (!name) return ws.close();
