@@ -82,6 +82,17 @@ const CLEAR_SCREEN = Buffer.from('\x1b[3J\x1b[2J\x1b[H');
 const hostUp = () => !!(hostWs && hostWs.readyState === 1);
 function sendHost(obj) { if (hostUp()) { try { hostWs.send(JSON.stringify(obj)); return true; } catch {} } return false; }
 const hostedHas = name => hostUp() && hostSessions.has(name);
+// E4: on-demand deep tail from muxd (previews) — request/response correlated by rid, 2.5s timeout.
+const pendingTails = new Map(); let _rid = 0;
+function requestHostTail(name, lines) {
+  if (!hostUp()) return Promise.resolve(null);
+  const rid = 'r' + (++_rid);
+  return new Promise(resolve => {
+    const to = setTimeout(() => { pendingTails.delete(rid); resolve(null); }, 2500);
+    pendingTails.set(rid, txt => { clearTimeout(to); resolve(txt); });
+    sendHost({ t: 'tail', s: name, lines, rid });
+  });
+}
 function tmuxHas(name) { try { execSync(`tmux has-session -t ${name} 2>/dev/null`); return true; } catch { return false; } }
 
 // Persistent per-session status for the tab dots. We classify what's in each pane:
@@ -179,12 +190,13 @@ app.post('/api/sessions', (req, res) => {
 
 // Tail preview of a session's live pane (on demand: long-press / hover / palette) so you can tell what
 // a session is doing before attaching — last N lines, name-sanitized.
-app.get('/api/sessions/:name/tail', (req, res) => {
+app.get('/api/sessions/:name/tail', async (req, res) => {
   const name = SAFE(req.params.name);
   const lines = Math.min(200, Math.max(1, +req.query.lines || 14));
-  if (hostedHas(name)) {   // hosted: serve the tail muxd pushes with its status (already ANSI-stripped)
+  if (hostedHas(name)) {   // hosted: pull a proper-depth tail from muxd (fallback to the cached status tail)
+    const txt = await requestHostTail(name, lines);
     const h = hostSessions.get(name);
-    return res.json({ name, tail: String(h.tail || '').split('\n').slice(-lines).join('\n') });
+    return res.json({ name, tail: txt != null ? txt : String((h && h.tail) || '').split('\n').slice(-lines).join('\n') });
   }
   try {
     const out = execSync(`tmux capture-pane -p -t ${name} -S -${lines} 2>/dev/null`, { encoding: 'utf8' });
@@ -197,7 +209,22 @@ app.patch('/api/sessions/:name', (req, res) => {
   const name = SAFE(req.params.name);
   const to = SAFE(req.body && req.body.name);
   if (!to) return res.status(400).json({ error: 'name required' });
-  try { execSync(`tmux rename-session -t ${name} ${to} 2>/dev/null`); res.json({ ok: true, name: to }); }
+  if (to === name) return res.json({ ok: true, name: to });
+  if (tmuxHas(to) || hostSessions.has(to)) return res.status(409).json({ error: 'name already in use' });
+  // A2 #8: rename must carry the tab's auto-resume + pin state, or an armed tab silently loses them.
+  const migrate = () => {
+    if (_healOn.has(name)) { _healOn.delete(name); _healOn.add(to); saveHealOn(); }
+    if (_heal.has(name)) { _heal.set(to, _heal.get(name)); _heal.delete(name); }
+    if (pins.has(name)) { pins.set(to, pins.get(name)); pins.delete(name); savePins(); }
+  };
+  if (hostedHas(name)) {   // E1: hosted rename → muxd renames the session key (keeps the pty), we migrate state
+    sendHost({ t: 'rename', s: name, to });
+    if (hostSessions.has(name)) { hostSessions.set(to, hostSessions.get(name)); hostSessions.delete(name); }
+    migrate();
+    const st = sessions.get(name); if (st) { for (const c of st.clients.values()) { try { c.ws.close(4001, 'renamed'); } catch {} } sessions.delete(name); }  // viewers reconnect under the new name
+    return res.json({ ok: true, name: to, hosted: true });
+  }
+  try { execSync(`tmux rename-session -t ${name} ${to} 2>/dev/null`); migrate(); res.json({ ok: true, name: to }); }
   catch { res.status(500).json({ error: 'rename failed' }); }
 });
 
@@ -622,6 +649,7 @@ wssHost.on('connection', (ws, req) => {
         try { c.ws.send(CLEAR_SCREEN); c.ws.send(buf); for (const q of (c.q || [])) c.ws.send(q); } catch {}  // clear → replay → queued-live (A2 #2)
         c.q = [];
       }
+    } else if (m.t === 'tailr') { const f = pendingTails.get(m.rid); if (f) { pendingTails.delete(m.rid); f(String(m.text || '')); }
     } else if (m.t === 'killed') { hostSessions.delete(SAFE(m.s)); }
   });
   const ka = setInterval(() => { if (ws.readyState === 1) { try { ws.ping(); } catch {} } }, 20000);
@@ -728,10 +756,11 @@ wss.on('connection', async (ws, req) => {
   // ---- PC-HOSTED attach: bridge this viewer to muxd (no tmux, no ssh — the session lives on the PC).
   // An unknown name while the host link is up is created THERE, so new sessions default to the PC.
   if (hostUp() && (hostSessions.has(name) || pendingCreates.has(name) || !tmuxHas(name))) {
-    if (!hostSessions.has(name)) {
+    const known = hostSessions.get(name);
+    if (!known || known.alive === false) {   // new, or E3: attaching to a DEAD hosted session → revive it (muxd keeps its cmd)
       sendHost({ t: 'create', s: name, cmd: '', cols: vcols, rows: vrows });
       markPending(name);
-      hostSessions.set(name, { alive: true, created: Date.now(), lastOut: Date.now(), tail: '' });
+      if (!known) hostSessions.set(name, { alive: true, created: Date.now(), lastOut: Date.now(), tail: '' });
     }
     const id = 'c' + (++_cid);
     const st = sessionState(name);

@@ -89,6 +89,7 @@
   .tab[data-state="red"]    .dot { background:var(--rose);  box-shadow:0 0 0 3px var(--rose-dim); }
   .tab.unread .dot { animation: dotpulse 1.4s ease-in-out infinite; }   /* changed-while-away: pulse, any color */
   @keyframes dotpulse { 0%,100%{ opacity:1 } 50%{ opacity:.4 } }
+  .tab .pcchip { font-size:8px; font-weight:700; letter-spacing:.04em; color:var(--live); border:1px solid rgba(52,211,153,.35); border-radius:4px; padding:0 3px; line-height:1.5; flex:0 0 auto; }   /* runs on the PC = survives network/VPS failures */
   .tab .nm { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:13.5px; font-weight:500; }
   .tab.autoheal .nm::before { content:'⟳'; margin-right:3px; opacity:.65; font-size:.85em; }   /* per-tab auto-resume ON */
   .tab .kebab {
@@ -808,7 +809,7 @@ function renderTabs(){
     t.setAttribute('role','tab'); t.tabIndex=0; t.setAttribute('aria-selected', s.name===current?'true':'false');
     const st = {green:'agent working',yellow:'agent idle — waiting for your prompt',red:'agent stopped/exited',white:'neutral shell — no agent'}[s.state||'white'];
     t.title = s.name + (st?' · '+st:'');
-    t.innerHTML = `<span class="dot"></span><span class="nm"></span><button class="kebab" tabindex="-1">⋯</button>`;
+    t.innerHTML = `<span class="dot"></span><span class="nm"></span>${s.hosted?'<span class="pcchip" title="Runs on your PC — survives network/VPS failures">PC</span>':''}<button class="kebab" tabindex="-1">⋯</button>`;
     t.querySelector('.nm').textContent = s.name;
     t.querySelector('.kebab').setAttribute('aria-label', 'Actions for '+s.name);
     t.onclick = (ev)=>{ if(!ev.target.closest('.kebab')) connect(s.name); };
