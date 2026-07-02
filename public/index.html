@@ -599,7 +599,17 @@ const send = (t,d) => { if (ws && ws.readyState===1) ws.send(t+d); };
 // When the window is bigger than our screen (we're a phone following a desktop), we PAN.
 let viewportFit = null;            // {cols,rows} our screen can show at the current font
 let winSize = null;                // {cols,rows} the shared window the server told us to render
-let sizeModeLabel = '';            // e.g. "auto · 100×30" / "pinned · 40×80"
+let sizeModeLabel = '';            // e.g. "auto · 100×30" / "📌 Phone · 40×80"
+let sizePinned = false, sizeMine = false, sizePinLabel = '', sizeClients = [];   // from the 'd' control frame
+// Persistent DEVICE identity so a pin follows the DEVICE across reconnects/relay restarts (not the socket).
+const deviceId = (()=>{ let d=LS.get('mux_devid',''); if(!d){ d='d'+Math.random().toString(36).slice(2,10)+Date.now().toString(36).slice(-4); LS.set('mux_devid',d); } return d; })();
+function defaultLabel(){ const ua=navigator.userAgent||''; const mob=/Mobi|Android|iPhone|iPad/i.test(ua);
+  const os=/Android/i.test(ua)?'Android':/(iPhone|iPad|iOS)/i.test(ua)?'iOS':/Windows/i.test(ua)?'Windows':/Mac/i.test(ua)?'Mac':/Linux/i.test(ua)?'Linux':'';
+  return (mob?'Phone':'Desktop')+(os?' · '+os:''); }
+let deviceLabel = LS.get('mux_devlabel','') || defaultLabel();
+let lastInputAt = Date.now();
+function markActive(){ lastInputAt = Date.now(); }
+function actFlag(){ return (Date.now()-lastInputAt < 180000) ? 1 : 0; }
 let selectMode = false;            // when ON, the terminal FREEZES so text can be selected (a live repaint clears it)
 let _frozenBuf = [];               // output that arrived while frozen, buffered so the highlight survives; flushed on unfreeze
 let autoFreeze = false;            // desktop: auto-frozen because a mouse selection is in progress (no "Sel" press needed)
@@ -619,16 +629,34 @@ function onControl(s){
   if(s[0]!=='d') return;
   let m; try{ m=JSON.parse(s.slice(1)); }catch(e){ return; }
   winSize={cols:m.cols, rows:m.rows}; sizeModeLabel=m.modeLabel||'';
+  sizePinned = m.mode==='pinned'; sizeMine = !!m.mine; sizePinLabel = m.pinLabel||''; sizeClients = m.clients||[];
   if(term.cols!==m.cols || term.rows!==m.rows){ try{ term.resize(m.cols, m.rows); }catch(e){} }
   applyPan(); updateMeta(); updateSizeBtn();
 }
-function cycleSize(){ send('s',''); }
-function updateSizeBtn(){ const b=$('#sizebtn'); if(b) b.textContent='⇲ '+(sizeModeLabel? sizeModeLabel.replace(/ · .*/,'') : 'size'); if(b) b.title='Window size: '+(sizeModeLabel||'auto')+' — tap to cycle through connected devices'; }
+// TAP the size chip = pin the shared window to THIS device (everyone mirrors/pans it) — last-pinner-wins.
+// Tap again when it's already yours = back to auto. Long-press = pin another connected device.
+function cycleSize(){ send('P', (sizePinned && sizeMine) ? '0' : ''); }
+function pinToOtherDevice(){
+  const others = (sizeClients||[]).filter(c=> (c.dev||('sock-'+c.id)) !== deviceId);
+  if(!others.length){ flash('No other device connected to pin'); return; }
+  const next = others[0];
+  send('P', '#'+(next.dev||('sock-'+next.id)));
+  flash('Pinned the window to '+(next.label||'that device'));
+}
+function updateSizeBtn(){ const b=$('#sizebtn'); if(!b) return;
+  const dims = winSize ? (' '+winSize.cols+'×'+winSize.rows) : '';
+  b.textContent = sizePinned ? ('📌 '+(sizeMine?'this':(sizePinLabel||'device'))+dims) : ('⇲ auto'+dims);
+  b.classList.toggle('on', sizePinned && sizeMine);
+  b.title = sizePinned
+    ? (sizeMine ? 'Window size pinned to THIS device — everyone follows you. Tap for auto; long-press to pin another device.'
+                : 'Window size pinned to “'+(sizePinLabel||'another device')+'”. Tap to take over (pin to THIS device); long-press to pin another.')
+    : 'Auto size (widest active device). Tap to pin the window to THIS device for everyone; long-press to pin another.';
+}
 
 // Measure (don't apply) what our screen can show, report it as 'v'; the server's 'd' drives term size.
 function doFit(){
   let dim=null; try{ dim=fit.proposeDimensions(); }catch(e){}
-  if(dim && dim.cols && dim.rows){ viewportFit={cols:dim.cols, rows:dim.rows}; if(ws && ws.readyState===1 && current) send('v', JSON.stringify(viewportFit)); }
+  if(dim && dim.cols && dim.rows){ viewportFit={cols:dim.cols, rows:dim.rows}; if(ws && ws.readyState===1 && current) send('v', JSON.stringify({cols:dim.cols, rows:dim.rows, vis:document.visibilityState==='visible', act:actFlag()})); }
   applyPan(); updateMeta();
 }
 function applyViewport(){ const vv=window.visualViewport; if(vv) $('#app').style.height = vv.height+'px'; doFit(); }
@@ -641,7 +669,7 @@ window.addEventListener('orientationchange', ()=>setTimeout(applyViewport,250));
 // preventDefault so it doesn't get mis-read as a selection or page scroll).
 (function(){
   const host=$('#term'); let active=false,lastX=0,lastY=0,moved=false,accY=0;
-  host.addEventListener('touchstart', e=>{ if(e.touches.length!==1){ active=false; return; } active=true; moved=false; accY=0; lastX=e.touches[0].clientX; lastY=e.touches[0].clientY; }, {passive:true});
+  host.addEventListener('touchstart', e=>{ markActive(); if(e.touches.length!==1){ active=false; return; } active=true; moved=false; accY=0; lastX=e.touches[0].clientX; lastY=e.touches[0].clientY; }, {passive:true});
   host.addEventListener('touchmove', e=>{
     if(!active || e.touches.length!==1) return;
     if(selectMode) return;   // let the drag fall through to xterm's text selection (no scroll/pan)
@@ -674,6 +702,7 @@ function setFont(px){ fontSize=Math.min(20,Math.max(11,px)); term.options.fontSi
 function updateMeta(){ $('#statusmeta').textContent = current ? `${term.cols}×${term.rows}${$('#term').classList.contains('pan')?' · pan':''}` : ''; }
 
 term.onData(d => {
+  markActive();
   if (autoFreeze && !selectMode) { autoFreeze=false; try{ term.clearSelection(); }catch(e){} flushFrozen(); }   // typing = you're done selecting → go live
   // a sticky modifier (tapped on the keybar) applies to the next char you type on the phone keyboard
   if ((mods.ctrl||mods.alt||mods.shift) && d.length===1) { d = applyModsToChar(d); clearMods(); }
@@ -713,7 +742,7 @@ function connect(name, isRetry){
   setStatus('busy', `connecting to <span class="name">${esc(name)}</span>&hellip;`);
   doFit();
   // per-socket token: a stale socket from a rapid switch/reconnect must never write or set status
-  const sock = ws = new WebSocket(`${proto}//${location.host}${base}/ws?session=${encodeURIComponent(name)}&cols=${(viewportFit&&viewportFit.cols)||term.cols}&rows=${(viewportFit&&viewportFit.rows)||term.rows}`);
+  const sock = ws = new WebSocket(`${proto}//${location.host}${base}/ws?session=${encodeURIComponent(name)}&cols=${(viewportFit&&viewportFit.cols)||term.cols}&rows=${(viewportFit&&viewportFit.rows)||term.rows}&dev=${encodeURIComponent(deviceId)}&label=${encodeURIComponent(deviceLabel)}`);
   sock.binaryType='arraybuffer';
   const fresh = ()=> ws===sock && current===name;
   sock.onopen = () => { if(!fresh()) return; reconnectDelay=1000; setStatus('live', `<span class="name">${esc(name)}</span> &middot; live`); doFit(); term.focus(); };
@@ -727,6 +756,10 @@ function connect(name, isRetry){
   renderTabs();
 }
 document.addEventListener('visibilitychange', ()=>{ if(document.visibilityState==='visible' && current && (!ws || ws.readyState>1)){ reconnectDelay=1000; connect(current, true); } });
+// activity heartbeat so the server's auto-size only weighs RECENTLY-ACTIVE devices (a backgrounded tab
+// stops counting after 3 min); also report visibility promptly so hiding/showing updates auto instantly.
+setInterval(()=>{ if(ws && ws.readyState===1 && current) send('h', JSON.stringify({vis:document.visibilityState==='visible', act:actFlag()})); }, 30000);
+document.addEventListener('visibilitychange', ()=>{ if(ws && ws.readyState===1 && current) send('h', JSON.stringify({vis:document.visibilityState==='visible', act:document.visibilityState==='visible'?1:actFlag()})); });
 window.addEventListener('online', ()=>{ if(current && (!ws || ws.readyState>1)){ reconnectDelay=1000; connect(current, true); } });
 
 // ---- sessions / unread ----
@@ -1245,6 +1278,11 @@ function buildKeybar(){
   kb.appendChild(mk('Copy','accent', copyFromTerm));
   kb.appendChild(mk('Paste','accent', pasteToTerm));
   const sb=mk('⇲ size','accent', cycleSize); sb.id='sizebtn'; kb.appendChild(sb);
+  { let lp; const start=()=>{ lp=setTimeout(pinToOtherDevice,550); }; const cancel=()=>clearTimeout(lp);   // long-press = pin another device
+    sb.addEventListener('touchstart', start, {passive:true}); sb.addEventListener('touchend', cancel); sb.addEventListener('touchmove', cancel);
+    sb.addEventListener('mousedown', start); sb.addEventListener('mouseup', cancel); sb.addEventListener('mouseleave', cancel);
+    sb.addEventListener('contextmenu', e=>{ e.preventDefault(); pinToOtherDevice(); }); }
+  updateSizeBtn();
   kb.appendChild(kdivEl());
   // sticky modifiers (combine; apply to the next key OR typed char)
   const modg=document.createElement('div'); modg.className='kkeys';

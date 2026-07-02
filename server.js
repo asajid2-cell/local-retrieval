@@ -627,58 +627,90 @@ wssHost.on('connection', (ws, req) => {
   ws.on('close', () => { clearInterval(ka); if (hostWs === ws) { hostWs = null; console.log('[host] PC session host disconnected'); } });
 });
 
-// ---- shared window sizing (multi-client mirror, ONE stable size) --------------------------------
-// tmux can't give each client its own size on a shared window, and `window-size latest` made the whole
-// session snap to whoever typed last — so a phone shrank the desktop, two tabs fought, and stale clients
-// froze. Instead we hold EVERY attached tmux client at the same server-chosen size, so `window-size
-// largest` resolves to exactly that size (stable). Default 'auto' = the WIDEST connected viewport wins
-// (desktop over phone; if the desktop leaves, it falls back to the phone). The "cycle size" button pins
-// a specific connected client's size so you can deliberately work phone-sized. Clients render at the
-// window size and PAN if it's bigger than their screen.
-const sessions = new Map(); // name -> { clients: Map<id,Client>, mode: 'auto'|<clientId> }
+// ---- shared window sizing + DEVICE-IDENTITY PINNING (multi-client mirror, ONE stable size) --------
+// One shared size per session (tmux can't per-client-size a shared window; we hold every viewer at the
+// server-chosen size and each PANs if it's bigger than their screen). PIN = "prefer THIS device": the
+// pinned device's viewport drives the size for EVERYONE — last-pinner-wins — and it's keyed to a
+// persistent deviceId (localStorage), so a Wi-Fi blip / reconnect / relay restart does NOT lose the pin
+// (the old code pinned a connection id → gone on every reconnect). No pin = auto over the RECENTLY-ACTIVE
+// viewers only, so a backgrounded desktop tab in another room can't force your phone to pan forever.
+const PINS_FILE = __dirname + '/pins.json';
+let pins = new Map();   // session -> { deviceId, label, cols, rows, at }
+try { pins = new Map(JSON.parse(fs.readFileSync(PINS_FILE, 'utf8'))); } catch {}
+let _pinsDirty = false;
+function savePins() { try { fs.writeFileSync(PINS_FILE + '.tmp', JSON.stringify([...pins])); fs.renameSync(PINS_FILE + '.tmp', PINS_FILE); _pinsDirty = false; } catch {} }
+setInterval(() => { if (_pinsDirty) savePins(); }, 20000);
+const ACTIVE_MS = +process.env.MUX_ACTIVE_MS || 180000;   // "recently active" window that auto-size considers (3 min; env-overridable for tests)
+const PIN_HOLD_MS = 600000; // hold an absent pinned device's last size before falling back to auto (10 min)
+
+const sessions = new Map(); // name -> { clients: Map<id,Client>, cur }
 let _cid = 0;
 function sessionState(name) {
   let st = sessions.get(name);
-  if (!st) { st = { clients: new Map(), mode: 'auto' }; sessions.set(name, st); }
+  if (!st) { st = { clients: new Map(), cur: null }; sessions.set(name, st); }
   return st;
 }
-function targetSize(st) {
-  const cs = [...st.clients.values()].filter(c => c.vcols > 1 && c.vrows > 1);
-  if (!cs.length) return null;
-  if (st.mode !== 'auto') {
-    const pinned = st.clients.get(st.mode);
-    if (pinned && pinned.vcols > 1) return { cols: pinned.vcols, rows: pinned.vrows };
-    st.mode = 'auto'; // the pinned client left -> fall back to auto
+function isActive(c) { return c.visible !== false || (Date.now() - (c.lastActive || c.connAt || 0) < ACTIVE_MS); }
+function widest(list) { let b = list[0]; for (const c of list) if (c.vcols > b.vcols || (c.vcols === b.vcols && c.vrows > b.vrows)) b = c; return b; }
+function targetSize(st, name) {
+  const all = [...st.clients.values()].filter(c => c.vcols > 1 && c.vrows > 1);
+  const pin = pins.get(name);
+  if (pin) {
+    const onDev = all.filter(c => (c.deviceId || ('sock-' + c.id)) === pin.deviceId);
+    if (onDev.length) { const c = widest(onDev); if (c.vcols !== pin.cols || c.vrows !== pin.rows) { pin.cols = c.vcols; pin.rows = c.vrows; _pinsDirty = true; } return { cols: c.vcols, rows: c.vrows, pin }; }
+    if (Date.now() - (pin.at || 0) < PIN_HOLD_MS && pin.cols > 1) return { cols: pin.cols, rows: pin.rows, pin };  // pinned device away → hold its size (grace)
+    pins.delete(name); savePins();   // grace expired → drop the pin, fall to auto
   }
-  // auto = the WIDEST viewport (most columns; tie -> most rows). Width drives wrapping, so the widest
-  // client sees full-width content and narrower ones pan.
-  let best = cs[0];
-  for (const c of cs) if (c.vcols > best.vcols || (c.vcols === best.vcols && c.vrows > best.vrows)) best = c;
-  return { cols: best.vcols, rows: best.vrows };
+  if (!all.length) return null;
+  const active = all.filter(isActive);
+  const c = widest(active.length ? active : all);
+  return { cols: c.vcols, rows: c.vrows, pin: null };
 }
 function recompute(name) {
   const st = sessions.get(name); if (!st) return;
-  const sz = targetSize(st); if (!sz) return;
+  const sz = targetSize(st, name); if (!sz) return;
   const cols = Math.max(2, sz.cols | 0), rows = Math.max(2, sz.rows | 0);
   for (const c of st.clients.values()) { if (c.term) try { c.term.resize(cols, rows); } catch {} }
   // hosted session: ONE resize to the PC pty (deduped — a resize storm makes the TUI flicker-repaint)
   if ([...st.clients.values()].some(c => c.hosted)) {
     if (!st.cur || st.cur.cols !== cols || st.cur.rows !== rows) { st.cur = { cols, rows }; sendHost({ t: 'resize', s: name, cols, rows }); }
   }
-  const clients = [...st.clients.values()].map(c => ({ id: c.id, w: c.vcols, h: c.vrows }));
-  const modeLabel = st.mode === 'auto' ? `auto · ${cols}×${rows}` : `pinned · ${cols}×${rows}`;
+  const clients = [...st.clients.values()].map(c => ({ id: c.id, w: c.vcols, h: c.vrows, label: c.label || '', dev: c.deviceId || '', active: isActive(c) }));
+  const pinned = !!sz.pin, pinLabel = pinned ? (sz.pin.label || 'a device') : '';
   for (const c of st.clients.values()) {
-    if (c.ws.readyState === 1) {
-      try { c.ws.send('d' + JSON.stringify({ cols, rows, mode: st.mode, modeLabel, me: c.id, clients })); } catch {}
-    }
+    if (c.ws.readyState !== 1) continue;
+    const mine = pinned && sz.pin.deviceId === (c.deviceId || ('sock-' + c.id));
+    const modeLabel = pinned ? `📌 ${pinLabel} · ${cols}×${rows}` : `auto · ${cols}×${rows}`;
+    try { c.ws.send('d' + JSON.stringify({ cols, rows, mode: pinned ? 'pinned' : 'auto', pinLabel, mine, modeLabel, me: c.id, clients })); } catch {}
   }
 }
-function cycleMode(name) {
+function pinToDevice(name, client, on) {
+  if (on) pins.set(name, { deviceId: client.deviceId || ('sock-' + client.id), label: client.label || 'this device', cols: client.vcols, rows: client.vrows, at: Date.now() });
+  else pins.delete(name);
+  savePins(); recompute(name);
+}
+function pinToDeviceId(name, deviceId) {   // long-press: pin to ANY listed device
   const st = sessions.get(name); if (!st) return;
-  const ids = ['auto', ...st.clients.keys()];
-  const i = Math.max(0, ids.indexOf(st.mode));
-  st.mode = ids[(i + 1) % ids.length];
-  recompute(name);
+  const c = [...st.clients.values()].find(x => (x.deviceId || ('sock-' + x.id)) === deviceId);
+  if (c) pinToDevice(name, c, true);
+}
+function cycleMode(name, client) {   // the size chip / legacy 's': toggle pin-to-ME ↔ auto (last-pinner-wins)
+  const pin = pins.get(name);
+  const mine = pin && client && pin.deviceId === (client.deviceId || ('sock-' + client.id));
+  pinToDevice(name, client, !mine);
+}
+function applyActivity(client, o) {
+  if (o && typeof o.vis === 'boolean') client.visible = o.vis;
+  if (o && o.act) client.lastActive = Date.now();
+}
+// Shared sizing/pin/activity message handler for BOTH paths ('i' input stays with each caller).
+function handleClientMsg(name, client, s) {
+  const t = s[0];
+  if (t === 'v' || t === 'r') { try { const o = JSON.parse(s.slice(1)); if (o.cols) client.vcols = Math.max(2, o.cols | 0); if (o.rows) client.vrows = Math.max(2, o.rows | 0); applyActivity(client, o); } catch {} recompute(name); return true; }
+  if (t === 'h') { try { applyActivity(client, JSON.parse(s.slice(1))); } catch {} return true; }
+  if (t === 'P') { const arg = s.slice(1); if (arg && arg[0] === '#') pinToDeviceId(name, arg.slice(1)); else pinToDevice(name, client, arg !== '0'); return true; }
+  if (t === 's') { cycleMode(name, client); return true; }
+  return false;
 }
 
 wss.on('connection', async (ws, req) => {
@@ -688,6 +720,8 @@ wss.on('connection', async (ws, req) => {
   if (!name) return ws.close();
   const vcols = Math.max(2, +u.searchParams.get('cols') || 100);
   const vrows = Math.max(2, +u.searchParams.get('rows') || 30);
+  const deviceId = (u.searchParams.get('dev') || '').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 40);   // persistent device identity for pinning
+  const label = (u.searchParams.get('label') || '').replace(/[^\w .·/+-]/g, '').slice(0, 32) || 'device';
 
   // ---- PC-HOSTED attach: bridge this viewer to muxd (no tmux, no ssh — the session lives on the PC).
   // An unknown name while the host link is up is created THERE, so new sessions default to the PC.
@@ -699,7 +733,7 @@ wss.on('connection', async (ws, req) => {
     }
     const id = 'c' + (++_cid);
     const st = sessionState(name);
-    const client = { id, ws, term: null, hosted: true, vcols, vrows, sbWait: true, sbTok: ++_cid, q: [] };
+    const client = { id, ws, term: null, hosted: true, vcols, vrows, sbWait: true, sbTok: ++_cid, q: [], deviceId, label, visible: true, lastActive: Date.now(), connAt: Date.now() };
     st.clients.set(id, client);
     sendHost({ t: 'sb', s: name });                                    // scrollback replay first, live bytes queue behind it
     // sb didn't arrive in time (muxd slow) → go live, but CLEAR first so a reconnect's stale screen
@@ -707,10 +741,9 @@ wss.on('connection', async (ws, req) => {
     setTimeout(() => { if (client.sbWait) { client.sbWait = false; try { ws.send(CLEAR_SCREEN); for (const q of client.q) ws.send(q); } catch {} client.q = []; } }, 4000);
     recompute(name);
     ws.on('message', m => {
-      const s = m.toString(); const t = s[0];
-      if (t === 'i') sendHost({ t: 'i', s: name, d: Buffer.from(s.slice(1), 'utf8').toString('base64') });
-      else if (t === 'v' || t === 'r') { try { const { cols, rows } = JSON.parse(s.slice(1)); client.vcols = Math.max(2, cols | 0); client.vrows = Math.max(2, rows | 0); recompute(name); } catch {} }
-      else if (t === 's') { cycleMode(name); }
+      const s = m.toString();
+      if (s[0] === 'i') { sendHost({ t: 'i', s: name, d: Buffer.from(s.slice(1), 'utf8').toString('base64') }); client.lastActive = Date.now(); return; }
+      handleClientMsg(name, client, s);
     });
     const ka = setInterval(() => { if (ws.readyState === 1) { try { ws.ping(); } catch {} } }, 25000);
     ws.on('close', () => { clearInterval(ka); st.clients.delete(id); recompute(name); });
@@ -723,7 +756,7 @@ wss.on('connection', async (ws, req) => {
   const term = pty.spawn('tmux', ['attach', '-t', name], { name: 'xterm-256color', cols: vcols, rows: vrows, env: process.env });
   const id = 'c' + (++_cid);
   const st = sessionState(name);
-  const client = { id, ws, term, vcols, vrows };
+  const client = { id, ws, term, vcols, vrows, deviceId, label, visible: true, lastActive: Date.now(), connAt: Date.now() };
   st.clients.set(id, client);
   // Terminal output as BINARY frames; control messages (window size) as TEXT frames — so the client can
   // tell them apart unambiguously (terminal bytes can start with any character).
@@ -731,13 +764,8 @@ wss.on('connection', async (ws, req) => {
   recompute(name);
   ws.on('message', m => {
     const s = m.toString();
-    const t = s[0];
-    if (t === 'i') term.write(s.slice(1));
-    else if (t === 'v' || t === 'r') { // 'v' = my viewport fit (new); 'r' = legacy resize — same handling
-      try { const { cols, rows } = JSON.parse(s.slice(1)); client.vcols = Math.max(2, cols | 0); client.vrows = Math.max(2, rows | 0); recompute(name); } catch {}
-    }
-    else if (t === 's') { cycleMode(name); }   // cycle the shared window size (auto -> each client -> auto)
-    // 't' (or anything else) = client keepalive ping; ignored.
+    if (s[0] === 'i') { term.write(s.slice(1)); client.lastActive = Date.now(); return; }
+    handleClientMsg(name, client, s);   // v/r resize, h heartbeat, P pin, s cycle
   });
   const ka = setInterval(() => { if (ws.readyState === 1) { try { ws.ping(); } catch {} } }, 25000);
   ws.on('close', () => { clearInterval(ka); st.clients.delete(id); try { term.kill(); } catch {} recompute(name); });
