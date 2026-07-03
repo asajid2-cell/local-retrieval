@@ -84,6 +84,10 @@ function markPending(name) { pendingCreates.set(name, Date.now() + 8000); }
 // Clear-scrollback + clear-screen + home: prefixes a scrollback replay so a reconnecting viewer that
 // still shows the pre-drop screen doesn't get the replay stacked ON TOP of it (A2 #2/#3).
 const CLEAR_SCREEN = Buffer.from('\x1b[3J\x1b[2J\x1b[H');
+// Hosted sessions are PC-local first. Web attach must become live quickly; scrollback is a bounded
+// convenience replay, not something allowed to stall live terminal bytes for multiple seconds.
+const HOST_SB_BYTES = +process.env.MUX_HOST_SB_BYTES || 60000;
+const HOST_SB_WAIT_MS = +process.env.MUX_HOST_SB_WAIT_MS || 900;
 const hostUp = () => !!(hostWs && hostWs.readyState === 1);
 function sendHost(obj) { if (hostUp()) { try { hostWs.send(JSON.stringify(obj)); return true; } catch {} } return false; }
 const hostedHas = name => hostUp() && hostSessions.has(name);
@@ -790,10 +794,9 @@ wss.on('connection', async (ws, req) => {
     const st = sessionState(name);
     const client = { id, ws, term: null, hosted: true, vcols, vrows, sbWait: true, sbTok: ++_cid, q: [], deviceId, label, visible: true, lastActive: Date.now(), connAt: Date.now() };
     st.clients.set(id, client);
-    sendHost({ t: 'sb', s: name });                                    // scrollback replay first, live bytes queue behind it
-    // sb didn't arrive in time (muxd slow) → go live, but CLEAR first so a reconnect's stale screen
-    // doesn't collide with the incoming live bytes.
-    setTimeout(() => { if (client.sbWait) { client.sbWait = false; try { ws.send(CLEAR_SCREEN); for (const q of client.q) ws.send(q); } catch {} client.q = []; } }, 4000);
+    sendHost({ t: 'sb', s: name, max: HOST_SB_BYTES });                  // bounded replay; live bytes queue briefly behind it
+    // If scrollback is slow or large, go live quickly. Local muxd keeps running either way.
+    setTimeout(() => { if (client.sbWait) { client.sbWait = false; try { ws.send(CLEAR_SCREEN); for (const q of client.q) ws.send(q); } catch {} client.q = []; } }, HOST_SB_WAIT_MS);
     recompute(name);
     ws.on('message', m => {
       const s = m.toString();

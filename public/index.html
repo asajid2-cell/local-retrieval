@@ -939,12 +939,10 @@ async function relaunchSession(s){
   flash('Relaunching '+s.name+'…');
   try{
     await fetch(base+'/api/sessions/'+encodeURIComponent(s.name),{method:'DELETE'});   // drop the dead session
-    await new Promise(r=>setTimeout(r,500));
     const res=await fetch(base+'/api/sessions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:s.name, command:cmd})});
     if(!res.ok) throw new Error('HTTP '+res.status);
-    await new Promise(r=>setTimeout(r,700));
-    connect(s.name);                                  // attach the fresh session (connect tears down the old socket)
-    setTimeout(loadSessions, 800);
+    connect(s.name);                                  // attach immediately; the hosted path queues/revives on muxd
+    loadSessions(s.name);
     flash('Relaunched '+s.name+' — agent restarting');
   }catch(e){ flash('Relaunch failed: '+(e.message||e)); loadSessions(); }
 }
