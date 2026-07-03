@@ -252,24 +252,17 @@ async def screen_pump(ws, stop):
         await asyncio.sleep(0.12)
 
 
-def child_args(command):
-    if command:
-        encoded = base64.b64encode(command.encode("utf-16le")).decode("ascii")
-        return ["powershell.exe", "-NoLogo", "-NoExit", "-EncodedCommand", encoded]
-    return ["powershell.exe", "-NoLogo"]
+async def wait_child(child):
+    while child.poll() is None:
+        await asyncio.sleep(0.2)
+    return int(child.returncode or 0)
 
 
-async def main_async(args):
+async def register_owner(args, command, cwd):
     import json
 
-    ensure_muxd_started()
-    enable_console_modes()
-    command = args.cmd or ""
-    if args.cmd_b64:
-        command = base64.b64decode(args.cmd_b64).decode("utf-8", "replace")
-    cwd = args.cwd if args.cwd and os.path.isdir(args.cwd) else os.getcwd()
-    stop = asyncio.Event()
-    async with websockets.connect(URL, max_size=8_000_000, ping_interval=20, ping_timeout=15) as ws:
+    ws = await websockets.connect(URL, max_size=8_000_000, ping_interval=20, ping_timeout=15)
+    try:
         cols, rows = visible_size()
         await ws.send(
             json.dumps(
@@ -283,26 +276,111 @@ async def main_async(args):
                 }
             )
         )
-        first = json.loads(await ws.recv())
+        first = json.loads(await asyncio.wait_for(ws.recv(), 8))
         if first.get("t") == "err":
-            print("[muxrun] " + first.get("m", "registration failed"), file=sys.stderr)
-            return 2
-        child = subprocess.Popen(child_args(command), cwd=cwd)
-        tasks = [
-            asyncio.create_task(listen_remote(ws, child)),
-            asyncio.create_task(screen_pump(ws, stop)),
-        ]
+            raise RuntimeError(first.get("m", "registration failed"))
+        return ws
+    except Exception:
         try:
-            while child.poll() is None:
-                await asyncio.sleep(0.2)
-        finally:
-            stop.set()
-            for task in tasks:
-                task.cancel()
+            await ws.close()
+        except Exception:
+            pass
+        raise
+
+
+async def connect_owner(args, command, cwd, child_started):
+    deadline = time.monotonic() + (float("inf") if child_started else 20.0)
+    backoff = 0.5
+    last_error = None
+    while time.monotonic() < deadline:
+        ensure_muxd_started()
+        try:
+            return await register_owner(args, command, cwd)
+        except RuntimeError as e:
+            last_error = e
+            msg = str(e)
+            if "already has a visible local owner" in msg and not child_started:
+                raise
+            print("[muxrun] owner registration failed; retrying: " + msg, file=sys.stderr)
+        except Exception as e:
+            last_error = e
+            print("[muxrun] muxd owner link unavailable; retrying: " + str(e), file=sys.stderr)
+        await asyncio.sleep(backoff)
+        backoff = min(5.0, backoff * 1.6)
+    if last_error:
+        raise last_error
+    raise RuntimeError("timed out registering with muxd")
+
+
+async def run_owner_link(ws, child):
+    import json
+
+    stop = asyncio.Event()
+    tasks = [
+        asyncio.create_task(listen_remote(ws, child)),
+        asyncio.create_task(screen_pump(ws, stop)),
+        asyncio.create_task(wait_child(child)),
+    ]
+    try:
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        if tasks[2] in done:
             try:
                 await ws.send(json.dumps({"t": "dead"}))
             except Exception:
                 pass
+            return "child-exit"
+        await asyncio.sleep(0.3)
+        if child.poll() is not None:
+            try:
+                await ws.send(json.dumps({"t": "dead"}))
+            except Exception:
+                pass
+            return "child-exit"
+        return "link-drop"
+    finally:
+        stop.set()
+        for task in tasks:
+            task.cancel()
+        try:
+            await ws.close()
+        except Exception:
+            pass
+
+
+def child_args(command):
+    if command:
+        encoded = base64.b64encode(command.encode("utf-16le")).decode("ascii")
+        return ["powershell.exe", "-NoLogo", "-NoExit", "-EncodedCommand", encoded]
+    return ["powershell.exe", "-NoLogo"]
+
+
+async def main_async(args):
+    ensure_muxd_started()
+    enable_console_modes()
+    command = args.cmd or ""
+    if args.cmd_b64:
+        command = base64.b64decode(args.cmd_b64).decode("utf-8", "replace")
+    cwd = args.cwd if args.cwd and os.path.isdir(args.cwd) else os.getcwd()
+
+    try:
+        ws = await connect_owner(args, command, cwd, child_started=False)
+    except Exception as e:
+        print("[muxrun] " + str(e), file=sys.stderr)
+        return 2
+
+    child = subprocess.Popen(child_args(command), cwd=cwd)
+    while child.poll() is None:
+        try:
+            result = await run_owner_link(ws, child)
+            if result == "child-exit":
+                break
+            print("[muxrun] muxd owner link dropped; re-registering while child continues", file=sys.stderr)
+            ws = await connect_owner(args, command, cwd, child_started=True)
+        except Exception as e:
+            if child.poll() is not None:
+                break
+            print("[muxrun] muxd owner link failed; re-registering while child continues: " + str(e), file=sys.stderr)
+            ws = await connect_owner(args, command, cwd, child_started=True)
     return int(child.returncode or 0)
 
 

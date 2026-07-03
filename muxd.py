@@ -51,7 +51,7 @@ RING_CAP = 800_000           # per-session scrollback bytes kept
 SB_SEND = 260_000            # bytes replayed to a newly-attached viewer
 LOCAL_SB_SEND = int(ENV.get("LOCAL_SB_SEND", "60000"))  # local muxctl attach should become live fast
 LOCAL_FIRST_TIMEOUT = float(ENV.get("LOCAL_FIRST_TIMEOUT", "3"))
-LOOP_WATCHDOG_WARN = float(ENV.get("LOOP_WATCHDOG_WARN", "3"))
+LOOP_WATCHDOG_WARN = float(ENV.get("LOOP_WATCHDOG_WARN", "30"))
 LOOP_WATCHDOG_EXIT = float(ENV.get("LOOP_WATCHDOG_EXIT", "12"))
 PROTOCOL = 2
 CAPS = ["ls", "info", "create", "open", "attach", "kill", "rename", "heal", "tail", "scrollback", "resize", "owner"]
@@ -327,11 +327,8 @@ def start_watchdog_thread():
             reason = f"[watchdog] event loop has not ticked for {stale:.1f}s; live={live}"
             log(reason)
             dump_thread_stacks(reason)
-            if stale >= LOOP_WATCHDOG_EXIT and not live:
-                log("[watchdog] no live muxd-owned sessions; exiting so the scheduled task can restart muxd")
-                os._exit(70)
             if stale >= LOOP_WATCHDOG_EXIT:
-                log("[watchdog] live muxd-owned sessions exist; not auto-restarting because that would kill work")
+                log("[watchdog] auto-restart disabled; leaving muxd running so lag cannot reset session state")
 
     threading.Thread(target=run, name="muxd-watchdog", daemon=True).start()
 
