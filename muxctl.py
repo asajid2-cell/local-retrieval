@@ -19,8 +19,9 @@ EXT = {b'H': b'\x1b[A', b'P': b'\x1b[B', b'M': b'\x1b[C', b'K': b'\x1b[D',
 def enable_vt_out():
     k = ctypes.windll.kernel32
     h = k.GetStdHandle(-11)
-    m = ctypes.c_uint(); k.GetConsoleMode(h, ctypes.byref(m))
-    k.SetConsoleMode(h, m.value | 0x0004)   # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+    m = ctypes.c_uint()
+    if k.GetConsoleMode(h, ctypes.byref(m)):
+        k.SetConsoleMode(h, m.value | 0x0004)   # ENABLE_VIRTUAL_TERMINAL_PROCESSING
 
 def term_size():
     try:
@@ -60,6 +61,10 @@ async def do_create(name):
         print("%s %s" % ("created" if m.get("created") else "ready", m.get("s", name)))
         return 0
 
+async def do_next_name():
+    print(next_name(await fetch_list()))
+    return 0
+
 async def do_attach(name, create=False):
     enable_vt_out()
     cols, rows = term_size()
@@ -67,6 +72,12 @@ async def do_attach(name, create=False):
         await ws.send(json.dumps({"t": "open" if create else "attach", "s": name, "cols": cols, "rows": rows}))
         loop = asyncio.get_event_loop()
         stop = asyncio.Event()
+        sendq = asyncio.Queue()
+        send_lock = asyncio.Lock()
+
+        async def safe_send(payload):
+            async with send_lock:
+                await ws.send(payload)
 
         def input_thread():
             while True:
@@ -77,15 +88,44 @@ async def do_attach(name, create=False):
                     if not seq: continue
                     data = seq
                 elif ch == b'\x1d':                    # Ctrl-] = detach
-                    loop.call_soon_threadsafe(stop.set); return
+                    loop.call_soon_threadsafe(stop.set)
+                    loop.call_soon_threadsafe(sendq.put_nowait, None)
+                    return
                 else:
                     data = ch
-                asyncio.run_coroutine_threadsafe(ws.send(json.dumps({"t": "i", "d": base64.b64encode(data).decode()})), loop)
+                loop.call_soon_threadsafe(sendq.put_nowait, data)
         threading.Thread(target=input_thread, daemon=True).start()
+
+        async def send_input():
+            while True:
+                data = await sendq.get()
+                if data is None: return
+                buf = bytearray(data)
+                deadline = loop.time() + 0.004
+                while len(buf) < 4096:
+                    timeout = max(0, deadline - loop.time())
+                    if timeout <= 0: break
+                    try: more = await asyncio.wait_for(sendq.get(), timeout)
+                    except asyncio.TimeoutError: break
+                    if more is None: return
+                    buf += more
+                await safe_send(bytes(buf))
+
+        async def resize_watch():
+            last = (cols, rows)
+            while True:
+                await asyncio.sleep(0.25)
+                cur = term_size()
+                if cur == last: continue
+                last = cur
+                await safe_send(json.dumps({"t": "resize", "cols": cur[0], "rows": cur[1]}))
 
         async def recv():
             try:
                 async for raw in ws:
+                    if isinstance(raw, (bytes, bytearray)):
+                        sys.stdout.buffer.write(bytes(raw)); sys.stdout.buffer.flush()
+                        continue
                     try: m = json.loads(raw)
                     except Exception: continue
                     if m.get("t") == "o":
@@ -94,9 +134,11 @@ async def do_attach(name, create=False):
                         sys.stderr.write("\r\n[muxctl] " + m.get("m", "error") + "\r\n"); return
             finally:
                 stop.set()
-        rt = asyncio.create_task(recv())
+                try: sendq.put_nowait(None)
+                except Exception: pass
+        tasks = [asyncio.create_task(recv()), asyncio.create_task(send_input()), asyncio.create_task(resize_watch())]
         await stop.wait()
-        rt.cancel()
+        for task in tasks: task.cancel()
     sys.stdout.write("\r\n[muxctl] detached\r\n")
 
 def main():
@@ -106,6 +148,8 @@ def main():
             asyncio.run(do_ls())
         elif a[0] in ("create", "new") and len(a) >= 2:
             raise SystemExit(asyncio.run(do_create(a[1])))
+        elif a[0] in ("next-name", "next"):
+            raise SystemExit(asyncio.run(do_next_name()))
         elif a[0] in ("attach", "a") and len(a) >= 2:
             try: asyncio.run(do_attach(a[1], create=False))
             except KeyboardInterrupt: pass
@@ -116,7 +160,7 @@ def main():
             try: asyncio.run(do_attach(name, create=True))
             except KeyboardInterrupt: pass
         else:
-            print("usage: muxctl ls | muxctl create <session> | muxctl attach <session> | muxctl open [session]")
+            print("usage: muxctl ls | muxctl next-name | muxctl create <session> | muxctl attach <session> | muxctl open [session]")
     except OSError as e:
         sys.stderr.write("[muxctl] cannot reach muxd at %s: %s\n" % (URL, e))
         raise SystemExit(2)

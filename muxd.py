@@ -11,7 +11,7 @@
 #
 # State: sessions.json manifest (resume commands) -> muxd restart / PC reboot lists unarmed sessions
 # as dormant placeholders. Only sessions explicitly armed with heal auto-start.
-import asyncio, base64, collections, json, os, queue, re, sys, threading, time, traceback
+import asyncio, base64, collections, json, os, queue, re, subprocess, sys, threading, time, traceback
 import faulthandler
 try: faulthandler.enable(open(os.path.join(os.path.expanduser("~"), "muxd", "muxd.crash"), "a"))
 except Exception: pass
@@ -68,12 +68,25 @@ class Session:
         else: self.dead = True          # placeholder tab: NOTHING runs until the user attaches (revive) or arms it
 
     def spawn(self):
-        self.pty = PtyProcess.spawn("powershell.exe -NoLogo", dimensions=(self.rows, self.cols), cwd=self.cwd)
+        cmdline = "powershell.exe -NoLogo"
+        direct_cmd = False
+        if self.cmd:
+            cmdline = subprocess.list2cmdline(["powershell.exe", "-NoLogo", "-NoExit", "-Command", self.cmd])
+            direct_cmd = True
+        try:
+            self.pty = PtyProcess.spawn(cmdline, dimensions=(self.rows, self.cols), cwd=self.cwd)
+        except Exception:
+            if not self.cmd:
+                raise
+            # If a saved command hits a Windows command-line edge case, keep the session usable and
+            # fall back to typing the command into an already-started shell.
+            self.pty = PtyProcess.spawn("powershell.exe -NoLogo", dimensions=(self.rows, self.cols), cwd=self.cwd)
+            direct_cmd = False
         self.dead = False
         t = threading.Thread(target=self._reader, args=(self.pty,), daemon=True); t.start()
-        if self.cmd:
-            threading.Timer(2.5, self._type_cmd, args=(self.pty,)).start()
-        log(f"[{self.name}] spawned pty ({self.cols}x{self.rows}) cmd={'yes' if self.cmd else 'no'}")
+        if self.cmd and not direct_cmd:
+            threading.Timer(0.8, self._type_cmd, args=(self.pty,)).start()
+        log(f"[{self.name}] spawned pty ({self.cols}x{self.rows}) cmd={'direct' if direct_cmd else ('typed' if self.cmd else 'no')}")
 
     def _type_cmd(self, pty):
         try:
@@ -132,11 +145,13 @@ class Session:
         try: self.pty.setwinsize(rows, cols)
         except Exception as e: log(f"[{self.name}] resize failed: {e}")
 
-    def scrollback(self):
+    def scrollback(self, limit=SB_SEND):
+        try: limit = max(0, min(RING_CAP, int(limit)))
+        except Exception: limit = SB_SEND
         out, n = [], 0
         for b in reversed(self.ring):
             out.append(b); n += len(b)
-            if n >= SB_SEND: break
+            if n >= limit: break
         return b"".join(reversed(out))
 
     def tail_text(self, nbytes=1600, lines=0):
@@ -285,14 +300,16 @@ async def main():
             lq = asyncio.Queue(); s.local.add(lq)
             if first.get("cols"): s.resize(int(first.get("cols")), int(first.get("rows") or 40))
             try:
-                await ws.send(json.dumps({"t": "o", "d": base64.b64encode(s.scrollback()).decode()}))
+                await ws.send(s.scrollback())
                 async def pump():
                     while True:
                         data = await lq.get()
-                        await ws.send(json.dumps({"t": "o", "d": base64.b64encode(data).decode()}))
+                        await ws.send(data)
                 pt = asyncio.create_task(pump())
                 try:
                     async for raw in ws:
+                        if isinstance(raw, (bytes, bytearray)):
+                            s.write(bytes(raw)); continue
                         try: m = json.loads(raw)
                         except Exception: continue
                         if m.get("t") == "i": s.write(base64.b64decode(m.get("d", "")))
@@ -388,7 +405,7 @@ async def main():
                                 sessions[name].resize(m.get("cols", 140), m.get("rows", 40))
                             elif t == "sb" and name in sessions:
                                 await ws.send(json.dumps({"t": "sb", "s": name,
-                                                          "d": base64.b64encode(sessions[name].scrollback()).decode()}))
+                                                          "d": base64.b64encode(sessions[name].scrollback(m.get("max", SB_SEND))).decode()}))
                             elif t == "rename" and name in sessions:
                                 to = SAFE(m.get("to", ""))
                                 if to and to not in sessions:

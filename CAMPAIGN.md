@@ -43,6 +43,8 @@
 | 3 | Attribute web glitchiness with measured output path | Slow path appears as host link churn, frame flood, or client render backlog | Controlled noisy session with timestamps/log counts | Dead if controlled session is smooth while real agent remains slow | smoke-tested |
 | 4 | Backend sync freshness | Web project/running sync is stale or disabled independently of terminal muxing | Inspect `/api/projects`, app sync process/logs | Dead if project sync is live and not part of current UX failure | not blocker |
 | 5 | Latency parity attribution | If multiplex is not identical to local, overhead is one of shell startup, relay transport, browser xterm rendering, or launcher compatibility | Fresh vs warm local/web probes and code inspection | Dead if measurements cannot separate startup from transport | attributed |
+| 6 | Local-first fast path | If the local launcher talks straight to muxd and muxctl uses raw local frames, local start/attach becomes independent of VPS latency and closer to native terminal behavior | Patch muxctl/muxd/profile, then start/attach while relay is down | Dead if local input/output depends on the relay or profile cannot be made direct | won except CFA profile shadow |
+| 7 | Remote viewer decoupling | If web is only a viewer/controller, scrollback replay and relaunch waits can move off the critical path without risking local work | Limit hosted scrollback replay, shorten sb wait, remove fixed relaunch sleeps | Dead if web attach loses live output or creates tmux twins while host is up | won |
 
 ## Fronts
 | Front | Mechanism | State | Last advance |
@@ -64,12 +66,21 @@
 - 2026-07-03: Latency probe pass. Fresh local muxd sessions took ~3.5-3.9s to produce marker output; fresh relay sessions took ~3.6-3.7s, so the relay is not the dominant cold-start bottleneck. Direct winpty startup of PowerShell/cmd variants took ~3.0-3.4s, identifying local ConPTY/shell startup as the main cold-start cost.
 - 2026-07-03: Warm-session probe pass. Existing session local attach/input produced marker output in ~74-145ms. Existing session relay attach/input via VPS loopback produced marker output in ~65-220ms. Transport overhead is present but not multi-second.
 - 2026-07-03: Frontend code inspection: relaunch path has hard-coded waits of 500ms + 700ms + 800ms; each web attach writes scrollback replay into xterm (`SB_SEND=260000` from muxd, browser xterm scrollback 8000). Heavy scrollback can cause browser-main-thread jank even when the PTY is healthy.
+- 2026-07-03: Local-first implementation pass opened. New kill criteria: local `multiplex` must call muxd directly, muxctl local input/output must continue while the relay is down, and web attach/relaunch must not block live terminal use on heavy scrollback or fixed sleeps.
+- 2026-07-03: Implemented local binary muxctl/muxd loopback frames, 4ms input coalescing, resize watcher, and direct PowerShell `-Command` launch for saved commands (fallback to typed command if spawn fails).
+- 2026-07-03: Defender CFA blocked replacing `Microsoft.PowerShell_profile.ps1` despite Ahmed having ACL FullControl (`EnableControlledFolderAccess=1`, write denied). Installed direct PATH launchers `mux`, `multiplex-local`, and `multiplex.cmd`; note PowerShell's existing `multiplex` function still shadows `multiplex.cmd` until the profile is edited from an allowed/elevated app.
+- 2026-07-03: Patched `/usr/local/bin/multiplex-session` compatibility helper so stale profile launches still bounce into PC muxd instead of creating tmux twins; synthetic default `ai` now lets muxctl choose the next local ai/ai2/... name.
+- 2026-07-03: Patched web relay: hosted attach requests at most 60000 bytes of scrollback and waits only 900ms before going live; web relaunch removed fixed 500ms + 700ms + 800ms sleeps and connects immediately after create.
+- 2026-07-03: End-to-end proof: `localfirst-proof-1783071194` produced local marker before relay stop in 3669.9ms (cold shell), then while `multiplex-app.service` was stopped produced a second local marker in 47.7ms. After relay restart, health showed `host.connected=true`, `host.sessions=1`; VPS loopback `/ws` marker returned in 53ms. Cleanup left local and relay session lists empty.
+- 2026-07-03: Direct saved-command startup proof: `directcmd-proof-1783071263` logged `cmd=direct` and produced marker in 3370.0ms. The old 2.5s delayed typing path is removed from the normal case; remaining cold-start cost is still PowerShell/ConPTY startup.
 
 ## Learnings
 - The word "session" currently names three different things: VPS tmux, relay-visible hosted session, and muxd local ConPTY. Reliability requires one normal ownership path.
 - Windows Defender Controlled Folder Access is enabled, and direct writes to `C:\Users\Ahmed\Documents\WindowsPowerShell\Microsoft.PowerShell_profile.ps1` are denied from this process. The old function still prints stale text, but the VPS helper it invokes now lands in muxd.
 - Cold-start parity with an already-open local terminal is impossible with the current architecture because muxd creates a new winpty/ConPTY + shell for each new session. To match an existing local terminal, muxd needs either a warm shell/PTY pool or direct process launch of parsed agent commands.
 - Runtime parity is much closer after startup; the remaining non-local feel is mostly browser/xterm rendering, scrollback replay, shared-size/pan behavior, and the old `multiplex` profile still taking a compatibility SSH bounce.
+- Local muxctl attach now uses raw local WebSocket frames, not JSON/base64 per keypress. This removes avoidable localhost overhead without changing the relay protocol.
+- Remote/web is now explicitly secondary: bounded scrollback and short sb wait keep browser rendering from blocking the live hosted PTY path.
 
 ## BLOCKED / Decisions needed
-- Cosmetic/direct launcher cleanup is blocked by Controlled Folder Access unless the profile can be edited from an allowed/elevated process. Functional named attach is covered by the helper bridge.
+- Exact PowerShell `multiplex` function replacement is blocked by Controlled Folder Access unless the profile can be edited from an allowed/elevated process or Defender allows the editor. Functional paths are covered by direct `mux` / `multiplex-local` launchers and the patched helper bridge.
