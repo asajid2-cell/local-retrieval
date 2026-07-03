@@ -186,14 +186,14 @@ async def main():
     outq = asyncio.Queue()
 
     # boot policy (user-specified): agents NEVER auto-start on a fresh boot unless the session was
-    # ARMED (auto-resume on). Armed → recreate + resume now. Unarmed → a dead placeholder tab; the
-    # shell+agent come back only when the user attaches it (revive) — an explicit action.
+    # ARMED (auto-resume on). Armed -> recreate + resume now. Unarmed -> a dead placeholder tab that
+    # stays dormant until an explicit create/relaunch sends a non-empty resume command.
     for name, m in manifest_load().items():
         if SAFE(name) and name not in sessions:
             try:
                 heal = bool(m.get("heal"))
                 sessions[name] = Session(name, m.get("cmd", ""), m.get("cwd", ""), m.get("cols", 140), m.get("rows", 40), loop, outq, heal=heal, spawn_now=heal)
-                log(f"[boot] {'recreated + resumed (armed)' if heal else 'listed as dormant (unarmed — starts on attach)'}: {name}")
+                log(f"[boot] {'recreated + resumed (armed)' if heal else 'listed as dormant (unarmed - explicit relaunch required)'}: {name}")
             except Exception as e: log(f"[boot] {name} failed: {e}")
 
     async def self_heal_tick():
@@ -317,11 +317,22 @@ async def main():
                                     pass                                    # already hosted + alive
                                 else:
                                     prev = sessions.get(name)               # reviving a DEAD session → keep its cmd/cwd/size (don't wipe the resume)
-                                    cmd = m.get("cmd", "") or (prev.cmd if prev else "")
+                                    requested_cmd = (m.get("cmd", "") or "").strip()
+                                    requested_heal = bool(m.get("heal")) if ("heal" in m) else bool(prev.heal if prev else False)
+                                    # Plain web attach to a dormant, unarmed placeholder sends create{cmd:""}.
+                                    # Do not translate that into "resume the saved command"; only an explicit
+                                    # Relaunch/Create request (non-empty cmd) or an armed watcher may start work.
+                                    if prev and prev.dead and not prev.heal and not requested_heal and not requested_cmd:
+                                        if m.get("cols"): prev.cols = int(m.get("cols") or prev.cols)
+                                        if m.get("rows"): prev.rows = int(m.get("rows") or prev.rows)
+                                        log(f"[{name}] attach to dormant unarmed session - left stopped")
+                                        await ws.send(json.dumps({"t": "sessions", "list": sess_list()}))
+                                        continue
+                                    cmd = requested_cmd or (prev.cmd if prev else "")
                                     cwd = m.get("cwd", "") or (prev.cwd if prev else "")
                                     cols = int(m.get("cols") or (prev.cols if prev else 140))
                                     rows = int(m.get("rows") or (prev.rows if prev else 40))
-                                    heal = bool(m.get("heal")) if ("heal" in m) else bool(prev.heal if prev else False)
+                                    heal = requested_heal
                                     if prev: prev.kill(by_user=False)
                                     sessions[name] = Session(name, cmd, cwd, cols, rows, loop, outq, heal=heal)
                                     manifest_save()
