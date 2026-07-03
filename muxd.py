@@ -6,11 +6,11 @@
 # to the VPS relay (no inbound port on the PC) and multiplexes all sessions over one WebSocket.
 #
 # Protocol (JSON text frames over ws):
-#   muxd -> relay:  hello{host,sessions} · sessions{list} · o{s,d:b64} · sb{s,d:b64} · killed{s} · pong
-#   relay -> muxd:  create{s,cmd,cwd,cols,rows} · i{s,d:b64} · resize{s,cols,rows} · kill{s} · sb{s} · ping
+#   muxd -> relay:  hello{host,sessions} . sessions{list} . o{s,d:b64} . sb{s,d:b64} . killed{s} . pong
+#   relay -> muxd:  create{s,cmd,cwd,cols,rows} . i{s,d:b64} . resize{s,cols,rows} . kill{s} . sb{s} . ping
 #
-# State: sessions.json manifest (resume commands) -> muxd restart / PC reboot auto-recreates and
-# re-runs each session's resume, so even the "PC reboot" failure self-heals.
+# State: sessions.json manifest (resume commands) -> muxd restart / PC reboot lists unarmed sessions
+# as dormant placeholders. Only sessions explicitly armed with heal auto-start.
 import asyncio, base64, collections, json, os, queue, re, sys, threading, time, traceback
 import faulthandler
 try: faulthandler.enable(open(os.path.join(os.path.expanduser("~"), "muxd", "muxd.crash"), "a"))
@@ -179,7 +179,7 @@ SAFE = lambda s: re.sub(r"[^A-Za-z0-9_.-]", "", str(s or ""))[:48]
 def sess_list():
     return [{"name": n, "alive": s.alive(), "created": int(s.created * 1000),
              "lastOut": int(s.last_out * 1000), "cols": s.cols, "rows": s.rows,
-             "tail": s.tail_text()} for n, s in sessions.items()]
+             "tail": s.tail_text(), "heal": s.heal} for n, s in sessions.items()]
 
 async def main():
     loop = asyncio.get_running_loop()
@@ -228,6 +228,42 @@ async def main():
     # exactly like a web viewer, so you get `tmux attach`-style parity from a Windows Terminal on the PC.
     async def local_serve():
         import websockets as _ws
+        def ensure_local_session(first, spawn_if_missing):
+            name = SAFE(first.get("s", ""))
+            if not name:
+                return None, "session name required", False
+            prev = sessions.get(name)
+            requested_cmd = (first.get("cmd", "") or "").strip()
+            requested_cwd = first.get("cwd", "") or ""
+            requested_heal = bool(first.get("heal")) if ("heal" in first) else bool(prev.heal if prev else False)
+            cols = int(first.get("cols") or (prev.cols if prev else 140))
+            rows = int(first.get("rows") or (prev.rows if prev else 40))
+            if prev and prev.alive():
+                prev.heal = requested_heal
+                if requested_cmd and requested_cmd != prev.cmd:
+                    prev.cmd = requested_cmd
+                if requested_cwd:
+                    prev.cwd = requested_cwd
+                if first.get("cols"): prev.resize(cols, rows)
+                manifest_save()
+                return prev, "", False
+            if prev and not spawn_if_missing:
+                return prev, "", False
+            if not prev and not spawn_if_missing:
+                return None, "no such session: " + name, False
+
+            # Local `open` is an explicit user start/attach action. If a dormant placeholder has a
+            # saved resume command, reuse it; plain web tab selection still sends relay create{cmd:""}
+            # and remains stopped for unarmed sessions.
+            cmd = requested_cmd or (prev.cmd if prev else "")
+            cwd = requested_cwd or (prev.cwd if prev else "")
+            if prev:
+                prev.kill(by_user=False)
+            s = Session(name, cmd, cwd, cols, rows, loop, outq, heal=requested_heal)
+            sessions[name] = s
+            manifest_save()
+            return s, "", True
+
         async def handler(ws):
             try:
                 first = json.loads(await ws.recv())
@@ -235,10 +271,17 @@ async def main():
                 return
             if first.get("t") == "ls":
                 await ws.send(json.dumps({"t": "ls", "list": sess_list()})); return
-            name = SAFE(first.get("s", ""))
-            if name not in sessions:
-                await ws.send(json.dumps({"t": "err", "m": "no such session: " + name})); return
-            s = sessions[name]
+            if first.get("t") == "create":
+                s, err, created = ensure_local_session(first, True)
+                if err:
+                    await ws.send(json.dumps({"t": "err", "m": err})); return
+                await ws.send(json.dumps({"t": "created", "s": s.name, "created": created, "alive": s.alive()})); return
+            if first.get("t") == "open":
+                s, err, _created = ensure_local_session(first, True)
+            else:
+                s, err, _created = ensure_local_session(first, False)
+            if err:
+                await ws.send(json.dumps({"t": "err", "m": err})); return
             lq = asyncio.Queue(); s.local.add(lq)
             if first.get("cols"): s.resize(int(first.get("cols")), int(first.get("rows") or 40))
             try:
