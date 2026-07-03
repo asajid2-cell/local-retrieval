@@ -50,8 +50,9 @@ RING_CAP = 800_000           # per-session scrollback bytes kept
 SB_SEND = 260_000            # bytes replayed to a newly-attached viewer
 
 class Session:
-    def __init__(self, name, cmd, cwd, cols, rows, loop, outq):
+    def __init__(self, name, cmd, cwd, cols, rows, loop, outq, heal=False, spawn_now=True):
         self.name, self.cmd, self.cwd = name, cmd or "", cwd or DEFAULT_CWD
+        self.heal = bool(heal)          # opt-in: ONLY healed (user-armed) sessions auto-start at boot / auto-respawn
         self.cols, self.rows = max(20, cols or 140), max(8, rows or 40)
         self.created = time.time(); self.last_out = time.time()
         self.ring = collections.deque(); self.ring_len = 0
@@ -61,8 +62,10 @@ class Session:
         self.pending = bytearray(); self.plock = threading.Lock()   # output coalescing (flushed by the pump)
         self.local = set()                                          # local (muxctl) viewer queues — fanned the same output
         self.wq = queue.Queue()                                     # input write queue → serialized, chunked writes
+        self.pty = None
         threading.Thread(target=self._writer, daemon=True).start()
-        self.spawn()
+        if spawn_now: self.spawn()
+        else: self.dead = True          # placeholder tab: NOTHING runs until the user attaches (revive) or arms it
 
     def spawn(self):
         self.pty = PtyProcess.spawn("powershell.exe -NoLogo", dimensions=(self.rows, self.cols), cwd=self.cwd)
@@ -109,6 +112,7 @@ class Session:
             s = self.wq.get()
             if s is None: return
             try:
+                if self.pty is None or self.dead: continue
                 if len(s) <= 1024:
                     self.pty.write(s)
                 else:
@@ -159,7 +163,7 @@ sessions = {}    # name -> Session
 
 def manifest_save():
     try:
-        data = {n: {"cmd": s.cmd, "cwd": s.cwd, "cols": s.cols, "rows": s.rows}
+        data = {n: {"cmd": s.cmd, "cwd": s.cwd, "cols": s.cols, "rows": s.rows, "heal": s.heal}
                 for n, s in sessions.items() if not s.user_killed}
         tmp = MANIFEST + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f: json.dump(data, f)
@@ -181,12 +185,15 @@ async def main():
     loop = asyncio.get_running_loop()
     outq = asyncio.Queue()
 
-    # boot-recreate: bring back every manifest session (PC reboot / muxd restart self-heal)
+    # boot policy (user-specified): agents NEVER auto-start on a fresh boot unless the session was
+    # ARMED (auto-resume on). Armed → recreate + resume now. Unarmed → a dead placeholder tab; the
+    # shell+agent come back only when the user attaches it (revive) — an explicit action.
     for name, m in manifest_load().items():
         if SAFE(name) and name not in sessions:
             try:
-                sessions[name] = Session(name, m.get("cmd", ""), m.get("cwd", ""), m.get("cols", 140), m.get("rows", 40), loop, outq)
-                log(f"[boot] recreated {name}")
+                heal = bool(m.get("heal"))
+                sessions[name] = Session(name, m.get("cmd", ""), m.get("cwd", ""), m.get("cols", 140), m.get("rows", 40), loop, outq, heal=heal, spawn_now=heal)
+                log(f"[boot] {'recreated + resumed (armed)' if heal else 'listed as dormant (unarmed — starts on attach)'}: {name}")
             except Exception as e: log(f"[boot] {name} failed: {e}")
 
     async def self_heal_tick():
@@ -194,7 +201,7 @@ async def main():
         while True:
             await asyncio.sleep(15)
             for s in list(sessions.values()):
-                if s.dead and not s.user_killed and s.cmd:
+                if s.dead and not s.user_killed and s.cmd and s.heal:   # opt-in only: unarmed sessions stay down
                     now = time.time()
                     s.deaths = [t for t in s.deaths if now - t < 600]
                     if len(s.deaths) >= 3: continue
@@ -314,10 +321,13 @@ async def main():
                                     cwd = m.get("cwd", "") or (prev.cwd if prev else "")
                                     cols = int(m.get("cols") or (prev.cols if prev else 140))
                                     rows = int(m.get("rows") or (prev.rows if prev else 40))
+                                    heal = bool(m.get("heal")) if ("heal" in m) else bool(prev.heal if prev else False)
                                     if prev: prev.kill(by_user=False)
-                                    sessions[name] = Session(name, cmd, cwd, cols, rows, loop, outq)
+                                    sessions[name] = Session(name, cmd, cwd, cols, rows, loop, outq, heal=heal)
                                     manifest_save()
                                 await ws.send(json.dumps({"t": "sessions", "list": sess_list()}))
+                            elif t == "heal" and name in sessions:
+                                sessions[name].heal = bool(m.get("on")); manifest_save()
                             elif t == "i" and name in sessions:
                                 sessions[name].write(base64.b64decode(m.get("d", "")))
                             elif t == "resize" and name in sessions:
