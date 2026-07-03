@@ -3,3 +3,4 @@ muxd.log*
 muxd.crash
 sessions.json
 .token.tmp
+profile-backups/

@@ -46,8 +46,12 @@ TOKEN = ENV.get("MUX_HOST_TOKEN", "")
 RELAYS = [u for u in [ENV.get("RELAY_LAN", ""), ENV.get("RELAY_PUBLIC", "")] if u]
 DEFAULT_CWD = ENV.get("DEFAULT_CWD", r"Z:\328\CMPUT328-A2\codexworks\301")
 LOCAL_PORT = int(ENV.get("LOCAL_PORT", "7699"))   # muxctl local-attach loopback port
+LAN_RETURN_INTERVAL = max(10, int(ENV.get("LAN_RETURN_INTERVAL", "30")))
 RING_CAP = 800_000           # per-session scrollback bytes kept
 SB_SEND = 260_000            # bytes replayed to a newly-attached viewer
+LOCAL_SB_SEND = int(ENV.get("LOCAL_SB_SEND", "60000"))  # local muxctl attach should become live fast
+PROTOCOL = 2
+CAPS = ["ls", "info", "create", "open", "attach", "kill", "rename", "heal", "tail", "scrollback", "resize", "owner"]
 
 class Session:
     def __init__(self, name, cmd, cwd, cols, rows, loop, outq, heal=False, spawn_now=True):
@@ -71,7 +75,8 @@ class Session:
         cmdline = "powershell.exe -NoLogo"
         direct_cmd = False
         if self.cmd:
-            cmdline = subprocess.list2cmdline(["powershell.exe", "-NoLogo", "-NoExit", "-Command", self.cmd])
+            encoded = base64.b64encode(self.cmd.encode("utf-16le")).decode("ascii")
+            cmdline = subprocess.list2cmdline(["powershell.exe", "-NoLogo", "-NoExit", "-EncodedCommand", encoded])
             direct_cmd = True
         try:
             self.pty = PtyProcess.spawn(cmdline, dimensions=(self.rows, self.cols), cwd=self.cwd)
@@ -174,6 +179,80 @@ class Session:
         except Exception: pass
         self.dead = True
 
+class OwnerSession:
+    # A visible local terminal owns the agent. muxd only relays that terminal's screen
+    # snapshots to the VPS and forwards remote keystrokes back into the owner sidecar.
+    def __init__(self, name, cmd, cwd, cols, rows, loop, outq, owner_ws, heal=False):
+        self.name, self.cmd, self.cwd = name, cmd or "", cwd or DEFAULT_CWD
+        self.heal = bool(heal)
+        self.cols, self.rows = max(20, int(cols or 140)), max(8, int(rows or 40))
+        self.created = time.time(); self.last_out = time.time()
+        self.ring = collections.deque(); self.ring_len = 0
+        self.dead = False; self.user_killed = False
+        self.deaths = []
+        self.loop, self.outq = loop, outq
+        self.pending = bytearray(); self.plock = threading.Lock()
+        self.local = set()
+        self.owner_ws = owner_ws
+        self.owner = True
+
+    def ingest(self, data: bytes):
+        if not data: return
+        self.ring.append(data); self.ring_len += len(data); self.last_out = time.time()
+        while self.ring_len > RING_CAP:
+            old = self.ring.popleft(); self.ring_len -= len(old)
+        with self.plock:
+            self.pending += data
+            if len(self.pending) > 2_000_000:
+                del self.pending[:len(self.pending) - 2_000_000]
+
+    def drain(self):
+        if not self.pending: return None
+        with self.plock:
+            chunk = bytes(self.pending); self.pending = bytearray()
+        return chunk
+
+    def _send_owner(self, obj):
+        try:
+            asyncio.run_coroutine_threadsafe(self.owner_ws.send(json.dumps(obj)), self.loop)
+        except Exception as e:
+            log(f"[{self.name}] owner send failed: {e}")
+
+    def write(self, data: bytes):
+        self._send_owner({"t": "i", "d": base64.b64encode(data).decode("ascii")})
+
+    def resize(self, cols, rows):
+        # Remote viewers never own size for an owner-backed session. The sidecar reports
+        # the visible terminal size, and web follows it.
+        return
+
+    def scrollback(self, limit=SB_SEND):
+        try: limit = max(0, min(RING_CAP, int(limit)))
+        except Exception: limit = SB_SEND
+        out, n = [], 0
+        for b in reversed(self.ring):
+            out.append(b); n += len(b)
+            if n >= limit: break
+        return b"".join(reversed(out))
+
+    def tail_text(self, nbytes=1600, lines=0):
+        raw = bytearray()
+        for b in reversed(self.ring):
+            raw[:0] = b
+            if len(raw) >= nbytes: break
+        s = bytes(raw[-nbytes:]).decode("utf-8", "replace")
+        s = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07\x1b]*(\x07|\x1b\\)|[\x00-\x08\x0b\x0c\x0e-\x1f]", "", s)
+        if lines: return "\n".join(s.split("\n")[-lines:]).rstrip()
+        return s[-900:]
+
+    def alive(self):
+        return not self.dead
+
+    def kill(self, by_user=True):
+        self.user_killed = by_user
+        self.dead = True
+        self._send_owner({"t": "kill"})
+
 sessions = {}    # name -> Session
 
 def manifest_save():
@@ -194,7 +273,9 @@ SAFE = lambda s: re.sub(r"[^A-Za-z0-9_.-]", "", str(s or ""))[:48]
 def sess_list():
     return [{"name": n, "alive": s.alive(), "created": int(s.created * 1000),
              "lastOut": int(s.last_out * 1000), "cols": s.cols, "rows": s.rows,
-             "tail": s.tail_text(), "heal": s.heal} for n, s in sessions.items()]
+             "tail": s.tail_text(), "heal": s.heal, "localViewers": len(s.local),
+             "localFirst": bool(getattr(s, "owner", False)) or len(s.local) > 0,
+             "owner": bool(getattr(s, "owner", False))} for n, s in sessions.items()]
 
 async def main():
     loop = asyncio.get_running_loop()
@@ -284,8 +365,56 @@ async def main():
                 first = json.loads(await ws.recv())
             except Exception:
                 return
+            if first.get("t") == "info":
+                await ws.send(json.dumps({"t": "info", "protocol": PROTOCOL, "caps": CAPS,
+                                          "host": os.environ.get("COMPUTERNAME", "pc"),
+                                          "sessions": len(sessions)})); return
             if first.get("t") == "ls":
                 await ws.send(json.dumps({"t": "ls", "list": sess_list()})); return
+            if first.get("t") == "kill":
+                name = SAFE(first.get("s", ""))
+                if not name or name not in sessions:
+                    await ws.send(json.dumps({"t": "err", "m": "no such session: " + name})); return
+                sessions[name].kill(by_user=True)
+                del sessions[name]
+                manifest_save()
+                await ws.send(json.dumps({"t": "killed", "s": name})); return
+            if first.get("t") == "owner":
+                name = SAFE(first.get("s", ""))
+                if not name:
+                    await ws.send(json.dumps({"t": "err", "m": "session name required"})); return
+                prev = sessions.get(name)
+                if prev and prev.alive():
+                    if bool(getattr(prev, "owner", False)):
+                        await ws.send(json.dumps({"t": "err", "m": "session already has a visible local owner: " + name})); return
+                    prev.kill(by_user=False)
+                owner = OwnerSession(name, first.get("cmd", ""), first.get("cwd", ""),
+                                     int(first.get("cols") or 140), int(first.get("rows") or 40),
+                                     loop, outq, ws, heal=bool(first.get("heal")))
+                sessions[name] = owner
+                manifest_save()
+                await ws.send(json.dumps({"t": "owner-ok", "s": name, "alive": True}))
+                outq.put_nowait(("dead", name, ""))  # force relay session-list refresh
+                try:
+                    async for raw in ws:
+                        try:
+                            m = json.loads(raw if isinstance(raw, str) else raw.decode("utf-8", "replace"))
+                        except Exception:
+                            continue
+                        mt = m.get("t")
+                        if mt == "o":
+                            owner.ingest(base64.b64decode(m.get("d", "")))
+                        elif mt == "size":
+                            owner.cols = max(20, int(m.get("cols") or owner.cols))
+                            owner.rows = max(8, int(m.get("rows") or owner.rows))
+                        elif mt == "dead":
+                            owner.dead = True
+                            break
+                finally:
+                    if sessions.get(name) is owner:
+                        owner.dead = True
+                        outq.put_nowait(("dead", name, ""))
+                return
             if first.get("t") == "create":
                 s, err, created = ensure_local_session(first, True)
                 if err:
@@ -300,7 +429,9 @@ async def main():
             lq = asyncio.Queue(); s.local.add(lq)
             if first.get("cols"): s.resize(int(first.get("cols")), int(first.get("rows") or 40))
             try:
-                await ws.send(s.scrollback())
+                sb_limit = int(first.get("sb") if first.get("sb") is not None else LOCAL_SB_SEND)
+                if sb_limit > 0:
+                    await ws.send(s.scrollback(sb_limit))
                 async def pump():
                     while True:
                         data = await lq.get()
@@ -334,7 +465,8 @@ async def main():
                 async with websockets.connect(url, max_size=8_000_000, ping_interval=20, ping_timeout=15, open_timeout=8) as ws:
                     backoff = 1
                     log(f"connected to relay {cand}")
-                    await ws.send(json.dumps({"t": "hello", "host": os.environ.get("COMPUTERNAME", "pc"), "sessions": sess_list()}))
+                    await ws.send(json.dumps({"t": "hello", "host": os.environ.get("COMPUTERNAME", "pc"),
+                                              "protocol": PROTOCOL, "caps": CAPS, "sessions": sess_list()}))
 
                     async def pump_out():
                         while True:
@@ -354,7 +486,7 @@ async def main():
                         # preferred (LAN) relay is reachable again; if so, drop this link so the outer loop
                         # reconnects starting at RELAYS[0] and we stop paying the fallback latency tax.
                         while True:
-                            await asyncio.sleep(180)
+                            await asyncio.sleep(LAN_RETURN_INTERVAL)
                             try:
                                 lan = RELAYS[0] + ("&" if "?" in RELAYS[0] else "?") + "token=" + TOKEN
                                 async with websockets.connect(lan, open_timeout=6) as p:
@@ -402,7 +534,11 @@ async def main():
                             elif t == "i" and name in sessions:
                                 sessions[name].write(base64.b64decode(m.get("d", "")))
                             elif t == "resize" and name in sessions:
-                                sessions[name].resize(m.get("cols", 140), m.get("rows", 40))
+                                s = sessions[name]
+                                if s.local:
+                                    log(f"[{name}] ignored remote resize while local viewer is attached")
+                                else:
+                                    s.resize(m.get("cols", 140), m.get("rows", 40))
                             elif t == "sb" and name in sessions:
                                 await ws.send(json.dumps({"t": "sb", "s": name,
                                                           "d": base64.b64encode(sessions[name].scrollback(m.get("max", SB_SEND))).decode()}))
