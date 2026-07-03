@@ -612,10 +612,10 @@ let sizeModeLabel = '';            // e.g. "auto · 100×30" / "📌 Phone · 40
 let sizePinned = false, sizeMine = false, sizePinLabel = '', sizeClients = [];   // from the 'd' control frame
 // Persistent DEVICE identity so a pin follows the DEVICE across reconnects/relay restarts (not the socket).
 const deviceId = (()=>{ let d=LS.get('mux_devid',''); if(!d){ d='d'+Math.random().toString(36).slice(2,10)+Date.now().toString(36).slice(-4); LS.set('mux_devid',d); } return d; })();
-function defaultLabel(){ const ua=navigator.userAgent||''; const mob=/Mobi|Android|iPhone|iPad/i.test(ua);
+function defaultDeviceLabel(){ const ua=navigator.userAgent||''; const mob=/Mobi|Android|iPhone|iPad/i.test(ua);
   const os=/Android/i.test(ua)?'Android':/(iPhone|iPad|iOS)/i.test(ua)?'iOS':/Windows/i.test(ua)?'Windows':/Mac/i.test(ua)?'Mac':/Linux/i.test(ua)?'Linux':'';
   return (mob?'Phone':'Desktop')+(os?' · '+os:''); }
-let deviceLabel = LS.get('mux_devlabel','') || defaultLabel();
+let deviceLabel = LS.get('mux_devlabel','') || defaultDeviceLabel();
 let lastInputAt = Date.now();
 function markActive(){ lastInputAt = Date.now(); }
 function actFlag(){ return (Date.now()-lastInputAt < 180000) ? 1 : 0; }
