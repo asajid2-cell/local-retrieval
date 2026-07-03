@@ -189,6 +189,7 @@ public sealed class ArchiveService
             FileStamps = new Dictionary<string, string>(Store.FileStamps),
             TagColors = new Dictionary<string, string>(Store.TagColors),
             TagLayers = new Dictionary<string, int>(Store.TagLayers),
+            PendingNewChats = new List<PendingNewChat>(Store.PendingNewChats),
         };
         await _saveGate.WaitAsync();
         try
