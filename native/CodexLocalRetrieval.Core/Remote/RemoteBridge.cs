@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json;
 using System.Threading;
@@ -32,7 +33,6 @@ public sealed class RemoteBridge
 
     private const string SshHardenOpts = "-o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3";
     private static readonly TimeSpan SshHardTimeout = TimeSpan.FromSeconds(30);
-    private const string MultiplexWtWindow = "multiplex";
 
     public RemoteBridge(Func<Settings?> settings, Func<bool> guiPrimaryRunning, ClaudeSessionStore claude, string codexDbPath, Action<string>? log = null)
     {
@@ -122,7 +122,7 @@ public sealed class RemoteBridge
                 case "addtocollection":
                     res = (false, "desktop app required for collection changes"); break;
                 case "startmux":
-                    res = StartMuxOwner(c.muxName ?? c.sessionName ?? "", c.muxCommand ?? ""); break;
+                    res = await StartMuxHeadlessAsync(c.muxName ?? c.sessionName ?? "", c.muxCommand ?? ""); break;
                 default:
                     res = (false, "unknown command"); break;
             }
@@ -140,40 +140,41 @@ public sealed class RemoteBridge
         return _claude.RenameSession(id, title) ? (true, "renamed") : (false, "session not found");
     }
 
-    private (bool ok, string detail) StartMuxOwner(string name, string command)
+    private async Task<(bool ok, string detail)> StartMuxHeadlessAsync(string name, string command)
     {
         name = (name ?? "").Trim();
         command = (command ?? "").Trim();
         if (string.IsNullOrEmpty(name)) return (false, "missing mux session name");
         try
         {
-            var muxrun = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".local", "bin", "muxrun.cmd");
-            if (!File.Exists(muxrun)) muxrun = "muxrun";
-            var cmdB64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(command));
-            try
-            {
-                var wt = new ProcessStartInfo { FileName = "wt", UseShellExecute = false };
-                wt.ArgumentList.Add("-w");
-                wt.ArgumentList.Add(MultiplexWtWindow);
-                wt.ArgumentList.Add("new-tab");
-                wt.ArgumentList.Add("--title");
-                wt.ArgumentList.Add(name);
-                wt.ArgumentList.Add(muxrun);
-                wt.ArgumentList.Add(name);
-                wt.ArgumentList.Add("--cmd-b64");
-                wt.ArgumentList.Add(cmdB64);
-                Process.Start(wt);
-            }
-            catch (Exception ex)
-            {
-                _log("Windows Terminal launch failed, falling back to cmd.exe: " + ex.Message);
-                var ownerCommand = $"\"{muxrun}\" \"{name}\" --cmd-b64 {cmdB64}";
-                var psi = new ProcessStartInfo { FileName = "cmd.exe", UseShellExecute = true, Arguments = "/k " + ownerCommand };
-                Process.Start(psi);
-            }
-            return (true, "started visible local mux owner: " + name);
+            var text = await LocalMuxdRequestAsync(new { t = "create", s = name, cmd = command, cols = 140, rows = 40 });
+            using var doc = JsonDocument.Parse(text);
+            if (doc.RootElement.TryGetProperty("t", out var t) && t.GetString() == "created")
+                return (true, "started PC-local mux session: " + name);
+            if (doc.RootElement.TryGetProperty("t", out t) && t.GetString() == "err")
+                return (false, doc.RootElement.TryGetProperty("m", out var m) ? m.GetString() ?? "muxd error" : "muxd error");
+            return (false, "unexpected muxd response: " + text);
         }
         catch (Exception ex) { return (false, ex.Message); }
+    }
+
+    private static async Task<string> LocalMuxdRequestAsync(object message)
+    {
+        using var ws = new ClientWebSocket();
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(8));
+        await ws.ConnectAsync(new Uri("ws://127.0.0.1:7699"), cts.Token);
+        var bytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(message));
+        await ws.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, cts.Token);
+        using var ms = new MemoryStream();
+        var buffer = new byte[16 * 1024];
+        WebSocketReceiveResult result;
+        do
+        {
+            result = await ws.ReceiveAsync(new ArraySegment<byte>(buffer), cts.Token);
+            if (result.MessageType == WebSocketMessageType.Close) break;
+            ms.Write(buffer, 0, result.Count);
+        } while (!result.EndOfMessage);
+        return Encoding.UTF8.GetString(ms.ToArray());
     }
 
     private string ReadTranscriptTail(string tool, string sessionId, int maxChars = 7000)

@@ -13,14 +13,10 @@ using Microsoft.UI.Xaml;
 
 namespace CodexLocalRetrieval_Native;
 
-// "Start in multiplexer": resume a chat in a visible local terminal, with a sidecar tap that lets
-// harmonizerlabs.cc/multiplex mirror/control it. The local terminal is the owner; web is additive.
+// "Start in multiplexer": resume a chat in a PC-local muxd session. muxd owns the PTY on this
+// machine; harmonizerlabs.cc/multiplex and local `mux <name>` attach to that same headless session.
 public sealed partial class MainPage
 {
-    // All remote sessions share one Windows Terminal window so a busy day of resumes is tabs, not a
-    // screenful of windows. Anchored by this window name; the first tab creates it, the rest join it.
-    private const string MultiplexWtWindow = "multiplex";
-
     private void ResumeInMultiplex_Click(object sender, RoutedEventArgs e)
     {
         if (_selected is not null) StartRemoteSession(_selected);
@@ -51,7 +47,13 @@ public sealed partial class MainPage
             // Running locally (or elsewhere) right now? Don't let two copies fight over the transcript.
             if (!await ConfirmRunOrKillAsync(session)) { SyncStatus.Text = "Cancelled - already running."; return; }
 
-            OpenMultiplexOwnerTerminal(name, command);
+            var created = await CreateLocalMuxdSessionAsync(name, command);
+            if (!created.ok)
+            {
+                Diag.Log($"Mux create FAILED ({created.detail}) name={name}");
+                SyncStatus.Text = "Could not create the mux session - see log.";
+                return;
+            }
 
             // Bump like a local resume so the chat is where you expect when you come back to the app.
             session.UpdatedAt = DateTime.UtcNow.ToString("O");
@@ -59,7 +61,7 @@ public sealed partial class MainPage
             SessionList.SelectedItem = session;
             _ = _archive.SaveAsync();
 
-            SyncStatus.Text = $"Mux \"{title}\" live as \"{name}\" - open it on your phone at /multiplex.";
+            SyncStatus.Text = $"Mux \"{title}\" live as \"{name}\" - open it on your phone at /multiplex or attach with mux {name}.";
         }
         catch (Exception ex)
         {
@@ -180,7 +182,7 @@ public sealed partial class MainPage
                 }
                 else if (string.Equals(c.type, "startmux", StringComparison.OrdinalIgnoreCase))
                 {
-                    res = StartMuxOwnerFromCommand(c.muxName ?? c.sessionName ?? "", c.muxCommand ?? "");
+                    res = await StartMuxHeadlessFromCommandAsync(c.muxName ?? c.sessionName ?? "", c.muxCommand ?? "");
                 }
                 else res = (false, "unknown command");
                 var ackJson = JsonSerializer.Serialize(new { ok = res.ok, detail = res.detail });
@@ -209,21 +211,13 @@ public sealed partial class MainPage
         public string? collection { get; set; }
     }
 
-    private (bool ok, string detail) StartMuxOwnerFromCommand(string name, string command)
+    private async Task<(bool ok, string detail)> StartMuxHeadlessFromCommandAsync(string name, string command)
     {
         name = (name ?? "").Trim();
         command = (command ?? "").Trim();
         if (string.IsNullOrEmpty(name)) return (false, "missing mux session name");
-        try
-        {
-            OpenMultiplexOwnerTerminal(name, command);
-            return (true, "started visible local mux owner: " + name);
-        }
-        catch (Exception ex)
-        {
-            Diag.Log("StartMuxOwnerFromCommand failed " + ex);
-            return (false, ex.Message);
-        }
+        var created = await CreateLocalMuxdSessionAsync(name, command);
+        return created.ok ? (true, "started PC-local mux session: " + name) : created;
     }
 
     // Web "Add to collection": file a multiplex session's chat into a (new or existing) collection. The web
@@ -483,39 +477,4 @@ public sealed partial class MainPage
         catch (Exception ex) { return (false, ex.Message); }
     }
 
-    // Open the owner terminal. muxrun starts the agent in this visible console with inherited stdio,
-    // registers the session with muxd, and mirrors the visible screen to the web.
-    private void OpenMultiplexOwnerTerminal(string name, string command)
-    {
-        var muxrun = System.IO.Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".local", "bin", "muxrun.cmd");
-        if (!System.IO.File.Exists(muxrun)) muxrun = "muxrun";
-        var cmdB64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(command));
-        try
-        {
-            var psi = new ProcessStartInfo
-            {
-                FileName = "wt",
-                UseShellExecute = false,
-            };
-            psi.ArgumentList.Add("-w");
-            psi.ArgumentList.Add(MultiplexWtWindow);
-            psi.ArgumentList.Add("new-tab");
-            psi.ArgumentList.Add("--title");
-            psi.ArgumentList.Add(name);
-            psi.ArgumentList.Add(muxrun);
-            psi.ArgumentList.Add(name);
-            psi.ArgumentList.Add("--cmd-b64");
-            psi.ArgumentList.Add(cmdB64);
-            Process.Start(psi);
-        }
-        catch (Exception ex)
-        {
-            Diag.Log("Windows Terminal unavailable, falling back to a window: " + ex.Message);
-            var ownerCommand = $"\"{muxrun}\" \"{name}\" --cmd-b64 {cmdB64}";
-            var psi = new ProcessStartInfo { FileName = "cmd.exe", UseShellExecute = true, Arguments = "/k " + ownerCommand };
-            Process.Start(psi);
-        }
-    }
 }
