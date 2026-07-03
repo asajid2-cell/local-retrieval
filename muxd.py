@@ -169,8 +169,16 @@ class Session:
         cols, rows = max(20, int(cols)), max(8, int(rows))
         if (cols, rows) == (self.cols, self.rows): return
         self.cols, self.rows = cols, rows
-        try: self.pty.setwinsize(rows, cols)
-        except Exception as e: log(f"[{self.name}] resize failed: {e}")
+        pty = self.pty
+        if pty is None or self.dead:
+            return
+        def do_resize():
+            try:
+                if pty is self.pty and not self.dead:
+                    pty.setwinsize(rows, cols)
+            except Exception as e:
+                log(f"[{self.name}] resize failed: {e}")
+        threading.Thread(target=do_resize, name=f"{self.name}-resize", daemon=True).start()
 
     def scrollback(self, limit=SB_SEND):
         try: limit = max(0, min(RING_CAP, int(limit)))
@@ -192,14 +200,20 @@ class Session:
         return s[-900:]
 
     def alive(self):
-        try: return (not self.dead) and self.pty.isalive()
-        except Exception: return False
+        # Keep status/list paths off winpty. The reader thread owns EOF detection and flips
+        # self.dead; probing ConPTY here can block the shared asyncio loop for every session.
+        return (not self.dead) and self.pty is not None
 
     def kill(self, by_user=True):
         self.user_killed = by_user
-        try: self.pty.terminate(force=True)
-        except Exception: pass
+        pty = self.pty
+        self.pty = None
         self.dead = True
+        if pty is not None:
+            def terminate():
+                try: pty.terminate(force=True)
+                except Exception: pass
+            threading.Thread(target=terminate, name=f"{self.name}-terminate", daemon=True).start()
 
 class OwnerSession:
     # A visible local terminal owns the agent. muxd only relays that terminal's screen
@@ -354,6 +368,15 @@ def sess_list():
              "localFirst": bool(getattr(s, "owner", False)) or len(s.local) > 0,
              "owner": bool(getattr(s, "owner", False))} for n, s in sessions.items()]
 
+async def spawn_session_off_loop(s):
+    await asyncio.get_running_loop().run_in_executor(None, s.spawn)
+    return s
+
+async def new_session_off_loop(name, cmd, cwd, cols, rows, loop, outq, heal=False):
+    s = Session(name, cmd, cwd, cols, rows, loop, outq, heal=heal, spawn_now=False)
+    await spawn_session_off_loop(s)
+    return s
+
 async def main():
     start_watchdog_thread()
     loop = asyncio.get_running_loop()
@@ -397,7 +420,7 @@ async def main():
                     s.deaths = [t for t in s.deaths if now - t < 600]
                     if len(s.deaths) >= 3: continue
                     s.deaths.append(now)
-                    try: s.spawn(); log(f"[heal] {s.name} shell died -> respawned + resume queued")
+                    try: await spawn_session_off_loop(s); log(f"[heal] {s.name} shell died -> respawned + resume queued")
                     except Exception as e: log(f"[heal] {s.name} respawn failed: {e}")
     asyncio.create_task(self_heal_tick())
 
@@ -419,7 +442,7 @@ async def main():
     # exactly like a web viewer, so you get `tmux attach`-style parity from a Windows Terminal on the PC.
     async def local_serve():
         import websockets as _ws
-        def ensure_local_session(first, spawn_if_missing):
+        async def ensure_local_session(first, spawn_if_missing):
             name = SAFE(first.get("s", ""))
             if not name:
                 return None, "session name required", False
@@ -450,7 +473,10 @@ async def main():
             cwd = requested_cwd or (prev.cwd if prev else "")
             if prev:
                 prev.kill(by_user=False)
-            s = Session(name, cmd, cwd, cols, rows, loop, outq, heal=requested_heal)
+            try:
+                s = await new_session_off_loop(name, cmd, cwd, cols, rows, loop, outq, heal=requested_heal)
+            except Exception as e:
+                return None, "spawn failed: " + str(e), False
             sessions[name] = s
             manifest_save()
             return s, "", True
@@ -537,14 +563,14 @@ async def main():
                             outq.put_nowait(("dead", name, ""))
                     return
                 if first.get("t") == "create":
-                    s, err, created = ensure_local_session(first, True)
+                    s, err, created = await ensure_local_session(first, True)
                     if err:
                         await ws.send(json.dumps({"t": "err", "m": err})); return
                     await ws.send(json.dumps({"t": "created", "s": s.name, "created": created, "alive": s.alive()})); return
                 if first.get("t") == "open":
-                    s, err, _created = ensure_local_session(first, True)
+                    s, err, _created = await ensure_local_session(first, True)
                 else:
-                    s, err, _created = ensure_local_session(first, False)
+                    s, err, _created = await ensure_local_session(first, False)
                 if err:
                     await ws.send(json.dumps({"t": "err", "m": err})); return
                 lq = asyncio.Queue(); s.local.add(lq)
@@ -666,7 +692,12 @@ async def main():
                                     rows = int(m.get("rows") or (prev.rows if prev else 40))
                                     heal = requested_heal
                                     if prev: prev.kill(by_user=False)
-                                    sessions[name] = Session(name, cmd, cwd, cols, rows, loop, outq, heal=heal)
+                                    try:
+                                        sessions[name] = await new_session_off_loop(name, cmd, cwd, cols, rows, loop, outq, heal=heal)
+                                    except Exception as e:
+                                        log(f"[{name}] spawn failed: {e}")
+                                        await ws.send(json.dumps({"t": "sessions", "list": sess_list()}))
+                                        continue
                                     manifest_save()
                                 await ws.send(json.dumps({"t": "sessions", "list": sess_list()}))
                             elif t == "heal" and name in sessions:
