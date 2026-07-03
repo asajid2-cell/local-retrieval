@@ -219,6 +219,14 @@ async def do_status():
     print("host: %s" % info.get("host", "pc"))
     print("caps: %s" % ", ".join(info.get("caps") or []))
     print("sessions: %s" % info.get("sessions", "?"))
+    if "pid" in info:
+        print("pid: %s uptime: %ss" % (info.get("pid"), info.get("uptimeSec", "?")))
+    if "loopLagMs" in info:
+        print("loop lag: %sms current, %sms max" % (info.get("loopLagMs"), info.get("maxLoopLagMs")))
+    if "localTotal" in info:
+        print("local control: active=%s total=%s errors=%s last=%sms %s" % (
+            info.get("localActive", "?"), info.get("localTotal", "?"), info.get("localErrors", "?"),
+            info.get("lastLocalMs", "?"), info.get("lastLocalT", "")))
     return 0
 
 def check_shell_entrypoints():

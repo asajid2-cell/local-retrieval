@@ -50,8 +50,30 @@ LAN_RETURN_INTERVAL = max(10, int(ENV.get("LAN_RETURN_INTERVAL", "30")))
 RING_CAP = 800_000           # per-session scrollback bytes kept
 SB_SEND = 260_000            # bytes replayed to a newly-attached viewer
 LOCAL_SB_SEND = int(ENV.get("LOCAL_SB_SEND", "60000"))  # local muxctl attach should become live fast
+LOCAL_FIRST_TIMEOUT = float(ENV.get("LOCAL_FIRST_TIMEOUT", "3"))
+LOOP_WATCHDOG_WARN = float(ENV.get("LOOP_WATCHDOG_WARN", "3"))
+LOOP_WATCHDOG_EXIT = float(ENV.get("LOOP_WATCHDOG_EXIT", "12"))
 PROTOCOL = 2
 CAPS = ["ls", "info", "create", "open", "attach", "kill", "rename", "heal", "tail", "scrollback", "resize", "owner"]
+STARTED = time.time()
+
+WATCH = {
+    "last_tick": time.monotonic(),
+    "last_lag": 0.0,
+    "max_lag": 0.0,
+    "local_active": 0,
+    "local_total": 0,
+    "local_errors": 0,
+    "last_local_ms": 0.0,
+    "last_local_t": "",
+    "last_local_peer": "",
+}
+WATCH_LOCK = threading.Lock()
+WATCHDOG_STARTED = False
+
+def watch_snapshot():
+    with WATCH_LOCK:
+        return dict(WATCH)
 
 class Session:
     def __init__(self, name, cmd, cwd, cols, rows, loop, outq, heal=False, spawn_now=True):
@@ -255,6 +277,64 @@ class OwnerSession:
 
 sessions = {}    # name -> Session
 
+def live_session_names():
+    names = []
+    for name, sess in list(sessions.items()):
+        try:
+            if sess.alive():
+                names.append(name)
+        except Exception:
+            pass
+    return names
+
+def dump_thread_stacks(reason):
+    try:
+        frames = sys._current_frames()
+        lines = [time.strftime("%m-%d %H:%M:%S") + " " + reason]
+        for th in threading.enumerate():
+            lines.append(f"\n--- thread {th.name} ident={th.ident} daemon={th.daemon} ---")
+            frame = frames.get(th.ident)
+            if frame is None:
+                lines.append("(no frame)")
+            else:
+                lines.extend(traceback.format_stack(frame))
+        path = LOG + ".stacks"
+        with open(path, "a", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        log(f"[watchdog] dumped thread stacks to {path}")
+    except Exception as e:
+        log(f"[watchdog] stack dump failed: {e}")
+
+def start_watchdog_thread():
+    global WATCHDOG_STARTED
+    if WATCHDOG_STARTED:
+        return
+    WATCHDOG_STARTED = True
+
+    def run():
+        last_report = 0.0
+        while True:
+            time.sleep(2)
+            snap = watch_snapshot()
+            stale = time.monotonic() - float(snap.get("last_tick", 0.0))
+            if stale < LOOP_WATCHDOG_WARN:
+                continue
+            now = time.monotonic()
+            if now - last_report < 30:
+                continue
+            last_report = now
+            live = live_session_names()
+            reason = f"[watchdog] event loop has not ticked for {stale:.1f}s; live={live}"
+            log(reason)
+            dump_thread_stacks(reason)
+            if stale >= LOOP_WATCHDOG_EXIT and not live:
+                log("[watchdog] no live muxd-owned sessions; exiting so the scheduled task can restart muxd")
+                os._exit(70)
+            if stale >= LOOP_WATCHDOG_EXIT:
+                log("[watchdog] live muxd-owned sessions exist; not auto-restarting because that would kill work")
+
+    threading.Thread(target=run, name="muxd-watchdog", daemon=True).start()
+
 def manifest_save():
     try:
         data = {n: {"cmd": s.cmd, "cwd": s.cwd, "cols": s.cols, "rows": s.rows, "heal": s.heal}
@@ -278,8 +358,26 @@ def sess_list():
              "owner": bool(getattr(s, "owner", False))} for n, s in sessions.items()]
 
 async def main():
+    start_watchdog_thread()
     loop = asyncio.get_running_loop()
     outq = asyncio.Queue()
+
+    async def loop_monitor():
+        last = time.monotonic()
+        last_warn = 0.0
+        while True:
+            await asyncio.sleep(0.5)
+            now = time.monotonic()
+            lag = max(0.0, now - last - 0.5)
+            last = now
+            with WATCH_LOCK:
+                WATCH["last_tick"] = now
+                WATCH["last_lag"] = lag
+                WATCH["max_lag"] = max(float(WATCH.get("max_lag", 0.0)), lag)
+            if lag >= LOOP_WATCHDOG_WARN and now - last_warn >= 30:
+                last_warn = now
+                log(f"[watchdog] event loop lag {lag:.3f}s")
+    asyncio.create_task(loop_monitor())
 
     # boot policy (user-specified): agents NEVER auto-start on a fresh boot unless the session was
     # ARMED (auto-resume on). Armed -> recreate + resume now. Unarmed -> a dead placeholder tab that
@@ -361,95 +459,140 @@ async def main():
             return s, "", True
 
         async def handler(ws):
+            peer = str(getattr(ws, "remote_address", ""))
+            started = time.perf_counter()
+            req_t = "?"
+            failed = False
+            with WATCH_LOCK:
+                WATCH["local_active"] += 1
+                WATCH["local_total"] += 1
             try:
-                first = json.loads(await ws.recv())
-            except Exception:
-                return
-            if first.get("t") == "info":
-                await ws.send(json.dumps({"t": "info", "protocol": PROTOCOL, "caps": CAPS,
-                                          "host": os.environ.get("COMPUTERNAME", "pc"),
-                                          "sessions": len(sessions)})); return
-            if first.get("t") == "ls":
-                await ws.send(json.dumps({"t": "ls", "list": sess_list()})); return
-            if first.get("t") == "kill":
-                name = SAFE(first.get("s", ""))
-                if not name or name not in sessions:
-                    await ws.send(json.dumps({"t": "err", "m": "no such session: " + name})); return
-                sessions[name].kill(by_user=True)
-                del sessions[name]
-                manifest_save()
-                await ws.send(json.dumps({"t": "killed", "s": name})); return
-            if first.get("t") == "owner":
-                name = SAFE(first.get("s", ""))
-                if not name:
-                    await ws.send(json.dumps({"t": "err", "m": "session name required"})); return
-                prev = sessions.get(name)
-                if prev and prev.alive():
-                    if bool(getattr(prev, "owner", False)):
-                        await ws.send(json.dumps({"t": "err", "m": "session already has a visible local owner: " + name})); return
-                    prev.kill(by_user=False)
-                owner = OwnerSession(name, first.get("cmd", ""), first.get("cwd", ""),
-                                     int(first.get("cols") or 140), int(first.get("rows") or 40),
-                                     loop, outq, ws, heal=bool(first.get("heal")))
-                sessions[name] = owner
-                manifest_save()
-                await ws.send(json.dumps({"t": "owner-ok", "s": name, "alive": True}))
-                outq.put_nowait(("dead", name, ""))  # force relay session-list refresh
                 try:
-                    async for raw in ws:
-                        try:
-                            m = json.loads(raw if isinstance(raw, str) else raw.decode("utf-8", "replace"))
-                        except Exception:
-                            continue
-                        mt = m.get("t")
-                        if mt == "o":
-                            owner.ingest(base64.b64decode(m.get("d", "")))
-                        elif mt == "size":
-                            owner.cols = max(20, int(m.get("cols") or owner.cols))
-                            owner.rows = max(8, int(m.get("rows") or owner.rows))
-                        elif mt == "dead":
+                    raw_first = await asyncio.wait_for(ws.recv(), LOCAL_FIRST_TIMEOUT)
+                    first = json.loads(raw_first if isinstance(raw_first, str) else raw_first.decode("utf-8", "replace"))
+                    req_t = str(first.get("t", "?"))
+                except asyncio.TimeoutError:
+                    failed = True
+                    log(f"[local] first frame timeout from {peer}")
+                    return
+                except Exception as e:
+                    failed = True
+                    log(f"[local] invalid first frame from {peer}: {type(e).__name__}: {e}")
+                    return
+
+                if first.get("t") == "info":
+                    snap = watch_snapshot()
+                    await ws.send(json.dumps({"t": "info", "protocol": PROTOCOL, "caps": CAPS,
+                                              "host": os.environ.get("COMPUTERNAME", "pc"),
+                                              "sessions": len(sessions), "pid": os.getpid(),
+                                              "uptimeSec": int(time.time() - STARTED),
+                                              "loopLagMs": round(float(snap.get("last_lag", 0.0)) * 1000, 1),
+                                              "maxLoopLagMs": round(float(snap.get("max_lag", 0.0)) * 1000, 1),
+                                              "localActive": max(0, int(snap.get("local_active", 0)) - 1),
+                                              "localTotal": snap.get("local_total", 0),
+                                              "localErrors": snap.get("local_errors", 0),
+                                              "lastLocalMs": round(float(snap.get("last_local_ms", 0.0)), 1),
+                                              "lastLocalT": snap.get("last_local_t", "")})); return
+                if first.get("t") == "ls":
+                    await ws.send(json.dumps({"t": "ls", "list": sess_list()})); return
+                if first.get("t") == "kill":
+                    name = SAFE(first.get("s", ""))
+                    if not name or name not in sessions:
+                        await ws.send(json.dumps({"t": "err", "m": "no such session: " + name})); return
+                    sessions[name].kill(by_user=True)
+                    del sessions[name]
+                    manifest_save()
+                    await ws.send(json.dumps({"t": "killed", "s": name})); return
+                if first.get("t") == "owner":
+                    name = SAFE(first.get("s", ""))
+                    if not name:
+                        await ws.send(json.dumps({"t": "err", "m": "session name required"})); return
+                    prev = sessions.get(name)
+                    if prev and prev.alive():
+                        if bool(getattr(prev, "owner", False)):
+                            await ws.send(json.dumps({"t": "err", "m": "session already has a visible local owner: " + name})); return
+                        prev.kill(by_user=False)
+                    owner = OwnerSession(name, first.get("cmd", ""), first.get("cwd", ""),
+                                         int(first.get("cols") or 140), int(first.get("rows") or 40),
+                                         loop, outq, ws, heal=bool(first.get("heal")))
+                    sessions[name] = owner
+                    manifest_save()
+                    await ws.send(json.dumps({"t": "owner-ok", "s": name, "alive": True}))
+                    outq.put_nowait(("dead", name, ""))  # force relay session-list refresh
+                    try:
+                        async for raw in ws:
+                            try:
+                                m = json.loads(raw if isinstance(raw, str) else raw.decode("utf-8", "replace"))
+                            except Exception:
+                                continue
+                            mt = m.get("t")
+                            if mt == "o":
+                                owner.ingest(base64.b64decode(m.get("d", "")))
+                            elif mt == "size":
+                                owner.cols = max(20, int(m.get("cols") or owner.cols))
+                                owner.rows = max(8, int(m.get("rows") or owner.rows))
+                            elif mt == "dead":
+                                owner.dead = True
+                                break
+                    finally:
+                        if sessions.get(name) is owner:
                             owner.dead = True
-                            break
-                finally:
-                    if sessions.get(name) is owner:
-                        owner.dead = True
-                        outq.put_nowait(("dead", name, ""))
-                return
-            if first.get("t") == "create":
-                s, err, created = ensure_local_session(first, True)
+                            outq.put_nowait(("dead", name, ""))
+                    return
+                if first.get("t") == "create":
+                    s, err, created = ensure_local_session(first, True)
+                    if err:
+                        await ws.send(json.dumps({"t": "err", "m": err})); return
+                    await ws.send(json.dumps({"t": "created", "s": s.name, "created": created, "alive": s.alive()})); return
+                if first.get("t") == "open":
+                    s, err, _created = ensure_local_session(first, True)
+                else:
+                    s, err, _created = ensure_local_session(first, False)
                 if err:
                     await ws.send(json.dumps({"t": "err", "m": err})); return
-                await ws.send(json.dumps({"t": "created", "s": s.name, "created": created, "alive": s.alive()})); return
-            if first.get("t") == "open":
-                s, err, _created = ensure_local_session(first, True)
-            else:
-                s, err, _created = ensure_local_session(first, False)
-            if err:
-                await ws.send(json.dumps({"t": "err", "m": err})); return
-            lq = asyncio.Queue(); s.local.add(lq)
-            if first.get("cols"): s.resize(int(first.get("cols")), int(first.get("rows") or 40))
-            try:
-                sb_limit = int(first.get("sb") if first.get("sb") is not None else LOCAL_SB_SEND)
-                if sb_limit > 0:
-                    await ws.send(s.scrollback(sb_limit))
-                async def pump():
-                    while True:
-                        data = await lq.get()
-                        await ws.send(data)
-                pt = asyncio.create_task(pump())
+                lq = asyncio.Queue(); s.local.add(lq)
+                if first.get("cols"): s.resize(int(first.get("cols")), int(first.get("rows") or 40))
                 try:
-                    async for raw in ws:
-                        if isinstance(raw, (bytes, bytearray)):
-                            s.write(bytes(raw)); continue
-                        try: m = json.loads(raw)
-                        except Exception: continue
-                        if m.get("t") == "i": s.write(base64.b64decode(m.get("d", "")))
-                        elif m.get("t") == "resize": s.resize(m.get("cols", 140), m.get("rows", 40))
-                finally: pt.cancel()
+                    sb_limit = int(first.get("sb") if first.get("sb") is not None else LOCAL_SB_SEND)
+                    if sb_limit > 0:
+                        await ws.send(s.scrollback(sb_limit))
+                    async def pump():
+                        while True:
+                            data = await lq.get()
+                            await ws.send(data)
+                    pt = asyncio.create_task(pump())
+                    try:
+                        async for raw in ws:
+                            if isinstance(raw, (bytes, bytearray)):
+                                s.write(bytes(raw)); continue
+                            try: m = json.loads(raw)
+                            except Exception: continue
+                            if m.get("t") == "i": s.write(base64.b64decode(m.get("d", "")))
+                            elif m.get("t") == "resize": s.resize(m.get("cols", 140), m.get("rows", 40))
+                    finally: pt.cancel()
+                finally:
+                    s.local.discard(lq)
+            except Exception as e:
+                failed = True
+                log(f"[local] {req_t} handler failed for {peer}: {type(e).__name__}: {e}")
+                try:
+                    await ws.send(json.dumps({"t": "err", "m": f"local handler failed: {type(e).__name__}"}))
+                except Exception:
+                    pass
             finally:
-                s.local.discard(lq)
+                elapsed_ms = (time.perf_counter() - started) * 1000
+                with WATCH_LOCK:
+                    WATCH["local_active"] = max(0, int(WATCH.get("local_active", 0)) - 1)
+                    WATCH["last_local_ms"] = elapsed_ms
+                    WATCH["last_local_t"] = req_t
+                    WATCH["last_local_peer"] = peer
+                    if failed:
+                        WATCH["local_errors"] += 1
+                if failed or (req_t in ("info", "ls", "kill", "create") and elapsed_ms > 1000):
+                    log(f"[local] {req_t} from {peer} finished in {elapsed_ms:.1f}ms failed={failed}")
         try:
-            async with _ws.serve(handler, "127.0.0.1", LOCAL_PORT):
+            async with _ws.serve(handler, "127.0.0.1", LOCAL_PORT, ping_interval=20,
+                                 ping_timeout=10, close_timeout=2, max_queue=32):
                 await asyncio.Future()
         except Exception as e:
             log(f"local attach server failed on :{LOCAL_PORT}: {e}")
