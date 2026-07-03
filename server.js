@@ -180,7 +180,7 @@ app.post('/api/sessions', (req, res) => {
   // muxd types the resume command itself once its shell is up. Host down → legacy tmux+ssh fallback.
   if (hostUp() && !tmuxHas(name)) {
     const created = !hostSessions.has(name);
-    sendHost({ t: 'create', s: name, cmd, cols: 140, rows: 40 });
+    sendHost({ t: 'create', s: name, cmd, cols: 140, rows: 40, heal: _healOn.has(name) });
     markPending(name);
     if (created) hostSessions.set(name, { alive: true, created: Date.now(), lastOut: Date.now(), tail: '' });  // optimistic: routes the imminent /ws attach to the host
     return res.json({ ok: true, name, created, hosted: true });
@@ -249,6 +249,7 @@ app.post('/api/sessions/:name/autoheal', (req, res) => {
   const on = !!(req.body && req.body.on);
   if (on) _healOn.add(name); else { _healOn.delete(name); _heal.delete(name); }
   saveHealOn();
+  if (hostedHas(name)) sendHost({ t: 'heal', s: name, on });   // muxd mirrors the arm → only ARMED sessions auto-start at PC boot
   res.json({ ok: true, name, autoheal: on });
 });
 
@@ -426,11 +427,19 @@ function bootRecreate() {
     const cmd = muxCommandFor(name);
     if (!cmd) { console.log(`[boot-recreate] ${name}: armed but no resume command (not in a synced collection) — skipped`); continue; }
     try {
-      execSync(`tmux new -d -s ${name} ${JSON.stringify(SESSION_CMD)} 2>/dev/null`, { timeout: 3000 });
-      const N = name, C = 'cls; ' + cmd;
-      setTimeout(() => { try { execFile('tmux', ['send-keys', '-t', N, C, 'Enter']); } catch {} }, 3800);   // wait for ssh→PS, then resume
-      const mem = _sessState.get(name) || {}; mem.everAgent = true; _sessState.set(name, mem);             // restored deliberately → watchdog self-heals if this resume fails
-      n++; console.log(`[boot-recreate] ${name}: recreated + queued resume`);
+      if (hostUp()) {
+        // recoveries land on the SAFE path: recreate as a PC-hosted session (muxd runs the resume)
+        sendHost({ t: 'create', s: name, cmd, cols: 140, rows: 40, heal: true });
+        markPending(name);
+        hostSessions.set(name, { alive: true, created: Date.now(), lastOut: Date.now(), tail: '' });
+        n++; console.log(`[boot-recreate] ${name}: recreated HOSTED + resume queued`);
+      } else {
+        execSync(`tmux new -d -s ${name} ${JSON.stringify(SESSION_CMD)} 2>/dev/null`, { timeout: 3000 });
+        const N = name, C = 'cls; ' + cmd;
+        setTimeout(() => { try { execFile('tmux', ['send-keys', '-t', N, C, 'Enter']); } catch {} }, 3800);   // wait for ssh→PS, then resume
+        const mem = _sessState.get(name) || {}; mem.everAgent = true; _sessState.set(name, mem);             // restored deliberately → watchdog self-heals if this resume fails
+        n++; console.log(`[boot-recreate] ${name}: recreated via tmux fallback (host link down) + queued resume`);
+      }
     } catch (e) { console.log(`[boot-recreate] ${name}: failed: ${e.message}`); }
   }
   if (n) console.log(`[boot-recreate] restored ${n} armed session(s) after a wipe`);
@@ -770,7 +779,7 @@ wss.on('connection', async (ws, req) => {
   if (hostUp() && (hostSessions.has(name) || pendingCreates.has(name) || !tmuxHas(name))) {
     const known = hostSessions.get(name);
     if (!known || known.alive === false) {   // new, or E3: attaching to a DEAD hosted session → revive it (muxd keeps its cmd)
-      sendHost({ t: 'create', s: name, cmd: '', cols: vcols, rows: vrows });
+      sendHost({ t: 'create', s: name, cmd: '', cols: vcols, rows: vrows, heal: _healOn.has(name) });
       markPending(name);
       if (!known) hostSessions.set(name, { alive: true, created: Date.now(), lastOut: Date.now(), tail: '' });
     }
