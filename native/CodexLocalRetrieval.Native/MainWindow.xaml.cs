@@ -26,7 +26,11 @@ public sealed partial class MainWindow : Window
         SetTitleBar(AppTitleBar);
         Diag.Log("MW.ctor: titlebar set");
 
-        AppWindow.SetIcon("Assets/AppIcon.ico");
+        // Absolute path: a relative "Assets/AppIcon.ico" resolves against the working directory, which
+        // is NOT the app folder when launched from a shortcut without a Start-in dir — then SetIcon fails
+        // silently and the taskbar shows the generic icon. AppContext.BaseDirectory is always the app dir.
+        var iconPath = System.IO.Path.Combine(System.AppContext.BaseDirectory, "Assets", "AppIcon.ico");
+        if (System.IO.File.Exists(iconPath)) AppWindow.SetIcon(iconPath);
         AppWindow.Resize(new Windows.Graphics.SizeInt32(1500, 980));
         Diag.Log("MW.ctor: appwindow configured");
 

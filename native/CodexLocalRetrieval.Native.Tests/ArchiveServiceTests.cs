@@ -294,6 +294,26 @@ public sealed class ArchiveServiceTests
     }
 
     [TestMethod]
+    public void BuildMultiplexCommand_EscapesSingleQuoteInCwd()
+    {
+        var service = new ArchiveService(useBundledStore: true);
+        var cwd = Path.Combine(Path.GetTempPath(), "mux quote's cwd " + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(cwd);
+        try
+        {
+            var session = new ArchiveSession { Id = "cx-quote", Tool = "codex", Workspace = cwd, SourcePath = Path.Combine(cwd, "cx-quote.jsonl") };
+
+            var cmd = service.BuildMultiplexCommand(session);
+
+            Assert.AreEqual($"cd '{cwd.Replace('\\', '/').Replace("'", "''")}'; codex resume --include-non-interactive cx-quote", cmd);
+        }
+        finally
+        {
+            try { Directory.Delete(cwd, recursive: true); } catch { }
+        }
+    }
+
+    [TestMethod]
     public void BuildMultiplexCommand_Claude_UsesClaudeResume()
     {
         var service = new ArchiveService(useBundledStore: true);
@@ -320,7 +340,7 @@ public sealed class ArchiveServiceTests
     {
         var session = new ArchiveSession { Id = "3b7b7fbc-c196", Tool = "claude", Title = "Cortex Engine AAA Push" };
         var name = ArchiveService.MultiplexSessionName(session);
-        Assert.AreEqual("cortex-engine-aaa-push-3b7b", name);
+        Assert.AreEqual("cortex-engine-aaa-push-3b7bc196", name);
     }
 
     [TestMethod]
@@ -328,7 +348,28 @@ public sealed class ArchiveServiceTests
     {
         var session = new ArchiveSession { Id = "abcd1234", Tool = "codex", Title = "" };
         var name = ArchiveService.MultiplexSessionName(session);
-        Assert.AreEqual("cx-abcd", name);
+        Assert.AreEqual("cx-abcd1234", name);
+    }
+
+    [TestMethod]
+    public void MultiplexSessionName_UsesIdSuffixToAvoidUuidV7PrefixCollisions()
+    {
+        var a = new ArchiveSession
+        {
+            Id = "019f26ab-7133-7553-8e76-c09eb8ebfa6c",
+            Tool = "codex",
+            Title = "Continue this archived work from local context"
+        };
+        var b = new ArchiveSession
+        {
+            Id = "019f26b2-f740-7aa2-b38f-2a15a659607f",
+            Tool = "codex",
+            Title = "Continue this archived work from local context"
+        };
+
+        Assert.AreEqual("continue-this-archived-work-019ffa6c", ArchiveService.MultiplexSessionName(a));
+        Assert.AreEqual("continue-this-archived-work-019f607f", ArchiveService.MultiplexSessionName(b));
+        Assert.AreNotEqual(ArchiveService.MultiplexSessionName(a), ArchiveService.MultiplexSessionName(b));
     }
 
     // The projection the app pushes to the VPS so the web can list projects + resume chats remotely:
@@ -361,6 +402,39 @@ public sealed class ArchiveServiceTests
         }
     }
 
+    // runningSessions in the projection: every live agent appears (for the web's "Running on PC" view),
+    // enriched with the matched chat's title + collection when its session id OR an alias is known; an
+    // uncollected/unknown session still appears with null title/collection. Ordered newest-first.
+    [TestMethod]
+    public void BuildProjectsProjectionJson_EnrichesRunningSessions()
+    {
+        var svc = new ArchiveService(useBundledStore: true);
+        var cwd = System.IO.Path.GetTempPath().TrimEnd('\\', '/');
+        var s1 = new ArchiveSession { Id = "cl1", Tool = "claude", Title = "Cortex Push", Workspace = cwd, SourcePath = System.IO.Path.Combine(cwd, "cl1.jsonl") };
+        s1.Aliases.Add("alias-1");
+        svc.Store.Sessions[s1.Id] = s1;
+        svc.Store.Collections["col1"] = new ArchiveCollection { Id = "col1", Name = "Cortex Engine", SessionIds = new() { s1.Id } };
+
+        var sessions = new[]
+        {
+            new ArchiveService.RunningSessionInfo(100, "claude", "cl1", "VS Code", "2026-06-29T01:00:00Z", ""),         // matched by id
+            new ArchiveService.RunningSessionInfo(200, "claude", "alias-1", "VS Code", "2026-06-29T03:00:00Z", ""),     // matched by alias
+            new ArchiveService.RunningSessionInfo(300, "codex", "unknown-xyz", "Terminal", "2026-06-29T02:00:00Z", ""), // uncollected
+        };
+        using var doc = System.Text.Json.JsonDocument.Parse(svc.BuildProjectsProjectionJson(null, sessions));
+        var rs = doc.RootElement.GetProperty("runningSessions");
+        Assert.AreEqual(3, rs.GetArrayLength());
+        // newest-first by startedAt: alias-1 (03:00) > unknown (02:00) > cl1 (01:00)
+        Assert.AreEqual(200, rs[0].GetProperty("pid").GetInt32());
+        Assert.AreEqual("Cortex Push", rs[0].GetProperty("title").GetString());
+        Assert.AreEqual("Cortex Engine", rs[0].GetProperty("collection").GetString());
+        Assert.AreEqual(300, rs[1].GetProperty("pid").GetInt32());
+        Assert.AreEqual(System.Text.Json.JsonValueKind.Null, rs[1].GetProperty("title").ValueKind);   // uncollected -> null title
+        Assert.AreEqual("Terminal", rs[1].GetProperty("parent").GetString());
+        Assert.AreEqual(100, rs[2].GetProperty("pid").GetInt32());
+        Assert.AreEqual("Cortex Push", rs[2].GetProperty("title").GetString());                       // matched by id
+    }
+
     // The "is this chat already running?" guard reads the resumed session id off a claude/codex process
     // command line (local OR multiplex). Must match BuildMultiplexCommand's shapes and ignore non-resumes.
     [TestMethod]
@@ -372,6 +446,22 @@ public sealed class ArchiveServiceTests
         Assert.AreEqual("", ArchiveService.ParseResumedSessionId(@"C:\x\claude.exe"));   // fresh, not a resume
         Assert.AreEqual("", ArchiveService.ParseResumedSessionId("codex resume"));        // picker, no id
         Assert.AreEqual("", ArchiveService.ParseResumedSessionId(""));
+    }
+
+    [TestMethod]
+    public void RunningSessions_IgnoresCodexAppServerHelper()
+    {
+        Assert.IsFalse(CodexLocalRetrieval.Core.Remote.RunningSessions.IsLiveAgentProcess(
+            "codex.exe",
+            @"""C:\Users\Ahmed\AppData\Local\OpenAI\Codex\bin\msix-26.623.9142.0\codex.exe"" app-server --listen stdio://"));
+
+        Assert.IsTrue(CodexLocalRetrieval.Core.Remote.RunningSessions.IsLiveAgentProcess(
+            "codex.exe",
+            @"""C:\Users\Ahmed\AppData\Local\OpenAI\Codex\bin\codex.exe"" resume --include-non-interactive 019f26ab-7133-7553-8e76-c09eb8ebfa6c"));
+
+        Assert.IsTrue(CodexLocalRetrieval.Core.Remote.RunningSessions.IsLiveAgentProcess(
+            "claude.exe",
+            @"""C:\Users\Ahmed\.local\bin\claude.exe"" --resume f4413437-fb58-4002-8643-506f3b30cfde"));
     }
 
     // REGRESSION (real bug, session 3b7b7fbc "Cortex Engine AAA Push"): Claude files a transcript
@@ -674,9 +764,10 @@ public sealed class ArchiveServiceTests
             var session = new ArchiveSession { Id = "claude-1", Tool = "claude", SourcePath = transcript, UpdatedAt = "2020-01-01T00:00:00.0000000Z" };
             svc.Store.Sessions[session.Id] = session;
 
-            var native = await svc.BumpSessionAsync(session);
+            var (native, recovered) = await svc.BumpSessionAsync(session);
 
             Assert.IsTrue(native, "the transcript file existed, so the native mtime was touched");
+            Assert.IsFalse(recovered, "a plain transcript has no SDK entrypoint, so nothing was recovered");
             Assert.IsTrue(File.GetLastWriteTimeUtc(transcript) > oldStamp.AddHours(1), "transcript mtime moved to ~now");
             Assert.IsTrue(DateTime.Parse(session.UpdatedAt, CultureInfo.InvariantCulture, DateTimeStyles.AdjustToUniversal) > DateTime.UtcNow.AddMinutes(-5), "our list order is bumped too");
         }
@@ -685,6 +776,276 @@ public sealed class ArchiveServiceTests
             if (Directory.Exists(dir)) Directory.Delete(dir, true);
             if (File.Exists(store)) File.Delete(store);
         }
+    }
+
+    // ★ Recover (Claude): a chat created by the Agent SDK carries entrypoint "sdk-cli", which claude.exe
+    // filters OUT of `claude --resume` (function BTs). Bumping mtime alone is invisible for such a chat.
+    // The bump must REWRITE the entrypoint to "cli" so the fallen-away chat re-appears. Regression guard.
+    [TestMethod]
+    public async Task Bump_ClaudeSdkSession_RewritesEntrypointSoItResurfaces()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "clr-recover-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        var transcript = Path.Combine(dir, "sdk-session.jsonl");
+        // Line 1 is a summary/meta line with NO entrypoint (as real continued sessions start), so the
+        // detector must scan past it into the head — not just check line 1. Lines 2-3 carry sdk-cli.
+        File.WriteAllText(transcript,
+            "{\"type\":\"summary\",\"summary\":\"prior\",\"leafUuid\":\"x\"}\n" +
+            "{\"type\":\"user\",\"entrypoint\":\"sdk-cli\",\"message\":{\"content\":\"hi\"}}\n" +
+            "{\"type\":\"assistant\",\"entrypoint\":\"sdk-cli\",\"aiTitle\":\"My chat\"}\n");
+
+        var svc = TempService(out var store);
+        try
+        {
+            Assert.IsTrue(ArchiveService.IsHiddenClaudeEntrypoint(transcript), "an sdk-cli transcript is hidden from the picker");
+
+            var session = new ArchiveSession { Id = "claude-sdk-1", Tool = "claude", SourcePath = transcript, UpdatedAt = "2020-01-01T00:00:00.0000000Z" };
+            svc.Store.Sessions[session.Id] = session;
+
+            var (native, recovered) = await svc.BumpSessionAsync(session);
+
+            Assert.IsTrue(native, "transcript existed → mtime bumped");
+            Assert.IsTrue(recovered, "the sdk-cli entrypoint was rewritten so the chat resurfaces");
+            var text = File.ReadAllText(transcript);
+            Assert.IsFalse(text.Contains("sdk-cli"), "no sdk-cli entrypoint remains");
+            Assert.IsTrue(text.Contains("\"entrypoint\":\"cli\""), "entrypoint rewritten to the interactive value");
+            Assert.IsTrue(text.Contains("\"aiTitle\":\"My chat\""), "the rest of the transcript is preserved");
+            Assert.IsFalse(ArchiveService.IsHiddenClaudeEntrypoint(transcript), "after recovery the chat is no longer hidden");
+
+            // Idempotent: a second bump of an already-visible chat doesn't report another recovery.
+            var (_, recovered2) = await svc.BumpSessionAsync(session);
+            Assert.IsFalse(recovered2, "already-visible chat needs no further recovery");
+        }
+        finally
+        {
+            if (Directory.Exists(dir)) Directory.Delete(dir, true);
+            if (File.Exists(store)) File.Delete(store);
+        }
+    }
+
+    // ★ Codex bump: `codex resume` orders the rollout FILES by mtime (NOT threads.updated_at_ms — verified
+    // by driving the real picker), so the bump MUST touch the rollout file. Regression guard for the fix.
+    [TestMethod]
+    public async Task Bump_CodexSession_TouchesRolloutFileMtime()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "clr-bumpcodex-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        var rollout = Path.Combine(dir, "rollout-2026-01-01T00-00-00-codex-1.jsonl");
+        File.WriteAllText(rollout, "{}");
+        var oldStamp = DateTime.UtcNow.AddHours(-5);
+        File.SetLastWriteTimeUtc(rollout, oldStamp);
+
+        var svc = TempService(out var store);
+        try
+        {
+            var session = new ArchiveSession { Id = "codex-1", Tool = "codex", SourcePath = rollout, UpdatedAt = "2020-01-01T00:00:00.0000000Z" };
+            svc.Store.Sessions[session.Id] = session;
+
+            var (native, _) = await svc.BumpSessionAsync(session);
+
+            Assert.IsTrue(native, "the rollout file existed, so its mtime was touched");
+            Assert.IsTrue(File.GetLastWriteTimeUtc(rollout) > oldStamp.AddHours(1), "rollout mtime moved to ~now — that's what codex resume actually sorts by");
+            Assert.IsTrue(DateTime.Parse(session.UpdatedAt, CultureInfo.InvariantCulture, DateTimeStyles.AdjustToUniversal) > DateTime.UtcNow.AddMinutes(-5), "our list order bumped too");
+        }
+        finally
+        {
+            if (Directory.Exists(dir)) Directory.Delete(dir, true);
+            if (File.Exists(store)) File.Delete(store);
+        }
+    }
+
+    // Native rename (Claude): writes a `custom-title` record to the transcript (the first title Claude's
+    // resume picker reads) and updates the in-app native Title. App-only CustomTitle is untouched.
+    [TestMethod]
+    public async Task RenameNative_ClaudeSession_AppendsCustomTitleAndUpdatesTitle()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "clr-rn-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        var transcript = Path.Combine(dir, "session.jsonl");
+        File.WriteAllText(transcript, "{\"type\":\"user\",\"entrypoint\":\"cli\",\"message\":{\"content\":\"hi\"}}\n");
+        var svc = TempService(out var store);
+        try
+        {
+            var session = new ArchiveSession { Id = "claude-rn-1", Tool = "claude", SourcePath = transcript, Title = "old native", CustomTitle = "app name" };
+            svc.Store.Sessions[session.Id] = session;
+
+            var status = await svc.RenameNativeAsync(session, "Renamed In Claude");
+
+            var text = File.ReadAllText(transcript);
+            Assert.IsTrue(text.Contains("\"type\":\"custom-title\""), "a custom-title record was appended");
+            Assert.IsTrue(text.Contains("\"customTitle\":\"Renamed In Claude\""), "the new title is in the record");
+            Assert.AreEqual("Renamed In Claude", session.Title, "the in-app native Title is updated");
+            Assert.AreEqual("app name", session.CustomTitle, "the app-only CustomTitle is NOT touched by a native rename");
+            Assert.IsTrue((status ?? "").Contains("Claude", StringComparison.OrdinalIgnoreCase), "status mentions Claude");
+        }
+        finally { if (Directory.Exists(dir)) Directory.Delete(dir, true); if (File.Exists(store)) File.Delete(store); }
+    }
+
+    // RenameNativeById (the remote/web path): a running session not in the archive still renames by id —
+    // here, an indexed session is found and renamed in place.
+    [TestMethod]
+    public async Task RenameNativeById_IndexedClaude_RenamesInPlace()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "clr-rnid-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        var transcript = Path.Combine(dir, "x.jsonl");
+        File.WriteAllText(transcript, "{\"type\":\"user\",\"message\":{\"content\":\"hi\"}}\n");
+        var svc = TempService(out var store);
+        try
+        {
+            var session = new ArchiveSession { Id = "rnid-1", Tool = "claude", SourcePath = transcript, Title = "before" };
+            svc.Store.Sessions[session.Id] = session;
+
+            var status = await svc.RenameNativeByIdAsync("claude", "rnid-1", "After Remote");
+
+            Assert.AreEqual("After Remote", session.Title);
+            Assert.IsTrue(File.ReadAllText(transcript).Contains("\"customTitle\":\"After Remote\""));
+            Assert.IsFalse((status ?? "failed").Contains("failed", StringComparison.OrdinalIgnoreCase));
+        }
+        finally { if (Directory.Exists(dir)) Directory.Delete(dir, true); if (File.Exists(store)) File.Delete(store); }
+    }
+
+    [TestMethod]
+    public async Task RenameNativeById_MissingArgs_ReturnsNeedsHint()
+    {
+        var svc = TempService(out var store);
+        try
+        {
+            var s1 = await svc.RenameNativeByIdAsync("claude", "", "title");
+            var s2 = await svc.RenameNativeByIdAsync("claude", "id", "");
+            Assert.IsTrue((s1 ?? "").Contains("needs", StringComparison.OrdinalIgnoreCase));
+            Assert.IsTrue((s2 ?? "").Contains("needs", StringComparison.OrdinalIgnoreCase));
+        }
+        finally { if (File.Exists(store)) File.Delete(store); }
+    }
+
+    // ★ CLAUDE (the real path): the new chat is identified by the transcript that APPEARS in the cwd's
+    // project folder after launch (folder-diff vs the KnownIds snapshot) — robust even when the cwd is the
+    // shared 301 root and regardless of how Workspace parses. Uses the real ~/.claude/projects with a
+    // unique temp cwd (no collision) and cleans up.
+    [TestMethod]
+    public async Task PendingNewChat_Claude_FilesNewTranscriptByFolderDiff()
+    {
+        var cwd = Path.Combine(Path.GetTempPath(), "clrpend" + Guid.NewGuid().ToString("N").Substring(0, 12));
+        var encoded = System.Text.RegularExpressions.Regex.Replace(cwd.TrimEnd('\\', '/'), @"[\\/:.\s]", "-");
+        var folder = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".claude", "projects", encoded);
+        var svc = TempService(out var store);
+        try
+        {
+            Directory.CreateDirectory(folder);   // empty at queue time
+            var col = await svc.CreateCollectionAsync("FolderDiff Proj");
+            await svc.QueuePendingNewChatAsync("claude", cwd, col.Id);
+            Assert.AreEqual(0, svc.Store.PendingNewChats[0].KnownIds.Count, "no transcripts existed at launch");
+
+            var newId = Guid.NewGuid().ToString();   // a new chat appears in the folder
+            File.WriteAllText(Path.Combine(folder, newId + ".jsonl"), "{\"type\":\"user\",\"message\":{\"content\":\"hi\"}}\n");
+
+            var filed = await svc.ReconcilePendingNewChatsAsync();
+            Assert.IsTrue(filed, "reconcile filed the new transcript");
+            Assert.IsTrue(svc.Store.Collections[col.Id].SessionIds.Contains(newId), "the NEW transcript id was filed into the collection");
+            Assert.AreEqual(0, svc.Store.PendingNewChats.Count, "pending consumed");
+        }
+        finally { try { if (Directory.Exists(folder)) Directory.Delete(folder, true); } catch { } if (File.Exists(store)) File.Delete(store); }
+    }
+
+    // A transcript that ALREADY existed at launch (in the snapshot) is NOT filed — only a genuinely new one.
+    [TestMethod]
+    public async Task PendingNewChat_Claude_IgnoresPreExistingTranscripts()
+    {
+        var cwd = Path.Combine(Path.GetTempPath(), "clrpend" + Guid.NewGuid().ToString("N").Substring(0, 12));
+        var encoded = System.Text.RegularExpressions.Regex.Replace(cwd.TrimEnd('\\', '/'), @"[\\/:.\s]", "-");
+        var folder = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".claude", "projects", encoded);
+        var svc = TempService(out var store);
+        try
+        {
+            Directory.CreateDirectory(folder);
+            var oldId = Guid.NewGuid().ToString();   // a transcript that exists BEFORE the start
+            File.WriteAllText(Path.Combine(folder, oldId + ".jsonl"), "{}\n");
+            var col = await svc.CreateCollectionAsync("Proj");
+            await svc.QueuePendingNewChatAsync("claude", cwd, col.Id);
+            Assert.AreEqual(1, svc.Store.PendingNewChats[0].KnownIds.Count, "the pre-existing transcript is in the snapshot");
+
+            var filed = await svc.ReconcilePendingNewChatsAsync();
+            Assert.IsFalse(filed, "nothing new appeared -> nothing filed");
+            Assert.IsFalse(svc.Store.Collections[col.Id].SessionIds.Contains(oldId), "the pre-existing chat is NOT filed");
+            Assert.AreEqual(1, svc.Store.PendingNewChats.Count, "pending keeps waiting");
+        }
+        finally { try { if (Directory.Exists(folder)) Directory.Delete(folder, true); } catch { } if (File.Exists(store)) File.Delete(store); }
+    }
+
+    // CODEX path (no per-cwd folder): matched by tool + normalized workspace, created after launch.
+    [TestMethod]
+    public async Task PendingNewChat_Codex_FilesByCwdOnIndex()
+    {
+        var cwd = Path.Combine(Path.GetTempPath(), "clr-cwd-" + Guid.NewGuid().ToString("N"));
+        var svc = TempService(out var store);
+        try
+        {
+            var col = await svc.CreateCollectionAsync("Codex Proj");
+            await svc.QueuePendingNewChatAsync("codex", cwd, col.Id);
+            var fresh = new ArchiveSession { Id = "cx-1", Tool = "codex", Workspace = cwd, CreatedAt = DateTime.UtcNow.ToString("O") };
+            await svc.MergeScanAsync(new DiskScan(new List<ArchiveSession> { fresh }, new List<ArchiveSession>()), refreshList: false);
+
+            Assert.IsTrue(svc.Store.Collections[col.Id].SessionIds.Contains("cx-1"), "codex new chat filed by cwd");
+            Assert.AreEqual(0, svc.Store.PendingNewChats.Count, "pending consumed");
+        }
+        finally { if (File.Exists(store)) File.Delete(store); }
+    }
+
+    // A codex pending must NOT grab a session in a different folder.
+    [TestMethod]
+    public async Task PendingNewChat_Codex_DoesNotFileOtherFolder()
+    {
+        var cwd = Path.Combine(Path.GetTempPath(), "clr-cwd-" + Guid.NewGuid().ToString("N"));
+        var other = Path.Combine(Path.GetTempPath(), "clr-other-" + Guid.NewGuid().ToString("N"));
+        var svc = TempService(out var store);
+        try
+        {
+            var col = await svc.CreateCollectionAsync("Proj");
+            await svc.QueuePendingNewChatAsync("codex", cwd, col.Id);
+            var elsewhere = new ArchiveSession { Id = "else-1", Tool = "codex", Workspace = other, CreatedAt = DateTime.UtcNow.ToString("O") };
+            await svc.MergeScanAsync(new DiskScan(new List<ArchiveSession> { elsewhere }, new List<ArchiveSession>()), refreshList: false);
+
+            Assert.IsFalse(svc.Store.Collections[col.Id].SessionIds.Contains("else-1"), "a session in another folder is not filed");
+            Assert.AreEqual(1, svc.Store.PendingNewChats.Count, "the pending intent keeps waiting");
+        }
+        finally { if (File.Exists(store)) File.Delete(store); }
+    }
+
+    [TestMethod]
+    public async Task PendingNewChat_SaveReload_PreservesIntent()
+    {
+        var cwd = Path.Combine(Path.GetTempPath(), "clr-pending-" + Guid.NewGuid().ToString("N"));
+        var svc = TempService(out var store);
+        try
+        {
+            var col = await svc.CreateCollectionAsync("Persist Me");
+            await svc.QueuePendingNewChatAsync("codex", cwd, col.Id);
+
+            var reader = new ArchiveService(storePath: store);
+            await reader.LoadAsync();
+
+            Assert.AreEqual(1, reader.Store.PendingNewChats.Count, "pending start-chat intents must survive SaveAsync");
+            Assert.AreEqual("codex", reader.Store.PendingNewChats[0].Tool);
+            Assert.AreEqual(cwd, reader.Store.PendingNewChats[0].Cwd);
+            Assert.AreEqual(col.Id, reader.Store.PendingNewChats[0].CollectionId);
+        }
+        finally { if (File.Exists(store)) File.Delete(store); }
+    }
+
+    [TestMethod]
+    public void BuildStartLaunch_Shell_OpensPlainTerminalInCwd()
+    {
+        var svc = TempService(out var store);
+        try
+        {
+            var cwd = Path.GetTempPath();
+            var launch = svc.BuildStartLaunch("shell", cwd);
+            Assert.AreEqual("cmd.exe", launch.Exe);
+            Assert.AreEqual("", launch.DisplayCommand, "a shell has no agent command");
+            Assert.AreEqual(cwd.TrimEnd('\\'), launch.WorkingDirectory.TrimEnd('\\'));
+        }
+        finally { if (File.Exists(store)) File.Delete(store); }
     }
 
     private static ArchiveService TempService(out string store)

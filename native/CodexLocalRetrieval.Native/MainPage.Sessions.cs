@@ -131,13 +131,15 @@ public sealed partial class MainPage
     {
         try
         {
-            var native = await _archive.BumpSessionAsync(session);
+            var (native, recovered) = await _archive.BumpSessionAsync(session);
             SessionList.SelectedItem = session;
             RenderCurrent();
             var where = string.Equals(session.Tool, "codex", StringComparison.OrdinalIgnoreCase) ? "codex resume" : "Claude's recent chats";
-            SyncStatus.Text = native
-                ? $"Bumped \"{Trim(session.DisplayTitle, 40)}\" to the top of {where}."
-                : $"Bumped \"{Trim(session.DisplayTitle, 40)}\" here - couldn't find it in {where}.";
+            SyncStatus.Text = !native
+                ? $"Bumped \"{Trim(session.DisplayTitle, 40)}\" here - couldn't find it in {where}."
+                : recovered
+                    ? $"Recovered \"{Trim(session.DisplayTitle, 40)}\" (was hidden) and bumped it to the top of {where}."
+                    : $"Bumped \"{Trim(session.DisplayTitle, 40)}\" to the top of {where}.";
         }
         catch (Exception ex)
         {

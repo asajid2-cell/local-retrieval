@@ -141,19 +141,14 @@ public sealed class ArchiveSettings
     [JsonPropertyName("claudeLaunchArgs")]
     public string ClaudeLaunchArgs { get; set; } = "";
 
-    // Remote (multiplex) session support. "Start remote session" creates a tmux session on the VPS
-    // that SSHes back into THIS PC and resumes the chat, then mirrors it locally and to
-    // harmonizerlabs.cc/multiplex. MultiplexSshTarget = the user@host of the VPS the app reaches over
-    // its own (owner-only) SSH; the multiplex API listens on loopback there, so an SSH-tunnelled curl
-    // creates the session without needing an SSO cookie. Empty target disables the feature in the UI.
+    // Remote (multiplex) session support. The PC-local muxd owns the terminal session and dials out to
+    // the relay so harmonizerlabs.cc/multiplex can mirror it. MultiplexSshTarget is still used by the
+    // app's owner-only command/projection bridge to the VPS loopback API.
     [JsonPropertyName("multiplexSshTarget")]
     public string MultiplexSshTarget { get; set; } = "harmonizer@192.168.1.142";
 
     [JsonPropertyName("multiplexApiPort")]
     public int MultiplexApiPort { get; set; } = 7682;
-
-    [JsonPropertyName("multiplexSessionLauncher")]
-    public string MultiplexSessionLauncher { get; set; } = "/usr/local/bin/multiplex-session";
 }
 
 public sealed class AiProviderSettings

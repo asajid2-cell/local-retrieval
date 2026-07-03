@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
 using System.Management;
+using System.Text.Json;
 using System.Threading.Tasks;
 using CodexLocalRetrieval.Core.Models;
 using CodexLocalRetrieval.Core.Services;
@@ -61,8 +62,10 @@ public sealed partial class MainPage
             foreach (ManagementObject mo in searcher.Get())
             {
                 var cl = mo["CommandLine"]?.ToString() ?? "";
+                var procName = mo["Name"]?.ToString() ?? "";
+                if (!CodexLocalRetrieval.Core.Remote.RunningSessions.IsLiveAgentProcess(procName, cl)) continue;
                 var sid = ArchiveService.ParseResumedSessionId(cl) ?? "";
-                var name = (mo["Name"]?.ToString() ?? "").ToLowerInvariant();
+                var name = procName.ToLowerInvariant();
                 var tool = name.Contains("codex") ? "codex" : "claude";
                 var pid = 0; try { pid = Convert.ToInt32(mo["ProcessId"]); } catch { }
                 var ppid = 0; try { ppid = Convert.ToInt32(mo["ParentProcessId"]); } catch { }
@@ -128,36 +131,54 @@ public sealed partial class MainPage
         catch (Exception ex) { return (false, $"kill failed: {ex.Message}"); }
     }
 
-    private void TryKillChat(int pid)
+    private (bool ok, string detail) TryKillChat(int pid)
     {
-        try { Process.GetProcessById(pid).Kill(entireProcessTree: true); InvalidateRunningCache(); }
-        catch (Exception ex) { Diag.Log($"Kill pid {pid} failed: " + ex.Message); }
+        try { Process.GetProcessById(pid).Kill(entireProcessTree: true); InvalidateRunningCache(); return (true, "killed"); }
+        catch (ArgumentException) { InvalidateRunningCache(); return (true, "already gone"); }
+        catch (Exception ex) { Diag.Log($"Kill pid {pid} failed: " + ex.Message); return (false, ex.Message); }
     }
 
-    // Does a multiplex session of this name already exist on the VPS? Lets "Resume in multiplex" ATTACH
-    // an already-running session instead of injecting a second resume into it.
-    private static async Task<bool> RemoteSessionExistsAsync(string target, int port, string name)
+    private enum RelayMuxState { None, Hosted, Legacy }
+
+    // What does the relay know about this name? The relay can report PC-hosted muxd sessions as well as
+    // legacy tmux sessions, so parse the JSON instead of string-searching and never treat this as a
+    // creation fallback. It is only a duplicate-run guard and cleanup path.
+    private static async Task<RelayMuxState> RelayMuxStateAsync(string target, int port, string name)
     {
         try
         {
             // Hardened + hard-timeout via RunSshAsync (no -n/timeout here was another way to hang the app).
             var (_, outText) = await RunSshAsync(target, $"curl -s http://127.0.0.1:{port}/api/sessions");
-            return outText.Contains($"\"name\":\"{name}\"");
+            using var doc = JsonDocument.Parse(outText);
+            if (doc.RootElement.ValueKind != JsonValueKind.Array) return RelayMuxState.None;
+            foreach (var s in doc.RootElement.EnumerateArray())
+            {
+                if (!s.TryGetProperty("name", out var n) || !string.Equals(n.GetString(), name, StringComparison.OrdinalIgnoreCase))
+                    continue;
+                if (s.TryGetProperty("hosted", out var hosted) && hosted.ValueKind == JsonValueKind.True)
+                    return RelayMuxState.Hosted;
+                if (s.TryGetProperty("legacy", out var legacy) && legacy.ValueKind == JsonValueKind.True)
+                    return RelayMuxState.Legacy;
+                return RelayMuxState.Legacy;
+            }
         }
-        catch { return false; }
+        catch { }
+        return RelayMuxState.None;
     }
 
-    // DELETE the multiplex session on the VPS (ends its tmux session + the agent running inside it).
-    private static async Task DeleteRemoteSessionAsync(string target, int port, string name)
+    // DELETE a relay-visible mux session. This is cleanup/duplicate prevention only; creation is local muxd.
+    private static async Task<(bool ok, string detail)> DeleteRelayMuxSessionAsync(string target, int port, string name)
     {
         try
         {
-            await RunSshAsync(target, $"curl -s -X DELETE http://127.0.0.1:{port}/api/sessions/{name}");
+            var (code, outText) = await RunSshAsync(target, $"curl -s -X DELETE http://127.0.0.1:{port}/api/sessions/{name}");
+            if (code == 0 && outText.Contains("\"ok\":true", StringComparison.OrdinalIgnoreCase)) return (true, "deleted");
+            return (false, $"relay delete failed rc={code} {outText.Trim()}");
         }
-        catch { }
+        catch (Exception ex) { return (false, ex.Message); }
     }
 
-    private enum RunGuard { Proceed, Kill, Cancel }
+    private enum RunGuard { Kill, Cancel }
 
     private async Task<RunGuard> ConfirmAlreadyRunningAsync(string title, string where)
     {
@@ -167,27 +188,30 @@ public sealed partial class MainPage
             Content = $"\"{title}\" looks like it's already running in {where}. Running it twice makes two " +
                       "processes write the same transcript and can corrupt it. Kill the running copy and take over here?",
             PrimaryButtonText = "Kill it & continue",
-            SecondaryButtonText = "Start anyway",
             CloseButtonText = "Cancel",
             DefaultButton = ContentDialogButton.Primary,
             XamlRoot = XamlRoot,
         };
         var r = await dialog.ShowAsync();
         return r == ContentDialogResult.Primary ? RunGuard.Kill
-             : r == ContentDialogResult.Secondary ? RunGuard.Proceed
              : RunGuard.Cancel;
     }
 
-    // Shared pre-launch guard for BOTH resume flows: for THIS chat, check a multiplex session on the
-    // VPS AND a local agent process, and if either is up, offer to kill it (or cancel and deal with it
-    // later). Returns false to abort the launch.
+    // Shared pre-launch guard for BOTH resume flows: for THIS chat, check local muxd first, then the
+    // relay's explicit hosted/legacy state, plus a loose local agent process. If any are up, offer to
+    // kill it or cancel. Returns false to abort the launch.
     private async Task<bool> ConfirmRunOrKillAsync(ArchiveSession session)
     {
         var settings = _archive.Store.Settings;
         var target = (settings.MultiplexSshTarget ?? "").Trim();
         var muxName = ArchiveService.MultiplexSessionName(session);
 
-        var muxUp = !string.IsNullOrEmpty(target) && await RemoteSessionExistsAsync(target, settings.MultiplexApiPort, muxName);
+        var localMuxUp = await LocalMuxdSessionAliveAsync(muxName);
+        var relayState = !localMuxUp && !string.IsNullOrEmpty(target)
+            ? await RelayMuxStateAsync(target, settings.MultiplexApiPort, muxName)
+            : RelayMuxState.None;
+        var relayMuxUp = relayState != RelayMuxState.None;
+        var muxUp = localMuxUp || relayMuxUp;
         var running = await Task.Run(GetRunningChats);
         var localPid = (!string.IsNullOrEmpty(session.Id) && running.TryGetValue(session.Id, out var pid)) ? pid : 0;
         // if a multiplex is up, the running process IS its agent (not a separate local one)
@@ -195,13 +219,33 @@ public sealed partial class MainPage
 
         if (!muxUp && !localUp) return true;   // nothing running -> proceed
 
-        var where = muxUp ? "a multiplex on the VPS" : "locally on this PC";
+        var where = localMuxUp ? "a local mux session"
+                  : relayState == RelayMuxState.Hosted ? "a PC-hosted mux session reported by the relay"
+                  : relayState == RelayMuxState.Legacy ? "a legacy relay-side session"
+                  : "locally on this PC";
         var choice = await ConfirmAlreadyRunningAsync(Trim(session.DisplayTitle, 40), where);
         if (choice == RunGuard.Cancel) return false;
         if (choice == RunGuard.Kill)
         {
-            if (muxUp) await DeleteRemoteSessionAsync(target, settings.MultiplexApiPort, muxName);
-            if (localPid != 0) TryKillChat(localPid);
+            if (localMuxUp)
+            {
+                var deleted = await DeleteLocalMuxdSessionAsync(muxName);
+                if (!deleted.ok)
+                {
+                    SyncStatus.Text = "Could not kill the local mux session: " + deleted.detail;
+                    return false;
+                }
+            }
+            else if (relayMuxUp)
+            {
+                var deleted = await DeleteRelayMuxSessionAsync(target, settings.MultiplexApiPort, muxName);
+                if (!deleted.ok) { SyncStatus.Text = "Could not kill the relay-visible mux session: " + deleted.detail; return false; }
+            }
+            if (localPid != 0)
+            {
+                var killed = TryKillChat(localPid);
+                if (!killed.ok) { SyncStatus.Text = "Could not kill the local running agent: " + killed.detail; return false; }
+            }
             await Task.Delay(400);
         }
         return true;

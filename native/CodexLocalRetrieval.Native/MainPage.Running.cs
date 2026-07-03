@@ -17,7 +17,7 @@ namespace CodexLocalRetrieval_Native;
 // collection, kill — without hunting through the web UI or Task Manager.
 public sealed partial class MainPage
 {
-    private sealed record MuxRow(string Name, string State, bool Hosted, bool Armed, long Activity, bool Attached);
+    private sealed record MuxRow(string Name, string State, bool Hosted, bool Alive, bool Armed, long Activity, bool Attached);
     private int _runningSeq;
 
     private void RenderRunningPage()
@@ -61,6 +61,7 @@ public sealed partial class MainPage
                         s.TryGetProperty("name", out var n) ? n.GetString() ?? "" : "",
                         s.TryGetProperty("state", out var st) ? st.GetString() ?? "white" : "white",
                         s.TryGetProperty("hosted", out var h) && h.GetBoolean(),
+                        s.TryGetProperty("alive", out var alive) && alive.GetBoolean(),
                         s.TryGetProperty("autoheal", out var a) && a.GetBoolean(),
                         s.TryGetProperty("activity", out var ac) ? ac.GetInt64() : 0,
                         s.TryGetProperty("attached", out var at) && at.GetBoolean()));
@@ -74,7 +75,7 @@ public sealed partial class MainPage
         if (seq != _runningSeq || _screen != "Running") return;   // navigated away / re-rendered meanwhile
 
         var mux = muxTask.Result.Where(m => m.Name.Length > 0).OrderByDescending(m => m.Activity).ToList();
-        var muxIds = new HashSet<string>(mux.Select(m => m.Name), StringComparer.OrdinalIgnoreCase);
+        var muxIds = new HashSet<string>(mux.Where(m => m.Alive).Select(m => m.Name), StringComparer.OrdinalIgnoreCase);
         // a local process whose session is a multiplex one is the SAME agent seen from the OS side — don't list it twice
         var local = localTask.Result
             .Where(r => string.IsNullOrEmpty(r.SessionId)

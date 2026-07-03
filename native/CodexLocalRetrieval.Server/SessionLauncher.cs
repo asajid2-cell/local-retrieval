@@ -50,6 +50,31 @@ public sealed class SessionLauncher
         catch (Exception ex) { return (false, "couldn't launch: " + ex.Message); }
     }
 
+    // Spin up the FULL desktop app on this PC on demand (the headless server stays light by default).
+    // Idempotent: if it's already running, just say so. Path: CLR_DESKTOP_APP_EXE or the install default.
+    public (bool ok, string message) OpenDesktopApp()
+    {
+        if (!_allow) return (false, "Launching is disabled on this server (set CLR_REMOTE_ALLOW_LAUNCH=1).");
+        var exe = Environment.GetEnvironmentVariable("CLR_DESKTOP_APP_EXE");
+        if (string.IsNullOrWhiteSpace(exe) || !File.Exists(exe))
+            exe = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                               "Programs", "CodexLocalRetrieval", "CodexLocalRetrieval.Native.exe");
+        if (!File.Exists(exe)) return (false, "Desktop app not found (install it, or set CLR_DESKTOP_APP_EXE).");
+        try
+        {
+            if (Process.GetProcessesByName("CodexLocalRetrieval.Native").Length > 0)
+                return (true, "The desktop app is already running on the PC.");
+            Process.Start(new ProcessStartInfo
+            {
+                FileName = exe,
+                WorkingDirectory = Path.GetDirectoryName(exe)!,   // so its relative asset/icon loads resolve
+                UseShellExecute = true
+            });
+            return (true, "Launching the desktop app on the PC…");
+        }
+        catch (Exception ex) { return (false, "couldn't launch the desktop app: " + ex.Message); }
+    }
+
     private static void OpenUri(string uri) =>
         Process.Start(new ProcessStartInfo { FileName = uri, UseShellExecute = true });
 

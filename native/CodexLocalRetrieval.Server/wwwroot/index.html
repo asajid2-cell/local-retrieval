@@ -222,6 +222,7 @@
     <h1>Codex Archive</h1>
     <span class="sub" id="subtitle"></span>
     <span class="spacer"></span>
+    <button class="iconbtn" id="openAppBtn" title="Open the full desktop app on the PC" hidden>Open app</button>
     <button class="iconbtn" id="refreshBtn" title="Reload">Reload</button>
     <button class="iconbtn" id="settingsBtn" title="Access token">Key</button>
   </header>
@@ -254,7 +255,7 @@ if(_urlToken){ try{ localStorage.setItem('clr_token', _urlToken); }catch{} }
 const App = {
   token: _urlToken || localStorage.getItem('clr_token') || '',
   tab: 'agent',
-  chats: [], stats: null, q: '',
+  chats: null, stats: null, q: '',   /* chats:null = not loaded yet (lazy — only when the Chats tab opens) */
   detail: null, showRollout: false,
   copilot: [], copilotBusy: false, copilotCtl: null,
   // live agent: a browser of all codex+claude sessions + an open conversation you can drive
@@ -317,21 +318,48 @@ function switchTab(t){
 }
 $('#settingsBtn').addEventListener('click',()=>openGate());
 $('#refreshBtn').addEventListener('click',()=>{ if(App.tab==='chats'){loadChats(App.q);} });
+$('#openAppBtn').addEventListener('click', openDesktopApp);
+
+// Light by default, heavy on demand: spin up the full desktop app on the PC from here.
+async function openDesktopApp(){
+  const btn=$('#openAppBtn'); btn.disabled=true; const old=btn.textContent;
+  try{
+    const r=await api('/api/desktop-app/open',{method:'POST'});
+    showToast(r.message || 'Launching the desktop app…');
+    setTimeout(refreshAppState, 2500);
+  }catch(e){ showToast('Couldn’t open the desktop app: '+e.message); }
+  finally{ btn.disabled=false; btn.textContent=old; }
+}
+// Show the button only when this server can launch (CLR_REMOTE_ALLOW_LAUNCH); label reflects running state.
+async function refreshAppState(){
+  try{
+    const s=await api('/api/desktop-app');
+    const btn=$('#openAppBtn');
+    btn.hidden = !s.available;
+    btn.textContent = s.running ? 'App running' : 'Open app';
+    btn.title = s.running ? 'The full desktop app is running on the PC' : 'Open the full desktop app on the PC';
+  }catch(e){ /* unauth/offline — leave hidden */ }
+}
 
 /* ---------- data ---------- */
 async function boot(){
+  // Light by default: the landing tab (Agent) lists live sessions WITHOUT the archive, so we don't load
+  // the heavy chat index here. /api/stats + the chat list load lazily the first time you open Chats.
   try{
-    const h=await api('/api/stats'); App.stats=h; setDot('ok');
-    $('#subtitle').textContent = h.totalChats+' chats';
-    await loadChats('');
+    setDot('ok');
+    refreshAppState();
+    render();
   }catch(e){ if(e.message!=='unauthorized'){ setDot('bad'); renderError(e.message); } }
+}
+async function loadStats(){
+  try{ App.stats=await api('/api/stats'); $('#subtitle').textContent = App.stats.totalChats+' chats'; if(App.tab==='chats') render(); }catch(e){}
 }
 async function loadChats(q){
   App.q=q;
   try{
     const r=await api('/api/chats?limit=40&q='+encodeURIComponent(q||''));
-    App.chats=r.results; if(App.tab==='chats'&&!App.detail) render();
-  }catch(e){ if(e.message!=='unauthorized') renderError(e.message); }
+    App.chats=r.results||[]; if(App.tab==='chats'&&!App.detail) render();
+  }catch(e){ if(App.chats==null) App.chats=[]; if(e.message!=='unauthorized') renderError(e.message); }
 }
 async function openDetail(id){
   try{
@@ -392,6 +420,12 @@ function renderChats(v){
   const input=el('input',{class:'txt',type:'search',placeholder:'Search your chats…','aria-label':'Search chats',value:App.q});
   let t; input.addEventListener('input',e=>{clearTimeout(t);t=setTimeout(()=>loadChats(e.target.value),250);});
   v.append(el('div',{class:'search'}, input));
+  // Lazy: the first time you open Chats, load the archive (index + stats) on demand.
+  if(App.chats==null){
+    v.append(el('div',{class:'note'}, el('span',{class:'spin'}),' loading your chats…'));
+    loadChats(App.q||''); loadStats();
+    return;
+  }
   if(App.stats) v.append(el('div',{class:'meta',style:'margin-bottom:12px'},
     `${App.stats.totalChats} chats · ${App.stats.byTool?.codex||0} codex · ${App.stats.byTool?.claude||0} claude · ${App.stats.favorites} pinned`));
   if(!App.chats.length){ v.append(el('div',{class:'empty'}, App.q?'No chats match that search.':'No chats indexed yet.')); return; }

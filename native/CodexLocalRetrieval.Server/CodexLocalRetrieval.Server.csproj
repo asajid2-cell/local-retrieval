@@ -7,6 +7,12 @@
     <RootNamespace>CodexLocalRetrieval.Server</RootNamespace>
     <AssemblyName>CodexLocalRetrieval.Server</AssemblyName>
     <InvariantGlobalization>true</InvariantGlobalization>
+    <!-- This is a single-user, low-traffic personal server. ASP.NET defaults to Server GC, which
+         reserves large per-core heaps and is slow to return memory to the OS (~420MB resident for an
+         11MB store). Workstation GC + background collection keeps the working set far smaller and hands
+         memory back after spikes — the right trade for an always-on background process. -->
+    <ServerGarbageCollection>false</ServerGarbageCollection>
+    <ConcurrentGarbageCollection>true</ConcurrentGarbageCollection>
   </PropertyGroup>
 
   <ItemGroup>

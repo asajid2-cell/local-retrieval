@@ -33,11 +33,14 @@ $ErrorActionPreference = 'Stop'
 
 $repo       = Split-Path -Parent $PSScriptRoot
 $proj       = Join-Path $repo 'native\CodexLocalRetrieval.Native\CodexLocalRetrieval.Native.csproj'
+$serverProj = Join-Path $repo 'native\CodexLocalRetrieval.Server\CodexLocalRetrieval.Server.csproj'
 $tfm        = 'net8.0-windows10.0.26100.0'
 $rid        = 'win-x64'
 $exeName    = 'CodexLocalRetrieval.Native.exe'
 $installDir = Join-Path $env:LOCALAPPDATA 'Programs\CodexLocalRetrieval'
 $buildDir   = Join-Path $repo "native\CodexLocalRetrieval.Native\bin\Release\$tfm\$rid"
+$serverBuildDir = Join-Path $repo 'native\CodexLocalRetrieval.Server\bin\Release\net8.0'
+$remoteDir  = Join-Path $env:LOCALAPPDATA 'CodexArchiveRemote'
 $dataDir    = Join-Path $env:LOCALAPPDATA 'CodexLocalRetrieval'
 
 Write-Host "Building Codex Local Retrieval (Release)..." -ForegroundColor Cyan
@@ -50,16 +53,25 @@ function Stop-AppAndDeps {
         $ps = Get-Process -Name $n -ErrorAction SilentlyContinue
         if ($ps) { $ps | Stop-Process -Force -ErrorAction SilentlyContinue; foreach ($p in $ps) { try { $p.WaitForExit(6000) | Out-Null } catch {} } }
     }
+    try {
+        Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe' OR Name = 'pwsh.exe'" |
+            Where-Object { $_.CommandLine -like '*CodexArchiveRemote*remote-tunnel.ps1*' -or $_.CommandLine -like '*CodexArchiveRemote*run-remote.ps1*' } |
+            ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    } catch {}
     try { Stop-ScheduledTask -TaskName 'CodexArchiveRemote' -ErrorAction SilentlyContinue } catch {}   # the bridge task can relaunch the app mid-install
 }
 Stop-AppAndDeps
 
 & dotnet build $proj -c Release -r $rid --nologo -v m
 if ($LASTEXITCODE -ne 0) { throw "dotnet build failed (exit $LASTEXITCODE)" }
+& dotnet build $serverProj -c Release --nologo -v m
+if ($LASTEXITCODE -ne 0) { throw "server dotnet build failed (exit $LASTEXITCODE)" }
 
 $builtExe = Join-Path $buildDir $exeName
 if (-not (Test-Path $builtExe)) { throw "Built exe not found: $builtExe" }
 if (-not (Test-Path (Join-Path $buildDir 'CodexLocalRetrieval.Native.pri'))) { throw "App .pri missing from build output - the app would crash on XAML load." }
+if (-not (Test-Path (Join-Path $serverBuildDir 'CodexLocalRetrieval.Server.exe'))) { throw "Built remote bridge exe not found: $serverBuildDir" }
+if (-not (Test-Path (Join-Path $serverBuildDir 'CodexLocalRetrieval.Core.dll'))) { throw "Built remote bridge is missing CodexLocalRetrieval.Core.dll" }
 
 Write-Host "Staging a COMPLETE, verified install (atomic swap) ..." -ForegroundColor Cyan
 Stop-AppAndDeps            # once more, in case a copy relaunched during the build
@@ -113,6 +125,38 @@ if ($stillMissing) {
     throw "Install verification failed [$($stillMissing -join ', ')]. Rolled back to the previous install."
 }
 if (Test-Path $backup) { Remove-Item $backup -Recurse -Force -ErrorAction SilentlyContinue }
+
+# 6) Keep the always-on remote bridge in lockstep with the GUI/Core build. It runs from
+# %LOCALAPPDATA%\CodexArchiveRemote, not from the GUI install dir, so failing to update it leaves the
+# VPS Projects/Running feed on stale code even though the desktop app was updated.
+if (Test-Path $remoteDir) {
+    Write-Host "Staging remote bridge update (atomic swap) ..." -ForegroundColor Cyan
+    Stop-AppAndDeps
+    Start-Sleep -Milliseconds 300
+
+    $remoteStaging = "$remoteDir.staging"
+    $remoteBackup = "$remoteDir.old"
+    if (Test-Path $remoteStaging) { Remove-Item $remoteStaging -Recurse -Force -ErrorAction SilentlyContinue }
+    if (Test-Path $remoteBackup) { Remove-Item $remoteBackup -Recurse -Force -ErrorAction SilentlyContinue }
+    New-Item -ItemType Directory -Force -Path $remoteStaging | Out-Null
+
+    foreach ($pattern in 'run-remote.ps1','remote-tunnel.ps1','Start-Remote.ps1','signing.key','*.log','web.config') {
+        Get-ChildItem -LiteralPath $remoteDir -Filter $pattern -File -ErrorAction SilentlyContinue |
+            Copy-Item -Destination $remoteStaging -Force -ErrorAction SilentlyContinue
+    }
+    Get-ChildItem -LiteralPath $serverBuildDir -Exclude '*.pdb' | Copy-Item -Destination $remoteStaging -Recurse -Force
+
+    $remoteCritical = @('CodexLocalRetrieval.Server.exe','CodexLocalRetrieval.Server.dll','CodexLocalRetrieval.Core.dll',
+        'CodexLocalRetrieval.Server.runtimeconfig.json','CodexLocalRetrieval.Server.deps.json','run-remote.ps1','remote-tunnel.ps1')
+    $remoteMissing = $remoteCritical | Where-Object { -not (Test-Path (Join-Path $remoteStaging $_)) }
+    if ($remoteMissing) { Remove-Item $remoteStaging -Recurse -Force -ErrorAction SilentlyContinue; throw "Refusing to update remote bridge: staged bridge is missing [$($remoteMissing -join ', ')]." }
+
+    Rename-Item -LiteralPath $remoteDir -NewName (Split-Path $remoteBackup -Leaf) -ErrorAction Stop
+    Rename-Item -LiteralPath $remoteStaging -NewName (Split-Path $remoteDir -Leaf) -ErrorAction Stop
+    if (Test-Path $remoteBackup) { Remove-Item $remoteBackup -Recurse -Force -ErrorAction SilentlyContinue }
+} else {
+    Write-Host "Remote bridge folder not found; skipped CodexArchiveRemote update." -ForegroundColor DarkYellow
+}
 try { Start-ScheduledTask -TaskName 'CodexArchiveRemote' -ErrorAction SilentlyContinue } catch {}   # restart the bridge we paused
 
 # A small marker so you can tell what's installed.

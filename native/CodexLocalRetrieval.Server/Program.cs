@@ -39,11 +39,11 @@ var allowLaunch = Environment.GetEnvironmentVariable("CLR_REMOTE_ALLOW_LAUNCH") 
 var storePath = Environment.GetEnvironmentVariable("CLR_REMOTE_STORE");
 var useBundled = Environment.GetEnvironmentVariable("CLR_REMOTE_BUNDLED") == "1";
 var archive = new ArchiveService(storePath: string.IsNullOrWhiteSpace(storePath) ? null : storePath, useBundledStore: useBundled);
-await archive.LoadAsync();
-if (Environment.GetEnvironmentVariable("CLR_REMOTE_SYNC") != "0")
-{
-    try { await archive.SyncFromDiskAsync(); } catch (Exception ex) { Console.Error.WriteLine("sync warning: " + ex.Message); }
-}
+// LAZY: the archive (store + disk index) is the heavy part (~150-200MB), but only the Chats tab and the
+// co-pilot use it — the Agent tab lists live sessions straight from the app-server / Claude store. So we
+// DON'T load it at startup; the first archive-backed request triggers a one-time load (+ disk sync). An
+// idle server (Agent-only use, or just sitting there) stays light until you actually browse your archive.
+var syncOnLoad = Environment.GetEnvironmentVariable("CLR_REMOTE_SYNC") != "0";
 
 IChatBackend? BackendFactory()
 {
@@ -55,6 +55,28 @@ IChatBackend? BackendFactory()
 }
 
 var api = new RemoteApi(archive, BackendFactory, redactReads, allowLaunch);
+
+// One-time, thread-safe on-demand archive load. Endpoints that read the archive await this first; the
+// first caller pays the load+sync, everyone after returns instantly.
+var _archiveLoaded = false;
+var _archiveGate = new SemaphoreSlim(1, 1);
+var _lastArchiveAccess = DateTime.UtcNow;
+async Task EnsureArchiveAsync()
+{
+    _lastArchiveAccess = DateTime.UtcNow;   // every access resets the idle-unload clock
+    if (_archiveLoaded) return;
+    await _archiveGate.WaitAsync();
+    try
+    {
+        if (_archiveLoaded) return;
+        await archive.LoadAsync();
+        if (syncOnLoad) { try { await archive.SyncFromDiskAsync(); } catch (Exception ex) { Console.Error.WriteLine("sync warning: " + ex.Message); } }
+        _archiveLoaded = true;
+        _lastArchiveAccess = DateTime.UtcNow;
+        Console.WriteLine($"archive loaded on demand: {archive.Store.Sessions.Count} chats");
+    }
+    finally { _archiveGate.Release(); }
+}
 
 // Resolve wwwroot robustly: next to the binary when published, else the project source when running
 // from bin during development. Content root = binary dir so this works regardless of launch cwd.
@@ -132,16 +154,17 @@ else
 app.UseDefaultFiles();
 app.UseStaticFiles();
 
-app.MapGet("/healthz", () => Results.Ok(new { ok = true, service = "codex-local-retrieval", chats = archive.Store.Sessions.Count }));
-app.MapGet("/api/stats", () => Results.Json(api.Stats()));
-app.MapGet("/api/chats", (string? q, int? limit) => Results.Json(api.Search(q, limit ?? 20)));
-app.MapGet("/api/chats/{id}", (string id, int? page, int? pageSize) =>
-    api.Read(id, page ?? 0, pageSize ?? 20) is { } r ? Results.Json(r) : Results.NotFound(new { error = "no chat with that id" }));
-app.MapGet("/api/chats/{id}/events", (string id, int? limit) =>
-    api.Events(id, limit ?? 400) is { } r ? Results.Json(r) : Results.NotFound(new { error = "no chat with that id" }));
-app.MapPost("/api/copilot", async (CopilotRequest req, CancellationToken ct) => Results.Json(await api.CopilotAsync(req.Message, req.History, ct)));
-app.MapPost("/api/chats/{id}/resume", (string id, ResumeRequest? req) => Results.Json(api.ResumeCommand(id, req?.Launch ?? false)));
-app.MapPost("/api/chats/{id}/favorite", async (string id, FavoriteRequest? req) => Results.Json(await api.FavoriteAsync(id, req?.Favorite ?? true)));
+// healthz stays light — it must NOT trigger the archive load (it's a liveness probe).
+app.MapGet("/healthz", () => Results.Ok(new { ok = true, service = "codex-local-retrieval", archiveLoaded = _archiveLoaded, chats = _archiveLoaded ? archive.Store.Sessions.Count : -1 }));
+app.MapGet("/api/stats", async () => { await EnsureArchiveAsync(); return Results.Json(api.Stats()); });
+app.MapGet("/api/chats", async (string? q, int? limit) => { await EnsureArchiveAsync(); return Results.Json(api.Search(q, limit ?? 20)); });
+app.MapGet("/api/chats/{id}", async (string id, int? page, int? pageSize) =>
+    { await EnsureArchiveAsync(); return api.Read(id, page ?? 0, pageSize ?? 20) is { } r ? Results.Json(r) : Results.NotFound(new { error = "no chat with that id" }); });
+app.MapGet("/api/chats/{id}/events", async (string id, int? limit) =>
+    { await EnsureArchiveAsync(); return api.Events(id, limit ?? 400) is { } r ? Results.Json(r) : Results.NotFound(new { error = "no chat with that id" }); });
+app.MapPost("/api/copilot", async (CopilotRequest req, CancellationToken ct) => { await EnsureArchiveAsync(); return Results.Json(await api.CopilotAsync(req.Message, req.History, ct)); });
+app.MapPost("/api/chats/{id}/resume", async (string id, ResumeRequest? req) => { await EnsureArchiveAsync(); return Results.Json(api.ResumeCommand(id, req?.Launch ?? false)); });
+app.MapPost("/api/chats/{id}/favorite", async (string id, FavoriteRequest? req) => { await EnsureArchiveAsync(); return Results.Json(await api.FavoriteAsync(id, req?.Favorite ?? true)); });
 
 // Live agent: our server is a client of `codex app-server` (the desktop-app protocol). The hub owns
 // the one app-server and multiplexes it. /api/agent/sessions lists ALL sessions; the WS opens/drives one.
@@ -192,6 +215,15 @@ app.MapPost("/api/agent/sessions/{id}/open", (string id, OpenRequest req) =>
     return ok ? Results.Json(new { ok = true, message = msg }) : Results.BadRequest(new { error = msg });
 });
 
+// "Open the full desktop app on the PC" — light headless server by default, heavy app on demand.
+// Owner-gated by the global auth middleware; honours the same CLR_REMOTE_ALLOW_LAUNCH switch.
+app.MapGet("/api/desktop-app", () => Results.Json(new { available = launcher.Enabled, running = System.Diagnostics.Process.GetProcessesByName("CodexLocalRetrieval.Native").Length > 0 }));
+app.MapPost("/api/desktop-app/open", () =>
+{
+    var (ok, msg) = launcher.OpenDesktopApp();
+    return ok ? Results.Json(new { ok = true, message = msg }) : Results.BadRequest(new { error = msg });
+});
+
 app.Map("/api/agent", async (HttpContext ctx) =>
 {
     if (!ctx.WebSockets.IsWebSocketRequest) { ctx.Response.StatusCode = StatusCodes.Status400BadRequest; return; }
@@ -199,7 +231,73 @@ app.Map("/api/agent", async (HttpContext ctx) =>
     await AgentWebSocket.HandleAsync(sock, agentHub, claudeStore, claudeDriver, commandSigner, defaultWs, ctx.RequestAborted);
 });
 
+// Idle eviction: keep loaded only while in use. After CLR_REMOTE_IDLE_UNLOAD_SEC (default 300s) with no
+// archive-backed request, drop the in-memory store and force a compacting GC so the pages go back to the
+// OS — the server falls back to its ~40MB idle weight. The next browse reloads it on demand. 0 = never.
+var idleUnloadSec = int.TryParse(Environment.GetEnvironmentVariable("CLR_REMOTE_IDLE_UNLOAD_SEC"), out var iu) ? iu : 300;
+if (idleUnloadSec > 0)
+{
+    _ = Task.Run(async () =>
+    {
+        while (true)
+        {
+            await Task.Delay(TimeSpan.FromSeconds(30));
+            if (!_archiveLoaded) continue;
+            if ((DateTime.UtcNow - _lastArchiveAccess).TotalSeconds < idleUnloadSec) continue;
+            await _archiveGate.WaitAsync();
+            try
+            {
+                if (_archiveLoaded && (DateTime.UtcNow - _lastArchiveAccess).TotalSeconds >= idleUnloadSec)
+                {
+                    archive.Unload();
+                    _archiveLoaded = false;
+                    System.Runtime.GCSettings.LargeObjectHeapCompactionMode = System.Runtime.GCLargeObjectHeapCompactionMode.CompactOnce;
+                    GC.Collect(2, GCCollectionMode.Aggressive, blocking: true, compacting: true);
+                    GC.WaitForPendingFinalizers();
+                    GC.Collect(2, GCCollectionMode.Aggressive, blocking: true, compacting: true);
+                    NativeMem.TrimWorkingSet();   // return the committed pages to the OS, not just the managed heap
+                    Console.WriteLine($"archive unloaded after {idleUnloadSec}s idle — RAM released");
+                }
+            }
+            catch (Exception ex) { Console.Error.WriteLine("idle-unload warning: " + ex.Message); }
+            finally { _archiveGate.Release(); }
+        }
+    });
+}
+
+// ---- remote command bridge: keep the web's "running on PC" view + Open/Kill/transcript/rename working
+// even when the heavy desktop app is CLOSED. The bridge pushes a light running-sessions heartbeat + drains
+// the multiplex command queue over the SAME owner-only SSH the desktop app uses — but ONLY while the
+// desktop app is NOT running (the app is the primary bridge when open, and pushes the full enriched
+// projection, so the two never double-process). SSH target/port come from the app's settings, read once
+// without loading the heavy archive. Disable with CLR_REMOTE_BRIDGE=0.
+if (Environment.GetEnvironmentVariable("CLR_REMOTE_BRIDGE") != "0")
+{
+    RemoteBridge.Settings? bridgeSettings = null;
+    try
+    {
+        var st = archive.ReadSettingsOnly();
+        if (!string.IsNullOrWhiteSpace(st.MultiplexSshTarget))
+            bridgeSettings = new RemoteBridge.Settings(st.MultiplexSshTarget.Trim(), st.MultiplexApiPort);
+    }
+    catch (Exception ex) { Console.Error.WriteLine("bridge settings read failed: " + ex.Message); }
+
+    if (bridgeSettings is not null)
+    {
+        var codexDbPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".codex", "state_5.sqlite");
+        bool DesktopAppRunning()
+        {
+            try { return System.Diagnostics.Process.GetProcessesByName("CodexLocalRetrieval.Native").Length > 0; }
+            catch { return false; }
+        }
+        var bridge = new RemoteBridge(() => bridgeSettings, DesktopAppRunning, claudeStore, codexDbPath, m => Console.WriteLine("[bridge] " + m));
+        _ = bridge.RunLoopAsync(app.Lifetime.ApplicationStopping);
+        Console.WriteLine($"remote command bridge armed (target {bridgeSettings.Target}:{bridgeSettings.Port}; active only while the desktop app is closed)");
+    }
+    else Console.WriteLine("remote command bridge OFF — no multiplex SSH target in settings.");
+}
+
 var authMode = hlAuthOn ? $"hl-auth ({hlBase}, page:{hlPage ?? "any"})" : "bearer token";
-Console.WriteLine($"codex-local-retrieval remote server on http://{bind}:{port}  (chats: {archive.Store.Sessions.Count}, auth: {authMode}, launch: {(allowLaunch ? "on" : "off")}, redact-reads: {(redactReads ? "on" : "off")})");
+Console.WriteLine($"codex-local-retrieval remote server on http://{bind}:{port}  (archive: lazy (loads on first browse), auth: {authMode}, launch: {(allowLaunch ? "on" : "off")}, redact-reads: {(redactReads ? "on" : "off")})");
 app.Run();
 return 0;
