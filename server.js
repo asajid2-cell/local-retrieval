@@ -477,14 +477,17 @@ function probePc() {
 }
 setTimeout(probePc, 2000); setInterval(probePc, 30000);
 app.get('/api/health', (req, res) => {
-  let tmuxOk = false, sessions = 0;
-  try { const o = execSync(`tmux list-sessions -F x 2>/dev/null`, { encoding: 'utf8', timeout: 1500 }).trim(); sessions = o ? o.split('\n').length : 0; tmuxOk = true; } catch {}
+  let tmuxAvailable = false, sessions = 0;
+  try { execSync(`tmux -V`, { encoding: 'utf8', timeout: 1500 }); tmuxAvailable = true; } catch {}
+  try { const o = execSync(`tmux list-sessions -F x 2>/dev/null`, { encoding: 'utf8', timeout: 1500 }).trim(); sessions = o ? o.split('\n').length : 0; } catch {}
   let gaveUp = 0; for (const h of _heal.values()) if (h.gaveUp) gaveUp++;
   // A2 #9: if the PC host is down but armed sessions exist that have NO tmux twin, they're hosted-and
   // unreachable (can't be healed) → surface that as degraded instead of a falsely-green dot.
   let hostedArmedDown = 0; if (!hostUp()) for (const n of _healOn) { if (!tmuxHas(n)) hostedArmedDown++; }
-  const degraded = !tmuxOk || _pcHealth.reachable === false || gaveUp > 0 || hostedArmedDown > 0;
-  res.json({ ok: !degraded, degraded, uptimeSec: Math.round(process.uptime()), tmux: tmuxOk, sessions, armed: _healOn.size, gaveUp, hostedArmedDown, pc: _pcHealth,
+  // muxd is now the primary terminal owner. A stopped tmux server just means there are no legacy
+  // fallback sessions; it is only degraded if muxd is down and tmux is unavailable too.
+  const degraded = (!hostUp() && !tmuxAvailable) || _pcHealth.reachable === false || gaveUp > 0 || hostedArmedDown > 0;
+  res.json({ ok: !degraded, degraded, uptimeSec: Math.round(process.uptime()), tmux: tmuxAvailable, sessions, armed: _healOn.size, gaveUp, hostedArmedDown, pc: _pcHealth,
              host: { connected: hostUp(), name: hostLabel, sessions: hostSessions.size }, node: process.version, at: Date.now() });
 });
 
