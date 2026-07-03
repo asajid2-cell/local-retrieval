@@ -4,3 +4,4 @@ muxd.crash
 sessions.json
 .token.tmp
 profile-backups/
+__pycache__/
