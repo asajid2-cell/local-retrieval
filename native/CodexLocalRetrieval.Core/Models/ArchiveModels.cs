@@ -40,6 +40,35 @@ public sealed class AppStoreData
     // to the bottom. Unlisted tags use the default layer. Sorting only - never hides anything.
     [JsonPropertyName("tagLayers")]
     public Dictionary<string, int> TagLayers { get; set; } = new();
+
+    // "Start chat" can target a collection before the new chat's session id exists. We remember the
+    // intent (tool + cwd + collection) and file the first matching new session into the collection on
+    // the next index pass, then drop the entry. Expires so a never-started chat doesn't linger.
+    [JsonPropertyName("pendingNewChats")]
+    public List<PendingNewChat> PendingNewChats { get; set; } = new();
+}
+
+// A "Start chat" that should be filed into a collection once its session is indexed (matched by
+// tool + working directory + creation time). See ArchiveService.ReconcilePendingNewChats.
+public sealed class PendingNewChat
+{
+    [JsonPropertyName("cwd")]
+    public string Cwd { get; set; } = "";          // the ORIGINAL launch cwd (used to find the tool's project folder)
+
+    [JsonPropertyName("tool")]
+    public string Tool { get; set; } = "";         // "claude" | "codex"
+
+    [JsonPropertyName("collectionId")]
+    public string CollectionId { get; set; } = "";
+
+    [JsonPropertyName("createdAt")]
+    public string CreatedAt { get; set; } = "";    // ISO-8601 UTC, when "Start chat" was launched
+
+    // The Claude transcript ids that ALREADY existed in this cwd's project folder at launch time. The new
+    // chat is whichever transcript appears in that folder afterwards (not in this set) — a precise identity
+    // match that doesn't depend on parsing the workspace or on a shared cwd like the 301 root.
+    [JsonPropertyName("knownIds")]
+    public List<string> KnownIds { get; set; } = new();
 }
 
 // A place agent sessions are stored on disk. Defaults cover Codex + Claude; an agent or the user
@@ -204,8 +233,14 @@ public sealed class ChatFilter
     public bool MatchAllIncludes { get; set; }     // false = ANY include tag; true = must have ALL of them
     public string? CollectionId { get; set; }       // restrict to this collection's members
 
+    // Creation-date mode. "" = default (recent-activity order). The list normally reorders by whatever
+    // was touched last; these pin it to WHEN THE CHAT WAS STARTED instead: created-newest |
+    // created-oldest sort by creation date; created-today | created-week | created-month are range
+    // filters (newest-first within the range).
+    public string DateMode { get; set; } = "";
+
     public bool IsEmpty => string.IsNullOrWhiteSpace(Query) && IncludeTags.Count == 0
-        && ExcludeTags.Count == 0 && string.IsNullOrEmpty(CollectionId);
+        && ExcludeTags.Count == 0 && string.IsNullOrEmpty(CollectionId) && string.IsNullOrEmpty(DateMode);
 }
 
 // A collection moved to "Recently Deleted" - the full grouping plus when it was removed, so it can

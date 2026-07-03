@@ -176,6 +176,12 @@
                             <TextBlock Text="Collections" />
                         </StackPanel>
                     </Button>
+                    <Button Click="Nav_Click" Style="{StaticResource PillButtonStyle}" Tag="Running">
+                        <StackPanel Orientation="Horizontal" Spacing="10">
+                            <SymbolIcon Symbol="Play" />
+                            <TextBlock Text="Running" />
+                        </StackPanel>
+                    </Button>
                     <Button Click="Nav_Click" Style="{StaticResource PillButtonStyle}" Tag="Settings">
                         <StackPanel Orientation="Horizontal" Spacing="10">
                             <SymbolIcon Symbol="Setting" />

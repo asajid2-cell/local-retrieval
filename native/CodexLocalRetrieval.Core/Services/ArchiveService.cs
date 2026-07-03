@@ -66,6 +66,41 @@ public sealed class ArchiveService
         RefreshSessions(OrderedVisibleSessions(Store.Sessions.Values));
     }
 
+    // Read ONLY the top-level Settings object straight from the store file, WITHOUT materializing the
+    // (tens-of-MB) session index — so the always-on light headless server can learn its multiplex SSH
+    // target/port for the remote bridge and still stay ~40MB. Returns defaults if the store is absent.
+    public ArchiveSettings ReadSettingsOnly()
+    {
+        try
+        {
+            var loadPath = File.Exists(_storePath) ? _storePath : _bundledStorePath;
+            if (!File.Exists(loadPath)) return new ArchiveSettings();
+            var bytes = File.ReadAllBytes(loadPath);
+            var reader = new Utf8JsonReader(bytes);
+            while (reader.Read())
+            {
+                if (reader.TokenType == JsonTokenType.PropertyName && reader.CurrentDepth == 1
+                    && string.Equals(reader.GetString(), "Settings", StringComparison.OrdinalIgnoreCase))
+                {
+                    reader.Read();   // advance onto the value (StartObject)
+                    return JsonSerializer.Deserialize<ArchiveSettings>(ref reader, _jsonOptions) ?? new ArchiveSettings();
+                }
+            }
+        }
+        catch { }
+        return new ArchiveSettings();
+    }
+
+    // Release the in-memory store (all sessions + their loaded content + capped search text) so an idle
+    // background server hands its RAM back to the OS. LoadAsync re-reads everything from app-store.json on
+    // the next access, so this is LOSSLESS — purely a memory/first-hit-latency trade. The caller forces a
+    // compacting GC afterwards to actually return the pages.
+    public void Unload()
+    {
+        Store = new AppStoreData();
+        RefreshSessions(Array.Empty<ArchiveSession>());
+    }
+
     // Lazy-load a chat's full content (messages + code blocks) from its source file on demand, OFF the
     // UI thread. The store holds only metadata, so this runs when a chat is opened or its content is
     // needed (co-pilot, copy-code). Cheap no-op once loaded.
@@ -167,10 +202,13 @@ public sealed class ArchiveService
         finally { _saveGate.Release(); }
     }
 
-    public void RefreshSessions(IEnumerable<ArchiveSession> sessions)
+    public void RefreshSessions(IEnumerable<ArchiveSession> sessions, bool preserveOrder = false)
     {
         Sessions.Clear();
-        foreach (var session in OrderedVisibleSessions(sessions).Take(600))
+        // preserveOrder: the caller already ordered the set deliberately (e.g. by creation date) —
+        // re-sorting by pinned/recency here would silently undo that.
+        var ordered = preserveOrder ? sessions.Where(s => !s.Archived) : OrderedVisibleSessions(sessions);
+        foreach (var session in ordered.Take(600))
         {
             if (session.Tags.Count == 0)
             {
@@ -231,6 +269,150 @@ public sealed class ArchiveService
         session.CustomTitle = CleanTitle(title);
         await SaveAsync();
         RefreshSessions(Store.Sessions.Values);
+    }
+
+    // Rename the chat's NATIVE name (the tool's own title) and persist + refresh. Returns the write
+    // status. Distinct from RenameSessionAsync (which sets the app-only CustomTitle).
+    public async Task<string?> RenameNativeAsync(ArchiveSession session, string title)
+    {
+        var status = await TryWriteCanonicalNameAsync(session, title);
+        await SaveAsync();
+        RefreshSessions(Store.Sessions.Values);
+        return status;
+    }
+
+    // Native-rename a chat by its session id (used by the remote/web rename of a running session, which
+    // may not be in the archive). Prefers an indexed session (so the app's state updates too); otherwise
+    // writes straight to the tool's store by id (codex DB) / transcript (claude). Returns a status.
+    public async Task<string?> RenameNativeByIdAsync(string tool, string sessionId, string title)
+    {
+        if (string.IsNullOrWhiteSpace(sessionId) || string.IsNullOrWhiteSpace(title))
+            return "rename needs a session id and a title.";
+        var existing = Store.Sessions.Values.FirstOrDefault(s =>
+            string.Equals(s.Id, sessionId, StringComparison.OrdinalIgnoreCase) ||
+            s.Aliases.Any(a => string.Equals(a, sessionId, StringComparison.OrdinalIgnoreCase)));
+        if (existing is not null) return await RenameNativeAsync(existing, title);
+        var transient = new ArchiveSession { Id = sessionId, Tool = tool, SourcePath = ResolveClaudeTranscriptPath(tool, sessionId) ?? "" };
+        return await TryWriteCanonicalNameAsync(transient, title);
+    }
+
+    private static string? ResolveClaudeTranscriptPath(string tool, string id)
+    {
+        if (string.Equals(tool, "codex", StringComparison.OrdinalIgnoreCase)) return null; // codex renames by DB id
+        try
+        {
+            var root = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".claude", "projects");
+            if (Directory.Exists(root))
+                foreach (var dir in Directory.EnumerateDirectories(root))
+                {
+                    var f = Path.Combine(dir, id + ".jsonl");
+                    if (File.Exists(f)) return f;
+                }
+        }
+        catch { }
+        return null;
+    }
+
+    // Remember that the next new chat started in `cwd` with `tool` should be filed into `collectionId`.
+    // Reconciled on the next index pass (ReconcilePendingNewChats). No-op if the collection is unknown.
+    public async Task QueuePendingNewChatAsync(string tool, string cwd, string collectionId)
+    {
+        if (string.IsNullOrWhiteSpace(cwd) || string.IsNullOrWhiteSpace(collectionId) || !Store.Collections.ContainsKey(collectionId)) return;
+        // Replace any prior pending for the same cwd+collection (a re-launch supersedes).
+        Store.PendingNewChats.RemoveAll(p =>
+            NormalizePath(p.Cwd) == NormalizePath(cwd) && string.Equals(p.CollectionId, collectionId, StringComparison.Ordinal));
+        Store.PendingNewChats.Add(new PendingNewChat
+        {
+            Cwd = cwd,   // keep the ORIGINAL cwd so we can find the Claude project folder (case-encoded)
+            Tool = tool,
+            CollectionId = collectionId,
+            CreatedAt = DateTime.UtcNow.ToString("O"),
+            KnownIds = ClaudeFolderTranscripts(cwd).Select(t => t.id).ToList()   // snapshot ids already there
+        });
+        await SaveAsync();
+    }
+
+    // (id, creation-time) of every Claude transcript currently in the project folder for `cwd`. The folder
+    // name is the cwd with [\/:.\s] -> '-' (Claude may also lowercase the drive letter), so we match the
+    // directory case-insensitively. Returns empty if the folder doesn't exist yet (no chats there).
+    private static List<(string id, DateTime created)> ClaudeFolderTranscripts(string cwd)
+    {
+        var list = new List<(string, DateTime)>();
+        try
+        {
+            var root = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".claude", "projects");
+            if (!Directory.Exists(root)) return list;
+            var want = EncodeClaudeProjectFolder(cwd);
+            var folder = Directory.EnumerateDirectories(root)
+                .FirstOrDefault(d => string.Equals(Path.GetFileName(d), want, StringComparison.OrdinalIgnoreCase));
+            if (folder is not null)
+                foreach (var f in Directory.EnumerateFiles(folder, "*.jsonl"))
+                {
+                    DateTime ct; try { ct = File.GetCreationTimeUtc(f); } catch { ct = DateTime.UtcNow; }
+                    list.Add((Path.GetFileNameWithoutExtension(f), ct));
+                }
+        }
+        catch { }
+        return list;
+    }
+
+    // File freshly-started "Start chat" sessions into their target collection. Runs cheap (one folder
+    // listing per pending) and on the UI thread (the caller mutates the store). Returns true if anything
+    // was filed/dropped. Claude: the new chat = the transcript that appeared in the cwd folder since launch
+    // (KnownIds snapshot). Codex: the most-recent codex session in that cwd created after launch.
+    public async Task<bool> ReconcilePendingNewChatsAsync()
+    {
+        var changed = ReconcilePendingNewChats();
+        if (changed) { await SaveAsync(); RefreshSessions(Store.Sessions.Values); }
+        return changed;
+    }
+
+    // File freshly-indexed sessions into the collection a "Start chat" targeted, matching by tool +
+    // normalized cwd + creation time. Drops filed/expired/orphaned entries. Pure in-memory (the caller
+    // saves). Expires entries older than 2h so a chat that was never actually started doesn't linger.
+    private bool ReconcilePendingNewChats()
+    {
+        if (Store.PendingNewChats.Count == 0) return false;
+        var now = DateTimeOffset.UtcNow;
+        var keep = new List<PendingNewChat>();
+        var changed = false;
+        foreach (var p in Store.PendingNewChats)
+        {
+            DateTimeOffset.TryParse(p.CreatedAt, null, System.Globalization.DateTimeStyles.AdjustToUniversal, out var created);
+            if (created != default && now - created > TimeSpan.FromHours(24)) { changed = true; continue; }   // expired -> drop
+            if (!Store.Collections.TryGetValue(p.CollectionId, out var collection)) { changed = true; continue; } // collection gone -> drop
+
+            string? newId = null;
+            if (string.Equals(p.Tool, "codex", StringComparison.OrdinalIgnoreCase))
+            {
+                // Codex has no per-cwd folder; match the earliest codex session in this cwd created after launch.
+                var cwdN = NormalizePath(p.Cwd);
+                newId = Store.Sessions.Values
+                    .Where(s => string.Equals(s.Tool, "codex", StringComparison.OrdinalIgnoreCase) && NormalizePath(s.Workspace) == cwdN)
+                    .Where(s => { DateTimeOffset.TryParse(s.CreatedAt, out var c); return c == default || c >= created.AddMinutes(-2); })
+                    .OrderBy(s => s.CreatedAt, StringComparer.Ordinal)
+                    .FirstOrDefault()?.Id;
+            }
+            else
+            {
+                // Claude: the new chat = the EARLIEST transcript in the cwd folder that wasn't there at launch.
+                var known = new HashSet<string>(p.KnownIds ?? new List<string>(), StringComparer.OrdinalIgnoreCase);
+                newId = ClaudeFolderTranscripts(p.Cwd)
+                    .Where(t => !known.Contains(t.id))
+                    .OrderBy(t => t.created)
+                    .Select(t => t.id)
+                    .FirstOrDefault();
+            }
+
+            if (!string.IsNullOrEmpty(newId))
+            {
+                if (!collection.SessionIds.Contains(newId)) collection.SessionIds.Add(newId);
+                changed = true;   // filed -> drop the pending entry
+            }
+            else keep.Add(p);     // no new chat yet -> keep waiting (up to 24h)
+        }
+        if (changed) Store.PendingNewChats = keep;
+        return changed;
     }
 
     public async Task TogglePinAsync(ArchiveSession session)
@@ -626,12 +808,15 @@ public sealed class ArchiveService
                 var s = await ResolveOrIndexTargetAsync(cmd);
                 var inputId = ExplicitId(cmd);
                 if (s is null) return new AgentCommandResult(false, ResolveFailureHelp("bump"), inputId);
-                var native = await BumpSessionAsync(s);
-                var where = string.Equals(s.Tool, "codex", StringComparison.OrdinalIgnoreCase) ? "codex resume" : "Claude's recent chats";
-                return new AgentCommandResult(
-                    true,
-                    native ? $"Bumped \"{s.DisplayTitle}\" to the top of {where}." : $"Bumped \"{s.DisplayTitle}\" in the app (native list unchanged — chat not found in {where}).",
-                    inputId, s.Id, Persisted: native);
+                var (native, recovered) = await BumpSessionAsync(s);
+                var picker = string.Equals(s.Tool, "codex", StringComparison.OrdinalIgnoreCase) ? "codex resume" : "claude --resume";
+                var fileWord = string.Equals(s.Tool, "codex", StringComparison.OrdinalIgnoreCase) ? "rollout file" : "transcript";
+                var msg = !native
+                    ? $"Bumped \"{s.DisplayTitle}\" in the app, but its {fileWord} wasn't found, so {picker} is unchanged."
+                    : recovered
+                        ? $"Recovered \"{s.DisplayTitle}\" (it was hidden as an SDK session) and bumped it to the top of {picker}."
+                        : $"Bumped \"{s.DisplayTitle}\" to the top of {picker}.";
+                return new AgentCommandResult(true, msg, inputId, s.Id, Persisted: native);
             }
 
             case "tag":
@@ -890,12 +1075,44 @@ public sealed class ArchiveService
 
     // L11: write the canonical name back to the agent's own store so the rename shows up in
     // Codex/Claude's native resume picker too — not just inside this app.
+    // Write the chat's NATIVE/canonical title — the tool's OWN name (what `codex resume` / Claude's
+    // recent list show), distinct from the app-only CustomTitle. Codex: update threads.title in its
+    // state DB. Claude: append a `custom-title` record to the transcript (exactly how Claude Code itself
+    // renames — its resume picker reads customTitle first). Also updates session.Title so the app +
+    // remote views reflect the new native name immediately. Returns a human status string.
     public async Task<string?> TryWriteCanonicalNameAsync(ArchiveSession session, string? canonicalName)
     {
         if (string.IsNullOrWhiteSpace(canonicalName)) return null;
+        var clean = CleanTitle(canonicalName!);
+        string status;
         if (string.Equals(session.Tool, "codex", StringComparison.OrdinalIgnoreCase))
-            return await Task.Run(() => WriteCodexThreadTitle(session.Id, canonicalName!));
-        return "Claude has no external rename API yet, so the canonical name stays app-only.";
+            status = await Task.Run(() => WriteCodexThreadTitle(session.Id, clean));
+        else
+            status = await Task.Run(() => WriteClaudeCustomTitle(session, clean));
+        // Reflect the new native name in the app's model (Title = native; DisplayTitle falls back to it).
+        if (!string.IsNullOrWhiteSpace(clean)) session.Title = clean;
+        return status;
+    }
+
+    // Append a `custom-title` line to a Claude transcript — the same record Claude Code writes on rename,
+    // and the first title its resume picker reads (customTitle wins over aiTitle). Returns a status string.
+    private static string WriteClaudeCustomTitle(ArchiveSession session, string title)
+    {
+        try
+        {
+            var path = session.SourcePath;
+            if (string.IsNullOrEmpty(path) || !File.Exists(path)) return "Claude transcript not found; local name updated.";
+            var id = string.IsNullOrEmpty(session.Id) ? Path.GetFileNameWithoutExtension(path) : session.Id;
+            var rec = JsonSerializer.Serialize(new { type = "custom-title", sessionId = id, customTitle = title });
+            using var fs = new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite);
+            using var sw = new StreamWriter(fs);
+            sw.Write(rec + "\n");
+            return "Native name written to Claude (shows in claude --resume).";
+        }
+        catch (Exception ex)
+        {
+            return "Claude native rename failed (" + ex.Message + "); local name updated.";
+        }
     }
 
     private static string WriteCodexThreadTitle(string id, string title)
@@ -912,7 +1129,10 @@ public sealed class ArchiveService
             command.CommandText = "update threads set title = $t where id = $id";
             command.Parameters.AddWithValue("$t", title);
             command.Parameters.AddWithValue("$id", id);
-            return command.ExecuteNonQuery() > 0 ? "Canonical name written to Codex." : "No matching Codex thread; local name updated.";
+            // NB: this sets threads.title (what THIS app + the remote views read). `codex resume` shows
+            // its OWN auto-generated title, which Codex computes from the conversation and exposes no
+            // settable field for — so we don't claim it changes there.
+            return command.ExecuteNonQuery() > 0 ? "Renamed in Codex (app + remote views)." : "No matching Codex thread; local name updated.";
         }
         catch (Exception ex)
         {
@@ -920,37 +1140,166 @@ public sealed class ArchiveService
         }
     }
 
-    // "Bump": float a chat to the top of Codex/Claude's OWN resume picker without sending a message.
-    // Each picker sorts by recency, so we just refresh the recency signal it reads:
-    //   - Codex orders by threads.updated_at_ms in ~/.codex/state_5.sqlite (keyed by the thread id).
-    //   - Claude lists transcript .jsonl files by file mtime.
-    // Also floats the chat to the top of THIS app's list. Returns true if the native signal was updated.
-    public async Task<bool> BumpSessionAsync(ArchiveSession session)
+    // "Bump": float a chat to the top of Codex/Claude's OWN resume picker (and RECOVER a chat that
+    // fell off the picker entirely) without sending a message. ★ VERIFIED by driving the real pickers
+    // (pyte over a pty) AND by disassembling claude.exe's enumeration:
+    //   - CODEX: `codex resume` orders the rollout .jsonl files under ~/.codex/sessions by FILE mtime.
+    //     It does NOT read threads.updated_at_ms in state_5.sqlite (changing any DB column, even
+    //     `archived`, does not move the picker). Touching the rollout file mtime floats it to "0s ago"
+    //     at #1 — confirmed on chats of any age (a May thread jumped to the top). No window cutoff.
+    //   - CLAUDE: `claude --resume` enumerates EVERY .jsonl in the project dir (no time window),
+    //     sorts survivors by transcript FILE mtime DESC, and shows a page. Touching the transcript
+    //     mtime floats a *surfaced* chat to #1. BUT a session is silently DROPPED from the picker when
+    //     its `entrypoint` is one of {sdk-cli, sdk-ts, sdk-py} (claude.exe treats SDK/headless sessions
+    //     as third-party). Chats created by the Agent SDK — i.e. how Claude Code runs in automation —
+    //     carry "sdk-cli", so they NEVER appear no matter how recent. ★ FIX/RECOVER (proven): rewrite
+    //     the transcript's `entrypoint` to an interactive value ("cli") and the fallen-away chat
+    //     surfaces in `claude --resume` (then mtime sorts it to #1). A session is also dropped if its
+    //     first line is `isSidechain:true`, sessionKind is daemon/daemon-worker, or it has no summary
+    //     (title || lastPrompt || summary || firstPrompt) in the 64KB head/tail window — those are
+    //     genuine sub-agent/daemon transcripts and are left alone.
+    // Codex also gets its state-DB updated_at_ms refreshed for the separate app-server thread/list path.
+    // Returns (Touched: transcript/rollout mtime was bumped, Recovered: a hidden Claude chat's
+    // entrypoint was rewritten so it re-appears in the picker).
+    public async Task<(bool Touched, bool Recovered)> BumpSessionAsync(ArchiveSession session)
     {
         var nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-        var native = await Task.Run(() =>
+        var result = await Task.Run(() =>
         {
-            if (string.Equals(session.Tool, "codex", StringComparison.OrdinalIgnoreCase))
-            {
-                var dbPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".codex", "state_5.sqlite");
-                var ids = new List<string> { session.Id };
-                ids.AddRange(session.Aliases);
-                return BumpCodexThreadUpdatedAt(dbPath, ids, nowMs) > 0;
-            }
+            var touched = false;
+            var recovered = false;
             try
             {
                 var path = string.IsNullOrEmpty(session.SourcePath) ? ""
                     : Path.IsPathRooted(session.SourcePath) ? session.SourcePath : Path.Combine(_rootPath, session.SourcePath);
-                if (path.Length > 0 && File.Exists(path)) { File.SetLastWriteTimeUtc(path, DateTime.UtcNow); return true; }
+                if (path.Length > 0 && File.Exists(path))
+                {
+                    // For Claude, first un-hide the chat if it's an SDK-entrypoint session (else the
+                    // picker never shows it, so an mtime bump alone is invisible). Do this BEFORE the
+                    // mtime touch so the rewrite's own write doesn't leave a stale timestamp.
+                    if (string.Equals(session.Tool, "claude", StringComparison.OrdinalIgnoreCase))
+                        recovered = RecoverClaudeEntrypoint(path);
+                    File.SetLastWriteTimeUtc(path, DateTime.UtcNow);   // bump to top (mtime sort)
+                    touched = true;
+                }
             }
             catch { }
-            return false;
+            if (string.Equals(session.Tool, "codex", StringComparison.OrdinalIgnoreCase))
+            {
+                try
+                {
+                    var dbPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".codex", "state_5.sqlite");
+                    var ids = new List<string> { session.Id };
+                    ids.AddRange(session.Aliases);
+                    BumpCodexThreadUpdatedAt(dbPath, ids, nowMs);   // app-server thread/list path (not the TUI picker)
+                }
+                catch { }
+            }
+            return (touched, recovered);
         });
 
         session.UpdatedAt = DateTime.UtcNow.ToString("O");   // top of our list too
         await SaveAsync();
         RefreshSessions(Store.Sessions.Values);
-        return native;
+        return result;
+    }
+
+    // Entrypoints claude.exe treats as third-party/headless and HIDES from the interactive
+    // `claude --resume` picker (function BTs in the binary checks against this set).
+    private static readonly string[] HiddenClaudeEntrypoints = { "sdk-cli", "sdk-ts", "sdk-py" };
+
+    // True if this Claude transcript would be hidden from `claude --resume` because of its entrypoint.
+    // Mirrors claude.exe's BTs/jV: it reads the FIRST 64KB and takes the FIRST `entrypoint` value it
+    // finds (the first transcript line is often a meta/summary line with no entrypoint, so a line-1
+    // check misses it). The session is hidden iff that first entrypoint is one of the SDK values.
+    public static bool IsHiddenClaudeEntrypoint(string path)
+    {
+        if (string.IsNullOrEmpty(path) || !File.Exists(path)) return false;
+        try
+        {
+            const int headBytes = 65536;   // Bw in the binary
+            var buf = new char[headBytes];
+            int read;
+            using (var reader = new StreamReader(path, Encoding.UTF8))
+                read = reader.Read(buf, 0, headBytes);
+            var head = new string(buf, 0, read);
+            var ep = FirstEntrypoint(head);
+            return ep != null && Array.IndexOf(HiddenClaudeEntrypoints, ep) >= 0;
+        }
+        catch { return false; }
+    }
+
+    // Find the value of the first "entrypoint":"..." in the text (both compact and spaced spellings),
+    // honoring backslash escapes — the same scan jV does in the binary.
+    private static string? FirstEntrypoint(string s)
+    {
+        var best = -1; string? val = null;
+        foreach (var pat in new[] { "\"entrypoint\":\"", "\"entrypoint\": \"" })
+        {
+            var a = s.IndexOf(pat, StringComparison.Ordinal);
+            if (a < 0) continue;
+            var l = a + pat.Length; var c = l;
+            while (c < s.Length)
+            {
+                if (s[c] == '\\') { c += 2; continue; }
+                if (s[c] == '"') break;
+                c++;
+            }
+            if (best < 0 || a < best) { best = a; val = s.Substring(l, Math.Min(c, s.Length) - l); }
+        }
+        return val;
+    }
+
+    // Rewrite a Claude transcript's `entrypoint` from an SDK value ({sdk-cli,sdk-ts,sdk-py}) to the
+    // interactive "cli" so the chat is no longer filtered out of `claude --resume`. Streams line by
+    // line so multi-MB transcripts don't blow memory; only rewrites the file when a change is needed
+    // (so it's a no-op + preserves the file for already-visible chats). Returns true if it rewrote.
+    public static bool RecoverClaudeEntrypoint(string path)
+    {
+        if (string.IsNullOrEmpty(path) || !File.Exists(path)) return false;
+        // (needle -> replacement) for both compact and spaced JSON spellings.
+        var swaps = new List<(string From, string To)>();
+        foreach (var ep in HiddenClaudeEntrypoints)
+        {
+            swaps.Add(("\"entrypoint\":\"" + ep + "\"", "\"entrypoint\":\"cli\""));
+            swaps.Add(("\"entrypoint\": \"" + ep + "\"", "\"entrypoint\": \"cli\""));
+        }
+        var tmp = path + ".bumptmp";
+        try
+        {
+            var changed = false;
+            using (var reader = new StreamReader(path, Encoding.UTF8))
+            using (var writer = new StreamWriter(tmp, false, new UTF8Encoding(false)))
+            {
+                string? line;
+                while ((line = reader.ReadLine()) != null)
+                {
+                    var outLine = line;
+                    foreach (var (from, to) in swaps)
+                        if (outLine.IndexOf(from, StringComparison.Ordinal) >= 0)
+                            outLine = outLine.Replace(from, to);
+                    if (!ReferenceEquals(outLine, line) && !string.Equals(outLine, line, StringComparison.Ordinal))
+                        changed = true;
+                    writer.Write(outLine);
+                    writer.Write('\n');
+                }
+            }
+            if (changed)
+            {
+                File.Delete(path);
+                File.Move(tmp, path);
+            }
+            else
+            {
+                try { File.Delete(tmp); } catch { }
+            }
+            return changed;
+        }
+        catch
+        {
+            try { if (File.Exists(tmp)) File.Delete(tmp); } catch { }
+            return false;
+        }
     }
 
     // Set updated_at_ms (+ updated_at seconds) = now for the given thread ids in Codex's state DB,
@@ -1072,13 +1421,33 @@ public sealed class ArchiveService
             baseSet = baseSet.Where(s => ids.Contains(s.Id));
         }
 
-        return baseSet
+        var result = baseSet
             .Where(s => f.IncludeTags.Count == 0
                         || (f.MatchAllIncludes
                             ? f.IncludeTags.All(t => SessionHasTag(s, t))
                             : f.IncludeTags.Any(t => SessionHasTag(s, t))))
-            .Where(s => f.ExcludeTags.Count == 0 || !f.ExcludeTags.Any(t => SessionHasTag(s, t)))
-            .ToList();
+            .Where(s => f.ExcludeTags.Count == 0 || !f.ExcludeTags.Any(t => SessionHasTag(s, t)));
+
+        // Creation-date mode: range-filter and/or order by WHEN THE CHAT WAS STARTED (CreatedAt),
+        // instead of the default touched-last order that constantly reshuffles the list.
+        var mode = (f.DateMode ?? "").ToLowerInvariant();
+        if (mode.Length > 0)
+        {
+            static DateTimeOffset CreatedOf(ArchiveSession s) =>
+                DateTimeOffset.TryParse(s.CreatedAt, null, System.Globalization.DateTimeStyles.AdjustToUniversal, out var c) ? c : DateTimeOffset.MinValue;
+            var today = DateTimeOffset.Now.Date;
+            result = mode switch
+            {
+                "created-today" => result.Where(s => CreatedOf(s).ToLocalTime().Date == today),
+                "created-week"  => result.Where(s => CreatedOf(s).ToLocalTime().Date >= today.AddDays(-7)),
+                "created-month" => result.Where(s => CreatedOf(s).ToLocalTime().Date >= today.AddDays(-30)),
+                _ => result,
+            };
+            result = mode == "created-oldest"
+                ? result.OrderBy(s => CreatedOf(s) == DateTimeOffset.MinValue ? DateTimeOffset.MaxValue : CreatedOf(s))  // unknown creation dates sink to the end either way
+                : result.OrderByDescending(CreatedOf);
+        }
+        return result.ToList();
     }
 
     // ---- Collection (project) filtering + demote ordering --------------------------------------
@@ -1503,6 +1872,7 @@ public sealed class ArchiveService
             foreach (var id in orphans) Store.Sessions.Remove(id);
         }
         foreach (var kv in scan.Stamps) Store.FileStamps[kv.Key] = kv.Value;
+        ReconcilePendingNewChats();   // file freshly-started chats into their target collection (folder-diff identity)
         Store.Settings.BundledHistoryAbsorbed = true;
         Store.Settings.IndexVersion = CurrentIndexVersion;
         await SaveAsync();
@@ -1596,6 +1966,23 @@ public sealed class ArchiveService
         return new ResumeLaunch(exe, args, cwd, $"\"{exe}\" {args}");
     }
 
+    // Build a launch for a NEW (un-resumed) chat of `tool` in `cwd`. Resolves a trusted CLI exe exactly
+    // like the resume path (so a planted codex.exe in the cwd can't run); "shell" opens a plain terminal.
+    // Returns Exe="" with a human reason if the CLI isn't found. DisplayCommand is "" for a shell.
+    public ResumeLaunch BuildStartLaunch(string tool, string cwd)
+    {
+        cwd = Directory.Exists(cwd) ? cwd : Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        if (string.Equals(tool, "shell", StringComparison.OrdinalIgnoreCase))
+            return new ResumeLaunch("cmd.exe", "", cwd, "");
+        var isClaude = string.Equals(tool, "claude", StringComparison.OrdinalIgnoreCase);
+        var exe = isClaude ? ResolveClaudeExe() : ResolveCodexExe();
+        if (!Path.IsPathRooted(exe) || !File.Exists(exe))
+            return new ResumeLaunch("", "", cwd, $"The {(isClaude ? "claude" : "codex")} CLI was not found at a trusted path.");
+        var extra = ((isClaude ? Store.Settings.ClaudeLaunchArgs : Store.Settings.CodexLaunchArgs) ?? "")
+            .Replace("\r", " ").Replace("\n", " ").Trim();
+        return new ResumeLaunch(exe, extra, cwd, string.IsNullOrEmpty(extra) ? $"\"{exe}\"" : $"\"{exe}\" {extra}");
+    }
+
     // The shell command injected into a multiplex (tmux → SSH-into-Windows) session so it resumes THIS
     // chat: cd into the recovered launch dir, then run the resume by BARE tool name. claude/codex
     // resolve on the Windows SSH PATH — codex via the ~/.local/bin shim, which already injects
@@ -1643,12 +2030,65 @@ public sealed class ArchiveService
         return "";
     }
 
+    // One live claude/codex agent process on this PC, as seen by the Native process scan. The web's
+    // "Running on PC" view lists these so you can SEE what's actually running (incl. forgotten/background
+    // VS Code sessions) and kill any of them remotely. SessionId is the chat it's resuming (if any);
+    // Core enriches Title/Collection by matching it to the archive.
+    public sealed record RunningSessionInfo(
+        int Pid, string Tool, string SessionId, string Parent, string StartedAt, string Cwd,
+        string RealTitle = "", string Preview = "");
+
+    // The chat's REAL claude/codex name (and a one-line preview), read from the tool's own store — so a
+    // session that isn't in our archive (no app title) still shows what it actually is. Codex keeps a
+    // `title` + `first_user_message` per thread in state_5.sqlite; returns (title, firstUserMessage).
+    public static (string Title, string Preview) ReadCodexThreadTitle(string dbPath, string id)
+    {
+        if (string.IsNullOrWhiteSpace(id) || !File.Exists(dbPath)) return ("", "");
+        try
+        {
+            var builder = new SqliteConnectionStringBuilder { DataSource = dbPath, Mode = SqliteOpenMode.ReadOnly };
+            using var connection = new SqliteConnection(builder.ToString());
+            connection.Open();
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = "select title, first_user_message from threads where id = $id limit 1";
+            cmd.Parameters.AddWithValue("$id", id);
+            using var r = cmd.ExecuteReader();
+            if (r.Read())
+            {
+                var title = r.IsDBNull(0) ? "" : r.GetString(0);
+                var fum = r.IsDBNull(1) ? "" : r.GetString(1);
+                return (title.Trim(), fum.Trim());
+            }
+        }
+        catch { }
+        return ("", "");
+    }
+
+    // The on-disk rollout (.jsonl) path Codex records for a thread — used to open its transcript.
+    public static string? ReadCodexRolloutPath(string dbPath, string id)
+    {
+        if (string.IsNullOrWhiteSpace(id) || !File.Exists(dbPath)) return null;
+        try
+        {
+            var builder = new SqliteConnectionStringBuilder { DataSource = dbPath, Mode = SqliteOpenMode.ReadOnly };
+            using var connection = new SqliteConnection(builder.ToString());
+            connection.Open();
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = "select rollout_path from threads where id = $id limit 1";
+            cmd.Parameters.AddWithValue("$id", id);
+            return cmd.ExecuteScalar() as string;
+        }
+        catch { return null; }
+    }
+
     // A compact JSON projection of every collection + its resumable chats, pushed to the VPS so the
     // web (harmonizerlabs.cc/multiplex → Projects) can list your projects and resume any chat into a
     // multiplex from anywhere. Each chat carries the multiplex session name + the resume command the
     // web POSTs to /api/sessions, and a `running` flag (from a live process scan) so the web can warn
     // before starting a second copy. Only chats with a safe, resumable command are included.
-    public string BuildProjectsProjectionJson(ISet<string>? runningIds = null)
+    // `runningSessions` is the full list of live agent processes (for the web's "Running on PC" view),
+    // each enriched here with the matched chat title + collection name when the session id is known.
+    public string BuildProjectsProjectionJson(ISet<string>? runningIds = null, IEnumerable<RunningSessionInfo>? runningSessions = null)
     {
         var collections = Store.Collections.Values
             .OrderBy(c => c.Name, StringComparer.OrdinalIgnoreCase)
@@ -1673,7 +2113,39 @@ public sealed class ArchiveService
             })
             .Where(c => c.chats.Count > 0)
             .ToList();
-        return JsonSerializer.Serialize(new { host = Environment.MachineName, collections });
+
+        // Map every known chat's id + aliases -> (title, collection) so a running process can be named.
+        var byId = new Dictionary<string, (string Title, string Collection)>(StringComparer.OrdinalIgnoreCase);
+        foreach (var col in Store.Collections.Values)
+            foreach (var sid in col.SessionIds)
+                if (Store.Sessions.TryGetValue(sid, out var s) && s is not null)
+                {
+                    if (!string.IsNullOrEmpty(s.Id)) byId[s.Id] = (s.DisplayTitle, col.Name);
+                    foreach (var a in s.Aliases) if (!string.IsNullOrEmpty(a)) byId[a] = (s.DisplayTitle, col.Name);
+                }
+
+        var running = (runningSessions ?? Enumerable.Empty<RunningSessionInfo>())
+            .Select(r =>
+            {
+                byId.TryGetValue(r.SessionId ?? "", out var hit);
+                return new
+                {
+                    pid = r.Pid,
+                    tool = r.Tool,
+                    sessionId = r.SessionId,
+                    parent = r.Parent,
+                    startedAt = r.StartedAt,
+                    cwd = r.Cwd,
+                    title = hit.Title,             // null when the running session isn't in any collection
+                    collection = hit.Collection,
+                    realTitle = string.IsNullOrEmpty(r.RealTitle) ? null : r.RealTitle,   // the tool's OWN name
+                    preview = string.IsNullOrEmpty(r.Preview) ? null : r.Preview,
+                };
+            })
+            .OrderByDescending(r => r.startedAt, StringComparer.Ordinal)
+            .ToList();
+
+        return JsonSerializer.Serialize(new { host = Environment.MachineName, collections, runningSessions = running });
     }
 
     public static string ResolveClaudeExe()

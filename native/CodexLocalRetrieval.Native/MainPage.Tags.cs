@@ -23,6 +23,18 @@ public sealed partial class MainPage
     private readonly HashSet<string> _excludeTags = new(StringComparer.OrdinalIgnoreCase);
     private bool _matchAllIncludes;
     private string? _filterCollectionId;   // scope the chat list to one project (collection), or null
+    private string _dateMode = "";          // "" recent-activity (default) | created-newest/oldest/today/week/month
+
+    private static readonly (string Value, string Label)[] DateModes =
+    {
+        ("", "Recent activity (default)"),
+        ("created-newest", "Created · newest first"),
+        ("created-oldest", "Created · oldest first"),
+        ("created-today", "Created today"),
+        ("created-week", "Created · last 7 days"),
+        ("created-month", "Created · last 30 days"),
+    };
+    private string DateModeLabel() => DateModes.FirstOrDefault(m => m.Value == _dateMode).Label ?? "Recent activity (default)";
 
     private ChatFilter CurrentChatFilter() => new()
     {
@@ -30,7 +42,8 @@ public sealed partial class MainPage
         IncludeTags = _includeTags.ToList(),
         ExcludeTags = _excludeTags.ToList(),
         MatchAllIncludes = _matchAllIncludes,
-        CollectionId = _filterCollectionId
+        CollectionId = _filterCollectionId,
+        DateMode = _dateMode
     };
 
     private string? FilterCollectionName() =>
@@ -40,7 +53,7 @@ public sealed partial class MainPage
     private void ApplyFilters()
     {
         var results = _archive.FilterChats(CurrentChatFilter());
-        _archive.RefreshSessions(results);
+        _archive.RefreshSessions(results, preserveOrder: _dateMode.Length > 0);   // a date mode chose its own order
         SelectFirstSession();
         RenderCurrent();
         RenderTagFilterBar();
@@ -320,6 +333,25 @@ public sealed partial class MainPage
         foreach (var tc in all) list.Children.Add(TriStateTagRow(tc, _includeTags, _excludeTags, () => { RefreshFilterFlyout(); ApplyFilters(); }));
         root.Children.Add(new ScrollViewer { Content = list, VerticalScrollBarVisibility = ScrollBarVisibility.Auto, MaxHeight = 320, HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled });
 
+        // Created-date mode: sort/filter by WHEN THE CHAT WAS STARTED — the list normally reshuffles
+        // by recent activity; this pins it (newest/oldest/today/7d/30d).
+        root.Children.Add(new Border { Height = 1, Background = LineBrush(), Margin = new Thickness(0, 2, 0, 2) });
+        var dateRow = new Grid { ColumnDefinitions = { new ColumnDefinition(), new ColumnDefinition { Width = GridLength.Auto } } };
+        dateRow.Children.Add(new TextBlock { Text = "Created", Foreground = new SolidColorBrush(ChipText), FontSize = 12, VerticalAlignment = VerticalAlignment.Center });
+        var dateBtn = new DropDownButton { Content = new TextBlock { Text = DateModeLabel(), FontSize = 12 }, MinHeight = 30 };
+        var dateFlyout = new MenuFlyout { AreOpenCloseAnimationsEnabled = false };
+        foreach (var (value, label) in DateModes)
+        {
+            var v = value;
+            var item = new MenuFlyoutItem { Text = label };
+            item.Click += (_, _) => { _dateMode = v; RefreshFilterFlyout(); ApplyFilters(); };
+            dateFlyout.Items.Add(item);
+        }
+        dateBtn.Flyout = dateFlyout;
+        Grid.SetColumn(dateBtn, 1);
+        dateRow.Children.Add(dateBtn);
+        root.Children.Add(dateRow);
+
         // Project (collection) scope: restrict the whole filter to one project's chats.
         if (_archive.Store.Collections.Count > 0)
         {
@@ -345,10 +377,10 @@ public sealed partial class MainPage
             root.Children.Add(projRow);
         }
 
-        if (_includeTags.Count > 0 || _excludeTags.Count > 0 || _filterCollectionId is not null)
+        if (_includeTags.Count > 0 || _excludeTags.Count > 0 || _filterCollectionId is not null || _dateMode.Length > 0)
         {
             var clear = new Button { Style = (Style)Resources["PillButtonStyle"], HorizontalAlignment = HorizontalAlignment.Stretch, Content = new TextBlock { Text = "Clear filters", FontSize = 12 } };
-            clear.Click += (_, _) => { _includeTags.Clear(); _excludeTags.Clear(); _filterCollectionId = null; RefreshFilterFlyout(); ApplyFilters(); };
+            clear.Click += (_, _) => { _includeTags.Clear(); _excludeTags.Clear(); _filterCollectionId = null; _dateMode = ""; RefreshFilterFlyout(); ApplyFilters(); };
             root.Children.Add(clear);
         }
         return root;
@@ -415,12 +447,17 @@ public sealed partial class MainPage
             _filterCollectionId = null;   // collection was deleted
 
         TagFilterBar.Children.Clear();
-        if (_includeTags.Count == 0 && _excludeTags.Count == 0 && _filterCollectionId is null)
+        if (_includeTags.Count == 0 && _excludeTags.Count == 0 && _filterCollectionId is null && _dateMode.Length == 0)
         {
             TagFilterScroller.Visibility = Visibility.Collapsed;
             return;
         }
         TagFilterScroller.Visibility = Visibility.Visible;
+
+        if (_dateMode.Length > 0)
+            TagFilterBar.Children.Add(TagChip(DateModeLabel().Replace(" (default)", ""), active: true,
+                onTap: () => { _dateMode = ""; ApplyFilters(); },
+                onRemove: () => { _dateMode = ""; ApplyFilters(); }));
 
         if (FilterCollectionName() is { } projName)
             TagFilterBar.Children.Add(TagChip("in: " + projName, active: true,
@@ -445,7 +482,7 @@ public sealed partial class MainPage
                 onTap: () => { _excludeTags.Remove(t); ApplyFilters(); },
                 onRemove: () => { _excludeTags.Remove(t); ApplyFilters(); }));
         }
-        TagFilterBar.Children.Add(AddChip("clear", () => { _includeTags.Clear(); _excludeTags.Clear(); _filterCollectionId = null; ApplyFilters(); }));
+        TagFilterBar.Children.Add(AddChip("clear", () => { _includeTags.Clear(); _excludeTags.Clear(); _filterCollectionId = null; _dateMode = ""; ApplyFilters(); }));
     }
 
     // ---- Per-chat tag editor (right panel) ---------------------------------------------------

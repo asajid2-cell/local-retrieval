@@ -215,6 +215,9 @@ public sealed partial class MainPage : Page
             case "Brain":
                 RenderBrainPage();
                 break;
+            case "Running":
+                RenderRunningPage();
+                break;
             default:
                 RenderArchive();
                 break;
@@ -501,6 +504,11 @@ public sealed partial class MainPage : Page
         ToolTipService.SetToolTip(brainButton, "Build a durable, source-linked memory brain for a project");
         brainButton.Click += (_, _) => Navigate("Brain");
 
+        // "Start chat" — the front door for a brand-new chat (pick tool + folder, optionally a collection).
+        var startButton = new Button { Style = (Style)Resources["PrimaryPillButtonStyle"], Content = "+ Start chat" };
+        ToolTipService.SetToolTip(startButton, "Start a new Claude/Codex chat in a folder you choose (optionally a new folder / collection)");
+        startButton.Click += async (_, _) => await StartChatAsync();
+
         var header = new Grid { ColumnDefinitions = { new ColumnDefinition(), new ColumnDefinition { Width = GridLength.Auto } } };
         header.Children.Add(new TextBlock
         {
@@ -527,6 +535,7 @@ public sealed partial class MainPage : Page
         headerActions.Children.Add(BackupMenuButton());
         headerActions.Children.Add(brainButton);
         headerActions.Children.Add(newButton);
+        headerActions.Children.Add(startButton);
         Grid.SetColumn(headerActions, 1);
         header.Children.Add(headerActions);
 
@@ -640,6 +649,7 @@ public sealed partial class MainPage : Page
             SettingControlRow("Custom accent", AccentColorPicker()),
             SettingControlRow("Shape", ShapeCombo()),
             SettingControlRow("Density", DensityCombo())));
+        MainContent.Children.Add(RemoteServerPanel());
         MainContent.Children.Add(AgentAccessPanel());
         MainContent.Children.Add(AiProviderPanel());
         MainContent.Children.Add(SettingRow("Read-only source mode", _archive.Store.Settings.ReadOnlySourceMode ? "On" : "Off"));
@@ -1198,6 +1208,29 @@ public sealed partial class MainPage : Page
         };
     }
 
+    // The last 1-2 path segments of a chat's working folder — enough to see where it lives at a glance
+    // and spot two chats saved under different roots (e.g. "codexworks\301" vs "301\alarmonizer").
+    private static string ShortFolder(string ws)
+    {
+        if (string.IsNullOrWhiteSpace(ws)) return "";
+        var parts = ws.Replace('/', '\\').TrimEnd('\\').Split('\\', StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length == 0) return "";
+        return parts.Length == 1 ? parts[0] : parts[^2] + "\\" + parts[^1];
+    }
+
+    // Open a chat's working folder in Explorer (so you can see exactly where it lives on disk).
+    private void OpenSessionFolder(ArchiveSession session)
+    {
+        var ws = session.Workspace;
+        try
+        {
+            if (!string.IsNullOrWhiteSpace(ws) && Directory.Exists(ws))
+                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo { FileName = "explorer.exe", Arguments = $"\"{ws}\"", UseShellExecute = true });
+            else { SetClipboardText(ws ?? ""); SyncStatus.Text = "That folder isn't on this PC; copied its path instead."; }
+        }
+        catch (Exception ex) { Diag.Log("OpenSessionFolder: " + ex); SyncStatus.Text = "Couldn't open the folder - see log."; }
+    }
+
     private UIElement SessionRow(ArchiveSession session, Action? onRemove = null, Action<int, bool>? onMove = null)
     {
         var resumeButton = new Button
@@ -1234,16 +1267,22 @@ public sealed partial class MainPage : Page
         var dots = TagDots(session);
         if (dots is not null) meta.Children.Add(dots);
 
-        grid.Children.Add(new StackPanel
+        var titleStack = new StackPanel
         {
             Spacing = 3,
             VerticalAlignment = VerticalAlignment.Center,
-            Children =
-            {
-                new TextBlock { Text = session.DisplayTitle, Foreground = StrongBrush(), TextTrimming = TextTrimming.CharacterEllipsis, MaxLines = 1 },
-                meta
-            }
-        });
+            Children = { new TextBlock { Text = session.DisplayTitle, Foreground = StrongBrush(), TextTrimming = TextTrimming.CharacterEllipsis, MaxLines = 1 } }
+        };
+        var folder = ShortFolder(session.Workspace);
+        if (folder.Length > 0)
+        {
+            var fb = new TextBlock { Text = folder, Foreground = MutedBrush(), FontSize = 11,
+                                     TextTrimming = TextTrimming.CharacterEllipsis, MaxLines = 1 };
+            ToolTipService.SetToolTip(fb, session.Workspace);   // hover = full path
+            titleStack.Children.Add(fb);
+        }
+        titleStack.Children.Add(meta);
+        grid.Children.Add(titleStack);
         var actions = new StackPanel
         {
             Orientation = Orientation.Horizontal,
@@ -1351,8 +1390,14 @@ public sealed partial class MainPage : Page
         flyout.Items.Add(new MenuFlyoutSeparator());
 
         var rename = new MenuFlyoutItem { Text = "Rename" };
+        ToolTipService.SetToolTip(rename, "Set the app display name (this app only).");
         rename.Click += async (_, _) => await RenameSessionByAsync(session);
         flyout.Items.Add(rename);
+
+        var renameNative = new MenuFlyoutItem { Text = "Native name..." };
+        ToolTipService.SetToolTip(renameNative, "View / change the chat's own name in Claude/Codex (shows in their resume list).");
+        renameNative.Click += async (_, _) => await RenameNativeByAsync(session);
+        flyout.Items.Add(renameNative);
 
         var pin = new MenuFlyoutItem { Text = session.Pinned ? "Unpin" : "Pin to top" };
         pin.Click += async (_, _) => { await _archive.TogglePinAsync(session); RenderCurrent(); };
@@ -1361,6 +1406,17 @@ public sealed partial class MainPage : Page
         var copyPath = new MenuFlyoutItem { Text = "Copy chat path" };
         copyPath.Click += (_, _) => { SetClipboardText(session.SourcePath); SyncStatus.Text = "Copied chat path."; };
         flyout.Items.Add(copyPath);
+
+        if (!string.IsNullOrWhiteSpace(session.Workspace))
+        {
+            var openFolder = new MenuFlyoutItem { Text = "Open folder" };
+            ToolTipService.SetToolTip(openFolder, session.Workspace);
+            openFolder.Click += (_, _) => OpenSessionFolder(session);
+            flyout.Items.Add(openFolder);
+            var copyFolder = new MenuFlyoutItem { Text = "Copy folder path" };
+            copyFolder.Click += (_, _) => { SetClipboardText(session.Workspace); SyncStatus.Text = "Copied folder path."; };
+            flyout.Items.Add(copyFolder);
+        }
 
         var copyResume = new MenuFlyoutItem { Text = "Copy agent resume prompt" };
         copyResume.Click += async (_, _) =>
@@ -1404,6 +1460,43 @@ public sealed partial class MainPage : Page
         if (await dialog.ShowAsync() == ContentDialogResult.Primary && !string.IsNullOrWhiteSpace(input.Text))
         {
             await _archive.RenameSessionAsync(session, input.Text);
+            RenderCurrent();
+        }
+    }
+
+    // View + change the chat's NATIVE name — the tool's OWN title (what `codex resume` / Claude's recent
+    // list show), as opposed to the app-only display name. The dialog is pre-filled with the current
+    // native name (so it's also a "view"); saving writes it back to Codex's DB / the Claude transcript.
+    private async Task RenameNativeByAsync(ArchiveSession session)
+    {
+        var isCodex = string.Equals(session.Tool, "codex", StringComparison.OrdinalIgnoreCase);
+        var current = string.IsNullOrWhiteSpace(session.Title) ? "(none yet)" : session.Title;
+        var input = new TextBox { Text = session.Title ?? "", MinWidth = 440, CornerRadius = ControlCornerRadius() };
+        var panel = new StackPanel { Spacing = 10 };
+        panel.Children.Add(new TextBlock
+        {
+            Text = isCodex
+                ? "This is the Codex session's own name (in Codex's thread store). Changing it updates this app and the remote views. " +
+                  "Note: `codex resume` shows its own auto-generated title, which Codex doesn't let you set."
+                : "This is the Claude session's own name — what shows in `claude --resume`. Changing it writes a custom-title to the transcript, exactly like Claude Code's rename.",
+            Foreground = MutedBrush(), TextWrapping = TextWrapping.Wrap
+        });
+        panel.Children.Add(new TextBlock { Text = "Current native name: " + current, Foreground = MutedBrush(), TextWrapping = TextWrapping.Wrap, FontSize = 12 });
+        panel.Children.Add(input);
+        var dialog = new ContentDialog
+        {
+            Title = "Native name",
+            Content = panel,
+            PrimaryButtonText = "Save",
+            CloseButtonText = "Cancel",
+            DefaultButton = ContentDialogButton.Primary,
+            XamlRoot = XamlRoot
+        };
+        if (await dialog.ShowAsync() == ContentDialogResult.Primary && !string.IsNullOrWhiteSpace(input.Text)
+            && !string.Equals(input.Text.Trim(), session.Title?.Trim(), StringComparison.Ordinal))
+        {
+            var status = await _archive.RenameNativeAsync(session, input.Text);
+            SyncStatus.Text = status ?? $"Renamed native name to \"{Trim(input.Text, 40)}\".";
             RenderCurrent();
         }
     }
@@ -1950,8 +2043,14 @@ public sealed partial class MainPage : Page
         flyout.Items.Add(bumpItem);
 
         var renameItem = new MenuFlyoutItem { Text = "Rename chat" };
+        ToolTipService.SetToolTip(renameItem, "Set the app display name (this app only).");
         renameItem.Click += async (_, _) => await RenameSelected();
         flyout.Items.Add(renameItem);
+
+        var renameNativeItem = new MenuFlyoutItem { Text = "Native name..." };
+        ToolTipService.SetToolTip(renameNativeItem, "View / change the chat's own name in Claude/Codex (shows in their resume list).");
+        renameNativeItem.Click += async (_, _) => await RenameNativeByAsync(session);
+        flyout.Items.Add(renameNativeItem);
 
         var addToCollection = new MenuFlyoutSubItem { Text = "Add to collection" };
         foreach (var collection in _archive.Store.Collections.Values.OrderBy(c => c.Name))
@@ -1979,6 +2078,14 @@ public sealed partial class MainPage : Page
         var copyPathItem = new MenuFlyoutItem { Text = "Copy chat path" };
         copyPathItem.Click += (_, _) => Copy("path");
         flyout.Items.Add(copyPathItem);
+
+        if (!string.IsNullOrWhiteSpace(session.Workspace))
+        {
+            var openFolderItem = new MenuFlyoutItem { Text = "Open folder" };
+            ToolTipService.SetToolTip(openFolderItem, session.Workspace);
+            openFolderItem.Click += (_, _) => OpenSessionFolder(session);
+            flyout.Items.Add(openFolderItem);
+        }
 
         var archiveItem = new MenuFlyoutItem { Text = "Archive chat" };
         archiveItem.Click += async (_, _) => await ArchiveSelected();
