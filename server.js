@@ -13,6 +13,9 @@ function atomicWrite(file, data) { try { fs.writeFileSync(file + '.tmp', data); 
 function hostTokenOk(t) { if (!HOST_TOKEN || !t || t.length !== HOST_TOKEN.length) return false; try { return crypto.timingSafeEqual(Buffer.from(t), Buffer.from(HOST_TOKEN)); } catch { return false; } }
 
 const app = express();
+const TEST_MODE = process.env.MUX_TEST_MODE === '1';
+const STATE_DIR = process.env.MUX_STATE_DIR || __dirname;
+try { fs.mkdirSync(STATE_DIR, { recursive: true }); } catch {}
 app.use(express.json({ limit: '6mb' }));   // the desktop app pushes its whole projects projection
 app.use((err, req, res, next) => {
   if (err && err.type === 'entity.parse.failed') return res.status(400).json({ error: 'invalid JSON body' });
@@ -253,7 +256,7 @@ app.post('/api/sessions', async (req, res) => {
                            hasCommand: !!normalizedCommand(cmd), shellOnly: !normalizedCommand(cmd), ready: true, kind: normalizedCommand(cmd) ? 'command' : 'shell', cmdSig: commandSig(cmd) });
   const confirmed = await waitForHostState(() => {
     const h = hostSessions.get(name);
-    return h && h.alive !== false ? h : null;
+    return h && h.alive !== false && !pendingCreates.has(name) && hostedCompatibleWithCommand(h, cmd) ? h : null;
   }, 15000);
   if (!confirmed.ok) return failHost(res, 504, 'PC-local mux session not confirmed', confirmed.error);
   res.json({ ok: true, name, created: true, hosted: true, owner: !!confirmed.value.owner, hostProtocol: hostProtocol.protocol || 0 });
@@ -352,7 +355,7 @@ app.post('/api/sessions/:name/autoheal', async (req, res) => {
 // --- project sync: the desktop app pushes its collections/chats projection here while it's open, so
 // the web can show your projects and resume chats remotely. POST is loopback-only (the app reaches in
 // over its own SSH); GET is owner-gated (the web). `live` = the app pushed within the last ~45s. ------
-const PROJECTS_FILE = __dirname + '/projects.json';
+const PROJECTS_FILE = STATE_DIR + '/projects.json';
 let _projects = { collections: [], host: '', syncedAt: 0, runningSessions: [] };
 try { _projects = JSON.parse(fs.readFileSync(PROJECTS_FILE, 'utf8')); } catch {}
 function appSyncedAt() { return _projects.appSyncedAt || _projects.syncedAt || 0; }
@@ -448,7 +451,7 @@ app.post('/api/running', (req, res) => {
 // that dies on every launch can't spin forever. ★ PER-TAB opt-in: only sessions the user enabled (in
 // _healOn) are watched + relaunched — toggle via POST /api/sessions/:name/autoheal. MUX_AUTOHEAL=0 = master off.
 const _heal = new Map();   // name -> { lastTail, lastChange, lastGreen, deaths[], lastRelaunch, gaveUp }
-const AUTOHEAL_FILE = __dirname + '/autoheal.json';
+const AUTOHEAL_FILE = STATE_DIR + '/autoheal.json';
 let _healOn = new Set();    // session names OPTED IN to auto-resume (per-tab, persisted across restarts)
 try { _healOn = new Set(JSON.parse(fs.readFileSync(AUTOHEAL_FILE, 'utf8'))); } catch {}
 function saveHealOn() { atomicWrite(AUTOHEAL_FILE, JSON.stringify([..._healOn])); }
@@ -540,7 +543,7 @@ function autoHealTick() {
   const live = new Set(names);
   for (const k of _heal.keys()) if (!live.has(k)) _heal.delete(k);
 }
-if (process.env.MUX_AUTOHEAL !== '0') setInterval(autoHealTick, 12000);
+if (!TEST_MODE && process.env.MUX_AUTOHEAL !== '0') setInterval(autoHealTick, 12000);
 
 // ---- BOOT-RECREATE (P0): on relay start, recreate every ARMED session (autoheal.json) as a PC-hosted
 // muxd session when the host is connected and protocol-current. STRICTLY opt-in: never creates a session
@@ -572,7 +575,7 @@ function bootRecreate() {
   }
   if (n) console.log(`[boot-recreate] restored ${n} armed session(s) after a wipe`);
 }
-setTimeout(bootRecreate, 25000);  // let _healOn load AND give muxd time to reconnect+hello first, so
+if (!TEST_MODE) setTimeout(bootRecreate, 25000);  // let _healOn load AND give muxd time to reconnect+hello first, so
                                   // hosted sessions are visible before any armed recreate is attempted
 
 // ---- PC reachability probe + /api/health (P0 observability, D7). A lightweight TCP-connect to the PC's
@@ -580,7 +583,7 @@ setTimeout(bootRecreate, 25000);  // let _healOn load AND give muxd time to reco
 // the Jul 2 .146→.154 DHCP orphaning would have shown here instantly as pc.reachable=false.
 let _winHost = '192.168.1.146';
 try { const _c = fs.readFileSync((process.env.HOME || '') + '/.ssh/config', 'utf8'); const _m = _c.match(/Host\s+win\b[\s\S]*?HostName\s+(\S+)/i); if (_m) _winHost = _m[1]; } catch {}
-let _pcHealth = { reachable: null, rttMs: null, host: _winHost, at: 0 };
+let _pcHealth = TEST_MODE ? { reachable: true, rttMs: 0, host: 'test', at: Date.now() } : { reachable: null, rttMs: null, host: _winHost, at: 0 };
 // When the PC becomes unreachable, it may just have moved to a new DHCP IP (Jul 2: .146→.154 orphaned the
 // fleet). Kick the MAC-based resolver (runs the ping-sweep in its own subprocess — never blocks this loop),
 // then reload the (possibly updated) HostName so the next ssh-back + boot-recreate target the new address.
@@ -603,7 +606,7 @@ function probePc() {
   sock.on('error', () => done(false));
   sock.on('timeout', () => done(false));
 }
-setTimeout(probePc, 2000); setInterval(probePc, 30000);
+if (!TEST_MODE) { setTimeout(probePc, 2000); setInterval(probePc, 30000); }
 app.get('/api/health', (req, res) => {
   let tmuxAvailable = false;
   try { execSync(`tmux -V`, { encoding: 'utf8', timeout: 1500 }); tmuxAvailable = true; } catch {}
@@ -613,7 +616,9 @@ app.get('/api/health', (req, res) => {
   // A2 #9: if the PC host is down, armed sessions are hosted-and-unreachable (can't be healed) → surface
   // that as degraded instead of a falsely-green dot. Legacy tmux names are also degraded blockers.
   let hostedArmedDown = !hostUp() ? _healOn.size : 0;
-  const degraded = !hostUp() || !hostProtocolOk() || _pcHealth.reachable === false || gaveUp > 0 || hostedArmedDown > 0 || legacyNames.length > 0 || !projects.bridgeLive;
+  const degraded = TEST_MODE
+    ? (!hostUp() || !hostProtocolOk() || legacyNames.length > 0)
+    : (!hostUp() || !hostProtocolOk() || _pcHealth.reachable === false || gaveUp > 0 || hostedArmedDown > 0 || legacyNames.length > 0 || !projects.bridgeLive);
   res.json({ ok: !degraded, degraded, uptimeSec: Math.round(process.uptime()), tmuxAvailable, sessions: hostSessions.size,
              legacySessions: legacyNames.length, legacyNames, legacyPolicy: 'blocked', armed: _healOn.size, gaveUp, hostedArmedDown, pc: _pcHealth,
              projects,
@@ -624,7 +629,7 @@ app.get('/api/health', (req, res) => {
 // --- app command queue: the owner (web) enqueues actions for the desktop app; the app polls + acks them.
 // Today: "kill" a live agent session. Enqueue is owner-gated (the global auth middleware above); pull +
 // ack are loopback-only (only the app, reaching in over its own SSH, can read the queue or run anything).
-const COMMANDS_FILE = __dirname + '/app-commands.json';
+const COMMANDS_FILE = STATE_DIR + '/app-commands.json';
 let _commands = [];
 try { _commands = JSON.parse(fs.readFileSync(COMMANDS_FILE, 'utf8')); } catch {}
 function saveCommands() { atomicWrite(COMMANDS_FILE, JSON.stringify(_commands)); }
@@ -694,9 +699,9 @@ app.get('/api/app-commands/:id', (req, res) => {  // web (owner) polls a command
 // --- file upload side-channel: phone -> VPS (stored here) -> the desktop app pulls it down to the PC
 // (scp, via a `fetchfile` command) and points the model at the local path. Deliberately NOT routed
 // through the terminal/tmux. Owner-gated by the global middleware; size-capped; pruned after an hour.
-const UPLOADS_DIR = __dirname + '/uploads';
+const UPLOADS_DIR = STATE_DIR + '/uploads';
 try { fs.mkdirSync(UPLOADS_DIR, { recursive: true }); } catch {}
-const UPLOADS_META = __dirname + '/uploads-meta.json';
+const UPLOADS_META = STATE_DIR + '/uploads-meta.json';
 let _uploads = [];
 try { _uploads = JSON.parse(fs.readFileSync(UPLOADS_META, 'utf8')); } catch {}
 function saveUploadsMeta() { atomicWrite(UPLOADS_META, JSON.stringify(_uploads)); }
@@ -851,7 +856,7 @@ wssHost.on('connection', (ws, req) => {
 // persistent deviceId (localStorage), so a Wi-Fi blip / reconnect / relay restart does NOT lose the pin
 // (the old code pinned a connection id → gone on every reconnect). No pin = auto over the RECENTLY-ACTIVE
 // viewers only, so a backgrounded desktop tab in another room can't force your phone to pan forever.
-const PINS_FILE = __dirname + '/pins.json';
+const PINS_FILE = STATE_DIR + '/pins.json';
 let pins = new Map();   // session -> { deviceId, label, cols, rows, at }
 try { pins = new Map(JSON.parse(fs.readFileSync(PINS_FILE, 'utf8'))); } catch {}
 let _pinsDirty = false;
