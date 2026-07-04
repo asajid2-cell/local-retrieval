@@ -11,7 +11,7 @@
 #
 # State: sessions.json manifest (resume commands) -> muxd restart / PC reboot lists unarmed sessions
 # as dormant placeholders. Only sessions explicitly armed with heal auto-start.
-import asyncio, base64, collections, json, os, queue, re, subprocess, sys, threading, time, traceback
+import asyncio, base64, collections, hashlib, json, os, queue, re, subprocess, sys, threading, time, traceback
 import faulthandler
 try: faulthandler.enable(open(os.path.join(os.path.expanduser("~"), "muxd", "muxd.crash"), "a"))
 except Exception: pass
@@ -361,12 +361,43 @@ def manifest_load():
 
 SAFE = lambda s: re.sub(r"[^A-Za-z0-9_.-]", "", str(s or ""))[:48]
 
+def normalized_cmd(cmd):
+    return (cmd or "").strip()
+
+def command_sig(cmd):
+    cmd = normalized_cmd(cmd)
+    return hashlib.sha256(cmd.encode("utf-8")).hexdigest()[:16] if cmd else ""
+
+def session_has_command(sess):
+    return bool(normalized_cmd(getattr(sess, "cmd", "")))
+
+def session_payload(name, sess):
+    alive = False
+    try: alive = bool(sess.alive())
+    except Exception: alive = False
+    has_cmd = session_has_command(sess)
+    owner = bool(getattr(sess, "owner", False))
+    kind = "command" if has_cmd else ("shell" if alive else "dormant")
+    return {"name": name, "alive": alive, "created": int(sess.created * 1000),
+            "lastOut": int(sess.last_out * 1000), "cols": sess.cols, "rows": sess.rows,
+            "tail": sess.tail_text(), "heal": sess.heal, "localViewers": len(sess.local),
+            "localFirst": owner or len(sess.local) > 0, "owner": owner,
+            "hasCommand": has_cmd, "shellOnly": alive and not has_cmd,
+            "ready": alive, "kind": kind, "cmdSig": command_sig(getattr(sess, "cmd", ""))}
+
+def needs_relaunch_for_command(prev, requested_cmd):
+    requested = normalized_cmd(requested_cmd)
+    if not requested:
+        return False
+    try:
+        if not prev.alive():
+            return True
+    except Exception:
+        return True
+    return command_sig(getattr(prev, "cmd", "")) != command_sig(requested)
+
 def sess_list():
-    return [{"name": n, "alive": s.alive(), "created": int(s.created * 1000),
-             "lastOut": int(s.last_out * 1000), "cols": s.cols, "rows": s.rows,
-             "tail": s.tail_text(), "heal": s.heal, "localViewers": len(s.local),
-             "localFirst": bool(getattr(s, "owner", False)) or len(s.local) > 0,
-             "owner": bool(getattr(s, "owner", False))} for n, s in sessions.items()]
+    return [session_payload(n, s) for n, s in sessions.items()]
 
 async def spawn_session_off_loop(s):
     await asyncio.get_running_loop().run_in_executor(None, s.spawn)
@@ -452,7 +483,7 @@ async def main():
             requested_heal = bool(first.get("heal")) if ("heal" in first) else bool(prev.heal if prev else False)
             cols = int(first.get("cols") or (prev.cols if prev else 140))
             rows = int(first.get("rows") or (prev.rows if prev else 40))
-            if prev and prev.alive():
+            if prev and prev.alive() and not needs_relaunch_for_command(prev, requested_cmd):
                 prev.heal = requested_heal
                 if requested_cmd and requested_cmd != prev.cmd:
                     prev.cmd = requested_cmd
@@ -671,7 +702,9 @@ async def main():
                             except Exception: continue
                             t, name = m.get("t"), SAFE(m.get("s", ""))
                             if t == "create" and name:
-                                if name in sessions and sessions[name].alive():
+                                prev = sessions.get(name)
+                                requested_cmd = (m.get("cmd", "") or "").strip()
+                                if prev and prev.alive() and not needs_relaunch_for_command(prev, requested_cmd):
                                     pass                                    # already hosted + alive
                                 else:
                                     prev = sessions.get(name)               # reviving a DEAD session → keep its cmd/cwd/size (don't wipe the resume)
