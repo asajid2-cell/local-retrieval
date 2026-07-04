@@ -84,12 +84,16 @@
   /* persistent agent-status dot: white=neutral shell · green=working · yellow=idle/waiting · red=agent gone */
   .tab .dot { width:8px; height:8px; border-radius:50%; background:#9aa0a6; flex:0 0 auto; transition:background .25s, box-shadow .25s; }
   .tab[data-state="white"]  .dot { background:#e8eaed; }
+  .tab[data-state="dormant"] .dot { background:#9aa0a6; box-shadow:0 0 0 3px rgba(154,160,166,.13); }
   .tab[data-state="green"]  .dot { background:var(--live);  box-shadow:0 0 0 3px rgba(52,211,153,.16); }
   .tab[data-state="yellow"] .dot { background:var(--warn);  box-shadow:0 0 0 3px rgba(251,191,36,.16); }
   .tab[data-state="red"]    .dot { background:var(--rose);  box-shadow:0 0 0 3px var(--rose-dim); }
   .tab.unread .dot { animation: dotpulse 1.4s ease-in-out infinite; }   /* changed-while-away: pulse, any color */
   @keyframes dotpulse { 0%,100%{ opacity:1 } 50%{ opacity:.4 } }
   .tab .pcchip { font-size:8px; font-weight:700; letter-spacing:.04em; color:var(--live); border:1px solid rgba(52,211,153,.35); border-radius:4px; padding:0 3px; line-height:1.5; flex:0 0 auto; }   /* runs on the PC = survives network/VPS failures */
+  .tab .pcchip.dormant { color:var(--faint); border-color:rgba(154,160,166,.45); }
+  .tab .pcchip.stale { color:var(--warn); border-color:rgba(251,191,36,.45); }
+  .tab .pcchip.legacy { color:var(--rose); border-color:rgba(251,113,133,.5); }
   .tab .nm { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:13.5px; font-weight:500; }
   .tab.autoheal .nm::before { content:'⟳'; margin-right:3px; opacity:.65; font-size:.85em; }   /* per-tab auto-resume ON */
   .tab .kebab {
@@ -370,10 +374,95 @@
     #app.kb-on #keybar button { height:30px; min-width:0; padding:3px 10px; }   /* compact so it doesn't eat terminal rows */
   }
   #kbtoggle.on { color:var(--accent); }
+  #mobileNav { display:none; }
+  #mobileNav button, #mobileNav a {
+    min-width:0; min-height:48px; padding:6px 4px; border:none; border-radius:var(--r-m);
+    background:transparent; color:var(--muted); font:600 11.5px/1.1 inherit; text-decoration:none;
+    display:flex; flex-direction:column; align-items:center; justify-content:center; gap:4px; cursor:pointer;
+  }
+  #mobileNav svg { width:18px; height:18px; flex:0 0 auto; }
+  #mobileNav button.active, #mobileNav a.active { background:var(--raised); color:var(--txt); }
   @media (pointer:coarse) {
     .icon, .newtab { height:44px; min-width:44px; }
     .tab { height:44px; }
     .tab .kebab { width:32px; height:32px; }
+  }
+  @media (max-width:59.99rem) {
+    #app {
+      grid-template-rows:auto minmax(0,1fr) auto auto;
+      grid-template-areas:"topbar" "term" "status" "mobileNav";
+    }
+    #mobileNav {
+      grid-area:mobileNav; display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:var(--sp1);
+      padding:var(--sp1) var(--sp2); padding-bottom:max(var(--sp1),env(safe-area-inset-bottom));
+      background:var(--panel); border-top:1px solid var(--line); min-width:0;
+    }
+    #topbar { min-height:52px; }
+    .top-actions { gap:0; }
+    #projbtn, #zen, #fontdown, #fontup, #kbtoggle { display:none; }
+    #refresh, #copybtn { height:44px; min-width:44px; }
+    #tabwrap, #keybar { display:none; }
+    #term { padding:var(--sp1); }
+    #status { min-height:30px; padding:5px var(--sp3); }
+    #status #statustext { font-size:12px; }
+
+    #app.mobile-view-sessions {
+      grid-template-rows:auto minmax(0,1fr) auto auto;
+      grid-template-areas:"topbar" "tabs" "status" "mobileNav";
+    }
+    #app.mobile-view-sessions #term, #app.mobile-view-sessions #keybar { display:none; }
+    #app.mobile-view-sessions #tabwrap {
+      display:flex; flex-direction:column; align-items:stretch; min-height:0; gap:var(--sp2);
+      padding:var(--sp3); background:var(--bg); border-bottom:none; overflow:hidden;
+    }
+    #app.mobile-view-sessions #tabs {
+      flex:1 1 auto; min-height:0; display:flex; flex-direction:column; align-items:stretch;
+      gap:var(--sp2); overflow:auto; padding-bottom:var(--sp1);
+    }
+    #app.mobile-view-sessions #tabs:empty::before {
+      white-space:normal; padding:var(--sp4); border:1px solid var(--line);
+      border-radius:var(--r-m); background:var(--panel); text-align:center;
+    }
+    #app.mobile-view-sessions .tab {
+      width:100%; max-width:none; height:54px; padding:0 var(--sp2) 0 var(--sp3);
+      border:1px solid var(--line); background:var(--panel); justify-content:flex-start;
+    }
+    #app.mobile-view-sessions .tab.active { background:var(--raised); border-color:#343440; }
+    #app.mobile-view-sessions .tab .nm { font-size:14px; }
+    #app.mobile-view-sessions .tab .kebab { margin-left:auto; }
+    #app.mobile-view-sessions .newtab {
+      width:100%; height:48px; border:1px solid var(--rose); background:var(--rose-dim);
+      color:transparent; font-size:0; border-radius:var(--r-m);
+    }
+    #app.mobile-view-sessions .newtab::before {
+      content:"New session"; color:var(--rose); font-size:14px; font-weight:600; line-height:1;
+    }
+
+    #app.mobile-view-terminal {
+      grid-template-rows:auto minmax(0,1fr) auto auto;
+      grid-template-areas:"topbar" "term" "status" "mobileNav";
+    }
+    #app.mobile-view-terminal #tabwrap, #app.mobile-view-terminal #keybar { display:none; }
+
+    #app.mobile-view-keys {
+      grid-template-rows:auto minmax(4rem,1fr) auto auto auto;
+      grid-template-areas:"topbar" "term" "status" "keys" "mobileNav";
+    }
+    #app.mobile-view-keys #tabwrap { display:none; }
+    #app.mobile-view-keys #term { min-height:0; }
+    #app.mobile-view-keys #keybar {
+      display:flex; flex-wrap:wrap; align-items:flex-start; align-content:flex-start;
+      gap:6px; min-height:0; max-height:none; overflow:visible; padding:6px var(--sp2);
+    }
+    #app.mobile-view-keys .kkeys, #app.mobile-view-keys .kmodes { flex-wrap:wrap; min-width:0; }
+    #app.mobile-view-keys .kkeys { flex:1 1 auto; gap:6px; }
+    #app.mobile-view-keys .key { height:38px; min-width:40px; padding:0 10px; font-size:13px; }
+    #app.mobile-view-keys .kmode { height:34px; min-width:34px; padding:0 8px; }
+    #app.mobile-view-keys .kdiv { display:none; }
+    #app.zen #mobileNav, #app.zen #status, #app.zen #keybar { display:none; }
+    #app.zen { grid-template-rows:auto minmax(0,1fr); grid-template-areas:"topbar" "term"; }
+    #empty { padding:var(--sp4) var(--sp3); }
+    #empty .quick button { min-height:44px; }
   }
   @media (max-width:23rem) { .brand .wordmark { display:none; } }   /* keep the icon row from crowding the brand on tiny phones */
 </style>
@@ -426,7 +515,7 @@
   <main id="term">
     <div id="empty">
       <span class="big">No session open</span>
-      <span class="sub">Start one — it runs on the VPS and mirrors your desktop, so you can pick it up from anywhere.</span>
+      <span class="sub">Start one — it opens on your PC and mirrors to this site, so you can pick it up from anywhere.</span>
       <span class="quick">
         <button data-profile="claude"><span class="rose">✳</span> Start Claude</button>
         <button data-profile="codex"><span class="rose">▢</span> Start Codex</button>
@@ -438,6 +527,24 @@
 
   <div id="status"><span class="sdot"></span><span id="statustext">connecting&hellip;</span><span class="meta" id="statusmeta"></span></div>
   <div id="keybar"></div>
+  <nav id="mobileNav" aria-label="Mobile views">
+    <button type="button" data-mobile-view="sessions" aria-label="Sessions" aria-pressed="false">
+      <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 6h14M5 12h14M5 18h14" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+      <span>Sessions</span>
+    </button>
+    <button type="button" data-mobile-view="terminal" aria-label="Terminal" aria-pressed="false">
+      <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><rect x="3.5" y="5" width="17" height="14" rx="2" stroke="currentColor" stroke-width="1.7"/><path d="M7 10l3 2-3 2M12.5 15h4" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      <span>Terminal</span>
+    </button>
+    <a class="projects" href="projects.html" aria-label="Projects">
+      <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M3 7a2 2 0 012-2h3.6a2 2 0 011.5.7L12 7.5h7a2 2 0 012 2V17a2 2 0 01-2 2H5a2 2 0 01-2-2V7z" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></svg>
+      <span>Projects</span>
+    </a>
+    <button type="button" data-mobile-view="keys" aria-label="Keys" aria-pressed="false">
+      <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><rect x="3" y="7" width="18" height="10" rx="1.6" stroke="currentColor" stroke-width="1.6"/><path d="M6 10h.01M9 10h.01M12 10h.01M15 10h.01M18 10h.01M7 13.5h10" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+      <span>Keys</span>
+    </button>
+  </nav>
 </div>
 
 <div id="copyview" hidden role="dialog" aria-modal="true" aria-label="Select and copy terminal text">
@@ -467,7 +574,7 @@
 
 <dialog id="renamedlg">
   <h3>Rename session</h3>
-  <p class="hint">Renames the tmux session on the VPS (it keeps running).</p>
+  <p class="hint">Renames the PC-hosted mux session (it keeps running).</p>
   <input id="renameinput" autocapitalize="off" autocomplete="off" spellcheck="false">
   <div class="row"><button class="act" id="cancelrename">Cancel</button><button class="act primary" id="dorename">Rename</button></div>
 </dialog>
@@ -523,6 +630,42 @@ const $ = s => document.querySelector(s);
 const base = location.pathname.replace(/\/[^/]*$/, '') || '';
 const api = p => fetch(base + '/api/' + p, { headers:{'Content-Type':'application/json'} });
 const LS = { get:(k,d)=>{ try{ return JSON.parse(localStorage.getItem(k)) ?? d; }catch(e){ return d; } }, set:(k,v)=>{ try{ localStorage.setItem(k, JSON.stringify(v)); }catch(e){} } };
+const mobileMQ = window.matchMedia ? window.matchMedia('(max-width: 59.99rem)') : {matches:false,addEventListener:()=>{},addListener:()=>{}};
+const MOBILE_VIEWS = ['sessions','terminal','keys'];
+let mobileView = LS.get('mux_mobile_view','terminal');
+if(!MOBILE_VIEWS.includes(mobileView)) mobileView='terminal';
+const isMobile = () => !!mobileMQ.matches;
+function setMobileView(view, persist=true){
+  if(!MOBILE_VIEWS.includes(view)) view='terminal';
+  mobileView=view;
+  if(persist) LS.set('mux_mobile_view', view);
+  const app=$('#app'); if(!app) return;
+  MOBILE_VIEWS.forEach(v=>app.classList.toggle('mobile-view-'+v, isMobile() && view===v));
+  document.querySelectorAll('[data-mobile-view]').forEach(b=>{
+    const on=isMobile() && b.dataset.mobileView===view;
+    b.classList.toggle('active', on);
+    b.setAttribute('aria-pressed', on?'true':'false');
+  });
+  if(isMobile() && view!=='sessions'){
+    setTimeout(()=>{ applyViewport(); try{ term.focus(); }catch(e){} }, 60);
+  }
+}
+function syncMobileView(){
+  const app=$('#app'); if(!app) return;
+  app.classList.toggle('mobile-device', isMobile());
+  if(isMobile()) setMobileView(mobileView, false);
+  else {
+    MOBILE_VIEWS.forEach(v=>app.classList.remove('mobile-view-'+v));
+    document.querySelectorAll('[data-mobile-view]').forEach(b=>{ b.classList.remove('active'); b.setAttribute('aria-pressed','false'); });
+    setTimeout(applyViewport, 60);
+  }
+}
+function initMobileViews(){
+  document.querySelectorAll('[data-mobile-view]').forEach(b=> b.onclick=()=>setMobileView(b.dataset.mobileView));
+  if(mobileMQ.addEventListener) mobileMQ.addEventListener('change', syncMobileView);
+  else if(mobileMQ.addListener) mobileMQ.addListener(syncMobileView);
+  syncMobileView();
+}
 
 let fontSize = Math.min(20, Math.max(11, LS.get('mux_font', 14)));
 const term = new Terminal({
@@ -730,6 +873,31 @@ $('#jumplive').onclick = ()=>{ term.scrollToBottom(); newLines=0; showJump(); te
 
 // ---- connection + auto-reconnect ----
 function clearReconnect(){ if(reconnectTimer){ clearTimeout(reconnectTimer); reconnectTimer=null; } }
+function attachBlocker(s){
+  if(!s) return '';
+  if(s.dormant) return s.detail || 'Dormant session: relaunch it from Projects or run mux locally.';
+  if(s.legacyBlocked || s.legacyTwin) return s.legacyDetail || s.detail || 'Legacy tmux blocker: relay refuses to attach/manage this session.';
+  if(s.hostProtocolOk===false) return s.hostProtocolDetail || 'muxd protocol mismatch - restart MuxdSessionHost.';
+  return '';
+}
+function findSession(name){ return (window._sessions||[]).find(s=>s.name===name) || null; }
+function stopAttach(name, reason){
+  clearReconnect();
+  intentional = true;
+  if(ws){ try{ ws.onclose=null; ws.close(); }catch(e){} ws=null; }
+  intentional = false;
+  current = null;
+  LS.set('mux_last', null);
+  $('#empty').style.display='flex';
+  setStatus('warn', `<span class="name">${esc(name)}</span> &middot; ${esc(reason || 'session is not attachable')}`);
+  renderTabs();
+}
+function closeRefusal(ev){
+  const reason = (ev && ev.reason) || '';
+  if(ev && ev.code===1008) return reason || 'unauthorized - sign in again';
+  if(ev && ev.code===1013) return reason || 'session unavailable';
+  return '';
+}
 function scheduleReconnect(name){
   clearReconnect();
   if (document.visibilityState!=='visible') return;
@@ -739,6 +907,8 @@ function scheduleReconnect(name){
 }
 function connect(name, isRetry){
   clearReconnect();
+  const blocker = attachBlocker(findSession(name));
+  if(blocker){ stopAttach(name, blocker); return; }
   intentional = true;
   if (ws) { try{ ws.onclose=null; ws.close(); }catch(e){} ws=null; }
   intentional = false;
@@ -760,9 +930,16 @@ function connect(name, isRetry){
     if(isFrozen()){ _frozenBuf.push(new Uint8Array(e.data)); if(_frozenBuf.length>6000) _frozenBuf.splice(0, _frozenBuf.length-6000); return; }   // FROZEN for selection: buffer output; a repaint would wipe the highlight
     const wasBottom=atBottom(); term.write(new Uint8Array(e.data)); markReadLive();
     if(!wasBottom){ newLines += 1; showJump(); } };
-  sock.onclose = () => { if(ws===sock && current===name && !intentional){ scheduleReconnect(name); } };
+  sock.onclose = ev => {
+    if(ws===sock && current===name && !intentional){
+      const refused = closeRefusal(ev);
+      if(refused){ stopAttach(name, refused); return; }
+      scheduleReconnect(name);
+    }
+  };
   sock.onerror = () => {};
   renderTabs();
+  if(isMobile()) setMobileView('terminal');
 }
 document.addEventListener('visibilitychange', ()=>{ if(document.visibilityState==='visible' && current && (!ws || ws.readyState>1)){ reconnectDelay=1000; connect(current, true); } });
 // activity heartbeat so the server's auto-size only weighs RECENTLY-ACTIVE devices (a backgrounded tab
@@ -796,7 +973,14 @@ async function loadSessions(select){
   if (select && !list.find(s=>s.name===select)) list.push({name:select, attached:false, activity:Date.now()});
   renderTabs();
   if (select) { connect(select); return; }
-  if (!current && list.length) { const last=LS.get('mux_last',null); connect(list.find(s=>s.name===last)?last:list[0].name); return; }
+  if (!current && list.length) {
+    const choices = list.filter(s=>!attachBlocker(s));
+    const last=LS.get('mux_last',null);
+    const pick=choices.find(s=>s.name===last)||choices[0];
+    if(pick){ connect(pick.name); return; }
+    setStatus('warn', 'No live sessions to attach. Dormant tabs are ready to relaunch from Projects or with mux locally.');
+    return;
+  }
   if (!current && !list.length) setStatus('', 'No sessions &mdash; tap + to start one');
 }
 function renderTabs(){
@@ -809,15 +993,35 @@ function renderTabs(){
     t.setAttribute('role','tab'); t.tabIndex=0; t.setAttribute('aria-selected', s.name===current?'true':'false');
     const st = {green:'agent working',yellow:'agent idle — waiting for your prompt',red:'agent stopped/exited',white:'neutral shell — no agent'}[s.state||'white'];
     t.title = s.name + (st?' · '+st:'');
-    t.innerHTML = `<span class="dot"></span><span class="nm"></span>${s.hosted?'<span class="pcchip" title="Runs on your PC — survives network/VPS failures">PC</span>':''}<button class="kebab" tabindex="-1">⋯</button>`;
+    const chips = `${s.hosted?'<span class="pcchip" title="Runs on your PC — survives network/VPS failures">PC</span>':''}`+
+      `${s.legacyTwin?'<span class="pcchip legacy" title="Legacy tmux session with the same name exists on the VPS">TWIN</span>':''}`+
+      `${s.legacyBlocked?'<span class="pcchip legacy" title="Legacy tmux diagnostic only — relay refuses to attach/manage it">LEGACY</span>':''}`;
+    t.innerHTML = `<span class="dot"></span><span class="nm"></span>${chips}<button class="kebab" tabindex="-1">⋯</button>`;
     t.querySelector('.nm').textContent = s.name;
+    if (s.dormant) {
+      t.title = s.name + ' - dormant: no shell or agent is running';
+      t.querySelector('.nm').insertAdjacentHTML('afterend', '<span class="pcchip dormant" title="Dormant placeholder - relaunch from Projects or open locally with mux">DORMANT</span>');
+    }
+    const pc = t.querySelector('.pcchip');
+    if (pc && s.hostProtocolOk === false) {
+      pc.classList.add('stale');
+      pc.textContent = 'STALE';
+      pc.title = s.hostProtocolDetail || 'muxd protocol mismatch - restart MuxdSessionHost';
+      t.title += ' - muxd protocol mismatch';
+    }
+    if (s.legacyTwin || s.legacyBlocked) t.title += ' - legacy tmux blocker';
     t.querySelector('.kebab').setAttribute('aria-label', 'Actions for '+s.name);
-    t.onclick = (ev)=>{ if(!ev.target.closest('.kebab')) connect(s.name); };
+    t.onclick = (ev)=>{ if(ev.target.closest('.kebab')) return; if(s.legacyBlocked){ setStatus('warn', esc(s.detail || 'Legacy tmux blocker')); return; } connect(s.name); };
     t.onkeydown = (ev)=>{
-      if((ev.key==='Enter'||ev.key===' ') && !ev.target.closest('.kebab')){ ev.preventDefault(); connect(s.name); }
+      if((ev.key==='Enter'||ev.key===' ') && !ev.target.closest('.kebab')){ ev.preventDefault(); if(s.legacyBlocked) setStatus('warn', esc(s.detail || 'Legacy tmux blocker')); else connect(s.name); }
       else if(ev.key==='Delete'||ev.key==='Backspace'||ev.key==='ContextMenu'){ ev.preventDefault(); openMenu(s, t.querySelector('.kebab')); }   // keyboard route to actions
     };
     t.querySelector('.kebab').onclick = (ev)=>{ ev.stopPropagation(); openMenu(s, ev.currentTarget); };
+    if (s.dormant) {
+      const dormantMsg = () => setStatus('warn', esc(s.detail || 'Dormant session - relaunch from Projects or run mux locally.'));
+      t.onclick = (ev)=>{ if(ev.target.closest('.kebab')) return; dormantMsg(); };
+      t.onkeydown = (ev)=>{ if((ev.key==='Enter'||ev.key===' ') && !ev.target.closest('.kebab')){ ev.preventDefault(); dormantMsg(); } else if(ev.key==='Delete'||ev.key==='Backspace'||ev.key==='ContextMenu'){ ev.preventDefault(); openMenu(s, t.querySelector('.kebab')); } };
+    }
     let lp; t.addEventListener('touchstart', ()=>{ lp=setTimeout(()=>openMenu(s, t.querySelector('.kebab')),500); }, {passive:true});
     t.addEventListener('touchend', ()=>clearTimeout(lp));
     if (s.name===current) setTimeout(()=>t.scrollIntoView({inline:'nearest',block:'nearest'}),0);
@@ -862,14 +1066,15 @@ function closeMenu(){ const o=menuOpener; $('#menu').classList.remove('show'); m
 document.addEventListener('click', e=>{ if(menuFor && !e.target.closest('#menu') && !e.target.closest('.kebab')) closeMenu(); });
 document.addEventListener('keydown', e=>{ if(e.key==='Escape') closeMenu(); });
 function menuAction(a, s){
+  if(a==='open' && s.dormant){ flash(s.detail || 'Dormant session - relaunch from Projects or run mux locally.'); return; }
   if(a==='open') connect(s.name);
   else if(a==='addcol') addToCollection(s);
   else if(a==='autoheal') toggleAutoheal(s);
   else if(a==='relaunch') relaunchSession(s);
-  else if(a==='opencmd'){ navigator.clipboard?.writeText('multiplex '+s.name).then(()=>flash('Open command copied — paste it in a fresh local terminal')).catch(()=>{}); }
+  else if(a==='opencmd'){ navigator.clipboard?.writeText('mux '+s.name).then(()=>flash('Open command copied — paste it in a fresh local terminal')).catch(()=>{}); }
   else if(a==='rename'){ $('#renameinput').value=s.name; renameTarget=s.name; openDialog('#renamedlg'); setTimeout(()=>$('#renameinput').select(),50); }
   else if(a==='copy'){ const url=location.origin+location.pathname+'?s='+encodeURIComponent(s.name); navigator.clipboard?.writeText(url).then(()=>flash('Link copied')).catch(()=>{}); }
-  else if(a==='kill'){ if(confirm('Kill session "'+s.name+'"? This ENDS it on the VPS (any running agent stops).')){ killSession(s.name); } }
+  else if(a==='kill'){ if(confirm('Kill session "'+s.name+'"? This ends the PC-hosted mux session (any running agent stops).')){ killSession(s.name); } }
 }
 // ---- app-sync state + Add-to-collection --------------------------------------------------------------
 // Collections are OWNED by the desktop app; the web must NOT create them independently or state drifts. So
@@ -878,7 +1083,7 @@ function menuAction(a, s){
 let _appLive=false, _appCollections=[], addColTarget=null;
 async function pollAppSync(){
   try{ const p=await (await fetch(base+'/api/projects',{headers:{'Content-Type':'application/json'}})).json();
-       _appLive=!!p.live; _appCollections=Array.isArray(p.collections)?p.collections:[]; }
+       _appLive=!!(p.appLive ?? p.live); _appCollections=Array.isArray(p.collections)?p.collections:[]; }
   catch(e){ _appLive=false; }
 }
 pollAppSync(); setInterval(pollAppSync, 8000);
@@ -898,7 +1103,7 @@ function submitAddCol(name){
   if(!_appLive){ flash('App went offline — can’t add now'); $('#addcoldlg').close(); return; }
   fetch(base+'/api/app-commands',{ method:'POST', headers:{'Content-Type':'application/json'},
     body:JSON.stringify({ type:'addtocollection', muxName:s.name, sessionName:s.name, collection:name }) })
-    .then(r=>{ if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); })
+    .then(async r=>{ if(!r.ok) throw new Error(await apiError(r)); return r.json(); })
     .then(()=>{ $('#addcoldlg').close(); flash('Queued “'+s.name+'” → “'+name+'” — the app files it on its next sync'); })
     .catch(e=>flash('Couldn’t queue: '+(e.message||e)));
 }
@@ -907,18 +1112,29 @@ function submitAddCol(name){
 function toggleAutoheal(s){
   const on = !s.autoheal;
   fetch(base+'/api/sessions/'+encodeURIComponent(s.name)+'/autoheal',{ method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({on}) })
-    .then(r=>{ if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); })
+    .then(async r=>{ if(!r.ok) throw new Error(await apiError(r)); return r.json(); })
     .then(()=>{ s.autoheal=on; const t=(window._sessions||[]).find(x=>x.name===s.name); if(t) t.autoheal=on; renderTabs();
       flash(on?'⟳ Auto-resume ON for “'+s.name+'” — it’ll relaunch if the agent dies while working':'Auto-resume off for “'+s.name+'”'); })
     .catch(e=>flash('Toggle failed: '+(e.message||e)));
 }
-async function killSession(name){
-  await fetch(base+'/api/sessions/'+encodeURIComponent(name),{method:'DELETE'});
-  if(current===name){ intentional=true; current=null; if(ws){try{ws.close();}catch(e){}} term.reset(); $('#empty').style.display='flex'; setStatus('','Session ended'); }
-  loadSessions();
+async function apiError(r){
+  let msg='HTTP '+r.status;
+  try{
+    const j=await r.json();
+    if(j && (j.error || j.detail)) msg=(j.error||msg)+(j.detail?': '+j.detail:'');
+  }catch(e){}
+  return msg;
 }
-// Relaunch a session's AGENT. After a reboot the tmux tab survives but its `ssh -t win` died (you land at
-// the VPS bash prompt). This recreates the session fresh so it SSHes back into the PC and re-runs the
+async function killSession(name){
+  try{
+    const r=await fetch(base+'/api/sessions/'+encodeURIComponent(name),{method:'DELETE'});
+    if(!r.ok) throw new Error(await apiError(r));
+    if(current===name){ intentional=true; current=null; if(ws){try{ws.close();}catch(e){}} term.reset(); $('#empty').style.display='flex'; setStatus('','Session ended'); }
+    loadSessions();
+  }catch(e){ flash('Kill failed: '+(e.message||e)); loadSessions(); }
+}
+// Relaunch a session's AGENT. After a reboot an unarmed mux session may be listed but dormant. This
+// recreates the PC-hosted session fresh and re-runs the
 // chat's resume command — the workspace comes back identically. The command is matched from the projects
 // projection by session name, so it works for any session tied to a synced chat (no desktop app needed).
 async function relaunchSession(s){
@@ -938,9 +1154,10 @@ async function relaunchSession(s){
   if(!confirm('Relaunch the agent for “'+s.name+'”?\n\nRe-runs its resume command on your PC (claude/codex --resume) — best after a reboot. The dead scrollback in this tab is cleared.')) return;
   flash('Relaunching '+s.name+'…');
   try{
-    await fetch(base+'/api/sessions/'+encodeURIComponent(s.name),{method:'DELETE'});   // drop the dead session
+    const drop=await fetch(base+'/api/sessions/'+encodeURIComponent(s.name),{method:'DELETE'});   // drop the dead session
+    if(!drop.ok) throw new Error(await apiError(drop));
     const res=await fetch(base+'/api/sessions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:s.name, command:cmd})});
-    if(!res.ok) throw new Error('HTTP '+res.status);
+    if(!res.ok) throw new Error(await apiError(res));
     connect(s.name);                                  // attach immediately; the hosted path queues/revives on muxd
     loadSessions(s.name);
     flash('Relaunched '+s.name+' — agent restarting');
@@ -966,8 +1183,11 @@ $('#newname').addEventListener('keydown', e=>{ if(e.key==='Enter'){ e.preventDef
 $('#createnew').onclick = async ()=>{
   const name=($('#newname').value||'').replace(/[^A-Za-z0-9_.-]/g,'').slice(0,40);
   const cmd=profileCmd(newProfile); $('#newdlg').close(); if(!name) return;
-  await fetch(base+'/api/sessions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name, command:cmd})});
-  loadSessions(name);
+  try{
+    const r=await fetch(base+'/api/sessions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name, command:cmd})});
+    if(!r.ok) throw new Error(await apiError(r));
+    loadSessions(name);
+  }catch(e){ flash('Create failed: '+(e.message||e)); loadSessions(); }
 };
 document.querySelectorAll('#empty .quick button').forEach(b=> b.onclick=()=>openNew(b.dataset.profile));
 
@@ -981,8 +1201,8 @@ $('#renameinput').addEventListener('keydown', e=>{ if(e.key==='Enter'){ e.preven
 $('#dorename').onclick = async ()=>{
   const to=($('#renameinput').value||'').replace(/[^A-Za-z0-9_.-]/g,'').slice(0,40); const from=renameTarget;
   $('#renamedlg').close(); if(!to||!from||to===from) return;
-  let ok=false; try{ const r=await fetch(base+'/api/sessions/'+encodeURIComponent(from),{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:to})}); ok=r.ok; }catch(e){}
-  if(!ok){ flash('Rename failed'); return; }
+  let ok=false, err=''; try{ const r=await fetch(base+'/api/sessions/'+encodeURIComponent(from),{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:to})}); ok=r.ok; if(!ok) err=await apiError(r); }catch(e){ err=e.message||String(e); }
+  if(!ok){ flash('Rename failed'+(err?': '+err:'')); return; }
   if(read[from]!=null){ read[to]=read[from]; delete read[from]; LS.set('mux_read',read); }   // migrate read-state
   if(LS.get('mux_last',null)===from) LS.set('mux_last', to);
   if(current===from) connect(to);   // re-attach under the new name (only on confirmed rename)
@@ -1403,6 +1623,7 @@ document.addEventListener('keydown', e=>{ if(e.key==='Escape' && !$('#copyview')
 
 // ---- boot ----
 buildKeybar();
+initMobileViews();
 applyViewport();
 loadSessions(new URLSearchParams(location.search).get('s') || undefined);
 setInterval(()=>{ if(document.visibilityState==='visible') loadSessions(); }, 4000);
@@ -1412,10 +1633,11 @@ async function pollHealth(){
   const dot=$('#health'); if(!dot) return;
   try{
     const h = await (await fetch(base+'/api/health')).json();
-    dot.className = 'hdot ' + (!h.tmux ? 'bad' : (h.degraded ? 'warn' : 'ok'));
+    dot.className = 'hdot ' + (h.ok ? 'ok' : (h.degraded ? 'warn' : 'bad'));
     const up = h.uptimeSec>=3600 ? Math.round(h.uptimeSec/3600)+'h' : Math.round(h.uptimeSec/60)+'m';
     const pc = (h.pc && h.pc.reachable) ? ('PC '+h.pc.rttMs+'ms') : ((h.pc && h.pc.reachable===false) ? 'PC UNREACHABLE' : 'PC …');
-    dot.title = (h.degraded?'DEGRADED':'healthy')+` · ${h.sessions} sessions · ${pc} · ${h.armed} armed`
+    const host = h.host && h.host.connected ? `host ${h.host.name||'pc'} proto ${h.host.protocol||'?'}` : 'host offline';
+    dot.title = (h.degraded?'DEGRADED':'healthy')+` · ${h.legacySessions||0} legacy · ${pc} · ${host} · ${h.armed} armed`
       + (h.gaveUp?` · ${h.gaveUp} gave-up`:'') + ` · up ${up} · node ${h.node}`;
   }catch(e){ dot.className='hdot bad'; dot.title='relay unreachable'; }
 }
