@@ -74,9 +74,83 @@ except urllib.error.HTTPError as e:
     return json.loads(out.splitlines()[-1])
 
 
+def remote_node_json(script, timeout=25):
+    encoded = base64.b64encode(script.encode("utf-8")).decode("ascii")
+    remote = "cd ~/multiplex-app && node - <<'NODE'\nconst src = Buffer.from('%s', 'base64').toString('utf8');\neval(src);\nNODE" % encoded
+    proc = subprocess.run(
+        ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", SSH_TARGET, remote],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=timeout + 15,
+        creationflags=CREATE_NO_WINDOW,
+    )
+    if proc.returncode != 0:
+        raise AssertionError(f"ssh node probe failed rc={proc.returncode}\nstdout={proc.stdout}\nstderr={proc.stderr}")
+    out = (proc.stdout or "").strip()
+    if not out:
+        raise AssertionError("remote node probe returned empty output")
+    return json.loads(out.splitlines()[-1])
+
+
+def relay_ws_marker(name, marker, timeout=25):
+    script = f"""
+const WebSocket = require('ws');
+const name = {json.dumps(name)};
+const marker = {json.dumps(marker)};
+const timeout = {int(timeout) * 1000};
+let seen = '';
+let done = false;
+function finish(obj, code) {{
+  if (done) return;
+  done = true;
+  console.log(JSON.stringify(obj));
+  try {{ ws.close(); }} catch {{}}
+  process.exit(code);
+}}
+const ws = new WebSocket('ws://127.0.0.1:7682/ws?session=' + encodeURIComponent(name) + '&cols=100&rows=30&dev=test&label=test');
+const timer = setTimeout(() => finish({{ ok:false, error:'timeout', seen: seen.slice(-1000) }}, 2), timeout);
+ws.on('open', () => {{
+  setTimeout(() => ws.send('iWrite-Output ' + marker + '\\r'), 800);
+}});
+ws.on('message', data => {{
+  seen += Buffer.from(data).toString('utf8');
+  if (seen.includes(marker)) {{
+    clearTimeout(timer);
+    finish({{ ok:true, marker, seen: seen.slice(-1000) }}, 0);
+  }}
+}});
+ws.on('close', (code, reason) => {{
+  if (!done) {{
+    clearTimeout(timer);
+    finish({{ ok:false, error:'closed', code, reason: String(reason), seen: seen.slice(-1000) }}, 3);
+  }}
+}});
+ws.on('error', err => {{
+  if (!done) {{
+    clearTimeout(timer);
+    finish({{ ok:false, error:err.message, seen: seen.slice(-1000) }}, 4);
+  }}
+}});
+"""
+    return remote_node_json(script, timeout=timeout)
+
+
 @unittest.skipUnless(enabled(), "set MUXD_VPS_TESTS=1 to run VPS-backed smoke tests")
 @unittest.skipIf(websockets is None, "websockets package is required for VPS smoke tests")
 class VpsSmokeTests(unittest.TestCase):
+    def setUp(self):
+        def host_ready():
+            health = relay_json("GET", "/api/health", timeout=10)
+            host = health.get("host") or {}
+            return health if host.get("connected") and host.get("protocolOk") else None
+
+        self.wait_for(
+            host_ready,
+            timeout=45,
+            label="relay host connected and protocol-current",
+        )
+
     def local_session(self, name):
         listing = local_json({"t": "ls"})
         for sess in listing.get("list", []):
@@ -165,6 +239,33 @@ class VpsSmokeTests(unittest.TestCase):
             self.assertFalse(second.get("created"), second)
             self.assertEqual(before.get("created"), after.get("created"))
             self.assertEqual(before.get("cmdSig"), after.get("cmdSig"))
+        finally:
+            self.kill(name)
+
+    def test_websocket_unknown_tab_creates_shell_and_bridges_io(self):
+        suffix = int(time.time() * 1000)
+        name = f"vps-web-{suffix}"
+        marker = f"MUXD_VPS_WEB_{suffix}"
+        self.kill(name)
+        try:
+            probe = relay_ws_marker(name, marker, timeout=30)
+            self.assertTrue(probe.get("ok"), probe)
+
+            local = self.wait_for(
+                lambda: self.local_session(name) if marker in ((self.local_session(name) or {}).get("tail") or "") else None,
+                label="websocket marker in local muxd tail",
+            )
+            self.assertTrue(local.get("alive"))
+            self.assertTrue(local.get("shellOnly"))
+            relay = self.relay_session(name)
+            self.assertIsNotNone(relay)
+            self.assertTrue(relay.get("hosted"))
+            self.assertTrue(relay.get("shellOnly"))
+
+            deleted = relay_json("DELETE", f"/api/sessions/{name}", timeout=20)
+            self.assertTrue(deleted.get("ok"), deleted)
+            self.wait_for(lambda: True if self.local_session(name) is None and self.relay_session(name) is None else None,
+                          label="websocket session deleted")
         finally:
             self.kill(name)
 

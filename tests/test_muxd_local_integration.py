@@ -40,6 +40,38 @@ def run_request(port, payload, timeout=8):
     return asyncio.run(request_json(port, payload, timeout=timeout))
 
 
+async def attach_and_roundtrip(port, name, command, marker, timeout=12):
+    async with websockets.connect(f"ws://127.0.0.1:{port}", open_timeout=timeout, close_timeout=1, ping_interval=None) as ws:
+        await asyncio.wait_for(ws.send(json.dumps({"t": "attach", "s": name, "cols": 100, "rows": 28, "sb": 0})), timeout)
+        await asyncio.wait_for(ws.send(command.encode("utf-8")), timeout)
+        deadline = time.time() + timeout
+        seen = bytearray()
+        while time.time() < deadline:
+            raw = await asyncio.wait_for(ws.recv(), max(0.1, deadline - time.time()))
+            if isinstance(raw, str):
+                raw = raw.encode("utf-8", "replace")
+            seen += raw
+            if marker.encode("utf-8") in seen:
+                return bytes(seen)
+    raise AssertionError(f"marker {marker!r} not seen through attach; saw={seen[-1000:]!r}")
+
+
+async def create_while_hammering_info(port, name, cmd, timeout=14):
+    create_task = asyncio.create_task(request_json(port, {"t": "create", "s": name, "cmd": cmd}, timeout=timeout))
+    samples = []
+    deadline = time.perf_counter() + timeout
+    while not create_task.done() and time.perf_counter() < deadline:
+        started = time.perf_counter()
+        try:
+            info = await request_json(port, {"t": "info"}, timeout=2)
+            samples.append((time.perf_counter() - started, info))
+        except Exception as exc:
+            samples.append((time.perf_counter() - started, exc))
+        await asyncio.sleep(0.05)
+    created = await asyncio.wait_for(create_task, timeout=timeout)
+    return created, samples
+
+
 class DisposableMuxd:
     def __init__(self):
         self.root = Path(tempfile.mkdtemp(prefix="muxd-it-"))
@@ -224,3 +256,35 @@ class MuxdLocalIntegrationTests(unittest.TestCase):
 
         self.assertEqual(killed.get("t"), "killed")
         self.assertIsNone(self.session(name))
+
+    def test_attach_stream_accepts_input_and_returns_output(self):
+        name = "it-attach-io"
+        marker = f"MUXD_IT_ATTACH_{int(time.time() * 1000)}"
+        self.kill(name)
+        try:
+            run_request(self.muxd.port, {"t": "create", "s": name}, timeout=12)
+
+            seen = asyncio.run(attach_and_roundtrip(self.muxd.port, name, f"Write-Output '{marker}'\r", marker))
+
+            self.assertIn(marker.encode("utf-8"), seen)
+            tail = self.wait_for_tail(name, marker)
+            self.assertTrue(tail.get("shellOnly"))
+        finally:
+            self.kill(name)
+
+    def test_create_does_not_block_info_requests(self):
+        name = "it-nonblocking-create"
+        marker = f"MUXD_IT_NONBLOCK_{int(time.time() * 1000)}"
+        self.kill(name)
+        try:
+            created, samples = asyncio.run(
+                create_while_hammering_info(self.muxd.port, name, f"Start-Sleep -Milliseconds 250; Write-Output '{marker}'")
+            )
+
+            self.assertTrue(created.get("created"))
+            self.assertGreaterEqual(len(samples), 1)
+            slow = [round(elapsed, 3) for elapsed, result in samples if elapsed > 1.0 or isinstance(result, Exception)]
+            self.assertEqual([], slow, f"info requests stalled or failed during create; samples={samples!r}")
+            self.wait_for_tail(name, marker)
+        finally:
+            self.kill(name)
