@@ -8,6 +8,7 @@ using System.Text;
 using System.Text.Json;
 using System.Threading.Tasks;
 using CodexLocalRetrieval.Core.Models;
+using CodexLocalRetrieval.Core.Remote;
 using CodexLocalRetrieval.Core.Services;
 using Microsoft.UI.Xaml;
 
@@ -366,15 +367,34 @@ public sealed partial class MainPage
     private static async Task<(bool ok, string detail)> EnsureMuxdScheduledTaskRunningAsync()
     {
         var query = await RunProcessCaptureAsync("schtasks", "/Query", "/TN", MuxdTaskName, "/FO", "CSV", "/NH");
-        if (query.code == 0 && query.outText.Contains("Running", StringComparison.OrdinalIgnoreCase))
-            return (true, "scheduled task already running");
         if (query.code != 0)
             return (false, "scheduled task query failed: " + (query.errText + " " + query.outText).Trim());
+        await EnsureMuxdScheduledTaskHiddenAsync();
+        if (query.outText.Contains("Running", StringComparison.OrdinalIgnoreCase))
+            return (true, "scheduled task already running");
 
         var run = await RunProcessCaptureAsync("schtasks", "/Run", "/TN", MuxdTaskName);
         if (run.code == 0) return (true, "scheduled task started");
         return (false, "scheduled task start failed: " + (run.errText + " " + run.outText).Trim());
     }
+
+    private static async Task EnsureMuxdScheduledTaskHiddenAsync()
+    {
+        try
+        {
+            var xml = await RunProcessCaptureAsync("schtasks", "/Query", "/TN", MuxdTaskName, "/XML");
+            if (xml.code != 0) return;
+            if (!MuxdTaskLaunch.TryGetHiddenPythonAction(xml.outText, File.Exists, out var exe, out var args)) return;
+            var taskRun = QuoteTaskArg(exe) + (string.IsNullOrWhiteSpace(args) ? "" : " " + args);
+            var change = await RunProcessCaptureAsync("schtasks", "/Change", "/TN", MuxdTaskName, "/TR", taskRun);
+            if (change.code != 0)
+                Diag.Log("Muxd task hidden-launch update failed: " + (change.errText + " " + change.outText).Trim());
+        }
+        catch (Exception ex) { Diag.Log("Muxd task hidden-launch check failed: " + ex.Message); }
+    }
+
+    private static string QuoteTaskArg(string value)
+        => "\"" + (value ?? "").Replace("\"", "\\\"") + "\"";
 
     private static async Task<(int code, string outText, string errText)> RunProcessCaptureAsync(string file, params string[] args)
     {
