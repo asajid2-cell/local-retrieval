@@ -1,8 +1,10 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Text.Json;
 using System.Threading.Tasks;
+using CodexLocalRetrieval.Core.Models;
 using CodexLocalRetrieval.Core.Services;
 using Microsoft.UI.Text;
 using Microsoft.UI.Xaml;
@@ -70,7 +72,7 @@ public sealed partial class MainPage
             catch { }
             return rows;
         });
-        var localTask = Task.Run(GetRunningSessions);
+        var localTask = Task.Run(() => EnrichRunningSessionTitles(ResolveMissingSessionIds(GetRunningSessions())));
         await Task.WhenAll(muxTask, localTask);
         if (seq != _runningSeq || _screen != "Running") return;   // navigated away / re-rendered meanwhile
 
@@ -79,7 +81,7 @@ public sealed partial class MainPage
         // a local process whose session is a multiplex one is the SAME agent seen from the OS side — don't list it twice
         var local = localTask.Result
             .Where(r => string.IsNullOrEmpty(r.SessionId)
-                        || !_archive.Store.Sessions.TryGetValue(r.SessionId, out var s0)
+                        || FindArchiveSessionForRunning(r) is not { } s0
                         || !muxIds.Contains(ArchiveService.MultiplexSessionName(s0)))
             .ToList();
 
@@ -117,6 +119,7 @@ public sealed partial class MainPage
 
     private Border MuxRowCard(MuxRow m, string target, int port)
     {
+        var session = FindArchiveSessionByMuxName(m.Name);
         var grid = new Grid { ColumnDefinitions = { new ColumnDefinition(), new ColumnDefinition { Width = GridLength.Auto } } };
         var left = new StackPanel { Spacing = 3, VerticalAlignment = VerticalAlignment.Center };
         var nameRow = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8 };
@@ -133,6 +136,10 @@ public sealed partial class MainPage
         if (m.Hosted) nameRow.Children.Add(SmallChip("PC", "Runs on this PC (muxd) — survives network/VPS failures"));
         if (m.Armed) nameRow.Children.Add(SmallChip("auto", "Auto-resume is ON for this session"));
         left.Children.Add(nameRow);
+        if (session is not null)
+        {
+            left.Children.Add(new TextBlock { Text = Trim(session.DisplayTitle, 110), Foreground = MutedBrush(), FontSize = 12, TextWrapping = TextWrapping.Wrap });
+        }
         var age = m.Activity > 0 ? $" · active {Ago(m.Activity)}" : "";
         left.Children.Add(new TextBlock { Text = stateLabel + age + (m.Attached ? " · viewer attached" : ""), Foreground = MutedBrush(), FontSize = 11 });
         grid.Children.Add(left);
@@ -142,6 +149,11 @@ public sealed partial class MainPage
         {
             await Windows.System.Launcher.LaunchUriAsync(new Uri("https://harmonizerlabs.cc/multiplex/?s=" + Uri.EscapeDataString(m.Name)));
         }));
+        if (session is not null)
+        {
+            var s = session;
+            actions.Children.Add(SmallAction("Transcript", "Open this chat's transcript in the archive reader", () => { OpenSession(s); return Task.CompletedTask; }));
+        }
         actions.Children.Add(SmallAction("Add to collection", "File this session's chat into a collection", () => { ShowMuxAddToCollectionFlyout(m.Name); return Task.CompletedTask; }));
         actions.Children.Add(SmallAction("Kill", "End this session (the agent stops)", async () =>
         {
@@ -158,20 +170,30 @@ public sealed partial class MainPage
 
     private Border LocalRowCard(ArchiveService.RunningSessionInfo r)
     {
-        var known = !string.IsNullOrEmpty(r.SessionId) && _archive.Store.Sessions.TryGetValue(r.SessionId, out _);
-        var session = known ? _archive.Store.Sessions[r.SessionId] : null;
+        var session = FindArchiveSessionForRunning(r);
         var title = session?.DisplayTitle ?? (string.IsNullOrEmpty(r.RealTitle) ? $"Unsaved {r.Tool} session" : r.RealTitle);
 
         var grid = new Grid { ColumnDefinitions = { new ColumnDefinition(), new ColumnDefinition { Width = GridLength.Auto } } };
         var left = new StackPanel { Spacing = 3, VerticalAlignment = VerticalAlignment.Center };
         var nameRow = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8 };
         nameRow.Children.Add(new TextBlock { Text = r.Tool == "codex" ? "CX" : "CL", Foreground = MutedBrush(), FontSize = 11, FontWeight = FontWeights.SemiBold, VerticalAlignment = VerticalAlignment.Center });
-        nameRow.Children.Add(new TextBlock { Text = Trim(title, 64), Foreground = StrongBrush(), FontSize = 14, FontWeight = FontWeights.SemiBold, VerticalAlignment = VerticalAlignment.Center });
+        var titleBlock = new TextBlock { Text = Trim(title, 64), Foreground = StrongBrush(), FontSize = 14, FontWeight = FontWeights.SemiBold, VerticalAlignment = VerticalAlignment.Center };
+        ToolTipService.SetToolTip(titleBlock, session?.SourcePath ?? r.SessionId);
+        nameRow.Children.Add(titleBlock);
         left.Children.Add(nameRow);
+        if (!string.IsNullOrWhiteSpace(r.Preview))
+        {
+            left.Children.Add(new TextBlock { Text = Trim(r.Preview, 150), Foreground = MutedBrush(), FontSize = 11, TextWrapping = TextWrapping.Wrap });
+        }
         left.Children.Add(new TextBlock { Text = $"{r.Parent} · pid {r.Pid}" + (string.IsNullOrEmpty(r.SessionId) ? "" : $" · {r.SessionId[..Math.Min(8, r.SessionId.Length)]}"), Foreground = MutedBrush(), FontSize = 11 });
         grid.Children.Add(left);
 
         var actions = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 6, VerticalAlignment = VerticalAlignment.Center };
+        if (!string.IsNullOrWhiteSpace(r.SessionId))
+        {
+            var knownSession = session;
+            actions.Children.Add(SmallAction("Transcript", "Open the transcript for this running process", async () => await OpenRunningTranscriptAsync(r, knownSession)));
+        }
         if (session is not null)
         {
             var s = session;
@@ -189,6 +211,71 @@ public sealed partial class MainPage
         grid.Children.Add(actions);
         return RowCard(grid);
     }
+
+    private ArchiveSession? FindArchiveSessionForRunning(ArchiveService.RunningSessionInfo running) =>
+        FindArchiveSessionByIdOrAlias(running.SessionId, running.Tool);
+
+    private ArchiveSession? FindArchiveSessionByIdOrAlias(string? id, string? tool)
+    {
+        if (string.IsNullOrWhiteSpace(id)) return null;
+        return _archive.ResolveTargetSession(new AgentCommand { id = id.Trim(), tool = tool });
+    }
+
+    private ArchiveSession? FindArchiveSessionByMuxName(string muxName)
+    {
+        if (string.IsNullOrWhiteSpace(muxName)) return null;
+        return _archive.Store.Sessions.Values.FirstOrDefault(s =>
+            string.Equals(ArchiveService.MultiplexSessionName(s), muxName, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private async Task OpenRunningTranscriptAsync(ArchiveService.RunningSessionInfo running, ArchiveSession? knownSession)
+    {
+        var session = knownSession ?? BuildTransientRunningSession(running);
+        if (session is null)
+        {
+            await ShowInfoAsync(
+                "Transcript not found",
+                string.IsNullOrWhiteSpace(running.SessionId)
+                    ? "This running process did not expose a session id."
+                    : $"No local transcript file was found for {running.Tool} session {running.SessionId}.");
+            return;
+        }
+
+        OpenSession(session);
+        SyncStatus.Text = $"Opened transcript for \"{Trim(session.DisplayTitle, 40)}\".";
+    }
+
+    private ArchiveSession? BuildTransientRunningSession(ArchiveService.RunningSessionInfo running)
+    {
+        if (string.IsNullOrWhiteSpace(running.SessionId)) return null;
+        var path = RunningTranscriptPath(running.Tool, running.SessionId);
+        if (string.IsNullOrWhiteSpace(path) || !File.Exists(path)) return null;
+
+        var title = !string.IsNullOrWhiteSpace(running.RealTitle)
+            ? running.RealTitle
+            : $"{running.Tool} running session {ShortId(running.SessionId)}";
+        var updated = DateTime.UtcNow.ToString("O");
+        try { updated = File.GetLastWriteTimeUtc(path).ToString("O"); } catch { }
+
+        return new ArchiveSession
+        {
+            Id = running.SessionId,
+            Tool = string.Equals(running.Tool, "claude", StringComparison.OrdinalIgnoreCase) ? "claude" : "codex",
+            Title = title,
+            SourcePath = path,
+            CreatedAt = updated,
+            UpdatedAt = updated,
+            Workspace = running.Cwd,
+            WorkspaceName = string.IsNullOrWhiteSpace(running.Cwd) ? "Running now" : Path.GetFileName(running.Cwd.TrimEnd('\\', '/')),
+        };
+    }
+
+    private static string? RunningTranscriptPath(string tool, string sessionId) =>
+        string.Equals(tool, "codex", StringComparison.OrdinalIgnoreCase)
+            ? ArchiveService.ReadCodexRolloutPath(CodexDbPath, sessionId)
+            : FindClaudeTranscript(sessionId);
+
+    private static string ShortId(string id) => id.Length <= 8 ? id : id[..4] + id[^4..];
 
     private Border SmallChip(string text, string tip)
     {
