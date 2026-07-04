@@ -93,6 +93,18 @@ let hostProtocol = { protocol: 0, caps: [] };
 const hostUp = () => !!(hostWs && hostWs.readyState === 1);
 function sendHost(obj) { if (hostUp()) { try { hostWs.send(JSON.stringify(obj)); return true; } catch {} } return false; }
 const hostedHas = name => hostUp() && hostSessions.has(name);
+function normalizedCommand(cmd) { return String(cmd || '').trim(); }
+function commandSig(cmd) {
+  const c = normalizedCommand(cmd);
+  return c ? crypto.createHash('sha256').update(c, 'utf8').digest('hex').slice(0, 16) : '';
+}
+function hostedCompatibleWithCommand(existing, cmd) {
+  const requestedSig = commandSig(cmd);
+  if (!requestedSig) return true;
+  if (!existing || existing.alive === false) return false;
+  if (existing.shellOnly || existing.hasCommand === false) return false;
+  return !!existing.cmdSig && existing.cmdSig === requestedSig;
+}
 function hostProtocolOk() {
   if (!hostUp() || hostProtocol.protocol < REQUIRED_HOST_PROTOCOL) return false;
   const caps = new Set(hostProtocol.caps || []);
@@ -195,6 +207,8 @@ function listSessions() {
       list.push({ name, windows: 1, created: h.created || 0, attached, activity: h.lastOut || 0,
                   state: detachedLocal ? 'detached' : (dormant ? 'dormant' : paneAgentState(name, h.tail || '')), autoheal: _healOn.has(name), hosted: true,
                   alive, dormant, detachedLocal, cols: h.cols || 0, rows: h.rows || 0,
+                  hasCommand: !!h.hasCommand, shellOnly: !!h.shellOnly, ready: !!h.ready,
+                  kind: h.kind || (dormant ? 'dormant' : (h.shellOnly ? 'shell' : 'command')), cmdSig: h.cmdSig || '',
                   localViewers: h.localViewers || 0, localFirst: !!h.localFirst,
                   detail: detachedLocal ? 'Local agent process is still running, but the muxd mirror is detached. New muxrun sessions re-register automatically; restart this one through mux to restore web terminal control.'
                          : dormant ? 'Dormant mux session: no shell or agent is running until you relaunch it or run mux locally.' : '',
@@ -228,14 +242,15 @@ app.post('/api/sessions', async (req, res) => {
   const cmd = typeof body.command === 'string' ? body.command : '';
   if (tmuxHas(name)) return failLegacy(res, name);
   const existing = hostSessions.get(name);
-  if (hostedHas(name) && existing && existing.alive !== false) return res.json({ ok: true, name, created: false, hosted: true, owner: !!existing.owner, hostProtocol: hostProtocol.protocol || 0 });
+  if (hostedHas(name) && existing && existing.alive !== false && hostedCompatibleWithCommand(existing, cmd)) return res.json({ ok: true, name, created: false, hosted: true, owner: !!existing.owner, hostProtocol: hostProtocol.protocol || 0 });
   if (!hasCommand) return res.status(400).json({ error: 'command required to start a mux session' });
   if (!requireHostProtocol(res, 'refusing to start PC-local mux session')) return;
   if (!sendHost({ t: 'create', s: name, cmd, cols: 140, rows: 40, heal: _healOn.has(name) })) {
     return failHost(res, 503, 'PC mux host offline', 'host socket closed before create could be sent');
   }
   markPending(name);
-  hostSessions.set(name, { alive: true, created: Date.now(), lastOut: Date.now(), tail: '', heal: _healOn.has(name), cols: 140, rows: 40, owner: false, localFirst: false, localViewers: 0 });
+  hostSessions.set(name, { alive: true, created: Date.now(), lastOut: Date.now(), tail: '', heal: _healOn.has(name), cols: 140, rows: 40, owner: false, localFirst: false, localViewers: 0,
+                           hasCommand: !!normalizedCommand(cmd), shellOnly: !normalizedCommand(cmd), ready: true, kind: normalizedCommand(cmd) ? 'command' : 'shell', cmdSig: commandSig(cmd) });
   const confirmed = await waitForHostState(() => {
     const h = hostSessions.get(name);
     return h && h.alive !== false ? h : null;
@@ -544,7 +559,9 @@ function bootRecreate() {
         // recoveries land on the SAFE path: recreate as a PC-hosted session (muxd runs the resume)
         sendHost({ t: 'create', s: name, cmd, cols: 140, rows: 40, heal: true });
         markPending(name);
-        hostSessions.set(name, { alive: true, created: Date.now(), lastOut: Date.now(), tail: '', heal: true });
+        hostSessions.set(name, { alive: true, created: Date.now(), lastOut: Date.now(), tail: '', heal: true,
+                                 hasCommand: !!normalizedCommand(cmd), shellOnly: !normalizedCommand(cmd), ready: true,
+                                 kind: normalizedCommand(cmd) ? 'command' : 'shell', cmdSig: commandSig(cmd) });
         n++; console.log(`[boot-recreate] ${name}: recreated HOSTED + resume queued`);
       } else if (hostUp()) {
         console.log(`[boot-recreate] ${name}: ${hostProtocolDetail()} - skipped`);
@@ -771,7 +788,21 @@ wssHost.on('connection', (ws, req) => {
       }
       const list = m.t === 'hello' ? m.sessions : m.list;
       const reported = new Set(), incoming = new Map();
-      for (const s of (list || [])) { const n = SAFE(s.name); if (n) { reported.add(n); incoming.set(n, { alive: !!s.alive, created: s.created || 0, lastOut: s.lastOut || 0, tail: String(s.tail || ''), cols: s.cols || 0, rows: s.rows || 0, heal: !!s.heal, owner: !!s.owner, localFirst: !!s.localFirst, localViewers: s.localViewers || 0 }); } }
+      for (const s of (list || [])) {
+        const n = SAFE(s.name);
+        if (n) {
+          const alive = !!s.alive;
+          const hasCommand = !!s.hasCommand;
+          const shellOnly = Object.prototype.hasOwnProperty.call(s, 'shellOnly') ? !!s.shellOnly : (alive && !hasCommand);
+          reported.add(n);
+          incoming.set(n, { alive, created: s.created || 0, lastOut: s.lastOut || 0, tail: String(s.tail || ''),
+                            cols: s.cols || 0, rows: s.rows || 0, heal: !!s.heal, owner: !!s.owner,
+                            localFirst: !!s.localFirst, localViewers: s.localViewers || 0,
+                            hasCommand, shellOnly, ready: Object.prototype.hasOwnProperty.call(s, 'ready') ? !!s.ready : alive,
+                            kind: String(s.kind || (alive ? (shellOnly ? 'shell' : 'command') : 'dormant')),
+                            cmdSig: String(s.cmdSig || '') });
+        }
+      }
       // A2 #1: don't let a status push evict an optimistic create muxd hasn't reported yet; confirm/expire pendings.
       for (const [n, exp] of [...pendingCreates]) {
         if (Date.now() > exp || reported.has(n)) pendingCreates.delete(n);
