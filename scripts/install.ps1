@@ -144,6 +144,8 @@ if (Test-Path $remoteDir) {
         Get-ChildItem -LiteralPath $remoteDir -Filter $pattern -File -ErrorAction SilentlyContinue |
             Copy-Item -Destination $remoteStaging -Force -ErrorAction SilentlyContinue
     }
+    $remoteTunnelTemplate = Join-Path $repo 'scripts\remote-tunnel.ps1'
+    if (Test-Path $remoteTunnelTemplate) { Copy-Item $remoteTunnelTemplate (Join-Path $remoteStaging 'remote-tunnel.ps1') -Force }
     Get-ChildItem -LiteralPath $serverBuildDir -Exclude '*.pdb' | Copy-Item -Destination $remoteStaging -Recurse -Force
 
     $remoteCritical = @('CodexLocalRetrieval.Server.exe','CodexLocalRetrieval.Server.dll','CodexLocalRetrieval.Core.dll',
