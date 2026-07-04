@@ -310,8 +310,14 @@
                     Style="{StaticResource PrimaryPillButtonStyle}" />
                 <Button
                     Click="ResumeInMultiplex_Click"
-                    Content="Resume in multiplex"
-                    ToolTipService.ToolTip="Resume in a multiplex you can also drive from your phone (harmonizerlabs.cc/multiplex)."
+                    Content="Start multiplex"
+                    ToolTipService.ToolTip="Start this chat in multiplex and open a local terminal attached to it."
+                    HorizontalAlignment="Stretch"
+                    Style="{StaticResource PillButtonStyle}" />
+                <Button
+                    Click="ResumeInHeadlessMultiplex_Click"
+                    Content="Start headless multiplex"
+                    ToolTipService.ToolTip="Start this chat in multiplex without opening a local terminal; attach later with mux &lt;name&gt;."
                     HorizontalAlignment="Stretch"
                     Style="{StaticResource PillButtonStyle}" />
                 <Button

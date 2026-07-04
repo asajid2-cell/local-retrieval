@@ -1329,10 +1329,15 @@ public sealed partial class MainPage : Page
         resume.Click += (_, _) => ResumeInTerminal(session);
         flyout.Items.Add(resume);
 
-        var remote = new MenuFlyoutItem { Text = "Resume in multiplex" };
-        ToolTipService.SetToolTip(remote, "Resume in a multiplex you can also drive from your phone (harmonizerlabs.cc/multiplex).");
-        remote.Click += (_, _) => StartRemoteSession(session);
+        var remote = new MenuFlyoutItem { Text = "Start multiplex" };
+        ToolTipService.SetToolTip(remote, "Start in multiplex and open a local terminal attached to it.");
+        remote.Click += (_, _) => StartRemoteSession(session, openLocalAttach: true);
         flyout.Items.Add(remote);
+
+        var headlessRemote = new MenuFlyoutItem { Text = "Start headless multiplex" };
+        ToolTipService.SetToolTip(headlessRemote, "Start in multiplex without opening a local terminal; attach later with mux <name>.");
+        headlessRemote.Click += (_, _) => StartRemoteSession(session, openLocalAttach: false);
+        flyout.Items.Add(headlessRemote);
 
         var bump = new MenuFlyoutItem
         {

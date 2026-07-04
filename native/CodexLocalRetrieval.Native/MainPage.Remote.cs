@@ -15,15 +15,20 @@ using Microsoft.UI.Xaml;
 namespace CodexLocalRetrieval_Native;
 
 // "Start in multiplexer": resume a chat in a PC-local muxd session. muxd owns the PTY on this
-// machine; harmonizerlabs.cc/multiplex and local `mux <name>` attach to that same headless session.
+// machine; harmonizerlabs.cc/multiplex and local `mux <name>` attach to that same session.
 public sealed partial class MainPage
 {
     private void ResumeInMultiplex_Click(object sender, RoutedEventArgs e)
     {
-        if (_selected is not null) StartRemoteSession(_selected);
+        if (_selected is not null) StartRemoteSession(_selected, openLocalAttach: true);
     }
 
-    private async void StartRemoteSession(ArchiveSession session)
+    private void ResumeInHeadlessMultiplex_Click(object sender, RoutedEventArgs e)
+    {
+        if (_selected is not null) StartRemoteSession(_selected, openLocalAttach: false);
+    }
+
+    private async void StartRemoteSession(ArchiveSession session, bool openLocalAttach = false)
     {
         var command = _archive.BuildMultiplexCommand(session);
         if (string.IsNullOrEmpty(command))
@@ -39,10 +44,20 @@ public sealed partial class MainPage
         try
         {
             // Already in muxd? Do not inject a SECOND resume into the same transcript.
-            // The visible terminal/web tab that owns it is already the place to continue.
+            // Attach locally if this was the foreground/local action.
             if (await LocalMuxdSessionAliveAsync(name))
             {
-                SyncStatus.Text = $"\"{title}\" is already in multiplexer as \"{name}\".";
+                if (openLocalAttach)
+                {
+                    var opened = OpenLocalMuxAttach(name);
+                    SyncStatus.Text = opened.ok
+                        ? $"\"{title}\" is already in multiplex as \"{name}\" - opening local terminal..."
+                        : $"\"{title}\" is already in multiplex as \"{name}\" - attach with mux {name}.";
+                }
+                else
+                {
+                    SyncStatus.Text = $"\"{title}\" is already in headless multiplex as \"{name}\" - attach with mux {name}.";
+                }
                 return;
             }
             // Running locally (or elsewhere) right now? Don't let two copies fight over the transcript.
@@ -62,7 +77,17 @@ public sealed partial class MainPage
             SessionList.SelectedItem = session;
             _ = _archive.SaveAsync();
 
-            SyncStatus.Text = $"Mux \"{title}\" live as \"{name}\" - open it on your phone at /multiplex or attach with mux {name}.";
+            if (openLocalAttach)
+            {
+                var opened = OpenLocalMuxAttach(name);
+                SyncStatus.Text = opened.ok
+                    ? $"Mux \"{title}\" live as \"{name}\" - opening local terminal; web can attach at /multiplex."
+                    : $"Mux \"{title}\" live as \"{name}\" - web can attach at /multiplex; local attach failed, run mux {name}.";
+            }
+            else
+            {
+                SyncStatus.Text = $"Headless mux \"{title}\" live as \"{name}\" - open it on your phone at /multiplex or attach with mux {name}.";
+            }
         }
         catch (Exception ex)
         {
@@ -70,6 +95,32 @@ public sealed partial class MainPage
             SyncStatus.Text = "Could not start the mux session - see log.";
         }
     }
+
+    private static (bool ok, string detail) OpenLocalMuxAttach(string name)
+    {
+        try
+        {
+            var mux = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".local", "bin", "mux.cmd");
+            if (!File.Exists(mux)) mux = "mux";
+            var command = $"{QuoteCmd(mux)} {QuoteCmd(name)}";
+            var psi = new ProcessStartInfo
+            {
+                FileName = "cmd.exe",
+                Arguments = $"/k \"{command}\"",
+                WorkingDirectory = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                UseShellExecute = true
+            };
+            Process.Start(psi);
+            return (true, command);
+        }
+        catch (Exception ex)
+        {
+            Diag.Log("OpenLocalMuxAttach FAILED " + ex);
+            return (false, ex.Message);
+        }
+    }
+
+    private static string QuoteCmd(string value) => "\"" + (value ?? "").Replace("\"", "\\\"") + "\"";
 
     // --- project sync: keep the web's Projects view (harmonizerlabs.cc/multiplex) in step with the app
     // while it's open, so you can see your collections + chats and resume any of them remotely. Pushes
