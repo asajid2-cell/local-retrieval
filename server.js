@@ -66,7 +66,15 @@ app.use(async (req, res, next) => {
   return res.status(403).send('Forbidden — owner only.');
 });
 
-app.use(express.static(__dirname + '/public'));
+app.use(express.static(__dirname + '/public', {
+  setHeaders(res, filePath) {
+    if (String(filePath || '').endsWith('.html')) {
+      res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+      res.setHeader('Pragma', 'no-cache');
+      res.setHeader('Expires', '0');
+    }
+  }
+}));
 
 const SAFE = s => String(s || '').replace(/[^A-Za-z0-9_.-]/g, '').slice(0, 48);
 // ---- PC SESSION HOST link (P2/P3 — the ownership flip) ---------------------------------------------
