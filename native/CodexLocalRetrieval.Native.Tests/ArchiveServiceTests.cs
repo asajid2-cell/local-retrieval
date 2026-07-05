@@ -387,9 +387,14 @@ public sealed class ArchiveServiceTests
         using var doc = System.Text.Json.JsonDocument.Parse(svc.BuildProjectsProjectionJson());
         var root = doc.RootElement;
         Assert.IsTrue(root.GetProperty("host").GetString()!.Length > 0);
+        var decks = root.GetProperty("decks");
+        Assert.AreEqual(1, decks.GetArrayLength());
+        Assert.AreEqual("main", decks[0].GetProperty("id").GetString());
         var cols = root.GetProperty("collections");
         Assert.AreEqual(1, cols.GetArrayLength());
         Assert.AreEqual("Cortex Engine", cols[0].GetProperty("name").GetString());
+        Assert.AreEqual("main", cols[0].GetProperty("deckId").GetString());
+        Assert.AreEqual("Main", cols[0].GetProperty("deckName").GetString());
         var chats = cols[0].GetProperty("chats");
         Assert.AreEqual(2, chats.GetArrayLength());
         foreach (var ch in chats.EnumerateArray())
@@ -428,6 +433,8 @@ public sealed class ArchiveServiceTests
         Assert.AreEqual(200, rs[0].GetProperty("pid").GetInt32());
         Assert.AreEqual("Cortex Push", rs[0].GetProperty("title").GetString());
         Assert.AreEqual("Cortex Engine", rs[0].GetProperty("collection").GetString());
+        Assert.AreEqual("main", rs[0].GetProperty("collectionDeckId").GetString());
+        Assert.AreEqual("Main", rs[0].GetProperty("collectionDeck").GetString());
         Assert.AreEqual(300, rs[1].GetProperty("pid").GetInt32());
         Assert.AreEqual(System.Text.Json.JsonValueKind.Null, rs[1].GetProperty("title").ValueKind);   // uncollected -> null title
         Assert.AreEqual("Terminal", rs[1].GetProperty("parent").GetString());

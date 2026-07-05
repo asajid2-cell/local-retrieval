@@ -229,7 +229,7 @@ public sealed partial class MainPage
                 }
                 else if (string.Equals(c.type, "addtocollection", StringComparison.OrdinalIgnoreCase))
                 {
-                    res = await AddSessionToCollectionAsync(c.muxName ?? c.sessionName ?? "", c.collection ?? "");
+                    res = await AddSessionToCollectionAsync(c.muxName ?? c.sessionName ?? "", c.collection ?? "", c.collectionId ?? "", c.deckId ?? "", c.deckName ?? c.deck ?? "");
                     added |= res.ok;
                 }
                 else if (string.Equals(c.type, "startmux", StringComparison.OrdinalIgnoreCase))
@@ -261,6 +261,10 @@ public sealed partial class MainPage
         public string? sessionName { get; set; }
         public string? muxCommand { get; set; }
         public string? collection { get; set; }
+        public string? collectionId { get; set; }
+        public string? deckId { get; set; }
+        public string? deck { get; set; }
+        public string? deckName { get; set; }
     }
 
     private async Task<(bool ok, string detail)> StartMuxHeadlessFromCommandAsync(string name, string command)
@@ -276,15 +280,37 @@ public sealed partial class MainPage
     // only allows this while the app is live (the app OWNS collections, so this can't drift out of sync). We
     // resolve the mux session name back to its ArchiveSession, then reuse the tested AddToCollectionAsync and
     // re-push the projection so the web reflects it.
-    private async Task<(bool ok, string detail)> AddSessionToCollectionAsync(string muxName, string collection)
+    private async Task<(bool ok, string detail)> AddSessionToCollectionAsync(string muxName, string collection, string collectionId = "", string deckId = "", string deckName = "")
     {
-        muxName = (muxName ?? "").Trim(); collection = (collection ?? "").Trim();
-        if (string.IsNullOrEmpty(muxName) || string.IsNullOrEmpty(collection)) return (false, "missing session or collection");
+        muxName = (muxName ?? "").Trim(); collection = (collection ?? "").Trim(); collectionId = (collectionId ?? "").Trim();
+        deckId = (deckId ?? "").Trim(); deckName = (deckName ?? "").Trim();
+        if (string.IsNullOrEmpty(muxName) || (string.IsNullOrEmpty(collection) && string.IsNullOrEmpty(collectionId))) return (false, "missing session or collection");
         ArchiveSession? session = null;
         foreach (var s in _archive.Store.Sessions.Values)
             if (string.Equals(ArchiveService.MultiplexSessionName(s), muxName, StringComparison.OrdinalIgnoreCase)) { session = s; break; }
         if (session is null) return (false, "no chat matches “" + muxName + "”");
-        try { await _archive.AddToCollectionAsync(session, collection); return (true, "added to " + collection); }
+        try
+        {
+            if (!string.IsNullOrEmpty(collectionId) && _archive.Store.Collections.ContainsKey(collectionId))
+            {
+                await _archive.AddToCollectionByIdAsync(session, collectionId);
+                var existing = _archive.Store.Collections[collectionId];
+                return (true, "added to " + existing.Name);
+            }
+            var resolvedDeck = _archive.ResolveDeckId(deckId);
+            if (string.IsNullOrWhiteSpace(deckId) && !string.IsNullOrWhiteSpace(deckName))
+            {
+                var existingDeck = _archive.Decks.FirstOrDefault(d => string.Equals(d.Name, deckName, StringComparison.OrdinalIgnoreCase));
+                resolvedDeck = existingDeck?.Id ?? (await _archive.CreateDeckAsync(deckName)).Id;
+            }
+            else if (!string.IsNullOrWhiteSpace(deckId) && !_archive.Decks.Any(d => string.Equals(d.Id, deckId, StringComparison.OrdinalIgnoreCase)))
+            {
+                return (false, "unknown deck: " + deckId);
+            }
+            await _archive.AddToCollectionAsync(session, collection, resolvedDeck);
+            var deckLabel = _archive.Decks.FirstOrDefault(d => string.Equals(d.Id, resolvedDeck, StringComparison.OrdinalIgnoreCase))?.Name ?? "Main";
+            return (true, "added to " + collection + " on " + deckLabel);
+        }
         catch (Exception ex) { return (false, "add failed: " + ex.Message); }
     }
 

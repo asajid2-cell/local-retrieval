@@ -2093,12 +2093,27 @@ public sealed class ArchiveService
     // each enriched here with the matched chat title + collection name when the session id is known.
     public string BuildProjectsProjectionJson(ISet<string>? runningIds = null, IEnumerable<RunningSessionInfo>? runningSessions = null)
     {
+        EnsureDecks();
+        var deckNames = Store.Decks.ToDictionary(d => d.Id, d => d.Name, StringComparer.OrdinalIgnoreCase);
+        var deckOrder = Store.Decks.Select((d, i) => new { d.Id, Order = i })
+            .ToDictionary(d => d.Id, d => d.Order, StringComparer.OrdinalIgnoreCase);
+        var decks = Store.Decks
+            .Select(d => new
+            {
+                id = d.Id,
+                name = d.Name,
+                collections = CollectionCountInDeck(d.Id),
+            })
+            .ToList();
         var collections = Store.Collections.Values
-            .OrderBy(c => c.Name, StringComparer.OrdinalIgnoreCase)
+            .OrderBy(c => deckOrder.TryGetValue(CollectionDeck(c), out var order) ? order : int.MaxValue)
+            .ThenBy(c => c.Name, StringComparer.OrdinalIgnoreCase)
             .Select(col => new
             {
                 id = col.Id,
                 name = col.Name,
+                deckId = CollectionDeck(col),
+                deckName = deckNames.TryGetValue(CollectionDeck(col), out var deckName) ? deckName : "Main",
                 chats = col.SessionIds
                     .Select(sid => Store.Sessions.TryGetValue(sid, out var s) ? s : null)
                     .Where(s => s is not null)
@@ -2117,14 +2132,16 @@ public sealed class ArchiveService
             .Where(c => c.chats.Count > 0)
             .ToList();
 
-        // Map every known chat's id + aliases -> (title, collection) so a running process can be named.
-        var byId = new Dictionary<string, (string Title, string Collection)>(StringComparer.OrdinalIgnoreCase);
+        // Map every known chat's id + aliases -> (title, collection, deck) so a running process can be named.
+        var byId = new Dictionary<string, (string Title, string Collection, string DeckId, string Deck)>(StringComparer.OrdinalIgnoreCase);
         foreach (var col in Store.Collections.Values)
             foreach (var sid in col.SessionIds)
                 if (Store.Sessions.TryGetValue(sid, out var s) && s is not null)
                 {
-                    if (!string.IsNullOrEmpty(s.Id)) byId[s.Id] = (s.DisplayTitle, col.Name);
-                    foreach (var a in s.Aliases) if (!string.IsNullOrEmpty(a)) byId[a] = (s.DisplayTitle, col.Name);
+                    var deckId = CollectionDeck(col);
+                    var deck = deckNames.TryGetValue(deckId, out var dn) ? dn : "Main";
+                    if (!string.IsNullOrEmpty(s.Id)) byId[s.Id] = (s.DisplayTitle, col.Name, deckId, deck);
+                    foreach (var a in s.Aliases) if (!string.IsNullOrEmpty(a)) byId[a] = (s.DisplayTitle, col.Name, deckId, deck);
                 }
 
         var running = (runningSessions ?? Enumerable.Empty<RunningSessionInfo>())
@@ -2141,6 +2158,8 @@ public sealed class ArchiveService
                     cwd = r.Cwd,
                     title = hit.Title,             // null when the running session isn't in any collection
                     collection = hit.Collection,
+                    collectionDeckId = hit.DeckId,
+                    collectionDeck = hit.Deck,
                     realTitle = string.IsNullOrEmpty(r.RealTitle) ? null : r.RealTitle,   // the tool's OWN name
                     preview = string.IsNullOrEmpty(r.Preview) ? null : r.Preview,
                 };
@@ -2148,7 +2167,7 @@ public sealed class ArchiveService
             .OrderByDescending(r => r.startedAt, StringComparer.Ordinal)
             .ToList();
 
-        return JsonSerializer.Serialize(new { host = Environment.MachineName, collections, runningSessions = running });
+        return JsonSerializer.Serialize(new { host = Environment.MachineName, decks, collections, runningSessions = running });
     }
 
     public static string ResolveClaudeExe()
