@@ -7,7 +7,7 @@
 #
 # Protocol (JSON text frames over ws):
 #   muxd -> relay:  hello{host,sessions} . sessions{list} . o{s,d:b64} . sb{s,d:b64} . killed{s} . pong
-#   relay -> muxd:  create{s,cmd,cwd,cols,rows} . i{s,d:b64} . resize{s,cols,rows} . kill{s} . sb{s} . ping
+#   relay -> muxd:  create{s,cmd,cwd,cols,rows,relaunch} . i{s,d:b64} . resize{s,cols,rows} . kill{s} . sb{s} . ping
 #
 # State: sessions.json manifest (resume commands) -> muxd restart / PC reboot lists unarmed sessions
 # as dormant placeholders. Only sessions explicitly armed with heal auto-start.
@@ -54,7 +54,7 @@ LOCAL_FIRST_TIMEOUT = float(ENV.get("LOCAL_FIRST_TIMEOUT", "3"))
 LOOP_WATCHDOG_WARN = float(ENV.get("LOOP_WATCHDOG_WARN", "30"))
 LOOP_WATCHDOG_EXIT = float(ENV.get("LOOP_WATCHDOG_EXIT", "12"))
 PROTOCOL = 2
-CAPS = ["ls", "info", "create", "open", "attach", "kill", "rename", "heal", "tail", "scrollback", "resize", "owner"]
+CAPS = ["ls", "info", "create", "open", "attach", "kill", "rename", "heal", "tail", "scrollback", "resize", "owner", "relaunch"]
 STARTED = time.time()
 AGENT_WORKING_FRESH = float(ENV.get("AGENT_WORKING_FRESH", "25"))
 AGENT_STARTING_GRACE = float(ENV.get("AGENT_STARTING_GRACE", "45"))
@@ -546,11 +546,12 @@ async def main():
                 return None, "session name required", False
             prev = sessions.get(name)
             requested_cmd = (first.get("cmd", "") or "").strip()
+            requested_relaunch = bool(first.get("relaunch"))
             requested_cwd = first.get("cwd", "") or ""
             requested_heal = bool(first.get("heal")) if ("heal" in first) else bool(prev.heal if prev else False)
             cols = int(first.get("cols") or (prev.cols if prev else 140))
             rows = int(first.get("rows") or (prev.rows if prev else 40))
-            if prev and prev.alive() and not needs_relaunch_for_command(prev, requested_cmd):
+            if prev and prev.alive() and not requested_relaunch and not needs_relaunch_for_command(prev, requested_cmd):
                 prev.heal = requested_heal
                 if requested_cmd and requested_cmd != prev.cmd:
                     prev.cmd = requested_cmd
@@ -569,6 +570,8 @@ async def main():
             # and remains stopped for unarmed sessions.
             cmd = requested_cmd or (prev.cmd if prev else "")
             cwd = requested_cwd or (prev.cwd if prev else "")
+            if requested_relaunch and not cmd:
+                return None, "no saved command for " + name, False
             if prev:
                 prev.kill(by_user=False)
             try:
@@ -771,16 +774,18 @@ async def main():
                             if t == "create" and name:
                                 prev = sessions.get(name)
                                 requested_cmd = (m.get("cmd", "") or "").strip()
-                                if prev and prev.alive() and not needs_relaunch_for_command(prev, requested_cmd):
+                                requested_relaunch = bool(m.get("relaunch"))
+                                if prev and prev.alive() and not requested_relaunch and not needs_relaunch_for_command(prev, requested_cmd):
                                     pass                                    # already hosted + alive
                                 else:
                                     prev = sessions.get(name)               # reviving a DEAD session → keep its cmd/cwd/size (don't wipe the resume)
                                     requested_cmd = (m.get("cmd", "") or "").strip()
+                                    requested_relaunch = bool(m.get("relaunch"))
                                     requested_heal = bool(m.get("heal")) if ("heal" in m) else bool(prev.heal if prev else False)
                                     # Plain web attach to a dormant, unarmed placeholder sends create{cmd:""}.
                                     # Do not translate that into "resume the saved command"; only an explicit
                                     # Relaunch/Create request (non-empty cmd) or an armed watcher may start work.
-                                    if prev and prev.dead and not prev.heal and not requested_heal and not requested_cmd:
+                                    if prev and prev.dead and not prev.heal and not requested_heal and not requested_cmd and not requested_relaunch:
                                         if m.get("cols"): prev.cols = int(m.get("cols") or prev.cols)
                                         if m.get("rows"): prev.rows = int(m.get("rows") or prev.rows)
                                         log(f"[{name}] attach to dormant unarmed session - left stopped")
@@ -788,6 +793,10 @@ async def main():
                                         continue
                                     cmd = requested_cmd or (prev.cmd if prev else "")
                                     cwd = m.get("cwd", "") or (prev.cwd if prev else "")
+                                    if requested_relaunch and not cmd:
+                                        log(f"[{name}] relaunch refused - no saved command")
+                                        await ws.send(json.dumps({"t": "sessions", "list": sess_list()}))
+                                        continue
                                     cols = int(m.get("cols") or (prev.cols if prev else 140))
                                     rows = int(m.get("rows") or (prev.rows if prev else 40))
                                     heal = requested_heal

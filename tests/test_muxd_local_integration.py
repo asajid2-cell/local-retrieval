@@ -218,6 +218,45 @@ class MuxdLocalIntegrationTests(unittest.TestCase):
         finally:
             self.kill(name)
 
+    def test_explicit_relaunch_reuses_saved_command(self):
+        name = "it-explicit-relaunch"
+        marker = f"MUXD_IT_EXPLICIT_{int(time.time() * 1000)}"
+        cmd = f"Write-Output '{marker}'"
+        self.kill(name)
+        try:
+            first = run_request(self.muxd.port, {"t": "create", "s": name, "cmd": cmd}, timeout=12)
+            self.assertTrue(first.get("created"))
+            before = self.wait_for_tail(name, marker)
+            time.sleep(0.05)
+
+            second = run_request(self.muxd.port, {"t": "create", "s": name, "relaunch": True}, timeout=12)
+            after = self.wait_for_tail(name, marker)
+
+            self.assertTrue(second.get("created"))
+            self.assertNotEqual(before.get("created"), after.get("created"))
+            self.assertEqual(before.get("cmdSig"), after.get("cmdSig"))
+            self.assertTrue(after.get("hasCommand"))
+        finally:
+            self.kill(name)
+
+    def test_explicit_relaunch_without_saved_command_is_refused(self):
+        name = "it-relaunch-no-command"
+        self.kill(name)
+        try:
+            first = run_request(self.muxd.port, {"t": "create", "s": name}, timeout=12)
+            self.assertTrue(first.get("created"))
+            before = self.session(name)
+
+            second = run_request(self.muxd.port, {"t": "create", "s": name, "relaunch": True}, timeout=12)
+            after = self.session(name)
+
+            self.assertEqual(second.get("t"), "err")
+            self.assertIn("no saved command", second.get("m", ""))
+            self.assertEqual(before.get("created"), after.get("created"))
+            self.assertTrue(after.get("shellOnly"))
+        finally:
+            self.kill(name)
+
     def test_different_command_replaces_wrong_live_session(self):
         name = "it-different-command"
         old_marker = f"MUXD_IT_OLD_{int(time.time() * 1000)}"
