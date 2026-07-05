@@ -123,7 +123,10 @@
      Vertical history belongs to xterm's scrollback, never to a browser wrapper scrollbar. */
   #term.pan { overflow-x:auto; overflow-y:hidden; touch-action:pan-x; }
   #term.pan .xterm, #term.pan .xterm-viewport, #term.pan .xterm-screen { width:max-content !important; }
-  #term.rowpan .xterm { will-change:transform; transform-origin:left top; }
+  /* When the shared terminal is taller than the visible phone pane, scroll the host to the live rows.
+     Do not transform .xterm itself; stale transforms can clip the renderer into a mostly black viewport. */
+  #term.rowpan { overflow-y:auto; overscroll-behavior:contain; touch-action:pan-x pan-y; }
+  #term.rowpan .xterm { transform:none !important; }
   #empty {
     position:absolute; inset:0; z-index:5; display:flex; flex-direction:column; gap:var(--sp3);
     align-items:center; justify-content:center; text-align:center; padding:var(--sp4); color:var(--muted);
@@ -690,16 +693,96 @@ term.loadAddon(fit);
 term.open($('#term'));
 let paintHealTimer=0;
 let userScrolledAt=0, userScrollSerial=0;
+let lastPaintRecoverAt=0;
 function healTerminalPaint(){
   try{
     if(term && term.rows) term.refresh(0, Math.max(0, term.rows-1));
+  }catch(e){}
+}
+function visibleBufferHasText(){
+  try{ return /\S/.test(termVisibleText()); }catch(e){ return false; }
+}
+function canvasHasVisiblePixels(canvas, hostRect){
+  const r=canvas.getBoundingClientRect();
+  const left=Math.max(r.left, hostRect.left), top=Math.max(r.top, hostRect.top);
+  const right=Math.min(r.right, hostRect.right), bottom=Math.min(r.bottom, hostRect.bottom);
+  if(right-left<4 || bottom-top<4 || !canvas.width || !canvas.height) return null;
+  let ctx; try{ ctx=canvas.getContext('2d', { willReadFrequently:true }); }catch(e){ return null; }
+  if(!ctx) return null;
+  const sx=canvas.width/Math.max(1,r.width), sy=canvas.height/Math.max(1,r.height);
+  let samples=0, visible=0;
+  const cols=18, rows=14;
+  for(let y=0;y<rows;y++){
+    for(let x=0;x<cols;x++){
+      const px=Math.max(0, Math.min(canvas.width-1, Math.floor((left-r.left + (x+0.5)*(right-left)/cols) * sx)));
+      const py=Math.max(0, Math.min(canvas.height-1, Math.floor((top-r.top + (y+0.5)*(bottom-top)/rows) * sy)));
+      let d; try{ d=ctx.getImageData(px, py, 1, 1).data; }catch(e){ return null; }
+      samples++;
+      if(d[3] > 0 && (d[0] > 35 || d[1] > 35 || d[2] > 35)) visible++;
+      if(visible) return true;
+    }
+  }
+  return samples ? false : null;
+}
+function domRowsHaveVisibleText(host, hostRect){
+  const rows=[...host.querySelectorAll('.xterm-rows > div')].filter(r=>/\S/.test(r.textContent||''));
+  if(!rows.length) return null;
+  let checked=0;
+  for(const row of rows){
+    const r=row.getBoundingClientRect(), cs=getComputedStyle(row);
+    if(cs.display==='none' || cs.visibility==='hidden' || cs.opacity==='0') continue;
+    checked++;
+    if(r.bottom>hostRect.top+2 && r.top<hostRect.bottom-2 && r.right>hostRect.left+2 && r.left<hostRect.right-2) return true;
+  }
+  return checked ? false : null;
+}
+function terminalPaintLooksBlank(){
+  if(!current || $('#empty').style.display!=='none' || !visibleBufferHasText()) return false;
+  const host=$('#term'), hostRect=host.getBoundingClientRect();
+  const domSeen=domRowsHaveVisibleText(host, hostRect);
+  if(domSeen===true) return false;
+  if(domSeen===false) return true;
+  const canvases=[...host.querySelectorAll('canvas')].filter(c=>c.offsetParent!==null);
+  if(!canvases.length) return false;
+  let checked=0;
+  for(const c of canvases){
+    const seen=canvasHasVisiblePixels(c, hostRect);
+    if(seen===true) return false;
+    if(seen===false) checked++;
+  }
+  return checked>0;
+}
+function resetTerminalSurface(){
+  const host=$('#term'), xt=host.querySelector('.xterm');
+  if(xt) xt.style.transform='';
+  if(!host.classList.contains('rowpan')) host.scrollTop=0;
+}
+function recoverTerminalPaint(reason){
+  const now=Date.now();
+  if(now-lastPaintRecoverAt<2000) return;
+  lastPaintRecoverAt=now;
+  const st=captureTermViewport(), serial=userScrollSerial;
+  resetTerminalSurface();
+  try{ term.clearTextureAtlas(); }catch(e){}
+  healTerminalPaint();
+  requestAnimationFrame(()=>{
+    try{ term.clearTextureAtlas(); }catch(e){}
+    healTerminalPaint();
+    restoreTermViewport(st, serial);
+    scheduleTerminalSurfaceAlign();
+  });
+  window.__muxLastPaintRecovery = { at:now, reason:reason||'paint-check', rows:term.rows, cols:term.cols };
+}
+function verifyTerminalPaint(reason){
+  try{
+    if(terminalPaintLooksBlank()) recoverTerminalPaint(reason);
   }catch(e){}
 }
 function schedulePaintHeal(delay=60){
   if(paintHealTimer) clearTimeout(paintHealTimer);
   paintHealTimer=setTimeout(()=>{
     paintHealTimer=0;
-    requestAnimationFrame(()=>{ healTerminalPaint(); requestAnimationFrame(healTerminalPaint); });
+    requestAnimationFrame(()=>{ healTerminalPaint(); requestAnimationFrame(()=>{ healTerminalPaint(); verifyTerminalPaint('scheduled'); }); });
   }, delay);
 }
 function noteUserScroll(){ userScrolledAt=Date.now(); userScrollSerial++; }
@@ -903,6 +986,7 @@ function scheduleTerminalSurfaceAlign(){
   if(surfaceAlignRaf) cancelAnimationFrame(surfaceAlignRaf);
   surfaceAlignRaf=requestAnimationFrame(()=>{ surfaceAlignRaf=0; alignTerminalSurface(); });
 }
+let wasRowOverflow=false;
 function alignTerminalSurface(){
   const host=$('#term'), xt=host.querySelector('.xterm');
   if(!xt) return;
@@ -910,14 +994,25 @@ function alignTerminalSurface(){
   host.classList.toggle('rowpan', rowOverflow);
   if(!rowOverflow){
     xt.style.transform='';
+    if(wasRowOverflow) host.scrollTop=0;
+    wasRowOverflow=false;
     return;
   }
+  xt.style.transform='';
   const cs=getComputedStyle(host);
   const padY=(parseFloat(cs.paddingTop)||0)+(parseFloat(cs.paddingBottom)||0);
   const visibleH=Math.max(0, host.clientHeight-padY);
-  const renderedH=xt.offsetHeight || Math.ceil((cellMetrics().h||18) * (term.rows||winSize.rows||0));
-  const offset=Math.max(0, Math.ceil(renderedH-visibleH));
-  xt.style.transform = offset ? `translateY(${-offset}px)` : '';
+  const renderedH=Math.max(xt.scrollHeight||0, xt.offsetHeight||0, Math.ceil((cellMetrics().h||18) * (term.rows||winSize.rows||0)));
+  if(!visibleH || !renderedH || renderedH<=visibleH+2){
+    host.classList.remove('rowpan');
+    host.scrollTop=0;
+    wasRowOverflow=false;
+    return;
+  }
+  const maxScroll=Math.max(0, host.scrollHeight-host.clientHeight);
+  const nearBottom=host.scrollTop>=maxScroll-8;
+  if(!wasRowOverflow || nearBottom || Date.now()-userScrolledAt>1200) host.scrollTop=maxScroll;
+  wasRowOverflow=true;
 }
 function onControl(s){
   if(s[0]!=='d') return;
@@ -1176,6 +1271,7 @@ function connect(name, isRetry){
   current = name; LS.set('mux_last', name); markRead(name);
   $('#empty').style.display='none';
   if (!isRetry) term.reset();
+  resetTerminalSurface();
   clearTermWriteQueue();
   autoFreeze=false; _frozenBuf=[];   // never carry a frozen selection across a session switch
   newLines=0; showJump();
