@@ -56,6 +56,11 @@ LOOP_WATCHDOG_EXIT = float(ENV.get("LOOP_WATCHDOG_EXIT", "12"))
 PROTOCOL = 2
 CAPS = ["ls", "info", "create", "open", "attach", "kill", "rename", "heal", "tail", "scrollback", "resize", "owner"]
 STARTED = time.time()
+AGENT_WORKING_FRESH = float(ENV.get("AGENT_WORKING_FRESH", "25"))
+AGENT_STARTING_GRACE = float(ENV.get("AGENT_STARTING_GRACE", "45"))
+ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]")
+STALE_CSI_RE = re.compile(r"\[[0-?]*[ -/]*[@-~]")
+CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 WATCH = {
     "last_tick": time.monotonic(),
@@ -74,6 +79,13 @@ WATCHDOG_STARTED = False
 def watch_snapshot():
     with WATCH_LOCK:
         return dict(WATCH)
+
+def clean_terminal_text(s):
+    # xterm/codex emits CSI sequences with intermediate bytes, e.g. ESC[0 q.
+    # Older sanitizing stripped ESC but left "[0 q", so remove those leftovers too.
+    s = ANSI_RE.sub("", str(s or ""))
+    s = STALE_CSI_RE.sub("", s)
+    return CTRL_RE.sub("", s)
 
 class Session:
     def __init__(self, name, cmd, cwd, cols, rows, loop, outq, heal=False, spawn_now=True):
@@ -194,8 +206,7 @@ class Session:
         for b in reversed(self.ring):
             raw[:0] = b
             if len(raw) >= nbytes: break
-        s = bytes(raw[-nbytes:]).decode("utf-8", "replace")
-        s = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07\x1b]*(\x07|\x1b\\)|[\x00-\x08\x0b\x0c\x0e-\x1f]", "", s)
+        s = clean_terminal_text(bytes(raw[-nbytes:]).decode("utf-8", "replace"))
         if lines: return "\n".join(s.split("\n")[-lines:]).rstrip()
         return s[-900:]
 
@@ -276,8 +287,7 @@ class OwnerSession:
         for b in reversed(self.ring):
             raw[:0] = b
             if len(raw) >= nbytes: break
-        s = bytes(raw[-nbytes:]).decode("utf-8", "replace")
-        s = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07\x1b]*(\x07|\x1b\\)|[\x00-\x08\x0b\x0c\x0e-\x1f]", "", s)
+        s = clean_terminal_text(bytes(raw[-nbytes:]).decode("utf-8", "replace"))
         if lines: return "\n".join(s.split("\n")[-lines:]).rstrip()
         return s[-900:]
 
@@ -371,6 +381,58 @@ def command_sig(cmd):
 def session_has_command(sess):
     return bool(normalized_cmd(getattr(sess, "cmd", "")))
 
+def fmt_age(seconds):
+    try: seconds = max(0.0, float(seconds))
+    except Exception: return "unknown"
+    if seconds < 1.5: return "just now"
+    if seconds < 60: return "%ds ago" % round(seconds)
+    if seconds < 3600: return "%dm ago" % round(seconds / 60)
+    return "%dh ago" % round(seconds / 3600)
+
+def tail_looks_at_shell_prompt(tail):
+    lines = [ln.strip() for ln in clean_terminal_text(tail).splitlines() if ln.strip()][-8:]
+    for line in lines:
+        if re.match(r"^(?:PS\s+)?[A-Za-z]:\\[^>]{0,180}>\s*$", line):
+            return True
+        if re.match(r"^[\w.\-]+@[\w.\-]+:[^#$]{0,180}[#$]\s*$", line):
+            return True
+    return False
+
+def session_agent_status(sess, alive=None, tail=None, now=None):
+    if now is None: now = time.time()
+    if alive is None:
+        try: alive = bool(sess.alive())
+        except Exception: alive = False
+    has_cmd = session_has_command(sess)
+    if not alive:
+        return {"agentState": "dormant", "agentLabel": "dormant",
+                "agentDetail": "no shell or agent is running until you relaunch it",
+                "agentConfidence": "high", "needsAttention": False}
+    if not has_cmd:
+        return {"agentState": "neutral", "agentLabel": "plain shell",
+                "agentDetail": "live terminal, no agent command registered",
+                "agentConfidence": "high", "needsAttention": False}
+    if tail is None:
+        try: tail = sess.tail_text(nbytes=4000)
+        except Exception: tail = ""
+    if tail_looks_at_shell_prompt(tail):
+        return {"agentState": "stopped", "agentLabel": "agent stopped",
+                "agentDetail": "the command-backed session returned to a shell prompt",
+                "agentConfidence": "high", "needsAttention": True}
+    last_out = float(getattr(sess, "last_out", 0) or 0)
+    created = float(getattr(sess, "created", 0) or 0)
+    last_age = (now - last_out) if last_out else float("inf")
+    created_age = (now - created) if created else float("inf")
+    if last_age <= AGENT_WORKING_FRESH or created_age <= AGENT_STARTING_GRACE:
+        return {"agentState": "working", "agentLabel": "agent working",
+                "agentDetail": "terminal output updated " + fmt_age(last_age),
+                "agentConfidence": "medium", "needsAttention": False,
+                "lastOutAgeMs": int(max(0.0, last_age) * 1000)}
+    return {"agentState": "attention", "agentLabel": "waiting for you",
+            "agentDetail": "no terminal output for " + fmt_age(last_age),
+            "agentConfidence": "medium", "needsAttention": True,
+            "lastOutAgeMs": int(max(0.0, last_age) * 1000)}
+
 def session_payload(name, sess):
     alive = False
     try: alive = bool(sess.alive())
@@ -378,12 +440,17 @@ def session_payload(name, sess):
     has_cmd = session_has_command(sess)
     owner = bool(getattr(sess, "owner", False))
     kind = "command" if has_cmd else ("shell" if alive else "dormant")
+    tail = sess.tail_text()
+    agent = session_agent_status(sess, alive=alive, tail=tail)
     return {"name": name, "alive": alive, "created": int(sess.created * 1000),
             "lastOut": int(sess.last_out * 1000), "cols": sess.cols, "rows": sess.rows,
-            "tail": sess.tail_text(), "heal": sess.heal, "localViewers": len(sess.local),
+            "tail": tail, "heal": sess.heal, "localViewers": len(sess.local),
             "localFirst": owner or len(sess.local) > 0, "owner": owner,
             "hasCommand": has_cmd, "shellOnly": alive and not has_cmd,
-            "ready": alive, "kind": kind, "cmdSig": command_sig(getattr(sess, "cmd", ""))}
+            "ready": alive, "kind": kind, "cmdSig": command_sig(getattr(sess, "cmd", "")),
+            "agentState": agent["agentState"], "agentLabel": agent["agentLabel"],
+            "agentDetail": agent["agentDetail"], "agentConfidence": agent["agentConfidence"],
+            "needsAttention": agent["needsAttention"], "lastOutAgeMs": agent.get("lastOutAgeMs", 0)}
 
 def needs_relaunch_for_command(prev, requested_cmd):
     requested = normalized_cmd(requested_cmd)

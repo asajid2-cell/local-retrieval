@@ -8,24 +8,25 @@ muxd = importlib.import_module("muxd")
 
 
 class FakeSession:
-    def __init__(self, cmd="", alive=True, owner=False):
+    def __init__(self, cmd="", alive=True, owner=False, tail="tail", last_out=120.0, created=100.0):
         self.name = "fake"
         self.cmd = cmd
         self.cwd = r"Z:\tmp"
-        self.created = 100.0
-        self.last_out = 120.0
+        self.created = created
+        self.last_out = last_out
         self.cols = 100
         self.rows = 30
         self.heal = False
         self.local = set()
         self.owner = owner
         self._alive = alive
+        self._tail = tail
 
     def alive(self):
         return self._alive
 
     def tail_text(self):
-        return "tail"
+        return self._tail
 
 
 class MuxdStateTests(unittest.TestCase):
@@ -41,7 +42,7 @@ class MuxdStateTests(unittest.TestCase):
 
     def test_command_payload_is_distinguishable_from_shell(self):
         cmd = "Write-Output TEST_MARKER"
-        payload = muxd.session_payload("agent", FakeSession(cmd=cmd, alive=True))
+        payload = muxd.session_payload("agent", FakeSession(cmd=cmd, alive=True, last_out=time.time()))
 
         self.assertTrue(payload["alive"])
         self.assertTrue(payload["ready"])
@@ -49,6 +50,32 @@ class MuxdStateTests(unittest.TestCase):
         self.assertFalse(payload["shellOnly"])
         self.assertEqual(payload["kind"], "command")
         self.assertEqual(payload["cmdSig"], muxd.command_sig(cmd))
+        self.assertEqual(payload["agentState"], "working")
+        self.assertFalse(payload["needsAttention"])
+
+    def test_terminal_sanitizer_removes_cursor_style_sequences(self):
+        self.assertEqual(muxd.clean_terminal_text("\x1b[0 qhello\x1b[?25l"), "hello")
+        self.assertEqual(muxd.clean_terminal_text("[0 qhello[49m"), "hello")
+
+    def test_quiet_command_backed_agent_needs_attention(self):
+        cmd = "codex resume abc"
+        payload = muxd.session_payload("quiet", FakeSession(cmd=cmd, alive=True, last_out=time.time() - 120))
+
+        self.assertEqual(payload["agentState"], "attention")
+        self.assertTrue(payload["needsAttention"])
+
+    def test_command_backed_shell_prompt_is_stopped(self):
+        cmd = "codex resume abc"
+        payload = muxd.session_payload("stopped", FakeSession(cmd=cmd, alive=True, tail=r"PS C:\Users\Ahmed>", last_out=time.time() - 120))
+
+        self.assertEqual(payload["agentState"], "stopped")
+        self.assertTrue(payload["needsAttention"])
+
+    def test_shell_only_payload_is_neutral_attention_state(self):
+        payload = muxd.session_payload("shell", FakeSession(cmd="", alive=True))
+
+        self.assertEqual(payload["agentState"], "neutral")
+        self.assertFalse(payload["needsAttention"])
 
     def test_existing_alive_shell_must_relaunch_when_resume_command_arrives(self):
         self.assertTrue(muxd.needs_relaunch_for_command(FakeSession(cmd="", alive=True), "claude --resume abc"))
