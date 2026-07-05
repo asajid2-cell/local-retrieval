@@ -876,9 +876,11 @@ function isActive(c) { return c.visible !== false || (Date.now() - (c.lastActive
 function widest(list) { let b = list[0]; for (const c of list) if (c.vcols > b.vcols || (c.vcols === b.vcols && c.vrows > b.vrows)) b = c; return b; }
 function targetSize(st, name) {
   const hosted = hostSessions.get(name);
-  if (hosted && hosted.alive !== false && (hosted.cols | 0) > 1 && (hosted.rows | 0) > 1) {
-    // Local-first rule: the PC-hosted PTY size is authoritative. Browser viewers tap it;
-    // they do not resize it, otherwise the local terminal gets corrupted by phone/browser dimensions.
+  const localOwned = hosted && hosted.alive !== false
+    && ((hosted.localViewers | 0) > 0 || !!hosted.owner);
+  if (localOwned && (hosted.cols | 0) > 1 && (hosted.rows | 0) > 1) {
+    // Local-first rule: an attached PC terminal owns the PTY size. Headless PC-hosted
+    // sessions still resize to the active web viewer so the site behaves like a native terminal.
     return { cols: hosted.cols | 0, rows: hosted.rows | 0, pin: null, hostedSize: true };
   }
   const all = [...st.clients.values()].filter(c => c.vcols > 1 && c.vrows > 1);

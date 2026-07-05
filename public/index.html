@@ -46,7 +46,7 @@
   }
   .brand { display:flex; align-items:center; gap:var(--sp2); flex:0 0 auto; }
   .brand, #tabwrap, .top-actions, #status, #keybar, #mobileNav {
-    position:relative; z-index:2; isolation:isolate; transform:translateZ(0); backface-visibility:hidden;
+    position:relative; z-index:2; isolation:isolate;
   }
   .brand .glyph { width:19px; height:19px; }
   .brand .wordmark { font-weight:600; font-size:15px; letter-spacing:.2px; }
@@ -115,11 +115,10 @@
   /* ---- terminal ---- */
   #term {
     grid-area:term; position:relative; z-index:0; min-height:0; min-width:0; background:#000;
-    padding:var(--sp1) var(--sp2); overflow:hidden; isolation:isolate; contain:layout paint style;
-    transform:translateZ(0); backface-visibility:hidden;
+    padding:var(--sp1) var(--sp2); overflow:hidden; isolation:isolate;
   }
-  #term .xterm { isolation:isolate; contain:layout paint style; }
-  #term .xterm-viewport, #term .xterm-screen { contain:paint; }
+  #term .xterm { isolation:isolate; min-height:100%; }
+  #term .xterm-viewport { min-height:100%; }
   /* "pan" = the shared window is bigger than this screen (a phone following a desktop): let the user
      drag horizontally to see the full width. xterm renders at its natural cols/rows; we scroll the host. */
   #term.pan { overflow:auto; touch-action:pan-x pan-y; }
@@ -872,6 +871,22 @@ window.addEventListener('orientationchange', ()=>setTimeout(applyViewport,250));
   }, {passive:false});
   host.addEventListener('touchend', ()=>{ active=false; }, {passive:true});
 })();
+
+// When a local 30-row terminal owns the size, the web surface can be taller than xterm's
+// rendered rows. Keep the whole black terminal area interactive by forwarding wheel events.
+$('#term').addEventListener('wheel', e=>{
+  const host=$('#term'), xt=host.querySelector('.xterm');
+  if(!xt || xt.contains(e.target)) return;
+  const target=host.querySelector('.xterm-viewport') || xt;
+  try{
+    target.dispatchEvent(new WheelEvent('wheel', {
+      deltaX:e.deltaX, deltaY:e.deltaY, deltaZ:e.deltaZ, deltaMode:e.deltaMode,
+      ctrlKey:e.ctrlKey, shiftKey:e.shiftKey, altKey:e.altKey, metaKey:e.metaKey,
+      bubbles:true, cancelable:true
+    }));
+    e.preventDefault();
+  }catch(_){}
+}, {passive:false});
 
 function setFont(px){ fontSize=Math.min(20,Math.max(11,px)); term.options.fontSize=fontSize; LS.set('mux_font',fontSize); doFit(); }
 function updateMeta(){ $('#statusmeta').textContent = current ? `${term.cols}×${term.rows}${$('#term').classList.contains('pan')?' · pan':''}` : ''; }
@@ -1653,7 +1668,6 @@ setInterval(()=>{ if(document.visibilityState==='visible') loadSessions(); }, 40
 document.addEventListener('visibilitychange', ()=>{ if(document.visibilityState==='visible') schedulePaintHeal(80); });
 window.addEventListener('focus', ()=>schedulePaintHeal(80));
 window.addEventListener('pageshow', ()=>schedulePaintHeal(80));
-setInterval(()=>{ if(document.visibilityState==='visible' && current && !isFrozen()) schedulePaintHeal(0); }, 5000);
 
 // ---- system health dot (P0 observability): polls /api/health → green ok / amber degraded / red down ----
 async function pollHealth(){
