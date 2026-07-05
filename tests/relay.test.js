@@ -556,6 +556,16 @@ test('terminal add-to-collection dialog supports decks and stable chat identity'
   assert.match(html, /pollUploadCmd\(queued\.id,\s*20000\)/);
 });
 
+test('terminal tab strip converts hovered wheel input to horizontal scrolling', () => {
+  const html = fs.readFileSync(path.join(REPO, 'public', 'index.html'), 'utf8');
+  assert.match(html, /#tabs\s*\{[^}]*overflow-x:auto;[^}]*overscroll-behavior:contain/);
+  assert.match(html, /wrap\.addEventListener\('wheel'/);
+  assert.match(html, /if\(e\.ctrlKey\) return/);
+  assert.match(html, /flexDirection/);
+  assert.match(html, /tabs\.scrollLeft \+= px/);
+  assert.match(html, /\}, \{passive:false\}\);/);
+});
+
 test('DELETE /api/sessions sends kill and waits until hosted row is gone', async t => {
   const h = new RelayHarness();
   await h.start();

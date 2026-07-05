@@ -73,7 +73,7 @@
     grid-area:tabs; display:flex; align-items:center; gap:var(--sp2);
     padding:var(--sp2) var(--sp3); background:var(--panel); border-bottom:1px solid var(--line);
   }
-  #tabs { display:flex; align-items:center; gap:var(--sp2); flex:0 1 auto; min-width:0; overflow-x:auto; scrollbar-width:none; }
+  #tabs { display:flex; align-items:center; gap:var(--sp2); flex:0 1 auto; min-width:0; overflow-x:auto; overscroll-behavior:contain; scrollbar-width:none; }
   #tabs::-webkit-scrollbar { display:none; }
   #tabs:empty::before { content:"no sessions — tap + to start one"; color:var(--muted); font-size:13px; padding:0 var(--sp1); white-space:nowrap; }
   .tab {
@@ -1313,6 +1313,29 @@ document.addEventListener('visibilitychange', ()=>{ if(document.visibilityState=
 setInterval(()=>{ if(ws && ws.readyState===1 && current) send('h', JSON.stringify({vis:document.visibilityState==='visible', act:actFlag()})); }, 30000);
 document.addEventListener('visibilitychange', ()=>{ if(ws && ws.readyState===1 && current) send('h', JSON.stringify({vis:document.visibilityState==='visible', act:document.visibilityState==='visible'?1:actFlag()})); });
 window.addEventListener('online', ()=>{ if(current && (!ws || ws.readyState>1)){ reconnectDelay=1000; connect(current, true); } });
+
+// Desktop tab strips are horizontal, so normal mouse-wheel input should move the tabs without
+// requiring Shift. Leave ctrl+wheel for browser zoom and leave the mobile sessions list vertical.
+(function(){
+  const wrap=$('#tabwrap'), tabs=$('#tabs');
+  if(!wrap || !tabs) return;
+  const wheelPixels=e=>{
+    const dominant = Math.abs(e.deltaX) >= Math.abs(e.deltaY) ? e.deltaX : e.deltaY;
+    if(e.deltaMode===1) return dominant * 32;
+    if(e.deltaMode===2) return dominant * Math.max(1, tabs.clientWidth);
+    return dominant;
+  };
+  wrap.addEventListener('wheel', e=>{
+    if(e.ctrlKey) return;
+    if((getComputedStyle(tabs).flexDirection||'row').startsWith('column')) return;
+    if(tabs.scrollWidth <= tabs.clientWidth + 1) return;
+    const px=wheelPixels(e);
+    if(!px) return;
+    tabs.scrollLeft += px;
+    e.preventDefault();
+    e.stopPropagation();
+  }, {passive:false});
+})();
 
 // ---- sessions / unread ----
 function markRead(name){ const s=(window._sessions||[]).find(x=>x.name===name); read[name] = s ? s.activity : Date.now(); LS.set('mux_read', read); }
