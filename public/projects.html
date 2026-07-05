@@ -710,7 +710,10 @@ function setDeckNewVisible(){
 }
 function addWorkspaceToCollection(){
   if(!appLive()){ alert('Open the desktop app first - it owns your collections, so this cannot drift out of sync.'); return; }
-  _wsTabs=(sessions||[]).map(s=>s.name).filter(Boolean);
+  const open=(sessions||[]).filter(s=>s && s.name);
+  _wsTabs=open
+    .filter(s=>s.sessionId || s.projectMuxName)
+    .map(s=>({ name:s.name, muxName:s.projectMuxName||s.name, sessionId:s.sessionId||'', title:s.chatTitle||s.name }));
   if(!_wsTabs.length){ alert('No open remote tabs to add — open some sessions in the terminal first.'); return; }
   const list=$('#wscollist'); list.innerHTML='';
   const cols=(data.collections||[]);
@@ -720,7 +723,8 @@ function addWorkspaceToCollection(){
   allDecks().forEach(d=>{ const o=document.createElement('option'); o.value=d.id; o.textContent=d.name; sel.appendChild(o); });
   const newOpt=document.createElement('option'); newOpt.value='__new__'; newOpt.textContent='New deck...'; sel.appendChild(newOpt);
   sel.onchange=setDeckNewVisible; setDeckNewVisible();
-  $('#wscolcount').textContent=_wsTabs.length+' tab'+(_wsTabs.length!==1?'s':'');
+  const skipped=open.length-_wsTabs.length;
+  $('#wscolcount').textContent=_wsTabs.length+' chat tab'+(_wsTabs.length!==1?'s':'')+(skipped?(' ('+skipped+' shell'+(skipped!==1?'s':'')+' skipped)'):'');
   $('#wscolnew').value=''; $('#wsdecknew').value=''; $('#wscoldlg').showModal(); setTimeout(()=>$('#wscolnew').focus(),60);
 }
 async function submitWsCol(target){
@@ -734,15 +738,16 @@ async function submitWsCol(target){
   const btns=$('#wscoldlg').querySelectorAll('button'); btns.forEach(b=>b.disabled=true);
   let ok=0, fail=0; const details=[];
   for(const t of _wsTabs){
+    const tab = typeof t==='string' ? { name:t, muxName:t, sessionId:'' } : t;
     try{
-      const r=await fetch('api/app-commands',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({type:'addtocollection', muxName:t, sessionName:t, collection:name, collectionId:target.collectionId||'', deckId:choice.deckId||'', deckName:choice.deckName||''})});
+      const r=await fetch('api/app-commands',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({type:'addtocollection', muxName:tab.muxName||tab.name, sessionName:tab.name, sessionId:tab.sessionId||'', collection:name, collectionId:target.collectionId||'', deckId:choice.deckId||'', deckName:choice.deckName||''})});
       if(!r.ok) throw new Error(await apiError(r));
       const queued=await r.json();
       const done=await awaitCmdResult(queued.id, 20000);
       if(done.ok) ok++;
-      else { fail++; details.push(t+': '+done.detail); }
+      else { fail++; details.push(tab.name+': '+done.detail); }
     }
-    catch(e){ fail++; details.push(t+': '+(e.message||e)); }
+    catch(e){ fail++; details.push(tab.name+': '+(e.message||e)); }
   }
   btns.forEach(b=>b.disabled=false); $('#wscoldlg').close();
   let msg='Added '+ok+' of your '+_wsTabs.length+' open tab'+(_wsTabs.length!==1?'s':'')+' to "'+name+'" on '+(choice.deckName||deckLabel(choice.deckId))+'.';

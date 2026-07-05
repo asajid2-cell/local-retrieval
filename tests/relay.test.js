@@ -508,11 +508,52 @@ test('projects sync preserves decks and app commands preserve collection deck ta
   assert.equal(pending[0].deckName, 'Client A');
 });
 
+test('GET /api/sessions annotates renamed mux tabs with projected chat identity', async t => {
+  const h = new RelayHarness();
+  await h.start();
+  t.after(async () => h.stop());
+  const cmd = "codex resume --include-non-interactive sid-proj";
+  const host = await h.connectHost([commandSession('short-tab-name', cmd, Date.now())]);
+  t.after(() => host.close());
+
+  await h.json('POST', '/api/projects', {
+    decks: [{ id: 'main', name: 'Main' }],
+    collections: [],
+    allChats: [{ id: 'sid-proj', tool: 'codex', title: 'Projected Chat', muxName: 'canonical-projected-sid-proj', muxCommand: cmd }],
+    runningSessions: [],
+    host: 'FAKEPC',
+  });
+
+  const sessions = await h.json('GET', '/api/sessions');
+  const row = sessions.find(s => s.name === 'short-tab-name');
+  assert.ok(row);
+  assert.equal(row.sessionId, 'sid-proj');
+  assert.equal(row.projectMuxName, 'canonical-projected-sid-proj');
+  assert.equal(row.chatLinked, true);
+});
+
 test('projects save-tabs dialog keeps new-deck row hidden until selected', () => {
   const html = fs.readFileSync(path.join(REPO, 'public', 'projects.html'), 'utf8');
   assert.match(html, /id="wsdecknewrow" hidden/);
   assert.match(html, /#wscoldlg\s+\.dlgrow\s*\{[^}]*display:flex/);
   assert.match(html, /#wscoldlg\s+\.dlgrow\[hidden\]\s*\{[^}]*display:none/);
+  assert.match(html, /sessionId:s\.sessionId\|\|''/);
+  assert.match(html, /muxName:s\.projectMuxName\|\|s\.name/);
+  assert.match(html, /sessionId:tab\.sessionId\|\|''/);
+});
+
+test('terminal add-to-collection dialog supports decks and stable chat identity', () => {
+  const html = fs.readFileSync(path.join(REPO, 'public', 'index.html'), 'utf8');
+  assert.match(html, /id="adddecksel"/);
+  assert.match(html, /id="adddecknewrow" hidden/);
+  assert.match(html, /dialog\s+\.row\[hidden\]\s*\{\s*display:none/);
+  assert.match(html, /_appDecks=Array\.isArray\(p\.decks\)\?p\.decks:\[\]/);
+  assert.match(html, /chatBackedSession\(s\)/);
+  assert.match(html, /muxName:s\.projectMuxName\|\|s\.muxName\|\|s\.name/);
+  assert.match(html, /sessionId:s\.sessionId\|\|''/);
+  assert.match(html, /deckId:choice\.deckId\|\|''/);
+  assert.match(html, /deckName:choice\.deckName\|\|''/);
+  assert.match(html, /pollUploadCmd\(queued\.id,\s*20000\)/);
 });
 
 test('DELETE /api/sessions sends kill and waits until hosted row is gone', async t => {

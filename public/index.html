@@ -286,13 +286,19 @@
   dialog p.hint { margin:0 0 var(--sp3); font-size:13px; color:var(--muted); line-height:1.5; }
   dialog code { background:var(--panel-2); padding:1px 5px; border-radius:6px; font-size:12px; }
   dialog label { display:block; font-size:12px; color:var(--muted); margin:0 0 6px; }
-  dialog input, dialog textarea {
+  dialog input, dialog textarea, dialog select {
     width:100%; padding:11px var(--sp3); border-radius:var(--r-m);
     border:1px solid var(--line); background:var(--panel-2); color:var(--txt);
     font:500 16px ui-monospace,monospace; margin-bottom:var(--sp3);
   }
+  dialog select { appearance:auto; }
   dialog textarea { min-height:120px; resize:vertical; line-height:1.5; }
-  dialog input:focus, dialog textarea:focus { outline:none; border-color:var(--rose); }
+  dialog input:focus, dialog textarea:focus, dialog select:focus { outline:none; border-color:var(--rose); }
+  dialog .row[hidden] { display:none; }
+  dialog .row input, dialog .row select { margin-bottom:0; }
+  dialog .row.adddeckrow { justify-content:stretch; align-items:center; }
+  dialog .row.adddeckrow label { flex:0 0 72px; margin:0; }
+  dialog .row.adddeckrow input, dialog .row.adddeckrow select { flex:1 1 auto; min-width:0; }
   /* file workspace = mini file explorer (grid + detail) */
   #uploaddlg { width:min(96vw,620px); }
   .wshead { display:flex; align-items:center; justify-content:space-between; gap:var(--sp2); flex-wrap:wrap; margin:0 0 var(--sp2); }
@@ -595,6 +601,8 @@
   <h3>Add to collection</h3>
   <p class="hint">Adds this session’s chat to a deck. Works only while the desktop app is open — it owns your collections, so this can’t drift out of sync.</p>
   <div id="addcollist" class="addcollist"></div>
+  <div class="row adddeckrow"><label for="adddecksel">Deck</label><select id="adddecksel"></select></div>
+  <div class="row adddeckrow" id="adddecknewrow" hidden><label for="adddecknew">New deck</label><input id="adddecknew" placeholder="deck name" autocapitalize="off" autocomplete="off" spellcheck="false"></div>
   <div class="row"><input id="addcolnew" placeholder="new collection name…" autocapitalize="off" autocomplete="off" spellcheck="false"><button class="act primary" id="addcolcreate">Create &amp; add</button></div>
   <div class="row"><div class="grow"></div><button class="act" id="addcolcancel">Cancel</button></div>
 </dialog>
@@ -1409,6 +1417,7 @@ function openMenu(s, anchor){
   sync.className = 'msync '+(_appLive?'ok':'off');
   const addB=m.querySelector('[data-a="addcol"]');
   if(!_appLive){ addB.disabled=true; addB.title='Open the desktop app to add to a collection (it owns your collections, so this can’t drift out of sync)'; }
+  else if(!chatBackedSession(s)){ addB.disabled=true; addB.title='This tab is not linked to a chat, so it cannot be filed into a collection'; }
   const ahB=m.querySelector('[data-a="autoheal"]');
   ahB.textContent = s.autoheal ? '⟳ Auto-resume: ON' : '⟳ Auto-resume: off';
   ahB.classList.toggle('on', !!s.autoheal);
@@ -1440,32 +1449,77 @@ function menuAction(a, s){
 // Collections are OWNED by the desktop app; the web must NOT create them independently or state drifts. So
 // we only allow "Add to collection" while the app is live (POST'd its projection within ~45s), and the add
 // itself goes through the app (an app-command it files on its next sync). Poll the sync state for the menu.
-let _appLive=false, _appCollections=[], addColTarget=null;
+let _appLive=false, _appCollections=[], _appDecks=[], addColTarget=null;
 async function pollAppSync(){
   try{ const p=await (await fetch(base+'/api/projects',{headers:{'Content-Type':'application/json'}})).json();
-       _appLive=!!(p.appLive ?? p.live); _appCollections=Array.isArray(p.collections)?p.collections:[]; }
+       _appLive=!!(p.appLive ?? p.live); _appCollections=Array.isArray(p.collections)?p.collections:[]; _appDecks=Array.isArray(p.decks)?p.decks:[]; }
   catch(e){ _appLive=false; }
 }
 pollAppSync(); setInterval(pollAppSync, 8000);
+function appDeckChoices(){
+  const seen=new Set(), out=[];
+  const add=(id,name)=>{ id=String(id||'main'); name=String(name||'Main'); if(seen.has(id)) return; seen.add(id); out.push({id,name}); };
+  _appDecks.forEach(d=>add(d.id,d.name));
+  add('main','Main');
+  _appCollections.forEach(c=>add(c.deckId||'main', c.deckName||'Main'));
+  return out;
+}
+function appDeckLabel(id){
+  const d=appDeckChoices().find(x=>String(x.id)===String(id||'main'));
+  return d ? d.name : 'Main';
+}
+function addColDeckChoice(){
+  const sel=$('#adddecksel');
+  if(!sel) return { deckId:'main', deckName:'Main' };
+  if(sel.value==='__new__') return { deckId:'', deckName:($('#adddecknew').value||'').trim() };
+  return { deckId:sel.value||'main', deckName:appDeckLabel(sel.value||'main') };
+}
+function setAddDeckNewVisible(){
+  const isNew=$('#adddecksel') && $('#adddecksel').value==='__new__';
+  $('#adddecknewrow').hidden=!isNew;
+  if(isNew) setTimeout(()=>$('#adddecknew').focus(),30);
+}
+function chatBackedSession(s){ return !!(s && (s.sessionId || s.projectMuxName)); }
 function addToCollection(s){
   if(!_appLive){ flash('Desktop app is closed — open it to add to a collection (so states don’t drift)'); return; }
+  if(!chatBackedSession(s)){ flash('This tab is not linked to a chat yet, so it cannot be filed into a collection'); return; }
   addColTarget=s;
   const list=$('#addcollist'); list.innerHTML='';
   if(!_appCollections.length){ const p=document.createElement('div'); p.className='hint'; p.textContent='No collections yet — type a name below to make one.'; list.appendChild(p); }
   _appCollections.forEach(c=>{ const b=document.createElement('button'); b.type='button'; b.className='act wide';
-    b.textContent=(c.name||'Untitled')+' · '+((c.chats||[]).length)+' chat'+(((c.chats||[]).length)!==1?'s':'');
-    b.onclick=()=>submitAddCol(c.name||'Untitled'); list.appendChild(b); });
-  $('#addcolnew').value=''; openDialog('#addcoldlg'); setTimeout(()=>$('#addcolnew').focus(),60);
+    b.textContent=(c.deckName||appDeckLabel(c.deckId))+' / '+(c.name||'Untitled')+' · '+((c.chats||[]).length)+' chat'+(((c.chats||[]).length)!==1?'s':'');
+    b.onclick=()=>submitAddCol({ collection:c.name||'Untitled', collectionId:c.id||'', deckId:c.deckId||'main', deckName:c.deckName||appDeckLabel(c.deckId) }); list.appendChild(b); });
+  const sel=$('#adddecksel'); sel.innerHTML='';
+  appDeckChoices().forEach(d=>{ const o=document.createElement('option'); o.value=d.id; o.textContent=d.name; sel.appendChild(o); });
+  const newOpt=document.createElement('option'); newOpt.value='__new__'; newOpt.textContent='New deck...'; sel.appendChild(newOpt);
+  sel.onchange=setAddDeckNewVisible; setAddDeckNewVisible();
+  $('#addcolnew').value=''; $('#adddecknew').value=''; openDialog('#addcoldlg'); setTimeout(()=>$('#addcolnew').focus(),60);
 }
-function submitAddCol(name){
-  const s=addColTarget; if(!s) return; name=(name||'').trim();
+async function submitAddCol(target){
+  if(typeof target==='string') target={ collection:target };
+  target=target||{};
+  const s=addColTarget; if(!s) return;
+  const choice=target.collectionId ? { deckId:target.deckId||'main', deckName:target.deckName||appDeckLabel(target.deckId) } : addColDeckChoice();
+  const name=(target.collection||$('#addcolnew').value||'').trim();
   if(!name){ flash('Pick a collection or type a new name'); return; }
+  if(!target.collectionId && !choice.deckId && !choice.deckName){ flash('Pick a deck or type a new deck name'); return; }
   if(!_appLive){ flash('App went offline — can’t add now'); $('#addcoldlg').close(); return; }
-  fetch(base+'/api/app-commands',{ method:'POST', headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({ type:'addtocollection', muxName:s.name, sessionName:s.name, collection:name }) })
-    .then(async r=>{ if(!r.ok) throw new Error(await apiError(r)); return r.json(); })
-    .then(()=>{ $('#addcoldlg').close(); flash('Queued “'+s.name+'” → “'+name+'” — the app files it on its next sync'); })
-    .catch(e=>flash('Couldn’t queue: '+(e.message||e)));
+  const btns=$('#addcoldlg').querySelectorAll('button'); btns.forEach(b=>b.disabled=true);
+  try{
+    const r=await fetch(base+'/api/app-commands',{ method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({ type:'addtocollection', muxName:s.projectMuxName||s.muxName||s.name, sessionName:s.name, sessionId:s.sessionId||'', collection:name, collectionId:target.collectionId||'', deckId:choice.deckId||'', deckName:choice.deckName||'' }) });
+    if(!r.ok) throw new Error(await apiError(r));
+    const queued=await r.json();
+    const detail=await pollUploadCmd(queued.id, 20000);
+    if(detail===null) throw new Error('timed out waiting for the desktop app');
+    $('#addcoldlg').close();
+    flash('Added "'+s.name+'" to "'+name+'" on '+(choice.deckName||appDeckLabel(choice.deckId)));
+    pollAppSync();
+  }catch(e){
+    flash('Couldn’t add: '+(e.message||e));
+  }finally{
+    btns.forEach(b=>b.disabled=false);
+  }
 }
 // Per-tab auto-resume toggle: when ON, the VPS watchdog re-runs this tab's resume command if its agent
 // dies while working. Persisted server-side by session name (survives restarts + relaunches).
@@ -1590,6 +1644,7 @@ $('#cancelrename').onclick = ()=>$('#renamedlg').close();
 $('#addcolcancel').onclick = ()=>$('#addcoldlg').close();
 $('#addcolcreate').onclick = ()=>submitAddCol($('#addcolnew').value);
 $('#addcolnew').addEventListener('keydown', e=>{ if(e.key==='Enter'){ e.preventDefault(); submitAddCol($('#addcolnew').value); } });
+$('#adddecknew').addEventListener('keydown', e=>{ if(e.key==='Enter'){ e.preventDefault(); submitAddCol($('#addcolnew').value); } });
 $('#renameinput').addEventListener('keydown', e=>{ if(e.key==='Enter'){ e.preventDefault(); $('#dorename').click(); } });
 $('#dorename').onclick = async ()=>{
   const to=($('#renameinput').value||'').replace(/[^A-Za-z0-9_.-]/g,'').slice(0,40); const from=renameTarget;

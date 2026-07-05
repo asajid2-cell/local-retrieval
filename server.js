@@ -299,6 +299,7 @@ function listSessions() {
   // conflict on the hosted row instead of silently hiding or killing the legacy process.
   if (hostUp()) {
     for (const [name, h] of hostSessions) {
+      const chat = projectedChatForHosted(h);
       const attached = (sessions.get(name) ? [...sessions.get(name).clients.values()].some(c => c.hosted) : false);
       const protocolOk = hostProtocolOk();
       const alive = h.alive !== false;
@@ -313,6 +314,9 @@ function listSessions() {
                   alive, dormant, detachedLocal, cols: h.cols || 0, rows: h.rows || 0,
                   hasCommand: !!h.hasCommand, shellOnly: !!h.shellOnly, ready: !!h.ready,
                   kind: h.kind || (dormant ? 'dormant' : (h.shellOnly ? 'shell' : 'command')), cmdSig: h.cmdSig || '',
+                  sessionId: String(chat && chat.id || ''), tool: String(chat && chat.tool || ''),
+                  chatTitle: String(chat && chat.title || ''), projectMuxName: String(chat && chat.muxName || ''),
+                  chatLinked: !!chat,
                   localViewers: h.localViewers || 0, localFirst: !!h.localFirst,
                   detail: detachedLocal ? 'Local agent process is still running, but the muxd mirror is detached. New muxrun sessions re-register automatically; restart this one through mux to restore web terminal control.'
                          : dormant ? 'Dormant mux session: no shell or agent is running until you relaunch it or run mux locally.' : '',
@@ -551,6 +555,14 @@ function allProjectedChats() {
     for (const chat of (Array.isArray(col.chats) ? col.chats : [])) out.push(chat);
   for (const chat of (Array.isArray(_projects.allChats) ? _projects.allChats : [])) out.push(chat);
   return out;
+}
+function projectedChatForHosted(hosted) {
+  const sig = String(hosted && hosted.cmdSig || '');
+  if (!sig) return null;
+  for (const chat of allProjectedChats()) {
+    if (commandSig(chat && chat.muxCommand || '') === sig) return chat;
+  }
+  return null;
 }
 function runningChatForMuxName(name) {
   const muxName = SAFE(name);
