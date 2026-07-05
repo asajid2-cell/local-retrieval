@@ -405,6 +405,31 @@ public sealed class ArchiveServiceTests
             StringAssert.Contains(cmd, "resume");
             Assert.IsFalse(ch.GetProperty("running").GetBoolean());   // no running set passed
         }
+        var all = root.GetProperty("allChats");
+        Assert.AreEqual(2, all.GetArrayLength(), "the remote projection also exposes indexed chats outside the collection tree");
+        Assert.IsTrue(all.EnumerateArray().All(ch => ch.GetProperty("muxCommand").GetString()!.Contains("resume")));
+        Assert.IsTrue(all.EnumerateArray().Any(ch => ch.GetProperty("collection").GetString() == "Cortex Engine"));
+    }
+
+    [TestMethod]
+    public void BuildProjectsProjectionJson_EmitsUncollectedIndexedChats()
+    {
+        var svc = new ArchiveService(useBundledStore: true);
+        var cwd = System.IO.Path.GetTempPath().TrimEnd('\\', '/');
+        var filed = new ArchiveSession { Id = "filed", Tool = "claude", Title = "Filed Chat", Workspace = cwd, SourcePath = System.IO.Path.Combine(cwd, "filed.jsonl") };
+        var old = new ArchiveSession { Id = "old-chat", Tool = "codex", Title = "Old Unfiled Chat", Workspace = cwd, SourcePath = System.IO.Path.Combine(cwd, "old.jsonl") };
+        svc.Store.Sessions[filed.Id] = filed;
+        svc.Store.Sessions[old.Id] = old;
+        svc.Store.Collections["col1"] = new ArchiveCollection { Id = "col1", Name = "Filed", SessionIds = new() { filed.Id } };
+
+        using var doc = System.Text.Json.JsonDocument.Parse(svc.BuildProjectsProjectionJson());
+        var all = doc.RootElement.GetProperty("allChats");
+        var oldRow = all.EnumerateArray().First(ch => ch.GetProperty("id").GetString() == "old-chat");
+
+        Assert.AreEqual("Old Unfiled Chat", oldRow.GetProperty("title").GetString());
+        Assert.AreEqual(System.Text.Json.JsonValueKind.Null, oldRow.GetProperty("collection").ValueKind);
+        Assert.IsTrue(oldRow.GetProperty("muxName").GetString()!.Length > 0);
+        StringAssert.Contains(oldRow.GetProperty("muxCommand").GetString()!, "resume");
     }
 
     // runningSessions in the projection: every live agent appears (for the web's "Running on PC" view),
@@ -440,6 +465,24 @@ public sealed class ArchiveServiceTests
         Assert.AreEqual("Terminal", rs[1].GetProperty("parent").GetString());
         Assert.AreEqual(100, rs[2].GetProperty("pid").GetInt32());
         Assert.AreEqual("Cortex Push", rs[2].GetProperty("title").GetString());                       // matched by id
+    }
+
+    [TestMethod]
+    public void BuildProjectsProjectionJson_NamesRunningUncollectedIndexedSession()
+    {
+        var svc = new ArchiveService(useBundledStore: true);
+        var cwd = System.IO.Path.GetTempPath().TrimEnd('\\', '/');
+        svc.Store.Sessions["known-unfiled"] = new ArchiveSession { Id = "known-unfiled", Tool = "codex", Title = "Known But Unfiled", Workspace = cwd, SourcePath = System.IO.Path.Combine(cwd, "known.jsonl") };
+
+        var sessions = new[]
+        {
+            new ArchiveService.RunningSessionInfo(300, "codex", "known-unfiled", "Terminal", "2026-06-29T02:00:00Z", ""),
+        };
+        using var doc = System.Text.Json.JsonDocument.Parse(svc.BuildProjectsProjectionJson(null, sessions));
+        var rs = doc.RootElement.GetProperty("runningSessions");
+
+        Assert.AreEqual("Known But Unfiled", rs[0].GetProperty("title").GetString());
+        Assert.AreEqual(System.Text.Json.JsonValueKind.Null, rs[0].GetProperty("collection").ValueKind);
     }
 
     // The "is this chat already running?" guard reads the resumed session id off a claude/codex process

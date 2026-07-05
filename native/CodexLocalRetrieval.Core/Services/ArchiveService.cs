@@ -2084,7 +2084,7 @@ public sealed class ArchiveService
         catch { return null; }
     }
 
-    // A compact JSON projection of every collection + its resumable chats, pushed to the VPS so the
+    // A compact JSON projection of every collection + a bounded all-chat archive, pushed to the VPS so the
     // web (harmonizerlabs.cc/multiplex → Projects) can list your projects and resume any chat into a
     // PC-hosted mux session from anywhere. Each chat carries the mux session name + the resume command
     // the web POSTs to /api/sessions, and a `running` flag (from a live process scan) so the web can warn
@@ -2105,6 +2105,37 @@ public sealed class ArchiveService
                 collections = CollectionCountInDeck(d.Id),
             })
             .ToList();
+        var collectionBySession = new Dictionary<string, (string Collection, string DeckId, string Deck)>(StringComparer.OrdinalIgnoreCase);
+        foreach (var col in Store.Collections.Values
+                     .OrderBy(c => deckOrder.TryGetValue(CollectionDeck(c), out var order) ? order : int.MaxValue)
+                     .ThenBy(c => c.Name, StringComparer.OrdinalIgnoreCase))
+        {
+            var deckId = CollectionDeck(col);
+            var deck = deckNames.TryGetValue(deckId, out var dn) ? dn : "Main";
+            foreach (var sid in col.SessionIds)
+                if (!string.IsNullOrWhiteSpace(sid) && !collectionBySession.ContainsKey(sid))
+                    collectionBySession[sid] = (col.Name, deckId, deck);
+        }
+        object? ChatProjection(ArchiveSession s)
+        {
+            var muxCommand = BuildMultiplexCommand(s);
+            if (string.IsNullOrEmpty(muxCommand)) return null;
+            collectionBySession.TryGetValue(s.Id, out var col);
+            return new
+            {
+                id = s.Id,
+                title = s.DisplayTitle,
+                tool = s.Tool,
+                muxName = MultiplexSessionName(s),
+                muxCommand,
+                running = runningIds is not null && !string.IsNullOrEmpty(s.Id) && runningIds.Contains(s.Id),
+                updatedAt = s.UpdatedAt,
+                workspace = s.WorkspaceName,
+                collection = string.IsNullOrEmpty(col.Collection) ? null : col.Collection,
+                collectionDeckId = string.IsNullOrEmpty(col.DeckId) ? null : col.DeckId,
+                collectionDeck = string.IsNullOrEmpty(col.Deck) ? null : col.Deck,
+            };
+        }
         var collections = Store.Collections.Values
             .OrderBy(c => deckOrder.TryGetValue(CollectionDeck(c), out var order) ? order : int.MaxValue)
             .ThenBy(c => c.Name, StringComparer.OrdinalIgnoreCase)
@@ -2117,23 +2148,27 @@ public sealed class ArchiveService
                 chats = col.SessionIds
                     .Select(sid => Store.Sessions.TryGetValue(sid, out var s) ? s : null)
                     .Where(s => s is not null)
-                    .Select(s => new
-                    {
-                        id = s!.Id,
-                        title = s.DisplayTitle,
-                        tool = s.Tool,
-                        muxName = MultiplexSessionName(s),
-                        muxCommand = BuildMultiplexCommand(s),
-                        running = runningIds is not null && !string.IsNullOrEmpty(s.Id) && runningIds.Contains(s.Id),
-                    })
-                    .Where(c => !string.IsNullOrEmpty(c.muxCommand))
+                    .Select(s => ChatProjection(s!))
+                    .Where(c => c is not null)
                     .ToList(),
             })
             .Where(c => c.chats.Count > 0)
             .ToList();
+        var allChats = OrderedVisibleSessions(Store.Sessions.Values)
+            .Select(ChatProjection)
+            .Where(c => c is not null)
+            .Take(500)
+            .ToList();
 
         // Map every known chat's id + aliases -> (title, collection, deck) so a running process can be named.
         var byId = new Dictionary<string, (string Title, string Collection, string DeckId, string Deck)>(StringComparer.OrdinalIgnoreCase);
+        foreach (var s in Store.Sessions.Values)
+        {
+            collectionBySession.TryGetValue(s.Id, out var col);
+            if (!string.IsNullOrEmpty(s.Id)) byId[s.Id] = (s.DisplayTitle, col.Collection, col.DeckId, col.Deck);
+            foreach (var a in s.Aliases)
+                if (!string.IsNullOrEmpty(a)) byId[a] = (s.DisplayTitle, col.Collection, col.DeckId, col.Deck);
+        }
         foreach (var col in Store.Collections.Values)
             foreach (var sid in col.SessionIds)
                 if (Store.Sessions.TryGetValue(sid, out var s) && s is not null)
@@ -2167,7 +2202,7 @@ public sealed class ArchiveService
             .OrderByDescending(r => r.startedAt, StringComparer.Ordinal)
             .ToList();
 
-        return JsonSerializer.Serialize(new { host = Environment.MachineName, decks, collections, runningSessions = running });
+        return JsonSerializer.Serialize(new { host = Environment.MachineName, decks, collections, allChats, runningSessions = running });
     }
 
     public static string ResolveClaudeExe()
