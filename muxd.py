@@ -23,12 +23,27 @@ MANIFEST = os.path.join(DIR, "sessions.json")
 LOG = os.path.join(DIR, "muxd.log")
 ENVF = os.path.join(DIR, "muxd.env")
 
+LOG_Q = queue.Queue(maxsize=4000)
+
+def _log_writer():
+    while True:
+        line = LOG_Q.get()
+        if line is None:
+            return
+        try:
+            if os.path.exists(LOG) and os.path.getsize(LOG) > 2_000_000:
+                os.replace(LOG, LOG + ".1")
+            with open(LOG, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except Exception:
+            pass
+
+threading.Thread(target=_log_writer, name="muxd-log-writer", daemon=True).start()
+
 def log(msg):
     line = time.strftime("%m-%d %H:%M:%S") + " " + msg
     try:
-        if os.path.exists(LOG) and os.path.getsize(LOG) > 2_000_000:
-            os.replace(LOG, LOG + ".1")
-        with open(LOG, "a", encoding="utf-8") as f: f.write(line + "\n")
+        LOG_Q.put_nowait(line)
     except Exception: pass
 
 def loadenv():
