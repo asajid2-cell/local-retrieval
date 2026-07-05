@@ -172,12 +172,11 @@ function failLegacy(res, name) {
   return failHost(res, 409, 'legacy tmux session exists', legacyDetail(name));
 }
 
-// Persistent per-session status for the tab dots. We classify what's in each pane:
-//   green  = a claude/codex turn is IN FLIGHT (always shows "esc to interrupt" + live markers)
-//   yellow = an agent is up but IDLE, waiting for your next prompt (its footer/input box is showing)
-//   white  = a neutral shell, no agent has run here
-//   red    = the agent is GONE (a bare shell, but an agent WAS here) — so a batch-file crash / codex
-//            insta-disconnect shows up immediately as the dot going red.
+// Per-session attention status for the tab dots:
+//   green  = command-backed agent is producing output recently (likely still working)
+//   yellow = command-backed agent is alive but quiet (likely waiting for the human)
+//   white  = neutral shell, no agent command is registered
+//   red    = stopped/blocker: command returned to a shell, legacy conflict, detached mirror, etc.
 const _sessState = new Map();   // name -> { everAgent }  (lets a bare shell read RED instead of WHITE)
 const _stateCache = new Map();  // name -> { at, state }   throttle hosted-tail classification bursts
                                  // polls (4s interval × several clients) must not spawn a subprocess per call
@@ -203,6 +202,87 @@ function paneAgentState(name, content) {
   _stateCache.set(name, { at: Date.now(), state });
   return state;
 }
+const AGENT_WORKING_FRESH_MS = Math.max(5000, Number(process.env.MUX_AGENT_WORKING_FRESH_MS || 25000));
+const AGENT_STARTING_GRACE_MS = Math.max(5000, Number(process.env.MUX_AGENT_STARTING_GRACE_MS || 45000));
+function cleanTerminalForState(s) {
+  return String(s || '')
+    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '')
+    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, '')
+    .replace(/\x1b[@-Z\\-_]/g, '')
+    // Older muxd builds stripped ESC from CSI sequences like ESC[0 q, leaving "[0 q".
+    .replace(/\[[0-?]*[ -/]*[@-~]/g, '')
+    .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '');
+}
+function fmtAge(ms) {
+  if (!Number.isFinite(ms) || ms < 0) return 'unknown';
+  if (ms < 1500) return 'just now';
+  if (ms < 60000) return Math.round(ms / 1000) + 's ago';
+  if (ms < 3600000) return Math.round(ms / 60000) + 'm ago';
+  return Math.round(ms / 3600000) + 'h ago';
+}
+function tailLooksAtShellPrompt(tail) {
+  const lines = cleanTerminalForState(tail).split(/\r?\n/).map(l => l.trim()).filter(Boolean).slice(-8);
+  return lines.some(l =>
+    /^(?:PS\s+)?[A-Za-z]:\\[^>]{0,180}>\s*$/.test(l) ||
+    /^[\w.\-]+@[\w.\-]+:[^#$]{0,180}[#$]\s*$/.test(l)
+  );
+}
+function hostAgentStatus(h) {
+  const s = String(h && h.agentState || '').toLowerCase();
+  if (!['working', 'attention', 'stopped', 'neutral', 'dormant'].includes(s)) return null;
+  const state = s === 'working' ? 'green' : s === 'attention' ? 'yellow' :
+                s === 'stopped' ? 'red' : s === 'dormant' ? 'dormant' : 'white';
+  return {
+    state,
+    agentState: s,
+    agentLabel: String(h.agentLabel || '') || (s === 'attention' ? 'waiting for you' : s),
+    agentDetail: String(h.agentDetail || ''),
+    agentConfidence: String(h.agentConfidence || 'medium'),
+    needsAttention: s === 'attention' || s === 'stopped',
+  };
+}
+function attentionStatusForHosted(name, h, opts = {}) {
+  if (opts.detachedLocal) return {
+    state: 'detached', agentState: 'detached', agentLabel: 'detached local agent',
+    agentDetail: 'agent process is alive locally, but muxd mirror is detached', agentConfidence: 'high',
+    needsAttention: true,
+  };
+  if (opts.dormant || !h || h.alive === false) return {
+    state: 'dormant', agentState: 'dormant', agentLabel: 'dormant',
+    agentDetail: 'no shell or agent is running until you relaunch it', agentConfidence: 'high',
+    needsAttention: false,
+  };
+  if (!h.hasCommand || h.shellOnly) return {
+    state: 'white', agentState: 'neutral', agentLabel: 'plain shell',
+    agentDetail: 'live terminal, no agent command registered', agentConfidence: 'high',
+    needsAttention: false,
+  };
+  const provided = hostAgentStatus(h);
+  if (provided) return provided;
+  if (tailLooksAtShellPrompt(h.tail || '')) return {
+    state: 'red', agentState: 'stopped', agentLabel: 'agent stopped',
+    agentDetail: 'the command-backed session returned to a shell prompt', agentConfidence: 'high',
+    needsAttention: true,
+  };
+  const now = Date.now();
+  const lastOut = Number(h.lastOut || 0);
+  const created = Number(h.created || 0);
+  const lastOutAgeMs = lastOut ? now - lastOut : NaN;
+  const createdAgeMs = created ? now - created : NaN;
+  if ((Number.isFinite(lastOutAgeMs) && lastOutAgeMs <= AGENT_WORKING_FRESH_MS) ||
+      (Number.isFinite(createdAgeMs) && createdAgeMs <= AGENT_STARTING_GRACE_MS)) {
+    return {
+      state: 'green', agentState: 'working', agentLabel: 'agent working',
+      agentDetail: 'terminal output updated ' + fmtAge(lastOutAgeMs), agentConfidence: 'medium',
+      needsAttention: false, lastOutAgeMs,
+    };
+  }
+  return {
+    state: 'yellow', agentState: 'attention', agentLabel: 'waiting for you',
+    agentDetail: 'no terminal output for ' + fmtAge(lastOutAgeMs), agentConfidence: 'medium',
+    needsAttention: true, lastOutAgeMs,
+  };
+}
 function listSessions() {
   let list = [];
   const legacy = new Set(legacyTmuxNames());
@@ -215,8 +295,12 @@ function listSessions() {
       const alive = h.alive !== false;
       const dormant = !alive;
       const detachedLocal = dormant && locallyRunningMuxName(name);
+      const attn = attentionStatusForHosted(name, h, { dormant, detachedLocal });
       list.push({ name, windows: 1, created: h.created || 0, attached, activity: h.lastOut || 0,
-                  state: detachedLocal ? 'detached' : (dormant ? 'dormant' : paneAgentState(name, h.tail || '')), autoheal: _healOn.has(name), hosted: true,
+                  state: attn.state, agentState: attn.agentState, agentLabel: attn.agentLabel,
+                  agentDetail: attn.agentDetail, agentConfidence: attn.agentConfidence,
+                  needsAttention: !!attn.needsAttention, lastOutAgeMs: attn.lastOutAgeMs,
+                  autoheal: _healOn.has(name), hosted: true,
                   alive, dormant, detachedLocal, cols: h.cols || 0, rows: h.rows || 0,
                   hasCommand: !!h.hasCommand, shellOnly: !!h.shellOnly, ready: !!h.ready,
                   kind: h.kind || (dormant ? 'dormant' : (h.shellOnly ? 'shell' : 'command')), cmdSig: h.cmdSig || '',
@@ -232,6 +316,8 @@ function listSessions() {
   for (const name of legacy) {
     if (list.some(s => s.name === name)) continue;
     list.push({ name, windows: 0, created: 0, attached: false, activity: 0, state: 'red',
+                agentState: 'blocked', agentLabel: 'legacy blocker', agentDetail: legacyDetail(name),
+                agentConfidence: 'high', needsAttention: true,
                 autoheal: _healOn.has(name), hosted: false, legacy: true, legacyBlocked: true,
                 detail: legacyDetail(name) });
   }
@@ -818,7 +904,9 @@ wssHost.on('connection', (ws, req) => {
                             localFirst: !!s.localFirst, localViewers: s.localViewers || 0,
                             hasCommand, shellOnly, ready: Object.prototype.hasOwnProperty.call(s, 'ready') ? !!s.ready : alive,
                             kind: String(s.kind || (alive ? (shellOnly ? 'shell' : 'command') : 'dormant')),
-                            cmdSig: String(s.cmdSig || '') });
+                            cmdSig: String(s.cmdSig || ''),
+                            agentState: String(s.agentState || ''), agentLabel: String(s.agentLabel || ''),
+                            agentDetail: String(s.agentDetail || ''), agentConfidence: String(s.agentConfidence || '') });
         }
       }
       // A2 #1: don't let a status push evict an optimistic create muxd hasn't reported yet; confirm/expire pendings.

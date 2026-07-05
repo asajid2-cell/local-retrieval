@@ -85,13 +85,14 @@
   /* active = filled + a crisp rose left accent (not a floating bead) */
   .tab.active { background:var(--raised); color:var(--txt); box-shadow:inset 2px 0 0 var(--rose); padding-left:calc(var(--sp3) + 2px); }
   /* the dot is a STATE signal for non-active tabs only: emerald=attached elsewhere, rose=unread */
-  /* persistent agent-status dot: white=neutral shell · green=working · yellow=idle/waiting · red=agent gone */
+  /* persistent attention dot: green=recent output/working · yellow=quiet/waiting · red=stopped/blocker · white=plain shell */
   .tab .dot { width:8px; height:8px; border-radius:50%; background:#9aa0a6; flex:0 0 auto; transition:background .25s, box-shadow .25s; }
   .tab[data-state="white"]  .dot { background:#e8eaed; }
   .tab[data-state="dormant"] .dot { background:#9aa0a6; box-shadow:0 0 0 3px rgba(154,160,166,.13); }
   .tab[data-state="green"]  .dot { background:var(--live);  box-shadow:0 0 0 3px rgba(52,211,153,.16); }
   .tab[data-state="yellow"] .dot { background:var(--warn);  box-shadow:0 0 0 3px rgba(251,191,36,.16); }
   .tab[data-state="red"]    .dot { background:var(--rose);  box-shadow:0 0 0 3px var(--rose-dim); }
+  .tab[data-state="detached"] .dot { background:var(--rose); box-shadow:0 0 0 3px var(--rose-dim); }
   .tab.unread .dot { animation: dotpulse 1.4s ease-in-out infinite; }   /* changed-while-away: pulse, any color */
   @keyframes dotpulse { 0%,100%{ opacity:1 } 50%{ opacity:.4 } }
   .tab .pcchip { font-size:8px; font-weight:700; letter-spacing:.04em; color:var(--live); border:1px solid rgba(52,211,153,.35); border-radius:4px; padding:0 3px; line-height:1.5; flex:0 0 auto; }   /* runs on the PC = survives network/VPS failures */
@@ -1250,10 +1251,12 @@ function renderTabs(){
   list.forEach(s => {
     const t = document.createElement('div');
     t.className = 'tab'+(s.name===current?' active':'')+(s.attached?' attached':'')+(s.unread?' unread':'')+(s.autoheal?' autoheal':'');
-    t.dataset.state = s.state || 'white';   // green=working · yellow=idle/waiting · red=agent gone · white=neutral shell
+    t.dataset.state = s.state || 'white';   // green=working · yellow=waiting/attention · red=stopped/blocker · white=plain shell
     t.setAttribute('role','tab'); t.tabIndex=0; t.setAttribute('aria-selected', s.name===current?'true':'false');
-    const st = {green:'agent working',yellow:'agent idle — waiting for your prompt',red:'agent stopped/exited',white:'neutral shell — no agent'}[s.state||'white'];
-    t.title = s.name + (st?' · '+st:'');
+    const st = s.agentLabel || {green:'agent working',yellow:'waiting for you',red:'agent stopped/blocker',detached:'detached local agent',dormant:'dormant',white:'plain shell — no agent'}[s.state||'white'];
+    const detail = s.agentDetail ? ' · '+s.agentDetail : '';
+    const conf = s.agentConfidence ? ' · '+s.agentConfidence+' confidence' : '';
+    t.title = s.name + (st?' · '+st:'') + detail + conf;
     const chips = `${s.hosted?'<span class="pcchip" title="Runs on your PC — survives network/VPS failures">PC</span>':''}`+
       `${s.legacyTwin?'<span class="pcchip legacy" title="Legacy tmux session with the same name exists on the VPS">TWIN</span>':''}`+
       `${s.legacyBlocked?'<span class="pcchip legacy" title="Legacy tmux diagnostic only — relay refuses to attach/manage it">LEGACY</span>':''}`;

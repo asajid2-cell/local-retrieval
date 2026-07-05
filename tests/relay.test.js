@@ -232,6 +232,36 @@ function dormantSession(name, cmd = '') {
   return { name, alive: false, created: 1000, lastOut: 1000, cols: 100, rows: 30, hasCommand: !!cmd, shellOnly: false, ready: false, kind: 'dormant', cmdSig: commandSig(cmd) };
 }
 
+test('GET /api/sessions reports trustable attention states from host facts', async t => {
+  const h = new RelayHarness();
+  await h.start();
+  t.after(async () => h.stop());
+  const cmd = 'codex resume abc';
+  const now = Date.now();
+  const host = await h.connectHost([
+    { ...commandSession('activecase', cmd, now - 1000), lastOut: now - 1000, tail: 'garbled tail without magic UI words' },
+    { ...commandSession('quietcase', cmd, now - 120000), lastOut: now - 120000, tail: 'Use /skills to list available skills' },
+    { ...commandSession('stoppedcase', cmd, now - 120000), lastOut: now - 120000, tail: 'PS C:\\Users\\Ahmed>' },
+    shellSession('shellcase'),
+  ]);
+  t.after(() => host.close());
+
+  const rows = await h.json('GET', '/api/sessions');
+  const byName = Object.fromEntries(rows.map(r => [r.name, r]));
+  assert.equal(byName.activecase.state, 'green');
+  assert.equal(byName.activecase.agentState, 'working');
+  assert.equal(byName.activecase.needsAttention, false);
+  assert.equal(byName.quietcase.state, 'yellow');
+  assert.equal(byName.quietcase.agentState, 'attention');
+  assert.equal(byName.quietcase.needsAttention, true);
+  assert.equal(byName.stoppedcase.state, 'red');
+  assert.equal(byName.stoppedcase.agentState, 'stopped');
+  assert.equal(byName.stoppedcase.needsAttention, true);
+  assert.equal(byName.shellcase.state, 'white');
+  assert.equal(byName.shellcase.agentState, 'neutral');
+  assert.equal(byName.shellcase.needsAttention, false);
+});
+
 test('POST /api/sessions relaunches shell-only hosted session and waits for muxd confirmation', async t => {
   const h = new RelayHarness();
   await h.start();
