@@ -122,6 +122,7 @@
      Vertical history belongs to xterm's scrollback, never to a browser wrapper scrollbar. */
   #term.pan { overflow-x:auto; overflow-y:hidden; touch-action:pan-x; }
   #term.pan .xterm, #term.pan .xterm-viewport, #term.pan .xterm-screen { width:max-content !important; }
+  #term.rowpan .xterm { will-change:transform; transform-origin:left top; }
   #empty {
     position:absolute; inset:0; z-index:5; display:flex; flex-direction:column; gap:var(--sp3);
     align-items:center; justify-content:center; text-align:center; padding:var(--sp4); color:var(--muted);
@@ -777,6 +778,19 @@ function hardenHelperTextarea(){
   h.setAttribute('autocapitalize', 'off');
   h.setAttribute('spellcheck', 'false');
   h.setAttribute('aria-autocomplete', 'none');
+  if(!h.dataset.muxHardened){
+    h.dataset.muxHardened = '1';
+    ['compositionstart','compositionend','beforeinput','input'].forEach(type=>{
+      h.addEventListener(type, ev=>{
+        logMobileInputEvent(type, {
+          data: ev.data || '',
+          inputType: ev.inputType || '',
+          valueLen: h.value ? h.value.length : 0,
+          composing: !!ev.isComposing
+        });
+      }, true);
+    });
+  }
 }
 hardenHelperTextarea();
 if (location.search.includes('demo')) { window.__term = term; window.__dropws = ()=>{ if(ws) ws.close(); }; }
@@ -872,9 +886,37 @@ function cellMetrics(){
 }
 function applyPan(){
   const host=$('#term');
-  if(!winSize || !viewportFit){ host.classList.remove('pan'); return; }
+  if(!winSize || !viewportFit){
+    host.classList.remove('pan');
+    host.classList.remove('rowpan');
+    const xt=host.querySelector('.xterm'); if(xt) xt.style.transform='';
+    return;
+  }
   const panning = winSize.cols > viewportFit.cols+1;
   host.classList.toggle('pan', panning);
+  scheduleTerminalSurfaceAlign();
+}
+
+let surfaceAlignRaf=0;
+function scheduleTerminalSurfaceAlign(){
+  if(surfaceAlignRaf) cancelAnimationFrame(surfaceAlignRaf);
+  surfaceAlignRaf=requestAnimationFrame(()=>{ surfaceAlignRaf=0; alignTerminalSurface(); });
+}
+function alignTerminalSurface(){
+  const host=$('#term'), xt=host.querySelector('.xterm');
+  if(!xt) return;
+  const rowOverflow = !!(isMobile() && winSize && viewportFit && winSize.rows > viewportFit.rows+1);
+  host.classList.toggle('rowpan', rowOverflow);
+  if(!rowOverflow){
+    xt.style.transform='';
+    return;
+  }
+  const cs=getComputedStyle(host);
+  const padY=(parseFloat(cs.paddingTop)||0)+(parseFloat(cs.paddingBottom)||0);
+  const visibleH=Math.max(0, host.clientHeight-padY);
+  const renderedH=xt.offsetHeight || Math.ceil((cellMetrics().h||18) * (term.rows||winSize.rows||0));
+  const offset=Math.max(0, Math.ceil(renderedH-visibleH));
+  xt.style.transform = offset ? `translateY(${-offset}px)` : '';
 }
 function onControl(s){
   if(s[0]!=='d') return;
@@ -989,20 +1031,89 @@ function stripTerminalGeneratedReports(s){
   }
   return { out, dropped };
 }
-let lastMobileInput='', lastMobileInputAt=0;
-function dropDuplicateMobileInput(s){
+const debugInputEnabled = /(?:[?&]debuginput=1(?:&|$))/.test(location.search);
+window.__muxInputLog = window.__muxInputLog || [];
+function logMobileInputEvent(type, detail){
+  if(!debugInputEnabled) return;
+  window.__muxInputLog.push(Object.assign({ t:Date.now(), type }, detail||{}));
+  if(window.__muxInputLog.length>200) window.__muxInputLog.splice(0, window.__muxInputLog.length-200);
+}
+const MOBILE_INPUT_WINDOW_MS = 6000;
+const MOBILE_INPUT_WINDOW_MAX = 768;
+let mobileInputMemory='', mobileInputMemoryAt=0;
+function isPlainMobileText(s){
+  return !!s && !/[\x00-\x1f\x7f-\x9f]/.test(s);
+}
+function resetMobileInputMemory(){
+  mobileInputMemory='';
+  mobileInputMemoryAt=0;
+}
+function rememberMobileInput(s, now=Date.now()){
+  if(!isPlainMobileText(s)){
+    resetMobileInputMemory();
+    return;
+  }
+  if(now-mobileInputMemoryAt > MOBILE_INPUT_WINDOW_MS) mobileInputMemory='';
+  mobileInputMemory=(mobileInputMemory+s).slice(-MOBILE_INPUT_WINDOW_MAX);
+  mobileInputMemoryAt=now;
+}
+function repeatedWholePhrase(s){
+  if(!isPlainMobileText(s) || s.length<18) return s;
+  const exact = s.match(/^([\s\S]{8,}?)(?:\s+\1)+$/);
+  if(exact) return exact[1];
+  if(s.length % 2 === 0){
+    const half=s.length/2, left=s.slice(0, half), right=s.slice(half);
+    if(left.length>=9 && left===right) return left;
+  }
+  return s;
+}
+function suffixPrefixOverlap(a, b){
+  const max=Math.min(a.length, b.length);
+  for(let n=max; n>=6; n--){
+    if(a.endsWith(b.slice(0,n))) return n;
+  }
+  return 0;
+}
+function filterMobileTextInput(s){
+  if(!isMobile()) return s;
   const now=Date.now();
-  if(isMobile() && s.length>1 && s===lastMobileInput && now-lastMobileInputAt<900) return true;
-  lastMobileInput=s; lastMobileInputAt=now;
-  return false;
+  if(!isPlainMobileText(s)){
+    resetMobileInputMemory();
+    return s;
+  }
+  if(now-mobileInputMemoryAt > MOBILE_INPUT_WINDOW_MS) mobileInputMemory='';
+  let out = repeatedWholePhrase(s);
+  if(out.length>1 && mobileInputMemory){
+    const recent=mobileInputMemory;
+    const trimmed=out.replace(/^\s+/, '');
+    if(recent.endsWith(out) || recent.endsWith(trimmed) || recent.includes(out) || (trimmed.length>=8 && recent.includes(trimmed))){
+      logMobileInputEvent('drop-duplicate', { data: out, recent: recent.slice(-160) });
+      return '';
+    }
+    let cut=suffixPrefixOverlap(recent, out);
+    let source=out;
+    if(!cut && trimmed!==out){
+      cut=suffixPrefixOverlap(recent, trimmed);
+      source=trimmed;
+    }
+    if(cut){
+      const delta=source.slice(cut);
+      logMobileInputEvent('trim-overlap', { data: out, cut, delta, recent: recent.slice(-160) });
+      out=delta;
+    }
+  }
+  if(out) rememberMobileInput(out, now);
+  return out;
 }
 term.onData(d => {
+  logMobileInputEvent('onData', { data:d });
   const filtered = stripTerminalGeneratedReports(d);
   if(filtered.dropped){
     d = filtered.out;
     if(!d) return;
   }
-  if(dropDuplicateMobileInput(d)) return;
+  d = filterMobileTextInput(d);
+  if(!d) return;
   markActive();
   if (autoFreeze && !selectMode) { autoFreeze=false; try{ term.clearSelection(); }catch(e){} flushFrozen(); }   // typing = you're done selecting → go live
   // a sticky modifier (tapped on the keybar) applies to the next char you type on the phone keyboard
