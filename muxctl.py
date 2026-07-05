@@ -17,6 +17,10 @@ TASK_NAME = os.environ.get("MUXD_TASK", "MuxdSessionHost")
 AUTOSTART = os.environ.get("MUXCTL_AUTOSTART", "1").lower() not in ("0", "false", "no", "off")
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 LOCAL_SCROLLBACK = max(0, int(os.environ.get("MUXCTL_SCROLLBACK", "60000")))
+
+def env_truthy(name):
+    return os.environ.get(name, "").lower() in ("1", "true", "yes", "on")
+
 # extended-key scan codes (after 0x00/0xe0 prefix) -> VT sequences
 EXT = {b'H': b'\x1b[A', b'P': b'\x1b[B', b'M': b'\x1b[C', b'K': b'\x1b[D',
        b'G': b'\x1b[H', b'O': b'\x1b[F', b'I': b'\x1b[5~', b'Q': b'\x1b[6~',
@@ -36,6 +40,25 @@ ENABLE_PROCESSED_OUTPUT = 0x0001
 ENABLE_WRAP_AT_EOL_OUTPUT = 0x0002
 ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
 DISABLE_NEWLINE_AUTO_RETURN = 0x0008
+
+def attach_input_mode(current, vt_input=False):
+    next_mode = current | ENABLE_EXTENDED_FLAGS
+    next_mode &= ~(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_QUICK_EDIT_MODE |
+                   ENABLE_WINDOW_INPUT | ENABLE_MOUSE_INPUT | ENABLE_PROCESSED_INPUT)
+    if vt_input:
+        next_mode |= ENABLE_VIRTUAL_TERMINAL_INPUT
+    else:
+        next_mode &= ~ENABLE_VIRTUAL_TERMINAL_INPUT
+    return next_mode
+
+def flush_console_input():
+    if os.name != "nt":
+        return
+    try:
+        k = ctypes.windll.kernel32
+        k.FlushConsoleInputBuffer(k.GetStdHandle(STD_INPUT_HANDLE))
+    except Exception:
+        pass
 
 class COORD(ctypes.Structure):
     _fields_ = [("X", ctypes.c_short), ("Y", ctypes.c_short)]
@@ -71,16 +94,11 @@ def terminal_attach_mode():
         k.SetConsoleMode(hout, out_mode.value | ENABLE_PROCESSED_OUTPUT | ENABLE_WRAP_AT_EOL_OUTPUT |
                          ENABLE_VIRTUAL_TERMINAL_PROCESSING | DISABLE_NEWLINE_AUTO_RETURN)
     if have_in:
-        # Raw-ish input with VT translation lets Windows Terminal send arrow/function keys,
-        # bracketed paste, and mouse wheel/tracking sequences to the hosted PTY. QuickEdit is
-        # disabled so an accidental click/drag cannot freeze the client.
-        next_mode = (in_mode.value | ENABLE_VIRTUAL_TERMINAL_INPUT | ENABLE_WINDOW_INPUT |
-                     ENABLE_MOUSE_INPUT | ENABLE_EXTENDED_FLAGS)
-        next_mode &= ~(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_QUICK_EDIT_MODE)
-        # Keep processed input disabled so Ctrl-C reaches the hosted shell/agent instead of
-        # killing muxctl itself.
-        next_mode &= ~ENABLE_PROCESSED_INPUT
-        k.SetConsoleMode(hin, next_mode)
+        # Stay in classic key-input mode by default. VT/mouse/window input can make
+        # terminal-generated reports and mouse coordinates look like typed bytes to
+        # msvcrt.getch(), which then injects them into the hosted shell.
+        k.SetConsoleMode(hin, attach_input_mode(in_mode.value, env_truthy("MUXCTL_VT_INPUT")))
+        flush_console_input()
     try:
         yield
     finally:
