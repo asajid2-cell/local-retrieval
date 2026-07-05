@@ -508,6 +508,13 @@ test('projects sync preserves decks and app commands preserve collection deck ta
   assert.equal(pending[0].deckName, 'Client A');
 });
 
+test('projects save-tabs dialog keeps new-deck row hidden until selected', () => {
+  const html = fs.readFileSync(path.join(REPO, 'public', 'projects.html'), 'utf8');
+  assert.match(html, /id="wsdecknewrow" hidden/);
+  assert.match(html, /#wscoldlg\s+\.dlgrow\s*\{[^}]*display:flex/);
+  assert.match(html, /#wscoldlg\s+\.dlgrow\[hidden\]\s*\{[^}]*display:none/);
+});
+
 test('DELETE /api/sessions sends kill and waits until hosted row is gone', async t => {
   const h = new RelayHarness();
   await h.start();
