@@ -687,6 +687,7 @@ const fit = new FitAddon.FitAddon();
 term.loadAddon(fit);
 term.open($('#term'));
 let paintHealTimer=0;
+let userScrolledAt=0, userScrollSerial=0;
 function healTerminalPaint(){
   try{
     if(term && term.rows) term.refresh(0, Math.max(0, term.rows-1));
@@ -699,10 +700,36 @@ function schedulePaintHeal(delay=60){
     requestAnimationFrame(()=>{ healTerminalPaint(); requestAnimationFrame(healTerminalPaint); });
   }, delay);
 }
+function noteUserScroll(){ userScrolledAt=Date.now(); userScrollSerial++; }
+function captureTermViewport(){
+  try{
+    const b=term.buffer.active;
+    return { viewportY:b.viewportY, baseY:b.baseY, wasBottom:b.viewportY>=b.baseY };
+  }catch(e){ return null; }
+}
+function restoreTermViewport(st, serial){
+  if(!st) return;
+  requestAnimationFrame(()=>{
+    if(serial!==undefined && serial!==userScrollSerial) return;
+    try{
+      const b=term.buffer.active;
+      if(st.wasBottom && Date.now()-userScrolledAt>500) term.scrollToBottom();
+      else term.scrollToLine(Math.max(0, Math.min(st.viewportY, b.baseY)));
+      showJump();
+    }catch(e){}
+  });
+}
+function preserveTermViewport(fn){
+  const st=captureTermViewport(), serial=userScrollSerial;
+  const r=fn();
+  restoreTermViewport(st, serial);
+  return r;
+}
 const WRITE_SLICE = 65536;
 let termWriteQueue = [];
 let termWriting = false;
 let termWriteEpoch = 0;
+let terminalWriteActive = 0;
 function clearTermWriteQueue(){
   termWriteEpoch++;
   termWriteQueue = [];
@@ -722,20 +749,36 @@ function pumpTermWrite(){
   if(!termWriteQueue.length) return;
   const item = termWriteQueue.shift();
   termWriting = true;
+  const scrollState = captureTermViewport();
+  const scrollSerial = userScrollSerial;
+  terminalWriteActive++;
   try{
     term.write(item.chunk, ()=>{
+      terminalWriteActive = Math.max(0, terminalWriteActive-1);
       termWriting = false;
+      restoreTermViewport(scrollState, scrollSerial);
       schedulePaintHeal(20);
       if(termWriteQueue.length) setTimeout(pumpTermWrite, 0);
       else showJump();
     });
   }catch(e){
+    terminalWriteActive = Math.max(0, terminalWriteActive-1);
     termWriting = false;
     setTimeout(pumpTermWrite, 0);
   }
 }
 const helper = $('#term').querySelector('.xterm-helper-textarea');
-if (helper) helper.setAttribute('data-destruct-ignore', '');
+function hardenHelperTextarea(){
+  const h = $('#term').querySelector('.xterm-helper-textarea');
+  if(!h) return;
+  h.setAttribute('data-destruct-ignore', '');
+  h.setAttribute('autocomplete', 'off');
+  h.setAttribute('autocorrect', 'off');
+  h.setAttribute('autocapitalize', 'off');
+  h.setAttribute('spellcheck', 'false');
+  h.setAttribute('aria-autocomplete', 'none');
+}
+hardenHelperTextarea();
 if (location.search.includes('demo')) { window.__term = term; window.__dropws = ()=>{ if(ws) ws.close(); }; }
 
 // ---- DESKTOP text selection: make "select → copy" just work. A live TUI (codex/claude) repaints every
@@ -838,7 +881,7 @@ function onControl(s){
   let m; try{ m=JSON.parse(s.slice(1)); }catch(e){ return; }
   winSize={cols:m.cols, rows:m.rows}; sizeModeLabel=m.modeLabel||'';
   sizePinned = m.mode==='pinned'; sizeMine = !!m.mine; sizePinLabel = m.pinLabel||''; sizeClients = m.clients||[];
-  if(term.cols!==m.cols || term.rows!==m.rows){ try{ term.resize(m.cols, m.rows); schedulePaintHeal(20); }catch(e){} }
+  if(term.cols!==m.cols || term.rows!==m.rows){ try{ preserveTermViewport(()=>term.resize(m.cols, m.rows)); hardenHelperTextarea(); schedulePaintHeal(20); }catch(e){} }
   applyPan(); updateMeta(); updateSizeBtn();
 }
 // TAP the size chip = pin the shared window to THIS device (everyone mirrors/pans it) — last-pinner-wins.
@@ -867,9 +910,11 @@ function doFit(){
   if(dim && dim.cols && dim.rows){ viewportFit={cols:dim.cols, rows:dim.rows}; if(ws && ws.readyState===1 && current) send('v', JSON.stringify({cols:dim.cols, rows:dim.rows, vis:document.visibilityState==='visible', act:actFlag()})); }
   applyPan(); updateMeta();
 }
-function applyViewport(){ const vv=window.visualViewport; if(vv) $('#app').style.height = vv.height+'px'; doFit(); }
-if (window.visualViewport){ visualViewport.addEventListener('resize', applyViewport); visualViewport.addEventListener('scroll', applyViewport); }
-new ResizeObserver(doFit).observe($('#term'));
+let viewportTimer=0;
+function applyViewport(){ const vv=window.visualViewport; if(vv) $('#app').style.height = vv.height+'px'; preserveTermViewport(doFit); }
+function scheduleViewportFit(delay=80){ if(viewportTimer) clearTimeout(viewportTimer); viewportTimer=setTimeout(()=>{ viewportTimer=0; applyViewport(); }, delay); }
+if (window.visualViewport){ visualViewport.addEventListener('resize', ()=>scheduleViewportFit(isMobile()?140:40)); }
+new ResizeObserver(()=>preserveTermViewport(doFit)).observe($('#term'));
 window.addEventListener('orientationchange', ()=>setTimeout(applyViewport,250));
 
 // ---- touch: drag to scroll terminal HISTORY (vertical) and PAN the wider-than-screen view (horizontal).
@@ -885,8 +930,9 @@ window.addEventListener('orientationchange', ()=>setTimeout(applyViewport,250));
     if(!moved && Math.abs(dx)+Math.abs(dy)<6) return;
     moved=true;
     if(Math.abs(dy)>=Math.abs(dx)){
-      const ch=cellMetrics().h||18; accY+=dy; const lines=Math.trunc(accY/ch);
+      const ch=cellMetrics().h||18; accY+=dy; accY=Math.max(-ch*8, Math.min(ch*8, accY)); const lines=Math.trunc(accY/ch);
       if(lines){
+        noteUserScroll();
         // Normal buffer (shell, claude transcript): scroll xterm's own scrollback.
         // Alternate buffer (codex / claude full-screen TUI) has NO scrollback, so scrollLines is a silent
         // no-op there ("can't read up"). Forward a wheel event instead and let xterm hand the app its
@@ -900,7 +946,7 @@ window.addEventListener('orientationchange', ()=>setTimeout(applyViewport,250));
         accY-=lines*ch;
       }
       e.preventDefault();
-    } else if(host.classList.contains('pan')){ host.scrollLeft-=dx; e.preventDefault(); }
+    } else if(host.classList.contains('pan')){ noteUserScroll(); host.scrollLeft-=dx; e.preventDefault(); }
     lastX=t.clientX; lastY=t.clientY;
   }, {passive:false});
   host.addEventListener('touchend', ()=>{ active=false; }, {passive:true});
@@ -909,6 +955,7 @@ window.addEventListener('orientationchange', ()=>setTimeout(applyViewport,250));
 // When a local 30-row terminal owns the size, the web surface can be taller than xterm's
 // rendered rows. Keep the whole black terminal area interactive by forwarding wheel events.
 $('#term').addEventListener('wheel', e=>{
+  if(e.deltaX || e.deltaY) noteUserScroll();
   const host=$('#term'), xt=host.querySelector('.xterm');
   if(!xt || xt.contains(e.target)) return;
   const target=host.querySelector('.xterm-viewport') || xt;
@@ -925,7 +972,37 @@ $('#term').addEventListener('wheel', e=>{
 function setFont(px){ fontSize=Math.min(20,Math.max(11,px)); term.options.fontSize=fontSize; LS.set('mux_font',fontSize); doFit(); }
 function updateMeta(){ $('#statusmeta').textContent = current ? `${term.cols}×${term.rows}${$('#term').classList.contains('pan')?' · pan':''}` : ''; }
 
+function takeTerminalReport(s){
+  let m = s.match(/^\x1b\[\?[0-9;]*c/); if(m) return m[0].length;      // primary DA, e.g. ESC[?1;2c
+  m = s.match(/^\x1b\[>[0-9;]*c/); if(m) return m[0].length;           // secondary DA
+  m = s.match(/^\x1b\[[0-9;]*R/); if(m) return m[0].length;            // cursor-position report
+  m = s.match(/^\x1b\[[0-9;?]*n/); if(m) return m[0].length;           // device/status report
+  m = s.match(/^\x1b\][0-9;]+;[^\x07\x1b]*(?:\x07|\x1b\\)/); if(m) return m[0].length; // OSC color/title report
+  return 0;
+}
+function stripTerminalGeneratedReports(s){
+  let out='', dropped=false;
+  for(let i=0;i<s.length;){
+    const n=takeTerminalReport(s.slice(i));
+    if(n){ dropped=true; i+=n; continue; }
+    out += s[i++];
+  }
+  return { out, dropped };
+}
+let lastMobileInput='', lastMobileInputAt=0;
+function dropDuplicateMobileInput(s){
+  const now=Date.now();
+  if(isMobile() && s.length>1 && s===lastMobileInput && now-lastMobileInputAt<900) return true;
+  lastMobileInput=s; lastMobileInputAt=now;
+  return false;
+}
 term.onData(d => {
+  const filtered = stripTerminalGeneratedReports(d);
+  if(filtered.dropped){
+    d = filtered.out;
+    if(!d) return;
+  }
+  if(dropDuplicateMobileInput(d)) return;
   markActive();
   if (autoFreeze && !selectMode) { autoFreeze=false; try{ term.clearSelection(); }catch(e){} flushFrozen(); }   // typing = you're done selecting → go live
   // a sticky modifier (tapped on the keybar) applies to the next char you type on the phone keyboard
