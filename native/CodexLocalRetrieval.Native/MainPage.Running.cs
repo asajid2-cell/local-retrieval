@@ -19,7 +19,7 @@ namespace CodexLocalRetrieval_Native;
 // collection, kill — without hunting through the web UI or Task Manager.
 public sealed partial class MainPage
 {
-    private sealed record MuxRow(string Name, string State, bool Hosted, bool Alive, bool Armed, long Activity, bool Attached);
+    private sealed record MuxRow(string Name, string State, string AgentLabel, string AgentDetail, bool Hosted, bool Alive, bool Armed, long Activity, bool Attached);
     private int _runningSeq;
 
     private void RenderRunningPage()
@@ -62,6 +62,8 @@ public sealed partial class MainPage
                     rows.Add(new MuxRow(
                         s.TryGetProperty("name", out var n) ? n.GetString() ?? "" : "",
                         s.TryGetProperty("state", out var st) ? st.GetString() ?? "white" : "white",
+                        s.TryGetProperty("agentLabel", out var al) ? al.GetString() ?? "" : "",
+                        s.TryGetProperty("agentDetail", out var ad) ? ad.GetString() ?? "" : "",
                         s.TryGetProperty("hosted", out var h) && h.GetBoolean(),
                         s.TryGetProperty("alive", out var alive) && alive.GetBoolean(),
                         s.TryGetProperty("autoheal", out var a) && a.GetBoolean(),
@@ -98,13 +100,27 @@ public sealed partial class MainPage
     private TextBlock SectionLabel(string text) => new()
     { Text = text, Foreground = StrongBrush(), FontSize = 14, FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 10, 0, 6) };
 
-    private static (string glyph, string label) StateBadge(string state) => state switch
+    private static (string glyph, string label) StateBadge(string state, string agentLabel, string agentDetail)
     {
-        "green" => ("●", "working"),
-        "yellow" => ("●", "idle — waiting for a prompt"),
-        "red" => ("●", "agent gone"),
-        _ => ("○", "shell / dormant"),
-    };
+        var glyph = state switch
+        {
+            "green" or "yellow" or "red" or "detached" => "\u25CF",
+            _ => "\u25CB",
+        };
+        var label = !string.IsNullOrWhiteSpace(agentLabel)
+            ? agentLabel
+            : state switch
+            {
+                "green" => "working",
+                "yellow" => "waiting for you",
+                "red" => "stopped/blocker",
+                "detached" => "detached local agent",
+                "dormant" => "dormant",
+                _ => "plain shell",
+            };
+        if (!string.IsNullOrWhiteSpace(agentDetail)) label += " - " + agentDetail;
+        return (glyph, label);
+    }
 
     private Border RowCard(UIElement content) => new()
     {
@@ -123,7 +139,7 @@ public sealed partial class MainPage
         var grid = new Grid { ColumnDefinitions = { new ColumnDefinition(), new ColumnDefinition { Width = GridLength.Auto } } };
         var left = new StackPanel { Spacing = 3, VerticalAlignment = VerticalAlignment.Center };
         var nameRow = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8 };
-        var (glyph, stateLabel) = StateBadge(m.State);
+        var (glyph, stateLabel) = StateBadge(m.State, m.AgentLabel, m.AgentDetail);
         var dotColor = m.State switch
         {
             "green" => Windows.UI.Color.FromArgb(255, 0x34, 0xD3, 0x99),
