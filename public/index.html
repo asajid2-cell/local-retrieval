@@ -1401,7 +1401,7 @@ async function killSession(name){
 // recreates the PC-hosted session fresh and re-runs the
 // chat's resume command — the workspace comes back identically. The command is matched from the projects
 // projection by session name, so it works for any session tied to a synced chat (no desktop app needed).
-async function relaunchSession(s){
+async function legacyRelaunchSession(s){
   let cmd=null, chObj=null, pj=null;
   try{
     pj=await (await fetch(base+'/api/projects',{headers:{'Content-Type':'application/json'}})).json();
@@ -1429,6 +1429,39 @@ async function relaunchSession(s){
 }
 function flash(msg){ setStatus('', msg); setTimeout(()=>{ if(current) setStatus(ws&&ws.readyState===1?'live':'busy', `<span class="name">${esc(current)}</span> &middot; ${ws&&ws.readyState===1?'live':'reconnecting…'}`); }, 1400); }
 
+function syncedMuxCommand(name){
+  for(const c of (_appCollections||[])){
+    for(const ch of (c.chats||[])){
+      if(ch.muxName===name && ch.muxCommand) return ch.muxCommand;
+    }
+  }
+  return '';
+}
+async function refreshSyncedMuxCommand(name){
+  let cmd=syncedMuxCommand(name);
+  if(cmd) return cmd;
+  try{
+    const p=await (await fetch(base+'/api/projects',{headers:{'Content-Type':'application/json'}})).json();
+    _appLive=!!(p.appLive ?? p.live); _appCollections=Array.isArray(p.collections)?p.collections:[];
+    cmd=syncedMuxCommand(name);
+  }catch(e){}
+  return cmd;
+}
+async function relaunchSession(s){
+  const cmd=await refreshSyncedMuxCommand(s.name);
+  if(!cmd && !s.hasCommand){ flash('No saved resume command for "'+s.name+'". Open it once from the desktop app to link it.'); return; }
+  if(!confirm('Relaunch the agent for "'+s.name+'"?\n\nThis stops any matching running copy first, then restarts the mux session on your PC.')) return;
+  flash('Relaunching '+s.name+'...');
+  try{
+    const body=cmd?{command:cmd}:{};
+    const res=await fetch(base+'/api/sessions/'+encodeURIComponent(s.name)+'/relaunch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    if(!res.ok) throw new Error(await apiError(res));
+    if(current===s.name) term.reset();
+    connect(s.name);
+    loadSessions(s.name);
+    flash('Relaunched '+s.name+' - agent restarting');
+  }catch(e){ flash('Relaunch failed: '+(e.message||e)); loadSessions(); }
+}
 // ---- dialogs ----
 function openDialog(sel){ $('#app').inert=true; const d=$(sel); d.showModal(); }
 document.querySelectorAll('dialog').forEach(d=> d.addEventListener('close', ()=>{ if(!document.querySelector('dialog[open]')) $('#app').inert=false; }));

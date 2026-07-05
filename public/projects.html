@@ -282,11 +282,17 @@ function renderSync(d){
   else $('#synctext').textContent = 'Not synced yet - open the desktop app to push your projects here';
 }
 const chatKey = ch => String(ch.id||ch.muxName||ch.title||'');
+function archiveChats(){ return Array.isArray(data && data.allChats) ? data.allChats : []; }
 // Signature of everything VISIBLE/structural except `running` (which changes constantly and is
 // applied in place). A rename / new chat / changed command flips this -> we show the refresh pill
 // rather than mutating the live list (a fresh page is the only guaranteed-clean repaint).
-function structSig(cols){ return (cols||[]).map(c=> (c.id||'')+':'+(c.name||'')+'#'+(c.chats||[]).map(ch=> chatKey(ch)+'~'+(ch.title||'')+'~'+(ch.tool||'')+'~'+(ch.muxName||'')+'~'+(ch.muxCommand?'1':'0')).join(',')).join('|'); }
-function indexChats(){ const m={}; (data.collections||[]).forEach(c=>(c.chats||[]).forEach(ch=>{ m[chatKey(ch)]=ch; })); return m; }
+function structSig(d){
+  const cols=(d&&d.collections)||[];
+  const all=(d&&d.allChats)||[];
+  const chatSig=ch=>chatKey(ch)+'~'+(ch.title||'')+'~'+(ch.tool||'')+'~'+(ch.muxName||'')+'~'+(ch.muxCommand?'1':'0')+'~'+(ch.collection||'');
+  return cols.map(c=> (c.id||'')+':'+(c.name||'')+'#'+(c.chats||[]).map(chatSig).join(',')).join('|')+'||all#'+all.map(chatSig).join(',');
+}
+function indexChats(){ const m={}; archiveChats().forEach(ch=>{ m[chatKey(ch)]=ch; }); (data.collections||[]).forEach(c=>(c.chats||[]).forEach(ch=>{ m[chatKey(ch)]=ch; })); return m; }
 const goSvg = '<svg class="cgo" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M9 6l6 6-6 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
 
 // A chat counts as "running locally" ONLY if its id is in the LIVE runningSessions list (the same
@@ -307,8 +313,13 @@ function sessionBlocker(name){
   if(!name) return null;
   return (sessions||[]).find(s => s && s.name===name && (s.legacyBlocked || s.legacyTwin || s.hostProtocolOk===false)) || null;
 }
+function muxSession(name){ return (sessions||[]).find(s=>s && s.name===name) || null; }
 function isActionableMuxSession(s){ return !!(s && s.hosted && s.alive!==false && !s.dormant && !s.legacyBlocked && !s.legacyTwin && s.hostProtocolOk!==false); }
 function actionableMuxNames(){ return new Set((sessions||[]).filter(isActionableMuxSession).map(s=>s.name)); }
+function canRelaunchMuxName(name){
+  const s=muxSession(name);
+  return !!(s && s.hosted && s.hasCommand && !sessionBlocker(name));
+}
 function blockerDetail(s){ return (s && (s.detail || s.legacyDetail || s.hostProtocolDetail)) || 'mux session is blocked by stale protocol or legacy tmux state'; }
 
 // Resume button state. inMux=already a running multiplex (Attach); localRun=running locally,
@@ -320,7 +331,7 @@ function setBtnState(btn, ch, muxNames, runIds){
   btn.classList.remove('running','warn'); btn.disabled=false; btn.title='';
   if(inMux){ btn.textContent='Attach'; btn.classList.add('running'); }
   else if(blocked){ btn.textContent=blocked.hostProtocolOk===false?'Stale':'Blocked'; btn.disabled=true; btn.title=blockerDetail(blocked); }
-  else if(!ch.muxName || !ch.muxCommand){ btn.textContent='Unavailable'; btn.disabled=true; btn.title='No remote-resume command for this chat — open it from the desktop app.'; }
+  else if(!ch.muxName || (!ch.muxCommand && !canRelaunchMuxName(ch.muxName))){ btn.textContent='Unavailable'; btn.disabled=true; btn.title='No remote-resume command for this chat - open it from the desktop app.'; }
   else if(localRun){ btn.textContent='Take over'; btn.classList.add('warn'); }
   else btn.textContent='Resume remote';
   btn.onclick=()=>{ if(!btn.disabled) resume(ch, inMux, localRun); };
@@ -343,12 +354,24 @@ function chatNode(ch, withColl){
 function buildList(){
   const el=$('#viewList'); el.innerHTML=''; rows.length=0;
   const cols=(data&&data.collections)||[];
+  const allArchive=archiveChats();
   const withChats=cols.filter(c=>(c.chats||[]).length);
-  if(!withChats.length){
+  if(!withChats.length && !allArchive.length){
     const msg = cols.length
       ? 'Your synced projects don’t have any resumable chats yet.<br>Start a chat in the desktop app — it’ll show up here to resume remotely.'
       : 'No projects synced yet.<br>Open the desktop app — it pushes your collections &amp; chats here so you can resume them remotely.';
     el.innerHTML=`<div class="projempty">${msg}</div>`; built=true; queueMarkRows(); return;
+  }
+  if(allArchive.length){
+    const c={id:'__all__', name:'All chats', chats:allArchive};
+    const crow=document.createElement('button'); crow.type='button'; crow.className='crow';
+    crow.innerHTML=`<span class="cname"></span><span class="crun" hidden title="has a running chat"></span><span class="ccount"></span>${goSvg}`;
+    crow.querySelector('.cname').textContent='All chats';
+    crow.querySelector('.ccount').textContent=`${allArchive.length} indexed chat${allArchive.length!==1?'s':''}`;
+    crow.setAttribute('aria-label', `All indexed chats, ${allArchive.length} chat${allArchive.length!==1?'s':''}`);
+    crow.onclick=()=>openDetail('__all__', crow);
+    el.appendChild(crow);
+    rows.push({ id:'__all__', name:'all chats indexed archive sessions', crow, crun:crow.querySelector('.crun'), total:allArchive.length, coll:c });
   }
   withChats.forEach(c=>{
     const all=c.chats||[];
@@ -372,6 +395,7 @@ function buildList(){
 function applyRunning(){
   const muxNames=actionableMuxNames(); const runIds=liveRunIds();
   const byId={}; (data.collections||[]).forEach(c=>{ byId[c.id]=c; });
+  if(archiveChats().length) byId.__all__={id:'__all__', name:'All chats', chats:archiveChats()};
   rows.forEach(r=>{
     const c=byId[r.id]||r.coll; r.coll=c;
     const anyRun=(c.chats||[]).some(ch=> chatLive(ch, runIds) || (ch.muxName && muxNames.has(ch.muxName)));
@@ -386,7 +410,7 @@ function applyRunningVisible(){
 
 // ---- detail view (fresh small paint per open; list hidden so nothing painted shifts) ----
 function openDetail(id, origin){
-  const c=(data.collections||[]).find(x=>x.id===id); if(!c) return;
+  const c=id==='__all__' ? {id:'__all__', name:'All chats', chats:archiveChats()} : (data.collections||[]).find(x=>x.id===id); if(!c) return;
   curDetail=id; detailOrigin=origin||null; visibleChats.length=0;
   const el=$('#viewDetail'); el.innerHTML='';
   const head=document.createElement('div'); head.className='dhead';
@@ -394,17 +418,19 @@ function openDetail(id, origin){
   head.querySelector('.dname').textContent=c.name||'Untitled';
   const all=c.chats||[]; head.querySelector('.dcount').textContent=`${all.length} chat${all.length!==1?'s':''}`;
   head.style.display='flex'; head.style.alignItems='center'; head.style.gap='8px';
-  const rlb=document.createElement('button'); rlb.type='button';
-  rlb.style.cssText='margin-left:auto;padding:6px 12px;font-size:13px;border-radius:8px;border:1px solid var(--line,#2c2c33);background:var(--panel,#17171c);color:var(--fg,#ededf0);cursor:pointer;white-space:nowrap;flex:0 0 auto';
-  rlb.textContent='↻ Relaunch'; rlb.title='Kill any of this collection’s chats running in multiplex and restart them all';
-  rlb.onclick=()=>relaunchCollection(c);
-  head.appendChild(rlb);
+  if(id!=='__all__'){
+    const rlb=document.createElement('button'); rlb.type='button';
+    rlb.style.cssText='margin-left:auto;padding:6px 12px;font-size:13px;border-radius:8px;border:1px solid var(--line,#2c2c33);background:var(--panel,#17171c);color:var(--fg,#ededf0);cursor:pointer;white-space:nowrap;flex:0 0 auto';
+    rlb.textContent='↻ Relaunch'; rlb.title='Kill any of this collection’s chats running in multiplex and restart them all';
+    rlb.onclick=()=>relaunchCollection(c);
+    head.appendChild(rlb);
+  }
   el.appendChild(head);
   if(!all.length){ const e2=document.createElement('div'); e2.className='projempty'; e2.textContent='No chats in this collection yet.'; el.appendChild(e2); }
-  else all.forEach(ch=> el.appendChild(chatNode(ch, '')));
+  else all.forEach(ch=> el.appendChild(chatNode(ch, id==='__all__' ? (ch.collection||ch.workspace||'') : '')));
   $('#viewList').hidden=true; $('#projsearch').hidden=true;
   el.hidden=false; el.scrollTop=0;
-  $('#backproj').hidden=false; $('#brandword').textContent='project';
+  $('#backproj').hidden=false; $('#brandword').textContent=id==='__all__'?'all chats':'project';
   $('#backproj').focus();
   queueMarkRows();
 }
@@ -421,10 +447,19 @@ function applyFilter(){
   const q=($('#projfilter').value||'').toLowerCase().trim();
   if(!q){ if(curDetail==='__search__') showList(); return; }
   const hits=[];
-  (data.collections||[]).forEach(c=>{ const cn=String(c.name||''); (c.chats||[]).forEach(ch=>{
-    const hay=((ch.title||ch.id||'')+' '+cn).toLowerCase();
-    if(hay.includes(q)) hits.push({ch, coll:cn});
-  }); });
+  const all=archiveChats();
+  if(all.length){
+    all.forEach(ch=>{
+      const coll=ch.collection||'';
+      const hay=((ch.title||ch.id||'')+' '+coll+' '+(ch.workspace||'')).toLowerCase();
+      if(hay.includes(q)) hits.push({ch, coll:coll||'All chats'});
+    });
+  } else {
+    (data.collections||[]).forEach(c=>{ const cn=String(c.name||''); (c.chats||[]).forEach(ch=>{
+      const hay=((ch.title||ch.id||'')+' '+cn).toLowerCase();
+      if(hay.includes(q)) hits.push({ch, coll:cn});
+    }); });
+  }
   visibleChats.length=0;
   const el=$('#viewDetail'); el.innerHTML='';
   const lbl=document.createElement('div'); lbl.className='reslabel'; lbl.textContent=`${hits.length} match${hits.length!==1?'es':''} for “${q}”`; el.appendChild(lbl);
@@ -731,7 +766,7 @@ async function stopLocalCopyForRelaunch(ch){
 // ---- Relaunch collection: KILL any of a collection's chats currently running in multiplex, then restart
 // them all fresh (re-run each chat's resume command). Right-click a collection row, or the ↻ in the header.
 async function relaunchCollection(c){
-  const chats=(c.chats||[]).filter(ch=>ch.muxName && ch.muxCommand);
+  const chats=(c.chats||[]).filter(ch=>ch.muxName && (ch.muxCommand || canRelaunchMuxName(ch.muxName)));
   if(!chats.length){ alert('No resumable chats in “'+(c.name||'this collection')+'” — open them once from the desktop app to link them.'); return; }
   const blocked=chats.map(ch=>sessionBlocker(ch.muxName)).filter(Boolean);
   if(blocked.length){ alert('Cannot relaunch yet: '+blocked.length+' mux session'+(blocked.length!==1?'s are':' is')+' blocked/stale. Fix the blocker first; not falling back to a legacy path.'); return; }
@@ -741,15 +776,8 @@ async function relaunchCollection(c){
   let ok=0, fail=0;
   for(const ch of chats){
     try{
-      if(muxNames.has(ch.muxName)){
-        const drop=await fetch('api/sessions/'+encodeURIComponent(ch.muxName),{method:'DELETE'});   // kill the running copy
-        if(!drop.ok) throw new Error(await apiError(drop));
-      } else if(chatLive(ch,runIds)){
-        const stopped=await stopLocalCopyForRelaunch(ch);
-        if(!stopped.ok) throw new Error('local kill failed: '+stopped.detail);
-      }
-      await new Promise(r=>setTimeout(r,250));
-      const res=await fetch('api/sessions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:ch.muxName, command:ch.muxCommand})});
+      const body=ch.muxCommand?{command:ch.muxCommand}:{};
+      const res=await fetch('api/sessions/'+encodeURIComponent(ch.muxName)+'/relaunch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
       if(res.ok) ok++; else throw new Error(await apiError(res));
     }catch(e){ fail++; }
   }
@@ -775,7 +803,7 @@ function closeCollMenu(){ const m=document.getElementById('collmenu'); if(m) m.r
 document.addEventListener('click', e=>{ if(!e.target.closest('#collmenu')) closeCollMenu(); });
 document.addEventListener('keydown', e=>{ if(e.key==='Escape') closeCollMenu(); });
 
-async function resume(ch, inMux, localRun){
+async function legacyResume(ch, inMux, localRun){
   const name=ch.muxName; if(!name){ alert('No remote-resume info for this chat'); return; }
   if(!inMux){
     if(!ch.muxCommand){ alert('No resume command for this chat — open it from the desktop app.'); return; }
@@ -803,6 +831,20 @@ async function resume(ch, inMux, localRun){
          if(!res.ok) throw new Error(await apiError(res)); }
     catch(e){ alert('Could not start the remote session ('+(e.message||e)+').\nNot opening the terminal.'); return; }
   }
+  location.href = './?s='+encodeURIComponent(name);
+}
+
+async function resume(ch, inMux, localRun){
+  const name=ch.muxName; if(!name){ alert('No remote-resume info for this chat'); return; }
+  if(inMux){ location.href = './?s='+encodeURIComponent(name); return; }
+  if(!ch.muxCommand && !canRelaunchMuxName(name)){ alert('No saved resume command for this chat - open it once from the desktop app.'); return; }
+  if(localRun && !confirm('"'+(ch.title||name)+'" is already running on your PC.\n\nI will stop that copy first, then restart it in mux so there is only one transcript writer.\n\nProceed?')) return;
+  try{
+    const body=ch.muxCommand?{command:ch.muxCommand}:{};
+    const res=await fetch('api/sessions/'+encodeURIComponent(name)+'/relaunch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    if(!res.ok) throw new Error(await apiError(res));
+  }
+  catch(e){ alert('Could not relaunch the session ('+(e.message||e)+').\nNot opening the terminal.'); return; }
   location.href = './?s='+encodeURIComponent(name);
 }
 
@@ -836,9 +878,9 @@ async function load(){
   let nd=null, nsess=null;
   try{ nd = await (await fetch('api/projects',{headers:{'Content-Type':'application/json'}})).json(); }catch(e){}
   try{ nsess = await (await fetch('api/sessions',{headers:{'Content-Type':'application/json'}})).json(); }catch(e){}
-  if(!built){ data = nd||{collections:[]}; sessions = nsess||[]; sig=structSig(data.collections); renderSync(data); buildList(); updateRunPill(); return; }
+  if(!built){ data = nd||{collections:[]}; sessions = nsess||[]; sig=structSig(data); renderSync(data); buildList(); updateRunPill(); return; }
   if(nd===null && nsess===null) return;                    // both fetches failed — keep showing what we have
-  const newSig = structSig(((nd||data).collections)||[]);
+  const newSig = structSig(nd||data);
   if(nd && newSig!==sig){                                  // content/structure drift -> freeze the list (don't mutate it),
     data.runningSessions=nd.runningSessions; data.live=nd.live; data.appLive=nd.appLive; data.bridgeLive=nd.bridgeLive;
     data.syncedAt=nd.syncedAt; data.appSyncedAt=nd.appSyncedAt; data.runningSyncedAt=nd.runningSyncedAt; data.host=nd.host;  // but keep the running info fresh

@@ -122,6 +122,9 @@ function hostProtocolOk() {
   for (const c of REQUIRED_HOST_CAPS) if (!caps.has(c)) return false;
   return true;
 }
+function hostSupportsCap(cap) {
+  return hostUp() && (hostProtocol.caps || []).map(String).includes(cap);
+}
 function hostProtocolDetail() {
   if (!hostUp()) return 'muxd is not connected';
   return `muxd protocol ${hostProtocol.protocol || 'unknown'} lacks the required capabilities; restart MuxdSessionHost to load the current muxd`;
@@ -129,6 +132,12 @@ function hostProtocolDetail() {
 function requireHostProtocol(res, action) {
   if (hostProtocolOk()) return true;
   failHost(res, 503, 'PC mux host protocol mismatch', `${action}: ${hostProtocolDetail()}`);
+  return false;
+}
+function requireHostCapability(res, cap, action) {
+  if (!requireHostProtocol(res, action)) return false;
+  if (hostSupportsCap(cap)) return true;
+  failHost(res, 503, 'PC mux host protocol mismatch', `${action}: muxd is missing capability "${cap}"; restart MuxdSessionHost to load the current muxd`);
   return false;
 }
 function waitForHostState(check, timeoutMs = 6000) {
@@ -356,6 +365,54 @@ app.post('/api/sessions', async (req, res) => {
   res.json({ ok: true, name, created: true, hosted: true, owner: !!confirmed.value.owner, hostProtocol: hostProtocol.protocol || 0 });
 });
 
+function hostSessionHasSavedCommand(h) {
+  return !!(h && h.hasCommand && !h.shellOnly);
+}
+
+// Explicit relaunch is different from viewing/attaching a dormant tab. It may reuse muxd's saved
+// manifest command, and it first stops any matching non-mux local copy reported by the desktop bridge
+// so a claude/codex transcript never gets two writers.
+app.post('/api/sessions/:name/relaunch', async (req, res) => {
+  const name = SAFE(req.params.name);
+  if (!name) return res.status(400).json({ error: 'name required' });
+  if (tmuxHas(name)) return failLegacy(res, name);
+  if (!requireHostCapability(res, 'relaunch', 'refusing to relaunch PC-local mux session')) return;
+
+  const body = req.body || {};
+  const cmd = typeof body.command === 'string' ? body.command.trim() : '';
+  const existing = hostSessions.get(name);
+  if (!cmd && !hostSessionHasSavedCommand(existing)) {
+    return res.status(400).json({
+      error: 'no saved resume command',
+      detail: 'Open this chat from the desktop app once so muxd can save its resume command, or relaunch with an explicit command.',
+    });
+  }
+
+  const stopped = await stopLocalCopyForMuxName(name);
+  if (!stopped.ok) return failHost(res, 409, 'could not stop existing local copy', stopped.detail);
+
+  const priorCreated = existing ? Number(existing.created || 0) : 0;
+  const cols = Number(body.cols) || Number(existing && existing.cols) || 140;
+  const rows = Number(body.rows) || Number(existing && existing.rows) || 40;
+  markPending(name);
+  if (!sendHost({ t: 'create', s: name, cmd, cols, rows, heal: _healOn.has(name), relaunch: true })) {
+    pendingCreates.delete(name);
+    return failHost(res, 503, 'PC mux host offline', 'host socket closed before relaunch could be sent');
+  }
+  const confirmed = await waitForHostState(() => {
+    const h = hostSessions.get(name);
+    if (!h || h.alive === false || pendingCreates.has(name)) return null;
+    const commandOk = cmd ? hostedCompatibleWithCommand(h, cmd) : hostSessionHasSavedCommand(h);
+    if (!commandOk) return null;
+    if (priorCreated && Number(h.created || 0) === priorCreated) return null;
+    return h;
+  }, 20000);
+  if (!confirmed.ok) return failHost(res, 504, 'PC-local mux relaunch not confirmed', confirmed.error);
+  res.json({ ok: true, name, created: true, relaunched: true, hosted: true,
+             stoppedLocal: !!stopped.stopped, owner: !!confirmed.value.owner,
+             hostProtocol: hostProtocol.protocol || 0 });
+});
+
 // Tail preview of a session's live pane (on demand: long-press / hover / palette) so you can tell what
 // a session is doing before attaching — last N lines, name-sanitized.
 app.get('/api/sessions/:name/tail', async (req, res) => {
@@ -450,7 +507,7 @@ app.post('/api/sessions/:name/autoheal', async (req, res) => {
 // the web can show your projects and resume chats remotely. POST is loopback-only (the app reaches in
 // over its own SSH); GET is owner-gated (the web). `live` = the app pushed within the last ~45s. ------
 const PROJECTS_FILE = STATE_DIR + '/projects.json';
-let _projects = { decks: [], collections: [], host: '', syncedAt: 0, runningSessions: [] };
+let _projects = { decks: [], collections: [], allChats: [], host: '', syncedAt: 0, runningSessions: [] };
 try { _projects = JSON.parse(fs.readFileSync(PROJECTS_FILE, 'utf8')); } catch {}
 function appSyncedAt() { return _projects.appSyncedAt || _projects.syncedAt || 0; }
 function runningSyncedAt() { return _projects.runningSyncedAt || _projects.syncedAt || 0; }
@@ -469,6 +526,7 @@ function projectsHealth() {
     runningAgeMs: runningAt > 0 ? now - runningAt : null,
     decks: Array.isArray(_projects.decks) ? _projects.decks.length : 0,
     collections: Array.isArray(_projects.collections) ? _projects.collections.length : 0,
+    allChats: Array.isArray(_projects.allChats) ? _projects.allChats.length : 0,
     runningSessions: Array.isArray(_projects.runningSessions) ? _projects.runningSessions.length : 0,
     pendingCommands,
   };
@@ -482,12 +540,45 @@ function locallyRunningMuxName(name) {
   if (!bridgeLive()) return false;
   const runningIds = currentRunningIds();
   if (!runningIds.size) return false;
-  for (const col of (Array.isArray(_projects.collections) ? _projects.collections : [])) {
-    for (const chat of (Array.isArray(col.chats) ? col.chats : [])) {
-      if (String(chat && chat.muxName || '') === name && runningIds.has(String(chat && chat.id || '').toLowerCase())) return true;
-    }
+  for (const chat of allProjectedChats()) {
+    if (String(chat && chat.muxName || '') === name && runningIds.has(String(chat && chat.id || '').toLowerCase())) return true;
   }
   return false;
+}
+function allProjectedChats() {
+  const out = [];
+  for (const col of (Array.isArray(_projects.collections) ? _projects.collections : []))
+    for (const chat of (Array.isArray(col.chats) ? col.chats : [])) out.push(chat);
+  for (const chat of (Array.isArray(_projects.allChats) ? _projects.allChats : [])) out.push(chat);
+  return out;
+}
+function runningChatForMuxName(name) {
+  const muxName = SAFE(name);
+  if (!muxName || !bridgeLive()) return null;
+  const running = Array.isArray(_projects.runningSessions) ? _projects.runningSessions : [];
+  if (!running.length) return null;
+  const byId = new Map(running.map(r => [String(r && r.sessionId || '').toLowerCase(), r]));
+  for (const chat of allProjectedChats()) {
+    if (String(chat && chat.muxName || '') !== muxName) continue;
+    const run = byId.get(String(chat && chat.id || '').toLowerCase());
+    if (run) return { chat, run };
+  }
+  return null;
+}
+async function stopLocalCopyForMuxName(name) {
+  const found = runningChatForMuxName(name);
+  if (!found) return { ok: true, stopped: false };
+  const chat = found.chat || {};
+  const run = found.run || {};
+  const queued = enqueueAppCommand({
+    type: 'kill',
+    sessionId: chat.id || run.sessionId || '',
+    pid: run.pid || 0,
+    label: chat.title || name,
+  });
+  const done = await waitForCommandResult(queued.id, 15000);
+  if (!done.ok) return { ok: false, stopped: false, detail: done.detail || 'desktop app did not confirm the running copy stopped' };
+  return { ok: true, stopped: true };
 }
 function normalizedCollectionsForCurrentRunning() {
   const cols = Array.isArray(_projects.collections) ? _projects.collections : [];
@@ -501,12 +592,22 @@ function normalizedCollectionsForCurrentRunning() {
     })) : [],
   }));
 }
+function normalizedAllChatsForCurrentRunning() {
+  const chats = Array.isArray(_projects.allChats) ? _projects.allChats : [];
+  if (!bridgeLive()) return chats;
+  const runningIds = currentRunningIds();
+  return chats.map(chat => ({
+    ...chat,
+    running: runningIds.has(String(chat && chat.id || '').toLowerCase()),
+  }));
+}
 app.post('/api/projects', (req, res) => {
   const b = req.body || {};
   const now = Date.now();
   _projects = {
     decks: Array.isArray(b.decks) ? b.decks : [],
     collections: Array.isArray(b.collections) ? b.collections : [],
+    allChats: Array.isArray(b.allChats) ? b.allChats : [],
     runningSessions: Array.isArray(b.runningSessions) ? b.runningSessions : [],
     host: String(b.host || ''),
     syncedAt: now, appSyncedAt: now, runningSyncedAt: now,
@@ -519,6 +620,7 @@ app.get('/api/projects', (req, res) => {
   res.json({
     decks: Array.isArray(_projects.decks) ? _projects.decks : [],
     collections: normalizedCollectionsForCurrentRunning(), host: _projects.host || '',
+    allChats: normalizedAllChatsForCurrentRunning(),
     runningSessions: _projects.runningSessions || [],
     syncedAt: a, appSyncedAt: a, runningSyncedAt: r,
     appLive: Date.now() - a < 45000,

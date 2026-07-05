@@ -11,7 +11,7 @@ const { once } = require('node:events');
 const WebSocket = require('ws');
 
 const REPO = path.resolve(__dirname, '..');
-const HOST_CAPS = ['create', 'kill', 'rename', 'heal', 'tail', 'scrollback'];
+const HOST_CAPS = ['create', 'kill', 'rename', 'heal', 'tail', 'scrollback', 'relaunch'];
 
 function commandSig(cmd) {
   const c = String(cmd || '').trim();
@@ -342,6 +342,106 @@ test('dormant hosted session refuses websocket attach and does not create a shel
   await host.assertNo(m => m.t === 'create' && m.s === 'dormantcase', 'dormant attach should not create');
 });
 
+test('POST /api/sessions/:name/relaunch reuses muxd saved command for dormant session', async t => {
+  const h = new RelayHarness();
+  await h.start();
+  t.after(async () => h.stop());
+  const cmd = "Write-Output 'SAVED'";
+  const host = await h.connectHost([dormantSession('savedcase', cmd)]);
+  t.after(() => host.close());
+
+  const post = h.request('POST', '/api/sessions/savedcase/relaunch', {});
+  const create = await host.waitFor(m => m.t === 'create' && m.s === 'savedcase', 'relaunch savedcase');
+  assert.equal(create.cmd, '');
+  assert.equal(create.relaunch, true);
+
+  let settled = false;
+  post.then(() => { settled = true; });
+  await sleep(150);
+  assert.equal(settled, false, 'relaunch returned before muxd confirmed the restarted session');
+
+  host.sendSessions([commandSession('savedcase', cmd, 9000)]);
+  const res = await post;
+  assert.equal(res.status, 200);
+  assert.equal(res.body.relaunched, true);
+  assert.equal(res.body.created, true);
+});
+
+test('POST /api/sessions/:name/relaunch refuses sessions with no saved command', async t => {
+  const h = new RelayHarness();
+  await h.start();
+  t.after(async () => h.stop());
+  const host = await h.connectHost([shellSession('plaincase')]);
+  t.after(() => host.close());
+
+  const res = await h.request('POST', '/api/sessions/plaincase/relaunch', {});
+
+  assert.equal(res.status, 400);
+  assert.match(res.body.error, /no saved resume command/);
+  await host.assertNo(m => m.t === 'create' && m.s === 'plaincase', 'plain shell should not relaunch without a command');
+});
+
+test('POST /api/sessions/:name/relaunch stops matching local copy before starting muxd', async t => {
+  const h = new RelayHarness();
+  await h.start();
+  t.after(async () => h.stop());
+  const cmd = "Write-Output 'TAKEOVER'";
+  const host = await h.connectHost([dormantSession('takeover', cmd)]);
+  t.after(() => host.close());
+  await h.json('POST', '/api/projects', {
+    decks: [],
+    collections: [{ id: 'c1', name: 'Work', chats: [{ id: 'sid1', title: 'Takeover', muxName: 'takeover', muxCommand: cmd }] }],
+    runningSessions: [{ sessionId: 'sid1', pid: 1234 }],
+    host: 'FAKEPC',
+  });
+
+  const post = h.request('POST', '/api/sessions/takeover/relaunch', { command: cmd });
+  const pending = await waitFor(async () => {
+    const cmds = await h.json('GET', '/api/app-commands');
+    return cmds.find(c => c.type === 'kill' && c.sessionId === 'sid1') || null;
+  }, 'queued local kill');
+  await h.json('POST', `/api/app-commands/${pending.id}/ack`, { ok: true });
+
+  const create = await host.waitFor(m => m.t === 'create' && m.s === 'takeover', 'create takeover');
+  assert.equal(create.cmd, cmd);
+  assert.equal(create.relaunch, true);
+  host.sendSessions([commandSession('takeover', cmd, 9000)]);
+  const res = await post;
+  assert.equal(res.status, 200);
+  assert.equal(res.body.stoppedLocal, true);
+});
+
+test('POST /api/sessions/:name/relaunch stops local copy matched through allChats', async t => {
+  const h = new RelayHarness();
+  await h.start();
+  t.after(async () => h.stop());
+  const cmd = "Write-Output 'ALLCHAT'";
+  const host = await h.connectHost([dormantSession('allchat-takeover', cmd)]);
+  t.after(() => host.close());
+  await h.json('POST', '/api/projects', {
+    decks: [],
+    collections: [],
+    allChats: [{ id: 'sid-all', title: 'All Chat Takeover', muxName: 'allchat-takeover', muxCommand: cmd }],
+    runningSessions: [{ sessionId: 'sid-all', pid: 4321 }],
+    host: 'FAKEPC',
+  });
+
+  const post = h.request('POST', '/api/sessions/allchat-takeover/relaunch', { command: cmd });
+  const pending = await waitFor(async () => {
+    const cmds = await h.json('GET', '/api/app-commands');
+    return cmds.find(c => c.type === 'kill' && c.sessionId === 'sid-all') || null;
+  }, 'queued allChats local kill');
+  await h.json('POST', `/api/app-commands/${pending.id}/ack`, { ok: true });
+
+  const create = await host.waitFor(m => m.t === 'create' && m.s === 'allchat-takeover', 'create allchat-takeover');
+  assert.equal(create.cmd, cmd);
+  assert.equal(create.relaunch, true);
+  host.sendSessions([commandSession('allchat-takeover', cmd, 9000)]);
+  const res = await post;
+  assert.equal(res.status, 200);
+  assert.equal(res.body.stoppedLocal, true);
+});
+
 test('unknown websocket tab creates PC-local shell, bridges scrollback, input, and output', async t => {
   const h = new RelayHarness();
   await h.start();
@@ -380,6 +480,7 @@ test('projects sync preserves decks and app commands preserve collection deck ta
     host: 'FAKEPC',
     decks: [{ id: 'main', name: 'Main' }, { id: 'client-a', name: 'Client A' }],
     collections: [{ id: 'client-a--ops', name: 'Ops', deckId: 'client-a', deckName: 'Client A', chats: [] }],
+    allChats: [{ id: 'old1', title: 'Old Chat', muxName: 'old-chat', muxCommand: 'codex resume old1' }],
     runningSessions: [],
   };
   const pushed = await h.request('POST', '/api/projects', project);
@@ -388,6 +489,8 @@ test('projects sync preserves decks and app commands preserve collection deck ta
   assert.deepEqual(pulled.decks, project.decks);
   assert.equal(pulled.collections[0].deckId, 'client-a');
   assert.equal(pulled.collections[0].deckName, 'Client A');
+  assert.equal(pulled.allChats.length, 1);
+  assert.equal(pulled.allChats[0].muxName, 'old-chat');
 
   const queued = await h.request('POST', '/api/app-commands', {
     type: 'addtocollection',
