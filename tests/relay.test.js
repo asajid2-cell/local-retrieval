@@ -328,7 +328,7 @@ test('unknown websocket tab creates PC-local shell, bridges scrollback, input, a
   host.sendSessions([shellSession('webshell')]);
 
   const sb = await host.waitFor(m => m.t === 'sb' && m.s === 'webshell', 'scrollback request');
-  assert.equal(sb.max > 0, true);
+  assert.equal(sb.max, 800000);
   host.sendScrollback('webshell', 'SCROLLBACK\n');
 
   ws.send('iWrite-Output WEB_OK\r');
@@ -339,6 +339,40 @@ test('unknown websocket tab creates PC-local shell, bridges scrollback, input, a
   host.sendOutput('webshell', 'WEB_OK\r\n');
   assert.match(await output, /WEB_OK/);
   ws.close();
+});
+
+test('projects sync preserves decks and app commands preserve collection deck target', async t => {
+  const h = new RelayHarness();
+  await h.start();
+  t.after(async () => h.stop());
+
+  const project = {
+    host: 'FAKEPC',
+    decks: [{ id: 'main', name: 'Main' }, { id: 'client-a', name: 'Client A' }],
+    collections: [{ id: 'client-a--ops', name: 'Ops', deckId: 'client-a', deckName: 'Client A', chats: [] }],
+    runningSessions: [],
+  };
+  const pushed = await h.request('POST', '/api/projects', project);
+  assert.equal(pushed.status, 200);
+  const pulled = await h.json('GET', '/api/projects');
+  assert.deepEqual(pulled.decks, project.decks);
+  assert.equal(pulled.collections[0].deckId, 'client-a');
+  assert.equal(pulled.collections[0].deckName, 'Client A');
+
+  const queued = await h.request('POST', '/api/app-commands', {
+    type: 'addtocollection',
+    muxName: 'chat-one',
+    collectionId: 'client-a--ops',
+    collection: 'Ops',
+    deckId: 'client-a',
+    deckName: 'Client A',
+  });
+  assert.equal(queued.status, 200);
+  const pending = await h.json('GET', '/api/app-commands');
+  assert.equal(pending.length, 1);
+  assert.equal(pending[0].collectionId, 'client-a--ops');
+  assert.equal(pending[0].deckId, 'client-a');
+  assert.equal(pending[0].deckName, 'Client A');
 });
 
 test('DELETE /api/sessions sends kill and waits until hosted row is gone', async t => {

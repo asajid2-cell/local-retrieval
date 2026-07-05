@@ -68,6 +68,9 @@
   #wscoldlg .dlgrow { display:flex; gap:8px; align-items:center; margin-top:8px; }
   #wscolnew { flex:1 1 auto; min-width:0; height:38px; padding:0 12px; border-radius:8px; border:1px solid var(--line); background:var(--bg,#0e0e12); color:var(--fg,#ededf0); }
   #wscolnew:focus { outline:none; border-color:var(--rose); }
+  #wsdecksel, #wsdecknew { flex:1 1 auto; min-width:0; height:38px; padding:0 12px; border-radius:8px; border:1px solid var(--line); background:var(--bg,#0e0e12); color:var(--fg,#ededf0); }
+  #wsdecksel:focus, #wsdecknew:focus { outline:none; border-color:var(--rose); }
+  .wslabel { flex:0 0 62px; color:var(--muted); font-size:12.5px; }
   #wscoldlg button { height:38px; padding:0 14px; border-radius:8px; border:1px solid var(--line); background:var(--panel); color:var(--fg,#ededf0); cursor:pointer; flex:0 0 auto; }
   #wscoldlg button.prim { background:var(--rose); color:#1a0a0e; border-color:var(--rose); font-weight:600; }
 
@@ -231,6 +234,8 @@
   <h3>Save open tabs to a collection</h3>
   <p class="dlghint">Files all <b id="wscolcount">0 tabs</b> you have open in multiplex into a deck. Tabs tied to a chat get added; plain shells are skipped. Works only while the desktop app is open (it owns your collections). Reopen the whole collection later with its <b>↻ Relaunch</b> button.</p>
   <div id="wscollist" class="wscollist"></div>
+  <div class="dlgrow"><label class="wslabel" for="wsdecksel">Deck</label><select id="wsdecksel"></select></div>
+  <div class="dlgrow" id="wsdecknewrow" hidden><label class="wslabel" for="wsdecknew">New deck</label><input id="wsdecknew" placeholder="deck name" autocapitalize="off" autocomplete="off" spellcheck="false"></div>
   <div class="dlgrow"><input id="wscolnew" placeholder="new collection name…" autocapitalize="off" autocomplete="off" spellcheck="false"><button id="wscolcreate" type="button" class="prim">Create &amp; add</button></div>
   <div class="dlgrow" style="justify-content:flex-end"><button id="wscolcancel" type="button">Cancel</button></div>
 </dialog>
@@ -644,6 +649,29 @@ async function awaitCmd(id, ms){
 // ---- Save open tabs → collection: file EVERY open multiplex tab into a (new/existing) collection so you can
 // snapshot your current workspace, then reopen it all later via the collection's ↻ Relaunch button. -------
 let _wsTabs=[];
+function allDecks(){
+  const seen=new Set(), out=[];
+  const add=(id,name)=>{ id=String(id||'main'); name=String(name||'Main'); if(seen.has(id)) return; seen.add(id); out.push({id,name}); };
+  (Array.isArray(data.decks)?data.decks:[]).forEach(d=>add(d.id,d.name));
+  add('main','Main');
+  (data.collections||[]).forEach(c=>add(c.deckId||'main', c.deckName||'Main'));
+  return out;
+}
+function deckLabel(id){
+  const d=allDecks().find(x=>String(x.id)===String(id||'main'));
+  return d ? d.name : 'Main';
+}
+function wsDeckChoice(){
+  const sel=$('#wsdecksel');
+  if(!sel) return { deckId:'main', deckName:'Main' };
+  if(sel.value==='__new__') return { deckId:'', deckName:($('#wsdecknew').value||'').trim() };
+  return { deckId:sel.value||'main', deckName:deckLabel(sel.value||'main') };
+}
+function setDeckNewVisible(){
+  const isNew=$('#wsdecksel') && $('#wsdecksel').value==='__new__';
+  $('#wsdecknewrow').hidden=!isNew;
+  if(isNew) setTimeout(()=>$('#wsdecknew').focus(),30);
+}
 function addWorkspaceToCollection(){
   if(!appLive()){ alert('Open the desktop app first - it owns your collections, so this cannot drift out of sync.'); return; }
   _wsTabs=(sessions||[]).map(s=>s.name).filter(Boolean);
@@ -651,18 +679,27 @@ function addWorkspaceToCollection(){
   const list=$('#wscollist'); list.innerHTML='';
   const cols=(data.collections||[]);
   if(!cols.length){ const p=document.createElement('div'); p.className='projempty'; p.textContent='No collections yet — type a name below to make one.'; list.appendChild(p); }
-  cols.forEach(c=>{ const b=document.createElement('button'); b.type='button'; b.className='wscolitem'; b.textContent=(c.name||'Untitled')+' · '+((c.chats||[]).length)+' chats'; b.onclick=()=>submitWsCol(c.name||'Untitled'); list.appendChild(b); });
+  cols.forEach(c=>{ const b=document.createElement('button'); b.type='button'; b.className='wscolitem'; b.textContent=(c.deckName||deckLabel(c.deckId))+' / '+(c.name||'Untitled')+' · '+((c.chats||[]).length)+' chats'; b.onclick=()=>submitWsCol({collection:c.name||'Untitled', collectionId:c.id||'', deckId:c.deckId||'main', deckName:c.deckName||deckLabel(c.deckId)}); list.appendChild(b); });
+  const sel=$('#wsdecksel'); sel.innerHTML='';
+  allDecks().forEach(d=>{ const o=document.createElement('option'); o.value=d.id; o.textContent=d.name; sel.appendChild(o); });
+  const newOpt=document.createElement('option'); newOpt.value='__new__'; newOpt.textContent='New deck...'; sel.appendChild(newOpt);
+  sel.onchange=setDeckNewVisible; setDeckNewVisible();
   $('#wscolcount').textContent=_wsTabs.length+' tab'+(_wsTabs.length!==1?'s':'');
-  $('#wscolnew').value=''; $('#wscoldlg').showModal(); setTimeout(()=>$('#wscolnew').focus(),60);
+  $('#wscolnew').value=''; $('#wsdecknew').value=''; $('#wscoldlg').showModal(); setTimeout(()=>$('#wscolnew').focus(),60);
 }
-async function submitWsCol(name){
-  name=(name||'').trim(); if(!name){ alert('Pick a collection or type a new name'); return; }
+async function submitWsCol(target){
+  if(typeof target==='string') target={collection:target};
+  target=target||{};
+  const choice=target.collectionId ? { deckId:target.deckId||'main', deckName:target.deckName||deckLabel(target.deckId) } : wsDeckChoice();
+  const name=(target.collection||$('#wscolnew').value||'').trim();
+  if(!name){ alert('Pick a collection or type a new name'); return; }
+  if(!target.collectionId && !choice.deckId && !choice.deckName){ alert('Pick a deck or type a new deck name'); return; }
   if(!appLive()){ alert('App went offline - cannot add now'); return; }
   const btns=$('#wscoldlg').querySelectorAll('button'); btns.forEach(b=>b.disabled=true);
   let ok=0, fail=0; const details=[];
   for(const t of _wsTabs){
     try{
-      const r=await fetch('api/app-commands',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({type:'addtocollection', muxName:t, sessionName:t, collection:name})});
+      const r=await fetch('api/app-commands',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({type:'addtocollection', muxName:t, sessionName:t, collection:name, collectionId:target.collectionId||'', deckId:choice.deckId||'', deckName:choice.deckName||''})});
       if(!r.ok) throw new Error(await apiError(r));
       const queued=await r.json();
       const done=await awaitCmdResult(queued.id, 20000);
@@ -672,11 +709,23 @@ async function submitWsCol(name){
     catch(e){ fail++; details.push(t+': '+(e.message||e)); }
   }
   btns.forEach(b=>b.disabled=false); $('#wscoldlg').close();
-  let msg='Added '+ok+' of your '+_wsTabs.length+' open tab'+(_wsTabs.length!==1?'s':'')+' to "'+name+'".';
+  let msg='Added '+ok+' of your '+_wsTabs.length+' open tab'+(_wsTabs.length!==1?'s':'')+' to "'+name+'" on '+(choice.deckName||deckLabel(choice.deckId))+'.';
   if(fail) msg+='\n\nFailed/skipped '+fail+':\n'+details.slice(0,6).join('\n')+(details.length>6?'\n...':'');
   else msg+='\n\nThe desktop app confirmed the collection update.';
   alert(msg);
   setTimeout(()=>location.reload(), fail ? 800 : 1800);
+}
+
+function runningSessionForChat(ch){
+  return (Array.isArray(data.runningSessions)?data.runningSessions:[]).find(r=>String(r.sessionId||'')===String(ch.id||'')) || null;
+}
+async function stopLocalCopyForRelaunch(ch){
+  const rs=runningSessionForChat(ch);
+  if(!rs) return {ok:false, detail:'running process not identified'};
+  const r=await fetch('api/app-commands',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({type:'kill', sessionId:ch.id||'', pid:rs.pid||0, label:ch.title||ch.muxName})});
+  if(!r.ok) return {ok:false, detail:await apiError(r)};
+  const queued=await r.json();
+  return await awaitCmdResult(queued.id, 20000);
 }
 
 // ---- Relaunch collection: KILL any of a collection's chats currently running in multiplex, then restart
@@ -688,14 +737,16 @@ async function relaunchCollection(c){
   if(blocked.length){ alert('Cannot relaunch yet: '+blocked.length+' mux session'+(blocked.length!==1?'s are':' is')+' blocked/stale. Fix the blocker first; not falling back to a legacy path.'); return; }
   const muxNames=actionableMuxNames(); const runIds=liveRunIds();
   const localOnly=chats.filter(ch=>chatLive(ch,runIds) && !muxNames.has(ch.muxName));
-  if(localOnly.length){ alert('Cannot relaunch this collection yet: '+localOnly.length+' chat'+(localOnly.length!==1?'s are':' is')+' already running locally on your PC. Kill those local copies from the running view first; relaunching now would fork the transcript.'); return; }
-  if(!confirm('Relaunch “'+(c.name||'collection')+'”?\n\nKills any of its '+chats.length+' chat'+(chats.length!==1?'s':'')+' currently running in multiplex and restarts them all fresh.')) return;
+  if(!confirm('Relaunch “'+(c.name||'collection')+'”?\n\nKills any matching multiplex sessions'+(localOnly.length?(' and '+localOnly.length+' local PC cop'+(localOnly.length===1?'y':'ies')):'')+', then restarts '+chats.length+' chat'+(chats.length!==1?'s':'')+' fresh.')) return;
   let ok=0, fail=0;
   for(const ch of chats){
     try{
       if(muxNames.has(ch.muxName)){
         const drop=await fetch('api/sessions/'+encodeURIComponent(ch.muxName),{method:'DELETE'});   // kill the running copy
         if(!drop.ok) throw new Error(await apiError(drop));
+      } else if(chatLive(ch,runIds)){
+        const stopped=await stopLocalCopyForRelaunch(ch);
+        if(!stopped.ok) throw new Error('local kill failed: '+stopped.detail);
       }
       await new Promise(r=>setTimeout(r,250));
       const res=await fetch('api/sessions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:ch.muxName, command:ch.muxCommand})});
@@ -808,4 +859,3 @@ window.addEventListener('resize', queueMarkRows);
 </script>
 </body>
 </html>
-

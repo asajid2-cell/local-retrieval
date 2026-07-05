@@ -96,7 +96,7 @@ function markPending(name) { pendingCreates.set(name, Date.now() + 8000); }
 const CLEAR_SCREEN = Buffer.from('\x1b[3J\x1b[2J\x1b[H');
 // Hosted sessions are PC-local first. Web attach must become live quickly; scrollback is a bounded
 // convenience replay, not something allowed to stall live terminal bytes for multiple seconds.
-const HOST_SB_BYTES = +process.env.MUX_HOST_SB_BYTES || 60000;
+const HOST_SB_BYTES = +process.env.MUX_HOST_SB_BYTES || 800000;
 const HOST_SB_WAIT_MS = +process.env.MUX_HOST_SB_WAIT_MS || 900;
 const REQUIRED_HOST_PROTOCOL = 2;
 const REQUIRED_HOST_CAPS = new Set(['create', 'kill', 'rename', 'heal', 'tail', 'scrollback']);
@@ -364,7 +364,7 @@ app.post('/api/sessions/:name/autoheal', async (req, res) => {
 // the web can show your projects and resume chats remotely. POST is loopback-only (the app reaches in
 // over its own SSH); GET is owner-gated (the web). `live` = the app pushed within the last ~45s. ------
 const PROJECTS_FILE = STATE_DIR + '/projects.json';
-let _projects = { collections: [], host: '', syncedAt: 0, runningSessions: [] };
+let _projects = { decks: [], collections: [], host: '', syncedAt: 0, runningSessions: [] };
 try { _projects = JSON.parse(fs.readFileSync(PROJECTS_FILE, 'utf8')); } catch {}
 function appSyncedAt() { return _projects.appSyncedAt || _projects.syncedAt || 0; }
 function runningSyncedAt() { return _projects.runningSyncedAt || _projects.syncedAt || 0; }
@@ -381,6 +381,7 @@ function projectsHealth() {
     bridgeLive: runningAt > 0 && now - runningAt < 45000,
     appAgeMs: appAt > 0 ? now - appAt : null,
     runningAgeMs: runningAt > 0 ? now - runningAt : null,
+    decks: Array.isArray(_projects.decks) ? _projects.decks.length : 0,
     collections: Array.isArray(_projects.collections) ? _projects.collections.length : 0,
     runningSessions: Array.isArray(_projects.runningSessions) ? _projects.runningSessions.length : 0,
     pendingCommands,
@@ -418,6 +419,7 @@ app.post('/api/projects', (req, res) => {
   const b = req.body || {};
   const now = Date.now();
   _projects = {
+    decks: Array.isArray(b.decks) ? b.decks : [],
     collections: Array.isArray(b.collections) ? b.collections : [],
     runningSessions: Array.isArray(b.runningSessions) ? b.runningSessions : [],
     host: String(b.host || ''),
@@ -429,6 +431,7 @@ app.post('/api/projects', (req, res) => {
 app.get('/api/projects', (req, res) => {
   const a = appSyncedAt(), r = runningSyncedAt();
   res.json({
+    decks: Array.isArray(_projects.decks) ? _projects.decks : [],
     collections: normalizedCollectionsForCurrentRunning(), host: _projects.host || '',
     runningSessions: _projects.runningSessions || [],
     syncedAt: a, appSyncedAt: a, runningSyncedAt: r,
@@ -650,7 +653,9 @@ function enqueueAppCommand(b) {
                 pid: Number(b.pid) || 0, uploadId: String(b.uploadId || ''), filename: String(b.filename || ''),
                 title: String(b.title || '').slice(0, 200), keep: !!b.keep, label: String(b.label || ''),
                 muxName: String(b.muxName || ''), sessionName: String(b.sessionName || ''), muxCommand: String(b.muxCommand || ''),
-                collection: String(b.collection || '').slice(0, 200), ts: Date.now(), status: 'pending', detail: '' };
+                collection: String(b.collection || '').slice(0, 200), collectionId: String(b.collectionId || '').slice(0, 200),
+                deckId: String(b.deckId || '').slice(0, 200), deck: String(b.deck || '').slice(0, 200),
+                deckName: String(b.deckName || '').slice(0, 200), ts: Date.now(), status: 'pending', detail: '' };
   _commands.push(cmd); saveCommands();
   return cmd;
 }
@@ -674,7 +679,7 @@ app.post('/api/app-commands', (req, res) => {     // web (owner) enqueues
   if (b.type === 'transcript' && !b.sessionId) return res.status(400).json({ error: 'sessionId required' });
   if (b.type === 'fetchfile' && !b.uploadId) return res.status(400).json({ error: 'uploadId required' });
   if (b.type === 'rename' && (!b.sessionId || !String(b.title || '').trim())) return res.status(400).json({ error: 'sessionId and title required' });
-  if (b.type === 'addtocollection' && (!(b.muxName || b.sessionName) || !String(b.collection || '').trim())) return res.status(400).json({ error: 'muxName/sessionName and collection required' });
+  if (b.type === 'addtocollection' && (!(b.muxName || b.sessionName) || !(String(b.collection || '').trim() || String(b.collectionId || '').trim()))) return res.status(400).json({ error: 'muxName/sessionName and collection required' });
   if (b.type === 'addtocollection' && !appLive()) return res.status(409).json({ error: 'desktop app is not live; collection changes are disabled' });
   if (b.type === 'startmux' && !(b.muxName || b.sessionName)) return res.status(400).json({ error: 'muxName/sessionName required' });
   const cmd = enqueueAppCommand(b);

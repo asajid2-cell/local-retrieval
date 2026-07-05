@@ -26,7 +26,7 @@
   html, body {
     margin:0; height:100%; background:var(--bg); color:var(--txt);
     font:500 14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
-    overscroll-behavior:none; -webkit-text-size-adjust:100%;
+    overflow:hidden; overscroll-behavior:none; -webkit-text-size-adjust:100%;
   }
   body { position:fixed; inset:0; }
   #app {
@@ -118,9 +118,9 @@
     padding:var(--sp1) var(--sp2); overflow:hidden; isolation:isolate;
   }
   #term .xterm { isolation:isolate; }
-  /* "pan" = the shared window is bigger than this screen (a phone following a desktop): let the user
-     drag horizontally to see the full width. xterm renders at its natural cols/rows; we scroll the host. */
-  #term.pan { overflow:auto; touch-action:pan-x pan-y; }
+  /* "pan" = the shared window is wider than this screen: let the user drag horizontally.
+     Vertical history belongs to xterm's scrollback, never to a browser wrapper scrollbar. */
+  #term.pan { overflow-x:auto; overflow-y:hidden; touch-action:pan-x; }
   #term.pan .xterm, #term.pan .xterm-viewport, #term.pan .xterm-screen { width:max-content !important; }
   #empty {
     position:absolute; inset:0; z-index:5; display:flex; flex-direction:column; gap:var(--sp3);
@@ -677,7 +677,7 @@ function initMobileViews(){
 
 let fontSize = Math.min(20, Math.max(11, LS.get('mux_font', 14)));
 const term = new Terminal({
-  cursorBlink:true, fontSize, scrollback:8000, allowProposedApi:true,
+  cursorBlink:true, fontSize, scrollback:60000, allowProposedApi:true,
   fontFamily:'ui-monospace,SFMono-Regular,Menlo,Consolas,"Roboto Mono",monospace',
   theme:{ background:'#000000', foreground:'#ededf0', cursor:'#fb7185', cursorAccent:'#000000',
           selectionBackground:'#3a2b30', black:'#15151a', red:'#fb7185', green:'#34d399',
@@ -698,6 +698,41 @@ function schedulePaintHeal(delay=60){
     paintHealTimer=0;
     requestAnimationFrame(()=>{ healTerminalPaint(); requestAnimationFrame(healTerminalPaint); });
   }, delay);
+}
+const WRITE_SLICE = 65536;
+let termWriteQueue = [];
+let termWriting = false;
+let termWriteEpoch = 0;
+function clearTermWriteQueue(){
+  termWriteEpoch++;
+  termWriteQueue = [];
+  termWriting = false;
+}
+function enqueueTermWrite(bytes){
+  const src = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  const epoch = termWriteEpoch;
+  for(let off=0; off<src.length; off+=WRITE_SLICE){
+    termWriteQueue.push({ epoch, chunk:src.subarray(off, Math.min(off+WRITE_SLICE, src.length)) });
+  }
+  pumpTermWrite();
+}
+function pumpTermWrite(){
+  if(termWriting) return;
+  while(termWriteQueue.length && termWriteQueue[0].epoch !== termWriteEpoch) termWriteQueue.shift();
+  if(!termWriteQueue.length) return;
+  const item = termWriteQueue.shift();
+  termWriting = true;
+  try{
+    term.write(item.chunk, ()=>{
+      termWriting = false;
+      schedulePaintHeal(20);
+      if(termWriteQueue.length) setTimeout(pumpTermWrite, 0);
+      else showJump();
+    });
+  }catch(e){
+    termWriting = false;
+    setTimeout(pumpTermWrite, 0);
+  }
 }
 const helper = $('#term').querySelector('.xterm-helper-textarea');
 if (helper) helper.setAttribute('data-destruct-ignore', '');
@@ -787,7 +822,7 @@ let selectMode = false;            // when ON, the terminal FREEZES so text can 
 let _frozenBuf = [];               // output that arrived while frozen, buffered so the highlight survives; flushed on unfreeze
 let autoFreeze = false;            // desktop: auto-frozen because a mouse selection is in progress (no "Sel" press needed)
 const isFrozen = ()=> selectMode || autoFreeze;
-function flushFrozen(){ const buf=_frozenBuf; _frozenBuf=[]; for(const chunk of buf){ try{ term.write(chunk); }catch(e){} } }
+function flushFrozen(){ const buf=_frozenBuf; _frozenBuf=[]; for(const chunk of buf){ enqueueTermWrite(chunk); } }
 function cellMetrics(){
   try { const d = term._core._renderService.dimensions.css.cell; if (d && d.height) return { w:d.width, h:d.height }; } catch(e){}
   return { w: fontSize*0.6, h: fontSize*1.2 };
@@ -795,7 +830,7 @@ function cellMetrics(){
 function applyPan(){
   const host=$('#term');
   if(!winSize || !viewportFit){ host.classList.remove('pan'); return; }
-  const panning = winSize.cols > viewportFit.cols+1 || winSize.rows > viewportFit.rows+1;
+  const panning = winSize.cols > viewportFit.cols+1;
   host.classList.toggle('pan', panning);
 }
 function onControl(s){
@@ -803,7 +838,7 @@ function onControl(s){
   let m; try{ m=JSON.parse(s.slice(1)); }catch(e){ return; }
   winSize={cols:m.cols, rows:m.rows}; sizeModeLabel=m.modeLabel||'';
   sizePinned = m.mode==='pinned'; sizeMine = !!m.mine; sizePinLabel = m.pinLabel||''; sizeClients = m.clients||[];
-  if(term.cols!==m.cols || term.rows!==m.rows){ try{ term.resize(m.cols, m.rows); }catch(e){} }
+  if(term.cols!==m.cols || term.rows!==m.rows){ try{ term.resize(m.cols, m.rows); schedulePaintHeal(20); }catch(e){} }
   applyPan(); updateMeta(); updateSizeBtn();
 }
 // TAP the size chip = pin the shared window to THIS device (everyone mirrors/pans it) — last-pinner-wins.
@@ -952,6 +987,7 @@ function connect(name, isRetry){
   current = name; LS.set('mux_last', name); markRead(name);
   $('#empty').style.display='none';
   if (!isRetry) term.reset();
+  clearTermWriteQueue();
   autoFreeze=false; _frozenBuf=[];   // never carry a frozen selection across a session switch
   newLines=0; showJump();
   const proto = location.protocol==='https:'?'wss:':'ws:';
@@ -965,7 +1001,7 @@ function connect(name, isRetry){
   sock.onmessage = e => { if(!fresh()) return;
     if(typeof e.data==='string'){ onControl(e.data); return; }     // control frame: shared window size
     if(isFrozen()){ _frozenBuf.push(new Uint8Array(e.data)); if(_frozenBuf.length>6000) _frozenBuf.splice(0, _frozenBuf.length-6000); return; }   // FROZEN for selection: buffer output; a repaint would wipe the highlight
-    const wasBottom=atBottom(); term.write(new Uint8Array(e.data)); markReadLive();
+    const wasBottom=atBottom(); enqueueTermWrite(new Uint8Array(e.data)); markReadLive();
     if(!wasBottom){ newLines += 1; showJump(); } };
   sock.onclose = ev => {
     if(ws===sock && current===name && !intentional){
