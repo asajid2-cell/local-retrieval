@@ -72,6 +72,19 @@ public sealed class ArchitectureLaunchSurfaceTests
     }
 
     [TestMethod]
+    public void RemoteBridge_DelegatesMuxLaunchReservationToMuxd()
+    {
+        var root = FindRepoRoot();
+        var bridge = Path.Combine(root, "native", "CodexLocalRetrieval.Core", "Remote", "RemoteBridge.cs");
+        var text = File.ReadAllText(bridge);
+
+        Assert.IsFalse(
+            text.Contains("SessionLaunchGovernor", StringComparison.Ordinal)
+            || text.Contains("SessionLaunchClaims", StringComparison.Ordinal),
+            "Muxd is the sole reservation authority for mux-hosted writers; a bridge-side claim deadlocks against muxd.");
+    }
+
+    [TestMethod]
     public void CopilotConfirmation_DoesNotPreviewResumeCommands()
     {
         var root = FindRepoRoot();

@@ -31,7 +31,6 @@ public sealed class RemoteBridge
     private readonly string _codexDbPath;
     private readonly Action<string> _log;
     private readonly Func<string?, string?, string?, Task<(bool ok, ArchiveService.RemoteMuxLaunch? launch, string detail)>>? _resolveMuxLaunch;
-    private readonly SessionLaunchGovernor _launchGovernor;
 
     private const string SshHardenOpts = "-o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3";
     private static readonly TimeSpan SshHardTimeout = TimeSpan.FromSeconds(30);
@@ -42,8 +41,7 @@ public sealed class RemoteBridge
         ClaudeSessionStore claude,
         string codexDbPath,
         Action<string>? log = null,
-        Func<string?, string?, string?, Task<(bool ok, ArchiveService.RemoteMuxLaunch? launch, string detail)>>? resolveMuxLaunch = null,
-        SessionLaunchGovernor? launchGovernor = null)
+        Func<string?, string?, string?, Task<(bool ok, ArchiveService.RemoteMuxLaunch? launch, string detail)>>? resolveMuxLaunch = null)
     {
         _settings = settings;
         _guiPrimaryRunning = guiPrimaryRunning;
@@ -51,7 +49,6 @@ public sealed class RemoteBridge
         _codexDbPath = codexDbPath ?? "";
         _log = log ?? (_ => { });
         _resolveMuxLaunch = resolveMuxLaunch;
-        _launchGovernor = launchGovernor ?? new SessionLaunchGovernor(new SessionLaunchGovernorOptions(Log: _log));
     }
 
     public async Task RunLoopAsync(CancellationToken ct)
@@ -212,41 +209,30 @@ public sealed class RemoteBridge
                 return (false, resolved.detail);
             }
             var launch = resolved.launch;
-            var request = new SessionLaunchRequest(
+            var ids = ResumeCandidateIds(launch.Command, launch.Aliases);
+            var text = await LocalMuxdRequestAsync(new { t = "create", s = name, cmd = launch.Command, cols = 140, rows = 40, ids });
+            using var doc = JsonDocument.Parse(text);
+            if (doc.RootElement.TryGetProperty("t", out var t) && t.GetString() == "created")
+            {
+                RecordSessionEvent(
+                    launch.SessionId,
+                    launch.Aliases,
+                    "mux.started.remote-command",
+                    "Started PC-local mux session from headless remote command.",
+                    details: new Dictionary<string, string> { ["muxName"] = name });
+                return (true, "started PC-local mux session: " + name);
+            }
+            var detail = doc.RootElement.TryGetProperty("m", out var m)
+                ? m.GetString() ?? "muxd error"
+                : "unexpected muxd response: " + text;
+            RecordSessionEvent(
                 launch.SessionId,
                 launch.Aliases,
-                launch.Tool,
-                "remote-bridge",
-                "headless bridge mux create",
-                "mux.refused.remote-command",
-                "mux.started.remote-command",
                 "mux.failed.remote-command",
-                launch.Title,
-                launch.Workspace,
-                Details: new Dictionary<string, string> { ["muxName"] = name });
-            if (!_launchGovernor.TryAcquireRequiredResumeCommand(launch.Command, request, out _, out var lease, out var claimDetail))
-            {
-                return (false, claimDetail);
-            }
-            using (lease)
-            {
-                var ids = ResumeCandidateIds(launch.Command, launch.Aliases);
-                var text = await LocalMuxdRequestAsync(new { t = "create", s = name, cmd = launch.Command, cols = 140, rows = 40, ids });
-                using var doc = JsonDocument.Parse(text);
-                if (doc.RootElement.TryGetProperty("t", out var t) && t.GetString() == "created")
-                {
-                    lease?.MarkStarted("Started PC-local mux session from headless remote command.");
-                    return (true, "started PC-local mux session: " + name);
-                }
-                if (doc.RootElement.TryGetProperty("t", out t) && t.GetString() == "err")
-                {
-                    var detail = doc.RootElement.TryGetProperty("m", out var m) ? m.GetString() ?? "muxd error" : "muxd error";
-                    lease?.MarkFailed(detail);
-                    return (false, detail);
-                }
-                lease?.MarkFailed("Unexpected muxd response while starting headless remote command.");
-                return (false, "unexpected muxd response: " + text);
-            }
+                detail,
+                "warn",
+                details: new Dictionary<string, string> { ["muxName"] = name });
+            return (false, detail);
         }
         catch (Exception ex)
         {

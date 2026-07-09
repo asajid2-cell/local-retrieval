@@ -307,7 +307,7 @@ public static class SessionLaunchClaims
         void Add(string? id)
         {
             id = (id ?? "").Trim();
-            if (id.Length == 0) return;
+            if (id.Length == 0 || id.Any(ch => !(ch <= 0x7f && (char.IsLetterOrDigit(ch) || ch is '.' or '-' or '_')))) return;
             if (!ids.Any(existing => string.Equals(existing, id, StringComparison.OrdinalIgnoreCase)))
                 ids.Add(id);
         }
@@ -321,7 +321,7 @@ public static class SessionLaunchClaims
 
     private static string ClaimFileName(string id)
     {
-        var cleaned = new string(id.Where(ch => char.IsLetterOrDigit(ch) || ch is '-' or '_').Take(36).ToArray());
+        var cleaned = new string(id.Where(ch => ch <= 0x7f && (char.IsLetterOrDigit(ch) || ch is '-' or '_')).Take(36).ToArray());
         if (string.IsNullOrWhiteSpace(cleaned)) cleaned = "session";
         var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(id.ToLowerInvariant()))).ToLowerInvariant();
         return $"{cleaned}-{hash[..16]}.claim.json";

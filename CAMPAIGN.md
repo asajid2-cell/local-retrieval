@@ -47,6 +47,9 @@
 - 2026-07-09: Independent Codex review confirmed muxd concurrent-create and asynchronous-relaunch overlap.
 - 2026-07-09: Real producer projection omits `muxCommand`, while relay/UI fixtures still require it.
 - 2026-07-09: Relay persistence swallows write failures and command delivery expires after ten minutes.
+- 2026-07-09: Independent tandem audit found that failed PTY termination orphaned the handle and visible owner websocket closure was incorrectly treated as child exit.
+- 2026-07-09: L1/L2 accepted at `L2b_20260709`: failed termination now retains PTY/input/claim, owner registration is claim-protected with reconnect identity and explicit exit confirmation, boot/heal preserve aliases, node CLI shims are scanned, and relay backlog is bounded.
+- 2026-07-09: Unified acceptance evidence: app 306 passed / 2 skipped, relay 25 passed, muxd 44 passed / 3 VPS-only skipped. muxd checkpoint `be29d6b`.
 
 ## Decisions Needed
 

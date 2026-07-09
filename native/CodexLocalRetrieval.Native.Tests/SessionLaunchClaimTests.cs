@@ -8,6 +8,48 @@ namespace CodexLocalRetrieval.Native.Tests;
 public class SessionLaunchClaimTests
 {
     [TestMethod]
+    public void ClaimFileName_MatchesMuxdContract()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "claim-name-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var expected = Path.Combine(root, "Parent-ID_123-76d41cbf4b150c76.claim.json");
+            File.WriteAllText(expected, "{}");
+
+            var claims = SessionLaunchClaims.ReadClaimsForSession(
+                "Parent-ID_123",
+                options: new SessionLaunchClaims.Options(RootDirectory: root));
+
+            Assert.AreEqual(1, claims.Count);
+            Assert.AreEqual(expected, claims[0].Path);
+        }
+        finally
+        {
+            Directory.Delete(root, true);
+        }
+    }
+
+    [TestMethod]
+    public void TryAcquire_RejectsNonAsciiSessionIdentity()
+    {
+        using var dir = TempClaimDir();
+
+        Assert.IsFalse(SessionLaunchClaims.TryAcquire(
+            "ünicode-id",
+            null,
+            "test",
+            out var claim,
+            out var detail,
+            _ => false,
+            Options(dir.Path)));
+
+        Assert.IsNull(claim);
+        StringAssert.Contains(detail, "missing session id");
+        Assert.AreEqual(0, Directory.EnumerateFiles(dir.Path).Count());
+    }
+
+    [TestMethod]
     public void TryAcquire_BlocksSecondClaimUntilReleased()
     {
         using var dir = TempClaimDir();
