@@ -29,6 +29,7 @@ tsconfig.json
 # Local design/planning notes (kept out of the public tree)
 design/
 LOOPS*.md
+!LOOPS.md
 TANDEM.md
 IMPLEMENTATION_TEST_PLAN.md
 PUBLIC_REPO_AUDIT.md
@@ -44,6 +45,7 @@ Thumbs.db
 
 # Release build outputs
 artifacts/
+CURRENT_FAILED.md
 
 # remote server: battery fixtures and publish output
 _battery*.html
