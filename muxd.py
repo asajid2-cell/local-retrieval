@@ -11,7 +11,8 @@
 #
 # State: sessions.json manifest (resume commands) -> muxd restart / PC reboot lists unarmed sessions
 # as dormant placeholders. Only sessions explicitly armed with heal auto-start.
-import asyncio, base64, collections, hashlib, json, os, queue, re, subprocess, sys, threading, time, traceback
+import asyncio, base64, collections, ctypes, glob, hashlib, json, os, queue, re, socket, subprocess, sys, threading, time, traceback
+from ctypes import wintypes
 import faulthandler
 try: faulthandler.enable(open(os.path.join(os.path.expanduser("~"), "muxd", "muxd.crash"), "a"))
 except Exception: pass
@@ -22,8 +23,200 @@ DIR = os.path.join(HOME, "muxd")
 MANIFEST = os.path.join(DIR, "sessions.json")
 LOG = os.path.join(DIR, "muxd.log")
 ENVF = os.path.join(DIR, "muxd.env")
+# {name: {pid, cwd, alive}} — the desktop app reads this to link a live claude/codex process to its mux
+# TAB by walking the process's ancestor pids to a shell pid here (deterministic; no folder guessing). Lets
+# a shell-launched agent be added to a collection / relaunched by its real chat id.
+LIVE_TABS = os.path.join(DIR, "live-tabs.json")
+
+# ---- SINGLE-OWNER GATE ---------------------------------------------------------------------------
+# A session's transcript is safe ONLY while exactly one live agent owns it. Two live processes on the
+# same session id is what silently freezes/truncates a Claude conversation. muxd must therefore NEVER
+# resume a session id that is already alive somewhere else on this PC — not on boot-arm, not on
+# self-heal, not on an explicit create. These helpers answer "is this id live right now?" from ground
+# truth (Claude's own per-process registry + live agent command lines), so muxd can refuse a duplicate.
+
+def _pid_alive(pid):
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    try:
+        k32 = ctypes.windll.kernel32
+        h = k32.OpenProcess(0x1000, False, pid)   # PROCESS_QUERY_LIMITED_INFORMATION
+        if not h:
+            return False
+        code = ctypes.c_ulong()
+        k32.GetExitCodeProcess(h, ctypes.byref(code))
+        k32.CloseHandle(h)
+        return code.value == 259                   # STILL_ACTIVE
+    except Exception:
+        return False
+
+def _parse_resume_id(cmd):
+    cmd = cmd or ""
+    m = re.search(r'--resume\s+["\']?([0-9A-Za-z][0-9A-Za-z._-]*)["\']?', cmd)   # claude --resume <id>
+    if m:
+        return m.group(1)
+    m = re.search(r'\bresume\b(.*)', cmd)                            # codex resume [flags] <id>
+    if m:
+        for parts in re.findall(r'"([^"]*)"|\'([^\']*)\'|(\S+)', m.group(1)):
+            tok = next((x for x in parts if x), "")
+            if tok.startswith('-'):
+                continue
+            if tok.lower() in ("resume", "--include-non-interactive"):
+                continue
+            return tok
+    return ""
+
+def _try_agent_cmdlines():
+    """[(pid, cmdline)] for every live claude.exe/codex.exe — one CIM query (used for codex, which has
+    no registry). Best-effort: a failure just means codex-resume conflicts aren't caught this pass."""
+    out = []
+    try:
+        ps = ("Get-CimInstance Win32_Process -Filter \"Name='claude.exe' or Name='codex.exe'\" | "
+              "Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress")
+        r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                           capture_output=True, text=True, timeout=15)
+        if r.returncode != 0:
+            return False, out, (r.stderr or r.stdout or "CIM process query failed").strip()
+        data = json.loads(r.stdout) if r.stdout.strip() else []
+        if isinstance(data, dict):
+            data = [data]
+        for d in data:
+            try:
+                out.append((int(d.get("ProcessId") or 0), d.get("CommandLine") or ""))
+            except Exception:
+                pass
+    except Exception as e:
+        return False, out, str(e)
+    return True, out, ""
+
+def _agent_cmdlines():
+    ok, out, _ = _try_agent_cmdlines()
+    return out
+
+def try_live_session_ids():
+    """sid(lower) -> pid for every live claude/codex session on this PC. Claude sessions come from its
+    own registry (~/.claude/sessions/<pid>.json — covers IDLE and FORKED ones with no id on the command
+    line); codex + any explicit resume come from live agent command lines."""
+    out = {}
+    try:
+        for fn in glob.glob(os.path.join(HOME, ".claude", "sessions", "*.json")):
+            file_pid = 0
+            try: file_pid = int(os.path.splitext(os.path.basename(fn))[0])
+            except Exception: pass
+            if file_pid and not _pid_alive(file_pid):
+                continue
+            try:
+                with open(fn, encoding="utf-8") as f:
+                    j = json.load(f)
+                pid = j.get("pid"); sid = j.get("sessionId")
+                if sid and _pid_alive(pid):
+                    out.setdefault(str(sid).lower(), int(pid))
+            except Exception as e:
+                return False, out, f"could not verify Claude live-session registry file {os.path.basename(fn)}: {e}"
+    except Exception as e:
+        return False, out, f"could not enumerate Claude live-session registry: {e}"
+    ok, cmdlines, detail = _try_agent_cmdlines()
+    if not ok:
+        return False, out, detail or "could not verify live claude/codex processes"
+    for pid, cl in cmdlines:
+        sid = _parse_resume_id(cl)
+        if sid and _pid_alive(pid):
+            out.setdefault(sid.lower(), pid)
+    return True, out, ""
+
+def live_session_ids():
+    ok, out, _ = try_live_session_ids()
+    return out
+
+def _candidate_resume_ids(cmd, ids=None):
+    out = []
+    def add(v):
+        v = str(v or "").strip()
+        if v and v.lower() not in [x.lower() for x in out]:
+            out.append(v)
+    add(_parse_resume_id(cmd))
+    if ids:
+        for v in ids:
+            add(v)
+    return out
+
+def conflict_detail(conflict):
+    if len(conflict) > 2 and conflict[2]:
+        return conflict[2]
+    return f"session {conflict[0]} already live (pid {conflict[1]})"
+
+def resume_conflict(cmd, live=None, ids=None):
+    """If cmd would resume a session id that is ALREADY live elsewhere, return (sid, pid); else None.
+    A fresh session (no resume id) never conflicts."""
+    candidates = _candidate_resume_ids(cmd, ids)
+    if not candidates:
+        return None
+    detail = ""
+    if live is None:
+        ok, live, detail = try_live_session_ids()
+    elif isinstance(live, tuple):
+        ok, live, detail = live
+    else:
+        ok = True
+    if not ok:
+        return (candidates[0], 0, detail or "could not verify live claude/codex processes")
+    for sid in candidates:
+        pid = live.get(sid.lower())
+        if pid:
+            return (sid, pid, "")
+    return None
+
+# ---- TRANSCRIPT GUARDIAN keep-alive --------------------------------------------------------------
+# The guardian (transcript_guardian.py) byte-mirrors every live transcript so no fork/truncation can
+# erase a conversation. muxd is the always-on process, so muxd keeps it running — decoupled from WHO
+# launched it: if nothing is listening on the guardian's single-instance lock port, spawn one.
+GUARDIAN_PY   = os.path.join(DIR, "transcript_guardian.py")
+GUARDIAN_PORT = 7690
+def _guardian_data_dir():
+    lad = os.environ.get("LOCALAPPDATA") or os.path.join(HOME, "AppData", "Local")
+    return os.environ.get("GUARDIAN_DIR") or os.path.join(lad, "CodexLocalRetrieval", "transcript-guardian")
+GUARDIAN_PIDFILE = os.path.join(_guardian_data_dir(), "guardian.pid")
+
+def _guardian_running():
+    # Primary signal: the guardian's published pid is a live process. Robust (no TCP-backlog fragility).
+    try:
+        with open(GUARDIAN_PIDFILE, encoding="utf-8") as f:
+            if _pid_alive(int(f.read().strip())):
+                return True
+    except (OSError, ValueError):
+        pass
+    # Fallback: probe the single-instance lock port (covers a missing/stale pidfile with a live instance).
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(0.4)
+    try:
+        s.connect(("127.0.0.1", GUARDIAN_PORT))
+        return True
+    except OSError:
+        return False
+    finally:
+        try: s.close()
+        except OSError: pass
+
+def _guardian_keepalive():
+    while True:
+        try:
+            if os.path.exists(GUARDIAN_PY) and not _guardian_running():
+                flags = 0x00000008 | 0x08000000   # DETACHED_PROCESS | CREATE_NO_WINDOW
+                subprocess.Popen([sys.executable, GUARDIAN_PY],
+                                 creationflags=flags, close_fds=True,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                log("[guardian] not running — launched transcript_guardian.py")
+        except Exception as e:
+            log(f"[guardian] keepalive error: {e}")
+        time.sleep(30)
 
 LOG_Q = queue.Queue(maxsize=4000)
+INSTANCE_MUTEX_NAME = "Local\\CodexMuxdSessionHost"
+_INSTANCE_MUTEX_HANDLE = None
 
 def _log_writer():
     while True:
@@ -45,6 +238,39 @@ def log(msg):
     try:
         LOG_Q.put_nowait(line)
     except Exception: pass
+
+def _log_now(msg):
+    line = time.strftime("%m-%d %H:%M:%S") + " " + msg
+    try:
+        with open(LOG, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+def acquire_single_instance():
+    """Return (ok, detail). On Windows, only one muxd may own relay/local/session state."""
+    global _INSTANCE_MUTEX_HANDLE
+    if os.name != "nt":
+        return True, ""
+    if _INSTANCE_MUTEX_HANDLE:
+        return True, ""
+    try:
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+        k32.CreateMutexW.restype = wintypes.HANDLE
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        k32.CloseHandle.restype = wintypes.BOOL
+        handle = k32.CreateMutexW(None, False, INSTANCE_MUTEX_NAME)
+        if not handle:
+            return False, f"CreateMutexW failed: {ctypes.get_last_error()}"
+        err = ctypes.get_last_error()
+        if err == 183:  # ERROR_ALREADY_EXISTS
+            k32.CloseHandle(handle)
+            return False, "another muxd instance already owns the single-instance mutex"
+        _INSTANCE_MUTEX_HANDLE = handle
+        return True, ""
+    except Exception as e:
+        return False, f"single-instance mutex check failed: {e}"
 
 def loadenv():
     env = {}
@@ -384,6 +610,28 @@ def manifest_load():
     try: return json.load(open(MANIFEST, encoding="utf-8"))
     except Exception: return {}
 
+def live_tabs_snapshot():
+    out = {}
+    for n, s in sessions.items():
+        pid = 0
+        try:
+            p = getattr(s, "pty", None)
+            if p is not None: pid = int(getattr(p, "pid", 0) or 0)
+        except Exception:
+            pid = 0
+        try: alive = bool(s.alive())
+        except Exception: alive = False
+        out[n] = {"pid": pid, "cwd": getattr(s, "cwd", "") or "", "alive": alive, "hasCommand": session_has_command(s)}
+    return out
+
+def write_live_tabs():
+    try:
+        tmp = LIVE_TABS + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f: json.dump(live_tabs_snapshot(), f)
+        os.replace(tmp, LIVE_TABS)
+    except Exception as e:
+        log(f"live-tabs write failed: {e}")
+
 SAFE = lambda s: re.sub(r"[^A-Za-z0-9_.-]", "", str(s or ""))[:48]
 
 def normalized_cmd(cmd):
@@ -492,6 +740,7 @@ async def new_session_off_loop(name, cmd, cwd, cols, rows, loop, outq, heal=Fals
 
 async def main():
     start_watchdog_thread()
+    threading.Thread(target=_guardian_keepalive, name="guardian-keepalive", daemon=True).start()
     loop = asyncio.get_running_loop()
     outq = asyncio.Queue()
 
@@ -515,12 +764,22 @@ async def main():
     # boot policy (user-specified): agents NEVER auto-start on a fresh boot unless the session was
     # ARMED (auto-resume on). Armed -> recreate + resume now. Unarmed -> a dead placeholder tab that
     # stays dormant until an explicit create/relaunch sends a non-empty resume command.
+    # liveness runs a PowerShell CIM query (blocking) — NEVER call it on the event-loop thread or muxd
+    # freezes and hosted sessions drop. Always hop to a worker thread.
+    boot_live = await loop.run_in_executor(None, try_live_session_ids)
     for name, m in manifest_load().items():
         if SAFE(name) and name not in sessions:
             try:
                 heal = bool(m.get("heal"))
-                sessions[name] = Session(name, m.get("cmd", ""), m.get("cwd", ""), m.get("cols", 140), m.get("rows", 40), loop, outq, heal=heal, spawn_now=heal)
-                log(f"[boot] {'recreated + resumed (armed)' if heal else 'listed as dormant (unarmed - explicit relaunch required)'}: {name}")
+                mcmd = m.get("cmd", "")
+                # GATE: never auto-resume an id that's already live elsewhere (would be a double-open).
+                conflict = resume_conflict(mcmd, boot_live) if heal else None
+                spawn_now = heal and not conflict
+                sessions[name] = Session(name, mcmd, m.get("cwd", ""), m.get("cols", 140), m.get("rows", 40), loop, outq, heal=heal, spawn_now=spawn_now)
+                if conflict:
+                    log(f"[boot] REFUSED auto-resume of {name}: session {conflict[0]} already live (pid {conflict[1]}) — left dormant (no double-open)")
+                else:
+                    log(f"[boot] {'recreated + resumed (armed)' if spawn_now else 'listed as dormant (unarmed - explicit relaunch required)'}: {name}")
             except Exception as e: log(f"[boot] {name} failed: {e}")
 
     async def self_heal_tick():
@@ -532,6 +791,12 @@ async def main():
                     now = time.time()
                     s.deaths = [t for t in s.deaths if now - t < 600]
                     if len(s.deaths) >= 3: continue
+                    # GATE: if this id came back to life on its own (or is live elsewhere), do NOT respawn
+                    # a second owner — just leave the dead tab down until the live one exits. Off-loop (blocking CIM).
+                    conflict = await asyncio.get_running_loop().run_in_executor(None, resume_conflict, s.cmd)
+                    if conflict:
+                        log(f"[heal] SKIP respawn of {s.name}: session {conflict[0]} already live (pid {conflict[1]}) — no double-open")
+                        continue
                     s.deaths.append(now)
                     try: await spawn_session_off_loop(s); log(f"[heal] {s.name} shell died -> respawned + resume queued")
                     except Exception as e: log(f"[heal] {s.name} respawn failed: {e}")
@@ -561,6 +826,7 @@ async def main():
                 return None, "session name required", False
             prev = sessions.get(name)
             requested_cmd = (first.get("cmd", "") or "").strip()
+            requested_ids = first.get("ids") if isinstance(first.get("ids"), list) else []
             requested_relaunch = bool(first.get("relaunch"))
             requested_cwd = first.get("cwd", "") or ""
             requested_heal = bool(first.get("heal")) if ("heal" in first) else bool(prev.heal if prev else False)
@@ -587,6 +853,14 @@ async def main():
             cwd = requested_cwd or (prev.cwd if prev else "")
             if requested_relaunch and not cmd:
                 return None, "no saved command for " + name, False
+            # GATE: opening/relaunching a session that is already live in a terminal (or another tab) is
+            # the double-open that loses conversations. Only refuse when THIS tab isn't the live one
+            # (a live prev is our own tab being relaunched — that's fine; we kill it below then respawn).
+            if (not prev) or (not prev.alive()):
+                conflict = resume_conflict(cmd, ids=requested_ids)
+                if conflict:
+                    return None, (f"refused: session {conflict[0]} is already live (pid {conflict[1]}) elsewhere — "
+                                  f"close it first. Opening a 2nd live copy is what loses conversations."), False
             if prev:
                 prev.kill(by_user=False)
             try:
@@ -729,12 +1003,17 @@ async def main():
                         WATCH["local_errors"] += 1
                 if failed or (req_t in ("info", "ls", "kill", "create") and elapsed_ms > 1000):
                     log(f"[local] {req_t} from {peer} finished in {elapsed_ms:.1f}ms failed={failed}")
-        try:
-            async with _ws.serve(handler, "127.0.0.1", LOCAL_PORT, ping_interval=20,
-                                 ping_timeout=10, close_timeout=2, max_queue=32):
-                await asyncio.Future()
-        except Exception as e:
-            log(f"local attach server failed on :{LOCAL_PORT}: {e}")
+        # Auto-rebind loop: if the local attach server ever fails to bind or its task exits (which used to
+        # leave `mux` locally dead until a full muxd restart), keep retrying so it self-heals.
+        while True:
+            try:
+                async with _ws.serve(handler, "127.0.0.1", LOCAL_PORT, ping_interval=20,
+                                     ping_timeout=10, close_timeout=2, max_queue=32):
+                    log(f"local attach server listening on 127.0.0.1:{LOCAL_PORT}")
+                    await asyncio.Future()
+            except Exception as e:
+                log(f"local attach server failed on :{LOCAL_PORT}: {e}; retrying in 3s")
+                await asyncio.sleep(3)
     asyncio.create_task(local_serve())
 
     import websockets
@@ -761,6 +1040,8 @@ async def main():
                     async def pump_status():
                         while True:
                             await asyncio.sleep(5)
+                            try: await asyncio.get_running_loop().run_in_executor(None, write_live_tabs)   # off-loop file write
+                            except Exception: pass
                             await ws.send(json.dumps({"t": "sessions", "list": sess_list()}))
 
                     async def lan_return():
@@ -789,6 +1070,7 @@ async def main():
                             if t == "create" and name:
                                 prev = sessions.get(name)
                                 requested_cmd = (m.get("cmd", "") or "").strip()
+                                requested_ids = m.get("ids") if isinstance(m.get("ids"), list) else []
                                 requested_relaunch = bool(m.get("relaunch"))
                                 if prev and prev.alive() and not requested_relaunch and not needs_relaunch_for_command(prev, requested_cmd):
                                     pass                                    # already hosted + alive
@@ -815,6 +1097,15 @@ async def main():
                                     cols = int(m.get("cols") or (prev.cols if prev else 140))
                                     rows = int(m.get("rows") or (prev.rows if prev else 40))
                                     heal = requested_heal
+                                    # GATE: refuse to spawn a 2nd live owner of a session already alive
+                                    # elsewhere (a live prev is our own tab being relaunched — allowed).
+                                    if (not prev) or (not prev.alive()):
+                                        conflict = resume_conflict(cmd, ids=requested_ids)
+                                        if conflict:
+                                            log(f"[{name}] create REFUSED: session {conflict[0]} already live (pid {conflict[1]}) — avoiding double-open")
+                                            await ws.send(json.dumps({"t": "sessions", "list": sess_list(),
+                                                "notice": f"'{name}' is already live elsewhere (pid {conflict[1]}). Close that copy first — a second one loses the conversation."}))
+                                            continue
                                     if prev: prev.kill(by_user=False)
                                     try:
                                         sessions[name] = await new_session_off_loop(name, cmd, cwd, cols, rows, loop, outq, heal=heal)
@@ -861,6 +1152,10 @@ async def main():
 if __name__ == "__main__":
     os.makedirs(DIR, exist_ok=True)
     log("=== muxd starting ===")
+    ok, detail = acquire_single_instance()
+    if not ok:
+        _log_now("FATAL: refusing to start duplicate muxd: " + detail)
+        sys.exit(0)
     if not TOKEN or not RELAYS:
         log("FATAL: muxd.env needs MUX_HOST_TOKEN and RELAY_LAN/RELAY_PUBLIC"); sys.exit(1)
     while True:                      # top-level crash guard: muxd must never die quietly

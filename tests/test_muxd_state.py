@@ -30,6 +30,41 @@ class FakeSession:
 
 
 class MuxdStateTests(unittest.TestCase):
+    def test_single_instance_mutex_refuses_duplicate_muxd(self):
+        class FakeCall:
+            def __init__(self, result):
+                self.result = result
+                self.calls = []
+
+            def __call__(self, *args):
+                self.calls.append(args)
+                return self.result
+
+        class FakeKernel32:
+            def __init__(self):
+                self.CreateMutexW = FakeCall(1234)
+                self.CloseHandle = FakeCall(True)
+
+        fake = FakeKernel32()
+        old_windll = muxd.ctypes.WinDLL
+        old_get_last_error = muxd.ctypes.get_last_error
+        old_handle = muxd._INSTANCE_MUTEX_HANDLE
+        try:
+            muxd._INSTANCE_MUTEX_HANDLE = None
+            muxd.ctypes.WinDLL = lambda *args, **kwargs: fake
+            muxd.ctypes.get_last_error = lambda: 183
+
+            ok, detail = muxd.acquire_single_instance()
+
+            self.assertFalse(ok)
+            self.assertIn("already owns", detail)
+            self.assertEqual(fake.CloseHandle.calls, [(1234,)])
+            self.assertIsNone(muxd._INSTANCE_MUTEX_HANDLE)
+        finally:
+            muxd.ctypes.WinDLL = old_windll
+            muxd.ctypes.get_last_error = old_get_last_error
+            muxd._INSTANCE_MUTEX_HANDLE = old_handle
+
     def test_shell_only_payload_is_not_command_backed(self):
         payload = muxd.session_payload("shell", FakeSession(cmd="", alive=True))
 
@@ -95,6 +130,24 @@ class MuxdStateTests(unittest.TestCase):
 
     def test_command_signature_ignores_surrounding_whitespace(self):
         self.assertEqual(muxd.command_sig("  claude --resume abc  "), muxd.command_sig("claude --resume abc"))
+
+    def test_resume_parser_accepts_quoted_ids(self):
+        self.assertEqual(muxd._parse_resume_id('claude --resume "quoted-claude"'), "quoted-claude")
+        self.assertEqual(muxd._parse_resume_id('codex resume --include-non-interactive "quoted-codex"'), "quoted-codex")
+
+    def test_resume_conflict_checks_alias_candidates(self):
+        conflict = muxd.resume_conflict("codex resume parent-id", live={"child-id": 4242}, ids=["parent-id", "child-id"])
+
+        self.assertIsNotNone(conflict)
+        self.assertEqual(conflict[0], "child-id")
+        self.assertEqual(conflict[1], 4242)
+
+    def test_resume_conflict_fails_closed_when_live_scan_unverified(self):
+        conflict = muxd.resume_conflict("codex resume parent-id", live=(False, {}, "WMI unavailable"))
+
+        self.assertIsNotNone(conflict)
+        self.assertEqual(conflict[0], "parent-id")
+        self.assertIn("WMI unavailable", muxd.conflict_detail(conflict))
 
     def test_session_alive_uses_cached_dead_flag_not_conpty_probe(self):
         class PtyThatMustNotBeQueried:
