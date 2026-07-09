@@ -2783,9 +2783,27 @@ public sealed class ArchiveService
     {
         var launch = BuildResumeLaunch(session, exeOverride, extraArgsOverride);
         if (string.IsNullOrWhiteSpace(launch.Exe) || string.IsNullOrWhiteSpace(launch.Arguments)) return "";
+        return BuildMultiplexCommand(launch);
+    }
+
+    public string BuildMultiplexStartCommand(string tool, string? cwd = null)
+    {
+        var launch = BuildStartLaunch(
+            tool,
+            string.IsNullOrWhiteSpace(cwd)
+                ? Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)
+                : cwd);
+        if (string.IsNullOrWhiteSpace(launch.Exe)) return "";
+        return BuildMultiplexCommand(launch);
+    }
+
+    private static string BuildMultiplexCommand(ResumeLaunch launch)
+    {
         var cwd = QuotePowerShellSingle(launch.WorkingDirectory.Replace('\\', '/'));
         var exe = QuotePowerShellSingle(launch.Exe.Replace('\\', '/'));
-        return $"cd {cwd}; & {exe} {launch.Arguments}";
+        return string.IsNullOrWhiteSpace(launch.Arguments)
+            ? $"cd {cwd}; & {exe}"
+            : $"cd {cwd}; & {exe} {launch.Arguments}";
     }
 
     private static string ResumeSessionId(ArchiveSession session)
@@ -2894,42 +2912,46 @@ public sealed class ArchiveService
         string Title,
         string Workspace);
 
+    public sealed record PendingMuxBinding(string MuxName, RemoteMuxLaunch Launch);
+
     public bool TryBuildRemoteMuxLaunch(
         string? sessionId,
         string? tool,
-        string? legacyMuxCommand,
         out RemoteMuxLaunch? launch,
         out string detail,
         Func<ArchiveSession, string>? multiplexCommandFactory = null)
     {
         launch = null;
         var requestedId = (sessionId ?? "").Trim();
-        var legacyCommand = (legacyMuxCommand ?? "").Trim();
-        var legacyId = "";
-
-        if (!string.IsNullOrWhiteSpace(legacyCommand))
+        var requestedTool = (tool ?? "").Trim().ToLowerInvariant();
+        if (string.IsNullOrWhiteSpace(requestedId))
         {
-            if (!TryParseSingleResumedSessionId(legacyCommand, out legacyId, out detail))
+            if (requestedTool is not ("claude" or "codex"))
+            {
+                detail = "remote mux start refused: tool must be claude or codex";
                 return false;
+            }
+            var startCommand = BuildMultiplexStartCommand(requestedTool);
+            if (string.IsNullOrWhiteSpace(startCommand))
+            {
+                detail = $"remote mux start refused: no trusted {requestedTool} launch is available";
+                return false;
+            }
+            launch = new RemoteMuxLaunch(
+                "",
+                requestedTool,
+                startCommand,
+                Array.Empty<string>(),
+                requestedTool,
+                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile));
+            detail = "ok";
+            return true;
         }
 
-        var id = !string.IsNullOrWhiteSpace(requestedId) ? requestedId : legacyId;
-        if (string.IsNullOrWhiteSpace(id))
-        {
-            detail = "missing session id for remote mux launch";
-            return false;
-        }
-
-        var session = ResolveSessionByIdOrAlias(id, tool);
+        var session = ResolveSessionByIdOrAlias(requestedId, requestedTool);
         if (session is null)
         {
             detail = "remote mux launch refused: session id is not in this app's archive";
-            return false;
-        }
-
-        if (!string.IsNullOrWhiteSpace(legacyId) && !SessionHasIdOrAlias(session, legacyId))
-        {
-            detail = "remote mux launch refused: command resume id does not match requested session";
             return false;
         }
 
@@ -3059,7 +3081,7 @@ public sealed class ArchiveService
                         && new[] { s.Id }.Concat(s.Aliases)
                             .Any(id => !string.IsNullOrWhiteSpace(id) && runningIds.Contains(id)),
                     updatedAt = s.UpdatedAt,
-                    workspace = s.WorkspaceName,
+                    workspaceLabel = s.WorkspaceName,
                 collection = string.IsNullOrEmpty(col.Collection) ? null : col.Collection,
                 collectionDeckId = string.IsNullOrEmpty(col.DeckId) ? null : col.DeckId,
                 collectionDeck = string.IsNullOrEmpty(col.Deck) ? null : col.Deck,
@@ -3119,13 +3141,11 @@ public sealed class ArchiveService
                     sessionId = r.SessionId,
                     parent = r.Parent,
                     startedAt = r.StartedAt,
-                    cwd = r.Cwd,
                     title = hit.Title,             // null when the running session isn't in any collection
                     collection = hit.Collection,
                     collectionDeckId = hit.DeckId,
                     collectionDeck = hit.Deck,
                     realTitle = string.IsNullOrEmpty(r.RealTitle) ? null : r.RealTitle,   // the tool's OWN name
-                    preview = string.IsNullOrEmpty(r.Preview) ? null : r.Preview,
                 };
             })
             .OrderByDescending(r => r.startedAt, StringComparer.Ordinal)
@@ -3136,6 +3156,7 @@ public sealed class ArchiveService
             kv => kv.Key, kv => (object)new { color = kv.Value.Color, kind = kv.Value.Kind }, StringComparer.OrdinalIgnoreCase);
         return JsonSerializer.Serialize(new
         {
+            schemaVersion = 3,
             host = Environment.MachineName,
             decks,
             collections,
@@ -3168,7 +3189,12 @@ public sealed class ArchiveService
         if (!string.IsNullOrEmpty(defaultColor) && string.IsNullOrEmpty(m.Color)) m.Color = defaultColor;
     }
 
-    // Deterministically link each SHELL-launched mux tab (a bare `mux` you then ran claude/codex in) to its
+    private readonly object _resolvedMuxBindingsGate = new();
+    private Dictionary<string, (string Id, string Tool, string Cwd)> _resolvedMuxBindings =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    // Deterministically link each unresolved mux tab (a shell-started agent or a fresh trusted CLI launch)
+    // to its live chat. Once a fresh launch is identified, callers bind the trusted resume command into muxd.
     // live chat, so it can be filed into a collection / relaunched by real id. muxd writes {tab:{pid,cwd}} to
     // live-tabs.json; we match a running claude/codex to its tab by walking the process's ancestry to that
     // shell pid, then take the resume id from its command line, or (fresh agent) the newest transcript in the
@@ -3180,7 +3206,12 @@ public sealed class ArchiveService
         Dictionary<string, JsonElement>? tabs = null;
         try { if (File.Exists(path)) tabs = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(File.ReadAllText(path)); }
         catch { }
-        if (tabs is null || tabs.Count == 0) return result;
+        if (tabs is null || tabs.Count == 0)
+        {
+            lock (_resolvedMuxBindingsGate)
+                _resolvedMuxBindings = new(StringComparer.OrdinalIgnoreCase);
+            return result;
+        }
 
         var shellPidToTab = new Dictionary<int, string>();
         var tabCwd = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -3193,11 +3224,23 @@ public sealed class ArchiveService
                 var hasCmd = el.TryGetProperty("hasCommand", out var h) && h.ValueKind == JsonValueKind.True;
                 var pid = el.TryGetProperty("pid", out var p) && p.TryGetInt32(out var pv) ? pv : 0;
                 var cwd = el.TryGetProperty("cwd", out var c) ? (c.GetString() ?? "") : "";
-                if (alive && !hasCmd && pid > 0) { shellPidToTab[pid] = name; tabCwd[name] = cwd; }   // only command-less shells need resolving
+                var sessionId = el.TryGetProperty("sessionId", out var sid) ? sid.GetString() ?? "" : "";
+                var identityPending = el.TryGetProperty("identityPending", out var pending)
+                                      && pending.ValueKind == JsonValueKind.True;
+                if (alive && pid > 0 && (!hasCmd || identityPending || string.IsNullOrWhiteSpace(sessionId)))
+                {
+                    shellPidToTab[pid] = name;
+                    tabCwd[name] = cwd;
+                }
             }
             catch { }
         }
-        if (shellPidToTab.Count == 0) return result;
+        if (shellPidToTab.Count == 0)
+        {
+            lock (_resolvedMuxBindingsGate)
+                _resolvedMuxBindings = new(StringComparer.OrdinalIgnoreCase);
+            return result;
+        }
 
         var ppid = RunningSessions.ProcessParentMap();
         var agents = RunningSessions.ScanAgentsWithPpid();
@@ -3244,14 +3287,16 @@ public sealed class ArchiveService
 
         // PASS 2 — greedy best-match assignment: no TAB or CHAT id is used twice, so two tabs can NEVER bind
         // the same chat (a contested fresh chat goes to the tab whose start-time matches best).
-        foreach (var (tab, id, tool) in AssignTabChats(proposals))
+        var assignments = AssignTabChats(proposals).ToList();
+        var resolvedBindings = new Dictionary<string, (string Id, string Tool, string Cwd)>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (tab, id, tool) in assignments)
         {
             Store.Sessions.TryGetValue(id, out var chat);
-            var muxCommand = chat is not null ? BuildMultiplexCommand(chat)
-                : (string.Equals(tool, "codex", StringComparison.OrdinalIgnoreCase) ? $"codex resume {id}" : $"claude --resume {id}");
             var title = chat?.DisplayTitle ?? tab;
-            RecordTabChat(tab, id, tool, title, muxCommand);   // rotate the tab's session history
+            RecordTabChat(tab, id, tool, title);   // rotate the tab's session history
+            resolvedBindings[tab] = (id, tool, tabCwd.TryGetValue(tab, out var cwd) ? cwd : "");
         }
+        lock (_resolvedMuxBindingsGate) _resolvedMuxBindings = resolvedBindings;
 
         // PER-SHELL, always: a tab's ledger is built ONLY from agents whose process tree traces to THAT
         // shell's pid (above) — never from the folder. So two shells in the same folder keep completely
@@ -3271,6 +3316,39 @@ public sealed class ArchiveService
             };
         }
         return result;
+    }
+
+    public IReadOnlyList<PendingMuxBinding> ResolvePendingMuxBindings()
+    {
+        ResolveMuxTabChats();
+        Dictionary<string, (string Id, string Tool, string Cwd)> snapshot;
+        lock (_resolvedMuxBindingsGate)
+            snapshot = new(_resolvedMuxBindings, StringComparer.OrdinalIgnoreCase);
+
+        var bindings = new List<PendingMuxBinding>();
+        foreach (var (muxName, resolved) in snapshot)
+        {
+            var session = ResolveSessionByIdOrAlias(resolved.Id, resolved.Tool)
+                          ?? new ArchiveSession
+                          {
+                              Id = resolved.Id,
+                              Tool = resolved.Tool,
+                              Title = muxName,
+                              Workspace = resolved.Cwd,
+                          };
+            var command = BuildMultiplexCommand(session);
+            if (string.IsNullOrWhiteSpace(command)) continue;
+            bindings.Add(new PendingMuxBinding(
+                muxName,
+                new RemoteMuxLaunch(
+                    session.Id,
+                    session.Tool,
+                    command,
+                    session.Aliases.ToArray(),
+                    session.DisplayTitle,
+                    session.Workspace)));
+        }
+        return bindings;
     }
 
     // Greedy best-match assignment of live agents to their tabs: process proposals most-confident first
@@ -3357,13 +3435,13 @@ public sealed class ArchiveService
     private bool _muxHistoryDirty;
     // Note the chat currently in a tab; when it CHANGES, the previous chat rotates into that tab's history
     // (dedup by id, most-recent first, capped) so no session a tab ever hosted is lost. Persisted lazily.
-    private void RecordTabChat(string tab, string id, string tool, string title, string muxCommand)
+    private void RecordTabChat(string tab, string id, string tool, string title)
     {
         if (string.IsNullOrEmpty(tab) || string.IsNullOrEmpty(id)) return;
         if (!Store.MuxTabHistory.TryGetValue(tab, out var rec)) { rec = new MuxTabRecord { FirstSeen = DateTime.UtcNow.ToString("O") }; Store.MuxTabHistory[tab] = rec; }
         if (rec.Current is not null && string.Equals(rec.Current.Id, id, StringComparison.OrdinalIgnoreCase))
         {
-            rec.Current.Title = title; rec.Current.MuxCommand = muxCommand; rec.Current.At = DateTime.UtcNow.ToString("O");
+            rec.Current.Title = title; rec.Current.At = DateTime.UtcNow.ToString("O");
             return;   // same chat still current — refresh, no rotation
         }
         if (rec.Current is not null)
@@ -3373,7 +3451,7 @@ public sealed class ArchiveService
         }
         rec.History.RemoveAll(h => string.Equals(h.Id, id, StringComparison.OrdinalIgnoreCase));   // new current shouldn't also sit in history
         if (rec.History.Count > 30) rec.History.RemoveRange(30, rec.History.Count - 30);
-        rec.Current = new MuxTabChat { Id = id, Tool = tool, Title = title, MuxCommand = muxCommand, At = DateTime.UtcNow.ToString("O") };
+        rec.Current = new MuxTabChat { Id = id, Tool = tool, Title = title, At = DateTime.UtcNow.ToString("O") };
         _muxHistoryDirty = true;
     }
 

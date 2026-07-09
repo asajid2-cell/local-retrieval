@@ -165,12 +165,18 @@ async Task<IEnumerable<string>> AliasesForSessionId(string sessionId)
             .ToArray();
 }
 
-async Task<(bool ok, ArchiveService.RemoteMuxLaunch? launch, string detail)> ResolveRemoteMuxLaunchAsync(string? sessionId, string? tool, string? legacyMuxCommand)
+async Task<(bool ok, ArchiveService.RemoteMuxLaunch? launch, string detail)> ResolveRemoteMuxLaunchAsync(string? sessionId, string? tool)
 {
     await EnsureArchiveAsync();
-    return archive.TryBuildRemoteMuxLaunch(sessionId, tool, legacyMuxCommand, out var launch, out var detail)
+    return archive.TryBuildRemoteMuxLaunch(sessionId, tool, out var launch, out var detail)
         ? (true, launch, detail)
         : (false, null, detail);
+}
+
+async Task<IReadOnlyList<ArchiveService.PendingMuxBinding>> ResolvePendingMuxBindingsAsync()
+{
+    await EnsureArchiveAsync();
+    return archive.ResolvePendingMuxBindings();
 }
 
 app.UseDefaultFiles();
@@ -320,7 +326,8 @@ if (Environment.GetEnvironmentVariable("CLR_REMOTE_BRIDGE") != "0")
             claudeStore,
             codexDbPath,
             m => Console.WriteLine("[bridge] " + m),
-            ResolveRemoteMuxLaunchAsync);
+            ResolveRemoteMuxLaunchAsync,
+            ResolvePendingMuxBindingsAsync);
         _ = bridge.RunLoopAsync(app.Lifetime.ApplicationStopping);
         Console.WriteLine($"remote command bridge armed (target {bridgeSettings.Target}:{bridgeSettings.Port}; active only while the desktop app is closed)");
     }

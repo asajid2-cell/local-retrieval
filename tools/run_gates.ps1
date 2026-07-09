@@ -48,9 +48,18 @@ if (-not $hardFail) {
     } 'Passed!'
 }
 
+$projectionArtifact = Join-Path $artifactDir 'projects-projection.json'
+if (-not $hardFail) {
+    Run-Gate 'projection-contract' {
+        dotnet run --project tools\ProjectionContractProbe\ProjectionContractProbe.csproj `
+            -c Release -- $projectionArtifact
+    } 'projects-projection.json'
+}
+
 Set-Location $relay
 Run-Gate 'relay-tests' {
     $env:NODE_PATH = "$env:TEMP\mux-relay-node-deps\node_modules"
+    $env:MUX_PROJECTION_ARTIFACT = $projectionArtifact
     node --check server.js
     if ($LASTEXITCODE -eq 0) { node --test tests\relay.test.js }
 } '# pass '

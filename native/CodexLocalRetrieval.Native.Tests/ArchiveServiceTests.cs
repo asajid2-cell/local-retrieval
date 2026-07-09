@@ -566,8 +566,17 @@ public sealed class ArchiveServiceTests
         svc.Store.Sessions[s1.Id] = s1; svc.Store.Sessions[s2.Id] = s2;
         svc.Store.Collections["col1"] = new ArchiveCollection { Id = "col1", Name = "Cortex Engine", SessionIds = new() { s1.Id, s2.Id } };
 
-        using var doc = System.Text.Json.JsonDocument.Parse(svc.BuildProjectsProjectionJson());
+        var projection = svc.BuildProjectsProjectionJson();
+        using var doc = System.Text.Json.JsonDocument.Parse(projection);
         var root = doc.RootElement;
+        Assert.AreEqual(3, root.GetProperty("schemaVersion").GetInt32());
+        Assert.IsFalse(projection.Contains("\"muxCommand\"", StringComparison.Ordinal));
+        Assert.IsFalse(projection.Contains("\"command\"", StringComparison.Ordinal));
+        Assert.IsFalse(projection.Contains("\"cwd\"", StringComparison.Ordinal));
+        Assert.IsFalse(projection.Contains("\"pcPath\"", StringComparison.Ordinal));
+        Assert.IsFalse(projection.Contains("\"workspace\"", StringComparison.Ordinal));
+        Assert.IsFalse(projection.Contains("\"sourcePath\"", StringComparison.Ordinal));
+        Assert.IsFalse(projection.Contains("\"preview\"", StringComparison.Ordinal));
         Assert.IsTrue(root.GetProperty("host").GetString()!.Length > 0);
         var decks = root.GetProperty("decks");
         Assert.AreEqual(1, decks.GetArrayLength());
@@ -663,6 +672,8 @@ public sealed class ArchiveServiceTests
         Assert.AreEqual("Terminal", rs[1].GetProperty("parent").GetString());
         Assert.AreEqual(100, rs[2].GetProperty("pid").GetInt32());
         Assert.AreEqual("Cortex Push", rs[2].GetProperty("title").GetString());                       // matched by id
+        Assert.IsTrue(rs.EnumerateArray().All(r => !r.TryGetProperty("cwd", out _)),
+            "remote running projection must not expose local filesystem paths");
     }
 
     [TestMethod]
@@ -729,7 +740,6 @@ public sealed class ArchiveServiceTests
         var ok = service.TryBuildRemoteMuxLaunch(
             "alias-id",
             "codex",
-            null,
             out var launch,
             out var detail,
             s => $"cd 'C:/work'; & 'C:/Trusted/codex.exe' resume --include-non-interactive {s.Id}");
@@ -742,23 +752,22 @@ public sealed class ArchiveServiceTests
     }
 
     [TestMethod]
-    public void TryBuildRemoteMuxLaunch_RejectsLegacyCommandThatDoesNotMatchRequestedSession()
+    public void TryBuildRemoteMuxLaunch_RejectsUnknownOpaqueSessionId()
     {
         var service = new ArchiveService(useBundledStore: true);
         var session = new ArchiveSession { Id = "wanted-id", Tool = "codex", Workspace = Path.GetTempPath(), SourcePath = Path.Combine(Path.GetTempPath(), "wanted-id.jsonl") };
         service.Store.Sessions[session.Id] = session;
 
         var ok = service.TryBuildRemoteMuxLaunch(
-            "wanted-id",
+            "other-id",
             "codex",
-            "codex resume other-id",
             out var launch,
             out var detail,
             _ => "should not be used");
 
         Assert.IsFalse(ok);
         Assert.IsNull(launch);
-        StringAssert.Contains(detail, "does not match requested session");
+        StringAssert.Contains(detail, "not in this app's archive");
     }
 
     [TestMethod]

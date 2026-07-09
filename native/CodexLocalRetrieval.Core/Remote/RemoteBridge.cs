@@ -30,7 +30,8 @@ public sealed class RemoteBridge
     private readonly ClaudeSessionStore _claude;
     private readonly string _codexDbPath;
     private readonly Action<string> _log;
-    private readonly Func<string?, string?, string?, Task<(bool ok, ArchiveService.RemoteMuxLaunch? launch, string detail)>>? _resolveMuxLaunch;
+    private readonly Func<string?, string?, Task<(bool ok, ArchiveService.RemoteMuxLaunch? launch, string detail)>>? _resolveMuxLaunch;
+    private readonly Func<Task<IReadOnlyList<ArchiveService.PendingMuxBinding>>>? _resolvePendingMuxBindings;
 
     private const string SshHardenOpts = "-o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3";
     private static readonly TimeSpan SshHardTimeout = TimeSpan.FromSeconds(30);
@@ -41,7 +42,8 @@ public sealed class RemoteBridge
         ClaudeSessionStore claude,
         string codexDbPath,
         Action<string>? log = null,
-        Func<string?, string?, string?, Task<(bool ok, ArchiveService.RemoteMuxLaunch? launch, string detail)>>? resolveMuxLaunch = null)
+        Func<string?, string?, Task<(bool ok, ArchiveService.RemoteMuxLaunch? launch, string detail)>>? resolveMuxLaunch = null,
+        Func<Task<IReadOnlyList<ArchiveService.PendingMuxBinding>>>? resolvePendingMuxBindings = null)
     {
         _settings = settings;
         _guiPrimaryRunning = guiPrimaryRunning;
@@ -49,6 +51,7 @@ public sealed class RemoteBridge
         _codexDbPath = codexDbPath ?? "";
         _log = log ?? (_ => { });
         _resolveMuxLaunch = resolveMuxLaunch;
+        _resolvePendingMuxBindings = resolvePendingMuxBindings;
     }
 
     public async Task RunLoopAsync(CancellationToken ct)
@@ -64,6 +67,7 @@ public sealed class RemoteBridge
                     var s = _settings();
                     if (s is not null && !string.IsNullOrWhiteSpace(s.Target))
                     {
+                        await ReconcilePendingMuxBindingsAsync();
                         if (tick % 3 == 0) await PushRunningAsync(s);   // running heartbeat ~every 9s (keeps `live` + refreshes the list)
                         await PollAndProcessAsync(s);                    // drain commands ~every 3s (snappy kills); also re-pushes after a kill
                     }
@@ -75,6 +79,45 @@ public sealed class RemoteBridge
         }
     }
 
+    private async Task ReconcilePendingMuxBindingsAsync()
+    {
+        if (_resolvePendingMuxBindings is null) return;
+        try
+        {
+            var listing = await LocalMuxdRequestAsync(new { t = "ls" });
+            using var listDoc = JsonDocument.Parse(listing);
+            if (!listDoc.RootElement.TryGetProperty("list", out var list) || list.ValueKind != JsonValueKind.Array)
+                return;
+            var needsResolution = list.EnumerateArray().Any(session =>
+                (session.TryGetProperty("identityPending", out var pending) && pending.ValueKind == JsonValueKind.True)
+                || (session.TryGetProperty("alive", out var alive) && alive.ValueKind == JsonValueKind.True
+                    && session.TryGetProperty("hasCommand", out var hasCommand) && hasCommand.ValueKind == JsonValueKind.False));
+            if (!needsResolution) return;
+        }
+        catch { return; }
+
+        foreach (var binding in await _resolvePendingMuxBindings())
+        {
+            try
+            {
+                var launch = binding.Launch;
+                var response = await LocalMuxdRequestAsync(new
+                {
+                    t = "bind",
+                    s = binding.MuxName,
+                    cmd = launch.Command,
+                    sessionId = launch.SessionId,
+                    aliases = launch.Aliases
+                });
+                using var doc = JsonDocument.Parse(response);
+                if (doc.RootElement.TryGetProperty("t", out var type) && type.GetString() == "bind-ok")
+                    continue;
+                _log($"mux identity bind deferred for {binding.MuxName}: {response}");
+            }
+            catch (Exception ex) { _log($"mux identity bind deferred for {binding.MuxName}: {ex.Message}"); }
+        }
+    }
+
     // Keep the web's running list + `live` flag fresh via a LIGHT partial update (only runningSessions),
     // so the collections projection the desktop app last pushed is left intact.
     private async Task PushRunningAsync(Settings s)
@@ -83,12 +126,13 @@ public sealed class RemoteBridge
         var running = scanned.Select(r => new
         {
             pid = r.Pid, tool = r.Tool, sessionId = r.SessionId, parent = r.Parent,
-            startedAt = r.StartedAt, cwd = r.Cwd,
+            startedAt = r.StartedAt,
             title = (string?)null, collection = (string?)null,
-            realTitle = RealTitle(r.Tool, r.SessionId), preview = (string?)null,
+            realTitle = RealTitle(r.Tool, r.SessionId),
         }).OrderByDescending(r => r.startedAt, StringComparer.Ordinal).ToList();
         var json = JsonSerializer.Serialize(new
         {
+            schemaVersion = 3,
             host = Environment.MachineName,
             runningSessions = running,
             runningVerified = verified,
@@ -124,6 +168,7 @@ public sealed class RemoteBridge
         {
             if (string.IsNullOrEmpty(c.id)) continue;
             (bool ok, string detail) res;
+            var onPc = false;
             switch ((c.type ?? "").ToLowerInvariant())
             {
                 case "kill":
@@ -149,15 +194,27 @@ public sealed class RemoteBridge
                 case "rename":
                     res = Rename(c.tool ?? "claude", c.sessionId ?? "", c.title ?? ""); changed |= res.ok; break;
                 case "fetchfile":
-                    res = await FetchUploadedFileAsync(s.Target, c.uploadId ?? "", c.filename ?? "", c.keep); break;
+                {
+                    var transfer = await RemoteUploadTransfer.FetchAndInsertAsync(
+                        s.Target,
+                        c.uploadId ?? "",
+                        c.filename ?? "",
+                        c.keep,
+                        c.muxName ?? c.sessionName,
+                        c.insert,
+                        LocalMuxdRequestAsync);
+                    res = (transfer.Ok, transfer.Detail);
+                    onPc = transfer.OnPc;
+                    break;
+                }
                 case "addtocollection":
                     res = (false, "desktop app required for collection changes"); break;
                 case "startmux":
-                    res = await StartMuxHeadlessAsync(c.muxName ?? c.sessionName ?? "", c.sessionId ?? "", c.tool ?? "", c.muxCommand ?? ""); break;
+                    res = await StartMuxHeadlessAsync(c.muxName ?? c.sessionName ?? "", c.sessionId ?? "", c.tool ?? ""); break;
                 default:
                     res = (false, "unknown command"); break;
             }
-            var ackJson = JsonSerializer.Serialize(new { ok = res.ok, detail = res.detail });
+            var ackJson = JsonSerializer.Serialize(new { ok = res.ok, detail = res.detail, onPc });
             await RunSshAsync(s.Target, $"curl -s -X POST http://127.0.0.1:{s.Port}/api/app-commands/{c.id}/ack -H 'Content-Type: application/json' --data-binary @-", ackJson);
         }
         if (changed) { await Task.Delay(300); await PushRunningAsync(s); }   // reflect a kill/rename fast
@@ -171,12 +228,10 @@ public sealed class RemoteBridge
         return _claude.RenameSession(id, title) ? (true, "renamed") : (false, "session not found");
     }
 
-    private async Task<(bool ok, string detail)> StartMuxHeadlessAsync(string name, string requestedSessionId, string tool, string legacyCommand)
+    private async Task<(bool ok, string detail)> StartMuxHeadlessAsync(string name, string requestedSessionId, string tool)
     {
         name = (name ?? "").Trim();
         var eventSessionId = (requestedSessionId ?? "").Trim();
-        if (string.IsNullOrWhiteSpace(eventSessionId))
-            eventSessionId = ArchiveService.ParseResumedSessionId(legacyCommand ?? "") ?? "";
         if (string.IsNullOrEmpty(name))
         {
             RecordSessionEvent(
@@ -196,7 +251,7 @@ public sealed class RemoteBridge
                 return (false, resolverMissing);
             }
 
-            var resolved = await _resolveMuxLaunch(requestedSessionId, tool, legacyCommand);
+            var resolved = await _resolveMuxLaunch(requestedSessionId, tool);
             if (!resolved.ok || resolved.launch is null)
             {
                 RecordSessionEvent(
@@ -209,8 +264,17 @@ public sealed class RemoteBridge
                 return (false, resolved.detail);
             }
             var launch = resolved.launch;
-            var ids = ResumeCandidateIds(launch.Command, launch.Aliases);
-            var text = await LocalMuxdRequestAsync(new { t = "create", s = name, cmd = launch.Command, cols = 140, rows = 40, ids });
+            var text = await LocalMuxdRequestAsync(new
+            {
+                t = "create",
+                s = name,
+                cmd = launch.Command,
+                cols = 140,
+                rows = 40,
+                sessionId = launch.SessionId,
+                aliases = launch.Aliases,
+                identityPending = string.IsNullOrWhiteSpace(launch.SessionId)
+            });
             using var doc = JsonDocument.Parse(text);
             if (doc.RootElement.TryGetProperty("t", out var t) && t.GetString() == "created")
             {
@@ -276,21 +340,6 @@ public sealed class RemoteBridge
         SessionEventLedger.AppendBestEffortQueued(ev, _log);
     }
 
-    private static string[] ResumeCandidateIds(string command, IEnumerable<string>? aliases)
-    {
-        var ids = new List<string>();
-        void Add(string? id)
-        {
-            id = (id ?? "").Trim();
-            if (id.Length == 0) return;
-            if (!ids.Any(x => string.Equals(x, id, StringComparison.OrdinalIgnoreCase))) ids.Add(id);
-        }
-        Add(ArchiveService.ParseResumedSessionId(command));
-        if (aliases is not null)
-            foreach (var alias in aliases) Add(alias);
-        return ids.ToArray();
-    }
-
     private static async Task<string> LocalMuxdRequestAsync(object message)
     {
         using var ws = new ClientWebSocket();
@@ -341,49 +390,6 @@ public sealed class RemoteBridge
         catch (Exception ex) { return "(error reading transcript: " + ex.Message + ")"; }
     }
 
-    // Pull an uploaded file from the VPS down to THIS PC (scp). keep -> persistent app folder; else %TEMP%.
-    private static async Task<(bool ok, string detail)> FetchUploadedFileAsync(string target, string uploadId, string filename, bool keep)
-    {
-        if (string.IsNullOrWhiteSpace(uploadId)) return (false, "no uploadId");
-        var safe = SanitizeFilename(filename);
-        var destDir = keep
-            ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "CodexMultiplexUploads")
-            : Path.Combine(Path.GetTempPath(), "multiplex-uploads");
-        try { Directory.CreateDirectory(destDir); } catch { }
-        var dest = Path.Combine(destDir, safe);
-        if (File.Exists(dest)) dest = Path.Combine(destDir, uploadId + "_" + safe);   // no clobber
-        var remote = $"{target}:multiplex-app/uploads/{uploadId}/{safe}";
-        Process? p = null;
-        try
-        {
-            var psi = new ProcessStartInfo { FileName = "scp", UseShellExecute = false, RedirectStandardOutput = true, RedirectStandardError = true, CreateNoWindow = true };
-            psi.ArgumentList.Add("-q");
-            psi.ArgumentList.Add("-o"); psi.ArgumentList.Add("BatchMode=yes");
-            psi.ArgumentList.Add("-o"); psi.ArgumentList.Add("ConnectTimeout=10");
-            psi.ArgumentList.Add(remote); psi.ArgumentList.Add(dest);
-            p = Process.Start(psi);
-            if (p is null) return (false, "scp failed to start");
-            var errTask = p.StandardError.ReadToEndAsync();
-            using var cts = new CancellationTokenSource(SshHardTimeout);
-            try { await p.WaitForExitAsync(cts.Token); }
-            catch (OperationCanceledException) { try { p.Kill(entireProcessTree: true); } catch { } return (false, "scp timeout"); }
-            var err = await errTask;
-            if (p.ExitCode == 0 && File.Exists(dest)) return (true, dest);
-            return (false, "scp exit " + p.ExitCode + (string.IsNullOrWhiteSpace(err) ? "" : " — " + err.Trim()));
-        }
-        catch (Exception ex) { try { p?.Kill(entireProcessTree: true); } catch { } return (false, "scp error: " + ex.Message); }
-        finally { p?.Dispose(); }
-    }
-
-    private static string SanitizeFilename(string name)
-    {
-        name = Path.GetFileName(name ?? "file");
-        var sb = new StringBuilder();
-        foreach (var ch in name) sb.Append(char.IsLetterOrDigit(ch) || ch == '.' || ch == '-' || ch == '_' ? ch : '_');
-        var s = sb.ToString();
-        return string.IsNullOrEmpty(s) ? "file" : (s.Length > 120 ? s[..120] : s);
-    }
-
     // Hardened ssh + hard timeout (see class note). `-n` (stdin from /dev/null) only when not feeding stdin.
     private async Task<(int code, string outText)> RunSshAsync(string target, string remoteCmd, string? stdin = null)
     {
@@ -430,6 +436,6 @@ public sealed class RemoteBridge
         public bool keep { get; set; }
         public string? muxName { get; set; }
         public string? sessionName { get; set; }
-        public string? muxCommand { get; set; }
+        public string? insert { get; set; }
     }
 }

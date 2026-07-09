@@ -84,7 +84,7 @@ public sealed partial class MainPage
                 return;
             }
 
-            var created = await CreateLocalMuxdSessionAsync(name, command, session.Aliases);
+            var created = await CreateLocalMuxdSessionAsync(name, command, session.Id, session.Aliases);
             if (!created.ok)
             {
                 Diag.Log($"Mux create FAILED ({created.detail}) name={name}");
@@ -210,9 +210,34 @@ public sealed partial class MainPage
     {
         if (_tabTracking) return;
         _tabTracking = true;
-        try { await Task.Run(() => _archive.TrackMuxTabsNow()); }   // WMI + folder scan off the UI thread
+        try
+        {
+            var bindings = await Task.Run(() => _archive.ResolvePendingMuxBindings());
+            foreach (var binding in bindings)
+                await BindPendingMuxIdentityAsync(binding);
+        }
         catch { }
         finally { _tabTracking = false; }
+    }
+
+    private async Task BindPendingMuxIdentityAsync(ArchiveService.PendingMuxBinding binding)
+    {
+        try
+        {
+            var launch = binding.Launch;
+            var response = await LocalMuxdRequestAsync(new
+            {
+                t = "bind",
+                s = binding.MuxName,
+                cmd = launch.Command,
+                sessionId = launch.SessionId,
+                aliases = launch.Aliases
+            });
+            using var doc = JsonDocument.Parse(response);
+            if (!doc.RootElement.TryGetProperty("t", out var type) || type.GetString() != "bind-ok")
+                Diag.Log($"Mux identity bind deferred for {binding.MuxName}: {response}");
+        }
+        catch (Exception ex) { Diag.Log($"Mux identity bind deferred for {binding.MuxName}: {ex.Message}"); }
     }
 
     private async Task PushProjectsAsync()
@@ -277,6 +302,7 @@ public sealed partial class MainPage
             {
                 if (string.IsNullOrEmpty(c.id)) continue;
                 (bool ok, string detail) res;
+                var onPc = false;
                 if (string.Equals(c.type, "kill", StringComparison.OrdinalIgnoreCase))
                 {
                     // DISABLED: autonomous remote kill was the #1 cause of lost work. Relay-queued "kill"
@@ -321,7 +347,16 @@ public sealed partial class MainPage
                 }
                 else if (string.Equals(c.type, "fetchfile", StringComparison.OrdinalIgnoreCase))
                 {
-                    res = await FetchUploadedFileAsync(target, c.uploadId ?? "", c.filename ?? "", c.keep);
+                    var transfer = await RemoteUploadTransfer.FetchAndInsertAsync(
+                        target,
+                        c.uploadId ?? "",
+                        c.filename ?? "",
+                        c.keep,
+                        c.muxName ?? c.sessionName,
+                        c.insert,
+                        message => LocalMuxdRequestAsync(message));
+                    res = (transfer.Ok, transfer.Detail);
+                    onPc = transfer.OnPc;
                 }
                 else if (string.Equals(c.type, "addtocollection", StringComparison.OrdinalIgnoreCase))
                 {
@@ -330,7 +365,7 @@ public sealed partial class MainPage
                 }
                 else if (string.Equals(c.type, "startmux", StringComparison.OrdinalIgnoreCase))
                 {
-                    res = await StartMuxHeadlessFromCommandAsync(c.muxName ?? c.sessionName ?? "", c.sessionId ?? "", c.tool ?? "", c.muxCommand ?? "");
+                    res = await StartMuxHeadlessFromIntentAsync(c.muxName ?? c.sessionName ?? "", c.sessionId ?? "", c.tool ?? "");
                 }
                 else if (string.Equals(c.type, "cleartabhistory", StringComparison.OrdinalIgnoreCase))
                 {
@@ -345,7 +380,7 @@ public sealed partial class MainPage
                     added = true;   // re-push so the web re-tints
                 }
                 else res = (false, "unknown command");
-                var ackJson = JsonSerializer.Serialize(new { ok = res.ok, detail = res.detail });
+                var ackJson = JsonSerializer.Serialize(new { ok = res.ok, detail = res.detail, onPc });
                 await SshSendAsync(target, $"curl -s -X POST http://127.0.0.1:{port}/api/app-commands/{c.id}/ack -H 'Content-Type: application/json' --data-binary @-", ackJson);
             }
             if (killed || renamed || added) { await Task.Delay(300); await PushProjectsAsync(); }   // reflect a kill/rename/add fast
@@ -367,7 +402,7 @@ public sealed partial class MainPage
         public bool keep { get; set; }
         public string? muxName { get; set; }
         public string? sessionName { get; set; }
-        public string? muxCommand { get; set; }
+        public string? insert { get; set; }
         public string? collection { get; set; }
         public string? collectionId { get; set; }
         public string? deckId { get; set; }
@@ -375,11 +410,11 @@ public sealed partial class MainPage
         public string? deckName { get; set; }
     }
 
-    private async Task<(bool ok, string detail)> StartMuxHeadlessFromCommandAsync(string name, string sessionId, string tool, string legacyCommand)
+    private async Task<(bool ok, string detail)> StartMuxHeadlessFromIntentAsync(string name, string sessionId, string tool)
     {
         name = (name ?? "").Trim();
         if (string.IsNullOrEmpty(name)) return (false, "missing mux session name");
-        if (!_archive.TryBuildRemoteMuxLaunch(sessionId, tool, legacyCommand, out var launch, out var detail) || launch is null)
+        if (!_archive.TryBuildRemoteMuxLaunch(sessionId, tool, out var launch, out var detail) || launch is null)
         {
             RecordSessionEvent(
                 string.IsNullOrWhiteSpace(sessionId) ? null : _archive.ResolveSessionByIdOrAlias(sessionId, tool),
@@ -394,7 +429,7 @@ public sealed partial class MainPage
             return (false, detail);
         }
         var session = _archive.ResolveSessionByIdOrAlias(launch.SessionId, launch.Tool);
-        var created = await CreateLocalMuxdSessionAsync(name, launch.Command, launch.Aliases);
+        var created = await CreateLocalMuxdSessionAsync(name, launch.Command, launch.SessionId, launch.Aliases);
         RecordSessionEvent(
             session,
             created.ok ? "mux.started.remote-command" : "mux.refused.remote-command",
@@ -490,7 +525,7 @@ public sealed partial class MainPage
                 ResolvedSessionId: session.Id);
         }
 
-        var created = await CreateLocalMuxdSessionAsync(name, command, session.Aliases);
+        var created = await CreateLocalMuxdSessionAsync(name, command, session.Id, session.Aliases);
         if (!created.ok)
         {
             RecordSessionEvent(
@@ -564,43 +599,6 @@ public sealed partial class MainPage
             return (true, "added to " + collection + " on " + deckLabel);
         }
         catch (Exception ex) { return (false, "add failed: " + ex.Message); }
-    }
-
-    // Pull an uploaded file from the VPS down to THIS PC (where the agent runs), so the web can attach its
-    // local path to a prompt. scp handles binary cleanly. `keep` files go to a persistent app folder; the
-    // rest go to %TEMP% (Windows clears it, so they "disappear" on restart — the "leave" default).
-    private static async Task<(bool ok, string detail)> FetchUploadedFileAsync(string target, string uploadId, string filename, bool keep = false)
-    {
-        if (string.IsNullOrWhiteSpace(uploadId)) return (false, "no uploadId");
-        var safe = SanitizeFilename(filename);
-        var destDir = keep
-            ? System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "CodexMultiplexUploads")
-            : System.IO.Path.Combine(System.IO.Path.GetTempPath(), "multiplex-uploads");
-        try { System.IO.Directory.CreateDirectory(destDir); } catch { }
-        var dest = System.IO.Path.Combine(destDir, safe);
-        if (System.IO.File.Exists(dest)) dest = System.IO.Path.Combine(destDir, uploadId + "_" + safe);   // no clobber
-        var remote = $"{target}:multiplex-app/uploads/{uploadId}/{safe}";
-        try
-        {
-            var psi = new ProcessStartInfo { FileName = "scp", UseShellExecute = false, RedirectStandardOutput = true, RedirectStandardError = true, CreateNoWindow = true };
-            psi.ArgumentList.Add("-q"); psi.ArgumentList.Add(remote); psi.ArgumentList.Add(dest);
-            using var p = Process.Start(psi);
-            if (p is null) return (false, "scp failed to start");
-            var err = await p.StandardError.ReadToEndAsync();
-            await p.WaitForExitAsync();
-            if (p.ExitCode == 0 && System.IO.File.Exists(dest)) return (true, dest);
-            return (false, "scp exit " + p.ExitCode + (string.IsNullOrWhiteSpace(err) ? "" : " — " + err.Trim()));
-        }
-        catch (Exception ex) { return (false, "scp error: " + ex.Message); }
-    }
-
-    private static string SanitizeFilename(string name)
-    {
-        name = System.IO.Path.GetFileName(name ?? "file");
-        var sb = new StringBuilder();
-        foreach (var ch in name) sb.Append(char.IsLetterOrDigit(ch) || ch == '.' || ch == '-' || ch == '_' ? ch : '_');
-        var s = sb.ToString();
-        return string.IsNullOrEmpty(s) ? "file" : (s.Length > 120 ? s.Substring(0, 120) : s);
     }
 
     // SSH hardening so a single stalled connection can NEVER wedge the bridge again (the bug that left
@@ -763,71 +761,46 @@ public sealed partial class MainPage
         return false;
     }
 
-    private async Task<(bool ok, string detail)> CreateLocalMuxdSessionAsync(string name, string command, IEnumerable<string>? aliases = null)
+    private async Task<(bool ok, string detail)> CreateLocalMuxdSessionAsync(
+        string name,
+        string command,
+        string? sessionId = null,
+        IEnumerable<string>? aliases = null)
     {
         try
         {
-            var sessionId = ArchiveService.ParseResumedSessionId(command) ?? "";
-            var request = new SessionLaunchRequest(
-                sessionId,
-                aliases,
-                command.Contains("claude", StringComparison.OrdinalIgnoreCase) ? "claude" : "codex",
-                "native",
-                "desktop mux create",
-                "mux.refused.claim",
-                "mux.started.create",
-                "mux.failed.create",
-                Details: new Dictionary<string, string> { ["muxName"] = name });
-            if (!_launchGovernor.TryAcquireRequiredResumeCommand(
-                    command,
-                    request,
-                    out _,
-                    out var lease,
-                    out var claimDetail))
-                return (false, claimDetail);
-            using (lease)
+            var cap = await EnsureLocalMuxdCapabilityAsync("create");
+            if (!cap.ok) return cap;
+            var canonicalId = (sessionId ?? "").Trim();
+            if (string.IsNullOrWhiteSpace(canonicalId))
+                canonicalId = ArchiveService.ParseResumedSessionId(command) ?? "";
+            var identityAliases = (aliases ?? Array.Empty<string>())
+                .Where(a => !string.IsNullOrWhiteSpace(a)
+                            && !string.Equals(a, canonicalId, StringComparison.OrdinalIgnoreCase))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+            var text = await LocalMuxdRequestAsync(new
             {
-                var cap = await EnsureLocalMuxdCapabilityAsync("create");
-                if (!cap.ok)
-                {
-                    lease?.MarkFailed(cap.detail);
-                    return cap;
-                }
-                var ids = ResumeCandidateIds(command, aliases);
-                var text = await LocalMuxdRequestAsync(new { t = "create", s = name, cmd = command, cols = 140, rows = 40, ids });
-                using var doc = JsonDocument.Parse(text);
-                if (doc.RootElement.TryGetProperty("t", out var t) && t.GetString() == "err")
-                {
-                    var detail = doc.RootElement.TryGetProperty("m", out var m) ? m.GetString() ?? "muxd error" : "muxd error";
-                    lease?.MarkFailed(detail);
-                    return (false, detail);
-                }
-                if (doc.RootElement.TryGetProperty("t", out t) && t.GetString() == "created")
-                {
-                    lease?.MarkStarted("Started PC-local mux session.");
-                    return (true, text);
-                }
-                var unexpected = "unexpected muxd create response: " + Trim(text, 160);
-                lease?.MarkFailed(unexpected);
-                return (false, unexpected);
+                t = "create",
+                s = name,
+                cmd = command,
+                cols = 140,
+                rows = 40,
+                sessionId = canonicalId,
+                aliases = identityAliases,
+                identityPending = string.IsNullOrWhiteSpace(canonicalId)
+            });
+            using var doc = JsonDocument.Parse(text);
+            if (doc.RootElement.TryGetProperty("t", out var t) && t.GetString() == "err")
+            {
+                var detail = doc.RootElement.TryGetProperty("m", out var m) ? m.GetString() ?? "muxd error" : "muxd error";
+                return (false, detail);
             }
+            if (doc.RootElement.TryGetProperty("t", out t) && t.GetString() == "created")
+                return (true, text);
+            return (false, "unexpected muxd create response: " + Trim(text, 160));
         }
         catch (Exception ex) { return (false, ex.Message); }
-    }
-
-    private static string[] ResumeCandidateIds(string command, IEnumerable<string>? aliases)
-    {
-        var ids = new List<string>();
-        void Add(string? id)
-        {
-            id = (id ?? "").Trim();
-            if (id.Length == 0) return;
-            if (!ids.Any(x => string.Equals(x, id, StringComparison.OrdinalIgnoreCase))) ids.Add(id);
-        }
-        Add(ArchiveService.ParseResumedSessionId(command));
-        if (aliases is not null)
-            foreach (var alias in aliases) Add(alias);
-        return ids.ToArray();
     }
 
     private static async Task<(bool ok, string detail)> EnsureLocalMuxdCapabilityAsync(string cap)

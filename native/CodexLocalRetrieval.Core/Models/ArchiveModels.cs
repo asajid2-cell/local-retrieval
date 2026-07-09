@@ -66,7 +66,6 @@ public sealed class MuxTabChat
     [JsonPropertyName("id")] public string Id { get; set; } = "";
     [JsonPropertyName("tool")] public string Tool { get; set; } = "";
     [JsonPropertyName("title")] public string Title { get; set; } = "";
-    [JsonPropertyName("muxCommand")] public string MuxCommand { get; set; } = "";
     [JsonPropertyName("at")] public string At { get; set; } = "";   // ISO-8601 UTC, when last seen in the tab
 }
 

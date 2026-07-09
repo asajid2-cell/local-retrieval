@@ -2,20 +2,21 @@
 
 Overall: **GREEN - acceptable checkpoint**
 
-- Tag: `L2b_20260709`
-- Date: 2026-07-09 14:16:09 -06:00
-- Accepted tag: `L2b_20260709`
-- App HEAD: 3b69c7b Add unified reliability acceptance campaign
+- Tag: `L3_20260709`
+- Date: 2026-07-09 15:49:10 -06:00
+- Accepted tag: `L3_20260709`
+- App HEAD: 3a7e8a7 Consolidate mux session launch ownership
 - App tree: DIRTY
-- Relay tree: CLEAN
-- muxd tree: CLEAN
+- Relay tree: DIRTY
+- muxd tree: DIRTY
 
 ## Gates
 
-- **dotnet-build**: PASS -- exit=0, log=Z:\328\CMPUT328-A2\codexworks\301\WorkRepo\ournewfolder\codex-local-retrieval-remote\artifacts\reliability\L2b_20260709\dotnet-build.log
-- **dotnet-tests**: PASS -- exit=0, log=Z:\328\CMPUT328-A2\codexworks\301\WorkRepo\ournewfolder\codex-local-retrieval-remote\artifacts\reliability\L2b_20260709\dotnet-tests.log
-- **relay-tests**: PASS -- exit=0, log=Z:\328\CMPUT328-A2\codexworks\301\WorkRepo\ournewfolder\codex-local-retrieval-remote\artifacts\reliability\L2b_20260709\relay-tests.log
-- **muxd-tests**: PASS -- exit=0, log=Z:\328\CMPUT328-A2\codexworks\301\WorkRepo\ournewfolder\codex-local-retrieval-remote\artifacts\reliability\L2b_20260709\muxd-tests.log
+- **dotnet-build**: PASS -- exit=0, log=Z:\328\CMPUT328-A2\codexworks\301\WorkRepo\ournewfolder\codex-local-retrieval-remote\artifacts\reliability\L3_20260709\dotnet-build.log
+- **dotnet-tests**: PASS -- exit=0, log=Z:\328\CMPUT328-A2\codexworks\301\WorkRepo\ournewfolder\codex-local-retrieval-remote\artifacts\reliability\L3_20260709\dotnet-tests.log
+- **projection-contract**: PASS -- exit=0, log=Z:\328\CMPUT328-A2\codexworks\301\WorkRepo\ournewfolder\codex-local-retrieval-remote\artifacts\reliability\L3_20260709\projection-contract.log
+- **relay-tests**: PASS -- exit=0, log=Z:\328\CMPUT328-A2\codexworks\301\WorkRepo\ournewfolder\codex-local-retrieval-remote\artifacts\reliability\L3_20260709\relay-tests.log
+- **muxd-tests**: PASS -- exit=0, log=Z:\328\CMPUT328-A2\codexworks\301\WorkRepo\ournewfolder\codex-local-retrieval-remote\artifacts\reliability\L3_20260709\muxd-tests.log
 
 ## Residuals
 
