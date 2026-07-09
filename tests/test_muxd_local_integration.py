@@ -86,7 +86,7 @@ class DisposableMuxd:
                     f"LOCAL_PORT={self.port}",
                     f"INSTANCE_MUTEX_NAME=Local\\CodexMuxdTest-{self.port}",
                     f"DEFAULT_CWD={self.root}",
-                    "LOCAL_FIRST_TIMEOUT=1",
+                    "LOCAL_FIRST_TIMEOUT=5",
                     "LOOP_WATCHDOG_WARN=120",
                     "",
                 ]
