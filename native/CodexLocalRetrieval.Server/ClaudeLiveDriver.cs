@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using CodexLocalRetrieval.Core.Agents;
+using CodexLocalRetrieval.Core.Remote;
 
 namespace CodexLocalRetrieval.Server;
 
@@ -9,12 +10,30 @@ namespace CodexLocalRetrieval.Server;
 public sealed class ClaudeLiveDriver
 {
     private readonly string _exe;
-    public ClaudeLiveDriver(string? exe = null) => _exe = exe ?? Resolve();
+    private readonly SessionLaunchGovernor _launchGovernor;
+
+    public ClaudeLiveDriver(
+        string? exe = null,
+        Func<string, bool>? isSessionLive = null,
+        SessionLaunchClaims.Options? claimOptions = null,
+        SessionLaunchGovernor? launchGovernor = null)
+    {
+        _exe = exe ?? Resolve();
+        _launchGovernor = launchGovernor ?? new SessionLaunchGovernor(new SessionLaunchGovernorOptions(claimOptions, IsSessionLive: isSessionLive));
+    }
 
     public bool Available => File.Exists(_exe) || _exe == "claude";
 
-    public Process StartTurn(string? sessionId, string cwd, string prompt, Func<AgentEvent, Task> onEvent, CancellationToken ct, string permissionMode = "acceptEdits")
+    public Process StartTurn(string? sessionId, string cwd, string prompt, Func<AgentEvent, Task> onEvent, CancellationToken ct, string permissionMode = "acceptEdits", IEnumerable<string>? aliases = null)
     {
+        SessionLaunchLease? lease = null;
+        if (!string.IsNullOrWhiteSpace(sessionId))
+        {
+            var request = LaunchRequest(sessionId, aliases, permissionMode);
+            if (!_launchGovernor.TryAcquire(request, out lease, out var leaseDetail))
+                throw new InvalidOperationException(leaseDetail);
+        }
+
         // only the known-safe set; default acceptEdits. "bypassPermissions" is reachable only for an
         // owner-signed auto command (the WS gates it on CommandSigner.Verify), never for an unsigned one.
         if (permissionMode is not ("acceptEdits" or "bypassPermissions" or "default" or "plan")) permissionMode = "acceptEdits";
@@ -41,8 +60,37 @@ public sealed class ClaudeLiveDriver
             psi.ArgumentList.Add(sessionId);
         }
 
-        var proc = Process.Start(psi)!;
+        Process proc;
+        try
+        {
+            proc = Process.Start(psi) ?? throw new InvalidOperationException("could not start Claude process");
+        }
+        catch
+        {
+            lease?.MarkFailed("Claude live turn process failed to start.");
+            lease?.Dispose();
+            throw;
+        }
         proc.StandardInput.Close(); // we never write; closing avoids a blocked-stdin wait
+        if (lease is not null)
+        {
+            lease.MarkStarted("Claude live turn process started.", new Dictionary<string, string> { ["pid"] = proc.Id.ToString(), ["permissionMode"] = permissionMode }, retainUntilExpiry: false);
+            var liveLease = lease;
+            _ = Task.Run(async () =>
+            {
+                try { await proc.WaitForExitAsync(CancellationToken.None); }
+                catch { }
+                finally
+                {
+                    RecordSessionEvent(sessionId, aliases, "claude.turn.exited", "Claude live turn process exited.", details: new Dictionary<string, string> { ["pid"] = proc.Id.ToString(), ["exitCode"] = SafeExitCode(proc) });
+                    liveLease.Dispose();
+                }
+            });
+        }
+        else
+        {
+            RecordSessionEvent(sessionId, aliases, "claude.turn.started", "Claude live turn process started.", details: new Dictionary<string, string> { ["pid"] = proc.Id.ToString(), ["permissionMode"] = permissionMode });
+        }
 
         _ = Task.Run(async () =>
         {
@@ -69,5 +117,61 @@ public sealed class ClaudeLiveDriver
         var prog = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Programs", "claude", "claude.exe");
         if (File.Exists(prog)) return prog;
         return "claude"; // last resort: rely on PATH
+    }
+
+    private static SessionLaunchRequest LaunchRequest(string? sessionId, IEnumerable<string>? aliases, string permissionMode)
+        => new(
+            sessionId,
+            aliases,
+            "claude",
+            "server",
+            "server Claude live turn",
+            "claude.turn.refused.claim",
+            "claude.turn.started",
+            "claude.turn.failed",
+            Details: new Dictionary<string, string> { ["permissionMode"] = permissionMode });
+
+    private static void RecordSessionEvent(
+        string? sessionId,
+        IEnumerable<string>? aliases,
+        string kind,
+        string summary,
+        string severity = "info",
+        string? permissionMode = null,
+        IReadOnlyDictionary<string, string>? details = null)
+    {
+        var ids = new List<string>();
+        void Add(string? id)
+        {
+            id = (id ?? "").Trim();
+            if (id.Length == 0) return;
+            if (!ids.Any(x => string.Equals(x, id, StringComparison.OrdinalIgnoreCase))) ids.Add(id);
+        }
+        Add(sessionId);
+        if (aliases is not null)
+            foreach (var alias in aliases) Add(alias);
+        Dictionary<string, string>? merged = null;
+        if (details is not null) merged = new Dictionary<string, string>(details, StringComparer.OrdinalIgnoreCase);
+        if (!string.IsNullOrWhiteSpace(permissionMode))
+        {
+            merged ??= new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            merged["permissionMode"] = permissionMode!;
+        }
+        var ev = SessionEventLedger.Create(
+            kind,
+            summary,
+            sessionId,
+            "claude",
+            source: "server",
+            severity: severity,
+            details: merged,
+            sessionIds: ids);
+        SessionEventLedger.AppendBestEffortQueued(ev);
+    }
+
+    private static string SafeExitCode(Process proc)
+    {
+        try { return proc.HasExited ? proc.ExitCode.ToString() : ""; }
+        catch { return ""; }
     }
 }

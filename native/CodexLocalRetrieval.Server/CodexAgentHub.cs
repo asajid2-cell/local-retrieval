@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Text.Json;
 using CodexLocalRetrieval.Core.Agents;
+using CodexLocalRetrieval.Core.Remote;
 
 namespace CodexLocalRetrieval.Server;
 
@@ -10,18 +11,29 @@ namespace CodexLocalRetrieval.Server;
 public sealed class CodexAgentHub : IAsyncDisposable
 {
     private readonly string _exe;
+    private readonly SessionLaunchGovernor _launchGovernor;
     private readonly SemaphoreSlim _initLock = new(1, 1);
     private CodexAppServer? _srv;
 
     // threadId -> consumer that receives this thread's notifications / approval-requests.
     private readonly ConcurrentDictionary<string, Func<JsonElement, Task>> _noteRoutes = new();
     private readonly ConcurrentDictionary<string, Func<JsonElement, Task>> _reqRoutes = new();
+    private readonly ConcurrentDictionary<string, SessionLaunchLease> _activeTurnClaims = new(StringComparer.OrdinalIgnoreCase);
 
-    public CodexAgentHub(string exe) => _exe = exe;
+    public CodexAgentHub(
+        string exe,
+        Func<string, bool>? isSessionLive = null,
+        SessionLaunchClaims.Options? claimOptions = null,
+        SessionLaunchGovernor? launchGovernor = null)
+    {
+        _exe = exe;
+        _launchGovernor = launchGovernor ?? new SessionLaunchGovernor(new SessionLaunchGovernorOptions(claimOptions, IsSessionLive: isSessionLive));
+    }
 
     private async Task<CodexAppServer> EnsureAsync(CancellationToken ct)
     {
         if (_srv is { HasExited: false }) return _srv;
+        ReleaseAllTurnClaims();
         await _initLock.WaitAsync(ct);
         try
         {
@@ -38,9 +50,16 @@ public sealed class CodexAgentHub : IAsyncDisposable
 
     private async Task PumpNotifications(CodexAppServer s)
     {
-        await foreach (var note in s.Notifications.ReadAllAsync())
-            if (ThreadIdOf(note) is { } tid && _noteRoutes.TryGetValue(tid, out var f))
-                try { await f(note); } catch { }
+        try
+        {
+            await foreach (var note in s.Notifications.ReadAllAsync())
+            {
+                RetireTurnClaimIfTerminal(note);
+                if (ThreadIdOf(note) is { } tid && _noteRoutes.TryGetValue(tid, out var f))
+                    try { await f(note); } catch { }
+            }
+        }
+        finally { ReleaseAllTurnClaims(); }
     }
 
     private async Task PumpServerRequests(CodexAppServer s)
@@ -99,21 +118,71 @@ public sealed class CodexAgentHub : IAsyncDisposable
     public async Task<string> NewThreadAsync(string cwd, Func<JsonElement, Task> onNote, Func<JsonElement, Task> onReq, CancellationToken ct, string approvalPolicy = "on-request", string sandbox = "workspace-write")
     {
         var s = await EnsureAsync(ct);
-        var res = await s.RequestAsync("thread/start", new { cwd, sandbox, approvalPolicy }, ct);
-        var id = res.TryGetProperty("thread", out var t) && t.TryGetProperty("id", out var idEl) ? idEl.GetString() ?? "" : "";
-        if (id.Length > 0) { _noteRoutes[id] = onNote; _reqRoutes[id] = onReq; }
-        return id;
+        var freshRequest = new SessionLaunchRequest(
+            null,
+            null,
+            "codex",
+            "server",
+            "codex app-server thread/start",
+            "codex.thread.refused",
+            "codex.thread.started",
+            "codex.thread.failed",
+            Workspace: cwd,
+            Details: new Dictionary<string, string>
+            {
+                ["approvalPolicy"] = approvalPolicy,
+                ["sandbox"] = sandbox
+            });
+        using var lease = _launchGovernor.BeginFresh(freshRequest);
+        try
+        {
+            var res = await s.RequestAsync("thread/start", new { cwd, sandbox, approvalPolicy }, ct);
+            var id = res.TryGetProperty("thread", out var t) && t.TryGetProperty("id", out var idEl) ? idEl.GetString() ?? "" : "";
+            if (id.Length > 0) { _noteRoutes[id] = onNote; _reqRoutes[id] = onReq; }
+            using var startedLease = _launchGovernor.BeginFresh(freshRequest with { SessionId = id });
+            startedLease.MarkStarted("Codex app-server fresh thread started.", retainUntilExpiry: false);
+            return id;
+        }
+        catch
+        {
+            lease.MarkFailed("Codex app-server fresh thread failed to start.");
+            throw;
+        }
     }
 
-    public async Task StartTurnAsync(string threadId, string text, CancellationToken ct, string? approvalPolicy = null)
+    public async Task StartTurnAsync(string threadId, string text, CancellationToken ct, string? approvalPolicy = null, IEnumerable<string>? aliases = null)
     {
+        if (_activeTurnClaims.ContainsKey(threadId))
+        {
+            RecordSessionEvent(threadId, aliases, "codex.turn.refused.active", "Codex turn refused because this server already has a turn running.", "warn", approvalPolicy);
+            throw new InvalidOperationException("That Codex chat already has a turn running in this server. Wait for it to finish or interrupt it before sending another.");
+        }
+        var request = LaunchRequest(threadId, aliases, approvalPolicy);
+        if (!_launchGovernor.TryAcquire(request, out var lease, out var leaseDetail))
+            throw new InvalidOperationException(leaseDetail);
+        if (!_activeTurnClaims.TryAdd(threadId, lease!))
+        {
+            lease?.Dispose();
+            RecordSessionEvent(threadId, aliases, "codex.turn.refused.active", "Codex turn refused because this server already has a turn running.", "warn", approvalPolicy);
+            throw new InvalidOperationException("That Codex chat already has a turn running in this server. Wait for it to finish or interrupt it before sending another.");
+        }
         var s = await EnsureAsync(ct);
         // turn/start takes UserInput[]; the text variant is {type:"text", text, text_elements:[]}.
         var input = new object[] { new { type = "text", text, text_elements = Array.Empty<object>() } };
         object prms = approvalPolicy is null
             ? new { threadId, input }
             : new { threadId, input, approvalPolicy }; // "never" = autonomous (owner-signed auto turn)
-        await s.RequestAsync("turn/start", prms, ct);
+        try
+        {
+            await s.RequestAsync("turn/start", prms, ct);
+            lease?.MarkStarted("Codex app-server turn started.", retainUntilExpiry: false);
+        }
+        catch
+        {
+            lease?.MarkFailed("Codex app-server turn failed to start.");
+            if (_activeTurnClaims.TryRemove(threadId, out var active)) active.Dispose();
+            throw;
+        }
     }
 
     public async Task InterruptAsync(string threadId, CancellationToken ct)
@@ -137,7 +206,73 @@ public sealed class CodexAgentHub : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
+        ReleaseAllTurnClaims();
         if (_srv is not null) await _srv.DisposeAsync();
+    }
+
+    private void RetireTurnClaimIfTerminal(JsonElement note)
+    {
+        var method = note.TryGetProperty("method", out var mEl) ? mEl.GetString() ?? "" : "";
+        if (method is not ("turn/completed" or "turn/failed" or "turn/cancelled" or "turn/interrupted")) return;
+        if (ThreadIdOf(note) is { } tid && _activeTurnClaims.TryRemove(tid, out var claim))
+        {
+            RecordSessionEvent(tid, null, "codex." + method.Replace('/', '.'), "Codex app-server turn reached terminal state.");
+            claim.Dispose();
+        }
+    }
+
+    private void ReleaseAllTurnClaims()
+    {
+        foreach (var key in _activeTurnClaims.Keys)
+            if (_activeTurnClaims.TryRemove(key, out var claim))
+                claim.Dispose();
+    }
+
+    private static SessionLaunchRequest LaunchRequest(string threadId, IEnumerable<string>? aliases, string? approvalPolicy)
+        => new(
+            threadId,
+            aliases,
+            "codex",
+            "server",
+            "codex app-server turn/start",
+            "codex.turn.refused.claim",
+            "codex.turn.started",
+            "codex.turn.failed",
+            Details: string.IsNullOrWhiteSpace(approvalPolicy)
+                ? null
+                : new Dictionary<string, string> { ["approvalPolicy"] = approvalPolicy! });
+
+    private static void RecordSessionEvent(
+        string? sessionId,
+        IEnumerable<string>? aliases,
+        string kind,
+        string summary,
+        string severity = "info",
+        string? approvalPolicy = null)
+    {
+        var ids = new List<string>();
+        void Add(string? id)
+        {
+            id = (id ?? "").Trim();
+            if (id.Length == 0) return;
+            if (!ids.Any(x => string.Equals(x, id, StringComparison.OrdinalIgnoreCase))) ids.Add(id);
+        }
+        Add(sessionId);
+        if (aliases is not null)
+            foreach (var alias in aliases) Add(alias);
+        var details = string.IsNullOrWhiteSpace(approvalPolicy)
+            ? null
+            : new Dictionary<string, string> { ["approvalPolicy"] = approvalPolicy! };
+        var ev = SessionEventLedger.Create(
+            kind,
+            summary,
+            sessionId,
+            "codex",
+            source: "server",
+            severity: severity,
+            details: details,
+            sessionIds: ids);
+        SessionEventLedger.AppendBestEffortQueued(ev);
     }
 }
 

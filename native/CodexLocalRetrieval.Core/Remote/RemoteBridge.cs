@@ -30,17 +30,28 @@ public sealed class RemoteBridge
     private readonly ClaudeSessionStore _claude;
     private readonly string _codexDbPath;
     private readonly Action<string> _log;
+    private readonly Func<string?, string?, string?, Task<(bool ok, ArchiveService.RemoteMuxLaunch? launch, string detail)>>? _resolveMuxLaunch;
+    private readonly SessionLaunchGovernor _launchGovernor;
 
     private const string SshHardenOpts = "-o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3";
     private static readonly TimeSpan SshHardTimeout = TimeSpan.FromSeconds(30);
 
-    public RemoteBridge(Func<Settings?> settings, Func<bool> guiPrimaryRunning, ClaudeSessionStore claude, string codexDbPath, Action<string>? log = null)
+    public RemoteBridge(
+        Func<Settings?> settings,
+        Func<bool> guiPrimaryRunning,
+        ClaudeSessionStore claude,
+        string codexDbPath,
+        Action<string>? log = null,
+        Func<string?, string?, string?, Task<(bool ok, ArchiveService.RemoteMuxLaunch? launch, string detail)>>? resolveMuxLaunch = null,
+        SessionLaunchGovernor? launchGovernor = null)
     {
         _settings = settings;
         _guiPrimaryRunning = guiPrimaryRunning;
         _claude = claude;
         _codexDbPath = codexDbPath ?? "";
         _log = log ?? (_ => { });
+        _resolveMuxLaunch = resolveMuxLaunch;
+        _launchGovernor = launchGovernor ?? new SessionLaunchGovernor(new SessionLaunchGovernorOptions(Log: _log));
     }
 
     public async Task RunLoopAsync(CancellationToken ct)
@@ -71,14 +82,21 @@ public sealed class RemoteBridge
     // so the collections projection the desktop app last pushed is left intact.
     private async Task PushRunningAsync(Settings s)
     {
-        var running = RunningSessions.Scan().Select(r => new
+        var verified = RunningSessions.TryScan(out var scanned, out var verificationDetail);
+        var running = scanned.Select(r => new
         {
             pid = r.Pid, tool = r.Tool, sessionId = r.SessionId, parent = r.Parent,
             startedAt = r.StartedAt, cwd = r.Cwd,
             title = (string?)null, collection = (string?)null,
             realTitle = RealTitle(r.Tool, r.SessionId), preview = (string?)null,
         }).OrderByDescending(r => r.startedAt, StringComparer.Ordinal).ToList();
-        var json = JsonSerializer.Serialize(new { host = Environment.MachineName, runningSessions = running });
+        var json = JsonSerializer.Serialize(new
+        {
+            host = Environment.MachineName,
+            runningSessions = running,
+            runningVerified = verified,
+            runningVerificationDetail = verified ? "" : verificationDetail,
+        });
         var remote = $"curl -s -X POST http://127.0.0.1:{s.Port}/api/running -H 'Content-Type: application/json' --data-binary @-";
         await RunSshAsync(s.Target, remote, json);
     }
@@ -112,7 +130,23 @@ public sealed class RemoteBridge
             switch ((c.type ?? "").ToLowerInvariant())
             {
                 case "kill":
-                    res = RunningSessions.Kill(c.sessionId, c.pid); changed |= res.ok; break;
+                    // DISABLED: autonomous remote kill (this headless server executed relay-queued "kill"
+                    // commands with no user intent, terminating live local sessions — a top cause of lost
+                    // work, and it kept running even when the desktop app was closed). Never kill a local
+                    // agent from a polled command. Ack as refused so the relay clears it.
+                    _log($"Remote kill REFUSED (autonomous kill disabled): session='{c.sessionId}' pid={c.pid}");
+                    RecordSessionEvent(
+                        c.sessionId,
+                        null,
+                        "remote.kill.refused",
+                        "Autonomous remote kill command refused.",
+                        "warn",
+                        details: new Dictionary<string, string>
+                        {
+                            ["requestedTool"] = c.tool ?? "",
+                            ["pid"] = c.pid.ToString()
+                        });
+                    res = (false, "autonomous remote kill is disabled (it was terminating live sessions)"); break;
                 case "transcript":
                     res = (true, ReadTranscriptTail(c.tool ?? "claude", c.sessionId ?? "")); break;
                 case "rename":
@@ -122,7 +156,7 @@ public sealed class RemoteBridge
                 case "addtocollection":
                     res = (false, "desktop app required for collection changes"); break;
                 case "startmux":
-                    res = await StartMuxHeadlessAsync(c.muxName ?? c.sessionName ?? "", c.muxCommand ?? ""); break;
+                    res = await StartMuxHeadlessAsync(c.muxName ?? c.sessionName ?? "", c.sessionId ?? "", c.tool ?? "", c.muxCommand ?? ""); break;
                 default:
                     res = (false, "unknown command"); break;
             }
@@ -140,22 +174,135 @@ public sealed class RemoteBridge
         return _claude.RenameSession(id, title) ? (true, "renamed") : (false, "session not found");
     }
 
-    private async Task<(bool ok, string detail)> StartMuxHeadlessAsync(string name, string command)
+    private async Task<(bool ok, string detail)> StartMuxHeadlessAsync(string name, string requestedSessionId, string tool, string legacyCommand)
     {
         name = (name ?? "").Trim();
-        command = (command ?? "").Trim();
-        if (string.IsNullOrEmpty(name)) return (false, "missing mux session name");
+        var eventSessionId = (requestedSessionId ?? "").Trim();
+        if (string.IsNullOrWhiteSpace(eventSessionId))
+            eventSessionId = ArchiveService.ParseResumedSessionId(legacyCommand ?? "") ?? "";
+        if (string.IsNullOrEmpty(name))
+        {
+            RecordSessionEvent(
+                eventSessionId,
+                null,
+                "mux.refused.remote-command",
+                "Headless mux start refused because the command had no mux session name.",
+                "warn");
+            return (false, "missing mux session name");
+        }
         try
         {
-            var text = await LocalMuxdRequestAsync(new { t = "create", s = name, cmd = command, cols = 140, rows = 40 });
-            using var doc = JsonDocument.Parse(text);
-            if (doc.RootElement.TryGetProperty("t", out var t) && t.GetString() == "created")
-                return (true, "started PC-local mux session: " + name);
-            if (doc.RootElement.TryGetProperty("t", out t) && t.GetString() == "err")
-                return (false, doc.RootElement.TryGetProperty("m", out var m) ? m.GetString() ?? "muxd error" : "muxd error");
-            return (false, "unexpected muxd response: " + text);
+            if (_resolveMuxLaunch is null)
+            {
+                const string resolverMissing = "headless remote mux start refused: no local archive resolver is configured";
+                RecordSessionEvent(eventSessionId, null, "mux.refused.remote-command", resolverMissing, "warn", details: new Dictionary<string, string> { ["muxName"] = name });
+                return (false, resolverMissing);
+            }
+
+            var resolved = await _resolveMuxLaunch(requestedSessionId, tool, legacyCommand);
+            if (!resolved.ok || resolved.launch is null)
+            {
+                RecordSessionEvent(
+                    eventSessionId,
+                    null,
+                    "mux.refused.remote-command",
+                    resolved.detail,
+                    "warn",
+                    details: new Dictionary<string, string> { ["muxName"] = name });
+                return (false, resolved.detail);
+            }
+            var launch = resolved.launch;
+            var request = new SessionLaunchRequest(
+                launch.SessionId,
+                launch.Aliases,
+                launch.Tool,
+                "remote-bridge",
+                "headless bridge mux create",
+                "mux.refused.remote-command",
+                "mux.started.remote-command",
+                "mux.failed.remote-command",
+                launch.Title,
+                launch.Workspace,
+                Details: new Dictionary<string, string> { ["muxName"] = name });
+            if (!_launchGovernor.TryAcquireRequiredResumeCommand(launch.Command, request, out _, out var lease, out var claimDetail))
+            {
+                return (false, claimDetail);
+            }
+            using (lease)
+            {
+                var ids = ResumeCandidateIds(launch.Command, launch.Aliases);
+                var text = await LocalMuxdRequestAsync(new { t = "create", s = name, cmd = launch.Command, cols = 140, rows = 40, ids });
+                using var doc = JsonDocument.Parse(text);
+                if (doc.RootElement.TryGetProperty("t", out var t) && t.GetString() == "created")
+                {
+                    lease?.MarkStarted("Started PC-local mux session from headless remote command.");
+                    return (true, "started PC-local mux session: " + name);
+                }
+                if (doc.RootElement.TryGetProperty("t", out t) && t.GetString() == "err")
+                {
+                    var detail = doc.RootElement.TryGetProperty("m", out var m) ? m.GetString() ?? "muxd error" : "muxd error";
+                    lease?.MarkFailed(detail);
+                    return (false, detail);
+                }
+                lease?.MarkFailed("Unexpected muxd response while starting headless remote command.");
+                return (false, "unexpected muxd response: " + text);
+            }
         }
-        catch (Exception ex) { return (false, ex.Message); }
+        catch (Exception ex)
+        {
+            RecordSessionEvent(
+                eventSessionId,
+                null,
+                "mux.refused.remote-command",
+                ex.Message,
+                "warn",
+                details: new Dictionary<string, string> { ["muxName"] = name });
+            return (false, ex.Message);
+        }
+    }
+
+    private void RecordSessionEvent(
+        string? sessionId,
+        IEnumerable<string>? aliases,
+        string kind,
+        string summary,
+        string severity = "info",
+        IReadOnlyDictionary<string, string>? details = null)
+    {
+        var ids = new List<string>();
+        void Add(string? id)
+        {
+            id = (id ?? "").Trim();
+            if (id.Length == 0) return;
+            if (!ids.Any(x => string.Equals(x, id, StringComparison.OrdinalIgnoreCase))) ids.Add(id);
+        }
+        Add(sessionId);
+        if (aliases is not null)
+            foreach (var alias in aliases) Add(alias);
+        var ev = SessionEventLedger.Create(
+            kind,
+            summary,
+            sessionId,
+            source: "remote-bridge",
+            severity: severity,
+            details: details,
+            sessionIds: ids);
+        SessionEventLedger.AppendBestEffortQueued(ev, _log);
+    }
+
+    private static string[] ResumeCandidateIds(string command, IEnumerable<string>? aliases)
+    {
+        var ids = new List<string>();
+        void Add(string? id)
+        {
+            id = (id ?? "").Trim();
+            if (id.Length == 0) return;
+            if (!ids.Any(x => string.Equals(x, id, StringComparison.OrdinalIgnoreCase))) ids.Add(id);
+        }
+        Add(ArchiveService.ParseResumedSessionId(command));
+        if (aliases is not null)
+            foreach (var alias in aliases) Add(alias);
+        return ids.ToArray();
     }
 
     private static async Task<string> LocalMuxdRequestAsync(object message)

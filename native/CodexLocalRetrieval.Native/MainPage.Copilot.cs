@@ -4,6 +4,7 @@ using System.Linq;
 using System.Text.Json;
 using System.Threading.Tasks;
 using CodexLocalRetrieval.Core.Chat;
+using CodexLocalRetrieval.Core.Remote;
 using CodexLocalRetrieval.Core.Services;
 using Microsoft.UI.Text;
 using Microsoft.UI.Xaml;
@@ -256,11 +257,10 @@ public sealed partial class MainPage
             }
             else
             {
-                var launch = _archive.BuildResumeLaunch(session);
-                body = $"Open a NEW terminal and resume “{session.DisplayTitle}”?\n\n" +
-                       "This launches an external agent CLI:\n" +
-                       $"  {launch.DisplayCommand}\n" +
-                       $"in {launch.WorkingDirectory}";
+                var summary = SessionIntegrity.Build(_archive.Store, session);
+                body = string.Equals(summary.Severity, "danger", StringComparison.OrdinalIgnoreCase)
+                    ? $"Select \"{session.DisplayTitle}\" for review?\n\nResume is blocked until integrity is clear:\n{summary.Headline}"
+                    : $"Select \"{session.DisplayTitle}\" for manual resume?\n\nUse the Resume button after reviewing the integrity panel.";
             }
             defaultButton = ContentDialogButton.Close; // a terminal launch should default to Skip
         }
@@ -283,8 +283,16 @@ public sealed partial class MainPage
 
     private void ResumeChatFromCopilot(string id)
     {
+        // DISABLED autonomous spawn: the co-pilot must NEVER launch a `claude --resume` on its own — an
+        // agent-initiated resume can double-open a session the user already has live and (verified) that
+        // makes Claude silently drop writes → lost work. Just surface the chat; the USER resumes it.
         var session = _archive.GetSession(id);
-        if (session is not null) DispatcherQueue.TryEnqueue(() => ResumeInTerminal(session));
+        if (session is null) return;
+        DispatcherQueue.TryEnqueue(() =>
+        {
+            SelectSessionRow(session);
+            SyncStatus.Text = $"Co-pilot suggests resuming \"{Trim(session.DisplayTitle, 40)}\" — click Resume to launch it yourself.";
+        });
     }
 
     private async void OpenChatPreview(string id)

@@ -56,7 +56,7 @@
                 <TextBlock
                     Grid.Column="1"
                     MaxLines="1"
-                    Text="{Binding DisplayTitle}"
+                    Text="{Binding ListTitle}"
                     TextTrimming="CharacterEllipsis" />
                 <TextBlock
                     Grid.Column="2"
@@ -182,6 +182,12 @@
                             <TextBlock Text="Running" />
                         </StackPanel>
                     </Button>
+                    <Button Click="Nav_Click" Style="{StaticResource PillButtonStyle}" Tag="Custody">
+                        <StackPanel Orientation="Horizontal" Spacing="10">
+                            <FontIcon FontFamily="Segoe Fluent Icons" FontSize="15" Glyph="&#xE72E;" />
+                            <TextBlock Text="Custody" />
+                        </StackPanel>
+                    </Button>
                     <Button Click="Nav_Click" Style="{StaticResource PillButtonStyle}" Tag="Settings">
                         <StackPanel Orientation="Horizontal" Spacing="10">
                             <SymbolIcon Symbol="Setting" />
@@ -190,17 +196,18 @@
                     </Button>
                 </StackPanel>
 
+                <!-- Extended selection: plain click opens a chat; Ctrl/Shift-click builds a multi-selection
+                     (right-click one of them -> Add all to a collection). See SessionList_SelectionChanged. -->
                 <ListView
                     x:Name="SessionList"
                     Grid.Row="3"
                     Margin="0,18,0,0"
                     Background="Transparent"
                     BorderThickness="0"
-                    IsItemClickEnabled="True"
-                    ItemClick="SessionList_ItemClick"
                     ItemTemplate="{StaticResource SessionTemplate}"
                     RightTapped="SessionList_RightTapped"
-                    SelectionMode="Single" />
+                    SelectionChanged="SessionList_SelectionChanged"
+                    SelectionMode="Extended" />
 
                 <StackPanel Grid.Row="4" Spacing="10">
                     <Button
@@ -252,6 +259,28 @@
                             Foreground="{StaticResource TextStrongBrush}" />
                     </StackPanel>
                     <StackPanel x:Name="HeaderActions" Grid.Column="1" Orientation="Horizontal" Spacing="10">
+                        <Button
+                            x:Name="MsgViewToggle"
+                            Click="MsgViewToggle_Click"
+                            Style="{StaticResource PillButtonStyle}"
+                            ToolTipService.ToolTip="Cycle what the transcript shows: everything / agent messages only / your messages only">
+                            <TextBlock x:Name="MsgViewToggleText" Text="View: all" />
+                        </Button>
+                        <Button
+                            Click="JumpPrevUser_Click"
+                            Style="{StaticResource PillButtonStyle}"
+                            ToolTipService.ToolTip="Jump to your previous message (repeat to step back through your messages)">
+                            <StackPanel Orientation="Horizontal" Spacing="6">
+                                <FontIcon FontFamily="Segoe Fluent Icons" FontSize="12" Glyph="&#xE70E;" />
+                                <TextBlock Text="Your msg" />
+                            </StackPanel>
+                        </Button>
+                        <Button
+                            Click="JumpStart_Click"
+                            Style="{StaticResource PillButtonStyle}"
+                            ToolTipService.ToolTip="Jump to the very first message, then scroll down">
+                            <TextBlock Text="Start" />
+                        </Button>
                         <Button Click="CopyContext_Click" Style="{StaticResource PillButtonStyle}">
                             <StackPanel Orientation="Horizontal" Spacing="8">
                                 <SymbolIcon Symbol="Copy" />
@@ -298,23 +327,48 @@
                 HorizontalScrollBarVisibility="Disabled"
                 VerticalScrollBarVisibility="Auto">
             <StackPanel x:Name="RightPanel" Spacing="12">
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+                    <TextBlock
+                        VerticalAlignment="Center"
+                        FontSize="18"
+                        FontWeight="SemiBold"
+                        Foreground="{StaticResource TextStrongBrush}"
+                        Text="Integrity" />
+                    <Button
+                        Grid.Column="1"
+                        Padding="8,4"
+                        Click="RefreshIntegrity_Click"
+                        Style="{StaticResource PillButtonStyle}"
+                        ToolTipService.ToolTip="Refresh custody checks for this chat">
+                        <SymbolIcon Symbol="Refresh" />
+                    </Button>
+                </Grid>
+                <StackPanel x:Name="IntegrityItems" Spacing="6" />
+                <Border Height="1" Background="{StaticResource LineBrush}" />
                 <TextBlock
                     FontSize="18"
                     FontWeight="SemiBold"
                     Foreground="{StaticResource TextStrongBrush}"
                     Text="Quick actions" />
                 <Button
+                    x:Name="ResumeTerminalButton"
                     Click="ResumeInTerminal_Click"
                     Content="Resume in terminal"
                     HorizontalAlignment="Stretch"
                     Style="{StaticResource PrimaryPillButtonStyle}" />
                 <Button
+                    x:Name="ResumeMultiplexButton"
                     Click="ResumeInMultiplex_Click"
                     Content="Start multiplex"
                     ToolTipService.ToolTip="Start this chat in multiplex and open a local terminal attached to it."
                     HorizontalAlignment="Stretch"
                     Style="{StaticResource PillButtonStyle}" />
                 <Button
+                    x:Name="ResumeHeadlessMultiplexButton"
                     Click="ResumeInHeadlessMultiplex_Click"
                     Content="Start headless multiplex"
                     ToolTipService.ToolTip="Start this chat in multiplex without opening a local terminal; attach later with mux &lt;name&gt;."
@@ -327,6 +381,7 @@
                     HorizontalAlignment="Stretch"
                     Style="{StaticResource PillButtonStyle}" />
                 <Button Click="CopyContext_Click" Content="Copy resume prompt" HorizontalAlignment="Stretch" Style="{StaticResource PillButtonStyle}" />
+                <Button x:Name="CopyCommandButton" Click="CopyCommand_Click" Content="Copy resume command" ToolTipService.ToolTip="Copy the CLI command that resumes this chat (codex resume &lt;id&gt; / claude --resume &lt;id&gt;)" HorizontalAlignment="Stretch" Style="{StaticResource PillButtonStyle}" />
                 <Button Click="CopyPath_Click" Content="Copy chat path" HorizontalAlignment="Stretch" Style="{StaticResource PillButtonStyle}" />
                 <Button Click="CopyCode_Click" Content="Copy all code" HorizontalAlignment="Stretch" Style="{StaticResource PillButtonStyle}" />
                 <Button Click="Restore_Click" Content="Build restore packet" HorizontalAlignment="Stretch" Style="{StaticResource PillButtonStyle}" />

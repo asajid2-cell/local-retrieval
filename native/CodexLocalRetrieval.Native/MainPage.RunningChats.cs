@@ -94,9 +94,33 @@ public sealed partial class MainPage
     private Dictionary<string, int> GetRunningChats()
     {
         var map = new Dictionary<string, int>();
+        var pids = new List<int>();
         foreach (var r in GetRunningSessions())
+        {
+            if (r.Pid > 0) pids.Add(r.Pid);
             if (!string.IsNullOrEmpty(r.SessionId) && !map.ContainsKey(r.SessionId))
-                map[r.SessionId] = r.Pid;
+                map[r.SessionId] = r.Pid;   // resumed sessions carry their id on the command line
+        }
+        // GROUND TRUTH for sessions whose id ISN'T on the command line — a chat forked/started locally
+        // without --resume, or one sitting IDLE in the background. This is what stops two live copies of the
+        // same session (a double-writer that loses progress). Two reliable sources, unioned:
+        var livePids = new HashSet<int>(pids);
+        //  • Claude keeps its OWN registry (~/.claude/sessions/<pid>.json) of every live session, idle or
+        //    forked — claude open-append-closes its transcript so a file check can't see an idle one.
+        try
+        {
+            foreach (var kv in CodexLocalRetrieval.Core.Remote.RunningSessions.ClaudeLiveSessionIds(livePids))
+                if (!map.ContainsKey(kv.Key)) map[kv.Key] = kv.Value;
+        }
+        catch { }
+        //  • Codex holds its rollout file OPEN for the whole session, so which transcript each agent has open
+        //    is the ground truth there (also catches a claude that's mid-write).
+        try
+        {
+            foreach (var kv in CodexLocalRetrieval.Core.Remote.OpenHandles.OpenTranscriptSessionIds(pids))
+                if (!map.ContainsKey(kv.Key)) map[kv.Key] = kv.Value;
+        }
+        catch { }
         return map;
     }
 
@@ -155,6 +179,11 @@ public sealed partial class MainPage
             {
                 if (!s.TryGetProperty("name", out var n) || !string.Equals(n.GetString(), name, StringComparison.OrdinalIgnoreCase))
                     continue;
+                // A DORMANT session (e.g. every tab after a reboot) is just a placeholder — NOT a running
+                // agent. Treat it as none so resume doesn't false-warn "already running / kill it"; the
+                // separate local-process check still fires if the chat is actually running on this PC.
+                var alive = s.TryGetProperty("alive", out var a) && a.ValueKind == JsonValueKind.True;
+                if (!alive) return RelayMuxState.None;
                 if (s.TryGetProperty("hosted", out var hosted) && hosted.ValueKind == JsonValueKind.True)
                     return RelayMuxState.Hosted;
                 if (s.TryGetProperty("legacy", out var legacy) && legacy.ValueKind == JsonValueKind.True)
@@ -213,7 +242,11 @@ public sealed partial class MainPage
         var relayMuxUp = relayState != RelayMuxState.None;
         var muxUp = localMuxUp || relayMuxUp;
         var running = await Task.Run(GetRunningChats);
-        var localPid = (!string.IsNullOrEmpty(session.Id) && running.TryGetValue(session.Id, out var pid)) ? pid : 0;
+        // Match on the session id OR any of its aliases (a fork/resume writes a lineage id) so a live copy
+        // started under a different id — but the SAME transcript — is still caught.
+        var localPid = 0;
+        if (!string.IsNullOrEmpty(session.Id) && running.TryGetValue(session.Id, out var pid)) localPid = pid;
+        else foreach (var a in session.Aliases) if (!string.IsNullOrEmpty(a) && running.TryGetValue(a, out var pa)) { localPid = pa; break; }
         // if a multiplex is up, the running process IS its agent (not a separate local one)
         var localUp = localPid != 0 && !muxUp;
 

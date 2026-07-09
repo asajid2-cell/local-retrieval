@@ -33,7 +33,9 @@ public sealed partial class MainPage
         var command = _archive.BuildMultiplexCommand(session);
         if (string.IsNullOrEmpty(command))
         {
+            RecordSessionEvent(session, "mux.refused.invalid", "Mux session refused because this chat has no safe resume command.", "warn");
             SyncStatus.Text = "Mux session refused: this chat's id is not a safe resume token.";
+            if (ReferenceEquals(_selected, session)) RenderIntegrity(force: true);
             return;
         }
 
@@ -47,6 +49,15 @@ public sealed partial class MainPage
             // Attach locally if this was the foreground/local action.
             if (await LocalMuxdSessionAliveAsync(name))
             {
+                RecordSessionEvent(
+                    session,
+                    "mux.already.live",
+                    "Mux start reused an already-live muxd session instead of injecting another resume.",
+                    details: new Dictionary<string, string>
+                    {
+                        ["muxName"] = name,
+                        ["openLocalAttach"] = openLocalAttach.ToString()
+                    });
                 if (openLocalAttach)
                 {
                     var opened = OpenLocalMuxAttach(name);
@@ -61,38 +72,78 @@ public sealed partial class MainPage
                 return;
             }
             // Running locally (or elsewhere) right now? Don't let two copies fight over the transcript.
-            if (!await ConfirmRunOrKillAsync(session)) { SyncStatus.Text = "Cancelled - already running."; return; }
+            if (!await ConfirmRunOrKillAsync(session))
+            {
+                RecordSessionEvent(
+                    session,
+                    "mux.refused.running",
+                    "Mux start cancelled because the session already had a live owner.",
+                    "warn",
+                    details: new Dictionary<string, string> { ["muxName"] = name });
+                SyncStatus.Text = "Cancelled - already running.";
+                return;
+            }
 
-            var created = await CreateLocalMuxdSessionAsync(name, command);
+            var created = await CreateLocalMuxdSessionAsync(name, command, session.Aliases);
             if (!created.ok)
             {
                 Diag.Log($"Mux create FAILED ({created.detail}) name={name}");
+                RecordSessionEvent(
+                    session,
+                    "mux.refused.create",
+                    created.detail,
+                    "warn",
+                    details: new Dictionary<string, string> { ["muxName"] = name });
                 SyncStatus.Text = "Could not create the mux session - see log.";
                 return;
             }
 
             // Bump like a local resume so the chat is where you expect when you come back to the app.
             session.UpdatedAt = DateTime.UtcNow.ToString("O");
-            _archive.RefreshSessions(_archive.Store.Sessions.Values);
-            SessionList.SelectedItem = session;
+            ReapplyActiveFilter();   // respects the active filter + spam-hide instead of dumping the whole store
+            SelectSessionRow(session);
             _ = _archive.SaveAsync();
 
             if (openLocalAttach)
             {
                 var opened = OpenLocalMuxAttach(name);
+                RecordSessionEvent(
+                    session,
+                    "mux.started.local",
+                    "Started PC-local mux session and opened a local attach terminal.",
+                    details: new Dictionary<string, string>
+                    {
+                        ["muxName"] = name,
+                        ["attachOpened"] = opened.ok.ToString()
+                    });
                 SyncStatus.Text = opened.ok
                     ? $"Mux \"{title}\" live as \"{name}\" - opening local terminal; web can attach at /multiplex."
                     : $"Mux \"{title}\" live as \"{name}\" - web can attach at /multiplex; local attach failed, run mux {name}.";
             }
             else
             {
+                RecordSessionEvent(
+                    session,
+                    "mux.started.headless",
+                    "Started headless PC-local mux session.",
+                    details: new Dictionary<string, string> { ["muxName"] = name });
                 SyncStatus.Text = $"Headless mux \"{title}\" live as \"{name}\" - open it on your phone at /multiplex or attach with mux {name}.";
             }
         }
         catch (Exception ex)
         {
             Diag.Log("StartRemoteSession FAILED " + ex);
+            RecordSessionEvent(
+                session,
+                "mux.failed",
+                ex.Message,
+                "error",
+                details: new Dictionary<string, string> { ["muxName"] = name });
             SyncStatus.Text = "Could not start the mux session - see log.";
+        }
+        finally
+        {
+            if (ReferenceEquals(_selected, session)) RenderIntegrity(force: true);
         }
     }
 
@@ -127,8 +178,10 @@ public sealed partial class MainPage
     // the projection now + every 30s; the web shows "synced / app live" when these land. --------------
     private DispatcherTimer? _syncTimer;
     private DispatcherTimer? _cmdTimer;
+    private DispatcherTimer? _tabTimer;
     private bool _syncPushing;
     private bool _cmdPolling;
+    private bool _tabTracking;
 
     public void StartProjectSync()
     {
@@ -144,9 +197,23 @@ public sealed partial class MainPage
         _cmdTimer.Tick -= OnCmdTick;
         _cmdTimer.Tick += OnCmdTick;
         _cmdTimer.Start();
+        // Track which chat each mux tab is hosting on a fast loop (off the UI thread) so a brief
+        // `claude` → `codex` → exit is caught into the tab's session history even between 30s pushes.
+        _tabTimer ??= new DispatcherTimer { Interval = TimeSpan.FromSeconds(5) };
+        _tabTimer.Tick -= OnTabTick;
+        _tabTimer.Tick += OnTabTick;
+        _tabTimer.Start();
     }
     private async void OnSyncTick(object? sender, object e) => await PushProjectsAsync();
     private async void OnCmdTick(object? sender, object e) => await PollCommandsAsync();
+    private async void OnTabTick(object? sender, object e)
+    {
+        if (_tabTracking) return;
+        _tabTracking = true;
+        try { await Task.Run(() => _archive.TrackMuxTabsNow()); }   // WMI + folder scan off the UI thread
+        catch { }
+        finally { _tabTracking = false; }
+    }
 
     private async Task PushProjectsAsync()
     {
@@ -157,11 +224,17 @@ public sealed partial class MainPage
         string json;
         try
         {
-            var sessions = await Task.Run(() => EnrichRunningSessionTitles(ResolveMissingSessionIds(GetRunningSessions())));
+            var scan = await Task.Run(() =>
+            {
+                var verified = RunningSessions.TryScan(out var list, out var detail);
+                return (verified, detail, sessions: EnrichRunningSessionTitles(ResolveMissingSessionIds(list)));
+            });
+            var sessions = scan.sessions;
             var running = new HashSet<string>(
                 sessions.Where(s => !string.IsNullOrEmpty(s.SessionId)).Select(s => s.SessionId),
                 StringComparer.OrdinalIgnoreCase);
-            json = _archive.BuildProjectsProjectionJson(running, sessions);
+            json = _archive.BuildProjectsProjectionJson(running, sessions, scan.verified, scan.detail);
+            await _archive.SaveMuxHistoryIfDirtyAsync();   // persist any tab-session-history rotation the projection detected
         }
         catch (Exception ex) { Diag.Log("BuildProjects failed: " + ex.Message); return; }
         _syncPushing = true;
@@ -206,8 +279,25 @@ public sealed partial class MainPage
                 (bool ok, string detail) res;
                 if (string.Equals(c.type, "kill", StringComparison.OrdinalIgnoreCase))
                 {
-                    res = await Task.Run(() => KillRunningSession(c.sessionId, c.pid));
-                    killed |= res.ok;
+                    // DISABLED: autonomous remote kill was the #1 cause of lost work. Relay-queued "kill"
+                    // commands were executed here every 3s with NO user intent — and when the ack curl
+                    // timed out the command wasn't dequeued, so it re-fired every poll, terminating live
+                    // local claude/codex sessions (see "Remote kill (session )" bursts in the log). The app
+                    // must NEVER kill a local agent from a polled command. Ack it as refused so the relay
+                    // clears it; killing is a deliberate LOCAL action only (or re-add behind an approval gate).
+                    Diag.Log($"Remote kill REFUSED (autonomous kill disabled): session='{c.sessionId}' pid={c.pid}");
+                    RecordSessionEvent(
+                        null,
+                        "remote.kill.refused",
+                        "Autonomous remote kill command refused.",
+                        "warn",
+                        details: new Dictionary<string, string>
+                        {
+                            ["requestedSessionId"] = c.sessionId ?? "",
+                            ["requestedTool"] = c.tool ?? "",
+                            ["pid"] = c.pid.ToString()
+                        });
+                    res = (false, "autonomous remote kill is disabled (it was terminating live sessions); kill locally instead");
                 }
                 else if (string.Equals(c.type, "transcript", StringComparison.OrdinalIgnoreCase))
                 {
@@ -223,18 +313,36 @@ public sealed partial class MainPage
                     res = (ok, status ?? "renamed");
                     renamed |= ok;
                 }
+                else if (string.Equals(c.type, "setapptitle", StringComparison.OrdinalIgnoreCase))
+                {
+                    var ok = await _archive.RenameAppTitleByIdAsync(c.sessionId ?? "", c.title ?? "");
+                    res = (ok, ok ? "app name set" : "chat not in this app's archive");
+                    renamed |= ok;
+                }
                 else if (string.Equals(c.type, "fetchfile", StringComparison.OrdinalIgnoreCase))
                 {
                     res = await FetchUploadedFileAsync(target, c.uploadId ?? "", c.filename ?? "", c.keep);
                 }
                 else if (string.Equals(c.type, "addtocollection", StringComparison.OrdinalIgnoreCase))
                 {
-                    res = await AddSessionToCollectionAsync(c.muxName ?? c.sessionName ?? "", c.collection ?? "", c.collectionId ?? "", c.deckId ?? "", c.deckName ?? c.deck ?? "");
+                    res = await AddSessionToCollectionAsync(c.muxName ?? c.sessionName ?? "", c.collection ?? "", c.collectionId ?? "", c.deckId ?? "", c.deckName ?? c.deck ?? "", c.tool ?? "", c.sessionId ?? "");
                     added |= res.ok;
                 }
                 else if (string.Equals(c.type, "startmux", StringComparison.OrdinalIgnoreCase))
                 {
-                    res = await StartMuxHeadlessFromCommandAsync(c.muxName ?? c.sessionName ?? "", c.muxCommand ?? "");
+                    res = await StartMuxHeadlessFromCommandAsync(c.muxName ?? c.sessionName ?? "", c.sessionId ?? "", c.tool ?? "", c.muxCommand ?? "");
+                }
+                else if (string.Equals(c.type, "cleartabhistory", StringComparison.OrdinalIgnoreCase))
+                {
+                    var n = await _archive.ClearMuxTabHistoryAsync(c.muxName);   // one tab, or ALL when muxName is empty
+                    res = (true, n > 0 ? $"cleared session history for {n} tab(s)" : "no tab history to clear");
+                    added |= n > 0;   // trigger a fast re-push so the web reflects the cleared history
+                }
+                else if (string.Equals(c.type, "settabcolor", StringComparison.OrdinalIgnoreCase))
+                {
+                    await _archive.SetTabColorAsync(c.muxName ?? c.sessionName ?? "", c.title);   // title carries the hex color ("" clears)
+                    res = (true, "tab color set");
+                    added = true;   // re-push so the web re-tints
                 }
                 else res = (false, "unknown command");
                 var ackJson = JsonSerializer.Serialize(new { ok = res.ok, detail = res.detail });
@@ -267,28 +375,172 @@ public sealed partial class MainPage
         public string? deckName { get; set; }
     }
 
-    private async Task<(bool ok, string detail)> StartMuxHeadlessFromCommandAsync(string name, string command)
+    private async Task<(bool ok, string detail)> StartMuxHeadlessFromCommandAsync(string name, string sessionId, string tool, string legacyCommand)
     {
         name = (name ?? "").Trim();
-        command = (command ?? "").Trim();
         if (string.IsNullOrEmpty(name)) return (false, "missing mux session name");
-        var created = await CreateLocalMuxdSessionAsync(name, command);
+        if (!_archive.TryBuildRemoteMuxLaunch(sessionId, tool, legacyCommand, out var launch, out var detail) || launch is null)
+        {
+            RecordSessionEvent(
+                string.IsNullOrWhiteSpace(sessionId) ? null : _archive.ResolveSessionByIdOrAlias(sessionId, tool),
+                "mux.refused.remote-command",
+                detail,
+                "warn",
+                details: new Dictionary<string, string>
+                {
+                    ["muxName"] = name,
+                    ["requestedSessionId"] = sessionId ?? ""
+                });
+            return (false, detail);
+        }
+        var session = _archive.ResolveSessionByIdOrAlias(launch.SessionId, launch.Tool);
+        var created = await CreateLocalMuxdSessionAsync(name, launch.Command, launch.Aliases);
+        RecordSessionEvent(
+            session,
+            created.ok ? "mux.started.remote-command" : "mux.refused.remote-command",
+            created.ok ? "Started PC-local mux session from remote command." : created.detail,
+            created.ok ? "info" : "warn",
+            details: new Dictionary<string, string>
+            {
+                ["muxName"] = name,
+                ["sessionId"] = launch.SessionId
+            });
         return created.ok ? (true, "started PC-local mux session: " + name) : created;
+    }
+
+    // /tomux handoff: resolve the caller's own session, stop the local owner, verify the
+    // transcript is no longer live, then start muxd as the new owner. Starting mux first creates
+    // the double-writer race that loses Claude/Codex rollouts.
+    private async Task<CodexLocalRetrieval.Core.Models.AgentCommandResult> HandleToMuxAsync(CodexLocalRetrieval.Core.Models.AgentCommand c)
+    {
+        CodexLocalRetrieval.Core.Models.ArchiveSession? session = null;
+        try { session = await _archive.ResolveOrIndexTargetAsync(c); } catch { }
+        if (session is null)
+        {
+            RecordSessionEvent(
+                null,
+                "tomux.refused.unresolved",
+                "Tomux handoff refused because the caller session could not be resolved.",
+                "warn",
+                details: new Dictionary<string, string>
+                {
+                    ["requestedId"] = c.id ?? c.target ?? "",
+                    ["requestedTool"] = c.tool ?? ""
+                });
+            return new CodexLocalRetrieval.Core.Models.AgentCommandResult(false, "couldn't resolve this session — pass id + tool (e.g. $env:CLAUDE_CODE_SESSION_ID).");
+
+        }
+
+        var name = !string.IsNullOrWhiteSpace(c.name) ? c.name!.Trim() : ArchiveService.MultiplexSessionName(session);
+        var command = _archive.BuildMultiplexCommand(session);
+        if (string.IsNullOrWhiteSpace(command))
+        {
+            RecordSessionEvent(
+                session,
+                "tomux.refused.invalid",
+                "Tomux handoff refused because this chat has no safe resume command.",
+                "warn",
+                details: new Dictionary<string, string> { ["muxName"] = name });
+            return new CodexLocalRetrieval.Core.Models.AgentCommandResult(false, "no resume command for this session.");
+        }
+
+        if (c.pid <= 0 && CodexLocalRetrieval.Core.Remote.RunningSessions.IsSessionLive(session.Id, session.Aliases))
+        {
+            RecordSessionEvent(
+                session,
+                "tomux.refused.missing-pid",
+                "Tomux handoff refused because the live caller did not provide a host pid.",
+                "warn",
+                details: new Dictionary<string, string> { ["muxName"] = name });
+            return new CodexLocalRetrieval.Core.Models.AgentCommandResult(false,
+                "this chat is live but /tomux did not provide a host pid; refusing to start a second writer.",
+                ResolvedSessionId: session.Id);
+        }
+
+        var killed = await Task.Run(() => c.pid > 0 ? KillRunningSession(null, c.pid) : KillRunningSession(session.Id, 0));
+        if (!killed.ok)
+        {
+            RecordSessionEvent(
+                session,
+                "tomux.refused.kill",
+                killed.detail,
+                "warn",
+                details: new Dictionary<string, string>
+                {
+                    ["muxName"] = name,
+                    ["pid"] = c.pid.ToString()
+                });
+            return new CodexLocalRetrieval.Core.Models.AgentCommandResult(false,
+                "couldn't stop the local owner, so multiplex handoff was refused: " + killed.detail,
+                ResolvedSessionId: session.Id);
+        }
+
+        await Task.Delay(500);
+        InvalidateRunningCache();
+        if (CodexLocalRetrieval.Core.Remote.RunningSessions.IsSessionLive(session.Id, session.Aliases))
+        {
+            RecordSessionEvent(
+                session,
+                "tomux.refused.still-live",
+                "Tomux handoff refused because the local owner still appeared live after stop.",
+                "warn",
+                details: new Dictionary<string, string> { ["muxName"] = name });
+            return new CodexLocalRetrieval.Core.Models.AgentCommandResult(false,
+                "local owner still appears live after stop; refusing to start a second writer.",
+                ResolvedSessionId: session.Id);
+        }
+
+        var created = await CreateLocalMuxdSessionAsync(name, command, session.Aliases);
+        if (!created.ok)
+        {
+            RecordSessionEvent(
+                session,
+                "tomux.refused.create",
+                created.detail,
+                "warn",
+                details: new Dictionary<string, string> { ["muxName"] = name });
+            return new CodexLocalRetrieval.Core.Models.AgentCommandResult(false, "multiplex start failed: " + created.detail);
+        }
+
+        _archive.SetTabKind(name, "remote-resumed", "#e879f9");   // default tint so you can tell it's a resumed-remote
+
+        await _archive.SaveAsync();
+        await PushProjectsAsync();
+        RecordSessionEvent(
+            session,
+            "tomux.completed",
+            "Tomux handoff completed: local owner stopped and mux became the owner.",
+            details: new Dictionary<string, string>
+            {
+                ["muxName"] = name,
+                ["pid"] = c.pid.ToString()
+            });
+        return new CodexLocalRetrieval.Core.Models.AgentCommandResult(true,
+            $"Handed off to multiplex as '{name}' (resumed-remote); local session stopped. Open the multiplex site to drive it.",
+            ResolvedSessionId: session.Id);
     }
 
     // Web "Add to collection": file a multiplex session's chat into a (new or existing) collection. The web
     // only allows this while the app is live (the app OWNS collections, so this can't drift out of sync). We
     // resolve the mux session name back to its ArchiveSession, then reuse the tested AddToCollectionAsync and
     // re-push the projection so the web reflects it.
-    private async Task<(bool ok, string detail)> AddSessionToCollectionAsync(string muxName, string collection, string collectionId = "", string deckId = "", string deckName = "")
+    private async Task<(bool ok, string detail)> AddSessionToCollectionAsync(string muxName, string collection, string collectionId = "", string deckId = "", string deckName = "", string tool = "", string sessionId = "")
     {
         muxName = (muxName ?? "").Trim(); collection = (collection ?? "").Trim(); collectionId = (collectionId ?? "").Trim();
-        deckId = (deckId ?? "").Trim(); deckName = (deckName ?? "").Trim();
+        deckId = (deckId ?? "").Trim(); deckName = (deckName ?? "").Trim(); sessionId = (sessionId ?? "").Trim();
         if (string.IsNullOrEmpty(muxName) || (string.IsNullOrEmpty(collection) && string.IsNullOrEmpty(collectionId))) return (false, "missing session or collection");
         ArchiveSession? session = null;
-        foreach (var s in _archive.Store.Sessions.Values)
-            if (string.Equals(ArchiveService.MultiplexSessionName(s), muxName, StringComparison.OrdinalIgnoreCase)) { session = s; break; }
-        if (session is null) return (false, "no chat matches “" + muxName + "”");
+        // Prefer the resolved REAL chat id (the mux-tab resolver linked this shell tab to its live agent chat)
+        // so a shell-launched tab files its actual, relaunchable chat rather than a name-only placeholder.
+        if (!string.IsNullOrEmpty(sessionId))
+            session = _archive.Store.Sessions.Values.FirstOrDefault(s =>
+                string.Equals(s.Id, sessionId, StringComparison.OrdinalIgnoreCase) ||
+                s.Aliases.Any(a => string.Equals(a, sessionId, StringComparison.OrdinalIgnoreCase)));
+        if (session is null)
+            foreach (var s in _archive.Store.Sessions.Values)
+                if (string.Equals(ArchiveService.MultiplexSessionName(s), muxName, StringComparison.OrdinalIgnoreCase)) { session = s; break; }
+        // Still nothing (an un-linkable shell) → a named placeholder so "add ALL tabs" still captures it.
+        if (session is null) session = _archive.EnsureMuxTabPlaceholder(muxName, tool);
         try
         {
             if (!string.IsNullOrEmpty(collectionId) && _archive.Store.Collections.ContainsKey(collectionId))
@@ -511,21 +763,71 @@ public sealed partial class MainPage
         return false;
     }
 
-    private static async Task<(bool ok, string detail)> CreateLocalMuxdSessionAsync(string name, string command)
+    private async Task<(bool ok, string detail)> CreateLocalMuxdSessionAsync(string name, string command, IEnumerable<string>? aliases = null)
     {
         try
         {
-            var cap = await EnsureLocalMuxdCapabilityAsync("create");
-            if (!cap.ok) return cap;
-            var text = await LocalMuxdRequestAsync(new { t = "create", s = name, cmd = command, cols = 140, rows = 40 });
-            using var doc = JsonDocument.Parse(text);
-            if (doc.RootElement.TryGetProperty("t", out var t) && t.GetString() == "err")
-                return (false, doc.RootElement.TryGetProperty("m", out var m) ? m.GetString() ?? "muxd error" : "muxd error");
-            if (doc.RootElement.TryGetProperty("t", out t) && t.GetString() == "created")
-                return (true, text);
-            return (false, "unexpected muxd create response: " + Trim(text, 160));
+            var sessionId = ArchiveService.ParseResumedSessionId(command) ?? "";
+            var request = new SessionLaunchRequest(
+                sessionId,
+                aliases,
+                command.Contains("claude", StringComparison.OrdinalIgnoreCase) ? "claude" : "codex",
+                "native",
+                "desktop mux create",
+                "mux.refused.claim",
+                "mux.started.create",
+                "mux.failed.create",
+                Details: new Dictionary<string, string> { ["muxName"] = name });
+            if (!_launchGovernor.TryAcquireRequiredResumeCommand(
+                    command,
+                    request,
+                    out _,
+                    out var lease,
+                    out var claimDetail))
+                return (false, claimDetail);
+            using (lease)
+            {
+                var cap = await EnsureLocalMuxdCapabilityAsync("create");
+                if (!cap.ok)
+                {
+                    lease?.MarkFailed(cap.detail);
+                    return cap;
+                }
+                var ids = ResumeCandidateIds(command, aliases);
+                var text = await LocalMuxdRequestAsync(new { t = "create", s = name, cmd = command, cols = 140, rows = 40, ids });
+                using var doc = JsonDocument.Parse(text);
+                if (doc.RootElement.TryGetProperty("t", out var t) && t.GetString() == "err")
+                {
+                    var detail = doc.RootElement.TryGetProperty("m", out var m) ? m.GetString() ?? "muxd error" : "muxd error";
+                    lease?.MarkFailed(detail);
+                    return (false, detail);
+                }
+                if (doc.RootElement.TryGetProperty("t", out t) && t.GetString() == "created")
+                {
+                    lease?.MarkStarted("Started PC-local mux session.");
+                    return (true, text);
+                }
+                var unexpected = "unexpected muxd create response: " + Trim(text, 160);
+                lease?.MarkFailed(unexpected);
+                return (false, unexpected);
+            }
         }
         catch (Exception ex) { return (false, ex.Message); }
+    }
+
+    private static string[] ResumeCandidateIds(string command, IEnumerable<string>? aliases)
+    {
+        var ids = new List<string>();
+        void Add(string? id)
+        {
+            id = (id ?? "").Trim();
+            if (id.Length == 0) return;
+            if (!ids.Any(x => string.Equals(x, id, StringComparison.OrdinalIgnoreCase))) ids.Add(id);
+        }
+        Add(ArchiveService.ParseResumedSessionId(command));
+        if (aliases is not null)
+            foreach (var alias in aliases) Add(alias);
+        return ids.ToArray();
     }
 
     private static async Task<(bool ok, string detail)> EnsureLocalMuxdCapabilityAsync(string cap)

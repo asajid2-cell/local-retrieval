@@ -5,6 +5,7 @@ using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
 using CodexLocalRetrieval.Core.Models;
+using CodexLocalRetrieval.Core.Remote;
 using Microsoft.UI.Text;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
@@ -50,9 +51,11 @@ public sealed partial class MainPage
             var added = _archive.Store.Sessions.Count - before;
             Diag.Log($"Sync: indexed {indexed}, store now {_archive.Store.Sessions.Count} (was {before}, +{added})");
 
+            // MergeScanAsync's refresh now routes through OnReapplyFilter (ReapplyActiveFilter), which keeps
+            // the active filter/sort AND the current selection — so a background sync no longer drops filters.
             _selected = (keepId is not null ? _archive.Sessions.FirstOrDefault(s => s.Id == keepId) : null)
                         ?? _archive.Sessions.FirstOrDefault();
-            SessionList.SelectedItem = _selected;
+            SelectSessionRow(_selected);
             RenderCurrent();
             SyncStatus.Text = $"{_archive.Sessions.Count} chats - synced {DateTime.Now:h:mm tt}"
                               + (added > 0 ? $" - +{added} new" : "");
@@ -77,45 +80,107 @@ public sealed partial class MainPage
     // Open a real terminal and run `codex resume <id>` in the chat's original workspace, so the
     // agent session continues with the right cwd. This is the difference between an archive you
     // read and one you can pick back up.
-    private async void ResumeInTerminal(ArchiveSession session)
+    private async void ResumeInTerminal(ArchiveSession session, string trigger = "user")
     {
+        var failureRecordedByGovernor = false;
         try
         {
             // Guard against resuming a chat that's already running (locally or in a multiplex) - two
             // runs corrupt the transcript. Offers to kill the running copy first.
-            if (!await ConfirmRunOrKillAsync(session)) { SyncStatus.Text = "Cancelled - already running."; return; }
+            if (!await ConfirmRunOrKillAsync(session))
+            {
+                RecordSessionEvent(
+                    session,
+                    "resume.refused.running",
+                    "Terminal resume cancelled because the session already had a live owner.",
+                    "warn",
+                    details: new Dictionary<string, string> { ["trigger"] = trigger });
+                SyncStatus.Text = "Cancelled - already running.";
+                return;
+            }
 
             var launch = _archive.BuildResumeLaunch(session);
             if (string.IsNullOrEmpty(launch.Exe))
             {
                 Diag.Log("Resume refused: " + launch.DisplayCommand);
+                RecordSessionEvent(
+                    session,
+                    "resume.refused.invalid",
+                    launch.DisplayCommand,
+                    "warn",
+                    details: new Dictionary<string, string> { ["trigger"] = trigger });
                 SyncStatus.Text = launch.DisplayCommand;
                 return;
             }
             var cwd = Directory.Exists(launch.WorkingDirectory)
                 ? launch.WorkingDirectory
                 : Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-            Diag.Log($"Resume launch: {launch.DisplayCommand} (cwd={cwd})");
-            var psi = new ProcessStartInfo
+            // HARD GATE (belt-and-suspenders, AFTER the dialog, regardless of what triggered this resume):
+            // never start a 2nd OS process for a session that is live or already being launched. The claim
+            // closes the check-then-spawn race across the GUI, headless server, and remote bridge.
+            var request = new SessionLaunchRequest(
+                session.Id,
+                session.Aliases,
+                session.Tool,
+                "native",
+                $"native terminal resume ({trigger})",
+                "resume.refused.claim",
+                "resume.started.terminal",
+                "resume.failed.terminal",
+                session.DisplayTitle,
+                session.Workspace,
+                new Dictionary<string, string> { ["trigger"] = trigger });
+            if (!_launchGovernor.TryAcquire(request, out var lease, out var claimDetail))
             {
-                FileName = "cmd.exe",
-                Arguments = $"/k \"{launch.DisplayCommand}\"",
-                WorkingDirectory = cwd,
-                UseShellExecute = true
-            };
-            Process.Start(psi);
+                Diag.Log($"Resume ABORTED - {claimDetail} (trigger={trigger}): {session.Id}");
+                SyncStatus.Text = $"\"{Trim(session.DisplayTitle, 40)}\" is not being launched: {claimDetail}.";
+                return;
+            }
+            using (lease)
+            {
+                try
+                {
+                    Diag.Log($"Resume launch [trigger={trigger}]: {launch.DisplayCommand} (cwd={cwd})");
+                    var psi = new ProcessStartInfo
+                    {
+                        FileName = "cmd.exe",
+                        Arguments = $"/k \"{launch.DisplayCommand}\"",
+                        WorkingDirectory = cwd,
+                        UseShellExecute = true
+                    };
+                    Process.Start(psi);
+                    lease?.MarkStarted("Started terminal resume.");
+                }
+                catch (Exception ex)
+                {
+                    failureRecordedByGovernor = true;
+                    lease?.MarkFailed(ex.Message);
+                    throw;
+                }
+            }
             // Bump to the top now so it's where you expect when you come back; a real message in the
             // resumed terminal will keep it there (and surface it in claude/codex's own picker too).
             session.UpdatedAt = DateTime.UtcNow.ToString("O");
-            _archive.RefreshSessions(_archive.Store.Sessions.Values);
-            SessionList.SelectedItem = session;
+            ReapplyActiveFilter();   // respects the active filter + spam-hide instead of dumping the whole store
+            SelectSessionRow(session);
             _ = _archive.SaveAsync();
             SyncStatus.Text = $"Resuming \"{Trim(session.DisplayTitle, 40)}\" in a terminal...";
         }
         catch (Exception ex)
         {
             Diag.Log("Resume launch FAILED " + ex);
+            if (!failureRecordedByGovernor)
+                RecordSessionEvent(
+                    session,
+                    "resume.failed.terminal",
+                    ex.Message,
+                    "error",
+                    details: new Dictionary<string, string> { ["trigger"] = trigger });
             SyncStatus.Text = "Could not open terminal - see log.";
+        }
+        finally
+        {
+            if (ReferenceEquals(_selected, session)) RenderIntegrity(force: true);
         }
     }
 
@@ -132,7 +197,7 @@ public sealed partial class MainPage
         try
         {
             var (native, recovered) = await _archive.BumpSessionAsync(session);
-            SessionList.SelectedItem = session;
+            SelectSessionRow(session);
             RenderCurrent();
             var where = string.Equals(session.Tool, "codex", StringComparison.OrdinalIgnoreCase) ? "codex resume" : "Claude's recent chats";
             SyncStatus.Text = !native
@@ -157,23 +222,7 @@ public sealed partial class MainPage
     private void ShowAddToProjectFlyout(FrameworkElement anchor, ArchiveSession session)
     {
         var flyout = new MenuFlyout { AreOpenCloseAnimationsEnabled = false };
-        foreach (var collection in _archive.Store.Collections.Values.OrderBy(c => c.Name))
-        {
-            var item = new MenuFlyoutItem { Text = collection.Name, Tag = collection.Name };
-            item.Click += async (s, _) =>
-            {
-                if ((s as MenuFlyoutItem)?.Tag is string name)
-                {
-                    await _archive.AddToCollectionAsync(session, name);
-                    SyncStatus.Text = $"Added to \"{name}\".";
-                }
-            };
-            flyout.Items.Add(item);
-        }
-        if (_archive.Store.Collections.Count > 0) flyout.Items.Add(new MenuFlyoutSeparator());
-        var newItem = new MenuFlyoutItem { Text = "New project..." };
-        newItem.Click += async (_, _) => await AddSelectedToNewCollection();
-        flyout.Items.Add(newItem);
+        BuildAddToCollectionItems(flyout.Items, new[] { session }, () => RenderCurrent());
         flyout.ShowAt(anchor);
     }
 

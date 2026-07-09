@@ -23,18 +23,51 @@ public sealed partial class MainPage
     private readonly HashSet<string> _excludeTags = new(StringComparer.OrdinalIgnoreCase);
     private bool _matchAllIncludes;
     private string? _filterCollectionId;   // scope the chat list to one project (collection), or null
-    private string _dateMode = "";          // "" recent-activity (default) | created-newest/oldest/today/week/month
+    private string _dateMode = "";          // SORT: "" recent-activity | created-newest/oldest | last-user | first-user
+    private string _dateRange = "";         // RANGE filter (combines with sort): "" any | today | week | month
+    private string _toolFilter = "";        // "" both | "codex" | "claude"
 
+    // SORT of the list (single choice). Combines with the date-range + agent + tag filters.
     private static readonly (string Value, string Label)[] DateModes =
     {
         ("", "Recent activity (default)"),
         ("created-newest", "Created · newest first"),
         ("created-oldest", "Created · oldest first"),
-        ("created-today", "Created today"),
-        ("created-week", "Created · last 7 days"),
-        ("created-month", "Created · last 30 days"),
+        ("last-user", "Last user message"),
+        ("first-user", "First user message"),
     };
     private string DateModeLabel() => DateModes.FirstOrDefault(m => m.Value == _dateMode).Label ?? "Recent activity (default)";
+
+    // DATE-RANGE filter (single choice, COMBINES with the sort).
+    private static readonly (string Value, string Label)[] DateRanges =
+    {
+        ("", "Any time"),
+        ("today", "Created today"),
+        ("week", "Created · last 7 days"),
+        ("month", "Created · last 30 days"),
+    };
+    private string DateRangeLabel() => DateRanges.FirstOrDefault(r => r.Value == _dateRange).Label ?? "Any time";
+
+    private static readonly (string Value, string Label)[] ToolFilters =
+    {
+        ("", "Any agent"),
+        ("codex", "Codex"),
+        ("claude", "Claude"),
+    };
+    private string ToolFilterLabel() => ToolFilters.FirstOrDefault(t => t.Value == _toolFilter).Label ?? "Any agent";
+
+    private bool _showHidden;   // reveal the auto-hidden one-off / spam chats (default off = they're hidden)
+    private int _minUserMsgs;   // hide chats with fewer than this many real user prompts (0 = off)
+    private static readonly (int Value, string Label)[] MinUserMsgOptions =
+    {
+        (0, "Any"),
+        (2, "2+ your messages"),
+        (3, "3+ your messages"),
+        (5, "5+ your messages"),
+        (10, "10+ your messages"),
+        (25, "25+ your messages"),
+    };
+    private string MinUserMsgLabel() => MinUserMsgOptions.FirstOrDefault(m => m.Value == _minUserMsgs).Label ?? "Any";
 
     private ChatFilter CurrentChatFilter() => new()
     {
@@ -43,8 +76,35 @@ public sealed partial class MainPage
         ExcludeTags = _excludeTags.ToList(),
         MatchAllIncludes = _matchAllIncludes,
         CollectionId = _filterCollectionId,
-        DateMode = _dateMode
+        DateMode = _dateMode,
+        DateRange = _dateRange,
+        Tool = _toolFilter,
+        MinUserMessages = _minUserMsgs,
+        ShowHidden = _showHidden
     };
+
+    // The funnel filters WITHOUT the text query — used to constrain the Deep-search results to the same
+    // agent / date / min-messages / tags / project the main list is filtered by.
+    private ChatFilter CurrentFiltersNoQuery() => new()
+    {
+        IncludeTags = _includeTags.ToList(),
+        ExcludeTags = _excludeTags.ToList(),
+        MatchAllIncludes = _matchAllIncludes,
+        CollectionId = _filterCollectionId,
+        DateMode = _dateMode,
+        DateRange = _dateRange,
+        Tool = _toolFilter,
+        MinUserMessages = _minUserMsgs,
+        ShowHidden = _showHidden,
+    };
+
+    // Session ids that pass the active funnel filters (no text query). Empty filters -> null (no restriction).
+    internal HashSet<string>? ActiveFilterAllowedIds()
+    {
+        var f = CurrentFiltersNoQuery();
+        if (f.IsEmpty) return null;
+        return new HashSet<string>(_archive.FilterChats(f).Select(s => s.Id), StringComparer.OrdinalIgnoreCase);
+    }
 
     private string? FilterCollectionName() =>
         _filterCollectionId is not null && _archive.Store.Collections.TryGetValue(_filterCollectionId, out var c) ? c.Name : null;
@@ -53,10 +113,67 @@ public sealed partial class MainPage
     private void ApplyFilters()
     {
         var results = _archive.FilterChats(CurrentChatFilter());
-        _archive.RefreshSessions(results, preserveOrder: _dateMode.Length > 0);   // a date mode chose its own order
+        // last-user / first-user sorts flip each visible row's title to what YOU said.
+        var titleMode = (_dateMode == "last-user" || _dateMode == "first-user") ? _dateMode : "";
+        foreach (var s in results) s.RowTitleMode = titleMode;
+        // A sort OR a search picks the order; preserve it (don't let RefreshSessions re-sort by recent).
+        var preserve = _dateMode.Length > 0 || !string.IsNullOrWhiteSpace(SearchBox.Text);
+        _archive.RefreshSessions(results, preserveOrder: preserve);
         SelectFirstSession();
         RenderCurrent();
         RenderTagFilterBar();
+        if (_screen == "Search" && !string.IsNullOrWhiteSpace(_deepSearchQuery)) RenderSearch(_deepSearchQuery);   // keep deep-search results in sync with the funnel
+    }
+
+    // Re-run the ACTIVE filter WITHOUT changing your selection — used after a mutation (add-to-collection,
+    // rename, tag, pin, archive) or a background sync, so the list stays filtered instead of snapping back
+    // to everything. (ApplyFilters, by contrast, re-selects the first row — right for a fresh filter change.)
+    private void ReapplyActiveFilter()
+    {
+        var keep = _selected?.Id;
+        var results = _archive.FilterChats(CurrentChatFilter());
+        var titleMode = (_dateMode == "last-user" || _dateMode == "first-user") ? _dateMode : "";
+        foreach (var s in results) s.RowTitleMode = titleMode;
+        var preserve = _dateMode.Length > 0 || !string.IsNullOrWhiteSpace(SearchBox.Text);
+        _archive.RefreshSessions(results, preserveOrder: preserve);
+        if (!string.IsNullOrEmpty(keep))
+        {
+            var m = _archive.Sessions.FirstOrDefault(x => string.Equals(x.Id, keep, StringComparison.OrdinalIgnoreCase));
+            if (m is not null) { _selected = m; SelectSessionRow(m); }
+        }
+        RenderTagFilterBar();
+    }
+
+    // ENTER in the search box: scan the full transcript FILES (fuzzy word-overlap) and append any chats the
+    // fast in-memory search missed — so pasting a specific turn (even one from mid-chat, past the 6000-char
+    // cap, with a word or two off) surfaces the chat it came from. Heavy, so it's Enter-only, not per-keystroke.
+    private int _diskSearchGen;
+    private async void DeepSearchCurrentQuery()
+    {
+        var q = (SearchBox.Text ?? "").Trim();
+        var gen = ++_diskSearchGen;
+        if (q.Length < 8) return;   // deep search is for a phrase, not a one-word keyword
+        SyncStatus.Text = "Searching full transcripts…";
+        IReadOnlyList<ArchiveSession> extra;
+        try { extra = await _archive.SearchDiskPhraseAsync(q, 40); }
+        catch { SyncStatus.Text = "Full-transcript search failed."; return; }
+        if (gen != _diskSearchGen || !string.Equals((SearchBox.Text ?? "").Trim(), q, StringComparison.Ordinal)) return;   // a newer search superseded this
+        var have = new HashSet<string>(_archive.Sessions.Select(s => s.Id), StringComparer.OrdinalIgnoreCase);
+        var titleMode = (_dateMode == "last-user" || _dateMode == "first-user") ? _dateMode : "";
+        var added = 0;
+        foreach (var s in extra)
+        {
+            if (have.Contains(s.Id) || s.Archived) continue;
+            if (!_showHidden && ArchiveService.IsLowSignalChat(s)) continue;   // keep one-offs hidden unless revealed
+            s.RowTitleMode = titleMode;
+            _archive.Sessions.Add(s);
+            added++;
+        }
+        if (_archive.Sessions.Count > 0 && SessionList.SelectedItem is null) SelectFirstSession();
+        RenderCurrent();
+        SyncStatus.Text = added > 0
+            ? $"+{added} chat{(added == 1 ? "" : "s")} matched this phrase in the full transcript."
+            : (_archive.Sessions.Count > 0 ? $"{_archive.Sessions.Count} match{(_archive.Sessions.Count == 1 ? "" : "es")}." : "No chat contains that phrase.");
     }
 
     // Cycle a tag through the filter: none -> include -> exclude -> none (include & exclude are exclusive).
@@ -333,11 +450,10 @@ public sealed partial class MainPage
         foreach (var tc in all) list.Children.Add(TriStateTagRow(tc, _includeTags, _excludeTags, () => { RefreshFilterFlyout(); ApplyFilters(); }));
         root.Children.Add(new ScrollViewer { Content = list, VerticalScrollBarVisibility = ScrollBarVisibility.Auto, MaxHeight = 320, HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled });
 
-        // Created-date mode: sort/filter by WHEN THE CHAT WAS STARTED — the list normally reshuffles
-        // by recent activity; this pins it (newest/oldest/today/7d/30d).
+        // SORT + DATE-RANGE + AGENT all combine (e.g. "Claude chats created today, sorted by last message").
         root.Children.Add(new Border { Height = 1, Background = LineBrush(), Margin = new Thickness(0, 2, 0, 2) });
         var dateRow = new Grid { ColumnDefinitions = { new ColumnDefinition(), new ColumnDefinition { Width = GridLength.Auto } } };
-        dateRow.Children.Add(new TextBlock { Text = "Created", Foreground = new SolidColorBrush(ChipText), FontSize = 12, VerticalAlignment = VerticalAlignment.Center });
+        dateRow.Children.Add(new TextBlock { Text = "Sort", Foreground = new SolidColorBrush(ChipText), FontSize = 12, VerticalAlignment = VerticalAlignment.Center });
         var dateBtn = new DropDownButton { Content = new TextBlock { Text = DateModeLabel(), FontSize = 12 }, MinHeight = 30 };
         var dateFlyout = new MenuFlyout { AreOpenCloseAnimationsEnabled = false };
         foreach (var (value, label) in DateModes)
@@ -351,6 +467,71 @@ public sealed partial class MainPage
         Grid.SetColumn(dateBtn, 1);
         dateRow.Children.Add(dateBtn);
         root.Children.Add(dateRow);
+
+        // Date-range filter — combines with the sort above.
+        var rangeRow = new Grid { ColumnDefinitions = { new ColumnDefinition(), new ColumnDefinition { Width = GridLength.Auto } } };
+        rangeRow.Children.Add(new TextBlock { Text = "Date", Foreground = new SolidColorBrush(ChipText), FontSize = 12, VerticalAlignment = VerticalAlignment.Center });
+        var rangeBtn = new DropDownButton { Content = new TextBlock { Text = DateRangeLabel(), FontSize = 12 }, MinHeight = 30 };
+        var rangeFlyout = new MenuFlyout { AreOpenCloseAnimationsEnabled = false };
+        foreach (var (value, label) in DateRanges)
+        {
+            var v = value;
+            var item = new MenuFlyoutItem { Text = label };
+            item.Click += (_, _) => { _dateRange = v; RefreshFilterFlyout(); ApplyFilters(); };
+            rangeFlyout.Items.Add(item);
+        }
+        rangeBtn.Flyout = rangeFlyout;
+        Grid.SetColumn(rangeBtn, 1);
+        rangeRow.Children.Add(rangeBtn);
+        root.Children.Add(rangeRow);
+
+        // Agent (tool) scope: show only Codex or only Claude chats.
+        var toolRow = new Grid { ColumnDefinitions = { new ColumnDefinition(), new ColumnDefinition { Width = GridLength.Auto } } };
+        toolRow.Children.Add(new TextBlock { Text = "Agent", Foreground = new SolidColorBrush(ChipText), FontSize = 12, VerticalAlignment = VerticalAlignment.Center });
+        var toolBtn = new DropDownButton { Content = new TextBlock { Text = ToolFilterLabel(), FontSize = 12 }, MinHeight = 30 };
+        var toolFlyout = new MenuFlyout { AreOpenCloseAnimationsEnabled = false };
+        foreach (var (value, label) in ToolFilters)
+        {
+            var v = value;
+            var item = new MenuFlyoutItem { Text = label };
+            item.Click += (_, _) => { _toolFilter = v; RefreshFilterFlyout(); ApplyFilters(); };
+            toolFlyout.Items.Add(item);
+        }
+        toolBtn.Flyout = toolFlyout;
+        Grid.SetColumn(toolBtn, 1);
+        toolRow.Children.Add(toolBtn);
+        root.Children.Add(toolRow);
+
+        // Min user-messages: hide one-off / low-substance chats (e.g. 5+ = "real working sessions only").
+        var umRow = new Grid { ColumnDefinitions = { new ColumnDefinition(), new ColumnDefinition { Width = GridLength.Auto } } };
+        umRow.Children.Add(new TextBlock { Text = "Your messages", Foreground = new SolidColorBrush(ChipText), FontSize = 12, VerticalAlignment = VerticalAlignment.Center });
+        var umBtn = new DropDownButton { Content = new TextBlock { Text = MinUserMsgLabel(), FontSize = 12 }, MinHeight = 30 };
+        var umFlyout = new MenuFlyout { AreOpenCloseAnimationsEnabled = false };
+        foreach (var (value, label) in MinUserMsgOptions)
+        {
+            var v = value;
+            var item = new MenuFlyoutItem { Text = label };
+            item.Click += (_, _) => { _minUserMsgs = v; RefreshFilterFlyout(); ApplyFilters(); };
+            umFlyout.Items.Add(item);
+        }
+        umBtn.Flyout = umFlyout;
+        Grid.SetColumn(umBtn, 1);
+        umRow.Children.Add(umBtn);
+        root.Children.Add(umRow);
+
+        // Show-hidden toggle: reveal the auto-hidden one-off / spam chats (single prompt, tiny transcript).
+        // Off by default so those hundreds of spawned judge/probe sessions never clutter the list or search.
+        var hiddenN = _archive.HiddenChatCount();
+        var shRow = new Grid { ColumnDefinitions = { new ColumnDefinition(), new ColumnDefinition { Width = GridLength.Auto } } };
+        var shLabel = new StackPanel { Orientation = Orientation.Vertical, VerticalAlignment = VerticalAlignment.Center };
+        shLabel.Children.Add(new TextBlock { Text = "Show hidden chats", Foreground = new SolidColorBrush(ChipText), FontSize = 12 });
+        shLabel.Children.Add(new TextBlock { Text = $"{hiddenN} one-off chat{(hiddenN == 1 ? "" : "s")} auto-hidden", Foreground = MutedBrush(), FontSize = 11 });
+        shRow.Children.Add(shLabel);
+        var shToggle = new ToggleSwitch { IsOn = _showHidden, OnContent = "On", OffContent = "Off", MinWidth = 0, HorizontalAlignment = HorizontalAlignment.Right };
+        shToggle.Toggled += (_, _) => { if (_showHidden != shToggle.IsOn) { _showHidden = shToggle.IsOn; RefreshFilterFlyout(); ApplyFilters(); } };
+        Grid.SetColumn(shToggle, 1);
+        shRow.Children.Add(shToggle);
+        root.Children.Add(shRow);
 
         // Project (collection) scope: restrict the whole filter to one project's chats.
         if (_archive.Store.Collections.Count > 0)
@@ -377,10 +558,10 @@ public sealed partial class MainPage
             root.Children.Add(projRow);
         }
 
-        if (_includeTags.Count > 0 || _excludeTags.Count > 0 || _filterCollectionId is not null || _dateMode.Length > 0)
+        if (_includeTags.Count > 0 || _excludeTags.Count > 0 || _filterCollectionId is not null || _dateMode.Length > 0 || _dateRange.Length > 0 || _toolFilter.Length > 0 || _minUserMsgs > 0 || _showHidden)
         {
             var clear = new Button { Style = (Style)Resources["PillButtonStyle"], HorizontalAlignment = HorizontalAlignment.Stretch, Content = new TextBlock { Text = "Clear filters", FontSize = 12 } };
-            clear.Click += (_, _) => { _includeTags.Clear(); _excludeTags.Clear(); _filterCollectionId = null; _dateMode = ""; RefreshFilterFlyout(); ApplyFilters(); };
+            clear.Click += (_, _) => { _includeTags.Clear(); _excludeTags.Clear(); _filterCollectionId = null; _dateMode = ""; _dateRange = ""; _toolFilter = ""; _minUserMsgs = 0; _showHidden = false; RefreshFilterFlyout(); ApplyFilters(); };
             root.Children.Add(clear);
         }
         return root;
@@ -447,17 +628,37 @@ public sealed partial class MainPage
             _filterCollectionId = null;   // collection was deleted
 
         TagFilterBar.Children.Clear();
-        if (_includeTags.Count == 0 && _excludeTags.Count == 0 && _filterCollectionId is null && _dateMode.Length == 0)
+        if (_includeTags.Count == 0 && _excludeTags.Count == 0 && _filterCollectionId is null && _dateMode.Length == 0 && _dateRange.Length == 0 && _toolFilter.Length == 0 && _minUserMsgs == 0 && !_showHidden)
         {
             TagFilterScroller.Visibility = Visibility.Collapsed;
             return;
         }
         TagFilterScroller.Visibility = Visibility.Visible;
 
+        if (_showHidden)
+            TagFilterBar.Children.Add(TagChip("showing hidden", active: true,
+                onTap: () => { _showHidden = false; ApplyFilters(); },
+                onRemove: () => { _showHidden = false; ApplyFilters(); }));
+
+        if (_toolFilter.Length > 0)
+            TagFilterBar.Children.Add(TagChip(ToolFilterLabel(), active: true,
+                onTap: () => { _toolFilter = ""; ApplyFilters(); },
+                onRemove: () => { _toolFilter = ""; ApplyFilters(); }));
+
         if (_dateMode.Length > 0)
             TagFilterBar.Children.Add(TagChip(DateModeLabel().Replace(" (default)", ""), active: true,
                 onTap: () => { _dateMode = ""; ApplyFilters(); },
                 onRemove: () => { _dateMode = ""; ApplyFilters(); }));
+
+        if (_dateRange.Length > 0)
+            TagFilterBar.Children.Add(TagChip(DateRangeLabel(), active: true,
+                onTap: () => { _dateRange = ""; ApplyFilters(); },
+                onRemove: () => { _dateRange = ""; ApplyFilters(); }));
+
+        if (_minUserMsgs > 0)
+            TagFilterBar.Children.Add(TagChip("≥ " + _minUserMsgs + " msgs", active: true,
+                onTap: () => { _minUserMsgs = 0; ApplyFilters(); },
+                onRemove: () => { _minUserMsgs = 0; ApplyFilters(); }));
 
         if (FilterCollectionName() is { } projName)
             TagFilterBar.Children.Add(TagChip("in: " + projName, active: true,
@@ -482,7 +683,7 @@ public sealed partial class MainPage
                 onTap: () => { _excludeTags.Remove(t); ApplyFilters(); },
                 onRemove: () => { _excludeTags.Remove(t); ApplyFilters(); }));
         }
-        TagFilterBar.Children.Add(AddChip("clear", () => { _includeTags.Clear(); _excludeTags.Clear(); _filterCollectionId = null; _dateMode = ""; ApplyFilters(); }));
+        TagFilterBar.Children.Add(AddChip("clear", () => { _includeTags.Clear(); _excludeTags.Clear(); _filterCollectionId = null; _dateMode = ""; _dateRange = ""; _toolFilter = ""; _minUserMsgs = 0; _showHidden = false; ApplyFilters(); }));
     }
 
     // ---- Per-chat tag editor (right panel) ---------------------------------------------------

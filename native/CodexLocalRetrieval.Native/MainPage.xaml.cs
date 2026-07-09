@@ -1,6 +1,7 @@
 ﻿using System.Collections.ObjectModel;
 using System.Text.RegularExpressions;
 using CodexLocalRetrieval.Core.Models;
+using CodexLocalRetrieval.Core.Remote;
 using CodexLocalRetrieval.Core.Services;
 using Microsoft.UI;
 using Microsoft.UI.Xaml;
@@ -16,6 +17,7 @@ public sealed partial class MainPage : Page
 {
     private readonly ArchiveService _archive = new();
     private readonly AiChatService _ai = new();
+    private readonly SessionLaunchGovernor _launchGovernor = new();
     private readonly Stack<string> _backStack = new();
     private ArchiveSession? _selected;
     private string _screen = "Archive";
@@ -57,6 +59,7 @@ public sealed partial class MainPage : Page
             Diag.Log("MP.Loaded: archive loaded (" + _archive.Sessions.Count + " sessions)");
             ApplyThemeAndShape();
             _storeLoaded = true;
+            _archive.OnReapplyFilter = ReapplyActiveFilter;   // mutations/sync re-run the active filter instead of dropping it
             SessionList.ItemsSource = _archive.Sessions;
             Diag.Log("MP.Loaded: list bound");
             SelectFirstSession();
@@ -82,6 +85,31 @@ public sealed partial class MainPage : Page
     private DateTime _liveMtime = DateTime.MinValue;
     private ArchiveSession? _liveSession;
     private bool _liveBusy;
+    private bool _openFreshenDone;   // one fresh re-parse per chat-open, so a cached transcript is never stale
+
+    // Force a fresh re-parse of the just-opened chat from disk, then repaint if it actually changed. This
+    // defeats stale index-time transcripts (e.g. a huge Codex chat that was head-capped days ago) — the
+    // re-parse now reads the file TAIL, so the newest user + agent messages show. Cheap and off-thread.
+    private async Task FreshenOpenChatAsync(ArchiveSession s)
+    {
+        try
+        {
+            var beforeCount = s.MessageCount;
+            var beforeLast = s.LastUserMessage ?? "";
+            await _archive.ReloadContentAsync(s);
+            if (_screen != "Archive" || !ReferenceEquals(_selected, s)) return;
+            // Re-baseline the live watcher so it doesn't immediately reload again.
+            _liveSession = s;
+            _liveMtime = _archive.SourceWriteTimeUtc(s);
+            if (s.MessageCount != beforeCount || !string.Equals(s.LastUserMessage ?? "", beforeLast, StringComparison.Ordinal))
+            {
+                _fullMsgs = null; _fullMsgsFor = "";   // filtered views re-extract from the fresh transcript
+                _scrollArchiveToBottom = true;
+                RenderArchive();
+            }
+        }
+        catch (Exception ex) { Diag.Log("Freshen open: " + ex.Message); }
+    }
 
     private void StartLiveReader()
     {
@@ -141,13 +169,35 @@ public sealed partial class MainPage : Page
     private void SelectFirstSession()
     {
         _selected = _archive.Sessions.FirstOrDefault();
-        SessionList.SelectedItem = _selected;
+        SelectSessionRow(_selected);
     }
 
-    private void SessionList_ItemClick(object sender, ItemClickEventArgs e)
+    // Programmatic selection must NOT be treated as a user click (which opens/navigates). Every code
+    // path that highlights a row goes through here so SelectionChanged can distinguish user clicks
+    // from our own bookkeeping.
+    private bool _suppressSelChanged;
+    private void SelectSessionRow(ArchiveSession? s)
     {
-        _selected = e.ClickedItem as ArchiveSession;
-        Navigate("Archive");
+        _suppressSelChanged = true;
+        try { SessionList.SelectedItem = s; }
+        finally { _suppressSelChanged = false; }
+    }
+
+    // Plain click selects one row -> open it. Ctrl/Shift-click grows a multi-selection (count > 1);
+    // in that case we leave the open chat alone — the right-click menu acts on the whole selection.
+    private void SessionList_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (_suppressSelChanged) return;
+        var sel = SessionList.SelectedItems;
+        if (sel.Count == 1)
+        {
+            _selected = sel[0] as ArchiveSession;
+            Navigate("Archive");
+        }
+        else if (sel.Count > 1)
+        {
+            SyncStatus.Text = $"{sel.Count} chats selected — right-click to add them to a collection.";
+        }
     }
 
     private void SearchBox_KeyDown(object sender, KeyRoutedEventArgs e)
@@ -155,16 +205,13 @@ public sealed partial class MainPage : Page
         if (e.Key == Windows.System.VirtualKey.Enter)
         {
             ApplyFilters();
+            DeepSearchCurrentQuery();   // Enter = also scan full transcripts for the phrase (paste a turn, hit Enter)
         }
     }
 
-    private void SearchBox_TextChanged(object sender, TextChangedEventArgs e)
-    {
-        if (SearchBox.Text.Length == 0)
-        {
-            ApplyFilters();
-        }
-    }
+    // Live in-memory filter as you type (title + capped content + all active filters). The deeper
+    // full-transcript phrase search is heavy, so it runs on ENTER only (see SearchBox_KeyDown), not per key.
+    private void SearchBox_TextChanged(object sender, TextChangedEventArgs e) => ApplyFilters();
 
     // Kept for callers that pre-set SearchBox.Text (e.g. capture replay); routes through the unified
     // text + tag filter so an active tag filter is always respected.
@@ -218,6 +265,9 @@ public sealed partial class MainPage : Page
             case "Running":
                 RenderRunningPage();
                 break;
+            case "Custody":
+                RenderCustodyPage();
+                break;
             default:
                 RenderArchive();
                 break;
@@ -250,6 +300,7 @@ public sealed partial class MainPage : Page
         Add("Bump to top of resume list", () => _ = BumpSession(_selected!));
         flyout.Items.Add(new MenuFlyoutSeparator());
         Add("Copy resume prompt", () => Copy("resume"));
+        Add("Copy resume command", CopyResumeCommandIfClear);
         Add("Copy chat path", () => Copy("path"));
         Add("Copy all code", () => Copy("code"));
         flyout.Items.Add(new MenuFlyoutSeparator());
@@ -276,6 +327,117 @@ public sealed partial class MainPage : Page
     private bool _scrollArchiveToBottom;   // jump to newest after the first render of a chat
     private bool _loadingOlder;            // re-entrancy guard while prepending older messages on scroll-up
     private ArchiveSession? _contentLoadingSession;
+    private string _msgFilter = "all";      // reader: "all" | "assistant" (agent only) | "user" (your messages only)
+    private ArchiveMessage? _jumpUserAnchor; // reader: the user message we last jumped to (repeat = step further back)
+    private List<ArchiveMessage>? _fullMsgs; // FULL transcript (no 600-window) for the filtered views
+    private string _fullMsgsFor = "";
+    private bool _fullMsgsLoading;
+
+    // The messages the reader currently shows, after the agent-only / user-only toggle. "all" uses the real
+    // (windowed) collection; the filtered modes scan the FULL transcript so a long agent run whose recent
+    // window holds no user prompt still shows every user message (fixes the "No messages of this kind" bug).
+    private System.Collections.Generic.IList<ArchiveMessage> CurrentReaderMessages()
+    {
+        if (_selected is null) return System.Array.Empty<ArchiveMessage>();
+        if (_msgFilter == "all") return _selected.Messages;
+        var key = _selected.Id + "|" + _msgFilter;
+        // The uncapped kind-extract for this chat+view is already the exact set — return it as-is.
+        if (_fullMsgs is not null && _fullMsgsFor == key) return _fullMsgs;
+        // Not loaded yet: show the windowed subset so there's something while the full extract lands.
+        if (_msgFilter == "assistant") return _selected.Messages.Where(m => m.EffectiveKind is "assistant" or "reasoning").ToList();
+        return _selected.Messages.Where(m => m.EffectiveKind == "user").ToList();
+    }
+
+    // Load the UNCAPPED, kind-specific message set once per chat+view, then re-render when it lands — so a
+    // huge chat's View:you shows every user prompt (not just the few in the 18000-line parse window).
+    private async Task EnsureFullMessagesAsync()
+    {
+        if (_selected is null || _msgFilter == "all") return;
+        var key = _selected.Id + "|" + _msgFilter;
+        if (_fullMsgs is not null && _fullMsgsFor == key) return;
+        if (_fullMsgsLoading) return;
+        _fullMsgsLoading = true;
+        var sess = _selected; var filter = _msgFilter;
+        try
+        {
+            var full = await _archive.ExtractReaderMessagesAsync(sess, filter);
+            if (ReferenceEquals(_selected, sess) && _msgFilter == filter) { _fullMsgs = full; _fullMsgsFor = sess.Id + "|" + filter; }
+        }
+        catch (Exception ex) { Diag.Log("ExtractReaderMessages: " + ex.Message); }
+        finally { _fullMsgsLoading = false; }
+        if (ReferenceEquals(_selected, sess) && _msgFilter == filter && _screen == "Archive") RenderArchive();
+    }
+
+    private void UpdateMsgViewToggle() =>
+        MsgViewToggleText.Text = _msgFilter switch { "assistant" => "View: agent", "user" => "View: you", _ => "View: all" };
+
+    // Cycle the transcript view: everything -> agent messages only (no tool steps / no your-messages) ->
+    // your messages only -> back. Re-renders from the newest of the filtered view.
+    private async void MsgViewToggle_Click(object sender, RoutedEventArgs e)
+    {
+        _msgFilter = _msgFilter switch { "all" => "assistant", "assistant" => "user", _ => "all" };
+        UpdateMsgViewToggle();
+        _jumpUserAnchor = null;
+        _archiveShown = ArchivePageSize;
+        _scrollArchiveToBottom = true;
+        RenderArchive();
+        if (_msgFilter != "all") await EnsureFullMessagesAsync();
+    }
+
+    // Step UP through YOUR messages: first press -> your most recent message; each further press -> the
+    // one before it. Wraps to the newest once you pass the top.
+    private void JumpPrevUser_Click(object sender, RoutedEventArgs e)
+    {
+        if (_selected is null || !_selected.ContentLoaded) return;
+        var msgs = _selected.Messages;
+        if (msgs.Count == 0) return;
+        if (_msgFilter == "assistant") { _msgFilter = "all"; UpdateMsgViewToggle(); }   // your messages must be visible
+        int from = _jumpUserAnchor is not null ? msgs.IndexOf(_jumpUserAnchor) : msgs.Count;
+        if (from < 0) from = msgs.Count;
+        int target = -1;
+        for (int i = from - 1; i >= 0; i--) if (msgs[i].EffectiveKind == "user") { target = i; break; }
+        if (target < 0) for (int i = msgs.Count - 1; i >= 0; i--) if (msgs[i].EffectiveKind == "user") { target = i; break; }   // wrap
+        if (target < 0) return;
+        _jumpUserAnchor = msgs[target];
+        ScrollToMessage(target);
+    }
+
+    // Jump to the very first message of the (current) view and leave the user free to scroll down.
+    private void JumpStart_Click(object sender, RoutedEventArgs e)
+    {
+        if (_selected is null || !_selected.ContentLoaded) return;
+        var count = CurrentReaderMessages().Count;
+        if (count == 0) return;
+        _archiveShown = count;                 // realize the whole transcript so the top is reachable
+        _scrollArchiveToBottom = false;
+        _jumpUserAnchor = null;
+        RenderArchive();
+        MainScroller.UpdateLayout();
+        MainScroller.ChangeView(null, 0, null, disableAnimation: true);
+    }
+
+    // Realize the window that contains `fullIndex` (an index into _selected.Messages), re-render, then
+    // bring that message's element into view — accounting for the reader's paging + kind filter.
+    private void ScrollToMessage(int fullIndex)
+    {
+        if (_selected is null || fullIndex < 0 || fullIndex >= _selected.Messages.Count) return;
+        var target = _selected.Messages[fullIndex];
+        var disp = CurrentReaderMessages();
+        int dispIdx = disp.IndexOf(target);
+        if (dispIdx < 0) { _msgFilter = "all"; UpdateMsgViewToggle(); disp = CurrentReaderMessages(); dispIdx = disp.IndexOf(target); }
+        if (dispIdx < 0) return;
+        int needed = disp.Count - dispIdx;     // target must fall within the last `shown` of the window
+        if ((_archiveShown <= 0 ? ArchivePageSize : _archiveShown) < needed)
+            _archiveShown = System.Math.Min(disp.Count, needed + 3);
+        _scrollArchiveToBottom = false;
+        RenderArchive();
+        MainScroller.UpdateLayout();
+        var shown = System.Math.Min(_archiveShown <= 0 ? ArchivePageSize : _archiveShown, disp.Count);
+        var start = disp.Count - shown;
+        int childIndex = (start > 0 ? 1 : 0) + (dispIdx - start);   // +1 for the "scroll up to load…" note
+        if (childIndex >= 0 && childIndex < MainContent.Children.Count && MainContent.Children[childIndex] is FrameworkElement fe)
+            fe.StartBringIntoView(new BringIntoViewOptions { VerticalAlignmentRatio = 0.12, AnimationDesired = true });
+    }
 
     private int _searchShown;
     private string _lastSearchQuery = "";
@@ -288,6 +450,7 @@ public sealed partial class MainPage : Page
             : $"{(string.Equals(_selected.Tool, "claude", StringComparison.OrdinalIgnoreCase) ? "Claude" : "Codex")} chat - archive reader";
         TitleText.Text = _selected?.DisplayTitle ?? "No chat selected";
         MainContent.Children.Clear();
+        RenderIntegrity();
         RenderTags();
 
         if (_selected is null)
@@ -297,7 +460,7 @@ public sealed partial class MainPage : Page
         }
 
         // New chat selected -> start fresh and jump to the newest messages once it renders.
-        if (!ReferenceEquals(_selected, _lastArchiveSession)) { _archiveShown = 0; _lastArchiveSession = _selected; _scrollArchiveToBottom = true; }
+        if (!ReferenceEquals(_selected, _lastArchiveSession)) { _archiveShown = 0; _lastArchiveSession = _selected; _scrollArchiveToBottom = true; _msgFilter = "all"; _jumpUserAnchor = null; _fullMsgs = null; _fullMsgsFor = ""; _openFreshenDone = false; UpdateMsgViewToggle(); }
 
         // Content lazy-loads from the source file the first time you open a chat (the store holds only
         // metadata). The reader shows the MOST RECENT messages at the bottom; scrolling up auto-loads
@@ -313,10 +476,20 @@ public sealed partial class MainPage : Page
             return;
         }
 
-        var messages = _selected.Messages;
+        // Content is cached (from index time or a prior open) — render it now, but force ONE fresh re-parse
+        // per open so a chat NEVER shows a stale transcript from a previous session (the "3 days old" bug).
+        if (!_openFreshenDone)
+        {
+            _openFreshenDone = true;
+            _ = FreshenOpenChatAsync(_selected);
+        }
+
+        var messages = CurrentReaderMessages();
         if (messages.Count == 0)
         {
-            MainContent.Children.Add(EmptyBlock("No conversation messages parsed", _selected.SourcePath));
+            MainContent.Children.Add(EmptyBlock(
+                _msgFilter == "all" ? "No conversation messages parsed" : "No messages of this kind in this chat",
+                _msgFilter == "all" ? _selected.SourcePath : "Switch the View toggle back to all."));
             return;
         }
         var shown = Math.Min(_archiveShown <= 0 ? ArchivePageSize : _archiveShown, messages.Count);
@@ -351,7 +524,7 @@ public sealed partial class MainPage : Page
         if (_screen != "Archive" || _selected is null || !_selected.ContentLoaded) return;
         if (MainScroller.VerticalOffset > 48) return;   // only fire when near the top
 
-        var count = _selected.Messages.Count;
+        var count = CurrentReaderMessages().Count;
         var shown = Math.Min(_archiveShown <= 0 ? ArchivePageSize : _archiveShown, count);
         if (shown >= count) return;                       // nothing older to load
 
@@ -385,34 +558,87 @@ public sealed partial class MainPage : Page
         }
     }
 
+    private int _deepScreenGen;
+    private List<ArchiveSearchHit> _deepResults = new();
+
     private void RenderSearch(string query)
     {
         ScreenLabel.Text = "Deep content retrieval";
         TitleText.Text = "Global search";
         MainContent.Children.Clear();
-
         MainContent.Children.Add(DeepSearchPanel());
-        var hits = _archive.DeepSearch(_deepSearchQuery);
-        if (hits.Count == 0)
+
+        var q = (_deepSearchQuery ?? "").Trim();
+        if (q.Length == 0)
         {
-            MainContent.Children.Add(EmptyBlock("No deep matches", "Try fewer words, a rough phrase, a file name, or a path fragment."));
+            // No query: show the most-recent chats as a starting point.
+            var recents = _archive.DeepSearch("", 60);
+            if (!_showHidden) recents = recents.Where(h => !CodexLocalRetrieval.Core.Services.ArchiveService.IsLowSignalChat(h.Session)).ToList();
+            foreach (var h in recents) MainContent.Children.Add(SearchHitResult(h));
             return;
         }
 
-        // New query -> start paging fresh (Show more keeps the same query, so it won't reset).
-        if (!string.Equals(_deepSearchQuery, _lastSearchQuery, StringComparison.Ordinal)) { _searchShown = 0; _lastSearchQuery = _deepSearchQuery; }
-        var shown = Math.Min(_searchShown <= 0 ? SearchPageSize : _searchShown, hits.Count);
-        for (var i = 0; i < shown; i++) MainContent.Children.Add(SearchHitResult(hits[i]));
+        // Same query already resolved (e.g. "Show more" re-render) -> paint from cache; else run the scan.
+        if (string.Equals(q, _lastSearchQuery, StringComparison.Ordinal) && _deepResults.Count > 0)
+        {
+            RenderDeepResults();
+            return;
+        }
+        MainContent.Children.Add(EmptyBlock("Searching every conversation…", "Scanning real transcript content — ranking by how often your words appear."));
+        _ = RunDeepContentSearchAsync(q);
+    }
 
-        if (shown < hits.Count)
+    // Full-content scan off the UI thread, then rank + paint. A generation guard drops stale runs so fast
+    // re-queries don't clobber each other.
+    private async Task RunDeepContentSearchAsync(string q)
+    {
+        var gen = ++_deepScreenGen;
+        IReadOnlyList<ArchiveSearchHit> hits;
+        try { hits = await _archive.DeepSearchContentAsync(q, 300); }
+        catch (Exception ex) { Diag.Log("DeepContent: " + ex.Message); hits = System.Array.Empty<ArchiveSearchHit>(); }
+        if (gen != _deepScreenGen || _screen != "Search" || !string.Equals((_deepSearchQuery ?? "").Trim(), q, StringComparison.Ordinal)) return;
+
+        var allowed = ActiveFilterAllowedIds();   // same funnel filters (agent/date/min-msgs/tags/project) as the list
+        var list = hits.AsEnumerable();
+        if (allowed is not null) list = list.Where(h => allowed.Contains(h.Session.Id));
+        if (!_showHidden) list = list.Where(h => !CodexLocalRetrieval.Core.Services.ArchiveService.IsLowSignalChat(h.Session));
+        _deepResults = list.ToList();
+        _lastSearchQuery = q;
+        _searchShown = 0;
+        RenderDeepResults();
+    }
+
+    private void RenderDeepResults()
+    {
+        // Rebuild the screen body (keep the search panel at the top).
+        MainContent.Children.Clear();
+        MainContent.Children.Add(DeepSearchPanel());
+
+        if (_deepResults.Count == 0)
+        {
+            MainContent.Children.Add(EmptyBlock("No chat contains those words",
+                "Try fewer or different words — deep search matches the real content of every conversation."));
+            return;
+        }
+
+        MainContent.Children.Add(new TextBlock
+        {
+            Text = $"{_deepResults.Count} chat{(_deepResults.Count == 1 ? "" : "s")} match — most relevant first",
+            Foreground = MutedBrush(), FontSize = 12, Margin = new Thickness(2, 0, 0, 8)
+        });
+
+        var shown = Math.Min(_searchShown <= 0 ? SearchPageSize : _searchShown, _deepResults.Count);
+        for (var i = 0; i < shown; i++) MainContent.Children.Add(SearchHitResult(_deepResults[i]));
+
+        if (shown < _deepResults.Count)
         {
             var more = new Button
             {
-                Content = $"Show {Math.Min(SearchPageSize, hits.Count - shown)} more  ({hits.Count - shown} left)",
+                Content = $"Show {Math.Min(SearchPageSize, _deepResults.Count - shown)} more  ({_deepResults.Count - shown} left)",
                 Margin = new Thickness(0, 8, 0, 16),
                 HorizontalAlignment = HorizontalAlignment.Center
             };
-            more.Click += (_, _) => { _searchShown = shown + SearchPageSize; RenderSearch(query); };
+            more.Click += (_, _) => { _searchShown = shown + SearchPageSize; RenderDeepResults(); };
             MainContent.Children.Add(more);
         }
     }
@@ -888,7 +1114,7 @@ public sealed partial class MainPage : Page
             Children =
             {
                 new TextBlock { Text = hit.Session.DisplayTitle, Foreground = StrongBrush(), FontSize = 17, FontWeight = Microsoft.UI.Text.FontWeights.SemiBold, TextWrapping = TextWrapping.Wrap },
-                new TextBlock { Text = $"{hit.SourceLabel} - score {hit.Score} - {hit.MatchedTerms}", Foreground = MutedBrush(), FontSize = 12, TextWrapping = TextWrapping.Wrap },
+                new TextBlock { Text = $"{(string.Equals(hit.Session.Tool, "claude", StringComparison.OrdinalIgnoreCase) ? "CLAUDE" : "CODEX")} · {hit.SourceLabel} · score {hit.Score} · {hit.MatchedTerms}", Foreground = MutedBrush(), FontSize = 12, TextWrapping = TextWrapping.Wrap },
                 new TextBlock { Text = hit.Snippet, Foreground = StrongBrush(), TextWrapping = TextWrapping.Wrap, LineHeight = 21 },
                 new StackPanel
                 {
@@ -1362,18 +1588,7 @@ public sealed partial class MainPage : Page
 
         // Add to collection (multi-membership: a chat can live in several collections at once).
         var addToCol = new MenuFlyoutSubItem { Text = "Add to collection" };
-        foreach (var col in _archive.Store.Collections.Values.OrderBy(c => c.Name, StringComparer.OrdinalIgnoreCase))
-        {
-            var name = col.Name;
-            var already = col.SessionIds.Contains(session.Id);
-            var ci = new MenuFlyoutItem { Text = already ? "✓  " + name : name, IsEnabled = !already };
-            ci.Click += async (_, _) => { await _archive.AddToCollectionAsync(session, name); SyncStatus.Text = $"Added to \"{name}\"."; RenderCurrent(); };
-            addToCol.Items.Add(ci);
-        }
-        if (addToCol.Items.Count > 0) addToCol.Items.Add(new MenuFlyoutSeparator());
-        var newCol = new MenuFlyoutItem { Text = "New collection..." };
-        newCol.Click += async (_, _) => await AddSessionToNewCollectionAsync(session);
-        addToCol.Items.Add(newCol);
+        BuildAddToCollectionItems(addToCol.Items, new[] { session }, () => RenderCurrent());
         flyout.Items.Add(addToCol);
 
         // Tags: toggle the chat's current tags off, or add a new one - taggable from inside a collection.
@@ -1992,6 +2207,18 @@ public sealed partial class MainPage : Page
     private void CopyContext_Click(object sender, RoutedEventArgs e) => Copy("resume");
     private void CopyCode_Click(object sender, RoutedEventArgs e) => Copy("code");
     private void CopyPath_Click(object sender, RoutedEventArgs e) => Copy("path");
+    private void CopyCommand_Click(object sender, RoutedEventArgs e) => CopyResumeCommandIfClear();
+
+    private void CopyResumeCommandIfClear()
+    {
+        if (RiskySessionActionBlocked())
+        {
+            SyncStatus.Text = "Resume command blocked: this chat is live, pending, unverifiable, or otherwise unsafe to duplicate.";
+            return;
+        }
+        Copy("command");
+        SyncStatus.Text = "Resume command copied.";
+    }
 
     private async void Copy(string mode)
     {
@@ -2013,7 +2240,7 @@ public sealed partial class MainPage : Page
     private void OpenSession(ArchiveSession session)
     {
         _selected = session;
-        SessionList.SelectedItem = session;
+        SelectSessionRow(session);
         Navigate("Archive");
     }
 
@@ -2034,8 +2261,32 @@ public sealed partial class MainPage : Page
         var session = FindSessionFromElement(e.OriginalSource as DependencyObject) ?? SessionList.SelectedItem as ArchiveSession;
         if (session is null) return;
 
+        var targets = RightClickTargets(session);
+
+        // Multi-select: right-clicking one of several selected rows -> a compact bulk menu (add all to a
+        // collection, archive all, clear). Don't collapse the selection.
+        if (targets.Count > 1)
+        {
+            var bulk = new MenuFlyout { AreOpenCloseAnimationsEnabled = false };
+            var header = new MenuFlyoutItem { Text = $"{targets.Count} chats selected", IsEnabled = false };
+            bulk.Items.Add(header);
+            bulk.Items.Add(new MenuFlyoutSeparator());
+            var addAll = new MenuFlyoutSubItem { Text = "Add to collection" };
+            BuildAddToCollectionItems(addAll.Items, targets, () => RenderCurrent());
+            bulk.Items.Add(addAll);
+            var archiveAll = new MenuFlyoutItem { Text = $"Archive {targets.Count} chats" };
+            archiveAll.Click += async (_, _) => await ArchiveManyAsync(targets);
+            bulk.Items.Add(archiveAll);
+            bulk.Items.Add(new MenuFlyoutSeparator());
+            var clear = new MenuFlyoutItem { Text = "Clear selection" };
+            clear.Click += (_, _) => { SessionList.SelectedItems.Clear(); SyncStatus.Text = ""; };
+            bulk.Items.Add(clear);
+            bulk.ShowAt(SessionList, e.GetPosition(SessionList));
+            return;
+        }
+
         _selected = session;
-        SessionList.SelectedItem = session;
+        SelectSessionRow(session);
 
         var flyout = new MenuFlyout { AreOpenCloseAnimationsEnabled = false }; // snap open instantly (no fade-in lag)
         var pinItem = new MenuFlyoutItem { Text = session.Pinned ? "Unpin chat" : "Pin chat" };
@@ -2058,22 +2309,7 @@ public sealed partial class MainPage : Page
         flyout.Items.Add(renameNativeItem);
 
         var addToCollection = new MenuFlyoutSubItem { Text = "Add to collection" };
-        foreach (var collection in _archive.Store.Collections.Values.OrderBy(c => c.Name))
-        {
-            var collectionItem = new MenuFlyoutItem { Text = collection.Name, Tag = collection.Name };
-            collectionItem.Click += async (menuSender, _) =>
-            {
-                if ((menuSender as MenuFlyoutItem)?.Tag is string name && _selected is not null)
-                {
-                    await _archive.AddToCollectionAsync(_selected, name);
-                    RenderCurrent();
-                }
-            };
-            addToCollection.Items.Add(collectionItem);
-        }
-        var newCollectionItem = new MenuFlyoutItem { Text = "New collection..." };
-        newCollectionItem.Click += async (_, _) => await AddSelectedToNewCollection();
-        addToCollection.Items.Add(newCollectionItem);
+        BuildAddToCollectionItems(addToCollection.Items, new[] { session }, () => RenderCurrent());
         flyout.Items.Add(addToCollection);
 
         var copyItem = new MenuFlyoutItem { Text = "Copy restore packet" };
@@ -2242,12 +2478,119 @@ public sealed partial class MainPage : Page
         }
     }
 
+    // ---- Shared "Add to collection" menu (deck-grouped, multi-target) -------------------------
+    // Populates `into` (a MenuFlyout.Items or MenuFlyoutSubItem.Items) with the collections to file
+    // `targets` into. When more than one deck holds collections, they're nested under a submenu per
+    // deck so the list stays organized instead of one long flat dump. Clicking a collection files
+    // EVERY target into it in a single save. `after` refreshes the UI.
+    private void BuildAddToCollectionItems(IList<MenuFlyoutItemBase> into, IReadOnlyList<ArchiveSession> targets, Action after, bool includeNew = true)
+    {
+        var single = targets.Count == 1;
+        var decks = _archive.Decks;
+        var multiDeck = decks.Count(d => _archive.CollectionCountInDeck(d.Id) > 0) > 1;
+
+        MenuFlyoutItem CollItem(CodexLocalRetrieval.Core.Models.ArchiveCollection col)
+        {
+            var name = col.Name;
+            var id = col.Id;
+            var allIn = targets.Count > 0 && targets.All(t => col.SessionIds.Contains(t.Id));
+            var item = new MenuFlyoutItem { Text = (single && allIn) ? "✓  " + name : name, IsEnabled = !(single && allIn) };
+            item.Click += async (_, _) =>
+            {
+                var n = await _archive.AddManyToCollectionByIdAsync(targets, id);
+                SyncStatus.Text = single ? $"Added to \"{name}\"." : $"Added {n} chat{(n == 1 ? "" : "s")} to \"{name}\".";
+                after();
+            };
+            return item;
+        }
+
+        if (multiDeck)
+        {
+            foreach (var deck in decks)
+            {
+                var cols = _archive.CollectionsInDeck(deck.Id).OrderBy(c => c.Name, StringComparer.OrdinalIgnoreCase).ToList();
+                if (cols.Count == 0) continue;
+                var sub = new MenuFlyoutSubItem { Text = deck.Name };
+                foreach (var col in cols) sub.Items.Add(CollItem(col));
+                into.Add(sub);
+            }
+        }
+        else
+        {
+            foreach (var col in _archive.Store.Collections.Values.OrderBy(c => c.Name, StringComparer.OrdinalIgnoreCase))
+                into.Add(CollItem(col));
+        }
+
+        if (includeNew)
+        {
+            if (into.Count > 0) into.Add(new MenuFlyoutSeparator());
+            var nc = new MenuFlyoutItem { Text = "New collection..." };
+            nc.Click += async (_, _) => { await AddTargetsToNewCollectionAsync(targets); after(); };
+            into.Add(nc);
+        }
+    }
+
+    // New-collection dialog for one OR many chats, with a deck picker so it lands in the right deck.
+    private async Task AddTargetsToNewCollectionAsync(IReadOnlyList<ArchiveSession> targets)
+    {
+        if (targets.Count == 0) return;
+        var input = new TextBox { Text = "Saved", MinWidth = 420, CornerRadius = ControlCornerRadius(), PlaceholderText = "Collection name" };
+        var deckPicker = new ComboBox { MinWidth = 220, HorizontalAlignment = HorizontalAlignment.Stretch };
+        foreach (var d in _archive.Decks) deckPicker.Items.Add(new ComboBoxItem { Content = d.Name, Tag = d.Id });
+        deckPicker.SelectedIndex = Math.Max(0, _archive.Decks.ToList().FindIndex(d => string.Equals(d.Id, _archive.ActiveDeckId, StringComparison.OrdinalIgnoreCase)));
+        var panel = new StackPanel { Spacing = 10 };
+        panel.Children.Add(new TextBlock { Text = targets.Count == 1 ? "Name" : $"Name — {targets.Count} chats will be added", Foreground = MutedBrush(), FontSize = 12 });
+        panel.Children.Add(input);
+        if (_archive.Decks.Count > 1)
+        {
+            panel.Children.Add(new TextBlock { Text = "Deck", Foreground = MutedBrush(), FontSize = 12 });
+            panel.Children.Add(deckPicker);
+        }
+        var dialog = new ContentDialog
+        {
+            Title = targets.Count == 1 ? "New collection" : $"New collection ({targets.Count} chats)",
+            Content = panel,
+            PrimaryButtonText = "Create & add",
+            CloseButtonText = "Cancel",
+            DefaultButton = ContentDialogButton.Primary,
+            XamlRoot = XamlRoot
+        };
+        if (await dialog.ShowAsync() == ContentDialogResult.Primary && !string.IsNullOrWhiteSpace(input.Text))
+        {
+            var deckId = (deckPicker.SelectedItem as ComboBoxItem)?.Tag as string;
+            var col = await _archive.CreateCollectionAsync(input.Text.Trim(), deckId);
+            var n = await _archive.AddManyToCollectionByIdAsync(targets, col.Id);
+            SyncStatus.Text = targets.Count == 1 ? $"Added to \"{col.Name}\"." : $"Added {n} chat{(n == 1 ? "" : "s")} to new collection \"{col.Name}\".";
+            RenderCurrent();
+        }
+    }
+
+    // The chats a right-click acts on: the whole multi-selection when the clicked row is part of it,
+    // otherwise just the clicked row.
+    private IReadOnlyList<ArchiveSession> RightClickTargets(ArchiveSession clicked)
+    {
+        var selected = SessionList.SelectedItems.OfType<ArchiveSession>().ToList();
+        return (selected.Count > 1 && selected.Any(s => string.Equals(s.Id, clicked.Id, StringComparison.OrdinalIgnoreCase)))
+            ? selected
+            : new List<ArchiveSession> { clicked };
+    }
+
     private async Task ArchiveSelected()
     {
         if (_selected is null) return;
         await _archive.ArchiveSessionAsync(_selected);
         SelectFirstSession();
         RenderCurrent();
+    }
+
+    // Bulk-archive a multi-selection.
+    private async Task ArchiveManyAsync(IReadOnlyList<ArchiveSession> targets)
+    {
+        foreach (var t in targets) await _archive.ArchiveSessionAsync(t);
+        SessionList.SelectedItems.Clear();
+        SelectFirstSession();
+        RenderCurrent();
+        SyncStatus.Text = $"Archived {targets.Count} chat{(targets.Count == 1 ? "" : "s")}.";
     }
 
     private async Task ShowInfoAsync(string title, string message)

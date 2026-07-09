@@ -4,6 +4,7 @@ using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
 using CodexLocalRetrieval.Core.Models;
+using CodexLocalRetrieval.Core.Remote;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Windows.Storage.Pickers;
@@ -128,6 +129,21 @@ public sealed partial class MainPage
             SyncStatus.Text = launch.DisplayCommand;   // e.g. "The claude CLI was not found at a trusted path."
             return;
         }
+        SessionLaunchLease? lease = null;
+        if (toolKey != "shell")
+        {
+            var request = new SessionLaunchRequest(
+                null,
+                null,
+                toolKey,
+                "native",
+                "native fresh chat start",
+                "start.refused.native",
+                "start.started.native",
+                "start.failed.native",
+                Workspace: cwd);
+            lease = _launchGovernor.BeginFresh(request);
+        }
         try
         {
             var args = string.IsNullOrEmpty(launch.DisplayCommand) ? "/k" : $"/k \"{launch.DisplayCommand}\"";
@@ -138,12 +154,18 @@ public sealed partial class MainPage
                 WorkingDirectory = launch.WorkingDirectory,
                 UseShellExecute = true
             });
+            lease?.MarkStarted("Started fresh chat terminal.");
         }
         catch (Exception ex)
         {
+            lease?.MarkFailed(ex.Message);
             Diag.Log("Start chat launch failed " + ex);
             SyncStatus.Text = "Could not open a terminal - see log.";
             return;
+        }
+        finally
+        {
+            lease?.Dispose();
         }
 
         // Optionally remember to file the new chat into a collection once it's indexed (not for shell -

@@ -1,5 +1,7 @@
 using System.Globalization;
+using System.Text.Json;
 using CodexLocalRetrieval.Core.Models;
+using CodexLocalRetrieval.Core.Remote;
 using CodexLocalRetrieval.Core.Services;
 using Microsoft.Data.Sqlite;
 
@@ -8,6 +10,7 @@ namespace CodexLocalRetrieval.Native.Tests;
 [TestClass]
 public sealed class ArchiveServiceTests
 {
+
     private static string WriteRollout(string dir, string fileName, string id, string isoTimestamp, string userText)
     {
         Directory.CreateDirectory(dir);
@@ -68,6 +71,78 @@ public sealed class ArchiveServiceTests
 
             Assert.IsTrue(svc.Store.Sessions.ContainsKey(runtimeId));
             Assert.IsTrue(svc.Store.Sessions[runtimeId].Aliases.Contains(forkedFrom), "forked_from_id should resolve as a strong alias");
+        }
+        finally
+        {
+            if (Directory.Exists(dir)) Directory.Delete(dir, true);
+            if (File.Exists(store)) File.Delete(store);
+        }
+    }
+
+    [TestMethod]
+    public async Task Codex_ForkedRolloutKeepsFirstSessionMetaAsCanonicalResumeId()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "clr-codexfork-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        const string childId = "019f340d-2e44-7cc0-9302-f18d331da72c";
+        const string parentId = "019f26b2-f740-7aa2-b38f-2a15a659607f";
+        var path = Path.Combine(dir, "rollout-2026-07-05T14-51-46-" + childId + ".jsonl");
+        File.WriteAllLines(path, new[]
+        {
+            "{\"timestamp\":\"2026-07-05T20:51:48Z\",\"type\":\"session_meta\",\"payload\":{\"session_id\":\"" + childId + "\",\"id\":\"" + childId + "\",\"forked_from_id\":\"" + parentId + "\",\"cwd\":\"z:/child\"}}",
+            "{\"timestamp\":\"2026-07-05T20:51:48Z\",\"type\":\"session_meta\",\"payload\":{\"session_id\":\"" + parentId + "\",\"id\":\"" + parentId + "\",\"cwd\":\"z:/parent\"}}",
+            "{\"timestamp\":\"2026-07-05T20:51:49Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"improving codesniff archive reader\"}}"
+        });
+        var svc = TempService(out var store);
+        try
+        {
+            await svc.IndexRootAsync(dir);
+
+            Assert.IsTrue(svc.Store.Sessions.ContainsKey(childId), "the fork/current id is the store key");
+            Assert.IsFalse(svc.Store.Sessions.ContainsKey(parentId), "a later parent session_meta must not overwrite the fork id");
+            var session = svc.Store.Sessions[childId];
+            Assert.AreEqual("z:/child", session.Workspace, "workspace also comes from the current fork header");
+            Assert.IsTrue(session.Aliases.Contains(parentId), "parent id remains a lookup alias");
+
+            var launch = svc.BuildResumeLaunch(session, exeOverride: "C:\\codex.exe");
+            StringAssert.Contains(launch.Arguments, childId);
+            Assert.IsFalse(launch.Arguments.Contains(parentId), "resume must target the child/fork id, not the parent");
+            var mux = svc.BuildMultiplexCommand(session);
+            StringAssert.Contains(mux, childId);
+            Assert.IsFalse(mux.Contains(parentId), "multiplex resume must target the child/fork id, not the parent");
+        }
+        finally
+        {
+            if (Directory.Exists(dir)) Directory.Delete(dir, true);
+            if (File.Exists(store)) File.Delete(store);
+        }
+    }
+
+    [TestMethod]
+    public async Task Codex_SubagentRolloutUsesPayloadIdInsteadOfParentSessionId()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "clr-codexsubagent-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        const string parentId = "019f26c0-f85d-78d2-a5e4-152073b9fbb3";
+        const string childId = "019f26d4-0ecd-7e22-872b-050b89cc1f95";
+        var path = Path.Combine(dir, "rollout-2026-07-03T01-14-19-" + childId + ".jsonl");
+        File.WriteAllLines(path, new[]
+        {
+            "{\"timestamp\":\"2026-07-03T07:14:20Z\",\"type\":\"session_meta\",\"payload\":{\"session_id\":\"" + parentId + "\",\"id\":\"" + childId + "\",\"parent_thread_id\":\"" + parentId + "\",\"cwd\":\"z:/child\"}}",
+            "{\"timestamp\":\"2026-07-03T07:14:21Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"subagent task\"}}"
+        });
+        var svc = TempService(out var store);
+        try
+        {
+            await svc.IndexRootAsync(dir);
+
+            Assert.IsTrue(svc.Store.Sessions.ContainsKey(childId), "payload id / filename is the resumable child id");
+            Assert.IsFalse(svc.Store.Sessions.ContainsKey(parentId), "parent session_id must not become the store key");
+            var session = svc.Store.Sessions[childId];
+            Assert.IsTrue(session.Aliases.Contains(parentId), "parent session_id remains a lookup alias");
+            var launch = svc.BuildResumeLaunch(session, exeOverride: "C:\\codex.exe");
+            StringAssert.Contains(launch.Arguments, childId);
+            Assert.IsFalse(launch.Arguments.Contains(parentId), "resume must target the child id, not the parent");
         }
         finally
         {
@@ -216,6 +291,99 @@ public sealed class ArchiveServiceTests
         finally { Directory.Delete(dir, true); }
     }
 
+    [TestMethod]
+    public async Task MergeScan_RekeysSameSourcePathAndRewritesCollections()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "clr-rekey-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        var path = Path.Combine(dir, "rollout-child.jsonl");
+        File.WriteAllText(path, "{}\n");
+        var service = new ArchiveService(storePath: Path.Combine(dir, "store.json"));
+        service.Store.Settings.BundledHistoryAbsorbed = true;
+        const string oldId = "019f26b2-f740-7aa2-b38f-2a15a659607f";
+        const string newId = "019f340d-2e44-7cc0-9302-f18d331da72c";
+        var existing = new ArchiveSession
+        {
+            Id = oldId,
+            SourcePath = path,
+            Tool = "codex",
+            CustomTitle = "Codesniff work",
+            Pinned = true,
+            Archived = true,
+            Reviewed = true,
+            Starred = true
+        };
+        existing.Tags.Add("active");
+        existing.SpecialPhrases.Add("petunia");
+        service.Store.Sessions[oldId] = existing;
+        service.Store.Collections["work"] = new ArchiveCollection { Id = "work", Name = "Work", SessionIds = new() { oldId } };
+        service.Store.DeletedCollections.Add(new DeletedCollection
+        {
+            DeletedAt = "2026-07-05T00:00:00Z",
+            Collection = new ArchiveCollection { Id = "deleted", Name = "Deleted", SessionIds = new() { oldId } }
+        });
+
+        try
+        {
+            var incoming = new ArchiveSession { Id = newId, SourcePath = path, Tool = "codex", Title = "fresh title" };
+            await service.MergeScanAsync(new DiskScan(new List<ArchiveSession> { incoming }, new List<ArchiveSession>())
+            {
+                Stamps = new Dictionary<string, string> { [path] = "1:1" },
+                FullRescan = true
+            }, refreshList: false);
+
+            Assert.IsTrue(service.Store.Sessions.ContainsKey(newId), "the corrected id is present");
+            Assert.IsFalse(service.Store.Sessions.ContainsKey(oldId), "the stale key was removed");
+            var repaired = service.Store.Sessions[newId];
+            Assert.AreEqual("Codesniff work", repaired.CustomTitle, "local naming survives rekey");
+            Assert.IsTrue(repaired.Pinned);
+            Assert.IsTrue(repaired.Archived);
+            Assert.IsTrue(repaired.Reviewed);
+            Assert.IsTrue(repaired.Starred);
+            Assert.IsTrue(repaired.Tags.Contains("active"));
+            Assert.IsTrue(repaired.SpecialPhrases.Contains("petunia"), "codenames survive rekey");
+            Assert.IsTrue(repaired.Aliases.Contains(oldId), "the stale id remains a direct alias");
+            CollectionAssert.AreEqual(new[] { newId }, service.Store.Collections["work"].SessionIds);
+            CollectionAssert.AreEqual(new[] { newId }, service.Store.DeletedCollections[0].Collection.SessionIds);
+        }
+        finally { Directory.Delete(dir, true); }
+    }
+
+    [TestMethod]
+    public async Task SaveAsync_AtomicallyReplacesStoreAndKeepsFullMetadataBackup()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "clr-save-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            var store = Path.Combine(dir, "store.json");
+            var service = new ArchiveService(storePath: store);
+            var first = new ArchiveSession { Id = "s1", Tool = "codex", Title = "first" };
+            first.SpecialPhrases.Add("petunia");
+            service.Store.Sessions[first.Id] = first;
+
+            await service.SaveAsync();
+
+            service.Store.Sessions["s2"] = new ArchiveSession { Id = "s2", Tool = "claude", Title = "second" };
+            await service.SaveAsync();
+
+            Assert.IsTrue(File.Exists(store), "current store exists after save");
+            Assert.AreEqual(0, Directory.GetFiles(dir, "*.tmp").Length, "temp files are cleaned after commit");
+            var backups = Directory.GetFiles(service.StoreBackupsDir, "app-store-*.json");
+            Assert.AreEqual(1, backups.Length, "second save keeps the previous full store as a backup");
+
+            using var current = JsonDocument.Parse(File.ReadAllText(store));
+            Assert.IsTrue(current.RootElement.GetProperty("sessions").TryGetProperty("s2", out _), "current store has the latest session");
+
+            using var backup = JsonDocument.Parse(File.ReadAllText(backups[0]));
+            var backupSessions = backup.RootElement.GetProperty("sessions");
+            Assert.IsTrue(backupSessions.TryGetProperty("s1", out var backedUpFirst), "backup keeps the previous session");
+            Assert.IsFalse(backupSessions.TryGetProperty("s2", out _), "backup is the previous version, not a duplicate of current");
+            Assert.AreEqual("petunia", backedUpFirst.GetProperty("specialPhrases")[0].GetString());
+        }
+        finally { Directory.Delete(dir, true); }
+    }
+
     // N1: a Claude chat resumes with `claude --resume <id>`, not the codex form.
     [TestMethod]
     public void BuildResumeLaunch_RoutesClaudeSessionsToClaudeCli()
@@ -248,6 +416,20 @@ public sealed class ArchiveServiceTests
         StringAssert.Contains(launch.DisplayCommand, "--profile http_sse resume");
     }
 
+    [TestMethod]
+    public void BuildResumeLaunch_RefusesResumeInConfiguredLaunchArgs()
+    {
+        var service = new ArchiveService(useBundledStore: true);
+        service.Store.Settings.CodexLaunchArgs = @"--profile http_sse resume ""smuggled-id""";
+        var cwd = Path.GetTempPath().TrimEnd('\\', '/');
+        var session = new ArchiveSession { Id = "real-id", Tool = "codex", Workspace = cwd, SourcePath = Path.Combine(cwd, "real-id.jsonl") };
+
+        var launch = service.BuildResumeLaunch(session, exeOverride: "C:\\codex.exe");
+
+        Assert.AreEqual("", launch.Exe);
+        StringAssert.Contains(launch.DisplayCommand, "must not contain a resume");
+    }
+
     // Default path must be untouched when no launch args are set.
     [TestMethod]
     public void BuildResumeLaunch_EmptyLaunchArgs_LeavesDefaultPathUntouched()
@@ -274,22 +456,22 @@ public sealed class ArchiveServiceTests
         Assert.AreEqual("--mcp-debug --resume cl-7", launch.Arguments);
     }
 
-    // The multiplex resume command runs over SSH-into-Windows where `codex` is the shim that already
-    // adds --profile http_sse, so the command must use the BARE tool name and must NOT re-add the
-    // local launch-args (a doubled --profile would break codex's arg parser). The cd uses forward
-    // slashes so the Windows path survives JSON+shell nesting on the way to the API.
+    // The multiplex resume command runs inside the chat workspace, so it must not rely on cwd lookup
+    // for `codex`/`claude`. Use a trusted CLI path and PowerShell invocation, with forward slashes so
+    // the path survives JSON+shell nesting on the way to muxd.
     [TestMethod]
-    public void BuildMultiplexCommand_Codex_BareToolForwardSlashCd_NoDoubledProfile()
+    public void BuildMultiplexCommand_Codex_UsesTrustedExeForwardSlashCd()
     {
         var service = new ArchiveService(useBundledStore: true);
         service.Store.Settings.CodexLaunchArgs = "--profile http_sse";
         var cwd = Path.GetTempPath().TrimEnd('\\', '/');
         var session = new ArchiveSession { Id = "cx-9", Tool = "codex", Workspace = cwd, SourcePath = Path.Combine(cwd, "cx-9.jsonl") };
+        var exe = @"C:\Trusted Codex\codex.exe";
 
-        var cmd = service.BuildMultiplexCommand(session);
+        var cmd = service.BuildMultiplexCommand(session, exeOverride: exe);
 
-        Assert.AreEqual($"cd '{cwd.Replace('\\', '/')}'; codex resume --include-non-interactive cx-9", cmd);
-        Assert.IsFalse(cmd.Contains("--profile"), "shim adds the profile; the command must not double it");
+        Assert.AreEqual($"cd '{cwd.Replace('\\', '/')}'; & '{exe.Replace('\\', '/')}' --profile http_sse resume --include-non-interactive cx-9", cmd);
+        Assert.IsFalse(cmd.Contains("; codex ", StringComparison.OrdinalIgnoreCase), "cwd-resolved bare codex must not be used");
         Assert.IsFalse(cmd.Contains("\\"), "the cd path must use forward slashes");
     }
 
@@ -303,9 +485,9 @@ public sealed class ArchiveServiceTests
         {
             var session = new ArchiveSession { Id = "cx-quote", Tool = "codex", Workspace = cwd, SourcePath = Path.Combine(cwd, "cx-quote.jsonl") };
 
-            var cmd = service.BuildMultiplexCommand(session);
+            var cmd = service.BuildMultiplexCommand(session, exeOverride: @"C:\Trusted Codex\codex.exe", extraArgsOverride: "");
 
-            Assert.AreEqual($"cd '{cwd.Replace('\\', '/').Replace("'", "''")}'; codex resume --include-non-interactive cx-quote", cmd);
+            Assert.AreEqual($"cd '{cwd.Replace('\\', '/').Replace("'", "''")}'; & 'C:/Trusted Codex/codex.exe' resume --include-non-interactive cx-quote", cmd);
         }
         finally
         {
@@ -320,9 +502,9 @@ public sealed class ArchiveServiceTests
         var cwd = Path.GetTempPath().TrimEnd('\\', '/');
         var session = new ArchiveSession { Id = "cl-9", Tool = "claude", Workspace = cwd, SourcePath = Path.Combine(cwd, "cl-9.jsonl") };
 
-        var cmd = service.BuildMultiplexCommand(session);
+        var cmd = service.BuildMultiplexCommand(session, exeOverride: @"C:\Tools\claude.exe");
 
-        Assert.AreEqual($"cd '{cwd.Replace('\\', '/')}'; claude --resume cl-9", cmd);
+        Assert.AreEqual($"cd '{cwd.Replace('\\', '/')}'; & 'C:/Tools/claude.exe' --resume cl-9", cmd);
     }
 
     [TestMethod]
@@ -372,8 +554,8 @@ public sealed class ArchiveServiceTests
         Assert.AreNotEqual(ArchiveService.MultiplexSessionName(a), ArchiveService.MultiplexSessionName(b));
     }
 
-    // The projection the app pushes to the VPS so the web can list projects + resume chats remotely:
-    // one entry per collection, each chat carrying a mux session name + a resumable command.
+    // The projection the app pushes to the VPS so the web can list projects + request resumes remotely:
+    // one entry per collection, each chat carrying a mux session name but no executable command.
     [TestMethod]
     public void BuildProjectsProjectionJson_EmitsCollectionsWithResumableChats()
     {
@@ -400,14 +582,12 @@ public sealed class ArchiveServiceTests
         foreach (var ch in chats.EnumerateArray())
         {
             Assert.IsTrue(ch.GetProperty("muxName").GetString()!.Length > 0);
-            var cmd = ch.GetProperty("muxCommand").GetString()!;
-            StringAssert.StartsWith(cmd, "cd '");
-            StringAssert.Contains(cmd, "resume");
+            Assert.IsFalse(ch.TryGetProperty("muxCommand", out _), "remote projection must not expose executable launch commands");
             Assert.IsFalse(ch.GetProperty("running").GetBoolean());   // no running set passed
         }
         var all = root.GetProperty("allChats");
         Assert.AreEqual(2, all.GetArrayLength(), "the remote projection also exposes indexed chats outside the collection tree");
-        Assert.IsTrue(all.EnumerateArray().All(ch => ch.GetProperty("muxCommand").GetString()!.Contains("resume")));
+        Assert.IsTrue(all.EnumerateArray().All(ch => !ch.TryGetProperty("muxCommand", out _)));
         Assert.IsTrue(all.EnumerateArray().Any(ch => ch.GetProperty("collection").GetString() == "Cortex Engine"));
     }
 
@@ -429,7 +609,25 @@ public sealed class ArchiveServiceTests
         Assert.AreEqual("Old Unfiled Chat", oldRow.GetProperty("title").GetString());
         Assert.AreEqual(System.Text.Json.JsonValueKind.Null, oldRow.GetProperty("collection").ValueKind);
         Assert.IsTrue(oldRow.GetProperty("muxName").GetString()!.Length > 0);
-        StringAssert.Contains(oldRow.GetProperty("muxCommand").GetString()!, "resume");
+        Assert.IsFalse(oldRow.TryGetProperty("muxCommand", out _), "remote projection must not expose executable launch commands");
+    }
+
+    [TestMethod]
+    public void BuildProjectsProjectionJson_EmitsAliasesAndRunningFlagUsesAliases()
+    {
+        var svc = new ArchiveService(useBundledStore: true);
+        var cwd = System.IO.Path.GetTempPath().TrimEnd('\\', '/');
+        var session = new ArchiveSession { Id = "parent-id", Tool = "codex", Title = "Alias Chat", Workspace = cwd, SourcePath = System.IO.Path.Combine(cwd, "alias.jsonl") };
+        session.Aliases.Add("child-id");
+        svc.Store.Sessions[session.Id] = session;
+        svc.Store.Collections["col1"] = new ArchiveCollection { Id = "col1", Name = "Aliases", SessionIds = new() { session.Id } };
+
+        using var doc = System.Text.Json.JsonDocument.Parse(svc.BuildProjectsProjectionJson(new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "child-id" }));
+        var chat = doc.RootElement.GetProperty("collections")[0].GetProperty("chats")[0];
+        var aliases = chat.GetProperty("aliases").EnumerateArray().Select(a => a.GetString()).ToList();
+
+        CollectionAssert.Contains(aliases, "child-id");
+        Assert.IsTrue(chat.GetProperty("running").GetBoolean());
     }
 
     // runningSessions in the projection: every live agent appears (for the web's "Running on PC" view),
@@ -491,11 +689,76 @@ public sealed class ArchiveServiceTests
     public void ParseResumedSessionId_ExtractsClaudeAndCodexIds()
     {
         Assert.AreEqual("3b7b7fbc", ArchiveService.ParseResumedSessionId(@"C:\x\claude.exe --resume 3b7b7fbc"));
+        Assert.AreEqual("quoted-claude", ArchiveService.ParseResumedSessionId(@"C:\x\claude.exe --resume ""quoted-claude"""));
         Assert.AreEqual("9f2a", ArchiveService.ParseResumedSessionId(@"codex.exe --profile http_sse resume --include-non-interactive 9f2a"));
+        Assert.AreEqual("quoted-codex", ArchiveService.ParseResumedSessionId(@"codex.exe --profile http_sse resume --include-non-interactive ""quoted-codex"""));
         Assert.AreEqual("ab12", ArchiveService.ParseResumedSessionId("codex resume ab12"));
         Assert.AreEqual("", ArchiveService.ParseResumedSessionId(@"C:\x\claude.exe"));   // fresh, not a resume
         Assert.AreEqual("", ArchiveService.ParseResumedSessionId("codex resume"));        // picker, no id
         Assert.AreEqual("", ArchiveService.ParseResumedSessionId(""));
+    }
+
+    [TestMethod]
+    public void TryParseSingleResumedSessionId_RejectsAmbiguousOrShellChainedCommands()
+    {
+        Assert.IsFalse(ArchiveService.TryParseSingleResumedSessionId("codex resume idle-id && codex resume live-id", out _, out var chained));
+        StringAssert.Contains(chained, "shell control");
+
+        Assert.IsFalse(ArchiveService.TryParseSingleResumedSessionId("codex resume first-id codex resume second-id", out _, out var ambiguous));
+        StringAssert.Contains(ambiguous, "multiple resume ids");
+
+        Assert.IsTrue(ArchiveService.TryParseSingleResumedSessionId("cd 'C:/work'; & 'C:/Trusted/codex.exe' resume --include-non-interactive only-id", out var id, out var detail), detail);
+        Assert.AreEqual("only-id", id);
+    }
+
+    [TestMethod]
+    public void TryBuildRemoteMuxLaunch_UsesCanonicalArchiveSessionForAliasIntent()
+    {
+        var service = new ArchiveService(useBundledStore: true);
+        var session = new ArchiveSession
+        {
+            Id = "canonical-id",
+            Tool = "codex",
+            Title = "Canonical",
+            Workspace = Path.GetTempPath(),
+            SourcePath = Path.Combine(Path.GetTempPath(), "canonical-id.jsonl")
+        };
+        session.Aliases.Add("alias-id");
+        service.Store.Sessions[session.Id] = session;
+
+        var ok = service.TryBuildRemoteMuxLaunch(
+            "alias-id",
+            "codex",
+            null,
+            out var launch,
+            out var detail,
+            s => $"cd 'C:/work'; & 'C:/Trusted/codex.exe' resume --include-non-interactive {s.Id}");
+
+        Assert.IsTrue(ok, detail);
+        Assert.IsNotNull(launch);
+        Assert.AreEqual("canonical-id", launch!.SessionId);
+        StringAssert.Contains(launch.Command, "canonical-id");
+        CollectionAssert.Contains(launch.Aliases.ToList(), "alias-id");
+    }
+
+    [TestMethod]
+    public void TryBuildRemoteMuxLaunch_RejectsLegacyCommandThatDoesNotMatchRequestedSession()
+    {
+        var service = new ArchiveService(useBundledStore: true);
+        var session = new ArchiveSession { Id = "wanted-id", Tool = "codex", Workspace = Path.GetTempPath(), SourcePath = Path.Combine(Path.GetTempPath(), "wanted-id.jsonl") };
+        service.Store.Sessions[session.Id] = session;
+
+        var ok = service.TryBuildRemoteMuxLaunch(
+            "wanted-id",
+            "codex",
+            "codex resume other-id",
+            out var launch,
+            out var detail,
+            _ => "should not be used");
+
+        Assert.IsFalse(ok);
+        Assert.IsNull(launch);
+        StringAssert.Contains(detail, "does not match requested session");
     }
 
     [TestMethod]
@@ -873,6 +1136,82 @@ public sealed class ArchiveServiceTests
         }
     }
 
+    // ★ SAFETY: the app must NEVER rewrite the transcript of a LIVE agent — that is exactly what silently
+    // destroyed whole conversations (delete+replace a file a running claude was still appending to).
+    // Regression guard: with sessionMayBeLive=true, recovery is a strict no-op and the file is untouched.
+    [TestMethod]
+    public void RecoverClaudeEntrypoint_RefusesToRewriteALiveSession()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "clr-live-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        var transcript = Path.Combine(dir, "live.jsonl");
+        var original =
+            "{\"type\":\"summary\",\"summary\":\"prior\"}\n" +
+            "{\"type\":\"user\",\"entrypoint\":\"sdk-cli\",\"message\":{\"content\":\"hi\"}}\n";
+        File.WriteAllText(transcript, original);
+        try
+        {
+            var rewrote = ArchiveService.RecoverClaudeEntrypoint(transcript, sessionMayBeLive: true, backupDir: null);
+            Assert.IsFalse(rewrote, "a live session's transcript must not be rewritten");
+            Assert.AreEqual(original, File.ReadAllText(transcript), "the live transcript is byte-for-byte untouched");
+        }
+        finally { if (Directory.Exists(dir)) Directory.Delete(dir, true); }
+    }
+
+    // ★ SAFETY: when we DO rewrite an idle session's transcript, keep a restorable backup of the original
+    // first, so any rewrite is reversible. Regression guard for the "make a copy so it isn't destructive".
+    [TestMethod]
+    public void RecoverClaudeEntrypoint_KeepsRestorableBackupBeforeRewrite()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "clr-bak-" + Guid.NewGuid().ToString("N"));
+        var backupDir = Path.Combine(dir, "transcript-backups");
+        Directory.CreateDirectory(dir);
+        var transcript = Path.Combine(dir, "idle.jsonl");
+        var original =
+            "{\"type\":\"summary\",\"summary\":\"prior\"}\n" +
+            "{\"type\":\"user\",\"entrypoint\":\"sdk-cli\",\"message\":{\"content\":\"hi\"}}\n";
+        File.WriteAllText(transcript, original);
+        try
+        {
+            var rewrote = ArchiveService.RecoverClaudeEntrypoint(transcript, sessionMayBeLive: false, backupDir: backupDir);
+            Assert.IsTrue(rewrote, "an idle sdk-cli transcript is recovered");
+            Assert.IsFalse(File.ReadAllText(transcript).Contains("sdk-cli"), "entrypoint rewritten to cli");
+
+            var backups = Directory.GetFiles(backupDir, "*.bak.jsonl");
+            Assert.AreEqual(1, backups.Length, "exactly one restorable backup was written");
+            Assert.AreEqual(original, File.ReadAllText(backups[0]), "the backup holds the ORIGINAL (restorable) transcript");
+        }
+        finally { if (Directory.Exists(dir)) Directory.Delete(dir, true); }
+    }
+
+    // ★ Tab↔chat binding must never confuse two tabs onto the same chat, even when several fresh agents
+    // start near-simultaneously in the same folder. Greedy best-match: each tab and each chat used once,
+    // explicit --resume ids (delta -1) win first, and a contested fresh chat goes to the closest start-time.
+    [TestMethod]
+    public void AssignTabChats_NeverBindsTwoTabsToTheSameChat()
+    {
+        // tab A and tab B both correlate to fresh chat "X" (B is a closer time match); tab A also has a
+        // weaker match to "Y"; tab C resumed "Z" explicitly (certain).
+        var proposals = new List<(string tab, string id, string tool, double delta)>
+        {
+            ("A", "X", "claude", 4.0),
+            ("A", "Y", "claude", 30.0),
+            ("B", "X", "claude", 1.0),   // closer to X than A
+            ("C", "Z", "codex",  -1.0),  // explicit resume id → certain
+        };
+        var winners = ArchiveService.AssignTabChats(proposals).ToList();
+
+        var byTab = winners.ToDictionary(w => w.tab, w => w.id);
+        Assert.AreEqual("Z", byTab["C"], "explicit resume id binds with certainty");
+        Assert.AreEqual("X", byTab["B"], "the closer start-time match wins the contested fresh chat X");
+        Assert.AreEqual("Y", byTab["A"], "the loser falls back to its own next-best chat, not X");
+
+        var ids = winners.Select(w => w.id).ToList();
+        Assert.AreEqual(ids.Count, ids.Distinct().Count(), "no chat id is bound to two tabs");
+        var tabs = winners.Select(w => w.tab).ToList();
+        Assert.AreEqual(tabs.Count, tabs.Distinct().Count(), "no tab is bound to two chats");
+    }
+
     // ★ Codex bump: `codex resume` orders the rollout FILES by mtime (NOT threads.updated_at_ms — verified
     // by driving the real picker), so the bump MUST touch the rollout file. Regression guard for the fix.
     [TestMethod]
@@ -1094,6 +1433,22 @@ public sealed class ArchiveServiceTests
             Assert.AreEqual("cmd.exe", launch.Exe);
             Assert.AreEqual("", launch.DisplayCommand, "a shell has no agent command");
             Assert.AreEqual(cwd.TrimEnd('\\'), launch.WorkingDirectory.TrimEnd('\\'));
+        }
+        finally { if (File.Exists(store)) File.Delete(store); }
+    }
+
+    [TestMethod]
+    public void BuildStartLaunch_RefusesResumeInConfiguredLaunchArgs()
+    {
+        var svc = TempService(out var store);
+        try
+        {
+            svc.Store.Settings.CodexLaunchArgs = @"resume ""smuggled-id""";
+
+            var launch = svc.BuildStartLaunch("codex", Path.GetTempPath());
+
+            Assert.AreEqual("", launch.Exe);
+            StringAssert.Contains(launch.DisplayCommand, "must not contain a resume");
         }
         finally { if (File.Exists(store)) File.Delete(store); }
     }
@@ -1764,24 +2119,26 @@ public sealed class ArchiveServiceTests
         finally { if (File.Exists(store)) File.Delete(store); }
     }
 
-    // Codex resume/fork sessions can expose CODEX_THREAD_ID as the rollout filename while the app's
-    // stored key is a canonical parent id. The agent should still pass the runtime id, and the app
-    // should resolve it to the stored key without falling back to cwd/latest.
+    // Codex resume/fork sessions can expose the current thread id in the rollout path/header while
+    // the app has a stale parent key. Exact-id filing should refresh and rekey that row.
     [TestMethod]
-    public async Task AgentCommand_AddSelfToProject_RuntimeIdInSourcePath_ResolvesStoredKey()
+    public async Task AgentCommand_AddSelfToProject_RuntimeIdInSourcePath_RekeysStoredChat()
     {
         var svc = TempService(out var store);
+        var dir = Path.Combine(Path.GetTempPath(), "clr-runtime-rekey-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
         try
         {
             const string runtimeId = "019f0d62-b2e5-70a1-8e81-4ff2722ca865";
             const string storedId = "019f0d3e-1d12-7cc3-b892-94652a2f95ee";
+            var path = WriteRollout(dir, "rollout-2026-06-28T02-39-59-" + runtimeId + ".jsonl", runtimeId, "2026-06-28T02:39:59Z", "runtime-keyed chat");
             svc.Store.Sessions[storedId] = new ArchiveSession
             {
                 Id = storedId,
                 Title = "Review VENPOD history",
                 Tool = "codex",
                 Workspace = "z:\\proj",
-                SourcePath = "C:\\Users\\Ahmed\\.codex\\sessions\\2026\\06\\28\\rollout-2026-06-28T02-39-59-" + runtimeId + ".jsonl",
+                SourcePath = path,
                 UpdatedAt = "2026-06-28T00:00:00Z"
             };
 
@@ -1796,11 +2153,17 @@ public sealed class ArchiveServiceTests
 
             Assert.IsTrue(r.Ok, r.Message);
             Assert.AreEqual(runtimeId, r.InputId);
-            Assert.AreEqual(storedId, r.ResolvedSessionId);
+            Assert.AreEqual(runtimeId, r.ResolvedSessionId);
             Assert.AreEqual(true, r.Persisted);
-            Assert.IsTrue(svc.Store.Collections.Values.First(c => c.Name == "Venpod").SessionIds.Contains(storedId));
+            Assert.IsTrue(svc.Store.Sessions.ContainsKey(runtimeId), "the stored row was rekeyed to the current runtime id");
+            Assert.IsFalse(svc.Store.Sessions.ContainsKey(storedId), "the stale key was removed");
+            Assert.IsTrue(svc.Store.Collections.Values.First(c => c.Name == "Venpod").SessionIds.Contains(runtimeId));
         }
-        finally { if (File.Exists(store)) File.Delete(store); }
+        finally
+        {
+            if (File.Exists(store)) File.Delete(store);
+            if (Directory.Exists(dir)) Directory.Delete(dir, true);
+        }
     }
 
     [TestMethod]

@@ -46,6 +46,45 @@ public sealed class AppStoreData
     // the next index pass, then drop the entry. Expires so a never-started chat doesn't linger.
     [JsonPropertyName("pendingNewChats")]
     public List<PendingNewChat> PendingNewChats { get; set; } = new();
+
+    // Per mux TAB (by name): the chat currently running in it + every chat that has run in it before, so
+    // no session a tab ever hosted is lost. Maintained by the mux-tab resolver as tabs switch agents/chats;
+    // powers "relaunch → pick which past session" and "add this tab (+ its history) to a collection".
+    [JsonPropertyName("muxTabHistory")]
+    public Dictionary<string, MuxTabRecord> MuxTabHistory { get; set; } = new();
+
+    // Per mux TAB (by name) presentation: a user-chosen color (like a PowerShell tab color) and a kind
+    // (e.g. "remote-resumed" for a session handed off from a local terminal via /tomux — tinted by default
+    // so you can tell at a glance it's a resumed-remote). Projected to the web to tint the tab.
+    [JsonPropertyName("muxTabMeta")]
+    public Dictionary<string, MuxTabMeta> MuxTabMeta { get; set; } = new();
+}
+
+// One chat that has lived in a mux tab (current or historical).
+public sealed class MuxTabChat
+{
+    [JsonPropertyName("id")] public string Id { get; set; } = "";
+    [JsonPropertyName("tool")] public string Tool { get; set; } = "";
+    [JsonPropertyName("title")] public string Title { get; set; } = "";
+    [JsonPropertyName("muxCommand")] public string MuxCommand { get; set; } = "";
+    [JsonPropertyName("at")] public string At { get; set; } = "";   // ISO-8601 UTC, when last seen in the tab
+}
+
+// Per-tab presentation: a chosen color + a kind flag (e.g. remote-resumed) shown as a tint on the web.
+public sealed class MuxTabMeta
+{
+    [JsonPropertyName("color")] public string Color { get; set; } = "";     // hex like "#e879f9", or "" for none
+    [JsonPropertyName("kind")] public string Kind { get; set; } = "";       // "" | "remote-resumed"
+}
+
+// A tab's session history: the current chat + previously-seen chats (most-recent first, current excluded).
+public sealed class MuxTabRecord
+{
+    [JsonPropertyName("current")] public MuxTabChat? Current { get; set; }
+    [JsonPropertyName("history")] public List<MuxTabChat> History { get; set; } = new();
+    // When the app first saw this tab (ISO-8601 UTC). The folder-observation ledger only captures sessions
+    // created AFTER this, so a tab shows what it hosted — not the cwd's whole back-catalog.
+    [JsonPropertyName("firstSeen")] public string FirstSeen { get; set; } = "";
 }
 
 // A "Start chat" that should be filed into a collection once its session is indexed (matched by
@@ -228,14 +267,31 @@ public sealed class ChatFilter
     public bool MatchAllIncludes { get; set; }     // false = ANY include tag; true = must have ALL of them
     public string? CollectionId { get; set; }       // restrict to this collection's members
 
-    // Creation-date mode. "" = default (recent-activity order). The list normally reorders by whatever
-    // was touched last; these pin it to WHEN THE CHAT WAS STARTED instead: created-newest |
-    // created-oldest sort by creation date; created-today | created-week | created-month are range
-    // filters (newest-first within the range).
+    // Restrict the list to one agent: "" = both, "codex", or "claude".
+    public string Tool { get; set; } = "";
+
+    // SORT of the list (single choice): "" = recent activity (touched last) | created-newest |
+    // created-oldest | last-user (order by recency, title = last user message) | first-user (title =
+    // first user message). Combines freely with DateRange, Tool, tags, and collection.
     public string DateMode { get; set; } = "";
 
+    // DATE-RANGE filter (single choice, COMBINES with the sort): "" = any | today | week | month.
+    // Restricts to chats CREATED within the range; the chosen sort still orders what's left.
+    public string DateRange { get; set; } = "";
+
+    // Keep only chats with at LEAST this many real user prompts (0 = off). "Filter out chats with <5"
+    // = 5; "hide one-off chats" = 2. Combines with everything else.
+    public int MinUserMessages { get; set; }
+
+    // By default the list auto-hides "one-off" chats — a single user prompt and a tiny transcript
+    // (the hundreds of spawned judge/probe sessions). Set true to reveal them everywhere (list,
+    // search, scroll). This is a visibility toggle, NOT a narrowing filter, so it's excluded from
+    // IsEmpty (turning it on doesn't count as "filtering").
+    public bool ShowHidden { get; set; }
+
     public bool IsEmpty => string.IsNullOrWhiteSpace(Query) && IncludeTags.Count == 0
-        && ExcludeTags.Count == 0 && string.IsNullOrEmpty(CollectionId) && string.IsNullOrEmpty(DateMode);
+        && ExcludeTags.Count == 0 && string.IsNullOrEmpty(CollectionId) && string.IsNullOrEmpty(DateMode)
+        && string.IsNullOrEmpty(DateRange) && string.IsNullOrEmpty(Tool) && MinUserMessages <= 0;
 }
 
 // A collection moved to "Recently Deleted" - the full grouping plus when it was removed, so it can
@@ -278,18 +334,17 @@ public sealed class ArchiveSession : INotifyPropertyChanged
     // re-sync), so they notify their computed display props to keep the live ListView in sync.
     private string _title = "";
     [JsonPropertyName("title")]
-    public string Title { get => _title; set { _title = value; Raise(); Raise(nameof(DisplayTitle)); } }
+    public string Title { get => _title; set { _title = value; Raise(); Raise(nameof(DisplayTitle)); Raise(nameof(ListTitle)); } }
 
     private string _customTitle = "";
     [JsonPropertyName("customTitle")]
-    public string CustomTitle { get => _customTitle; set { _customTitle = value; Raise(); Raise(nameof(DisplayTitle)); } }
+    public string CustomTitle { get => _customTitle; set { _customTitle = value; Raise(); Raise(nameof(DisplayTitle)); Raise(nameof(ListTitle)); } }
 
     [JsonPropertyName("sourcePath")]
     public string SourcePath { get; set; } = "";
 
-    // Alternate strong ids found in the transcript header/path. Agents pass their runtime env id;
-    // the store may key a resumed/forked chat by a canonical parent id, so exact-id operations
-    // resolve through these aliases without falling back to heuristics.
+    // Alternate strong ids found in the transcript header/path. The session Id remains the current
+    // resumable chat id; parent/fork ids live here only so exact-id operations can resolve safely.
     [JsonPropertyName("aliases")]
     public ObservableCollection<string> Aliases { get; set; } = new();
 
@@ -336,6 +391,12 @@ public sealed class ArchiveSession : INotifyPropertyChanged
     [JsonPropertyName("tags")]
     public ObservableCollection<string> Tags { get; set; } = new();
 
+    // User-assigned searchable CODENAMES ("special phrases"). A chat can carry several; many chats can
+    // share one (e.g. every chat under codename "petunia"). Folded into SearchText, so searching the
+    // phrase surfaces every chat stashed under it. App-only metadata — NEVER written into the transcript.
+    [JsonPropertyName("specialPhrases")]
+    public ObservableCollection<string> SpecialPhrases { get; set; } = new();
+
     [JsonPropertyName("reviewed")]
     public bool Reviewed { get; set; }
 
@@ -351,6 +412,32 @@ public sealed class ArchiveSession : INotifyPropertyChanged
 
     [JsonIgnore]
     public string DisplayTitle => string.IsNullOrWhiteSpace(CustomTitle) ? Title : CustomTitle;
+
+    // The last / first thing the USER typed in this chat (capped, single line). Captured at parse time from
+    // the FULL transcript so the last/first-user-message list sorts + titles work without loading per row.
+    [JsonPropertyName("lastUserMessage")]
+    public string LastUserMessage { get; set; } = "";
+
+    [JsonPropertyName("firstUserMessage")]
+    public string FirstUserMessage { get; set; } = "";
+
+    // How many REAL user prompts this chat has (your turns, not tool results) — counted from the FULL
+    // transcript at parse time. Drives the "min user messages" filter and is shown on the row.
+    [JsonPropertyName("userMessageCount")]
+    public int UserMessageCount { get; set; }
+
+    // Row-title mode the list sets per-row: "" = name, "last-user" = your last message, "first-user" = your
+    // first message. Lets the "last/first user message" sorts show what you said instead of the chat name.
+    private string _rowTitleMode = "";
+    [JsonIgnore]
+    public string RowTitleMode { get => _rowTitleMode; set { if (_rowTitleMode == value) return; _rowTitleMode = value; Raise(nameof(ListTitle)); } }
+
+    [JsonIgnore]
+    public string ListTitle => _rowTitleMode == "last-user"
+            ? (string.IsNullOrWhiteSpace(LastUserMessage) ? "No messages · " + DisplayTitle : LastUserMessage)
+        : _rowTitleMode == "first-user"
+            ? (string.IsNullOrWhiteSpace(FirstUserMessage) ? DisplayTitle : FirstUserMessage)
+        : DisplayTitle;
 
     [JsonIgnore]
     public string PinGlyph => Pinned ? "*" : "";
@@ -422,6 +509,9 @@ public sealed class AgentCommand
     public string? cwd { get; set; }                // self/latest resolution by workspace
     public string? id { get; set; }                 // explicit session id
     public string? target { get; set; }             // "self" | "latest" | <session-id>
+    public int pid { get; set; }                    // tomux: the caller's host agent pid, for a reliable local kill
+    public string? phrase { get; set; }             // stash: a searchable codename ("special phrase") to file this chat under
+    public string? collection { get; set; }         // stash: the collection name (alias of project)
 }
 
 public sealed record AgentCommandResult(

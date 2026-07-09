@@ -151,12 +151,35 @@ else
     });
 }
 
+async Task<IEnumerable<string>> AliasesForSessionId(string sessionId)
+{
+    await EnsureArchiveAsync();
+    var session = archive.Store.Sessions.Values.FirstOrDefault(s =>
+        string.Equals(s.Id, sessionId, StringComparison.OrdinalIgnoreCase) ||
+        s.Aliases.Any(a => string.Equals(a, sessionId, StringComparison.OrdinalIgnoreCase)));
+    return session is null
+        ? new[] { sessionId }
+        : new[] { session.Id }.Concat(session.Aliases)
+            .Where(id => !string.IsNullOrWhiteSpace(id))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+}
+
+async Task<(bool ok, ArchiveService.RemoteMuxLaunch? launch, string detail)> ResolveRemoteMuxLaunchAsync(string? sessionId, string? tool, string? legacyMuxCommand)
+{
+    await EnsureArchiveAsync();
+    return archive.TryBuildRemoteMuxLaunch(sessionId, tool, legacyMuxCommand, out var launch, out var detail)
+        ? (true, launch, detail)
+        : (false, null, detail);
+}
+
 app.UseDefaultFiles();
 app.UseStaticFiles();
 
 // healthz stays light — it must NOT trigger the archive load (it's a liveness probe).
 app.MapGet("/healthz", () => Results.Ok(new { ok = true, service = "codex-local-retrieval", archiveLoaded = _archiveLoaded, chats = _archiveLoaded ? archive.Store.Sessions.Count : -1 }));
 app.MapGet("/api/stats", async () => { await EnsureArchiveAsync(); return Results.Json(api.Stats()); });
+app.MapGet("/api/custody", async (CancellationToken ct) => { await EnsureArchiveAsync(); return Results.Json(await Task.Run(() => api.Custody(), ct)); });
 app.MapGet("/api/chats", async (string? q, int? limit) => { await EnsureArchiveAsync(); return Results.Json(api.Search(q, limit ?? 20)); });
 app.MapGet("/api/chats/{id}", async (string id, int? page, int? pageSize) =>
     { await EnsureArchiveAsync(); return api.Read(id, page ?? 0, pageSize ?? 20) is { } r ? Results.Json(r) : Results.NotFound(new { error = "no chat with that id" }); });
@@ -209,9 +232,10 @@ app.MapPost("/api/agent/sessions/{id}/rename", (string id, RenameRequest req) =>
 var claudeExeForLaunch = Environment.GetEnvironmentVariable("CLR_CLAUDE_EXE")
     ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".local", "bin", "claude.exe");
 var launcher = new SessionLauncher(claudeExeForLaunch, codexExe, allowLaunch);
-app.MapPost("/api/agent/sessions/{id}/open", (string id, OpenRequest req) =>
+app.MapPost("/api/agent/sessions/{id}/open", async (string id, OpenRequest req) =>
 {
-    var (ok, msg) = launcher.Open(req?.Source ?? "codex", id, req?.Target ?? "terminal", req?.Cwd);
+    var aliases = await AliasesForSessionId(id);
+    var (ok, msg) = launcher.Open(req?.Source ?? "codex", id, req?.Target ?? "terminal", req?.Cwd, aliases);
     return ok ? Results.Json(new { ok = true, message = msg }) : Results.BadRequest(new { error = msg });
 });
 
@@ -228,7 +252,7 @@ app.Map("/api/agent", async (HttpContext ctx) =>
 {
     if (!ctx.WebSockets.IsWebSocketRequest) { ctx.Response.StatusCode = StatusCodes.Status400BadRequest; return; }
     using var sock = await ctx.WebSockets.AcceptWebSocketAsync();
-    await AgentWebSocket.HandleAsync(sock, agentHub, claudeStore, claudeDriver, commandSigner, defaultWs, ctx.RequestAborted);
+    await AgentWebSocket.HandleAsync(sock, agentHub, claudeStore, claudeDriver, commandSigner, defaultWs, ctx.RequestAborted, AliasesForSessionId);
 });
 
 // Idle eviction: keep loaded only while in use. After CLR_REMOTE_IDLE_UNLOAD_SEC (default 300s) with no
@@ -290,7 +314,13 @@ if (Environment.GetEnvironmentVariable("CLR_REMOTE_BRIDGE") != "0")
             try { return System.Diagnostics.Process.GetProcessesByName("CodexLocalRetrieval.Native").Length > 0; }
             catch { return false; }
         }
-        var bridge = new RemoteBridge(() => bridgeSettings, DesktopAppRunning, claudeStore, codexDbPath, m => Console.WriteLine("[bridge] " + m));
+        var bridge = new RemoteBridge(
+            () => bridgeSettings,
+            DesktopAppRunning,
+            claudeStore,
+            codexDbPath,
+            m => Console.WriteLine("[bridge] " + m),
+            ResolveRemoteMuxLaunchAsync);
         _ = bridge.RunLoopAsync(app.Lifetime.ApplicationStopping);
         Console.WriteLine($"remote command bridge armed (target {bridgeSettings.Target}:{bridgeSettings.Port}; active only while the desktop app is closed)");
     }

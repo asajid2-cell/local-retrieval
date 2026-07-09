@@ -110,6 +110,14 @@ public sealed partial class MainPage
                 results.Add((item, new AgentCommandResult(false, item.ParseError!)));
 
             var commandLines = pending.Where(p => p.Command is not null).ToList();
+
+            // /tomux: hand a live LOCAL session off to multiplex (start it there, then stop the local copy).
+            // Needs the Native mux-start + kill, so it's handled here rather than in Core's ApplyAgentCommand.
+            bool IsToMux(AgentCommand c) => ArchiveService.NormalizeAgentOp(c.op) == "tomux";
+            foreach (var item in commandLines.Where(p => IsToMux(p.Command!)))
+                results.Add((item, await HandleToMuxAsync(item.Command!)));
+            commandLines = commandLines.Where(p => !IsToMux(p.Command!)).ToList();
+
             foreach (var item in commandLines.Where(p => IsSourceOp(p.Command!)))
                 results.Add((item, await _archive.ApplyAgentCommandAsync(item.Command!)));
 
@@ -251,6 +259,12 @@ Commands (one JSON object per line):
   {{""op"":""setName"",""name"":""<in-app name>"",""id"":""<runtime-id>"",""tool"":""codex"",""requestId"":""...""}}  set this chat's app-only name (no project needed)
   {{""op"":""tag"",""tags"":[""bug"",""urgent""],""id"":""<runtime-id>"",""tool"":""codex"",""requestId"":""...""}}     add app-only tags to this chat (untag removes)
   {{""op"":""rename"",""id"":""<runtime-id>"",""tool"":""codex"",""localName"":""..."",""canonicalName"":""..."",""requestId"":""...""}}
+  {{""op"":""tomux"",""id"":""<runtime-id>"",""tool"":""claude"",""pid"":<your host agent pid>,""name"":""<optional tab name>"",""requestId"":""...""}}  HAND THIS SESSION OFF TO MULTIPLEX: resumes it as a muxd-hosted tab (drivable from the web, tinted 'remote-resumed'), then STOPS this local copy. Pass ""pid"" = the claude.exe/codex.exe host pid so the local kill is reliable.
+  {{""op"":""stash"",""name"":""<app name>"",""collection"":""<collection>"",""deck"":""<deck, default Main>"",""phrase"":""<codename e.g. petunia>"",""id"":""<runtime-id>"",""tool"":""claude"",""requestId"":""...""}}  STASH this chat: set its app-only name, file it into a collection on a deck, AND tag it with a searchable CODENAME (""special phrase""). Any subset of name/collection/phrase works. Searching that phrase in the app later surfaces EVERY chat stashed under it — so many chats can live under one codename.
+
+SPECIAL PHRASES (codenames): app-only searchable labels a chat carries — several per chat, and many chats
+can share one. They are folded into the app's search text, so typing the phrase in the search box (or deep
+search) brings up every chat stashed under it. They are NEVER written into your transcript.
 
 `addToProject` and `addToCollection` are accepted as legacy aliases for `addSelfToProject`.
 `setName`/`name`/`label` are aliases for `rename`. The optional ""name"" on addSelfToProject (or

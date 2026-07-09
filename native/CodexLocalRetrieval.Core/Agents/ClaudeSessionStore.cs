@@ -169,11 +169,28 @@ public sealed class ClaudeSessionStore
     {
         var path = PathOf(id);
         if (path is null || !File.Exists(path)) return false;
+        // Invariant: the app never writes into a transcript a LIVE agent owns. Defer the rename if the
+        // session is currently running (its own writes take precedence; retry once it's idle).
+        if (IsIdLive(id)) return false;
         var rec = JsonSerializer.Serialize(new { type = "custom-title", sessionId = id, customTitle = title });
         using var fs = new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite);
         using var sw = new StreamWriter(fs);
         sw.Write(rec + "\n");
         return true;
+    }
+
+    // True if a live claude/codex agent is currently resuming this session id (so its transcript is owned).
+    private static bool IsIdLive(string id)
+    {
+        try
+        {
+            if (string.IsNullOrEmpty(id)) return false;
+            foreach (var r in CodexLocalRetrieval.Core.Remote.RunningSessions.Scan())
+                if (!string.IsNullOrEmpty(r.SessionId) && string.Equals(r.SessionId, id, StringComparison.OrdinalIgnoreCase))
+                    return true;
+            return false;
+        }
+        catch { return false; }
     }
 
     private static string? FirstUserText(JsonElement content)

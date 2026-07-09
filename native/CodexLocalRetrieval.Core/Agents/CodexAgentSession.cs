@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Threading.Channels;
+using CodexLocalRetrieval.Core.Remote;
 
 namespace CodexLocalRetrieval.Core.Agents;
 
@@ -14,17 +15,19 @@ public sealed class CodexAgentSession : IAgentSession
     private readonly string? _model;
     private readonly string _serviceTier;
     private readonly string _sandbox;
+    private readonly SessionLaunchGovernor _launchGovernor;
     private readonly Channel<AgentEvent> _channel = Channel.CreateUnbounded<AgentEvent>();
     private readonly object _lock = new();
     private Process? _proc;
 
-    public CodexAgentSession(string exe, string workspace, string? model = null, string serviceTier = "fast", string sandbox = "workspace-write")
+    public CodexAgentSession(string exe, string workspace, string? model = null, string serviceTier = "fast", string sandbox = "workspace-write", SessionLaunchGovernor? launchGovernor = null)
     {
         _exe = exe;
         Workspace = workspace;
         _model = model;
         _serviceTier = serviceTier;
         _sandbox = sandbox;
+        _launchGovernor = launchGovernor ?? new SessionLaunchGovernor();
     }
 
     public string Agent => "codex";
@@ -62,10 +65,58 @@ public sealed class CodexAgentSession : IAgentSession
         if (!string.IsNullOrWhiteSpace(_model)) { psi.ArgumentList.Add("-m"); psi.ArgumentList.Add(_model!); }
         psi.ArgumentList.Add(text);
 
+        SessionLaunchLease? lease = null;
+        var adoptedSessionId = SessionId;
+        try
+        {
+            if (!string.IsNullOrWhiteSpace(adoptedSessionId))
+            {
+                var request = new SessionLaunchRequest(
+                    adoptedSessionId,
+                    null,
+                    "codex",
+                    "core-agent-session",
+                    "codex exec resume turn",
+                    "codex.exec.refused.claim",
+                    "codex.exec.started",
+                    "codex.exec.failed",
+                    Workspace: Workspace);
+                if (!_launchGovernor.TryAcquire(request, out lease, out var leaseDetail))
+                    throw new InvalidOperationException(leaseDetail);
+            }
+            else
+            {
+                lease = _launchGovernor.BeginFresh(new SessionLaunchRequest(
+                    null,
+                    null,
+                    "codex",
+                    "core-agent-session",
+                    "codex exec fresh turn",
+                    "codex.exec.refused",
+                    "codex.exec.started",
+                    "codex.exec.failed",
+                    Workspace: Workspace));
+            }
+        }
+        catch
+        {
+            Busy = false;
+            throw;
+        }
+
         var proc = new Process { StartInfo = psi };
         try
         {
-            proc.Start();
+            try
+            {
+                proc.Start();
+                lease?.MarkStarted(string.IsNullOrWhiteSpace(adoptedSessionId) ? "Codex exec fresh turn started." : "Codex exec resume turn started.", retainUntilExpiry: false);
+            }
+            catch (Exception ex)
+            {
+                lease?.MarkFailed(ex.Message);
+                throw;
+            }
             lock (_lock) _proc = proc;
             proc.StandardInput.Close(); // EOF so `codex exec` doesn't block reading stdin
             var stderrTask = proc.StandardError.ReadToEndAsync(ct);
@@ -97,6 +148,7 @@ public sealed class CodexAgentSession : IAgentSession
         }
         finally
         {
+            lease?.Dispose();
             Busy = false;
             lock (_lock) _proc = null;
         }

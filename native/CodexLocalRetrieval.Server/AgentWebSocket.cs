@@ -18,7 +18,7 @@ public static class AgentWebSocket
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
     };
 
-    public static async Task HandleAsync(WebSocket ws, CodexAgentHub hub, ClaudeSessionStore claude, ClaudeLiveDriver claudeDriver, CommandSigner signer, string defaultWorkspace, CancellationToken ct)
+    public static async Task HandleAsync(WebSocket ws, CodexAgentHub hub, ClaudeSessionStore claude, ClaudeLiveDriver claudeDriver, CommandSigner signer, string defaultWorkspace, CancellationToken ct, Func<string, Task<IEnumerable<string>>>? aliasesForSessionId = null)
     {
         var send = new SemaphoreSlim(1, 1);
         string? openThreadId = null;
@@ -61,6 +61,18 @@ public static class AgentWebSocket
             if (!signer.Verify(canonical, nonce, ts, sig, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), out var reason))
             { await SendJson(ws, send, AgentEvent.Err("rejected: " + reason + ". Check your owner key."), ct); return false; }
             return true;
+        }
+
+        async Task<(bool ok, IEnumerable<string>? aliases)> TryResolveAliasesAsync(string? sessionId)
+        {
+            if (string.IsNullOrWhiteSpace(sessionId) || aliasesForSessionId is null) return (true, null);
+            try { return (true, await aliasesForSessionId(sessionId)); }
+            catch (Exception ex)
+            {
+                await SendJson(ws, send, AgentEvent.Err("refused: could not verify session aliases (" + ex.Message + "); refusing to risk a second writer."), ct);
+                await SendJson(ws, send, AgentEvent.Stat("idle"), ct);
+                return (false, null);
+            }
         }
 
         try
@@ -131,21 +143,38 @@ public static class AgentWebSocket
 
                         if (openSource == "claude")
                         {
-                            await SendJson(ws, send, AgentEvent.Stat("turn-start"), ct);
-                            claudeProc = claudeDriver.StartTurn(claudeSid, claudeCwd, text!, async ev =>
+                            if (claudeProc is { HasExited: false })
                             {
-                                if (ev.Kind == AgentEventKind.SessionStarted) { claudeSid = ev.SessionId; return; } // track id, don't render
-                                await SendJson(ws, send, ev, ct);
-                            }, ct, auto ? "bypassPermissions" : "acceptEdits");
+                                await SendJson(ws, send, AgentEvent.Err("refused: this Claude turn is still running; wait or interrupt it before sending another."), ct);
+                                break;
+                            }
+                            await SendJson(ws, send, AgentEvent.Stat("turn-start"), ct);
+                            try
+                            {
+                                var aliasResult = await TryResolveAliasesAsync(claudeSid);
+                                if (!aliasResult.ok) break;
+                                claudeProc = claudeDriver.StartTurn(claudeSid, claudeCwd, text!, async ev =>
+                                {
+                                    if (ev.Kind == AgentEventKind.SessionStarted) { claudeSid = ev.SessionId; return; } // track id, don't render
+                                    await SendJson(ws, send, ev, ct);
+                                }, ct, auto ? "bypassPermissions" : "acceptEdits", aliasResult.aliases);
+                            }
+                            catch (InvalidOperationException ex)
+                            {
+                                await SendJson(ws, send, AgentEvent.Err("refused: " + ex.Message), ct);
+                                await SendJson(ws, send, AgentEvent.Stat("idle"), ct);
+                            }
                         }
                         else if (openThreadId is not null)
                         {
                             var tid = openThreadId;
                             var policy = auto ? "never" : null; // never = autonomous (owner-signed); else inherit session policy (approvals)
+                            var aliasResult = await TryResolveAliasesAsync(tid);
+                            if (!aliasResult.ok) break;
                             // fire-and-forget so the receive loop stays free for interrupt; surface failures.
                             _ = Task.Run(async () =>
                             {
-                                try { await hub.StartTurnAsync(tid, text!, ct, policy); }
+                                try { await hub.StartTurnAsync(tid, text!, ct, policy, aliasResult.aliases); }
                                 catch (Exception ex) { await SendJson(ws, send, AgentEvent.Err("send failed: " + ex.Message), ct); }
                             }, ct);
                         }
