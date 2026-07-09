@@ -8,6 +8,7 @@ import asyncio
 import base64
 import ctypes
 import os
+import secrets
 import subprocess
 import sys
 import time
@@ -227,11 +228,36 @@ async def listen_remote(ws, child):
         if m.get("t") == "i":
             write_console_input(base64.b64decode(m.get("d", "")))
         elif m.get("t") == "kill":
-            try:
-                child.terminate()
-            except Exception:
-                pass
+            await asyncio.get_running_loop().run_in_executor(None, terminate_child_tree, child)
+            if child.poll() is not None:
+                try:
+                    await ws.send(json.dumps({"t": "dead"}))
+                except Exception:
+                    pass
             return
+
+
+def terminate_child_tree(child):
+    if child.poll() is not None:
+        return True
+    try:
+        subprocess.run(
+            ["taskkill.exe", "/PID", str(child.pid), "/T", "/F"],
+            timeout=8,
+            creationflags=CREATE_NO_WINDOW,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        try:
+            child.terminate()
+        except Exception:
+            pass
+    try:
+        child.wait(timeout=8)
+    except subprocess.TimeoutExpired:
+        return False
+    return child.poll() is not None
 
 
 async def screen_pump(ws, stop):
@@ -258,7 +284,7 @@ async def wait_child(child):
     return int(child.returncode or 0)
 
 
-async def register_owner(args, command, cwd):
+async def register_owner(args, command, cwd, owner_key):
     import json
 
     ws = await websockets.connect(URL, max_size=8_000_000, ping_interval=20, ping_timeout=15)
@@ -273,6 +299,7 @@ async def register_owner(args, command, cwd):
                     "cwd": cwd,
                     "cols": cols,
                     "rows": rows,
+                    "ownerKey": owner_key,
                 }
             )
         )
@@ -288,14 +315,14 @@ async def register_owner(args, command, cwd):
         raise
 
 
-async def connect_owner(args, command, cwd, child_started):
+async def connect_owner(args, command, cwd, child_started, owner_key):
     deadline = time.monotonic() + (float("inf") if child_started else 20.0)
     backoff = 0.5
     last_error = None
     while time.monotonic() < deadline:
         ensure_muxd_started()
         try:
-            return await register_owner(args, command, cwd)
+            return await register_owner(args, command, cwd, owner_key)
         except RuntimeError as e:
             last_error = e
             msg = str(e)
@@ -361,9 +388,10 @@ async def main_async(args):
     if args.cmd_b64:
         command = base64.b64decode(args.cmd_b64).decode("utf-8", "replace")
     cwd = args.cwd if args.cwd and os.path.isdir(args.cwd) else os.getcwd()
+    owner_key = secrets.token_urlsafe(32)
 
     try:
-        ws = await connect_owner(args, command, cwd, child_started=False)
+        ws = await connect_owner(args, command, cwd, child_started=False, owner_key=owner_key)
     except Exception as e:
         print("[muxrun] " + str(e), file=sys.stderr)
         return 2
@@ -375,12 +403,12 @@ async def main_async(args):
             if result == "child-exit":
                 break
             print("[muxrun] muxd owner link dropped; re-registering while child continues", file=sys.stderr)
-            ws = await connect_owner(args, command, cwd, child_started=True)
+            ws = await connect_owner(args, command, cwd, child_started=True, owner_key=owner_key)
         except Exception as e:
             if child.poll() is not None:
                 break
             print("[muxrun] muxd owner link failed; re-registering while child continues: " + str(e), file=sys.stderr)
-            ws = await connect_owner(args, command, cwd, child_started=True)
+            ws = await connect_owner(args, command, cwd, child_started=True, owner_key=owner_key)
     return int(child.returncode or 0)
 
 

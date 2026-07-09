@@ -1,7 +1,11 @@
 import importlib
 import asyncio
+import json
+import os
+import tempfile
 import time
 import unittest
+from datetime import datetime, timedelta, timezone
 
 
 muxd = importlib.import_module("muxd")
@@ -30,6 +34,153 @@ class FakeSession:
 
 
 class MuxdStateTests(unittest.TestCase):
+    def test_launch_claim_filename_matches_csharp_contract(self):
+        self.assertEqual(
+            "Parent-ID_123-76d41cbf4b150c76.claim.json",
+            muxd.claim_file_name("Parent-ID_123"),
+        )
+
+    def test_launch_claim_ids_reject_non_ascii_aliases(self):
+        self.assertEqual(
+            ["ascii-id"],
+            muxd.launch_candidate_ids("", ["ascii-id", "ünicode-id"]),
+        )
+
+    def test_live_process_scan_includes_node_cli_shims(self):
+        class Result:
+            returncode = 0
+            stdout = "[]"
+            stderr = ""
+
+        calls = []
+        old_run = muxd.subprocess.run
+        try:
+            muxd.subprocess.run = lambda args, **kwargs: calls.append(args) or Result()
+
+            ok, values, detail = muxd._try_agent_cmdlines()
+        finally:
+            muxd.subprocess.run = old_run
+
+        self.assertTrue(ok, detail)
+        self.assertEqual([], values)
+        self.assertIn("Name='node.exe'", " ".join(calls[0]))
+
+    def test_relay_output_backlog_is_bounded(self):
+        q = muxd.RelayOutQueue(maxsize=2)
+
+        self.assertTrue(q.put_nowait(("o", "a", b"one")))
+        self.assertTrue(q.put_nowait(("o", "a", b"two")))
+        self.assertFalse(q.put_nowait(("o", "a", b"three")))
+
+        self.assertEqual(2, q.qsize())
+        self.assertEqual(1, q.dropped)
+
+    def test_manifest_preserves_canonical_and_alias_ids(self):
+        class ManifestSession(FakeSession):
+            def __init__(self):
+                super().__init__(cmd="codex resume parent-id")
+                self.name = "manifest-aliases"
+                self.user_killed = False
+                self.heal = True
+                self.cols = 120
+                self.rows = 36
+                self.ids = ["parent-id", "child-id"]
+
+        old_manifest = muxd.MANIFEST
+        old_sessions = muxd.sessions
+        with tempfile.TemporaryDirectory(prefix="muxd-manifest-test-") as root:
+            try:
+                muxd.MANIFEST = os.path.join(root, "sessions.json")
+                muxd.sessions = {"manifest-aliases": ManifestSession()}
+                muxd.manifest_save()
+                data = json.load(open(muxd.MANIFEST, encoding="utf-8"))
+                self.assertEqual(
+                    ["parent-id", "child-id"],
+                    data["manifest-aliases"]["ids"],
+                )
+            finally:
+                muxd.MANIFEST = old_manifest
+                muxd.sessions = old_sessions
+
+    def test_launch_claim_blocks_alias_overlap_until_release(self):
+        old_root = muxd.CLAIM_ROOT
+        old_scan = muxd.try_live_session_ids
+        with tempfile.TemporaryDirectory(prefix="muxd-claims-") as root:
+            try:
+                muxd.CLAIM_ROOT = root
+                muxd.try_live_session_ids = lambda: (True, {}, "")
+
+                claim, detail = muxd.acquire_launch_claim(
+                    "codex resume parent-id",
+                    ["parent-id", "child-id"],
+                    "test",
+                )
+
+                self.assertIsNotNone(claim, detail)
+                self.assertEqual(["child-id", "parent-id"], sorted(claim.ids))
+                self.assertEqual(2, len(os.listdir(root)))
+                blocked, blocked_detail = muxd.acquire_launch_claim(
+                    "codex resume child-id",
+                    ["child-id"],
+                    "second",
+                )
+                self.assertIsNone(blocked)
+                self.assertIn("launch already pending", blocked_detail)
+
+                claim.release()
+                self.assertEqual([], os.listdir(root))
+            finally:
+                muxd.CLAIM_ROOT = old_root
+                muxd.try_live_session_ids = old_scan
+
+    def test_csharp_shaped_claim_blocks_muxd(self):
+        old_root = muxd.CLAIM_ROOT
+        old_scan = muxd.try_live_session_ids
+        with tempfile.TemporaryDirectory(prefix="muxd-csharp-claim-") as root:
+            try:
+                muxd.CLAIM_ROOT = root
+                muxd.try_live_session_ids = lambda: (True, {}, "")
+                now = datetime.now(timezone.utc)
+                path = os.path.join(root, muxd.claim_file_name("shared-id"))
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(
+                        {
+                            "SessionId": "shared-id",
+                            "CandidateIds": ["shared-id"],
+                            "OwnerPid": os.getpid(),
+                            "OwnerProcess": "CodexLocalRetrieval",
+                            "CreatedUtc": now.isoformat(),
+                            "ExpiresUtc": (now + timedelta(minutes=2)).isoformat(),
+                            "Reason": "C# test claim",
+                        },
+                        f,
+                    )
+
+                claim, detail = muxd.acquire_launch_claim("codex resume shared-id", ["shared-id"])
+
+                self.assertIsNone(claim)
+                self.assertIn("CodexLocalRetrieval pid", detail)
+            finally:
+                muxd.CLAIM_ROOT = old_root
+                muxd.try_live_session_ids = old_scan
+
+    def test_launch_claim_fails_closed_when_live_scan_is_unverified(self):
+        old_root = muxd.CLAIM_ROOT
+        old_scan = muxd.try_live_session_ids
+        with tempfile.TemporaryDirectory(prefix="muxd-claims-fail-closed-") as root:
+            try:
+                muxd.CLAIM_ROOT = root
+                muxd.try_live_session_ids = lambda: (False, {}, "WMI unavailable")
+
+                claim, detail = muxd.acquire_launch_claim("codex resume unsafe-id", ["unsafe-id"])
+
+                self.assertIsNone(claim)
+                self.assertIn("WMI unavailable", detail)
+                self.assertEqual([], os.listdir(root))
+            finally:
+                muxd.CLAIM_ROOT = old_root
+                muxd.try_live_session_ids = old_scan
+
     def test_single_instance_mutex_refuses_duplicate_muxd(self):
         class FakeCall:
             def __init__(self, result):
@@ -162,9 +313,154 @@ class MuxdStateTests(unittest.TestCase):
 
 
 class MuxdAsyncTests(unittest.IsolatedAsyncioTestCase):
+    async def test_terminate_session_waits_for_pty_termination(self):
+        class SlowPty:
+            pid = 0
+
+            def __init__(self):
+                self.finished = False
+
+            def terminate(self, force=True):
+                time.sleep(0.25)
+                self.finished = True
+
+        sess = muxd.Session.__new__(muxd.Session)
+        sess.name = "slow-stop"
+        sess.pty = SlowPty()
+        sess.dead = False
+        sess.user_killed = False
+        sess.wq = __import__("queue").Queue()
+
+        started = time.perf_counter()
+        ok, detail = await muxd.terminate_session_off_loop(sess, by_user=True, timeout=2)
+        elapsed = time.perf_counter() - started
+
+        self.assertTrue(ok, detail)
+        self.assertTrue(sess.pty is None)
+        self.assertTrue(sess.dead)
+        self.assertTrue(elapsed >= 0.2, f"termination returned before the PTY stop completed: {elapsed:.3f}s")
+
+    async def test_terminate_session_releases_claim_only_after_process_exit(self):
+        events = []
+
+        class SlowPty:
+            pid = 0
+
+            def terminate(self, force=True):
+                time.sleep(0.15)
+                events.append("process-exited")
+
+        class Claim:
+            paths = ("claim.json",)
+
+            def release(self):
+                events.append("claim-released")
+
+        sess = muxd.Session.__new__(muxd.Session)
+        sess.name = "claim-stop"
+        sess.pty = SlowPty()
+        sess.dead = False
+        sess.user_killed = False
+        sess.wq = __import__("queue").Queue()
+        sess._launch_claim = Claim()
+        sess.claim_paths = ["claim.json"]
+
+        ok, detail = await muxd.terminate_session_off_loop(sess, timeout=2)
+
+        self.assertTrue(ok, detail)
+        self.assertEqual(["process-exited", "claim-released"], events)
+        self.assertIsNone(sess._launch_claim)
+        self.assertEqual([], sess.claim_paths)
+
+    async def test_failed_termination_preserves_live_owner_and_claim(self):
+        class LivePty:
+            pid = 4242
+
+            def terminate(self, force=True):
+                return
+
+        class Claim:
+            paths = ("claim.json",)
+
+            def __init__(self):
+                self.released = False
+
+            def release(self):
+                self.released = True
+
+        pty = LivePty()
+        claim = Claim()
+        sess = muxd.Session.__new__(muxd.Session)
+        sess.name = "failed-stop"
+        sess.pty = pty
+        sess.dead = False
+        sess.user_killed = False
+        sess.wq = __import__("queue").Queue()
+        sess._launch_claim = claim
+        sess.claim_paths = ["claim.json"]
+
+        old_alive = muxd._pid_alive
+        old_run = muxd.subprocess.run
+        try:
+            muxd._pid_alive = lambda pid: True
+            muxd.subprocess.run = lambda *args, **kwargs: None
+
+            ok, detail = await muxd.terminate_session_off_loop(sess, timeout=0.1)
+        finally:
+            muxd._pid_alive = old_alive
+            muxd.subprocess.run = old_run
+
+        self.assertFalse(ok)
+        self.assertIn("still alive", detail)
+        self.assertIs(sess.pty, pty, "failed exit verification must not orphan the live PTY handle")
+        self.assertFalse(sess.dead, "the still-live session must remain attached and usable")
+        self.assertIs(sess._launch_claim, claim)
+        self.assertFalse(claim.released)
+        self.assertTrue(sess.wq.empty(), "failed termination must not stop the input writer")
+
+    async def test_visible_owner_requires_explicit_child_exit_confirmation(self):
+        class Claim:
+            def __init__(self):
+                self.released = False
+
+            def release(self):
+                self.released = True
+
+        class Owner:
+            owner = True
+            owner_exit_confirmed = False
+            dead = False
+
+            def __init__(self):
+                self._launch_claim = Claim()
+                self.claim_paths = ["owner.claim.json"]
+
+            def kill(self, by_user=True):
+                self.user_killed = by_user
+
+        owner = Owner()
+        ok, detail = await muxd.terminate_session_off_loop(owner, timeout=0.1)
+
+        self.assertFalse(ok)
+        self.assertIn("did not confirm child-process exit", detail)
+        self.assertFalse(owner.dead)
+        self.assertFalse(owner._launch_claim.released)
+
+        async def confirm_exit():
+            await asyncio.sleep(0.1)
+            owner.owner_exit_confirmed = True
+
+        confirmation = asyncio.create_task(confirm_exit())
+        ok, detail = await muxd.terminate_session_off_loop(owner, timeout=1)
+        await confirmation
+
+        self.assertTrue(ok, detail)
+        self.assertTrue(owner.dead)
+        self.assertIsNone(owner._launch_claim)
+
     async def test_new_session_spawn_runs_off_event_loop(self):
         class SlowSession:
-            def __init__(self, name, cmd, cwd, cols, rows, loop, outq, heal=False, spawn_now=True):
+            def __init__(self, name, cmd, cwd, cols, rows, loop, outq, heal=False, spawn_now=True, ids=None):
                 self.name = name
                 self.spawned = False
 

@@ -11,8 +11,9 @@
 #
 # State: sessions.json manifest (resume commands) -> muxd restart / PC reboot lists unarmed sessions
 # as dormant placeholders. Only sessions explicitly armed with heal auto-start.
-import asyncio, base64, collections, ctypes, glob, hashlib, json, os, queue, re, socket, subprocess, sys, threading, time, traceback
+import asyncio, base64, collections, ctypes, glob, hashlib, json, os, queue, re, socket, subprocess, sys, tempfile, threading, time, traceback
 from ctypes import wintypes
+from datetime import datetime, timedelta, timezone
 import faulthandler
 try: faulthandler.enable(open(os.path.join(os.path.expanduser("~"), "muxd", "muxd.crash"), "a"))
 except Exception: pass
@@ -75,7 +76,7 @@ def _try_agent_cmdlines():
     no registry). Best-effort: a failure just means codex-resume conflicts aren't caught this pass."""
     out = []
     try:
-        ps = ("Get-CimInstance Win32_Process -Filter \"Name='claude.exe' or Name='codex.exe'\" | "
+        ps = ("Get-CimInstance Win32_Process -Filter \"Name='claude.exe' or Name='codex.exe' or Name='node.exe'\" | "
               "Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress")
         r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
                            capture_output=True, text=True, timeout=15)
@@ -294,6 +295,12 @@ LOCAL_SB_SEND = int(ENV.get("LOCAL_SB_SEND", "60000"))  # local muxctl attach sh
 LOCAL_FIRST_TIMEOUT = float(ENV.get("LOCAL_FIRST_TIMEOUT", "3"))
 LOOP_WATCHDOG_WARN = float(ENV.get("LOOP_WATCHDOG_WARN", "30"))
 LOOP_WATCHDOG_EXIT = float(ENV.get("LOOP_WATCHDOG_EXIT", "12"))
+CLAIM_ROOT = ENV.get("LAUNCH_CLAIM_ROOT") or os.path.join(
+    os.environ.get("LOCALAPPDATA") or tempfile.gettempdir(),
+    "CodexLocalRetrieval",
+    "launch-claims",
+)
+CLAIM_TTL_SECONDS = max(10, int(ENV.get("LAUNCH_CLAIM_TTL_SECONDS", "120")))
 PROTOCOL = 2
 CAPS = ["ls", "info", "create", "open", "attach", "kill", "rename", "heal", "tail", "scrollback", "resize", "owner", "relaunch"]
 STARTED = time.time()
@@ -302,6 +309,233 @@ AGENT_STARTING_GRACE = float(ENV.get("AGENT_STARTING_GRACE", "45"))
 ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]")
 STALE_CSI_RE = re.compile(r"\[[0-?]*[ -/]*[@-~]")
 CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def launch_candidate_ids(cmd="", ids=None):
+    candidates = _candidate_resume_ids(cmd, ids)
+    unique = {}
+    for value in candidates:
+        value = str(value or "").strip()
+        if value and re.fullmatch(r"[A-Za-z0-9._-]+", value):
+            unique.setdefault(value.lower(), value)
+    return sorted(unique.values(), key=str.lower)
+
+
+def claim_file_name(session_id):
+    session_id = str(session_id or "").strip()
+    cleaned = "".join(ch for ch in session_id if ch.isascii() and (ch.isalnum() or ch in "-_"))[:36] or "session"
+    digest = hashlib.sha256(session_id.lower().encode("utf-8")).hexdigest()[:16]
+    return f"{cleaned}-{digest}.claim.json"
+
+
+def _claim_path(session_id):
+    return os.path.join(CLAIM_ROOT, claim_file_name(session_id))
+
+
+def _claim_timestamp(value):
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone(timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
+def _read_claim_metadata(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            value = json.load(f)
+        return value if isinstance(value, dict) else None
+    except Exception:
+        return None
+
+
+def _claim_expiry(path, metadata):
+    parsed = _claim_timestamp((metadata or {}).get("ExpiresUtc"))
+    if parsed is not None:
+        return parsed
+    try:
+        return datetime.fromtimestamp(os.path.getmtime(path), timezone.utc) + timedelta(seconds=CLAIM_TTL_SECONDS)
+    except OSError:
+        return datetime.now(timezone.utc) + timedelta(seconds=CLAIM_TTL_SECONDS)
+
+
+def _blocking_claim_detail(session_id, path, metadata):
+    expiry = _claim_expiry(path, metadata).astimezone()
+    owner = "unknown owner"
+    if metadata:
+        owner = f"{metadata.get('OwnerProcess') or 'unknown'} pid {metadata.get('OwnerPid') or 0}"
+    return (
+        f"launch already pending for session {session_id} "
+        f"({owner}, expires {expiry.strftime('%Y-%m-%d %H:%M:%S %Z')}); "
+        "refusing to start another writer"
+    )
+
+
+class LaunchClaim:
+    def __init__(self, ids, held):
+        self.ids = tuple(ids)
+        self._held = dict(held)
+        self.paths = tuple(self._held)
+        self._released = False
+
+    def release(self):
+        if self._released:
+            return
+        self._released = True
+        for path, fd in list(self._held.items()):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                log(f"launch claim release failed for {path}: {e}")
+        self._held.clear()
+
+
+def _without_ignored_live(live, ignored):
+    if not isinstance(live, tuple):
+        live = (True, live, "")
+    ok, values, detail = live
+    filtered = dict(values or {})
+    for session_id, pid in (ignored or {}).items():
+        if filtered.get(str(session_id).lower()) == pid:
+            filtered.pop(str(session_id).lower(), None)
+    return ok, filtered, detail
+
+
+def _pid_descends_from(pid, ancestor_pid):
+    try:
+        pid = int(pid)
+        ancestor_pid = int(ancestor_pid)
+    except (TypeError, ValueError):
+        return None
+    if pid <= 0 or ancestor_pid <= 0:
+        return None
+    if pid == ancestor_pid:
+        return True
+    script = (
+        f"$p={pid};$a={ancestor_pid};$seen=@{{}};"
+        "while($p -gt 0 -and -not $seen.ContainsKey($p)){"
+        "$seen[$p]=$true;if($p -eq $a){Write-Output true;exit 0};"
+        "$row=Get-CimInstance Win32_Process -Filter \"ProcessId=$p\" -ErrorAction Stop;"
+        "if($null -eq $row){break};$p=[int]$row.ParentProcessId};"
+        "Write-Output false"
+    )
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        if result.returncode != 0:
+            return None
+        value = result.stdout.strip().lower()
+        return True if value == "true" else False if value == "false" else None
+    except Exception:
+        return None
+
+
+def session_owned_live_ids(session, live):
+    if not isinstance(live, tuple):
+        live = (True, live, "")
+    ok, values, detail = live
+    if not ok:
+        return False, {}, detail
+    pty = getattr(session, "pty", None)
+    root_pid = int(getattr(pty, "pid", 0) or 0) if pty is not None else 0
+    ignored = {}
+    for session_id in launch_candidate_ids(getattr(session, "cmd", ""), getattr(session, "ids", None)):
+        pid = (values or {}).get(session_id.lower())
+        if not pid:
+            continue
+        owned = _pid_descends_from(pid, root_pid)
+        if owned is None:
+            return False, {}, f"could not verify whether pid {pid} belongs to mux session {session.name}"
+        if owned:
+            ignored[session_id.lower()] = pid
+    return True, ignored, ""
+
+
+def acquire_launch_claim(cmd="", ids=None, reason="muxd session launch", live=None, ignored_live=None):
+    candidate_ids = launch_candidate_ids(cmd, ids)
+    if not candidate_ids:
+        return None, ""
+
+    if live is None:
+        live = try_live_session_ids()
+    conflict = resume_conflict(cmd, live=_without_ignored_live(live, ignored_live), ids=candidate_ids)
+    if conflict:
+        return None, "refused: " + conflict_detail(conflict)
+
+    try:
+        os.makedirs(CLAIM_ROOT, exist_ok=True)
+    except OSError as e:
+        return None, f"couldn't create launch-claim directory: {e}"
+
+    now = datetime.now(timezone.utc)
+    targets = [(session_id, _claim_path(session_id)) for session_id in candidate_ids]
+    for session_id, path in targets:
+        if not os.path.exists(path):
+            continue
+        metadata = _read_claim_metadata(path)
+        expiry = _claim_expiry(path, metadata)
+        owner_is_dead_muxd = (
+            str((metadata or {}).get("OwnerProcess") or "").lower() == "muxd"
+            and not _pid_alive((metadata or {}).get("OwnerPid"))
+        )
+        if expiry <= now or owner_is_dead_muxd:
+            try:
+                os.remove(path)
+                continue
+            except FileNotFoundError:
+                continue
+            except OSError as e:
+                return None, (
+                    f"expired launch claim for session {session_id} could not be cleared ({e}); "
+                    "refusing to risk a second writer"
+                )
+        return None, _blocking_claim_detail(session_id, path, metadata)
+
+    expires = now + timedelta(seconds=CLAIM_TTL_SECONDS)
+    metadata = {
+        "SessionId": candidate_ids[0],
+        "CandidateIds": candidate_ids,
+        "OwnerPid": os.getpid(),
+        "OwnerProcess": "muxd",
+        "CreatedUtc": now.isoformat().replace("+00:00", "Z"),
+        "ExpiresUtc": expires.isoformat().replace("+00:00", "Z"),
+        "Reason": str(reason or "muxd session launch").strip(),
+    }
+    payload = json.dumps(metadata, indent=2).encode("utf-8")
+    held = {}
+    try:
+        for session_id, path in sorted(targets, key=lambda item: item[1].lower()):
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR)
+            held[path] = fd
+            os.write(fd, payload)
+            os.fsync(fd)
+    except FileExistsError:
+        LaunchClaim(candidate_ids, held).release()
+        metadata = _read_claim_metadata(path)
+        return None, _blocking_claim_detail(session_id, path, metadata)
+    except Exception as e:
+        LaunchClaim(candidate_ids, held).release()
+        return None, f"couldn't reserve launch for session {session_id}: {e}"
+
+    second_live = _without_ignored_live(try_live_session_ids(), ignored_live)
+    conflict = resume_conflict(cmd, live=second_live, ids=candidate_ids)
+    if conflict:
+        LaunchClaim(candidate_ids, held).release()
+        return None, "refused: " + conflict_detail(conflict)
+    return LaunchClaim(candidate_ids, held), "reserved"
+
 
 WATCH = {
     "last_tick": time.monotonic(),
@@ -317,6 +551,21 @@ WATCH = {
 WATCH_LOCK = threading.Lock()
 WATCHDOG_STARTED = False
 
+
+class RelayOutQueue(asyncio.Queue):
+    """Bound relay backlog so an outage cannot exhaust memory and kill hosted sessions."""
+
+    def __init__(self, maxsize=64):
+        super().__init__(maxsize=maxsize)
+        self.dropped = 0
+
+    def put_nowait(self, item):
+        if self.full():
+            self.dropped += 1
+            return False
+        super().put_nowait(item)
+        return True
+
 def watch_snapshot():
     with WATCH_LOCK:
         return dict(WATCH)
@@ -329,8 +578,11 @@ def clean_terminal_text(s):
     return CTRL_RE.sub("", s)
 
 class Session:
-    def __init__(self, name, cmd, cwd, cols, rows, loop, outq, heal=False, spawn_now=True):
+    def __init__(self, name, cmd, cwd, cols, rows, loop, outq, heal=False, spawn_now=True, ids=None):
         self.name, self.cmd, self.cwd = name, cmd or "", cwd or DEFAULT_CWD
+        self.ids = launch_candidate_ids(self.cmd, ids)
+        self.claim_paths = []
+        self._launch_claim = None
         self.heal = bool(heal)          # opt-in: ONLY healed (user-armed) sessions auto-start at boot / auto-respawn
         self.cols, self.rows = max(20, cols or 140), max(8, rows or 40)
         self.created = time.time(); self.last_out = time.time()
@@ -390,8 +642,8 @@ class Session:
                 old = self.ring.popleft(); self.ring_len -= len(old)
             with self.plock:                           # coalesced; the pump flushes on a ~12ms timer
                 self.pending += b                       # backpressure: if a flood outruns a slow link, keep the
-                if len(self.pending) > 2_000_000:       # last ~2MB unsent (the ring still holds full history for reattach)
-                    del self.pending[:len(self.pending) - 2_000_000]
+                if len(self.pending) > 512_000:         # last ~512KB unsent (the ring still holds history for reattach)
+                    del self.pending[:len(self.pending) - 512_000]
 
     def drain(self):
         if not self.pending: return None
@@ -470,8 +722,11 @@ class Session:
 class OwnerSession:
     # A visible local terminal owns the agent. muxd only relays that terminal's screen
     # snapshots to the VPS and forwards remote keystrokes back into the owner sidecar.
-    def __init__(self, name, cmd, cwd, cols, rows, loop, outq, owner_ws, heal=False):
+    def __init__(self, name, cmd, cwd, cols, rows, loop, outq, owner_ws, heal=False, ids=None, owner_key=""):
         self.name, self.cmd, self.cwd = name, cmd or "", cwd or DEFAULT_CWD
+        self.ids = launch_candidate_ids(self.cmd, ids)
+        self.claim_paths = []
+        self._launch_claim = None
         self.heal = bool(heal)
         self.cols, self.rows = max(20, int(cols or 140)), max(8, int(rows or 40))
         self.created = time.time(); self.last_out = time.time()
@@ -483,6 +738,8 @@ class OwnerSession:
         self.local = set()
         self.owner_ws = owner_ws
         self.owner = True
+        self.owner_key = str(owner_key or "")
+        self.owner_exit_confirmed = False
 
     def ingest(self, data: bytes):
         if not data: return
@@ -491,8 +748,8 @@ class OwnerSession:
             old = self.ring.popleft(); self.ring_len -= len(old)
         with self.plock:
             self.pending += data
-            if len(self.pending) > 2_000_000:
-                del self.pending[:len(self.pending) - 2_000_000]
+            if len(self.pending) > 512_000:
+                del self.pending[:len(self.pending) - 512_000]
 
     def drain(self):
         if not self.pending: return None
@@ -537,7 +794,6 @@ class OwnerSession:
 
     def kill(self, by_user=True):
         self.user_killed = by_user
-        self.dead = True
         self._send_owner({"t": "kill"})
 
 sessions = {}    # name -> Session
@@ -599,7 +855,8 @@ def start_watchdog_thread():
 
 def manifest_save():
     try:
-        data = {n: {"cmd": s.cmd, "cwd": s.cwd, "cols": s.cols, "rows": s.rows, "heal": s.heal}
+        data = {n: {"cmd": s.cmd, "cwd": s.cwd, "cols": s.cols, "rows": s.rows, "heal": s.heal,
+                    "ids": list(getattr(s, "ids", []) or [])}
                 for n, s in sessions.items() if not s.user_killed}
         tmp = MANIFEST + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f: json.dump(data, f)
@@ -733,16 +990,313 @@ async def spawn_session_off_loop(s):
     await asyncio.get_running_loop().run_in_executor(None, s.spawn)
     return s
 
-async def new_session_off_loop(name, cmd, cwd, cols, rows, loop, outq, heal=False):
-    s = Session(name, cmd, cwd, cols, rows, loop, outq, heal=heal, spawn_now=False)
+async def new_session_off_loop(name, cmd, cwd, cols, rows, loop, outq, heal=False, ids=None):
+    s = Session(name, cmd, cwd, cols, rows, loop, outq, heal=heal, spawn_now=False, ids=ids)
     await spawn_session_off_loop(s)
     return s
+
+
+def release_session_claim(s):
+    claim = getattr(s, "_launch_claim", None)
+    if claim is not None:
+        claim.release()
+    s._launch_claim = None
+    s.claim_paths = []
+
+
+async def terminate_session_off_loop(s, by_user=True, timeout=12, release_claim_on_success=True):
+    """Stop a session and do not return success until its PTY process is confirmed gone."""
+    if s is None:
+        return True, "already stopped"
+    s.user_killed = by_user
+    if bool(getattr(s, "owner", False)):
+        try:
+            s.kill(by_user=by_user)
+        except Exception as e:
+            return False, f"owner stop request failed: {e}"
+        deadline = time.monotonic() + max(0.1, timeout)
+        while not bool(getattr(s, "owner_exit_confirmed", False)):
+            if time.monotonic() >= deadline:
+                return False, "visible local owner did not confirm child-process exit"
+            await asyncio.sleep(0.05)
+        s.dead = True
+        if release_claim_on_success:
+            release_session_claim(s)
+        return True, "owner exited"
+
+    pty = getattr(s, "pty", None)
+    pid = int(getattr(pty, "pid", 0) or 0) if pty is not None else 0
+    if pty is None:
+        if release_claim_on_success:
+            release_session_claim(s)
+        return True, "already stopped"
+    s.dead = True
+
+    def terminate_and_verify():
+        terminate_error = None
+        try:
+            pty.terminate(force=True)
+        except Exception as e:
+            terminate_error = e
+        if pid > 0 and _pid_alive(pid):
+            try:
+                subprocess.run(
+                    ["taskkill.exe", "/PID", str(pid), "/T", "/F"],
+                    timeout=max(2, int(timeout)),
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except Exception:
+                pass
+        deadline = time.monotonic() + max(0.1, timeout)
+        while pid > 0 and _pid_alive(pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        if pid > 0 and _pid_alive(pid):
+            return False, f"process {pid} is still alive after termination"
+        if terminate_error is not None and pid <= 0:
+            return False, f"PTY termination failed: {terminate_error}"
+        return True, "process exited"
+
+    try:
+        result = await asyncio.wait_for(
+            asyncio.get_running_loop().run_in_executor(None, terminate_and_verify),
+            timeout=max(1, timeout + 2),
+        )
+        if result[0]:
+            if s.pty is pty:
+                s.pty = None
+            try:
+                s.wq.put_nowait(None)
+            except Exception:
+                pass
+            if release_claim_on_success:
+                release_session_claim(s)
+        elif s.pty is pty:
+            s.dead = False
+        return result
+    except asyncio.TimeoutError:
+        if s.pty is pty:
+            s.dead = False
+        return False, "process termination verification timed out"
+
 
 async def main():
     start_watchdog_thread()
     threading.Thread(target=_guardian_keepalive, name="guardian-keepalive", daemon=True).start()
     loop = asyncio.get_running_loop()
-    outq = asyncio.Queue()
+    outq = RelayOutQueue()
+    launch_locks = {}
+
+    def launch_lock(name):
+        lock = launch_locks.get(name)
+        if lock is None:
+            lock = asyncio.Lock()
+            launch_locks[name] = lock
+        return lock
+
+    async def remove_session(name, by_user):
+        async with launch_lock(name):
+            current = sessions.get(name)
+            if current is None:
+                return False, "no such session: " + name
+            ok, detail = await terminate_session_off_loop(current, by_user=by_user)
+            if not ok:
+                return False, detail
+            if sessions.get(name) is current:
+                del sessions[name]
+            manifest_save()
+            return True, detail
+
+    async def reserve_launch_claim(name, cmd, candidate_ids, prev=None):
+        if not cmd:
+            return None, False, ""
+        existing_claim = getattr(prev, "_launch_claim", None) if prev else None
+        if existing_claim is not None and set(existing_claim.ids) == set(candidate_ids):
+            return existing_claim, True, ""
+
+        live = await asyncio.get_running_loop().run_in_executor(None, try_live_session_ids)
+        ignored_live = {}
+        if prev and prev.alive():
+            owned_ok, ignored_live, owned_detail = await asyncio.get_running_loop().run_in_executor(
+                None, lambda: session_owned_live_ids(prev, live)
+            )
+            if not owned_ok:
+                return None, False, owned_detail or "could not verify current mux session ownership"
+        claim, detail = await asyncio.get_running_loop().run_in_executor(
+            None,
+            lambda: acquire_launch_claim(
+                cmd,
+                candidate_ids,
+                f"muxd session {name}",
+                live=live,
+                ignored_live=ignored_live,
+            ),
+        )
+        return claim, False, detail
+
+    async def coordinate_owner_registration(first, ws):
+        name = SAFE(first.get("s", ""))
+        if not name:
+            return None, "session name required"
+        owner_key = str(first.get("ownerKey", "") or "")
+        if len(owner_key) < 24:
+            return None, "visible owner registration requires a reconnect key"
+
+        async with launch_lock(name):
+            prev = sessions.get(name)
+            cmd = (first.get("cmd", "") or "").strip() or (prev.cmd if prev else "")
+            ids = first.get("ids") if isinstance(first.get("ids"), list) else []
+            candidate_ids = launch_candidate_ids(cmd, ids or (prev.ids if prev else None))
+            reconnect = bool(
+                prev
+                and getattr(prev, "owner", False)
+                and not prev.alive()
+                and getattr(prev, "owner_key", "") == owner_key
+            )
+            if prev and prev.alive():
+                return None, "session already has a visible local owner: " + name
+            if prev and getattr(prev, "owner", False) and not reconnect:
+                return None, "visible owner reconnect key did not match: " + name
+            if reconnect and (
+                normalized_cmd(getattr(prev, "cmd", "")) != normalized_cmd(cmd)
+                or set(getattr(prev, "ids", []) or []) != set(candidate_ids)
+            ):
+                return None, "visible owner reconnect identity changed: " + name
+
+            claim, preserve_existing_claim, claim_detail = await reserve_launch_claim(
+                name, cmd, candidate_ids, prev
+            )
+            if candidate_ids and claim is None:
+                return None, claim_detail or "could not reserve visible owner"
+
+            if prev and not reconnect:
+                ok, detail = await terminate_session_off_loop(
+                    prev,
+                    by_user=False,
+                    release_claim_on_success=not preserve_existing_claim,
+                )
+                if not ok:
+                    if claim is not getattr(prev, "_launch_claim", None) and claim is not None:
+                        claim.release()
+                    return None, "previous session did not exit: " + detail
+            if prev and preserve_existing_claim:
+                prev._launch_claim = None
+                prev.claim_paths = []
+
+            owner = OwnerSession(
+                name,
+                cmd,
+                first.get("cwd", "") or (prev.cwd if prev else ""),
+                int(first.get("cols") or 140),
+                int(first.get("rows") or 40),
+                loop,
+                outq,
+                ws,
+                heal=bool(first.get("heal")),
+                ids=candidate_ids,
+                owner_key=owner_key,
+            )
+            owner._launch_claim = claim
+            owner.claim_paths = list(claim.paths) if claim is not None else []
+            sessions[name] = owner
+            manifest_save()
+            return owner, ""
+
+    async def coordinate_session_request(first, spawn_if_missing, leave_unarmed_dormant=False):
+        name = SAFE(first.get("s", ""))
+        if not name:
+            return None, "session name required", False
+        async with launch_lock(name):
+            prev = sessions.get(name)
+            requested_cmd = (first.get("cmd", "") or "").strip()
+            requested_ids = first.get("ids") if isinstance(first.get("ids"), list) else []
+            requested_relaunch = bool(first.get("relaunch"))
+            requested_cwd = first.get("cwd", "") or ""
+            requested_heal = bool(first.get("heal")) if ("heal" in first) else bool(prev.heal if prev else False)
+            cols = int(first.get("cols") or (prev.cols if prev else 140))
+            rows = int(first.get("rows") or (prev.rows if prev else 40))
+            cmd = requested_cmd or (prev.cmd if prev else "")
+            cwd = requested_cwd or (prev.cwd if prev else "")
+            candidate_ids = launch_candidate_ids(cmd, requested_ids or (prev.ids if prev else None))
+
+            if prev and prev.alive() and not requested_relaunch and not needs_relaunch_for_command(prev, requested_cmd):
+                claim, _, claim_detail = await reserve_launch_claim(name, cmd, candidate_ids, prev)
+                if candidate_ids and claim is None:
+                    return None, claim_detail or "could not reserve running session ownership", False
+                prev.heal = requested_heal
+                if requested_cmd and requested_cmd != prev.cmd:
+                    prev.cmd = requested_cmd
+                prev.ids = candidate_ids
+                if claim is not None:
+                    prev._launch_claim = claim
+                    prev.claim_paths = list(claim.paths)
+                if requested_cwd:
+                    prev.cwd = requested_cwd
+                if first.get("cols"):
+                    prev.resize(cols, rows)
+                manifest_save()
+                return prev, "", False
+            if prev and not spawn_if_missing:
+                return prev, "", False
+            if not prev and not spawn_if_missing:
+                return None, "no such session: " + name, False
+            if (
+                leave_unarmed_dormant
+                and prev
+                and prev.dead
+                and not prev.heal
+                and not requested_heal
+                and not requested_cmd
+                and not requested_relaunch
+            ):
+                if first.get("cols"):
+                    prev.cols = cols
+                if first.get("rows"):
+                    prev.rows = rows
+                log(f"[{name}] attach to dormant unarmed session - left stopped")
+                return prev, "", False
+
+            if requested_relaunch and not cmd:
+                return None, "no saved command for " + name, False
+            if prev and prev.alive() and bool(getattr(prev, "owner", False)):
+                return None, "session has a visible local owner; close it explicitly before relaunch", False
+
+            claim, preserve_existing_claim, claim_detail = await reserve_launch_claim(
+                name, cmd, candidate_ids, prev
+            )
+            existing_claim = getattr(prev, "_launch_claim", None) if prev else None
+            if candidate_ids and claim is None:
+                return None, claim_detail or "could not reserve session launch", False
+
+            if prev:
+                ok, detail = await terminate_session_off_loop(
+                    prev,
+                    by_user=False,
+                    release_claim_on_success=not preserve_existing_claim,
+                )
+                if not ok:
+                    if claim is not existing_claim and claim is not None:
+                        claim.release()
+                    return None, "previous session did not exit: " + detail, False
+                if preserve_existing_claim:
+                    prev._launch_claim = None
+                    prev.claim_paths = []
+                if sessions.get(name) is prev:
+                    del sessions[name]
+            try:
+                created = await new_session_off_loop(
+                    name, cmd, cwd, cols, rows, loop, outq, heal=requested_heal, ids=candidate_ids
+                )
+            except Exception as e:
+                if claim is not None:
+                    claim.release()
+                return None, "spawn failed: " + str(e), False
+            created._launch_claim = claim
+            created.claim_paths = list(claim.paths) if claim is not None else []
+            sessions[name] = created
+            manifest_save()
+            return created, "", True
 
     async def loop_monitor():
         last = time.monotonic()
@@ -766,20 +1320,27 @@ async def main():
     # stays dormant until an explicit create/relaunch sends a non-empty resume command.
     # liveness runs a PowerShell CIM query (blocking) — NEVER call it on the event-loop thread or muxd
     # freezes and hosted sessions drop. Always hop to a worker thread.
-    boot_live = await loop.run_in_executor(None, try_live_session_ids)
     for name, m in manifest_load().items():
         if SAFE(name) and name not in sessions:
             try:
                 heal = bool(m.get("heal"))
                 mcmd = m.get("cmd", "")
-                # GATE: never auto-resume an id that's already live elsewhere (would be a double-open).
-                conflict = resume_conflict(mcmd, boot_live) if heal else None
-                spawn_now = heal and not conflict
-                sessions[name] = Session(name, mcmd, m.get("cwd", ""), m.get("cols", 140), m.get("rows", 40), loop, outq, heal=heal, spawn_now=spawn_now)
-                if conflict:
-                    log(f"[boot] REFUSED auto-resume of {name}: session {conflict[0]} already live (pid {conflict[1]}) — left dormant (no double-open)")
-                else:
-                    log(f"[boot] {'recreated + resumed (armed)' if spawn_now else 'listed as dormant (unarmed - explicit relaunch required)'}: {name}")
+                ids = m.get("ids") if isinstance(m.get("ids"), list) else []
+                sessions[name] = Session(
+                    name, mcmd, m.get("cwd", ""), m.get("cols", 140), m.get("rows", 40),
+                    loop, outq, heal=heal, spawn_now=False, ids=ids
+                )
+                if heal:
+                    _session, detail, created = await coordinate_session_request(
+                        {"t": "create", "s": name, "relaunch": True, "heal": True, "ids": ids},
+                        True,
+                    )
+                    if detail:
+                        log(f"[boot] REFUSED auto-resume of {name}: {detail}; left dormant")
+                    elif created:
+                        log(f"[boot] recreated + resumed (armed): {name}")
+                    continue
+                log(f"[boot] listed as dormant (unarmed - explicit relaunch required): {name}")
             except Exception as e: log(f"[boot] {name} failed: {e}")
 
     async def self_heal_tick():
@@ -791,15 +1352,15 @@ async def main():
                     now = time.time()
                     s.deaths = [t for t in s.deaths if now - t < 600]
                     if len(s.deaths) >= 3: continue
-                    # GATE: if this id came back to life on its own (or is live elsewhere), do NOT respawn
-                    # a second owner — just leave the dead tab down until the live one exits. Off-loop (blocking CIM).
-                    conflict = await asyncio.get_running_loop().run_in_executor(None, resume_conflict, s.cmd)
-                    if conflict:
-                        log(f"[heal] SKIP respawn of {s.name}: session {conflict[0]} already live (pid {conflict[1]}) — no double-open")
-                        continue
                     s.deaths.append(now)
-                    try: await spawn_session_off_loop(s); log(f"[heal] {s.name} shell died -> respawned + resume queued")
-                    except Exception as e: log(f"[heal] {s.name} respawn failed: {e}")
+                    _session, detail, created = await coordinate_session_request(
+                        {"t": "create", "s": s.name, "relaunch": True, "heal": True, "ids": s.ids},
+                        True,
+                    )
+                    if detail:
+                        log(f"[heal] SKIP respawn of {s.name}: {detail}")
+                    elif created:
+                        log(f"[heal] {s.name} shell died -> respawned + resume queued")
     asyncio.create_task(self_heal_tick())
 
     async def flush_out():
@@ -821,55 +1382,7 @@ async def main():
     async def local_serve():
         import websockets as _ws
         async def ensure_local_session(first, spawn_if_missing):
-            name = SAFE(first.get("s", ""))
-            if not name:
-                return None, "session name required", False
-            prev = sessions.get(name)
-            requested_cmd = (first.get("cmd", "") or "").strip()
-            requested_ids = first.get("ids") if isinstance(first.get("ids"), list) else []
-            requested_relaunch = bool(first.get("relaunch"))
-            requested_cwd = first.get("cwd", "") or ""
-            requested_heal = bool(first.get("heal")) if ("heal" in first) else bool(prev.heal if prev else False)
-            cols = int(first.get("cols") or (prev.cols if prev else 140))
-            rows = int(first.get("rows") or (prev.rows if prev else 40))
-            if prev and prev.alive() and not requested_relaunch and not needs_relaunch_for_command(prev, requested_cmd):
-                prev.heal = requested_heal
-                if requested_cmd and requested_cmd != prev.cmd:
-                    prev.cmd = requested_cmd
-                if requested_cwd:
-                    prev.cwd = requested_cwd
-                if first.get("cols"): prev.resize(cols, rows)
-                manifest_save()
-                return prev, "", False
-            if prev and not spawn_if_missing:
-                return prev, "", False
-            if not prev and not spawn_if_missing:
-                return None, "no such session: " + name, False
-
-            # Local `open` is an explicit user start/attach action. If a dormant placeholder has a
-            # saved resume command, reuse it; plain web tab selection still sends relay create{cmd:""}
-            # and remains stopped for unarmed sessions.
-            cmd = requested_cmd or (prev.cmd if prev else "")
-            cwd = requested_cwd or (prev.cwd if prev else "")
-            if requested_relaunch and not cmd:
-                return None, "no saved command for " + name, False
-            # GATE: opening/relaunching a session that is already live in a terminal (or another tab) is
-            # the double-open that loses conversations. Only refuse when THIS tab isn't the live one
-            # (a live prev is our own tab being relaunched — that's fine; we kill it below then respawn).
-            if (not prev) or (not prev.alive()):
-                conflict = resume_conflict(cmd, ids=requested_ids)
-                if conflict:
-                    return None, (f"refused: session {conflict[0]} is already live (pid {conflict[1]}) elsewhere — "
-                                  f"close it first. Opening a 2nd live copy is what loses conversations."), False
-            if prev:
-                prev.kill(by_user=False)
-            try:
-                s = await new_session_off_loop(name, cmd, cwd, cols, rows, loop, outq, heal=requested_heal)
-            except Exception as e:
-                return None, "spawn failed: " + str(e), False
-            sessions[name] = s
-            manifest_save()
-            return s, "", True
+            return await coordinate_session_request(first, spawn_if_missing)
 
         async def handler(ws):
             peer = str(getattr(ws, "remote_address", ""))
@@ -912,24 +1425,15 @@ async def main():
                     name = SAFE(first.get("s", ""))
                     if not name or name not in sessions:
                         await ws.send(json.dumps({"t": "err", "m": "no such session: " + name})); return
-                    sessions[name].kill(by_user=True)
-                    del sessions[name]
-                    manifest_save()
+                    ok, detail = await remove_session(name, by_user=True)
+                    if not ok:
+                        await ws.send(json.dumps({"t": "err", "m": detail})); return
                     await ws.send(json.dumps({"t": "killed", "s": name})); return
                 if first.get("t") == "owner":
                     name = SAFE(first.get("s", ""))
-                    if not name:
-                        await ws.send(json.dumps({"t": "err", "m": "session name required"})); return
-                    prev = sessions.get(name)
-                    if prev and prev.alive():
-                        if bool(getattr(prev, "owner", False)):
-                            await ws.send(json.dumps({"t": "err", "m": "session already has a visible local owner: " + name})); return
-                        prev.kill(by_user=False)
-                    owner = OwnerSession(name, first.get("cmd", ""), first.get("cwd", ""),
-                                         int(first.get("cols") or 140), int(first.get("rows") or 40),
-                                         loop, outq, ws, heal=bool(first.get("heal")))
-                    sessions[name] = owner
-                    manifest_save()
+                    owner, detail = await coordinate_owner_registration(first, ws)
+                    if owner is None:
+                        await ws.send(json.dumps({"t": "err", "m": detail})); return
                     await ws.send(json.dumps({"t": "owner-ok", "s": name, "alive": True}))
                     outq.put_nowait(("dead", name, ""))  # force relay session-list refresh
                     try:
@@ -945,6 +1449,7 @@ async def main():
                                 owner.cols = max(20, int(m.get("cols") or owner.cols))
                                 owner.rows = max(8, int(m.get("rows") or owner.rows))
                             elif mt == "dead":
+                                owner.owner_exit_confirmed = True
                                 owner.dead = True
                                 break
                     finally:
@@ -1026,6 +1531,19 @@ async def main():
                 async with websockets.connect(url, max_size=8_000_000, ping_interval=20, ping_timeout=15, open_timeout=8) as ws:
                     backoff = 1
                     log(f"connected to relay {cand}")
+                    stale_frames = 0
+                    while True:
+                        try:
+                            outq.get_nowait()
+                            stale_frames += 1
+                        except asyncio.QueueEmpty:
+                            break
+                    if stale_frames or outq.dropped:
+                        log(
+                            f"relay backlog reset on reconnect: stale={stale_frames} "
+                            f"dropped={outq.dropped}; session rings remain available for scrollback"
+                        )
+                        outq.dropped = 0
                     await ws.send(json.dumps({"t": "hello", "host": os.environ.get("COMPUTERNAME", "pc"),
                                               "protocol": PROTOCOL, "caps": CAPS, "sessions": sess_list()}))
 
@@ -1068,53 +1586,19 @@ async def main():
                             except Exception: continue
                             t, name = m.get("t"), SAFE(m.get("s", ""))
                             if t == "create" and name:
-                                prev = sessions.get(name)
-                                requested_cmd = (m.get("cmd", "") or "").strip()
-                                requested_ids = m.get("ids") if isinstance(m.get("ids"), list) else []
-                                requested_relaunch = bool(m.get("relaunch"))
-                                if prev and prev.alive() and not requested_relaunch and not needs_relaunch_for_command(prev, requested_cmd):
-                                    pass                                    # already hosted + alive
+                                _session, err, _created = await coordinate_session_request(
+                                    m, True, leave_unarmed_dormant=True
+                                )
+                                if err:
+                                    log(f"[{name}] create REFUSED: {err}")
+                                    await ws.send(json.dumps({
+                                        "t": "sessions",
+                                        "list": sess_list(),
+                                        "notice": err,
+                                    }))
                                 else:
-                                    prev = sessions.get(name)               # reviving a DEAD session → keep its cmd/cwd/size (don't wipe the resume)
-                                    requested_cmd = (m.get("cmd", "") or "").strip()
-                                    requested_relaunch = bool(m.get("relaunch"))
-                                    requested_heal = bool(m.get("heal")) if ("heal" in m) else bool(prev.heal if prev else False)
-                                    # Plain web attach to a dormant, unarmed placeholder sends create{cmd:""}.
-                                    # Do not translate that into "resume the saved command"; only an explicit
-                                    # Relaunch/Create request (non-empty cmd) or an armed watcher may start work.
-                                    if prev and prev.dead and not prev.heal and not requested_heal and not requested_cmd and not requested_relaunch:
-                                        if m.get("cols"): prev.cols = int(m.get("cols") or prev.cols)
-                                        if m.get("rows"): prev.rows = int(m.get("rows") or prev.rows)
-                                        log(f"[{name}] attach to dormant unarmed session - left stopped")
-                                        await ws.send(json.dumps({"t": "sessions", "list": sess_list()}))
-                                        continue
-                                    cmd = requested_cmd or (prev.cmd if prev else "")
-                                    cwd = m.get("cwd", "") or (prev.cwd if prev else "")
-                                    if requested_relaunch and not cmd:
-                                        log(f"[{name}] relaunch refused - no saved command")
-                                        await ws.send(json.dumps({"t": "sessions", "list": sess_list()}))
-                                        continue
-                                    cols = int(m.get("cols") or (prev.cols if prev else 140))
-                                    rows = int(m.get("rows") or (prev.rows if prev else 40))
-                                    heal = requested_heal
-                                    # GATE: refuse to spawn a 2nd live owner of a session already alive
-                                    # elsewhere (a live prev is our own tab being relaunched — allowed).
-                                    if (not prev) or (not prev.alive()):
-                                        conflict = resume_conflict(cmd, ids=requested_ids)
-                                        if conflict:
-                                            log(f"[{name}] create REFUSED: session {conflict[0]} already live (pid {conflict[1]}) — avoiding double-open")
-                                            await ws.send(json.dumps({"t": "sessions", "list": sess_list(),
-                                                "notice": f"'{name}' is already live elsewhere (pid {conflict[1]}). Close that copy first — a second one loses the conversation."}))
-                                            continue
-                                    if prev: prev.kill(by_user=False)
-                                    try:
-                                        sessions[name] = await new_session_off_loop(name, cmd, cwd, cols, rows, loop, outq, heal=heal)
-                                    except Exception as e:
-                                        log(f"[{name}] spawn failed: {e}")
-                                        await ws.send(json.dumps({"t": "sessions", "list": sess_list()}))
-                                        continue
-                                    manifest_save()
-                                await ws.send(json.dumps({"t": "sessions", "list": sess_list()}))
+                                    await ws.send(json.dumps({"t": "sessions", "list": sess_list()}))
+                                continue
                             elif t == "heal" and name in sessions:
                                 sessions[name].heal = bool(m.get("on")); manifest_save()
                             elif t == "i" and name in sessions:
@@ -1137,8 +1621,10 @@ async def main():
                                 await ws.send(json.dumps({"t": "tailr", "rid": m.get("rid", ""),
                                                           "text": sessions[name].tail_text(nbytes=200000, lines=int(m.get("lines") or 40))}))
                             elif t == "kill" and name in sessions:
-                                sessions[name].kill(by_user=True)
-                                del sessions[name]; manifest_save()
+                                ok, detail = await remove_session(name, by_user=True)
+                                if not ok:
+                                    await ws.send(json.dumps({"t": "sessions", "list": sess_list(), "notice": detail}))
+                                    continue
                                 await ws.send(json.dumps({"t": "killed", "s": name}))
                                 await ws.send(json.dumps({"t": "sessions", "list": sess_list()}))
                     finally:

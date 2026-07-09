@@ -72,6 +72,43 @@ async def create_while_hammering_info(port, name, cmd, timeout=14):
     return created, samples
 
 
+async def concurrent_requests(port, payloads, timeout=14):
+    return await asyncio.gather(
+        *(request_json(port, payload, timeout=timeout) for payload in payloads)
+    )
+
+
+async def owner_collision(port, name, cmd, timeout=14):
+    first = await websockets.connect(
+        f"ws://127.0.0.1:{port}",
+        open_timeout=timeout,
+        close_timeout=1,
+        ping_interval=None,
+    )
+    try:
+        await first.send(json.dumps({
+            "t": "owner",
+            "s": name,
+            "cmd": cmd,
+            "ownerKey": "a" * 32,
+        }))
+        first_response = json.loads(await asyncio.wait_for(first.recv(), timeout))
+        second_response = await request_json(
+            port,
+            {
+                "t": "owner",
+                "s": name,
+                "cmd": cmd,
+                "ownerKey": "b" * 32,
+            },
+            timeout=timeout,
+        )
+        await first.send(json.dumps({"t": "dead"}))
+        return first_response, second_response
+    finally:
+        await first.close()
+
+
 class DisposableMuxd:
     def __init__(self):
         self.root = Path(tempfile.mkdtemp(prefix="muxd-it-"))
@@ -86,6 +123,7 @@ class DisposableMuxd:
                     f"LOCAL_PORT={self.port}",
                     f"INSTANCE_MUTEX_NAME=Local\\CodexMuxdTest-{self.port}",
                     f"DEFAULT_CWD={self.root}",
+                    f"LAUNCH_CLAIM_ROOT={self.root / 'launch-claims'}",
                     "LOCAL_FIRST_TIMEOUT=5",
                     "LOOP_WATCHDOG_WARN=120",
                     "",
@@ -238,6 +276,82 @@ class MuxdLocalIntegrationTests(unittest.TestCase):
             self.assertNotEqual(before.get("created"), after.get("created"))
             self.assertEqual(before.get("cmdSig"), after.get("cmdSig"))
             self.assertTrue(after.get("hasCommand"))
+        finally:
+            self.kill(name)
+
+    def test_concurrent_create_has_exactly_one_winner(self):
+        name = "it-concurrent-create"
+        marker = f"MUXD_IT_CONCURRENT_{int(time.time() * 1000)}"
+        cmd = f"Write-Output '{marker}'; # codex resume concurrent-create-session"
+        self.kill(name)
+        try:
+            results = asyncio.run(
+                concurrent_requests(
+                    self.muxd.port,
+                    [
+                        {"t": "create", "s": name, "cmd": cmd, "ids": ["concurrent-create-session"]},
+                        {"t": "create", "s": name, "cmd": cmd, "ids": ["concurrent-create-session"]},
+                    ],
+                )
+            )
+
+            winners = [r for r in results if r.get("created") is True]
+            self.assertEqual(1, len(winners), f"concurrent create must have one winner: {results!r}")
+            self.wait_for_tail(name, marker)
+        finally:
+            self.kill(name)
+
+    def test_visible_owner_registration_has_one_identity_owner(self):
+        name = "it-owner-claim"
+        cmd = "codex resume it-owner-identity"
+        self.kill(name)
+        try:
+            first, second = asyncio.run(owner_collision(self.muxd.port, name, cmd))
+
+            self.assertEqual("owner-ok", first.get("t"), first)
+            self.assertEqual("err", second.get("t"), second)
+            self.assertIn("visible local owner", second.get("m", ""))
+        finally:
+            self.kill(name)
+
+    def test_relaunch_waits_until_previous_process_exits(self):
+        name = "it-relaunch-exit-barrier"
+        marker = f"MUXD_IT_EXIT_BARRIER_{int(time.time() * 1000)}"
+        pid_file = self.muxd.root / "previous-pid.txt"
+        overlap_file = self.muxd.root / "overlap.txt"
+        pid_ps = pid_file.as_posix().replace("'", "''")
+        overlap_ps = overlap_file.as_posix().replace("'", "''")
+        cmd = (
+            f"$old=0; if(Test-Path -LiteralPath '{pid_ps}'){{"
+            f"$old=[int](Get-Content -LiteralPath '{pid_ps}');"
+            f"if(Get-Process -Id $old -ErrorAction SilentlyContinue){{"
+            f"Set-Content -LiteralPath '{overlap_ps}' -Value 'overlap'}}}};"
+            f"Set-Content -LiteralPath '{pid_ps}' -Value $PID;"
+            f"Write-Output '{marker}'; while($true){{Start-Sleep -Milliseconds 200}}"
+        )
+        self.kill(name)
+        for path in (pid_file, overlap_file):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+        try:
+            first = run_request(self.muxd.port, {"t": "create", "s": name, "cmd": cmd}, timeout=12)
+            self.assertTrue(first.get("created"))
+            self.wait_for_tail(name, marker)
+            deadline = time.time() + 5
+            while time.time() < deadline and not pid_file.exists():
+                time.sleep(0.05)
+            self.assertTrue(pid_file.exists(), "first writer did not publish its PID")
+
+            second = run_request(self.muxd.port, {"t": "create", "s": name, "relaunch": True}, timeout=12)
+            self.assertTrue(second.get("created"))
+            self.wait_for_tail(name, marker)
+
+            self.assertFalse(
+                overlap_file.exists(),
+                "replacement started while the previous PowerShell writer was still alive",
+            )
         finally:
             self.kill(name)
 
