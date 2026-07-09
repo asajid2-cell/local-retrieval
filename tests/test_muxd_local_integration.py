@@ -140,6 +140,7 @@ class DisposableMuxd:
         self.env["PYTHONUNBUFFERED"] = "1"
         self.env["INSTANCE_MUTEX_NAME"] = f"Local\\CodexMuxdTest-{self.port}"
         self.env["MUXCTL_PORT"] = str(self.port)
+        self.env["MUXD_TEST_PERSIST_FAULT_FILE"] = str(self.root / "persist-fault.json")
         self.start_process()
 
     def start_process(self):
@@ -187,6 +188,12 @@ class DisposableMuxd:
         if log_path.exists():
             log_tail = "\n".join(log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-40:])
         return f"{reason}\nlog:\n{log_tail}"
+
+    def fail_persistence(self, stage, file="sessions.json"):
+        (self.root / "persist-fault.json").write_text(
+            json.dumps({"file": file, "stage": stage}),
+            encoding="utf-8",
+        )
 
     def close(self):
         self.stop_process()
@@ -531,6 +538,85 @@ class MuxdLocalIntegrationTests(unittest.TestCase):
 
         self.assertEqual(killed.get("t"), "killed")
         self.assertIsNone(self.session(name))
+
+    def test_create_is_not_acknowledged_and_spawn_is_reaped_when_manifest_commit_fails(self):
+        name = "it-create-persist-fail"
+        self.kill(name)
+        self.muxd.fail_persistence("before_write")
+
+        result = run_request(
+            self.muxd.port,
+            {
+                "t": "create",
+                "s": name,
+                "cmd": "while($true){Start-Sleep -Milliseconds 200}",
+            },
+            timeout=12,
+        )
+
+        self.assertEqual("err", result.get("t"), result)
+        self.assertIn("durably record spawned session", result.get("m", ""))
+        self.assertIsNone(self.session(name))
+        self.muxd.restart()
+        self.assertIsNone(self.session(name))
+
+    def test_kill_does_not_stop_or_ack_when_tombstone_commit_fails(self):
+        name = "it-kill-persist-fail"
+        self.kill(name)
+        created = run_request(
+            self.muxd.port,
+            {
+                "t": "create",
+                "s": name,
+                "cmd": "while($true){Start-Sleep -Milliseconds 200}",
+            },
+            timeout=12,
+        )
+        self.assertTrue(created.get("created"), created)
+        self.muxd.fail_persistence("before_write")
+
+        result = run_request(self.muxd.port, {"t": "kill", "s": name}, timeout=8)
+
+        self.assertEqual("err", result.get("t"), result)
+        self.assertIn("durably record session stop", result.get("m", ""))
+        self.assertTrue(self.session(name).get("alive"))
+        self.kill(name)
+
+    def test_bind_rolls_back_identity_when_manifest_commit_fails(self):
+        name = "it-bind-persist-fail"
+        self.kill(name)
+        try:
+            created = run_request(
+                self.muxd.port,
+                {
+                    "t": "create",
+                    "s": name,
+                    "cmd": "while($true){Start-Sleep -Milliseconds 200}",
+                    "identityPending": True,
+                },
+                timeout=12,
+            )
+            self.assertTrue(created.get("created"), created)
+            self.muxd.fail_persistence("before_write")
+
+            result = run_request(
+                self.muxd.port,
+                {
+                    "t": "bind",
+                    "s": name,
+                    "cmd": "Write-Output bound; # codex resume durable-bind-id",
+                    "sessionId": "durable-bind-id",
+                },
+                timeout=12,
+            )
+
+            self.assertEqual("err", result.get("t"), result)
+            self.assertIn("durably bind session identity", result.get("m", ""))
+            current = self.session(name)
+            self.assertTrue(current.get("identityPending"))
+            self.assertEqual("", current.get("sessionId"))
+        finally:
+            self.kill(name)
 
     def test_attach_stream_accepts_input_and_returns_output(self):
         name = "it-attach-io"

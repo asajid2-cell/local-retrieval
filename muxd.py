@@ -30,6 +30,115 @@ ENVF = os.path.join(DIR, "muxd.env")
 # a shell-launched agent be added to a collection / relaunched by its real chat id.
 LIVE_TABS = os.path.join(DIR, "live-tabs.json")
 
+_DURABLE_TEMP_SEQUENCE = 0
+
+def _durable_checkpoint(fault, stage):
+    if fault is not None:
+        fault(stage)
+    fault_file = os.environ.get("MUXD_TEST_PERSIST_FAULT_FILE", "")
+    if not fault_file or not os.path.exists(fault_file):
+        return
+    try:
+        with open(fault_file, encoding="utf-8") as stream:
+            requested = json.load(stream)
+    except Exception:
+        return
+    if (
+        isinstance(requested, dict)
+        and requested.get("stage") == stage
+        and (not requested.get("file") or requested.get("file") == os.path.basename(MANIFEST))
+    ):
+        try:
+            os.remove(fault_file)
+        except OSError:
+            pass
+        raise OSError(f"injected persistence failure at {stage} for {os.path.basename(MANIFEST)}")
+
+def _replace_write_through(source, destination):
+    if os.name != "nt":
+        os.replace(source, destination)
+        return
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    move = kernel32.MoveFileExW
+    move.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD]
+    move.restype = wintypes.BOOL
+    flags = 0x1 | 0x8  # MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH
+    if not move(source, destination, flags):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+def _fsync_directory(directory):
+    if os.name == "nt":
+        return
+    fd = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+def _durable_commit_bytes(path, payload, fault=None):
+    global _DURABLE_TEMP_SEQUENCE
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    _DURABLE_TEMP_SEQUENCE += 1
+    tmp = f"{path}.{os.getpid()}.{_DURABLE_TEMP_SEQUENCE}.tmp"
+    try:
+        _durable_checkpoint(fault, "before_write")
+        with open(tmp, "xb", buffering=0) as stream:
+            stream.write(payload)
+            _durable_checkpoint(fault, "before_file_fsync")
+            os.fsync(stream.fileno())
+        _durable_checkpoint(fault, "before_replace")
+        _replace_write_through(tmp, path)
+        _durable_checkpoint(fault, "before_directory_fsync")
+        _fsync_directory(directory)
+        _durable_checkpoint(fault, "before_readback")
+        with open(path, "rb") as stream:
+            committed = stream.read()
+        if committed != payload:
+            raise OSError("committed state did not read back identically: " + path)
+    finally:
+        try:
+            os.remove(tmp)
+        except FileNotFoundError:
+            pass
+
+def durable_json_write(path, value, fault=None):
+    payload = json.dumps(value, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    if os.path.exists(path):
+        with open(path, "rb") as stream:
+            previous = stream.read()
+        _durable_commit_bytes(path + ".bak", previous)
+    _durable_commit_bytes(path, payload, fault=fault)
+
+def _decode_persisted_json(path, payload):
+    try:
+        return json.loads(payload.decode("utf-8"))
+    except Exception as exc:
+        raise OSError("invalid persisted JSON: " + path) from exc
+
+def durable_json_load(path, fallback):
+    if os.path.exists(path):
+        try:
+            with open(path, "rb") as stream:
+                return _decode_persisted_json(path, stream.read())
+        except OSError as primary_error:
+            backup = path + ".bak"
+            if not os.path.exists(backup):
+                raise primary_error
+            with open(backup, "rb") as stream:
+                backup_payload = stream.read()
+            restored = _decode_persisted_json(backup, backup_payload)
+            _durable_commit_bytes(path, backup_payload)
+            return restored
+    backup = path + ".bak"
+    if os.path.exists(backup):
+        with open(backup, "rb") as stream:
+            backup_payload = stream.read()
+        restored = _decode_persisted_json(backup, backup_payload)
+        _durable_commit_bytes(path, backup_payload)
+        return restored
+    return fallback
+
 # ---- SINGLE-OWNER GATE ---------------------------------------------------------------------------
 # A session's transcript is safe ONLY while exactly one live agent owns it. Two live processes on the
 # same session id is what silently freezes/truncates a Claude conversation. muxd must therefore NEVER
@@ -958,25 +1067,61 @@ def start_watchdog_thread():
 
     threading.Thread(target=run, name="muxd-watchdog", daemon=True).start()
 
-def manifest_save():
-    try:
-        data = {n: {"cmd": s.cmd, "cwd": s.cwd, "cols": s.cols, "rows": s.rows, "heal": s.heal,
-                    "sessionId": getattr(s, "session_id", "") or "",
-                    "aliases": list(getattr(s, "aliases", []) or []),
-                    "ids": list(getattr(s, "ids", []) or []),
-                    "owner": bool(getattr(s, "owner", False) or getattr(s, "expected_owner", False)),
-                    "ownerKey": str(getattr(s, "owner_key", "") or ""),
-                    "identityPending": bool(getattr(s, "identity_pending", False)),
-                    "deaths": [float(value) for value in list(getattr(s, "deaths", []) or [])[-16:]]}
-                for n, s in sessions.items() if not s.user_killed}
-        tmp = MANIFEST + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f: json.dump(data, f)
-        os.replace(tmp, MANIFEST)
-    except Exception as e: log(f"manifest save failed: {e}")
+def manifest_payload(source=None):
+    source = sessions if source is None else source
+    return {
+        n: {"cmd": s.cmd, "cwd": s.cwd, "cols": s.cols, "rows": s.rows, "heal": s.heal,
+            "sessionId": getattr(s, "session_id", "") or "",
+            "aliases": list(getattr(s, "aliases", []) or []),
+            "ids": list(getattr(s, "ids", []) or []),
+            "owner": bool(getattr(s, "owner", False) or getattr(s, "expected_owner", False)),
+            "ownerKey": str(getattr(s, "owner_key", "") or ""),
+            "identityPending": bool(getattr(s, "identity_pending", False)),
+            "deaths": [float(value) for value in list(getattr(s, "deaths", []) or [])[-16:]]}
+        for n, s in source.items() if not s.user_killed
+    }
+
+def manifest_save(source=None):
+    durable_json_write(MANIFEST, manifest_payload(source))
 
 def manifest_load():
-    try: return json.load(open(MANIFEST, encoding="utf-8"))
-    except Exception: return {}
+    return durable_json_load(MANIFEST, {})
+
+_PERSISTED_SESSION_FIELDS = (
+    "cmd",
+    "cwd",
+    "cols",
+    "rows",
+    "heal",
+    "session_id",
+    "aliases",
+    "ids",
+    "owner",
+    "expected_owner",
+    "owner_key",
+    "identity_pending",
+    "deaths",
+    "user_killed",
+)
+
+def persisted_session_snapshot(session):
+    snapshot = {}
+    for field in _PERSISTED_SESSION_FIELDS:
+        value = getattr(session, field, None)
+        if isinstance(value, list):
+            value = list(value)
+        elif isinstance(value, tuple):
+            value = tuple(value)
+        snapshot[field] = value
+    snapshot["_launch_claim"] = getattr(session, "_launch_claim", None)
+    snapshot["claim_paths"] = list(getattr(session, "claim_paths", []) or [])
+    return snapshot
+
+def restore_persisted_session(session, snapshot):
+    for field in _PERSISTED_SESSION_FIELDS:
+        setattr(session, field, snapshot[field])
+    session._launch_claim = snapshot["_launch_claim"]
+    session.claim_paths = list(snapshot["claim_paths"])
 
 def live_tabs_snapshot():
     out = {}
@@ -1001,9 +1146,7 @@ def live_tabs_snapshot():
 
 def write_live_tabs():
     try:
-        tmp = LIVE_TABS + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f: json.dump(live_tabs_snapshot(), f)
-        os.replace(tmp, LIVE_TABS)
+        durable_json_write(LIVE_TABS, live_tabs_snapshot())
     except Exception as e:
         log(f"live-tabs write failed: {e}")
 
@@ -1261,12 +1404,22 @@ async def main():
             current = sessions.get(name)
             if current is None:
                 return False, "no such session: " + name
+            candidate = dict(sessions)
+            candidate.pop(name, None)
+            try:
+                manifest_save(candidate)
+            except Exception as e:
+                return False, "could not durably record session stop: " + str(e)
             ok, detail = await terminate_session_off_loop(current, by_user=by_user)
             if not ok:
+                current.user_killed = False
+                try:
+                    manifest_save(sessions)
+                except Exception as restore_error:
+                    return False, detail + "; manifest rollback also failed: " + str(restore_error)
                 return False, detail
             if sessions.get(name) is current:
                 del sessions[name]
-            manifest_save()
             return True, detail
 
     async def reserve_launch_claim(name, cmd, candidate_ids, prev=None, ignored_live_override=None):
@@ -1353,10 +1506,21 @@ async def main():
             claim, preserve_existing_claim, claim_detail = await reserve_launch_claim(
                 name, cmd, candidate_ids, prev, ignored_live_override=ignored_live_override
             )
+            existing_claim = getattr(prev, "_launch_claim", None) if prev else None
             if candidate_ids and claim is None:
                 return None, claim_detail or "could not reserve visible owner"
 
+            tombstoned = False
             if prev and not reconnect:
+                candidate = dict(sessions)
+                candidate.pop(name, None)
+                try:
+                    manifest_save(candidate)
+                    tombstoned = True
+                except Exception as e:
+                    if claim is not existing_claim and claim is not None:
+                        claim.release()
+                    return None, "could not durably reserve owner replacement: " + str(e)
                 ok, detail = await terminate_session_off_loop(
                     prev,
                     by_user=False,
@@ -1387,8 +1551,20 @@ async def main():
             )
             owner._launch_claim = claim
             owner.claim_paths = list(claim.paths) if claim is not None else []
+            candidate = dict(sessions)
+            candidate[name] = owner
+            try:
+                manifest_save(candidate)
+            except Exception as e:
+                if claim is not existing_claim and claim is not None:
+                    claim.release()
+                if preserve_existing_claim and prev is not None:
+                    prev._launch_claim = existing_claim
+                    prev.claim_paths = list(existing_claim.paths) if existing_claim is not None else []
+                if tombstoned and sessions.get(name) is prev:
+                    del sessions[name]
+                return None, "could not durably register visible owner: " + str(e)
             sessions[name] = owner
-            manifest_save()
             return owner, ""
 
     async def coordinate_session_request(first, spawn_if_missing, leave_unarmed_dormant=False):
@@ -1428,6 +1604,8 @@ async def main():
                 claim, _, claim_detail = await reserve_launch_claim(name, cmd, candidate_ids, prev)
                 if candidate_ids and claim is None:
                     return None, claim_detail or "could not reserve running session ownership", False
+                snapshot = persisted_session_snapshot(prev)
+                old_claim = snapshot["_launch_claim"]
                 prev.heal = requested_heal
                 if requested_cmd and requested_cmd != prev.cmd:
                     prev.cmd = requested_cmd
@@ -1441,8 +1619,19 @@ async def main():
                 if requested_cwd:
                     prev.cwd = requested_cwd
                 if first.get("cols"):
+                    prev.cols = cols
+                    prev.rows = rows
+                try:
+                    manifest_save()
+                except Exception as e:
+                    restore_persisted_session(prev, snapshot)
+                    if claim is not None and claim is not old_claim:
+                        claim.release()
+                    return None, "could not durably update session: " + str(e), False
+                if old_claim is not None and old_claim is not claim:
+                    old_claim.release()
+                if first.get("cols"):
                     prev.resize(cols, rows)
-                manifest_save()
                 return prev, "", False
             if prev and not spawn_if_missing:
                 return prev, "", False
@@ -1480,12 +1669,25 @@ async def main():
                 return None, claim_detail or "could not reserve session launch", False
 
             if prev:
+                candidate = dict(sessions)
+                candidate.pop(name, None)
+                try:
+                    manifest_save(candidate)
+                except Exception as e:
+                    if claim is not existing_claim and claim is not None:
+                        claim.release()
+                    return None, "could not durably reserve session replacement: " + str(e), False
                 ok, detail = await terminate_session_off_loop(
                     prev,
                     by_user=False,
                     release_claim_on_success=not preserve_existing_claim,
                 )
                 if not ok:
+                    prev.user_killed = False
+                    try:
+                        manifest_save(sessions)
+                    except Exception as restore_error:
+                        detail += "; manifest rollback also failed: " + str(restore_error)
                     if claim is not existing_claim and claim is not None:
                         claim.release()
                     return None, "previous session did not exit: " + detail, False
@@ -1507,8 +1709,17 @@ async def main():
             created.claim_paths = list(claim.paths) if claim is not None else []
             created.identity_pending = requested_identity_pending
             created.deaths = prior_deaths
+            candidate = dict(sessions)
+            candidate[name] = created
+            try:
+                manifest_save(candidate)
+            except Exception as e:
+                stopped, stop_detail = await terminate_session_off_loop(created, by_user=False)
+                if not stopped:
+                    sessions[name] = created
+                    return None, "manifest commit failed and spawned session could not be stopped: " + stop_detail, False
+                return None, "could not durably record spawned session: " + str(e), False
             sessions[name] = created
-            manifest_save()
             return created, "", True
 
     async def bind_session_identity(first):
@@ -1559,9 +1770,8 @@ async def main():
             if claim is None:
                 return None, claim_detail or "could not reserve captured session identity"
 
-            old_claim = getattr(current, "_launch_claim", None)
-            if old_claim is not None and old_claim is not claim:
-                old_claim.release()
+            snapshot = persisted_session_snapshot(current)
+            old_claim = snapshot["_launch_claim"]
             current.cmd = cmd
             current.session_id = canonical_id
             current.aliases = identity_aliases
@@ -1569,7 +1779,15 @@ async def main():
             current._launch_claim = claim
             current.claim_paths = list(claim.paths)
             current.identity_pending = False
-            manifest_save()
+            try:
+                manifest_save()
+            except Exception as e:
+                restore_persisted_session(current, snapshot)
+                if claim is not old_claim:
+                    claim.release()
+                return None, "could not durably bind session identity: " + str(e)
+            if old_claim is not None and old_claim is not claim:
+                old_claim.release()
             return current, ""
 
     async def loop_monitor():
@@ -1955,7 +2173,19 @@ async def main():
                                 if bool(m.get("on")) and getattr(sessions[name], "identity_pending", False):
                                     log(f"[{name}] refused auto-resume while fresh identity is pending")
                                 else:
-                                    sessions[name].heal = bool(m.get("on")); manifest_save()
+                                    session = sessions[name]
+                                    previous = session.heal
+                                    session.heal = bool(m.get("on"))
+                                    try:
+                                        manifest_save()
+                                    except Exception as e:
+                                        session.heal = previous
+                                        log(f"[{name}] heal persistence failed: {e}")
+                                        await ws.send(json.dumps({
+                                            "t": "sessions",
+                                            "list": sess_list(),
+                                            "notice": "auto-resume policy was not persisted",
+                                        }))
                             elif t == "i" and name in sessions:
                                 sessions[name].write(base64.b64decode(m.get("d", "")))
                             elif t == "resize" and name in sessions:
@@ -1970,7 +2200,23 @@ async def main():
                             elif t == "rename" and name in sessions:
                                 to = strict_mux_name(m.get("to", ""))
                                 if to and to not in sessions:
-                                    s = sessions.pop(name); s.name = to; sessions[to] = s; manifest_save()
+                                    s = sessions[name]
+                                    candidate = dict(sessions)
+                                    candidate.pop(name)
+                                    candidate[to] = s
+                                    try:
+                                        manifest_save(candidate)
+                                    except Exception as e:
+                                        log(f"[{name}] rename persistence failed: {e}")
+                                        await ws.send(json.dumps({
+                                            "t": "sessions",
+                                            "list": sess_list(),
+                                            "notice": "session rename was not persisted",
+                                        }))
+                                        continue
+                                    sessions.pop(name)
+                                    s.name = to
+                                    sessions[to] = s
                                     await ws.send(json.dumps({"t": "sessions", "list": sess_list()}))
                             elif t == "tail" and name in sessions:
                                 await ws.send(json.dumps({"t": "tailr", "rid": m.get("rid", ""),

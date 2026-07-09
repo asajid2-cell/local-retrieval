@@ -36,6 +36,63 @@ class FakeSession:
 
 
 class MuxdStateTests(unittest.TestCase):
+    def test_durable_json_write_preserves_previous_state_on_precommit_failures(self):
+        with tempfile.TemporaryDirectory(prefix="muxd-durable-") as root:
+            path = os.path.join(root, "state.json")
+            original = json.dumps({"version": 1}, separators=(",", ":")).encode("utf-8")
+            with open(path, "wb") as stream:
+                stream.write(original)
+
+            for failed_stage in ("before_write", "before_file_fsync", "before_replace"):
+                def fault(stage, expected=failed_stage):
+                    if stage == expected:
+                        raise OSError("injected " + stage)
+
+                with self.assertRaisesRegex(OSError, "injected " + failed_stage):
+                    muxd.durable_json_write(path, {"version": 2}, fault=fault)
+                with open(path, "rb") as stream:
+                    self.assertEqual(original, stream.read())
+                self.assertFalse(any(name.endswith(".tmp") for name in os.listdir(root)))
+
+    def test_durable_json_write_fails_closed_after_replace_uncertainty(self):
+        with tempfile.TemporaryDirectory(prefix="muxd-durable-") as root:
+            path = os.path.join(root, "state.json")
+            with open(path, "w", encoding="utf-8") as stream:
+                json.dump({"version": 1}, stream)
+
+            def fail_directory_fsync(stage):
+                if stage == "before_directory_fsync":
+                    raise OSError("injected directory fsync")
+
+            with self.assertRaisesRegex(OSError, "injected directory fsync"):
+                muxd.durable_json_write(path, {"version": 2}, fault=fail_directory_fsync)
+            with open(path, encoding="utf-8") as stream:
+                self.assertEqual({"version": 2}, json.load(stream))
+            with open(path + ".bak", encoding="utf-8") as stream:
+                self.assertEqual({"version": 1}, json.load(stream))
+
+            def corrupt_readback(stage):
+                if stage == "before_readback":
+                    with open(path, "w", encoding="utf-8") as stream:
+                        json.dump({"version": 999}, stream)
+
+            with self.assertRaisesRegex(OSError, "committed state did not read back identically"):
+                muxd.durable_json_write(path, {"version": 3}, fault=corrupt_readback)
+            with open(path + ".bak", encoding="utf-8") as stream:
+                self.assertEqual({"version": 2}, json.load(stream))
+
+    def test_durable_json_load_restores_corrupt_primary_from_backup(self):
+        with tempfile.TemporaryDirectory(prefix="muxd-durable-") as root:
+            path = os.path.join(root, "state.json")
+            with open(path, "w", encoding="utf-8") as stream:
+                stream.write('{"broken"')
+            with open(path + ".bak", "w", encoding="utf-8") as stream:
+                json.dump({"version": 7}, stream)
+
+            self.assertEqual({"version": 7}, muxd.durable_json_load(path, {"version": 0}))
+            with open(path, encoding="utf-8") as stream:
+                self.assertEqual({"version": 7}, json.load(stream))
+
     def test_launch_claim_filename_matches_csharp_contract(self):
         self.assertEqual(
             "Parent-ID_123-76d41cbf4b150c76.claim.json",
