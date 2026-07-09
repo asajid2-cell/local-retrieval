@@ -84,6 +84,7 @@ class DisposableMuxd:
                     "MUX_HOST_TOKEN=test-token",
                     "RELAY_LAN=ws://127.0.0.1:1/host",
                     f"LOCAL_PORT={self.port}",
+                    f"INSTANCE_MUTEX_NAME=Local\\CodexMuxdTest-{self.port}",
                     f"DEFAULT_CWD={self.root}",
                     "LOCAL_FIRST_TIMEOUT=1",
                     "LOOP_WATCHDOG_WARN=120",
@@ -98,6 +99,7 @@ class DisposableMuxd:
         env["HOMEDRIVE"] = self.root.drive or "C:"
         env["HOMEPATH"] = str(self.root)[len(self.root.drive) :] if self.root.drive else str(self.root)
         env["PYTHONUNBUFFERED"] = "1"
+        env["INSTANCE_MUTEX_NAME"] = f"Local\\CodexMuxdTest-{self.port}"
         self.proc = subprocess.Popen(
             [sys.executable, str(MUXD)],
             cwd=str(REPO),

@@ -215,7 +215,7 @@ def _guardian_keepalive():
         time.sleep(30)
 
 LOG_Q = queue.Queue(maxsize=4000)
-INSTANCE_MUTEX_NAME = "Local\\CodexMuxdSessionHost"
+INSTANCE_MUTEX_NAME = os.environ.get("INSTANCE_MUTEX_NAME", "Local\\CodexMuxdSessionHost")
 _INSTANCE_MUTEX_HANDLE = None
 
 def _log_writer():
