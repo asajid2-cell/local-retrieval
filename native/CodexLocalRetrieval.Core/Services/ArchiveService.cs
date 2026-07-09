@@ -166,46 +166,115 @@ public sealed class ArchiveService
         var loadPath = File.Exists(_storePath) ? _storePath : _bundledStorePath;
         if (File.Exists(loadPath))
         {
-            // The store can be tens of MB. Read + deserialize OFF the calling (UI) thread, straight from
-            // the file stream (no giant intermediate string), so launch never blocks the UI.
-            Store = await Task.Run(() =>
-            {
-                using var fs = File.OpenRead(loadPath);
-                var data = JsonSerializer.Deserialize<AppStoreData>(fs, _jsonOptions) ?? new AppStoreData();
-                // A store written before the metadata-only change still has full (uncapped) Text; cap it in
-                // memory so even the first load is light. Next save persists the capped form.
-                foreach (var s in data.Sessions.Values)
-                    if (s.Text.Length > SearchTextCap) s.Text = s.Text[..SearchTextCap];
-                return data;
-            }) ?? new AppStoreData();
+            Store = await LoadStoreWithRecoveryAsync(loadPath);
         }
         NormalizeSettings();
         EnsureDecks();
         RefreshSessions(OrderedVisibleSessions(Store.Sessions.Values));
     }
 
+    private async Task<AppStoreData> LoadStoreWithRecoveryAsync(string loadPath)
+    {
+        return await Task.Run(async () =>
+        {
+            try
+            {
+                return ReadStore(loadPath);
+            }
+            catch (Exception primaryError) when (string.Equals(loadPath, _storePath, StringComparison.OrdinalIgnoreCase))
+            {
+                foreach (var backup in StoreBackupFiles())
+                {
+                    try
+                    {
+                        var bytes = File.ReadAllBytes(backup);
+                        var recovered = ReadStore(bytes, backup);
+                        var corruptBackup = Path.Combine(
+                            StoreBackupsDir,
+                            "corrupt-app-store-" + DateTime.UtcNow.ToString("yyyyMMdd-HHmmss-fff") + "-"
+                            + Guid.NewGuid().ToString("N") + ".json");
+                        await DurableFileStore.WriteAtomicAsync(_storePath, bytes, corruptBackup);
+                        return recovered;
+                    }
+                    catch
+                    {
+                        // Try the next older verified generation.
+                    }
+                }
+
+                throw new InvalidDataException(
+                    "The app store is corrupt and no valid durable backup could be recovered.",
+                    primaryError);
+            }
+        });
+    }
+
+    private AppStoreData ReadStore(string path)
+    {
+        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+        var data = JsonSerializer.Deserialize<AppStoreData>(stream, _jsonOptions)
+            ?? throw new InvalidDataException("App store deserialized to null: " + path);
+        NormalizeLoadedStore(data);
+        return data;
+    }
+
+    private AppStoreData ReadStore(byte[] bytes, string source)
+    {
+        var data = JsonSerializer.Deserialize<AppStoreData>(bytes, _jsonOptions)
+            ?? throw new InvalidDataException("App store deserialized to null: " + source);
+        NormalizeLoadedStore(data);
+        return data;
+    }
+
+    private static void NormalizeLoadedStore(AppStoreData data)
+    {
+        foreach (var session in data.Sessions.Values)
+            if (session.Text.Length > SearchTextCap) session.Text = session.Text[..SearchTextCap];
+    }
+
+    private IEnumerable<string> StoreBackupFiles() =>
+        Directory.Exists(StoreBackupsDir)
+            ? Directory.EnumerateFiles(StoreBackupsDir, "app-store-*.json")
+                .OrderByDescending(File.GetLastWriteTimeUtc)
+            : Array.Empty<string>();
+
     // Read ONLY the top-level Settings object straight from the store file, WITHOUT materializing the
     // (tens-of-MB) session index — so the always-on light headless server can learn its multiplex SSH
     // target/port for the remote bridge and still stay ~40MB. Returns defaults if the store is absent.
     public ArchiveSettings ReadSettingsOnly()
     {
+        var loadPath = File.Exists(_storePath) ? _storePath : _bundledStorePath;
+        if (!File.Exists(loadPath)) return new ArchiveSettings();
         try
         {
-            var loadPath = File.Exists(_storePath) ? _storePath : _bundledStorePath;
-            if (!File.Exists(loadPath)) return new ArchiveSettings();
-            var bytes = File.ReadAllBytes(loadPath);
-            var reader = new Utf8JsonReader(bytes);
-            while (reader.Read())
-            {
-                if (reader.TokenType == JsonTokenType.PropertyName && reader.CurrentDepth == 1
-                    && string.Equals(reader.GetString(), "Settings", StringComparison.OrdinalIgnoreCase))
-                {
-                    reader.Read();   // advance onto the value (StartObject)
-                    return JsonSerializer.Deserialize<ArchiveSettings>(ref reader, _jsonOptions) ?? new ArchiveSettings();
-                }
-            }
+            return ReadSettingsOnlyFrom(loadPath);
         }
-        catch { }
+        catch (Exception primaryError) when (string.Equals(loadPath, _storePath, StringComparison.OrdinalIgnoreCase))
+        {
+            foreach (var backup in StoreBackupFiles())
+            {
+                try { return ReadSettingsOnlyFrom(backup); }
+                catch { }
+            }
+            throw new InvalidDataException(
+                "The app store settings are corrupt and no valid durable backup could be read.",
+                primaryError);
+        }
+    }
+
+    private ArchiveSettings ReadSettingsOnlyFrom(string path)
+    {
+        var bytes = File.ReadAllBytes(path);
+        var reader = new Utf8JsonReader(bytes);
+        while (reader.Read())
+        {
+            if (reader.TokenType != JsonTokenType.PropertyName || reader.CurrentDepth != 1
+                || !string.Equals(reader.GetString(), "Settings", StringComparison.OrdinalIgnoreCase))
+                continue;
+            reader.Read();
+            return JsonSerializer.Deserialize<ArchiveSettings>(ref reader, _jsonOptions)
+                ?? throw new InvalidDataException("Settings deserialized to null: " + path);
+        }
         return new ArchiveSettings();
     }
 
@@ -324,62 +393,18 @@ public sealed class ArchiveService
             await Task.Run(async () =>
             {
                 var json = JsonSerializer.Serialize(snapshot, _jsonOptions);
-                var tmp = Path.Combine(storeDir, Path.GetFileName(_storePath) + "." + Guid.NewGuid().ToString("N") + ".tmp");
-                try
-                {
-                    await using (var fs = new FileStream(tmp, FileMode.CreateNew, FileAccess.Write, FileShare.None, 64 * 1024, FileOptions.WriteThrough))
-                    {
-                        var bytes = Encoding.UTF8.GetBytes(json);
-                        await fs.WriteAsync(bytes);
-                        await fs.FlushAsync();
-                        fs.Flush(flushToDisk: true);
-                    }
-
-                    await using (var fs = new FileStream(tmp, FileMode.Open, FileAccess.Read, FileShare.Read))
-                    {
-                        if (await JsonSerializer.DeserializeAsync<AppStoreData>(fs, _jsonOptions) is null)
-                            throw new InvalidDataException("serialized app store did not round-trip");
-                    }
-
-                    if (File.Exists(_storePath))
-                    {
-                        Directory.CreateDirectory(StoreBackupsDir);
-                        var backup = Path.Combine(StoreBackupsDir, "app-store-" + DateTime.UtcNow.ToString("yyyyMMdd-HHmmss-fff") + "-" + Guid.NewGuid().ToString("N") + ".json");
-                        await ReplaceFileWithRetryAsync(tmp, _storePath, backup);
-                        PruneOldFiles(StoreBackupsDir, "app-store-*.json", MaxAutoBackups);
-                    }
-                    else
-                    {
-                        File.Move(tmp, _storePath);
-                    }
-                }
-                finally
-                {
-                    TryDeleteFile(tmp);
-                }
+                if (JsonSerializer.Deserialize<AppStoreData>(json, _jsonOptions) is null)
+                    throw new InvalidDataException("serialized app store did not round-trip");
+                Directory.CreateDirectory(StoreBackupsDir);
+                var backup = Path.Combine(
+                    StoreBackupsDir,
+                    "app-store-" + DateTime.UtcNow.ToString("yyyyMMdd-HHmmss-fff") + "-"
+                    + Guid.NewGuid().ToString("N") + ".json");
+                await DurableFileStore.WriteAtomicAsync(_storePath, Encoding.UTF8.GetBytes(json), backup);
+                PruneOldFiles(StoreBackupsDir, "app-store-*.json", MaxAutoBackups);
             });
         }
         finally { _saveGate.Release(); }
-    }
-
-    private static async Task ReplaceFileWithRetryAsync(string source, string destination, string backup)
-    {
-        Exception? last = null;
-        for (var attempt = 0; attempt < 6; attempt++)
-        {
-            try
-            {
-                File.Replace(source, destination, backup, ignoreMetadataErrors: true);
-                return;
-            }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-            {
-                last = ex;
-                await Task.Delay(25 * (attempt + 1));
-            }
-        }
-
-        throw new IOException("Could not atomically replace app store after retries; existing store was left untouched.", last);
     }
 
     // The UI sets this to re-run the ACTIVE chat filter (preserving the selection). Every mutation + sync
@@ -3432,7 +3457,8 @@ public sealed class ArchiveService
     }
 
 
-    private bool _muxHistoryDirty;
+    private long _muxHistoryVersion;
+    private long _muxHistorySavedVersion;
     // Note the chat currently in a tab; when it CHANGES, the previous chat rotates into that tab's history
     // (dedup by id, most-recent first, capped) so no session a tab ever hosted is lost. Persisted lazily.
     private void RecordTabChat(string tab, string id, string tool, string title)
@@ -3452,7 +3478,7 @@ public sealed class ArchiveService
         rec.History.RemoveAll(h => string.Equals(h.Id, id, StringComparison.OrdinalIgnoreCase));   // new current shouldn't also sit in history
         if (rec.History.Count > 30) rec.History.RemoveRange(30, rec.History.Count - 30);
         rec.Current = new MuxTabChat { Id = id, Tool = tool, Title = title, At = DateTime.UtcNow.ToString("O") };
-        _muxHistoryDirty = true;
+        _muxHistoryVersion++;
     }
 
     // Clear a tab's session history — or ALL tabs' when tabName is empty (the web "delete all tabs / start
@@ -3462,16 +3488,22 @@ public sealed class ArchiveService
         int n;
         if (string.IsNullOrWhiteSpace(tabName)) { n = Store.MuxTabHistory.Count; Store.MuxTabHistory.Clear(); }
         else { n = Store.MuxTabHistory.Remove(tabName!) ? 1 : 0; }
-        if (n > 0) { _muxHistoryDirty = false; await SaveAsync(); }
+        if (n > 0)
+        {
+            var version = ++_muxHistoryVersion;
+            await SaveAsync();
+            _muxHistorySavedVersion = Math.Max(_muxHistorySavedVersion, version);
+        }
         return n;
     }
 
     // Persist tab history if the resolver rotated anything (called from the projects push, off the hot path).
     public async Task SaveMuxHistoryIfDirtyAsync()
     {
-        if (!_muxHistoryDirty) return;
-        _muxHistoryDirty = false;
+        var version = _muxHistoryVersion;
+        if (version <= _muxHistorySavedVersion) return;
         await SaveAsync();
+        _muxHistorySavedVersion = Math.Max(_muxHistorySavedVersion, version);
     }
 
     public static string ResolveClaudeExe()

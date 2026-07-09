@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Text;
 using System.Text.Json;
 using CodexLocalRetrieval.Core.Models;
 using CodexLocalRetrieval.Core.Remote;
@@ -380,6 +381,118 @@ public sealed class ArchiveServiceTests
             Assert.IsTrue(backupSessions.TryGetProperty("s1", out var backedUpFirst), "backup keeps the previous session");
             Assert.IsFalse(backupSessions.TryGetProperty("s2", out _), "backup is the previous version, not a duplicate of current");
             Assert.AreEqual("petunia", backedUpFirst.GetProperty("specialPhrases")[0].GetString());
+        }
+        finally { Directory.Delete(dir, true); }
+    }
+
+    [TestMethod]
+    public async Task DurableFileStore_PrecommitFailuresLeavePreviousBytesUntouched()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "clr-durable-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            var destination = Path.Combine(dir, "store.json");
+            var backup = Path.Combine(dir, "store.bak.json");
+            var original = Encoding.UTF8.GetBytes("{\"version\":1}");
+            await File.WriteAllBytesAsync(destination, original);
+
+            foreach (var failedStage in new[]
+                     {
+                         DurableWriteStage.BeforeWrite,
+                         DurableWriteStage.BeforeFileFlush,
+                         DurableWriteStage.BeforeReplace,
+                     })
+            {
+                await Assert.ThrowsExactlyAsync<IOException>(() =>
+                    DurableFileStore.WriteAtomicAsync(
+                        destination,
+                        Encoding.UTF8.GetBytes("{\"version\":2}"),
+                        backup,
+                        stage =>
+                        {
+                            if (stage == failedStage) throw new IOException("injected " + stage);
+                        }));
+                CollectionAssert.AreEqual(original, await File.ReadAllBytesAsync(destination));
+                Assert.AreEqual(0, Directory.GetFiles(dir, "*.tmp").Length);
+            }
+        }
+        finally { Directory.Delete(dir, true); }
+    }
+
+    [TestMethod]
+    public async Task DurableFileStore_ReadbackMismatchThrowsAndPreservesBackup()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "clr-durable-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            var destination = Path.Combine(dir, "store.json");
+            var backup = Path.Combine(dir, "store.bak.json");
+            var original = Encoding.UTF8.GetBytes("{\"version\":1}");
+            await File.WriteAllBytesAsync(destination, original);
+
+            var ex = await Assert.ThrowsExactlyAsync<IOException>(() =>
+                DurableFileStore.WriteAtomicAsync(
+                    destination,
+                    Encoding.UTF8.GetBytes("{\"version\":2}"),
+                    backup,
+                    stage =>
+                    {
+                        if (stage == DurableWriteStage.BeforeReadBack)
+                            File.WriteAllText(destination, "{\"version\":999}");
+                    }));
+
+            StringAssert.Contains(ex.Message, "committed file did not read back identically");
+            CollectionAssert.AreEqual(original, await File.ReadAllBytesAsync(backup));
+        }
+        finally { Directory.Delete(dir, true); }
+    }
+
+    [TestMethod]
+    public async Task LoadAsync_RecoversCorruptPrimaryFromNewestValidStoreBackup()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "clr-recover-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            var store = Path.Combine(dir, "store.json");
+            var writer = new ArchiveService(storePath: store);
+            writer.Store.Settings.MultiplexApiPort = 7999;
+            writer.Store.Sessions["preserved"] = new ArchiveSession
+                { Id = "preserved", Tool = "codex", Title = "preserved" };
+            await writer.SaveAsync();
+            writer.Store.Sessions["latest"] = new ArchiveSession
+                { Id = "latest", Tool = "claude", Title = "latest" };
+            await writer.SaveAsync();
+
+            File.WriteAllText(store, "{\"broken\"");
+
+            var reader = new ArchiveService(storePath: store);
+            await reader.LoadAsync();
+
+            Assert.IsTrue(reader.Store.Sessions.ContainsKey("preserved"));
+            Assert.IsFalse(reader.Store.Sessions.ContainsKey("latest"));
+            Assert.AreEqual(7999, reader.ReadSettingsOnly().MultiplexApiPort);
+            using var restored = JsonDocument.Parse(File.ReadAllText(store));
+            Assert.IsTrue(restored.RootElement.GetProperty("sessions").TryGetProperty("preserved", out _));
+        }
+        finally { Directory.Delete(dir, true); }
+    }
+
+    [TestMethod]
+    public async Task LoadAsync_CorruptPrimaryWithoutBackupFailsClosed()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "clr-recover-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            var store = Path.Combine(dir, "store.json");
+            File.WriteAllText(store, "{\"broken\"");
+            var service = new ArchiveService(storePath: store);
+
+            await Assert.ThrowsExactlyAsync<InvalidDataException>(() => service.LoadAsync());
+            Assert.ThrowsExactly<InvalidDataException>(() => service.ReadSettingsOnly());
         }
         finally { Directory.Delete(dir, true); }
     }

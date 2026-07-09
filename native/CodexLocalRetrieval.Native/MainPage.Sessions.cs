@@ -163,7 +163,7 @@ public sealed partial class MainPage
             session.UpdatedAt = DateTime.UtcNow.ToString("O");
             ReapplyActiveFilter();   // respects the active filter + spam-hide instead of dumping the whole store
             SelectSessionRow(session);
-            _ = _archive.SaveAsync();
+            await _archive.SaveAsync();
             SyncStatus.Text = $"Resuming \"{Trim(session.DisplayTitle, 40)}\" in a terminal...";
         }
         catch (Exception ex)
