@@ -233,7 +233,7 @@
 </div>
 <dialog id="wscoldlg">
   <h3>Save open tabs to a collection</h3>
-  <p class="dlghint">Files all <b id="wscolcount">0 tabs</b> you have open in multiplex into a deck. Tabs tied to a chat get added; plain shells are skipped. Works only while the desktop app is open (it owns your collections). Reopen the whole collection later with its <b>↻ Relaunch</b> button.</p>
+  <p class="dlghint">Files <b id="wscolcount">0 tabs</b> — <b>every open tab</b> in multiplex — into a deck. Chat-linked tabs keep their chat; shell-launched tabs are saved as named markers. Works only while the desktop app is open (it owns your collections). Reopen chat-linked ones later with <b>↻ Relaunch</b>.</p>
   <div id="wscollist" class="wscollist"></div>
   <div class="dlgrow"><label class="wslabel" for="wsdecksel">Deck</label><select id="wsdecksel"></select></div>
   <div class="dlgrow" id="wsdecknewrow" hidden><label class="wslabel" for="wsdecknew">New deck</label><input id="wsdecknew" placeholder="deck name" autocapitalize="off" autocomplete="off" spellcheck="false"></div>
@@ -711,9 +711,12 @@ function setDeckNewVisible(){
 function addWorkspaceToCollection(){
   if(!appLive()){ alert('Open the desktop app first - it owns your collections, so this cannot drift out of sync.'); return; }
   const open=(sessions||[]).filter(s=>s && s.name);
+  // EVERY open tab, not just chat-linked ones. Shell-launched tabs (a bare `mux` you ran claude/codex in)
+  // have no indexed chat; the desktop app files them as a named "mux-tab" placeholder so the whole open
+  // working set is captured. (dormant placeholders that never ran are still skipped — nothing to save.)
   _wsTabs=open
-    .filter(s=>s.sessionId || s.projectMuxName)
-    .map(s=>({ name:s.name, muxName:s.projectMuxName||s.name, sessionId:s.sessionId||'', title:s.chatTitle||s.name }));
+    .filter(s=>s.alive!==false)
+    .map(s=>({ name:s.name, muxName:s.projectMuxName||s.name, sessionId:s.sessionId||'', title:s.chatTitle||s.name, tool:s.tool||'', linked:!!(s.sessionId||s.projectMuxName) }));
   if(!_wsTabs.length){ alert('No open remote tabs to add — open some sessions in the terminal first.'); return; }
   const list=$('#wscollist'); list.innerHTML='';
   const cols=(data.collections||[]);
@@ -723,8 +726,8 @@ function addWorkspaceToCollection(){
   allDecks().forEach(d=>{ const o=document.createElement('option'); o.value=d.id; o.textContent=d.name; sel.appendChild(o); });
   const newOpt=document.createElement('option'); newOpt.value='__new__'; newOpt.textContent='New deck...'; sel.appendChild(newOpt);
   sel.onchange=setDeckNewVisible; setDeckNewVisible();
-  const skipped=open.length-_wsTabs.length;
-  $('#wscolcount').textContent=_wsTabs.length+' chat tab'+(_wsTabs.length!==1?'s':'')+(skipped?(' ('+skipped+' shell'+(skipped!==1?'s':'')+' skipped)'):'');
+  const dormant=open.length-_wsTabs.length;
+  $('#wscolcount').textContent=_wsTabs.length+' open tab'+(_wsTabs.length!==1?'s':'')+(dormant?(' ('+dormant+' dormant skipped)'):'');
   $('#wscolnew').value=''; $('#wsdecknew').value=''; $('#wscoldlg').showModal(); setTimeout(()=>$('#wscolnew').focus(),60);
 }
 async function submitWsCol(target){
@@ -740,7 +743,7 @@ async function submitWsCol(target){
   for(const t of _wsTabs){
     const tab = typeof t==='string' ? { name:t, muxName:t, sessionId:'' } : t;
     try{
-      const r=await fetch('api/app-commands',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({type:'addtocollection', muxName:tab.muxName||tab.name, sessionName:tab.name, sessionId:tab.sessionId||'', collection:name, collectionId:target.collectionId||'', deckId:choice.deckId||'', deckName:choice.deckName||''})});
+      const r=await fetch('api/app-commands',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({type:'addtocollection', muxName:tab.muxName||tab.name, sessionName:tab.name, sessionId:tab.sessionId||'', tool:tab.tool||'', collection:name, collectionId:target.collectionId||'', deckId:choice.deckId||'', deckName:choice.deckName||''})});
       if(!r.ok) throw new Error(await apiError(r));
       const queued=await r.json();
       const done=await awaitCmdResult(queued.id, 20000);

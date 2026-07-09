@@ -99,10 +99,6 @@
   .tab .pcchip.dormant { color:var(--faint); border-color:rgba(154,160,166,.45); }
   .tab .pcchip.stale { color:var(--warn); border-color:rgba(251,191,36,.45); }
   .tab .pcchip.legacy { color:var(--rose); border-color:rgba(251,113,133,.5); }
-  .tab .pcchip.remote { color:#e879f9; border-color:rgba(232,121,249,.5); }   /* resumed-remote (from /tomux) */
-  .colorpop .swrow { display:flex; gap:6px; padding:6px 4px; flex-wrap:wrap; }
-  .colorpop .sw { width:26px; height:26px; border-radius:7px; border:1px solid var(--line); cursor:pointer; padding:0; }
-  .colorpop .clr { width:100%; }
   .tab .nm { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:13.5px; font-weight:500; }
   .tab.autoheal .nm::before { content:'⟳'; margin-right:3px; opacity:.65; font-size:.85em; }   /* per-tab auto-resume ON */
   .tab .kebab {
@@ -316,9 +312,6 @@
   dialog .row.adddeckrow { justify-content:stretch; align-items:center; }
   dialog .row.adddeckrow label { flex:0 0 72px; margin:0; }
   dialog .row.adddeckrow input, dialog .row.adddeckrow select { flex:1 1 auto; min-width:0; }
-  /* deck section headers in the Add-to-collection picker */
-  #addcollist .addcoldeckhdr { font-size:11px; text-transform:uppercase; letter-spacing:.05em; color:var(--faint); font-weight:600; margin:var(--sp2) 0 4px; padding-left:2px; }
-  #addcollist .addcoldeckhdr:first-child { margin-top:0; }
   /* file workspace = mini file explorer (grid + detail) */
   #uploaddlg { width:min(96vw,620px); }
   .wshead { display:flex; align-items:center; justify-content:space-between; gap:var(--sp2); flex-wrap:wrap; margin:0 0 var(--sp2); }
@@ -529,7 +522,7 @@
       <button class="icon compose-desktop" id="uploadbtn" title="Upload &amp; attach a file (pictures, PDFs, zips)" aria-label="Upload and attach a file">
         <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M21 11.5l-8.6 8.6a5 5 0 01-7.1-7.1l8.6-8.6a3.5 3.5 0 014.9 4.9l-8.5 8.5a2 2 0 01-2.8-2.8l7.8-7.8" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
       </button>
-      <button class="icon" id="managebtn" title="Manage tabs (delete all / export)" aria-label="Manage tabs">
+      <button class="icon" id="managebtn" title="Manage tabs (kill all / export)" aria-label="Manage tabs">
         <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h10" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
       </button>
       <button class="icon" id="zen" title="Zen / fullscreen (F11)" aria-label="Zen / fullscreen">
@@ -622,7 +615,7 @@
   <p class="hint">Bulk actions across all <b id="managecount">0</b> open multiplex tabs.</p>
   <div class="managebtns">
     <button class="act wide" id="exporttabs">⬇ Export tabs as text — names, session history &amp; resume commands</button>
-    <button class="act wide danger" id="killalltabs">🗑 Delete ALL tabs (start fresh)</button>
+    <button class="act wide danger" id="killalltabs">🗑 Kill ALL tabs</button>
   </div>
   <div class="row"><button class="act" id="manageclose">Close</button></div>
 </dialog>
@@ -948,7 +941,7 @@ function reloadTerminal(quiet){
   connect(name, true);   // re-attach: CLEAR + scrollback replay + live, all client state reset
 }
 document.addEventListener('keydown', e=>{ if(e.ctrlKey && e.altKey && (e.key==='r'||e.key==='R')){ e.preventDefault(); e.stopPropagation(); reloadTerminal(); } }, true);
-window.__muxBuild='2026-07-07-scrollfix';   // bump per web deploy so a loaded version is verifiable
+window.__muxBuild='2026-07-07-managetabs';   // bump per web deploy so a loaded version is verifiable
 try{ console.info('multiplex build', window.__muxBuild); }catch(e){}
 const helper = $('#term').querySelector('.xterm-helper-textarea');
 function hardenHelperTextarea(){
@@ -1232,27 +1225,13 @@ window.addEventListener('orientationchange', ()=>setTimeout(applyViewport,250));
   host.addEventListener('touchend', ()=>{ active=false; }, {passive:true});
 })();
 
-// Wheel scrolling that CAN'T get stuck. Runs at capture phase (before xterm's own handler), so a stuck
-// mouse-tracking mode (which would otherwise send the wheel to the app as a mouse event, freezing the
-// scrollback) can never eat it. In a NORMAL buffer we scroll xterm's scrollback OURSELVES and stop the
-// event; only in the ALTERNATE buffer (full-screen TUI with no scrollback) do we forward the wheel so the
-// app scrolls its own view.
+// When a local 30-row terminal owns the size, the web surface can be taller than xterm's
+// rendered rows. Keep the whole black terminal area interactive by forwarding wheel events.
 $('#term').addEventListener('wheel', e=>{
-  if(!(e.deltaX || e.deltaY)) return;
-  noteUserScroll();
+  if(e.deltaX || e.deltaY) noteUserScroll();
   const host=$('#term'), xt=host.querySelector('.xterm');
-  let alt=false; try{ alt = term.buffer.active.type==='alternate'; }catch(_){}
-  if(!alt){
-    const ch=(cellMetrics().h)||18;
-    const px = e.deltaMode===1 ? e.deltaY*ch : (e.deltaMode===2 ? e.deltaY*(term.rows||24)*ch : e.deltaY);
-    const lines = Math.trunc(px/ch) || (e.deltaY>0?1:(e.deltaY<0?-1:0));
-    if(lines){ try{ term.scrollLines(lines); }catch(_){} }
-    e.preventDefault(); e.stopPropagation();
-    return;
-  }
-  // Alternate buffer: hand the wheel to the app so it scrolls its own transcript.
-  const target=(xt && !xt.contains(e.target)) ? (host.querySelector('.xterm-viewport')||xt) : (host.querySelector('.xterm-viewport'));
-  if(!target) return;
+  if(!xt || xt.contains(e.target)) return;
+  const target=host.querySelector('.xterm-viewport') || xt;
   try{
     target.dispatchEvent(new WheelEvent('wheel', {
       deltaX:e.deltaX, deltaY:e.deltaY, deltaZ:e.deltaZ, deltaMode:e.deltaMode,
@@ -1261,7 +1240,7 @@ $('#term').addEventListener('wheel', e=>{
     }));
     e.preventDefault();
   }catch(_){}
-}, {passive:false, capture:true});
+}, {passive:false});
 
 function setFont(px){ fontSize=Math.min(20,Math.max(11,px)); term.options.fontSize=fontSize; LS.set('mux_font',fontSize); doFit(); }
 function updateMeta(){ $('#statusmeta').textContent = current ? `${term.cols}×${term.rows}${$('#term').classList.contains('pan')?' · pan':''}` : ''; }
@@ -1578,12 +1557,6 @@ function renderTabs(){
       `${s.legacyBlocked?'<span class="pcchip legacy" title="Legacy tmux diagnostic only — relay refuses to attach/manage it">LEGACY</span>':''}`;
     t.innerHTML = `<span class="dot"></span><span class="nm"></span>${chips}<button class="kebab" tabindex="-1">⋯</button>`;
     t.querySelector('.nm').textContent = s.name;
-    // Per-tab tint (like a PowerShell tab color) + a resumed-remote marker (default magenta if no color set).
-    const tintColor = s.tabColor || (s.tabKind==='remote-resumed' ? '#e879f9' : '');
-    if (tintColor) { t.style.borderLeft = '3px solid '+tintColor; t.style.paddingLeft = 'calc(var(--sp3) - 1px)'; }
-    if (s.tabKind==='remote-resumed') {
-      t.querySelector('.nm').insertAdjacentHTML('afterend', '<span class="pcchip remote" title="Resumed-remote — handed here from a local session via /tomux">REMOTE</span>');
-    }
     if (s.dormant) {
       t.title = s.name + ' - dormant: no shell or agent is running';
       t.querySelector('.nm').insertAdjacentHTML('afterend', '<span class="pcchip dormant" title="Dormant placeholder - relaunch from Projects or open locally with mux">DORMANT</span>');
@@ -1629,7 +1602,6 @@ function openMenu(s, anchor){
     `<button data-a="opencmd">⌨ Copy local-open command</button>`+
     `<button data-a="reload">↻ Reload terminal (unfreeze)</button>`+
     `<button data-a="rename">✎ Rename</button>`+
-    `<button data-a="color">🎨 Tab color</button>`+
     `<button data-a="copy">⧉ Copy link</button>`+
     `<button data-a="kill" class="danger">🗑 Kill session</button>`;
   m.querySelector('.mtitle').textContent = s.name;
@@ -1653,25 +1625,6 @@ function openMenu(s, anchor){
   setTimeout(()=>m.querySelector('button')?.focus(), 0);   // move focus in for keyboard
 }
 function closeMenu(){ const o=menuOpener; $('#menu').classList.remove('show'); menuFor=null; menuOpener=null; if(o && o.isConnected) try{ o.focus(); }catch(e){} }
-// Per-tab color (PowerShell-style tab colors). Owned by the desktop app (settabcolor command).
-const TABCOLORS=['#e879f9','#60a5fa','#34d399','#fbbf24','#f87171','#a78bfa','#f472b6','#22d3ee'];
-function pickTabColor(s){
-  if(!_appLive){ flash('Open the desktop app to set tab colors (it owns tab state)'); return; }
-  const pop=document.createElement('div'); pop.className='menu show colorpop';
-  pop.innerHTML='<div class="mtitle">Tab color · '+esc(s.name)+'</div><div class="swrow"></div><button class="clr">Clear color</button>';
-  const row=pop.querySelector('.swrow');
-  TABCOLORS.forEach(hex=>{ const b=document.createElement('button'); b.className='sw'; b.style.background=hex; b.title=hex; b.onclick=()=>{ setTabColor(s.name,hex); pop.remove(); }; row.appendChild(b); });
-  pop.querySelector('.clr').onclick=()=>{ setTabColor(s.name,''); pop.remove(); };
-  document.body.appendChild(pop);
-  pop.style.left=Math.max(8,(window.innerWidth-pop.offsetWidth)/2)+'px';
-  pop.style.top=Math.max(8,(window.innerHeight-pop.offsetHeight)/2)+'px';
-  const close=(e)=>{ if(!e.target.closest('.colorpop')){ pop.remove(); document.removeEventListener('click',close,true); } };
-  setTimeout(()=>document.addEventListener('click',close,true),0);
-}
-async function setTabColor(name,hex){
-  try{ await fetch(base+'/api/app-commands',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({type:'settabcolor',muxName:name,title:hex})}); flash(hex?'Tab color set':'Tab color cleared'); }
-  catch(e){ flash('Couldn’t set tab color'); }
-}
 document.addEventListener('click', e=>{ if(menuFor && !e.target.closest('#menu') && !e.target.closest('.kebab')) closeMenu(); });
 document.addEventListener('keydown', e=>{ if(e.key==='Escape') closeMenu(); });
 function menuAction(a, s){
@@ -1684,7 +1637,6 @@ function menuAction(a, s){
   else if(a==='opencmd'){ navigator.clipboard?.writeText('mux '+s.name).then(()=>flash('Open command copied — paste it in a fresh local terminal')).catch(()=>{}); }
   else if(a==='reload'){ if(current===s.name) reloadTerminal(); else connect(s.name); }
   else if(a==='rename'){ openRenameDialog(s); }
-  else if(a==='color'){ pickTabColor(s); }
   else if(a==='copy'){ const url=location.origin+location.pathname+'?s='+encodeURIComponent(s.name); navigator.clipboard?.writeText(url).then(()=>flash('Link copied')).catch(()=>{}); }
   else if(a==='kill'){ if(confirm('Kill session "'+s.name+'"? This ends the PC-hosted mux session (any running agent stops).')){ killSession(s.name); } }
 }
@@ -1729,22 +1681,9 @@ function addToCollection(s){
   addColTarget=s;
   const list=$('#addcollist'); list.innerHTML='';
   if(!_appCollections.length){ const p=document.createElement('div'); p.className='hint'; p.textContent='No collections yet — type a name below to make one.'; list.appendChild(p); }
-  // Group collections under their deck (headers) so the picker stays organized instead of one long flat list.
-  const groups=new Map();
-  _appCollections.forEach(c=>{ const did=String(c.deckId||'main'); if(!groups.has(did)) groups.set(did,{name:c.deckName||appDeckLabel(did),cols:[]}); groups.get(did).cols.push(c); });
-  const orderedDecks=appDeckChoices().filter(d=>groups.has(String(d.id)));
-  groups.forEach((g,did)=>{ if(!orderedDecks.some(d=>String(d.id)===did)) orderedDecks.push({id:did,name:g.name}); });
-  const multiDeck=orderedDecks.length>1;
-  orderedDecks.forEach(d=>{ const g=groups.get(String(d.id)); if(!g) return;
-    if(multiDeck){ const h=document.createElement('div'); h.className='addcoldeckhdr'; h.textContent=g.name; list.appendChild(h); }
-    g.cols.slice().sort((a,b)=>String(a.name||'').localeCompare(String(b.name||''))).forEach(c=>{
-      const b=document.createElement('button'); b.type='button'; b.className='act wide';
-      const n=(c.chats||[]).length;
-      b.textContent=(c.name||'Untitled')+' · '+n+' chat'+(n!==1?'s':'');
-      b.onclick=()=>submitAddCol({ collection:c.name||'Untitled', collectionId:c.id||'', deckId:c.deckId||'main', deckName:c.deckName||appDeckLabel(c.deckId) });
-      list.appendChild(b);
-    });
-  });
+  _appCollections.forEach(c=>{ const b=document.createElement('button'); b.type='button'; b.className='act wide';
+    b.textContent=(c.deckName||appDeckLabel(c.deckId))+' / '+(c.name||'Untitled')+' · '+((c.chats||[]).length)+' chat'+(((c.chats||[]).length)!==1?'s':'');
+    b.onclick=()=>submitAddCol({ collection:c.name||'Untitled', collectionId:c.id||'', deckId:c.deckId||'main', deckName:c.deckName||appDeckLabel(c.deckId) }); list.appendChild(b); });
   const sel=$('#adddecksel'); sel.innerHTML='';
   appDeckChoices().forEach(d=>{ const o=document.createElement('option'); o.value=d.id; o.textContent=d.name; sel.appendChild(o); });
   const newOpt=document.createElement('option'); newOpt.value='__new__'; newOpt.textContent='New deck...'; sel.appendChild(newOpt);
@@ -1892,18 +1831,16 @@ function exportTabs(){
 }
 async function killAllTabs(){
   const list=(window._sessions||[]).slice();
-  if(!list.length){ flash('No tabs to delete'); return; }
-  if(!confirm('Delete ALL '+list.length+' tabs and start fresh?\n\nThis removes every PC-hosted mux tab (any running agents stop) AND clears their tracked session history. Cannot be undone.\n\n(Tip: Export first if you want to keep the resume commands.)')) return;
+  if(!list.length){ flash('No tabs to kill'); return; }
+  if(!confirm('Kill ALL '+list.length+' tabs?\n\nThis ends every PC-hosted mux session — any running agents stop. Cannot be undone.\n\n(Tip: Export first if you want to keep the resume commands.)')) return;
   $('#managedlg').close();
-  flash('Deleting '+list.length+' tabs…');
+  flash('Killing '+list.length+' tabs…');
   let ok=0, fail=0;
   for(const s of list){
     try{ const r=await fetch(base+'/api/sessions/'+encodeURIComponent(s.name),{method:'DELETE'}); if(r.ok) ok++; else fail++; }catch(e){ fail++; }
   }
-  // Start fresh: also clear the app's per-tab session history so no stale/mislabeled entries linger.
-  if(_appLive){ try{ await fetch(base+'/api/app-commands',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({type:'cleartabhistory'})}); }catch(e){} }
-  if(current){ intentional=true; try{ if(ws) ws.close(); }catch(e){} intentional=false; current=null; try{ term.reset(); }catch(e){} $('#empty').style.display='flex'; setStatus('','All tabs deleted'); }
-  flash('Deleted '+ok+' tab'+(ok!==1?'s':'')+(fail?(' · '+fail+' failed'):''));
+  if(current){ intentional=true; try{ if(ws) ws.close(); }catch(e){} intentional=false; current=null; try{ term.reset(); }catch(e){} $('#empty').style.display='flex'; setStatus('','All tabs killed'); }
+  flash('Killed '+ok+' tab'+(ok!==1?'s':'')+(fail?(' · '+fail+' failed'):''));
   loadSessions();
 }
 // ---- tab session history: every chat a tab has hosted (current + historical), each relaunchable and

@@ -471,6 +471,51 @@ test('unknown websocket tab creates PC-local shell, bridges scrollback, input, a
   ws.close();
 });
 
+test('late scrollback after the sbWait timeout still paints the screen (black-screen regression)', async t => {
+  // The relay blanks the terminal (CLEAR_SCREEN) on attach and repaints it from muxd's ring replay.
+  // On an idle session the sb reply routinely lands AFTER the HOST_SB_WAIT_MS timeout (40ms here). The
+  // old code cleared on timeout and then DROPPED the late sb (guarded on c.sbWait) -> permanent black
+  // terminal until the agent emitted a byte. This asserts the replay is delivered even when late.
+  const h = new RelayHarness();
+  await h.start();
+  t.after(async () => h.stop());
+  const cmd = "codex resume idle";
+  const host = await h.connectHost([commandSession('idlecase', cmd, Date.now())]);
+  t.after(() => host.close());
+
+  const ws = new WebSocket(`ws://127.0.0.1:${h.port}/ws?session=idlecase&cols=80&rows=24`);
+  await once(ws, 'open');
+  await host.waitFor(m => m.t === 'sb' && m.s === 'idlecase', 'scrollback request');
+
+  await sleep(150);                                   // let the 40ms sbWait timeout elapse (idle: no output)
+  const painted = waitForWsText(ws, /IDLE_SB_MARKER/, 'late scrollback replay reaches the client');
+  host.sendScrollback('idlecase', 'IDLE_SB_MARKER screen contents\r\n');
+  assert.match(await painted, /IDLE_SB_MARKER/);      // old code: dropped -> this times out (screen stays black)
+  ws.close();
+});
+
+test('burst output during attach never blanks-and-drops (busy-session regression)', async t => {
+  // If output floods while the client is still waiting for scrollback, the relay must go live WITHOUT
+  // losing the screen. The old overflow path set sbWait=false, orphaned the queued frames, skipped the
+  // clear, and then dropped the sb -> lost output on a busy attach. This asserts flooded output arrives.
+  const h = new RelayHarness();
+  await h.start();
+  t.after(async () => h.stop());
+  const cmd = "codex resume busy";
+  const host = await h.connectHost([commandSession('busycase', cmd, Date.now())]);
+  t.after(() => host.close());
+
+  const ws = new WebSocket(`ws://127.0.0.1:${h.port}/ws?session=busycase&cols=80&rows=24`);
+  await once(ws, 'open');
+  await host.waitFor(m => m.t === 'sb' && m.s === 'busycase', 'scrollback request');
+
+  const got = waitForWsText(ws, /BURST_LINE_0007/, 'flooded output frames reach the client');
+  for (let i = 0; i < 10; i++) host.sendOutput('busycase', `BURST_LINE_${String(i).padStart(4, '0')}\r\n`);
+  host.sendScrollback('busycase', 'SB\r\n');
+  assert.match(await got, /BURST_LINE_0007/);
+  ws.close();
+});
+
 test('projects sync preserves decks and app commands preserve collection deck target', async t => {
   const h = new RelayHarness();
   await h.start();

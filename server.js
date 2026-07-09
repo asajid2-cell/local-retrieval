@@ -5,6 +5,7 @@ const express = require('express');
 const http = require('http');
 const { WebSocketServer } = require('ws');
 const fs = require('fs');
+const path = require('path');
 const crypto = require('crypto');
 const { execSync, execFile } = require('child_process');
 // crash-safe state writes: write a temp then rename (rename is atomic) so an unclean VPS reboot can't
@@ -299,7 +300,7 @@ function listSessions() {
   // conflict on the hosted row instead of silently hiding or killing the legacy process.
   if (hostUp()) {
     for (const [name, h] of hostSessions) {
-      const chat = projectedChatForHosted(h);
+      const chat = projectedChatForHosted(h, name);
       const attached = (sessions.get(name) ? [...sessions.get(name).clients.values()].some(c => c.hosted) : false);
       const protocolOk = hostProtocolOk();
       const alive = h.alive !== false;
@@ -316,7 +317,11 @@ function listSessions() {
                   kind: h.kind || (dormant ? 'dormant' : (h.shellOnly ? 'shell' : 'command')), cmdSig: h.cmdSig || '',
                   sessionId: String(chat && chat.id || ''), tool: String(chat && chat.tool || ''),
                   chatTitle: String(chat && chat.title || ''), projectMuxName: String(chat && chat.muxName || ''),
+                  nativeTitle: String(chat && chat.nativeTitle || ''), appTitle: String(chat && chat.appTitle || ''),
+                  muxCommand: String(chat && chat.muxCommand || ''),   // the current chat's resume command (for copy/export)
                   chatLinked: !!chat,
+                  tabColor: tabMetaFor(name).color, tabKind: tabMetaFor(name).kind,   // per-tab tint + "remote-resumed"
+                  tabHistory: tabHistoryFor(name),   // past chats this tab has hosted → relaunch-picker + add-historical-to-collection
                   localViewers: h.localViewers || 0, localFirst: !!h.localFirst,
                   detail: detachedLocal ? 'Local agent process is still running, but the muxd mirror is detached. New muxrun sessions re-register automatically; restart this one through mux to restore web terminal control.'
                          : dormant ? 'Dormant mux session: no shell or agent is running until you relaunch it or run mux locally.' : '',
@@ -354,8 +359,10 @@ app.post('/api/sessions', async (req, res) => {
   const existing = hostSessions.get(name);
   if (hostedHas(name) && existing && existing.alive !== false && hostedCompatibleWithCommand(existing, cmd)) return res.json({ ok: true, name, created: false, hosted: true, owner: !!existing.owner, hostProtocol: hostProtocol.protocol || 0 });
   if (!hasCommand) return res.status(400).json({ error: 'command required to start a mux session' });
+  const localOwner = await ensureNoLocalOwnerForMuxName(name, cmd);
+  if (!localOwner.ok) return failHost(res, 409, 'local copy is already running', localOwner.detail);
   if (!requireHostProtocol(res, 'refusing to start PC-local mux session')) return;
-  if (!sendHost({ t: 'create', s: name, cmd, cols: 140, rows: 40, heal: _healOn.has(name) })) {
+  if (!sendHost({ t: 'create', s: name, cmd, ids: resumeCandidateIds(name, cmd), cols: 140, rows: 40, heal: _healOn.has(name) })) {
     return failHost(res, 503, 'PC mux host offline', 'host socket closed before create could be sent');
   }
   markPending(name);
@@ -374,8 +381,8 @@ function hostSessionHasSavedCommand(h) {
 }
 
 // Explicit relaunch is different from viewing/attaching a dormant tab. It may reuse muxd's saved
-// manifest command, and it first stops any matching non-mux local copy reported by the desktop bridge
-// so a claude/codex transcript never gets two writers.
+// manifest command, but it must not remotely take over a matching local owner. If the app/headless
+// bridge reports a local writer for this chat, fail closed and let the user close or hand off locally.
 app.post('/api/sessions/:name/relaunch', async (req, res) => {
   const name = SAFE(req.params.name);
   if (!name) return res.status(400).json({ error: 'name required' });
@@ -392,14 +399,14 @@ app.post('/api/sessions/:name/relaunch', async (req, res) => {
     });
   }
 
-  const stopped = await stopLocalCopyForMuxName(name);
-  if (!stopped.ok) return failHost(res, 409, 'could not stop existing local copy', stopped.detail);
+  const localOwner = await ensureNoLocalOwnerForMuxName(name, cmd);
+  if (!localOwner.ok) return failHost(res, 409, 'local copy is already running', localOwner.detail);
 
   const priorCreated = existing ? Number(existing.created || 0) : 0;
   const cols = Number(body.cols) || Number(existing && existing.cols) || 140;
   const rows = Number(body.rows) || Number(existing && existing.rows) || 40;
   markPending(name);
-  if (!sendHost({ t: 'create', s: name, cmd, cols, rows, heal: _healOn.has(name), relaunch: true })) {
+  if (!sendHost({ t: 'create', s: name, cmd, ids: resumeCandidateIds(name, cmd), cols, rows, heal: _healOn.has(name), relaunch: true })) {
     pendingCreates.delete(name);
     return failHost(res, 503, 'PC mux host offline', 'host socket closed before relaunch could be sent');
   }
@@ -413,7 +420,7 @@ app.post('/api/sessions/:name/relaunch', async (req, res) => {
   }, 20000);
   if (!confirmed.ok) return failHost(res, 504, 'PC-local mux relaunch not confirmed', confirmed.error);
   res.json({ ok: true, name, created: true, relaunched: true, hosted: true,
-             stoppedLocal: !!stopped.stopped, owner: !!confirmed.value.owner,
+             stoppedLocal: false, owner: !!confirmed.value.owner,
              hostProtocol: hostProtocol.protocol || 0 });
 });
 
@@ -511,12 +518,13 @@ app.post('/api/sessions/:name/autoheal', async (req, res) => {
 // the web can show your projects and resume chats remotely. POST is loopback-only (the app reaches in
 // over its own SSH); GET is owner-gated (the web). `live` = the app pushed within the last ~45s. ------
 const PROJECTS_FILE = STATE_DIR + '/projects.json';
-let _projects = { decks: [], collections: [], allChats: [], host: '', syncedAt: 0, runningSessions: [] };
+let _projects = { decks: [], collections: [], allChats: [], host: '', syncedAt: 0, runningSessions: [], runningVerified: false, runningVerificationDetail: '' };
 try { _projects = JSON.parse(fs.readFileSync(PROJECTS_FILE, 'utf8')); } catch {}
 function appSyncedAt() { return _projects.appSyncedAt || _projects.syncedAt || 0; }
 function runningSyncedAt() { return _projects.runningSyncedAt || _projects.syncedAt || 0; }
 function appLive() { return Date.now() - appSyncedAt() < 45000; }
 function bridgeLive() { return Date.now() - runningSyncedAt() < 45000; }
+function runningVerified() { return bridgeLive() && _projects.runningVerified === true; }
 function projectsHealth() {
   const now = Date.now();
   const appAt = appSyncedAt();
@@ -526,6 +534,8 @@ function projectsHealth() {
   return {
     appLive: appAt > 0 && now - appAt < 45000,
     bridgeLive: runningAt > 0 && now - runningAt < 45000,
+    runningVerified: runningVerified(),
+    runningVerificationDetail: String(_projects.runningVerificationDetail || ''),
     appAgeMs: appAt > 0 ? now - appAt : null,
     runningAgeMs: runningAt > 0 ? now - runningAt : null,
     decks: Array.isArray(_projects.decks) ? _projects.decks.length : 0,
@@ -540,12 +550,79 @@ function currentRunningIds() {
     .map(s => String(s && s.sessionId || '').toLowerCase())
     .filter(Boolean));
 }
+function chatIds(chat) {
+  const ids = [];
+  const add = v => {
+    const s = String(v || '').trim();
+    if (s && !ids.some(x => x.toLowerCase() === s.toLowerCase())) ids.push(s);
+  };
+  add(chat && chat.id);
+  add(chat && chat.sessionId);
+  if (Array.isArray(chat && chat.aliases)) for (const a of chat.aliases) add(a);
+  if (Array.isArray(chat && chat.Aliases)) for (const a of chat.Aliases) add(a);
+  return ids;
+}
+function commandTokens(command) {
+  const tokens = [];
+  const re = /"([^"]*)"|'([^']*)'|(\S+)/g;
+  let m;
+  while ((m = re.exec(String(command || ''))) !== null) tokens.push(m[1] ?? m[2] ?? m[3] ?? '');
+  return tokens.filter(Boolean);
+}
+function parseResumeSessionId(command) {
+  const tokens = commandTokens(command);
+  for (let i = 0; i < tokens.length; i++) {
+    const t = path.basename(tokens[i]).toLowerCase();
+    if (t === 'codex' || t === 'codex.exe') {
+      const resumeAt = tokens.findIndex((x, j) => j > i && String(x).toLowerCase() === 'resume');
+      if (resumeAt >= 0) {
+        for (let j = resumeAt + 1; j < tokens.length; j++) {
+          const v = String(tokens[j] || '');
+          if (!v || v.startsWith('-')) continue;
+          return v;
+        }
+      }
+    }
+    if (t === 'claude' || t === 'claude.exe') {
+      for (let j = i + 1; j < tokens.length - 1; j++)
+        if (String(tokens[j]).toLowerCase() === '--resume') return String(tokens[j + 1] || '');
+    }
+  }
+  const codex = String(command || '').match(/\bcodex(?:\.exe)?\b[\s\S]*?\bresume\b(?:\s+--[^\s]+)*\s+["']?([^"'\s;]+)/i);
+  if (codex) return codex[1];
+  const claude = String(command || '').match(/\bclaude(?:\.exe)?\b[\s\S]*?\b--resume\s+["']?([^"'\s;]+)/i);
+  return claude ? claude[1] : '';
+}
+function projectedChatCandidates(name, command = '') {
+  const muxName = SAFE(name);
+  const sig = commandSig(command);
+  const sid = parseResumeSessionId(command).toLowerCase();
+  return allProjectedChats().filter(chat => {
+    if (!chat) return false;
+    if (muxName && String(chat.muxName || '') === muxName) return true;
+    if (sig && commandSig(chat.muxCommand || '') === sig) return true;
+    if (sid && chatIds(chat).some(id => id.toLowerCase() === sid)) return true;
+    return false;
+  });
+}
+function resumeCandidateIds(name, command = '') {
+  const ids = [];
+  const add = id => {
+    id = String(id || '').trim();
+    if (!id) return;
+    if (!ids.some(x => x.toLowerCase() === id.toLowerCase())) ids.push(id);
+  };
+  add(parseResumeSessionId(command));
+  for (const chat of projectedChatCandidates(name, command))
+    for (const id of chatIds(chat)) add(id);
+  return ids;
+}
 function locallyRunningMuxName(name) {
-  if (!bridgeLive()) return false;
+  if (!runningVerified()) return false;
   const runningIds = currentRunningIds();
   if (!runningIds.size) return false;
   for (const chat of allProjectedChats()) {
-    if (String(chat && chat.muxName || '') === name && runningIds.has(String(chat && chat.id || '').toLowerCase())) return true;
+    if (String(chat && chat.muxName || '') === name && chatIds(chat).some(id => runningIds.has(id.toLowerCase()))) return true;
   }
   return false;
 }
@@ -556,61 +633,105 @@ function allProjectedChats() {
   for (const chat of (Array.isArray(_projects.allChats) ? _projects.allChats : [])) out.push(chat);
   return out;
 }
-function projectedChatForHosted(hosted) {
+// Past chats a tab has hosted (from the app's per-tab session history), for the relaunch picker +
+// add-historical-to-collection. Sanitized shape the web can render/act on.
+// Per-tab presentation (color + kind) the app projected, for tinting the tab / marking a resumed-remote.
+function tabMetaFor(name) {
+  const mtm = _projects && _projects.muxTabMeta;
+  const t = mtm && name && typeof mtm === 'object' ? mtm[name] : null;
+  return { color: String((t && t.color) || ''), kind: String((t && t.kind) || '') };
+}
+function tabHistoryFor(name) {
+  const mtc = _projects && _projects.muxTabChats;
+  const t = mtc && name && typeof mtc === 'object' ? mtc[name] : null;
+  const hist = t && Array.isArray(t.history) ? t.history : [];
+  return hist.filter(h => h && h.id).slice(0, 30).map(h => ({
+    id: String(h.id), tool: String(h.tool || ''), title: String(h.title || h.id),
+    muxCommand: String(h.muxCommand || ''), at: String(h.at || ''),
+  }));
+}
+function projectedChatForHosted(hosted, name) {
   const sig = String(hosted && hosted.cmdSig || '');
-  if (!sig) return null;
-  for (const chat of allProjectedChats()) {
-    if (commandSig(chat && chat.muxCommand || '') === sig) return chat;
+  if (sig) {
+    for (const chat of allProjectedChats()) {
+      if (commandSig(chat && chat.muxCommand || '') === sig) return chat;
+    }
   }
+  // Shell-launched tab (no muxd command) → the app's deterministic resolver linked it to its LIVE chat
+  // (agent matched to this tab by ancestor pid; id from the resume flag or the tab's newest transcript).
+  const mtc = _projects && _projects.muxTabChats;
+  const t = mtc && name && typeof mtc === 'object' ? mtc[name] : null;
+  if (t && t.id) return { id: String(t.id), tool: String(t.tool || ''), title: String(t.title || name), muxName: String(name), muxCommand: String(t.muxCommand || '') };
   return null;
 }
 function runningChatForMuxName(name) {
   const muxName = SAFE(name);
-  if (!muxName || !bridgeLive()) return null;
+  if (!muxName || !runningVerified()) return null;
   const running = Array.isArray(_projects.runningSessions) ? _projects.runningSessions : [];
   if (!running.length) return null;
   const byId = new Map(running.map(r => [String(r && r.sessionId || '').toLowerCase(), r]));
   for (const chat of allProjectedChats()) {
     if (String(chat && chat.muxName || '') !== muxName) continue;
-    const run = byId.get(String(chat && chat.id || '').toLowerCase());
+    const run = chatIds(chat).map(id => byId.get(id.toLowerCase())).find(Boolean);
     if (run) return { chat, run };
   }
   return null;
 }
-async function stopLocalCopyForMuxName(name) {
+function ensureNoLocalOwnerForMuxName(name, command = '') {
+  const resumeId = parseResumeSessionId(command);
+  const candidates = projectedChatCandidates(name, command);
+  if (!runningVerified()) {
+    if (resumeId || candidates.length)
+      return { ok: false, stopped: false, detail: 'could not verify local running sessions'
+          + (_projects.runningVerificationDetail ? ` (${_projects.runningVerificationDetail})` : '')
+          + '; refusing remote resume because it could create a second writer.' };
+    return { ok: true, stopped: false };
+  }
+  const running = Array.isArray(_projects.runningSessions) ? _projects.runningSessions : [];
+  const byId = new Map(running.map(r => [String(r && r.sessionId || '').toLowerCase(), r]));
+  for (const chat of candidates) {
+    const run = chatIds(chat).map(id => byId.get(id.toLowerCase())).find(Boolean);
+    if (run) return localOwnerRefusal(name, chat, run);
+  }
+  if (resumeId) {
+    const run = byId.get(String(resumeId).toLowerCase());
+    if (run) return localOwnerRefusal(name, { id: resumeId, title: name }, run);
+  }
   const found = runningChatForMuxName(name);
   if (!found) return { ok: true, stopped: false };
-  const chat = found.chat || {};
-  const run = found.run || {};
-  const queued = enqueueAppCommand({
-    type: 'kill',
-    sessionId: chat.id || run.sessionId || '',
-    pid: run.pid || 0,
-    label: chat.title || name,
-  });
-  const done = await waitForCommandResult(queued.id, 15000);
-  if (!done.ok) return { ok: false, stopped: false, detail: done.detail || 'desktop app did not confirm the running copy stopped' };
-  return { ok: true, stopped: true };
+  return localOwnerRefusal(name, found.chat, found.run);
+}
+function localOwnerRefusal(name, chat, run) {
+  chat = chat || {};
+  run = run || {};
+  const label = String(chat.title || name || 'this chat');
+  const sid = String(chat.id || run.sessionId || '');
+  const pid = Number(run.pid || 0);
+  return {
+    ok: false,
+    stopped: false,
+    detail: `${label} is already running locally${pid ? ` (pid ${pid})` : ''}${sid ? ` as ${sid}` : ''}; refusing remote relaunch because it would create a second writer.`,
+  };
 }
 function normalizedCollectionsForCurrentRunning() {
   const cols = Array.isArray(_projects.collections) ? _projects.collections : [];
-  if (!bridgeLive()) return cols;
+  if (!runningVerified()) return cols;
   const runningIds = currentRunningIds();
   return cols.map(col => ({
     ...col,
     chats: Array.isArray(col.chats) ? col.chats.map(chat => ({
       ...chat,
-      running: runningIds.has(String(chat && chat.id || '').toLowerCase()),
+      running: chatIds(chat).some(id => runningIds.has(id.toLowerCase())),
     })) : [],
   }));
 }
 function normalizedAllChatsForCurrentRunning() {
   const chats = Array.isArray(_projects.allChats) ? _projects.allChats : [];
-  if (!bridgeLive()) return chats;
+  if (!runningVerified()) return chats;
   const runningIds = currentRunningIds();
   return chats.map(chat => ({
     ...chat,
-    running: runningIds.has(String(chat && chat.id || '').toLowerCase()),
+    running: chatIds(chat).some(id => runningIds.has(id.toLowerCase())),
   }));
 }
 app.post('/api/projects', (req, res) => {
@@ -621,6 +742,10 @@ app.post('/api/projects', (req, res) => {
     collections: Array.isArray(b.collections) ? b.collections : [],
     allChats: Array.isArray(b.allChats) ? b.allChats : [],
     runningSessions: Array.isArray(b.runningSessions) ? b.runningSessions : [],
+    muxTabChats: (b.muxTabChats && typeof b.muxTabChats === 'object') ? b.muxTabChats : {},   // {tabName: {id,tool,muxCommand,title}} — links shell-launched tabs to their live chat
+    muxTabMeta: (b.muxTabMeta && typeof b.muxTabMeta === 'object') ? b.muxTabMeta : {},   // {tabName: {color,kind}} — per-tab tint + remote-resumed flag
+    runningVerified: b.runningVerified === true,
+    runningVerificationDetail: String(b.runningVerificationDetail || ''),
     host: String(b.host || ''),
     syncedAt: now, appSyncedAt: now, runningSyncedAt: now,
   };
@@ -634,6 +759,8 @@ app.get('/api/projects', (req, res) => {
     collections: normalizedCollectionsForCurrentRunning(), host: _projects.host || '',
     allChats: normalizedAllChatsForCurrentRunning(),
     runningSessions: _projects.runningSessions || [],
+    runningVerified: runningVerified(),
+    runningVerificationDetail: String(_projects.runningVerificationDetail || ''),
     syncedAt: a, appSyncedAt: a, runningSyncedAt: r,
     appLive: Date.now() - a < 45000,
     bridgeLive: Date.now() - r < 45000,
@@ -647,6 +774,8 @@ app.post('/api/running', (req, res) => {
   if (!isTrustedLocal(req)) return res.status(403).json({ error: 'forbidden' });
   const b = req.body || {};
   _projects.runningSessions = Array.isArray(b.runningSessions) ? b.runningSessions : [];
+  _projects.runningVerified = b.runningVerified === true;
+  _projects.runningVerificationDetail = String(b.runningVerificationDetail || '');
   if (b.host) _projects.host = String(b.host);
   _projects.runningSyncedAt = Date.now();   // bridge-only: do not make GUI-owned collection commands look available
   atomicWrite(PROJECTS_FILE, JSON.stringify(_projects));
@@ -744,6 +873,12 @@ function autoHealTick() {
     if (now - h.lastAct < 9000) { _heal.set(name, h); continue; }        // let the previous action settle
     if (h.acts.length >= 5) { if (!h.gaveUp) { h.gaveUp = true; console.log(`[autoheal] ${name}: GAVE UP (5 recovery actions/10min — PC or network likely down)`); } _heal.set(name, h); continue; }
 
+    const localOwner = ensureNoLocalOwnerForMuxName(name, cmd);
+    if (!localOwner.ok) {
+      console.log(`[autoheal] ${name}: ${localOwner.detail}`);
+      _heal.set(name, h); continue;
+    }
+
     try {
       sendHost({ t: 'i', s: name, d: Buffer.from('cls; ' + cmd + '\r', 'utf8').toString('base64') });
       h.acts.push(now); h.lastAct = now; h.phase = 'resumed'; h.resumedGoal = h.hadGoal;
@@ -770,8 +905,10 @@ function bootRecreate() {
     if (!cmd) { console.log(`[boot-recreate] ${name}: armed but no resume command (not in a synced collection) — skipped`); continue; }
     try {
       if (hostProtocolOk()) {
+        const localOwner = ensureNoLocalOwnerForMuxName(name, cmd);
+        if (!localOwner.ok) { console.log(`[boot-recreate] ${name}: ${localOwner.detail} - skipped`); continue; }
         // recoveries land on the SAFE path: recreate as a PC-hosted session (muxd runs the resume)
-        sendHost({ t: 'create', s: name, cmd, cols: 140, rows: 40, heal: true });
+        sendHost({ t: 'create', s: name, cmd, ids: resumeCandidateIds(name, cmd), cols: 140, rows: 40, heal: true });
         markPending(name);
         hostSessions.set(name, { alive: true, created: Date.now(), lastOut: Date.now(), tail: '', heal: true,
                                  hasCommand: !!normalizedCommand(cmd), shellOnly: !normalizedCommand(cmd), ready: true,
@@ -785,6 +922,14 @@ function bootRecreate() {
     } catch (e) { console.log(`[boot-recreate] ${name}: failed: ${e.message}`); }
   }
   if (n) console.log(`[boot-recreate] restored ${n} armed session(s) after a wipe`);
+}
+if (TEST_MODE) {
+  app.post('/__test/autoheal', (req, res) => {
+    _healOn = new Set(Array.isArray(req.body && req.body.names) ? req.body.names.map(SAFE).filter(Boolean) : []);
+    res.json({ ok: true, names: [..._healOn] });
+  });
+  app.post('/__test/autoheal-tick', (req, res) => { autoHealTick(); res.json({ ok: true }); });
+  app.post('/__test/boot-recreate', (req, res) => { bootRecreate(); res.json({ ok: true }); });
 }
 if (!TEST_MODE) setTimeout(bootRecreate, 25000);  // let _healOn load AND give muxd time to reconnect+hello first, so
                                   // hosted sessions are visible before any armed recreate is attempted
@@ -871,7 +1016,7 @@ function waitForCommandResult(id, timeoutMs) {
     tick();
   });
 }
-const ALLOWED_CMDS = new Set(['kill', 'transcript', 'fetchfile', 'rename', 'addtocollection', 'startmux']);
+const ALLOWED_CMDS = new Set(['kill', 'transcript', 'fetchfile', 'rename', 'setapptitle', 'addtocollection', 'startmux', 'cleartabhistory', 'settabcolor']);
 app.post('/api/app-commands', (req, res) => {     // web (owner) enqueues
   const b = req.body || {};
   if (!ALLOWED_CMDS.has(b.type)) return res.status(400).json({ error: 'unsupported command' });
@@ -879,9 +1024,14 @@ app.post('/api/app-commands', (req, res) => {     // web (owner) enqueues
   if (b.type === 'transcript' && !b.sessionId) return res.status(400).json({ error: 'sessionId required' });
   if (b.type === 'fetchfile' && !b.uploadId) return res.status(400).json({ error: 'uploadId required' });
   if (b.type === 'rename' && (!b.sessionId || !String(b.title || '').trim())) return res.status(400).json({ error: 'sessionId and title required' });
+  if (b.type === 'setapptitle' && !b.sessionId) return res.status(400).json({ error: 'sessionId required' });   // empty title = clear the app override
   if (b.type === 'addtocollection' && (!(b.muxName || b.sessionName) || !(String(b.collection || '').trim() || String(b.collectionId || '').trim()))) return res.status(400).json({ error: 'muxName/sessionName and collection required' });
   if (b.type === 'addtocollection' && !appLive()) return res.status(409).json({ error: 'desktop app is not live; collection changes are disabled' });
   if (b.type === 'startmux' && !(b.muxName || b.sessionName)) return res.status(400).json({ error: 'muxName/sessionName required' });
+  if (b.type === 'startmux') {
+    const localOwner = ensureNoLocalOwnerForMuxName(b.muxName || b.sessionName, b.muxCommand || '');
+    if (!localOwner.ok) return res.status(409).json({ error: 'local copy is already running', detail: localOwner.detail });
+  }
   const cmd = enqueueAppCommand(b);
   res.json({ ok: true, id: cmd.id });
 });
@@ -1045,17 +1195,33 @@ wssHost.on('connection', (ws, req) => {
       const buf = Buffer.from(m.d || '', 'base64');
       for (const c of st.clients.values()) {
         if (!c.hosted || c.ws.readyState !== 1) continue;
-        if (c.sbWait) { (c.q = c.q || []).push(buf); if (c.q.length > 800) { c.sbWait = false; } continue; }  // hold live bytes until the scrollback replay lands
-        try { c.ws.send(buf); } catch {}
+        if (c.sbWait) {
+          (c.q = c.q || []).push(buf); c.qBytes = (c.qBytes || 0) + buf.length;
+          // Flood while still waiting for scrollback: relieve memory, but NEVER blank-and-drop.
+          // The live stream itself repaints a TUI, so go live now — clear once (a fresh attach
+          // starts clean) and replay what we buffered. wentLive means a late sb is dropped, but
+          // only because real output is already painting the screen (never leaves it black).
+          if (c.qBytes > 2000000 || c.q.length > 4000) {
+            c.sbWait = false; c.wentLive = true;
+            try { c.ws.send(CLEAR_SCREEN); for (const q of c.q) c.ws.send(q); } catch {}
+            c.q = []; c.qBytes = 0;
+          }
+          continue;
+        }
+        try { c.ws.send(buf); c.wentLive = true; } catch {}
       }
     } else if (m.t === 'sb') {
       const n = SAFE(m.s); const st = sessions.get(n); if (!st) return;
       const buf = Buffer.from(m.d || '', 'base64');
       for (const c of st.clients.values()) {
-        if (!c.hosted || !c.sbWait) continue;                          // late/duplicate sb after a client went live → dropped (A2 #3)
-        c.sbWait = false;
+        // Deliver the replay unless live output has already painted (wentLive). Crucially this
+        // fires EVEN IF the sbWait timeout already elapsed: the timeout no longer blanks the
+        // screen, so a late sb is the only thing that paints an idle session. Dropping it here
+        // (the old `!c.sbWait` guard) is exactly what left an idle terminal black.
+        if (!c.hosted || c.wentLive) continue;
+        c.sbWait = false; c.wentLive = true;
         try { c.ws.send(CLEAR_SCREEN); c.ws.send(buf); for (const q of (c.q || [])) c.ws.send(q); } catch {}  // clear → replay → queued-live (A2 #2)
-        c.q = [];
+        c.q = []; c.qBytes = 0;
       }
     } else if (m.t === 'tailr') { const f = pendingTails.get(m.rid); if (f) { pendingTails.delete(m.rid); f(String(m.text || '')); }
     } else if (m.t === 'killed') { hostSessions.delete(SAFE(m.s)); }
@@ -1202,15 +1368,26 @@ wss.on('connection', async (ws, req) => {
     }
     const id = 'c' + (++_cid);
     const st = sessionState(name);
-    const client = { id, ws, term: null, hosted: true, vcols, vrows, sbWait: true, sbTok: ++_cid, q: [], deviceId, label, visible: true, lastActive: Date.now(), connAt: Date.now() };
+    const client = { id, ws, term: null, hosted: true, vcols, vrows, sbWait: true, wentLive: false, sbTok: ++_cid, q: [], qBytes: 0, deviceId, label, visible: true, lastActive: Date.now(), connAt: Date.now() };
     st.clients.set(id, client);
     if (!sendHost({ t: 'sb', s: name, max: HOST_SB_BYTES })) {           // bounded replay; live bytes queue briefly behind it
       st.clients.delete(id);
       try { ws.close(1013, 'PC mux host offline'); } catch {}
       return;
     }
-    // If scrollback is slow or large, go live quickly. Local muxd keeps running either way.
-    setTimeout(() => { if (client.sbWait) { client.sbWait = false; try { ws.send(CLEAR_SCREEN); for (const q of client.q) ws.send(q); } catch {} client.q = []; } }, HOST_SB_WAIT_MS);
+    // Scrollback slow/large: relieve the wait WITHOUT blanking the screen. If live output was
+    // buffered, flow it now (a TUI repaints). If the session is idle (nothing buffered), leave the
+    // screen as-is and keep waiting — wentLive stays false so the sb reply (or the next live byte)
+    // still paints it. Blanking here and then dropping the late sb was the black-screen bug.
+    setTimeout(() => {
+      if (!client.sbWait) return;
+      client.sbWait = false;
+      if (client.q && client.q.length) {
+        client.wentLive = true;
+        try { ws.send(CLEAR_SCREEN); for (const q of client.q) ws.send(q); } catch {}
+        client.q = []; client.qBytes = 0;
+      }
+    }, HOST_SB_WAIT_MS);
     recompute(name);
     ws.on('message', m => {
       const s = m.toString();

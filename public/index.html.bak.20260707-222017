@@ -948,7 +948,7 @@ function reloadTerminal(quiet){
   connect(name, true);   // re-attach: CLEAR + scrollback replay + live, all client state reset
 }
 document.addEventListener('keydown', e=>{ if(e.ctrlKey && e.altKey && (e.key==='r'||e.key==='R')){ e.preventDefault(); e.stopPropagation(); reloadTerminal(); } }, true);
-window.__muxBuild='2026-07-07-scrollfix';   // bump per web deploy so a loaded version is verifiable
+window.__muxBuild='2026-07-07-tomux';   // bump per web deploy so a loaded version is verifiable
 try{ console.info('multiplex build', window.__muxBuild); }catch(e){}
 const helper = $('#term').querySelector('.xterm-helper-textarea');
 function hardenHelperTextarea(){
@@ -1232,27 +1232,13 @@ window.addEventListener('orientationchange', ()=>setTimeout(applyViewport,250));
   host.addEventListener('touchend', ()=>{ active=false; }, {passive:true});
 })();
 
-// Wheel scrolling that CAN'T get stuck. Runs at capture phase (before xterm's own handler), so a stuck
-// mouse-tracking mode (which would otherwise send the wheel to the app as a mouse event, freezing the
-// scrollback) can never eat it. In a NORMAL buffer we scroll xterm's scrollback OURSELVES and stop the
-// event; only in the ALTERNATE buffer (full-screen TUI with no scrollback) do we forward the wheel so the
-// app scrolls its own view.
+// When a local 30-row terminal owns the size, the web surface can be taller than xterm's
+// rendered rows. Keep the whole black terminal area interactive by forwarding wheel events.
 $('#term').addEventListener('wheel', e=>{
-  if(!(e.deltaX || e.deltaY)) return;
-  noteUserScroll();
+  if(e.deltaX || e.deltaY) noteUserScroll();
   const host=$('#term'), xt=host.querySelector('.xterm');
-  let alt=false; try{ alt = term.buffer.active.type==='alternate'; }catch(_){}
-  if(!alt){
-    const ch=(cellMetrics().h)||18;
-    const px = e.deltaMode===1 ? e.deltaY*ch : (e.deltaMode===2 ? e.deltaY*(term.rows||24)*ch : e.deltaY);
-    const lines = Math.trunc(px/ch) || (e.deltaY>0?1:(e.deltaY<0?-1:0));
-    if(lines){ try{ term.scrollLines(lines); }catch(_){} }
-    e.preventDefault(); e.stopPropagation();
-    return;
-  }
-  // Alternate buffer: hand the wheel to the app so it scrolls its own transcript.
-  const target=(xt && !xt.contains(e.target)) ? (host.querySelector('.xterm-viewport')||xt) : (host.querySelector('.xterm-viewport'));
-  if(!target) return;
+  if(!xt || xt.contains(e.target)) return;
+  const target=host.querySelector('.xterm-viewport') || xt;
   try{
     target.dispatchEvent(new WheelEvent('wheel', {
       deltaX:e.deltaX, deltaY:e.deltaY, deltaZ:e.deltaZ, deltaMode:e.deltaMode,
@@ -1261,7 +1247,7 @@ $('#term').addEventListener('wheel', e=>{
     }));
     e.preventDefault();
   }catch(_){}
-}, {passive:false, capture:true});
+}, {passive:false});
 
 function setFont(px){ fontSize=Math.min(20,Math.max(11,px)); term.options.fontSize=fontSize; LS.set('mux_font',fontSize); doFit(); }
 function updateMeta(){ $('#statusmeta').textContent = current ? `${term.cols}×${term.rows}${$('#term').classList.contains('pan')?' · pan':''}` : ''; }
