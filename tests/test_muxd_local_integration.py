@@ -18,6 +18,7 @@ except ImportError:  # pragma: no cover - covered by unittest skip
 
 REPO = Path(__file__).resolve().parents[1]
 MUXD = REPO / "muxd.py"
+MUXRUN = REPO / "muxrun.py"
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
@@ -131,22 +132,39 @@ class DisposableMuxd:
             ),
             encoding="utf-8",
         )
-        env = os.environ.copy()
-        env["HOME"] = str(self.root)
-        env["USERPROFILE"] = str(self.root)
-        env["HOMEDRIVE"] = self.root.drive or "C:"
-        env["HOMEPATH"] = str(self.root)[len(self.root.drive) :] if self.root.drive else str(self.root)
-        env["PYTHONUNBUFFERED"] = "1"
-        env["INSTANCE_MUTEX_NAME"] = f"Local\\CodexMuxdTest-{self.port}"
+        self.env = os.environ.copy()
+        self.env["HOME"] = str(self.root)
+        self.env["USERPROFILE"] = str(self.root)
+        self.env["HOMEDRIVE"] = self.root.drive or "C:"
+        self.env["HOMEPATH"] = str(self.root)[len(self.root.drive) :] if self.root.drive else str(self.root)
+        self.env["PYTHONUNBUFFERED"] = "1"
+        self.env["INSTANCE_MUTEX_NAME"] = f"Local\\CodexMuxdTest-{self.port}"
+        self.env["MUXCTL_PORT"] = str(self.port)
+        self.start_process()
+
+    def start_process(self):
         self.proc = subprocess.Popen(
             [sys.executable, str(MUXD)],
             cwd=str(REPO),
-            env=env,
+            env=self.env,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             creationflags=CREATE_NO_WINDOW,
         )
         self.wait_ready()
+
+    def stop_process(self):
+        if self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=6)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait(timeout=6)
+
+    def restart(self):
+        self.stop_process()
+        self.start_process()
 
     def wait_ready(self):
         deadline = time.time() + 18
@@ -171,13 +189,7 @@ class DisposableMuxd:
         return f"{reason}\nlog:\n{log_tail}"
 
     def close(self):
-        if self.proc.poll() is None:
-            self.proc.terminate()
-            try:
-                self.proc.wait(timeout=6)
-            except subprocess.TimeoutExpired:
-                self.proc.kill()
-                self.proc.wait(timeout=6)
+        self.stop_process()
         shutil.rmtree(self.root, ignore_errors=True)
 
 
@@ -236,7 +248,7 @@ class MuxdLocalIntegrationTests(unittest.TestCase):
             self.assertTrue(relaunched.get("hasCommand"))
             self.assertFalse(relaunched.get("shellOnly"))
             self.assertEqual(relaunched.get("kind"), "command")
-            self.assertTrue(relaunched.get("cmdSig"))
+            self.assertNotIn("cmdSig", relaunched)
         finally:
             self.kill(name)
 
@@ -254,7 +266,7 @@ class MuxdLocalIntegrationTests(unittest.TestCase):
             after = self.session(name)
             self.assertFalse(second.get("created"))
             self.assertEqual(before.get("created"), after.get("created"))
-            self.assertEqual(before.get("cmdSig"), after.get("cmdSig"))
+            self.assertNotIn("cmdSig", after)
         finally:
             self.kill(name)
 
@@ -274,8 +286,8 @@ class MuxdLocalIntegrationTests(unittest.TestCase):
 
             self.assertTrue(second.get("created"))
             self.assertNotEqual(before.get("created"), after.get("created"))
-            self.assertEqual(before.get("cmdSig"), after.get("cmdSig"))
             self.assertTrue(after.get("hasCommand"))
+            self.assertNotIn("cmdSig", after)
         finally:
             self.kill(name)
 
@@ -313,6 +325,59 @@ class MuxdLocalIntegrationTests(unittest.TestCase):
             self.assertIn("visible local owner", second.get("m", ""))
         finally:
             self.kill(name)
+
+    def test_visible_owner_reclaims_manifest_after_muxd_restart(self):
+        name = "it-owner-restart"
+        cmd = "while($true){Start-Sleep -Milliseconds 200}"
+        self.kill(name)
+        owner = subprocess.Popen(
+            [sys.executable, str(MUXRUN), name, "--cwd", str(self.muxd.root), "--cmd", cmd],
+            cwd=str(REPO),
+            env=self.muxd.env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=CREATE_NO_WINDOW,
+        )
+        try:
+            deadline = time.time() + 12
+            before = None
+            while time.time() < deadline:
+                before = self.session(name)
+                if before and before.get("owner"):
+                    break
+                time.sleep(0.2)
+            self.assertIsNotNone(before)
+            self.assertTrue(before.get("owner"), before)
+
+            manifest = json.loads((self.muxd.root / "muxd" / "sessions.json").read_text(encoding="utf-8"))
+            self.assertTrue(manifest[name]["owner"])
+            self.assertGreaterEqual(len(manifest[name]["ownerKey"]), 24)
+
+            self.muxd.restart()
+
+            deadline = time.time() + 15
+            after = None
+            while time.time() < deadline:
+                after = self.session(name)
+                if after and after.get("owner"):
+                    break
+                time.sleep(0.25)
+            self.assertIsNone(owner.poll(), "muxrun child owner exited during muxd restart")
+            self.assertIsNotNone(after)
+            self.assertTrue(after.get("owner"), after)
+        finally:
+            self.kill(name)
+            try:
+                owner.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                subprocess.run(
+                    ["taskkill.exe", "/PID", str(owner.pid), "/T", "/F"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=10,
+                    creationflags=CREATE_NO_WINDOW,
+                )
+                owner.wait(timeout=5)
 
     def test_relaunch_waits_until_previous_process_exits(self):
         name = "it-relaunch-exit-barrier"
@@ -373,6 +438,61 @@ class MuxdLocalIntegrationTests(unittest.TestCase):
         finally:
             self.kill(name)
 
+    def test_pending_fresh_identity_cannot_relaunch_until_bound(self):
+        name = "it-pending-identity"
+        marker = f"MUXD_IT_PENDING_{int(time.time() * 1000)}"
+        self.kill(name)
+        try:
+            first = run_request(
+                self.muxd.port,
+                {
+                    "t": "create",
+                    "s": name,
+                    "cmd": f"Write-Output '{marker}'; while($true){{Start-Sleep -Milliseconds 200}}",
+                    "identityPending": True,
+                },
+                timeout=12,
+            )
+            self.assertTrue(first.get("created"))
+            pending = self.wait_for_tail(name, marker)
+            self.assertTrue(pending.get("identityPending"))
+            self.assertEqual("", pending.get("sessionId"))
+
+            refused = run_request(
+                self.muxd.port,
+                {"t": "create", "s": name, "relaunch": True},
+                timeout=12,
+            )
+            self.assertEqual("err", refused.get("t"))
+            self.assertIn("identity has not been captured", refused.get("m", ""))
+
+            resume_marker = marker + "_RESUMED"
+            bound = run_request(
+                self.muxd.port,
+                {
+                    "t": "bind",
+                    "s": name,
+                    "cmd": f"Write-Output '{resume_marker}'; # codex resume captured-id",
+                    "sessionId": "captured-id",
+                    "aliases": [],
+                },
+                timeout=12,
+            )
+            self.assertEqual("bind-ok", bound.get("t"), bound)
+            after = self.session(name)
+            self.assertFalse(after.get("identityPending"))
+            self.assertEqual("captured-id", after.get("sessionId"))
+
+            relaunched = run_request(
+                self.muxd.port,
+                {"t": "create", "s": name, "relaunch": True},
+                timeout=12,
+            )
+            self.assertTrue(relaunched.get("created"))
+            self.wait_for_tail(name, resume_marker)
+        finally:
+            self.kill(name)
+
     def test_different_command_replaces_wrong_live_session(self):
         name = "it-different-command"
         old_marker = f"MUXD_IT_OLD_{int(time.time() * 1000)}"
@@ -386,8 +506,8 @@ class MuxdLocalIntegrationTests(unittest.TestCase):
             new = self.wait_for_tail(name, new_marker)
             self.assertTrue(second.get("created"))
             self.assertNotEqual(old.get("created"), new.get("created"))
-            self.assertNotEqual(old.get("cmdSig"), new.get("cmdSig"))
             self.assertNotIn(old_marker, new.get("tail") or "")
+            self.assertNotIn("cmdSig", new)
         finally:
             self.kill(name)
 

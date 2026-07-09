@@ -185,26 +185,35 @@ class VpsSmokeTests(unittest.TestCase):
         except Exception:
             pass
 
-    def test_relay_relaunches_existing_shell_only_session_with_requested_command(self):
+    def test_relay_relaunches_dormant_session_from_muxd_saved_command(self):
         suffix = int(time.time() * 1000)
-        name = f"vps-shell-{suffix}"
+        name = f"vps-saved-{suffix}"
         marker = f"MUXD_VPS_RELAUNCH_{suffix}"
-        cmd = f"Write-Output '{marker}'"
+        cmd = f"Write-Output '{marker}'; Start-Sleep -Milliseconds 250"
         self.kill(name)
         try:
-            created = local_json({"t": "create", "s": name, "cols": 100, "rows": 28}, timeout=12)
+            created = local_json({"t": "create", "s": name, "cmd": cmd, "cols": 100, "rows": 28}, timeout=12)
             self.assertTrue(created.get("created"))
-            shell = self.wait_for(lambda: self.relay_session(name) if (self.relay_session(name) or {}).get("shellOnly") else None, label="shell-only relay row")
-            self.assertTrue(shell.get("alive"))
-            self.assertFalse(shell.get("hasCommand"))
+            before = self.wait_for(
+                lambda: self.local_session(name) if marker in ((self.local_session(name) or {}).get("tail") or "") else None,
+                label="initial command marker",
+            )
+            dormant = self.wait_for(
+                lambda: self.relay_session(name) if (self.relay_session(name) or {}).get("dormant") else None,
+                label="dormant saved-command relay row",
+            )
+            self.assertTrue(dormant.get("hasCommand"))
 
-            result = relay_json("POST", "/api/sessions", {"name": name, "command": cmd}, timeout=25)
+            result = relay_json("POST", f"/api/sessions/{name}/relaunch", {}, timeout=25)
             self.assertTrue(result.get("ok"), result)
             self.assertTrue(result.get("created"), result)
 
             local = self.wait_for(
-                lambda: self.local_session(name) if marker in ((self.local_session(name) or {}).get("tail") or "") else None,
-                label="command marker in local muxd tail",
+                lambda: self.local_session(name)
+                if (self.local_session(name) or {}).get("created") != before.get("created")
+                and marker in ((self.local_session(name) or {}).get("tail") or "")
+                else None,
+                label="saved command marker after relaunch",
             )
             self.assertTrue(local.get("hasCommand"))
             self.assertFalse(local.get("shellOnly"))
@@ -214,31 +223,30 @@ class VpsSmokeTests(unittest.TestCase):
                 label="command-backed relay row",
             )
             self.assertFalse(relay.get("shellOnly"))
-            self.assertTrue(relay.get("cmdSig"))
+            self.assertNotIn("cmdSig", relay)
         finally:
             self.kill(name)
 
-    def test_relay_reuses_same_command_session_without_restarting(self):
+    def test_relay_reuses_existing_live_command_session_without_restarting(self):
         suffix = int(time.time() * 1000)
         name = f"vps-same-{suffix}"
         marker = f"MUXD_VPS_SAME_{suffix}"
-        cmd = f"Write-Output '{marker}'"
+        cmd = f"Write-Output '{marker}'; while($true){{Start-Sleep -Milliseconds 200}}"
         self.kill(name)
         try:
-            first = relay_json("POST", "/api/sessions", {"name": name, "command": cmd}, timeout=25)
-            self.assertTrue(first.get("ok"), first)
+            first = local_json({"t": "create", "s": name, "cmd": cmd}, timeout=12)
             self.assertTrue(first.get("created"), first)
             before = self.wait_for(
                 lambda: self.local_session(name) if marker in ((self.local_session(name) or {}).get("tail") or "") else None,
                 label="first command marker",
             )
 
-            second = relay_json("POST", "/api/sessions", {"name": name, "command": cmd}, timeout=25)
+            second = relay_json("POST", "/api/sessions", {"name": name}, timeout=25)
             after = self.local_session(name)
             self.assertTrue(second.get("ok"), second)
             self.assertFalse(second.get("created"), second)
             self.assertEqual(before.get("created"), after.get("created"))
-            self.assertEqual(before.get("cmdSig"), after.get("cmdSig"))
+            self.assertNotIn("cmdSig", after)
         finally:
             self.kill(name)
 

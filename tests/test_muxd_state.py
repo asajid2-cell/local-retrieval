@@ -2,7 +2,9 @@ import importlib
 import asyncio
 import json
 import os
+import queue
 import tempfile
+import threading
 import time
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -84,7 +86,13 @@ class MuxdStateTests(unittest.TestCase):
                 self.heal = True
                 self.cols = 120
                 self.rows = 36
+                self.session_id = "parent-id"
+                self.aliases = ("child-id",)
                 self.ids = ["parent-id", "child-id"]
+                self.owner = True
+                self.owner_key = "k" * 32
+                self.identity_pending = True
+                self.deaths = [100.0, 200.0]
 
         old_manifest = muxd.MANIFEST
         old_sessions = muxd.sessions
@@ -93,11 +101,18 @@ class MuxdStateTests(unittest.TestCase):
                 muxd.MANIFEST = os.path.join(root, "sessions.json")
                 muxd.sessions = {"manifest-aliases": ManifestSession()}
                 muxd.manifest_save()
-                data = json.load(open(muxd.MANIFEST, encoding="utf-8"))
+                with open(muxd.MANIFEST, encoding="utf-8") as stream:
+                    data = json.load(stream)
                 self.assertEqual(
                     ["parent-id", "child-id"],
                     data["manifest-aliases"]["ids"],
                 )
+                self.assertEqual("parent-id", data["manifest-aliases"]["sessionId"])
+                self.assertEqual(["child-id"], data["manifest-aliases"]["aliases"])
+                self.assertTrue(data["manifest-aliases"]["owner"])
+                self.assertEqual("k" * 32, data["manifest-aliases"]["ownerKey"])
+                self.assertTrue(data["manifest-aliases"]["identityPending"])
+                self.assertEqual([100.0, 200.0], data["manifest-aliases"]["deaths"])
             finally:
                 muxd.MANIFEST = old_manifest
                 muxd.sessions = old_sessions
@@ -224,7 +239,59 @@ class MuxdStateTests(unittest.TestCase):
         self.assertFalse(payload["hasCommand"])
         self.assertTrue(payload["shellOnly"])
         self.assertEqual(payload["kind"], "shell")
-        self.assertEqual(payload["cmdSig"], "")
+        self.assertNotIn("cmdSig", payload)
+
+    def test_session_payload_exposes_opaque_identity_without_command_fingerprint(self):
+        session = FakeSession(cmd="codex resume canonical-id", alive=True)
+        session.session_id = "canonical-id"
+        session.aliases = ("child-id",)
+        session.ids = ("canonical-id", "child-id")
+
+        payload = muxd.session_payload("agent", session)
+
+        self.assertEqual("canonical-id", payload["sessionId"])
+        self.assertEqual(["child-id"], payload["aliases"])
+        self.assertNotIn("cmd", payload)
+        self.assertNotIn("cmdSig", payload)
+        self.assertNotIn("cwd", payload)
+
+    def test_session_payload_exposes_pending_identity_without_command_data(self):
+        session = FakeSession(cmd="codex", alive=True)
+        session.identity_pending = True
+
+        payload = muxd.session_payload("fresh", session)
+
+        self.assertTrue(payload["identityPending"])
+        self.assertEqual("", payload["sessionId"])
+        self.assertNotIn("cmd", payload)
+
+    def test_remote_create_protocol_accepts_only_opaque_saved_command_intent(self):
+        valid = {
+            "t": "create",
+            "s": "safe-tab",
+            "rid": "hcabc-1",
+            "cols": 140,
+            "rows": 40,
+            "relaunch": True,
+            "heal": False,
+        }
+        self.assertEqual("", muxd.remote_create_violation(valid))
+
+        invalid = [
+            {**valid, "cmd": "codex resume secret"},
+            {**valid, "cwd": r"C:\Users\Ahmed\secret"},
+            {**valid, "sessionId": "secret"},
+            {**valid, "ids": ["secret"]},
+            {**valid, "s": "../safe-tab"},
+            {**valid, "rid": r"C:\secret"},
+            {**valid, "cols": 1000000},
+            {**valid, "heal": "true"},
+        ]
+        for frame in invalid:
+            self.assertTrue(
+                muxd.remote_create_violation(frame),
+                f"remote create frame must be rejected: {frame!r}",
+            )
 
     def test_command_payload_is_distinguishable_from_shell(self):
         cmd = "Write-Output TEST_MARKER"
@@ -235,7 +302,7 @@ class MuxdStateTests(unittest.TestCase):
         self.assertTrue(payload["hasCommand"])
         self.assertFalse(payload["shellOnly"])
         self.assertEqual(payload["kind"], "command")
-        self.assertEqual(payload["cmdSig"], muxd.command_sig(cmd))
+        self.assertNotIn("cmdSig", payload)
         self.assertEqual(payload["agentState"], "working")
         self.assertFalse(payload["needsAttention"])
 
@@ -256,6 +323,35 @@ class MuxdStateTests(unittest.TestCase):
 
         self.assertEqual(payload["agentState"], "stopped")
         self.assertTrue(payload["needsAttention"])
+
+    def test_confirmed_input_reports_actual_pty_write_result(self):
+        class Pty:
+            def __init__(self):
+                self.writes = []
+
+            def write(self, value):
+                self.writes.append(value)
+
+        session = muxd.Session.__new__(muxd.Session)
+        session.name = "input-confirm"
+        session.wq = queue.Queue()
+        session.pty = Pty()
+        session.dead = False
+        worker = threading.Thread(target=session._writer, daemon=True)
+        worker.start()
+        try:
+            ok, detail = session.write_confirmed(b"hello\r")
+            self.assertTrue(ok, detail)
+            self.assertEqual(["hello\r"], session.pty.writes)
+
+            session.dead = True
+            ok, detail = session.write_confirmed(b"lost\r")
+            self.assertFalse(ok)
+            self.assertIn("not live", detail)
+            self.assertEqual(["hello\r"], session.pty.writes)
+        finally:
+            session.wq.put(None)
+            worker.join(timeout=2)
 
     def test_shell_only_payload_is_neutral_attention_state(self):
         payload = muxd.session_payload("shell", FakeSession(cmd="", alive=True))
@@ -285,6 +381,41 @@ class MuxdStateTests(unittest.TestCase):
     def test_resume_parser_accepts_quoted_ids(self):
         self.assertEqual(muxd._parse_resume_id('claude --resume "quoted-claude"'), "quoted-claude")
         self.assertEqual(muxd._parse_resume_id('codex resume --include-non-interactive "quoted-codex"'), "quoted-codex")
+
+    def test_command_resume_target_is_canonical_when_supplied_identity_conflicts(self):
+        canonical, aliases, ids = muxd.resolve_session_identity(
+            "codex resume actual-id",
+            "claimed-id",
+            [],
+            [],
+        )
+
+        self.assertEqual("actual-id", canonical)
+        self.assertEqual(("claimed-id",), aliases)
+        self.assertEqual(["actual-id", "claimed-id"], ids)
+
+    def test_owner_reconnect_ignores_only_agent_processes_under_reported_child(self):
+        old_descends = muxd._pid_descends_from
+        try:
+            muxd._pid_descends_from = lambda pid, ancestor: pid == 4321 and ancestor == 4000
+            ok, ignored, detail = muxd.owner_reconnect_ignored_live(
+                ["session-id"],
+                4000,
+                (True, {"session-id": 4321}, ""),
+            )
+            self.assertTrue(ok, detail)
+            self.assertEqual({"session-id": 4321}, ignored)
+
+            ok, ignored, detail = muxd.owner_reconnect_ignored_live(
+                ["session-id"],
+                4999,
+                (True, {"session-id": 4321}, ""),
+            )
+            self.assertFalse(ok)
+            self.assertEqual({}, ignored)
+            self.assertIn("outside", detail)
+        finally:
+            muxd._pid_descends_from = old_descends
 
     def test_resume_conflict_checks_alias_candidates(self):
         conflict = muxd.resume_conflict("codex resume parent-id", live={"child-id": 4242}, ids=["parent-id", "child-id"])
@@ -460,7 +591,10 @@ class MuxdAsyncTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_new_session_spawn_runs_off_event_loop(self):
         class SlowSession:
-            def __init__(self, name, cmd, cwd, cols, rows, loop, outq, heal=False, spawn_now=True, ids=None):
+            def __init__(
+                self, name, cmd, cwd, cols, rows, loop, outq, heal=False,
+                spawn_now=True, ids=None, session_id="", aliases=None
+            ):
                 self.name = name
                 self.spawned = False
 

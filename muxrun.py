@@ -193,7 +193,7 @@ def vk_for_char(ch):
 
 def write_console_input(data: bytes):
     if os.name != "nt" or not data:
-        return
+        return False
     text = data.decode("utf-8", "replace")
     k = ctypes.windll.kernel32
     hin = k.GetStdHandle(STD_INPUT_HANDLE)
@@ -211,10 +211,11 @@ def write_console_input(data: bytes):
             rec.Event.KeyEvent.dwControlKeyState = 0
             records.append(rec)
     if not records:
-        return
+        return False
     arr = (INPUT_RECORD * len(records))(*records)
     written = wintypes.DWORD()
-    k.WriteConsoleInputW(hin, arr, len(records), ctypes.byref(written))
+    ok = bool(k.WriteConsoleInputW(hin, arr, len(records), ctypes.byref(written)))
+    return ok and int(written.value) == len(records)
 
 
 async def listen_remote(ws, child):
@@ -226,7 +227,17 @@ async def listen_remote(ws, child):
         except Exception:
             continue
         if m.get("t") == "i":
-            write_console_input(base64.b64decode(m.get("d", "")))
+            ok = False
+            try:
+                ok = write_console_input(base64.b64decode(m.get("d", "")))
+            except Exception:
+                ok = False
+            if m.get("rid"):
+                await ws.send(json.dumps({
+                    "t": "inputResult",
+                    "rid": str(m.get("rid")),
+                    "ok": bool(ok),
+                }))
         elif m.get("t") == "kill":
             await asyncio.get_running_loop().run_in_executor(None, terminate_child_tree, child)
             if child.poll() is not None:
@@ -284,7 +295,7 @@ async def wait_child(child):
     return int(child.returncode or 0)
 
 
-async def register_owner(args, command, cwd, owner_key):
+async def register_owner(args, command, cwd, owner_key, child_pid=0):
     import json
 
     ws = await websockets.connect(URL, max_size=8_000_000, ping_interval=20, ping_timeout=15)
@@ -300,6 +311,7 @@ async def register_owner(args, command, cwd, owner_key):
                     "cols": cols,
                     "rows": rows,
                     "ownerKey": owner_key,
+                    "childPid": int(child_pid or 0),
                 }
             )
         )
@@ -315,14 +327,14 @@ async def register_owner(args, command, cwd, owner_key):
         raise
 
 
-async def connect_owner(args, command, cwd, child_started, owner_key):
+async def connect_owner(args, command, cwd, child_started, owner_key, child_pid=0):
     deadline = time.monotonic() + (float("inf") if child_started else 20.0)
     backoff = 0.5
     last_error = None
     while time.monotonic() < deadline:
         ensure_muxd_started()
         try:
-            return await register_owner(args, command, cwd, owner_key)
+            return await register_owner(args, command, cwd, owner_key, child_pid)
         except RuntimeError as e:
             last_error = e
             msg = str(e)
@@ -403,12 +415,26 @@ async def main_async(args):
             if result == "child-exit":
                 break
             print("[muxrun] muxd owner link dropped; re-registering while child continues", file=sys.stderr)
-            ws = await connect_owner(args, command, cwd, child_started=True, owner_key=owner_key)
+            ws = await connect_owner(
+                args,
+                command,
+                cwd,
+                child_started=True,
+                owner_key=owner_key,
+                child_pid=child.pid,
+            )
         except Exception as e:
             if child.poll() is not None:
                 break
             print("[muxrun] muxd owner link failed; re-registering while child continues: " + str(e), file=sys.stderr)
-            ws = await connect_owner(args, command, cwd, child_started=True, owner_key=owner_key)
+            ws = await connect_owner(
+                args,
+                command,
+                cwd,
+                child_started=True,
+                owner_key=owner_key,
+                child_pid=child.pid,
+            )
     return int(child.returncode or 0)
 
 

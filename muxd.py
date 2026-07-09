@@ -7,7 +7,8 @@
 #
 # Protocol (JSON text frames over ws):
 #   muxd -> relay:  hello{host,sessions} . sessions{list} . o{s,d:b64} . sb{s,d:b64} . killed{s} . pong
-#   relay -> muxd:  create{s,cmd,cwd,cols,rows,relaunch} . i{s,d:b64} . resize{s,cols,rows} . kill{s} . sb{s} . ping
+#   relay -> muxd:  create{s,rid,cols,rows,relaunch,heal} . i{s,d:b64} . resize{s,cols,rows} .
+#                    kill{s} . rename{s,to} . heal{s,on} . tail{s,rid,lines} . sb{s} . ping
 #
 # State: sessions.json manifest (resume commands) -> muxd restart / PC reboot lists unarmed sessions
 # as dormant placeholders. Only sessions explicitly armed with heal auto-start.
@@ -301,8 +302,8 @@ CLAIM_ROOT = ENV.get("LAUNCH_CLAIM_ROOT") or os.path.join(
     "launch-claims",
 )
 CLAIM_TTL_SECONDS = max(10, int(ENV.get("LAUNCH_CLAIM_TTL_SECONDS", "120")))
-PROTOCOL = 2
-CAPS = ["ls", "info", "create", "open", "attach", "kill", "rename", "heal", "tail", "scrollback", "resize", "owner", "relaunch"]
+PROTOCOL = 3
+CAPS = ["ls", "info", "create", "createAck", "bind", "input", "open", "attach", "kill", "rename", "heal", "tail", "scrollback", "resize", "owner", "relaunch"]
 STARTED = time.time()
 AGENT_WORKING_FRESH = float(ENV.get("AGENT_WORKING_FRESH", "25"))
 AGENT_STARTING_GRACE = float(ENV.get("AGENT_STARTING_GRACE", "45"))
@@ -319,6 +320,28 @@ def launch_candidate_ids(cmd="", ids=None):
         if value and re.fullmatch(r"[A-Za-z0-9._-]+", value):
             unique.setdefault(value.lower(), value)
     return sorted(unique.values(), key=str.lower)
+
+
+def _safe_identity(value):
+    value = str(value or "").strip()
+    return value if re.fullmatch(r"[A-Za-z0-9._-]+", value) else ""
+
+
+def resolve_session_identity(cmd="", session_id="", aliases=None, ids=None):
+    command_id = _safe_identity(_parse_resume_id(cmd))
+    requested_id = _safe_identity(session_id)
+    # The executable resume target is ground truth. A supplied id may be an archive alias, but it
+    # must never hide which identity the process was actually told to run.
+    canonical = command_id or requested_id
+    alias_values = []
+    for value in ([requested_id] if requested_id else []) + list(aliases or []) + _candidate_resume_ids(cmd, ids):
+        value = _safe_identity(value)
+        if not value or (canonical and value.lower() == canonical.lower()):
+            continue
+        if value.lower() not in [x.lower() for x in alias_values]:
+            alias_values.append(value)
+    all_ids = launch_candidate_ids(cmd, ([canonical] if canonical else []) + alias_values)
+    return canonical, tuple(alias_values), all_ids
 
 
 def claim_file_name(session_id):
@@ -462,6 +485,31 @@ def session_owned_live_ids(session, live):
             ignored[session_id.lower()] = pid
     return True, ignored, ""
 
+def owner_reconnect_ignored_live(candidate_ids, child_pid, live):
+    if not isinstance(live, tuple):
+        live = (True, live, "")
+    ok, values, detail = live
+    if not ok:
+        return False, {}, detail
+    try:
+        child_pid = int(child_pid)
+    except (TypeError, ValueError):
+        child_pid = 0
+    if child_pid <= 0:
+        return False, {}, "visible owner reconnect did not report its live child pid"
+    ignored = {}
+    for session_id in candidate_ids:
+        pid = (values or {}).get(str(session_id).lower())
+        if not pid:
+            continue
+        owned = _pid_descends_from(pid, child_pid)
+        if owned is None:
+            return False, {}, f"could not verify whether pid {pid} belongs to the reconnecting visible owner"
+        if not owned:
+            return False, {}, f"session {session_id} is live outside the reconnecting visible owner"
+        ignored[str(session_id).lower()] = pid
+    return True, ignored, ""
+
 
 def acquire_launch_claim(cmd="", ids=None, reason="muxd session launch", live=None, ignored_live=None):
     candidate_ids = launch_candidate_ids(cmd, ids)
@@ -578,11 +626,17 @@ def clean_terminal_text(s):
     return CTRL_RE.sub("", s)
 
 class Session:
-    def __init__(self, name, cmd, cwd, cols, rows, loop, outq, heal=False, spawn_now=True, ids=None):
+    def __init__(self, name, cmd, cwd, cols, rows, loop, outq, heal=False, spawn_now=True,
+                 ids=None, session_id="", aliases=None):
         self.name, self.cmd, self.cwd = name, cmd or "", cwd or DEFAULT_CWD
-        self.ids = launch_candidate_ids(self.cmd, ids)
+        self.session_id, self.aliases, self.ids = resolve_session_identity(
+            self.cmd, session_id, aliases, ids
+        )
         self.claim_paths = []
         self._launch_claim = None
+        self.expected_owner = False
+        self.owner_key = ""
+        self.identity_pending = False
         self.heal = bool(heal)          # opt-in: ONLY healed (user-armed) sessions auto-start at boot / auto-respawn
         self.cols, self.rows = max(20, cols or 140), max(8, rows or 40)
         self.created = time.time(); self.last_out = time.time()
@@ -654,21 +708,48 @@ class Session:
     def _writer(self):
         # serialize input; slice large pastes into <=1KB writes so a big paste can't stall/garble ConPTY input.
         while True:
-            s = self.wq.get()
-            if s is None: return
+            item = self.wq.get()
+            if item is None: return
+            if isinstance(item, tuple):
+                s, completed, outcome = item
+            else:
+                s, completed, outcome = item, None, None
+            ok, detail = False, "PTY is not live"
             try:
-                if self.pty is None or self.dead: continue
-                if len(s) <= 1024:
-                    self.pty.write(s)
-                else:
-                    for i in range(0, len(s), 1024):
-                        if self.dead: break
-                        self.pty.write(s[i:i+1024]); time.sleep(0.004)
-            except Exception as e: log(f"[{self.name}] write failed: {e}")
+                if self.pty is not None and not self.dead:
+                    if len(s) <= 1024:
+                        self.pty.write(s)
+                        ok, detail = True, ""
+                    else:
+                        ok, detail = True, ""
+                        for i in range(0, len(s), 1024):
+                            if self.dead:
+                                ok, detail = False, "PTY exited during input"
+                                break
+                            self.pty.write(s[i:i+1024]); time.sleep(0.004)
+            except Exception as e:
+                detail = "PTY input write failed"
+                log(f"[{self.name}] write failed: {e}")
+            finally:
+                if completed is not None:
+                    outcome.append((ok, detail))
+                    completed.set()
 
     def write(self, data: bytes):
         try: self.wq.put(data.decode("utf-8", "replace"))
         except Exception as e: log(f"[{self.name}] enqueue failed: {e}")
+
+    def write_confirmed(self, data: bytes, timeout=8):
+        completed = threading.Event()
+        outcome = []
+        try:
+            self.wq.put((data.decode("utf-8", "replace"), completed, outcome))
+        except Exception as e:
+            log(f"[{self.name}] confirmed enqueue failed: {e}")
+            return False, "PTY input queue failed"
+        if not completed.wait(timeout):
+            return False, "PTY input write timed out"
+        return outcome[0] if outcome else (False, "PTY input write did not report a result")
 
     def resize(self, cols, rows):
         cols, rows = max(20, int(cols)), max(8, int(rows))
@@ -722,9 +803,12 @@ class Session:
 class OwnerSession:
     # A visible local terminal owns the agent. muxd only relays that terminal's screen
     # snapshots to the VPS and forwards remote keystrokes back into the owner sidecar.
-    def __init__(self, name, cmd, cwd, cols, rows, loop, outq, owner_ws, heal=False, ids=None, owner_key=""):
+    def __init__(self, name, cmd, cwd, cols, rows, loop, outq, owner_ws, heal=False,
+                 ids=None, session_id="", aliases=None, owner_key=""):
         self.name, self.cmd, self.cwd = name, cmd or "", cwd or DEFAULT_CWD
-        self.ids = launch_candidate_ids(self.cmd, ids)
+        self.session_id, self.aliases, self.ids = resolve_session_identity(
+            self.cmd, session_id, aliases, ids
+        )
         self.claim_paths = []
         self._launch_claim = None
         self.heal = bool(heal)
@@ -738,8 +822,12 @@ class OwnerSession:
         self.local = set()
         self.owner_ws = owner_ws
         self.owner = True
+        self.expected_owner = True
         self.owner_key = str(owner_key or "")
+        self.identity_pending = False
         self.owner_exit_confirmed = False
+        self.input_waiters = {}
+        self.input_seq = 0
 
     def ingest(self, data: bytes):
         if not data: return
@@ -765,6 +853,23 @@ class OwnerSession:
 
     def write(self, data: bytes):
         self._send_owner({"t": "i", "d": base64.b64encode(data).decode("ascii")})
+
+    async def write_confirmed(self, data: bytes, timeout=8):
+        self.input_seq += 1
+        rid = f"input-{self.input_seq}"
+        future = self.loop.create_future()
+        self.input_waiters[rid] = future
+        try:
+            await self.owner_ws.send(json.dumps({
+                "t": "i",
+                "rid": rid,
+                "d": base64.b64encode(data).decode("ascii"),
+            }))
+            return await asyncio.wait_for(future, timeout)
+        except Exception:
+            return False, "visible terminal input failed"
+        finally:
+            self.input_waiters.pop(rid, None)
 
     def resize(self, cols, rows):
         # Remote viewers never own size for an owner-backed session. The sidecar reports
@@ -856,7 +961,13 @@ def start_watchdog_thread():
 def manifest_save():
     try:
         data = {n: {"cmd": s.cmd, "cwd": s.cwd, "cols": s.cols, "rows": s.rows, "heal": s.heal,
-                    "ids": list(getattr(s, "ids", []) or [])}
+                    "sessionId": getattr(s, "session_id", "") or "",
+                    "aliases": list(getattr(s, "aliases", []) or []),
+                    "ids": list(getattr(s, "ids", []) or []),
+                    "owner": bool(getattr(s, "owner", False) or getattr(s, "expected_owner", False)),
+                    "ownerKey": str(getattr(s, "owner_key", "") or ""),
+                    "identityPending": bool(getattr(s, "identity_pending", False)),
+                    "deaths": [float(value) for value in list(getattr(s, "deaths", []) or [])[-16:]]}
                 for n, s in sessions.items() if not s.user_killed}
         tmp = MANIFEST + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f: json.dump(data, f)
@@ -878,7 +989,14 @@ def live_tabs_snapshot():
             pid = 0
         try: alive = bool(s.alive())
         except Exception: alive = False
-        out[n] = {"pid": pid, "cwd": getattr(s, "cwd", "") or "", "alive": alive, "hasCommand": session_has_command(s)}
+        out[n] = {
+            "pid": pid,
+            "cwd": getattr(s, "cwd", "") or "",
+            "alive": alive,
+            "hasCommand": session_has_command(s),
+            "sessionId": getattr(s, "session_id", "") or "",
+            "identityPending": bool(getattr(s, "identity_pending", False)),
+        }
     return out
 
 def write_live_tabs():
@@ -890,6 +1008,42 @@ def write_live_tabs():
         log(f"live-tabs write failed: {e}")
 
 SAFE = lambda s: re.sub(r"[^A-Za-z0-9_.-]", "", str(s or ""))[:48]
+
+def strict_mux_name(value):
+    raw = str(value or "").strip()
+    return raw if raw and SAFE(raw) == raw else ""
+
+REMOTE_CREATE_FIELDS = {"t", "s", "rid", "cols", "rows", "relaunch", "heal"}
+
+def remote_create_violation(frame):
+    if not isinstance(frame, dict):
+        return "create frame must be an object"
+    extra = set(frame) - REMOTE_CREATE_FIELDS
+    if extra:
+        return "create frame contains forbidden fields"
+    if frame.get("t") != "create":
+        return "not a create frame"
+    if not strict_mux_name(frame.get("s", "")):
+        return "invalid mux session name"
+    rid = str(frame.get("rid", "") or "")
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", rid):
+        return "invalid create request id"
+    for key, low, high in (("cols", 20, 500), ("rows", 8, 200)):
+        if key not in frame:
+            continue
+        value = frame.get(key)
+        if isinstance(value, bool):
+            return f"invalid {key}"
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            return f"invalid {key}"
+        if value < low or value > high:
+            return f"invalid {key}"
+    for key in ("relaunch", "heal"):
+        if key in frame and not isinstance(frame.get(key), bool):
+            return f"invalid {key}"
+    return ""
 
 def normalized_cmd(cmd):
     return (cmd or "").strip()
@@ -967,7 +1121,10 @@ def session_payload(name, sess):
             "tail": tail, "heal": sess.heal, "localViewers": len(sess.local),
             "localFirst": owner or len(sess.local) > 0, "owner": owner,
             "hasCommand": has_cmd, "shellOnly": alive and not has_cmd,
-            "ready": alive, "kind": kind, "cmdSig": command_sig(getattr(sess, "cmd", "")),
+            "ready": alive, "kind": kind,
+            "sessionId": getattr(sess, "session_id", "") or "",
+            "aliases": list(getattr(sess, "aliases", []) or []),
+            "identityPending": bool(getattr(sess, "identity_pending", False)),
             "agentState": agent["agentState"], "agentLabel": agent["agentLabel"],
             "agentDetail": agent["agentDetail"], "agentConfidence": agent["agentConfidence"],
             "needsAttention": agent["needsAttention"], "lastOutAgeMs": agent.get("lastOutAgeMs", 0)}
@@ -990,8 +1147,12 @@ async def spawn_session_off_loop(s):
     await asyncio.get_running_loop().run_in_executor(None, s.spawn)
     return s
 
-async def new_session_off_loop(name, cmd, cwd, cols, rows, loop, outq, heal=False, ids=None):
-    s = Session(name, cmd, cwd, cols, rows, loop, outq, heal=heal, spawn_now=False, ids=ids)
+async def new_session_off_loop(name, cmd, cwd, cols, rows, loop, outq, heal=False, ids=None,
+                               session_id="", aliases=None):
+    s = Session(
+        name, cmd, cwd, cols, rows, loop, outq, heal=heal, spawn_now=False,
+        ids=ids, session_id=session_id, aliases=aliases
+    )
     await spawn_session_off_loop(s)
     return s
 
@@ -1108,7 +1269,7 @@ async def main():
             manifest_save()
             return True, detail
 
-    async def reserve_launch_claim(name, cmd, candidate_ids, prev=None):
+    async def reserve_launch_claim(name, cmd, candidate_ids, prev=None, ignored_live_override=None):
         if not cmd:
             return None, False, ""
         existing_claim = getattr(prev, "_launch_claim", None) if prev else None
@@ -1116,8 +1277,8 @@ async def main():
             return existing_claim, True, ""
 
         live = await asyncio.get_running_loop().run_in_executor(None, try_live_session_ids)
-        ignored_live = {}
-        if prev and prev.alive():
+        ignored_live = dict(ignored_live_override or {})
+        if prev and prev.alive() and ignored_live_override is None:
             owned_ok, ignored_live, owned_detail = await asyncio.get_running_loop().run_in_executor(
                 None, lambda: session_owned_live_ids(prev, live)
             )
@@ -1136,7 +1297,7 @@ async def main():
         return claim, False, detail
 
     async def coordinate_owner_registration(first, ws):
-        name = SAFE(first.get("s", ""))
+        name = strict_mux_name(first.get("s", ""))
         if not name:
             return None, "session name required"
         owner_key = str(first.get("ownerKey", "") or "")
@@ -1147,16 +1308,31 @@ async def main():
             prev = sessions.get(name)
             cmd = (first.get("cmd", "") or "").strip() or (prev.cmd if prev else "")
             ids = first.get("ids") if isinstance(first.get("ids"), list) else []
-            candidate_ids = launch_candidate_ids(cmd, ids or (prev.ids if prev else None))
-            reconnect = bool(
+            requested_aliases = first.get("aliases") if isinstance(first.get("aliases"), list) else []
+            requested_session_id = _safe_identity(first.get("sessionId", ""))
+            canonical_id, identity_aliases, candidate_ids = resolve_session_identity(
+                cmd,
+                requested_session_id or (getattr(prev, "session_id", "") if prev else ""),
+                requested_aliases or (getattr(prev, "aliases", ()) if prev else ()),
+                ids or (prev.ids if prev else None),
+            )
+            live_owner_reconnect = bool(
                 prev
                 and getattr(prev, "owner", False)
                 and not prev.alive()
                 and getattr(prev, "owner_key", "") == owner_key
             )
+            restored_owner_reconnect = bool(
+                prev
+                and getattr(prev, "expected_owner", False)
+                and not getattr(prev, "owner", False)
+                and not prev.alive()
+                and getattr(prev, "owner_key", "") == owner_key
+            )
+            reconnect = live_owner_reconnect or restored_owner_reconnect
             if prev and prev.alive():
                 return None, "session already has a visible local owner: " + name
-            if prev and getattr(prev, "owner", False) and not reconnect:
+            if prev and (getattr(prev, "owner", False) or getattr(prev, "expected_owner", False)) and not reconnect:
                 return None, "visible owner reconnect key did not match: " + name
             if reconnect and (
                 normalized_cmd(getattr(prev, "cmd", "")) != normalized_cmd(cmd)
@@ -1164,8 +1340,18 @@ async def main():
             ):
                 return None, "visible owner reconnect identity changed: " + name
 
+            ignored_live_override = None
+            if restored_owner_reconnect and candidate_ids:
+                live = await asyncio.get_running_loop().run_in_executor(None, try_live_session_ids)
+                owned_ok, ignored_live_override, owned_detail = await asyncio.get_running_loop().run_in_executor(
+                    None,
+                    lambda: owner_reconnect_ignored_live(candidate_ids, first.get("childPid", 0), live),
+                )
+                if not owned_ok:
+                    return None, owned_detail or "could not verify reconnecting visible owner"
+
             claim, preserve_existing_claim, claim_detail = await reserve_launch_claim(
-                name, cmd, candidate_ids, prev
+                name, cmd, candidate_ids, prev, ignored_live_override=ignored_live_override
             )
             if candidate_ids and claim is None:
                 return None, claim_detail or "could not reserve visible owner"
@@ -1193,8 +1379,10 @@ async def main():
                 loop,
                 outq,
                 ws,
-                heal=bool(first.get("heal")),
+                heal=bool(first.get("heal")) if "heal" in first else bool(prev.heal if prev else False),
                 ids=candidate_ids,
+                session_id=canonical_id,
+                aliases=identity_aliases,
                 owner_key=owner_key,
             )
             owner._launch_claim = claim
@@ -1211,14 +1399,30 @@ async def main():
             prev = sessions.get(name)
             requested_cmd = (first.get("cmd", "") or "").strip()
             requested_ids = first.get("ids") if isinstance(first.get("ids"), list) else []
+            requested_aliases = first.get("aliases") if isinstance(first.get("aliases"), list) else []
+            requested_session_id = _safe_identity(first.get("sessionId", ""))
             requested_relaunch = bool(first.get("relaunch"))
             requested_cwd = first.get("cwd", "") or ""
             requested_heal = bool(first.get("heal")) if ("heal" in first) else bool(prev.heal if prev else False)
+            requested_identity_pending = (
+                bool(first.get("identityPending"))
+                if "identityPending" in first
+                else bool(getattr(prev, "identity_pending", False) if prev else False)
+            )
             cols = int(first.get("cols") or (prev.cols if prev else 140))
             rows = int(first.get("rows") or (prev.rows if prev else 40))
             cmd = requested_cmd or (prev.cmd if prev else "")
             cwd = requested_cwd or (prev.cwd if prev else "")
-            candidate_ids = launch_candidate_ids(cmd, requested_ids or (prev.ids if prev else None))
+            canonical_id, identity_aliases, candidate_ids = resolve_session_identity(
+                cmd,
+                requested_session_id or (getattr(prev, "session_id", "") if prev else ""),
+                requested_aliases or (getattr(prev, "aliases", ()) if prev else ()),
+                requested_ids or (prev.ids if prev else None),
+            )
+            if canonical_id:
+                requested_identity_pending = False
+            if requested_identity_pending and requested_heal:
+                return None, "cannot arm auto-resume until the fresh session identity is captured", False
 
             if prev and prev.alive() and not requested_relaunch and not needs_relaunch_for_command(prev, requested_cmd):
                 claim, _, claim_detail = await reserve_launch_claim(name, cmd, candidate_ids, prev)
@@ -1228,6 +1432,9 @@ async def main():
                 if requested_cmd and requested_cmd != prev.cmd:
                     prev.cmd = requested_cmd
                 prev.ids = candidate_ids
+                prev.session_id = canonical_id
+                prev.aliases = identity_aliases
+                prev.identity_pending = requested_identity_pending
                 if claim is not None:
                     prev._launch_claim = claim
                     prev.claim_paths = list(claim.paths)
@@ -1259,6 +1466,8 @@ async def main():
 
             if requested_relaunch and not cmd:
                 return None, "no saved command for " + name, False
+            if requested_relaunch and prev and getattr(prev, "identity_pending", False):
+                return None, "fresh session identity has not been captured; refusing to start a different chat", False
             if prev and prev.alive() and bool(getattr(prev, "owner", False)):
                 return None, "session has a visible local owner; close it explicitly before relaunch", False
 
@@ -1266,6 +1475,7 @@ async def main():
                 name, cmd, candidate_ids, prev
             )
             existing_claim = getattr(prev, "_launch_claim", None) if prev else None
+            prior_deaths = list(getattr(prev, "deaths", []) or []) if prev else []
             if candidate_ids and claim is None:
                 return None, claim_detail or "could not reserve session launch", False
 
@@ -1286,7 +1496,8 @@ async def main():
                     del sessions[name]
             try:
                 created = await new_session_off_loop(
-                    name, cmd, cwd, cols, rows, loop, outq, heal=requested_heal, ids=candidate_ids
+                    name, cmd, cwd, cols, rows, loop, outq, heal=requested_heal,
+                    ids=candidate_ids, session_id=canonical_id, aliases=identity_aliases
                 )
             except Exception as e:
                 if claim is not None:
@@ -1294,9 +1505,72 @@ async def main():
                 return None, "spawn failed: " + str(e), False
             created._launch_claim = claim
             created.claim_paths = list(claim.paths) if claim is not None else []
+            created.identity_pending = requested_identity_pending
+            created.deaths = prior_deaths
             sessions[name] = created
             manifest_save()
             return created, "", True
+
+    async def bind_session_identity(first):
+        name = strict_mux_name(first.get("s", ""))
+        if not name:
+            return None, "session name required"
+        cmd = (first.get("cmd", "") or "").strip()
+        command_id = _safe_identity(_parse_resume_id(cmd))
+        if not cmd or not command_id:
+            return None, "identity binding requires a trusted resume command"
+        requested_session_id = _safe_identity(first.get("sessionId", ""))
+        aliases = first.get("aliases") if isinstance(first.get("aliases"), list) else []
+        canonical_id, identity_aliases, candidate_ids = resolve_session_identity(
+            cmd,
+            requested_session_id,
+            aliases,
+            first.get("ids") if isinstance(first.get("ids"), list) else [],
+        )
+        if not canonical_id or not candidate_ids:
+            return None, "identity binding did not contain an opaque session id"
+
+        async with launch_lock(name):
+            current = sessions.get(name)
+            if current is None or not current.alive():
+                return None, "session is not live: " + name
+            if not getattr(current, "identity_pending", False):
+                current_ids = {str(value).lower() for value in ([getattr(current, "session_id", "")] + list(getattr(current, "aliases", []) or [])) if value}
+                if canonical_id.lower() in current_ids:
+                    return current, ""
+                return None, "session already has a different canonical identity"
+
+            pty = getattr(current, "pty", None)
+            root_pid = int(getattr(pty, "pid", 0) or 0) if pty is not None else 0
+            live = await asyncio.get_running_loop().run_in_executor(None, try_live_session_ids)
+            owned_ok, ignored_live, owned_detail = await asyncio.get_running_loop().run_in_executor(
+                None,
+                lambda: owner_reconnect_ignored_live(candidate_ids, root_pid, live),
+            )
+            if not owned_ok:
+                return None, owned_detail or "could not verify pending session ownership"
+            claim, _, claim_detail = await reserve_launch_claim(
+                name,
+                cmd,
+                candidate_ids,
+                current,
+                ignored_live_override=ignored_live,
+            )
+            if claim is None:
+                return None, claim_detail or "could not reserve captured session identity"
+
+            old_claim = getattr(current, "_launch_claim", None)
+            if old_claim is not None and old_claim is not claim:
+                old_claim.release()
+            current.cmd = cmd
+            current.session_id = canonical_id
+            current.aliases = identity_aliases
+            current.ids = candidate_ids
+            current._launch_claim = claim
+            current.claim_paths = list(claim.paths)
+            current.identity_pending = False
+            manifest_save()
+            return current, ""
 
     async def loop_monitor():
         last = time.monotonic()
@@ -1321,15 +1595,32 @@ async def main():
     # liveness runs a PowerShell CIM query (blocking) — NEVER call it on the event-loop thread or muxd
     # freezes and hosted sessions drop. Always hop to a worker thread.
     for name, m in manifest_load().items():
-        if SAFE(name) and name not in sessions:
+        if strict_mux_name(name) and name not in sessions:
             try:
                 heal = bool(m.get("heal"))
                 mcmd = m.get("cmd", "")
                 ids = m.get("ids") if isinstance(m.get("ids"), list) else []
-                sessions[name] = Session(
+                aliases = m.get("aliases") if isinstance(m.get("aliases"), list) else []
+                restored = Session(
                     name, mcmd, m.get("cwd", ""), m.get("cols", 140), m.get("rows", 40),
-                    loop, outq, heal=heal, spawn_now=False, ids=ids
+                    loop, outq, heal=heal, spawn_now=False, ids=ids,
+                    session_id=m.get("sessionId", ""), aliases=aliases
                 )
+                restored.expected_owner = bool(m.get("owner"))
+                restored.owner_key = str(m.get("ownerKey", "") or "")
+                restored.identity_pending = bool(m.get("identityPending"))
+                restored.deaths = [
+                    float(value)
+                    for value in (m.get("deaths") if isinstance(m.get("deaths"), list) else [])
+                    if isinstance(value, (int, float))
+                ][-16:]
+                sessions[name] = restored
+                if restored.expected_owner:
+                    log(f"[boot] waiting for visible owner reconnect: {name}")
+                    continue
+                if restored.identity_pending:
+                    log(f"[boot] fresh identity was not captured for {name}; left dormant")
+                    continue
                 if heal:
                     _session, detail, created = await coordinate_session_request(
                         {"t": "create", "s": name, "relaunch": True, "heal": True, "ids": ids},
@@ -1348,7 +1639,14 @@ async def main():
         while True:
             await asyncio.sleep(15)
             for s in list(sessions.values()):
-                if s.dead and not s.user_killed and s.cmd and s.heal:   # opt-in only: unarmed sessions stay down
+                if (
+                    s.dead
+                    and not s.user_killed
+                    and s.cmd
+                    and s.heal
+                    and not getattr(s, "expected_owner", False)
+                    and not getattr(s, "identity_pending", False)
+                ):   # opt-in only: unarmed and externally-owned sessions stay down
                     now = time.time()
                     s.deaths = [t for t in s.deaths if now - t < 600]
                     if len(s.deaths) >= 3: continue
@@ -1448,20 +1746,56 @@ async def main():
                             elif mt == "size":
                                 owner.cols = max(20, int(m.get("cols") or owner.cols))
                                 owner.rows = max(8, int(m.get("rows") or owner.rows))
+                            elif mt == "inputResult":
+                                waiter = owner.input_waiters.get(str(m.get("rid", "")))
+                                if waiter is not None and not waiter.done():
+                                    waiter.set_result((
+                                        bool(m.get("ok")),
+                                        "" if m.get("ok") else "visible terminal rejected input",
+                                    ))
                             elif mt == "dead":
                                 owner.owner_exit_confirmed = True
                                 owner.dead = True
                                 break
                     finally:
+                        for waiter in list(owner.input_waiters.values()):
+                            if not waiter.done():
+                                waiter.set_result((False, "visible owner disconnected during input"))
                         if sessions.get(name) is owner:
                             owner.dead = True
                             outq.put_nowait(("dead", name, ""))
                     return
+                if first.get("t") == "bind":
+                    s, detail = await bind_session_identity(first)
+                    if s is None:
+                        await ws.send(json.dumps({"t": "err", "m": detail})); return
+                    outq.put_nowait(("dead", s.name, ""))  # force relay session-list refresh
+                    await ws.send(json.dumps({"t": "bind-ok", "s": s.name, "sessionId": s.session_id})); return
                 if first.get("t") == "create":
                     s, err, created = await ensure_local_session(first, True)
                     if err:
                         await ws.send(json.dumps({"t": "err", "m": err})); return
                     await ws.send(json.dumps({"t": "created", "s": s.name, "created": created, "alive": s.alive()})); return
+                if first.get("t") == "input":
+                    name = SAFE(first.get("s", ""))
+                    s = sessions.get(name)
+                    if s is None or not s.alive():
+                        await ws.send(json.dumps({"t": "err", "m": "session is not live: " + name})); return
+                    try:
+                        data = base64.b64decode(first.get("d", ""), validate=True)
+                    except Exception:
+                        await ws.send(json.dumps({"t": "err", "m": "invalid input payload"})); return
+                    if not data:
+                        await ws.send(json.dumps({"t": "err", "m": "input payload is empty"})); return
+                    if isinstance(s, OwnerSession):
+                        ok, detail = await s.write_confirmed(data)
+                    else:
+                        ok, detail = await asyncio.get_running_loop().run_in_executor(
+                            None, lambda: s.write_confirmed(data)
+                        )
+                    if not ok:
+                        await ws.send(json.dumps({"t": "err", "m": detail})); return
+                    await ws.send(json.dumps({"t": "input-ok", "s": name})); return
                 if first.get("t") == "open":
                     s, err, _created = await ensure_local_session(first, True)
                 else:
@@ -1584,23 +1918,44 @@ async def main():
                         async for raw in ws:
                             try: m = json.loads(raw)
                             except Exception: continue
-                            t, name = m.get("t"), SAFE(m.get("s", ""))
-                            if t == "create" and name:
-                                _session, err, _created = await coordinate_session_request(
+                            t = m.get("t")
+                            name = strict_mux_name(m.get("s", ""))
+                            if t == "create":
+                                violation = remote_create_violation(m)
+                                if violation:
+                                    log(f"[relay] rejected create protocol frame: {violation}")
+                                    await ws.close(code=1008, reason="create frame violated protocol")
+                                    break
+                                request_id = str(m.get("rid", "") or "")
+                                session, err, created = await coordinate_session_request(
                                     m, True, leave_unarmed_dormant=True
                                 )
                                 if err:
                                     log(f"[{name}] create REFUSED: {err}")
                                     await ws.send(json.dumps({
-                                        "t": "sessions",
-                                        "list": sess_list(),
-                                        "notice": err,
+                                        "t": "createResult",
+                                        "rid": request_id,
+                                        "s": name,
+                                        "ok": False,
+                                        "created": False,
+                                        "detail": "muxd refused the create request",
                                     }))
                                 else:
-                                    await ws.send(json.dumps({"t": "sessions", "list": sess_list()}))
+                                    await ws.send(json.dumps({
+                                        "t": "createResult",
+                                        "rid": request_id,
+                                        "s": name,
+                                        "ok": True,
+                                        "created": bool(created),
+                                        "detail": "",
+                                        "session": session_payload(name, session),
+                                    }))
                                 continue
                             elif t == "heal" and name in sessions:
-                                sessions[name].heal = bool(m.get("on")); manifest_save()
+                                if bool(m.get("on")) and getattr(sessions[name], "identity_pending", False):
+                                    log(f"[{name}] refused auto-resume while fresh identity is pending")
+                                else:
+                                    sessions[name].heal = bool(m.get("on")); manifest_save()
                             elif t == "i" and name in sessions:
                                 sessions[name].write(base64.b64decode(m.get("d", "")))
                             elif t == "resize" and name in sessions:
@@ -1613,7 +1968,7 @@ async def main():
                                 await ws.send(json.dumps({"t": "sb", "s": name,
                                                           "d": base64.b64encode(sessions[name].scrollback(m.get("max", SB_SEND))).decode()}))
                             elif t == "rename" and name in sessions:
-                                to = SAFE(m.get("to", ""))
+                                to = strict_mux_name(m.get("to", ""))
                                 if to and to not in sessions:
                                     s = sessions.pop(name); s.name = to; sessions[to] = s; manifest_save()
                                     await ws.send(json.dumps({"t": "sessions", "list": sess_list()}))
@@ -1623,7 +1978,8 @@ async def main():
                             elif t == "kill" and name in sessions:
                                 ok, detail = await remove_session(name, by_user=True)
                                 if not ok:
-                                    await ws.send(json.dumps({"t": "sessions", "list": sess_list(), "notice": detail}))
+                                    log(f"[{name}] remote stop failed: {detail}")
+                                    await ws.send(json.dumps({"t": "sessions", "list": sess_list(), "notice": "session stop failed"}))
                                     continue
                                 await ws.send(json.dumps({"t": "killed", "s": name}))
                                 await ws.send(json.dumps({"t": "sessions", "list": sess_list()}))
