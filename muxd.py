@@ -328,21 +328,44 @@ def _release_pty_resources(pty):
     """Close pywinpty transport and release the native pseudoconsole handle."""
     if pty is None:
         return
-    for attribute in ("fileobj", "_server"):
-        resource = getattr(pty, attribute, None)
-        if resource is None:
-            continue
+    cleanup_lock = getattr(pty, "_muxd_cleanup_lock", None)
+    if cleanup_lock is None:
+        cleanup_lock = threading.Lock()
         try:
-            resource.close()
+            pty._muxd_cleanup_lock = cleanup_lock
         except Exception:
             pass
-    try:
-        pty.fd = -1
-        pty.closed = True
-        pty._thread = None
-        pty.pty = None
-    except Exception:
-        pass
+    with cleanup_lock:
+        if getattr(pty, "_muxd_cleanup_done", False):
+            return
+        native = getattr(pty, "pty", None)
+        try:
+            if native is not None:
+                native.cancel_io()
+        except Exception:
+            pass
+        for attribute in ("fileobj", "_server"):
+            resource = getattr(pty, attribute, None)
+            if resource is None:
+                continue
+            try:
+                resource.close()
+            except Exception:
+                pass
+        reader = getattr(pty, "_thread", None)
+        if reader is not None and reader is not threading.current_thread():
+            try:
+                reader.join(timeout=2)
+            except Exception:
+                pass
+        try:
+            pty.fd = -1
+            pty.closed = True
+            pty._thread = None
+            pty.pty = None
+            pty._muxd_cleanup_done = True
+        except Exception:
+            pass
 
 def _parse_resume_id(cmd):
     cmd = cmd or ""

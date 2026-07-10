@@ -1093,10 +1093,18 @@ class MuxdAsyncTests(unittest.IsolatedAsyncioTestCase):
             pid = 0
 
             def __init__(self):
+                class Native:
+                    def __init__(self):
+                        self.cancelled = False
+
+                    def cancel_io(self):
+                        self.cancelled = True
+
                 self.fileobj = Resource()
                 self._server = Resource()
-                self._thread = object()
-                self.pty = object()
+                self._thread = None
+                self.pty = Native()
+                self.native = self.pty
                 self.closed = False
                 self.fd = 123
 
@@ -1120,6 +1128,7 @@ class MuxdAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(-1, pty.fd)
         self.assertIsNone(pty._thread)
         self.assertIsNone(pty.pty)
+        self.assertTrue(pty.native.cancelled)
 
     async def test_terminate_session_releases_claim_only_after_process_exit(self):
         events = []
