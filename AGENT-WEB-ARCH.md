@@ -30,20 +30,11 @@ the read-only co-pilot) becomes one tab; the new live-agent engine is the heart.
 ## The layers
 
 ### 1. Agent transport adapters (PC)  →  `Core/Agents/`
-One interface, two implementations, so the rest of the app is agent-agnostic.
+The server owns one contained Codex app-server and one contained Claude process per live turn.
+Both adapters normalize output into the same `AgentEvent` wire model.
 
-```
-interface IAgentSession {
-  Task Start(workspaceCwd, resumeSessionId?, model?, permissionMode?)
-  Task SendUser(text)                     // a new user turn / steering message
-  Task Interrupt()                        // stop the current turn
-  Task Respond(permissionId, allow)       // approve/deny a tool/command
-  IAsyncEnumerable<AgentEvent> Events     // normalized stream (see model below)
-  Task Close()
-}
-```
-- `ClaudeAgentSession` — spawns the stream-json process, frames JSON in/out, maps Claude events → `AgentEvent`.
-- `CodexAgentSession` — `codex exec --json` (v3a) then `app-server` JSON-RPC (v3b), maps → `AgentEvent`.
+- `ClaudeLiveDriver` — spawns a contained stream-json process and maps Claude events → `AgentEvent`.
+- `CodexAgentHub` — owns one contained `codex app-server` JSON-RPC process and multiplexes threads.
 
 ### 2. Unified event model  →  `Core/Agents/AgentEvent.cs`  (the crux)
 Both live adapters **and** the stored-rollout parser normalize into ONE model, so a single renderer
@@ -54,10 +45,9 @@ tool_call(name,input) · tool_output(stream) · permission_request(id,detail) ·
 status(running|idle|error) · turn_result(usage) · session_ended
 ```
 
-### 3. Session manager (server)  →  `Server/Agents/`
-Owns live `IAgentSession`s keyed by id: spawn, track, route messages, **buffer events for reconnect**
-(ring buffer → replay when a dropped WebSocket reconnects), concurrency cap, idle timeout, cleanup.
-Resume mapping: archive chat → (agent, sessionId, workspace) → spawn the right adapter with `--resume`.
+### 3. Session manager (server)  →  `Server/`
+Owns live routes keyed by thread id, tracks cross-process writer claims, and tears down contained
+agent processes when the server or owning socket exits.
 
 ### 4. Archive layer (existing, extended)  →  `Core/Services/ArchiveService` + a new parser
 - Already indexes **all** codex + claude chats (old + new). Keep it.
@@ -93,8 +83,8 @@ nginx `/remote` already forwards `Upgrade` headers, so WebSockets work. WS upgra
 
 ## Build order (vertical slices — each independently usable)
 
-- **P0 — Live Claude session, end to end (the core proof).** `IAgentSession` + `AgentEvent` +
-  `ClaudeAgentSession` (stream-json) + `WS /api/agent` + a minimal conversation UI: type a message →
+- **P0 — Live Claude session, end to end (the core proof).** `AgentEvent` +
+  `ClaudeLiveDriver` (stream-json) + `WS /api/agent` + a minimal conversation UI: type a message →
   watch Claude reason, call tools, run commands, answer — live, in a new workspace. *Verifier:* an
   integration test driving `ClaudeAgentSession` against the real CLI on a throwaway dir asserts we get
   assistant + tool events; a live browser turn streams.
@@ -102,7 +92,7 @@ nginx `/remote` already forwards `Upgrade` headers, so WebSockets work. WS upgra
   continue live.
 - **P2 — History as real conversations.** `RolloutToEvents` for Claude (then Codex) → every old chat
   renders in the same view. *Verifier:* parser tests on fixture rollouts.
-- **P3 — Codex.** `CodexAgentSession` via `exec --json`, then `app-server` for full steering.
+- **P3 — Codex.** `CodexAgentHub` via one shared `app-server` for full steering.
 - **P4 — Steering & robustness.** interrupt, approve/deny, model pick, reconnect/replay, caps.
 - **P5 — Ship through /remote.** hl-auth-gate the WS, re-publish, e2e from the phone.
 
@@ -131,12 +121,11 @@ returns real sessions). M1 sidebar of all sessions (thread/list) + open any as a
 (thread/read). M2 go live (resume + turn/start + streaming item/* deltas). M3 approvals + steer. M4
 Claude adapter + ship through /remote.
 
-## Status (P0 — the earlier low-fidelity slice, kept as a fallback path)
+## Status (P0 — historical low-fidelity slice, removed)
 
 **P0 — DONE + verified (codex-first).** Live codex session over a WebSocket, driven from the web:
-- `Core/Agents/`: `AgentEvent` (unified model), `IAgentSession`, `CodexEventMapper` (pure, 9 tests),
-  `CodexAgentSession` (`codex exec --json` per turn, `exec resume <thread_id>` for follow-ups,
-  interrupt = kill).
+- The obsolete exec-per-turn `CodexAgentSession` fallback was removed. Codex traffic has one
+  production owner: `CodexAgentHub` backed by the contained app-server.
 - `Server/AgentWebSocket.cs` + `WS /api/agent` (op: start|send|interrupt; streams AgentEvents).
 - `wwwroot/`: an **Agent** tab (default) — start a session in a workspace, send tasks, watch the
   agent's commands/output/reasoning/answer stream live; Stop to interrupt.

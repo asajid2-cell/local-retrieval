@@ -22,7 +22,7 @@
 | L4 durable state | success requires flush/replace/read-back | injected-failure persistence tests | done `L4_20260709i`: app 320 passed / 2 skipped; relay 51 passed; muxd 75 passed / 3 VPS-only skipped |
 | L5 durable command delivery | lease/idempotency; no age loss | crash/restart/replay queue tests | done `L5_20260709`: app 329 passed / 2 skipped; relay 64 passed; muxd 80 passed / 3 skipped |
 | L6 canonical server launcher | archive identity and trusted args only | server route/launcher tests | done `L6_20260710`: app 345 passed / 2 skipped; relay 64 passed; muxd 80 passed / 3 skipped |
-| L7 process containment | child writer exits with owner or remains blocked | Windows lifecycle integration test | pending |
+| L7 process containment | child writer exits with owner or remains blocked | Windows lifecycle integration test | done `L7b_20260710`: app 388 passed / 2 skipped; relay 66 passed; muxd 92 passed / 3 VPS-only skipped |
 | L8 synthesis/deploy | all gates and runtime probes green | `tools/run_gates.ps1` plus install/deploy smoke | pending |
 
 ## Baseline
@@ -125,3 +125,44 @@
 - `L6_20260710`: unified runner green. App 345 passed / 2 environment skips; serialized projection
   contract passed; relay 64 passed; muxd 80 passed / 3 VPS-only skips. Evidence:
   `artifacts/reliability/L6_20260710`. The runner advanced `CURRENT.md` only after every gate passed.
+- 2026-07-10 L7 process containment added Windows Job Object custody for app-server and Claude
+  children, bounded stdout/stderr capture and line readers, cancellation-aware app-server requests,
+  supervised pumps, and shutdown paths that retain launch claims whenever process death cannot be
+  confirmed. The old direct Codex session path was removed so app-server ownership has one authority.
+- Archive content is now lazy and deduplicated per session, large transcript search streams from
+  source files, and UI/copilot content paths are asynchronous. The deterministic non-pumping
+  dispatcher repro changed from a greater-than-20-second deadlock to `no deadlock observed`.
+- The formerly intermittent confirmed-termination claim cleanup test passed 50/50 isolated runs.
+  Claim release is centralized and disposes the cross-process lease before removing in-memory
+  bookkeeping, while old notification pumps can release only claims owned by their server generation.
+- The first unified L7 gate correctly failed when the shared muxd integration harness stopped
+  answering after cumulative session churn. Audit found eager writer threads on every dormant or
+  failed-before-spawn Session and a `pty is None` path that never sent a shutdown sentinel. Writers
+  are now lazy and generation-bound, and every successful terminal path stops them.
+- The writer-leak verifier is mutation-proven: restoring eager startup changed active threads from
+  2 to 102 for 100 dormant sessions and failed; the corrected tree adds zero threads. The full muxd
+  suite passed 84 tests with 3 VPS-only skips after the fix.
+- Independent Claude corrected-tree review `mux-l7-final-20260710` returned ACCEPT after rerunning
+  the deadlock repro and 188 focused tests. Driver reruns passed the same 188-test slice and the full
+  .NET suite at 388 passed / 2 environment skips.
+- `L7_20260710`: unified runner green. App 388 passed / 2 environment skips; serialized projection
+  contract passed; relay 64 passed; muxd 84 passed / 3 VPS-only skips. Evidence:
+  `artifacts/reliability/L7_20260710`. The runner advanced `CURRENT.md` only after every gate passed.
+- The post-L7 muxd audit found that durable manifest writes still ran on the asyncio event loop and
+  that natural PTY EOF could leave writer threads alive. State mutations now run as cancellation-safe
+  serialized transactions, durable writes run in the executor, and caller cancellation cannot release
+  the transaction lock while spawn, termination, or persistence is still in flight.
+- Writer enqueue and shutdown now share one mutex, so accepted input is ordered before the stop
+  sentinel and cannot disappear behind it. Each writer is pinned to its PTY generation. Non-durable
+  input bypasses the global durable-state transaction, preserving control of unrelated live sessions
+  while another session is inside a slow manifest write.
+- Slow-write mutation evidence: an injected 1.5-second durable write previously made an `info`
+  request take 1.523 seconds and produced 1047ms loop lag. The corrected tests prove both `info`
+  and unrelated terminal input remain below 0.75 seconds during the same injected write. Concurrent
+  distinct creates survive restart without stale-snapshot loss.
+- Independent corrected-tree tandem `mux-l7b-async-persistence-20260710` returned ACCEPT on pinned
+  blobs `212ddf8` / `8129a19` / `bb4575c`. Three complete pre-review muxd suites passed, followed by
+  the final corrected suite at 92 passed / 3 VPS-only skips.
+- `L7b_20260710`: unified runner green. App 388 passed / 2 environment skips; serialized projection
+  contract passed; relay 66 passed; muxd 92 passed / 3 VPS-only skips. Evidence:
+  `artifacts/reliability/L7b_20260710`. The runner advanced `CURRENT.md` only after every gate passed.

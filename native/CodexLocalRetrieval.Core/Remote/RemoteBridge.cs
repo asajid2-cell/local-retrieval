@@ -32,6 +32,7 @@ public sealed class RemoteBridge
     private readonly Action<string> _log;
     private readonly Func<string?, string?, Task<(bool ok, ArchiveService.RemoteMuxLaunch? launch, string detail)>>? _resolveMuxLaunch;
     private readonly Func<Task<IReadOnlyList<ArchiveService.PendingMuxBinding>>>? _resolvePendingMuxBindings;
+    private readonly IProcessContainment? _processContainment;
     private readonly string _commandLeaseOwner = RemoteCommandProtocol.LeaseOwner("headless");
 
     private const string SshHardenOpts = "-o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3";
@@ -44,7 +45,8 @@ public sealed class RemoteBridge
         string codexDbPath,
         Action<string>? log = null,
         Func<string?, string?, Task<(bool ok, ArchiveService.RemoteMuxLaunch? launch, string detail)>>? resolveMuxLaunch = null,
-        Func<Task<IReadOnlyList<ArchiveService.PendingMuxBinding>>>? resolvePendingMuxBindings = null)
+        Func<Task<IReadOnlyList<ArchiveService.PendingMuxBinding>>>? resolvePendingMuxBindings = null,
+        IProcessContainment? processContainment = null)
     {
         _settings = settings;
         _guiPrimaryRunning = guiPrimaryRunning;
@@ -53,6 +55,7 @@ public sealed class RemoteBridge
         _log = log ?? (_ => { });
         _resolveMuxLaunch = resolveMuxLaunch;
         _resolvePendingMuxBindings = resolvePendingMuxBindings;
+        _processContainment = processContainment;
     }
 
     public async Task RunLoopAsync(CancellationToken ct)
@@ -369,6 +372,8 @@ public sealed class RemoteBridge
         {
             result = await ws.ReceiveAsync(new ArraySegment<byte>(buffer), cts.Token);
             if (result.MessageType == WebSocketMessageType.Close) break;
+            if (ms.Length + result.Count > 4 * 1024 * 1024)
+                throw new InvalidDataException("muxd response exceeded the 4 MiB limit");
             ms.Write(buffer, 0, result.Count);
         } while (!result.EndOfMessage);
         return Encoding.UTF8.GetString(ms.ToArray());
@@ -408,7 +413,6 @@ public sealed class RemoteBridge
     // Hardened ssh + hard timeout (see class note). `-n` (stdin from /dev/null) only when not feeding stdin.
     private async Task<(int code, string outText)> RunSshAsync(string target, string remoteCmd, string? stdin = null)
     {
-        Process? p = null;
         try
         {
             var stdinFlag = stdin is null ? "-n " : "";
@@ -420,22 +424,26 @@ public sealed class RemoteBridge
                 RedirectStandardInput = stdin is not null,
                 RedirectStandardOutput = true, RedirectStandardError = true,
             };
-            p = Process.Start(psi);
-            if (p is null) return (-1, "");
-            if (stdin is not null) { await p.StandardInput.WriteAsync(stdin); p.StandardInput.Close(); }
-            var outTask = p.StandardOutput.ReadToEndAsync();
-            using var cts = new CancellationTokenSource(SshHardTimeout);
-            try { await p.WaitForExitAsync(cts.Token); }
-            catch (OperationCanceledException)
+            var result = await ContainedProcessRunner.RunAsync(
+                psi,
+                SshHardTimeout,
+                stdin,
+                maxStdoutChars: 4 * 1024 * 1024,
+                maxStderrChars: 64 * 1024,
+                containment: _processContainment);
+            if (result.TimedOut)
             {
-                try { p.Kill(entireProcessTree: true); } catch { }
                 _log($"ssh timed out ({SshHardTimeout.TotalSeconds:0}s), tree-killed: {remoteCmd}");
                 return (-2, "");
             }
-            return (p.ExitCode, await outTask);
+            if (result.StdoutTruncated)
+            {
+                _log($"ssh output exceeded the 4 MiB capture limit: {remoteCmd}");
+                return (-3, "");
+            }
+            return (result.ExitCode, result.Stdout);
         }
-        catch (Exception ex) { try { p?.Kill(entireProcessTree: true); } catch { } _log("RunSsh failed: " + ex.Message); return (-1, ""); }
-        finally { p?.Dispose(); }
+        catch (Exception ex) { _log("RunSsh failed: " + ex.Message); return (-1, ""); }
     }
 
     private async Task AckCommandAsync(Settings settings, string commandId, string ackJson)

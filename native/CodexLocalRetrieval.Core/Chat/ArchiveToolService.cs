@@ -64,15 +64,15 @@ public sealed class ArchiveToolService
             return new { query, count = results.Count, results };
         });
 
-    private ChatTool ReadChat() => Read("read_chat",
+    private ChatTool ReadChat() => ReadAsync("read_chat",
         "Read one chat by id: a summary plus a page of messages (cleaned, capped). Page through with 'page'.",
         Obj(("id", Str("session id from search_chats")), ("page", Int("0-based page, default 0")), ("pageSize", Int("messages per page 1-15, default 8"))),
         new[] { "id" },
-        args =>
+        async (args, cancellationToken) =>
         {
             var session = _archive.GetSession(Arg(args, "id"));
             if (session is null) return new { error = "No chat with that id. Use search_chats first." };
-            _archive.EnsureContent(session); // content lazy-loads from the source file
+            await _archive.EnsureContentAsync(session, cancellationToken);
             var page = IntArg(args, "page", 0, 0, 1000);
             var size = IntArg(args, "pageSize", 8, 1, 15);
             var all = session.Messages;
@@ -147,14 +147,15 @@ public sealed class ArchiveToolService
                 .ToList()
         });
 
-    private ChatTool RestorePacket() => Read("restore_packet",
+    private ChatTool RestorePacket() => ReadAsync("restore_packet",
         "Generate a restore packet (handoff prompt) for one chat by id, to continue it in a new session.",
         Obj(("id", Str("session id"))), new[] { "id" },
-        args =>
+        async (args, cancellationToken) =>
         {
             var session = _archive.GetSession(Arg(args, "id"));
             if (session is null) return new { error = "No chat with that id." };
-            return new { id = session.Id, restore_packet = SecretRedactor.Scrub(Cap(_archive.RestorePacket(session), 4000)) };
+            var packet = await _archive.RestorePacketAsync(session, cancellationToken);
+            return new { id = session.Id, restore_packet = SecretRedactor.Scrub(Cap(packet, 4000)) };
         });
 
     // ---- mutations (IsMutation => orchestrator requires confirmation) ----
@@ -229,6 +230,18 @@ public sealed class ArchiveToolService
         Spec = new ChatToolSpec(name, desc, WithRequired(schema, required)),
         IsMutation = false,
         Execute = (args, _) => Task.FromResult(run(args))
+    };
+
+    private static ChatTool ReadAsync(
+        string name,
+        string desc,
+        object schema,
+        string[] required,
+        Func<JsonElement, CancellationToken, Task<object>> run) => new()
+    {
+        Spec = new ChatToolSpec(name, desc, WithRequired(schema, required)),
+        IsMutation = false,
+        Execute = run
     };
 
     private static ChatTool Write(string name, string desc, object schema, string[] required, Func<JsonElement, Task<object>> run) => new()

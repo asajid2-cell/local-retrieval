@@ -7,6 +7,7 @@ using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json;
 using System.Threading.Tasks;
+using CodexLocalRetrieval.Core.Agents;
 using CodexLocalRetrieval.Core.Models;
 using CodexLocalRetrieval.Core.Remote;
 using CodexLocalRetrieval.Core.Services;
@@ -709,7 +710,6 @@ public sealed partial class MainPage
     // Run ssh with the hardened options + a hard timeout. Returns (exitCode, stdout); -2 = timed out (tree-killed).
     private static async Task<(int code, string outText)> RunSshAsync(string target, string remoteCmd, string? stdin = null)
     {
-        Process? p = null;
         try
         {
             var stdinFlag = stdin is null ? "-n " : "";   // -n only when we're NOT feeding stdin
@@ -721,23 +721,25 @@ public sealed partial class MainPage
                 RedirectStandardInput = stdin is not null,
                 RedirectStandardOutput = true, RedirectStandardError = true,
             };
-            p = Process.Start(psi);
-            if (p is null) return (-1, "");
-            if (stdin is not null) { await p.StandardInput.WriteAsync(stdin); p.StandardInput.Close(); }
-            var outTask = p.StandardOutput.ReadToEndAsync();
-            using var cts = new System.Threading.CancellationTokenSource(SshHardTimeout);
-            try { await p.WaitForExitAsync(cts.Token); }
-            catch (OperationCanceledException)
+            var result = await ContainedProcessRunner.RunAsync(
+                psi,
+                SshHardTimeout,
+                stdin,
+                maxStdoutChars: 4 * 1024 * 1024,
+                maxStderrChars: 64 * 1024);
+            if (result.TimedOut)
             {
-                try { p.Kill(entireProcessTree: true); } catch { }
                 Diag.Log($"ssh timed out ({SshHardTimeout.TotalSeconds:0}s), tree-killed: {remoteCmd}");
                 return (-2, "");
             }
-            var o = await outTask;
-            return (p.ExitCode, o);
+            if (result.StdoutTruncated)
+            {
+                Diag.Log($"ssh output exceeded the 4 MiB capture limit: {remoteCmd}");
+                return (-3, "");
+            }
+            return (result.ExitCode, result.Stdout);
         }
-        catch (Exception ex) { try { p?.Kill(entireProcessTree: true); } catch { } Diag.Log("RunSsh failed: " + ex.Message); return (-1, ""); }
-        finally { p?.Dispose(); }
+        catch (Exception ex) { Diag.Log("RunSsh failed: " + ex.Message); return (-1, ""); }
     }
 
     // Run a remote command over our owner-only SSH and capture stdout.
@@ -779,6 +781,8 @@ public sealed partial class MainPage
         {
             result = await ws.ReceiveAsync(new ArraySegment<byte>(buffer), cts.Token);
             if (result.MessageType == WebSocketMessageType.Close) break;
+            if (ms.Length + result.Count > 4 * 1024 * 1024)
+                throw new InvalidDataException("muxd response exceeded the 4 MiB limit");
             ms.Write(buffer, 0, result.Count);
         } while (!result.EndOfMessage);
         return Encoding.UTF8.GetString(ms.ToArray());
@@ -818,26 +822,22 @@ public sealed partial class MainPage
 
     private static async Task<(int code, string outText, string errText)> RunProcessCaptureAsync(string file, params string[] args)
     {
-        Process? p = null;
         try
         {
             var psi = new ProcessStartInfo { FileName = file, UseShellExecute = false, RedirectStandardOutput = true, RedirectStandardError = true, CreateNoWindow = true };
             foreach (var a in args) psi.ArgumentList.Add(a);
-            p = Process.Start(psi);
-            if (p is null) return (-1, "", "process did not start");
-            var outTask = p.StandardOutput.ReadToEndAsync();
-            var errTask = p.StandardError.ReadToEndAsync();
-            using var cts = new System.Threading.CancellationTokenSource(TimeSpan.FromSeconds(6));
-            try { await p.WaitForExitAsync(cts.Token); }
-            catch (OperationCanceledException)
-            {
-                try { p.Kill(entireProcessTree: true); } catch { }
+            var result = await ContainedProcessRunner.RunAsync(
+                psi,
+                TimeSpan.FromSeconds(6),
+                maxStdoutChars: 1024 * 1024,
+                maxStderrChars: 64 * 1024);
+            if (result.TimedOut)
                 return (-2, "", "process timed out");
-            }
-            return (p.ExitCode, await outTask, await errTask);
+            if (result.StdoutTruncated || result.StderrTruncated)
+                return (-3, "", "process output exceeded the capture limit");
+            return (result.ExitCode, result.Stdout, result.Stderr);
         }
-        catch (Exception ex) { try { p?.Kill(entireProcessTree: true); } catch { } return (-1, "", ex.Message); }
-        finally { p?.Dispose(); }
+        catch (Exception ex) { return (-1, "", ex.Message); }
     }
 
     private static async Task<bool> LocalMuxdSessionAliveAsync(string name)

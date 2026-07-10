@@ -245,14 +245,36 @@ public class ServerSingleOwnerGateTests
     }
 
     [TestMethod]
-    public async Task CodexAgentSession_RefusesAdoptedResumeWhenGovernorDenies()
+    public void CodexAgentHub_OldNotificationPumpReleasesOnlyItsServerGeneration()
     {
-        var governor = new SessionLaunchGovernor(new SessionLaunchGovernorOptions(IsSessionLive: id => id == "live-codex"));
-        var session = new CodexAgentSession("codex-do-not-launch.exe", Path.GetTempPath(), launchGovernor: governor);
-        session.AdoptSession("live-codex");
+        var root = FindRepoRoot();
+        var source = File.ReadAllText(
+            Path.Combine(root, "native", "CodexLocalRetrieval.Server", "CodexAgentHub.cs"));
+        var methodStart = source.IndexOf("private async Task PumpNotifications", StringComparison.Ordinal);
+        var methodEnd = source.IndexOf("private async Task PumpServerRequests", methodStart, StringComparison.Ordinal);
+        var method = source[methodStart..methodEnd];
 
-        await Assert.ThrowsExactlyAsync<InvalidOperationException>(() => session.SendUserAsync("hello"));
-        Assert.IsFalse(session.Busy);
+        StringAssert.Contains(method, "ReleaseTurnClaims(s");
+        Assert.IsFalse(
+            method.Contains("ReleaseAllTurnClaims", StringComparison.Ordinal),
+            "A late pump from an old app-server must not release claims owned by its replacement.");
+    }
+
+    [TestMethod]
+    public void CodexAgentHub_ReleasesLeaseBeforeRemovingClaimBookkeeping()
+    {
+        var root = FindRepoRoot();
+        var source = File.ReadAllText(
+            Path.Combine(root, "native", "CodexLocalRetrieval.Server", "CodexAgentHub.cs"));
+        var methodStart = source.IndexOf("private void ReleaseClaim(", StringComparison.Ordinal);
+        var methodEnd = source.IndexOf("private static SessionLaunchRequest", methodStart, StringComparison.Ordinal);
+        var method = source[methodStart..methodEnd];
+
+        Assert.IsGreaterThanOrEqualTo(0, methodStart);
+        Assert.IsGreaterThan(
+            method.IndexOf("pair.Value.Lease.Dispose()", StringComparison.Ordinal),
+            method.IndexOf(".Remove(pair)", StringComparison.Ordinal),
+            "Claim files must be released before the active-claim entry becomes invisible to competing cleanup paths.");
     }
 
     [TestMethod]

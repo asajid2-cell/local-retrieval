@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Text.Json;
 using CodexLocalRetrieval.Core.Agents;
 using CodexLocalRetrieval.Core.Remote;
@@ -14,6 +15,10 @@ public sealed record ThreadRouteBinding(
 public sealed record PreparedThreadOpen(
     ThreadRouteBinding Binding,
     IReadOnlyList<AgentEvent> History);
+
+internal sealed record ActiveTurnClaim(
+    CodexAppServer Server,
+    SessionLaunchLease Lease);
 
 public sealed class ThreadRouteRegistry
 {
@@ -71,38 +76,80 @@ public sealed class CodexAgentHub : IAsyncDisposable
 {
     private readonly string _exe;
     private readonly SessionLaunchGovernor _launchGovernor;
+    private readonly IProcessContainment? _processContainment;
+    private readonly Func<ProcessStartInfo, Process?>? _processStarter;
+    private readonly TimeSpan _shutdownTimeout;
     private readonly SemaphoreSlim _initLock = new(1, 1);
+    private readonly CancellationTokenSource _lifetime = new();
+    private readonly object _disposeGate = new();
     private CodexAppServer? _srv;
+    private Task? _disposeTask;
+    private int _disposeStarted;
 
     // The newest socket owns a thread's event route. Tokenized close prevents an older socket from
     // disconnecting that newer owner when the old tab navigates away or closes.
     private readonly ThreadRouteRegistry _routes = new();
-    private readonly ConcurrentDictionary<string, SessionLaunchLease> _activeTurnClaims = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, ActiveTurnClaim> _activeTurnClaims = new(StringComparer.OrdinalIgnoreCase);
 
     public CodexAgentHub(
         string exe,
         Func<string, bool>? isSessionLive = null,
         SessionLaunchClaims.Options? claimOptions = null,
-        SessionLaunchGovernor? launchGovernor = null)
+        SessionLaunchGovernor? launchGovernor = null,
+        IProcessContainment? processContainment = null,
+        Func<ProcessStartInfo, Process?>? processStarter = null,
+        TimeSpan? shutdownTimeout = null)
     {
         _exe = exe;
         _launchGovernor = launchGovernor ?? new SessionLaunchGovernor(new SessionLaunchGovernorOptions(claimOptions, IsSessionLive: isSessionLive));
+        _processContainment = processContainment;
+        _processStarter = processStarter;
+        _shutdownTimeout = shutdownTimeout ?? TimeSpan.FromSeconds(10);
+        if (_shutdownTimeout <= TimeSpan.Zero)
+            throw new ArgumentOutOfRangeException(nameof(shutdownTimeout));
     }
 
     private async Task<CodexAppServer> EnsureAsync(CancellationToken ct)
     {
-        if (_srv is { HasExited: false }) return _srv;
-        ReleaseAllTurnClaims();
-        await _initLock.WaitAsync(ct);
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposeStarted) != 0, this);
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, _lifetime.Token);
+        await _initLock.WaitAsync(linked.Token);
         try
         {
+            ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposeStarted) != 0, this);
             if (_srv is { HasExited: false }) return _srv;
-            var s = CodexAppServer.Start(_exe);
-            await s.InitializeAsync(ct);
-            _ = Task.Run(() => PumpNotifications(s));
-            _ = Task.Run(() => PumpServerRequests(s));
-            _srv = s;
-            return s;
+            if (_srv is not null)
+            {
+                var stale = _srv;
+                _srv = null;
+                try
+                {
+                    await stale.DisposeAsync();
+                }
+                finally
+                {
+                    ReleaseTurnClaims(stale, retainUntilExpiry: !stale.TerminationConfirmed);
+                }
+            }
+            ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposeStarted) != 0, this);
+            var s = CodexAppServer.Start(
+                _exe,
+                processContainment: _processContainment,
+                processStarter: _processStarter);
+            try
+            {
+                await s.InitializeAsync(linked.Token);
+                ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposeStarted) != 0, this);
+                _ = Task.Run(() => PumpNotifications(s));
+                _ = Task.Run(() => PumpServerRequests(s));
+                _srv = s;
+                return s;
+            }
+            catch
+            {
+                await s.DisposeAsync();
+                throw;
+            }
         }
         finally { _initLock.Release(); }
     }
@@ -113,23 +160,36 @@ public sealed class CodexAgentHub : IAsyncDisposable
         {
             await foreach (var note in s.Notifications.ReadAllAsync())
             {
-                RetireTurnClaimIfTerminal(note);
+                RetireTurnClaimIfTerminal(s, note);
                 if (ThreadIdOf(note) is { } tid && _routes.TryGet(tid, out var route))
                     try { await route.OnNote(note); } catch { }
             }
         }
-        finally { ReleaseAllTurnClaims(); }
+        catch
+        {
+        }
+        finally
+        {
+            try { await s.DisposeAsync(); } catch { }
+            ReleaseTurnClaims(s, retainUntilExpiry: !s.TerminationConfirmed);
+        }
     }
 
     private async Task PumpServerRequests(CodexAppServer s)
     {
-        await foreach (var req in s.ServerRequests.ReadAllAsync())
+        try
         {
-            // route approval requests to the owning thread; auto-deny if no owner is listening.
-            if (ThreadIdOf(req) is { } tid && _routes.TryGet(tid, out var route))
-                try { await route.OnRequest(req); continue; } catch { }
-            if (req.TryGetProperty("id", out var idEl) && idEl.ValueKind == JsonValueKind.Number)
-                await s.RespondAsync(idEl.GetInt32(), new { decision = "decline" });
+            await foreach (var req in s.ServerRequests.ReadAllAsync())
+            {
+                // route approval requests to the owning thread; auto-deny if no owner is listening.
+                if (ThreadIdOf(req) is { } tid && _routes.TryGet(tid, out var route))
+                    try { await route.OnRequest(req); continue; } catch { }
+                if (req.TryGetProperty("id", out var idEl) && idEl.ValueKind == JsonValueKind.Number)
+                    await s.RespondAsync(idEl.GetInt32(), new { decision = "decline" });
+            }
+        }
+        catch
+        {
         }
     }
 
@@ -253,13 +313,15 @@ public sealed class CodexAgentHub : IAsyncDisposable
             // Hold the cross-process lease now, but publish this turn only after Ensure completes.
             s = await EnsureAsync(ct);
         }
-        catch
+        catch (Exception ex)
         {
-            lease?.MarkFailed("Codex app-server failed before the turn claim was published.");
+            lease?.MarkFailed(
+                "Codex app-server failed before the turn claim was published.",
+                retainUntilExpiry: ex is ProcessContainmentException { TerminationConfirmed: false });
             lease?.Dispose();
             throw;
         }
-        if (!_activeTurnClaims.TryAdd(threadId, lease!))
+        if (!_activeTurnClaims.TryAdd(threadId, new ActiveTurnClaim(s, lease!)))
         {
             lease?.Dispose();
             RecordSessionEvent(threadId, aliases, "codex.turn.refused.active", "Codex turn refused because this server already has a turn running.", "warn", approvalPolicy);
@@ -275,10 +337,12 @@ public sealed class CodexAgentHub : IAsyncDisposable
             await s.RequestAsync("turn/start", prms, ct);
             lease?.MarkStarted("Codex app-server turn started.", retainUntilExpiry: false);
         }
-        catch
+        catch (Exception ex)
         {
-            lease?.MarkFailed("Codex app-server turn failed to start.");
-            if (_activeTurnClaims.TryRemove(threadId, out var active)) active.Dispose();
+            lease?.MarkFailed(
+                "Codex app-server turn failed to start.",
+                retainUntilExpiry: ex is not CodexAppServerResponseException && !s.TerminationConfirmed);
+            if (_activeTurnClaims.TryRemove(threadId, out var active)) active.Lease.Dispose();
             throw;
         }
     }
@@ -299,28 +363,120 @@ public sealed class CodexAgentHub : IAsyncDisposable
     public void CloseThread(ThreadRouteBinding binding) => _routes.Close(binding);
     public bool IsTurnActive(string threadId) => _activeTurnClaims.ContainsKey(threadId);
 
-    public async ValueTask DisposeAsync()
+    public ValueTask DisposeAsync()
     {
-        ReleaseAllTurnClaims();
-        if (_srv is not null) await _srv.DisposeAsync();
+        lock (_disposeGate)
+            return new ValueTask(_disposeTask ??= DisposeCoreAsync());
     }
 
-    private void RetireTurnClaimIfTerminal(JsonElement note)
+    private async Task DisposeCoreAsync()
     {
-        var method = note.TryGetProperty("method", out var mEl) ? mEl.GetString() ?? "" : "";
-        if (method is not ("turn/completed" or "turn/failed" or "turn/cancelled" or "turn/interrupted")) return;
-        if (ThreadIdOf(note) is { } tid && _activeTurnClaims.TryRemove(tid, out var claim))
+        if (Interlocked.Exchange(ref _disposeStarted, 1) != 0) return;
+        _lifetime.Cancel();
+        CodexAppServer? server;
+        if (!await _initLock.WaitAsync(_shutdownTimeout))
         {
-            RecordSessionEvent(tid, null, "codex." + method.Replace('/', '.'), "Codex app-server turn reached terminal state.");
-            claim.Dispose();
+            ReleaseAllTurnClaims(retainUntilExpiry: true);
+            _ = FinishTimedOutDisposalAsync();
+            throw new TimeoutException("Codex hub initialization did not stop before the shutdown deadline.");
+        }
+        try
+        {
+            server = _srv;
+            _srv = null;
+        }
+        finally
+        {
+            _initLock.Release();
+        }
+
+        if (server is null)
+        {
+            ReleaseAllTurnClaims();
+            _lifetime.Dispose();
+            return;
+        }
+
+        try
+        {
+            await server.DisposeAsync();
+        }
+        finally
+        {
+            ReleaseAllTurnClaims(retainUntilExpiry: !server.TerminationConfirmed);
+            _lifetime.Dispose();
         }
     }
 
-    private void ReleaseAllTurnClaims()
+    private async Task FinishTimedOutDisposalAsync()
     {
-        foreach (var key in _activeTurnClaims.Keys)
-            if (_activeTurnClaims.TryRemove(key, out var claim))
-                claim.Dispose();
+        CodexAppServer? server = null;
+        try
+        {
+            await _initLock.WaitAsync();
+            try
+            {
+                server = _srv;
+                _srv = null;
+            }
+            finally
+            {
+                _initLock.Release();
+            }
+
+            if (server is not null)
+            {
+                try { await server.DisposeAsync(); }
+                finally { ReleaseTurnClaims(server, retainUntilExpiry: !server.TerminationConfirmed); }
+            }
+        }
+        catch
+        {
+            if (server is not null)
+                ReleaseTurnClaims(server, retainUntilExpiry: true);
+        }
+        finally
+        {
+            ReleaseAllTurnClaims(retainUntilExpiry: true);
+            _lifetime.Dispose();
+        }
+    }
+
+    private void RetireTurnClaimIfTerminal(CodexAppServer server, JsonElement note)
+    {
+        var method = note.TryGetProperty("method", out var mEl) ? mEl.GetString() ?? "" : "";
+        if (method is not ("turn/completed" or "turn/failed" or "turn/cancelled" or "turn/interrupted")) return;
+        if (ThreadIdOf(note) is not { } tid
+            || !_activeTurnClaims.TryGetValue(tid, out var claim)
+            || !ReferenceEquals(claim.Server, server))
+            return;
+
+        RecordSessionEvent(tid, null, "codex." + method.Replace('/', '.'), "Codex app-server turn reached terminal state.");
+        ReleaseClaim(new KeyValuePair<string, ActiveTurnClaim>(tid, claim), retainUntilExpiry: false);
+    }
+
+    private void ReleaseTurnClaims(CodexAppServer server, bool retainUntilExpiry)
+    {
+        foreach (var pair in _activeTurnClaims)
+        {
+            if (!ReferenceEquals(pair.Value.Server, server)) continue;
+            ReleaseClaim(pair, retainUntilExpiry);
+        }
+    }
+
+    private void ReleaseAllTurnClaims(bool retainUntilExpiry = false)
+    {
+        foreach (var pair in _activeTurnClaims)
+            ReleaseClaim(pair, retainUntilExpiry);
+    }
+
+    private void ReleaseClaim(
+        KeyValuePair<string, ActiveTurnClaim> pair,
+        bool retainUntilExpiry)
+    {
+        if (retainUntilExpiry) pair.Value.Lease.RetainUntilExpiry();
+        pair.Value.Lease.Dispose();
+        ((ICollection<KeyValuePair<string, ActiveTurnClaim>>)_activeTurnClaims).Remove(pair);
     }
 
     private static SessionLaunchRequest LaunchRequest(string threadId, IEnumerable<string>? aliases, string? approvalPolicy)

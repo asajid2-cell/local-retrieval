@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Text;
+using CodexLocalRetrieval.Core.Agents;
 
 namespace CodexLocalRetrieval.Core.Memory;
 
@@ -13,6 +14,10 @@ namespace CodexLocalRetrieval.Core.Memory;
 // app's existing ResumeInTerminal / OpenBackupsFolder pattern (no NuGet git dependency).
 public sealed class GitHistory
 {
+    private static readonly TimeSpan CommandTimeout = TimeSpan.FromSeconds(20);
+    private const int MaxStdoutChars = 4 * 1024 * 1024;
+    private const int MaxStderrChars = 64 * 1024;
+
     public sealed record GitResult(bool Ok, int ExitCode, string StdOut, string StdErr);
 
     private static bool? _available;
@@ -106,12 +111,26 @@ public sealed class GitHistory
                 StandardOutputEncoding = Encoding.UTF8,
                 StandardErrorEncoding = Encoding.UTF8,
             };
-            using var p = Process.Start(psi);
-            if (p is null) return new GitResult(false, -1, "", "could not start git");
-            var so = p.StandardOutput.ReadToEnd();
-            var se = p.StandardError.ReadToEnd();
-            if (!p.WaitForExit(20000)) { try { p.Kill(true); } catch { } return new GitResult(false, -1, so, "git timed out"); }
-            return new GitResult(p.ExitCode == 0, p.ExitCode, so, se);
+            var result = Task.Run(() => ContainedProcessRunner.RunAsync(
+                        psi,
+                        CommandTimeout,
+                        maxStdoutChars: MaxStdoutChars,
+                        maxStderrChars: MaxStderrChars))
+                .GetAwaiter()
+                .GetResult();
+            if (result.TimedOut)
+                return new GitResult(false, result.ExitCode, result.Stdout, "git timed out");
+            if (result.StdoutTruncated || result.StderrTruncated)
+                return new GitResult(
+                    false,
+                    result.ExitCode,
+                    result.Stdout,
+                    result.Stderr + Environment.NewLine + "git output exceeded the capture limit");
+            return new GitResult(
+                result.ExitCode == 0,
+                result.ExitCode,
+                result.Stdout,
+                result.Stderr);
         }
         catch (Exception ex)
         {

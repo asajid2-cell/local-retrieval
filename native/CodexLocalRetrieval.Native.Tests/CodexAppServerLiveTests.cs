@@ -16,7 +16,8 @@ public sealed class CodexAppServerLiveTests
     [TestCategory("LiveCodex")]
     public async Task Initialize_And_ListThreads_ReturnsRealSessions()
     {
-        await using var srv = CodexAppServer.Start(CodexExe);
+        using var job = WindowsProcessJob.CreateKillOnClose();
+        await using var srv = CodexAppServer.Start(CodexExe, processContainment: job);
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
 
         var init = await srv.InitializeAsync(cts.Token);

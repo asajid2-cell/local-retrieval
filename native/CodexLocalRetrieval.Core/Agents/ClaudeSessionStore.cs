@@ -9,6 +9,8 @@ namespace CodexLocalRetrieval.Core.Agents;
 // rollout parser does for codex, into AgentEvents, so one renderer shows both tools identically.
 public sealed class ClaudeSessionStore
 {
+    private const int MaxHistoryLineChars = 4 * 1024 * 1024;
+    private const int MaxMessageChars = 128 * 1024;
     private readonly string _root;
     // session id -> rollout path, populated on List() so Open can find the file by id.
     private readonly Dictionary<string, string> _paths = new();
@@ -57,15 +59,28 @@ public sealed class ClaudeSessionStore
 
     public List<AgentEvent> ReadHistory(string id, int maxEvents = 600, int maxOutputChars = 6000)
     {
-        var events = new List<AgentEvent>();
+        if (maxEvents <= 0) return new List<AgentEvent>();
+        var events = new Queue<AgentEvent>(maxEvents);
+        void Add(AgentEvent ev)
+        {
+            events.Enqueue(ev);
+            if (events.Count > maxEvents) events.Dequeue();
+        }
         var path = PathOf(id);
-        if (path is null || !File.Exists(path)) return events;
+        if (path is null || !File.Exists(path)) return new List<AgentEvent>();
 
         using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
         using var sr = new StreamReader(fs);
+        var reader = new BoundedTextLineReader(
+            sr,
+            MaxHistoryLineChars,
+            discardOversizedLine: true);
         string? line;
-        while ((line = sr.ReadLine()) is not null)
+        while (true)
         {
+            try { line = reader.ReadLine(); }
+            catch (InvalidDataException) { continue; }
+            if (line is null) break;
             if (string.IsNullOrWhiteSpace(line)) continue;
             JsonElement root;
             try { using var d = JsonDocument.Parse(line); root = d.RootElement.Clone(); } catch { continue; }
@@ -75,8 +90,8 @@ public sealed class ClaudeSessionStore
 
             if (content.ValueKind == JsonValueKind.String)
             {
-                if (type == "user" && !IsBoilerplate(content.GetString())) events.Add(new AgentEvent { Kind = AgentEventKind.UserMessage, Text = content.GetString() });
-                else if (type == "assistant") events.Add(new AgentEvent { Kind = AgentEventKind.AssistantText, Text = content.GetString() });
+                if (type == "user" && !IsBoilerplate(content.GetString())) Add(new AgentEvent { Kind = AgentEventKind.UserMessage, Text = Cap(content.GetString() ?? "", MaxMessageChars) });
+                else if (type == "assistant") Add(new AgentEvent { Kind = AgentEventKind.AssistantText, Text = Cap(content.GetString() ?? "", MaxMessageChars) });
                 continue;
             }
             if (content.ValueKind != JsonValueKind.Array) continue;
@@ -87,24 +102,23 @@ public sealed class ClaudeSessionStore
                 {
                     case "text":
                         var t = Str(b, "text") ?? "";
-                        if (type == "user") { if (!IsBoilerplate(t)) events.Add(new AgentEvent { Kind = AgentEventKind.UserMessage, Text = t }); }
-                        else events.Add(new AgentEvent { Kind = AgentEventKind.AssistantText, Text = t });
+                        if (type == "user") { if (!IsBoilerplate(t)) Add(new AgentEvent { Kind = AgentEventKind.UserMessage, Text = Cap(t, MaxMessageChars) }); }
+                        else Add(new AgentEvent { Kind = AgentEventKind.AssistantText, Text = Cap(t, MaxMessageChars) });
                         break;
                     case "thinking":
                         var th = Str(b, "thinking") ?? "";
-                        if (th.Length > 0) events.Add(new AgentEvent { Kind = AgentEventKind.Thinking, Text = th });
+                        if (th.Length > 0) Add(new AgentEvent { Kind = AgentEventKind.Thinking, Text = Cap(th, MaxMessageChars) });
                         break;
                     case "tool_use":
-                        events.Add(new AgentEvent { Kind = AgentEventKind.ToolCall, ItemId = Str(b, "id"), ToolName = Str(b, "name") ?? "tool", ToolInput = RawToolInput(b), State = "completed" });
+                        Add(new AgentEvent { Kind = AgentEventKind.ToolCall, ItemId = Str(b, "id"), ToolName = Str(b, "name") ?? "tool", ToolInput = RawToolInput(b), State = "completed" });
                         break;
                     case "tool_result":
-                        events.Add(new AgentEvent { Kind = AgentEventKind.ToolOutput, ItemId = Str(b, "tool_use_id"), Output = Cap(FlattenResult(b), maxOutputChars), State = "completed" });
+                        Add(new AgentEvent { Kind = AgentEventKind.ToolOutput, ItemId = Str(b, "tool_use_id"), Output = Cap(FlattenResult(b), maxOutputChars), State = "completed" });
                         break;
                 }
             }
         }
-        if (events.Count > maxEvents) events.RemoveRange(0, events.Count - maxEvents);
-        return events;
+        return events.ToList();
     }
 
     // The session's real title, exactly as Claude Code resolves it: a user-set custom-title wins, else
@@ -117,9 +131,16 @@ public sealed class ClaudeSessionStore
         {
             using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
             using var sr = new StreamReader(fs);
+            var reader = new BoundedTextLineReader(
+                sr,
+                1024 * 1024,
+                discardOversizedLine: true);
             string? line; int n = 0;
-            while ((line = sr.ReadLine()) is not null && n++ < 250)
+            while (n++ < 250)
             {
+                try { line = reader.ReadLine(); }
+                catch (InvalidDataException) { continue; }
+                if (line is null) break;
                 JsonElement root;
                 try { using var d = JsonDocument.Parse(line); root = d.RootElement.Clone(); } catch { continue; }
                 if (cwd.Length == 0 && Str(root, "cwd") is { Length: > 0 } c) cwd = c;

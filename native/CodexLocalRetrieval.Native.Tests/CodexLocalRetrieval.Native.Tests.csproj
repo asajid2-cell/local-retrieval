@@ -18,6 +18,8 @@
 
   <ItemGroup>
     <ProjectReference Include="..\CodexLocalRetrieval.Core\CodexLocalRetrieval.Core.csproj" />
+    <ProjectReference Include="..\CodexLocalRetrieval.ProcessJobProbe\CodexLocalRetrieval.ProcessJobProbe.csproj"
+                      ReferenceOutputAssembly="false" />
     <ProjectReference Include="..\CodexLocalRetrieval.Server\CodexLocalRetrieval.Server.csproj" />
   </ItemGroup>
 

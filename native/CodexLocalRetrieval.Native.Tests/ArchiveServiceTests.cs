@@ -1,3 +1,4 @@
+using System.Collections.ObjectModel;
 using System.Globalization;
 using System.Text;
 using System.Text.Json;
@@ -1272,10 +1273,73 @@ public sealed class ArchiveServiceTests
             var s = service.Store.Sessions["cl-1"];
             Assert.AreEqual("claude", s.Tool);
             Assert.AreEqual("z:\\proj", s.Workspace);
-            Assert.IsTrue(s.Messages.Count >= 2, "both claude messages should parse");
             StringAssert.Contains(s.Text, "ship the claude feature");
+            Assert.IsFalse(s.ContentLoaded, "a sync must retain metadata, not every transcript payload");
+            Assert.IsEmpty(s.Messages, "parsed messages must be released after metadata extraction");
+
+            await service.EnsureContentAsync(s);
+
+            Assert.IsTrue(s.ContentLoaded);
+            Assert.IsTrue(s.Messages.Count >= 2, "opening the chat should lazy-load both Claude messages");
         }
         finally { Directory.Delete(claudeDir, true); }
+    }
+
+    [TestMethod]
+    public async Task EnsureContentAsync_ConcurrentCallersShareOneParse()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "clr-lazy-load-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        var source = Path.Combine(dir, "session.jsonl");
+        File.WriteAllText(source, "{}");
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var parseCount = 0;
+        var service = new ArchiveService(
+            storePath: Path.Combine(dir, "store.json"),
+            useBundledStore: false,
+            parseSessionOverride: async (_, _) =>
+            {
+                Interlocked.Increment(ref parseCount);
+                entered.TrySetResult();
+                await release.Task;
+                return new ArchiveSession
+                {
+                    MessageCount = 1,
+                    Messages = new ObservableCollection<ArchiveMessage>
+                    {
+                        new() { Id = "one", Role = "assistant", Text = "loaded once" }
+                    }
+                };
+            });
+        var session = new ArchiveSession
+        {
+            Id = "concurrent-load",
+            Tool = "codex",
+            SourcePath = source,
+        };
+
+        try
+        {
+            var opens = Enumerable.Range(0, 24)
+                .Select(_ => Task.Run(() => service.EnsureContentAsync(session)))
+                .ToArray();
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await Task.Delay(100);
+            Assert.AreEqual(1, Volatile.Read(ref parseCount), "concurrent opens must share one disk parse");
+
+            release.TrySetResult();
+            await Task.WhenAll(opens).WaitAsync(TimeSpan.FromSeconds(5));
+
+            Assert.AreEqual(1, Volatile.Read(ref parseCount));
+            Assert.IsTrue(session.ContentLoaded);
+            Assert.AreEqual("loaded once", session.Messages.Single().Text);
+        }
+        finally
+        {
+            release.TrySetResult();
+            Directory.Delete(dir, true);
+        }
     }
 
     [TestMethod]
@@ -1371,7 +1435,15 @@ public sealed class ArchiveServiceTests
 
             Assert.AreEqual(1, indexed, "the file must still index despite the partial tail line");
             Assert.IsTrue(service.Store.Sessions.ContainsKey("live-1"));
-            Assert.IsTrue(service.Store.Sessions["live-1"].Messages.Count >= 1, "good lines above the partial must survive");
+            var session = service.Store.Sessions["live-1"];
+            StringAssert.Contains(session.Text, "active session", "metadata from good lines above the partial must survive");
+            Assert.IsFalse(session.ContentLoaded);
+            Assert.IsEmpty(session.Messages);
+
+            await service.EnsureContentAsync(session);
+
+            Assert.IsTrue(session.ContentLoaded);
+            Assert.IsTrue(session.Messages.Count >= 1, "good lines above the partial must survive lazy loading");
         }
         finally { Directory.Delete(root, true); }
     }
@@ -1605,6 +1677,35 @@ public sealed class ArchiveServiceTests
             Assert.AreEqual(original, File.ReadAllText(backups[0]), "the backup holds the ORIGINAL (restorable) transcript");
         }
         finally { if (Directory.Exists(dir)) Directory.Delete(dir, true); }
+    }
+
+    [TestMethod]
+    public void RecoverClaudeEntrypoint_StreamsOversizedLinesAndChunkBoundaryMatches()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "clr-entrypoint-stream-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        var transcript = Path.Combine(dir, "oversized.jsonl");
+        var prefix = new string('x', (64 * 1024) - 10);
+        var suffix = new string('y', 600_000);
+        var original = prefix + "\"entrypoint\":\"sdk-cli\"" + suffix;
+        File.WriteAllText(transcript, original);
+
+        try
+        {
+            var rewrote = ArchiveService.RecoverClaudeEntrypoint(transcript);
+            var recovered = File.ReadAllText(transcript);
+
+            Assert.IsTrue(rewrote);
+            Assert.IsFalse(recovered.Contains("sdk-cli", StringComparison.Ordinal));
+            Assert.IsTrue(recovered.Contains("\"entrypoint\":\"cli\"", StringComparison.Ordinal));
+            Assert.IsTrue(recovered.StartsWith(prefix, StringComparison.Ordinal));
+            Assert.IsTrue(recovered.EndsWith(suffix, StringComparison.Ordinal));
+            Assert.IsFalse(recovered.EndsWith("\n", StringComparison.Ordinal), "streaming recovery must preserve EOF shape");
+        }
+        finally
+        {
+            Directory.Delete(dir, true);
+        }
     }
 
     // ★ Tab↔chat binding must never confuse two tabs onto the same chat, even when several fresh agents
@@ -2777,6 +2878,147 @@ public sealed class ArchiveServiceTests
     }
 
     [TestMethod]
+    public async Task DeepSearchContent_StreamsTranscriptBeyondLegacyWholeFileLimit()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "clr-deep-stream-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        var path = Path.Combine(dir, "large.jsonl");
+        try
+        {
+            await using (var stream = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.Read))
+            await using (var writer = new StreamWriter(stream))
+            {
+                const string filler = "{\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"bounded streaming search filler payload\"}}";
+                while (stream.Length <= 49L * 1024 * 1024)
+                    await writer.WriteLineAsync(filler);
+                await writer.WriteLineAsync(
+                    "{\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"needle-orbit reliability sentinel\"}}");
+            }
+
+            var service = TempService(out var store);
+            service.Store.Sessions["large-search"] = new ArchiveSession
+            {
+                Id = "large-search",
+                Title = "large transcript",
+                SourcePath = path,
+                UpdatedAt = "2026-07-10T12:00:00Z",
+            };
+
+            var hits = await service.DeepSearchContentAsync("needle orbit");
+
+            Assert.IsTrue(
+                hits.Any(hit => hit.Session.Id == "large-search"),
+                "Deep search must stream large transcripts instead of skipping or materializing them.");
+            if (File.Exists(store)) File.Delete(store);
+        }
+        finally
+        {
+            if (Directory.Exists(dir)) Directory.Delete(dir, true);
+        }
+    }
+
+    [TestMethod]
+    public async Task EnsureContent_SynchronousCallerDoesNotDeadlockBehindDispatcherBoundLoad()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "clr-lazy-load-dispatcher-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        var source = Path.Combine(dir, "session.jsonl");
+        File.WriteAllText(source, "{}");
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var completed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var service = new ArchiveService(
+            storePath: Path.Combine(dir, "store.json"),
+            useBundledStore: false,
+            parseSessionOverride: async (_, _) =>
+            {
+                entered.TrySetResult();
+                await release.Task;
+                return new ArchiveSession
+                {
+                    MessageCount = 1,
+                    Messages = new ObservableCollection<ArchiveMessage>
+                    {
+                        new() { Id = "one", Role = "assistant", Text = "loaded" }
+                    }
+                };
+            });
+        var session = new ArchiveSession
+        {
+            Id = "dispatcher-load",
+            Tool = "codex",
+            SourcePath = source,
+        };
+        var thread = new Thread(() =>
+        {
+            SynchronizationContext.SetSynchronizationContext(new NonPumpingSynchronizationContext());
+            var pending = service.EnsureContentAsync(session);
+            service.EnsureContent(session);
+            GC.KeepAlive(pending);
+            completed.TrySetResult();
+        })
+        {
+            IsBackground = true,
+        };
+
+        try
+        {
+            thread.Start();
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            release.TrySetResult();
+            await completed.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+            Assert.IsTrue(session.ContentLoaded);
+            Assert.AreEqual("loaded", session.Messages.Single().Text);
+        }
+        finally
+        {
+            release.TrySetResult();
+            if (thread.IsAlive) thread.Join(TimeSpan.FromSeconds(1));
+            Directory.Delete(dir, true);
+        }
+    }
+
+    [TestMethod]
+    public async Task DeepSearchContent_SamplesTailOfTranscriptBeyondSearchBudget()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "clr-deep-sample-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        var path = Path.Combine(dir, "giant.jsonl");
+        try
+        {
+            await using (var stream = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.Read))
+            {
+                stream.SetLength(129L * 1024 * 1024);
+                stream.Position = stream.Length;
+                var tail = Encoding.UTF8.GetBytes(
+                    "\n{\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"tailonly sentinelphrase\"}}\n");
+                await stream.WriteAsync(tail);
+            }
+
+            var service = TempService(out var store);
+            service.Store.Sessions["giant-search"] = new ArchiveSession
+            {
+                Id = "giant-search",
+                Title = "giant transcript",
+                SourcePath = path,
+                UpdatedAt = "2026-07-10T12:00:00Z",
+            };
+
+            var hits = await service.DeepSearchContentAsync("tailonly sentinelphrase");
+
+            Assert.IsTrue(
+                hits.Any(hit => hit.Session.Id == "giant-search"),
+                "Oversized transcripts must remain searchable through bounded head/tail sampling.");
+            if (File.Exists(store)) File.Delete(store);
+        }
+        finally
+        {
+            if (Directory.Exists(dir)) Directory.Delete(dir, true);
+        }
+    }
+
+    [TestMethod]
     public async Task CopyPayload_BuildsRestorePacketAndCodePayload()
     {
         var service = new ArchiveService(useBundledStore: true);
@@ -2804,5 +3046,12 @@ public sealed class ArchiveServiceTests
 
         Assert.IsTrue(hits.Any(hit => hit.Session.Id == "fixture-b" && hit.Snippet.Contains("restore", StringComparison.OrdinalIgnoreCase)));
         Assert.AreEqual(fixture.SourcePath, path);
+    }
+
+    private sealed class NonPumpingSynchronizationContext : SynchronizationContext
+    {
+        public override void Post(SendOrPostCallback d, object? state)
+        {
+        }
     }
 }

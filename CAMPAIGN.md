@@ -50,6 +50,29 @@
 - 2026-07-09: Independent tandem audit found that failed PTY termination orphaned the handle and visible owner websocket closure was incorrectly treated as child exit.
 - 2026-07-09: L1/L2 accepted at `L2b_20260709`: failed termination now retains PTY/input/claim, owner registration is claim-protected with reconnect identity and explicit exit confirmation, boot/heal preserve aliases, node CLI shims are scanned, and relay backlog is bounded.
 - 2026-07-09: Unified acceptance evidence: app 306 passed / 2 skipped, relay 25 passed, muxd 44 passed / 3 VPS-only skipped. muxd checkpoint `be29d6b`.
+- 2026-07-10: L7 contained app-server and Claude child processes with Windows Job Objects, bounded
+  all process/line capture, supervised server pumps, and retained cross-process ownership whenever
+  child termination could not be proven. Archive loading became lazy, per-session serialized, and
+  context-independent so a blocked UI dispatcher cannot deadlock an in-flight load.
+- 2026-07-10: The dispatcher deadlock repro now prints `no deadlock observed`; the prior flaky
+  confirmed-termination claim-release test passed 50/50 isolated runs; the broader reliability
+  slice passed 188/188 and the full .NET suite passed 388 with 2 environment skips.
+- 2026-07-10: The first L7 runner attempt exposed a muxd resource leak under cumulative session
+  churn. Dormant and failed-before-spawn sessions eagerly created immortal input-writer threads,
+  and already-stopped sessions never sent the writer sentinel. Writers are now lazy and
+  generation-bound, successful terminal paths stop them, and a mutation-proven 100-session test
+  verifies zero thread growth instead of the old +100.
+- 2026-07-10: Unified `L7_20260710` acceptance passed app build/tests, real projection contract,
+  relay tests, and muxd tests. Evidence is under `artifacts/reliability/L7_20260710`; machine-owned
+  `CURRENT.md` advanced only on the all-green rerun.
+- 2026-07-10: The post-L7 muxd audit moved durable manifest I/O off the event loop under a
+  cancellation-safe global state transaction, closed natural-EOF writer leaks, made enqueue and
+  shutdown sentinel ordering atomic, pinned writers to PTY generations, and kept non-durable input
+  responsive during unrelated durable writes.
+- 2026-07-10: Independent tandem `mux-l7b-async-persistence-20260710` accepted pinned final blobs
+  `212ddf8` / `8129a19` / `bb4575c`. The unified `L7b_20260710` gate passed app 388 / 2 skipped,
+  relay 66, and muxd 92 / 3 VPS-only skipped. Evidence is under
+  `artifacts/reliability/L7b_20260710`.
 
 ## Decisions Needed
 

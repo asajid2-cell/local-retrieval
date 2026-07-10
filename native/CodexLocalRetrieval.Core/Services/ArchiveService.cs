@@ -1,8 +1,10 @@
 using System.Collections.ObjectModel;
+using System.Runtime.CompilerServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using CodexLocalRetrieval.Core.Agents;
 using CodexLocalRetrieval.Core.Memory;
 using CodexLocalRetrieval.Core.Models;
 using CodexLocalRetrieval.Core.Remote;
@@ -29,6 +31,8 @@ public sealed class ArchiveService
     private const int ClaudeTailBytes = 32 * 1024 * 1024;
     private const int CodexTailBytes = 16 * 1024 * 1024;
     private const int SearchTextCap = 6_000; // capped, in-memory searchable text per session (full content lazy-loads)
+    private const int MaxDiskSearchParallelism = 4;
+    private const long MaxDiskSearchBytesPerFile = 128L * 1024 * 1024;
 
     private static string CapText(string s) => string.IsNullOrEmpty(s) || s.Length <= SearchTextCap ? s : s[^SearchTextCap..];
 
@@ -67,8 +71,18 @@ public sealed class ArchiveService
     {
         using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
         using var sr = new StreamReader(fs, Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
-        string? line;
-        while ((line = sr.ReadLine()) is not null) yield return line;
+        var reader = new BoundedTextLineReader(
+            sr,
+            MaxLineChars,
+            discardOversizedLine: true);
+        while (true)
+        {
+            string? line;
+            try { line = reader.ReadLine(); }
+            catch (InvalidDataException) { continue; }
+            if (line is null) yield break;
+            yield return line;
+        }
     }
 
     // Count REAL user prompts across the ENTIRE transcript (NOT bounded by the 18000-line parse cap), so a
@@ -83,10 +97,7 @@ public sealed class ArchiveService
         {
             // Shared read (ReadWrite|Delete) so a LIVE rollout — one the running agent still has open for
             // append — is counted instead of throwing a sharing violation (which silently zeroed the count).
-            using var stream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-            using var reader = new StreamReader(stream, Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
-            string? line;
-            while ((line = reader.ReadLine()) is not null)
+            foreach (var line in SafeReadLines(filePath))
             {
                 if (line.Length < 12 || line.Length > MaxLineChars) continue;
                 try
@@ -153,6 +164,8 @@ public sealed class ArchiveService
     private readonly string _bundledStorePath;
     private readonly JsonSerializerOptions _jsonOptions = new() { PropertyNameCaseInsensitive = true, WriteIndented = true };
     private readonly SemaphoreSlim _saveGate = new(1, 1);
+    private readonly ConditionalWeakTable<ArchiveSession, SemaphoreSlim> _contentLoadGates = new();
+    private readonly Func<string, string, Task<ArchiveSession?>>? _parseSessionOverride;
     private long _loadedGeneration;
 
     public AppStoreData Store { get; private set; } = new();
@@ -168,6 +181,15 @@ public sealed class ArchiveService
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             "CodexLocalRetrieval",
             "app-store.json");
+    }
+
+    internal ArchiveService(
+        string? storePath,
+        bool useBundledStore,
+        Func<string, string, Task<ArchiveSession?>> parseSessionOverride)
+        : this(storePath, useBundledStore)
+    {
+        _parseSessionOverride = parseSessionOverride ?? throw new ArgumentNullException(nameof(parseSessionOverride));
     }
 
     public async Task LoadAsync()
@@ -415,7 +437,25 @@ public sealed class ArchiveService
     // Lazy-load a chat's full content (messages + code blocks) from its source file on demand, OFF the
     // UI thread. The store holds only metadata, so this runs when a chat is opened or its content is
     // needed (co-pilot, copy-code). Cheap no-op once loaded.
-    public async Task EnsureContentAsync(ArchiveSession session)
+    public async Task EnsureContentAsync(
+        ArchiveSession session,
+        CancellationToken cancellationToken = default)
+    {
+        if (session.ContentLoaded) return;
+        var gate = _contentLoadGates.GetValue(session, static _ => new SemaphoreSlim(1, 1));
+        await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            if (!session.ContentLoaded)
+                await LoadContentCoreAsync(session).ConfigureAwait(false);
+        }
+        finally
+        {
+            gate.Release();
+        }
+    }
+
+    private async Task LoadContentCoreAsync(ArchiveSession session)
     {
         if (session.ContentLoaded) return;
         // SourcePath may be relative (the bundled demo store) — resolve against the project root.
@@ -428,12 +468,15 @@ public sealed class ArchiveService
         }
         try
         {
-            var parsed = await Task.Run(async () => await ParseSessionAsync(path, session.Tool));
+            var parsed = await Task.Run(() => _parseSessionOverride is null
+                    ? ParseSessionAsync(path, session.Tool)
+                    : _parseSessionOverride(path, session.Tool))
+                .ConfigureAwait(false);
             if (parsed is not null)
             {
                 session.Messages = parsed.Messages;
                 session.CodeBlocks = parsed.CodeBlocks;
-                session.MessageCount = parsed.Messages.Count;
+                session.MessageCount = parsed.MessageCount;
                 // Only the LAST user message is safe to refresh from the recent window; FirstUserMessage and
                 // UserMessageCount need the FULL transcript (set at index time), so don't clobber them here
                 // with windowed values — the recent window would undercount / show the wrong "first".
@@ -469,8 +512,17 @@ public sealed class ArchiveService
     // Force a fresh re-parse from disk (the live tail of an open chat as the agent keeps writing it).
     public async Task ReloadContentAsync(ArchiveSession session)
     {
-        session.ContentLoaded = false;
-        await EnsureContentAsync(session);
+        var gate = _contentLoadGates.GetValue(session, static _ => new SemaphoreSlim(1, 1));
+        await gate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            session.ContentLoaded = false;
+            await LoadContentCoreAsync(session).ConfigureAwait(false);
+        }
+        finally
+        {
+            gate.Release();
+        }
     }
 
     // The last-write time of a session's source transcript, for cheap "did it change?" polling.
@@ -668,16 +720,20 @@ public sealed class ArchiveService
         var scored = new System.Collections.Concurrent.ConcurrentBag<(ArchiveSession s, int hitCount)>();
         await Task.Run(() =>
         {
-            Parallel.ForEach(sessions, new ParallelOptions { MaxDegreeOfParallelism = Math.Max(2, Environment.ProcessorCount) }, s =>
+            Parallel.ForEach(sessions, new ParallelOptions { MaxDegreeOfParallelism = MaxDiskSearchParallelism }, s =>
             {
                 try
                 {
                     var path = Path.IsPathRooted(s.SourcePath) ? s.SourcePath : Path.Combine(_rootPath, s.SourcePath);
                     if (!File.Exists(path)) return;
-                    if (new FileInfo(path).Length > 96L * 1024 * 1024) return;
-                    var lower = SafeReadAllText(path).ToLowerInvariant();   // shared read: never block a live agent's append
-                    var present = 0;
-                    foreach (var t in tokens) if (lower.Contains(t, StringComparison.Ordinal)) present++;
+                    var scan = ScanTranscriptTokens(
+                        path,
+                        tokens,
+                        phrase: null,
+                        allowFuzzy: false,
+                        maxOccurrencesPerToken: 1,
+                        stopWhenAllPresent: true);
+                    var present = scan.Counts.Count(count => count > 0);
                     if (present >= need) scored.Add((s, present));
                 }
                 catch { }
@@ -751,57 +807,59 @@ public sealed class ArchiveService
         var scored = new System.Collections.Concurrent.ConcurrentBag<ArchiveSearchHit>();
         await Task.Run(() =>
         {
-            Parallel.ForEach(sessions, new ParallelOptions { MaxDegreeOfParallelism = Math.Max(2, Environment.ProcessorCount) }, s =>
+            Parallel.ForEach(sessions, new ParallelOptions { MaxDegreeOfParallelism = MaxDiskSearchParallelism }, s =>
             {
                 try
                 {
                     var path = Path.IsPathRooted(s.SourcePath) ? s.SourcePath : Path.Combine(_rootPath, s.SourcePath);
                     if (!File.Exists(path)) return;
                     var len = new FileInfo(path).Length;
-                    if (len > 48L * 1024 * 1024) return;   // bound peak memory (raw text is UTF-16 in RAM, parallel)
-                    var raw = SafeReadAllText(path);       // shared read: never block a live agent's append
                     var allowFuzzy = len < 3L * 1024 * 1024;
-                    string? low = allowFuzzy ? raw.ToLowerInvariant() : null;
+                    var scan = ScanTranscriptTokens(
+                        path,
+                        tokens,
+                        phrase,
+                        allowFuzzy,
+                        maxOccurrencesPerToken: 25,
+                        stopWhenAllPresent: false);
 
                     var titleLower = (s.DisplayTitle ?? "").ToLowerInvariant();
                     var present = 0;
                     var contentScore = 0;
                     var titleHits = 0;
-                    var firstIdx = -1;
                     var matched = new List<string>();
-                    foreach (var t in tokens)
+                    for (var i = 0; i < tokens.Count; i++)
                     {
+                        var t = tokens[i];
                         var inTitle = titleLower.Contains(t);
                         if (inTitle) titleHits++;
-                        var c = CountOccurrencesCI(raw, t);
+                        var c = scan.Counts[i];
                         if (c > 0)
                         {
                             present++; matched.Add(t);
                             contentScore += Math.Min(c, 25);
-                            var idx = raw.IndexOf(t, StringComparison.OrdinalIgnoreCase);
-                            if (idx >= 0 && (firstIdx < 0 || idx < firstIdx)) firstIdx = idx;
                         }
-                        else if (t.Length >= 5 && low is not null && HasCloseToken(t, low))
+                        else if (scan.FuzzyMatches[i])
                         {
                             present++; matched.Add(t + "~");
                             contentScore += 4;
                         }
                         else if (inTitle) { matched.Add(t); }
                     }
-                    if (titleHits == 0 && low is not null)
+                    if (titleHits == 0 && allowFuzzy)
                         titleHits = tokens.Count(t => t.Length >= 5 && HasCloseToken(t, titleLower));
 
                     if (present < need && titleHits == 0) return;   // not enough of the query is in this chat
 
                     var score = contentScore + titleHits * 60;
                     if (present == tokens.Count && tokens.Count > 1) score += 40;             // every word present
-                    if (phrase.Length > tokens[0].Length && raw.IndexOf(phrase, StringComparison.OrdinalIgnoreCase) >= 0) score += 80;  // exact phrase
+                    if (phrase.Length > tokens[0].Length && scan.ExactPhrase) score += 80;  // exact phrase
 
                     scored.Add(new ArchiveSearchHit
                     {
                         Session = s,
                         SourceLabel = present == 0 ? "title" : (titleHits > 0 ? "title + content" : "chat content"),
-                        Snippet = firstIdx >= 0 ? BuildFileSnippet(raw, firstIdx) : (s.DisplayTitle ?? ""),
+                        Snippet = scan.Snippet.Length > 0 ? scan.Snippet : (s.DisplayTitle ?? ""),
                         MatchedTerms = string.Join(", ", matched.Distinct()),
                         Score = score
                     });
@@ -819,6 +877,177 @@ public sealed class ArchiveService
     // The distinctive WORDS of a phrase (lowercase, 4+ letters/digits, deduped, capped) — the rare/meaningful
     // ones that identify a specific turn, skipping short filler ("the", "is"). Matched whole so surrounding
     // markdown/punctuation in the transcript never matters.
+    private sealed record TranscriptTokenScan(
+        int[] Counts,
+        bool[] FuzzyMatches,
+        bool ExactPhrase,
+        string Snippet);
+
+    private static TranscriptTokenScan ScanTranscriptTokens(
+        string path,
+        IReadOnlyList<string> tokens,
+        string? phrase,
+        bool allowFuzzy,
+        int maxOccurrencesPerToken,
+        bool stopWhenAllPresent)
+    {
+        var counts = new int[tokens.Count];
+        var fuzzyMatches = new bool[tokens.Count];
+        var exactPhrase = false;
+        var snippet = "";
+
+        bool ScanSegment(long start, long length)
+        {
+            using var stream = new FileStream(
+                path,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.ReadWrite | FileShare.Delete,
+                bufferSize: 64 * 1024,
+                FileOptions.SequentialScan);
+            var discardInitialPartialLine = false;
+            if (start > 0)
+            {
+                stream.Position = start - 1;
+                var prior = stream.ReadByte();
+                discardInitialPartialLine = prior is not ('\n' or '\r');
+            }
+            stream.Position = start;
+            using var limited = new ReadLimitStream(stream, length);
+            using var text = new StreamReader(
+                limited,
+                Encoding.UTF8,
+                detectEncodingFromByteOrderMarks: start == 0,
+                bufferSize: 64 * 1024);
+            var reader = new BoundedTextLineReader(
+                text,
+                MaxLineChars,
+                bufferSize: 64 * 1024,
+                discardOversizedLine: true);
+
+            if (discardInitialPartialLine)
+            {
+                try { _ = reader.ReadLine(); }
+                catch (InvalidDataException) { }
+            }
+
+            while (true)
+            {
+                string? line;
+                try { line = reader.ReadLine(); }
+                catch (InvalidDataException) { continue; }
+                if (line is null) return false;
+
+                if (!exactPhrase
+                    && !string.IsNullOrWhiteSpace(phrase)
+                    && line.Contains(phrase, StringComparison.OrdinalIgnoreCase))
+                    exactPhrase = true;
+
+                string? lower = null;
+                for (var i = 0; i < tokens.Count; i++)
+                {
+                    var token = tokens[i];
+                    if (counts[i] < maxOccurrencesPerToken)
+                    {
+                        var found = CountOccurrencesCI(
+                            line,
+                            token,
+                            maxOccurrencesPerToken - counts[i]);
+                        if (found > 0)
+                        {
+                            counts[i] += found;
+                            if (snippet.Length == 0)
+                            {
+                                var index = line.IndexOf(token, StringComparison.OrdinalIgnoreCase);
+                                if (index >= 0) snippet = BuildFileSnippet(line, index);
+                            }
+                        }
+                    }
+
+                    if (allowFuzzy
+                        && counts[i] == 0
+                        && !fuzzyMatches[i]
+                        && token.Length >= 5)
+                    {
+                        lower ??= line.ToLowerInvariant();
+                        fuzzyMatches[i] = HasCloseToken(token, lower);
+                    }
+                }
+
+                if (stopWhenAllPresent && counts.All(count => count > 0))
+                    return true;
+            }
+        }
+
+        var fileLength = new FileInfo(path).Length;
+        if (fileLength <= MaxDiskSearchBytesPerFile)
+        {
+            ScanSegment(0, fileLength);
+        }
+        else
+        {
+            var half = MaxDiskSearchBytesPerFile / 2;
+            var complete = ScanSegment(0, half);
+            if (!complete)
+                ScanSegment(fileLength - half, half);
+        }
+
+        return new TranscriptTokenScan(counts, fuzzyMatches, exactPhrase, snippet);
+    }
+
+    private sealed class ReadLimitStream(Stream inner, long limit) : Stream
+    {
+        private long _remaining = limit;
+
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+        public override long Position
+        {
+            get => throw new NotSupportedException();
+            set => throw new NotSupportedException();
+        }
+
+        public override int Read(byte[] buffer, int offset, int count)
+        {
+            if (_remaining <= 0) return 0;
+            var read = inner.Read(buffer, offset, (int)Math.Min(count, _remaining));
+            _remaining -= read;
+            return read;
+        }
+
+        public override int Read(Span<byte> buffer)
+        {
+            if (_remaining <= 0) return 0;
+            var read = inner.Read(buffer[..(int)Math.Min(buffer.Length, _remaining)]);
+            _remaining -= read;
+            return read;
+        }
+
+        public override ValueTask<int> ReadAsync(
+            Memory<byte> buffer,
+            CancellationToken cancellationToken = default)
+        {
+            if (_remaining <= 0) return ValueTask.FromResult(0);
+            return ReadLimitedAsync(buffer[..(int)Math.Min(buffer.Length, _remaining)], cancellationToken);
+        }
+
+        private async ValueTask<int> ReadLimitedAsync(
+            Memory<byte> buffer,
+            CancellationToken cancellationToken)
+        {
+            var read = await inner.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
+            _remaining -= read;
+            return read;
+        }
+
+        public override void Flush() => throw new NotSupportedException();
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    }
+
     private static List<string> DistinctiveTokens(string phrase) =>
         System.Text.RegularExpressions.Regex.Matches((phrase ?? "").ToLowerInvariant(), "[a-z0-9]{4,}")
             .Select(m => m.Value).Distinct().Take(16).ToList();
@@ -2061,17 +2290,7 @@ public sealed class ArchiveService
             using (var reader = new StreamReader(rfs, Encoding.UTF8, detectEncodingFromByteOrderMarks: true))
             using (var writer = new StreamWriter(tmp, false, new UTF8Encoding(false)))
             {
-                string? line;
-                while ((line = reader.ReadLine()) != null)
-                {
-                    var outLine = line;
-                    foreach (var (from, to) in swaps)
-                        if (outLine.IndexOf(from, StringComparison.Ordinal) >= 0)
-                            outLine = outLine.Replace(from, to);
-                    if (!string.Equals(outLine, line, StringComparison.Ordinal)) changed = true;
-                    writer.Write(outLine);
-                    writer.Write('\n');
-                }
+                changed = RewriteTextStreaming(reader, writer, swaps);
             }
             if (!changed) { TryDeleteFile(tmp); return false; }
 
@@ -2101,6 +2320,59 @@ public sealed class ArchiveService
         {
             TryDeleteFile(tmp);
             return false;
+        }
+    }
+
+    private static bool RewriteTextStreaming(
+        TextReader reader,
+        TextWriter writer,
+        IReadOnlyList<(string From, string To)> swaps)
+    {
+        var maxPatternLength = swaps.Max(s => s.From.Length);
+        var carry = "";
+        var buffer = new char[64 * 1024];
+        var changed = false;
+
+        while (true)
+        {
+            var count = reader.Read(buffer, 0, buffer.Length);
+            var eof = count == 0;
+            var source = count == 0 ? carry : carry + new string(buffer, 0, count);
+            var safeLimit = eof ? source.Length : Math.Max(0, source.Length - (maxPatternLength - 1));
+            var cursor = 0;
+
+            while (cursor < safeLimit)
+            {
+                var matchIndex = -1;
+                (string From, string To)? match = null;
+                foreach (var swap in swaps)
+                {
+                    var index = source.IndexOf(swap.From, cursor, StringComparison.Ordinal);
+                    if (index >= 0 && (matchIndex < 0 || index < matchIndex))
+                    {
+                        matchIndex = index;
+                        match = swap;
+                    }
+                }
+
+                if (matchIndex < 0 || matchIndex >= safeLimit) break;
+                writer.Write(source.AsSpan(cursor, matchIndex - cursor));
+                writer.Write(match!.Value.To);
+                cursor = matchIndex + match.Value.From.Length;
+                changed = true;
+            }
+
+            if (cursor < safeLimit)
+            {
+                writer.Write(source.AsSpan(cursor, safeLimit - cursor));
+                cursor = safeLimit;
+            }
+            carry = source[cursor..];
+            if (eof)
+            {
+                if (carry.Length > 0) writer.Write(carry);
+                return changed;
+            }
         }
     }
 
@@ -2456,6 +2728,33 @@ public sealed class ArchiveService
     public string CopyPayload(ArchiveSession session, string mode)
     {
         if (mode is not ("path" or "paths")) EnsureContent(session); // restore/code/resume need content (lazy)
+        return BuildCopyPayload(session, mode);
+    }
+
+    public async Task<string> CopyPayloadAsync(
+        ArchiveSession session,
+        string mode,
+        CancellationToken cancellationToken = default)
+    {
+        if (mode is "path" or "paths")
+            return BuildCopyPayload(session, mode);
+
+        var gate = _contentLoadGates.GetValue(session, static _ => new SemaphoreSlim(1, 1));
+        await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            if (!session.ContentLoaded)
+                await LoadContentCoreAsync(session).ConfigureAwait(false);
+            return BuildCopyPayload(session, mode);
+        }
+        finally
+        {
+            gate.Release();
+        }
+    }
+
+    private string BuildCopyPayload(ArchiveSession session, string mode)
+    {
         return mode switch
         {
             "code" => session.CodeBlocks.Count == 0
@@ -2463,7 +2762,7 @@ public sealed class ArchiveService
                 : string.Join("\n\n", session.CodeBlocks.Select(block => $"```{block.Language}\n{block.Code}\n```")),
             "path" => session.SourcePath,
             "paths" => $"Chat source: {session.SourcePath}\nWorkspace: {session.Workspace}",
-            "restore" => RestorePacket(session),
+            "restore" => BuildRestorePacket(session),
             "command" => ResumeCommandText(session),   // the actual CLI resume command (codex resume <id> / claude --resume <id>)
             _ => ResumePrompt(session)
         };
@@ -2483,6 +2782,17 @@ public sealed class ArchiveService
 
     public string RestorePacket(ArchiveSession session)
     {
+        EnsureContent(session);
+        return BuildRestorePacket(session);
+    }
+
+    public Task<string> RestorePacketAsync(
+        ArchiveSession session,
+        CancellationToken cancellationToken = default) =>
+        CopyPayloadAsync(session, "restore", cancellationToken);
+
+    private string BuildRestorePacket(ArchiveSession session)
+    {
         var firstUser = session.Messages.FirstOrDefault(m => m.Role == "user")?.Text ?? session.Title;
         return string.Join("\n\n", new[]
         {
@@ -2490,7 +2800,7 @@ public sealed class ArchiveService
             $"## Goal summary\n{firstUser}",
             $"## Current state\nLast archived activity: {session.UpdatedAt}",
             $"## Important paths\nChat source: {session.SourcePath}\nWorkspace: {session.Workspace}",
-            $"## Code blocks\n{CopyPayload(session, "code")}",
+            $"## Code blocks\n{BuildCopyPayload(session, "code")}",
             "## Suggested first prompt\nContinue from this restore packet. Treat source paths as read-only and recover the relevant code, decisions, and next actions."
         });
     }
@@ -2615,7 +2925,11 @@ public sealed class ArchiveService
                 }
 
                 var session = await ParseSessionAsync(file.FullName, src.Tool);
-                if (session is not null) parsed.Add(session);
+                if (session is not null)
+                {
+                    ReleaseIndexedContent(session);
+                    parsed.Add(session);
+                }
                 stamps[file.FullName] = stamp; // stamp only after a successful parse (or intentional sidechain skip)
             }
             catch (Exception ex)
@@ -2626,6 +2940,13 @@ public sealed class ArchiveService
         }
         progress?.Report($"{src.Tool}: {parsed.Count} new/changed of {newestFiles.Count}");
         return (parsed, stamps);
+    }
+
+    private static void ReleaseIndexedContent(ArchiveSession session)
+    {
+        session.Messages = new ObservableCollection<ArchiveMessage>();
+        session.CodeBlocks = new ObservableCollection<CodeBlock>();
+        session.ContentLoaded = false;
     }
 
     internal static EnumerationOptions TranscriptEnumerationOptions() => new()
@@ -2708,10 +3029,7 @@ public sealed class ArchiveService
         {
             try
             {
-                using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-                using var reader = new StreamReader(stream, Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
-                string? line;
-                while ((line = reader.ReadLine()) is not null)
+                foreach (var line in SafeReadLines(path))
                 {
                     if (line.Length < 8 || line.Length > MaxLineChars) continue;
                     try
@@ -3800,10 +4118,18 @@ public sealed class ArchiveService
         try
         {
             using var stream = new FileStream(session.SourcePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-            using var reader = new StreamReader(stream, Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
-            string? line;
-            while (events.Count < limit && (line = reader.ReadLine()) is not null)
+            using var text = new StreamReader(stream, Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
+            var reader = new BoundedTextLineReader(
+                text,
+                MaxLineChars,
+                discardOversizedLine: true);
+            var scanned = 0;
+            while (events.Count < limit && scanned++ < MaxLinesPerSession)
             {
+                string? line;
+                try { line = reader.ReadLine(); }
+                catch (InvalidDataException) { continue; }
+                if (line is null) break;
                 if (string.IsNullOrWhiteSpace(line) || line.Length > MaxLineChars) continue;
                 JsonDocument doc;
                 try { doc = JsonDocument.Parse(line); } catch { continue; }
@@ -3907,13 +4233,20 @@ public sealed class ArchiveService
         ArchiveMessage? lastTool = null;   // the function_call awaiting its function_call_output
 
         using var stream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-        using var reader = new StreamReader(stream, Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
+        using var streamReader = new StreamReader(stream, Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
+        var reader = new BoundedTextLineReader(
+            streamReader,
+            MaxLineChars,
+            discardOversizedLine: true);
         var lineCount = 0;
         var hitLineCap = false;
-        while (await reader.ReadLineAsync() is { } line)
+        while (true)
         {
-            lineCount++;
-            if (lineCount > MaxLinesPerSession) { hitLineCap = true; break; }
+            if (++lineCount > MaxLinesPerSession) { hitLineCap = true; break; }
+            string? line;
+            try { line = await reader.ReadLineAsync(); }
+            catch (InvalidDataException) { continue; }
+            if (line is null) break;
             if (string.IsNullOrWhiteSpace(line)) continue;
             if (line.Length > MaxLineChars) continue;
             JsonDocument doc;
@@ -4124,13 +4457,20 @@ public sealed class ArchiveService
         var updated = info.LastWriteTimeUtc.ToString("O");
 
         using var stream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-        using var reader = new StreamReader(stream, Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
+        using var streamReader = new StreamReader(stream, Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
+        var reader = new BoundedTextLineReader(
+            streamReader,
+            MaxLineChars,
+            discardOversizedLine: true);
         var lineCount = 0;
         var hitLineCap = false;
-        while (await reader.ReadLineAsync() is { } line)
+        while (true)
         {
-            lineCount++;
-            if (lineCount > MaxLinesPerSession) { hitLineCap = true; break; }
+            if (++lineCount > MaxLinesPerSession) { hitLineCap = true; break; }
+            string? line;
+            try { line = await reader.ReadLineAsync(); }
+            catch (InvalidDataException) { continue; }
+            if (line is null) break;
             if (string.IsNullOrWhiteSpace(line)) continue;
             if (line.Length > MaxLineChars) continue;
             JsonDocument doc;

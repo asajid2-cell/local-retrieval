@@ -180,9 +180,12 @@ app.MapPost("/api/chats/{id}/favorite", async (string id, FavoriteRequest? req, 
 // the one app-server and multiplexes it. /api/agent/sessions lists ALL sessions; the WS opens/drives one.
 var codexExe = Environment.GetEnvironmentVariable("CLR_CODEX_EXE") ?? ArchiveService.ResolveCodexExe();
 var defaultWs = Environment.GetEnvironmentVariable("CLR_AGENT_DEFAULT_WS") ?? Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-var agentHub = new CodexAgentHub(codexExe);
+using var childProcessJob = WindowsProcessJob.CreateKillOnClose();
+var agentHub = new CodexAgentHub(codexExe, processContainment: childProcessJob);
 var claudeStore = new ClaudeSessionStore(Environment.GetEnvironmentVariable("CLR_CLAUDE_PROJECTS"));
-var claudeDriver = new ClaudeLiveDriver(Environment.GetEnvironmentVariable("CLR_CLAUDE_EXE"));
+var claudeDriver = new ClaudeLiveDriver(
+    Environment.GetEnvironmentVariable("CLR_CLAUDE_EXE"),
+    processContainment: childProcessJob);
 // Owner-signing for "auto" (no-approval) turns: an owner-held key authorizes each auto command (HMAC,
 // fresh, non-replayed). Auto-generated + saved on the PC if unset; the owner reads it off the machine
 // (out-of-band) and enters it in the browser. Never transmitted.
@@ -329,7 +332,8 @@ if (Environment.GetEnvironmentVariable("CLR_REMOTE_BRIDGE") != "0")
             codexDbPath,
             m => Console.WriteLine("[bridge] " + m),
             ResolveRemoteMuxLaunchAsync,
-            ResolvePendingMuxBindingsAsync);
+            ResolvePendingMuxBindingsAsync,
+            childProcessJob);
         _ = bridge.RunLoopAsync(app.Lifetime.ApplicationStopping);
         Console.WriteLine($"remote command bridge armed (target {bridgeSettings.Target}:{bridgeSettings.Port}; active only while the desktop app is closed)");
     }
@@ -338,5 +342,19 @@ if (Environment.GetEnvironmentVariable("CLR_REMOTE_BRIDGE") != "0")
 
 var authMode = hlAuthOn ? $"hl-auth ({hlBase}, page:{hlPage ?? "any"})" : "bearer token";
 Console.WriteLine($"codex-local-retrieval remote server on http://{bind}:{port}  (archive: lazy (loads on first browse), auth: {authMode}, launch: {(allowLaunch ? "on" : "off")}, redact-reads: {(redactReads ? "on" : "off")})");
-app.Run();
+try
+{
+    app.Run();
+}
+finally
+{
+    try
+    {
+        await agentHub.DisposeAsync();
+    }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine("codex agent hub shutdown failed: " + ex);
+    }
+}
 return 0;

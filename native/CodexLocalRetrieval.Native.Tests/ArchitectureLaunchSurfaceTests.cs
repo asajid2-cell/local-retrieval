@@ -55,6 +55,141 @@ public sealed class ArchitectureLaunchSurfaceTests
     }
 
     [TestMethod]
+    public void ProductionAgentLaunchesHaveOneContainedBoundedProcessSurface()
+    {
+        var root = FindRepoRoot();
+        Assert.IsFalse(File.Exists(Path.Combine(
+            root,
+            "native",
+            "CodexLocalRetrieval.Core",
+            "Agents",
+            "CodexAgentSession.cs")));
+        Assert.IsFalse(File.Exists(Path.Combine(
+            root,
+            "native",
+            "CodexLocalRetrieval.Core",
+            "Agents",
+            "IAgentSession.cs")));
+
+        var productionRoots = new[]
+        {
+            Path.Combine(root, "native", "CodexLocalRetrieval.Core"),
+            Path.Combine(root, "native", "CodexLocalRetrieval.Server"),
+            Path.Combine(root, "native", "CodexLocalRetrieval.Native"),
+        };
+        var violations = new List<string>();
+        foreach (var dir in productionRoots)
+        {
+            foreach (var file in Directory.EnumerateFiles(dir, "*.cs", SearchOption.AllDirectories))
+            {
+                if (file.Contains(Path.DirectorySeparatorChar + "bin" + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)
+                    || file.Contains(Path.DirectorySeparatorChar + "obj" + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+                    continue;
+                var text = File.ReadAllText(file);
+                if (text.Contains(".StandardOutput.ReadToEndAsync(", StringComparison.Ordinal)
+                    || text.Contains(".StandardError.ReadToEndAsync(", StringComparison.Ordinal)
+                    || text.Contains(".StandardOutput.ReadToEnd(", StringComparison.Ordinal)
+                    || text.Contains(".StandardError.ReadToEnd(", StringComparison.Ordinal))
+                {
+                    violations.Add(Path.GetRelativePath(root, file) + " buffers child output without a capture bound");
+                }
+            }
+        }
+
+        Assert.IsEmpty(
+            violations,
+            "App-owned child output must use BoundedTextCapture/ContainedProcessRunner:" +
+            Environment.NewLine + string.Join(Environment.NewLine, violations));
+
+        var containment = File.ReadAllText(Path.Combine(
+            root,
+            "native",
+            "CodexLocalRetrieval.Core",
+            "Agents",
+            "WindowsProcessJob.cs"));
+        var interfaceStart = containment.IndexOf("public interface IProcessContainment", StringComparison.Ordinal);
+        var interfaceEnd = containment.IndexOf("// Owns server-controlled agent processes", interfaceStart, StringComparison.Ordinal);
+        var contract = containment[interfaceStart..interfaceEnd];
+        Assert.IsFalse(
+            contract.Contains("AttachOrTerminate", StringComparison.Ordinal),
+            "Production containment must be established before child code runs.");
+        StringAssert.Contains(
+            containment,
+            "private static readonly object ProcessCreationGate",
+            "Pipe creation through CreateProcessW must be serialized across job instances.");
+        StringAssert.Contains(
+            containment,
+            "lock (ProcessCreationGate)",
+            "The process-wide launch gate must cover the inheritable-handle window.");
+
+        var runner = File.ReadAllText(Path.Combine(
+            root,
+            "native",
+            "CodexLocalRetrieval.Core",
+            "Agents",
+            "ContainedProcessRunner.cs"));
+        Assert.DoesNotContain(
+            ".StandardInput.Close(",
+            runner,
+            "Synchronous StreamWriter.Close can flush outside the operation timeout.");
+        StringAssert.Contains(runner, "CloseStandardInputPipe()");
+
+        var program = File.ReadAllText(Path.Combine(
+            root,
+            "native",
+            "CodexLocalRetrieval.Server",
+            "Program.cs"));
+        var shutdownStart = program.IndexOf("await agentHub.DisposeAsync()", StringComparison.Ordinal);
+        Assert.IsGreaterThanOrEqualTo(0, shutdownStart);
+        var shutdown = program[shutdownStart..];
+        StringAssert.Contains(shutdown, "catch (Exception ex)");
+        StringAssert.Contains(shutdown, "Console.Error.WriteLine");
+    }
+
+    [TestMethod]
+    public void ArchiveTranscriptReadsAndSearchesAreStreamingAndBounded()
+    {
+        var root = FindRepoRoot();
+        var archive = File.ReadAllText(Path.Combine(
+            root,
+            "native",
+            "CodexLocalRetrieval.Core",
+            "Services",
+            "ArchiveService.cs"));
+
+        Assert.IsFalse(
+            archive.Contains("while (await reader.ReadLineAsync()", StringComparison.Ordinal)
+            || archive.Contains("while ((line = reader.ReadLine())", StringComparison.Ordinal),
+            "Transcript readers must reject oversized records before allocating an unbounded line.");
+
+        var phraseSearchStart = archive.IndexOf(
+            "public async Task<IReadOnlyList<ArchiveSession>> SearchDiskPhraseAsync",
+            StringComparison.Ordinal);
+        var phraseSearchEnd = archive.IndexOf(
+            "private static readonly HashSet<string> SearchStopwords",
+            phraseSearchStart,
+            StringComparison.Ordinal);
+        var phraseSearch = archive[phraseSearchStart..phraseSearchEnd];
+        Assert.DoesNotContain(
+            "SafeReadAllText",
+            phraseSearch,
+            "Phrase search must stream transcripts instead of materializing whole files.");
+
+        var deepSearchStart = archive.IndexOf(
+            "public async Task<IReadOnlyList<ArchiveSearchHit>> DeepSearchContentAsync",
+            StringComparison.Ordinal);
+        var deepSearchEnd = archive.IndexOf(
+            "private static List<string> DistinctiveTokens",
+            deepSearchStart,
+            StringComparison.Ordinal);
+        var deepSearch = archive[deepSearchStart..deepSearchEnd];
+        Assert.DoesNotContain(
+            "SafeReadAllText",
+            deepSearch,
+            "Deep search must stream transcripts instead of materializing whole files.");
+    }
+
+    [TestMethod]
     public void RemoteProjection_DoesNotExposeExecutableMuxCommands()
     {
         var root = FindRepoRoot();

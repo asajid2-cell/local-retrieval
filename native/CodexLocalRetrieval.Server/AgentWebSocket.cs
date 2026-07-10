@@ -12,6 +12,8 @@ namespace CodexLocalRetrieval.Server;
 // stream back as AgentEvents. One open thread per socket.
 public static class AgentWebSocket
 {
+    private const int MaxInboundMessageBytes = 4 * 1024 * 1024;
+    private static readonly TimeSpan SendTimeout = TimeSpan.FromSeconds(15);
     private static readonly JsonSerializerOptions Wire = new(JsonSerializerDefaults.Web)
     {
         Converters = { new JsonStringEnumConverter() },
@@ -29,6 +31,7 @@ public static class AgentWebSocket
         CancellationToken ownerStopping,
         Func<string, CancellationToken, Task<SessionResolutionResult>> resolveSession)
     {
+        using var socketLifetime = CancellationTokenSource.CreateLinkedTokenSource(ct, ownerStopping);
         var send = new SemaphoreSlim(1, 1);
         ThreadRouteBinding? openThread = null;
         var openSource = "codex";
@@ -265,7 +268,7 @@ public static class AgentWebSocket
                                         return;
                                     }
                                     await SendJson(ws, send, ev, ct);
-                                }, ownerStopping, auto ? "bypassPermissions" : "acceptEdits", openAliases);
+                                }, socketLifetime.Token, auto ? "bypassPermissions" : "acceptEdits", openAliases);
                             }
                             catch (InvalidOperationException ex)
                             {
@@ -307,6 +310,8 @@ public static class AgentWebSocket
         catch (WebSocketException) { }
         finally
         {
+            socketLifetime.Cancel();
+            try { if (claudeProc is not null && !claudeProc.HasExited) claudeProc.Kill(entireProcessTree: true); } catch { }
             ClearOpenSession();
             try { if (ws.State == WebSocketState.Open) await ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "bye", CancellationToken.None); } catch { }
         }
@@ -323,8 +328,20 @@ public static class AgentWebSocket
     private static async Task SendJson(WebSocket ws, SemaphoreSlim send, object payload, CancellationToken ct)
     {
         var bytes = JsonSerializer.SerializeToUtf8Bytes(payload, Wire);
-        await send.WaitAsync(ct);
-        try { if (ws.State == WebSocketState.Open) await ws.SendAsync(bytes, WebSocketMessageType.Text, true, ct); }
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        timeout.CancelAfter(SendTimeout);
+        await send.WaitAsync(timeout.Token);
+        try
+        {
+            if (ws.State != WebSocketState.Open)
+                throw new WebSocketException("WebSocket is no longer open.");
+            await ws.SendAsync(bytes, WebSocketMessageType.Text, true, timeout.Token);
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            ws.Abort();
+            throw new WebSocketException("WebSocket send exceeded the delivery deadline.");
+        }
         finally { send.Release(); }
     }
 
@@ -336,6 +353,8 @@ public static class AgentWebSocket
         {
             r = await ws.ReceiveAsync(buf, ct);
             if (r.MessageType == WebSocketMessageType.Close) return null;
+            if (ms.Length + r.Count > MaxInboundMessageBytes)
+                throw new InvalidDataException($"WebSocket message exceeded the {MaxInboundMessageBytes}-byte limit.");
             ms.Write(buf, 0, r.Count);
         } while (!r.EndOfMessage);
         return Encoding.UTF8.GetString(ms.ToArray());

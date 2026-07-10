@@ -1,5 +1,6 @@
 using System.Net;
 using System.Text.Json;
+using CodexLocalRetrieval.Core.Agents;
 using CodexLocalRetrieval.Core.Chat;
 using CodexLocalRetrieval.Core.Models;
 using CodexLocalRetrieval.Core.Services;
@@ -279,6 +280,18 @@ public sealed class ChatOrchestratorTests
         Assert.IsTrue(prompt.TrimEnd().EndsWith("Assistant:"));
     }
 
+    [TestMethod]
+    public async Task BoundedTextCapture_CapsMemoryButDrainsTheProducer()
+    {
+        var reader = new CaptureTrackingReader(new string('x', 128 * 1024));
+
+        var result = await BoundedTextCapture.ReadToEndAsync(reader, 4096);
+
+        Assert.AreEqual(4096, result.Text.Length);
+        Assert.IsTrue(result.Truncated);
+        Assert.IsTrue(reader.FullyDrained);
+    }
+
     // read_chat returns a summary + paged messages (ids-first, capped), never the whole conversation raw.
     [TestMethod]
     public async Task ReadChat_ReturnsSummaryAndPagedMessages()
@@ -455,5 +468,29 @@ public sealed class ChatOrchestratorTests
 
         await Assert.ThrowsExactlyAsync<OperationCanceledException>(() =>
             orchestrator.RunAsync(new List<ChatMessage> { ChatMessage.User("hi") }, cts.Token));
+    }
+
+    private sealed class CaptureTrackingReader(string text) : TextReader
+    {
+        private int _offset;
+
+        public bool FullyDrained { get; private set; }
+
+        public override ValueTask<int> ReadAsync(
+            Memory<char> buffer,
+            CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (_offset >= text.Length)
+            {
+                FullyDrained = true;
+                return ValueTask.FromResult(0);
+            }
+
+            var count = Math.Min(buffer.Length, text.Length - _offset);
+            text.AsMemory(_offset, count).CopyTo(buffer);
+            _offset += count;
+            return ValueTask.FromResult(count);
+        }
     }
 }

@@ -9,17 +9,26 @@ namespace CodexLocalRetrieval.Server;
 // via ClaudeStreamMapper and pushed to onEvent. acceptEdits lets it run without an interactive TTY.
 public sealed class ClaudeLiveDriver
 {
+    private const int MaxProtocolLineChars = 4 * 1024 * 1024;
+    private static readonly TimeSpan EventDeliveryTimeout = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan TerminationTimeout = TimeSpan.FromSeconds(5);
     private readonly string _exe;
     private readonly SessionLaunchGovernor _launchGovernor;
+    private readonly IProcessContainment? _processContainment;
+    private readonly Func<ProcessStartInfo, Process?>? _processStarter;
 
     public ClaudeLiveDriver(
         string? exe = null,
         Func<string, bool>? isSessionLive = null,
         SessionLaunchClaims.Options? claimOptions = null,
-        SessionLaunchGovernor? launchGovernor = null)
+        SessionLaunchGovernor? launchGovernor = null,
+        IProcessContainment? processContainment = null,
+        Func<ProcessStartInfo, Process?>? processStarter = null)
     {
         _exe = exe ?? Resolve();
         _launchGovernor = launchGovernor ?? new SessionLaunchGovernor(new SessionLaunchGovernorOptions(claimOptions, IsSessionLive: isSessionLive));
+        _processContainment = processContainment;
+        _processStarter = processStarter;
     }
 
     public bool Available => File.Exists(_exe) || _exe == "claude";
@@ -67,14 +76,22 @@ public sealed class ClaudeLiveDriver
             psi.ArgumentList.Add(sessionId);
         }
 
-        Process proc;
+        ContainedProcess proc;
         try
         {
-            proc = Process.Start(psi) ?? throw new InvalidOperationException("could not start Claude process");
+            if (_processContainment is not null && _processStarter is not null)
+                throw new ArgumentException("A test process starter cannot be combined with creation-time containment.");
+            if (_processContainment is null && _processStarter is null)
+                throw new InvalidOperationException("Claude live launch requires creation-time process containment.");
+            proc = _processContainment is null
+                ? ContainedProcess.Start(psi, _processStarter)
+                : _processContainment.StartContained(psi);
         }
-        catch
+        catch (Exception ex)
         {
-            lease?.MarkFailed("Claude live turn process failed to start.");
+            lease?.MarkFailed(
+                "Claude live turn process failed to start.",
+                retainUntilExpiry: ex is ProcessContainmentException { TerminationConfirmed: false });
             lease?.Dispose();
             throw;
         }
@@ -90,24 +107,39 @@ public sealed class ClaudeLiveDriver
             RecordSessionEvent(sessionId, aliases, "claude.turn.started", "Claude live turn process started.", details: new Dictionary<string, string> { ["pid"] = proc.Id.ToString(), ["permissionMode"] = permissionMode });
         }
 
-        var outputTask = PumpOutputAsync(proc.StandardOutput, proc.StandardError, onEvent);
+        var outputTask = PumpOutputAsync(proc.StandardOutput, proc.StandardError, onEvent, ownerStopping);
+        var ownerStopped = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var stopRegistration = ownerStopping.Register(() =>
         {
             try { if (!proc.HasExited) proc.Kill(entireProcessTree: true); } catch { }
+            ownerStopped.TrySetResult();
         });
         _ = Task.Run(async () =>
         {
+            var terminationConfirmed = false;
             try
             {
-                await proc.WaitForExitAsync(CancellationToken.None);
-                await outputTask;
+                var exitTask = proc.WaitForExitAsync(CancellationToken.None);
+                var completed = await Task.WhenAny(exitTask, ownerStopped.Task);
+                if (completed == ownerStopped.Task && !exitTask.IsCompleted)
+                    await exitTask.WaitAsync(TerminationTimeout);
+                else
+                    await exitTask;
+                terminationConfirmed = true;
+                await outputTask.WaitAsync(EventDeliveryTimeout + TerminationTimeout);
             }
             catch
             {
             }
             finally
             {
-                var exitCode = SafeExitCode(proc);
+                if (!terminationConfirmed)
+                {
+                    lease?.MarkFailed(
+                        "Claude live turn cleanup could not confirm process exit.",
+                        retainUntilExpiry: true);
+                }
+                var exitCode = SafeExitCode(proc.Process);
                 RecordSessionEvent(
                     sessionId,
                     aliases,
@@ -124,46 +156,89 @@ public sealed class ClaudeLiveDriver
             }
         });
 
-        return proc;
+        return proc.Process;
     }
 
     public static async Task PumpOutputAsync(
         TextReader stdout,
         TextReader stderr,
-        Func<AgentEvent, Task> onEvent)
+        Func<AgentEvent, Task> onEvent,
+        CancellationToken cancellationToken = default,
+        TimeSpan? eventDeliveryTimeout = null)
     {
-        var stderrDrain = DrainAsync(stderr);
+        var stderrDrain = DrainAsync(stderr, cancellationToken);
+        var output = new BoundedTextLineReader(stdout, MaxProtocolLineChars);
+        var deliveryTimeout = eventDeliveryTimeout is { } configured && configured > TimeSpan.Zero
+            ? configured
+            : EventDeliveryTimeout;
+        var consumerResponsive = true;
         try
         {
             string? line;
-            while ((line = await stdout.ReadLineAsync()) is not null)
+            while ((line = await output.ReadLineAsync(cancellationToken)) is not null)
                 foreach (var ev in ClaudeStreamMapper.Map(line))
-                    await NotifyBestEffortAsync(onEvent, ev);
+                    if (consumerResponsive)
+                        consumerResponsive = await NotifyBestEffortAsync(
+                            onEvent,
+                            ev,
+                            deliveryTimeout,
+                            cancellationToken);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
         }
         catch (Exception ex)
         {
-            await NotifyBestEffortAsync(onEvent, AgentEvent.Err("claude stream error: " + ex.Message));
+            if (consumerResponsive)
+                consumerResponsive = await NotifyBestEffortAsync(
+                    onEvent,
+                    AgentEvent.Err("claude stream error: " + ex.Message),
+                    deliveryTimeout,
+                    cancellationToken);
         }
         finally
         {
             try { await stderrDrain; } catch { }
-            await NotifyBestEffortAsync(onEvent, AgentEvent.Stat("idle"));
+            if (consumerResponsive)
+                await NotifyBestEffortAsync(
+                    onEvent,
+                    AgentEvent.Stat("idle"),
+                    deliveryTimeout,
+                    cancellationToken);
         }
     }
 
-    private static async Task DrainAsync(TextReader reader)
+    private static async Task DrainAsync(TextReader reader, CancellationToken cancellationToken)
     {
         var buffer = new char[4096];
-        while (await reader.ReadAsync(buffer.AsMemory()) > 0)
+        while (await reader.ReadAsync(buffer.AsMemory(), cancellationToken) > 0)
         {
         }
     }
 
-    private static async Task NotifyBestEffortAsync(
+    private static async Task<bool> NotifyBestEffortAsync(
         Func<AgentEvent, Task> onEvent,
-        AgentEvent ev)
+        AgentEvent ev,
+        TimeSpan timeout,
+        CancellationToken cancellationToken)
     {
-        try { await onEvent(ev); } catch { }
+        try
+        {
+            await onEvent(ev).WaitAsync(timeout, cancellationToken);
+            return true;
+        }
+        catch (TimeoutException)
+        {
+            return false;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            return false;
+        }
+        catch
+        {
+            return true;
+        }
     }
 
     private static string Resolve()

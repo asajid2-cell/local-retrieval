@@ -211,12 +211,30 @@ public sealed class SessionLaunchLease : IDisposable
         }
     }
 
-    public void MarkFailed(string? summary = null, IReadOnlyDictionary<string, string>? details = null)
+    public void MarkFailed(
+        string? summary = null,
+        IReadOnlyDictionary<string, string>? details = null,
+        bool retainUntilExpiry = false)
     {
         lock (_gate)
         {
             if (_disposed) return;
+            if (retainUntilExpiry && !_retained)
+            {
+                _claim?.RetainUntilExpiry();
+                _retained = true;
+            }
             _governor.RecordFailed(_request, summary, details);
+        }
+    }
+
+    public void RetainUntilExpiry()
+    {
+        lock (_gate)
+        {
+            if (_disposed || _retained) return;
+            _claim?.RetainUntilExpiry();
+            _retained = true;
         }
     }
 

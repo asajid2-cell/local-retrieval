@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
+using CodexLocalRetrieval.Core.Agents;
 
 namespace CodexLocalRetrieval.Core.Remote;
 
@@ -40,7 +41,6 @@ public static class RemoteUploadTransfer
         var dest = Path.Combine(destDir, safe);
 
         var remote = $"{target}:multiplex-app/uploads/{uploadId}/{safe}";
-        Process? process = null;
         try
         {
             var start = new ProcessStartInfo
@@ -58,35 +58,20 @@ public static class RemoteUploadTransfer
             start.ArgumentList.Add("ConnectTimeout=10");
             start.ArgumentList.Add(remote);
             start.ArgumentList.Add(dest);
-            process = Process.Start(start);
-            if (process is null)
-                return new RemoteUploadResult(false, "file download failed to start", false);
-
-            var stdoutTask = process.StandardOutput.ReadToEndAsync();
-            var stderrTask = process.StandardError.ReadToEndAsync();
-            using var cts = new CancellationTokenSource(TransferTimeout);
-            try
-            {
-                await process.WaitForExitAsync(cts.Token);
-            }
-            catch (OperationCanceledException)
-            {
-                try { process.Kill(entireProcessTree: true); } catch { }
+            var result = await ContainedProcessRunner.RunAsync(
+                start,
+                TransferTimeout,
+                maxStdoutChars: 64 * 1024,
+                maxStderrChars: 64 * 1024);
+            if (result.TimedOut)
                 return new RemoteUploadResult(false, "file download timed out", false);
-            }
-            await Task.WhenAll(stdoutTask, stderrTask);
 
-            if (process.ExitCode != 0 || !File.Exists(dest))
-                return new RemoteUploadResult(false, $"file download failed (scp exit {process.ExitCode})", false);
+            if (result.ExitCode != 0 || !File.Exists(dest))
+                return new RemoteUploadResult(false, $"file download failed (scp exit {result.ExitCode})", false);
         }
         catch
         {
-            try { process?.Kill(entireProcessTree: true); } catch { }
             return new RemoteUploadResult(false, "file download failed", false);
-        }
-        finally
-        {
-            process?.Dispose();
         }
 
         return await InsertDownloadedPathAsync(dest, filename, muxName, insert, intentId, muxRequest);

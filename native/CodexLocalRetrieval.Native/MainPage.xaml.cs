@@ -926,7 +926,26 @@ public sealed partial class MainPage : Page
         TitleText.Text = "Restore packet";
         MainContent.Children.Clear();
         if (_selected is null) return;
-        MainContent.Children.Add(TextPanel(_archive.RestorePacket(_selected)));
+        var session = _selected;
+        MainContent.Children.Add(EmptyBlock("Building restore packet...", session.WorkspaceName));
+        _ = LoadRestoreThenRenderAsync(session);
+    }
+
+    private async Task LoadRestoreThenRenderAsync(ArchiveSession session)
+    {
+        string packet;
+        try
+        {
+            packet = await _archive.RestorePacketAsync(session);
+        }
+        catch (Exception ex)
+        {
+            Diag.Log("Restore packet: " + ex.Message);
+            packet = "Could not build the restore packet.\n\n" + ex.Message;
+        }
+        if (!ReferenceEquals(_selected, session) || _screen != "Restore") return;
+        MainContent.Children.Clear();
+        MainContent.Children.Add(TextPanel(packet));
     }
 
     private static string CapDisplay(string s, int max) =>
@@ -1641,8 +1660,7 @@ public sealed partial class MainPage : Page
         var copyResume = new MenuFlyoutItem { Text = "Copy agent resume prompt" };
         copyResume.Click += async (_, _) =>
         {
-            await _archive.EnsureContentAsync(session);
-            SetClipboardText(_archive.CopyPayload(session, "resume"));
+            SetClipboardText(await _archive.CopyPayloadAsync(session, "resume"));
             SyncStatus.Text = "Copied a resume prompt - paste it into a fresh Claude/Codex agent.";
         };
         flyout.Items.Add(copyResume);
@@ -2224,9 +2242,8 @@ public sealed partial class MainPage : Page
     {
         if (_selected is null) return;
         var session = _selected;
-        if (mode is not ("path" or "paths")) await _archive.EnsureContentAsync(session); // off-thread, no UI block
         var package = new DataPackage();
-        package.SetText(_archive.CopyPayload(session, mode));
+        package.SetText(await _archive.CopyPayloadAsync(session, mode));
         Clipboard.SetContent(package);
     }
 

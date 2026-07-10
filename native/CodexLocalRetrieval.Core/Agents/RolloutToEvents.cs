@@ -9,17 +9,33 @@ namespace CodexLocalRetrieval.Core.Agents;
 // reasoning is encrypted on disk, so it's omitted from history (live reasoning streams in plaintext).
 public static class RolloutToEvents
 {
+    private const int MaxHistoryLineChars = 4 * 1024 * 1024;
+    private const int MaxMessageChars = 128 * 1024;
+    private const int MaxToolInputChars = 12 * 1024;
+
     public static List<AgentEvent> Parse(string path, int maxEvents = 500, int maxOutputChars = 6000)
     {
-        var events = new List<AgentEvent>();
-        if (!File.Exists(path)) return events;
+        if (maxEvents <= 0 || !File.Exists(path)) return new List<AgentEvent>();
+        var events = new Queue<AgentEvent>(maxEvents);
+        void Add(AgentEvent ev)
+        {
+            events.Enqueue(ev);
+            if (events.Count > maxEvents) events.Dequeue();
+        }
 
         // FileShare.ReadWrite because codex usually has the active session's rollout open for writing.
         using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
         using var sr = new StreamReader(fs);
+        var reader = new BoundedTextLineReader(
+            sr,
+            MaxHistoryLineChars,
+            discardOversizedLine: true);
         string? line;
-        while ((line = sr.ReadLine()) is not null)
+        while (true)
         {
+            try { line = reader.ReadLine(); }
+            catch (InvalidDataException) { continue; }
+            if (line is null) break;
             if (string.IsNullOrWhiteSpace(line)) continue;
             JsonElement root;
             try { using var d = JsonDocument.Parse(line); root = d.RootElement.Clone(); }
@@ -31,9 +47,9 @@ public static class RolloutToEvents
             if (type == "event_msg")
             {
                 if (pt == "user_message" && Str(pay, "message") is { Length: > 0 } um)
-                    events.Add(new AgentEvent { Kind = AgentEventKind.UserMessage, Text = um });
+                    Add(new AgentEvent { Kind = AgentEventKind.UserMessage, Text = Cap(um, MaxMessageChars) });
                 else if (pt == "agent_message" && Str(pay, "message") is { Length: > 0 } am)
-                    events.Add(new AgentEvent { Kind = AgentEventKind.AssistantText, Text = am });
+                    Add(new AgentEvent { Kind = AgentEventKind.AssistantText, Text = Cap(am, MaxMessageChars) });
             }
             else if (type == "response_item")
             {
@@ -41,18 +57,20 @@ public static class RolloutToEvents
                 {
                     case "function_call":
                     case "custom_tool_call":
-                        events.Add(new AgentEvent
+                        Add(new AgentEvent
                         {
                             Kind = AgentEventKind.ToolCall,
                             ItemId = Str(pay, "call_id") ?? Str(pay, "id"),
                             ToolName = "command",
-                            ToolInput = ExtractCommand(Str(pay, "arguments") ?? Str(pay, "input")),
+                            ToolInput = Cap(
+                                ExtractCommand(Str(pay, "arguments") ?? Str(pay, "input")),
+                                MaxToolInputChars),
                             State = "completed"
                         });
                         break;
                     case "function_call_output":
                     case "custom_tool_call_output":
-                        events.Add(new AgentEvent
+                        Add(new AgentEvent
                         {
                             Kind = AgentEventKind.ToolOutput,
                             ItemId = Str(pay, "call_id"),
@@ -64,8 +82,7 @@ public static class RolloutToEvents
             }
         }
 
-        if (events.Count > maxEvents) events.RemoveRange(0, events.Count - maxEvents);
-        return events;
+        return events.ToList();
     }
 
     private static string ExtractCommand(string? argsJson)

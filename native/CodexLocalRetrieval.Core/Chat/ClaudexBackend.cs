@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Text;
+using CodexLocalRetrieval.Core.Agents;
 
 namespace CodexLocalRetrieval.Core.Chat;
 
@@ -25,6 +26,7 @@ public sealed class ClaudexBackend : IChatBackend
 
     private const int MaxPromptChars = 48_000;
     private const int MaxOutputChars = 24_000;
+    private const int MaxErrorChars = 16_000;
 
     public async Task<BackendReply> CompleteAsync(IReadOnlyList<ChatMessage> messages, IReadOnlyList<ChatToolSpec> tools, CancellationToken cancellationToken)
     {
@@ -46,37 +48,20 @@ public sealed class ClaudexBackend : IChatBackend
         psi.ArgumentList.Add("text");
         if (!string.IsNullOrWhiteSpace(_model)) { psi.ArgumentList.Add("--model"); psi.ArgumentList.Add(_model!); }
 
-        using var process = new Process { StartInfo = psi };
-        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        timeoutCts.CancelAfter(_timeoutMs);
-        var token = timeoutCts.Token;
-
-        if (!process.Start()) throw new InvalidOperationException("Could not start the Claude CLI.");
-
-        // Start draining stdout/stderr BEFORE writing stdin: if the child fills its output pipe while
-        // we're still writing the prompt, an unread pipe would deadlock. The whole exchange is under
-        // the timeout so a child that never reads stdin can't hang us.
-        var stdoutTask = process.StandardOutput.ReadToEndAsync(token);
-        var stderrTask = process.StandardError.ReadToEndAsync(token);
-        try
-        {
-            await process.StandardInput.WriteAsync(prompt.AsMemory(), token);
-            process.StandardInput.Close();
-            await process.WaitForExitAsync(token);
-        }
-        catch (OperationCanceledException)
-        {
-            try { process.Kill(entireProcessTree: true); } catch { }
+        var result = await ContainedProcessRunner.RunAsync(
+            psi,
+            TimeSpan.FromMilliseconds(_timeoutMs),
+            prompt,
+            MaxOutputChars,
+            MaxErrorChars,
+            cancellationToken: cancellationToken);
+        if (result.TimedOut)
             throw new InvalidOperationException("The Claude CLI did not respond in time.");
-        }
+        if (result.ExitCode != 0)
+            throw new InvalidOperationException($"Claude CLI failed ({result.ExitCode}): {Trim(result.Stderr)}");
 
-        var stdout = await stdoutTask;
-        var stderr = await stderrTask;
-        if (process.ExitCode != 0)
-            throw new InvalidOperationException($"Claude CLI failed ({process.ExitCode}): {Trim(stderr)}");
-
-        var answer = stdout.Trim();
-        if (answer.Length > MaxOutputChars) answer = answer[..MaxOutputChars] + "...(truncated)";
+        var answer = result.Stdout.Trim();
+        if (result.StdoutTruncated) answer += "...(truncated)";
         return new BackendReply
         {
             Message = new ChatMessage { Role = "assistant", Content = string.IsNullOrWhiteSpace(answer) ? "(no response)" : answer },
@@ -106,4 +91,5 @@ public sealed class ClaudexBackend : IChatBackend
         var clean = s.Replace("\r", " ").Replace("\n", " ").Trim();
         return clean[..Math.Min(300, clean.Length)];
     }
+
 }

@@ -55,6 +55,52 @@ public sealed class RolloutAndLiveMappingTests
     }
 
     [TestMethod]
+    public void Rollout_CapsLargeMessagesAndRetainsOnlyTheNewestEvents()
+    {
+        var lines = Enumerable.Range(0, 20)
+            .Select(i => JsonSerializer.Serialize(new
+            {
+                type = "event_msg",
+                payload = new
+                {
+                    type = "user_message",
+                    message = i == 19 ? new string('x', 256 * 1024) : "message-" + i
+                }
+            }))
+            .ToArray();
+        var path = WriteRollout(lines);
+        try
+        {
+            var events = RolloutToEvents.Parse(path, maxEvents: 3);
+
+            Assert.HasCount(3, events);
+            Assert.AreEqual("message-17", events[0].Text);
+            Assert.AreEqual("message-18", events[1].Text);
+            Assert.IsLessThan(129 * 1024, events[2].Text!.Length);
+            StringAssert.Contains(events[2].Text, "truncated");
+        }
+        finally { File.Delete(path); }
+    }
+
+    [TestMethod]
+    public void Rollout_SkipsOversizedCorruptRecordAndKeepsNewerHistory()
+    {
+        var path = WriteRollout(
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"before\"}}",
+            new string('x', 4 * 1024 * 1024 + 1),
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"after\"}}");
+        try
+        {
+            var events = RolloutToEvents.Parse(path);
+
+            CollectionAssert.AreEqual(
+                new[] { "before", "after" },
+                events.Select(e => e.Text).ToArray());
+        }
+        finally { File.Delete(path); }
+    }
+
+    [TestMethod]
     public void Claude_Title_CustomBeatsAi_BeatsFirstPrompt_AndRenamePersists()
     {
         var root = Path.Combine(Path.GetTempPath(), "clr-rename-" + Guid.NewGuid().ToString("N"));
@@ -153,6 +199,66 @@ public sealed class RolloutAndLiveMappingTests
             StringAssert.Contains(ev[3].ToolInput!, "\"command\":\"ls\"");  // full raw input JSON (client renders it)
             Assert.AreEqual("t1", ev[4].ItemId);
             StringAssert.Contains(ev[4].Output!, "a.txt");
+        }
+        finally { Directory.Delete(root, true); }
+    }
+
+    [TestMethod]
+    public void ClaudeHistory_CapsLargeMessagesAndRetainsOnlyTheNewestEvents()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "clr-claude-bounds-" + Guid.NewGuid().ToString("N"));
+        var project = Path.Combine(root, "z--proj");
+        Directory.CreateDirectory(project);
+        var id = "99999999-2222-3333-4444-555555555555";
+        var lines = Enumerable.Range(0, 20)
+            .Select(i => JsonSerializer.Serialize(new
+            {
+                type = "assistant",
+                message = new
+                {
+                    role = "assistant",
+                    content = i == 19 ? new string('y', 256 * 1024) : "message-" + i
+                }
+            }))
+            .ToArray();
+        File.WriteAllLines(Path.Combine(project, id + ".jsonl"), lines);
+        try
+        {
+            var store = new ClaudeSessionStore(root);
+            var events = store.ReadHistory(id, maxEvents: 3);
+
+            Assert.HasCount(3, events);
+            Assert.AreEqual("message-17", events[0].Text);
+            Assert.AreEqual("message-18", events[1].Text);
+            Assert.IsLessThan(129 * 1024, events[2].Text!.Length);
+            StringAssert.Contains(events[2].Text, "truncated");
+        }
+        finally { Directory.Delete(root, true); }
+    }
+
+    [TestMethod]
+    public void ClaudeHistory_SkipsOversizedCorruptRecordAndKeepsNewerHistory()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "clr-claude-oversized-line-" + Guid.NewGuid().ToString("N"));
+        var project = Path.Combine(root, "z--proj");
+        Directory.CreateDirectory(project);
+        var id = "88888888-2222-3333-4444-555555555555";
+        File.WriteAllLines(
+            Path.Combine(project, id + ".jsonl"),
+            new[]
+            {
+                "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":\"before\"}}",
+                new string('x', 4 * 1024 * 1024 + 1),
+                "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":\"after\"}}"
+            });
+        try
+        {
+            var store = new ClaudeSessionStore(root);
+            var events = store.ReadHistory(id);
+
+            CollectionAssert.AreEqual(
+                new[] { "before", "after" },
+                events.Select(e => e.Text).ToArray());
         }
         finally { Directory.Delete(root, true); }
     }
