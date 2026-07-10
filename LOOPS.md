@@ -23,7 +23,7 @@
 | L5 durable command delivery | lease/idempotency; no age loss | crash/restart/replay queue tests | done `L5_20260709`: app 329 passed / 2 skipped; relay 64 passed; muxd 80 passed / 3 skipped |
 | L6 canonical server launcher | archive identity and trusted args only | server route/launcher tests | done `L6_20260710`: app 345 passed / 2 skipped; relay 64 passed; muxd 80 passed / 3 skipped |
 | L7 process containment | child writer exits with owner or remains blocked | Windows lifecycle integration test | done `L7b_20260710`: app 388 passed / 2 skipped; relay 66 passed; muxd 92 passed / 3 VPS-only skipped |
-| L8 synthesis/deploy | all gates and runtime probes green | `tools/run_gates.ps1` plus install/deploy smoke | done `L8_20260710`: app 388 / 2 skipped; relay 66; muxd 91 / 3 skipped |
+| L8 synthesis/deploy | all gates and runtime probes green | `tools/run_gates.ps1` plus install/deploy smoke | reopened: `L8_20260710` refuted by unsynchronized session ring |
 
 ## Baseline
 
@@ -192,3 +192,12 @@
 - `L8_20260710`: unified runner green. App 388 passed / 2 environment skips; serialized projection
   contract passed; relay 66 passed; muxd 91 passed / 3 VPS-only skips. Evidence:
   `artifacts/reliability/L8_20260710`.
+- `L8_20260710` was subsequently refuted and is not final acceptance. Fresh tandem review found
+  `Session._reader` mutated the PTY scrollback deque from a reader thread while `scrollback()` and
+  `tail_text()` iterated it on the asyncio thread without a lock. This retained the historical
+  `deque mutated during iteration` relay-disconnect failure despite the green suite.
+- Commit `fd0f232` gives ConPTY and visible-owner sessions one ring lock, routes append/eviction
+  through it, and snapshots immutable tuples under the same lock before formatting. The
+  lock-ownership verifier was observed red against the L8 candidate and green after the fix. The
+  corrected full muxd suite passed 92 tests with 3 VPS-only skips; deployment and unified
+  re-acceptance remain required.

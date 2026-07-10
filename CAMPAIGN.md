@@ -94,6 +94,14 @@
 - 2026-07-10: Unified `L8_20260710` acceptance passed app 388 / 2 environment skips, the real
   projection contract, relay 66, and muxd 91 / 3 VPS-only skips. Evidence is under
   `artifacts/reliability/L8_20260710`.
+- 2026-07-10: `L8_20260710` was refuted after acceptance. A fresh tandem reviewer traced the PTY
+  reader and found the session scrollback deque was still mutated from a reader thread while
+  asyncio status/attach paths iterated it without synchronization. This is the exact historical
+  `deque mutated during iteration` disconnect class and was absent from the accepted test suite.
+- 2026-07-10: The new lock-ownership regression failed against the accepted candidate because no
+  ring lock existed. Commit `fd0f232` synchronizes append, cap eviction, scrollback, and tail
+  snapshots for both ConPTY and visible-owner sessions. The corrected full muxd suite passed
+  92 tests with 3 VPS-only skips; the campaign remains open pending redeploy and unified rerun.
 
 ## Decisions Needed
 
