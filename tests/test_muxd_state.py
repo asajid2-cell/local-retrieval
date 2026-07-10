@@ -36,6 +36,34 @@ class FakeSession:
 
 
 class MuxdStateTests(unittest.TestCase):
+    def test_intent_compaction_bounds_terminal_history_without_dropping_uncertain_work(self):
+        now = 1_000_000.0
+        records = {
+            "local:create:old": {
+                "status": "completed",
+                "updatedAt": now - muxd.INTENT_TERMINAL_RETENTION_SECONDS - 1,
+            },
+            "local:create:recent": {
+                "status": "failed",
+                "updatedAt": now - 10,
+            },
+            "local:input:uncertain": {
+                "status": "dispatching",
+                "updatedAt": 1,
+            },
+            "relay:create:accepted": {
+                "status": "accepted",
+                "updatedAt": 1,
+            },
+        }
+
+        compacted = muxd.compact_intent_records(records, now=now)
+
+        self.assertNotIn("local:create:old", compacted)
+        self.assertIn("local:create:recent", compacted)
+        self.assertIn("local:input:uncertain", compacted)
+        self.assertIn("relay:create:accepted", compacted)
+
     def test_durable_json_write_preserves_previous_state_on_precommit_failures(self):
         with tempfile.TemporaryDirectory(prefix="muxd-durable-") as root:
             path = os.path.join(root, "state.json")
@@ -269,19 +297,19 @@ class MuxdStateTests(unittest.TestCase):
                     data = json.load(stream)
                 self.assertEqual(
                     ["parent-id", "child-id"],
-                    data["manifest-aliases"]["ids"],
+                    data["sessions"]["manifest-aliases"]["ids"],
                 )
-                self.assertEqual("parent-id", data["manifest-aliases"]["sessionId"])
-                self.assertEqual(["child-id"], data["manifest-aliases"]["aliases"])
-                self.assertTrue(data["manifest-aliases"]["owner"])
-                self.assertEqual("k" * 32, data["manifest-aliases"]["ownerKey"])
-                self.assertTrue(data["manifest-aliases"]["identityPending"])
-                self.assertEqual("stopping", data["manifest-aliases"]["lifecycle"])
-                self.assertEqual(4321, data["manifest-aliases"]["childPid"])
-                self.assertEqual("0000000000001234", data["manifest-aliases"]["childStartToken"])
-                self.assertEqual("replace", data["manifest-aliases"]["stopDisposition"])
-                self.assertTrue(data["manifest-aliases"]["userKilled"])
-                self.assertEqual([100.0, 200.0], data["manifest-aliases"]["deaths"])
+                self.assertEqual("parent-id", data["sessions"]["manifest-aliases"]["sessionId"])
+                self.assertEqual(["child-id"], data["sessions"]["manifest-aliases"]["aliases"])
+                self.assertTrue(data["sessions"]["manifest-aliases"]["owner"])
+                self.assertEqual("k" * 32, data["sessions"]["manifest-aliases"]["ownerKey"])
+                self.assertTrue(data["sessions"]["manifest-aliases"]["identityPending"])
+                self.assertEqual("stopping", data["sessions"]["manifest-aliases"]["lifecycle"])
+                self.assertEqual(4321, data["sessions"]["manifest-aliases"]["childPid"])
+                self.assertEqual("0000000000001234", data["sessions"]["manifest-aliases"]["childStartToken"])
+                self.assertEqual("replace", data["sessions"]["manifest-aliases"]["stopDisposition"])
+                self.assertTrue(data["sessions"]["manifest-aliases"]["userKilled"])
+                self.assertEqual([100.0, 200.0], data["sessions"]["manifest-aliases"]["deaths"])
             finally:
                 muxd.MANIFEST = old_manifest
                 muxd.sessions = old_sessions

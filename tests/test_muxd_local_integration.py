@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import os
 import shutil
@@ -298,6 +299,134 @@ class MuxdLocalIntegrationTests(unittest.TestCase):
         finally:
             self.kill(name)
 
+    def test_replayed_relaunch_intent_returns_prior_result_without_restarting_again(self):
+        name = "it-idempotent-relaunch"
+        intent_id = f"relaunch-{int(time.time() * 1000)}"
+        counter = self.muxd.root / "relaunch-count.txt"
+        marker = f"MUXD_IT_IDEMPOTENT_{int(time.time() * 1000)}"
+        quoted_counter = str(counter).replace("'", "''")
+        cmd = f"Add-Content -LiteralPath '{quoted_counter}' -Value launch; Write-Output '{marker}'"
+        self.kill(name)
+        try:
+            first = run_request(self.muxd.port, {"t": "create", "s": name, "cmd": cmd}, timeout=12)
+            self.assertTrue(first.get("created"))
+            self.wait_for_tail(name, marker)
+
+            request = {"t": "create", "s": name, "relaunch": True, "intentId": intent_id}
+            relaunched = run_request(self.muxd.port, request, timeout=12)
+            self.assertTrue(relaunched.get("created"))
+            self.wait_for_tail(name, marker)
+
+            self.muxd.restart()
+            replayed = run_request(self.muxd.port, request, timeout=12)
+            self.assertEqual(relaunched, replayed)
+            time.sleep(1.5)
+            self.assertEqual(counter.read_text(encoding="utf-8").splitlines(), ["launch", "launch"])
+
+            conflict = run_request(
+                self.muxd.port,
+                {"t": "create", "s": name, "relaunch": True, "heal": True, "intentId": intent_id},
+                timeout=12,
+            )
+            self.assertEqual("err", conflict.get("t"))
+            self.assertIn("different payload", conflict.get("m", ""))
+        finally:
+            self.kill(name)
+
+    def test_abandoned_accepted_create_intent_does_not_brick_the_session_name(self):
+        name = "it-abandoned-intent"
+        self.kill(name)
+        self.muxd.stop_process()
+        manifest_path = self.muxd.root / "muxd" / "sessions.json"
+        backup_path = Path(str(manifest_path) + ".bak")
+        if backup_path.exists():
+            backup_path.unlink()
+        old_key = "local:create:abandoned-intent"
+        manifest_path.write_text(json.dumps({
+            "version": 2,
+            "sessions": {},
+            "intents": {
+                old_key: {
+                    "kind": "create",
+                    "session": name,
+                    "fingerprint": "a" * 64,
+                    "status": "accepted",
+                    "result": {},
+                    "createdAt": time.time() - 10,
+                    "updatedAt": time.time() - 10,
+                },
+            },
+        }), encoding="utf-8")
+        self.muxd.start_process()
+        try:
+            result = run_request(
+                self.muxd.port,
+                {"t": "create", "s": name, "intentId": "replacement-intent"},
+                timeout=12,
+            )
+            self.assertEqual("created", result.get("t"), result)
+            persisted = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual("failed", persisted["intents"][old_key]["status"])
+            self.assertEqual(
+                "completed",
+                persisted["intents"]["local:create:replacement-intent"]["status"],
+            )
+        finally:
+            self.kill(name)
+
+    def test_distinct_concurrent_create_intents_serialize_and_converge(self):
+        name = "it-distinct-intents"
+        self.kill(name)
+        try:
+            results = asyncio.run(concurrent_requests(
+                self.muxd.port,
+                [
+                    {"t": "create", "s": name, "intentId": "distinct-intent-a"},
+                    {"t": "create", "s": name, "intentId": "distinct-intent-b"},
+                ],
+                timeout=12,
+            ))
+            self.assertTrue(all(result.get("t") == "created" for result in results), results)
+            self.assertEqual(1, sum(bool(result.get("created")) for result in results), results)
+        finally:
+            self.kill(name)
+
+    def test_replayed_input_intent_is_at_most_once(self):
+        name = "it-idempotent-input"
+        intent_id = f"input-{int(time.time() * 1000)}"
+        counter = self.muxd.root / "input-count.txt"
+        quoted_counter = str(counter).replace("'", "''")
+        command = f"Add-Content -LiteralPath '{quoted_counter}' -Value hit\r"
+        payload = {
+            "t": "input",
+            "s": name,
+            "d": base64.b64encode(command.encode("utf-8")).decode("ascii"),
+            "intentId": intent_id,
+        }
+        self.kill(name)
+        try:
+            run_request(self.muxd.port, {"t": "create", "s": name}, timeout=12)
+            first = run_request(self.muxd.port, payload, timeout=12)
+            self.assertEqual("input-ok", first.get("t"))
+            deadline = time.time() + 5
+            while time.time() < deadline and not counter.exists():
+                time.sleep(0.05)
+            self.assertTrue(counter.exists())
+
+            self.muxd.restart()
+            replayed = run_request(self.muxd.port, payload, timeout=12)
+            self.assertEqual(first, replayed)
+            time.sleep(0.2)
+            self.assertEqual(counter.read_text(encoding="utf-8").splitlines(), ["hit"])
+
+            conflicting = dict(payload)
+            conflicting["d"] = base64.b64encode(b"Write-Output conflict\r").decode("ascii")
+            conflict = run_request(self.muxd.port, conflicting, timeout=12)
+            self.assertEqual("err", conflict.get("t"))
+            self.assertIn("different payload", conflict.get("m", ""))
+        finally:
+            self.kill(name)
+
     def test_concurrent_create_has_exactly_one_winner(self):
         name = "it-concurrent-create"
         marker = f"MUXD_IT_CONCURRENT_{int(time.time() * 1000)}"
@@ -357,8 +486,8 @@ class MuxdLocalIntegrationTests(unittest.TestCase):
             self.assertTrue(before.get("owner"), before)
 
             manifest = json.loads((self.muxd.root / "muxd" / "sessions.json").read_text(encoding="utf-8"))
-            self.assertTrue(manifest[name]["owner"])
-            self.assertGreaterEqual(len(manifest[name]["ownerKey"]), 24)
+            self.assertTrue(manifest["sessions"][name]["owner"])
+            self.assertGreaterEqual(len(manifest["sessions"][name]["ownerKey"]), 24)
 
             self.muxd.restart()
 
@@ -498,8 +627,8 @@ class MuxdLocalIntegrationTests(unittest.TestCase):
         self.muxd.start_process()
 
         persisted = json.loads(manifest_path.read_text(encoding="utf-8"))
-        self.assertNotIn(removed_name, persisted)
-        self.assertIn(preserved_name, persisted)
+        self.assertNotIn(removed_name, persisted["sessions"])
+        self.assertIn(preserved_name, persisted["sessions"])
         self.assertIsNotNone(self.session(preserved_name))
         self.muxd.restart()
         self.assertIsNotNone(self.session(preserved_name))

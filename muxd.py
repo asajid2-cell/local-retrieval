@@ -904,6 +904,10 @@ class Session:
         self.child_pid = 0
         self.child_start_token = ""
         self.stop_disposition = ""
+        self.generation_id = "g" + os.urandom(16).hex()
+        self.operation_key = ""
+        self.operation_fingerprint = ""
+        self.operation_created = False
         self.heal = bool(heal)          # opt-in: ONLY healed (user-armed) sessions auto-start at boot / auto-respawn
         self.cols, self.rows = max(20, cols or 140), max(8, rows or 40)
         self.created = time.time(); self.last_out = time.time()
@@ -1100,6 +1104,10 @@ class OwnerSession:
         self.child_pid = 0
         self.child_start_token = ""
         self.stop_disposition = ""
+        self.generation_id = "g" + os.urandom(16).hex()
+        self.operation_key = ""
+        self.operation_fingerprint = ""
+        self.operation_created = False
         self.owner_exit_confirmed = False
         self.input_waiters = {}
         self.input_seq = 0
@@ -1176,7 +1184,10 @@ class OwnerSession:
         self.user_killed = by_user
         self._send_owner({"t": "kill"})
 
-sessions = {}    # name -> Session
+sessions = {}          # name -> Session
+intent_records = {}    # scope:type:intentId -> durable request/outcome tombstone
+INTENT_TERMINAL_RETENTION_SECONDS = 180 * 24 * 60 * 60
+INTENT_TERMINAL_LIMIT = 20000
 
 def live_session_names():
     names = []
@@ -1233,7 +1244,7 @@ def start_watchdog_thread():
 
     threading.Thread(target=run, name="muxd-watchdog", daemon=True).start()
 
-def manifest_payload(source=None):
+def session_records_payload(source=None):
     source = sessions if source is None else source
     return {
         n: {"cmd": s.cmd, "cwd": s.cwd, "cols": s.cols, "rows": s.rows, "heal": s.heal,
@@ -1248,14 +1259,48 @@ def manifest_payload(source=None):
             "childStartToken": str(getattr(s, "child_start_token", "") or ""),
             "stopDisposition": str(getattr(s, "stop_disposition", "") or ""),
             "userKilled": bool(getattr(s, "user_killed", False)),
+            "generationId": str(getattr(s, "generation_id", "") or ""),
+            "operationKey": str(getattr(s, "operation_key", "") or ""),
+            "operationFingerprint": str(getattr(s, "operation_fingerprint", "") or ""),
+            "operationCreated": bool(getattr(s, "operation_created", False)),
             "deaths": [float(value) for value in list(getattr(s, "deaths", []) or [])[-16:]]}
         for n, s in source.items()
     }
 
-def manifest_save(source=None):
-    durable_json_write(MANIFEST, manifest_payload(source))
+def manifest_payload(source=None):
+    return {
+        "version": 2,
+        "sessions": session_records_payload(source),
+        "intents": compact_intent_records(intent_records),
+    }
 
-def valid_manifest(value):
+def compact_intent_records(records, now=None):
+    now = time.time() if now is None else float(now)
+    live = {
+        key: record
+        for key, record in records.items()
+        if record.get("status") not in ("completed", "failed")
+    }
+    terminal = sorted(
+        (
+            (key, record)
+            for key, record in records.items()
+            if record.get("status") in ("completed", "failed")
+            and now - float(record.get("updatedAt", record.get("createdAt", 0)) or 0)
+            <= INTENT_TERMINAL_RETENTION_SECONDS
+        ),
+        key=lambda item: float(item[1].get("updatedAt", item[1].get("createdAt", 0)) or 0),
+        reverse=True,
+    )[:INTENT_TERMINAL_LIMIT]
+    return {**live, **dict(terminal)}
+
+def manifest_save(source=None):
+    payload = manifest_payload(source)
+    durable_json_write(MANIFEST, payload)
+    intent_records.clear()
+    intent_records.update(payload["intents"])
+
+def valid_session_records(value):
     if not isinstance(value, dict):
         return False
     required = ("cmd", "cwd", "cols", "rows", "heal")
@@ -1270,11 +1315,45 @@ def valid_manifest(value):
         and isinstance(record.get("childStartToken", ""), str)
         and str(record.get("stopDisposition", "") or "") in stop_dispositions
         and isinstance(record.get("userKilled", False), bool)
+        and isinstance(record.get("generationId", ""), str)
+        and isinstance(record.get("operationKey", ""), str)
+        and isinstance(record.get("operationFingerprint", ""), str)
+        and isinstance(record.get("operationCreated", False), bool)
         for name, record in value.items()
     )
 
+def valid_intent_records(value):
+    statuses = {"accepted", "dispatching", "completed", "failed", "uncertain"}
+    return isinstance(value, dict) and all(
+        isinstance(key, str)
+        and re.fullmatch(r"[A-Za-z0-9._:-]{1,320}", key)
+        and isinstance(record, dict)
+        and str(record.get("status", "")) in statuses
+        and re.fullmatch(r"[a-f0-9]{64}", str(record.get("fingerprint", "")))
+        and isinstance(record.get("kind", ""), str)
+        and isinstance(record.get("session", ""), str)
+        and isinstance(record.get("result", {}), dict)
+        for key, record in value.items()
+    )
+
+def valid_manifest(value):
+    if (
+        isinstance(value, dict)
+        and value.get("version") == 2
+        and "sessions" in value
+        and "intents" in value
+    ):
+        return valid_session_records(value.get("sessions")) and valid_intent_records(value.get("intents"))
+    return valid_session_records(value)
+
 def manifest_load():
-    return durable_json_load(MANIFEST, {}, validate=valid_manifest)
+    loaded = durable_json_load(MANIFEST, {}, validate=valid_manifest)
+    if isinstance(loaded, dict) and loaded.get("version") == 2:
+        intent_records.clear()
+        intent_records.update(loaded.get("intents") or {})
+        return loaded.get("sessions") or {}
+    intent_records.clear()
+    return loaded
 
 _PERSISTED_SESSION_FIELDS = (
     "cmd",
@@ -1293,6 +1372,10 @@ _PERSISTED_SESSION_FIELDS = (
     "child_pid",
     "child_start_token",
     "stop_disposition",
+    "generation_id",
+    "operation_key",
+    "operation_fingerprint",
+    "operation_created",
     "deaths",
     "user_killed",
 )
@@ -1387,6 +1470,22 @@ def normalized_cmd(cmd):
 def command_sig(cmd):
     cmd = normalized_cmd(cmd)
     return hashlib.sha256(cmd.encode("utf-8")).hexdigest()[:16] if cmd else ""
+
+def intent_id(value):
+    raw = str(value or "").strip()
+    return raw if re.fullmatch(r"[A-Za-z0-9._-]{1,128}", raw) else ""
+
+def intent_fingerprint(frame):
+    payload = {
+        str(key): value
+        for key, value in (frame or {}).items()
+        if key not in ("intentId", "rid") and not str(key).startswith("_")
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+def intent_key(scope, kind, request_id):
+    return f"{scope}:{kind}:{request_id}"
 
 def session_has_command(sess):
     return bool(normalized_cmd(getattr(sess, "cmd", "")))
@@ -1572,6 +1671,8 @@ async def main():
     loop = asyncio.get_running_loop()
     outq = RelayOutQueue()
     launch_locks = {}
+    intent_locks = {}
+    create_intent_locks = {}
 
     def launch_lock(name):
         lock = launch_locks.get(name)
@@ -1579,6 +1680,282 @@ async def main():
             lock = asyncio.Lock()
             launch_locks[name] = lock
         return lock
+
+    def operation_lock(key):
+        lock = intent_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            intent_locks[key] = lock
+        return lock
+
+    def create_intent_lock(name):
+        lock = create_intent_locks.get(name)
+        if lock is None:
+            lock = asyncio.Lock()
+            create_intent_locks[name] = lock
+        return lock
+
+    def persist_intent(key, record):
+        missing = object()
+        prior = intent_records.get(key, missing)
+        intent_records[key] = record
+        try:
+            manifest_save(sessions)
+        except Exception as error:
+            if not getattr(error, "committed", False):
+                if prior is missing:
+                    intent_records.pop(key, None)
+                else:
+                    intent_records[key] = prior
+            raise
+
+    def stable_session_result(session):
+        payload = session_payload(session.name, session)
+        return {
+            key: payload.get(key)
+            for key in (
+                "name", "alive", "created", "lastOut", "cols", "rows", "heal", "owner",
+                "localFirst", "localViewers", "hasCommand", "shellOnly", "ready", "kind",
+                "sessionId", "aliases", "identityPending",
+            )
+        } | {"generationId": str(getattr(session, "generation_id", "") or "")}
+
+    def create_semantic_result(session, detail, created):
+        if detail:
+            return {
+                "ok": False,
+                "created": False,
+                "detail": str(detail),
+                "retryable": False,
+                "session": {},
+            }
+        return {
+            "ok": True,
+            "created": bool(created),
+            "detail": "",
+            "retryable": False,
+            "session": stable_session_result(session),
+        }
+
+    def create_error(detail, retryable=False):
+        return {
+            "ok": False,
+            "created": False,
+            "detail": str(detail),
+            "retryable": bool(retryable),
+            "session": {},
+        }
+
+    async def coordinate_create_intent(first, scope, spawn_if_missing, leave_unarmed_dormant=False):
+        name = strict_mux_name(first.get("s", ""))
+        if not name:
+            return create_error("session name required")
+        async with create_intent_lock(name):
+            return await coordinate_create_intent_locked(
+                first,
+                scope,
+                spawn_if_missing,
+                leave_unarmed_dormant=leave_unarmed_dormant,
+            )
+
+    async def coordinate_create_intent_locked(first, scope, spawn_if_missing, leave_unarmed_dormant=False):
+        supplied = first.get("intentId") if "intentId" in first else first.get("rid")
+        request_id = intent_id(supplied)
+        if supplied and not request_id:
+            return create_error("invalid intent id")
+        if not request_id:
+            session, detail, created = await coordinate_session_request(
+                first,
+                spawn_if_missing,
+                leave_unarmed_dormant=leave_unarmed_dormant,
+            )
+            return create_semantic_result(session, detail, created)
+
+        key = intent_key(scope, "create", request_id)
+        fingerprint = intent_fingerprint(first)
+        name = strict_mux_name(first.get("s", ""))
+        async with operation_lock(key):
+            record = intent_records.get(key)
+            if record is not None:
+                if record.get("fingerprint") != fingerprint:
+                    return create_error("intent id is already bound to a different payload")
+                if record.get("status") in ("completed", "failed"):
+                    return dict(record.get("result") or {})
+                applied = sessions.get(name)
+                if (
+                    applied is not None
+                    and getattr(applied, "operation_key", "") == key
+                    and getattr(applied, "operation_fingerprint", "") == fingerprint
+                    and getattr(applied, "lifecycle", "") == "active"
+                    and applied.alive()
+                ):
+                    result = create_semantic_result(
+                        applied,
+                        "",
+                        bool(getattr(applied, "operation_created", False)),
+                    )
+                    persist_intent(key, {**record, "status": "completed", "result": result, "updatedAt": time.time()})
+                    return result
+            else:
+                unresolved = [
+                    (other_key, other)
+                    for other_key, other in intent_records.items()
+                    if other_key != key
+                    and other.get("kind") == "create"
+                    and other.get("session") == name
+                    and other.get("status") == "accepted"
+                ]
+                for other_key, other in unresolved:
+                    applied = sessions.get(name)
+                    if (
+                        applied is not None
+                        and getattr(applied, "operation_key", "") == other_key
+                        and getattr(applied, "operation_fingerprint", "") == other.get("fingerprint")
+                        and getattr(applied, "lifecycle", "") == "active"
+                        and applied.alive()
+                    ):
+                        old_result = create_semantic_result(
+                            applied,
+                            "",
+                            bool(getattr(applied, "operation_created", False)),
+                        )
+                        old_status = "completed"
+                    else:
+                        old_result = create_error(
+                            "accepted create intent was abandoned before its outcome became durable"
+                        )
+                        old_status = "failed"
+                    try:
+                        persist_intent(other_key, {
+                            **other,
+                            "status": old_status,
+                            "result": old_result,
+                            "updatedAt": time.time(),
+                        })
+                    except Exception as error:
+                        return create_error(
+                            "could not reconcile an abandoned create intent: " + str(error),
+                            retryable=True,
+                        )
+                record = {
+                    "kind": "create",
+                    "session": name,
+                    "fingerprint": fingerprint,
+                    "status": "accepted",
+                    "result": {},
+                    "createdAt": time.time(),
+                    "updatedAt": time.time(),
+                }
+                try:
+                    persist_intent(key, record)
+                except Exception as error:
+                    return create_error(
+                        "could not durably accept create intent: " + str(error),
+                        retryable=True,
+                    )
+
+            session, detail, created = await coordinate_session_request(
+                first,
+                spawn_if_missing,
+                leave_unarmed_dormant=leave_unarmed_dormant,
+                operation_key=key,
+                operation_fingerprint=fingerprint,
+            )
+            applied = sessions.get(name)
+            if (
+                detail
+                and applied is not None
+                and getattr(applied, "operation_key", "") == key
+                and getattr(applied, "operation_fingerprint", "") == fingerprint
+                and getattr(applied, "lifecycle", "") == "active"
+                and applied.alive()
+            ):
+                session = applied
+                detail = ""
+                created = bool(getattr(applied, "operation_created", False))
+            result = create_semantic_result(session, detail, created)
+            terminal = {
+                **record,
+                "status": "completed" if result["ok"] else "failed",
+                "result": result,
+                "updatedAt": time.time(),
+            }
+            try:
+                persist_intent(key, terminal)
+            except Exception as error:
+                return create_error(
+                    "create outcome persistence failed: " + str(error),
+                    retryable=True,
+                )
+            return result
+
+    async def execute_input_intent(first, session, data, scope="local"):
+        supplied = first.get("intentId")
+        request_id = intent_id(supplied)
+        if supplied and not request_id:
+            return {"t": "err", "m": "invalid intent id"}
+        if not request_id:
+            if session is None or not session.alive():
+                return {"t": "err", "m": "session is not live: " + strict_mux_name(first.get("s", ""))}
+            if isinstance(session, OwnerSession):
+                ok, detail = await session.write_confirmed(data)
+            else:
+                ok, detail = await asyncio.get_running_loop().run_in_executor(
+                    None, lambda: session.write_confirmed(data)
+                )
+            return {"t": "input-ok", "s": session.name} if ok else {"t": "err", "m": detail}
+
+        key = intent_key(scope, "input", request_id)
+        fingerprint = intent_fingerprint(first)
+        async with operation_lock(key):
+            record = intent_records.get(key)
+            if record is not None:
+                if record.get("fingerprint") != fingerprint:
+                    return {"t": "err", "m": "intent id is already bound to a different payload"}
+                if record.get("status") in ("completed", "failed"):
+                    return dict(record.get("result") or {})
+                return {
+                    "t": "err",
+                    "m": "input outcome is uncertain; the PTY write was not replayed",
+                }
+
+            if session is None or not session.alive():
+                return {"t": "err", "m": "session is not live: " + strict_mux_name(first.get("s", ""))}
+            record = {
+                "kind": "input",
+                "session": session.name,
+                "fingerprint": fingerprint,
+                "status": "dispatching",
+                "result": {},
+                "createdAt": time.time(),
+                "updatedAt": time.time(),
+            }
+            try:
+                persist_intent(key, record)
+            except Exception as error:
+                return {"t": "err", "m": "could not durably reserve input intent: " + str(error)}
+
+            if isinstance(session, OwnerSession):
+                ok, detail = await session.write_confirmed(data)
+            else:
+                ok, detail = await asyncio.get_running_loop().run_in_executor(
+                    None, lambda: session.write_confirmed(data)
+                )
+            result = {"t": "input-ok", "s": session.name} if ok else {"t": "err", "m": detail}
+            terminal = {
+                **record,
+                "status": "completed" if ok else "failed",
+                "result": result,
+                "updatedAt": time.time(),
+            }
+            try:
+                persist_intent(key, terminal)
+            except Exception as error:
+                return {
+                    "t": "err",
+                    "m": "input was dispatched but its outcome is uncertain and will not be replayed: " + str(error),
+                }
+            return result
 
     async def remove_session(name, by_user):
         async with launch_lock(name):
@@ -1785,7 +2162,13 @@ async def main():
             sessions[name] = owner
             return owner, ""
 
-    async def coordinate_session_request(first, spawn_if_missing, leave_unarmed_dormant=False):
+    async def coordinate_session_request(
+        first,
+        spawn_if_missing,
+        leave_unarmed_dormant=False,
+        operation_key="",
+        operation_fingerprint="",
+    ):
         name = SAFE(first.get("s", ""))
         if not name:
             return None, "session name required", False
@@ -1831,6 +2214,9 @@ async def main():
                 prev.session_id = canonical_id
                 prev.aliases = identity_aliases
                 prev.identity_pending = requested_identity_pending
+                prev.operation_key = operation_key
+                prev.operation_fingerprint = operation_fingerprint
+                prev.operation_created = False
                 if claim is not None:
                     prev._launch_claim = claim
                     prev.claim_paths = list(claim.paths)
@@ -1895,6 +2281,9 @@ async def main():
                 previous_snapshot = persisted_session_snapshot(prev)
                 prev.lifecycle = "stopping"
                 prev.stop_disposition = "replace"
+                prev.operation_key = operation_key
+                prev.operation_fingerprint = operation_fingerprint
+                prev.operation_created = True
                 pty = getattr(prev, "pty", None)
                 prev.child_pid = int(getattr(pty, "pid", 0) or getattr(prev, "child_pid", 0) or 0)
                 prev.child_start_token = (
@@ -1938,6 +2327,9 @@ async def main():
             created.identity_pending = requested_identity_pending
             created.deaths = prior_deaths
             created.lifecycle = "starting"
+            created.operation_key = operation_key
+            created.operation_fingerprint = operation_fingerprint
+            created.operation_created = True
             candidate = dict(sessions)
             candidate[name] = created
             try:
@@ -2150,6 +2542,10 @@ async def main():
             if restored.stop_disposition not in ("", "remove", "replace"):
                 restored.stop_disposition = ""
             restored.user_killed = bool(m.get("userKilled", False))
+            restored.generation_id = str(m.get("generationId", "") or restored.generation_id)
+            restored.operation_key = str(m.get("operationKey", "") or "")
+            restored.operation_fingerprint = str(m.get("operationFingerprint", "") or "")
+            restored.operation_created = bool(m.get("operationCreated", False))
             restored.deaths = [
                 float(value)
                 for value in (m.get("deaths") if isinstance(m.get("deaths"), list) else [])
@@ -2355,30 +2751,27 @@ async def main():
                     outq.put_nowait(("dead", s.name, ""))  # force relay session-list refresh
                     await ws.send(json.dumps({"t": "bind-ok", "s": s.name, "sessionId": s.session_id})); return
                 if first.get("t") == "create":
-                    s, err, created = await ensure_local_session(first, True)
-                    if err:
-                        await ws.send(json.dumps({"t": "err", "m": err})); return
-                    await ws.send(json.dumps({"t": "created", "s": s.name, "created": created, "alive": s.alive()})); return
+                    result = await coordinate_create_intent(first, "local", True)
+                    if not result.get("ok"):
+                        await ws.send(json.dumps({"t": "err", "m": result.get("detail", "create failed")})); return
+                    session = result.get("session") or {}
+                    await ws.send(json.dumps({
+                        "t": "created",
+                        "s": session.get("name", strict_mux_name(first.get("s", ""))),
+                        "created": bool(result.get("created")),
+                        "alive": bool(session.get("alive")),
+                    })); return
                 if first.get("t") == "input":
                     name = SAFE(first.get("s", ""))
                     s = sessions.get(name)
-                    if s is None or not s.alive():
-                        await ws.send(json.dumps({"t": "err", "m": "session is not live: " + name})); return
                     try:
                         data = base64.b64decode(first.get("d", ""), validate=True)
                     except Exception:
                         await ws.send(json.dumps({"t": "err", "m": "invalid input payload"})); return
                     if not data:
                         await ws.send(json.dumps({"t": "err", "m": "input payload is empty"})); return
-                    if isinstance(s, OwnerSession):
-                        ok, detail = await s.write_confirmed(data)
-                    else:
-                        ok, detail = await asyncio.get_running_loop().run_in_executor(
-                            None, lambda: s.write_confirmed(data)
-                        )
-                    if not ok:
-                        await ws.send(json.dumps({"t": "err", "m": detail})); return
-                    await ws.send(json.dumps({"t": "input-ok", "s": name})); return
+                    result = await execute_input_intent(first, s, data)
+                    await ws.send(json.dumps(result)); return
                 if first.get("t") == "open":
                     s, err, _created = await ensure_local_session(first, True)
                 else:
@@ -2510,18 +2903,19 @@ async def main():
                                     await ws.close(code=1008, reason="create frame violated protocol")
                                     break
                                 request_id = str(m.get("rid", "") or "")
-                                session, err, created = await coordinate_session_request(
-                                    m, True, leave_unarmed_dormant=True
+                                result = await coordinate_create_intent(
+                                    m, "relay", True, leave_unarmed_dormant=True
                                 )
-                                if err:
-                                    log(f"[{name}] create REFUSED: {err}")
+                                if not result.get("ok"):
+                                    log(f"[{name}] create REFUSED: {result.get('detail', 'create failed')}")
                                     await ws.send(json.dumps({
                                         "t": "createResult",
                                         "rid": request_id,
                                         "s": name,
                                         "ok": False,
                                         "created": False,
-                                        "detail": "muxd refused the create request",
+                                        "detail": result.get("detail", "muxd refused the create request"),
+                                        "retryable": bool(result.get("retryable")),
                                     }))
                                 else:
                                     await ws.send(json.dumps({
@@ -2529,9 +2923,10 @@ async def main():
                                         "rid": request_id,
                                         "s": name,
                                         "ok": True,
-                                        "created": bool(created),
+                                        "created": bool(result.get("created")),
                                         "detail": "",
-                                        "session": session_payload(name, session),
+                                        "retryable": False,
+                                        "session": result.get("session") or {},
                                     }))
                                 continue
                             elif t == "heal" and name in sessions:
