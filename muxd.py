@@ -324,6 +324,24 @@ def _terminate_pid_tree(pid, timeout=12):
         return False, f"process {pid} is still alive after termination"
     return True, "process exited"
 
+def _release_pty_resources(pty):
+    """Close pywinpty transport/server handles after the child is confirmed gone."""
+    if pty is None:
+        return
+    for attribute in ("fileobj", "_server"):
+        resource = getattr(pty, attribute, None)
+        if resource is None:
+            continue
+        try:
+            resource.close()
+        except Exception:
+            pass
+    try:
+        pty.fd = -1
+        pty.closed = True
+    except Exception:
+        pass
+
 def _parse_resume_id(cmd):
     cmd = cmd or ""
     m = re.search(r'--resume\s+["\']?([0-9A-Za-z][0-9A-Za-z._-]*)["\']?', cmd)   # claude --resume <id>
@@ -1069,11 +1087,13 @@ class Session:
             except Exception:
                 if pty is self.pty:
                     self.dead = True
+                    self.pty = None
                     writer_stopped = self.stop_input_writer()
                     if not writer_stopped:
                         log(f"[{self.name}] input writer did not stop after PTY EOF")
                     self.loop.call_soon_threadsafe(self.outq.put_nowait, ("dead", self.name, ""))
                     log(f"[{self.name}] pty EOF (shell exited or killed)")
+                _release_pty_resources(pty)
                 return
             if not data: continue
             if pty is not self.pty: return          # superseded by a respawn
@@ -1259,8 +1279,15 @@ class Session:
         self.dead = True
         if pty is not None:
             def terminate():
-                try: pty.terminate(force=True)
-                except Exception: pass
+                try:
+                    pty.terminate(force=True)
+                except Exception:
+                    pass
+                try:
+                    if not pty.isalive():
+                        _release_pty_resources(pty)
+                except Exception:
+                    pass
             threading.Thread(target=terminate, name=f"{self.name}-terminate", daemon=True).start()
 
 class OwnerSession:
@@ -1858,6 +1885,7 @@ async def terminate_session_off_loop(s, by_user=True, timeout=12, release_claim_
             return False, detail
         if terminate_error is not None and pid <= 0:
             return False, f"PTY termination failed: {terminate_error}"
+        _release_pty_resources(pty)
         return True, "process exited"
 
     try:

@@ -1081,6 +1081,42 @@ class MuxdAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(sess.dead)
         self.assertTrue(elapsed >= 0.2, f"termination returned before the PTY stop completed: {elapsed:.3f}s")
 
+    async def test_terminate_session_releases_pywinpty_transport_handles(self):
+        class Resource:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        class Pty:
+            pid = 0
+
+            def __init__(self):
+                self.fileobj = Resource()
+                self._server = Resource()
+                self.closed = False
+                self.fd = 123
+
+            def terminate(self, force=True):
+                return True
+
+        pty = Pty()
+        sess = muxd.Session.__new__(muxd.Session)
+        sess.name = "resource-stop"
+        sess.pty = pty
+        sess.dead = False
+        sess.user_killed = False
+        sess.wq = queue.Queue()
+
+        ok, detail = await muxd.terminate_session_off_loop(sess, timeout=2)
+
+        self.assertTrue(ok, detail)
+        self.assertTrue(pty.fileobj.closed)
+        self.assertTrue(pty._server.closed)
+        self.assertTrue(pty.closed)
+        self.assertEqual(-1, pty.fd)
+
     async def test_terminate_session_releases_claim_only_after_process_exit(self):
         events = []
 
