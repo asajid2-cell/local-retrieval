@@ -2,21 +2,21 @@
 
 Overall: **GREEN - acceptable checkpoint**
 
-- Tag: `L4_20260709i`
-- Date: 2026-07-09 18:36:19 -06:00
-- Accepted tag: `L4_20260709i`
-- App HEAD: 572d17b Add durable app store persistence
+- Tag: `L5_20260709`
+- Date: 2026-07-09 20:18:55 -06:00
+- Accepted tag: `L5_20260709`
+- App HEAD: d3c2201 Harden app store recovery and durable ownership
 - App tree: DIRTY
 - Relay tree: DIRTY
 - muxd tree: DIRTY
 
 ## Gates
 
-- **dotnet-build**: PASS -- exit=0, log=Z:\328\CMPUT328-A2\codexworks\301\WorkRepo\ournewfolder\codex-local-retrieval-remote\artifacts\reliability\L4_20260709i\dotnet-build.log
-- **dotnet-tests**: PASS -- exit=0, log=Z:\328\CMPUT328-A2\codexworks\301\WorkRepo\ournewfolder\codex-local-retrieval-remote\artifacts\reliability\L4_20260709i\dotnet-tests.log
-- **projection-contract**: PASS -- exit=0, log=Z:\328\CMPUT328-A2\codexworks\301\WorkRepo\ournewfolder\codex-local-retrieval-remote\artifacts\reliability\L4_20260709i\projection-contract.log
-- **relay-tests**: PASS -- exit=0, log=Z:\328\CMPUT328-A2\codexworks\301\WorkRepo\ournewfolder\codex-local-retrieval-remote\artifacts\reliability\L4_20260709i\relay-tests.log
-- **muxd-tests**: PASS -- exit=0, log=Z:\328\CMPUT328-A2\codexworks\301\WorkRepo\ournewfolder\codex-local-retrieval-remote\artifacts\reliability\L4_20260709i\muxd-tests.log
+- **dotnet-build**: PASS -- exit=0, log=Z:\328\CMPUT328-A2\codexworks\301\WorkRepo\ournewfolder\codex-local-retrieval-remote\artifacts\reliability\L5_20260709\dotnet-build.log
+- **dotnet-tests**: PASS -- exit=0, log=Z:\328\CMPUT328-A2\codexworks\301\WorkRepo\ournewfolder\codex-local-retrieval-remote\artifacts\reliability\L5_20260709\dotnet-tests.log
+- **projection-contract**: PASS -- exit=0, log=Z:\328\CMPUT328-A2\codexworks\301\WorkRepo\ournewfolder\codex-local-retrieval-remote\artifacts\reliability\L5_20260709\projection-contract.log
+- **relay-tests**: PASS -- exit=0, log=Z:\328\CMPUT328-A2\codexworks\301\WorkRepo\ournewfolder\codex-local-retrieval-remote\artifacts\reliability\L5_20260709\relay-tests.log
+- **muxd-tests**: PASS -- exit=0, log=Z:\328\CMPUT328-A2\codexworks\301\WorkRepo\ournewfolder\codex-local-retrieval-remote\artifacts\reliability\L5_20260709\muxd-tests.log
 
 ## Residuals
 

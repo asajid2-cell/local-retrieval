@@ -17,15 +17,17 @@ public static class RemoteUploadTransfer
         bool keep,
         string? muxName,
         string? insert,
+        string intentId,
         Func<object, Task<string>> muxRequest)
     {
         if (string.IsNullOrWhiteSpace(uploadId))
             return new RemoteUploadResult(false, "file download refused: missing upload id", false);
 
         var safe = SanitizeFilename(filename);
-        var destDir = keep
+        var destRoot = keep
             ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "CodexMultiplexUploads")
             : Path.Combine(Path.GetTempPath(), "multiplex-uploads");
+        var destDir = Path.Combine(destRoot, uploadId);
         try
         {
             Directory.CreateDirectory(destDir);
@@ -36,8 +38,6 @@ public static class RemoteUploadTransfer
         }
 
         var dest = Path.Combine(destDir, safe);
-        if (File.Exists(dest))
-            dest = Path.Combine(destDir, uploadId + "_" + safe);
 
         var remote = $"{target}:multiplex-app/uploads/{uploadId}/{safe}";
         Process? process = null;
@@ -89,7 +89,7 @@ public static class RemoteUploadTransfer
             process?.Dispose();
         }
 
-        return await InsertDownloadedPathAsync(dest, filename, muxName, insert, muxRequest);
+        return await InsertDownloadedPathAsync(dest, filename, muxName, insert, intentId, muxRequest);
     }
 
     public static async Task<RemoteUploadResult> InsertDownloadedPathAsync(
@@ -97,6 +97,7 @@ public static class RemoteUploadTransfer
         string filename,
         string? muxName,
         string? insert,
+        string intentId,
         Func<object, Task<string>> muxRequest)
     {
         var insertion = (insert ?? "").Trim().ToLowerInvariant();
@@ -116,7 +117,8 @@ public static class RemoteUploadTransfer
             {
                 t = "input",
                 s = muxName,
-                d = Convert.ToBase64String(Encoding.UTF8.GetBytes(input))
+                d = Convert.ToBase64String(Encoding.UTF8.GetBytes(input)),
+                intentId
             });
             using var doc = JsonDocument.Parse(response);
             var root = doc.RootElement;

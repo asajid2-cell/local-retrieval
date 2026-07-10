@@ -215,6 +215,7 @@ public sealed partial class MainPage
     private DispatcherTimer? _tabTimer;
     private bool _syncPushing;
     private bool _cmdPolling;
+    private readonly string _commandLeaseOwner = RemoteCommandProtocol.LeaseOwner("gui");
     private bool _tabTracking;
 
     public void StartProjectSync()
@@ -323,7 +324,11 @@ public sealed partial class MainPage
         try
         {
             var port = settings.MultiplexApiPort;
-            var outText = await SshCaptureAsync(target, $"curl -s http://127.0.0.1:{port}/api/app-commands");
+            var leaseJson = JsonSerializer.Serialize(new { owner = _commandLeaseOwner, limit = 1 });
+            var outText = (await RunSshAsync(
+                target,
+                $"curl -s -X POST http://127.0.0.1:{port}/api/app-commands/lease -H 'Content-Type: application/json' --data-binary @-",
+                leaseJson)).outText;
             if (string.IsNullOrWhiteSpace(outText)) return;
             List<AppCommand>? cmds;
             try { cmds = JsonSerializer.Deserialize<List<AppCommand>>(outText); } catch { return; }
@@ -337,7 +342,11 @@ public sealed partial class MainPage
                 if (string.IsNullOrEmpty(c.id)) continue;
                 (bool ok, string detail) res;
                 var onPc = false;
-                if (string.Equals(c.type, "kill", StringComparison.OrdinalIgnoreCase))
+                if (!RemoteCommandProtocol.IsReplaySafe(c.type, c.replayPolicy))
+                {
+                    res = (false, "command replay policy is missing or invalid");
+                }
+                else if (string.Equals(c.type, "kill", StringComparison.OrdinalIgnoreCase))
                 {
                     // DISABLED: autonomous remote kill was the #1 cause of lost work. Relay-queued "kill"
                     // commands were executed here every 3s with NO user intent — and when the ack curl
@@ -388,6 +397,7 @@ public sealed partial class MainPage
                         c.keep,
                         c.muxName ?? c.sessionName,
                         c.insert,
+                        c.intentId,
                         message => LocalMuxdRequestAsync(message));
                     res = (transfer.Ok, transfer.Detail);
                     onPc = transfer.OnPc;
@@ -399,7 +409,11 @@ public sealed partial class MainPage
                 }
                 else if (string.Equals(c.type, "startmux", StringComparison.OrdinalIgnoreCase))
                 {
-                    res = await StartMuxHeadlessFromIntentAsync(c.muxName ?? c.sessionName ?? "", c.sessionId ?? "", c.tool ?? "");
+                    res = await StartMuxHeadlessFromIntentAsync(
+                        c.muxName ?? c.sessionName ?? "",
+                        c.sessionId ?? "",
+                        c.tool ?? "",
+                        c.intentId);
                 }
                 else if (string.Equals(c.type, "cleartabhistory", StringComparison.OrdinalIgnoreCase))
                 {
@@ -414,8 +428,8 @@ public sealed partial class MainPage
                     added = true;   // re-push so the web re-tints
                 }
                 else res = (false, "unknown command");
-                var ackJson = JsonSerializer.Serialize(new { ok = res.ok, detail = res.detail, onPc });
-                await SshSendAsync(target, $"curl -s -X POST http://127.0.0.1:{port}/api/app-commands/{c.id}/ack -H 'Content-Type: application/json' --data-binary @-", ackJson);
+                var ackJson = JsonSerializer.Serialize(new { leaseToken = c.leaseToken, ok = res.ok, detail = res.detail, onPc });
+                await AckCommandAsync(target, port, c.id, ackJson);
             }
             if (killed || renamed || added) { await Task.Delay(300); await PushProjectsAsync(); }   // reflect a kill/rename/add fast
         }
@@ -423,10 +437,27 @@ public sealed partial class MainPage
         finally { _cmdPolling = false; }
     }
 
+    private static async Task AckCommandAsync(string target, int port, string commandId, string ackJson)
+    {
+        for (var attempt = 1; attempt <= 3; attempt++)
+        {
+            var result = await RunSshAsync(
+                target,
+                $"curl -sS -X POST http://127.0.0.1:{port}/api/app-commands/{commandId}/ack -H 'Content-Type: application/json' --data-binary @-",
+                ackJson);
+            if (result.code == 0 && RemoteCommandProtocol.AckSucceeded(result.outText)) return;
+            if (attempt < 3) await Task.Delay(attempt * 500);
+        }
+        Diag.Log($"Remote command acknowledgement remained unconfirmed: id={commandId}");
+    }
+
     private sealed class AppCommand
     {
         public string id { get; set; } = "";
+        public string intentId { get; set; } = "";
+        public string leaseToken { get; set; } = "";
         public string type { get; set; } = "";
+        public string replayPolicy { get; set; } = "";
         public string? sessionId { get; set; }
         public string? tool { get; set; }
         public int pid { get; set; }
@@ -444,7 +475,11 @@ public sealed partial class MainPage
         public string? deckName { get; set; }
     }
 
-    private async Task<(bool ok, string detail)> StartMuxHeadlessFromIntentAsync(string name, string sessionId, string tool)
+    private async Task<(bool ok, string detail)> StartMuxHeadlessFromIntentAsync(
+        string name,
+        string sessionId,
+        string tool,
+        string intentId)
     {
         name = (name ?? "").Trim();
         if (string.IsNullOrEmpty(name)) return (false, "missing mux session name");
@@ -463,7 +498,12 @@ public sealed partial class MainPage
             return (false, detail);
         }
         var session = _archive.ResolveSessionByIdOrAlias(launch.SessionId, launch.Tool);
-        var created = await CreateLocalMuxdSessionAsync(name, launch.Command, launch.SessionId, launch.Aliases);
+        var created = await CreateLocalMuxdSessionAsync(
+            name,
+            launch.Command,
+            launch.SessionId,
+            launch.Aliases,
+            intentId);
         RecordSessionEvent(
             session,
             created.ok ? "mux.started.remote-command" : "mux.refused.remote-command",
@@ -818,7 +858,8 @@ public sealed partial class MainPage
         string name,
         string command,
         string? sessionId = null,
-        IEnumerable<string>? aliases = null)
+        IEnumerable<string>? aliases = null,
+        string? intentId = null)
     {
         try
         {
@@ -841,7 +882,10 @@ public sealed partial class MainPage
                 rows = 40,
                 sessionId = canonicalId,
                 aliases = identityAliases,
-                identityPending = string.IsNullOrWhiteSpace(canonicalId)
+                identityPending = string.IsNullOrWhiteSpace(canonicalId),
+                intentId = string.IsNullOrWhiteSpace(intentId)
+                    ? RemoteCommandProtocol.NewIntent("local-create")
+                    : intentId
             });
             using var doc = JsonDocument.Parse(text);
             if (doc.RootElement.TryGetProperty("t", out var t) && t.GetString() == "err")

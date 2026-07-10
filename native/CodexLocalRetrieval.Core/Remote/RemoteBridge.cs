@@ -32,6 +32,7 @@ public sealed class RemoteBridge
     private readonly Action<string> _log;
     private readonly Func<string?, string?, Task<(bool ok, ArchiveService.RemoteMuxLaunch? launch, string detail)>>? _resolveMuxLaunch;
     private readonly Func<Task<IReadOnlyList<ArchiveService.PendingMuxBinding>>>? _resolvePendingMuxBindings;
+    private readonly string _commandLeaseOwner = RemoteCommandProtocol.LeaseOwner("headless");
 
     private const string SshHardenOpts = "-o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3";
     private static readonly TimeSpan SshHardTimeout = TimeSpan.FromSeconds(30);
@@ -157,7 +158,11 @@ public sealed class RemoteBridge
 
     private async Task PollAndProcessAsync(Settings s)
     {
-        var outText = (await RunSshAsync(s.Target, $"curl -s http://127.0.0.1:{s.Port}/api/app-commands")).outText;
+        var leaseJson = JsonSerializer.Serialize(new { owner = _commandLeaseOwner, limit = 1 });
+        var outText = (await RunSshAsync(
+            s.Target,
+            $"curl -s -X POST http://127.0.0.1:{s.Port}/api/app-commands/lease -H 'Content-Type: application/json' --data-binary @-",
+            leaseJson)).outText;
         if (string.IsNullOrWhiteSpace(outText)) return;
         List<Cmd>? cmds;
         try { cmds = JsonSerializer.Deserialize<List<Cmd>>(outText); } catch { return; }
@@ -169,7 +174,11 @@ public sealed class RemoteBridge
             if (string.IsNullOrEmpty(c.id)) continue;
             (bool ok, string detail) res;
             var onPc = false;
-            switch ((c.type ?? "").ToLowerInvariant())
+            if (!RemoteCommandProtocol.IsReplaySafe(c.type, c.replayPolicy))
+            {
+                res = (false, "command replay policy is missing or invalid");
+            }
+            else switch ((c.type ?? "").ToLowerInvariant())
             {
                 case "kill":
                     // DISABLED: autonomous remote kill (this headless server executed relay-queued "kill"
@@ -202,6 +211,7 @@ public sealed class RemoteBridge
                         c.keep,
                         c.muxName ?? c.sessionName,
                         c.insert,
+                        c.intentId,
                         LocalMuxdRequestAsync);
                     res = (transfer.Ok, transfer.Detail);
                     onPc = transfer.OnPc;
@@ -210,12 +220,12 @@ public sealed class RemoteBridge
                 case "addtocollection":
                     res = (false, "desktop app required for collection changes"); break;
                 case "startmux":
-                    res = await StartMuxHeadlessAsync(c.muxName ?? c.sessionName ?? "", c.sessionId ?? "", c.tool ?? ""); break;
+                    res = await StartMuxHeadlessAsync(c.muxName ?? c.sessionName ?? "", c.sessionId ?? "", c.tool ?? "", c.intentId); break;
                 default:
                     res = (false, "unknown command"); break;
             }
-            var ackJson = JsonSerializer.Serialize(new { ok = res.ok, detail = res.detail, onPc });
-            await RunSshAsync(s.Target, $"curl -s -X POST http://127.0.0.1:{s.Port}/api/app-commands/{c.id}/ack -H 'Content-Type: application/json' --data-binary @-", ackJson);
+            var ackJson = JsonSerializer.Serialize(new { leaseToken = c.leaseToken, ok = res.ok, detail = res.detail, onPc });
+            await AckCommandAsync(s, c.id, ackJson);
         }
         if (changed) { await Task.Delay(300); await PushRunningAsync(s); }   // reflect a kill/rename fast
     }
@@ -228,7 +238,11 @@ public sealed class RemoteBridge
         return _claude.RenameSession(id, title) ? (true, "renamed") : (false, "session not found");
     }
 
-    private async Task<(bool ok, string detail)> StartMuxHeadlessAsync(string name, string requestedSessionId, string tool)
+    private async Task<(bool ok, string detail)> StartMuxHeadlessAsync(
+        string name,
+        string requestedSessionId,
+        string tool,
+        string intentId)
     {
         name = (name ?? "").Trim();
         var eventSessionId = (requestedSessionId ?? "").Trim();
@@ -273,7 +287,8 @@ public sealed class RemoteBridge
                 rows = 40,
                 sessionId = launch.SessionId,
                 aliases = launch.Aliases,
-                identityPending = string.IsNullOrWhiteSpace(launch.SessionId)
+                identityPending = string.IsNullOrWhiteSpace(launch.SessionId),
+                intentId
             });
             using var doc = JsonDocument.Parse(text);
             if (doc.RootElement.TryGetProperty("t", out var t) && t.GetString() == "created")
@@ -423,10 +438,27 @@ public sealed class RemoteBridge
         finally { p?.Dispose(); }
     }
 
+    private async Task AckCommandAsync(Settings settings, string commandId, string ackJson)
+    {
+        for (var attempt = 1; attempt <= 3; attempt++)
+        {
+            var result = await RunSshAsync(
+                settings.Target,
+                $"curl -sS -X POST http://127.0.0.1:{settings.Port}/api/app-commands/{commandId}/ack -H 'Content-Type: application/json' --data-binary @-",
+                ackJson);
+            if (result.code == 0 && RemoteCommandProtocol.AckSucceeded(result.outText)) return;
+            if (attempt < 3) await Task.Delay(attempt * 500);
+        }
+        _log($"Remote command acknowledgement remained unconfirmed: id={commandId}");
+    }
+
     private sealed class Cmd
     {
         public string id { get; set; } = "";
+        public string intentId { get; set; } = "";
+        public string leaseToken { get; set; } = "";
         public string type { get; set; } = "";
+        public string replayPolicy { get; set; } = "";
         public string? sessionId { get; set; }
         public string? tool { get; set; }
         public int pid { get; set; }

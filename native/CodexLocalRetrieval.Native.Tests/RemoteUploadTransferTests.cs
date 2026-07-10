@@ -19,6 +19,7 @@ public sealed class RemoteUploadTransferTests
             "input.png",
             "tab-one",
             "path",
+            "fetch-intent-1",
             request =>
             {
                 requestJson = JsonSerializer.Serialize(request);
@@ -31,6 +32,7 @@ public sealed class RemoteUploadTransferTests
         using var request = JsonDocument.Parse(requestJson!);
         Assert.AreEqual("input", request.RootElement.GetProperty("t").GetString());
         Assert.AreEqual("tab-one", request.RootElement.GetProperty("s").GetString());
+        Assert.AreEqual("fetch-intent-1", request.RootElement.GetProperty("intentId").GetString());
         var inserted = Encoding.UTF8.GetString(
             Convert.FromBase64String(request.RootElement.GetProperty("d").GetString()!));
         Assert.AreEqual(localPath, inserted);
@@ -47,6 +49,7 @@ public sealed class RemoteUploadTransferTests
             "input.png",
             "tab-one",
             "element",
+            "fetch-intent-2",
             request =>
             {
                 requestJson = JsonSerializer.Serialize(request);

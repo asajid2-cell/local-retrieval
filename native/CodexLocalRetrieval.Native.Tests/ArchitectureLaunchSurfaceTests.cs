@@ -85,6 +85,47 @@ public sealed class ArchitectureLaunchSurfaceTests
     }
 
     [TestMethod]
+    public void RemoteCommandConsumers_UseFencedLeasesAndPropagateIntentIds()
+    {
+        var root = FindRepoRoot();
+        var files = new[]
+        {
+            Path.Combine(root, "native", "CodexLocalRetrieval.Core", "Remote", "RemoteBridge.cs"),
+            Path.Combine(root, "native", "CodexLocalRetrieval.Native", "MainPage.Remote.cs"),
+        };
+
+        foreach (var file in files)
+        {
+            var text = File.ReadAllText(file);
+            Assert.IsTrue(
+                text.Contains("/api/app-commands/lease", StringComparison.Ordinal),
+                Path.GetFileName(file) + " must claim commands through the durable lease endpoint.");
+            Assert.IsTrue(
+                text.Contains("limit = 1", StringComparison.Ordinal),
+                Path.GetFileName(file) + " executes commands serially and must lease only one command at a time.");
+            Assert.IsFalse(
+                text.Contains("limit = 8", StringComparison.Ordinal),
+                Path.GetFileName(file) + " must not reserve a batch that can expire before serial execution reaches it.");
+            Assert.IsTrue(
+                text.Contains("leaseToken = c.leaseToken", StringComparison.Ordinal),
+                Path.GetFileName(file) + " must fence acknowledgements with the lease token.");
+            Assert.IsTrue(
+                text.Contains("c.intentId", StringComparison.Ordinal),
+                Path.GetFileName(file) + " must propagate the relay intent into muxd.");
+            Assert.IsTrue(
+                text.Contains("RemoteCommandProtocol.IsReplaySafe", StringComparison.Ordinal),
+                Path.GetFileName(file) + " must refuse command types without an explicit replay policy.");
+            Assert.IsTrue(
+                text.Contains("AckCommandAsync", StringComparison.Ordinal),
+                Path.GetFileName(file) + " must retry acknowledgement with the same fenced lease token.");
+            Assert.IsFalse(
+                text.Contains($"curl -s http://127.0.0.1:{{", StringComparison.Ordinal)
+                && text.Contains("/api/app-commands\"", StringComparison.Ordinal),
+                Path.GetFileName(file) + " must not use the legacy unleased command pull.");
+        }
+    }
+
+    [TestMethod]
     public void CopilotConfirmation_DoesNotPreviewResumeCommands()
     {
         var root = FindRepoRoot();

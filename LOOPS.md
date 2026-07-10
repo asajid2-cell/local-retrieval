@@ -20,7 +20,7 @@
 | L2 shared launch identity | C# and muxd contend on the same alias claim files | cross-language claim compatibility tests | done `L2b_20260709`: app 306 passed, muxd claim/alias tests green |
 | L3 opaque relay protocol | relay never stores or receives commands/paths | real projection contract + relay tests | done `L3_20260709`: projection probe green; app 308 passed; relay 35 passed; muxd 55 passed |
 | L4 durable state | success requires flush/replace/read-back | injected-failure persistence tests | done `L4_20260709i`: app 320 passed / 2 skipped; relay 51 passed; muxd 75 passed / 3 VPS-only skipped |
-| L5 durable command delivery | lease/idempotency; no age loss | crash/restart/replay queue tests | pending |
+| L5 durable command delivery | lease/idempotency; no age loss | crash/restart/replay queue tests | done `L5_20260709`: app 329 passed / 2 skipped; relay 64 passed; muxd 80 passed / 3 skipped |
 | L6 canonical server launcher | archive identity and trusted args only | server route/launcher tests | pending |
 | L7 process containment | child writer exits with owner or remains blocked | Windows lifecycle integration test | pending |
 | L8 synthesis/deploy | all gates and runtime probes green | `tools/run_gates.ps1` plus install/deploy smoke | pending |
@@ -55,3 +55,40 @@
 - Relay boot reconciles upload tombstones and durable rename intents without blocking unrelated service startup. muxd persists lifecycle intent, loads the complete manifest before reconciliation, and only reaps a PID when its process-creation token proves custody.
 - Independent Claude and fresh Codex reviews found stale-PID reaping, partial-manifest deletion, committed-outcome downgrade, stale-primary recovery, and cross-store backup contamination. Each received a reproducing regression test before L4 acceptance. Lost relaunch acknowledgements remain explicitly queued for L5 idempotency; structural process containment remains L7.
 - The final relay review found a committed rename-intent write could leave memory stale and unnecessarily block later writes. Its fault-injected regression was mutation-proven red with the fix removed and green after restoration before final acceptance.
+- 2026-07-09 L5 contract: browser/API retries carry one opaque intent id; relay deduplicates
+  intent id + canonical payload, rejects key reuse with different payload, leases one command to
+  one consumer with a durable token/expiry/attempt, and requires that token for acknowledgement.
+  Pending and leased work is never age-pruned; only terminal outcomes may be retention-pruned.
+- L5 execution contract: both C# consumers use the lease API and propagate the command intent into
+  muxd. Create/relaunch is replay-safe through a durable muxd outcome ledger. PTY prompt insertion
+  is explicitly at-most-once: muxd durably records `dispatching` before writing and never repeats an
+  uncertain dispatch after restart, because PTY input and a file journal cannot commit atomically.
+- 2026-07-09 L5 verification gate is trusted. The accepted L4 implementation was observed red for
+  relay retry deduplication and missing lease endpoints, C# intent propagation failed to compile,
+  replayed muxd input executed twice, and replayed relaunch accepted conflicting payload/restarted.
+- L5 review hardening narrowed each serial C# consumer to one leased command, added a shared
+  replay-policy contract, retried fenced acknowledgements, and made undeclared future command
+  effects fail closed. Current effects are either refused, read-only, idempotent set operations,
+  or downstream intent-fenced.
+- Browser mutations use one shared durable intent journal. Network and retryable HTTP failures keep
+  the same intent across reloads and later user retries; terminal refusals clear it so corrected
+  work receives a fresh intent. Missing durable browser storage prevents the mutation from sending.
+- Relay terminal failures now return clearable `409` responses while only uncertain outcomes remain
+  retryable `5xx`. Leased work is not mistaken for terminal failure. Direct relaunch retries build
+  a stable muxd frame, queue health reports pending/leased work, and terminal command retention is
+  bounded without pruning live work.
+- muxd serializes create intents per session, lazily terminalizes abandoned `accepted` records, and
+  preserves explicit at-most-once uncertainty for PTY input. Terminal intent history is bounded;
+  `accepted` and `dispatching` records are never compacted.
+- Fresh Claude implementation review initially returned REFUTE with eight concrete failures. After
+  fixes, its second pass found one internal `startmux` policy propagation regression. Policy
+  derivation moved into the single enqueue authority and a cross-lane lease test was added. The
+  final independent verdict was ACCEPT.
+- Mutation evidence: removing relay lease-token comparison changed the expected stale-token `409`
+  to `200`; restoring it returned green. Replacing muxd cached create-outcome replay with an error
+  made the restart replay test fail; restoring it returned green. Full pre-gate suites: app
+  329 passed / 2 environment skips; relay 63 passed / 1 projection-artifact skip; muxd 80 passed /
+  3 VPS-only skips.
+- `L5_20260709`: unified runner green. App 329 passed / 2 environment skips; serialized projection
+  contract passed; relay 64 passed; muxd 80 passed / 3 VPS-only skips. Evidence:
+  `artifacts/reliability/L5_20260709`.
