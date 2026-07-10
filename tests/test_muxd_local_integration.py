@@ -468,6 +468,7 @@ class MuxdLocalIntegrationTests(unittest.TestCase):
     def test_replayed_input_intent_is_at_most_once(self):
         name = "it-idempotent-input"
         intent_id = f"input-{int(time.time() * 1000)}"
+        ready = f"MUXD_INPUT_READY_{int(time.time() * 1000)}"
         counter = self.muxd.root / "input-count.txt"
         quoted_counter = str(counter).replace("'", "''")
         command = f"Add-Content -LiteralPath '{quoted_counter}' -Value hit\r"
@@ -479,7 +480,12 @@ class MuxdLocalIntegrationTests(unittest.TestCase):
         }
         self.kill(name)
         try:
-            run_request(self.muxd.port, {"t": "create", "s": name}, timeout=12)
+            run_request(
+                self.muxd.port,
+                {"t": "create", "s": name, "cmd": f"Write-Output '{ready}'"},
+                timeout=12,
+            )
+            self.wait_for_tail(name, ready)
             first = run_request(self.muxd.port, payload, timeout=12)
             self.assertEqual("input-ok", first.get("t"))
             deadline = time.time() + 5

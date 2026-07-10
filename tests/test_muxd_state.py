@@ -96,6 +96,77 @@ class MuxdStateTests(unittest.TestCase):
         self.assertEqual(b"xyz", owner.scrollback())
         self.assertEqual("xyz", owner.tail_text())
 
+    def test_oversized_ring_chunk_keeps_the_newest_bounded_bytes(self):
+        payload = b"a" + (b"b" * muxd.RING_CAP)
+        session = muxd.Session(
+            "oversized-ring-session",
+            "",
+            tempfile.gettempdir(),
+            80,
+            24,
+            None,
+            None,
+            spawn_now=False,
+        )
+        owner = muxd.OwnerSession(
+            "oversized-ring-owner",
+            "",
+            tempfile.gettempdir(),
+            80,
+            24,
+            None,
+            None,
+            None,
+        )
+
+        session._append_ring(payload)
+        owner.ingest(payload)
+
+        self.assertEqual(muxd.RING_CAP, session.ring_len)
+        self.assertEqual(b"b" * muxd.RING_CAP, session.scrollback(muxd.RING_CAP))
+        self.assertEqual(muxd.RING_CAP, owner.ring_len)
+        self.assertEqual(b"b" * muxd.RING_CAP, owner.scrollback(muxd.RING_CAP))
+
+    def test_slow_local_viewer_queue_is_bounded_and_disconnected(self):
+        session = FakeSession()
+        local_queue = asyncio.Queue(maxsize=1)
+        local_queue.put_nowait(b"old")
+        session.local.add(local_queue)
+
+        muxd.fanout_local_output(session, b"new")
+
+        self.assertNotIn(local_queue, session.local)
+        self.assertIs(muxd.LOCAL_VIEWER_SLOW, local_queue.get_nowait())
+
+    def test_supervised_background_task_is_retained_and_restarted(self):
+        async def exercise():
+            registry = set()
+            restarted = asyncio.Event()
+            attempts = 0
+
+            async def worker():
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1:
+                    raise RuntimeError("injected task failure")
+                restarted.set()
+                await asyncio.Future()
+
+            task = muxd.start_supervised_background(
+                registry,
+                "test-worker",
+                worker,
+                restart_delay=0.01,
+            )
+            self.assertIn(task, registry)
+            await asyncio.wait_for(restarted.wait(), timeout=1)
+            self.assertEqual(2, attempts)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        asyncio.run(exercise())
+
     def test_intent_compaction_bounds_terminal_history_without_dropping_uncertain_work(self):
         now = 1_000_000.0
         records = {

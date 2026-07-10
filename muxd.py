@@ -882,6 +882,22 @@ class RelayOutQueue(asyncio.Queue):
         super().put_nowait(item)
         return True
 
+LOCAL_VIEWER_QUEUE_MAX = 4
+LOCAL_VIEWER_SLOW = object()
+
+def fanout_local_output(session, data):
+    for local_queue in list(session.local):
+        try:
+            local_queue.put_nowait(data)
+        except asyncio.QueueFull:
+            session.local.discard(local_queue)
+            try:
+                while True:
+                    local_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+            local_queue.put_nowait(LOCAL_VIEWER_SLOW)
+
 class AsyncRLock:
     def __init__(self):
         self._lock = asyncio.Lock()
@@ -933,6 +949,38 @@ async def run_state_transaction(lock, operation):
             except Exception as error:
                 log(f"state transaction failed after caller cancellation: {error}")
         raise
+
+async def supervise_background(name, factory, restart_delay=1.0):
+    while True:
+        try:
+            await factory()
+            log(f"[supervisor] {name} returned unexpectedly; restarting")
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            log(f"[supervisor] {name} failed: {type(error).__name__}: {error}; restarting")
+        await asyncio.sleep(max(0.01, restart_delay))
+
+def start_supervised_background(registry, name, factory, restart_delay=1.0):
+    task = asyncio.create_task(
+        supervise_background(name, factory, restart_delay=restart_delay),
+        name=f"muxd-{name}",
+    )
+    registry.add(task)
+
+    def completed(done):
+        registry.discard(done)
+        if done.cancelled():
+            return
+        try:
+            error = done.exception()
+        except asyncio.CancelledError:
+            return
+        if error is not None:
+            log(f"[supervisor] {name} supervisor exited: {type(error).__name__}: {error}")
+
+    task.add_done_callback(completed)
+    return task
 
 def watch_snapshot():
     with WATCH_LOCK:
@@ -1044,6 +1092,13 @@ class Session:
 
     def _append_ring(self, data):
         with self._ring_lock:
+            if len(data) >= RING_CAP:
+                retained = data[-RING_CAP:]
+                self.ring.clear()
+                self.ring.append(retained)
+                self.ring_len = len(retained)
+                self.last_out = time.time()
+                return
             self.ring.append(data)
             self.ring_len += len(data)
             self.last_out = time.time()
@@ -1262,6 +1317,13 @@ class OwnerSession:
 
     def _append_ring(self, data):
         with self._ring_lock:
+            if len(data) >= RING_CAP:
+                retained = data[-RING_CAP:]
+                self.ring.clear()
+                self.ring.append(retained)
+                self.ring_len = len(retained)
+                self.last_out = time.time()
+                return
             self.ring.append(data)
             self.ring_len += len(data)
             self.last_out = time.time()
@@ -1829,6 +1891,7 @@ async def main():
     intent_locks = {}
     create_intent_locks = {}
     state_lock = AsyncRLock()
+    background_tasks = set()
 
     def state_mutation(func):
         async def serialized(*args, **kwargs):
@@ -2707,7 +2770,7 @@ async def main():
             if lag >= LOOP_WATCHDOG_WARN and now - last_warn >= 30:
                 last_warn = now
                 log(f"[watchdog] event loop lag {lag:.3f}s")
-    asyncio.create_task(loop_monitor())
+    start_supervised_background(background_tasks, "loop-monitor", loop_monitor)
 
     async def reap_unresolved_processes(restored):
         pids = set()
@@ -2871,7 +2934,7 @@ async def main():
                         log(f"[heal] SKIP respawn of {s.name}: {detail}")
                     elif created:
                         log(f"[heal] {s.name} shell died -> respawned + resume queued")
-    asyncio.create_task(self_heal_tick())
+    start_supervised_background(background_tasks, "self-heal", self_heal_tick)
 
     async def flush_out():
         # coalesce each session's output into ONE ws frame per ~12ms tick — far fewer frames/less b64+JSON
@@ -2882,10 +2945,8 @@ async def main():
                 chunk = s.drain()
                 if chunk:
                     outq.put_nowait(("o", s.name, chunk))
-                    for lq in list(s.local):
-                        try: lq.put_nowait(chunk)
-                        except Exception: pass
-    asyncio.create_task(flush_out())
+                    fanout_local_output(s, chunk)
+    start_supervised_background(background_tasks, "output-flush", flush_out)
 
     # ---- LOCAL attach server (muxctl): loopback-only, no token — a raw console client streams a session
     # exactly like a web viewer, so you get `tmux attach`-style parity from a Windows Terminal on the PC.
@@ -3026,15 +3087,21 @@ async def main():
                     s, err, _created = await ensure_local_session(first, False)
                 if err:
                     await ws.send(json.dumps({"t": "err", "m": err})); return
-                lq = asyncio.Queue(); s.local.add(lq)
+                lq = asyncio.Queue(maxsize=LOCAL_VIEWER_QUEUE_MAX); s.local.add(lq)
                 if first.get("cols"): s.resize(int(first.get("cols")), int(first.get("rows") or 40))
                 try:
                     sb_limit = int(first.get("sb") if first.get("sb") is not None else LOCAL_SB_SEND)
                     if sb_limit > 0:
-                        await ws.send(s.scrollback(sb_limit))
+                        scrollback = await asyncio.get_running_loop().run_in_executor(
+                            None, lambda: s.scrollback(sb_limit)
+                        )
+                        await ws.send(scrollback)
                     async def pump():
                         while True:
                             data = await lq.get()
+                            if data is LOCAL_VIEWER_SLOW:
+                                await ws.close(code=1013, reason="local viewer is not draining output")
+                                return
                             await ws.send(data)
                     pt = asyncio.create_task(pump())
                     try:
@@ -3048,6 +3115,8 @@ async def main():
                     finally: pt.cancel()
                 finally:
                     s.local.discard(lq)
+            except _ws.exceptions.ConnectionClosedOK:
+                pass
             except Exception as e:
                 failed = True
                 log(f"[local] {req_t} handler failed for {peer}: {type(e).__name__}: {e}")
@@ -3077,7 +3146,7 @@ async def main():
             except Exception as e:
                 log(f"local attach server failed on :{LOCAL_PORT}: {e}; retrying in 3s")
                 await asyncio.sleep(3)
-    asyncio.create_task(local_serve())
+    start_supervised_background(background_tasks, "local-server", local_serve)
 
     import websockets
     backoff = 1
@@ -3205,8 +3274,15 @@ async def main():
                                 else:
                                     s.resize(m.get("cols", 140), m.get("rows", 40))
                             elif t == "sb" and name in sessions:
-                                await ws.send(json.dumps({"t": "sb", "s": name,
-                                                          "d": base64.b64encode(sessions[name].scrollback(m.get("max", SB_SEND))).decode()}))
+                                session = sessions[name]
+                                scrollback_limit = m.get("max", SB_SEND)
+                                encoded = await asyncio.get_running_loop().run_in_executor(
+                                    None,
+                                    lambda current=session, limit=scrollback_limit: base64.b64encode(
+                                        current.scrollback(limit)
+                                    ).decode(),
+                                )
+                                await ws.send(json.dumps({"t": "sb", "s": name, "d": encoded}))
                             elif t == "rename" and name in sessions:
                                 to = strict_mux_name(m.get("to", ""))
                                 if to and to not in sessions:
@@ -3221,8 +3297,16 @@ async def main():
                                         continue
                                     await ws.send(json.dumps({"t": "sessions", "list": sess_list()}))
                             elif t == "tail" and name in sessions:
-                                await ws.send(json.dumps({"t": "tailr", "rid": m.get("rid", ""),
-                                                          "text": sessions[name].tail_text(nbytes=200000, lines=int(m.get("lines") or 40))}))
+                                session = sessions[name]
+                                lines = int(m.get("lines") or 40)
+                                tail = await asyncio.get_running_loop().run_in_executor(
+                                    None,
+                                    lambda current=session, count=lines: current.tail_text(
+                                        nbytes=200000,
+                                        lines=count,
+                                    ),
+                                )
+                                await ws.send(json.dumps({"t": "tailr", "rid": m.get("rid", ""), "text": tail}))
                             elif t == "kill" and name in sessions:
                                 ok, detail = await remove_session(name, by_user=True)
                                 if not ok:
