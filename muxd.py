@@ -325,7 +325,7 @@ def _terminate_pid_tree(pid, timeout=12):
     return True, "process exited"
 
 def _release_pty_resources(pty):
-    """Close pywinpty transport/server handles after the child is confirmed gone."""
+    """Close pywinpty transport and release the native pseudoconsole handle."""
     if pty is None:
         return
     for attribute in ("fileobj", "_server"):
@@ -339,6 +339,8 @@ def _release_pty_resources(pty):
     try:
         pty.fd = -1
         pty.closed = True
+        pty._thread = None
+        pty.pty = None
     except Exception:
         pass
 
