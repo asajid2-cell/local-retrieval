@@ -1,5 +1,6 @@
 import importlib
 import asyncio
+import collections
 import json
 import os
 import queue
@@ -37,6 +38,64 @@ class FakeSession:
 
 
 class MuxdStateTests(unittest.TestCase):
+    def test_session_rings_hold_one_lock_for_mutation_and_snapshot_reads(self):
+        class GuardedDeque(collections.deque):
+            def __init__(self, lock, values=()):
+                self.lock = lock
+                super().__init__(values)
+
+            def check(self):
+                if not self.lock._is_owned():
+                    raise AssertionError("session ring accessed without owning its lock")
+
+            def append(self, value):
+                self.check()
+                return super().append(value)
+
+            def popleft(self):
+                self.check()
+                return super().popleft()
+
+            def __iter__(self):
+                self.check()
+                return super().__iter__()
+
+            def __reversed__(self):
+                self.check()
+                return super().__reversed__()
+
+        session = muxd.Session(
+            "ring-lock-session",
+            "",
+            tempfile.gettempdir(),
+            80,
+            24,
+            None,
+            None,
+            spawn_now=False,
+        )
+        session.ring = GuardedDeque(session._ring_lock, [b"a", b"b"])
+        session.ring_len = 2
+        session._append_ring(b"c")
+        self.assertEqual(b"abc", session.scrollback())
+        self.assertEqual("abc", session.tail_text())
+
+        owner = muxd.OwnerSession(
+            "ring-lock-owner",
+            "",
+            tempfile.gettempdir(),
+            80,
+            24,
+            None,
+            None,
+            None,
+        )
+        owner.ring = GuardedDeque(owner._ring_lock, [b"x", b"y"])
+        owner.ring_len = 2
+        owner.ingest(b"z")
+        self.assertEqual(b"xyz", owner.scrollback())
+        self.assertEqual("xyz", owner.tail_text())
+
     def test_intent_compaction_bounds_terminal_history_without_dropping_uncertain_work(self):
         now = 1_000_000.0
         records = {

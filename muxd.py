@@ -969,6 +969,7 @@ class Session:
         self.cols, self.rows = max(20, cols or 140), max(8, rows or 40)
         self.created = time.time(); self.last_out = time.time()
         self.ring = collections.deque(); self.ring_len = 0
+        self._ring_lock = threading.RLock()
         self.dead = False; self.user_killed = False
         self.deaths = []
         self.loop, self.outq = loop, outq
@@ -1029,9 +1030,7 @@ class Session:
             if not data: continue
             if pty is not self.pty: return          # superseded by a respawn
             b = data.encode("utf-8", "replace")
-            self.ring.append(b); self.ring_len += len(b); self.last_out = time.time()
-            while self.ring_len > RING_CAP:
-                old = self.ring.popleft(); self.ring_len -= len(old)
+            self._append_ring(b)
             with self.plock:                           # coalesced; the pump flushes on a ~12ms timer
                 self.pending += b                       # backpressure: if a flood outruns a slow link, keep the
                 if len(self.pending) > 512_000:         # last ~512KB unsent (the ring still holds history for reattach)
@@ -1042,6 +1041,19 @@ class Session:
         with self.plock:
             chunk = bytes(self.pending); self.pending = bytearray()
         return chunk
+
+    def _append_ring(self, data):
+        with self._ring_lock:
+            self.ring.append(data)
+            self.ring_len += len(data)
+            self.last_out = time.time()
+            while self.ring_len > RING_CAP:
+                old = self.ring.popleft()
+                self.ring_len -= len(old)
+
+    def _ring_snapshot(self):
+        with self._ring_lock:
+            return tuple(self.ring)
 
     def _ensure_writer_locked(self):
         if (
@@ -1166,14 +1178,14 @@ class Session:
         try: limit = max(0, min(RING_CAP, int(limit)))
         except Exception: limit = SB_SEND
         out, n = [], 0
-        for b in reversed(self.ring):
+        for b in reversed(self._ring_snapshot()):
             out.append(b); n += len(b)
             if n >= limit: break
         return b"".join(reversed(out))
 
     def tail_text(self, nbytes=1600, lines=0):
         raw = bytearray()
-        for b in reversed(self.ring):
+        for b in reversed(self._ring_snapshot()):
             raw[:0] = b
             if len(raw) >= nbytes: break
         s = clean_terminal_text(bytes(raw[-nbytes:]).decode("utf-8", "replace"))
@@ -1211,6 +1223,7 @@ class OwnerSession:
         self.cols, self.rows = max(20, int(cols or 140)), max(8, int(rows or 40))
         self.created = time.time(); self.last_out = time.time()
         self.ring = collections.deque(); self.ring_len = 0
+        self._ring_lock = threading.RLock()
         self.dead = False; self.user_killed = False
         self.deaths = []
         self.loop, self.outq = loop, outq
@@ -1235,9 +1248,7 @@ class OwnerSession:
 
     def ingest(self, data: bytes):
         if not data: return
-        self.ring.append(data); self.ring_len += len(data); self.last_out = time.time()
-        while self.ring_len > RING_CAP:
-            old = self.ring.popleft(); self.ring_len -= len(old)
+        self._append_ring(data)
         with self.plock:
             self.pending += data
             if len(self.pending) > 512_000:
@@ -1248,6 +1259,19 @@ class OwnerSession:
         with self.plock:
             chunk = bytes(self.pending); self.pending = bytearray()
         return chunk
+
+    def _append_ring(self, data):
+        with self._ring_lock:
+            self.ring.append(data)
+            self.ring_len += len(data)
+            self.last_out = time.time()
+            while self.ring_len > RING_CAP:
+                old = self.ring.popleft()
+                self.ring_len -= len(old)
+
+    def _ring_snapshot(self):
+        with self._ring_lock:
+            return tuple(self.ring)
 
     def _send_owner(self, obj):
         try:
@@ -1284,14 +1308,14 @@ class OwnerSession:
         try: limit = max(0, min(RING_CAP, int(limit)))
         except Exception: limit = SB_SEND
         out, n = [], 0
-        for b in reversed(self.ring):
+        for b in reversed(self._ring_snapshot()):
             out.append(b); n += len(b)
             if n >= limit: break
         return b"".join(reversed(out))
 
     def tail_text(self, nbytes=1600, lines=0):
         raw = bytearray()
-        for b in reversed(self.ring):
+        for b in reversed(self._ring_snapshot()):
             raw[:0] = b
             if len(raw) >= nbytes: break
         s = clean_terminal_text(bytes(raw[-nbytes:]).decode("utf-8", "replace"))
