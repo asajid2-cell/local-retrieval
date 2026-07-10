@@ -2871,6 +2871,13 @@ async def main():
             return await coordinate_session_request(first, spawn_if_missing)
 
         async def handler(ws):
+            headers = getattr(ws, "request_headers", None)
+            if headers is None:
+                headers = getattr(getattr(ws, "request", None), "headers", None)
+            if headers is not None and headers.get("Origin"):
+                log("[local] rejected browser-origin websocket")
+                await ws.close(code=1008, reason="browser origins are not allowed")
+                return
             peer = str(getattr(ws, "remote_address", ""))
             started = time.perf_counter()
             req_t = "?"

@@ -42,6 +42,24 @@ def run_request(port, payload, timeout=8):
     return asyncio.run(request_json(port, payload, timeout=timeout))
 
 
+async def browser_origin_close_code(port, timeout=8):
+    try:
+        async with websockets.connect(
+            f"ws://127.0.0.1:{port}",
+            origin="https://untrusted.example",
+            open_timeout=timeout,
+            close_timeout=1,
+            ping_interval=None,
+        ) as ws:
+            await asyncio.wait_for(ws.send(json.dumps({"t": "info"})), timeout)
+            await asyncio.wait_for(ws.recv(), timeout)
+    except websockets.exceptions.ConnectionClosed as exc:
+        if exc.rcvd is not None:
+            return exc.rcvd.code
+        return exc.sent.code if exc.sent is not None else None
+    raise AssertionError("browser-origin websocket was allowed to use the local muxd protocol")
+
+
 async def attach_and_roundtrip(port, name, command, marker, timeout=12):
     async with websockets.connect(f"ws://127.0.0.1:{port}", open_timeout=timeout, close_timeout=1, ping_interval=None) as ws:
         await asyncio.wait_for(ws.send(json.dumps({"t": "attach", "s": name, "cols": 100, "rows": 28, "sb": 0})), timeout)
@@ -262,6 +280,11 @@ class MuxdLocalIntegrationTests(unittest.TestCase):
             run_request(self.muxd.port, {"t": "kill", "s": name}, timeout=4)
         except Exception:
             pass
+
+    def test_local_control_rejects_browser_origin_before_first_frame(self):
+        self.assertEqual(1008, asyncio.run(browser_origin_close_code(self.muxd.port)))
+        info = run_request(self.muxd.port, {"t": "info"})
+        self.assertEqual("info", info.get("t"))
 
     def test_shell_only_session_relaunches_when_command_arrives(self):
         name = "it-shell-relaunch"
