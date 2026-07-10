@@ -44,7 +44,7 @@ class MuxdStateTests(unittest.TestCase):
                 stream.write(original)
 
             for failed_stage in ("before_write", "before_file_fsync", "before_replace"):
-                def fault(stage, expected=failed_stage):
+                def fault(stage, _path, expected=failed_stage):
                     if stage == expected:
                         raise OSError("injected " + stage)
 
@@ -60,18 +60,17 @@ class MuxdStateTests(unittest.TestCase):
             with open(path, "w", encoding="utf-8") as stream:
                 json.dump({"version": 1}, stream)
 
-            def fail_directory_fsync(stage):
+            def fail_directory_fsync(stage, _path):
                 if stage == "before_directory_fsync":
                     raise OSError("injected directory fsync")
 
-            with self.assertRaisesRegex(OSError, "injected directory fsync"):
-                muxd.durable_json_write(path, {"version": 2}, fault=fail_directory_fsync)
+            muxd.durable_json_write(path, {"version": 2}, fault=fail_directory_fsync)
             with open(path, encoding="utf-8") as stream:
                 self.assertEqual({"version": 2}, json.load(stream))
             with open(path + ".bak", encoding="utf-8") as stream:
                 self.assertEqual({"version": 1}, json.load(stream))
 
-            def corrupt_readback(stage):
+            def corrupt_readback(stage, _path):
                 if stage == "before_readback":
                     with open(path, "w", encoding="utf-8") as stream:
                         json.dump({"version": 999}, stream)
@@ -93,11 +92,114 @@ class MuxdStateTests(unittest.TestCase):
             with open(path, encoding="utf-8") as stream:
                 self.assertEqual({"version": 7}, json.load(stream))
 
+    def test_durable_json_load_restores_semantically_invalid_primary(self):
+        with tempfile.TemporaryDirectory(prefix="muxd-durable-") as root:
+            path = os.path.join(root, "state.json")
+            with open(path, "w", encoding="utf-8") as stream:
+                json.dump([], stream)
+            with open(path + ".bak", "w", encoding="utf-8") as stream:
+                json.dump({"valid": {"cmd": "", "cwd": "", "cols": 100, "rows": 30, "heal": False}}, stream)
+
+            loaded = muxd.durable_json_load(path, {}, validate=muxd.valid_manifest)
+
+            self.assertIn("valid", loaded)
+            with open(path, encoding="utf-8") as stream:
+                self.assertEqual(loaded, json.load(stream))
+
+    def test_backup_commit_error_never_claims_primary_candidate_committed(self):
+        with tempfile.TemporaryDirectory(prefix="muxd-durable-") as root:
+            path = os.path.join(root, "state.json")
+            with open(path, "w", encoding="utf-8") as stream:
+                json.dump({"version": 1}, stream)
+
+            def fail_backup(stage, _path):
+                if stage == "before_directory_fsync":
+                    raise OSError("backup durability uncertain")
+
+            with self.assertRaisesRegex(OSError, "backup durability uncertain") as raised:
+                muxd.durable_json_write(path, {"version": 2}, backup_fault=fail_backup)
+
+            self.assertFalse(getattr(raised.exception, "committed", True))
+            self.assertFalse(getattr(raised.exception, "primary_committed", True))
+            with open(path, encoding="utf-8") as stream:
+                self.assertEqual({"version": 1}, json.load(stream))
+
+    def test_post_replace_verification_read_failure_never_rolls_primary_backward(self):
+        with tempfile.TemporaryDirectory(prefix="muxd-durable-") as root:
+            path = os.path.join(root, "state.json")
+            with open(path, "w", encoding="utf-8") as stream:
+                json.dump({"version": 1}, stream)
+
+            original_open = open
+            primary_reads = 0
+
+            def failing_open(target, mode="r", *args, **kwargs):
+                nonlocal primary_reads
+                if target == path and "r" in mode:
+                    primary_reads += 1
+                    if primary_reads > 1:
+                        raise OSError("verification read unavailable")
+                return original_open(target, mode, *args, **kwargs)
+
+            old_open = muxd.open if hasattr(muxd, "open") else None
+            try:
+                muxd.open = failing_open
+                with self.assertRaises(OSError) as raised:
+                    muxd.durable_json_write(path, {"version": 2})
+            finally:
+                if old_open is None:
+                    delattr(muxd, "open")
+                else:
+                    muxd.open = old_open
+
+            self.assertTrue(getattr(raised.exception, "unknown", False))
+            self.assertFalse(getattr(raised.exception, "recovered", False))
+            with open(path, encoding="utf-8") as stream:
+                self.assertEqual({"version": 2}, json.load(stream))
+            with open(path + ".bak", encoding="utf-8") as stream:
+                self.assertEqual({"version": 1}, json.load(stream))
+
+    def test_retry_failure_preserves_already_confirmed_committed_generation(self):
+        with tempfile.TemporaryDirectory(prefix="muxd-durable-") as root:
+            path = os.path.join(root, "state.json")
+            with open(path, "w", encoding="utf-8") as stream:
+                json.dump({"version": 1}, stream)
+
+            def fail_initial(stage, _path):
+                if stage == "before_directory_fsync":
+                    raise OSError("initial durability uncertainty")
+
+            def fail_retry(stage, _path):
+                if stage == "before_write":
+                    raise OSError("retry unavailable")
+
+            with self.assertRaisesRegex(OSError, "retry unavailable") as raised:
+                muxd.durable_json_write(
+                    path,
+                    {"version": 2},
+                    fault=fail_initial,
+                    retry_fault=fail_retry,
+                )
+
+            self.assertTrue(getattr(raised.exception, "committed", False))
+            self.assertFalse(getattr(raised.exception, "mismatch", True))
+            self.assertFalse(getattr(raised.exception, "unknown", True))
+            with open(path, encoding="utf-8") as stream:
+                self.assertEqual({"version": 2}, json.load(stream))
+
     def test_launch_claim_filename_matches_csharp_contract(self):
         self.assertEqual(
             "Parent-ID_123-76d41cbf4b150c76.claim.json",
             muxd.claim_file_name("Parent-ID_123"),
         )
+
+    def test_process_start_token_fences_pid_reuse(self):
+        token = muxd._process_start_token(os.getpid())
+
+        self.assertTrue(token)
+        self.assertTrue(muxd._same_process_instance(os.getpid(), token))
+        self.assertFalse(muxd._same_process_instance(os.getpid(), token + "-stale"))
+        self.assertFalse(muxd._same_process_instance(os.getpid(), ""))
 
     def test_launch_claim_ids_reject_non_ascii_aliases(self):
         self.assertEqual(
@@ -149,6 +251,11 @@ class MuxdStateTests(unittest.TestCase):
                 self.owner = True
                 self.owner_key = "k" * 32
                 self.identity_pending = True
+                self.lifecycle = "stopping"
+                self.child_pid = 4321
+                self.child_start_token = "0000000000001234"
+                self.stop_disposition = "replace"
+                self.user_killed = True
                 self.deaths = [100.0, 200.0]
 
         old_manifest = muxd.MANIFEST
@@ -169,6 +276,11 @@ class MuxdStateTests(unittest.TestCase):
                 self.assertTrue(data["manifest-aliases"]["owner"])
                 self.assertEqual("k" * 32, data["manifest-aliases"]["ownerKey"])
                 self.assertTrue(data["manifest-aliases"]["identityPending"])
+                self.assertEqual("stopping", data["manifest-aliases"]["lifecycle"])
+                self.assertEqual(4321, data["manifest-aliases"]["childPid"])
+                self.assertEqual("0000000000001234", data["manifest-aliases"]["childStartToken"])
+                self.assertEqual("replace", data["manifest-aliases"]["stopDisposition"])
+                self.assertTrue(data["manifest-aliases"]["userKilled"])
                 self.assertEqual([100.0, 200.0], data["manifest-aliases"]["deaths"])
             finally:
                 muxd.MANIFEST = old_manifest

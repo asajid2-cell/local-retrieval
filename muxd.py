@@ -32,9 +32,9 @@ LIVE_TABS = os.path.join(DIR, "live-tabs.json")
 
 _DURABLE_TEMP_SEQUENCE = 0
 
-def _durable_checkpoint(fault, stage):
+def _durable_checkpoint(fault, stage, path):
     if fault is not None:
-        fault(stage)
+        fault(stage, path)
     fault_file = os.environ.get("MUXD_TEST_PERSIST_FAULT_FILE", "")
     if not fault_file or not os.path.exists(fault_file):
         return
@@ -46,13 +46,22 @@ def _durable_checkpoint(fault, stage):
     if (
         isinstance(requested, dict)
         and requested.get("stage") == stage
-        and (not requested.get("file") or requested.get("file") == os.path.basename(MANIFEST))
+        and (not requested.get("file") or requested.get("file") == os.path.basename(path))
     ):
+        remaining = int(requested.get("after", 0) or 0)
+        if remaining > 0:
+            requested["after"] = remaining - 1
+            try:
+                with open(fault_file, "w", encoding="utf-8") as stream:
+                    json.dump(requested, stream)
+            except OSError:
+                pass
+            return
         try:
             os.remove(fault_file)
         except OSError:
             pass
-        raise OSError(f"injected persistence failure at {stage} for {os.path.basename(MANIFEST)}")
+        raise OSError(f"injected persistence failure at {stage} for {os.path.basename(path)}")
 
 def _replace_write_through(source, destination):
     if os.name != "nt":
@@ -81,34 +90,98 @@ def _durable_commit_bytes(path, payload, fault=None):
     os.makedirs(directory, exist_ok=True)
     _DURABLE_TEMP_SEQUENCE += 1
     tmp = f"{path}.{os.getpid()}.{_DURABLE_TEMP_SEQUENCE}.tmp"
+    replaced = False
     try:
-        _durable_checkpoint(fault, "before_write")
+        _durable_checkpoint(fault, "before_write", path)
         with open(tmp, "xb", buffering=0) as stream:
             stream.write(payload)
-            _durable_checkpoint(fault, "before_file_fsync")
+            _durable_checkpoint(fault, "before_file_fsync", path)
             os.fsync(stream.fileno())
-        _durable_checkpoint(fault, "before_replace")
+        _durable_checkpoint(fault, "before_replace", path)
         _replace_write_through(tmp, path)
-        _durable_checkpoint(fault, "before_directory_fsync")
+        replaced = True
+        _durable_checkpoint(fault, "before_directory_fsync", path)
         _fsync_directory(directory)
-        _durable_checkpoint(fault, "before_readback")
+        _durable_checkpoint(fault, "before_readback", path)
         with open(path, "rb") as stream:
             committed = stream.read()
         if committed != payload:
             raise OSError("committed state did not read back identically: " + path)
+    except Exception as exc:
+        exc.target = path
+        exc.replaced = replaced
+        exc.committed = False
+        exc.mismatch = False
+        exc.unknown = False
+        if replaced:
+            try:
+                with open(path, "rb") as stream:
+                    actual = stream.read()
+                exc.committed = actual == payload
+                exc.mismatch = not exc.committed
+            except OSError as verification_error:
+                exc.unknown = True
+                exc.verification_error = verification_error
+        raise exc
     finally:
         try:
             os.remove(tmp)
         except FileNotFoundError:
             pass
 
-def durable_json_write(path, value, fault=None):
+def _compare_durable_bytes(path, expected):
+    try:
+        with open(path, "rb") as stream:
+            return "match" if stream.read() == expected else "mismatch"
+    except OSError:
+        return "unknown"
+
+def durable_json_write(path, value, fault=None, backup_fault=None, retry_fault=None):
     payload = json.dumps(value, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     if os.path.exists(path):
         with open(path, "rb") as stream:
             previous = stream.read()
-        _durable_commit_bytes(path + ".bak", previous)
-    _durable_commit_bytes(path, payload, fault=fault)
+        try:
+            _durable_commit_bytes(path + ".bak", previous, fault=backup_fault)
+        except Exception as exc:
+            exc.primary_committed = False
+            exc.committed = False
+            raise
+    try:
+        _durable_commit_bytes(path, payload, fault=fault)
+    except Exception as exc:
+        if getattr(exc, "committed", False):
+            try:
+                _durable_commit_bytes(path, payload, fault=retry_fault)
+                return
+            except Exception as retry_error:
+                retry_error.first_error = exc
+                comparison = _compare_durable_bytes(path, payload)
+                retry_error.committed = comparison == "match"
+                retry_error.mismatch = comparison == "mismatch"
+                retry_error.unknown = comparison == "unknown"
+                exc = retry_error
+        if getattr(exc, "unknown", False):
+            try:
+                with open(path, "rb") as stream:
+                    actual = stream.read()
+                if actual == payload:
+                    _durable_commit_bytes(path, payload)
+                    return
+                exc.unknown = False
+                exc.mismatch = True
+            except OSError as verification_error:
+                exc.verification_error = verification_error
+        backup = path + ".bak"
+        if getattr(exc, "replaced", False) and getattr(exc, "mismatch", False) and os.path.exists(backup):
+            try:
+                with open(backup, "rb") as stream:
+                    _durable_commit_bytes(path, stream.read())
+                exc.recovered = True
+                exc.committed = False
+            except Exception as recovery_error:
+                exc.recovery_error = recovery_error
+        raise exc
 
 def _decode_persisted_json(path, payload):
     try:
@@ -116,25 +189,31 @@ def _decode_persisted_json(path, payload):
     except Exception as exc:
         raise OSError("invalid persisted JSON: " + path) from exc
 
-def durable_json_load(path, fallback):
+def _validated_persisted_json(path, payload, validate):
+    value = _decode_persisted_json(path, payload)
+    if validate is not None and not validate(value):
+        raise OSError("invalid persisted state shape: " + path)
+    return value
+
+def durable_json_load(path, fallback, validate=None):
     if os.path.exists(path):
         try:
             with open(path, "rb") as stream:
-                return _decode_persisted_json(path, stream.read())
+                return _validated_persisted_json(path, stream.read(), validate)
         except OSError as primary_error:
             backup = path + ".bak"
             if not os.path.exists(backup):
                 raise primary_error
             with open(backup, "rb") as stream:
                 backup_payload = stream.read()
-            restored = _decode_persisted_json(backup, backup_payload)
+            restored = _validated_persisted_json(backup, backup_payload, validate)
             _durable_commit_bytes(path, backup_payload)
             return restored
     backup = path + ".bak"
     if os.path.exists(backup):
         with open(backup, "rb") as stream:
             backup_payload = stream.read()
-        restored = _decode_persisted_json(backup, backup_payload)
+        restored = _validated_persisted_json(backup, backup_payload, validate)
         _durable_commit_bytes(path, backup_payload)
         return restored
     return fallback
@@ -164,6 +243,81 @@ def _pid_alive(pid):
         return code.value == 259                   # STILL_ACTIVE
     except Exception:
         return False
+
+def _process_start_token(pid):
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return ""
+    if pid <= 0 or os.name != "nt":
+        return ""
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        open_process = kernel32.OpenProcess
+        open_process.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        open_process.restype = wintypes.HANDLE
+        get_process_times = kernel32.GetProcessTimes
+        get_process_times.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+        ]
+        get_process_times.restype = wintypes.BOOL
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = [wintypes.HANDLE]
+        close_handle.restype = wintypes.BOOL
+        handle = open_process(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return ""
+        try:
+            created = wintypes.FILETIME()
+            exited = wintypes.FILETIME()
+            kernel = wintypes.FILETIME()
+            user = wintypes.FILETIME()
+            if not get_process_times(
+                handle,
+                ctypes.byref(created),
+                ctypes.byref(exited),
+                ctypes.byref(kernel),
+                ctypes.byref(user),
+            ):
+                return ""
+            value = (int(created.dwHighDateTime) << 32) | int(created.dwLowDateTime)
+            return f"{value:016x}"
+        finally:
+            close_handle(handle)
+    except Exception:
+        return ""
+
+def _same_process_instance(pid, expected_start_token):
+    expected = str(expected_start_token or "")
+    return bool(expected) and _pid_alive(pid) and _process_start_token(pid) == expected
+
+def _terminate_pid_tree(pid, timeout=12):
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return True, "no process recorded"
+    if pid <= 0 or not _pid_alive(pid):
+        return True, "process already exited"
+    try:
+        subprocess.run(
+            ["taskkill.exe", "/PID", str(pid), "/T", "/F"],
+            timeout=max(2, int(timeout)),
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        pass
+    deadline = time.monotonic() + max(0.1, timeout)
+    while _pid_alive(pid) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    if _pid_alive(pid):
+        return False, f"process {pid} is still alive after termination"
+    return True, "process exited"
 
 def _parse_resume_id(cmd):
     cmd = cmd or ""
@@ -746,6 +900,10 @@ class Session:
         self.expected_owner = False
         self.owner_key = ""
         self.identity_pending = False
+        self.lifecycle = "active" if spawn_now else "dormant"
+        self.child_pid = 0
+        self.child_start_token = ""
+        self.stop_disposition = ""
         self.heal = bool(heal)          # opt-in: ONLY healed (user-armed) sessions auto-start at boot / auto-respawn
         self.cols, self.rows = max(20, cols or 140), max(8, rows or 40)
         self.created = time.time(); self.last_out = time.time()
@@ -762,6 +920,7 @@ class Session:
         else: self.dead = True          # placeholder tab: NOTHING runs until the user attaches (revive) or arms it
 
     def spawn(self):
+        self.lifecycle = "starting"
         cmdline = "powershell.exe -NoLogo"
         direct_cmd = False
         if self.cmd:
@@ -778,6 +937,9 @@ class Session:
             self.pty = PtyProcess.spawn("powershell.exe -NoLogo", dimensions=(self.rows, self.cols), cwd=self.cwd)
             direct_cmd = False
         self.dead = False
+        self.child_pid = int(getattr(self.pty, "pid", 0) or 0)
+        self.child_start_token = _process_start_token(self.child_pid)
+        self.lifecycle = "active"
         t = threading.Thread(target=self._reader, args=(self.pty,), daemon=True); t.start()
         if self.cmd and not direct_cmd:
             threading.Timer(0.8, self._type_cmd, args=(self.pty,)).start()
@@ -934,6 +1096,10 @@ class OwnerSession:
         self.expected_owner = True
         self.owner_key = str(owner_key or "")
         self.identity_pending = False
+        self.lifecycle = "active"
+        self.child_pid = 0
+        self.child_start_token = ""
+        self.stop_disposition = ""
         self.owner_exit_confirmed = False
         self.input_waiters = {}
         self.input_seq = 0
@@ -1077,15 +1243,38 @@ def manifest_payload(source=None):
             "owner": bool(getattr(s, "owner", False) or getattr(s, "expected_owner", False)),
             "ownerKey": str(getattr(s, "owner_key", "") or ""),
             "identityPending": bool(getattr(s, "identity_pending", False)),
+            "lifecycle": str(getattr(s, "lifecycle", "active") or "active"),
+            "childPid": int(getattr(s, "child_pid", 0) or 0),
+            "childStartToken": str(getattr(s, "child_start_token", "") or ""),
+            "stopDisposition": str(getattr(s, "stop_disposition", "") or ""),
+            "userKilled": bool(getattr(s, "user_killed", False)),
             "deaths": [float(value) for value in list(getattr(s, "deaths", []) or [])[-16:]]}
-        for n, s in source.items() if not s.user_killed
+        for n, s in source.items()
     }
 
 def manifest_save(source=None):
     durable_json_write(MANIFEST, manifest_payload(source))
 
+def valid_manifest(value):
+    if not isinstance(value, dict):
+        return False
+    required = ("cmd", "cwd", "cols", "rows", "heal")
+    lifecycles = {"active", "dormant", "starting", "stopping", "failed"}
+    stop_dispositions = {"", "remove", "replace"}
+    return all(
+        strict_mux_name(name)
+        and isinstance(record, dict)
+        and all(field in record for field in required)
+        and str(record.get("lifecycle", "active") or "active") in lifecycles
+        and isinstance(record.get("childPid", 0), int)
+        and isinstance(record.get("childStartToken", ""), str)
+        and str(record.get("stopDisposition", "") or "") in stop_dispositions
+        and isinstance(record.get("userKilled", False), bool)
+        for name, record in value.items()
+    )
+
 def manifest_load():
-    return durable_json_load(MANIFEST, {})
+    return durable_json_load(MANIFEST, {}, validate=valid_manifest)
 
 _PERSISTED_SESSION_FIELDS = (
     "cmd",
@@ -1100,6 +1289,10 @@ _PERSISTED_SESSION_FIELDS = (
     "expected_owner",
     "owner_key",
     "identity_pending",
+    "lifecycle",
+    "child_pid",
+    "child_start_token",
+    "stop_disposition",
     "deaths",
     "user_killed",
 )
@@ -1268,6 +1461,7 @@ def session_payload(name, sess):
             "sessionId": getattr(sess, "session_id", "") or "",
             "aliases": list(getattr(sess, "aliases", []) or []),
             "identityPending": bool(getattr(sess, "identity_pending", False)),
+            "lifecycle": str(getattr(sess, "lifecycle", "active") or "active"),
             "agentState": agent["agentState"], "agentLabel": agent["agentLabel"],
             "agentDetail": agent["agentDetail"], "agentConfidence": agent["agentConfidence"],
             "needsAttention": agent["needsAttention"], "lastOutAgeMs": agent.get("lastOutAgeMs", 0)}
@@ -1342,22 +1536,9 @@ async def terminate_session_off_loop(s, by_user=True, timeout=12, release_claim_
             pty.terminate(force=True)
         except Exception as e:
             terminate_error = e
-        if pid > 0 and _pid_alive(pid):
-            try:
-                subprocess.run(
-                    ["taskkill.exe", "/PID", str(pid), "/T", "/F"],
-                    timeout=max(2, int(timeout)),
-                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-            except Exception:
-                pass
-        deadline = time.monotonic() + max(0.1, timeout)
-        while pid > 0 and _pid_alive(pid) and time.monotonic() < deadline:
-            time.sleep(0.05)
-        if pid > 0 and _pid_alive(pid):
-            return False, f"process {pid} is still alive after termination"
+        stopped, detail = _terminate_pid_tree(pid, timeout=timeout)
+        if not stopped:
+            return False, detail
         if terminate_error is not None and pid <= 0:
             return False, f"PTY termination failed: {terminate_error}"
         return True, "process exited"
@@ -1404,20 +1585,37 @@ async def main():
             current = sessions.get(name)
             if current is None:
                 return False, "no such session: " + name
+            snapshot = persisted_session_snapshot(current)
+            current.lifecycle = "stopping"
+            current.stop_disposition = "remove" if by_user else "replace"
+            pty = getattr(current, "pty", None)
+            current.child_pid = int(getattr(pty, "pid", 0) or getattr(current, "child_pid", 0) or 0)
+            current.child_start_token = (
+                _process_start_token(current.child_pid)
+                or getattr(current, "child_start_token", "")
+            )
+            try:
+                manifest_save(sessions)
+            except Exception as e:
+                if not getattr(e, "committed", False):
+                    restore_persisted_session(current, snapshot)
+                    return False, "could not durably record session stop: " + str(e)
+            ok, detail = await terminate_session_off_loop(current, by_user=by_user)
+            if not ok:
+                restore_persisted_session(current, snapshot)
+                try:
+                    manifest_save(sessions)
+                except Exception as restore_error:
+                    return False, detail + "; active-state rollback failed: " + str(restore_error)
+                return False, detail
             candidate = dict(sessions)
             candidate.pop(name, None)
             try:
                 manifest_save(candidate)
             except Exception as e:
-                return False, "could not durably record session stop: " + str(e)
-            ok, detail = await terminate_session_off_loop(current, by_user=by_user)
-            if not ok:
-                current.user_killed = False
-                try:
-                    manifest_save(sessions)
-                except Exception as restore_error:
-                    return False, detail + "; manifest rollback also failed: " + str(restore_error)
-                return False, detail
+                if getattr(e, "committed", False) and sessions.get(name) is current:
+                    del sessions[name]
+                return False, "process exited but durable tombstone cleanup is unconfirmed: " + str(e)
             if sessions.get(name) is current:
                 del sessions[name]
             return True, detail
@@ -1512,21 +1710,36 @@ async def main():
 
             tombstoned = False
             if prev and not reconnect:
-                candidate = dict(sessions)
-                candidate.pop(name, None)
+                previous_snapshot = persisted_session_snapshot(prev)
+                prev.lifecycle = "stopping"
+                prev.stop_disposition = "replace"
+                prev.child_pid = int(getattr(prev, "child_pid", 0) or first.get("childPid", 0) or 0)
+                prev.child_start_token = (
+                    _process_start_token(prev.child_pid)
+                    or getattr(prev, "child_start_token", "")
+                )
                 try:
-                    manifest_save(candidate)
+                    manifest_save(sessions)
                     tombstoned = True
                 except Exception as e:
-                    if claim is not existing_claim and claim is not None:
-                        claim.release()
-                    return None, "could not durably reserve owner replacement: " + str(e)
+                    if getattr(e, "committed", False):
+                        tombstoned = True
+                    else:
+                        restore_persisted_session(prev, previous_snapshot)
+                        if claim is not existing_claim and claim is not None:
+                            claim.release()
+                        return None, "could not durably reserve owner replacement: " + str(e)
                 ok, detail = await terminate_session_off_loop(
                     prev,
                     by_user=False,
                     release_claim_on_success=not preserve_existing_claim,
                 )
                 if not ok:
+                    restore_persisted_session(prev, previous_snapshot)
+                    try:
+                        manifest_save(sessions)
+                    except Exception as restore_error:
+                        detail += "; active-state rollback failed: " + str(restore_error)
                     if claim is not getattr(prev, "_launch_claim", None) and claim is not None:
                         claim.release()
                     return None, "previous session did not exit: " + detail
@@ -1551,18 +1764,23 @@ async def main():
             )
             owner._launch_claim = claim
             owner.claim_paths = list(claim.paths) if claim is not None else []
+            owner.child_pid = int(first.get("childPid", 0) or 0)
+            owner.child_start_token = _process_start_token(owner.child_pid)
             candidate = dict(sessions)
             candidate[name] = owner
             try:
                 manifest_save(candidate)
             except Exception as e:
+                if getattr(e, "committed", False):
+                    sessions[name] = owner
+                    if existing_claim is not None and existing_claim is not claim:
+                        existing_claim.release()
+                    return None, "visible owner registration committed but durability is unconfirmed: " + str(e)
                 if claim is not existing_claim and claim is not None:
                     claim.release()
                 if preserve_existing_claim and prev is not None:
                     prev._launch_claim = existing_claim
                     prev.claim_paths = list(existing_claim.paths) if existing_claim is not None else []
-                if tombstoned and sessions.get(name) is prev:
-                    del sessions[name]
                 return None, "could not durably register visible owner: " + str(e)
             sessions[name] = owner
             return owner, ""
@@ -1624,6 +1842,10 @@ async def main():
                 try:
                     manifest_save()
                 except Exception as e:
+                    if getattr(e, "committed", False):
+                        if old_claim is not None and old_claim is not claim:
+                            old_claim.release()
+                        return None, "session update committed but durability is unconfirmed: " + str(e), False
                     restore_persisted_session(prev, snapshot)
                     if claim is not None and claim is not old_claim:
                         claim.release()
@@ -1665,29 +1887,39 @@ async def main():
             )
             existing_claim = getattr(prev, "_launch_claim", None) if prev else None
             prior_deaths = list(getattr(prev, "deaths", []) or []) if prev else []
+            replaced_prev = prev
             if candidate_ids and claim is None:
                 return None, claim_detail or "could not reserve session launch", False
 
             if prev:
-                candidate = dict(sessions)
-                candidate.pop(name, None)
+                previous_snapshot = persisted_session_snapshot(prev)
+                prev.lifecycle = "stopping"
+                prev.stop_disposition = "replace"
+                pty = getattr(prev, "pty", None)
+                prev.child_pid = int(getattr(pty, "pid", 0) or getattr(prev, "child_pid", 0) or 0)
+                prev.child_start_token = (
+                    _process_start_token(prev.child_pid)
+                    or getattr(prev, "child_start_token", "")
+                )
                 try:
-                    manifest_save(candidate)
+                    manifest_save(sessions)
                 except Exception as e:
-                    if claim is not existing_claim and claim is not None:
-                        claim.release()
-                    return None, "could not durably reserve session replacement: " + str(e), False
+                    if not getattr(e, "committed", False):
+                        restore_persisted_session(prev, previous_snapshot)
+                        if claim is not existing_claim and claim is not None:
+                            claim.release()
+                        return None, "could not durably reserve session replacement: " + str(e), False
                 ok, detail = await terminate_session_off_loop(
                     prev,
                     by_user=False,
                     release_claim_on_success=not preserve_existing_claim,
                 )
                 if not ok:
-                    prev.user_killed = False
+                    restore_persisted_session(prev, previous_snapshot)
                     try:
                         manifest_save(sessions)
                     except Exception as restore_error:
-                        detail += "; manifest rollback also failed: " + str(restore_error)
+                        detail += "; active-state rollback failed: " + str(restore_error)
                     if claim is not existing_claim and claim is not None:
                         claim.release()
                     return None, "previous session did not exit: " + detail, False
@@ -1696,30 +1928,76 @@ async def main():
                     prev.claim_paths = []
                 if sessions.get(name) is prev:
                     del sessions[name]
-            try:
-                created = await new_session_off_loop(
-                    name, cmd, cwd, cols, rows, loop, outq, heal=requested_heal,
-                    ids=candidate_ids, session_id=canonical_id, aliases=identity_aliases
-                )
-            except Exception as e:
-                if claim is not None:
-                    claim.release()
-                return None, "spawn failed: " + str(e), False
+
+            created = Session(
+                name, cmd, cwd, cols, rows, loop, outq, heal=requested_heal, spawn_now=False,
+                ids=candidate_ids, session_id=canonical_id, aliases=identity_aliases
+            )
             created._launch_claim = claim
             created.claim_paths = list(claim.paths) if claim is not None else []
             created.identity_pending = requested_identity_pending
             created.deaths = prior_deaths
+            created.lifecycle = "starting"
             candidate = dict(sessions)
             candidate[name] = created
             try:
                 manifest_save(candidate)
             except Exception as e:
-                stopped, stop_detail = await terminate_session_off_loop(created, by_user=False)
-                if not stopped:
+                if getattr(e, "committed", False):
                     sessions[name] = created
-                    return None, "manifest commit failed and spawned session could not be stopped: " + stop_detail, False
-                return None, "could not durably record spawned session: " + str(e), False
+                else:
+                    if replaced_prev is not None:
+                        sessions[name] = replaced_prev
+                    if claim is not None:
+                        claim.release()
+                return None, "could not durably reserve session start: " + str(e), False
+
             sessions[name] = created
+            try:
+                await spawn_session_off_loop(created)
+            except Exception as e:
+                stopped, stop_detail = await terminate_session_off_loop(created, by_user=False)
+                created.lifecycle = "failed" if stopped else "stopping"
+                created.stop_disposition = "" if stopped else "remove"
+                created.child_pid = int(getattr(created.pty, "pid", 0) or created.child_pid or 0)
+                created.child_start_token = (
+                    _process_start_token(created.child_pid)
+                    or getattr(created, "child_start_token", "")
+                )
+                created.dead = stopped
+                try:
+                    manifest_save(sessions)
+                except Exception as persist_error:
+                    return None, "spawn failed and failure state could not be persisted: " + str(persist_error), False
+                return None, "spawn failed: " + str(e) + "; stop=" + stop_detail, False
+
+            created.lifecycle = "active"
+            created.child_pid = int(getattr(created.pty, "pid", 0) or 0)
+            created.child_start_token = (
+                _process_start_token(created.child_pid)
+                or getattr(created, "child_start_token", "")
+            )
+            try:
+                manifest_save(sessions)
+            except Exception as e:
+                if getattr(e, "committed", False):
+                    return None, "spawned session is active but manifest durability is unconfirmed: " + str(e), False
+                stopped, stop_detail = await terminate_session_off_loop(created, by_user=False)
+                created.lifecycle = "failed" if stopped else "stopping"
+                created.stop_disposition = "" if stopped else "remove"
+                created.child_pid = int(getattr(created.pty, "pid", 0) or created.child_pid or 0)
+                created.child_start_token = (
+                    _process_start_token(created.child_pid)
+                    or getattr(created, "child_start_token", "")
+                )
+                try:
+                    manifest_save(sessions)
+                except Exception as persist_error:
+                    return None, (
+                        "active manifest commit failed; stop=" + stop_detail
+                        + "; failure state persistence also failed: " + str(persist_error)
+                    ), False
+                return None, "could not durably activate spawned session; stop=" + stop_detail, False
             return created, "", True
 
     async def bind_session_identity(first):
@@ -1782,6 +2060,10 @@ async def main():
             try:
                 manifest_save()
             except Exception as e:
+                if getattr(e, "committed", False):
+                    if old_claim is not None and old_claim is not claim:
+                        old_claim.release()
+                    return None, "identity binding committed but durability is unconfirmed: " + str(e)
                 restore_persisted_session(current, snapshot)
                 if claim is not old_claim:
                     claim.release()
@@ -1807,50 +2089,132 @@ async def main():
                 log(f"[watchdog] event loop lag {lag:.3f}s")
     asyncio.create_task(loop_monitor())
 
+    async def reap_unresolved_processes(restored):
+        pids = set()
+        if _same_process_instance(restored.child_pid, restored.child_start_token):
+            pids.add(restored.child_pid)
+        elif restored.child_pid > 0 and _pid_alive(restored.child_pid):
+            log(
+                f"[boot] ignored unverified persisted pid {restored.child_pid} for {restored.name}; "
+                "the process-instance token did not match"
+            )
+        candidate_ids = launch_candidate_ids(restored.cmd, restored.ids)
+        if candidate_ids:
+            live = await asyncio.get_running_loop().run_in_executor(None, try_live_session_ids)
+            if not live[0]:
+                return False, live[2] or "could not inspect live agent processes"
+            for session_id in candidate_ids:
+                pid = (live[1] or {}).get(session_id.lower())
+                if pid and int(pid) not in pids:
+                    return False, (
+                        f"matching live agent {session_id} has pid {pid}, but muxd cannot prove "
+                        "that process belongs to this interrupted lifecycle"
+                    )
+        for pid in pids:
+            ok, detail = await asyncio.get_running_loop().run_in_executor(
+                None, lambda target=pid: _terminate_pid_tree(target)
+            )
+            if not ok:
+                return False, detail
+        return True, "unresolved child processes are stopped"
+
     # boot policy (user-specified): agents NEVER auto-start on a fresh boot unless the session was
     # ARMED (auto-resume on). Armed -> recreate + resume now. Unarmed -> a dead placeholder tab that
     # stays dormant until an explicit create/relaunch sends a non-empty resume command.
     # liveness runs a PowerShell CIM query (blocking) — NEVER call it on the event-loop thread or muxd
     # freezes and hosted sessions drop. Always hop to a worker thread.
-    for name, m in manifest_load().items():
-        if strict_mux_name(name) and name not in sessions:
-            try:
-                heal = bool(m.get("heal"))
-                mcmd = m.get("cmd", "")
-                ids = m.get("ids") if isinstance(m.get("ids"), list) else []
-                aliases = m.get("aliases") if isinstance(m.get("aliases"), list) else []
-                restored = Session(
-                    name, mcmd, m.get("cwd", ""), m.get("cols", 140), m.get("rows", 40),
-                    loop, outq, heal=heal, spawn_now=False, ids=ids,
-                    session_id=m.get("sessionId", ""), aliases=aliases
-                )
-                restored.expected_owner = bool(m.get("owner"))
-                restored.owner_key = str(m.get("ownerKey", "") or "")
-                restored.identity_pending = bool(m.get("identityPending"))
-                restored.deaths = [
-                    float(value)
-                    for value in (m.get("deaths") if isinstance(m.get("deaths"), list) else [])
-                    if isinstance(value, (int, float))
-                ][-16:]
-                sessions[name] = restored
-                if restored.expected_owner:
-                    log(f"[boot] waiting for visible owner reconnect: {name}")
-                    continue
-                if restored.identity_pending:
-                    log(f"[boot] fresh identity was not captured for {name}; left dormant")
-                    continue
-                if heal:
-                    _session, detail, created = await coordinate_session_request(
-                        {"t": "create", "s": name, "relaunch": True, "heal": True, "ids": ids},
-                        True,
+    boot_manifest = manifest_load()
+    boot_names = []
+    for name, m in boot_manifest.items():
+        if not strict_mux_name(name) or name in sessions:
+            continue
+        heal = bool(m.get("heal"))
+        mcmd = m.get("cmd", "")
+        ids = m.get("ids") if isinstance(m.get("ids"), list) else []
+        aliases = m.get("aliases") if isinstance(m.get("aliases"), list) else []
+        try:
+            restored = Session(
+                name, mcmd, m.get("cwd", ""), m.get("cols", 140), m.get("rows", 40),
+                loop, outq, heal=heal, spawn_now=False, ids=ids,
+                session_id=m.get("sessionId", ""), aliases=aliases
+            )
+            restored.expected_owner = bool(m.get("owner"))
+            restored.owner_key = str(m.get("ownerKey", "") or "")
+            restored.identity_pending = bool(m.get("identityPending"))
+            restored.lifecycle = str(m.get("lifecycle", "active") or "active")
+            if restored.lifecycle not in ("active", "dormant", "starting", "stopping", "failed"):
+                restored.lifecycle = "failed"
+            restored.child_pid = int(m.get("childPid", 0) or 0)
+            restored.child_start_token = str(m.get("childStartToken", "") or "")
+            restored.stop_disposition = str(m.get("stopDisposition", "") or "")
+            if restored.stop_disposition not in ("", "remove", "replace"):
+                restored.stop_disposition = ""
+            restored.user_killed = bool(m.get("userKilled", False))
+            restored.deaths = [
+                float(value)
+                for value in (m.get("deaths") if isinstance(m.get("deaths"), list) else [])
+                if isinstance(value, (int, float))
+            ][-16:]
+        except Exception as error:
+            raise RuntimeError(f"could not restore durable session {name}") from error
+        sessions[name] = restored
+        boot_names.append(name)
+
+    # Reconcile only after every durable record is represented in memory. Any save below is therefore
+    # authoritative for the whole manifest and cannot erase entries that happened to sort later.
+    for name in boot_names:
+        restored = sessions.get(name)
+        if restored is None:
+            continue
+        m = boot_manifest[name]
+        heal = bool(m.get("heal"))
+        ids = m.get("ids") if isinstance(m.get("ids"), list) else []
+        try:
+            if restored.user_killed or restored.lifecycle in ("starting", "stopping"):
+                reaped, detail = await reap_unresolved_processes(restored)
+                if not reaped:
+                    raise RuntimeError(
+                        f"could not reconcile unresolved {restored.lifecycle} session {name}: {detail}"
                     )
-                    if detail:
-                        log(f"[boot] REFUSED auto-resume of {name}: {detail}; left dormant")
-                    elif created:
-                        log(f"[boot] recreated + resumed (armed): {name}")
+                remove_record = restored.user_killed or (
+                    restored.lifecycle == "stopping"
+                    and restored.stop_disposition == "remove"
+                )
+                if remove_record:
+                    sessions.pop(name, None)
+                    manifest_save(sessions)
+                    log(f"[boot] completed durable stop intent for {name}")
                     continue
-                log(f"[boot] listed as dormant (unarmed - explicit relaunch required): {name}")
-            except Exception as e: log(f"[boot] {name} failed: {e}")
+                restored.lifecycle = "failed" if restored.lifecycle == "starting" else "dormant"
+                restored.child_pid = 0
+                restored.child_start_token = ""
+                restored.stop_disposition = ""
+                restored.user_killed = False
+                manifest_save(sessions)
+                log(f"[boot] reconciled unresolved lifecycle for {name}; left dormant")
+                continue
+            if restored.lifecycle == "failed":
+                log(f"[boot] failed lifecycle for {name}; left dormant")
+                continue
+            if restored.expected_owner:
+                log(f"[boot] waiting for visible owner reconnect: {name}")
+                continue
+            if restored.identity_pending:
+                log(f"[boot] fresh identity was not captured for {name}; left dormant")
+                continue
+            if heal and not restored.user_killed:
+                _session, detail, created = await coordinate_session_request(
+                    {"t": "create", "s": name, "relaunch": True, "heal": True, "ids": ids},
+                    True,
+                )
+                if detail:
+                    log(f"[boot] REFUSED auto-resume of {name}: {detail}; left dormant")
+                elif created:
+                    log(f"[boot] recreated + resumed (armed): {name}")
+                continue
+            log(f"[boot] listed as dormant (unarmed - explicit relaunch required): {name}")
+        except Exception as e:
+            log(f"[boot] {name} failed: {e}")
 
     async def self_heal_tick():
         # a session whose SHELL died (pty EOF) is useless — recreate + re-run its resume (max 3/10min).
@@ -1860,6 +2224,7 @@ async def main():
                 if (
                     s.dead
                     and not s.user_killed
+                    and getattr(s, "lifecycle", "active") in ("active", "dormant")
                     and s.cmd
                     and s.heal
                     and not getattr(s, "expected_owner", False)
@@ -2179,7 +2544,8 @@ async def main():
                                     try:
                                         manifest_save()
                                     except Exception as e:
-                                        session.heal = previous
+                                        if not getattr(e, "committed", False):
+                                            session.heal = previous
                                         log(f"[{name}] heal persistence failed: {e}")
                                         await ws.send(json.dumps({
                                             "t": "sessions",
@@ -2207,11 +2573,15 @@ async def main():
                                     try:
                                         manifest_save(candidate)
                                     except Exception as e:
+                                        if getattr(e, "committed", False):
+                                            sessions.pop(name)
+                                            s.name = to
+                                            sessions[to] = s
                                         log(f"[{name}] rename persistence failed: {e}")
                                         await ws.send(json.dumps({
                                             "t": "sessions",
                                             "list": sess_list(),
-                                            "notice": "session rename was not persisted",
+                                            "notice": "session rename durability is unconfirmed",
                                         }))
                                         continue
                                     sessions.pop(name)

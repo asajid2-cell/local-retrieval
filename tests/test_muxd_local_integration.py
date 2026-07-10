@@ -189,9 +189,9 @@ class DisposableMuxd:
             log_tail = "\n".join(log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-40:])
         return f"{reason}\nlog:\n{log_tail}"
 
-    def fail_persistence(self, stage, file="sessions.json"):
+    def fail_persistence(self, stage, file="sessions.json", after=0):
         (self.root / "persist-fault.json").write_text(
-            json.dumps({"file": file, "stage": stage}),
+            json.dumps({"file": file, "stage": stage, "after": after}),
             encoding="utf-8",
         )
 
@@ -386,6 +386,231 @@ class MuxdLocalIntegrationTests(unittest.TestCase):
                 )
                 owner.wait(timeout=5)
 
+    def test_boot_never_resurrects_user_killed_armed_session(self):
+        name = "it-user-killed-boot"
+        self.kill(name)
+        self.muxd.stop_process()
+        manifest_path = self.muxd.root / "muxd" / "sessions.json"
+        manifest_path.write_text(
+            json.dumps({
+                name: {
+                    "cmd": "while($true){Start-Sleep -Milliseconds 200}; # codex resume user-killed-boot",
+                    "cwd": str(self.muxd.root),
+                    "cols": 100,
+                    "rows": 30,
+                    "heal": True,
+                    "ids": ["user-killed-boot"],
+                    "sessionId": "user-killed-boot",
+                    "aliases": [],
+                    "owner": False,
+                    "ownerKey": "",
+                    "identityPending": False,
+                    "lifecycle": "active",
+                    "childPid": 0,
+                    "stopDisposition": "",
+                    "userKilled": True,
+                    "deaths": [],
+                },
+            }),
+            encoding="utf-8",
+        )
+
+        self.muxd.start_process()
+
+        self.assertIsNone(self.session(name))
+        persisted = json.loads(manifest_path.read_text(encoding="utf-8"))
+        self.assertNotIn(name, persisted)
+
+    def test_boot_reconciles_interrupted_replacement_to_dormant(self):
+        name = "it-replace-boot"
+        self.kill(name)
+        self.muxd.stop_process()
+        manifest_path = self.muxd.root / "muxd" / "sessions.json"
+        manifest_path.write_text(
+            json.dumps({
+                name: {
+                    "cmd": "while($true){Start-Sleep -Milliseconds 200}",
+                    "cwd": str(self.muxd.root),
+                    "cols": 100,
+                    "rows": 30,
+                    "heal": False,
+                    "ids": [],
+                    "sessionId": "",
+                    "aliases": [],
+                    "owner": False,
+                    "ownerKey": "",
+                    "identityPending": False,
+                    "lifecycle": "stopping",
+                    "childPid": 0,
+                    "stopDisposition": "replace",
+                    "userKilled": False,
+                    "deaths": [],
+                },
+            }),
+            encoding="utf-8",
+        )
+
+        self.muxd.start_process()
+
+        restored = self.session(name)
+        self.assertIsNotNone(restored)
+        self.assertFalse(restored.get("alive"))
+        self.assertEqual("dormant", restored.get("lifecycle"))
+        self.kill(name)
+
+    def test_boot_reconciliation_never_drops_later_manifest_records(self):
+        removed_name = "it-boot-remove-first"
+        preserved_name = "it-boot-preserve-later"
+        self.kill(removed_name)
+        self.kill(preserved_name)
+        self.muxd.stop_process()
+        manifest_path = self.muxd.root / "muxd" / "sessions.json"
+
+        def record(cmd, lifecycle, *, user_killed=False, stop_disposition=""):
+            return {
+                "cmd": cmd,
+                "cwd": str(self.muxd.root),
+                "cols": 100,
+                "rows": 30,
+                "heal": False,
+                "ids": [],
+                "sessionId": "",
+                "aliases": [],
+                "owner": False,
+                "ownerKey": "",
+                "identityPending": False,
+                "lifecycle": lifecycle,
+                "childPid": 0,
+                "childStartToken": "",
+                "stopDisposition": stop_disposition,
+                "userKilled": user_killed,
+                "deaths": [],
+            }
+
+        manifest_path.write_text(
+            json.dumps({
+                removed_name: record("", "stopping", user_killed=True, stop_disposition="remove"),
+                preserved_name: record("Write-Output preserved", "dormant"),
+            }),
+            encoding="utf-8",
+        )
+
+        self.muxd.start_process()
+
+        persisted = json.loads(manifest_path.read_text(encoding="utf-8"))
+        self.assertNotIn(removed_name, persisted)
+        self.assertIn(preserved_name, persisted)
+        self.assertIsNotNone(self.session(preserved_name))
+        self.muxd.restart()
+        self.assertIsNotNone(self.session(preserved_name))
+        self.kill(preserved_name)
+
+    def test_boot_never_kills_live_process_with_recycled_pid(self):
+        name = "it-stale-pid-boot"
+        self.kill(name)
+        sentinel = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            creationflags=CREATE_NO_WINDOW,
+        )
+        try:
+            self.muxd.stop_process()
+            manifest_path = self.muxd.root / "muxd" / "sessions.json"
+            manifest_path.write_text(
+                json.dumps({
+                    name: {
+                        "cmd": "",
+                        "cwd": str(self.muxd.root),
+                        "cols": 100,
+                        "rows": 30,
+                        "heal": False,
+                        "ids": [],
+                        "sessionId": "",
+                        "aliases": [],
+                        "owner": False,
+                        "ownerKey": "",
+                        "identityPending": False,
+                        "lifecycle": "starting",
+                        "childPid": sentinel.pid,
+                        "childStartToken": "stale-process-instance",
+                        "stopDisposition": "",
+                        "userKilled": False,
+                        "deaths": [],
+                    },
+                }),
+                encoding="utf-8",
+            )
+
+            self.muxd.start_process()
+
+            self.assertIsNone(sentinel.poll(), "boot killed an unrelated process that reused a persisted PID")
+            restored = self.session(name)
+            self.assertIsNotNone(restored)
+            self.assertEqual("failed", restored.get("lifecycle"))
+            self.kill(name)
+        finally:
+            if sentinel.poll() is None:
+                sentinel.terminate()
+                sentinel.wait(timeout=5)
+
+    def test_boot_quarantines_unproven_matching_live_agent_without_killing_it(self):
+        name = "it-unproven-live-boot"
+        session_id = "unproven-live-boot"
+        self.kill(name)
+        node = shutil.which("node")
+        self.assertIsNotNone(node)
+        sentinel = subprocess.Popen(
+            [
+                node,
+                "-e",
+                "setTimeout(() => {}, 60000)",
+                "codex",
+                "resume",
+                session_id,
+            ],
+            creationflags=CREATE_NO_WINDOW,
+        )
+        try:
+            self.muxd.stop_process()
+            manifest_path = self.muxd.root / "muxd" / "sessions.json"
+            manifest_path.write_text(
+                json.dumps({
+                    name: {
+                        "cmd": f"codex resume {session_id}",
+                        "cwd": str(self.muxd.root),
+                        "cols": 100,
+                        "rows": 30,
+                        "heal": True,
+                        "ids": [session_id],
+                        "sessionId": session_id,
+                        "aliases": [],
+                        "owner": False,
+                        "ownerKey": "",
+                        "identityPending": False,
+                        "lifecycle": "starting",
+                        "childPid": 0,
+                        "childStartToken": "",
+                        "stopDisposition": "",
+                        "userKilled": False,
+                        "deaths": [],
+                    },
+                }),
+                encoding="utf-8",
+            )
+
+            self.muxd.start_process()
+
+            self.assertIsNone(sentinel.poll(), "boot killed a matching process without custody proof")
+            restored = self.session(name)
+            self.assertIsNotNone(restored)
+            self.assertEqual("starting", restored.get("lifecycle"))
+            persisted = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual("starting", persisted[name]["lifecycle"])
+            self.kill(name)
+        finally:
+            if sentinel.poll() is None:
+                sentinel.terminate()
+                sentinel.wait(timeout=5)
+
     def test_relaunch_waits_until_previous_process_exits(self):
         name = "it-relaunch-exit-barrier"
         marker = f"MUXD_IT_EXIT_BARRIER_{int(time.time() * 1000)}"
@@ -555,10 +780,58 @@ class MuxdLocalIntegrationTests(unittest.TestCase):
         )
 
         self.assertEqual("err", result.get("t"), result)
-        self.assertIn("durably record spawned session", result.get("m", ""))
+        self.assertIn("durably reserve session start", result.get("m", ""))
         self.assertIsNone(self.session(name))
         self.muxd.restart()
         self.assertIsNone(self.session(name))
+
+    def test_create_persists_starting_intent_before_spawn_and_keeps_failed_record(self):
+        name = "it-create-active-persist-fail"
+        self.kill(name)
+        self.muxd.fail_persistence("before_write", after=1)
+
+        result = run_request(
+            self.muxd.port,
+            {
+                "t": "create",
+                "s": name,
+                "cmd": "while($true){Start-Sleep -Milliseconds 200}",
+            },
+            timeout=20,
+        )
+
+        self.assertEqual("err", result.get("t"), result)
+        current = self.session(name)
+        self.assertIsNotNone(current)
+        self.assertFalse(current.get("alive"))
+        self.assertEqual("failed", current.get("lifecycle"))
+        self.muxd.restart()
+        restored = self.session(name)
+        self.assertIsNotNone(restored)
+        self.assertFalse(restored.get("alive"))
+        self.assertEqual("failed", restored.get("lifecycle"))
+        self.kill(name)
+
+    def test_create_retries_transient_post_replace_uncertainty(self):
+        name = "it-create-post-replace"
+        self.kill(name)
+        self.muxd.fail_persistence("before_directory_fsync")
+
+        result = run_request(
+            self.muxd.port,
+            {
+                "t": "create",
+                "s": name,
+                "cmd": "while($true){Start-Sleep -Milliseconds 200}",
+            },
+            timeout=20,
+        )
+
+        self.assertTrue(result.get("created"), result)
+        current = self.session(name)
+        self.assertTrue(current.get("alive"))
+        self.assertEqual("active", current.get("lifecycle"))
+        self.kill(name)
 
     def test_kill_does_not_stop_or_ack_when_tombstone_commit_fails(self):
         name = "it-kill-persist-fail"
@@ -581,6 +854,28 @@ class MuxdLocalIntegrationTests(unittest.TestCase):
         self.assertIn("durably record session stop", result.get("m", ""))
         self.assertTrue(self.session(name).get("alive"))
         self.kill(name)
+
+    def test_kill_retries_transient_post_replace_uncertainty(self):
+        name = "it-kill-post-replace"
+        self.kill(name)
+        created = run_request(
+            self.muxd.port,
+            {
+                "t": "create",
+                "s": name,
+                "cmd": "while($true){Start-Sleep -Milliseconds 200}",
+            },
+            timeout=12,
+        )
+        self.assertTrue(created.get("created"), created)
+        self.muxd.fail_persistence("before_directory_fsync")
+
+        result = run_request(self.muxd.port, {"t": "kill", "s": name}, timeout=12)
+
+        self.assertEqual("killed", result.get("t"), result)
+        self.assertIsNone(self.session(name))
+        self.muxd.restart()
+        self.assertIsNone(self.session(name))
 
     def test_bind_rolls_back_identity_when_manifest_commit_fails(self):
         name = "it-bind-persist-fail"
@@ -615,6 +910,41 @@ class MuxdLocalIntegrationTests(unittest.TestCase):
             current = self.session(name)
             self.assertTrue(current.get("identityPending"))
             self.assertEqual("", current.get("sessionId"))
+        finally:
+            self.kill(name)
+
+    def test_bind_retries_transient_post_replace_uncertainty(self):
+        name = "it-bind-post-replace"
+        self.kill(name)
+        try:
+            created = run_request(
+                self.muxd.port,
+                {
+                    "t": "create",
+                    "s": name,
+                    "cmd": "while($true){Start-Sleep -Milliseconds 200}",
+                    "identityPending": True,
+                },
+                timeout=12,
+            )
+            self.assertTrue(created.get("created"), created)
+            self.muxd.fail_persistence("before_directory_fsync")
+
+            result = run_request(
+                self.muxd.port,
+                {
+                    "t": "bind",
+                    "s": name,
+                    "cmd": "Write-Output bound; # codex resume durable-bind-post-replace",
+                    "sessionId": "durable-bind-post-replace",
+                },
+                timeout=12,
+            )
+
+            self.assertEqual("bind-ok", result.get("t"), result)
+            current = self.session(name)
+            self.assertFalse(current.get("identityPending"))
+            self.assertEqual("durable-bind-post-replace", current.get("sessionId"))
         finally:
             self.kill(name)
 
