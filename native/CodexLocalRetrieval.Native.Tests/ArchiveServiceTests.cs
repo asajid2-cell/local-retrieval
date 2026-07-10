@@ -370,16 +370,36 @@ public sealed class ArchiveServiceTests
 
             Assert.IsTrue(File.Exists(store), "current store exists after save");
             Assert.AreEqual(0, Directory.GetFiles(dir, "*.tmp").Length, "temp files are cleaned after commit");
-            var backups = Directory.GetFiles(service.StoreBackupsDir, "app-store-*.json");
-            Assert.AreEqual(1, backups.Length, "second save keeps the previous full store as a backup");
+            var backups = Directory.GetFiles(service.StoreBackupsDir, "*.json");
+            Assert.AreEqual(3, backups.Length, "each accepted generation has a committed snapshot and replacement keeps the previous bytes");
 
             using var current = JsonDocument.Parse(File.ReadAllText(store));
             Assert.IsTrue(current.RootElement.GetProperty("sessions").TryGetProperty("s2", out _), "current store has the latest session");
 
-            using var backup = JsonDocument.Parse(File.ReadAllText(backups[0]));
-            var backupSessions = backup.RootElement.GetProperty("sessions");
+            var snapshots = backups.Select(path => JsonDocument.Parse(File.ReadAllText(path))).ToArray();
+            try
+            {
+                Assert.AreEqual(2, snapshots.Count(snapshot => snapshot.RootElement.GetProperty("generation").GetInt64() == 1));
+                Assert.AreEqual(1, snapshots.Count(snapshot => snapshot.RootElement.GetProperty("generation").GetInt64() == 2));
+                var committed = snapshots.Single(snapshot => snapshot.RootElement.GetProperty("generation").GetInt64() == 2);
+                Assert.IsTrue(
+                    committed.RootElement.GetProperty("sessions").TryGetProperty("s2", out _),
+                    "the newest acknowledged generation has a redundant recovery snapshot");
+            }
+            finally
+            {
+                foreach (var snapshot in snapshots) snapshot.Dispose();
+            }
+
+            using var previous = JsonDocument.Parse(File.ReadAllText(
+                backups.First(path =>
+                {
+                    using var snapshot = JsonDocument.Parse(File.ReadAllText(path));
+                    return snapshot.RootElement.GetProperty("generation").GetInt64() == 1;
+                })));
+            var backupSessions = previous.RootElement.GetProperty("sessions");
             Assert.IsTrue(backupSessions.TryGetProperty("s1", out var backedUpFirst), "backup keeps the previous session");
-            Assert.IsFalse(backupSessions.TryGetProperty("s2", out _), "backup is the previous version, not a duplicate of current");
+            Assert.IsFalse(backupSessions.TryGetProperty("s2", out _), "previous-generation backup does not invent later state");
             Assert.AreEqual("petunia", backedUpFirst.GetProperty("specialPhrases")[0].GetString());
         }
         finally { Directory.Delete(dir, true); }
@@ -404,7 +424,7 @@ public sealed class ArchiveServiceTests
                          DurableWriteStage.BeforeReplace,
                      })
             {
-                await Assert.ThrowsExactlyAsync<IOException>(() =>
+                var ex = await Assert.ThrowsExactlyAsync<DurableWriteException>(() =>
                     DurableFileStore.WriteAtomicAsync(
                         destination,
                         Encoding.UTF8.GetBytes("{\"version\":2}"),
@@ -413,6 +433,8 @@ public sealed class ArchiveServiceTests
                         {
                             if (stage == failedStage) throw new IOException("injected " + stage);
                         }));
+                Assert.IsFalse(ex.Committed);
+                Assert.IsTrue(ex.Recovered);
                 CollectionAssert.AreEqual(original, await File.ReadAllBytesAsync(destination));
                 Assert.AreEqual(0, Directory.GetFiles(dir, "*.tmp").Length);
             }
@@ -432,7 +454,7 @@ public sealed class ArchiveServiceTests
             var original = Encoding.UTF8.GetBytes("{\"version\":1}");
             await File.WriteAllBytesAsync(destination, original);
 
-            var ex = await Assert.ThrowsExactlyAsync<IOException>(() =>
+            var ex = await Assert.ThrowsExactlyAsync<DurableWriteException>(() =>
                 DurableFileStore.WriteAtomicAsync(
                     destination,
                     Encoding.UTF8.GetBytes("{\"version\":2}"),
@@ -443,8 +465,72 @@ public sealed class ArchiveServiceTests
                             File.WriteAllText(destination, "{\"version\":999}");
                     }));
 
-            StringAssert.Contains(ex.Message, "committed file did not read back identically");
+            Assert.IsFalse(ex.Committed);
+            Assert.IsTrue(ex.Recovered);
             CollectionAssert.AreEqual(original, await File.ReadAllBytesAsync(backup));
+            CollectionAssert.AreEqual(original, await File.ReadAllBytesAsync(destination));
+        }
+        finally { Directory.Delete(dir, true); }
+    }
+
+    [TestMethod]
+    public async Task DurableFileStore_PostReplaceUncertaintyRetriesExactGeneration()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "clr-durable-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            var destination = Path.Combine(dir, "store.json");
+            var backup = Path.Combine(dir, "store.bak.json");
+            var replacement = Encoding.UTF8.GetBytes("{\"version\":2}");
+            await File.WriteAllTextAsync(destination, "{\"version\":1}");
+
+            await DurableFileStore.WriteAtomicAsync(
+                destination,
+                replacement,
+                backup,
+                stage =>
+                {
+                    if (stage == DurableWriteStage.BeforeDirectoryFlush)
+                        throw new IOException("injected post-replace uncertainty");
+                });
+
+            CollectionAssert.AreEqual(replacement, await File.ReadAllBytesAsync(destination));
+        }
+        finally { Directory.Delete(dir, true); }
+    }
+
+    [TestMethod]
+    public async Task DurableFileStore_UnknownVerificationNeverRollsPrimaryBackward()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "clr-durable-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            var destination = Path.Combine(dir, "store.json");
+            var backup = Path.Combine(dir, "store.bak.json");
+            var replacement = Encoding.UTF8.GetBytes("{\"version\":2}");
+            await File.WriteAllTextAsync(destination, "{\"version\":1}");
+
+            var ex = await Assert.ThrowsExactlyAsync<DurableWriteException>(() =>
+                DurableFileStore.WriteAtomicAsync(
+                    destination,
+                    replacement,
+                    backup,
+                    stage =>
+                    {
+                        if (stage is DurableWriteStage.BeforeDirectoryFlush
+                            or DurableWriteStage.BeforeVerificationRead)
+                            throw new IOException("injected verification uncertainty");
+                    }));
+
+            Assert.IsFalse(ex.Committed);
+            Assert.IsFalse(ex.Recovered);
+            Assert.IsTrue(ex.VerificationUnknown);
+            CollectionAssert.AreEqual(replacement, await File.ReadAllBytesAsync(destination));
+            CollectionAssert.AreEqual(
+                Encoding.UTF8.GetBytes("{\"version\":1}"),
+                await File.ReadAllBytesAsync(backup));
         }
         finally { Directory.Delete(dir, true); }
     }
@@ -466,16 +552,96 @@ public sealed class ArchiveServiceTests
                 { Id = "latest", Tool = "claude", Title = "latest" };
             await writer.SaveAsync();
 
+            foreach (var backup in Directory.GetFiles(writer.StoreBackupsDir, "*.json"))
+            {
+                using var snapshot = JsonDocument.Parse(File.ReadAllText(backup));
+                File.SetLastWriteTimeUtc(
+                    backup,
+                    snapshot.RootElement.GetProperty("generation").GetInt64() == 1
+                        ? DateTime.UtcNow.AddHours(1)
+                        : DateTime.UtcNow.AddHours(-1));
+            }
             File.WriteAllText(store, "{\"broken\"");
 
             var reader = new ArchiveService(storePath: store);
             await reader.LoadAsync();
 
             Assert.IsTrue(reader.Store.Sessions.ContainsKey("preserved"));
-            Assert.IsFalse(reader.Store.Sessions.ContainsKey("latest"));
+            Assert.IsTrue(reader.Store.Sessions.ContainsKey("latest"), "recovery chooses the highest valid generation, not the newest timestamp");
             Assert.AreEqual(7999, reader.ReadSettingsOnly().MultiplexApiPort);
             using var restored = JsonDocument.Parse(File.ReadAllText(store));
             Assert.IsTrue(restored.RootElement.GetProperty("sessions").TryGetProperty("preserved", out _));
+            Assert.IsTrue(restored.RootElement.GetProperty("sessions").TryGetProperty("latest", out _));
+        }
+        finally { Directory.Delete(dir, true); }
+    }
+
+    [TestMethod]
+    public async Task LoadAsync_ReplacesValidStalePrimaryWithNewerCommittedGeneration()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "clr-recover-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            var store = Path.Combine(dir, "store.json");
+            var writer = new ArchiveService(storePath: store);
+            writer.Store.Sessions["generation-one"] = new ArchiveSession
+                { Id = "generation-one", Tool = "codex", Title = "generation one" };
+            await writer.SaveAsync();
+            writer.Store.Sessions["generation-two"] = new ArchiveSession
+                { Id = "generation-two", Tool = "claude", Title = "generation two" };
+            await writer.SaveAsync();
+
+            var generationOne = Directory.GetFiles(writer.StoreBackupsDir, "*.json")
+                .Select(File.ReadAllBytes)
+                .First(bytes =>
+                {
+                    using var snapshot = JsonDocument.Parse(bytes);
+                    return snapshot.RootElement.GetProperty("generation").GetInt64() == 1;
+                });
+            await File.WriteAllBytesAsync(store, generationOne);
+
+            var reader = new ArchiveService(storePath: store);
+            await reader.LoadAsync();
+
+            Assert.AreEqual(2, reader.Store.Generation);
+            Assert.IsTrue(reader.Store.Sessions.ContainsKey("generation-one"));
+            Assert.IsTrue(reader.Store.Sessions.ContainsKey("generation-two"));
+            using var restored = JsonDocument.Parse(File.ReadAllText(store));
+            Assert.AreEqual(2, restored.RootElement.GetProperty("generation").GetInt64());
+        }
+        finally { Directory.Delete(dir, true); }
+    }
+
+    [TestMethod]
+    public async Task StoreBackups_AreNamespacedPerAuthoritativeStore()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "clr-recover-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            var firstPath = Path.Combine(dir, "app-store.json");
+            var secondPath = Path.Combine(dir, "second.json");
+            var first = new ArchiveService(storePath: firstPath);
+            first.Store.Sessions["first-only"] = new ArchiveSession
+                { Id = "first-only", Tool = "codex", Title = "first" };
+            await first.SaveAsync();
+
+            var second = new ArchiveService(storePath: secondPath);
+            for (var generation = 1; generation <= 3; generation++)
+            {
+                var id = "second-" + generation;
+                second.Store.Sessions[id] = new ArchiveSession { Id = id, Tool = "claude", Title = id };
+                await second.SaveAsync();
+            }
+            File.WriteAllText(firstPath, "{\"broken\"");
+
+            var recovered = new ArchiveService(storePath: firstPath);
+            await recovered.LoadAsync();
+
+            Assert.AreEqual(1, recovered.Store.Generation);
+            Assert.IsTrue(recovered.Store.Sessions.ContainsKey("first-only"));
+            Assert.IsFalse(recovered.Store.Sessions.Keys.Any(id => id.StartsWith("second-", StringComparison.Ordinal)));
         }
         finally { Directory.Delete(dir, true); }
     }
@@ -493,6 +659,126 @@ public sealed class ArchiveServiceTests
 
             await Assert.ThrowsExactlyAsync<InvalidDataException>(() => service.LoadAsync());
             Assert.ThrowsExactly<InvalidDataException>(() => service.ReadSettingsOnly());
+        }
+        finally { Directory.Delete(dir, true); }
+    }
+
+    [TestMethod]
+    public async Task LoadAsync_EmptyObjectRestoresBackupInsteadOfDefaults()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "clr-recover-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            var store = Path.Combine(dir, "store.json");
+            var writer = new ArchiveService(storePath: store);
+            writer.Store.Sessions["preserved"] = new ArchiveSession
+                { Id = "preserved", Tool = "codex", Title = "preserved" };
+            await writer.SaveAsync();
+            writer.Store.Sessions["newest"] = new ArchiveSession
+                { Id = "newest", Tool = "claude", Title = "newest" };
+            await writer.SaveAsync();
+            File.WriteAllText(store, "{}");
+
+            var reader = new ArchiveService(storePath: store);
+            await reader.LoadAsync();
+
+            Assert.IsTrue(reader.Store.Sessions.ContainsKey("preserved"));
+            Assert.IsTrue(reader.Store.Sessions.ContainsKey("newest"));
+        }
+        finally { Directory.Delete(dir, true); }
+    }
+
+    [TestMethod]
+    public async Task LoadAsync_MissingPrimaryRestoresNewestValidBackup()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "clr-recover-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            var store = Path.Combine(dir, "store.json");
+            var writer = new ArchiveService(storePath: store);
+            writer.Store.Settings.MultiplexApiPort = 8123;
+            writer.Store.Sessions["preserved"] = new ArchiveSession
+                { Id = "preserved", Tool = "codex", Title = "preserved" };
+            await writer.SaveAsync();
+            writer.Store.Sessions["newest"] = new ArchiveSession
+                { Id = "newest", Tool = "claude", Title = "newest" };
+            await writer.SaveAsync();
+            File.Delete(store);
+
+            var reader = new ArchiveService(storePath: store);
+            await reader.LoadAsync();
+
+            Assert.IsTrue(reader.Store.Sessions.ContainsKey("preserved"));
+            Assert.IsTrue(reader.Store.Sessions.ContainsKey("newest"));
+            Assert.AreEqual(8123, reader.ReadSettingsOnly().MultiplexApiPort);
+            Assert.IsTrue(File.Exists(store));
+        }
+        finally { Directory.Delete(dir, true); }
+    }
+
+    [TestMethod]
+    public async Task SaveAsync_TwoServiceInstancesRejectStaleOverwrite()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "clr-generation-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            var store = Path.Combine(dir, "store.json");
+            var seed = new ArchiveService(storePath: store);
+            seed.Store.Sessions["original"] = new ArchiveSession
+                { Id = "original", Tool = "codex", Title = "original" };
+            await seed.SaveAsync();
+
+            var first = new ArchiveService(storePath: store);
+            var stale = new ArchiveService(storePath: store);
+            await first.LoadAsync();
+            await stale.LoadAsync();
+            first.Store.Sessions["first-save"] = new ArchiveSession
+                { Id = "first-save", Tool = "claude", Title = "first-save" };
+            await first.SaveAsync();
+            stale.Store.Settings.MultiplexApiPort = 8999;
+
+            var conflict = await Assert.ThrowsExactlyAsync<StoreGenerationConflictException>(
+                () => stale.SaveAsync());
+
+            Assert.IsGreaterThan(conflict.Expected, conflict.Actual);
+            var reader = new ArchiveService(storePath: store);
+            await reader.LoadAsync();
+            Assert.IsTrue(reader.Store.Sessions.ContainsKey("first-save"));
+            Assert.AreNotEqual(8999, reader.Store.Settings.MultiplexApiPort);
+        }
+        finally { Directory.Delete(dir, true); }
+    }
+
+    [TestMethod]
+    public async Task SetFavoriteAsync_ReloadsAndMergesAfterGenerationConflict()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "clr-generation-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            var store = Path.Combine(dir, "store.json");
+            var seed = new ArchiveService(storePath: store);
+            seed.Store.Sessions["original"] = new ArchiveSession
+                { Id = "original", Tool = "codex", Title = "original" };
+            await seed.SaveAsync();
+
+            var desktop = new ArchiveService(storePath: store);
+            var server = new ArchiveService(storePath: store);
+            await desktop.LoadAsync();
+            await server.LoadAsync();
+            desktop.Store.Sessions["desktop-change"] = new ArchiveSession
+                { Id = "desktop-change", Tool = "claude", Title = "desktop-change" };
+            await desktop.SaveAsync();
+
+            Assert.IsTrue(await server.SetFavoriteAsync("original", true));
+
+            var reader = new ArchiveService(storePath: store);
+            await reader.LoadAsync();
+            Assert.IsTrue(reader.Store.Sessions["original"].Pinned);
+            Assert.IsTrue(reader.Store.Sessions.ContainsKey("desktop-change"));
         }
         finally { Directory.Delete(dir, true); }
     }

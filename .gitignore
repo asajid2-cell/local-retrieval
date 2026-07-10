@@ -42,6 +42,7 @@ native/CodexLocalRetrieval.Native/.github/
 # OS / editor
 Thumbs.db
 .DS_Store
+data/*.lock
 
 # Release build outputs
 artifacts/

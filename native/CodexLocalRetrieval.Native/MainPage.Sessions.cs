@@ -83,6 +83,7 @@ public sealed partial class MainPage
     private async void ResumeInTerminal(ArchiveSession session, string trigger = "user")
     {
         var failureRecordedByGovernor = false;
+        var launchStarted = false;
         try
         {
             // Guard against resuming a chat that's already running (locally or in a multiplex) - two
@@ -149,6 +150,7 @@ public sealed partial class MainPage
                         UseShellExecute = true
                     };
                     Process.Start(psi);
+                    launchStarted = true;
                     lease?.MarkStarted("Started terminal resume.");
                 }
                 catch (Exception ex)
@@ -168,15 +170,29 @@ public sealed partial class MainPage
         }
         catch (Exception ex)
         {
-            Diag.Log("Resume launch FAILED " + ex);
-            if (!failureRecordedByGovernor)
+            if (launchStarted)
+            {
+                Diag.Log("Resume metadata persistence FAILED after terminal launch " + ex);
                 RecordSessionEvent(
                     session,
-                    "resume.failed.terminal",
+                    "resume.started.metadata-failed",
                     ex.Message,
                     "error",
                     details: new Dictionary<string, string> { ["trigger"] = trigger });
-            SyncStatus.Text = "Could not open terminal - see log.";
+                SyncStatus.Text = "Terminal opened, but its recent-session metadata was not persisted - see log.";
+            }
+            else
+            {
+                Diag.Log("Resume launch FAILED " + ex);
+                if (!failureRecordedByGovernor)
+                    RecordSessionEvent(
+                        session,
+                        "resume.failed.terminal",
+                        ex.Message,
+                        "error",
+                        details: new Dictionary<string, string> { ["trigger"] = trigger });
+                SyncStatus.Text = "Could not open terminal - see log.";
+            }
         }
         finally
         {

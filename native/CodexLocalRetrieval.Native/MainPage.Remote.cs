@@ -41,6 +41,7 @@ public sealed partial class MainPage
 
         var name = ArchiveService.MultiplexSessionName(session);
         var title = Trim(session.DisplayTitle, 40);
+        var muxStarted = false;
         SyncStatus.Text = $"Starting mux session \"{title}\"...";
 
         try
@@ -97,12 +98,31 @@ public sealed partial class MainPage
                 SyncStatus.Text = "Could not create the mux session - see log.";
                 return;
             }
+            muxStarted = true;
 
             // Bump like a local resume so the chat is where you expect when you come back to the app.
             session.UpdatedAt = DateTime.UtcNow.ToString("O");
             ReapplyActiveFilter();   // respects the active filter + spam-hide instead of dumping the whole store
             SelectSessionRow(session);
-            await _archive.SaveAsync();
+            var metadataPersisted = true;
+            try
+            {
+                await _archive.SaveAsync();
+            }
+            catch (Exception ex)
+            {
+                metadataPersisted = false;
+                Diag.Log("Mux metadata persistence FAILED after session start " + ex);
+                RecordSessionEvent(
+                    session,
+                    "mux.started.metadata-failed",
+                    ex.Message,
+                    "error",
+                    details: new Dictionary<string, string> { ["muxName"] = name });
+            }
+            var metadataSuffix = metadataPersisted
+                ? ""
+                : " Session is live, but its recent-session metadata was not persisted.";
 
             if (openLocalAttach)
             {
@@ -117,8 +137,8 @@ public sealed partial class MainPage
                         ["attachOpened"] = opened.ok.ToString()
                     });
                 SyncStatus.Text = opened.ok
-                    ? $"Mux \"{title}\" live as \"{name}\" - opening local terminal; web can attach at /multiplex."
-                    : $"Mux \"{title}\" live as \"{name}\" - web can attach at /multiplex; local attach failed, run mux {name}.";
+                    ? $"Mux \"{title}\" live as \"{name}\" - opening local terminal; web can attach at /multiplex.{metadataSuffix}"
+                    : $"Mux \"{title}\" live as \"{name}\" - web can attach at /multiplex; local attach failed, run mux {name}.{metadataSuffix}";
             }
             else
             {
@@ -127,19 +147,33 @@ public sealed partial class MainPage
                     "mux.started.headless",
                     "Started headless PC-local mux session.",
                     details: new Dictionary<string, string> { ["muxName"] = name });
-                SyncStatus.Text = $"Headless mux \"{title}\" live as \"{name}\" - open it on your phone at /multiplex or attach with mux {name}.";
+                SyncStatus.Text = $"Headless mux \"{title}\" live as \"{name}\" - open it on your phone at /multiplex or attach with mux {name}.{metadataSuffix}";
             }
         }
         catch (Exception ex)
         {
-            Diag.Log("StartRemoteSession FAILED " + ex);
-            RecordSessionEvent(
-                session,
-                "mux.failed",
-                ex.Message,
-                "error",
-                details: new Dictionary<string, string> { ["muxName"] = name });
-            SyncStatus.Text = "Could not start the mux session - see log.";
+            if (muxStarted)
+            {
+                Diag.Log("StartRemoteSession post-start step FAILED " + ex);
+                RecordSessionEvent(
+                    session,
+                    "mux.started.post-start-failed",
+                    ex.Message,
+                    "error",
+                    details: new Dictionary<string, string> { ["muxName"] = name });
+                SyncStatus.Text = $"Mux \"{title}\" is live as \"{name}\", but a post-start step failed - see log.";
+            }
+            else
+            {
+                Diag.Log("StartRemoteSession FAILED " + ex);
+                RecordSessionEvent(
+                    session,
+                    "mux.failed",
+                    ex.Message,
+                    "error",
+                    details: new Dictionary<string, string> { ["muxName"] = name });
+                SyncStatus.Text = "Could not start the mux session - see log.";
+            }
         }
         finally
         {
@@ -539,8 +573,27 @@ public sealed partial class MainPage
 
         _archive.SetTabKind(name, "remote-resumed", "#e879f9");   // default tint so you can tell it's a resumed-remote
 
-        await _archive.SaveAsync();
-        await PushProjectsAsync();
+        string metadataWarning = "";
+        try
+        {
+            await _archive.SaveAsync();
+            await PushProjectsAsync();
+        }
+        catch (Exception ex)
+        {
+            metadataWarning = " The mux handoff succeeded, but app metadata synchronization failed.";
+            Diag.Log("Tomux metadata persistence FAILED after ownership handoff " + ex);
+            RecordSessionEvent(
+                session,
+                "tomux.completed.metadata-failed",
+                ex.Message,
+                "error",
+                details: new Dictionary<string, string>
+                {
+                    ["muxName"] = name,
+                    ["pid"] = c.pid.ToString()
+                });
+        }
         RecordSessionEvent(
             session,
             "tomux.completed",
@@ -551,7 +604,7 @@ public sealed partial class MainPage
                 ["pid"] = c.pid.ToString()
             });
         return new CodexLocalRetrieval.Core.Models.AgentCommandResult(true,
-            $"Handed off to multiplex as '{name}' (resumed-remote); local session stopped. Open the multiplex site to drive it.",
+            $"Handed off to multiplex as '{name}' (resumed-remote); local session stopped. Open the multiplex site to drive it.{metadataWarning}",
             ResolvedSessionId: session.Id);
     }
 

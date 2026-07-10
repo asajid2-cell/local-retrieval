@@ -8,6 +8,12 @@ namespace CodexLocalRetrieval.Core.Models;
 
 public sealed class AppStoreData
 {
+    [JsonPropertyName("storeSchemaVersion")]
+    public int StoreSchemaVersion { get; set; } = 1;
+
+    [JsonPropertyName("generation")]
+    public long Generation { get; set; }
+
     [JsonPropertyName("sessions")]
     public Dictionary<string, ArchiveSession> Sessions { get; set; } = new();
 
