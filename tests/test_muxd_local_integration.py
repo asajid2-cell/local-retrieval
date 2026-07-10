@@ -114,6 +114,30 @@ async def input_during_slow_create(port, fault_path, create_payload, input_paylo
     return created, input_result, input_elapsed
 
 
+async def attach_during_slow_create(port, fault_path, create_payload, target, timeout=18):
+    create_task = asyncio.create_task(
+        request_json(port, create_payload, timeout=timeout)
+    )
+    deadline = time.perf_counter() + timeout
+    while fault_path.exists() and time.perf_counter() < deadline:
+        await asyncio.sleep(0.01)
+    if fault_path.exists():
+        raise TimeoutError("slow persistence fault was not consumed")
+
+    started = time.perf_counter()
+    async with websockets.connect(
+        f"ws://127.0.0.1:{port}",
+        open_timeout=timeout,
+        close_timeout=1,
+        ping_interval=None,
+    ) as ws:
+        await ws.send(json.dumps({"t": "attach", "s": target, "sb": 60000}))
+        initial = await asyncio.wait_for(ws.recv(), timeout=timeout)
+    attach_elapsed = time.perf_counter() - started
+    created = await asyncio.wait_for(create_task, timeout=timeout)
+    return created, initial, attach_elapsed
+
+
 async def owner_collision(port, name, cmd, timeout=14):
     first = await websockets.connect(
         f"ws://127.0.0.1:{port}",
@@ -1276,6 +1300,44 @@ class MuxdLocalIntegrationTests(unittest.TestCase):
                 f"unrelated input waited for durable state transaction: {input_elapsed:.3f}s",
             )
             self.wait_for_tail(target, marker)
+        finally:
+            self.kill(target)
+            self.kill(creating)
+
+    def test_slow_manifest_persistence_does_not_block_read_only_attach(self):
+        target = "it-attach-during-persist"
+        creating = "it-attach-during-persist-create"
+        self.kill(target)
+        self.kill(creating)
+        try:
+            target_result = run_request(
+                self.muxd.port,
+                {"t": "create", "s": target},
+                timeout=18,
+            )
+            self.assertTrue(target_result.get("created"), target_result)
+
+            self.muxd.delay_persistence("before_write", 1500)
+            created, initial, attach_elapsed = asyncio.run(
+                attach_during_slow_create(
+                    self.muxd.port,
+                    self.muxd.root / "persist-fault.json",
+                    {
+                        "t": "create",
+                        "s": creating,
+                        "cmd": "while($true){Start-Sleep -Milliseconds 200}",
+                    },
+                    target,
+                )
+            )
+
+            self.assertTrue(created.get("created"), created)
+            self.assertIsInstance(initial, bytes)
+            self.assertLess(
+                attach_elapsed,
+                0.75,
+                f"read-only attach waited for durable state transaction: {attach_elapsed:.3f}s",
+            )
         finally:
             self.kill(target)
             self.kill(creating)

@@ -2892,6 +2892,14 @@ async def main():
     async def local_serve():
         import websockets as _ws
         async def ensure_local_session(first, spawn_if_missing):
+            if not spawn_if_missing:
+                name = SAFE(first.get("s", ""))
+                if not name:
+                    return None, "session name required", False
+                session = sessions.get(name)
+                if session is None:
+                    return None, "no such session: " + name, False
+                return session, "", False
             return await coordinate_session_request(first, spawn_if_missing)
 
         async def handler(ws):
