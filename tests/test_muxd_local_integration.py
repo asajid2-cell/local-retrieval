@@ -79,6 +79,22 @@ async def concurrent_requests(port, payloads, timeout=14):
         *(request_json(port, payload, timeout=timeout) for payload in payloads)
     )
 
+async def input_during_slow_create(port, fault_path, create_payload, input_payload, timeout=18):
+    create_task = asyncio.create_task(
+        request_json(port, create_payload, timeout=timeout)
+    )
+    deadline = time.perf_counter() + timeout
+    while fault_path.exists() and time.perf_counter() < deadline:
+        await asyncio.sleep(0.01)
+    if fault_path.exists():
+        raise TimeoutError("slow persistence fault was not consumed")
+
+    started = time.perf_counter()
+    input_result = await request_json(port, input_payload, timeout=timeout)
+    input_elapsed = time.perf_counter() - started
+    created = await asyncio.wait_for(create_task, timeout=timeout)
+    return created, input_result, input_elapsed
+
 
 async def owner_collision(port, name, cmd, timeout=14):
     first = await websockets.connect(
@@ -193,6 +209,17 @@ class DisposableMuxd:
     def fail_persistence(self, stage, file="sessions.json", after=0):
         (self.root / "persist-fault.json").write_text(
             json.dumps({"file": file, "stage": stage, "after": after}),
+            encoding="utf-8",
+        )
+
+    def delay_persistence(self, stage, delay_ms, file="sessions.json"):
+        (self.root / "persist-fault.json").write_text(
+            json.dumps({
+                "file": file,
+                "stage": stage,
+                "delayMs": delay_ms,
+                "fail": False,
+            }),
             encoding="utf-8",
         )
 
@@ -1108,3 +1135,113 @@ class MuxdLocalIntegrationTests(unittest.TestCase):
             self.wait_for_tail(name, marker)
         finally:
             self.kill(name)
+
+    def test_slow_manifest_persistence_does_not_block_info_requests(self):
+        name = "it-nonblocking-persist"
+        self.kill(name)
+        try:
+            self.muxd.delay_persistence("before_write", 1500)
+            created, samples = asyncio.run(
+                create_while_hammering_info(
+                    self.muxd.port,
+                    name,
+                    "while($true){Start-Sleep -Milliseconds 200}",
+                    timeout=18,
+                )
+            )
+
+            self.assertTrue(created.get("created"), created)
+            self.assertGreaterEqual(len(samples), 3, samples)
+            slow = [
+                round(elapsed, 3)
+                for elapsed, result in samples
+                if elapsed > 0.75 or isinstance(result, Exception)
+            ]
+            self.assertEqual(
+                [],
+                slow,
+                f"info requests stalled or failed during durable manifest write; samples={samples!r}",
+            )
+        finally:
+            self.kill(name)
+
+    def test_slow_manifest_persistence_does_not_block_unrelated_input(self):
+        target = "it-input-during-persist"
+        creating = "it-input-during-persist-create"
+        marker = f"MUXD_INPUT_DURING_PERSIST_{int(time.time() * 1000)}"
+        self.kill(target)
+        self.kill(creating)
+        try:
+            target_result = run_request(
+                self.muxd.port,
+                {
+                    "t": "create",
+                    "s": target,
+                },
+                timeout=18,
+            )
+            self.assertTrue(target_result.get("created"), target_result)
+
+            self.muxd.delay_persistence("before_write", 1500)
+            created, input_result, input_elapsed = asyncio.run(
+                input_during_slow_create(
+                    self.muxd.port,
+                    self.muxd.root / "persist-fault.json",
+                    {
+                        "t": "create",
+                        "s": creating,
+                        "cmd": "while($true){Start-Sleep -Milliseconds 200}",
+                    },
+                    {
+                        "t": "input",
+                        "s": target,
+                        "d": base64.b64encode(
+                            f"Write-Output '{marker}'\r".encode("utf-8")
+                        ).decode("ascii"),
+                    },
+                )
+            )
+
+            self.assertTrue(created.get("created"), created)
+            self.assertEqual("input-ok", input_result.get("t"), input_result)
+            self.assertLess(
+                input_elapsed,
+                0.75,
+                f"unrelated input waited for durable state transaction: {input_elapsed:.3f}s",
+            )
+            self.wait_for_tail(target, marker)
+        finally:
+            self.kill(target)
+            self.kill(creating)
+
+    def test_concurrent_distinct_creates_survive_restart_without_snapshot_loss(self):
+        first = "it-distinct-persist-a"
+        second = "it-distinct-persist-b"
+        self.kill(first)
+        self.kill(second)
+        try:
+            self.muxd.delay_persistence("before_write", 750)
+            results = asyncio.run(concurrent_requests(
+                self.muxd.port,
+                [
+                    {
+                        "t": "create",
+                        "s": first,
+                        "cmd": "while($true){Start-Sleep -Milliseconds 200}",
+                    },
+                    {
+                        "t": "create",
+                        "s": second,
+                        "cmd": "while($true){Start-Sleep -Milliseconds 200}",
+                    },
+                ],
+                timeout=18,
+            ))
+
+            self.assertTrue(all(result.get("created") for result in results), results)
+            self.muxd.restart()
+            self.assertIsNotNone(self.session(first))
+            self.assertIsNotNone(self.session(second))
+        finally:
+            self.kill(first)
+            self.kill(second)

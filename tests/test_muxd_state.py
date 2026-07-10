@@ -8,6 +8,7 @@ import threading
 import time
 import unittest
 from datetime import datetime, timedelta, timezone
+from unittest import mock
 
 
 muxd = importlib.import_module("muxd")
@@ -292,7 +293,7 @@ class MuxdStateTests(unittest.TestCase):
             try:
                 muxd.MANIFEST = os.path.join(root, "sessions.json")
                 muxd.sessions = {"manifest-aliases": ManifestSession()}
-                muxd.manifest_save()
+                muxd.durable_json_write(muxd.MANIFEST, muxd.manifest_payload())
                 with open(muxd.MANIFEST, encoding="utf-8") as stream:
                     data = json.load(stream)
                 self.assertEqual(
@@ -532,10 +533,12 @@ class MuxdStateTests(unittest.TestCase):
         session = muxd.Session.__new__(muxd.Session)
         session.name = "input-confirm"
         session.wq = queue.Queue()
+        session._writer_lock = threading.Lock()
+        session._writer_thread = None
+        session._writer_pty = None
         session.pty = Pty()
         session.dead = False
-        worker = threading.Thread(target=session._writer, daemon=True)
-        worker.start()
+        worker = session._ensure_writer()
         try:
             ok, detail = session.write_confirmed(b"hello\r")
             self.assertTrue(ok, detail)
@@ -547,8 +550,181 @@ class MuxdStateTests(unittest.TestCase):
             self.assertIn("not live", detail)
             self.assertEqual(["hello\r"], session.pty.writes)
         finally:
-            session.wq.put(None)
+            self.assertTrue(session.stop_input_writer())
             worker.join(timeout=2)
+
+    def test_dormant_session_does_not_start_input_writer(self):
+        session = muxd.Session(
+            "dormant",
+            "",
+            tempfile.gettempdir(),
+            80,
+            24,
+            None,
+            None,
+            spawn_now=False,
+        )
+
+        self.assertIsNone(session._writer_thread)
+        self.assertTrue(session.stop_input_writer())
+
+    def test_dormant_sessions_do_not_accumulate_writer_threads(self):
+        with mock.patch.object(
+            muxd.threading,
+            "Thread",
+            side_effect=AssertionError("dormant sessions must not create threads"),
+        ):
+            sessions = [
+                muxd.Session(
+                    f"dormant-{index}",
+                    "",
+                    tempfile.gettempdir(),
+                    80,
+                    24,
+                    None,
+                    None,
+                    spawn_now=False,
+                )
+                for index in range(100)
+            ]
+
+        self.assertTrue(all(session._writer_thread is None for session in sessions))
+
+    def test_natural_pty_eof_stops_input_writer(self):
+        class EofPty:
+            def read(self, _):
+                raise EOFError()
+
+        class Loop:
+            def call_soon_threadsafe(self, callback, *args):
+                callback(*args)
+
+        session = muxd.Session.__new__(muxd.Session)
+        session.name = "natural-eof"
+        session.wq = queue.Queue()
+        session._writer_lock = threading.Lock()
+        session._writer_thread = None
+        session._writer_pty = None
+        session.pty = EofPty()
+        session.dead = False
+        session.loop = Loop()
+        session.outq = queue.Queue()
+        worker = session._ensure_writer()
+
+        session._reader(session.pty)
+
+        worker.join(timeout=2)
+        self.assertTrue(session.dead)
+        self.assertFalse(worker.is_alive())
+        self.assertIsNone(session._writer_thread)
+        self.assertEqual(("dead", "natural-eof", ""), session.outq.get_nowait())
+
+    def test_retiring_writer_generation_cannot_write_to_replacement_pty(self):
+        started = threading.Event()
+        release = threading.Event()
+
+        class BlockingPty:
+            def __init__(self):
+                self.writes = []
+
+            def write(self, value):
+                if value == "block":
+                    started.set()
+                    release.wait(timeout=2)
+                self.writes.append(value)
+
+        class RecordingPty:
+            def __init__(self):
+                self.writes = []
+
+            def write(self, value):
+                self.writes.append(value)
+
+        session = muxd.Session.__new__(muxd.Session)
+        session.name = "writer-generation"
+        session.wq = queue.Queue()
+        session._writer_lock = threading.Lock()
+        session._writer_thread = None
+        session._writer_pty = None
+        first_pty = BlockingPty()
+        second_pty = RecordingPty()
+        session.pty = first_pty
+        session.dead = False
+        retiring = session._ensure_writer()
+        session.wq.put("block")
+        self.assertTrue(started.wait(timeout=1))
+        session.wq.put("stale")
+        self.assertFalse(session.stop_input_writer(timeout=0.01))
+
+        session.pty = second_pty
+        replacement = session._ensure_writer()
+        try:
+            ok, detail = session.write_confirmed(b"fresh")
+            self.assertTrue(ok, detail)
+            release.set()
+            retiring.join(timeout=2)
+
+            self.assertFalse(retiring.is_alive())
+            self.assertEqual(["block"], first_pty.writes)
+            self.assertEqual(["fresh"], second_pty.writes)
+        finally:
+            release.set()
+            self.assertTrue(session.stop_input_writer())
+            replacement.join(timeout=2)
+
+    def test_writer_enqueue_completes_before_stop_sentinel(self):
+        put_started = threading.Event()
+        release_put = threading.Event()
+        stop_finished = threading.Event()
+
+        class BlockingQueue:
+            def __init__(self):
+                self.items = []
+                self.calls = 0
+
+            def put_nowait(self, item):
+                self.calls += 1
+                if self.calls == 1:
+                    put_started.set()
+                    release_put.wait(timeout=2)
+                self.items.append(item)
+
+        class AliveThread:
+            def is_alive(self):
+                return True
+
+            def join(self, timeout=None):
+                return None
+
+        session = muxd.Session.__new__(muxd.Session)
+        session.name = "atomic-enqueue"
+        session.pty = object()
+        session.dead = False
+        session._writer_lock = threading.Lock()
+        session._writer_thread = AliveThread()
+        session._writer_pty = session.pty
+        session.wq = BlockingQueue()
+
+        enqueue = threading.Thread(
+            target=lambda: session._enqueue_writer_item("input"),
+            daemon=True,
+        )
+
+        def stop():
+            session.stop_input_writer(timeout=0)
+            stop_finished.set()
+
+        stopper = threading.Thread(target=stop, daemon=True)
+        enqueue.start()
+        self.assertTrue(put_started.wait(timeout=1))
+        stopper.start()
+        self.assertFalse(stop_finished.wait(timeout=0.05))
+
+        release_put.set()
+        enqueue.join(timeout=1)
+        stopper.join(timeout=1)
+
+        self.assertEqual(["input", None], session.wq.items)
 
     def test_shell_only_payload_is_neutral_attention_state(self):
         payload = muxd.session_payload("shell", FakeSession(cmd="", alive=True))
@@ -641,6 +817,78 @@ class MuxdStateTests(unittest.TestCase):
 
 
 class MuxdAsyncTests(unittest.IsolatedAsyncioTestCase):
+    async def test_async_state_lock_is_reentrant_and_serializes_other_tasks(self):
+        lock = muxd.AsyncRLock()
+        entered = asyncio.Event()
+
+        async def waiter():
+            async with lock:
+                entered.set()
+
+        async with lock:
+            async with lock:
+                task = asyncio.create_task(waiter())
+                await asyncio.sleep(0.05)
+                self.assertFalse(entered.is_set())
+
+        await asyncio.wait_for(task, timeout=1)
+        self.assertTrue(entered.is_set())
+
+    async def test_cancelled_state_transaction_finishes_before_next_writer_enters(self):
+        lock = muxd.AsyncRLock()
+        first_entered = asyncio.Event()
+        release_first = asyncio.Event()
+        second_entered = asyncio.Event()
+        order = []
+
+        async def first_operation():
+            first_entered.set()
+            await release_first.wait()
+            order.append("first")
+
+        async def second_operation():
+            second_entered.set()
+            order.append("second")
+
+        caller = asyncio.create_task(
+            muxd.run_state_transaction(lock, first_operation)
+        )
+        await asyncio.wait_for(first_entered.wait(), timeout=1)
+        caller.cancel()
+        second = asyncio.create_task(
+            muxd.run_state_transaction(lock, second_operation)
+        )
+        await asyncio.sleep(0.05)
+        self.assertFalse(second_entered.is_set())
+
+        release_first.set()
+        with self.assertRaises(asyncio.CancelledError):
+            await caller
+        await asyncio.wait_for(second, timeout=1)
+
+        self.assertEqual(["first", "second"], order)
+
+    async def test_terminate_already_stopped_session_stops_input_writer(self):
+        session = muxd.Session.__new__(muxd.Session)
+        session.name = "already-stopped"
+        session.wq = queue.Queue()
+        session._writer_lock = threading.Lock()
+        session._writer_thread = None
+        session._writer_pty = None
+        session.pty = None
+        session.dead = True
+        session.user_killed = False
+        session._launch_claim = None
+        session.claim_paths = []
+        worker = session._ensure_writer()
+
+        ok, detail = await muxd.terminate_session_off_loop(session)
+
+        self.assertTrue(ok, detail)
+        worker.join(timeout=2)
+        self.assertFalse(worker.is_alive())
+        self.assertIsNone(session._writer_thread)
+
     async def test_relay_tls_context_load_runs_off_loop_and_is_cached(self):
         marker = object()
         calls = []

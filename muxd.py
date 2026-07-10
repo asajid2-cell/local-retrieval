@@ -61,7 +61,12 @@ def _durable_checkpoint(fault, stage, path):
             os.remove(fault_file)
         except OSError:
             pass
-        raise OSError(f"injected persistence failure at {stage} for {os.path.basename(path)}")
+        delay_ms = max(0, int(requested.get("delayMs", 0) or 0))
+        if delay_ms:
+            time.sleep(delay_ms / 1000)
+        if requested.get("fail", True):
+            raise OSError(f"injected persistence failure at {stage} for {os.path.basename(path)}")
+        return
 
 def _replace_write_through(source, destination):
     if os.name != "nt":
@@ -877,6 +882,58 @@ class RelayOutQueue(asyncio.Queue):
         super().put_nowait(item)
         return True
 
+class AsyncRLock:
+    def __init__(self):
+        self._lock = asyncio.Lock()
+        self._owner = None
+        self._depth = 0
+
+    async def __aenter__(self):
+        task = asyncio.current_task()
+        if self._owner is task:
+            self._depth += 1
+            return self
+        await self._lock.acquire()
+        self._owner = task
+        self._depth = 1
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        task = asyncio.current_task()
+        if self._owner is not task:
+            raise RuntimeError("async state lock released by a non-owner task")
+        self._depth -= 1
+        if self._depth == 0:
+            self._owner = None
+            self._lock.release()
+
+    def owned_by_current_task(self):
+        return self._owner is asyncio.current_task()
+
+async def run_state_transaction(lock, operation):
+    if lock.owned_by_current_task():
+        return await operation()
+
+    async def execute():
+        async with lock:
+            return await operation()
+
+    transaction = asyncio.create_task(execute())
+    try:
+        return await asyncio.shield(transaction)
+    except asyncio.CancelledError:
+        while not transaction.done():
+            try:
+                await asyncio.shield(transaction)
+            except asyncio.CancelledError:
+                continue
+        if not transaction.cancelled():
+            try:
+                transaction.result()
+            except Exception as error:
+                log(f"state transaction failed after caller cancellation: {error}")
+        raise
+
 def watch_snapshot():
     with WATCH_LOCK:
         return dict(WATCH)
@@ -918,8 +975,10 @@ class Session:
         self.pending = bytearray(); self.plock = threading.Lock()   # output coalescing (flushed by the pump)
         self.local = set()                                          # local (muxctl) viewer queues — fanned the same output
         self.wq = queue.Queue()                                     # input write queue → serialized, chunked writes
+        self._writer_lock = threading.Lock()
+        self._writer_thread = None
+        self._writer_pty = None
         self.pty = None
-        threading.Thread(target=self._writer, daemon=True).start()
         if spawn_now: self.spawn()
         else: self.dead = True          # placeholder tab: NOTHING runs until the user attaches (revive) or arms it
 
@@ -944,6 +1003,7 @@ class Session:
         self.child_pid = int(getattr(self.pty, "pid", 0) or 0)
         self.child_start_token = _process_start_token(self.child_pid)
         self.lifecycle = "active"
+        self._ensure_writer()
         t = threading.Thread(target=self._reader, args=(self.pty,), daemon=True); t.start()
         if self.cmd and not direct_cmd:
             threading.Timer(0.8, self._type_cmd, args=(self.pty,)).start()
@@ -960,6 +1020,9 @@ class Session:
             except Exception:
                 if pty is self.pty:
                     self.dead = True
+                    writer_stopped = self.stop_input_writer()
+                    if not writer_stopped:
+                        log(f"[{self.name}] input writer did not stop after PTY EOF")
                     self.loop.call_soon_threadsafe(self.outq.put_nowait, ("dead", self.name, ""))
                     log(f"[{self.name}] pty EOF (shell exited or killed)")
                 return
@@ -980,10 +1043,63 @@ class Session:
             chunk = bytes(self.pending); self.pending = bytearray()
         return chunk
 
-    def _writer(self):
+    def _ensure_writer_locked(self):
+        if (
+            self._writer_thread is not None
+            and self._writer_thread.is_alive()
+            and self._writer_pty is self.pty
+        ):
+            return self._writer_thread
+        work_queue = queue.Queue()
+        pty = self.pty
+        thread = threading.Thread(
+            target=self._writer,
+            args=(work_queue, pty),
+            name=f"{self.name}-writer",
+            daemon=True,
+        )
+        self.wq = work_queue
+        self._writer_thread = thread
+        self._writer_pty = pty
+        thread.start()
+        return thread
+
+    def _ensure_writer(self):
+        with self._writer_lock:
+            return self._ensure_writer_locked()
+
+    def _enqueue_writer_item(self, item):
+        with self._writer_lock:
+            if not self.alive() or self.pty is None:
+                return False
+            self._ensure_writer_locked()
+            self.wq.put_nowait(item)
+            return True
+
+    def stop_input_writer(self, timeout=2):
+        lock = getattr(self, "_writer_lock", None)
+        if lock is None:
+            return True
+        with lock:
+            thread = self._writer_thread
+            work_queue = self.wq
+            self._writer_thread = None
+            self._writer_pty = None
+            if thread is not None:
+                try:
+                    work_queue.put_nowait(None)
+                except Exception:
+                    pass
+        if thread is None:
+            return True
+        if thread is not threading.current_thread():
+            thread.join(timeout=max(0, timeout))
+        return not thread.is_alive()
+
+    def _writer(self, work_queue, pty):
         # serialize input; slice large pastes into <=1KB writes so a big paste can't stall/garble ConPTY input.
         while True:
-            item = self.wq.get()
+            item = work_queue.get()
             if item is None: return
             if isinstance(item, tuple):
                 s, completed, outcome = item
@@ -991,17 +1107,17 @@ class Session:
                 s, completed, outcome = item, None, None
             ok, detail = False, "PTY is not live"
             try:
-                if self.pty is not None and not self.dead:
+                if pty is not None and pty is self.pty and not self.dead:
                     if len(s) <= 1024:
-                        self.pty.write(s)
+                        pty.write(s)
                         ok, detail = True, ""
                     else:
                         ok, detail = True, ""
                         for i in range(0, len(s), 1024):
-                            if self.dead:
+                            if self.dead or pty is not self.pty:
                                 ok, detail = False, "PTY exited during input"
                                 break
-                            self.pty.write(s[i:i+1024]); time.sleep(0.004)
+                            pty.write(s[i:i+1024]); time.sleep(0.004)
             except Exception as e:
                 detail = "PTY input write failed"
                 log(f"[{self.name}] write failed: {e}")
@@ -1011,17 +1127,22 @@ class Session:
                     completed.set()
 
     def write(self, data: bytes):
-        try: self.wq.put(data.decode("utf-8", "replace"))
+        try:
+            self._enqueue_writer_item(data.decode("utf-8", "replace"))
         except Exception as e: log(f"[{self.name}] enqueue failed: {e}")
 
     def write_confirmed(self, data: bytes, timeout=8):
         completed = threading.Event()
         outcome = []
         try:
-            self.wq.put((data.decode("utf-8", "replace"), completed, outcome))
+            accepted = self._enqueue_writer_item(
+                (data.decode("utf-8", "replace"), completed, outcome)
+            )
         except Exception as e:
             log(f"[{self.name}] confirmed enqueue failed: {e}")
             return False, "PTY input queue failed"
+        if not accepted:
+            return False, "PTY is not live"
         if not completed.wait(timeout):
             return False, "PTY input write timed out"
         return outcome[0] if outcome else (False, "PTY input write did not report a result")
@@ -1293,12 +1414,6 @@ def compact_intent_records(records, now=None):
         reverse=True,
     )[:INTENT_TERMINAL_LIMIT]
     return {**live, **dict(terminal)}
-
-def manifest_save(source=None):
-    payload = manifest_payload(source)
-    durable_json_write(MANIFEST, payload)
-    intent_records.clear()
-    intent_records.update(payload["intents"])
 
 def valid_session_records(value):
     if not isinstance(value, dict):
@@ -1638,6 +1753,9 @@ async def terminate_session_off_loop(s, by_user=True, timeout=12, release_claim_
     pty = getattr(s, "pty", None)
     pid = int(getattr(pty, "pid", 0) or 0) if pty is not None else 0
     if pty is None:
+        writer_stopped = await asyncio.get_running_loop().run_in_executor(None, s.stop_input_writer)
+        if not writer_stopped:
+            log(f"[{getattr(s, 'name', '?')}] input writer did not stop after session exit")
         if release_claim_on_success:
             release_session_claim(s)
         return True, "already stopped"
@@ -1664,10 +1782,9 @@ async def terminate_session_off_loop(s, by_user=True, timeout=12, release_claim_
         if result[0]:
             if s.pty is pty:
                 s.pty = None
-            try:
-                s.wq.put_nowait(None)
-            except Exception:
-                pass
+            writer_stopped = await asyncio.get_running_loop().run_in_executor(None, s.stop_input_writer)
+            if not writer_stopped:
+                log(f"[{getattr(s, 'name', '?')}] input writer did not stop after process exit")
             if release_claim_on_success:
                 release_session_claim(s)
         elif s.pty is pty:
@@ -1687,6 +1804,25 @@ async def main():
     launch_locks = {}
     intent_locks = {}
     create_intent_locks = {}
+    state_lock = AsyncRLock()
+
+    def state_mutation(func):
+        async def serialized(*args, **kwargs):
+            return await run_state_transaction(
+                state_lock,
+                lambda: func(*args, **kwargs),
+            )
+        return serialized
+
+    async def manifest_save_async(source=None):
+        async with state_lock:
+            payload = manifest_payload(source)
+            await asyncio.get_running_loop().run_in_executor(
+                None,
+                lambda: durable_json_write(MANIFEST, payload),
+            )
+            intent_records.clear()
+            intent_records.update(payload["intents"])
 
     def launch_lock(name):
         lock = launch_locks.get(name)
@@ -1709,12 +1845,13 @@ async def main():
             create_intent_locks[name] = lock
         return lock
 
-    def persist_intent(key, record):
+    @state_mutation
+    async def persist_intent(key, record):
         missing = object()
         prior = intent_records.get(key, missing)
         intent_records[key] = record
         try:
-            manifest_save(sessions)
+            await manifest_save_async(sessions)
         except Exception as error:
             if not getattr(error, "committed", False):
                 if prior is missing:
@@ -1760,6 +1897,7 @@ async def main():
             "session": {},
         }
 
+    @state_mutation
     async def coordinate_create_intent(first, scope, spawn_if_missing, leave_unarmed_dormant=False):
         name = strict_mux_name(first.get("s", ""))
         if not name:
@@ -1808,7 +1946,7 @@ async def main():
                         "",
                         bool(getattr(applied, "operation_created", False)),
                     )
-                    persist_intent(key, {**record, "status": "completed", "result": result, "updatedAt": time.time()})
+                    await persist_intent(key, {**record, "status": "completed", "result": result, "updatedAt": time.time()})
                     return result
             else:
                 unresolved = [
@@ -1840,7 +1978,7 @@ async def main():
                         )
                         old_status = "failed"
                     try:
-                        persist_intent(other_key, {
+                        await persist_intent(other_key, {
                             **other,
                             "status": old_status,
                             "result": old_result,
@@ -1861,7 +1999,7 @@ async def main():
                     "updatedAt": time.time(),
                 }
                 try:
-                    persist_intent(key, record)
+                    await persist_intent(key, record)
                 except Exception as error:
                     return create_error(
                         "could not durably accept create intent: " + str(error),
@@ -1895,7 +2033,7 @@ async def main():
                 "updatedAt": time.time(),
             }
             try:
-                persist_intent(key, terminal)
+                await persist_intent(key, terminal)
             except Exception as error:
                 return create_error(
                     "create outcome persistence failed: " + str(error),
@@ -1919,6 +2057,16 @@ async def main():
                 )
             return {"t": "input-ok", "s": session.name} if ok else {"t": "err", "m": detail}
 
+        return await execute_durable_input_intent(
+            first,
+            session,
+            data,
+            scope,
+            request_id,
+        )
+
+    @state_mutation
+    async def execute_durable_input_intent(first, session, data, scope, request_id):
         key = intent_key(scope, "input", request_id)
         fingerprint = intent_fingerprint(first)
         async with operation_lock(key):
@@ -1945,7 +2093,7 @@ async def main():
                 "updatedAt": time.time(),
             }
             try:
-                persist_intent(key, record)
+                await persist_intent(key, record)
             except Exception as error:
                 return {"t": "err", "m": "could not durably reserve input intent: " + str(error)}
 
@@ -1963,7 +2111,7 @@ async def main():
                 "updatedAt": time.time(),
             }
             try:
-                persist_intent(key, terminal)
+                await persist_intent(key, terminal)
             except Exception as error:
                 return {
                     "t": "err",
@@ -1971,6 +2119,7 @@ async def main():
                 }
             return result
 
+    @state_mutation
     async def remove_session(name, by_user):
         async with launch_lock(name):
             current = sessions.get(name)
@@ -1986,7 +2135,7 @@ async def main():
                 or getattr(current, "child_start_token", "")
             )
             try:
-                manifest_save(sessions)
+                await manifest_save_async(sessions)
             except Exception as e:
                 if not getattr(e, "committed", False):
                     restore_persisted_session(current, snapshot)
@@ -1995,14 +2144,14 @@ async def main():
             if not ok:
                 restore_persisted_session(current, snapshot)
                 try:
-                    manifest_save(sessions)
+                    await manifest_save_async(sessions)
                 except Exception as restore_error:
                     return False, detail + "; active-state rollback failed: " + str(restore_error)
                 return False, detail
             candidate = dict(sessions)
             candidate.pop(name, None)
             try:
-                manifest_save(candidate)
+                await manifest_save_async(candidate)
             except Exception as e:
                 if getattr(e, "committed", False) and sessions.get(name) is current:
                     del sessions[name]
@@ -2038,6 +2187,7 @@ async def main():
         )
         return claim, False, detail
 
+    @state_mutation
     async def coordinate_owner_registration(first, ws):
         name = strict_mux_name(first.get("s", ""))
         if not name:
@@ -2110,7 +2260,7 @@ async def main():
                     or getattr(prev, "child_start_token", "")
                 )
                 try:
-                    manifest_save(sessions)
+                    await manifest_save_async(sessions)
                     tombstoned = True
                 except Exception as e:
                     if getattr(e, "committed", False):
@@ -2128,7 +2278,7 @@ async def main():
                 if not ok:
                     restore_persisted_session(prev, previous_snapshot)
                     try:
-                        manifest_save(sessions)
+                        await manifest_save_async(sessions)
                     except Exception as restore_error:
                         detail += "; active-state rollback failed: " + str(restore_error)
                     if claim is not getattr(prev, "_launch_claim", None) and claim is not None:
@@ -2160,7 +2310,7 @@ async def main():
             candidate = dict(sessions)
             candidate[name] = owner
             try:
-                manifest_save(candidate)
+                await manifest_save_async(candidate)
             except Exception as e:
                 if getattr(e, "committed", False):
                     sessions[name] = owner
@@ -2176,6 +2326,7 @@ async def main():
             sessions[name] = owner
             return owner, ""
 
+    @state_mutation
     async def coordinate_session_request(
         first,
         spawn_if_missing,
@@ -2240,7 +2391,7 @@ async def main():
                     prev.cols = cols
                     prev.rows = rows
                 try:
-                    manifest_save()
+                    await manifest_save_async()
                 except Exception as e:
                     if getattr(e, "committed", False):
                         if old_claim is not None and old_claim is not claim:
@@ -2305,7 +2456,7 @@ async def main():
                     or getattr(prev, "child_start_token", "")
                 )
                 try:
-                    manifest_save(sessions)
+                    await manifest_save_async(sessions)
                 except Exception as e:
                     if not getattr(e, "committed", False):
                         restore_persisted_session(prev, previous_snapshot)
@@ -2320,7 +2471,7 @@ async def main():
                 if not ok:
                     restore_persisted_session(prev, previous_snapshot)
                     try:
-                        manifest_save(sessions)
+                        await manifest_save_async(sessions)
                     except Exception as restore_error:
                         detail += "; active-state rollback failed: " + str(restore_error)
                     if claim is not existing_claim and claim is not None:
@@ -2347,7 +2498,7 @@ async def main():
             candidate = dict(sessions)
             candidate[name] = created
             try:
-                manifest_save(candidate)
+                await manifest_save_async(candidate)
             except Exception as e:
                 if getattr(e, "committed", False):
                     sessions[name] = created
@@ -2372,7 +2523,7 @@ async def main():
                 )
                 created.dead = stopped
                 try:
-                    manifest_save(sessions)
+                    await manifest_save_async(sessions)
                 except Exception as persist_error:
                     return None, "spawn failed and failure state could not be persisted: " + str(persist_error), False
                 return None, "spawn failed: " + str(e) + "; stop=" + stop_detail, False
@@ -2384,7 +2535,7 @@ async def main():
                 or getattr(created, "child_start_token", "")
             )
             try:
-                manifest_save(sessions)
+                await manifest_save_async(sessions)
             except Exception as e:
                 if getattr(e, "committed", False):
                     return None, "spawned session is active but manifest durability is unconfirmed: " + str(e), False
@@ -2397,7 +2548,7 @@ async def main():
                     or getattr(created, "child_start_token", "")
                 )
                 try:
-                    manifest_save(sessions)
+                    await manifest_save_async(sessions)
                 except Exception as persist_error:
                     return None, (
                         "active manifest commit failed; stop=" + stop_detail
@@ -2406,6 +2557,7 @@ async def main():
                 return None, "could not durably activate spawned session; stop=" + stop_detail, False
             return created, "", True
 
+    @state_mutation
     async def bind_session_identity(first):
         name = strict_mux_name(first.get("s", ""))
         if not name:
@@ -2464,7 +2616,7 @@ async def main():
             current.claim_paths = list(claim.paths)
             current.identity_pending = False
             try:
-                manifest_save()
+                await manifest_save_async()
             except Exception as e:
                 if getattr(e, "committed", False):
                     if old_claim is not None and old_claim is not claim:
@@ -2477,6 +2629,44 @@ async def main():
             if old_claim is not None and old_claim is not claim:
                 old_claim.release()
             return current, ""
+
+    @state_mutation
+    async def set_session_heal(name, enabled):
+        session = sessions.get(name)
+        if session is None:
+            return False, "no such session"
+        if enabled and getattr(session, "identity_pending", False):
+            return False, "fresh identity is pending"
+        previous = session.heal
+        session.heal = bool(enabled)
+        try:
+            await manifest_save_async()
+        except Exception as error:
+            if not getattr(error, "committed", False):
+                session.heal = previous
+            return False, str(error)
+        return True, ""
+
+    @state_mutation
+    async def rename_session(name, target):
+        session = sessions.get(name)
+        if session is None or not target or target in sessions:
+            return False, "invalid or conflicting session name"
+        candidate = dict(sessions)
+        candidate.pop(name)
+        candidate[target] = session
+        try:
+            await manifest_save_async(candidate)
+        except Exception as error:
+            if getattr(error, "committed", False):
+                sessions.pop(name, None)
+                session.name = target
+                sessions[target] = session
+            return False, str(error)
+        sessions.pop(name)
+        session.name = target
+        sessions[target] = session
+        return True, ""
 
     async def loop_monitor():
         last = time.monotonic()
@@ -2592,7 +2782,7 @@ async def main():
                 )
                 if remove_record:
                     sessions.pop(name, None)
-                    manifest_save(sessions)
+                    await manifest_save_async(sessions)
                     log(f"[boot] completed durable stop intent for {name}")
                     continue
                 restored.lifecycle = "failed" if restored.lifecycle == "starting" else "dormant"
@@ -2600,7 +2790,7 @@ async def main():
                 restored.child_start_token = ""
                 restored.stop_disposition = ""
                 restored.user_killed = False
-                manifest_save(sessions)
+                await manifest_save_async(sessions)
                 log(f"[boot] reconciled unresolved lifecycle for {name}; left dormant")
                 continue
             if restored.lifecycle == "failed":
@@ -2952,23 +3142,16 @@ async def main():
                                     }))
                                 continue
                             elif t == "heal" and name in sessions:
-                                if bool(m.get("on")) and getattr(sessions[name], "identity_pending", False):
+                                healed, detail = await set_session_heal(name, bool(m.get("on")))
+                                if not healed and detail == "fresh identity is pending":
                                     log(f"[{name}] refused auto-resume while fresh identity is pending")
-                                else:
-                                    session = sessions[name]
-                                    previous = session.heal
-                                    session.heal = bool(m.get("on"))
-                                    try:
-                                        manifest_save()
-                                    except Exception as e:
-                                        if not getattr(e, "committed", False):
-                                            session.heal = previous
-                                        log(f"[{name}] heal persistence failed: {e}")
-                                        await ws.send(json.dumps({
-                                            "t": "sessions",
-                                            "list": sess_list(),
-                                            "notice": "auto-resume policy was not persisted",
-                                        }))
+                                elif not healed:
+                                    log(f"[{name}] heal persistence failed: {detail}")
+                                    await ws.send(json.dumps({
+                                        "t": "sessions",
+                                        "list": sess_list(),
+                                        "notice": "auto-resume policy was not persisted",
+                                    }))
                             elif t == "i" and name in sessions:
                                 sessions[name].write(base64.b64decode(m.get("d", "")))
                             elif t == "resize" and name in sessions:
@@ -2983,27 +3166,15 @@ async def main():
                             elif t == "rename" and name in sessions:
                                 to = strict_mux_name(m.get("to", ""))
                                 if to and to not in sessions:
-                                    s = sessions[name]
-                                    candidate = dict(sessions)
-                                    candidate.pop(name)
-                                    candidate[to] = s
-                                    try:
-                                        manifest_save(candidate)
-                                    except Exception as e:
-                                        if getattr(e, "committed", False):
-                                            sessions.pop(name)
-                                            s.name = to
-                                            sessions[to] = s
-                                        log(f"[{name}] rename persistence failed: {e}")
+                                    renamed, detail = await rename_session(name, to)
+                                    if not renamed:
+                                        log(f"[{name}] rename persistence failed: {detail}")
                                         await ws.send(json.dumps({
                                             "t": "sessions",
                                             "list": sess_list(),
                                             "notice": "session rename durability is unconfirmed",
                                         }))
                                         continue
-                                    sessions.pop(name)
-                                    s.name = to
-                                    sessions[to] = s
                                     await ws.send(json.dumps({"t": "sessions", "list": sess_list()}))
                             elif t == "tail" and name in sessions:
                                 await ws.send(json.dumps({"t": "tailr", "rid": m.get("rid", ""),
