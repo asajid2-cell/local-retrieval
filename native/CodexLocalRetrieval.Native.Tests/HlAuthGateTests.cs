@@ -64,4 +64,40 @@ public sealed class HlAuthGateTests
         }, "remote");
         Assert.AreEqual(GateOutcome.Allow, await gate.CheckAsync("hl_session=abc"));
     }
+
+    [TestMethod]
+    public void OutcomeCache_ExpiresEntriesAndBoundsCardinality()
+    {
+        var now = DateTimeOffset.Parse("2026-07-10T00:00:00Z");
+        var cache = new HlAuthOutcomeCache(3, TimeSpan.FromSeconds(30), () => now);
+
+        cache.Set("a", GateOutcome.Allow);
+        cache.Set("b", GateOutcome.Login);
+        cache.Set("c", GateOutcome.Forbid);
+        cache.Set("d", GateOutcome.Allow);
+
+        Assert.AreEqual(3, cache.Count);
+        Assert.IsFalse(cache.TryGet("a", out _));
+        Assert.IsTrue(cache.TryGet("d", out var outcome));
+        Assert.AreEqual(GateOutcome.Allow, outcome);
+
+        now = now.AddSeconds(30);
+        Assert.IsFalse(cache.TryGet("d", out _));
+        Assert.AreEqual(0, cache.Count);
+    }
+
+    [TestMethod]
+    public void OutcomeCache_ConcurrentWritersNeverExceedCapacity()
+    {
+        const int capacity = 64;
+        var cache = new HlAuthOutcomeCache(capacity, TimeSpan.FromMinutes(1));
+
+        Parallel.For(0, 10_000, i =>
+        {
+            cache.Set("cookie-" + i, (GateOutcome)(i % 3));
+            cache.TryGet("cookie-" + Math.Max(0, i - 1), out _);
+        });
+
+        Assert.IsLessThanOrEqualTo(capacity, cache.Count);
+    }
 }

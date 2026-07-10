@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Text;
 using System.Text.Json;
 
@@ -13,7 +14,7 @@ public sealed class ClaudeSessionStore
     private const int MaxMessageChars = 128 * 1024;
     private readonly string _root;
     // session id -> rollout path, populated on List() so Open can find the file by id.
-    private readonly Dictionary<string, string> _paths = new();
+    private readonly ConcurrentDictionary<string, string> _paths = new(StringComparer.OrdinalIgnoreCase);
 
     public ClaudeSessionStore(string? root = null) =>
         _root = root ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".claude", "projects");
@@ -43,7 +44,15 @@ public sealed class ClaudeSessionStore
         return infos;
     }
 
-    public string? PathOf(string id) => _paths.TryGetValue(id, out var p) ? p : ResolveById(id);
+    public string? PathOf(string id)
+    {
+        if (_paths.TryGetValue(id, out var path))
+        {
+            if (File.Exists(path)) return path;
+            _paths.TryRemove(new KeyValuePair<string, string>(id, path));
+        }
+        return ResolveById(id);
+    }
 
     // Find a session file by id even if List() wasn't called this process (deep link / restart).
     private string? ResolveById(string id)
@@ -52,7 +61,7 @@ public sealed class ClaudeSessionStore
         foreach (var dir in Directory.EnumerateDirectories(_root))
         {
             var p = Path.Combine(dir, id + ".jsonl");
-            if (File.Exists(p)) { _paths[id] = p; return p; }
+            if (File.Exists(p)) return _paths.GetOrAdd(id, p);
         }
         return null;
     }

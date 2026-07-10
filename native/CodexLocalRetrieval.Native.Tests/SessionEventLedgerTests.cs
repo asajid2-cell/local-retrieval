@@ -119,6 +119,36 @@ public sealed class SessionEventLedgerTests
     }
 
     [TestMethod]
+    public void ReadRecent_LargeMonthlyLedgerReadsOnlyBoundedTail()
+    {
+        using var dir = NewTempDir();
+        var options = Options(dir.Path);
+        var file = EventFile(dir.Path, options.EffectiveNow);
+        Directory.CreateDirectory(dir.Path);
+        using (var writer = new StreamWriter(file, append: false, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false)))
+        {
+            for (var i = 0; i < 75_000; i++)
+                writer.WriteLine(JsonSerializer.Serialize(new
+                {
+                    id = i.ToString(),
+                    at = options.EffectiveNow.ToString("O"),
+                    kind = "event." + i,
+                    summary = new string('x', 256)
+                }));
+        }
+
+        _ = SessionEventLedger.ReadRecent(1, options);
+        var before = GC.GetAllocatedBytesForCurrentThread();
+        var events = SessionEventLedger.ReadRecent(25, options);
+        var allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+
+        Assert.HasCount(25, events);
+        Assert.AreEqual("event.74999", events[0].Kind);
+        Assert.AreEqual("event.74975", events[^1].Kind);
+        Assert.IsLessThan(4L * 1024 * 1024, allocated, $"ReadRecent allocated {allocated:N0} bytes.");
+    }
+
+    [TestMethod]
     public void TryAppend_RespectsNamedMutexTimeout()
     {
         using var dir = NewTempDir();

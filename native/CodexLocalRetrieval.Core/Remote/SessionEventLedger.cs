@@ -24,6 +24,9 @@ public sealed record SessionEvent
 
 public static class SessionEventLedger
 {
+    private const int ReverseReadBufferBytes = 64 * 1024;
+    private const int MaxLedgerLineBytes = 256 * 1024;
+
     public sealed record Options(string? RootDirectory = null, DateTimeOffset? Now = null, TimeSpan? LockTimeout = null)
     {
         public string EffectiveRootDirectory
@@ -210,25 +213,85 @@ public static class SessionEventLedger
 
     private static IEnumerable<SessionEvent> ReadFileNewestFirst(string path)
     {
-        List<string> lines;
+        FileStream fs;
         try
         {
-            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-            using var reader = new StreamReader(fs, Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
-            lines = new List<string>();
-            while (reader.ReadLine() is { } line)
-                lines.Add(line);
+            fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
         }
         catch { yield break; }
-        for (var i = lines.Count - 1; i >= 0; i--)
+
+        using (fs)
         {
-            var line = lines[i];
-            if (string.IsNullOrWhiteSpace(line)) continue;
-            SessionEvent? ev;
-            try { ev = JsonSerializer.Deserialize<SessionEvent>(line); }
-            catch { continue; }
-            if (ev is not null && !string.IsNullOrWhiteSpace(ev.Kind))
-                yield return Normalize(ev);
+            var position = fs.Length;
+            var readBuffer = new byte[ReverseReadBufferBytes];
+            var lineBuffer = new byte[MaxLedgerLineBytes];
+            var lineLength = 0;
+            var oversized = false;
+
+            while (position > 0)
+            {
+                var requested = (int)Math.Min(readBuffer.Length, position);
+                position -= requested;
+                int read;
+                try
+                {
+                    fs.Position = position;
+                    read = 0;
+                    while (read < requested)
+                    {
+                        var count = fs.Read(readBuffer, read, requested - read);
+                        if (count == 0) break;
+                        read += count;
+                    }
+                }
+                catch { yield break; }
+                if (read <= 0) yield break;
+
+                for (var i = read - 1; i >= 0; i--)
+                {
+                    var b = readBuffer[i];
+                    if (b == (byte)'\n')
+                    {
+                        if (!oversized && TryParseReversedLine(lineBuffer, lineLength, out var ev))
+                            yield return ev;
+                        lineLength = 0;
+                        oversized = false;
+                    }
+                    else if (b != (byte)'\r')
+                    {
+                        if (lineLength < lineBuffer.Length) lineBuffer[lineLength++] = b;
+                        else oversized = true;
+                    }
+                }
+            }
+
+            if (!oversized && TryParseReversedLine(lineBuffer, lineLength, out var first))
+                yield return first;
+        }
+    }
+
+    private static bool TryParseReversedLine(byte[] buffer, int length, out SessionEvent ev)
+    {
+        ev = null!;
+        if (length == 0) return false;
+        Array.Reverse(buffer, 0, length);
+        try
+        {
+            var line = Encoding.UTF8.GetString(buffer, 0, length);
+            if (line.Length > 0 && line[0] == '\uFEFF') line = line[1..];
+            if (string.IsNullOrWhiteSpace(line)) return false;
+            var parsed = JsonSerializer.Deserialize<SessionEvent>(line);
+            if (parsed is null || string.IsNullOrWhiteSpace(parsed.Kind)) return false;
+            ev = Normalize(parsed);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+        finally
+        {
+            Array.Reverse(buffer, 0, length);
         }
     }
 

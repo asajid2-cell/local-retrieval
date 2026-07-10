@@ -87,7 +87,7 @@ if (hlAuthOn)
         using var resp = await http.SendAsync(req, ct);
         return resp.IsSuccessStatusCode ? await resp.Content.ReadAsStringAsync(ct) : null;
     }, hlPage);
-    var cache = new System.Collections.Concurrent.ConcurrentDictionary<string, (DateTime exp, GateOutcome outcome)>();
+    var cache = new HlAuthOutcomeCache(capacity: 1024, ttl: TimeSpan.FromSeconds(30));
 
     app.Use(async (ctx, next) =>
     {
@@ -95,8 +95,8 @@ if (hlAuthOn)
         var cookie = ctx.Request.Cookies[hlCookie];
         GateOutcome outcome;
         if (string.IsNullOrEmpty(cookie)) outcome = GateOutcome.Login;
-        else if (cache.TryGetValue(cookie, out var hit) && hit.exp > DateTime.UtcNow) outcome = hit.outcome;
-        else { outcome = await gate.CheckAsync(cookie, ctx.RequestAborted); cache[cookie] = (DateTime.UtcNow.AddSeconds(30), outcome); }
+        else if (cache.TryGet(cookie, out var hit)) outcome = hit;
+        else { outcome = await gate.CheckAsync(cookie, ctx.RequestAborted); cache.Set(cookie, outcome); }
 
         if (outcome == GateOutcome.Allow) { await next(); return; }
         if (outcome == GateOutcome.Login)

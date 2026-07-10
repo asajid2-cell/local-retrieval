@@ -264,6 +264,32 @@ public sealed class RolloutAndLiveMappingTests
     }
 
     [TestMethod]
+    public void ClaudePathCache_SupportsConcurrentListingAndLookup()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "clr-claude-concurrent-" + Guid.NewGuid().ToString("N"));
+        var project = Path.Combine(root, "z--proj");
+        Directory.CreateDirectory(project);
+        var ids = Enumerable.Range(0, 40).Select(i => $"session-{i:D3}").ToArray();
+        foreach (var id in ids)
+            File.WriteAllText(
+                Path.Combine(project, id + ".jsonl"),
+                "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":\"hello\"}}\n");
+
+        try
+        {
+            var store = new ClaudeSessionStore(root);
+            Parallel.For(0, 500, i =>
+            {
+                var id = ids[i % ids.Length];
+                Assert.HasCount(ids.Length, store.List(ids.Length));
+                Assert.AreEqual(Path.Combine(project, id + ".jsonl"), store.PathOf(id));
+                Assert.HasCount(1, store.ReadHistory(id));
+            });
+        }
+        finally { Directory.Delete(root, true); }
+    }
+
+    [TestMethod]
     public void ClaudeStream_MapsInitMessagesToolsAndResult()
     {
         Assert.AreEqual(AgentEventKind.SessionStarted,
