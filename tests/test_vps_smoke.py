@@ -189,7 +189,7 @@ class VpsSmokeTests(unittest.TestCase):
         suffix = int(time.time() * 1000)
         name = f"vps-saved-{suffix}"
         marker = f"MUXD_VPS_RELAUNCH_{suffix}"
-        cmd = f"Write-Output '{marker}'; Start-Sleep -Milliseconds 250"
+        cmd = f"Write-Output '{marker}'; Start-Sleep -Milliseconds 250; exit"
         self.kill(name)
         try:
             created = local_json({"t": "create", "s": name, "cmd": cmd, "cols": 100, "rows": 28}, timeout=12)

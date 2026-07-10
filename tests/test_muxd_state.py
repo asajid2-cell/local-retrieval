@@ -641,6 +641,41 @@ class MuxdStateTests(unittest.TestCase):
 
 
 class MuxdAsyncTests(unittest.IsolatedAsyncioTestCase):
+    async def test_relay_tls_context_load_runs_off_loop_and_is_cached(self):
+        marker = object()
+        calls = []
+        main_thread = threading.get_ident()
+        old_create = muxd.ssl.create_default_context
+        old_context = muxd._RELAY_TLS_CONTEXT
+        try:
+            muxd._RELAY_TLS_CONTEXT = None
+
+            def slow_create():
+                calls.append(threading.get_ident())
+                time.sleep(0.25)
+                return marker
+
+            muxd.ssl.create_default_context = slow_create
+            started = time.perf_counter()
+            loading = asyncio.create_task(muxd.relay_tls_context("wss://relay.example/host"))
+            await asyncio.sleep(0.05)
+            self.assertLess(
+                time.perf_counter() - started,
+                0.2,
+                "TLS certificate loading blocked the event loop",
+            )
+            self.assertIs(await loading, marker)
+            self.assertNotEqual(main_thread, calls[0])
+            self.assertIs(
+                await muxd.relay_tls_context("wss://relay.example/host"),
+                marker,
+            )
+            self.assertEqual(1, len(calls), "TLS context should be loaded once per muxd process")
+            self.assertIsNone(await muxd.relay_tls_context("ws://relay.example/host"))
+        finally:
+            muxd.ssl.create_default_context = old_create
+            muxd._RELAY_TLS_CONTEXT = old_context
+
     async def test_terminate_session_waits_for_pty_termination(self):
         class SlowPty:
             pid = 0

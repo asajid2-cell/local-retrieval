@@ -12,7 +12,7 @@
 #
 # State: sessions.json manifest (resume commands) -> muxd restart / PC reboot lists unarmed sessions
 # as dormant placeholders. Only sessions explicitly armed with heal auto-start.
-import asyncio, base64, collections, ctypes, glob, hashlib, json, os, queue, re, socket, subprocess, sys, tempfile, threading, time, traceback
+import asyncio, base64, collections, ctypes, glob, hashlib, json, os, queue, re, socket, ssl, subprocess, sys, tempfile, threading, time, traceback
 from ctypes import wintypes
 from datetime import datetime, timedelta, timezone
 import faulthandler
@@ -1433,13 +1433,27 @@ def strict_mux_name(value):
     return raw if raw and SAFE(raw) == raw else ""
 
 REMOTE_CREATE_FIELDS = {"t", "s", "rid", "cols", "rows", "relaunch", "heal"}
+_RELAY_TLS_CONTEXT = None
+_RELAY_TLS_CONTEXT_LOCK = threading.Lock()
+
+def _load_relay_tls_context():
+    global _RELAY_TLS_CONTEXT
+    with _RELAY_TLS_CONTEXT_LOCK:
+        if _RELAY_TLS_CONTEXT is None:
+            _RELAY_TLS_CONTEXT = ssl.create_default_context()
+        return _RELAY_TLS_CONTEXT
+
+async def relay_tls_context(url):
+    if not str(url or "").lower().startswith("wss://"):
+        return None
+    return await asyncio.get_running_loop().run_in_executor(None, _load_relay_tls_context)
 
 def remote_create_violation(frame):
     if not isinstance(frame, dict):
         return "create frame must be an object"
     extra = set(frame) - REMOTE_CREATE_FIELDS
     if extra:
-        return "create frame contains forbidden fields"
+        return "create frame contains forbidden fields: " + ",".join(sorted(map(str, extra)))
     if frame.get("t") != "create":
         return "not a create frame"
     if not strict_mux_name(frame.get("s", "")):
@@ -2838,7 +2852,15 @@ async def main():
         for cand in RELAYS:
             url = cand + ("&" if "?" in cand else "?") + "token=" + TOKEN
             try:
-                async with websockets.connect(url, max_size=8_000_000, ping_interval=20, ping_timeout=15, open_timeout=8) as ws:
+                tls_context = await relay_tls_context(url)
+                async with websockets.connect(
+                    url,
+                    ssl=tls_context,
+                    max_size=8_000_000,
+                    ping_interval=20,
+                    ping_timeout=15,
+                    open_timeout=8,
+                ) as ws:
                     backoff = 1
                     log(f"connected to relay {cand}")
                     stale_frames = 0
