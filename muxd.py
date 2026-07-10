@@ -570,7 +570,7 @@ CLAIM_ROOT = ENV.get("LAUNCH_CLAIM_ROOT") or os.path.join(
     "launch-claims",
 )
 CLAIM_TTL_SECONDS = max(10, int(ENV.get("LAUNCH_CLAIM_TTL_SECONDS", "120")))
-PROTOCOL = 3
+PROTOCOL = 4
 CAPS = ["ls", "info", "create", "createAck", "bind", "input", "open", "attach", "kill", "rename", "heal", "tail", "scrollback", "resize", "owner", "relaunch"]
 STARTED = time.time()
 AGENT_WORKING_FRESH = float(ENV.get("AGENT_WORKING_FRESH", "25"))
@@ -3276,13 +3276,19 @@ async def main():
                             elif t == "sb" and name in sessions:
                                 session = sessions[name]
                                 scrollback_limit = m.get("max", SB_SEND)
+                                scrollback_request_id = str(m.get("rid", "") or "")
                                 encoded = await asyncio.get_running_loop().run_in_executor(
                                     None,
                                     lambda current=session, limit=scrollback_limit: base64.b64encode(
                                         current.scrollback(limit)
                                     ).decode(),
                                 )
-                                await ws.send(json.dumps({"t": "sb", "s": name, "d": encoded}))
+                                await ws.send(json.dumps({
+                                    "t": "sb",
+                                    "s": name,
+                                    "rid": scrollback_request_id,
+                                    "d": encoded,
+                                }))
                             elif t == "rename" and name in sessions:
                                 to = strict_mux_name(m.get("to", ""))
                                 if to and to not in sessions:
