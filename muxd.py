@@ -12,7 +12,7 @@
 #
 # State: sessions.json manifest (resume commands) -> muxd restart / PC reboot lists unarmed sessions
 # as dormant placeholders. Only sessions explicitly armed with heal auto-start.
-import asyncio, base64, collections, ctypes, glob, hashlib, json, os, queue, re, socket, ssl, subprocess, sys, tempfile, threading, time, traceback
+import asyncio, base64, collections, ctypes, gc, glob, hashlib, json, os, queue, re, socket, ssl, subprocess, sys, tempfile, threading, time, traceback
 from ctypes import wintypes
 from datetime import datetime, timedelta, timezone
 import faulthandler
@@ -358,6 +358,8 @@ def _release_pty_resources(pty):
                 reader.join(timeout=2)
             except Exception:
                 pass
+            if reader.is_alive():
+                log("[conpty] pywinpty reader did not exit during resource cleanup")
         try:
             pty.fd = -1
             pty.closed = True
@@ -366,6 +368,8 @@ def _release_pty_resources(pty):
             pty._muxd_cleanup_done = True
         except Exception:
             pass
+        native = None
+        gc.collect()
 
 def _parse_resume_id(cmd):
     cmd = cmd or ""
