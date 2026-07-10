@@ -73,6 +73,27 @@
   `212ddf8` / `8129a19` / `bb4575c`. The unified `L7b_20260710` gate passed app 388 / 2 skipped,
   relay 66, and muxd 92 / 3 VPS-only skipped. Evidence is under
   `artifacts/reliability/L7b_20260710`.
+- 2026-07-10: L8 atomically installed the Release GUI and bridge with byte-identical managed
+  artifacts. The VPS relay's five runtime files matched local hashes; its systemd service stayed
+  active with zero restarts, healthy persistence, protocol 3 parity, no legacy tmux sessions, and
+  no queued commands.
+- 2026-07-10: Controlled muxd restart exposed and fixed one residual durable-state defect:
+  a crash-stale muxd-owned `active` record remained active with a dead PID. Commit `fe19a42`
+  process-token checks the interrupted lifecycle and persists it dormant with cleared custody.
+  The production manifest read back the normalized state after restart.
+- 2026-07-10: Browser-origin access to `ws://127.0.0.1:7699` was still possible. The integration
+  test was mutation-proven red against the old handler; commit `9489083` rejects browser origins
+  with close code 1008 before first-frame processing while preserving native control clients.
+- 2026-07-10: Production fault probes proved one PTY under same-intent duplicate create,
+  distinct-intent concurrent create, and lost-ack retry. VPS-backed relaunch/reuse/web-bridge
+  smokes passed 3/3. The final daemon stayed below the watchdog threshold during acceptance.
+- 2026-07-10: Memory soak distinguished bounded working sets from the old ballooning report. The
+  GUI peaked near 804 MiB and stabilized near 714 MiB with 4,344 chats. The headless archive cache
+  dropped from about 434 MiB to about 41 MiB at idle eviction and stabilized near 52 MiB. Large
+  transcript and bounded output tests remained green.
+- 2026-07-10: Unified `L8_20260710` acceptance passed app 388 / 2 environment skips, the real
+  projection contract, relay 66, and muxd 91 / 3 VPS-only skips. Evidence is under
+  `artifacts/reliability/L8_20260710`.
 
 ## Decisions Needed
 

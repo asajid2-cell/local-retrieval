@@ -23,7 +23,7 @@
 | L5 durable command delivery | lease/idempotency; no age loss | crash/restart/replay queue tests | done `L5_20260709`: app 329 passed / 2 skipped; relay 64 passed; muxd 80 passed / 3 skipped |
 | L6 canonical server launcher | archive identity and trusted args only | server route/launcher tests | done `L6_20260710`: app 345 passed / 2 skipped; relay 64 passed; muxd 80 passed / 3 skipped |
 | L7 process containment | child writer exits with owner or remains blocked | Windows lifecycle integration test | done `L7b_20260710`: app 388 passed / 2 skipped; relay 66 passed; muxd 92 passed / 3 VPS-only skipped |
-| L8 synthesis/deploy | all gates and runtime probes green | `tools/run_gates.ps1` plus install/deploy smoke | pending |
+| L8 synthesis/deploy | all gates and runtime probes green | `tools/run_gates.ps1` plus install/deploy smoke | done `L8_20260710`: app 388 / 2 skipped; relay 66; muxd 91 / 3 skipped |
 
 ## Baseline
 
@@ -166,3 +166,29 @@
 - `L7b_20260710`: unified runner green. App 388 passed / 2 environment skips; serialized projection
   contract passed; relay 66 passed; muxd 92 passed / 3 VPS-only skips. Evidence:
   `artifacts/reliability/L7b_20260710`. The runner advanced `CURRENT.md` only after every gate passed.
+- L8 installed the Release GUI and headless bridge through the atomic installer. Installed GUI,
+  Core, server, and bridge DLL hashes matched their build artifacts. The bridge restarted cleanly,
+  returned HTTP 200 on its local health endpoint, and relinquished command ownership while the GUI
+  was running.
+- The five relay runtime files matched the local committed hashes byte-for-byte on the VPS.
+  `multiplex-app.service` remained active with zero restarts, protocol 3 host parity, no legacy tmux
+  sessions, healthy persistence, and no pending commands.
+- Production restart inspection found one `fixbot-worker` shell that had already failed before
+  starting its engine. The controlled restart proved the old daemon and all owned children exited.
+  A production-discovered defect left its dead PID durably marked `active`; regression
+  `test_boot_durably_demotes_stale_active_session_to_dormant` reproduced it, then commit `fe19a42`
+  normalized stale active records to `dormant` with PID/token cleared.
+- Loopback control still accepted browser `Origin` handshakes. The new integration verifier was
+  observed red against the prior handler, then green after commit `9489083` closed browser-origin
+  sockets with policy code 1008 before reading a frame. Native origin-less control remained green.
+- VPS-backed relaunch, same-session reuse, and web terminal bridge tests passed 3/3. Live duplicate
+  create probes covered same-intent races, distinct-intent races, and caller disconnect/lost-ack
+  retry; each session produced exactly one PTY spawn and cleanup removed every probe.
+- Installed memory evidence: the GUI loaded 4,344 chats, peaked near 804 MiB, and stayed flat near
+  714 MiB during the soak. The headless server held about 434 MiB only while the archive was warm,
+  then compacted to about 41 MiB at the five-minute idle boundary and stabilized near 52 MiB.
+  Focused 49 MiB/129 MiB transcript streaming, concurrent lazy-load, bounded rollout/history, and
+  bounded process-output tests passed.
+- `L8_20260710`: unified runner green. App 388 passed / 2 environment skips; serialized projection
+  contract passed; relay 66 passed; muxd 91 passed / 3 VPS-only skips. Evidence:
+  `artifacts/reliability/L8_20260710`.
