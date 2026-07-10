@@ -614,6 +614,49 @@ class MuxdLocalIntegrationTests(unittest.TestCase):
         self.assertEqual("dormant", restored.get("lifecycle"))
         self.kill(name)
 
+    def test_boot_durably_demotes_stale_active_session_to_dormant(self):
+        name = "it-active-boot"
+        self.kill(name)
+        self.muxd.stop_process()
+        manifest_path = self.muxd.root / "muxd" / "sessions.json"
+        manifest_path.write_text(
+            json.dumps({
+                name: {
+                    "cmd": "Write-Output preserved",
+                    "cwd": str(self.muxd.root),
+                    "cols": 100,
+                    "rows": 30,
+                    "heal": False,
+                    "ids": [],
+                    "sessionId": "",
+                    "aliases": [],
+                    "owner": False,
+                    "ownerKey": "",
+                    "identityPending": False,
+                    "lifecycle": "active",
+                    "childPid": 424242,
+                    "childStartToken": "0000000000001234",
+                    "stopDisposition": "",
+                    "userKilled": False,
+                    "deaths": [],
+                },
+            }),
+            encoding="utf-8",
+        )
+
+        self.muxd.start_process()
+
+        restored = self.session(name)
+        self.assertIsNotNone(restored)
+        self.assertFalse(restored.get("alive"))
+        self.assertEqual("dormant", restored.get("lifecycle"))
+        persisted = json.loads(manifest_path.read_text(encoding="utf-8"))
+        record = persisted.get("sessions", persisted)[name]
+        self.assertEqual("dormant", record.get("lifecycle"))
+        self.assertEqual(0, record.get("childPid"))
+        self.assertEqual("", record.get("childStartToken"))
+        self.kill(name)
+
     def test_boot_reconciliation_never_drops_later_manifest_records(self):
         removed_name = "it-boot-remove-first"
         preserved_name = "it-boot-preserve-later"

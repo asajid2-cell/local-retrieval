@@ -2770,7 +2770,11 @@ async def main():
         heal = bool(m.get("heal"))
         ids = m.get("ids") if isinstance(m.get("ids"), list) else []
         try:
-            if restored.user_killed or restored.lifecycle in ("starting", "stopping"):
+            if restored.user_killed or (
+                not restored.expected_owner
+                and restored.lifecycle in ("active", "starting", "stopping")
+            ):
+                interrupted_lifecycle = restored.lifecycle
                 reaped, detail = await reap_unresolved_processes(restored)
                 if not reaped:
                     raise RuntimeError(
@@ -2792,7 +2796,8 @@ async def main():
                 restored.user_killed = False
                 await manifest_save_async(sessions)
                 log(f"[boot] reconciled unresolved lifecycle for {name}; left dormant")
-                continue
+                if interrupted_lifecycle != "active":
+                    continue
             if restored.lifecycle == "failed":
                 log(f"[boot] failed lifecycle for {name}; left dormant")
                 continue
