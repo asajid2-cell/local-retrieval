@@ -2565,34 +2565,55 @@ public sealed class ArchiveService
     private async Task<(List<ArchiveSession> Parsed, Dictionary<string, string> Stamps)> ParseSourceAsync(
         SessionSource src, IReadOnlyDictionary<string, string> known, IProgress<string>? progress)
     {
-        var files = Directory.EnumerateFiles(src.Root, "*.jsonl", SearchOption.AllDirectories)
-            .Select(path => new FileInfo(path))
-            .OrderByDescending(file => file.LastWriteTimeUtc)
+        var files = new List<(FileInfo File, DateTime LastWriteUtc)>();
+        try
+        {
+            foreach (var path in Directory.EnumerateFiles(src.Root, "*.jsonl", TranscriptEnumerationOptions()))
+            {
+                try
+                {
+                    var file = new FileInfo(path);
+                    files.Add((file, file.LastWriteTimeUtc));
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                    progress?.Report($"Skipped {Path.GetFileName(path)}: {ex.Message}");
+                }
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            progress?.Report($"Skipped source {src.Root}: {ex.Message}");
+        }
+        var newestFiles = files
+            .OrderByDescending(entry => entry.LastWriteUtc)
             .Take(MaxIndexedFiles)
             .ToList();
         var parsed = new List<ArchiveSession>();
         var stamps = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var file in files)
+        foreach (var entry in newestFiles)
         {
-            var stamp = file.LastWriteTimeUtc.Ticks + ":" + file.Length;
-
-            // Claude workflow/subagent journals collide on the filename "journal" and aren't chats.
-            // Stamp them (so they're "scanned" -> any old orphan entry prunes + we skip them next
-            // time) but don't parse them into a session.
-            if (src.Tool == "claude" && (file.Name == "journal.jsonl"
-                || file.FullName.Contains("\\subagents\\", StringComparison.OrdinalIgnoreCase)))
-            {
-                stamps[file.FullName] = stamp;
-                continue;
-            }
-
-            if (known.TryGetValue(file.FullName, out var old) && old == stamp)
-            {
-                stamps[file.FullName] = stamp; // unchanged: carry the stamp forward, skip the parse
-                continue;
-            }
+            var file = entry.File;
             try
             {
+                var stamp = file.LastWriteTimeUtc.Ticks + ":" + file.Length;
+
+                // Claude workflow/subagent journals collide on the filename "journal" and aren't chats.
+                // Stamp them (so they're "scanned" -> any old orphan entry prunes + we skip them next
+                // time) but don't parse them into a session.
+                if (src.Tool == "claude" && (file.Name == "journal.jsonl"
+                    || file.FullName.Contains("\\subagents\\", StringComparison.OrdinalIgnoreCase)))
+                {
+                    stamps[file.FullName] = stamp;
+                    continue;
+                }
+
+                if (known.TryGetValue(file.FullName, out var old) && old == stamp)
+                {
+                    stamps[file.FullName] = stamp; // unchanged: carry the stamp forward, skip the parse
+                    continue;
+                }
+
                 var session = await ParseSessionAsync(file.FullName, src.Tool);
                 if (session is not null) parsed.Add(session);
                 stamps[file.FullName] = stamp; // stamp only after a successful parse (or intentional sidechain skip)
@@ -2603,9 +2624,17 @@ public sealed class ArchiveService
                 progress?.Report($"Skipped {file.Name}: {ex.Message}");
             }
         }
-        progress?.Report($"{src.Tool}: {parsed.Count} new/changed of {files.Count}");
+        progress?.Report($"{src.Tool}: {parsed.Count} new/changed of {newestFiles.Count}");
         return (parsed, stamps);
     }
+
+    internal static EnumerationOptions TranscriptEnumerationOptions() => new()
+    {
+        RecurseSubdirectories = true,
+        IgnoreInaccessible = true,
+        ReturnSpecialDirectories = false,
+        AttributesToSkip = FileAttributes.Hidden | FileAttributes.System | FileAttributes.ReparsePoint,
+    };
 
     // Route by tool; auto-detect when a source's tool is unknown.
     private async Task<ArchiveSession?> ParseSessionAsync(string path, string tool)
@@ -2930,7 +2959,10 @@ public sealed class ArchiveService
     // filename `x & calc` from a malicious source root) is refused so it can't be injected into the
     // terminal command line.
     public static bool IsResumableId(string id) =>
-        !string.IsNullOrWhiteSpace(id) && id.Length <= 200 && Regex.IsMatch(id, "^[A-Za-z0-9._-]+$");
+        !string.IsNullOrWhiteSpace(id)
+        && id.Length <= 200
+        && char.IsAsciiLetterOrDigit(id[0])
+        && Regex.IsMatch(id, "^[A-Za-z0-9._-]+$");
 
     public ResumeLaunch BuildResumeLaunch(ArchiveSession session, string? exeOverride = null, string? extraArgsOverride = null)
     {

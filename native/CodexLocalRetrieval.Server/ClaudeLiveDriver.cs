@@ -24,7 +24,14 @@ public sealed class ClaudeLiveDriver
 
     public bool Available => File.Exists(_exe) || _exe == "claude";
 
-    public Process StartTurn(string? sessionId, string cwd, string prompt, Func<AgentEvent, Task> onEvent, CancellationToken ct, string permissionMode = "acceptEdits", IEnumerable<string>? aliases = null)
+    public Process StartTurn(
+        string? sessionId,
+        string cwd,
+        string prompt,
+        Func<AgentEvent, Task> onEvent,
+        CancellationToken ownerStopping,
+        string permissionMode = "acceptEdits",
+        IEnumerable<string>? aliases = null)
     {
         SessionLaunchLease? lease = null;
         if (!string.IsNullOrWhiteSpace(sessionId))
@@ -71,41 +78,92 @@ public sealed class ClaudeLiveDriver
             lease?.Dispose();
             throw;
         }
-        proc.StandardInput.Close(); // we never write; closing avoids a blocked-stdin wait
+        // We never write. Closing avoids a blocked-stdin wait, but an immediate child exit can race
+        // this close; lifecycle custody must still be installed in that case.
+        try { proc.StandardInput.Close(); } catch { }
         if (lease is not null)
         {
             lease.MarkStarted("Claude live turn process started.", new Dictionary<string, string> { ["pid"] = proc.Id.ToString(), ["permissionMode"] = permissionMode }, retainUntilExpiry: false);
-            var liveLease = lease;
-            _ = Task.Run(async () =>
-            {
-                try { await proc.WaitForExitAsync(CancellationToken.None); }
-                catch { }
-                finally
-                {
-                    RecordSessionEvent(sessionId, aliases, "claude.turn.exited", "Claude live turn process exited.", details: new Dictionary<string, string> { ["pid"] = proc.Id.ToString(), ["exitCode"] = SafeExitCode(proc) });
-                    liveLease.Dispose();
-                }
-            });
         }
         else
         {
             RecordSessionEvent(sessionId, aliases, "claude.turn.started", "Claude live turn process started.", details: new Dictionary<string, string> { ["pid"] = proc.Id.ToString(), ["permissionMode"] = permissionMode });
         }
 
+        var outputTask = PumpOutputAsync(proc.StandardOutput, proc.StandardError, onEvent);
+        var stopRegistration = ownerStopping.Register(() =>
+        {
+            try { if (!proc.HasExited) proc.Kill(entireProcessTree: true); } catch { }
+        });
         _ = Task.Run(async () =>
         {
             try
             {
-                string? line;
-                while ((line = await proc.StandardOutput.ReadLineAsync(ct)) is not null)
-                    foreach (var ev in ClaudeStreamMapper.Map(line))
-                        await onEvent(ev);
+                await proc.WaitForExitAsync(CancellationToken.None);
+                await outputTask;
             }
-            catch (Exception ex) { try { await onEvent(AgentEvent.Err("claude stream error: " + ex.Message)); } catch { } }
-            finally { try { await onEvent(AgentEvent.Stat("idle")); } catch { } }
-        }, ct);
+            catch
+            {
+            }
+            finally
+            {
+                var exitCode = SafeExitCode(proc);
+                RecordSessionEvent(
+                    sessionId,
+                    aliases,
+                    "claude.turn.exited",
+                    "Claude live turn process exited.",
+                    details: new Dictionary<string, string>
+                    {
+                        ["pid"] = proc.Id.ToString(),
+                        ["exitCode"] = exitCode,
+                    });
+                lease?.Dispose();
+                stopRegistration.Dispose();
+                proc.Dispose();
+            }
+        });
 
         return proc;
+    }
+
+    public static async Task PumpOutputAsync(
+        TextReader stdout,
+        TextReader stderr,
+        Func<AgentEvent, Task> onEvent)
+    {
+        var stderrDrain = DrainAsync(stderr);
+        try
+        {
+            string? line;
+            while ((line = await stdout.ReadLineAsync()) is not null)
+                foreach (var ev in ClaudeStreamMapper.Map(line))
+                    await NotifyBestEffortAsync(onEvent, ev);
+        }
+        catch (Exception ex)
+        {
+            await NotifyBestEffortAsync(onEvent, AgentEvent.Err("claude stream error: " + ex.Message));
+        }
+        finally
+        {
+            try { await stderrDrain; } catch { }
+            await NotifyBestEffortAsync(onEvent, AgentEvent.Stat("idle"));
+        }
+    }
+
+    private static async Task DrainAsync(TextReader reader)
+    {
+        var buffer = new char[4096];
+        while (await reader.ReadAsync(buffer.AsMemory()) > 0)
+        {
+        }
+    }
+
+    private static async Task NotifyBestEffortAsync(
+        Func<AgentEvent, Task> onEvent,
+        AgentEvent ev)
+    {
+        try { await onEvent(ev); } catch { }
     }
 
     private static string Resolve()

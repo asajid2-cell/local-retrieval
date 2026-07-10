@@ -21,7 +21,7 @@
 | L3 opaque relay protocol | relay never stores or receives commands/paths | real projection contract + relay tests | done `L3_20260709`: projection probe green; app 308 passed; relay 35 passed; muxd 55 passed |
 | L4 durable state | success requires flush/replace/read-back | injected-failure persistence tests | done `L4_20260709i`: app 320 passed / 2 skipped; relay 51 passed; muxd 75 passed / 3 VPS-only skipped |
 | L5 durable command delivery | lease/idempotency; no age loss | crash/restart/replay queue tests | done `L5_20260709`: app 329 passed / 2 skipped; relay 64 passed; muxd 80 passed / 3 skipped |
-| L6 canonical server launcher | archive identity and trusted args only | server route/launcher tests | pending |
+| L6 canonical server launcher | archive identity and trusted args only | server route/launcher tests | done `L6_20260710`: app 345 passed / 2 skipped; relay 64 passed; muxd 80 passed / 3 skipped |
 | L7 process containment | child writer exits with owner or remains blocked | Windows lifecycle integration test | pending |
 | L8 synthesis/deploy | all gates and runtime probes green | `tools/run_gates.ps1` plus install/deploy smoke | pending |
 
@@ -92,3 +92,36 @@
 - `L5_20260709`: unified runner green. App 329 passed / 2 environment skips; serialized projection
   contract passed; relay 64 passed; muxd 80 passed / 3 VPS-only skips. Evidence:
   `artifacts/reliability/L5_20260709`.
+- 2026-07-09 L6 plan: reduce the open request to an allowlisted target only; refresh and resolve a
+  unique canonical session from the server-side archive; derive tool, workspace, and aliases from
+  that trusted record; pass a typed descriptor into `SessionLauncher`; and launch with structured
+  `ProcessStartInfo.ArgumentList` entries only. Unknown, ambiguous, unsupported-tool, invalid-target,
+  and missing-workspace cases fail closed. The verifier must be observed red before implementation.
+- 2026-07-09 L6 archive-runtime verifier is mutation-proven. With `ArchiveRuntime`'s semaphore
+  weakened from `(1, 1)` to `(2, 2)`, `dotnet test
+  native\CodexLocalRetrieval.Native.Tests\CodexLocalRetrieval.Native.Tests.csproj --no-restore
+  --filter "FullyQualifiedName~ArchiveRuntimeTests"` exited 1: both tests failed because a second
+  archive operation entered during an active operation and idle unload completed during an active
+  reader. Restoring `(1, 1)` and rerunning the same command exited 0: 2 passed.
+- 2026-07-10 L6 transactional-open verification is mutation-proven. Resolver failure and new-thread
+  failure tests first failed because the prior open session was cleared, then passed after both
+  flows became prepare-then-commit. Codex ordering tests also exposed and then verified the required
+  live-check -> cross-process lease -> app-server ensure -> local active-claim sequence.
+- The final L6 focused gate passed 28/28:
+  `dotnet test native\CodexLocalRetrieval.Native.Tests\CodexLocalRetrieval.Native.Tests.csproj
+  --no-restore --filter
+  "FullyQualifiedName~ArchiveRuntimeTests|FullyQualifiedName~SessionOpenServiceTests|FullyQualifiedName~ServerSingleOwnerGateTests|FullyQualifiedName~TranscriptEnumeration"`.
+- The inherited full-suite gate was observed red as an operational verifier: 16-way method-level
+  parallelism drove the owned testhost above 2.3 GB, and the 3-minute hang collector identified
+  `SyncFromDisk_ResurfacesRealStoreIncludingMonthsOld` as an unbounded live-archive scan. Tests are
+  now single-worker, `RealStore` and `LiveCodex` are mechanically opt-in, and the acceptance runner
+  has a per-test hang collector. The corrected full suite passed 345 tests with 2 environment skips
+  in 42 seconds; a plain `dotnet test --no-build --no-restore` independently passed the same
+  345/347 contract in 26 seconds.
+- Final independent Claude review `mux-l6-review-20260709` returned ACCEPT after re-reading the
+  frozen production diff, including archive enumeration, transactional route takeover, writer
+  leases, process cleanup, structured arguments, and the bounded gate changes. No deterministic
+  session-loss, duplicate-writer, route, archive, launch, or process-leak blocker was found.
+- `L6_20260710`: unified runner green. App 345 passed / 2 environment skips; serialized projection
+  contract passed; relay 64 passed; muxd 80 passed / 3 VPS-only skips. Evidence:
+  `artifacts/reliability/L6_20260710`. The runner advanced `CURRENT.md` only after every gate passed.

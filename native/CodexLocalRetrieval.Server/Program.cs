@@ -1,5 +1,6 @@
 using CodexLocalRetrieval.Core.Agents;
 using CodexLocalRetrieval.Core.Chat;
+using CodexLocalRetrieval.Core.Models;
 using CodexLocalRetrieval.Core.Remote;
 using CodexLocalRetrieval.Core.Services;
 using CodexLocalRetrieval.Server;
@@ -44,6 +45,7 @@ var archive = new ArchiveService(storePath: string.IsNullOrWhiteSpace(storePath)
 // DON'T load it at startup; the first archive-backed request triggers a one-time load (+ disk sync). An
 // idle server (Agent-only use, or just sitting there) stays light until you actually browse your archive.
 var syncOnLoad = Environment.GetEnvironmentVariable("CLR_REMOTE_SYNC") != "0";
+var archiveRuntime = new ArchiveRuntime(archive, syncOnLoad, Console.Error.WriteLine);
 
 IChatBackend? BackendFactory()
 {
@@ -55,28 +57,6 @@ IChatBackend? BackendFactory()
 }
 
 var api = new RemoteApi(archive, BackendFactory, redactReads, allowLaunch);
-
-// One-time, thread-safe on-demand archive load. Endpoints that read the archive await this first; the
-// first caller pays the load+sync, everyone after returns instantly.
-var _archiveLoaded = false;
-var _archiveGate = new SemaphoreSlim(1, 1);
-var _lastArchiveAccess = DateTime.UtcNow;
-async Task EnsureArchiveAsync()
-{
-    _lastArchiveAccess = DateTime.UtcNow;   // every access resets the idle-unload clock
-    if (_archiveLoaded) return;
-    await _archiveGate.WaitAsync();
-    try
-    {
-        if (_archiveLoaded) return;
-        await archive.LoadAsync();
-        if (syncOnLoad) { try { await archive.SyncFromDiskAsync(); } catch (Exception ex) { Console.Error.WriteLine("sync warning: " + ex.Message); } }
-        _archiveLoaded = true;
-        _lastArchiveAccess = DateTime.UtcNow;
-        Console.WriteLine($"archive loaded on demand: {archive.Store.Sessions.Count} chats");
-    }
-    finally { _archiveGate.Release(); }
-}
 
 // Resolve wwwroot robustly: next to the binary when published, else the project source when running
 // from bin during development. Content root = binary dir so this works regardless of launch cwd.
@@ -151,49 +131,50 @@ else
     });
 }
 
-async Task<IEnumerable<string>> AliasesForSessionId(string sessionId)
-{
-    await EnsureArchiveAsync();
-    var session = archive.Store.Sessions.Values.FirstOrDefault(s =>
-        string.Equals(s.Id, sessionId, StringComparison.OrdinalIgnoreCase) ||
-        s.Aliases.Any(a => string.Equals(a, sessionId, StringComparison.OrdinalIgnoreCase)));
-    return session is null
-        ? new[] { sessionId }
-        : new[] { session.Id }.Concat(session.Aliases)
-            .Where(id => !string.IsNullOrWhiteSpace(id))
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .ToArray();
-}
-
 async Task<(bool ok, ArchiveService.RemoteMuxLaunch? launch, string detail)> ResolveRemoteMuxLaunchAsync(string? sessionId, string? tool)
 {
-    await EnsureArchiveAsync();
-    return archive.TryBuildRemoteMuxLaunch(sessionId, tool, out var launch, out var detail)
-        ? (true, launch, detail)
-        : (false, null, detail);
+    return await archiveRuntime.UseAsync((loadedArchive, _) =>
+    {
+        var result = loadedArchive.TryBuildRemoteMuxLaunch(sessionId, tool, out var launch, out var detail)
+            ? (true, launch, detail)
+            : (false, null, detail);
+        return Task.FromResult(result);
+    });
 }
 
 async Task<IReadOnlyList<ArchiveService.PendingMuxBinding>> ResolvePendingMuxBindingsAsync()
 {
-    await EnsureArchiveAsync();
-    return archive.ResolvePendingMuxBindings();
+    return await archiveRuntime.UseAsync(
+        (loadedArchive, _) => Task.FromResult(loadedArchive.ResolvePendingMuxBindings()));
 }
 
 app.UseDefaultFiles();
 app.UseStaticFiles();
 
 // healthz stays light — it must NOT trigger the archive load (it's a liveness probe).
-app.MapGet("/healthz", () => Results.Ok(new { ok = true, service = "codex-local-retrieval", archiveLoaded = _archiveLoaded, chats = _archiveLoaded ? archive.Store.Sessions.Count : -1 }));
-app.MapGet("/api/stats", async () => { await EnsureArchiveAsync(); return Results.Json(api.Stats()); });
-app.MapGet("/api/custody", async (CancellationToken ct) => { await EnsureArchiveAsync(); return Results.Json(await Task.Run(() => api.Custody(), ct)); });
-app.MapGet("/api/chats", async (string? q, int? limit) => { await EnsureArchiveAsync(); return Results.Json(api.Search(q, limit ?? 20)); });
-app.MapGet("/api/chats/{id}", async (string id, int? page, int? pageSize) =>
-    { await EnsureArchiveAsync(); return api.Read(id, page ?? 0, pageSize ?? 20) is { } r ? Results.Json(r) : Results.NotFound(new { error = "no chat with that id" }); });
-app.MapGet("/api/chats/{id}/events", async (string id, int? limit) =>
-    { await EnsureArchiveAsync(); return api.Events(id, limit ?? 400) is { } r ? Results.Json(r) : Results.NotFound(new { error = "no chat with that id" }); });
-app.MapPost("/api/copilot", async (CopilotRequest req, CancellationToken ct) => { await EnsureArchiveAsync(); return Results.Json(await api.CopilotAsync(req.Message, req.History, ct)); });
-app.MapPost("/api/chats/{id}/resume", async (string id, ResumeRequest? req) => { await EnsureArchiveAsync(); return Results.Json(api.ResumeCommand(id, req?.Launch ?? false)); });
-app.MapPost("/api/chats/{id}/favorite", async (string id, FavoriteRequest? req) => { await EnsureArchiveAsync(); return Results.Json(await api.FavoriteAsync(id, req?.Favorite ?? true)); });
+app.MapGet("/healthz", () => Results.Ok(new { ok = true, service = "codex-local-retrieval", archiveLoaded = archiveRuntime.IsLoaded, chats = archiveRuntime.SessionCount }));
+app.MapGet("/api/stats", async (CancellationToken ct) =>
+    Results.Json(await archiveRuntime.UseAsync((_, _) => Task.FromResult(api.Stats()), ct)));
+app.MapGet("/api/custody", async (CancellationToken ct) =>
+    Results.Json(await archiveRuntime.UseAsync((_, innerCt) => Task.Run(() => api.Custody(), innerCt), ct)));
+app.MapGet("/api/chats", async (string? q, int? limit, CancellationToken ct) =>
+    Results.Json(await archiveRuntime.UseAsync((_, _) => Task.FromResult(api.Search(q, limit ?? 20)), ct)));
+app.MapGet("/api/chats/{id}", async (string id, int? page, int? pageSize, CancellationToken ct) =>
+{
+    var result = await archiveRuntime.UseAsync((_, _) => Task.FromResult(api.Read(id, page ?? 0, pageSize ?? 20)), ct);
+    return result is not null ? Results.Json(result) : Results.NotFound(new { error = "no chat with that id" });
+});
+app.MapGet("/api/chats/{id}/events", async (string id, int? limit, CancellationToken ct) =>
+{
+    var result = await archiveRuntime.UseAsync((_, _) => Task.FromResult(api.Events(id, limit ?? 400)), ct);
+    return result is not null ? Results.Json(result) : Results.NotFound(new { error = "no chat with that id" });
+});
+app.MapPost("/api/copilot", async (CopilotRequest req, CancellationToken ct) =>
+    Results.Json(await archiveRuntime.UseAsync((_, innerCt) => api.CopilotAsync(req.Message, req.History, innerCt), ct)));
+app.MapPost("/api/chats/{id}/resume", async (string id, ResumeRequest? req, CancellationToken ct) =>
+    Results.Json(await archiveRuntime.UseAsync((_, _) => Task.FromResult(api.ResumeCommand(id, req?.Launch ?? false)), ct)));
+app.MapPost("/api/chats/{id}/favorite", async (string id, FavoriteRequest? req, CancellationToken ct) =>
+    Results.Json(await archiveRuntime.UseAsync((_, _) => api.FavoriteAsync(id, req?.Favorite ?? true), ct)));
 
 // Live agent: our server is a client of `codex app-server` (the desktop-app protocol). The hub owns
 // the one app-server and multiplexes it. /api/agent/sessions lists ALL sessions; the WS opens/drives one.
@@ -238,11 +219,29 @@ app.MapPost("/api/agent/sessions/{id}/rename", (string id, RenameRequest req) =>
 var claudeExeForLaunch = Environment.GetEnvironmentVariable("CLR_CLAUDE_EXE")
     ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".local", "bin", "claude.exe");
 var launcher = new SessionLauncher(claudeExeForLaunch, codexExe, allowLaunch);
-app.MapPost("/api/agent/sessions/{id}/open", async (string id, OpenRequest req) =>
+var canonicalSessionResolver = new CanonicalSessionResolver(async ct =>
 {
-    var aliases = await AliasesForSessionId(id);
-    var (ok, msg) = launcher.Open(req?.Source ?? "codex", id, req?.Target ?? "terminal", req?.Cwd, aliases);
-    return ok ? Results.Json(new { ok = true, message = msg }) : Results.BadRequest(new { error = msg });
+    return await archiveRuntime.UseAsync(
+        (loadedArchive, _) => Task.FromResult<IReadOnlyList<ArchiveSession>>(
+            loadedArchive.Store.Sessions.Values
+                .Select(s => new ArchiveSession
+                {
+                    Id = s.Id,
+                    Tool = s.Tool,
+                    Workspace = s.Workspace,
+                    Aliases = new(s.Aliases.ToArray()),
+                })
+                .ToArray()),
+        ct,
+        refreshBeforeUse: true);
+});
+var sessionOpenService = new SessionOpenService(canonicalSessionResolver, launcher);
+app.MapPost("/api/agent/sessions/{id}/open", async (string id, OpenRequest? req, CancellationToken ct) =>
+{
+    var result = await sessionOpenService.OpenAsync(id, req, ct);
+    return result.Ok
+        ? Results.Json(new { ok = true, message = result.Message })
+        : Results.BadRequest(new { error = result.Message });
 });
 
 // "Open the full desktop app on the PC" — light headless server by default, heavy app on demand.
@@ -258,7 +257,16 @@ app.Map("/api/agent", async (HttpContext ctx) =>
 {
     if (!ctx.WebSockets.IsWebSocketRequest) { ctx.Response.StatusCode = StatusCodes.Status400BadRequest; return; }
     using var sock = await ctx.WebSockets.AcceptWebSocketAsync();
-    await AgentWebSocket.HandleAsync(sock, agentHub, claudeStore, claudeDriver, commandSigner, defaultWs, ctx.RequestAborted, AliasesForSessionId);
+    await AgentWebSocket.HandleAsync(
+        sock,
+        agentHub,
+        claudeStore,
+        claudeDriver,
+        commandSigner,
+        defaultWs,
+        ctx.RequestAborted,
+        app.Lifetime.ApplicationStopping,
+        canonicalSessionResolver.ResolveAsync);
 });
 
 // Idle eviction: keep loaded only while in use. After CLR_REMOTE_IDLE_UNLOAD_SEC (default 300s) with no
@@ -272,15 +280,10 @@ if (idleUnloadSec > 0)
         while (true)
         {
             await Task.Delay(TimeSpan.FromSeconds(30));
-            if (!_archiveLoaded) continue;
-            if ((DateTime.UtcNow - _lastArchiveAccess).TotalSeconds < idleUnloadSec) continue;
-            await _archiveGate.WaitAsync();
             try
             {
-                if (_archiveLoaded && (DateTime.UtcNow - _lastArchiveAccess).TotalSeconds >= idleUnloadSec)
+                if (await archiveRuntime.TryUnloadIfIdleAsync(TimeSpan.FromSeconds(idleUnloadSec)))
                 {
-                    archive.Unload();
-                    _archiveLoaded = false;
                     System.Runtime.GCSettings.LargeObjectHeapCompactionMode = System.Runtime.GCLargeObjectHeapCompactionMode.CompactOnce;
                     GC.Collect(2, GCCollectionMode.Aggressive, blocking: true, compacting: true);
                     GC.WaitForPendingFinalizers();
@@ -290,7 +293,6 @@ if (idleUnloadSec > 0)
                 }
             }
             catch (Exception ex) { Console.Error.WriteLine("idle-unload warning: " + ex.Message); }
-            finally { _archiveGate.Release(); }
         }
     });
 }

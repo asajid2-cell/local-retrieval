@@ -9,11 +9,48 @@ namespace CodexLocalRetrieval.Native.Tests;
 public class ServerSingleOwnerGateTests
 {
     [TestMethod]
+    public void ThreadRouteRegistry_StaleSocketCannotRemoveNewerOwner()
+    {
+        var routes = new ThreadRouteRegistry();
+        var first = routes.Register("thread-1", _ => Task.CompletedTask, _ => Task.CompletedTask);
+        var second = routes.Register("thread-1", _ => Task.CompletedTask, _ => Task.CompletedTask);
+
+        routes.Close(first);
+
+        Assert.IsTrue(routes.TryGet("thread-1", out var current));
+        Assert.AreEqual(second.OwnerToken, current.OwnerToken);
+    }
+
+    [TestMethod]
+    public async Task ThreadRouteRegistry_FailedTakeoverPreservesExistingOwner()
+    {
+        var routes = new ThreadRouteRegistry();
+        var first = routes.Register("thread-1", _ => Task.CompletedTask, _ => Task.CompletedTask);
+
+        await Assert.ThrowsExactlyAsync<InvalidOperationException>(() =>
+            routes.ReplaceAfterAsync(
+                "thread-1",
+                _ => Task.CompletedTask,
+                _ => Task.CompletedTask,
+                () => Task.FromException(new InvalidOperationException("resume failed")),
+                CancellationToken.None));
+
+        Assert.IsTrue(routes.TryGet("thread-1", out var current));
+        Assert.AreEqual(first.OwnerToken, current.OwnerToken);
+    }
+
+    [TestMethod]
     public void SessionLauncher_RefusesTerminalResumeWhenSessionIsLive()
     {
         var launcher = new SessionLauncher("claude-do-not-launch.exe", "codex-do-not-launch.exe", allowLaunch: true, isSessionLive: id => id == "live-id");
 
-        var result = launcher.Open("codex", "live-id", "terminal", Environment.GetFolderPath(Environment.SpecialFolder.UserProfile));
+        var result = launcher.Open(
+            new TrustedSessionLaunch(
+                "live-id",
+                SessionTool.Codex,
+                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                new[] { "live-id" }),
+            SessionOpenTarget.Terminal);
 
         Assert.IsFalse(result.ok);
         StringAssert.Contains(result.message, "already running");
@@ -24,7 +61,13 @@ public class ServerSingleOwnerGateTests
     {
         var launcher = new SessionLauncher("claude-do-not-launch.exe", "codex-do-not-launch.exe", allowLaunch: true, isSessionLive: id => id == "child-id");
 
-        var result = launcher.Open("codex", "parent-id", "terminal", Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), new[] { "child-id" });
+        var result = launcher.Open(
+            new TrustedSessionLaunch(
+                "parent-id",
+                SessionTool.Codex,
+                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                new[] { "child-id" }),
+            SessionOpenTarget.Terminal);
 
         Assert.IsFalse(result.ok);
         StringAssert.Contains(result.message, "already running");
@@ -35,10 +78,37 @@ public class ServerSingleOwnerGateTests
     {
         var launcher = new SessionLauncher("claude-do-not-launch.exe", "codex-do-not-launch.exe", allowLaunch: true, isSessionLive: id => id == "live-claude");
 
-        var result = launcher.Open("claude", "live-claude", "vscode", Environment.GetFolderPath(Environment.SpecialFolder.UserProfile));
+        var result = launcher.Open(
+            new TrustedSessionLaunch(
+                "live-claude",
+                SessionTool.Claude,
+                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                new[] { "live-claude" }),
+            SessionOpenTarget.VsCode);
 
         Assert.IsFalse(result.ok);
         StringAssert.Contains(result.message, "already running");
+    }
+
+    [TestMethod]
+    public void SessionLauncher_RejectsInvalidTrustedCanonicalId()
+    {
+        var launcher = new SessionLauncher(
+            "claude-do-not-launch.exe",
+            "codex-do-not-launch.exe",
+            allowLaunch: true,
+            isSessionLive: _ => false);
+
+        var result = launcher.Open(
+            new TrustedSessionLaunch(
+                "--dangerously-skip-permissions",
+                SessionTool.Claude,
+                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                new[] { "--dangerously-skip-permissions" }),
+            SessionOpenTarget.Terminal);
+
+        Assert.IsFalse(result.ok);
+        StringAssert.Contains(result.message, "invalid");
     }
 
     [TestMethod]
@@ -85,6 +155,30 @@ public class ServerSingleOwnerGateTests
     }
 
     [TestMethod]
+    public async Task ClaudeLiveDriver_OutputPumpSurvivesDetachedConsumerAndDrainsStderr()
+    {
+        var stdout = new StringReader(
+            "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"sid-1\"}\n"
+            + "{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"done\"}\n");
+        var stderr = new TrackingTextReader(new string('x', 32 * 1024));
+        var callbacks = 0;
+        var delivered = new List<AgentEventKind>();
+
+        await ClaudeLiveDriver.PumpOutputAsync(stdout, stderr, ev =>
+        {
+            callbacks++;
+            if (callbacks == 1)
+                throw new IOException("socket detached");
+            delivered.Add(ev.Kind);
+            return Task.CompletedTask;
+        });
+
+        Assert.IsTrue(stderr.FullyDrained);
+        CollectionAssert.Contains(delivered, AgentEventKind.TurnResult);
+        CollectionAssert.Contains(delivered, AgentEventKind.Status);
+    }
+
+    [TestMethod]
     public async Task CodexAgentHub_RefusesStartTurnWhenSessionIsLive()
     {
         var hub = new CodexAgentHub("codex-do-not-launch.exe", isSessionLive: id => id == "live-codex");
@@ -114,6 +208,40 @@ public class ServerSingleOwnerGateTests
         {
             StringAssert.Contains(ex.Message, "already running");
         }
+    }
+
+    [TestMethod]
+    public async Task CodexAgentHub_FailedServerStartDoesNotLeakActiveTurnClaim()
+    {
+        var hub = new CodexAgentHub(
+            Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N"), "missing-codex.exe"),
+            isSessionLive: _ => false);
+
+        try
+        {
+            await hub.StartTurnAsync("turn-start-failure", "hello", CancellationToken.None);
+            Assert.Fail("StartTurnAsync should fail when the app-server executable is missing.");
+        }
+        catch
+        {
+        }
+
+        Assert.IsFalse(hub.IsTurnActive("turn-start-failure"));
+    }
+
+    [TestMethod]
+    public void CodexAgentHub_EnsuresServerBeforePublishingActiveTurnClaim()
+    {
+        var root = FindRepoRoot();
+        var source = File.ReadAllText(
+            Path.Combine(root, "native", "CodexLocalRetrieval.Server", "CodexAgentHub.cs"));
+        var methodStart = source.IndexOf("public async Task StartTurnAsync", StringComparison.Ordinal);
+        var methodEnd = source.IndexOf("public async Task InterruptAsync", methodStart, StringComparison.Ordinal);
+        var method = source[methodStart..methodEnd];
+
+        Assert.IsGreaterThanOrEqualTo(0, methodStart);
+        Assert.IsGreaterThan(method.IndexOf("EnsureAsync(ct)", StringComparison.Ordinal),
+            method.IndexOf("_activeTurnClaims.TryAdd", StringComparison.Ordinal));
     }
 
     [TestMethod]
@@ -147,5 +275,42 @@ public class ServerSingleOwnerGateTests
 
         Assert.IsFalse(conflicts);
         Assert.AreEqual("", sessionId);
+    }
+
+    private sealed class TrackingTextReader(string text) : TextReader
+    {
+        private int _offset;
+
+        public bool FullyDrained { get; private set; }
+
+        public override ValueTask<int> ReadAsync(
+            Memory<char> buffer,
+            CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (_offset >= text.Length)
+            {
+                FullyDrained = true;
+                return ValueTask.FromResult(0);
+            }
+
+            var count = Math.Min(buffer.Length, text.Length - _offset);
+            text.AsMemory(_offset, count).CopyTo(buffer);
+            _offset += count;
+            return ValueTask.FromResult(count);
+        }
+    }
+
+    private static string FindRepoRoot()
+    {
+        var dir = new DirectoryInfo(AppContext.BaseDirectory);
+        while (dir is not null)
+        {
+            if (File.Exists(Path.Combine(dir.FullName, "CodexLocalRetrieval.sln")))
+                return dir.FullName;
+            dir = dir.Parent;
+        }
+        throw new DirectoryNotFoundException(
+            "Could not find CodexLocalRetrieval.sln from " + AppContext.BaseDirectory);
     }
 }

@@ -52,7 +52,9 @@ $dotnetBuildPassed = $results['dotnet-build'].ok
 if ($dotnetBuildPassed) {
     Run-Gate 'dotnet-tests' {
         dotnet test native\CodexLocalRetrieval.Native.Tests\CodexLocalRetrieval.Native.Tests.csproj `
-            -c Release --no-build --logger 'console;verbosity=minimal'
+            -c Release --no-build --logger 'console;verbosity=minimal' `
+            --filter 'TestCategory!=RealStore&TestCategory!=LiveCodex' `
+            --blame-hang --blame-hang-timeout 3m --blame-hang-dump-type mini
     } 'Passed!'
 }
 

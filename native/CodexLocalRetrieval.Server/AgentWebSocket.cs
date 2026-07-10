@@ -18,16 +18,53 @@ public static class AgentWebSocket
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
     };
 
-    public static async Task HandleAsync(WebSocket ws, CodexAgentHub hub, ClaudeSessionStore claude, ClaudeLiveDriver claudeDriver, CommandSigner signer, string defaultWorkspace, CancellationToken ct, Func<string, Task<IEnumerable<string>>>? aliasesForSessionId = null)
+    public static async Task HandleAsync(
+        WebSocket ws,
+        CodexAgentHub hub,
+        ClaudeSessionStore claude,
+        ClaudeLiveDriver claudeDriver,
+        CommandSigner signer,
+        string defaultWorkspace,
+        CancellationToken ct,
+        CancellationToken ownerStopping,
+        Func<string, CancellationToken, Task<SessionResolutionResult>> resolveSession)
     {
         var send = new SemaphoreSlim(1, 1);
-        string? openThreadId = null;
+        ThreadRouteBinding? openThread = null;
         var openSource = "codex";
         string? openedId = null;           // the id the client opened (stable; used to bind signatures)
         string? claudeSid = null;          // current Claude session id (updated each turn)
         var claudeCwd = defaultWorkspace;
+        IReadOnlyList<string> openAliases = Array.Empty<string>();
         System.Diagnostics.Process? claudeProc = null;
+        Task? codexTurnStart = null;
+        long openGeneration = 0;
         var buf = new byte[16 * 1024];
+
+        void ClearOpenSession()
+        {
+            Interlocked.Increment(ref openGeneration);
+            if (openThread is not null) hub.CloseThread(openThread);
+            openThread = null;
+            claudeProc = null;
+            openedId = null;
+            claudeSid = null;
+            claudeCwd = defaultWorkspace;
+            openAliases = Array.Empty<string>();
+            openSource = "codex";
+            codexTurnStart = null;
+        }
+
+        bool IsClaudeTurnActive()
+        {
+            try { return claudeProc is not null && !claudeProc.HasExited; }
+            catch { return false; }
+        }
+
+        bool HasActiveTurn() =>
+            IsClaudeTurnActive()
+            || codexTurnStart is { IsCompleted: false }
+            || openThread is not null && hub.IsTurnActive(openThread.ThreadId);
 
         async Task OnNote(JsonElement note)
         {
@@ -63,18 +100,6 @@ public static class AgentWebSocket
             return true;
         }
 
-        async Task<(bool ok, IEnumerable<string>? aliases)> TryResolveAliasesAsync(string? sessionId)
-        {
-            if (string.IsNullOrWhiteSpace(sessionId) || aliasesForSessionId is null) return (true, null);
-            try { return (true, await aliasesForSessionId(sessionId)); }
-            catch (Exception ex)
-            {
-                await SendJson(ws, send, AgentEvent.Err("refused: could not verify session aliases (" + ex.Message + "); refusing to risk a second writer."), ct);
-                await SendJson(ws, send, AgentEvent.Stat("idle"), ct);
-                return (false, null);
-            }
-        }
-
         try
         {
             while (ws.State == WebSocketState.Open && !ct.IsCancellationRequested)
@@ -89,38 +114,107 @@ public static class AgentWebSocket
                     case "open":
                     {
                         var id = Str(root, "id");
-                        if (id is null) break;
-                        openSource = Str(root, "source") ?? "codex";
-                        openedId = id;
-                        if (openThreadId is not null) { hub.CloseThread(openThreadId); openThreadId = null; }
+                        if (id is null)
+                        {
+                            await SendJson(ws, send, new { kind = "OpenFailed", text = "open refused: session id is required" }, ct);
+                            await SendJson(ws, send, new { kind = "HistoryEnd" }, ct);
+                            break;
+                        }
+                        var committed = false;
                         try
                         {
-                            if (openSource == "claude")
+                            var resolution = await resolveSession(id, ct);
+                            if (!resolution.Ok || resolution.Session is null)
                             {
-                                claudeSid = id;
-                                claudeCwd = Str(root, "cwd") is { Length: > 0 } cc ? cc : defaultWorkspace;
-                                await SendJson(ws, send, new { kind = "Opened", threadId = id, live = claudeDriver.Available }, ct);
-                                foreach (var ev in claude.ReadHistory(id)) await SendJson(ws, send, ev, ct);
+                                await SendJson(ws, send, new { kind = "OpenFailed", text = "open refused: " + resolution.Message }, ct);
+                                await SendJson(ws, send, new { kind = "HistoryEnd" }, ct);
+                                break;
+                            }
+                            var trusted = resolution.Session;
+                            if (HasActiveTurn())
+                            {
+                                await SendJson(ws, send, new { kind = "OpenFailed", text = "open refused: interrupt or finish the active turn before switching sessions." }, ct);
+                                await SendJson(ws, send, new { kind = "HistoryEnd" }, ct);
+                                break;
+                            }
+                            id = trusted.SessionId;
+                            var nextSource = trusted.Tool == SessionTool.Claude ? "claude" : "codex";
+                            var nextGeneration = Interlocked.Read(ref openGeneration) + 1;
+                            ThreadRouteBinding? nextOpenThread = null;
+                            IReadOnlyList<AgentEvent> history;
+                            if (nextSource == "claude")
+                            {
+                                history = claude.ReadHistory(id);
                             }
                             else
                             {
-                                await hub.OpenThreadAsync(id, Str(root, "cwd"), OnNote, OnReq, ct);
-                                openThreadId = id;
-                                await SendJson(ws, send, new { kind = "Opened", threadId = id, live = true }, ct);
-                                foreach (var ev in await hub.ReadHistoryAsync(id, ct)) await SendJson(ws, send, ev, ct);
+                                var prepared = await hub.PrepareThreadOpenAsync(
+                                    id,
+                                    trusted.WorkingDirectory,
+                                    note => nextGeneration == Interlocked.Read(ref openGeneration) ? OnNote(note) : Task.CompletedTask,
+                                    req => nextGeneration == Interlocked.Read(ref openGeneration) ? OnReq(req) : Task.CompletedTask,
+                                    ct);
+                                nextOpenThread = prepared.Binding;
+                                history = prepared.History;
                             }
+
+                            ClearOpenSession();
+                            committed = true;
+                            openThread = nextOpenThread;
+                            openSource = nextSource;
+                            openedId = id;
+                            openAliases = trusted.Aliases;
+                            claudeSid = nextSource == "claude" ? id : null;
+                            claudeCwd = nextSource == "claude" ? trusted.WorkingDirectory : defaultWorkspace;
+                            await SendJson(ws, send, new
+                            {
+                                kind = "Opened",
+                                threadId = id,
+                                source = openSource,
+                                cwd = trusted.WorkingDirectory,
+                                live = nextSource == "claude" ? claudeDriver.Available : true
+                            }, ct);
+                            foreach (var ev in history) await SendJson(ws, send, ev, ct);
                         }
-                        catch (Exception ex) { await SendJson(ws, send, AgentEvent.Err("open failed: " + ex.Message), ct); }
+                        catch (Exception ex)
+                        {
+                            if (committed) ClearOpenSession();
+                            await SendJson(ws, send, new { kind = "OpenFailed", text = "open failed: " + ex.Message }, ct);
+                        }
                         await SendJson(ws, send, new { kind = "HistoryEnd" }, ct);
                         break;
                     }
                     case "new":
                     {
-                        openSource = "codex";
-                        if (openThreadId is not null) hub.CloseThread(openThreadId);
-                        openThreadId = await hub.NewThreadAsync(Str(root, "cwd") ?? defaultWorkspace, OnNote, OnReq, ct, Str(root, "approvalPolicy") ?? "on-request", Str(root, "sandbox") ?? "workspace-write");
-                        openedId = openThreadId;
-                        await SendJson(ws, send, new { kind = "Opened", threadId = openThreadId, isNew = true, live = true }, ct);
+                        if (HasActiveTurn())
+                        {
+                            await SendJson(ws, send, new { kind = "OpenFailed", text = "new session refused: interrupt or finish the active turn before switching sessions." }, ct);
+                            await SendJson(ws, send, new { kind = "HistoryEnd" }, ct);
+                            break;
+                        }
+                        var committed = false;
+                        try
+                        {
+                            var nextGeneration = Interlocked.Read(ref openGeneration) + 1;
+                            var nextOpenThread = await hub.NewThreadAsync(
+                                Str(root, "cwd") ?? defaultWorkspace,
+                                note => nextGeneration == Interlocked.Read(ref openGeneration) ? OnNote(note) : Task.CompletedTask,
+                                req => nextGeneration == Interlocked.Read(ref openGeneration) ? OnReq(req) : Task.CompletedTask,
+                                ct,
+                                Str(root, "approvalPolicy") ?? "on-request",
+                                Str(root, "sandbox") ?? "workspace-write");
+                            ClearOpenSession();
+                            committed = true;
+                            openThread = nextOpenThread;
+                            openedId = openThread.ThreadId;
+                            openAliases = new[] { openThread.ThreadId };
+                            await SendJson(ws, send, new { kind = "Opened", threadId = openThread.ThreadId, isNew = true, live = true }, ct);
+                        }
+                        catch (Exception ex)
+                        {
+                            if (committed) ClearOpenSession();
+                            await SendJson(ws, send, new { kind = "OpenFailed", text = "new session failed: " + ex.Message }, ct);
+                        }
                         await SendJson(ws, send, new { kind = "HistoryEnd" }, ct);
                         break;
                     }
@@ -128,6 +222,11 @@ public static class AgentWebSocket
                     {
                         var text = Str(root, "text");
                         if (string.IsNullOrWhiteSpace(text)) break;
+                        if (openedId is null)
+                        {
+                            await SendJson(ws, send, AgentEvent.Err("refused: no session is open."), ct);
+                            break;
+                        }
 
                         // mode controls the AGENT's autonomy: "auto" = no per-command approval, "safe" = approvals
                         // (codex) / edits-only (claude). When a signing key is configured BOTH require a valid owner
@@ -143,7 +242,7 @@ public static class AgentWebSocket
 
                         if (openSource == "claude")
                         {
-                            if (claudeProc is { HasExited: false })
+                            if (IsClaudeTurnActive())
                             {
                                 await SendJson(ws, send, AgentEvent.Err("refused: this Claude turn is still running; wait or interrupt it before sending another."), ct);
                                 break;
@@ -151,13 +250,22 @@ public static class AgentWebSocket
                             await SendJson(ws, send, AgentEvent.Stat("turn-start"), ct);
                             try
                             {
-                                var aliasResult = await TryResolveAliasesAsync(claudeSid);
-                                if (!aliasResult.ok) break;
+                                var generation = Interlocked.Read(ref openGeneration);
                                 claudeProc = claudeDriver.StartTurn(claudeSid, claudeCwd, text!, async ev =>
                                 {
-                                    if (ev.Kind == AgentEventKind.SessionStarted) { claudeSid = ev.SessionId; return; } // track id, don't render
+                                    if (generation != Interlocked.Read(ref openGeneration)) return;
+                                    if (ev.Kind == AgentEventKind.SessionStarted)
+                                    {
+                                        claudeSid = ev.SessionId;
+                                        if (!string.IsNullOrWhiteSpace(claudeSid))
+                                            openAliases = openAliases
+                                                .Append(claudeSid)
+                                                .Distinct(StringComparer.OrdinalIgnoreCase)
+                                                .ToArray();
+                                        return;
+                                    }
                                     await SendJson(ws, send, ev, ct);
-                                }, ct, auto ? "bypassPermissions" : "acceptEdits", aliasResult.aliases);
+                                }, ownerStopping, auto ? "bypassPermissions" : "acceptEdits", openAliases);
                             }
                             catch (InvalidOperationException ex)
                             {
@@ -165,24 +273,23 @@ public static class AgentWebSocket
                                 await SendJson(ws, send, AgentEvent.Stat("idle"), ct);
                             }
                         }
-                        else if (openThreadId is not null)
+                        else if (openThread is not null)
                         {
-                            var tid = openThreadId;
+                            var tid = openThread.ThreadId;
+                            var aliases = openAliases;
                             var policy = auto ? "never" : null; // never = autonomous (owner-signed); else inherit session policy (approvals)
-                            var aliasResult = await TryResolveAliasesAsync(tid);
-                            if (!aliasResult.ok) break;
                             // fire-and-forget so the receive loop stays free for interrupt; surface failures.
-                            _ = Task.Run(async () =>
+                            codexTurnStart = Task.Run(async () =>
                             {
-                                try { await hub.StartTurnAsync(tid, text!, ct, policy, aliasResult.aliases); }
+                                try { await hub.StartTurnAsync(tid, text!, ct, policy, aliases); }
                                 catch (Exception ex) { await SendJson(ws, send, AgentEvent.Err("send failed: " + ex.Message), ct); }
                             }, ct);
                         }
                         break;
                     }
                     case "interrupt":
-                        if (openSource == "claude") { try { claudeProc?.Kill(true); } catch { } await SendJson(ws, send, AgentEvent.Stat("idle"), ct); }
-                        else if (openThreadId is not null) await hub.InterruptAsync(openThreadId, ct);
+                        if (openSource == "claude") { try { claudeProc?.Kill(entireProcessTree: true); } catch { } await SendJson(ws, send, AgentEvent.Stat("idle"), ct); }
+                        else if (openThread is not null) await hub.InterruptAsync(openThread.ThreadId, ct);
                         break;
                     case "approve":
                         if (root.TryGetProperty("requestId", out var ridEl) && ridEl.TryGetInt32(out var rid))
@@ -200,8 +307,7 @@ public static class AgentWebSocket
         catch (WebSocketException) { }
         finally
         {
-            if (openThreadId is not null) hub.CloseThread(openThreadId);
-            try { if (claudeProc is { HasExited: false }) claudeProc.Kill(true); } catch { }
+            ClearOpenSession();
             try { if (ws.State == WebSocketState.Open) await ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "bye", CancellationToken.None); } catch { }
         }
     }

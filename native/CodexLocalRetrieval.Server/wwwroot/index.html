@@ -261,6 +261,7 @@ const App = {
   // live agent: a browser of all codex+claude sessions + an open conversation you can drive
   agentWs: null, agentSessions: null, agentView: 'list', agentThreadId: null, agentSource: 'codex',
   agentItems: [], agentBusy: false, agentLive: true, agentStatus: '', agentHistoryLoading: false,
+  agentPending: null, agentOpenFailed: false,
   agentQuery: '', agentFilter: 'all', agentStick: true,
   agentMode: 'safe', autoAvailable: null, askKey: false,
   agentTitle: '', agentCwd: '', agentRenaming: false, toast: '',
@@ -553,14 +554,15 @@ async function loadAgentSessions(){
   if(App.tab==='agent'&&App.agentView==='list') render();
 }
 async function openSession(id, source, title, cwd){
-  App.agentView='session'; App.agentItems=[]; App.agentBusy=false; App.agentLive=true; App.agentSource=source||'codex'; App.agentTitle=title||''; App.agentCwd=cwd||''; App.agentRenaming=false; App.agentHistoryLoading=true; App.agentStatus='connecting…'; render();
-  try{ await agentConnect(); App.agentWs.send(JSON.stringify({op:'open',id,source:App.agentSource})); }
-  catch(e){ App.agentStatus='connect failed: '+e.message; render(); }
+  if(App.agentPending)return;
+  App.agentPending={id,source,title,cwd}; App.agentOpenFailed=false; App.agentHistoryLoading=true; App.agentStatus='connecting…'; render();
+  try{ await agentConnect(); App.agentWs.send(JSON.stringify({op:'open',id})); }
+  catch(e){ App.agentPending=null; App.agentHistoryLoading=false; App.agentStatus='connect failed: '+e.message; render(); }
 }
 function showToast(msg){ App.toast=msg; render(); clearTimeout(showToast._t); showToast._t=setTimeout(()=>{ App.toast=''; if(App.tab==='agent') render(); }, 3500); }
 // reopen a chat where you work: in VS Code (the same session) or a terminal — launches on the PC.
 async function reopen(sess, target){
-  try{ const r=await api('/api/agent/sessions/'+encodeURIComponent(sess.id)+'/open', { method:'POST', body:{target, source:sess.source, cwd:sess.cwd} });
+  try{ const r=await api('/api/agent/sessions/'+encodeURIComponent(sess.id)+'/open', { method:'POST', body:{target} });
     showToast(r.message || 'opening…');
   }catch(e){ showToast('couldn’t reopen: '+e.message); }
 }
@@ -574,11 +576,12 @@ async function renameAgentSession(newTitle){
   render();
 }
 async function newSession(cwd){
+  if(App.agentPending)return;
   App.agentWorkspace=(cwd||'').trim(); localStorage.setItem('clr_agent_ws',App.agentWorkspace);
   if(!App.agentWorkspace){ App.agentStatus='enter a workspace path first'; render(); return; }
-  App.agentView='session'; App.agentItems=[]; App.agentBusy=false; App.agentStatus='connecting…'; render();
+  App.agentPending={id:null,source:'codex',title:'New Codex session',cwd:App.agentWorkspace}; App.agentOpenFailed=false; App.agentHistoryLoading=true; App.agentStatus='connecting…'; render();
   try{ await agentConnect(); App.agentWs.send(JSON.stringify({op:'new',cwd:App.agentWorkspace})); }
-  catch(e){ App.agentStatus='connect failed: '+e.message; render(); }
+  catch(e){ App.agentPending=null; App.agentHistoryLoading=false; App.agentStatus='connect failed: '+e.message; render(); }
 }
 // HMAC-SHA256 (hex) via Web Crypto — available in secure contexts (HTTPS, and localhost for dev).
 function randHex(n){ const a=new Uint8Array(n); crypto.getRandomValues(a); return [...a].map(b=>b.toString(16).padStart(2,'0')).join(''); }
@@ -597,6 +600,7 @@ async function signOp(op, f5, f8){
   return {source, threadId, ts, nonce, sig};
 }
 async function sendAgent(text){
+  if(App.agentPending)return;
   text=(text||'').trim(); if(!text||!App.agentWs||App.agentBusy) return;
   let msg={op:'send',text};
   if(App.autoAvailable){                                   // this server requires owner-signed commands
@@ -623,8 +627,8 @@ async function resolveApproval(it,allow){
 function agentUpsert(t,id){ let it=id!=null&&App.agentItems.find(x=>x.id===id&&x.t===t); if(!it){ it={t,id}; App.agentItems.push(it);} return it; }
 function onAgentEvent(ev){
   switch(ev.kind){
-    case 'Opened': App.agentThreadId=ev.threadId; App.agentItems=[]; App.agentView='session'; App.agentLive=ev.live!==false; App.agentMode='safe'; App.askKey=false; App.agentHistoryLoading=true; App.agentStatus=ev.isNew?'new session':'loading…'; break;
-    case 'HistoryEnd': App.agentHistoryLoading=false; App.agentStatus='ready'; break;
+    case 'Opened': { const pending=App.agentPending; App.agentPending=null; App.agentOpenFailed=false; App.agentThreadId=ev.threadId; App.agentSource=ev.source||(pending&&pending.source)||'codex'; App.agentCwd=ev.cwd||(pending&&pending.cwd)||''; App.agentTitle=(pending&&pending.title)||App.agentTitle||''; App.agentItems=[]; App.agentView='session'; App.agentLive=ev.live!==false; App.agentMode='safe'; App.askKey=false; App.agentHistoryLoading=true; App.agentStatus=ev.isNew?'new session':'loading…'; break; }
+    case 'HistoryEnd': App.agentHistoryLoading=false; if(App.agentOpenFailed) App.agentOpenFailed=false; else App.agentStatus='ready'; break;
     case 'UserMessage': App.agentItems.push({t:'user',id:ev.itemId||('u'+App.agentItems.length),text:ev.text||''}); break;
     case 'AssistantText': { const it=agentUpsert('assistant',ev.itemId||('a'+App.agentItems.length)); it.text = ev.delta ? (it.text||'')+(ev.text||'') : (ev.text||''); break; }
     case 'Thinking': { const it=agentUpsert('thinking',ev.itemId||('r'+App.agentItems.length)); it.text = ev.delta ? (it.text||'')+(ev.text||'') : (ev.text||''); break; }
@@ -632,6 +636,7 @@ function onAgentEvent(ev){
     case 'ToolOutput': { const it=agentUpsert('tool',ev.itemId); if(ev.delta){ it.output=(it.output||'')+(ev.output||''); } else if(ev.output!=null){ it.output=ev.output; } if(ev.exitCode!=null)it.exit=ev.exitCode; it.state=ev.state; break; }
     case 'Status': App.agentStatus=ev.text; if(ev.text==='turn-start')App.agentBusy=true; if(ev.text==='idle'||ev.text==='interrupted')App.agentBusy=false; break;
     case 'TurnResult': App.agentBusy=false; break;
+    case 'OpenFailed': App.agentPending=null; App.agentOpenFailed=true; App.agentHistoryLoading=false; App.agentStatus=ev.text||'session open failed'; App.agentBusy=false; break;
     case 'Error': App.agentItems.push({t:'error',text:ev.text}); App.agentBusy=false; break;
     case 'PermissionRequest': App.agentItems.push({t:'approval',requestId:ev.requestId,tool:ev.tool,text:ev.text,resolved:null}); break;
     default: return;
@@ -734,9 +739,9 @@ function renderAgent(v){
       v.append(el('div',{class:'search'}, ki, el('button',{class:'btn primary',onclick:()=>saveSignKey(ki.value)},'Save key')));
     }
   }
-  const ta=el('textarea',{class:'txt',rows:'1',placeholder:'Continue — tell the agent what to do next…','aria-label':'Message to agent',disabled:App.agentBusy?'':null});
+  const ta=el('textarea',{class:'txt',rows:'1',placeholder:'Continue — tell the agent what to do next…','aria-label':'Message to agent',disabled:(App.agentBusy||App.agentPending)?'':null});
   ta.addEventListener('keydown',e=>{ if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();const t=ta.value;ta.value='';sendAgent(t);} });
-  const send=el('button',{class:'btn primary',onclick:()=>{const t=ta.value;ta.value='';sendAgent(t);}},'Send');
+  const send=el('button',{class:'btn primary',disabled:App.agentPending?'':null,onclick:()=>{const t=ta.value;ta.value='';sendAgent(t);}},'Send');
   const stop=el('button',{class:'btn',onclick:()=>interruptAgent()},'Stop');
   v.append(el('div',{class:'composer'}, ta, App.agentBusy?stop:send));
 }

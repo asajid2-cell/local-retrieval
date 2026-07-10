@@ -204,7 +204,8 @@ public sealed class ArchiveServiceTests
         finally { Directory.Delete(root, true); }
     }
 
-    // L1 (machine proof): the real ~/.codex store resurfaces, including chats older than 30 days.
+    // L1 opt-in machine proof: dotnet test --filter "TestCategory=RealStore"
+    // The real ~/.codex store resurfaces, including chats older than 30 days.
     [TestMethod]
     [TestCategory("RealStore")]
     public async Task SyncFromDisk_ResurfacesRealStoreIncludingMonthsOld()
@@ -265,8 +266,22 @@ public sealed class ArchiveServiceTests
         Assert.AreEqual("", bad.Exe, "unsafe id must be refused (empty Exe)");
         Assert.IsFalse(ArchiveService.IsResumableId("x & calc.jsonl"));
         Assert.IsFalse(ArchiveService.IsResumableId("a\" & start calc \""));
+        Assert.IsFalse(ArchiveService.IsResumableId("--dangerously-skip-permissions"));
         Assert.IsTrue(ArchiveService.IsResumableId("019eb8f6-0f43-7f31-a284-f9da9cd5b3fa"));
         Assert.IsTrue(ArchiveService.IsResumableId("rollout-2026-06-15T22-39-19-019eceba"));
+    }
+
+    [TestMethod]
+    public void TranscriptEnumeration_SkipsInaccessibleAndReparseBranches()
+    {
+        var options = ArchiveService.TranscriptEnumerationOptions();
+
+        Assert.IsTrue(options.RecurseSubdirectories);
+        Assert.IsTrue(options.IgnoreInaccessible);
+        Assert.IsFalse(options.ReturnSpecialDirectories);
+        Assert.AreNotEqual(
+            FileAttributes.None,
+            options.AttributesToSkip & FileAttributes.ReparsePoint);
     }
 
     // Review #2: a parser-version migration prunes an orphan whose file now parses to a new id.
