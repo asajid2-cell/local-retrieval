@@ -42,6 +42,23 @@ function Run-Gate {
     Write-Host "[$status] $Name exit=$exit log=$log"
 }
 
+function Get-Head {
+    param([string]$Repo)
+    return (& git -C $Repo log -1 --pretty='%H %s')
+}
+
+function Get-SourceStatus {
+    param(
+        [string]$Repo,
+        [string[]]$Excludes = @()
+    )
+    $args = @('-C', $Repo, 'status', '--porcelain', '--untracked-files=all', '--', '.')
+    foreach ($exclude in $Excludes) {
+        $args += ":(exclude)$exclude"
+    }
+    return @(& git @args)
+}
+
 Set-Location $root
 Run-Gate 'dotnet-build' {
     dotnet build native\CodexLocalRetrieval.Native.Tests\CodexLocalRetrieval.Native.Tests.csproj `
@@ -78,13 +95,33 @@ Set-Location $muxd
 Run-Gate 'muxd-tests' {
     python -m py_compile muxd.py transcript_guardian.py
     if ($LASTEXITCODE -eq 0) { python -m unittest discover -s tests -p 'test_*.py' }
-} 'OK (skipped='
+} ''
 
 Set-Location $root
-$head = git log -1 --pretty='%h %s'
-$appDirty = git status --porcelain
-$relayDirty = git -C $relay status --porcelain
-$muxdDirty = git -C $muxd status --porcelain
+$appHead = Get-Head $root
+$relayHead = Get-Head $relay
+$muxdHead = Get-Head $muxd
+$appDirty = Get-SourceStatus $root
+$relayDirty = Get-SourceStatus $relay
+$muxdDirty = Get-SourceStatus $muxd @(
+    'live-tabs.json',
+    'live-tabs.json.bak',
+    'sessions.json',
+    'sessions.json.bak'
+)
+$provenanceOk = -not ($appDirty -or $relayDirty -or $muxdDirty)
+$results['source-provenance'] = @{
+    ok = $provenanceOk
+    log = Join-Path $artifactDir 'source-provenance.json'
+    exit = $(if ($provenanceOk) { 0 } else { 1 })
+}
+if (-not $provenanceOk) { $hardFail = $true }
+@{
+    app = @{ head = $appHead; dirty = @($appDirty) }
+    relay = @{ head = $relayHead; dirty = @($relayDirty) }
+    muxd = @{ head = $muxdHead; dirty = @($muxdDirty) }
+} | ConvertTo-Json -Depth 4 | Out-File -FilePath $results['source-provenance'].log -Encoding utf8
+Write-Host "[$(if ($provenanceOk) { 'PASS' } else { 'FAIL' })] source-provenance log=$($results['source-provenance'].log)"
 
 $overall = 'GREEN - acceptable checkpoint'
 if ($hardFail) { $overall = 'RED - DO NOT ACCEPT' }
@@ -98,10 +135,12 @@ $lines = @(
     "- Tag: ``$Tag``"
     "- Date: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz')"
     "- Accepted tag: ``$acceptedTag``"
-    "- App HEAD: $head"
-    "- App tree: $(if ($appDirty) { 'DIRTY' } else { 'CLEAN' })"
-    "- Relay tree: $(if ($relayDirty) { 'DIRTY' } else { 'CLEAN' })"
-    "- muxd tree: $(if ($muxdDirty) { 'DIRTY' } else { 'CLEAN' })"
+    "- App HEAD: $appHead"
+    "- Relay HEAD: $relayHead"
+    "- muxd HEAD: $muxdHead"
+    "- App source tree: $(if ($appDirty) { 'DIRTY' } else { 'CLEAN' })"
+    "- Relay source tree: $(if ($relayDirty) { 'DIRTY' } else { 'CLEAN' })"
+    "- muxd source tree: $(if ($muxdDirty) { 'DIRTY' } else { 'CLEAN' })"
     ''
     '## Gates'
     ''
