@@ -117,8 +117,14 @@ public sealed partial class MainPage
         //    is the ground truth there (also catches a claude that's mid-write).
         try
         {
-            foreach (var kv in CodexLocalRetrieval.Core.Remote.OpenHandles.OpenTranscriptSessionIds(pids))
-                if (!map.ContainsKey(kv.Key)) map[kv.Key] = kv.Value;
+            if (CodexLocalRetrieval.Core.Remote.RunningSessions.TryOpenTranscriptSessionIds(
+                    pids,
+                    out var openIds,
+                    out _))
+            {
+                foreach (var kv in openIds)
+                    if (!map.ContainsKey(kv.Key)) map[kv.Key] = kv.Value;
+            }
         }
         catch { }
         return map;

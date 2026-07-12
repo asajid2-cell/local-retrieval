@@ -277,6 +277,14 @@ public sealed class ArchitectureLaunchSurfaceTests
 
         Assert.Contains("QueryAllHandles(e =>", handles);
         Assert.DoesNotContain("new List<SYSTEM_HANDLE_ENTRY>", handles);
+
+        var runningChats = File.ReadAllText(Path.Combine(
+            root,
+            "native",
+            "CodexLocalRetrieval.Native",
+            "MainPage.RunningChats.cs"));
+        Assert.Contains("RunningSessions.TryOpenTranscriptSessionIds", runningChats);
+        Assert.DoesNotContain("OpenHandles.OpenTranscriptSessionIds", runningChats);
     }
 
     [TestMethod]

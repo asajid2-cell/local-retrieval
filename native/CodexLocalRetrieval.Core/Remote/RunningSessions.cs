@@ -254,6 +254,15 @@ public static class RunningSessions
         return true;
     }
 
+    public static bool TryOpenTranscriptSessionIds(
+        IEnumerable<int> processIds,
+        out Dictionary<string, int> ids,
+        out string detail)
+        => TryOpenTranscriptSessionIdsBounded(
+            new HashSet<int>(processIds.Where(pid => pid > 0)),
+            out ids,
+            out detail);
+
     private static void AddLivePid(Dictionary<string, HashSet<int>> live, string? sessionId, int pid)
     {
         if (string.IsNullOrWhiteSpace(sessionId) || pid <= 0) return;
