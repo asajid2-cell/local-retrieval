@@ -2,21 +2,24 @@
 
 Overall: **GREEN - acceptable checkpoint**
 
-- Tag: `L8_20260710`
-- Date: 2026-07-10 15:42:06 -06:00
-- Accepted tag: `L8_20260710`
-- App HEAD: 61804ba Harden session ownership and process containment
-- App tree: CLEAN
-- Relay tree: CLEAN
-- muxd tree: DIRTY
+- Tag: `L8b_20260711`
+- Date: 2026-07-12 00:03:39 -06:00
+- Accepted tag: `L8b_20260711`
+- App HEAD: 959348fda733f4811b7409d4846fe106e448fadf Pin acceptance to exact clean source commits
+- Relay HEAD: 94462177d230467cbcd27e97557b8bbe2b5f1c6c Bound relay viewers and correlate scrollback
+- muxd HEAD: 8181359564609341bf2b1810eec5a5e3bc2b93d5 Make muxd deployment restart self-recovering
+- App source tree: CLEAN
+- Relay source tree: CLEAN
+- muxd source tree: CLEAN
 
 ## Gates
 
-- **dotnet-build**: PASS -- exit=0, log=Z:\328\CMPUT328-A2\codexworks\301\WorkRepo\ournewfolder\codex-local-retrieval-remote\artifacts\reliability\L8_20260710\dotnet-build.log
-- **dotnet-tests**: PASS -- exit=0, log=Z:\328\CMPUT328-A2\codexworks\301\WorkRepo\ournewfolder\codex-local-retrieval-remote\artifacts\reliability\L8_20260710\dotnet-tests.log
-- **projection-contract**: PASS -- exit=0, log=Z:\328\CMPUT328-A2\codexworks\301\WorkRepo\ournewfolder\codex-local-retrieval-remote\artifacts\reliability\L8_20260710\projection-contract.log
-- **relay-tests**: PASS -- exit=0, log=Z:\328\CMPUT328-A2\codexworks\301\WorkRepo\ournewfolder\codex-local-retrieval-remote\artifacts\reliability\L8_20260710\relay-tests.log
-- **muxd-tests**: PASS -- exit=0, log=Z:\328\CMPUT328-A2\codexworks\301\WorkRepo\ournewfolder\codex-local-retrieval-remote\artifacts\reliability\L8_20260710\muxd-tests.log
+- **dotnet-build**: PASS -- exit=0, log=Z:\328\CMPUT328-A2\codexworks\301\WorkRepo\ournewfolder\codex-local-retrieval-remote\artifacts\reliability\L8b_20260711\dotnet-build.log
+- **dotnet-tests**: PASS -- exit=0, log=Z:\328\CMPUT328-A2\codexworks\301\WorkRepo\ournewfolder\codex-local-retrieval-remote\artifacts\reliability\L8b_20260711\dotnet-tests.log
+- **projection-contract**: PASS -- exit=0, log=Z:\328\CMPUT328-A2\codexworks\301\WorkRepo\ournewfolder\codex-local-retrieval-remote\artifacts\reliability\L8b_20260711\projection-contract.log
+- **relay-tests**: PASS -- exit=0, log=Z:\328\CMPUT328-A2\codexworks\301\WorkRepo\ournewfolder\codex-local-retrieval-remote\artifacts\reliability\L8b_20260711\relay-tests.log
+- **muxd-tests**: PASS -- exit=0, log=Z:\328\CMPUT328-A2\codexworks\301\WorkRepo\ournewfolder\codex-local-retrieval-remote\artifacts\reliability\L8b_20260711\muxd-tests.log
+- **source-provenance**: PASS -- exit=0, log=Z:\328\CMPUT328-A2\codexworks\301\WorkRepo\ournewfolder\codex-local-retrieval-remote\artifacts\reliability\L8b_20260711\source-provenance.json
 
 ## Residuals
 

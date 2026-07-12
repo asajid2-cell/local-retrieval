@@ -23,7 +23,7 @@
 | L5 durable command delivery | lease/idempotency; no age loss | crash/restart/replay queue tests | done `L5_20260709`: app 329 passed / 2 skipped; relay 64 passed; muxd 80 passed / 3 skipped |
 | L6 canonical server launcher | archive identity and trusted args only | server route/launcher tests | done `L6_20260710`: app 345 passed / 2 skipped; relay 64 passed; muxd 80 passed / 3 skipped |
 | L7 process containment | child writer exits with owner or remains blocked | Windows lifecycle integration test | done `L7b_20260710`: app 388 passed / 2 skipped; relay 66 passed; muxd 92 passed / 3 VPS-only skipped |
-| L8 synthesis/deploy | all gates and runtime probes green | `tools/run_gates.ps1` plus install/deploy smoke | reopened: `L8_20260710` refuted by unsynchronized session ring |
+| L8 synthesis/deploy | all gates and runtime probes green | `tools/run_gates.ps1` plus install/deploy smoke | done `L8b_20260711`: exact clean provenance; app 393 passed / 1 skipped; relay 72 passed; muxd 107 passed / 3 VPS-only skipped; VPS smoke 3/3 |
 
 ## Baseline
 
@@ -201,3 +201,34 @@
   lock-ownership verifier was observed red against the L8 candidate and green after the fix. The
   corrected full muxd suite passed 92 tests with 3 VPS-only skips; deployment and unified
   re-acceptance remain required.
+- 2026-07-11 production memory investigation identified leaked ConPTY transport hosts as a real
+  source of process and RAM growth. muxd now discovers `conhost.exe`, `OpenConsole.exe`, and
+  `winpty-agent.exe` by exact process instance, serializes PTY baseline/spawn/capture, attaches
+  ownership to each PTY generation, and retains failed cleanup for supervised retry. Ambiguous
+  post-spawn discovery quarantines new PTY creation until custody is restored. Exact-instance
+  termination verifies the creation token through one process handle and treats enumeration,
+  token-query, wait, or cleanup timeout failures as unresolved ownership rather than success.
+- Multi-round adversarial review refuted earlier ConPTY candidates for PID/taskkill TOCTOU,
+  incomplete attribution, identity-query failure, `WAIT_FAILED`, timed-out workers continuing to
+  mutate state, and failed-spawn cleanup losing retry custody. Each issue was fixed and covered by
+  regressions. The final full muxd suite passed 107 tests with 3 VPS-only skips. Fresh final
+  reviewers were unavailable because their account usage limits were exhausted, so no additional
+  independent final ACCEPT is claimed.
+- The production ConPTY probe `deploy-conpty-proof-2` captured `OpenConsole.exe` PID `34700`.
+  Normal muxd cleanup removed that exact process instance. The corrected deployment continued on
+  daemon PID `24104`.
+- A direct scheduled-task stop during deployment was interrupted before its paired start, proving
+  the old deployment sequence could leave the web app unable to create sessions. Durable session
+  records survived and boot reconciled interrupted active rows to dormant; none were deleted.
+  Restart custody now lives in `ops/restart_muxd.ps1`, which rechecks for active sessions, backs up
+  manifests, proves the old daemon and transport hosts exited, starts the replacement from a
+  `finally` recovery path, and verifies local health. The external restart proof replaced PID
+  `34824` with PID `24104` and returned task result 0.
+- `MuxdSessionHostWatchdog` runs outside muxd's process tree every minute. It restarts an absent
+  daemon, but preserves an unresponsive live owner instead of risking duplicate custody. The host
+  task itself retains ten one-minute restart-on-failure attempts and muxd retains its top-level
+  crash loop.
+- `L8b_20260711`: unified runner green on exact source commits app `959348f`, relay `9446217`, and
+  muxd `8181359`. App passed 393 tests with 1 environment skip; relay passed 72; muxd passed 107
+  with 3 VPS-only skips; the separate VPS-backed smoke passed 3/3. Evidence:
+  `artifacts/reliability/L8b_20260711`.

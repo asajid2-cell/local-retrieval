@@ -102,6 +102,36 @@
   ring lock existed. Commit `fd0f232` synchronizes append, cap eviction, scrollback, and tail
   snapshots for both ConPTY and visible-owner sessions. The corrected full muxd suite passed
   92 tests with 3 VPS-only skips; the campaign remains open pending redeploy and unified rerun.
+- 2026-07-11: Production process inspection proved leaked ConPTY transport hosts were contributing
+  to muxd RAM growth. The accepted implementation owns `conhost.exe`, `OpenConsole.exe`, and
+  `winpty-agent.exe` by PID plus process-creation token, ties custody to the PTY generation, and
+  retains uncertain or failed cleanup for supervised retry. Discovery ambiguity quarantines new
+  PTY creation rather than creating an unowned process. Exact-instance termination uses one
+  verified process handle and fails closed on enumeration, identity, wait, or deadline failures.
+- 2026-07-11: Adversarial review repeatedly rejected weaker ConPTY implementations for PID reuse
+  races, partial snapshot attribution, false success after identity-query failure, `WAIT_FAILED`,
+  cleanup workers surviving their caller timeout, and failed-spawn ownership being discarded.
+  Regression tests cover the corrected behavior. The full muxd suite passed 107 tests with 3
+  VPS-only skips. No fresh final independent verdict is claimed because the available reviewers
+  had exhausted their usage limits.
+- 2026-07-11: Production probe `deploy-conpty-proof-2` captured `OpenConsole.exe` PID `34700`;
+  normal muxd cleanup removed that exact process. VPS-backed relaunch, same-session reuse, and web
+  terminal smoke passed 3/3.
+- 2026-07-11: Deployment itself exposed an operational liveness defect: an interrupted direct
+  `schtasks /End` sequence stopped muxd before the corresponding start command ran. The web app
+  temporarily could not create sessions, but durable rows survived and boot reconciled interrupted
+  active records to dormant without deleting them. Commit `8181359` replaced that sequence with an
+  external restart controller that rechecks active sessions, backs up manifests, proves old process
+  exit, starts recovery from `finally`, and verifies health. Its live proof replaced PID `34824`
+  with PID `24104`; the controller and watchdog both returned result 0.
+- 2026-07-11: `MuxdSessionHostWatchdog` now runs every minute outside muxd's process tree. It
+  restarts only an absent daemon; an unresponsive live owner is logged and preserved to prevent a
+  duplicate writer. The host task also has ten one-minute restart attempts and muxd retains a
+  top-level crash loop.
+- 2026-07-12: Unified `L8b_20260711` acceptance passed on exact clean commits app `959348f`, relay
+  `9446217`, and muxd `8181359`: app 393 passed / 1 environment skip, relay 72 passed, muxd 107
+  passed / 3 VPS-only skips, with source provenance clean. Evidence is under
+  `artifacts/reliability/L8b_20260711`.
 
 ## Decisions Needed
 
