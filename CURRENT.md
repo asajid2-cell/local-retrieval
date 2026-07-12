@@ -2,11 +2,11 @@
 
 Overall: **GREEN - acceptable checkpoint**
 
-- Tag: `L8c_20260712`
-- Date: 2026-07-12 00:09:39 -06:00
-- Accepted tag: `L8c_20260712`
-- App HEAD: 5e9ed03db21b0fd06dad122686f53763475a7358 Close mux reliability deployment campaign
-- Relay HEAD: 94462177d230467cbcd27e97557b8bbe2b5f1c6c Bound relay viewers and correlate scrollback
+- Tag: `L8d_20260712b`
+- Date: 2026-07-12 01:29:39 -06:00
+- Accepted tag: `L8d_20260712b`
+- App HEAD: 4f409ecdcf718af281f37976346e00ab01e425e3 Harden mux relaunch ownership transfer
+- Relay HEAD: 0fa333a3dd525afcb7359a954f48fe454777a9de Make explicit relaunch transfer local ownership
 - muxd HEAD: 8181359564609341bf2b1810eec5a5e3bc2b93d5 Make muxd deployment restart self-recovering
 - App source tree: CLEAN
 - Relay source tree: CLEAN
@@ -14,12 +14,12 @@ Overall: **GREEN - acceptable checkpoint**
 
 ## Gates
 
-- **dotnet-build**: PASS -- exit=0, log=Z:\328\CMPUT328-A2\codexworks\301\WorkRepo\ournewfolder\codex-local-retrieval-remote\artifacts\reliability\L8c_20260712\dotnet-build.log
-- **dotnet-tests**: PASS -- exit=0, log=Z:\328\CMPUT328-A2\codexworks\301\WorkRepo\ournewfolder\codex-local-retrieval-remote\artifacts\reliability\L8c_20260712\dotnet-tests.log
-- **projection-contract**: PASS -- exit=0, log=Z:\328\CMPUT328-A2\codexworks\301\WorkRepo\ournewfolder\codex-local-retrieval-remote\artifacts\reliability\L8c_20260712\projection-contract.log
-- **relay-tests**: PASS -- exit=0, log=Z:\328\CMPUT328-A2\codexworks\301\WorkRepo\ournewfolder\codex-local-retrieval-remote\artifacts\reliability\L8c_20260712\relay-tests.log
-- **muxd-tests**: PASS -- exit=0, log=Z:\328\CMPUT328-A2\codexworks\301\WorkRepo\ournewfolder\codex-local-retrieval-remote\artifacts\reliability\L8c_20260712\muxd-tests.log
-- **source-provenance**: PASS -- exit=0, log=Z:\328\CMPUT328-A2\codexworks\301\WorkRepo\ournewfolder\codex-local-retrieval-remote\artifacts\reliability\L8c_20260712\source-provenance.json
+- **dotnet-build**: PASS -- exit=0, log=Z:\328\CMPUT328-A2\codexworks\301\WorkRepo\ournewfolder\codex-local-retrieval-remote\artifacts\reliability\L8d_20260712b\dotnet-build.log
+- **dotnet-tests**: PASS -- exit=0, log=Z:\328\CMPUT328-A2\codexworks\301\WorkRepo\ournewfolder\codex-local-retrieval-remote\artifacts\reliability\L8d_20260712b\dotnet-tests.log
+- **projection-contract**: PASS -- exit=0, log=Z:\328\CMPUT328-A2\codexworks\301\WorkRepo\ournewfolder\codex-local-retrieval-remote\artifacts\reliability\L8d_20260712b\projection-contract.log
+- **relay-tests**: PASS -- exit=0, log=Z:\328\CMPUT328-A2\codexworks\301\WorkRepo\ournewfolder\codex-local-retrieval-remote\artifacts\reliability\L8d_20260712b\relay-tests.log
+- **muxd-tests**: PASS -- exit=0, log=Z:\328\CMPUT328-A2\codexworks\301\WorkRepo\ournewfolder\codex-local-retrieval-remote\artifacts\reliability\L8d_20260712b\muxd-tests.log
+- **source-provenance**: PASS -- exit=0, log=Z:\328\CMPUT328-A2\codexworks\301\WorkRepo\ournewfolder\codex-local-retrieval-remote\artifacts\reliability\L8d_20260712b\source-provenance.json
 
 ## Residuals
 
