@@ -277,6 +277,8 @@ public sealed class ArchitectureLaunchSurfaceTests
 
         Assert.Contains("QueryAllHandles(e =>", handles);
         Assert.DoesNotContain("new List<SYSTEM_HANDLE_ENTRY>", handles);
+        Assert.Contains("GetFileType(dup) != FILE_TYPE_DISK", handles);
+        Assert.Contains("MaxHandleTableBytes", handles);
 
         var runningChats = File.ReadAllText(Path.Combine(
             root,

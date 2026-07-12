@@ -56,6 +56,7 @@ public static class OpenHandles
                 if (!DuplicateHandle(src, e.HandleValue, cur, out var dup, 0, false, DUPLICATE_SAME_ACCESS)) return;
                 try
                 {
+                    if (GetFileType(dup) != FILE_TYPE_DISK) return;
                     var path = FinalPath(dup);
                     if (path is null || !path.EndsWith(".jsonl", StringComparison.OrdinalIgnoreCase)) return;
                     var low = path.Replace('/', '\\').ToLowerInvariant();
@@ -90,6 +91,8 @@ public static class OpenHandles
     private const int STATUS_INFO_LENGTH_MISMATCH = unchecked((int)0xC0000004);
     private const uint PROCESS_DUP_HANDLE = 0x0040;
     private const uint DUPLICATE_SAME_ACCESS = 0x0002;
+    private const uint FILE_TYPE_DISK = 0x0001;
+    private const int MaxHandleTableBytes = 256 * 1024 * 1024;
 
     [StructLayout(LayoutKind.Sequential)]
     private struct SYSTEM_HANDLE_ENTRY
@@ -112,6 +115,8 @@ public static class OpenHandles
     private static extern bool DuplicateHandle(IntPtr srcProc, IntPtr srcHandle, IntPtr dstProc, out IntPtr dstHandle, uint access, bool inherit, uint options);
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool CloseHandle(IntPtr h);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern uint GetFileType(IntPtr hFile);
     [DllImport("kernel32.dll")]
     private static extern IntPtr GetCurrentProcess();
     [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
@@ -142,6 +147,8 @@ public static class OpenHandles
                 {
                     Marshal.FreeHGlobal(buf);
                     len = Math.Max(need, len * 2);
+                    if (len > MaxHandleTableBytes)
+                        throw new InvalidOperationException("system handle table exceeds the bounded scan limit");
                     buf = Marshal.AllocHGlobal(len);
                     continue;
                 }
