@@ -245,6 +245,24 @@ public sealed class ArchitectureLaunchSurfaceTests
     }
 
     [TestMethod]
+    public void Tomux_DoesNotKillCallerBeforeSharedMuxCustodyClassification()
+    {
+        var root = FindRepoRoot();
+        var gui = File.ReadAllText(Path.Combine(
+            root,
+            "native",
+            "CodexLocalRetrieval.Native",
+            "MainPage.Remote.cs"));
+        var start = gui.IndexOf("HandleToMuxAsync", StringComparison.Ordinal);
+        var end = gui.IndexOf("AddSessionToCollectionAsync", start, StringComparison.Ordinal);
+        var handler = gui.Substring(start, end - start);
+
+        Assert.DoesNotContain("KillRunningSession(null, c.pid)", handler);
+        Assert.Contains("MuxIdentityTransfer.ExecuteAsync", handler);
+        Assert.Contains("Already running in multiplex", handler);
+    }
+
+    [TestMethod]
     public void LiveOwnerScan_DoesNotPermanentlyPoisonLaunchesAfterOneTimeout()
     {
         var root = FindRepoRoot();

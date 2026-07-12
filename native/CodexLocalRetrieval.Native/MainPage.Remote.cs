@@ -594,39 +594,6 @@ public sealed partial class MainPage
                 ResolvedSessionId: session.Id);
         }
 
-        var killed = await Task.Run(() => c.pid > 0 ? KillRunningSession(null, c.pid) : KillRunningSession(session.Id, 0));
-        if (!killed.ok)
-        {
-            RecordSessionEvent(
-                session,
-                "tomux.refused.kill",
-                killed.detail,
-                "warn",
-                details: new Dictionary<string, string>
-                {
-                    ["muxName"] = name,
-                    ["pid"] = c.pid.ToString()
-                });
-            return new CodexLocalRetrieval.Core.Models.AgentCommandResult(false,
-                "couldn't stop the local owner, so multiplex handoff was refused: " + killed.detail,
-                ResolvedSessionId: session.Id);
-        }
-
-        await Task.Delay(500);
-        InvalidateRunningCache();
-        if (CodexLocalRetrieval.Core.Remote.RunningSessions.IsSessionLive(session.Id, session.Aliases))
-        {
-            RecordSessionEvent(
-                session,
-                "tomux.refused.still-live",
-                "Tomux handoff refused because the local owner still appeared live after stop.",
-                "warn",
-                details: new Dictionary<string, string> { ["muxName"] = name });
-            return new CodexLocalRetrieval.Core.Models.AgentCommandResult(false,
-                "local owner still appears live after stop; refusing to start a second writer.",
-                ResolvedSessionId: session.Id);
-        }
-
         var transferred = await CodexLocalRetrieval.Core.Remote.MuxIdentityTransfer.ExecuteAsync(
             name,
             session.Id,
@@ -685,14 +652,18 @@ public sealed partial class MainPage
         RecordSessionEvent(
             session,
             "tomux.completed",
-            "Tomux handoff completed: local owner stopped and mux became the owner.",
+            transferred.AlreadyOwned
+                ? "Tomux request was already satisfied by the existing mux owner."
+                : "Tomux handoff completed: local owner stopped and mux became the owner.",
             details: new Dictionary<string, string>
             {
                 ["muxName"] = name,
                 ["pid"] = c.pid.ToString()
             });
         return new CodexLocalRetrieval.Core.Models.AgentCommandResult(true,
-            $"Handed off to multiplex as '{name}' (resumed-remote); local session stopped. Open the multiplex site to drive it.{metadataWarning}",
+            transferred.AlreadyOwned
+                ? $"Already running in multiplex as '{name}'; the existing mux owner was preserved.{metadataWarning}"
+                : $"Handed off to multiplex as '{name}' (resumed-remote); local session stopped. Open the multiplex site to drive it.{metadataWarning}",
             ResolvedSessionId: session.Id);
     }
 
