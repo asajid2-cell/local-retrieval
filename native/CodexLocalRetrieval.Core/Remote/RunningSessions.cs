@@ -14,8 +14,10 @@ namespace CodexLocalRetrieval.Core.Remote;
 // drive the same "running on PC" remote view + kills when the desktop app is closed. Windows-only.
 public static class RunningSessions
 {
-    private static int _openHandleScanDisabled;
-    private static readonly TimeSpan OpenHandleScanTimeout = TimeSpan.FromSeconds(2);
+    private static readonly object OpenHandleScanGate = new();
+    private static Task<(bool Ok, Dictionary<string, int> Found, string Detail)>? _openHandleScan;
+    private static HashSet<int> _openHandleScanPids = new();
+    private static readonly TimeSpan OpenHandleScanTimeout = TimeSpan.FromSeconds(5);
     private static readonly System.Management.EnumerationOptions BoundedWmiOptions = new()
     {
         ReturnImmediately = true,
@@ -330,35 +332,44 @@ public static class RunningSessions
         ids = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
         detail = "";
         if (pids.Count == 0) return true;
-        if (Volatile.Read(ref _openHandleScanDisabled) != 0)
-        {
-            detail = "open transcript handle scan is disabled after a previous timeout; refusing to risk a second writer";
-            return false;
-        }
 
         try
         {
-            var task = Task.Run(() =>
+            Task<(bool Ok, Dictionary<string, int> Found, string Detail)>? task;
+            lock (OpenHandleScanGate)
             {
-                var ok = OpenHandles.TryOpenTranscriptSessionIds(pids, out var found, out var scanDetail);
-                return (ok, found, scanDetail);
-            });
+                if (_openHandleScan is null || _openHandleScan.IsCompleted)
+                {
+                    var scanPids = pids.ToArray();
+                    _openHandleScanPids = new HashSet<int>(scanPids);
+                    _openHandleScan = Task.Run(() =>
+                    {
+                        var ok = OpenHandles.TryOpenTranscriptSessionIds(scanPids, out var found, out var scanDetail);
+                        return (ok, found, scanDetail);
+                    });
+                }
+                task = pids.IsSubsetOf(_openHandleScanPids) ? _openHandleScan : null;
+            }
+            if (task is null)
+            {
+                detail = "open transcript handle scan is busy verifying another process set; refusing to risk a second writer";
+                return false;
+            }
             if (task.Wait(OpenHandleScanTimeout))
             {
                 var result = task.Result;
-                if (!result.ok)
+                if (!result.Ok)
                 {
-                    detail = result.scanDetail;
+                    detail = result.Detail;
                     return false;
                 }
-                ids = result.found;
+                ids = result.Found
+                    .Where(kv => pids.Contains(kv.Value))
+                    .ToDictionary(kv => kv.Key, kv => kv.Value, StringComparer.OrdinalIgnoreCase);
                 return true;
             }
 
-            // A timed-out handle scan means we cannot prove whether a transcript-only agent is live.
-            // Disable future scans in this process and make launch guards fail closed.
-            Volatile.Write(ref _openHandleScanDisabled, 1);
-            detail = "open transcript handle scan timed out; refusing to risk a second writer";
+            detail = "open transcript handle scan is still running; refusing to risk a second writer";
             return false;
         }
         catch (Exception ex)

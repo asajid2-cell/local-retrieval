@@ -245,6 +245,22 @@ public sealed class ArchitectureLaunchSurfaceTests
     }
 
     [TestMethod]
+    public void LiveOwnerScan_DoesNotPermanentlyPoisonLaunchesAfterOneTimeout()
+    {
+        var root = FindRepoRoot();
+        var running = File.ReadAllText(Path.Combine(
+            root,
+            "native",
+            "CodexLocalRetrieval.Core",
+            "Remote",
+            "RunningSessions.cs"));
+
+        Assert.DoesNotContain("_openHandleScanDisabled", running);
+        Assert.Contains("_openHandleScan", running);
+        Assert.Contains("is still running; refusing to risk a second writer", running);
+    }
+
+    [TestMethod]
     public void RemoteCommandConsumers_UseFencedLeasesAndPropagateIntentIds()
     {
         var root = FindRepoRoot();
