@@ -2,11 +2,11 @@
 
 Overall: **GREEN - acceptable checkpoint**
 
-- Tag: `L8j_20260712_web_terminal`
-- Date: 2026-07-12 02:55:31 -06:00
-- Accepted tag: `L8j_20260712_web_terminal`
-- App HEAD: 49ea90034e718967a58f7e09ac0ad2da94a76e01 Accept L8i tomux idempotency gate
-- Relay HEAD: 69899f593728449aced8862fa3deaaa94ae37ffb Harden web terminal replay and reconnect state
+- Tag: `L8k_20260712_web_terminal_final`
+- Date: 2026-07-12 03:02:54 -06:00
+- Accepted tag: `L8k_20260712_web_terminal_final`
+- App HEAD: 64d5db7c0b868bc4d9f569ec0d7df95bfc55411f Accept L8j web terminal reliability gate
+- Relay HEAD: 00cc373ddb4c1efea13b1ba8051a304a64dfd64c Align web creates with muxd bounds
 - muxd HEAD: 8181359564609341bf2b1810eec5a5e3bc2b93d5 Make muxd deployment restart self-recovering
 - App source tree: CLEAN
 - Relay source tree: CLEAN
@@ -14,13 +14,13 @@ Overall: **GREEN - acceptable checkpoint**
 
 ## Gates
 
-- **dotnet-build**: PASS -- exit=0, log=Z:\328\CMPUT328-A2\codexworks\301\WorkRepo\ournewfolder\codex-local-retrieval-remote\artifacts\reliability\L8j_20260712_web_terminal\dotnet-build.log
-- **native-app-build**: PASS -- exit=0, log=Z:\328\CMPUT328-A2\codexworks\301\WorkRepo\ournewfolder\codex-local-retrieval-remote\artifacts\reliability\L8j_20260712_web_terminal\native-app-build.log
-- **dotnet-tests**: PASS -- exit=0, log=Z:\328\CMPUT328-A2\codexworks\301\WorkRepo\ournewfolder\codex-local-retrieval-remote\artifacts\reliability\L8j_20260712_web_terminal\dotnet-tests.log
-- **projection-contract**: PASS -- exit=0, log=Z:\328\CMPUT328-A2\codexworks\301\WorkRepo\ournewfolder\codex-local-retrieval-remote\artifacts\reliability\L8j_20260712_web_terminal\projection-contract.log
-- **relay-tests**: PASS -- exit=0, log=Z:\328\CMPUT328-A2\codexworks\301\WorkRepo\ournewfolder\codex-local-retrieval-remote\artifacts\reliability\L8j_20260712_web_terminal\relay-tests.log
-- **muxd-tests**: PASS -- exit=0, log=Z:\328\CMPUT328-A2\codexworks\301\WorkRepo\ournewfolder\codex-local-retrieval-remote\artifacts\reliability\L8j_20260712_web_terminal\muxd-tests.log
-- **source-provenance**: PASS -- exit=0, log=Z:\328\CMPUT328-A2\codexworks\301\WorkRepo\ournewfolder\codex-local-retrieval-remote\artifacts\reliability\L8j_20260712_web_terminal\source-provenance.json
+- **dotnet-build**: PASS -- exit=0, log=Z:\328\CMPUT328-A2\codexworks\301\WorkRepo\ournewfolder\codex-local-retrieval-remote\artifacts\reliability\L8k_20260712_web_terminal_final\dotnet-build.log
+- **native-app-build**: PASS -- exit=0, log=Z:\328\CMPUT328-A2\codexworks\301\WorkRepo\ournewfolder\codex-local-retrieval-remote\artifacts\reliability\L8k_20260712_web_terminal_final\native-app-build.log
+- **dotnet-tests**: PASS -- exit=0, log=Z:\328\CMPUT328-A2\codexworks\301\WorkRepo\ournewfolder\codex-local-retrieval-remote\artifacts\reliability\L8k_20260712_web_terminal_final\dotnet-tests.log
+- **projection-contract**: PASS -- exit=0, log=Z:\328\CMPUT328-A2\codexworks\301\WorkRepo\ournewfolder\codex-local-retrieval-remote\artifacts\reliability\L8k_20260712_web_terminal_final\projection-contract.log
+- **relay-tests**: PASS -- exit=0, log=Z:\328\CMPUT328-A2\codexworks\301\WorkRepo\ournewfolder\codex-local-retrieval-remote\artifacts\reliability\L8k_20260712_web_terminal_final\relay-tests.log
+- **muxd-tests**: PASS -- exit=0, log=Z:\328\CMPUT328-A2\codexworks\301\WorkRepo\ournewfolder\codex-local-retrieval-remote\artifacts\reliability\L8k_20260712_web_terminal_final\muxd-tests.log
+- **source-provenance**: PASS -- exit=0, log=Z:\328\CMPUT328-A2\codexworks\301\WorkRepo\ournewfolder\codex-local-retrieval-remote\artifacts\reliability\L8k_20260712_web_terminal_final\source-provenance.json
 
 ## Residuals
 
