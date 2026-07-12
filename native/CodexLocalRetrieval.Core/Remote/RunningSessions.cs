@@ -17,7 +17,11 @@ public static class RunningSessions
     private static readonly object OpenHandleScanGate = new();
     private static Task<(bool Ok, Dictionary<string, int> Found, string Detail)>? _openHandleScan;
     private static HashSet<int> _openHandleScanPids = new();
+    private static (bool Ok, Dictionary<string, int> Found, string Detail)? _openHandleCache;
+    private static HashSet<int> _openHandleCachePids = new();
+    private static DateTime _openHandleCacheAt;
     private static readonly TimeSpan OpenHandleScanTimeout = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan OpenHandleCacheLifetime = TimeSpan.FromSeconds(30);
     private static readonly System.Management.EnumerationOptions BoundedWmiOptions = new()
     {
         ReturnImmediately = true,
@@ -338,7 +342,26 @@ public static class RunningSessions
             Task<(bool Ok, Dictionary<string, int> Found, string Detail)>? task;
             lock (OpenHandleScanGate)
             {
-                if (_openHandleScan is null || _openHandleScan.IsCompleted)
+                if (_openHandleScan is not null && _openHandleScan.IsCompleted)
+                {
+                    _openHandleCache = _openHandleScan.GetAwaiter().GetResult();
+                    _openHandleCachePids = new HashSet<int>(_openHandleScanPids);
+                    _openHandleCacheAt = DateTime.UtcNow;
+                    _openHandleScan = null;
+                }
+                if (_openHandleCache is not null
+                    && DateTime.UtcNow - _openHandleCacheAt <= OpenHandleCacheLifetime
+                    && pids.IsSubsetOf(_openHandleCachePids))
+                {
+                    if (!_openHandleCache.Value.Ok)
+                    {
+                        detail = _openHandleCache.Value.Detail;
+                        return false;
+                    }
+                    ids = FilterOpenHandleIds(_openHandleCache.Value.Found, pids);
+                    return true;
+                }
+                if (_openHandleScan is null)
                 {
                     var scanPids = pids.ToArray();
                     _openHandleScanPids = new HashSet<int>(scanPids);
@@ -363,9 +386,14 @@ public static class RunningSessions
                     detail = result.Detail;
                     return false;
                 }
-                ids = result.Found
-                    .Where(kv => pids.Contains(kv.Value))
-                    .ToDictionary(kv => kv.Key, kv => kv.Value, StringComparer.OrdinalIgnoreCase);
+                lock (OpenHandleScanGate)
+                {
+                    _openHandleCache = result;
+                    _openHandleCachePids = new HashSet<int>(_openHandleScanPids);
+                    _openHandleCacheAt = DateTime.UtcNow;
+                    if (ReferenceEquals(task, _openHandleScan)) _openHandleScan = null;
+                }
+                ids = FilterOpenHandleIds(result.Found, pids);
                 return true;
             }
 
@@ -378,6 +406,13 @@ public static class RunningSessions
             return false;
         }
     }
+
+    private static Dictionary<string, int> FilterOpenHandleIds(
+        Dictionary<string, int> found,
+        HashSet<int> pids)
+        => found
+            .Where(kv => pids.Contains(kv.Value))
+            .ToDictionary(kv => kv.Key, kv => kv.Value, StringComparer.OrdinalIgnoreCase);
 
     // Pure decision (testable): does any of a chat's ids (its own + lineage aliases) appear in the live set?
     public static bool AnyLive(IEnumerable<string?> candidateIds, ISet<string> liveIds)

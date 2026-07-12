@@ -29,11 +29,11 @@ public static class OpenHandles
         detail = "";
         var pids = new HashSet<int>(agentPids);
         if (pids.Count == 0) return true;
+        var found = result;
 
         var procHandles = new Dictionary<int, IntPtr>();
         try
         {
-            var entries = QueryAllHandles();
             var cur = GetCurrentProcess();
             foreach (var pid in pids)
             {
@@ -46,26 +46,26 @@ public static class OpenHandles
                 return false;
             }
 
-            foreach (var e in entries)
+            QueryAllHandles(e =>
             {
                 var pid = (int)(long)e.UniqueProcessId;
-                if (!procHandles.TryGetValue(pid, out var src)) continue;
+                if (!procHandles.TryGetValue(pid, out var src)) return;
                 // 0x0012019F = a synchronous handle (often a named pipe) whose resolution can block — skip.
-                if (e.GrantedAccess == 0x0012019F) continue;
+                if (e.GrantedAccess == 0x0012019F) return;
 
-                if (!DuplicateHandle(src, e.HandleValue, cur, out var dup, 0, false, DUPLICATE_SAME_ACCESS)) continue;
+                if (!DuplicateHandle(src, e.HandleValue, cur, out var dup, 0, false, DUPLICATE_SAME_ACCESS)) return;
                 try
                 {
                     var path = FinalPath(dup);
-                    if (path is null || !path.EndsWith(".jsonl", StringComparison.OrdinalIgnoreCase)) continue;
+                    if (path is null || !path.EndsWith(".jsonl", StringComparison.OrdinalIgnoreCase)) return;
                     var low = path.Replace('/', '\\').ToLowerInvariant();
-                    if (!(low.Contains("\\.claude\\projects\\") || low.Contains("\\.codex\\sessions\\"))) continue;
+                    if (!(low.Contains("\\.claude\\projects\\") || low.Contains("\\.codex\\sessions\\"))) return;
                     var id = SessionIdFromPath(path);
-                    if (!string.IsNullOrEmpty(id) && !result.ContainsKey(id)) result[id] = pid;
+                    if (!string.IsNullOrEmpty(id) && !found.ContainsKey(id)) found[id] = pid;
                 }
                 catch { }
                 finally { CloseHandle(dup); }
-            }
+            });
             return true;
         }
         catch (Exception ex)
@@ -127,7 +127,7 @@ public static class OpenHandles
         return p.StartsWith("\\\\?\\", StringComparison.Ordinal) ? p.Substring(4) : p;
     }
 
-    private static List<SYSTEM_HANDLE_ENTRY> QueryAllHandles()
+    private static void QueryAllHandles(Action<SYSTEM_HANDLE_ENTRY> visit)
     {
         var len = 0x200000;
         var buf = Marshal.AllocHGlobal(len);
@@ -153,10 +153,8 @@ public static class OpenHandles
             var count = Marshal.ReadIntPtr(buf).ToInt64();
             var entrySize = Marshal.SizeOf<SYSTEM_HANDLE_ENTRY>();
             var basePtr = IntPtr.Add(buf, IntPtr.Size * 2);   // skip NumberOfHandles + Reserved
-            var list = new List<SYSTEM_HANDLE_ENTRY>((int)Math.Min(count, int.MaxValue));
             for (long i = 0; i < count; i++)
-                list.Add(Marshal.PtrToStructure<SYSTEM_HANDLE_ENTRY>(IntPtr.Add(basePtr, (int)(i * entrySize))));
-            return list;
+                visit(Marshal.PtrToStructure<SYSTEM_HANDLE_ENTRY>(IntPtr.Add(basePtr, checked((int)(i * entrySize)))));
         }
         finally { Marshal.FreeHGlobal(buf); }
     }

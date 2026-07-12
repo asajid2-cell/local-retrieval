@@ -257,7 +257,26 @@ public sealed class ArchitectureLaunchSurfaceTests
 
         Assert.DoesNotContain("_openHandleScanDisabled", running);
         Assert.Contains("_openHandleScan", running);
+        Assert.Contains("OpenHandleCacheLifetime", running);
+        Assert.Contains("pids.IsSubsetOf(_openHandleCachePids)", running);
+        Assert.Contains("pids.IsSubsetOf(_openHandleScanPids)", running);
         Assert.Contains("is still running; refusing to risk a second writer", running);
+        Assert.Contains("busy verifying another process set", running);
+    }
+
+    [TestMethod]
+    public void OpenHandleScan_DoesNotCopyTheGlobalHandleTableIntoManagedMemory()
+    {
+        var root = FindRepoRoot();
+        var handles = File.ReadAllText(Path.Combine(
+            root,
+            "native",
+            "CodexLocalRetrieval.Core",
+            "Remote",
+            "OpenHandles.cs"));
+
+        Assert.Contains("QueryAllHandles(e =>", handles);
+        Assert.DoesNotContain("new List<SYSTEM_HANDLE_ENTRY>", handles);
     }
 
     [TestMethod]
