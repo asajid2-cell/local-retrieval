@@ -81,6 +81,10 @@ These are improvements, not unresolved session-loss defects:
 
 ## Restart Discipline
 
-Batch muxd changes, inspect live sessions, back up manifests, stop the scheduled task, prove the old
-daemon and owned children exited, start one replacement, then verify durable reconciliation and relay
-reconnect. Never restart merely to clear a transient symptom.
+Batch muxd changes, then run the on-demand `MuxdSessionHostRestart` task. Its helper rechecks live
+sessions immediately before stopping, refuses any active hosted PTY, backs up runtime manifests,
+proves the old daemon and transport hosts exited, starts one replacement from outside muxd's process
+tree, and verifies local control health. Never issue a stop/start sequence from a terminal muxd may
+own, and never restart merely to clear a transient symptom. `MuxdSessionHostWatchdog` checks health
+every minute and starts the host only when its process is absent; an unresponsive process is logged
+and preserved so watchdog recovery cannot destroy live process custody.
