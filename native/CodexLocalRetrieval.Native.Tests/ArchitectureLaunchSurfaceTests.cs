@@ -220,6 +220,23 @@ public sealed class ArchitectureLaunchSurfaceTests
     }
 
     [TestMethod]
+    public void UserConfirmedMuxTakeover_ConsolidatesIdentityAndUsesFencedRelaunch()
+    {
+        var root = FindRepoRoot();
+        var bridge = Path.Combine(root, "native", "CodexLocalRetrieval.Native", "MainPage.Remote.cs");
+        var text = File.ReadAllText(bridge);
+
+        Assert.Contains("TransferMuxIdentityAsync", text,
+            "Tomux and explicit relaunch must consolidate every mux row for the canonical chat identity.");
+        Assert.Contains("relaunch: takeover", text,
+            "A confirmed takeover must reach muxd as a relaunch under the same durable command intent.");
+        Assert.Contains("if (desired is not null) return (true, \"desired mux owner will be relaunched\", true);", text,
+            "An already-live requested tab must be relaunched, not mistaken for an idempotent no-op.");
+        Assert.Contains("RunningSessions.TryAllLiveSessionIds", text,
+            "External-owner transfer must fail closed when local running-state verification is uncertain.");
+    }
+
+    [TestMethod]
     public void RemoteCommandConsumers_UseFencedLeasesAndPropagateIntentIds()
     {
         var root = FindRepoRoot();
