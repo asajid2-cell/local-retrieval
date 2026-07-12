@@ -1,5 +1,6 @@
 import importlib
 import asyncio
+import ast
 import collections
 import json
 import os
@@ -38,6 +39,46 @@ class FakeSession:
 
 
 class MuxdStateTests(unittest.TestCase):
+    def test_all_pywinpty_spawns_are_inside_the_custody_critical_section(self):
+        with open(muxd.__file__, encoding="utf-8") as stream:
+            tree = ast.parse(stream.read())
+        calls = []
+
+        class SpawnVisitor(ast.NodeVisitor):
+            def __init__(self):
+                self.classes = []
+                self.functions = []
+
+            def visit_ClassDef(self, node):
+                self.classes.append(node.name)
+                self.generic_visit(node)
+                self.classes.pop()
+
+            def visit_FunctionDef(self, node):
+                self.functions.append(node.name)
+                self.generic_visit(node)
+                self.functions.pop()
+
+            def visit_Call(self, node):
+                function = node.func
+                if (
+                    isinstance(function, ast.Attribute)
+                    and function.attr == "spawn"
+                    and isinstance(function.value, ast.Name)
+                    and function.value.id == "PtyProcess"
+                ):
+                    calls.append(
+                        (
+                            self.classes[-1] if self.classes else "",
+                            self.functions[-1] if self.functions else "",
+                        )
+                    )
+                self.generic_visit(node)
+
+        SpawnVisitor().visit(tree)
+
+        self.assertEqual([("Session", "spawn"), ("Session", "spawn")], calls)
+
     def test_session_rings_hold_one_lock_for_mutation_and_snapshot_reads(self):
         class GuardedDeque(collections.deque):
             def __init__(self, lock, values=()):
@@ -359,6 +400,150 @@ class MuxdStateTests(unittest.TestCase):
         self.assertTrue(muxd._same_process_instance(os.getpid(), token))
         self.assertFalse(muxd._same_process_instance(os.getpid(), token + "-stale"))
         self.assertFalse(muxd._same_process_instance(os.getpid(), ""))
+        stopped, detail = muxd._terminate_process_instance(
+            os.getpid(),
+            token + "-stale",
+            timeout=0.1,
+        )
+        self.assertTrue(stopped, detail)
+        self.assertIn("different process instance", detail)
+
+    def test_conpty_host_baseline_rejects_missing_creation_tokens(self):
+        with mock.patch.object(
+            muxd, "_conpty_host_pids", return_value={4242}
+        ), mock.patch.object(
+            muxd, "_process_start_token", return_value=""
+        ):
+            with self.assertRaisesRegex(OSError, "could not capture creation token"):
+                muxd._conpty_host_process_records(os.getpid())
+
+    def test_spawn_does_not_start_when_conpty_host_baseline_is_incomplete(self):
+        session = muxd.Session(
+            "incomplete-baseline",
+            "",
+            tempfile.gettempdir(),
+            80,
+            24,
+            None,
+            None,
+            spawn_now=False,
+        )
+
+        with mock.patch.object(
+            muxd,
+            "_conpty_host_process_records",
+            side_effect=OSError("snapshot failed"),
+        ), mock.patch.object(muxd.PtyProcess, "spawn") as spawn:
+            with self.assertRaisesRegex(OSError, "snapshot failed"):
+                session.spawn()
+
+        spawn.assert_not_called()
+
+    @unittest.skipUnless(os.name == "nt", "Windows process handles are required")
+    def test_fenced_termination_rejects_wait_failure_without_terminating(self):
+        class Function(mock.Mock):
+            argtypes = None
+            restype = None
+
+        kernel32 = type("Kernel32", (), {})()
+        kernel32.OpenProcess = Function(return_value=123)
+
+        def get_process_times(_handle, created, exited, kernel, user):
+            created._obj.dwLowDateTime = 1
+            created._obj.dwHighDateTime = 0
+            return True
+
+        kernel32.GetProcessTimes = Function(side_effect=get_process_times)
+        kernel32.TerminateProcess = Function(return_value=True)
+        kernel32.WaitForSingleObject = Function(return_value=0xFFFFFFFF)
+        kernel32.CloseHandle = Function(return_value=True)
+
+        with mock.patch.object(muxd.ctypes, "WinDLL", return_value=kernel32), \
+             mock.patch.object(muxd.ctypes, "get_last_error", return_value=6):
+            stopped, detail = muxd._terminate_process_instance(
+                4242,
+                "0000000000000001",
+            )
+
+        self.assertFalse(stopped)
+        self.assertIn("could not query", detail)
+        kernel32.TerminateProcess.assert_not_called()
+
+    def test_failed_conpty_spawn_reaps_hosts_created_during_attempt(self):
+        session = muxd.Session(
+            "failed-spawn",
+            "",
+            tempfile.gettempdir(),
+            80,
+            24,
+            None,
+            None,
+            spawn_now=False,
+        )
+
+        with muxd._ORPHANED_CONPTY_LOCK:
+            muxd._ORPHANED_CONPTY_HOSTS.clear()
+        try:
+            with mock.patch.object(
+                muxd, "_conpty_host_pids", side_effect=[{100}, {100, 200}]
+            ), mock.patch.object(
+                muxd.PtyProcess, "spawn", side_effect=RuntimeError("spawn failed")
+            ), mock.patch.object(
+                muxd, "_process_start_token", return_value="start-token"
+            ), mock.patch.object(
+                muxd, "_terminate_process_instance", return_value=(False, "still alive")
+            ) as terminate:
+                with self.assertRaisesRegex(RuntimeError, "spawn failed"):
+                    session.spawn()
+
+            terminate.assert_called_once()
+            self.assertEqual((200, "start-token"), terminate.call_args.args)
+            self.assertGreater(terminate.call_args.kwargs["timeout"], 0)
+            self.assertLessEqual(terminate.call_args.kwargs["timeout"], 3)
+            with muxd._ORPHANED_CONPTY_LOCK:
+                self.assertIn((200, "start-token"), muxd._ORPHANED_CONPTY_HOSTS)
+        finally:
+            with muxd._ORPHANED_CONPTY_LOCK:
+                muxd._ORPHANED_CONPTY_HOSTS.clear()
+
+    @unittest.skipUnless(os.name == "nt", "ConPTY custody is Windows-specific")
+    def test_successful_spawn_fails_closed_without_transport_host_custody(self):
+        class Pty:
+            pid = 3131
+
+            def __init__(self):
+                self.terminated = False
+
+            def terminate(self, force=True):
+                self.terminated = force
+
+        session = muxd.Session(
+            "uncustodied-spawn",
+            "",
+            tempfile.gettempdir(),
+            80,
+            24,
+            None,
+            None,
+            spawn_now=False,
+        )
+        pty = Pty()
+
+        with mock.patch.object(
+            muxd, "_conpty_host_pids", return_value=set()
+        ), mock.patch.object(
+            muxd, "_new_conpty_host_processes", side_effect=[[], []]
+        ), mock.patch.object(
+            muxd.PtyProcess, "spawn", return_value=pty
+        ), mock.patch.object(
+            muxd, "_terminate_pid_tree", return_value=(True, "process exited")
+        ) as terminate:
+            with self.assertRaisesRegex(RuntimeError, "could not establish"):
+                session.spawn()
+
+        self.assertTrue(pty.terminated)
+        terminate.assert_called_once_with(3131, timeout=3)
+        self.assertIsNone(session.pty)
 
     def test_launch_claim_ids_reject_non_ascii_aliases(self):
         self.assertEqual(
@@ -1118,8 +1303,13 @@ class MuxdAsyncTests(unittest.IsolatedAsyncioTestCase):
         sess.dead = False
         sess.user_killed = False
         sess.wq = queue.Queue()
+        pty._muxd_conhost_lock = threading.Lock()
+        pty._muxd_conhost_processes = [(4242, "start-token")]
 
-        ok, detail = await muxd.terminate_session_off_loop(sess, timeout=2)
+        with mock.patch.object(
+            muxd, "_terminate_process_instance", return_value=(True, "process exited")
+        ) as terminate:
+            ok, detail = await muxd.terminate_session_off_loop(sess, timeout=2)
 
         self.assertTrue(ok, detail)
         self.assertTrue(pty.fileobj.closed)
@@ -1129,6 +1319,98 @@ class MuxdAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(pty._thread)
         self.assertIsNone(pty.pty)
         self.assertTrue(pty.native.cancelled)
+        terminate.assert_called_once()
+        self.assertEqual((4242, "start-token"), terminate.call_args.args)
+        self.assertGreater(terminate.call_args.kwargs["timeout"], 0)
+        self.assertLessEqual(terminate.call_args.kwargs["timeout"], 2)
+        self.assertEqual([], pty._muxd_conhost_processes)
+
+    def test_conhost_cleanup_is_generation_scoped_and_retries_failures(self):
+        old_pty = type("Pty", (), {})()
+        old_pty._muxd_conhost_lock = threading.Lock()
+        old_pty._muxd_conhost_processes = [(4242, "old-token")]
+        new_pty = type("Pty", (), {})()
+        new_pty._muxd_conhost_lock = threading.Lock()
+        new_pty._muxd_conhost_processes = [(5252, "new-token")]
+
+        with mock.patch.object(
+                 muxd,
+                 "_terminate_process_instance",
+                 side_effect=[(False, "still alive"), (True, "process exited")],
+             ) as terminate:
+            self.assertFalse(muxd._release_pty_conhosts(old_pty, "old"))
+            self.assertEqual([(4242, "old-token")], old_pty._muxd_conhost_processes)
+            self.assertEqual([(5252, "new-token")], new_pty._muxd_conhost_processes)
+            self.assertTrue(muxd._release_pty_conhosts(old_pty, "old"))
+
+        self.assertEqual([], old_pty._muxd_conhost_processes)
+        self.assertEqual(2, terminate.call_count)
+        for call in terminate.call_args_list:
+            self.assertEqual((4242, "old-token"), call.args)
+            self.assertGreater(call.kwargs["timeout"], 0)
+            self.assertLessEqual(call.kwargs["timeout"], 3)
+
+    def test_orphaned_conpty_hosts_remain_owned_until_supervised_reap_succeeds(self):
+        record = (6262, "orphan-token")
+        with muxd._ORPHANED_CONPTY_LOCK:
+            muxd._ORPHANED_CONPTY_HOSTS.clear()
+        try:
+            muxd._retain_orphaned_conpty_hosts([record], "test failure")
+            with mock.patch.object(
+                muxd,
+                "_terminate_process_instance",
+                side_effect=[(False, "still alive"), (True, "process exited")],
+            ):
+                self.assertEqual(1, muxd._reap_orphaned_conpty_hosts())
+                with muxd._ORPHANED_CONPTY_LOCK:
+                    self.assertIn(record, muxd._ORPHANED_CONPTY_HOSTS)
+                self.assertEqual(0, muxd._reap_orphaned_conpty_hosts())
+                with muxd._ORPHANED_CONPTY_LOCK:
+                    self.assertNotIn(record, muxd._ORPHANED_CONPTY_HOSTS)
+        finally:
+            with muxd._ORPHANED_CONPTY_LOCK:
+                muxd._ORPHANED_CONPTY_HOSTS.clear()
+
+    def test_incomplete_orphan_discovery_quarantines_spawns_until_reaped(self):
+        baseline = {100: "baseline-token"}
+        session = muxd.Session(
+            "quarantined-spawn",
+            "",
+            tempfile.gettempdir(),
+            80,
+            24,
+            None,
+            None,
+            spawn_now=False,
+        )
+        with muxd._ORPHANED_CONPTY_LOCK:
+            muxd._ORPHANED_CONPTY_HOSTS.clear()
+            muxd._PENDING_CONPTY_BASELINES.clear()
+        try:
+            muxd._retain_pending_conpty_baseline(baseline, "partial spawn")
+            with mock.patch.object(muxd.PtyProcess, "spawn") as spawn:
+                with self.assertRaisesRegex(RuntimeError, "quarantined"):
+                    session.spawn()
+            spawn.assert_not_called()
+
+            with mock.patch.object(
+                muxd,
+                "_new_conpty_host_processes",
+                return_value=[(200, "new-token")],
+            ), mock.patch.object(
+                muxd,
+                "_terminate_process_instance",
+                return_value=(True, "process exited"),
+            ):
+                self.assertEqual(0, muxd._reap_orphaned_conpty_hosts())
+
+            with muxd._ORPHANED_CONPTY_LOCK:
+                self.assertEqual({}, muxd._PENDING_CONPTY_BASELINES)
+                self.assertEqual({}, muxd._ORPHANED_CONPTY_HOSTS)
+        finally:
+            with muxd._ORPHANED_CONPTY_LOCK:
+                muxd._ORPHANED_CONPTY_HOSTS.clear()
+                muxd._PENDING_CONPTY_BASELINES.clear()
 
     async def test_terminate_session_releases_claim_only_after_process_exit(self):
         events = []
@@ -1207,6 +1489,53 @@ class MuxdAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(sess._launch_claim, claim)
         self.assertFalse(claim.released)
         self.assertTrue(sess.wq.empty(), "failed termination must not stop the input writer")
+
+    async def test_termination_deadline_waits_for_worker_and_never_revives_released_pty(self):
+        class Pty:
+            pid = 4242
+
+            def terminate(self, force=True):
+                return
+
+        class Claim:
+            def __init__(self):
+                self.released = False
+
+            def release(self):
+                self.released = True
+
+        pty = Pty()
+        claim = Claim()
+        sess = muxd.Session.__new__(muxd.Session)
+        sess.name = "timeout-stop"
+        sess.pty = pty
+        sess.dead = False
+        sess.user_killed = False
+        sess.wq = queue.Queue()
+        sess._launch_claim = claim
+        sess.claim_paths = ["claim.json"]
+
+        def slow_confirmed_exit(_pid, timeout):
+            time.sleep(0.2)
+            return True, "process exited"
+
+        started = time.perf_counter()
+        with mock.patch.object(
+            muxd, "_terminate_pid_tree", side_effect=slow_confirmed_exit
+        ):
+            ok, detail = await muxd.terminate_session_off_loop(
+                sess,
+                timeout=0.1,
+            )
+        elapsed = time.perf_counter() - started
+
+        self.assertFalse(ok)
+        self.assertIn("deadline expired", detail)
+        self.assertGreaterEqual(elapsed, 0.2)
+        self.assertTrue(sess.dead)
+        self.assertIs(sess.pty, pty)
+        self.assertIs(sess._launch_claim, claim)
+        self.assertFalse(claim.released)
 
     async def test_visible_owner_requires_explicit_child_exit_confirmation(self):
         class Claim:

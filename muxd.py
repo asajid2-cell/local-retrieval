@@ -300,6 +300,191 @@ def _same_process_instance(pid, expected_start_token):
     expected = str(expected_start_token or "")
     return bool(expected) and _pid_alive(pid) and _process_start_token(pid) == expected
 
+def _terminate_process_instance(pid, expected_start_token, timeout=3):
+    """Terminate exactly one Windows process instance, fenced by its creation time."""
+    if os.name != "nt":
+        return False, "process-instance termination is Windows-specific"
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return True, "no process recorded"
+    expected = str(expected_start_token or "")
+    if pid <= 0 or not expected:
+        return True, "no process instance recorded"
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    open_process = kernel32.OpenProcess
+    open_process.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    open_process.restype = wintypes.HANDLE
+    get_process_times = kernel32.GetProcessTimes
+    get_process_times.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+    ]
+    get_process_times.restype = wintypes.BOOL
+    terminate_process = kernel32.TerminateProcess
+    terminate_process.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    terminate_process.restype = wintypes.BOOL
+    wait_for_single = kernel32.WaitForSingleObject
+    wait_for_single.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    wait_for_single.restype = wintypes.DWORD
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [wintypes.HANDLE]
+    close_handle.restype = wintypes.BOOL
+    rights = 0x0001 | 0x1000 | 0x00100000  # TERMINATE | QUERY_LIMITED_INFORMATION | SYNCHRONIZE
+    handle = open_process(rights, False, pid)
+    if not handle:
+        error = ctypes.get_last_error()
+        if error == 87:  # ERROR_INVALID_PARAMETER: PID no longer exists
+            return True, "process already exited"
+        return False, f"could not open process {pid} for fenced termination (winerror={error})"
+    try:
+        created = wintypes.FILETIME()
+        exited = wintypes.FILETIME()
+        kernel = wintypes.FILETIME()
+        user = wintypes.FILETIME()
+        if not get_process_times(
+            handle,
+            ctypes.byref(created),
+            ctypes.byref(exited),
+            ctypes.byref(kernel),
+            ctypes.byref(user),
+        ):
+            return False, f"could not verify process {pid} creation time (winerror={ctypes.get_last_error()})"
+        actual_value = (int(created.dwHighDateTime) << 32) | int(created.dwLowDateTime)
+        if f"{actual_value:016x}" != expected:
+            return True, "PID now refers to a different process instance"
+        initial_wait = int(wait_for_single(handle, 0))
+        if initial_wait == 0:  # WAIT_OBJECT_0
+            return True, "process already exited"
+        if initial_wait == 0xFFFFFFFF:  # WAIT_FAILED
+            return False, f"could not query process {pid} state (winerror={ctypes.get_last_error()})"
+        if initial_wait != 258:  # WAIT_TIMEOUT
+            return False, f"unexpected wait result for process {pid} (result={initial_wait})"
+        if not terminate_process(handle, 1):
+            if wait_for_single(handle, 0) == 0:
+                return True, "process exited"
+            return False, f"could not terminate process {pid} (winerror={ctypes.get_last_error()})"
+        wait_ms = max(100, min(0xFFFFFFFE, int(max(0.1, timeout) * 1000)))
+        wait_result = int(wait_for_single(handle, wait_ms))
+        if wait_result == 0:
+            return True, "process exited"
+        if wait_result == 258:  # WAIT_TIMEOUT
+            return False, f"process {pid} is still alive after termination"
+        return False, f"could not wait for process {pid} termination (result={wait_result})"
+    finally:
+        close_handle(handle)
+
+class _PROCESSENTRY32W(ctypes.Structure):
+    _fields_ = [
+        ("dwSize", wintypes.DWORD),
+        ("cntUsage", wintypes.DWORD),
+        ("th32ProcessID", wintypes.DWORD),
+        ("th32DefaultHeapID", ctypes.c_size_t),
+        ("th32ModuleID", wintypes.DWORD),
+        ("cntThreads", wintypes.DWORD),
+        ("th32ParentProcessID", wintypes.DWORD),
+        ("pcPriClassBase", wintypes.LONG),
+        ("dwFlags", wintypes.DWORD),
+        ("szExeFile", wintypes.WCHAR * 260),
+    ]
+
+_CONPTY_SPAWN_LOCK = threading.Lock()
+_CONPTY_HOST_EXECUTABLES = (
+    "conhost.exe",
+    "openconsole.exe",
+    "winpty-agent.exe",
+)
+_ORPHANED_CONPTY_LOCK = threading.Lock()
+_ORPHANED_CONPTY_HOSTS = {}
+_PENDING_CONPTY_BASELINES = {}
+
+def _direct_child_pids(parent_pid, executable_name=""):
+    if os.name != "nt":
+        return set()
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_snapshot = kernel32.CreateToolhelp32Snapshot
+    create_snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    create_snapshot.restype = wintypes.HANDLE
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [wintypes.HANDLE]
+    close_handle.restype = wintypes.BOOL
+    snapshot = create_snapshot(0x00000002, 0)  # TH32CS_SNAPPROCESS
+    invalid_handle = ctypes.c_void_p(-1).value
+    if snapshot == invalid_handle:
+        raise ctypes.WinError(ctypes.get_last_error())
+    entry = _PROCESSENTRY32W()
+    entry.dwSize = ctypes.sizeof(entry)
+    wanted = str(executable_name or "").lower()
+    found = set()
+    try:
+        first = kernel32.Process32FirstW
+        first.argtypes = [wintypes.HANDLE, ctypes.POINTER(_PROCESSENTRY32W)]
+        first.restype = wintypes.BOOL
+        next_entry = kernel32.Process32NextW
+        next_entry.argtypes = [wintypes.HANDLE, ctypes.POINTER(_PROCESSENTRY32W)]
+        next_entry.restype = wintypes.BOOL
+        ctypes.set_last_error(0)
+        if not first(snapshot, ctypes.byref(entry)):
+            error = ctypes.get_last_error()
+            if error == 18:  # ERROR_NO_MORE_FILES
+                return set()
+            raise ctypes.WinError(error)
+        while True:
+            if int(entry.th32ParentProcessID) == int(parent_pid):
+                name = str(entry.szExeFile or "").lower()
+                if not wanted or name == wanted:
+                    found.add(int(entry.th32ProcessID))
+            ctypes.set_last_error(0)
+            if not next_entry(snapshot, ctypes.byref(entry)):
+                error = ctypes.get_last_error()
+                if error not in (0, 18):  # ERROR_NO_MORE_FILES
+                    raise ctypes.WinError(error)
+                break
+        return found
+    finally:
+        close_handle(snapshot)
+
+def _conpty_host_pids(parent_pid):
+    found = set()
+    for executable_name in _CONPTY_HOST_EXECUTABLES:
+        found.update(_direct_child_pids(parent_pid, executable_name))
+    return found
+
+def _conpty_host_process_records(parent_pid):
+    records = {}
+    for pid in _conpty_host_pids(parent_pid):
+        start_token = _process_start_token(pid)
+        if not start_token:
+            raise OSError(f"could not capture creation token for ConPTY host process {pid}")
+        records[pid] = start_token
+    return records
+
+def _new_conpty_host_processes(previous_records, timeout=1.0):
+    deadline = time.monotonic() + max(0.0, timeout)
+    owned = []
+    last_error = None
+    while True:
+        try:
+            current = _conpty_host_process_records(os.getpid())
+            owned = [
+                (pid, start_token)
+                for pid, start_token in sorted(current.items())
+                if (previous_records or {}).get(pid) != start_token
+            ]
+            last_error = None
+        except OSError as error:
+            last_error = error
+            owned = []
+        if owned or time.monotonic() >= deadline:
+            break
+        time.sleep(0.01)
+    if last_error is not None:
+        raise last_error
+    return owned
+
 def _terminate_pid_tree(pid, timeout=12):
     try:
         pid = int(pid)
@@ -324,7 +509,7 @@ def _terminate_pid_tree(pid, timeout=12):
         return False, f"process {pid} is still alive after termination"
     return True, "process exited"
 
-def _release_pty_resources(pty):
+def _release_pty_resources(pty, deadline=None):
     """Close pywinpty transport and release the native pseudoconsole handle."""
     if pty is None:
         return
@@ -355,7 +540,10 @@ def _release_pty_resources(pty):
         reader = getattr(pty, "_thread", None)
         if reader is not None and reader is not threading.current_thread():
             try:
-                reader.join(timeout=2)
+                join_timeout = 2
+                if deadline is not None:
+                    join_timeout = max(0.0, min(join_timeout, deadline - time.monotonic()))
+                reader.join(timeout=join_timeout)
             except Exception:
                 pass
             if reader.is_alive():
@@ -370,6 +558,103 @@ def _release_pty_resources(pty):
             pass
         native = None
         gc.collect()
+
+def _terminate_conhost_records(owned, timeout=3):
+    retained = []
+    failures = []
+    deadline = time.monotonic() + max(0.1, timeout)
+    for pid, start_token in owned:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            retained.append((pid, start_token))
+            failures.append("ConPTY host cleanup deadline expired")
+            continue
+        stopped, detail = _terminate_process_instance(
+            pid,
+            start_token,
+            timeout=remaining,
+        )
+        if not stopped:
+            retained.append((pid, start_token))
+            failures.append(detail)
+    return retained, failures
+
+def _retain_orphaned_conpty_hosts(owned, reason):
+    records = list(owned or ())
+    if not records:
+        return
+    with _ORPHANED_CONPTY_LOCK:
+        for pid, start_token in records:
+            _ORPHANED_CONPTY_HOSTS[(int(pid), str(start_token))] = str(reason or "")
+    log(f"[conpty] retained {len(records)} orphan host record(s) for supervised cleanup: {reason}")
+
+def _retain_pending_conpty_baseline(records, reason):
+    baseline = tuple(sorted((int(pid), str(token)) for pid, token in (records or {}).items()))
+    with _ORPHANED_CONPTY_LOCK:
+        _PENDING_CONPTY_BASELINES[baseline] = str(reason or "")
+    log(f"[conpty] quarantined new PTY spawns pending orphan discovery: {reason}")
+
+def _reap_orphaned_conpty_hosts(timeout=5):
+    with _CONPTY_SPAWN_LOCK:
+        with _ORPHANED_CONPTY_LOCK:
+            pending_baselines = list(_PENDING_CONPTY_BASELINES.items())
+        for baseline_key, reason in pending_baselines:
+            try:
+                discovered = _new_conpty_host_processes(
+                    dict(baseline_key),
+                    timeout=min(1.0, max(0.1, timeout)),
+                )
+            except OSError as error:
+                log(f"[conpty] orphan discovery still pending: {error}")
+                continue
+            with _ORPHANED_CONPTY_LOCK:
+                _PENDING_CONPTY_BASELINES.pop(baseline_key, None)
+            _retain_orphaned_conpty_hosts(discovered, reason)
+        with _ORPHANED_CONPTY_LOCK:
+            records = list(_ORPHANED_CONPTY_HOSTS)
+    retained, failures = _terminate_conhost_records(records, timeout=timeout)
+    retained_set = set(retained)
+    with _ORPHANED_CONPTY_LOCK:
+        for record in records:
+            if record not in retained_set:
+                _ORPHANED_CONPTY_HOSTS.pop(record, None)
+    if failures:
+        log(f"[conpty] supervised orphan cleanup still pending: {'; '.join(failures)}")
+    return len(retained)
+
+def _release_pty_conhosts(pty, session_name="?", timeout=3):
+    lock = getattr(pty, "_muxd_conhost_lock", None)
+    if lock is None:
+        return True
+    with lock:
+        owned = list(getattr(pty, "_muxd_conhost_processes", ()) or ())
+        retained, failures = _terminate_conhost_records(owned, timeout=timeout)
+        pty._muxd_conhost_processes = retained
+    if failures:
+        log(f"[{session_name}] ConPTY host cleanup failed: {'; '.join(failures)}")
+        return False
+    return True
+
+def _abort_uncustodied_pty(pty, conpty_hosts_before, session_name):
+    try:
+        pty.terminate(force=True)
+    except Exception:
+        pass
+    _terminate_pid_tree(int(getattr(pty, "pid", 0) or 0), timeout=3)
+    _release_pty_resources(pty)
+    try:
+        late_hosts = _new_conpty_host_processes(conpty_hosts_before, timeout=0.2)
+        retained, failures = _terminate_conhost_records(late_hosts, timeout=3)
+    except OSError as error:
+        _retain_pending_conpty_baseline(
+            conpty_hosts_before,
+            f"aborted spawn for {session_name}",
+        )
+        log(f"[{session_name}] could not enumerate ConPTY hosts after aborted spawn: {error}")
+        return
+    if retained:
+        _retain_orphaned_conpty_hosts(retained, f"aborted spawn for {session_name}")
+        log(f"[{session_name}] uncustodied ConPTY hosts survived abort: {'; '.join(failures)}")
 
 def _parse_resume_id(cmd):
     cmd = cmd or ""
@@ -1086,15 +1371,48 @@ class Session:
             encoded = base64.b64encode(self.cmd.encode("utf-16le")).decode("ascii")
             cmdline = subprocess.list2cmdline(["powershell.exe", "-NoLogo", "-NoExit", "-EncodedCommand", encoded])
             direct_cmd = True
-        try:
-            self.pty = PtyProcess.spawn(cmdline, dimensions=(self.rows, self.cols), cwd=self.cwd)
-        except Exception:
-            if not self.cmd:
+        with _CONPTY_SPAWN_LOCK:
+            with _ORPHANED_CONPTY_LOCK:
+                if _PENDING_CONPTY_BASELINES:
+                    raise RuntimeError(
+                        "ConPTY custody is quarantined pending orphan-host discovery"
+                    )
+            conpty_hosts_before = _conpty_host_process_records(os.getpid())
+            try:
+                try:
+                    pty = PtyProcess.spawn(cmdline, dimensions=(self.rows, self.cols), cwd=self.cwd)
+                except Exception:
+                    if not self.cmd:
+                        raise
+                    # If a saved command hits a Windows command-line edge case, keep the session usable and
+                    # fall back to typing the command into an already-started shell.
+                    pty = PtyProcess.spawn("powershell.exe -NoLogo", dimensions=(self.rows, self.cols), cwd=self.cwd)
+                    direct_cmd = False
+            except Exception:
+                try:
+                    orphaned = _new_conpty_host_processes(conpty_hosts_before, timeout=0.2)
+                    retained, failures = _terminate_conhost_records(orphaned, timeout=3)
+                    if retained:
+                        _retain_orphaned_conpty_hosts(retained, f"failed spawn for {self.name}")
+                        log(f"[{self.name}] failed spawn leaked ConPTY hosts: {'; '.join(failures)}")
+                except OSError as error:
+                    _retain_pending_conpty_baseline(
+                        conpty_hosts_before,
+                        f"failed spawn for {self.name}",
+                    )
+                    log(f"[{self.name}] could not enumerate ConPTY hosts after failed spawn: {error}")
                 raise
-            # If a saved command hits a Windows command-line edge case, keep the session usable and
-            # fall back to typing the command into an already-started shell.
-            self.pty = PtyProcess.spawn("powershell.exe -NoLogo", dimensions=(self.rows, self.cols), cwd=self.cwd)
-            direct_cmd = False
+            try:
+                owned_conhosts = _new_conpty_host_processes(conpty_hosts_before)
+            except OSError as error:
+                _abort_uncustodied_pty(pty, conpty_hosts_before, self.name)
+                raise RuntimeError("could not establish ConPTY host process custody") from error
+            if os.name == "nt" and not owned_conhosts:
+                _abort_uncustodied_pty(pty, conpty_hosts_before, self.name)
+                raise RuntimeError("could not establish ConPTY host process custody")
+            pty._muxd_conhost_lock = threading.Lock()
+            pty._muxd_conhost_processes = owned_conhosts
+        self.pty = pty
         self.dead = False
         self.child_pid = int(getattr(self.pty, "pid", 0) or 0)
         self.child_start_token = _process_start_token(self.child_pid)
@@ -1116,13 +1434,15 @@ class Session:
             except Exception:
                 if pty is self.pty:
                     self.dead = True
-                    self.pty = None
                     writer_stopped = self.stop_input_writer()
                     if not writer_stopped:
                         log(f"[{self.name}] input writer did not stop after PTY EOF")
                     self.loop.call_soon_threadsafe(self.outq.put_nowait, ("dead", self.name, ""))
                     log(f"[{self.name}] pty EOF (shell exited or killed)")
                 _release_pty_resources(pty)
+                conhosts_released = _release_pty_conhosts(pty, self.name)
+                if conhosts_released and pty is self.pty:
+                    self.pty = None
                 return
             if not data: continue
             if pty is not self.pty: return          # superseded by a respawn
@@ -1904,39 +2224,47 @@ async def terminate_session_off_loop(s, by_user=True, timeout=12, release_claim_
     s.dead = True
 
     def terminate_and_verify():
+        deadline = time.monotonic() + max(0.1, timeout)
         terminate_error = None
         try:
             pty.terminate(force=True)
         except Exception as e:
             terminate_error = e
-        stopped, detail = _terminate_pid_tree(pid, timeout=timeout)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 and _pid_alive(pid):
+            return False, "process termination deadline expired", True
+        stopped, detail = _terminate_pid_tree(pid, timeout=max(0.1, remaining))
         if not stopped:
-            return False, detail
+            return False, detail, True
         if terminate_error is not None and pid <= 0:
-            return False, f"PTY termination failed: {terminate_error}"
-        _release_pty_resources(pty)
-        return True, "process exited"
+            return False, f"PTY termination failed: {terminate_error}", True
+        _release_pty_resources(pty, deadline=deadline)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False, "ConPTY host cleanup deadline expired", False
+        if not _release_pty_conhosts(
+            pty,
+            getattr(s, "name", "?"),
+            timeout=remaining,
+        ):
+            return False, "ConPTY host process is still alive after termination", False
+        return True, "process exited", False
 
-    try:
-        result = await asyncio.wait_for(
-            asyncio.get_running_loop().run_in_executor(None, terminate_and_verify),
-            timeout=max(1, timeout + 2),
-        )
-        if result[0]:
-            if s.pty is pty:
-                s.pty = None
-            writer_stopped = await asyncio.get_running_loop().run_in_executor(None, s.stop_input_writer)
-            if not writer_stopped:
-                log(f"[{getattr(s, 'name', '?')}] input writer did not stop after process exit")
-            if release_claim_on_success:
-                release_session_claim(s)
-        elif s.pty is pty:
-            s.dead = False
-        return result
-    except asyncio.TimeoutError:
+    result = await asyncio.get_running_loop().run_in_executor(
+        None,
+        terminate_and_verify,
+    )
+    if result[0]:
         if s.pty is pty:
-            s.dead = False
-        return False, "process termination verification timed out"
+            s.pty = None
+        writer_stopped = await asyncio.get_running_loop().run_in_executor(None, s.stop_input_writer)
+        if not writer_stopped:
+            log(f"[{getattr(s, 'name', '?')}] input writer did not stop after process exit")
+        if release_claim_on_success:
+            release_session_claim(s)
+    elif result[2] and s.pty is pty:
+        s.dead = False
+    return result[0], result[1]
 
 
 async def main():
@@ -2828,6 +3156,25 @@ async def main():
                 last_warn = now
                 log(f"[watchdog] event loop lag {lag:.3f}s")
     start_supervised_background(background_tasks, "loop-monitor", loop_monitor)
+
+    async def conpty_orphan_reaper_tick():
+        while True:
+            await asyncio.sleep(5)
+            with _ORPHANED_CONPTY_LOCK:
+                pending = bool(
+                    _ORPHANED_CONPTY_HOSTS
+                    or _PENDING_CONPTY_BASELINES
+                )
+            if pending:
+                await asyncio.get_running_loop().run_in_executor(
+                    None,
+                    _reap_orphaned_conpty_hosts,
+                )
+    start_supervised_background(
+        background_tasks,
+        "conpty-orphan-reaper",
+        conpty_orphan_reaper_tick,
+    )
 
     async def reap_unresolved_processes(restored):
         pids = set()
