@@ -223,17 +223,25 @@ public sealed class ArchitectureLaunchSurfaceTests
     public void UserConfirmedMuxTakeover_ConsolidatesIdentityAndUsesFencedRelaunch()
     {
         var root = FindRepoRoot();
-        var bridge = Path.Combine(root, "native", "CodexLocalRetrieval.Native", "MainPage.Remote.cs");
-        var text = File.ReadAllText(bridge);
+        var gui = File.ReadAllText(Path.Combine(root, "native", "CodexLocalRetrieval.Native", "MainPage.Remote.cs"));
+        var headless = File.ReadAllText(Path.Combine(root, "native", "CodexLocalRetrieval.Core", "Remote", "RemoteBridge.cs"));
+        var transfer = File.ReadAllText(Path.Combine(root, "native", "CodexLocalRetrieval.Core", "Remote", "MuxIdentityTransfer.cs"));
 
-        Assert.Contains("TransferMuxIdentityAsync", text,
-            "Tomux and explicit relaunch must consolidate every mux row for the canonical chat identity.");
-        Assert.Contains("relaunch: takeover", text,
-            "A confirmed takeover must reach muxd as a relaunch under the same durable command intent.");
-        Assert.Contains("if (desired is not null) return (true, \"desired mux owner will be relaunched\", true);", text,
-            "An already-live requested tab must be relaunched, not mistaken for an idempotent no-op.");
-        Assert.Contains("RunningSessions.TryAllLiveSessionIds", text,
-            "External-owner transfer must fail closed when local running-state verification is uncertain.");
+        foreach (var (consumer, text) in new[] { ("GUI", gui), ("headless", headless) })
+        {
+            Assert.Contains("MuxIdentityTransfer.ExecuteAsync", text,
+                consumer + " relaunch must use the shared canonical-identity transfer boundary.");
+            Assert.Contains("relaunch", text,
+                consumer + " takeover must reach muxd as a relaunch under the same durable command intent.");
+            Assert.Contains("takeover", text,
+                consumer + " command consumer must preserve the explicit ownership-transfer flag.");
+        }
+        Assert.Contains("TryMuxOwnedAgentPids", transfer,
+            "Takeover must distinguish the requested mux owner's process from stray writers during replay.");
+        Assert.Contains("SelectMany", transfer,
+            "Takeover must stop every verified PID across the canonical identity and aliases.");
+        Assert.Contains("RunningSessions.TryLiveSessionPids", transfer,
+            "Shared transfer must fail closed and retain exact PID custody when local state is uncertain.");
     }
 
     [TestMethod]

@@ -16,6 +16,11 @@ public static class RunningSessions
 {
     private static int _openHandleScanDisabled;
     private static readonly TimeSpan OpenHandleScanTimeout = TimeSpan.FromSeconds(2);
+    private static readonly System.Management.EnumerationOptions BoundedWmiOptions = new()
+    {
+        ReturnImmediately = true,
+        Timeout = TimeSpan.FromSeconds(2)
+    };
 
     public static List<ArchiveService.RunningSessionInfo> Scan()
     {
@@ -32,7 +37,10 @@ public static class RunningSessions
         var names = new Dictionary<int, string>();
         try
         {
-            using var all = new ManagementObjectSearcher("SELECT ProcessId, Name FROM Win32_Process");
+            using var all = new ManagementObjectSearcher(
+                new ManagementScope(@"\\.\root\cimv2"),
+                new ObjectQuery("SELECT ProcessId, Name FROM Win32_Process"),
+                BoundedWmiOptions);
             foreach (ManagementObject mo in all.Get())
                 try { names[Convert.ToInt32(mo["ProcessId"])] = mo["Name"]?.ToString() ?? ""; } catch { }
         }
@@ -41,7 +49,9 @@ public static class RunningSessions
         try
         {
             using var searcher = new ManagementObjectSearcher(
-                "SELECT ProcessId, ParentProcessId, CommandLine, CreationDate, Name FROM Win32_Process WHERE Name='claude.exe' OR Name='codex.exe'");
+                new ManagementScope(@"\\.\root\cimv2"),
+                new ObjectQuery("SELECT ProcessId, ParentProcessId, CommandLine, CreationDate, Name FROM Win32_Process WHERE Name='claude.exe' OR Name='codex.exe'"),
+                BoundedWmiOptions);
             foreach (ManagementObject mo in searcher.Get())
             {
                 var cl = mo["CommandLine"]?.ToString() ?? "";
@@ -211,20 +221,107 @@ public static class RunningSessions
     public static bool TryAllLiveSessionIds(out HashSet<string> live, out string detail)
     {
         live = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (!TryLiveSessionPids(out var livePids, out detail)) return false;
+        foreach (var id in livePids.Keys) live.Add(id);
+        return true;
+    }
+
+    public static bool TryLiveSessionPids(out Dictionary<string, HashSet<int>> live, out string detail)
+    {
+        live = new Dictionary<string, HashSet<int>>(StringComparer.OrdinalIgnoreCase);
         detail = "";
         var pids = new HashSet<int>();
         if (!TryScan(out var sessions, out detail)) return false;
         foreach (var s in sessions)
         {
-            if (!string.IsNullOrEmpty(s.SessionId)) live.Add(s.SessionId);
+            AddLivePid(live, s.SessionId, s.Pid);
             if (s.Pid > 0) pids.Add(s.Pid);
         }
         if (!TryClaudeLiveSessionIds(pids, out var claudeLiveIds, out detail))
             return false;
-        foreach (var kv in claudeLiveIds) live.Add(kv.Key);
+        foreach (var kv in claudeLiveIds)
+            AddLivePid(live, kv.Key, kv.Value);
         if (!TryOpenTranscriptSessionIdsBounded(pids, out var openTranscriptIds, out detail))
             return false;
-        foreach (var kv in openTranscriptIds) live.Add(kv.Key);
+        foreach (var kv in openTranscriptIds)
+            AddLivePid(live, kv.Key, kv.Value);
+        return true;
+    }
+
+    private static void AddLivePid(Dictionary<string, HashSet<int>> live, string? sessionId, int pid)
+    {
+        if (string.IsNullOrWhiteSpace(sessionId) || pid <= 0) return;
+        if (!live.TryGetValue(sessionId, out var pids))
+            live[sessionId] = pids = new HashSet<int>();
+        pids.Add(pid);
+    }
+
+    public static bool TryMuxOwnedAgentPids(
+        string muxName,
+        IEnumerable<int> candidatePids,
+        out HashSet<int> owned,
+        out string detail)
+    {
+        owned = new HashSet<int>();
+        detail = "";
+        var liveTabs = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+            "muxd",
+            "live-tabs.json");
+        int shellPid;
+        try
+        {
+            using var doc = JsonDocument.Parse(File.ReadAllText(liveTabs));
+            if (!doc.RootElement.TryGetProperty(muxName, out var row)
+                || !row.TryGetProperty("pid", out var pidElement)
+                || !pidElement.TryGetInt32(out shellPid)
+                || shellPid <= 0)
+                return true;
+        }
+        catch (FileNotFoundException)
+        {
+            return true;
+        }
+        catch (Exception ex)
+        {
+            detail = "could not inspect mux process custody: " + ex.Message;
+            return false;
+        }
+
+        var parents = new Dictionary<int, int>();
+        try
+        {
+            using var searcher = new ManagementObjectSearcher(
+                new ManagementScope(@"\\.\root\cimv2"),
+                new ObjectQuery("SELECT ProcessId, ParentProcessId FROM Win32_Process"),
+                BoundedWmiOptions);
+            foreach (ManagementObject mo in searcher.Get())
+            {
+                var pid = Convert.ToInt32(mo["ProcessId"]);
+                var parent = Convert.ToInt32(mo["ParentProcessId"]);
+                if (pid > 0) parents[pid] = parent;
+            }
+        }
+        catch (Exception ex)
+        {
+            detail = "could not verify mux process ancestry: " + ex.Message;
+            return false;
+        }
+
+        foreach (var candidate in candidatePids.Where(pid => pid > 0).Distinct())
+        {
+            var current = candidate;
+            var seen = new HashSet<int>();
+            while (current > 0 && seen.Add(current))
+            {
+                if (current == shellPid)
+                {
+                    owned.Add(candidate);
+                    break;
+                }
+                if (!parents.TryGetValue(current, out current)) break;
+            }
+        }
         return true;
     }
 

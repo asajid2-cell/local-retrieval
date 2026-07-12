@@ -223,7 +223,13 @@ public sealed class RemoteBridge
                 case "addtocollection":
                     res = (false, "desktop app required for collection changes"); break;
                 case "startmux":
-                    res = await StartMuxHeadlessAsync(c.muxName ?? c.sessionName ?? "", c.sessionId ?? "", c.tool ?? "", c.intentId); break;
+                    res = await StartMuxHeadlessAsync(
+                        c.muxName ?? c.sessionName ?? "",
+                        c.sessionId ?? "",
+                        c.tool ?? "",
+                        c.intentId,
+                        c.takeover);
+                    break;
                 default:
                     res = (false, "unknown command"); break;
             }
@@ -245,7 +251,8 @@ public sealed class RemoteBridge
         string name,
         string requestedSessionId,
         string tool,
-        string intentId)
+        string intentId,
+        bool takeover = false)
     {
         name = (name ?? "").Trim();
         var eventSessionId = (requestedSessionId ?? "").Trim();
@@ -281,6 +288,25 @@ public sealed class RemoteBridge
                 return (false, resolved.detail);
             }
             var launch = resolved.launch;
+            if (takeover)
+            {
+                var transferred = await MuxIdentityTransfer.ExecuteAsync(
+                    name,
+                    launch.SessionId,
+                    launch.Aliases,
+                    LocalMuxdRequestAsync);
+                if (!transferred.Ok)
+                {
+                    RecordSessionEvent(
+                        launch.SessionId,
+                        launch.Aliases,
+                        "mux.refused.takeover",
+                        transferred.Detail,
+                        "warn",
+                        details: new Dictionary<string, string> { ["muxName"] = name });
+                    return (false, transferred.Detail);
+                }
+            }
             var text = await LocalMuxdRequestAsync(new
             {
                 t = "create",
@@ -291,6 +317,7 @@ public sealed class RemoteBridge
                 sessionId = launch.SessionId,
                 aliases = launch.Aliases,
                 identityPending = string.IsNullOrWhiteSpace(launch.SessionId),
+                relaunch = takeover,
                 intentId
             });
             using var doc = JsonDocument.Parse(text);
@@ -477,5 +504,6 @@ public sealed class RemoteBridge
         public string? muxName { get; set; }
         public string? sessionName { get; set; }
         public string? insert { get; set; }
+        public bool takeover { get; set; }
     }
 }

@@ -44,6 +44,7 @@ public sealed partial class MainPage
         var title = Trim(session.DisplayTitle, 40);
         var muxStarted = false;
         SyncStatus.Text = $"Starting mux session \"{title}\"...";
+        Diag.Log($"Mux start requested name={name} openLocalAttach={openLocalAttach}");
 
         try
         {
@@ -504,20 +505,24 @@ public sealed partial class MainPage
         var session = _archive.ResolveSessionByIdOrAlias(launch.SessionId, launch.Tool);
         if (takeover)
         {
-            var transferred = await TransferMuxIdentityAsync(name, launch.SessionId, launch.Aliases);
-            if (!transferred.ok)
+            var transferred = await CodexLocalRetrieval.Core.Remote.MuxIdentityTransfer.ExecuteAsync(
+                name,
+                launch.SessionId,
+                launch.Aliases,
+                message => LocalMuxdRequestAsync(message));
+            if (!transferred.Ok)
             {
                 RecordSessionEvent(
                     session,
                     "mux.refused.takeover",
-                    transferred.detail,
+                    transferred.Detail,
                     "warn",
                     details: new Dictionary<string, string>
                     {
                         ["muxName"] = name,
                         ["sessionId"] = launch.SessionId
                     });
-                return (false, transferred.detail);
+                return (false, transferred.Detail);
             }
         }
         var created = await CreateLocalMuxdSessionAsync(
@@ -538,81 +543,6 @@ public sealed partial class MainPage
                 ["sessionId"] = launch.SessionId
             });
         return created.ok ? (true, "started PC-local mux session: " + name) : created;
-    }
-
-    private sealed record LocalMuxIdentityRow(string Name, bool Alive, string SessionId, string[] Aliases);
-
-    private async Task<(bool ok, string detail, bool alreadyOwned)> TransferMuxIdentityAsync(
-        string desiredName,
-        string sessionId,
-        IEnumerable<string>? aliases)
-    {
-        var ids = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        if (!string.IsNullOrWhiteSpace(sessionId)) ids.Add(sessionId.Trim());
-        foreach (var alias in aliases ?? Array.Empty<string>())
-            if (!string.IsNullOrWhiteSpace(alias)) ids.Add(alias.Trim());
-        if (ids.Count == 0) return (false, "takeover has no canonical session identity", false);
-
-        List<LocalMuxIdentityRow> rows;
-        try
-        {
-            var text = await LocalMuxdRequestAsync(new { t = "ls" });
-            using var doc = JsonDocument.Parse(text);
-            rows = doc.RootElement.GetProperty("list").EnumerateArray()
-                .Select(row => new LocalMuxIdentityRow(
-                    row.GetProperty("name").GetString() ?? "",
-                    row.TryGetProperty("alive", out var alive) && alive.ValueKind == JsonValueKind.True,
-                    row.TryGetProperty("sessionId", out var sid) ? sid.GetString() ?? "" : "",
-                    row.TryGetProperty("aliases", out var aa) && aa.ValueKind == JsonValueKind.Array
-                        ? aa.EnumerateArray().Select(a => a.GetString() ?? "").Where(a => a.Length > 0).ToArray()
-                        : Array.Empty<string>()))
-                .Where(row => ids.Contains(row.SessionId) || row.Aliases.Any(ids.Contains))
-                .ToList();
-        }
-        catch (Exception ex)
-        {
-            return (false, "could not inspect mux ownership before takeover: " + ex.Message, false);
-        }
-
-        var desired = rows.FirstOrDefault(row =>
-            row.Alive && string.Equals(row.Name, desiredName, StringComparison.OrdinalIgnoreCase));
-
-        foreach (var row in rows.Where(row =>
-                     !string.Equals(row.Name, desiredName, StringComparison.OrdinalIgnoreCase)))
-        {
-            var removed = await DeleteLocalMuxdSessionAsync(row.Name);
-            if (!removed.ok)
-                return (false, $"could not remove existing mux owner '{row.Name}': {removed.detail}", false);
-        }
-
-        if (desired is not null) return (true, "desired mux owner will be relaunched", true);
-
-        InvalidateRunningCache();
-        if (!CodexLocalRetrieval.Core.Remote.RunningSessions.TryAllLiveSessionIds(out var liveIds, out var liveDetail))
-            return (false, "could not verify local ownership before takeover: " + liveDetail, false);
-        if (CodexLocalRetrieval.Core.Remote.RunningSessions.AnyLive(ids, liveIds))
-        {
-            var running = GetRunningChats();
-            var ownerPid = ids.Select(id => running.TryGetValue(id, out var pid) ? pid : 0).FirstOrDefault(pid => pid > 0);
-            if (ownerPid <= 0)
-                return (false, "matching local owner was detected but its exact process could not be identified", false);
-            var killed = TryKillChat(ownerPid);
-            if (!killed.ok)
-                return (false, "could not stop the matching local owner: " + killed.detail, false);
-
-            var deadline = DateTime.UtcNow.AddSeconds(12);
-            do
-            {
-                await Task.Delay(200);
-                InvalidateRunningCache();
-                if (!CodexLocalRetrieval.Core.Remote.RunningSessions.TryAllLiveSessionIds(out liveIds, out liveDetail))
-                    return (false, "could not verify local owner exit: " + liveDetail, false);
-                if (!CodexLocalRetrieval.Core.Remote.RunningSessions.AnyLive(ids, liveIds))
-                    return (true, "ownership transferred", false);
-            } while (DateTime.UtcNow < deadline);
-            return (false, "matching local owner did not exit after takeover", false);
-        }
-        return (true, "ownership available", false);
     }
 
     // /tomux handoff: resolve the caller's own session, stop the local owner, verify the
@@ -697,21 +627,25 @@ public sealed partial class MainPage
                 ResolvedSessionId: session.Id);
         }
 
-        var transferred = await TransferMuxIdentityAsync(name, session.Id, session.Aliases);
-        if (!transferred.ok)
+        var transferred = await CodexLocalRetrieval.Core.Remote.MuxIdentityTransfer.ExecuteAsync(
+            name,
+            session.Id,
+            session.Aliases,
+            message => LocalMuxdRequestAsync(message));
+        if (!transferred.Ok)
         {
             RecordSessionEvent(
                 session,
                 "tomux.refused.consolidation",
-                transferred.detail,
+                transferred.Detail,
                 "warn",
                 details: new Dictionary<string, string> { ["muxName"] = name });
             return new CodexLocalRetrieval.Core.Models.AgentCommandResult(false,
-                "couldn't consolidate the existing mux tab for this chat: " + transferred.detail,
+                "couldn't consolidate the existing mux tab for this chat: " + transferred.Detail,
                 ResolvedSessionId: session.Id);
         }
 
-        var created = transferred.alreadyOwned
+        var created = transferred.AlreadyOwned
             ? (ok: true, detail: "mux session already owns this identity")
             : await CreateLocalMuxdSessionAsync(name, command, session.Id, session.Aliases);
         if (!created.ok)

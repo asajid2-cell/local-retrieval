@@ -241,14 +241,43 @@ public sealed partial class MainPage
             : RelayMuxState.None;
         var relayMuxUp = relayState != RelayMuxState.None;
         var muxUp = localMuxUp || relayMuxUp;
-        var running = await Task.Run(GetRunningChats);
+        Dictionary<string, HashSet<int>> running;
+        try
+        {
+            var scan = await Task.Run(() =>
+            {
+                var ok = CodexLocalRetrieval.Core.Remote.RunningSessions.TryLiveSessionPids(
+                    out var live,
+                    out var detail);
+                return (ok, live, detail);
+            }).WaitAsync(TimeSpan.FromSeconds(6));
+            if (!scan.ok)
+            {
+                SyncStatus.Text = scan.detail;
+                Diag.Log("Mux launch guard refused: " + scan.detail);
+                return false;
+            }
+            running = scan.live;
+        }
+        catch (TimeoutException)
+        {
+            const string detail = "live-session verification timed out; refusing to risk a second writer";
+            SyncStatus.Text = detail;
+            Diag.Log("Mux launch guard refused: " + detail);
+            return false;
+        }
         // Match on the session id OR any of its aliases (a fork/resume writes a lineage id) so a live copy
         // started under a different id — but the SAME transcript — is still caught.
-        var localPid = 0;
-        if (!string.IsNullOrEmpty(session.Id) && running.TryGetValue(session.Id, out var pid)) localPid = pid;
-        else foreach (var a in session.Aliases) if (!string.IsNullOrEmpty(a) && running.TryGetValue(a, out var pa)) { localPid = pa; break; }
+        var ids = new HashSet<string>(session.Aliases ?? Array.Empty<string>(), StringComparer.OrdinalIgnoreCase);
+        if (!string.IsNullOrWhiteSpace(session.Id)) ids.Add(session.Id);
+        var localPids = ids
+            .Where(running.ContainsKey)
+            .SelectMany(id => running[id])
+            .Where(pid => pid > 0)
+            .Distinct()
+            .ToArray();
         // if a multiplex is up, the running process IS its agent (not a separate local one)
-        var localUp = localPid != 0 && !muxUp;
+        var localUp = localPids.Length > 0 && !muxUp;
 
         if (!muxUp && !localUp) return true;   // nothing running -> proceed
 
@@ -274,9 +303,9 @@ public sealed partial class MainPage
                 var deleted = await DeleteRelayMuxSessionAsync(target, settings.MultiplexApiPort, muxName);
                 if (!deleted.ok) { SyncStatus.Text = "Could not kill the relay-visible mux session: " + deleted.detail; return false; }
             }
-            if (localPid != 0)
+            foreach (var localPid in localPids)
             {
-                var killed = TryKillChat(localPid);
+                var killed = CodexLocalRetrieval.Core.Remote.RunningSessions.Kill(null, localPid);
                 if (!killed.ok) { SyncStatus.Text = "Could not kill the local running agent: " + killed.detail; return false; }
             }
             await Task.Delay(400);
