@@ -67,6 +67,13 @@ Run-Gate 'dotnet-build' {
 $dotnetBuildPassed = $results['dotnet-build'].ok
 
 if ($dotnetBuildPassed) {
+    Run-Gate 'native-app-build' {
+        dotnet build native\CodexLocalRetrieval.Native\CodexLocalRetrieval.Native.csproj `
+            -c Release -m:1 -p:UseSharedCompilation=false
+    } 'Build succeeded.'
+}
+
+if ($dotnetBuildPassed -and $results['native-app-build'].ok) {
     Run-Gate 'dotnet-tests' {
         dotnet test native\CodexLocalRetrieval.Native.Tests\CodexLocalRetrieval.Native.Tests.csproj `
             -c Release --no-build --logger 'console;verbosity=minimal' `

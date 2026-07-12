@@ -268,7 +268,7 @@ public sealed partial class MainPage
         }
         // Match on the session id OR any of its aliases (a fork/resume writes a lineage id) so a live copy
         // started under a different id — but the SAME transcript — is still caught.
-        var ids = new HashSet<string>(session.Aliases ?? Array.Empty<string>(), StringComparer.OrdinalIgnoreCase);
+        var ids = new HashSet<string>(session.Aliases, StringComparer.OrdinalIgnoreCase);
         if (!string.IsNullOrWhiteSpace(session.Id)) ids.Add(session.Id);
         var localPids = ids
             .Where(running.ContainsKey)
