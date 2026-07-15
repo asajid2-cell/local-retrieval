@@ -910,6 +910,8 @@ AGENT_STARTING_GRACE = float(ENV.get("AGENT_STARTING_GRACE", "45"))
 ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]")
 STALE_CSI_RE = re.compile(r"\[[0-?]*[ -/]*[@-~]")
 CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+PRIVATE_MODE_RE = re.compile(br"\x1b\[\?([0-9;]+)([hl])")
+REPLAY_PRIVATE_MODES = frozenset((47, 1047, 1049, 2004))
 
 
 def launch_candidate_ids(cmd="", ids=None):
@@ -1325,6 +1327,45 @@ def clean_terminal_text(s):
     s = STALE_CSI_RE.sub("", s)
     return CTRL_RE.sub("", s)
 
+
+class TerminalReplayState:
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._scan_tail = b""
+        self.private_modes = set()
+        self.cursor_visible = None
+
+    def ingest(self, data):
+        with self._lock:
+            scan = self._scan_tail + bytes(data or b"")
+            for match in PRIVATE_MODE_RE.finditer(scan):
+                enabled = match.group(2) == b"h"
+                for raw_mode in match.group(1).split(b";"):
+                    try:
+                        mode = int(raw_mode)
+                    except ValueError:
+                        continue
+                    if mode == 25:
+                        self.cursor_visible = enabled
+                    elif mode in REPLAY_PRIVATE_MODES:
+                        if enabled:
+                            self.private_modes.add(mode)
+                        else:
+                            self.private_modes.discard(mode)
+            self._scan_tail = scan[-64:]
+
+    def prefix(self):
+        with self._lock:
+            cursor_visible = self.cursor_visible
+            private_modes = tuple(sorted(self.private_modes))
+        out = []
+        if cursor_visible is not None:
+            out.append(b"\x1b[?25" + (b"h" if cursor_visible else b"l"))
+        for mode in private_modes:
+            out.append(f"\x1b[?{mode}h".encode("ascii"))
+        return b"".join(out)
+
+
 class Session:
     def __init__(self, name, cmd, cwd, cols, rows, loop, outq, heal=False, spawn_now=True,
                  ids=None, session_id="", aliases=None):
@@ -1350,11 +1391,14 @@ class Session:
         self.created = time.time(); self.last_out = time.time()
         self.ring = collections.deque(); self.ring_len = 0
         self._ring_lock = threading.RLock()
+        self.replay_state = TerminalReplayState()
         self.dead = False; self.user_killed = False
         self.deaths = []
         self.loop, self.outq = loop, outq
         self.pending = bytearray(); self.plock = threading.Lock()   # output coalescing (flushed by the pump)
         self.local = set()                                          # local (muxctl) viewer queues — fanned the same output
+        self.local_sizes = {}
+        self.remote_size_active = False
         self.wq = queue.Queue()                                     # input write queue → serialized, chunked writes
         self._writer_lock = threading.Lock()
         self._writer_thread = None
@@ -1447,6 +1491,7 @@ class Session:
             if not data: continue
             if pty is not self.pty: return          # superseded by a respawn
             b = data.encode("utf-8", "replace")
+            self.replay_state.ingest(b)
             self._append_ring(b)
             with self.plock:                           # coalesced; the pump flushes on a ~12ms timer
                 self.pending += b                       # backpressure: if a flood outruns a slow link, keep the
@@ -1605,7 +1650,7 @@ class Session:
         for b in reversed(self._ring_snapshot()):
             out.append(b); n += len(b)
             if n >= limit: break
-        return b"".join(reversed(out))
+        return self.replay_state.prefix() + b"".join(reversed(out))
 
     def tail_text(self, nbytes=1600, lines=0):
         raw = bytearray()
@@ -1655,11 +1700,14 @@ class OwnerSession:
         self.created = time.time(); self.last_out = time.time()
         self.ring = collections.deque(); self.ring_len = 0
         self._ring_lock = threading.RLock()
+        self.replay_state = TerminalReplayState()
         self.dead = False; self.user_killed = False
         self.deaths = []
         self.loop, self.outq = loop, outq
         self.pending = bytearray(); self.plock = threading.Lock()
         self.local = set()
+        self.local_sizes = {}
+        self.remote_size_active = False
         self.owner_ws = owner_ws
         self.owner = True
         self.expected_owner = True
@@ -1679,6 +1727,7 @@ class OwnerSession:
 
     def ingest(self, data: bytes):
         if not data: return
+        self.replay_state.ingest(data)
         self._append_ring(data)
         with self.plock:
             self.pending += data
@@ -1749,7 +1798,7 @@ class OwnerSession:
         for b in reversed(self._ring_snapshot()):
             out.append(b); n += len(b)
             if n >= limit: break
-        return b"".join(reversed(out))
+        return self.replay_state.prefix() + b"".join(reversed(out))
 
     def tail_text(self, nbytes=1600, lines=0):
         raw = bytearray()
@@ -1781,6 +1830,39 @@ def live_session_names():
         except Exception:
             pass
     return names
+
+
+def restore_local_session_size(session):
+    sizes = list(getattr(session, "local_sizes", {}).values())
+    if not sizes:
+        return
+    cols, rows = max(sizes, key=lambda value: (int(value[0]), int(value[1])))
+    session.resize(cols, rows)
+
+
+def update_local_session_size(session, viewer, cols, rows):
+    size = (int(cols), int(rows))
+    session.local_sizes[viewer] = size
+    if not session.remote_size_active:
+        session.resize(*size)
+
+
+def apply_remote_session_size(session, message):
+    if message.get("active") is False:
+        session.remote_size_active = False
+        restore_local_session_size(session)
+        return
+    session.remote_size_active = True
+    session.resize(message.get("cols", 140), message.get("rows", 40))
+
+
+def clear_remote_size_ownership():
+    for session in list(sessions.values()):
+        if not getattr(session, "remote_size_active", False):
+            continue
+        session.remote_size_active = False
+        restore_local_session_size(session)
+
 
 def dump_thread_stacks(reason):
     try:
@@ -2152,6 +2234,7 @@ def session_payload(name, sess):
             "aliases": list(getattr(sess, "aliases", []) or []),
             "identityPending": bool(getattr(sess, "identity_pending", False)),
             "lifecycle": str(getattr(sess, "lifecycle", "active") or "active"),
+            "childPid": int(getattr(sess, "child_pid", 0) or 0),
             "agentState": agent["agentState"], "agentLabel": agent["agentLabel"],
             "agentDetail": agent["agentDetail"], "agentConfidence": agent["agentConfidence"],
             "needsAttention": agent["needsAttention"], "lastOutAgeMs": agent.get("lastOutAgeMs", 0)}
@@ -3438,6 +3521,13 @@ async def main():
                             elif mt == "size":
                                 owner.cols = max(20, int(m.get("cols") or owner.cols))
                                 owner.rows = max(8, int(m.get("rows") or owner.rows))
+                            elif mt == "child":
+                                child_pid = int(m.get("pid", 0) or 0)
+                                if child_pid <= 0:
+                                    continue
+                                owner.child_pid = child_pid
+                                owner.child_start_token = _process_start_token(child_pid)
+                                await manifest_save_async(sessions)
                             elif mt == "inputResult":
                                 waiter = owner.input_waiters.get(str(m.get("rid", "")))
                                 if waiter is not None and not waiter.done():
@@ -3492,7 +3582,8 @@ async def main():
                 if err:
                     await ws.send(json.dumps({"t": "err", "m": err})); return
                 lq = asyncio.Queue(maxsize=LOCAL_VIEWER_QUEUE_MAX); s.local.add(lq)
-                if first.get("cols"): s.resize(int(first.get("cols")), int(first.get("rows") or 40))
+                if first.get("cols"):
+                    update_local_session_size(s, lq, first.get("cols"), first.get("rows") or 40)
                 try:
                     sb_limit = int(first.get("sb") if first.get("sb") is not None else LOCAL_SB_SEND)
                     if sb_limit > 0:
@@ -3515,10 +3606,16 @@ async def main():
                             try: m = json.loads(raw)
                             except Exception: continue
                             if m.get("t") == "i": s.write(base64.b64decode(m.get("d", "")))
-                            elif m.get("t") == "resize": s.resize(m.get("cols", 140), m.get("rows", 40))
+                            elif m.get("t") == "resize":
+                                update_local_session_size(
+                                    s, lq, m.get("cols", 140), m.get("rows", 40)
+                                )
                     finally: pt.cancel()
                 finally:
                     s.local.discard(lq)
+                    s.local_sizes.pop(lq, None)
+                    if not s.remote_size_active:
+                        restore_local_session_size(s)
             except _ws.exceptions.ConnectionClosedOK:
                 pass
             except Exception as e:
@@ -3672,11 +3769,7 @@ async def main():
                             elif t == "i" and name in sessions:
                                 sessions[name].write(base64.b64decode(m.get("d", "")))
                             elif t == "resize" and name in sessions:
-                                s = sessions[name]
-                                if s.local:
-                                    log(f"[{name}] ignored remote resize while local viewer is attached")
-                                else:
-                                    s.resize(m.get("cols", 140), m.get("rows", 40))
+                                apply_remote_session_size(sessions[name], m)
                             elif t == "sb" and name in sessions:
                                 session = sessions[name]
                                 scrollback_limit = m.get("max", SB_SEND)
@@ -3727,6 +3820,7 @@ async def main():
                                 await ws.send(json.dumps({"t": "sessions", "list": sess_list()}))
                     finally:
                         for tk in tasks: tk.cancel()
+                        clear_remote_size_ownership()
             except Exception as e:
                 log(f"relay link ({cand}) dropped/failed: {type(e).__name__}: {e}")
             # try next candidate immediately; back off only after all fail

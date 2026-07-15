@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import ctypes
 import json
 import os
 import shutil
@@ -10,6 +11,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from ctypes import wintypes
 
 try:
     import websockets
@@ -27,6 +29,25 @@ def free_port():
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         return int(sock.getsockname()[1])
+
+
+def process_alive(pid):
+    k = ctypes.windll.kernel32
+    k.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    k.OpenProcess.restype = wintypes.HANDLE
+    k.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    k.GetExitCodeProcess.restype = wintypes.BOOL
+    k.CloseHandle.argtypes = [wintypes.HANDLE]
+    handle = k.OpenProcess(0x1000, False, int(pid))  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not handle:
+        return False
+    try:
+        exit_code = wintypes.DWORD()
+        if not k.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            return False
+        return exit_code.value == 259  # STILL_ACTIVE
+    finally:
+        k.CloseHandle(handle)
 
 
 async def request_json(port, payload, timeout=8):
@@ -595,6 +616,90 @@ class MuxdLocalIntegrationTests(unittest.TestCase):
                 )
                 owner.wait(timeout=5)
 
+    def test_visible_owner_sidecar_death_cannot_orphan_its_child(self):
+        name = "it-owner-contained"
+        cmd = "while($true){Start-Sleep -Milliseconds 200}"
+        self.kill(name)
+        owner = subprocess.Popen(
+            [sys.executable, str(MUXRUN), name, "--cwd", str(self.muxd.root), "--cmd", cmd],
+            cwd=str(REPO),
+            env=self.muxd.env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=CREATE_NO_WINDOW,
+        )
+        child_pid = 0
+        try:
+            deadline = time.time() + 12
+            while time.time() < deadline:
+                row = self.session(name)
+                child_pid = int((row or {}).get("childPid") or 0)
+                if row and row.get("owner") and child_pid > 0:
+                    break
+                time.sleep(0.2)
+            self.assertGreater(child_pid, 0, "visible owner never published its child pid")
+            self.assertTrue(process_alive(child_pid), "visible owner child was not alive before sidecar termination")
+
+            owner.kill()
+            owner.wait(timeout=5)
+            deadline = time.time() + 8
+            while process_alive(child_pid) and time.time() < deadline:
+                time.sleep(0.1)
+            self.assertFalse(process_alive(child_pid), "visible owner child survived sidecar death")
+        finally:
+            self.kill(name)
+            if owner.poll() is None:
+                subprocess.run(
+                    ["taskkill.exe", "/PID", str(owner.pid), "/T", "/F"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=10,
+                    creationflags=CREATE_NO_WINDOW,
+                )
+
+    def test_visible_owner_kill_ack_waits_for_contained_child_exit(self):
+        name = "it-owner-kill-verified"
+        cmd = "while($true){Start-Sleep -Milliseconds 211}"
+        self.kill(name)
+        owner = subprocess.Popen(
+            [sys.executable, str(MUXRUN), name, "--cwd", str(self.muxd.root), "--cmd", cmd],
+            cwd=str(REPO),
+            env=self.muxd.env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=CREATE_NO_WINDOW,
+        )
+        child_pid = 0
+        try:
+            deadline = time.time() + 12
+            while time.time() < deadline:
+                row = self.session(name)
+                child_pid = int((row or {}).get("childPid") or 0)
+                if row and row.get("owner") and child_pid > 0:
+                    break
+                time.sleep(0.2)
+            self.assertGreater(child_pid, 0)
+            self.assertTrue(process_alive(child_pid))
+
+            killed = run_request(self.muxd.port, {"t": "kill", "s": name}, timeout=18)
+
+            self.assertEqual("killed", killed.get("t"), killed)
+            self.assertFalse(
+                process_alive(child_pid),
+                "visible-owner kill acknowledged before its contained child exited",
+            )
+            owner.wait(timeout=5)
+        finally:
+            self.kill(name)
+            if owner.poll() is None:
+                subprocess.run(
+                    ["taskkill.exe", "/PID", str(owner.pid), "/T", "/F"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=10,
+                    creationflags=CREATE_NO_WINDOW,
+                )
+
     def test_boot_never_resurrects_user_killed_armed_session(self):
         name = "it-user-killed-boot"
         self.kill(name)
@@ -1008,13 +1113,26 @@ class MuxdLocalIntegrationTests(unittest.TestCase):
     def test_kill_removes_session_from_manifest_and_listing(self):
         name = "it-kill"
         self.kill(name)
-        run_request(self.muxd.port, {"t": "create", "s": name}, timeout=12)
-        self.assertIsNotNone(self.session(name))
+        run_request(
+            self.muxd.port,
+            {
+                "t": "create",
+                "s": name,
+                "cmd": "$env:MUX_KILL_PROBE='it-kill'; while($true){Start-Sleep -Milliseconds 237}",
+            },
+            timeout=20,
+        )
+        current = self.session(name)
+        self.assertIsNotNone(current)
+        child_pid = int(current.get("childPid") or 0)
+        self.assertGreater(child_pid, 0)
+        self.assertTrue(process_alive(child_pid))
 
         killed = run_request(self.muxd.port, {"t": "kill", "s": name}, timeout=6)
 
         self.assertEqual(killed.get("t"), "killed")
         self.assertIsNone(self.session(name))
+        self.assertFalse(process_alive(child_pid), "kill acknowledged while the child process was still alive")
 
     def test_create_is_not_acknowledged_and_spawn_is_reaped_when_manifest_commit_fails(self):
         name = "it-create-persist-fail"

@@ -39,6 +39,105 @@ class FakeSession:
 
 
 class MuxdStateTests(unittest.TestCase):
+    def test_remote_size_ownership_blocks_local_resize_and_release_restores_it(self):
+        class SizedSession:
+            def __init__(self):
+                self.local_sizes = {}
+                self.remote_size_active = False
+                self.resizes = []
+
+            def resize(self, cols, rows):
+                self.resizes.append((int(cols), int(rows)))
+
+        session = SizedSession()
+        local_viewer = object()
+        muxd.update_local_session_size(session, local_viewer, 120, 30)
+        muxd.apply_remote_session_size(
+            session, {"active": True, "cols": 220, "rows": 52}
+        )
+        muxd.update_local_session_size(session, local_viewer, 132, 36)
+
+        self.assertTrue(session.remote_size_active)
+        self.assertEqual(session.resizes, [(120, 30), (220, 52)])
+
+        muxd.apply_remote_session_size(session, {"active": False})
+        self.assertFalse(session.remote_size_active)
+        self.assertEqual(session.resizes[-1], (132, 36))
+
+    def test_relay_disconnect_releases_remote_size_for_every_session(self):
+        class SizedSession:
+            def __init__(self, local_size):
+                self.local_sizes = {object(): local_size}
+                self.remote_size_active = True
+                self.resizes = []
+
+            def resize(self, cols, rows):
+                self.resizes.append((int(cols), int(rows)))
+
+        first = SizedSession((100, 28))
+        second = SizedSession((140, 42))
+        old_sessions = muxd.sessions
+        try:
+            muxd.sessions = {"first": first, "second": second}
+            muxd.clear_remote_size_ownership()
+        finally:
+            muxd.sessions = old_sessions
+
+        self.assertFalse(first.remote_size_active)
+        self.assertFalse(second.remote_size_active)
+        self.assertEqual(first.resizes, [(100, 28)])
+        self.assertEqual(second.resizes, [(140, 42)])
+
+    def test_terminal_replay_state_tracks_split_private_mode_sequences(self):
+        state = muxd.TerminalReplayState()
+        state.ingest(b"before\x1b[?10")
+        state.ingest(b"49h\x1b[?2004h\x1b[?25l")
+        self.assertEqual(
+            state.prefix(),
+            b"\x1b[?25l\x1b[?1049h\x1b[?2004h",
+        )
+        state.ingest(b"\x1b[?1049l\x1b[?2004l\x1b[?25h")
+        self.assertEqual(state.prefix(), b"\x1b[?25h")
+
+    def test_terminal_replay_state_is_safe_during_concurrent_ingest_and_prefix(self):
+        state = muxd.TerminalReplayState()
+        errors = []
+
+        def mutate():
+            try:
+                for _ in range(5000):
+                    state.ingest(b"\x1b[?1049h\x1b[?2004h\x1b[?1049l\x1b[?2004l")
+            except Exception as error:
+                errors.append(error)
+
+        worker = threading.Thread(target=mutate)
+        worker.start()
+        try:
+            while worker.is_alive():
+                state.prefix()
+        except Exception as error:
+            errors.append(error)
+        worker.join()
+
+        self.assertEqual([], errors)
+
+    def test_scrollback_reconstructs_active_terminal_modes_before_raw_suffix(self):
+        session = muxd.Session(
+            "replay-mode-session",
+            "",
+            r"Z:\tmp",
+            100,
+            30,
+            asyncio.new_event_loop(),
+            asyncio.Queue(),
+            spawn_now=False,
+        )
+        session.replay_state.ingest(b"\x1b[?1049h\x1b[?2004h")
+        session._append_ring(b"CURRENT_TUI_FRAME")
+        replay = session.scrollback()
+        self.assertTrue(replay.startswith(b"\x1b[?1049h\x1b[?2004h"))
+        self.assertTrue(replay.endswith(b"CURRENT_TUI_FRAME"))
+
     def test_all_pywinpty_spawns_are_inside_the_custody_critical_section(self):
         with open(muxd.__file__, encoding="utf-8") as stream:
             tree = ast.parse(stream.read())

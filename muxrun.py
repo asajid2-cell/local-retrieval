@@ -7,10 +7,12 @@ import argparse
 import asyncio
 import base64
 import ctypes
+import json
 import os
 import secrets
 import subprocess
 import sys
+import tempfile
 import time
 from ctypes import wintypes
 
@@ -31,6 +33,8 @@ ENABLE_WRAP_AT_EOL_OUTPUT = 0x0002
 ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
 ENABLE_QUICK_EDIT_MODE = 0x0040
 ENABLE_EXTENDED_FLAGS = 0x0080
+JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
 
 
 class COORD(ctypes.Structure):
@@ -77,6 +81,88 @@ class EVENT_UNION(ctypes.Union):
 
 class INPUT_RECORD(ctypes.Structure):
     _fields_ = [("EventType", wintypes.WORD), ("Event", EVENT_UNION)]
+
+
+class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("PerProcessUserTimeLimit", ctypes.c_int64),
+        ("PerJobUserTimeLimit", ctypes.c_int64),
+        ("LimitFlags", wintypes.DWORD),
+        ("MinimumWorkingSetSize", ctypes.c_size_t),
+        ("MaximumWorkingSetSize", ctypes.c_size_t),
+        ("ActiveProcessLimit", wintypes.DWORD),
+        ("Affinity", ctypes.c_size_t),
+        ("PriorityClass", wintypes.DWORD),
+        ("SchedulingClass", wintypes.DWORD),
+    ]
+
+
+class IO_COUNTERS(ctypes.Structure):
+    _fields_ = [
+        ("ReadOperationCount", ctypes.c_uint64),
+        ("WriteOperationCount", ctypes.c_uint64),
+        ("OtherOperationCount", ctypes.c_uint64),
+        ("ReadTransferCount", ctypes.c_uint64),
+        ("WriteTransferCount", ctypes.c_uint64),
+        ("OtherTransferCount", ctypes.c_uint64),
+    ]
+
+
+class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("BasicLimitInformation", JOBOBJECT_BASIC_LIMIT_INFORMATION),
+        ("IoInfo", IO_COUNTERS),
+        ("ProcessMemoryLimit", ctypes.c_size_t),
+        ("JobMemoryLimit", ctypes.c_size_t),
+        ("PeakProcessMemoryUsed", ctypes.c_size_t),
+        ("PeakJobMemoryUsed", ctypes.c_size_t),
+    ]
+
+
+class ChildJob:
+    def __init__(self):
+        self.handle = None
+        if os.name != "nt":
+            return
+        k = ctypes.windll.kernel32
+        k.CreateJobObjectW.argtypes = [wintypes.LPVOID, wintypes.LPCWSTR]
+        k.CreateJobObjectW.restype = wintypes.HANDLE
+        k.SetInformationJobObject.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_int,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+        ]
+        k.SetInformationJobObject.restype = wintypes.BOOL
+        k.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        k.AssignProcessToJobObject.restype = wintypes.BOOL
+        k.CloseHandle.argtypes = [wintypes.HANDLE]
+        k.CloseHandle.restype = wintypes.BOOL
+        handle = k.CreateJobObjectW(None, None)
+        if not handle:
+            raise ctypes.WinError()
+        info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if not k.SetInformationJobObject(
+            handle,
+            JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+            ctypes.byref(info),
+            ctypes.sizeof(info),
+        ):
+            k.CloseHandle(handle)
+            raise ctypes.WinError()
+        self.handle = handle
+
+    def assign(self, child):
+        if self.handle is None:
+            return
+        if not ctypes.windll.kernel32.AssignProcessToJobObject(self.handle, wintypes.HANDLE(child._handle)):
+            raise ctypes.WinError()
+
+    def close(self):
+        if self.handle is not None:
+            ctypes.windll.kernel32.CloseHandle(self.handle)
+            self.handle = None
 
 
 KEY_EVENT = 0x0001
@@ -240,11 +326,6 @@ async def listen_remote(ws, child):
                 }))
         elif m.get("t") == "kill":
             await asyncio.get_running_loop().run_in_executor(None, terminate_child_tree, child)
-            if child.poll() is not None:
-                try:
-                    await ws.send(json.dumps({"t": "dead"}))
-                except Exception:
-                    pass
             return
 
 
@@ -363,34 +444,53 @@ async def run_owner_link(ws, child):
     try:
         done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         if tasks[2] in done:
-            try:
-                await ws.send(json.dumps({"t": "dead"}))
-            except Exception:
-                pass
             return "child-exit"
         await asyncio.sleep(0.3)
         if child.poll() is not None:
-            try:
-                await ws.send(json.dumps({"t": "dead"}))
-            except Exception:
-                pass
             return "child-exit"
         return "link-drop"
     finally:
         stop.set()
         for task in tasks:
             task.cancel()
-        try:
-            await ws.close()
-        except Exception:
+
+
+def child_args(command, start_gate):
+    quoted_gate = start_gate.replace("'", "''")
+    gate = (
+        f"while(-not (Test-Path -LiteralPath '{quoted_gate}'))"
+        "{Start-Sleep -Milliseconds 20}; "
+        f"Remove-Item -LiteralPath '{quoted_gate}' -Force -ErrorAction SilentlyContinue; "
+    )
+    encoded = base64.b64encode((gate + command).encode("utf-16le")).decode("ascii")
+    return ["powershell.exe", "-NoLogo", "-NoExit", "-EncodedCommand", encoded]
+
+
+def launch_contained_child(command, cwd):
+    fd, start_gate = tempfile.mkstemp(prefix="muxrun-start-", suffix=".gate")
+    os.close(fd)
+    os.remove(start_gate)
+    job = ChildJob()
+    child = None
+    try:
+        child = subprocess.Popen(child_args(command, start_gate), cwd=cwd)
+        job.assign(child)
+        with open(start_gate, "wb"):
             pass
-
-
-def child_args(command):
-    if command:
-        encoded = base64.b64encode(command.encode("utf-16le")).decode("ascii")
-        return ["powershell.exe", "-NoLogo", "-NoExit", "-EncodedCommand", encoded]
-    return ["powershell.exe", "-NoLogo"]
+        return child, job
+    except Exception:
+        if child is not None:
+            try:
+                child.kill()
+                child.wait(timeout=5)
+            except Exception:
+                pass
+        job.close()
+        try:
+            os.remove(start_gate)
+        except OSError:
+            pass
+        raise
 
 
 async def main_async(args):
@@ -408,34 +508,52 @@ async def main_async(args):
         print("[muxrun] " + str(e), file=sys.stderr)
         return 2
 
-    child = subprocess.Popen(child_args(command), cwd=cwd)
-    while child.poll() is None:
+    child, job = launch_contained_child(command, cwd)
+    try:
+        await ws.send(json.dumps({"t": "child", "pid": child.pid}))
+        while child.poll() is None:
+            try:
+                result = await run_owner_link(ws, child)
+                if result == "child-exit":
+                    break
+                print("[muxrun] muxd owner link dropped; re-registering while child continues", file=sys.stderr)
+                try:
+                    await ws.close()
+                except Exception:
+                    pass
+                ws = await connect_owner(
+                    args,
+                    command,
+                    cwd,
+                    child_started=True,
+                    owner_key=owner_key,
+                    child_pid=child.pid,
+                )
+            except Exception as e:
+                if child.poll() is not None:
+                    break
+                print("[muxrun] muxd owner link failed; re-registering while child continues: " + str(e), file=sys.stderr)
+                ws = await connect_owner(
+                    args,
+                    command,
+                    cwd,
+                    child_started=True,
+                    owner_key=owner_key,
+                    child_pid=child.pid,
+                )
+        return int(child.returncode or 0)
+    finally:
+        # Closing the kill-on-close Job Object is the point at which every descendant is forced down.
+        # Only after that may muxd truthfully acknowledge the visible-owner session as dead.
+        job.close()
         try:
-            result = await run_owner_link(ws, child)
-            if result == "child-exit":
-                break
-            print("[muxrun] muxd owner link dropped; re-registering while child continues", file=sys.stderr)
-            ws = await connect_owner(
-                args,
-                command,
-                cwd,
-                child_started=True,
-                owner_key=owner_key,
-                child_pid=child.pid,
-            )
-        except Exception as e:
-            if child.poll() is not None:
-                break
-            print("[muxrun] muxd owner link failed; re-registering while child continues: " + str(e), file=sys.stderr)
-            ws = await connect_owner(
-                args,
-                command,
-                cwd,
-                child_started=True,
-                owner_key=owner_key,
-                child_pid=child.pid,
-            )
-    return int(child.returncode or 0)
+            await ws.send(json.dumps({"t": "dead"}))
+        except Exception:
+            pass
+        try:
+            await ws.close()
+        except Exception:
+            pass
 
 
 def main():
