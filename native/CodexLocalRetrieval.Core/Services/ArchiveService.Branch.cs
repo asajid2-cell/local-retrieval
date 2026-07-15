@@ -67,6 +67,22 @@ public sealed partial class ArchiveService
         return new BranchResult(true, $"Branched \"{parent.DisplayTitle}\".", branch);
     }
 
+    // Mark / unmark a chat as a reusable template (a curated starting point spawned via branch).
+    public async Task SetTemplateAsync(ArchiveSession session, bool isTemplate)
+    {
+        if (session is null || session.IsTemplate == isTemplate) return;
+        session.IsTemplate = isTemplate;
+        await SaveAsync();
+        ReapplyList();
+    }
+
+    // The chats the user curated as templates, newest-updated first.
+    public IReadOnlyList<ArchiveSession> Templates() =>
+        Store.Sessions.Values
+            .Where(s => s.IsTemplate && !s.Archived)
+            .OrderByDescending(s => s.UpdatedAt, StringComparer.Ordinal)
+            .ToList();
+
     private string ResolveSessionSourcePath(ArchiveSession session)
     {
         if (string.IsNullOrEmpty(session.SourcePath)) return "";

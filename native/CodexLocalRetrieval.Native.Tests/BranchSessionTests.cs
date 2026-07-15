@@ -79,6 +79,37 @@ public sealed class BranchSessionTests
         Assert.AreEqual("session_meta", doc.RootElement.GetProperty("type").GetString(), "unrelated fields are preserved");
     }
 
+    // Templates are the curated starting points shown in Start-chat; the flag persists and Templates()
+    // lists only non-archived templates.
+    [TestMethod]
+    public async Task Templates_ToggleFlagPersistsAndLists()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "clr-tmpl-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var storePath = Path.Combine(root, "store.json");
+            var svc = new ArchiveService(storePath: storePath);
+            var s = new ArchiveSession { Id = "t1", Tool = "codex", Title = "Context primer" };
+            svc.Store.Sessions["t1"] = s;
+
+            Assert.AreEqual(0, svc.Templates().Count);
+            await svc.SetTemplateAsync(s, true);
+            Assert.IsTrue(s.IsTemplate);
+            Assert.AreEqual("★⑂".Substring(0, 1), s.ListMarks);   // ★ only (not a branch)
+            CollectionAssert.AreEqual(new[] { "t1" }, svc.Templates().Select(x => x.Id).ToArray());
+            StringAssert.Contains(await File.ReadAllTextAsync(storePath), "isTemplate");
+
+            s.Archived = true;
+            Assert.AreEqual(0, svc.Templates().Count, "archived templates are hidden");
+            s.Archived = false;
+            await svc.SetTemplateAsync(s, false);
+            Assert.IsFalse(s.IsTemplate);
+            Assert.AreEqual(0, svc.Templates().Count);
+        }
+        finally { try { Directory.Delete(root, true); } catch { } }
+    }
+
     [TestMethod]
     public async Task BranchSessionAsync_MissingTranscript_FailsCleanly()
     {

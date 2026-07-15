@@ -1665,6 +1665,11 @@ public sealed partial class MainPage : Page
         branch.Click += async (_, _) => await BranchChatAsync(session);
         flyout.Items.Add(branch);
 
+        var template = new MenuFlyoutItem { Text = session.IsTemplate ? "Remove from templates" : "Add chat to templates" };
+        ToolTipService.SetToolTip(template, "Templates show in Start chat — spawn new chats that begin with this chat's context, any time.");
+        template.Click += async (_, _) => { await _archive.SetTemplateAsync(session, !session.IsTemplate); RenderCurrent(); };
+        flyout.Items.Add(template);
+
         var pin = new MenuFlyoutItem { Text = session.Pinned ? "Unpin" : "Pin to top" };
         pin.Click += async (_, _) => { await _archive.TogglePinAsync(session); RenderCurrent(); };
         flyout.Items.Add(pin);
@@ -2361,6 +2366,11 @@ public sealed partial class MainPage : Page
         ToolTipService.SetToolTip(branchItem, "Clone this chat's exact history into a new, resumable branch linked to this original.");
         branchItem.Click += async (_, _) => await BranchChatAsync(session);
         flyout.Items.Add(branchItem);
+
+        var templateItem = new MenuFlyoutItem { Text = session.IsTemplate ? "Remove from templates" : "Add chat to templates" };
+        ToolTipService.SetToolTip(templateItem, "Templates show in Start chat — spawn new chats that begin with this chat's context, any time.");
+        templateItem.Click += async (_, _) => { await _archive.SetTemplateAsync(session, !session.IsTemplate); RenderCurrent(); };
+        flyout.Items.Add(templateItem);
 
         var addToCollection = new MenuFlyoutSubItem { Text = "Add to collection" };
         BuildAddToCollectionItems(addToCollection.Items, new[] { session }, () => RenderCurrent());

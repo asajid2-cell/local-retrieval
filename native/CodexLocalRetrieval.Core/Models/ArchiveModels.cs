@@ -434,8 +434,26 @@ public sealed class ArchiveSession : INotifyPropertyChanged
     [JsonPropertyName("branchedAt")]
     public string BranchedAt { get; set; } = "";
 
+    // A template is a chat the user curated as a reusable STARTING POINT: from the Start-chat dialog you
+    // spawn a fresh chat that begins with this chat's full context (implemented as a branch of it), as many
+    // times as you like, whenever you like. App-only flag.
+    private bool _isTemplate;
+    [JsonPropertyName("isTemplate")]
+    public bool IsTemplate { get => _isTemplate; set { _isTemplate = value; Raise(); Raise(nameof(TemplateGlyph)); Raise(nameof(ListMarks)); } }
+
+    [JsonIgnore]
+    public string TemplateGlyph => IsTemplate ? "★" : "";
+
     [JsonIgnore]
     public bool IsBranch => !string.IsNullOrWhiteSpace(BranchOfId);
+
+    // Sidebar marker for a branch (bound in the SessionList template). Empty for non-branches.
+    [JsonIgnore]
+    public string BranchGlyph => IsBranch ? "⑂" : "";
+
+    // Combined sidebar marks: ★ for a template, ⑂ for a branch (a chat can be both).
+    [JsonIgnore]
+    public string ListMarks => (IsTemplate ? "★" : "") + (IsBranch ? "⑂" : "");
 
     [JsonIgnore]
     public string DisplayTitle => string.IsNullOrWhiteSpace(CustomTitle) ? Title : CustomTitle;

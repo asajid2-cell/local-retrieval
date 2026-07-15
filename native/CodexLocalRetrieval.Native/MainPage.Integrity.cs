@@ -55,6 +55,15 @@ public sealed partial class MainPage
             IntegrityItems.Children.Add(IntegrityUnblockButton());
         IntegrityItems.Children.Add(IntegrityMeta(summary));
 
+        // Branch linkage — a branch links back to its original; a parent lists the branches taken off it.
+        if (_selected.IsBranch)
+            IntegrityItems.Children.Add(BranchLinkBlock(_selected));
+        else
+        {
+            var branches = BranchesOf(_selected);
+            if (branches.Count > 0) IntegrityItems.Children.Add(BranchesOfBlock(branches));
+        }
+
         foreach (var check in summary.Checks)
             IntegrityItems.Children.Add(IntegrityCheckRow(check));
 

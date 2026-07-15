@@ -47,6 +47,7 @@
                     <ColumnDefinition Width="*" />
                     <ColumnDefinition Width="Auto" />
                     <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="Auto" />
                 </Grid.ColumnDefinitions>
                 <TextBlock
                     Width="14"
@@ -60,6 +61,14 @@
                     TextTrimming="CharacterEllipsis" />
                 <TextBlock
                     Grid.Column="2"
+                    Margin="6,0,0,0"
+                    VerticalAlignment="Center"
+                    FontSize="12"
+                    Foreground="{StaticResource AccentBrush}"
+                    ToolTipService.ToolTip="★ template · ⑂ branch"
+                    Text="{Binding ListMarks}" />
+                <TextBlock
+                    Grid.Column="3"
                     Margin="8,0,0,0"
                     VerticalAlignment="Center"
                     FontSize="10"
@@ -67,7 +76,7 @@
                     Foreground="{StaticResource TextMutedBrush}"
                     Text="{Binding ToolShort}" />
                 <TextBlock
-                    Grid.Column="3"
+                    Grid.Column="4"
                     Margin="8,0,0,0"
                     VerticalAlignment="Center"
                     Foreground="{StaticResource TextMutedBrush}"

@@ -3326,6 +3326,7 @@ public sealed partial class ArchiveService
             incoming.BranchOfId = existing.BranchOfId;
         if (string.IsNullOrWhiteSpace(incoming.BranchedAt) && !string.IsNullOrWhiteSpace(existing.BranchedAt))
             incoming.BranchedAt = existing.BranchedAt;
+        if (existing.IsTemplate) incoming.IsTemplate = true;
     }
 
     private Dictionary<string, ArchiveSession> FindSourcePathRekeys(IEnumerable<ArchiveSession> incoming)

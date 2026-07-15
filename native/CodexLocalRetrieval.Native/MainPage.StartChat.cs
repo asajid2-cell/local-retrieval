@@ -94,7 +94,39 @@ public sealed partial class MainPage
         }
         tool.SelectionChanged += (_, _) => UpdateToolMode();
 
+        // Start FROM a template: pick a curated chat and the new chat begins with its full context (a
+        // branch of it). Tool + folder then come from the template, so those fields are disabled.
+        var templates = _archive.Templates();
+        var templatePicker = new ComboBox { MinWidth = 320 };
+        templatePicker.Items.Add(new ComboBoxItem { Content = "(none — start a blank chat)", Tag = null });
+        foreach (var t in templates)
+            templatePicker.Items.Add(new ComboBoxItem { Content = t.DisplayTitle, Tag = t });
+        templatePicker.SelectedIndex = 0;
+        ArchiveSession? SelectedTemplate() => (templatePicker.SelectedItem as ComboBoxItem)?.Tag as ArchiveSession;
+        var templateNote = new TextBlock
+        {
+            Text = "Tool and folder come from the template.",
+            Foreground = MutedBrush(),
+            FontSize = 12,
+            Visibility = Visibility.Collapsed
+        };
+        void UpdateTemplateMode()
+        {
+            var usingTemplate = SelectedTemplate() is not null;
+            tool.IsEnabled = !usingTemplate;
+            location.IsEnabled = !usingTemplate;
+            newFolder.IsEnabled = !usingTemplate;
+            browse.IsEnabled = !usingTemplate;
+            templateNote.Visibility = usingTemplate ? Visibility.Visible : Visibility.Collapsed;
+        }
+        templatePicker.SelectionChanged += (_, _) => UpdateTemplateMode();
+
         var panel = new StackPanel { Spacing = 14, MinWidth = 500 };
+        if (templates.Count > 0)
+        {
+            panel.Children.Add(Labeled("Start from template", templatePicker));
+            panel.Children.Add(templateNote);
+        }
         panel.Children.Add(Labeled("Tool", tool));
         panel.Children.Add(Labeled("Working folder", locationRow));
         panel.Children.Add(Labeled("New subfolder", newFolder));
@@ -111,6 +143,17 @@ public sealed partial class MainPage
             XamlRoot = XamlRoot
         };
         if (await dialog.ShowAsync() != ContentDialogResult.Primary) return;
+
+        // From a template: spawn a branch that carries the template's context, apply this chat's name /
+        // phrase / collection, and resume it — tool + folder are inherited, so the rest of the flow is skipped.
+        var chosenTemplate = SelectedTemplate();
+        if (chosenTemplate is not null)
+        {
+            var templateCollection = (collection.Text ?? collection.SelectedItem as string ?? "").Trim();
+            if (templateCollection == "(no collection)") templateCollection = "";
+            await StartFromTemplateAsync(chosenTemplate, chatName.Text, phrase.Text, templateCollection, (deck.SelectedItem as Deck)?.Id);
+            return;
+        }
 
         var toolKey = (tool.SelectedItem as string) switch { "Codex" => "codex", "Shell only" => "shell", _ => "claude" };
         var baseDir = string.IsNullOrWhiteSpace(location.Text) ? home : location.Text.Trim();
