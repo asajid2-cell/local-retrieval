@@ -32,6 +32,7 @@ const HL_KEY = process.env.HL_INTERNAL_KEY || '';
 const HL_COOKIE = process.env.HLAUTH_COOKIE || 'hl_session';
 const HL_LOGIN = (process.env.HLAUTH_PUBLIC_BASE || 'https://harmonizerlabs.cc') + '/auth/login';
 const _authCache = new Map();
+const AUTH_CACHE_MAX = 5000;   // bound the cache so a flood of distinct cookies can't grow memory unbounded (still caches negatives to avoid hammering hl-auth)
 function cookieVal(req, name) {
   const m = (req.headers.cookie || '').match(new RegExp('(?:^|;\\s*)' + name + '=([^;]+)'));
   return m ? decodeURIComponent(m[1]) : null;
@@ -44,6 +45,10 @@ async function isOwner(token) {
     const r = await fetch(HLAUTH_BASE + '/internal/verify', { headers: { 'x-internal-key': HL_KEY, 'x-session-token': token } });
     const j = await r.json();
     const owner = !!(j.authenticated && j.user && j.user.isOwner);
+    if (_authCache.size >= AUTH_CACHE_MAX) {   // evict oldest (Map preserves insertion order) before inserting
+      const oldest = _authCache.keys().next().value;
+      if (oldest !== undefined) _authCache.delete(oldest);
+    }
     _authCache.set(token, { exp: Date.now() + 60000, owner });
     return owner;
   } catch { return false; }
@@ -54,6 +59,16 @@ function isTrustedLocal(req) {
   // which sets X-Forwarded-For, so it can never spoof this.
   const ra = req.socket.remoteAddress || '';
   return !req.headers['x-forwarded-for'] && (ra === '127.0.0.1' || ra === '::1' || ra === '::ffff:127.0.0.1');
+}
+// Cross-Site WebSocket Hijacking guard for /ws: WebSocket upgrades are NOT covered by CORS and the
+// browser auto-attaches the hl_session cookie, so a browser upgrade must present an allowlisted Origin.
+// A missing Origin is a non-browser client (tests/tools) — allowed only from trusted loopback.
+const ALLOWED_WS_ORIGINS = (process.env.ALLOWED_WS_ORIGINS || 'https://harmonizerlabs.cc')
+  .split(',').map(s => s.trim()).filter(Boolean);
+function wsOriginOk(req) {
+  const origin = req.headers.origin;
+  if (!origin) return isTrustedLocal(req);
+  return ALLOWED_WS_ORIGINS.includes(origin);
 }
 app.use(async (req, res, next) => {
   if (isTrustedLocal(req)) return next();
@@ -735,6 +750,7 @@ function normalizedAllChatsForCurrentRunning() {
   }));
 }
 app.post('/api/projects', (req, res) => {
+  if (!isTrustedLocal(req)) return res.status(403).json({ error: 'forbidden' });   // bridge (loopback) only — feeds the double-writer safety gate
   const b = req.body || {};
   const now = Date.now();
   _projects = {
@@ -1129,7 +1145,12 @@ const wss = new WebSocketServer({ noServer: true });
 const wssHost = new WebSocketServer({ noServer: true });
 server.on('upgrade', (req, socket, head) => {
   const p = (req.url || '').split('?')[0];
-  if (p === '/ws') wss.handleUpgrade(req, socket, head, ws => wss.emit('connection', ws, req));
+  if (p === '/ws') {
+    // Reject cross-site WebSocket hijacking BEFORE the handshake — a foreign/absent-from-remote Origin
+    // never gets a 101, so a hostile page in the owner's browser can't open a credentialed terminal socket.
+    if (!wsOriginOk(req)) { try { socket.destroy(); } catch {} return; }
+    wss.handleUpgrade(req, socket, head, ws => wss.emit('connection', ws, req));
+  }
   else if (p === '/host') {
     // reject a bad /host token BEFORE completing the handshake (constant-time) — no 101, no 'open'
     let ok = false; try { ok = hostTokenOk(new URL(req.url, 'http://x').searchParams.get('token')); } catch {}
