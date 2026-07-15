@@ -165,6 +165,68 @@ public class StashSkillTests
         finally { Directory.Delete(dir, true); }
     }
 
+    [TestMethod]
+    public void NormalizeAgentOp_MapsInfoAndTemplateAliases()
+    {
+        Assert.AreEqual("info", ArchiveService.NormalizeAgentOp("info"));
+        Assert.AreEqual("info", ArchiveService.NormalizeAgentOp("whoami"));
+        Assert.AreEqual("template", ArchiveService.NormalizeAgentOp("template"));
+        Assert.AreEqual("template", ArchiveService.NormalizeAgentOp("maketemplate"));
+    }
+
+    [TestMethod]
+    public async Task Stash_WithTemplateFlag_MarksCurrentChatAsTemplate()
+    {
+        var (svc, id, dir) = SeededService();
+        try
+        {
+            var res = await svc.ApplyAgentCommandAsync(new AgentCommand
+            { op = "stash", id = id, tool = "claude", collection = "Corpus", template = true });
+            Assert.IsTrue(res.Ok, res.Message);
+            Assert.IsTrue(svc.Store.Sessions[id].IsTemplate, "the template flag was applied");
+            Assert.IsTrue(svc.Templates().Any(t => t.Id == id), "it shows up in Templates()");
+            StringAssert.Contains(res.Message, "templates");
+        }
+        finally { Directory.Delete(dir, true); }
+    }
+
+    [TestMethod]
+    public async Task TemplateOp_TogglesAndReportsNoOp()
+    {
+        var (svc, id, dir) = SeededService();
+        try
+        {
+            var on = await svc.ApplyAgentCommandAsync(new AgentCommand { op = "template", id = id, tool = "claude" });
+            Assert.IsTrue(on.Ok);
+            Assert.IsTrue(svc.Store.Sessions[id].IsTemplate);
+
+            var off = await svc.ApplyAgentCommandAsync(new AgentCommand { op = "template", id = id, tool = "claude", template = false });
+            Assert.IsTrue(off.Ok);
+            Assert.IsFalse(svc.Store.Sessions[id].IsTemplate);
+        }
+        finally { Directory.Delete(dir, true); }
+    }
+
+    [TestMethod]
+    public async Task InfoOp_ReportsNameCollectionsPhrasesTemplate()
+    {
+        var (svc, id, dir) = SeededService();
+        try
+        {
+            await svc.ApplyAgentCommandAsync(new AgentCommand
+            { op = "stash", id = id, tool = "claude", name = "Context primer", collection = "Corpus", phrase = "mux", template = true });
+
+            var res = await svc.ApplyAgentCommandAsync(new AgentCommand { op = "info", id = id, tool = "claude" });
+            Assert.IsTrue(res.Ok, res.Message);
+            StringAssert.Contains(res.Message, "Context primer");
+            StringAssert.Contains(res.Message, "Corpus");
+            StringAssert.Contains(res.Message, "mux");
+            StringAssert.Contains(res.Message, "template: yes");
+            StringAssert.Contains(res.Message, id);
+        }
+        finally { Directory.Delete(dir, true); }
+    }
+
     private static (ArchiveService svc, string id, string dir) SeededService()
     {
         var dir = Path.Combine(Path.GetTempPath(), "clr-stash-" + Guid.NewGuid().ToString("N"));

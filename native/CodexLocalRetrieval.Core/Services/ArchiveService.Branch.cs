@@ -76,6 +76,31 @@ public sealed partial class ArchiveService
         ReapplyList();
     }
 
+    // Human-readable one-liner of how a chat is filed — used by the agent "info" op so a chat can check
+    // its own name, collections, phrases, template/branch status from the /stashme skill.
+    internal string DescribeSession(ArchiveSession s)
+    {
+        var cols = Store.Collections.Values
+            .Where(c => c.SessionIds.Contains(s.Id))
+            .Select(c => c.Name)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        var phrases = s.SpecialPhrases.Where(p => !string.IsNullOrWhiteSpace(p)).ToList();
+        var parent = s.IsBranch
+            ? (Store.Sessions.TryGetValue(s.BranchOfId, out var p) ? $"\"{p.DisplayTitle}\"" : s.BranchOfId)
+            : "no";
+        var branchCount = Store.Sessions.Values.Count(x =>
+            !x.Archived && string.Equals(x.BranchOfId, s.Id, StringComparison.OrdinalIgnoreCase));
+        return $"Chat \"{s.DisplayTitle}\" [{s.Tool}]"
+             + $" · native name: {(string.IsNullOrWhiteSpace(s.Title) ? "(none)" : $"\"{s.Title}\"")}"
+             + $" · collections: {(cols.Count == 0 ? "none" : string.Join(", ", cols))}"
+             + $" · phrases: {(phrases.Count == 0 ? "none" : string.Join(", ", phrases))}"
+             + $" · template: {(s.IsTemplate ? "yes" : "no")}"
+             + $" · branch of: {parent}"
+             + (branchCount > 0 ? $" · branches: {branchCount}" : "")
+             + $" · id: {s.Id}";
+    }
+
     // The chats the user curated as templates, newest-updated first.
     public IReadOnlyList<ArchiveSession> Templates() =>
         Store.Sessions.Values

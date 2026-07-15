@@ -557,6 +557,7 @@ public sealed class AgentCommand
     public int pid { get; set; }                    // tomux: the caller's host agent pid, for a reliable local kill
     public string? phrase { get; set; }             // stash: a searchable codename ("special phrase") to file this chat under
     public string? collection { get; set; }         // stash: the collection name (alias of project)
+    public bool? template { get; set; }             // stash: also mark this chat as a reusable template (Start-chat picker)
 }
 
 public sealed record AgentCommandResult(

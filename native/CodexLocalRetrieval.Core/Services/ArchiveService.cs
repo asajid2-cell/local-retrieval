@@ -1874,6 +1874,12 @@ public sealed partial class ArchiveService
                 var phrase = (cmd.phrase ?? "").Trim();
                 if (phrase.Length > 0 && AddSpecialPhrase(s, phrase)) did.Add($"codename \"{phrase}\"");
 
+                if (cmd.template == true)
+                {
+                    if (!s.IsTemplate) { s.IsTemplate = true; did.Add("added to templates"); }
+                    else did.Add("already a template");
+                }
+
                 // Deck: resolve, or CREATE it if a brand-new name was given (ResolveDeckId alone silently
                 // falls back to Main for an unknown name — /stashme should make the deck the user asked for).
                 string? deckId = null, deckDisplay = null;
@@ -1908,6 +1914,29 @@ public sealed partial class ArchiveService
                 await SaveAsync();
                 ReapplyList();
                 return new AgentCommandResult(true, $"Stashed \"{s.DisplayTitle}\": {string.Join("; ", did)}.", inputId, s.Id, proj, persisted);
+            }
+
+            case "info":
+            {
+                // Read back everything the app knows about THIS chat (name, native title, collections,
+                // phrases, template/branch status) so a chat can check how it's filed.
+                var s = await ResolveOrIndexTargetAsync(cmd);
+                var inputId = ExplicitId(cmd);
+                if (s is null) return new AgentCommandResult(false, ResolveFailureHelp("info"), inputId);
+                return new AgentCommandResult(true, DescribeSession(s), inputId, s.Id);
+            }
+
+            case "template":
+            {
+                // Mark (or with template:false, unmark) THIS chat as a reusable template.
+                var s = await ResolveOrIndexTargetAsync(cmd);
+                var inputId = ExplicitId(cmd);
+                if (s is null) return new AgentCommandResult(false, ResolveFailureHelp("template"), inputId);
+                var want = cmd.template ?? true;
+                if (s.IsTemplate == want)
+                    return new AgentCommandResult(true, $"\"{s.DisplayTitle}\" is {(want ? "already" : "not")} a template.", inputId, s.Id, Persisted: false);
+                await SetTemplateAsync(s, want);
+                return new AgentCommandResult(true, want ? $"Added \"{s.DisplayTitle}\" to templates." : $"Removed \"{s.DisplayTitle}\" from templates.", inputId, s.Id, Persisted: true);
             }
 
             default:
@@ -1976,6 +2005,8 @@ public sealed partial class ArchiveService
         {
             "addtoproject" or "addtocollection" or "addselftoproject" or "addselftocollection" => "addselftoproject",
             "stash" or "stashme" or "stashself" => "stash",
+            "info" or "get" or "status" or "whoami" or "check" or "whereami" => "info",
+            "template" or "totemplate" or "totemplates" or "addtemplate" or "maketemplate" => "template",
             "setname" or "name" or "label" or "setlabel" => "rename",
             "handoff" or "agentcontext" or "brainhandoff" or "context" => "handoff",
             "tomux" or "tomultiplex" or "to-mux" or "to_mux" or "muxhandoff" or "movetomux" => "tomux",
