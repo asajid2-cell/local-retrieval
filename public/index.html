@@ -955,7 +955,7 @@ function reloadTerminal(quiet){
   connect(name, true);   // re-attach: CLEAR + scrollback replay + live, all client state reset
 }
 document.addEventListener('keydown', e=>{ if(e.ctrlKey && e.altKey && (e.key==='r'||e.key==='R')){ e.preventDefault(); e.stopPropagation(); reloadTerminal(); } }, true);
-window.__muxBuild='2026-07-07-scrollfix';   // bump per web deploy so a loaded version is verifiable
+window.__muxBuild='2026-07-15-wheelscroll';   // bump per web deploy so a loaded version is verifiable
 try{ console.info('multiplex build', window.__muxBuild); }catch(e){}
 const helper = $('#term').querySelector('.xterm-helper-textarea');
 function hardenHelperTextarea(){
@@ -1433,7 +1433,12 @@ function stripMouseReports(s){
   if(!s || s.indexOf('\x1b') < 0) return s;
   return s
     .replace(/\x1b\[M[\s\S]{3}/g, '')      // X10 mouse: ESC [ M + 3 raw bytes
-    .replace(/\x1b\[<[0-9;]*[Mm]/g, '')    // SGR mouse (1006): ESC [ < b;x;y M/m
+    // SGR mouse (1006): ESC [ < Cb ; x ; y M/m. Strip the motion/drag/click flood, but KEEP wheel reports
+    // (Cb bit 6 = 64: up=64, down=65, +modifiers). A full-screen TUI on the ALT buffer (codex/claude) has
+    // no scrollback of its own, so the wheel report is the ONLY way it scrolls its transcript — dropping it
+    // is what made "can't scroll" on those sessions. Wheel is discrete + low-volume, so it never causes the
+    // per-move flood this guard exists to stop.
+    .replace(/\x1b\[<([0-9]+);[0-9]+;[0-9]+[Mm]/g, (m, cb) => ((+cb) & 64) ? m : '')
     .replace(/\x1b\[[0-9;]+M/g, '');        // urxvt/legacy (1015): ESC [ b;x;y M  (the [555;79;1M flood)
 }
 term.onData(d => {
