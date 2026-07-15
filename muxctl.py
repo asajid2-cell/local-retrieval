@@ -398,9 +398,10 @@ async def do_attach(name, create=False):
                         data = bytes(raw)
                         if first_binary:
                             first_binary = False
-                            if LOCAL_SCROLLBACK > 0 and len(data) > LOCAL_SCROLLBACK:
-                                data = data[-LOCAL_SCROLLBACK:]
-                            elif LOCAL_SCROLLBACK == 0:
+                            # Do NOT tail-truncate: muxd already bounds the replay server-side, and its FRONT
+                            # carries the mode prefix (alt-screen enter etc.). Cutting the front stripped the
+                            # prefix and started the screen mid-escape -> corrupted/black local attach.
+                            if LOCAL_SCROLLBACK == 0:
                                 data = b""
                         if data:
                             outq.put(data)
@@ -421,7 +422,12 @@ async def do_attach(name, create=False):
         await stop.wait()
         for task in tasks: task.cancel()
     restore_console()
-    sys.stdout.write("\r\n[muxctl] detached\r\n")
+    code = getattr(ws, "close_code", None)
+    reason = (getattr(ws, "close_reason", "") or "").strip()
+    if code and code != 1000:
+        sys.stdout.write("\r\n[muxctl] detached (code %s%s)\r\n" % (code, ": " + reason if reason else ""))
+    else:
+        sys.stdout.write("\r\n[muxctl] detached\r\n")
 
 def main():
     a = sys.argv[1:]

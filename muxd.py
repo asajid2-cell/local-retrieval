@@ -1216,7 +1216,7 @@ class RelayOutQueue(asyncio.Queue):
         super().put_nowait(item)
         return True
 
-LOCAL_VIEWER_QUEUE_MAX = 4
+LOCAL_VIEWER_QUEUE_MAX = 64          # ~768ms of link/loop-lag tolerance (was 4 = ~48ms -> spurious detaches)
 LOCAL_VIEWER_SLOW = object()
 
 def fanout_local_output(session, data):
@@ -1224,13 +1224,46 @@ def fanout_local_output(session, data):
         try:
             local_queue.put_nowait(data)
         except asyncio.QueueFull:
-            session.local.discard(local_queue)
+            # A brief lag must NOT detach a local terminal (that was the "[muxctl] detached" bug). Drop the
+            # OLDEST chunk to make room, keep the viewer, and nudge a full repaint so the momentary gap heals.
             try:
-                while True:
-                    local_queue.get_nowait()
+                local_queue.get_nowait()
             except asyncio.QueueEmpty:
                 pass
-            local_queue.put_nowait(LOCAL_VIEWER_SLOW)
+            try:
+                local_queue.put_nowait(data)
+            except asyncio.QueueFull:
+                pass
+            try:
+                redraw_nudge(session)
+            except Exception:
+                pass
+
+def redraw_nudge(session):
+    """Force a full repaint from a full-screen TUI by wiggling the PTY size (SIGWINCH) — alt-screen only,
+    rate-limited. The running TUI is the authoritative screen model, so this GUARANTEES a newly-attached or
+    resynced viewer sees a complete screen instead of a mid-stream diff fragment (the black-with-a-sliver
+    class). Input-free; the net size is unchanged."""
+    try:
+        modes = getattr(getattr(session, "replay_state", None), "private_modes", None)
+        if not modes or not (modes & {47, 1047, 1049}):
+            return
+    except Exception:
+        return
+    now = time.time()
+    if now - getattr(session, "_last_nudge", 0.0) < 1.0:
+        return
+    pty = getattr(session, "pty", None)
+    if pty is None or not hasattr(pty, "setwinsize"):
+        return
+    session._last_nudge = now
+    rows = max(2, int(getattr(session, "rows", 40)))
+    cols = max(2, int(getattr(session, "cols", 140)))
+    try:
+        pty.setwinsize(max(1, rows - 1), cols)
+        pty.setwinsize(rows, cols)
+    except Exception:
+        pass
 
 class AsyncRLock:
     def __init__(self):
@@ -3591,6 +3624,8 @@ async def main():
                             None, lambda: s.scrollback(sb_limit)
                         )
                         await ws.send(scrollback)
+                        # Guarantee a full frame for an alt-screen TUI attached locally.
+                        await asyncio.get_running_loop().run_in_executor(None, redraw_nudge, s)
                     async def pump():
                         while True:
                             data = await lq.get()
@@ -3786,6 +3821,9 @@ async def main():
                                     "rid": scrollback_request_id,
                                     "d": encoded,
                                 }))
+                                # Byte replay can't rebuild a full-screen TUI on its own; nudge the app to
+                                # emit an authoritative full frame right after the replay.
+                                await asyncio.get_running_loop().run_in_executor(None, redraw_nudge, session)
                             elif t == "rename" and name in sessions:
                                 to = strict_mux_name(m.get("to", ""))
                                 if to and to not in sessions:

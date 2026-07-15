@@ -267,7 +267,7 @@ class MuxdStateTests(unittest.TestCase):
         self.assertEqual(muxd.RING_CAP, owner.ring_len)
         self.assertEqual(b"b" * muxd.RING_CAP, owner.scrollback(muxd.RING_CAP))
 
-    def test_slow_local_viewer_queue_is_bounded_and_disconnected(self):
+    def test_slow_local_viewer_drops_oldest_and_keeps_viewer(self):
         session = FakeSession()
         local_queue = asyncio.Queue(maxsize=1)
         local_queue.put_nowait(b"old")
@@ -275,8 +275,10 @@ class MuxdStateTests(unittest.TestCase):
 
         muxd.fanout_local_output(session, b"new")
 
-        self.assertNotIn(local_queue, session.local)
-        self.assertIs(muxd.LOCAL_VIEWER_SLOW, local_queue.get_nowait())
+        # A brief lag must NOT detach the viewer (that was the spurious "[muxctl] detached"): it stays
+        # attached, the OLDEST chunk is dropped to make room, and the newest is delivered.
+        self.assertIn(local_queue, session.local)
+        self.assertEqual(b"new", local_queue.get_nowait())
 
     def test_supervised_background_task_is_retained_and_restarted(self):
         async def exercise():
