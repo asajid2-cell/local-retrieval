@@ -126,7 +126,7 @@
   /* "pan" = the shared window is wider than this screen: let the user drag horizontally.
      Vertical history belongs to xterm's scrollback, never to a browser wrapper scrollbar. */
   #term.pan { overflow-x:auto; overflow-y:hidden; touch-action:pan-x; }
-  #term.pan .xterm, #term.pan .xterm-viewport, #term.pan .xterm-screen { width:max-content !important; }
+  #term.pan .xterm { width:max-content !important; min-width:100%; }
   /* When the shared terminal is taller than the visible phone pane, scroll the host to the live rows.
      Do not transform .xterm itself; stale transforms can clip the renderer into a mostly black viewport. */
   #term.rowpan { overflow-y:auto; overscroll-behavior:contain; touch-action:pan-x pan-y; }
@@ -715,7 +715,8 @@ function setMobileView(view, persist=true){
     b.setAttribute('aria-pressed', on?'true':'false');
   });
   if(isMobile() && view!=='sessions'){
-    setTimeout(()=>{ applyViewport(); try{ term.focus(); }catch(e){} }, 60);
+    scheduleViewportFit(0);
+    setTimeout(()=>{ try{ term.focus(); }catch(e){} }, 60);
   }
 }
 function syncMobileView(){
@@ -725,7 +726,7 @@ function syncMobileView(){
   else {
     MOBILE_VIEWS.forEach(v=>app.classList.remove('mobile-view-'+v));
     document.querySelectorAll('[data-mobile-view]').forEach(b=>{ b.classList.remove('active'); b.setAttribute('aria-pressed','false'); });
-    setTimeout(applyViewport, 60);
+    scheduleViewportFit(0);
   }
 }
 function initMobileViews(){
@@ -877,8 +878,10 @@ let termWriteStartedAt = 0;   // when the in-flight term.write began — a wedge
 function clearTermWriteQueue(){
   termWriteEpoch++;
   termWriteQueue = [];
-  termWriting = false;
-  termWriteStartedAt = 0;
+  if(terminalWriteActive===0){
+    termWriting = false;
+    termWriteStartedAt = 0;
+  }
 }
 function enqueueTermWrite(bytes){
   const src = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
@@ -903,6 +906,10 @@ function pumpTermWrite(){
       terminalWriteActive = Math.max(0, terminalWriteActive-1);
       termWriting = false;
       termWriteStartedAt = 0;
+      if(item.epoch !== termWriteEpoch){
+        if(termWriteQueue.length) setTimeout(pumpTermWrite, 0);
+        return;
+      }
       restoreTermViewport(scrollState, scrollSerial);
       schedulePaintHeal(20);
       if(termWriteQueue.length) setTimeout(pumpTermWrite, 0);
@@ -1131,7 +1138,7 @@ let wasRowOverflow=false;
 function alignTerminalSurface(){
   const host=$('#term'), xt=host.querySelector('.xterm');
   if(!xt) return;
-  const rowOverflow = !!(isMobile() && winSize && viewportFit && winSize.rows > viewportFit.rows+1);
+  const rowOverflow = !!(winSize && viewportFit && winSize.rows > viewportFit.rows+1);
   host.classList.toggle('rowpan', rowOverflow);
   if(!rowOverflow){
     xt.style.transform='';
@@ -1184,17 +1191,68 @@ function updateSizeBtn(){ const b=$('#sizebtn'); if(!b) return;
 }
 
 // Measure (don't apply) what our screen can show, report it as 'v'; the server's 'd' drives term size.
-function doFit(){
-  let dim=null; try{ dim=fit.proposeDimensions(); }catch(e){}
-  if(dim && dim.cols && dim.rows){ viewportFit={cols:dim.cols, rows:dim.rows}; if(ws && ws.readyState===1 && current) send('v', JSON.stringify({cols:dim.cols, rows:dim.rows, vis:document.visibilityState==='visible', act:actFlag()})); }
-  applyPan(); updateMeta();
-}
-let viewportTimer=0;
+// Measurements are accepted only after the terminal is visible and the same geometry survives two frames.
+// This prevents display:none mobile views and half-laid-out tab switches from shrinking the shared PTY.
+let viewportTimer=0, layoutRaf=0, layoutGeneration=0;
+let pendingViewportKey='', pendingViewportCount=0, lastViewportReport='', lastViewportReportSocket=null;
 let _lastViewportResizeAt=0;
-function applyViewport(){ _lastViewportResizeAt=Date.now(); const vv=window.visualViewport; if(vv) $('#app').style.height = vv.height+'px'; preserveTermViewport(doFit); }
-function scheduleViewportFit(delay=80){ if(viewportTimer) clearTimeout(viewportTimer); viewportTimer=setTimeout(()=>{ viewportTimer=0; applyViewport(); }, delay); }
+function terminalSurfaceVisible(){
+  const host=$('#term');
+  if(!host || !host.isConnected || host.offsetParent===null) return false;
+  const cs=getComputedStyle(host), r=host.getBoundingClientRect();
+  return cs.display!=='none' && cs.visibility!=='hidden' && r.width>=120 && r.height>=80;
+}
+function reportViewport(dim){
+  viewportFit={cols:dim.cols, rows:dim.rows};
+  const key=dim.cols+'x'+dim.rows;
+  if(ws && ws.readyState===1 && current && (lastViewportReport!==key || lastViewportReportSocket!==ws)){
+    lastViewportReport=key;
+    lastViewportReportSocket=ws;
+    send('v', JSON.stringify({
+      cols:dim.cols, rows:dim.rows,
+      vis:document.visibilityState==='visible' && terminalSurfaceVisible(),
+      act:actFlag()
+    }));
+  }
+  applyPan();
+  updateMeta();
+}
+function runViewportMeasure(generation){
+  if(generation!==layoutGeneration || !terminalSurfaceVisible()) return;
+  let dim=null; try{ dim=fit.proposeDimensions(); }catch(e){}
+  if(!dim || dim.cols<10 || dim.rows<3) return;
+  const key=dim.cols+'x'+dim.rows;
+  if(key!==pendingViewportKey){
+    pendingViewportKey=key;
+    pendingViewportCount=1;
+    scheduleViewportFit(0);
+    return;
+  }
+  pendingViewportCount++;
+  if(pendingViewportCount<2){ scheduleViewportFit(0); return; }
+  reportViewport({cols:dim.cols, rows:dim.rows});
+}
+function scheduleViewportFit(delay=80){
+  if(viewportTimer) clearTimeout(viewportTimer);
+  viewportTimer=setTimeout(()=>{
+    viewportTimer=0;
+    const generation=++layoutGeneration;
+    if(layoutRaf) cancelAnimationFrame(layoutRaf);
+    layoutRaf=requestAnimationFrame(()=>requestAnimationFrame(()=>{
+      layoutRaf=0;
+      runViewportMeasure(generation);
+    }));
+  }, Math.max(0, delay));
+}
+function doFit(){ scheduleViewportFit(0); }
+function applyViewport(){
+  _lastViewportResizeAt=Date.now();
+  const vv=window.visualViewport;
+  if(vv && vv.height>0) $('#app').style.height = vv.height+'px';
+  scheduleViewportFit(0);
+}
 if (window.visualViewport){ visualViewport.addEventListener('resize', ()=>scheduleViewportFit(isMobile()?140:40)); }
-new ResizeObserver(()=>preserveTermViewport(doFit)).observe($('#term'));
+new ResizeObserver(()=>scheduleViewportFit(0)).observe($('#term'));
 window.addEventListener('orientationchange', ()=>setTimeout(applyViewport,250));
 
 // ---- touch: drag to scroll terminal HISTORY (vertical) and PAN the wider-than-screen view (horizontal).
@@ -1238,6 +1296,7 @@ window.addEventListener('orientationchange', ()=>setTimeout(applyViewport,250));
 // event; only in the ALTERNATE buffer (full-screen TUI with no scrollback) do we forward the wheel so the
 // app scrolls its own view.
 $('#term').addEventListener('wheel', e=>{
+  if(!e.isTrusted) return;   // synthetic forwarding must reach xterm, not recurse through this capture handler
   if(!(e.deltaX || e.deltaY)) return;
   noteUserScroll();
   const host=$('#term'), xt=host.querySelector('.xterm');
@@ -1251,6 +1310,7 @@ $('#term').addEventListener('wheel', e=>{
     return;
   }
   // Alternate buffer: hand the wheel to the app so it scrolls its own transcript.
+  if(xt && xt.contains(e.target)) return;   // xterm will handle the original trusted event itself
   const target=(xt && !xt.contains(e.target)) ? (host.querySelector('.xterm-viewport')||xt) : (host.querySelector('.xterm-viewport'));
   if(!target) return;
   try{
@@ -1457,44 +1517,62 @@ function scheduleReconnect(name){
   reconnectTimer = setTimeout(()=>{ if(current===name) connect(name, true); }, reconnectDelay);
   reconnectDelay = Math.min(10000, reconnectDelay*1.7);
 }
+let attachGeneration=0;
+function afterTerminalParserDrain(generation, callback){
+  let done=false;
+  const finish=()=>{
+    if(done) return;
+    done=true;
+    if(generation===attachGeneration) callback();
+  };
+  try{ term.write('', finish); }catch(e){ finish(); }
+  setTimeout(finish, 2500);
+}
 function connect(name, isRetry){
   clearReconnect();
   const blocker = attachBlocker(findSession(name));
   if(blocker){ stopAttach(name, blocker); return; }
+  const generation=++attachGeneration;
   intentional = true;
   if (ws) { try{ ws.onclose=null; ws.close(); }catch(e){} ws=null; }
   intentional = false;
   current = name; LS.set('mux_last', name); markRead(name);
   $('#empty').style.display='none';
-  if (!isRetry) term.reset();
-  resetTerminalSurface();
   clearTermWriteQueue();
   autoFreeze=false; _frozenBuf=[];   // never carry a frozen selection across a session switch
   resetTaDelta(true);                // start the mobile input-delta buffer fresh on a session switch
   newLines=0; showJump();
-  const proto = location.protocol==='https:'?'wss:':'ws:';
   setStatus('busy', `connecting to <span class="name">${esc(name)}</span>&hellip;`);
-  doFit();
-  // per-socket token: a stale socket from a rapid switch/reconnect must never write or set status
-  const sock = ws = new WebSocket(`${proto}//${location.host}${base}/ws?session=${encodeURIComponent(name)}&cols=${(viewportFit&&viewportFit.cols)||term.cols}&rows=${(viewportFit&&viewportFit.rows)||term.rows}&dev=${encodeURIComponent(deviceId)}&label=${encodeURIComponent(deviceLabel)}`);
-  sock.binaryType='arraybuffer';
-  const fresh = ()=> ws===sock && current===name;
-  sock.onopen = () => { if(!fresh()) return; reconnectDelay=1000; setStatus('live', `<span class="name">${esc(name)}</span> &middot; live`); doFit(); term.focus(); };
-  sock.onmessage = e => { if(!fresh()) return;
-    if(typeof e.data==='string'){ onControl(e.data); return; }     // control frame: shared window size
-    if(isFrozen()){ _frozenBuf.push(new Uint8Array(e.data)); if(_frozenBuf.length>6000) _frozenBuf.splice(0, _frozenBuf.length-6000); return; }   // FROZEN for selection: buffer output; a repaint would wipe the highlight
-    const wasBottom=atBottom(); enqueueTermWrite(new Uint8Array(e.data)); markReadLive();
-    if(!wasBottom){ newLines += 1; showJump(); } };
-  sock.onclose = ev => {
-    if(ws===sock && current===name && !intentional){
-      const refused = closeRefusal(ev);
-      if(refused){ stopAttach(name, refused); return; }
-      scheduleReconnect(name);
-    }
-  };
-  sock.onerror = () => {};
   renderTabs();
   if(isMobile()) setMobileView('terminal');
+  scheduleViewportFit(0);
+  // Drain any already-submitted xterm parser work before resetting for the new tab. A stale callback from
+  // the previous session can no longer repaint or restore its viewport after this attachment begins.
+  afterTerminalParserDrain(generation, ()=>{
+    if (!isRetry) term.reset();
+    resetTerminalSurface();
+    lastViewportReport='';
+    lastViewportReportSocket=null;
+    scheduleViewportFit(0);
+    const proto = location.protocol==='https:'?'wss:':'ws:';
+    const sock = ws = new WebSocket(`${proto}//${location.host}${base}/ws?session=${encodeURIComponent(name)}&cols=${(viewportFit&&viewportFit.cols)||term.cols}&rows=${(viewportFit&&viewportFit.rows)||term.rows}&dev=${encodeURIComponent(deviceId)}&label=${encodeURIComponent(deviceLabel)}`);
+    sock.binaryType='arraybuffer';
+    const fresh = ()=> generation===attachGeneration && ws===sock && current===name;
+    sock.onopen = () => { if(!fresh()) return; reconnectDelay=1000; setStatus('live', `<span class="name">${esc(name)}</span> &middot; live`); scheduleViewportFit(0); term.focus(); };
+    sock.onmessage = e => { if(!fresh()) return;
+      if(typeof e.data==='string'){ onControl(e.data); return; }     // control frame: shared window size
+      if(isFrozen()){ _frozenBuf.push(new Uint8Array(e.data)); if(_frozenBuf.length>6000) _frozenBuf.splice(0, _frozenBuf.length-6000); return; }   // FROZEN for selection: buffer output; a repaint would wipe the highlight
+      const wasBottom=atBottom(); enqueueTermWrite(new Uint8Array(e.data)); markReadLive();
+      if(!wasBottom){ newLines += 1; showJump(); } };
+    sock.onclose = ev => {
+      if(fresh() && !intentional){
+        const refused = closeRefusal(ev);
+        if(refused){ stopAttach(name, refused); return; }
+        scheduleReconnect(name);
+      }
+    };
+    sock.onerror = () => {};
+  });
 }
 document.addEventListener('visibilitychange', ()=>{ if(document.visibilityState==='visible' && current && (!ws || ws.readyState>1)){ reconnectDelay=1000; connect(current, true); } });
 // activity heartbeat so the server's auto-size only weighs RECENTLY-ACTIVE devices (a backgrounded tab
@@ -2445,9 +2523,14 @@ initMobileViews();
 applyViewport();
 loadSessions(new URLSearchParams(location.search).get('s') || undefined);
 setInterval(()=>{ if(document.visibilityState==='visible') loadSessions(); }, 4000);
-document.addEventListener('visibilitychange', ()=>{ if(document.visibilityState==='visible') schedulePaintHeal(80); });
-window.addEventListener('focus', ()=>schedulePaintHeal(80));
-window.addEventListener('pageshow', ()=>schedulePaintHeal(80));
+document.addEventListener('visibilitychange', ()=>{
+  if(document.visibilityState==='visible'){
+    scheduleViewportFit(0);
+    schedulePaintHeal(80);
+  }
+});
+window.addEventListener('focus', ()=>{ scheduleViewportFit(0); schedulePaintHeal(80); });
+window.addEventListener('pageshow', ()=>{ scheduleViewportFit(0); schedulePaintHeal(80); });
 
 // ---- system health dot (P0 observability): polls /api/health → green ok / amber degraded / red down ----
 async function pollHealth(){

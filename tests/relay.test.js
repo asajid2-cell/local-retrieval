@@ -381,7 +381,7 @@ test('POST /api/sessions/:name/relaunch refuses sessions with no saved command',
   await host.assertNo(m => m.t === 'create' && m.s === 'plaincase', 'plain shell should not relaunch without a command');
 });
 
-test('POST /api/sessions/:name/relaunch stops matching local copy before starting muxd', async t => {
+test('POST /api/sessions/:name/relaunch refuses a matching local owner', async t => {
   const h = new RelayHarness();
   await h.start();
   t.after(async () => h.stop());
@@ -392,26 +392,20 @@ test('POST /api/sessions/:name/relaunch stops matching local copy before startin
     decks: [],
     collections: [{ id: 'c1', name: 'Work', chats: [{ id: 'sid1', title: 'Takeover', muxName: 'takeover', muxCommand: cmd }] }],
     runningSessions: [{ sessionId: 'sid1', pid: 1234 }],
+    runningVerified: true,
     host: 'FAKEPC',
   });
 
-  const post = h.request('POST', '/api/sessions/takeover/relaunch', { command: cmd });
-  const pending = await waitFor(async () => {
-    const cmds = await h.json('GET', '/api/app-commands');
-    return cmds.find(c => c.type === 'kill' && c.sessionId === 'sid1') || null;
-  }, 'queued local kill');
-  await h.json('POST', `/api/app-commands/${pending.id}/ack`, { ok: true });
-
-  const create = await host.waitFor(m => m.t === 'create' && m.s === 'takeover', 'create takeover');
-  assert.equal(create.cmd, cmd);
-  assert.equal(create.relaunch, true);
-  host.sendSessions([commandSession('takeover', cmd, 9000)]);
-  const res = await post;
-  assert.equal(res.status, 200);
-  assert.equal(res.body.stoppedLocal, true);
+  const res = await h.request('POST', '/api/sessions/takeover/relaunch', { command: cmd });
+  assert.equal(res.status, 409);
+  assert.match(res.body.error, /local copy is already running/i);
+  assert.match(res.body.detail, /pid 1234/);
+  await host.assertNo(
+    m => m.t === 'create' && m.s === 'takeover',
+    'a remote relaunch must not start while a local owner is verified');
 });
 
-test('POST /api/sessions/:name/relaunch stops local copy matched through allChats', async t => {
+test('POST /api/sessions/:name/relaunch refuses a local owner matched through allChats', async t => {
   const h = new RelayHarness();
   await h.start();
   t.after(async () => h.stop());
@@ -423,23 +417,17 @@ test('POST /api/sessions/:name/relaunch stops local copy matched through allChat
     collections: [],
     allChats: [{ id: 'sid-all', title: 'All Chat Takeover', muxName: 'allchat-takeover', muxCommand: cmd }],
     runningSessions: [{ sessionId: 'sid-all', pid: 4321 }],
+    runningVerified: true,
     host: 'FAKEPC',
   });
 
-  const post = h.request('POST', '/api/sessions/allchat-takeover/relaunch', { command: cmd });
-  const pending = await waitFor(async () => {
-    const cmds = await h.json('GET', '/api/app-commands');
-    return cmds.find(c => c.type === 'kill' && c.sessionId === 'sid-all') || null;
-  }, 'queued allChats local kill');
-  await h.json('POST', `/api/app-commands/${pending.id}/ack`, { ok: true });
-
-  const create = await host.waitFor(m => m.t === 'create' && m.s === 'allchat-takeover', 'create allchat-takeover');
-  assert.equal(create.cmd, cmd);
-  assert.equal(create.relaunch, true);
-  host.sendSessions([commandSession('allchat-takeover', cmd, 9000)]);
-  const res = await post;
-  assert.equal(res.status, 200);
-  assert.equal(res.body.stoppedLocal, true);
+  const res = await h.request('POST', '/api/sessions/allchat-takeover/relaunch', { command: cmd });
+  assert.equal(res.status, 409);
+  assert.match(res.body.error, /local copy is already running/i);
+  assert.match(res.body.detail, /pid 4321/);
+  await host.assertNo(
+    m => m.t === 'create' && m.s === 'allchat-takeover',
+    'allChats identity must also block a duplicate remote writer');
 });
 
 test('unknown websocket tab creates PC-local shell, bridges scrollback, input, and output', async t => {
