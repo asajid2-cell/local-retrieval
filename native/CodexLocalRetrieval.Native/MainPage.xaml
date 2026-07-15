@@ -146,6 +146,12 @@
                 </StackPanel>
 
                 <StackPanel Grid.Row="2" Spacing="8">
+                    <Button Click="StartChat_Click" Style="{StaticResource PrimaryPillButtonStyle}">
+                        <StackPanel Orientation="Horizontal" Spacing="10">
+                            <FontIcon FontFamily="Segoe Fluent Icons" FontSize="15" Foreground="Black" Glyph="&#xE710;" />
+                            <TextBlock Text="Start chat" />
+                        </StackPanel>
+                    </Button>
                     <Button x:Name="ArchiveButton" Click="Nav_Click" Style="{StaticResource PrimaryPillButtonStyle}" Tag="Archive">
                         <StackPanel Orientation="Horizontal" Spacing="10">
                             <SymbolIcon Symbol="Library" />
@@ -180,6 +186,12 @@
                         <StackPanel Orientation="Horizontal" Spacing="10">
                             <SymbolIcon Symbol="Play" />
                             <TextBlock Text="Running" />
+                        </StackPanel>
+                    </Button>
+                    <Button Click="Nav_Click" Style="{StaticResource PillButtonStyle}" Tag="Phrases">
+                        <StackPanel Orientation="Horizontal" Spacing="10">
+                            <FontIcon FontFamily="Segoe Fluent Icons" FontSize="15" Glyph="&#xE8EC;" />
+                            <TextBlock Text="Phrases" />
                         </StackPanel>
                     </Button>
                     <Button Click="Nav_Click" Style="{StaticResource PillButtonStyle}" Tag="Custody">

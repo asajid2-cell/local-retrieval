@@ -100,6 +100,59 @@ public class SessionLaunchClaimTests
     }
 
     [TestMethod]
+    public void TryClearAbandonedClaim_RefusesLiveUnexpiredOwner()
+    {
+        using var dir = TempClaimDir();
+        var now = DateTimeOffset.UtcNow;
+        Assert.IsTrue(SessionLaunchClaims.TryAcquire(
+            "session-live-owner", null, "test", out var claim, out var detail, _ => false, Options(dir.Path, now)), detail);
+        claim!.RetainUntilExpiry();
+        claim.Dispose();
+        var info = SessionLaunchClaims.ReadClaimsForSession(
+            "session-live-owner", options: Options(dir.Path, now)).Single();
+
+        Assert.IsFalse(SessionLaunchClaims.TryClearAbandonedClaim(info, out var clearDetail, now, _ => true));
+        StringAssert.Contains(clearDetail, "still owned");
+        Assert.IsTrue(File.Exists(info.Path));
+    }
+
+    [TestMethod]
+    public void TryClearAbandonedClaim_ClearsOwnerlessUnexpiredClaim()
+    {
+        using var dir = TempClaimDir();
+        var now = DateTimeOffset.UtcNow;
+        Assert.IsTrue(SessionLaunchClaims.TryAcquire(
+            "session-dead-owner", null, "test", out var claim, out var detail, _ => false, Options(dir.Path, now)), detail);
+        claim!.RetainUntilExpiry();
+        claim.Dispose();
+        var info = SessionLaunchClaims.ReadClaimsForSession(
+            "session-dead-owner", options: Options(dir.Path, now)).Single();
+
+        Assert.IsTrue(SessionLaunchClaims.TryClearAbandonedClaim(info, out _, now, _ => false));
+        Assert.IsFalse(File.Exists(info.Path));
+    }
+
+    [TestMethod]
+    public void TryClearAbandonedClaim_DoesNotDeleteReplacedClaim()
+    {
+        using var dir = TempClaimDir();
+        var now = DateTimeOffset.UtcNow;
+        Assert.IsTrue(SessionLaunchClaims.TryAcquire(
+            "session-replaced", null, "old", out var claim, out var detail, _ => false, Options(dir.Path, now)), detail);
+        claim!.RetainUntilExpiry();
+        claim.Dispose();
+        var reviewed = SessionLaunchClaims.ReadClaimsForSession(
+            "session-replaced", options: Options(dir.Path, now)).Single();
+        File.WriteAllText(reviewed.Path,
+            $$"""{"SessionId":"session-replaced","CandidateIds":["session-replaced"],"OwnerPid":99999,"OwnerProcess":"new-owner","CreatedUtc":"{{now.AddSeconds(1):O}}","ExpiresUtc":"{{now.AddMinutes(5):O}}","Reason":"new"}""");
+
+        Assert.IsFalse(SessionLaunchClaims.TryClearAbandonedClaim(reviewed, out var clearDetail, now, _ => false));
+        StringAssert.Contains(clearDetail, "changed during cleanup");
+        Assert.IsTrue(File.Exists(reviewed.Path));
+        StringAssert.Contains(File.ReadAllText(reviewed.Path), "new-owner");
+    }
+
+    [TestMethod]
     public void TryAcquire_OnlyOneConcurrentCallerWins()
     {
         using var dir = TempClaimDir();

@@ -175,8 +175,29 @@ public sealed partial class MainPage
         {
             var dlg = new ContentDialog { Title = $"Kill \"{Trim(m.Name, 40)}\"?", Content = "Ends the session and stops its agent.", PrimaryButtonText = "Kill", CloseButtonText = "Cancel", DefaultButton = ContentDialogButton.Close, XamlRoot = XamlRoot };
             if (await dlg.ShowAsync() != ContentDialogResult.Primary) return;
-            await RunSshAsync(target, $"curl -s -X DELETE http://127.0.0.1:{port}/api/sessions/{m.Name}");
-            SyncStatus.Text = $"Killed \"{m.Name}\".";
+            var response = await RunSshAsync(
+                target,
+                $"curl -sS -f -X DELETE http://127.0.0.1:{port}/api/sessions/{Uri.EscapeDataString(m.Name)}");
+            if (response.code != 0)
+            {
+                SyncStatus.Text = $"Could not kill \"{m.Name}\"; relay request failed (exit {response.code}).";
+                return;
+            }
+            try
+            {
+                using var doc = JsonDocument.Parse(response.outText);
+                if (!doc.RootElement.TryGetProperty("ok", out var ok) || !ok.GetBoolean())
+                {
+                    SyncStatus.Text = $"Could not verify that \"{m.Name}\" stopped.";
+                    return;
+                }
+            }
+            catch (Exception ex)
+            {
+                SyncStatus.Text = $"Could not verify that \"{m.Name}\" stopped: {ex.Message}";
+                return;
+            }
+            SyncStatus.Text = $"Stopped \"{m.Name}\"; process exit verified by muxd.";
             RenderRunningPage();
         }));
         Grid.SetColumn(actions, 1);
@@ -219,8 +240,13 @@ public sealed partial class MainPage
         {
             var dlg = new ContentDialog { Title = $"Kill {r.Tool} (pid {r.Pid})?", Content = "Ends that running agent on this PC.", PrimaryButtonText = "Kill", CloseButtonText = "Cancel", DefaultButton = ContentDialogButton.Close, XamlRoot = XamlRoot };
             if (await dlg.ShowAsync() != ContentDialogResult.Primary) return;
-            TryKillChat(r.Pid);
-            SyncStatus.Text = $"Killed pid {r.Pid}.";
+            var killed = await Task.Run(() =>
+                CodexLocalRetrieval.Core.Remote.RunningSessions.Kill(r.SessionId, r.Pid));
+            SyncStatus.Text = killed.ok
+                ? $"Stopped pid {r.Pid}; exit verified."
+                : $"Could not stop pid {r.Pid}: {killed.detail}";
+            if (!killed.ok) return;
+            InvalidateRunningCache();
             RenderRunningPage();
         }));
         Grid.SetColumn(actions, 1);

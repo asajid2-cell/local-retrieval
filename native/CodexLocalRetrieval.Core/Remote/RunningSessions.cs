@@ -496,13 +496,21 @@ public static class RunningSessions
 
     // Kill the live agent for a session id (preferred) or an explicit pid — but ONLY if it resolves to one
     // of OUR scanned claude/codex processes (never an arbitrary pid).
-    public static (bool ok, string detail) Kill(string? sessionId, int pid)
+    public static (bool ok, string detail) Kill(string? sessionId, int pid, string? expectedStartedUtc = null)
     {
         var sessions = Scan();
-        var match = (!string.IsNullOrEmpty(sessionId)
-                        ? sessions.FirstOrDefault(s => string.Equals(s.SessionId, sessionId, StringComparison.OrdinalIgnoreCase))
-                        : null)
-                    ?? (pid > 0 ? sessions.FirstOrDefault(s => s.Pid == pid) : null);
+        // A session id is not unique while a duplicate launch exists. When the caller supplies the
+        // clicked row's pid, that exact process is the target and the session id is only a consistency
+        // check. Never fall back to a sibling process that happens to resume the same chat.
+        var match = pid > 0
+            ? sessions.FirstOrDefault(s =>
+                s.Pid == pid
+                && (string.IsNullOrEmpty(sessionId)
+                    || string.Equals(s.SessionId, sessionId, StringComparison.OrdinalIgnoreCase)))
+            : (!string.IsNullOrEmpty(sessionId)
+                ? sessions.FirstOrDefault(s =>
+                    string.Equals(s.SessionId, sessionId, StringComparison.OrdinalIgnoreCase))
+                : null);
         // No live match. "Already gone" is the desired end state — but only report it when we can CONFIRM
         // the process is dead, otherwise a transient/failed WMI scan (which returns an empty list) would
         // false-success EVERY kill. Verify the pid directly; if it's still alive, say so (don't claim gone).
@@ -516,12 +524,79 @@ public static class RunningSessions
             // session-id only: trust "gone" only if the scan actually returned data (so an empty scan ≠ success)
             return sessions.Count > 0 ? (true, "already gone") : (false, "couldn't verify — process scan returned nothing");
         }
+        if (!string.IsNullOrWhiteSpace(expectedStartedUtc)
+            && !string.Equals(match.StartedAt, expectedStartedUtc, StringComparison.Ordinal))
+            return (false, "process identity changed before stop; refusing to kill a reused pid");
         try
         {
-            Process.GetProcessById(match.Pid).Kill(entireProcessTree: true);
-            return (true, $"killed {match.Tool} pid {match.Pid}");
+            var processTree = SnapshotProcessTree(match.Pid);
+            using var process = Process.GetProcessById(match.Pid);
+            if (!string.IsNullOrWhiteSpace(expectedStartedUtc)
+                && DateTimeOffset.TryParse(expectedStartedUtc, out var expectedStart))
+            {
+                DateTimeOffset actualStart;
+                try { actualStart = process.StartTime.ToUniversalTime(); }
+                catch (Exception ex) { return (false, "couldn't revalidate process start time: " + ex.Message); }
+                if (Math.Abs((actualStart - expectedStart).TotalSeconds) > 1)
+                    return (false, "process identity changed before stop; refusing to kill a reused pid");
+            }
+            process.Kill(entireProcessTree: true);
+            if (!process.WaitForExit(12_000))
+                return (false, $"kill requested, but {match.Tool} pid {match.Pid} did not exit");
+            var deadline = DateTime.UtcNow.AddSeconds(12);
+            while (DateTime.UtcNow < deadline)
+            {
+                var alive = processTree.Where(IsProcessAlive).ToArray();
+                if (alive.Length == 0)
+                    return (true, $"killed {match.Tool} pid {match.Pid}; captured process-tree exit verified");
+                Thread.Sleep(50);
+            }
+            var remaining = processTree.Where(IsProcessAlive).OrderBy(value => value).ToArray();
+            return (false, $"kill requested, but process-tree pids are still alive: {string.Join(", ", remaining)}");
         }
         catch (ArgumentException) { return (true, "already gone"); }   // raced out between scan and kill
         catch (Exception ex) { return (false, $"kill failed: {ex.Message}"); }
+    }
+
+    private static HashSet<int> SnapshotProcessTree(int rootPid)
+    {
+        var children = new Dictionary<int, List<int>>();
+        using var searcher = new ManagementObjectSearcher(
+            new ManagementScope(@"\\.\root\cimv2"),
+            new ObjectQuery("SELECT ProcessId, ParentProcessId FROM Win32_Process"),
+            BoundedWmiOptions);
+        foreach (ManagementObject mo in searcher.Get())
+        {
+            var child = Convert.ToInt32(mo["ProcessId"]);
+            var parent = Convert.ToInt32(mo["ParentProcessId"]);
+            if (!children.TryGetValue(parent, out var list))
+                children[parent] = list = new List<int>();
+            list.Add(child);
+        }
+
+        var tree = new HashSet<int> { rootPid };
+        var pending = new Stack<int>();
+        pending.Push(rootPid);
+        while (pending.Count > 0)
+        {
+            var parent = pending.Pop();
+            if (!children.TryGetValue(parent, out var direct)) continue;
+            foreach (var child in direct)
+                if (tree.Add(child)) pending.Push(child);
+        }
+        return tree;
+    }
+
+    private static bool IsProcessAlive(int pid)
+    {
+        try
+        {
+            using var process = Process.GetProcessById(pid);
+            return !process.HasExited;
+        }
+        catch (ArgumentException)
+        {
+            return false;
+        }
     }
 }

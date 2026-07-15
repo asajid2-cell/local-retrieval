@@ -24,7 +24,8 @@ public sealed record SessionIntegrityClaim(
     string OwnerProcess,
     string ExpiresAt,
     string Reason,
-    bool Expired);
+    bool Expired,
+    string Path);
 
 public sealed record SessionIntegritySummary
 {
@@ -76,7 +77,7 @@ public static class SessionIntegrity
 
         var claimOptions = new SessionLaunchClaims.Options(options.ClaimRootDirectory, Now: now);
         var claims = SessionLaunchClaims.ReadClaimsForSession(session.Id, session.Aliases, claimOptions)
-            .Select(c => new SessionIntegrityClaim(c.SessionId, c.CandidateIds, c.OwnerPid, c.OwnerProcess, c.ExpiresUtc.ToString("O"), c.Reason, c.IsExpired(now)))
+            .Select(c => new SessionIntegrityClaim(c.SessionId, c.CandidateIds, c.OwnerPid, c.OwnerProcess, c.ExpiresUtc.ToString("O"), c.Reason, c.IsExpired(now), c.Path))
             .ToList();
         var activeClaims = claims.Where(c => !c.Expired).ToList();
         if (activeClaims.Count > 0)

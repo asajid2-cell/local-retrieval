@@ -51,6 +51,8 @@ public sealed partial class MainPage
         SetRiskySessionActionsEnabled(!string.Equals(summary.Severity, "danger", StringComparison.OrdinalIgnoreCase));
 
         IntegrityItems.Children.Add(IntegrityHeadline(summary.Severity, summary.Headline));
+        if (CanSafelyUnblock(summary))
+            IntegrityItems.Children.Add(IntegrityUnblockButton());
         IntegrityItems.Children.Add(IntegrityMeta(summary));
 
         foreach (var check in summary.Checks)
@@ -71,6 +73,103 @@ public sealed partial class MainPage
         if (summary.RecentEvents.Count > 0)
             IntegrityItems.Children.Add(IntegrityEvidenceBlock("Recent events", summary.RecentEvents.Take(4).Select(e =>
                 $"{e.Kind}: {Trim(e.Summary, 92)}")));
+    }
+
+    private bool CanSafelyUnblock(SessionIntegritySummary summary)
+    {
+        var dangerNames = summary.Checks.Where(c => c.Severity == "danger").Select(c => c.Name).ToList();
+        if (dangerNames.Count == 0 || dangerNames.Any(name => name is not ("Live owner" or "Launch claim")))
+            return false;
+        var exactClaim = SessionLaunchClaims.ReadClaimsForSession(summary.SessionId).Count > 0;
+        var exactOwner = RunningSessions.TryScan(out var running, out _)
+                         && running.Any(r => string.Equals(r.SessionId, summary.SessionId, StringComparison.OrdinalIgnoreCase));
+        return exactClaim || exactOwner;
+    }
+
+    private Button IntegrityUnblockButton()
+    {
+        var button = new Button
+        {
+            Content = "Unblock safely",
+            HorizontalAlignment = HorizontalAlignment.Stretch,
+            Style = (Style)Resources["PrimaryPillButtonStyle"]
+        };
+        ToolTipService.SetToolTip(button, "Stop verified owners, clear abandoned launch claims, then rerun every integrity check");
+        button.Click += async (_, _) => await UnblockSelectedSessionAsync();
+        return button;
+    }
+
+    private async Task UnblockSelectedSessionAsync()
+    {
+        if (_selected is null) return;
+        var session = _selected;
+        var dialog = new ContentDialog
+        {
+            Title = "Unblock this chat?",
+            Content = new TextBlock
+            {
+                Text = "The app will stop only verified Claude/Codex owners for this chat, clear only expired or ownerless launch claims, then verify the chat again. It will not report success while any blocker remains.",
+                TextWrapping = TextWrapping.Wrap,
+                MaxWidth = 460
+            },
+            PrimaryButtonText = "Stop and verify",
+            CloseButtonText = "Cancel",
+            DefaultButton = ContentDialogButton.Close,
+            XamlRoot = XamlRoot
+        };
+        if (await dialog.ShowAsync() != ContentDialogResult.Primary) return;
+
+        if (!RunningSessions.TryScan(out var running, out var scanDetail))
+        {
+            SyncStatus.Text = "Unblock stopped: " + scanDetail;
+            RenderIntegrity(force: true);
+            return;
+        }
+
+        foreach (var owner in running.Where(r =>
+                     string.Equals(r.SessionId, session.Id, StringComparison.OrdinalIgnoreCase)))
+        {
+            var killed = RunningSessions.Kill(session.Id, owner.Pid, owner.StartedAt);
+            if (!killed.ok)
+            {
+                SyncStatus.Text = $"Unblock stopped at pid {owner.Pid}: {killed.detail}";
+                RenderIntegrity(force: true);
+                return;
+            }
+        }
+
+        if (!RunningSessions.TryAllLiveSessionIds(out var afterKill, out var verifyDetail))
+        {
+            SyncStatus.Text = "Unblock could not verify owner exit: " + verifyDetail;
+            RenderIntegrity(force: true);
+            return;
+        }
+        if (afterKill.Contains(session.Id))
+        {
+            SyncStatus.Text = "Unblock stopped: a verified owner is still running.";
+            RenderIntegrity(force: true);
+            return;
+        }
+
+        var claims = SessionLaunchClaims.ReadClaimsForSession(session.Id);
+        foreach (var claim in claims)
+        {
+            Func<int, bool>? ownerAlive = claim.OwnerPid == Environment.ProcessId ? _ => false : null;
+            if (!SessionLaunchClaims.TryClearAbandonedClaim(claim, out var claimDetail, isProcessAlive: ownerAlive))
+            {
+                SyncStatus.Text = "Unblock stopped: " + claimDetail;
+                RenderIntegrity(force: true);
+                return;
+            }
+        }
+
+        await SyncNowAsync(initial: false);
+        RenderIntegrity(force: true);
+        if (_integritySummary is not null
+            && !string.Equals(_integritySummary.Severity, "danger", StringComparison.OrdinalIgnoreCase))
+            SyncStatus.Text = "Chat ownership is clean and verified.";
+        else
+            SyncStatus.Text = "Cleanup finished, but another integrity blocker remains. Nothing was relaunched.";
     }
 
     private bool RiskySessionActionBlocked()

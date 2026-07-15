@@ -135,10 +135,15 @@ public sealed partial class MainPage
     private (bool ok, string detail) KillRunningSession(string? sessionId, int pid)
     {
         var sessions = GetRunningSessions();
-        var match = (!string.IsNullOrEmpty(sessionId)
-                        ? sessions.FirstOrDefault(s => string.Equals(s.SessionId, sessionId, StringComparison.OrdinalIgnoreCase))
-                        : null)
-                    ?? (pid > 0 ? sessions.FirstOrDefault(s => s.Pid == pid) : null);
+        var match = pid > 0
+            ? sessions.FirstOrDefault(s =>
+                s.Pid == pid
+                && (string.IsNullOrEmpty(sessionId)
+                    || string.Equals(s.SessionId, sessionId, StringComparison.OrdinalIgnoreCase)))
+            : (!string.IsNullOrEmpty(sessionId)
+                ? sessions.FirstOrDefault(s =>
+                    string.Equals(s.SessionId, sessionId, StringComparison.OrdinalIgnoreCase))
+                : null);
         // No live match. Report "already gone" ONLY when confirmable — a failed/empty WMI scan would
         // otherwise false-success every kill. Verify the pid directly; if alive, don't claim it's gone.
         if (match is null)

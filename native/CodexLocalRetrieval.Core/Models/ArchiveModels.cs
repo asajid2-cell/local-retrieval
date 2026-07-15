@@ -96,6 +96,9 @@ public sealed class MuxTabRecord
 // tool + working directory + creation time). See ArchiveService.ReconcilePendingNewChats.
 public sealed class PendingNewChat
 {
+    [JsonPropertyName("intentId")]
+    public string IntentId { get; set; } = "";
+
     [JsonPropertyName("cwd")]
     public string Cwd { get; set; } = "";          // the ORIGINAL launch cwd (used to find the tool's project folder)
 
@@ -104,6 +107,12 @@ public sealed class PendingNewChat
 
     [JsonPropertyName("collectionId")]
     public string CollectionId { get; set; } = "";
+
+    [JsonPropertyName("customTitle")]
+    public string CustomTitle { get; set; } = "";
+
+    [JsonPropertyName("specialPhrase")]
+    public string SpecialPhrase { get; set; } = "";
 
     [JsonPropertyName("createdAt")]
     public string CreatedAt { get; set; } = "";    // ISO-8601 UTC, when "Start chat" was launched

@@ -204,6 +204,67 @@ public static class SessionLaunchClaims
         return claims;
     }
 
+    public static bool TryClearAbandonedClaim(
+        LaunchClaimInfo claim,
+        out string detail,
+        DateTimeOffset? now = null,
+        Func<int, bool>? isProcessAlive = null)
+    {
+        detail = "";
+        if (claim is null || string.IsNullOrWhiteSpace(claim.Path))
+        {
+            detail = "launch claim path is missing";
+            return false;
+        }
+
+        var current = now ?? DateTimeOffset.UtcNow;
+        var expired = claim.IsExpired(current);
+        var ownerAlive = claim.OwnerPid > 0 && (isProcessAlive ?? IsProcessAlive)(claim.OwnerPid);
+        if (!expired && ownerAlive)
+        {
+            detail = $"launch claim is still owned by {claim.OwnerProcess} pid {claim.OwnerPid}";
+            return false;
+        }
+
+        try
+        {
+            if (!File.Exists(claim.Path))
+            {
+                detail = "already gone";
+                return true;
+            }
+            var quarantine = claim.Path + ".clearing-" + Guid.NewGuid().ToString("N");
+            File.Move(claim.Path, quarantine);
+            var moved = ReadClaimMetadata(quarantine);
+            if (!SameClaim(claim, moved))
+            {
+                try
+                {
+                    if (!File.Exists(claim.Path)) File.Move(quarantine, claim.Path);
+                }
+                catch { }
+                detail = "launch claim changed during cleanup; refusing to delete it";
+                return false;
+            }
+            File.Delete(quarantine);
+            detail = expired ? "expired claim cleared" : "abandoned claim cleared";
+            return true;
+        }
+        catch (Exception ex)
+        {
+            detail = "claim cleanup failed: " + ex.Message;
+            return false;
+        }
+    }
+
+    private static bool SameClaim(LaunchClaimInfo expected, ClaimMetadata? actual)
+        => actual is not null
+           && string.Equals(expected.SessionId, actual.SessionId, StringComparison.Ordinal)
+           && expected.OwnerPid == actual.OwnerPid
+           && expected.CreatedUtc == actual.CreatedUtc
+           && expected.ExpiresUtc == actual.ExpiresUtc
+           && expected.CandidateIds.SequenceEqual(actual.CandidateIds, StringComparer.Ordinal);
+
     private static bool TryCheckAnyLive(
         IReadOnlyList<string> candidateIds,
         Func<string, bool>? isSessionLive,
@@ -331,6 +392,17 @@ public static class SessionLaunchClaims
     {
         try { return Process.GetCurrentProcess().ProcessName; }
         catch { return "unknown"; }
+    }
+
+    private static bool IsProcessAlive(int pid)
+    {
+        try
+        {
+            using var process = Process.GetProcessById(pid);
+            return !process.HasExited;
+        }
+        catch (ArgumentException) { return false; }
+        catch { return true; }
     }
 
     private static void ReleaseHeld(List<HeldClaimFile> held, bool deleteFiles)
