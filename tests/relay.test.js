@@ -443,7 +443,8 @@ test('unknown websocket tab creates PC-local shell, bridges scrollback, input, a
   const ws = new WebSocket(`ws://127.0.0.1:${h.port}/ws?session=webshell&cols=88&rows=22`);
   await once(ws, 'open');
   const create = await host.waitFor(m => m.t === 'create' && m.s === 'webshell', 'create webshell');
-  assert.equal(create.cmd, '');
+  assert.equal(create.cmd, undefined, 'opaque protocol: the relay never sends an executable command to muxd');
+  assert.ok(typeof create.rid === 'string' && create.rid.length > 0, 'create carries a request id');
   assert.equal(create.cols, 88);
   assert.equal(create.rows, 22);
   host.sendSessions([shellSession('webshell')]);
@@ -504,6 +505,32 @@ test('burst output during attach never blanks-and-drops (busy-session regression
   for (let i = 0; i < 10; i++) host.sendOutput('busycase', `BURST_LINE_${String(i).padStart(4, '0')}\r\n`);
   host.sendScrollback('busycase', 'SB\r\n');
   assert.match(await got, /BURST_LINE_0007/);
+  ws.close();
+});
+
+test('active TUI: late scrollback is still delivered after going live (alt-screen black-with-fragment regression)', async t => {
+  // The dominant production case: an ACTIVE alt-screen TUI emits live diffs that take the client live
+  // (timeout/overflow) BEFORE its scrollback arrives. The old code set wentLive and then DROPPED the
+  // late sb, so the client kept a cleared/partial screen forever -- black with one fragment. The sb must
+  // still be delivered (gated by sbDone, not wentLive) so the full screen paints. Also asserts the
+  // go-live path no longer blanks (no CLEAR before the sb).
+  const h = new RelayHarness();
+  await h.start();
+  t.after(async () => h.stop());
+  const host = await h.connectHost([commandSession('activecase', 'codex resume active', Date.now())]);
+  t.after(() => host.close());
+
+  const ws = new WebSocket(`ws://127.0.0.1:${h.port}/ws?session=activecase&cols=80&rows=24`);
+  await once(ws, 'open');
+  await host.waitFor(m => m.t === 'sb' && m.s === 'activecase', 'scrollback request');
+
+  // Live diff arrives first -> queues during sbWait -> the ~40ms timeout takes the client live.
+  host.sendOutput('activecase', 'PARTIAL_DIFF_FRAGMENT\r\n');
+  await sleep(150);
+
+  const painted = waitForWsText(ws, /FULL_SCREEN_MARKER/, 'late sb still paints the full screen after go-live');
+  host.sendScrollback('activecase', 'FULL_SCREEN_MARKER complete screen\r\n');
+  assert.match(await painted, /FULL_SCREEN_MARKER/);   // old code: wentLive -> sb dropped -> black-with-fragment forever
   ws.close();
 });
 

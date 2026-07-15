@@ -1222,13 +1222,13 @@ wssHost.on('connection', (ws, req) => {
         if (!c.hosted || c.ws.readyState !== 1) continue;
         if (c.sbWait) {
           (c.q = c.q || []).push(buf); c.qBytes = (c.qBytes || 0) + buf.length;
-          // Flood while still waiting for scrollback: relieve memory, but NEVER blank-and-drop.
-          // The live stream itself repaints a TUI, so go live now — clear once (a fresh attach
-          // starts clean) and replay what we buffered. wentLive means a late sb is dropped, but
-          // only because real output is already painting the screen (never leaves it black).
+          // Flood while still waiting for scrollback: relieve memory WITHOUT blanking. Go live over
+          // whatever's on screen (an alt-screen TUI emits cursor-addressed diffs, NOT a repaint, so a
+          // CLEAR here just black-screens it). Do NOT set sbDone — the real scrollback still arrives and
+          // delivers as CLEAR+full-replay, which is what actually paints the whole screen.
           if (c.qBytes > 2000000 || c.q.length > 4000) {
             c.sbWait = false; c.wentLive = true;
-            try { c.ws.send(CLEAR_SCREEN); for (const q of c.q) c.ws.send(q); } catch {}
+            try { for (const q of c.q) c.ws.send(q); } catch {}
             c.q = []; c.qBytes = 0;
           }
           continue;
@@ -1239,13 +1239,14 @@ wssHost.on('connection', (ws, req) => {
       const n = SAFE(m.s); const st = sessions.get(n); if (!st) return;
       const buf = Buffer.from(m.d || '', 'base64');
       for (const c of st.clients.values()) {
-        // Deliver the replay unless live output has already painted (wentLive). Crucially this
-        // fires EVEN IF the sbWait timeout already elapsed: the timeout no longer blanks the
-        // screen, so a late sb is the only thing that paints an idle session. Dropping it here
-        // (the old `!c.sbWait` guard) is exactly what left an idle terminal black.
-        if (!c.hosted || c.wentLive) continue;
-        c.sbWait = false; c.wentLive = true;
-        try { c.ws.send(CLEAR_SCREEN); c.ws.send(buf); for (const q of (c.q || [])) c.ws.send(q); } catch {}  // clear → replay → queued-live (A2 #2)
+        // Deliver this client's replay EXACTLY ONCE, gated by sbDone — NOT by wentLive. A client that
+        // already went live over a stale screen (timeout/overflow, or an alt-screen TUI whose diffs
+        // arrived first) still needs its scrollback to actually paint the full screen; dropping it on
+        // wentLive is what left an active TUI black-with-a-fragment. sbDone (not wentLive) also stops a
+        // NEW client's sb from re-clearing already-painted viewers.
+        if (!c.hosted || c.sbDone) continue;
+        c.sbWait = false; c.wentLive = true; c.sbDone = true;
+        try { c.ws.send(CLEAR_SCREEN); c.ws.send(buf); for (const q of (c.q || [])) c.ws.send(q); } catch {}  // clear → full replay → queued-live
         c.q = []; c.qBytes = 0;
       }
     } else if (m.t === 'tailr') { const f = pendingTails.get(m.rid); if (f) { pendingTails.delete(m.rid); f(String(m.text || '')); }
@@ -1385,7 +1386,7 @@ wss.on('connection', async (ws, req) => {
         try { ws.close(1013, hostProtocolDetail()); } catch {}
         return;
       }
-      if (!sendHost({ t: 'create', s: name, cmd: '', cols: vcols, rows: vrows, heal: _healOn.has(name) })) {
+      if (!sendHost({ t: 'create', s: name, rid: crypto.randomUUID(), cols: vcols, rows: vrows, heal: _healOn.has(name) })) {   // opaque create (muxd forbids cmd/ids, requires rid)
         try { ws.close(1013, 'PC mux host offline'); } catch {}
         return;
       }
@@ -1393,23 +1394,23 @@ wss.on('connection', async (ws, req) => {
     }
     const id = 'c' + (++_cid);
     const st = sessionState(name);
-    const client = { id, ws, term: null, hosted: true, vcols, vrows, sbWait: true, wentLive: false, sbTok: ++_cid, q: [], qBytes: 0, deviceId, label, visible: true, lastActive: Date.now(), connAt: Date.now() };
+    const client = { id, ws, term: null, hosted: true, vcols, vrows, sbWait: true, wentLive: false, sbDone: false, sbTok: ++_cid, q: [], qBytes: 0, deviceId, label, visible: true, lastActive: Date.now(), connAt: Date.now() };
     st.clients.set(id, client);
     if (!sendHost({ t: 'sb', s: name, max: HOST_SB_BYTES })) {           // bounded replay; live bytes queue briefly behind it
       st.clients.delete(id);
       try { ws.close(1013, 'PC mux host offline'); } catch {}
       return;
     }
-    // Scrollback slow/large: relieve the wait WITHOUT blanking the screen. If live output was
-    // buffered, flow it now (a TUI repaints). If the session is idle (nothing buffered), leave the
-    // screen as-is and keep waiting — wentLive stays false so the sb reply (or the next live byte)
-    // still paints it. Blanking here and then dropping the late sb was the black-screen bug.
+    // Scrollback slow/large: relieve the wait WITHOUT blanking. Flow buffered diffs over whatever's on
+    // screen; leave an idle session as-is. Do NOT set sbDone or CLEAR — the real sb, whenever it lands,
+    // still delivers as CLEAR+full-replay to paint the whole screen. (Blanking here + dropping the late
+    // sb was the dominant black-with-a-fragment bug for active alt-screen TUIs.)
     setTimeout(() => {
       if (!client.sbWait) return;
       client.sbWait = false;
       if (client.q && client.q.length) {
         client.wentLive = true;
-        try { ws.send(CLEAR_SCREEN); for (const q of client.q) ws.send(q); } catch {}
+        try { for (const q of client.q) ws.send(q); } catch {}
         client.q = []; client.qBytes = 0;
       }
     }, HOST_SB_WAIT_MS);
