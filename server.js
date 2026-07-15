@@ -377,7 +377,9 @@ app.post('/api/sessions', async (req, res) => {
   const localOwner = await ensureNoLocalOwnerForMuxName(name, cmd);
   if (!localOwner.ok) return failHost(res, 409, 'local copy is already running', localOwner.detail);
   if (!requireHostProtocol(res, 'refusing to start PC-local mux session')) return;
-  if (!sendHost({ t: 'create', s: name, cmd, ids: resumeCandidateIds(name, cmd), cols: 140, rows: 40, heal: _healOn.has(name) })) {
+  // Opaque create: muxd forbids executable commands/ids from the relay (anti-RCE) and resolves the
+  // command from its own manifest (or starts a bare shell). Send only {t,s,rid,cols,rows,heal}.
+  if (!sendHost({ t: 'create', s: name, rid: crypto.randomUUID(), cols: 140, rows: 40, heal: _healOn.has(name) })) {
     return failHost(res, 503, 'PC mux host offline', 'host socket closed before create could be sent');
   }
   markPending(name);
@@ -421,7 +423,9 @@ app.post('/api/sessions/:name/relaunch', async (req, res) => {
   const cols = Number(body.cols) || Number(existing && existing.cols) || 140;
   const rows = Number(body.rows) || Number(existing && existing.rows) || 40;
   markPending(name);
-  if (!sendHost({ t: 'create', s: name, cmd, ids: resumeCandidateIds(name, cmd), cols, rows, heal: _healOn.has(name), relaunch: true })) {
+  // Opaque relaunch: muxd reuses its own saved manifest command for this session; the relay never
+  // sends the executable. Send only {t,s,rid,cols,rows,heal,relaunch}.
+  if (!sendHost({ t: 'create', s: name, rid: crypto.randomUUID(), cols, rows, heal: _healOn.has(name), relaunch: true })) {
     pendingCreates.delete(name);
     return failHost(res, 503, 'PC mux host offline', 'host socket closed before relaunch could be sent');
   }

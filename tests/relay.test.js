@@ -272,7 +272,8 @@ test('POST /api/sessions relaunches shell-only hosted session and waits for muxd
   const cmd = "Write-Output 'REAL_AGENT'";
   const post = h.request('POST', '/api/sessions', { name: 'shellcase', command: cmd });
   const create = await host.waitFor(m => m.t === 'create' && m.s === 'shellcase', 'create shellcase');
-  assert.equal(create.cmd, cmd);
+  assert.equal(create.cmd, undefined, 'opaque protocol: the relay never sends an executable command to muxd');
+  assert.ok(typeof create.rid === 'string' && create.rid.length > 0, 'create carries a request id');
 
   let settled = false;
   post.then(() => { settled = true; });
@@ -317,7 +318,8 @@ test('POST /api/sessions replaces a different command-backed session', async t =
 
   const post = h.request('POST', '/api/sessions', { name: 'diffcase', command: newCmd });
   const create = await host.waitFor(m => m.t === 'create' && m.s === 'diffcase', 'create diffcase');
-  assert.equal(create.cmd, newCmd);
+  assert.equal(create.cmd, undefined, 'opaque protocol: the relay never sends an executable command to muxd');
+  assert.ok(typeof create.rid === 'string' && create.rid.length > 0, 'create carries a request id');
   host.sendSessions([commandSession('diffcase', newCmd, 3000)]);
 
   const res = await post;
@@ -352,8 +354,9 @@ test('POST /api/sessions/:name/relaunch reuses muxd saved command for dormant se
 
   const post = h.request('POST', '/api/sessions/savedcase/relaunch', {});
   const create = await host.waitFor(m => m.t === 'create' && m.s === 'savedcase', 'relaunch savedcase');
-  assert.equal(create.cmd, '');
+  assert.equal(create.cmd, undefined, 'opaque protocol: muxd reuses its own saved command, the relay sends none');
   assert.equal(create.relaunch, true);
+  assert.ok(typeof create.rid === 'string' && create.rid.length > 0, 'relaunch carries a request id');
 
   let settled = false;
   post.then(() => { settled = true; });
