@@ -312,6 +312,9 @@ public sealed class ArchiveService
     {
         foreach (var session in data.Sessions.Values)
             if (session.Text.Length > SearchTextCap) session.Text = session.Text[..SearchTextCap];
+        foreach (var pending in data.PendingNewChats)
+            if (string.IsNullOrWhiteSpace(pending.IntentId))
+                pending.IntentId = Guid.NewGuid().ToString("N");
     }
 
     private string StoreBackupPrefix
@@ -1143,23 +1146,48 @@ public sealed class ArchiveService
         return null;
     }
 
-    // Remember that the next new chat started in `cwd` with `tool` should be filed into `collectionId`.
-    // Reconciled on the next index pass (ReconcilePendingNewChats). No-op if the collection is unknown.
-    public async Task QueuePendingNewChatAsync(string tool, string cwd, string collectionId)
+    // Remember metadata for the next new chat started in `cwd` with `tool`. Only one unresolved launch
+    // per tool+cwd is allowed: two intents observing the same folder snapshot cannot be matched safely.
+    public async Task<string> QueuePendingNewChatAsync(
+        string tool,
+        string cwd,
+        string collectionId = "",
+        string customTitle = "",
+        string specialPhrase = "")
     {
-        if (string.IsNullOrWhiteSpace(cwd) || string.IsNullOrWhiteSpace(collectionId) || !Store.Collections.ContainsKey(collectionId)) return;
-        // Replace any prior pending for the same cwd+collection (a re-launch supersedes).
+        tool = (tool ?? "").Trim().ToLowerInvariant();
+        cwd = (cwd ?? "").Trim();
+        collectionId = (collectionId ?? "").Trim();
+        if (cwd.Length == 0 || (tool != "claude" && tool != "codex")) return "";
+        if (collectionId.Length > 0 && !Store.Collections.ContainsKey(collectionId)) return "";
+        ReconcilePendingNewChats();
+        // Starting again is an explicit user decision to supersede an unresolved launch in this exact
+        // tool+folder. Never let a stale pending intent become a permanent mutex that prevents launching.
         Store.PendingNewChats.RemoveAll(p =>
-            NormalizePath(p.Cwd) == NormalizePath(cwd) && string.Equals(p.CollectionId, collectionId, StringComparison.Ordinal));
+            string.Equals(p.Tool, tool, StringComparison.OrdinalIgnoreCase)
+            && NormalizePath(p.Cwd) == NormalizePath(cwd));
+
+        var intentId = Guid.NewGuid().ToString("N");
         Store.PendingNewChats.Add(new PendingNewChat
         {
+            IntentId = intentId,
             Cwd = cwd,   // keep the ORIGINAL cwd so we can find the Claude project folder (case-encoded)
             Tool = tool,
             CollectionId = collectionId,
+            CustomTitle = CleanTitle(customTitle ?? ""),
+            SpecialPhrase = (specialPhrase ?? "").Trim(),
             CreatedAt = DateTime.UtcNow.ToString("O"),
             KnownIds = ClaudeFolderTranscripts(cwd).Select(t => t.id).ToList()   // snapshot ids already there
         });
         await SaveAsync();
+        return intentId;
+    }
+
+    public async Task CancelPendingNewChatAsync(string intentId)
+    {
+        var removed = Store.PendingNewChats.RemoveAll(p =>
+            string.Equals(p.IntentId, intentId, StringComparison.Ordinal));
+        if (removed > 0) await SaveAsync();
     }
 
     // (id, creation-time) of every Claude transcript currently in the project folder for `cwd`. The folder
@@ -1208,35 +1236,73 @@ public sealed class ArchiveService
         var changed = false;
         foreach (var p in Store.PendingNewChats)
         {
-            DateTimeOffset.TryParse(p.CreatedAt, null, System.Globalization.DateTimeStyles.AdjustToUniversal, out var created);
+            if (!DateTimeOffset.TryParse(p.CreatedAt, null, System.Globalization.DateTimeStyles.AdjustToUniversal, out var created))
+            {
+                keep.Add(p);
+                continue;
+            }
             if (created != default && now - created > TimeSpan.FromHours(24)) { changed = true; continue; }   // expired -> drop
-            if (!Store.Collections.TryGetValue(p.CollectionId, out var collection)) { changed = true; continue; } // collection gone -> drop
+            ArchiveCollection? collection = null;
+            if (!string.IsNullOrWhiteSpace(p.CollectionId)
+                && !Store.Collections.TryGetValue(p.CollectionId, out collection))
+            {
+                changed = true;
+                continue;
+            }
 
             string? newId = null;
             if (string.Equals(p.Tool, "codex", StringComparison.OrdinalIgnoreCase))
             {
-                // Codex has no per-cwd folder; match the earliest codex session in this cwd created after launch.
+                // Codex has no per-cwd folder. Bind only when exactly one candidate exists.
                 var cwdN = NormalizePath(p.Cwd);
-                newId = Store.Sessions.Values
+                var candidates = Store.Sessions.Values
                     .Where(s => string.Equals(s.Tool, "codex", StringComparison.OrdinalIgnoreCase) && NormalizePath(s.Workspace) == cwdN)
-                    .Where(s => { DateTimeOffset.TryParse(s.CreatedAt, out var c); return c == default || c >= created.AddMinutes(-2); })
+                    .Where(s => DateTimeOffset.TryParse(s.CreatedAt, out var c) && c >= created.AddSeconds(-5))
                     .OrderBy(s => s.CreatedAt, StringComparer.Ordinal)
-                    .FirstOrDefault()?.Id;
+                    .Select(s => s.Id)
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .Take(2)
+                    .ToList();
+                if (candidates.Count == 1) newId = candidates[0];
             }
             else
             {
-                // Claude: the new chat = the EARLIEST transcript in the cwd folder that wasn't there at launch.
+                // Claude: bind only when exactly one transcript appeared since the launch snapshot.
                 var known = new HashSet<string>(p.KnownIds ?? new List<string>(), StringComparer.OrdinalIgnoreCase);
-                newId = ClaudeFolderTranscripts(p.Cwd)
+                var candidates = ClaudeFolderTranscripts(p.Cwd)
                     .Where(t => !known.Contains(t.id))
                     .OrderBy(t => t.created)
                     .Select(t => t.id)
-                    .FirstOrDefault();
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .Take(2)
+                    .ToList();
+                if (candidates.Count == 1) newId = candidates[0];
             }
 
             if (!string.IsNullOrEmpty(newId))
             {
-                if (!collection.SessionIds.Contains(newId)) collection.SessionIds.Add(newId);
+                var session = Store.Sessions.Values.FirstOrDefault(s =>
+                    string.Equals(s.Id, newId, StringComparison.OrdinalIgnoreCase)
+                    || s.Aliases.Any(a => string.Equals(a, newId, StringComparison.OrdinalIgnoreCase)));
+                if (session is null)
+                {
+                    if (collection is not null && !collection.SessionIds.Contains(newId))
+                    {
+                        collection.SessionIds.Add(newId);
+                        changed = true;
+                    }
+                    if (!string.IsNullOrWhiteSpace(p.CustomTitle) || !string.IsNullOrWhiteSpace(p.SpecialPhrase))
+                        keep.Add(p);
+                    else
+                        changed = true;
+                    continue;
+                }
+
+                if (collection is not null && !collection.SessionIds.Contains(session.Id))
+                    collection.SessionIds.Add(session.Id);
+                if (!string.IsNullOrWhiteSpace(p.CustomTitle))
+                    session.CustomTitle = CleanTitle(p.CustomTitle);
+                AddSpecialPhrase(session, p.SpecialPhrase);
                 changed = true;   // filed -> drop the pending entry
             }
             else keep.Add(p);     // no new chat yet -> keep waiting (up to 24h)
@@ -1656,6 +1722,27 @@ public sealed class ArchiveService
     public async Task<AgentCommandResult> ApplyAgentCommandAsync(AgentCommand cmd)
     {
         var op = NormalizeAgentOp(cmd.op);
+        var retryOnConflict = op is "init" or "addsource" or "favorite" or "pin"
+            or "addselftoproject" or "rename" or "tag" or "untag" or "stash";
+        for (var attempt = 0; ; attempt++)
+        {
+            try
+            {
+                return await ApplyAgentCommandOnceAsync(cmd);
+            }
+            catch (StoreGenerationConflictException) when (retryOnConflict && attempt == 0)
+            {
+                // Another app process committed first. Reload the authoritative generation and replay
+                // this idempotent metadata command so a transient desktop/server race cannot drop it or
+                // leave the durable inbox cursor permanently stuck on the same stale in-memory store.
+                await LoadAsync();
+            }
+        }
+    }
+
+    private async Task<AgentCommandResult> ApplyAgentCommandOnceAsync(AgentCommand cmd)
+    {
+        var op = NormalizeAgentOp(cmd.op);
         switch (op)
         {
             case "init":
@@ -1835,6 +1922,39 @@ public sealed class ArchiveService
         if (phrase.Length == 0) return false;
         if (s.SpecialPhrases.Any(p => string.Equals(p, phrase, StringComparison.OrdinalIgnoreCase))) return false;
         s.SpecialPhrases.Add(phrase);
+        return true;
+    }
+
+    // Clean a raw phrase list into the canonical set the store holds: trim each, drop blanks, and
+    // case-insensitively dedup while keeping the first spelling. Pure (no side effects) so the edit
+    // dialog and tests can share it.
+    public static List<string> CleanSpecialPhrases(IEnumerable<string>? phrases)
+    {
+        var cleaned = new List<string>();
+        foreach (var raw in phrases ?? Enumerable.Empty<string>())
+        {
+            var p = (raw ?? "").Trim();
+            if (p.Length == 0) continue;
+            if (cleaned.Any(x => string.Equals(x, p, StringComparison.OrdinalIgnoreCase))) continue;
+            cleaned.Add(p);
+        }
+        return cleaned;
+    }
+
+    // Replace a chat's special phrases with an explicit, cleaned list (the edit dialog's save path).
+    // Persists + refreshes the list. Returns true if the set actually changed (order or membership).
+    public async Task<bool> SetSpecialPhrasesAsync(ArchiveSession session, IEnumerable<string> phrases)
+    {
+        if (session is null) return false;
+        var cleaned = CleanSpecialPhrases(phrases);
+        var current = session.SpecialPhrases.ToList();
+        var unchanged = current.Count == cleaned.Count
+            && current.Zip(cleaned, (a, b) => string.Equals(a, b, StringComparison.Ordinal)).All(x => x);
+        if (unchanged) return false;
+        session.SpecialPhrases.Clear();
+        foreach (var p in cleaned) session.SpecialPhrases.Add(p);
+        await SaveAsync();
+        ReapplyList();
         return true;
     }
 

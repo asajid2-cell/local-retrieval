@@ -250,6 +250,9 @@ public sealed partial class MainPage : Page
             case "Collections":
                 RenderCollections();
                 break;
+            case "Phrases":
+                RenderPhrases();
+                break;
             case "Settings":
                 RenderSettings();
                 break;
@@ -1638,6 +1641,11 @@ public sealed partial class MainPage : Page
         renameNative.Click += async (_, _) => await RenameNativeByAsync(session);
         flyout.Items.Add(renameNative);
 
+        var editInfo = new MenuFlyoutItem { Text = "Edit info..." };
+        ToolTipService.SetToolTip(editInfo, "View all of this chat's info and edit its name and special phrases.");
+        editInfo.Click += async (_, _) => await ChatInfoDialogAsync(session);
+        flyout.Items.Add(editInfo);
+
         var pin = new MenuFlyoutItem { Text = session.Pinned ? "Unpin" : "Pin to top" };
         pin.Click += async (_, _) => { await _archive.TogglePinAsync(session); RenderCurrent(); };
         flyout.Items.Add(pin);
@@ -2324,6 +2332,11 @@ public sealed partial class MainPage : Page
         ToolTipService.SetToolTip(renameNativeItem, "View / change the chat's own name in Claude/Codex (shows in their resume list).");
         renameNativeItem.Click += async (_, _) => await RenameNativeByAsync(session);
         flyout.Items.Add(renameNativeItem);
+
+        var editInfoItem = new MenuFlyoutItem { Text = "Edit info..." };
+        ToolTipService.SetToolTip(editInfoItem, "View all of this chat's info and edit its name and special phrases.");
+        editInfoItem.Click += async (_, _) => await ChatInfoDialogAsync(session);
+        flyout.Items.Add(editInfoItem);
 
         var addToCollection = new MenuFlyoutSubItem { Text = "Add to collection" };
         BuildAddToCollectionItems(addToCollection.Items, new[] { session }, () => RenderCurrent());

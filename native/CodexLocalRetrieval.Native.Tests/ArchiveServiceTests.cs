@@ -272,6 +272,46 @@ public sealed class ArchiveServiceTests
         Assert.IsTrue(ArchiveService.IsResumableId("rollout-2026-06-15T22-39-19-019eceba"));
     }
 
+    // Editing a chat's phrases: the cleaner trims, drops blanks, and case-insensitively dedups while
+    // keeping the first spelling and original order.
+    [TestMethod]
+    public void CleanSpecialPhrases_TrimsDropsBlanksAndDedupsCaseInsensitive()
+    {
+        var cleaned = ArchiveService.CleanSpecialPhrases(new[] { " mux ", "MUX", "", "  ", "brain", "Brain", "sol" });
+        CollectionAssert.AreEqual(new[] { "mux", "brain", "sol" }, cleaned);
+        CollectionAssert.AreEqual(new string[0], ArchiveService.CleanSpecialPhrases(null));
+    }
+
+    // The edit dialog's save path replaces the whole set, persists it, and reports whether it changed
+    // (so a no-op edit doesn't churn the store).
+    [TestMethod]
+    public async Task SetSpecialPhrasesAsync_ReplacesPersistsAndDetectsNoOp()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "clr-phrase-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var storePath = Path.Combine(root, "store.json");
+            var svc = new ArchiveService(storePath: storePath);
+            var s = new ArchiveSession { Id = "sess-1" };
+            s.SpecialPhrases.Add("old");
+            svc.Store.Sessions["sess-1"] = s;
+
+            var changed = await svc.SetSpecialPhrasesAsync(s, new[] { "mux", " mux ", "Brain", "" });
+            Assert.IsTrue(changed, "replacing the set must report a change");
+            CollectionAssert.AreEqual(new[] { "mux", "Brain" }, s.SpecialPhrases.ToList());
+
+            var again = await svc.SetSpecialPhrasesAsync(s, new[] { "mux", "Brain" });
+            Assert.IsFalse(again, "re-applying the same cleaned set must be a no-op");
+
+            var onDisk = await File.ReadAllTextAsync(storePath);
+            StringAssert.Contains(onDisk, "mux", "phrase must be persisted to the store");
+            StringAssert.Contains(onDisk, "Brain");
+            Assert.IsFalse(onDisk.Contains("\"old\""), "the replaced phrase must be gone from the store");
+        }
+        finally { try { Directory.Delete(root, true); } catch { } }
+    }
+
     [TestMethod]
     public void TranscriptEnumeration_SkipsInaccessibleAndReparseBranches()
     {
@@ -785,6 +825,7 @@ public sealed class ArchiveServiceTests
             var server = new ArchiveService(storePath: store);
             await desktop.LoadAsync();
             await server.LoadAsync();
+            desktop.Store.Sessions["original"].SpecialPhrases.Add("durable-phrase");
             desktop.Store.Sessions["desktop-change"] = new ArchiveSession
                 { Id = "desktop-change", Tool = "claude", Title = "desktop-change" };
             await desktop.SaveAsync();
@@ -794,7 +835,52 @@ public sealed class ArchiveServiceTests
             var reader = new ArchiveService(storePath: store);
             await reader.LoadAsync();
             Assert.IsTrue(reader.Store.Sessions["original"].Pinned);
+            CollectionAssert.AreEqual(
+                new[] { "durable-phrase" },
+                reader.Store.Sessions["original"].SpecialPhrases.ToArray(),
+                "the server mutation must merge onto the latest generation without erasing desktop metadata");
             Assert.IsTrue(reader.Store.Sessions.ContainsKey("desktop-change"));
+        }
+        finally { Directory.Delete(dir, true); }
+    }
+
+    [TestMethod]
+    public async Task AgentCommand_StashReloadsAndReplaysAfterGenerationConflict()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "clr-agent-generation-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            var store = Path.Combine(dir, "store.json");
+            var seed = new ArchiveService(storePath: store);
+            seed.Store.Sessions["target"] = new ArchiveSession
+                { Id = "target", Tool = "codex", Title = "target" };
+            await seed.SaveAsync();
+
+            var desktop = new ArchiveService(storePath: store);
+            var agentBridge = new ArchiveService(storePath: store);
+            await desktop.LoadAsync();
+            await agentBridge.LoadAsync();
+
+            desktop.Store.Sessions["unrelated"] = new ArchiveSession
+                { Id = "unrelated", Tool = "claude", Title = "unrelated" };
+            await desktop.SaveAsync();
+
+            var result = await agentBridge.ApplyAgentCommandAsync(new AgentCommand
+            {
+                op = "stash",
+                id = "target",
+                tool = "codex",
+                phrase = "orchid"
+            });
+
+            Assert.IsTrue(result.Ok);
+            var reader = new ArchiveService(storePath: store);
+            await reader.LoadAsync();
+            Assert.IsTrue(reader.Store.Sessions.ContainsKey("unrelated"));
+            CollectionAssert.AreEqual(
+                new[] { "orchid" },
+                reader.Store.Sessions["target"].SpecialPhrases.ToArray());
         }
         finally { Directory.Delete(dir, true); }
     }
@@ -1895,11 +1981,13 @@ public sealed class ArchiveServiceTests
         try
         {
             var col = await svc.CreateCollectionAsync("Codex Proj");
-            await svc.QueuePendingNewChatAsync("codex", cwd, col.Id);
+            await svc.QueuePendingNewChatAsync("codex", cwd, col.Id, "Named before launch", "orchid");
             var fresh = new ArchiveSession { Id = "cx-1", Tool = "codex", Workspace = cwd, CreatedAt = DateTime.UtcNow.ToString("O") };
             await svc.MergeScanAsync(new DiskScan(new List<ArchiveSession> { fresh }, new List<ArchiveSession>()), refreshList: false);
 
             Assert.IsTrue(svc.Store.Collections[col.Id].SessionIds.Contains("cx-1"), "codex new chat filed by cwd");
+            Assert.AreEqual("Named before launch", svc.Store.Sessions["cx-1"].CustomTitle);
+            CollectionAssert.AreEqual(new[] { "orchid" }, svc.Store.Sessions["cx-1"].SpecialPhrases.ToArray());
             Assert.AreEqual(0, svc.Store.PendingNewChats.Count, "pending consumed");
         }
         finally { if (File.Exists(store)) File.Delete(store); }
@@ -1957,6 +2045,80 @@ public sealed class ArchiveServiceTests
             Assert.AreEqual("cmd.exe", launch.Exe);
             Assert.AreEqual("", launch.DisplayCommand, "a shell has no agent command");
             Assert.AreEqual(cwd.TrimEnd('\\'), launch.WorkingDirectory.TrimEnd('\\'));
+        }
+        finally { if (File.Exists(store)) File.Delete(store); }
+    }
+
+    [TestMethod]
+    public async Task PendingNewChat_SaveReload_PreservesNameAndPhraseWithoutCollection()
+    {
+        var svc = TempService(out var store);
+        try
+        {
+            var cwd = Path.Combine(Path.GetTempPath(), "metadata-" + Guid.NewGuid().ToString("N"));
+            await svc.QueuePendingNewChatAsync("codex", cwd, customTitle: "  Deliberate chat  ", specialPhrase: "orchid");
+
+            var reader = new ArchiveService(storePath: store);
+            await reader.LoadAsync();
+            Assert.AreEqual(1, reader.Store.PendingNewChats.Count);
+            Assert.AreEqual("", reader.Store.PendingNewChats[0].CollectionId);
+            Assert.AreEqual("Deliberate chat", reader.Store.PendingNewChats[0].CustomTitle);
+            Assert.AreEqual("orchid", reader.Store.PendingNewChats[0].SpecialPhrase);
+        }
+        finally { if (File.Exists(store)) File.Delete(store); }
+    }
+
+    [TestMethod]
+    public async Task PendingNewChat_SecondIntentSupersedesUnresolvedIntent()
+    {
+        var svc = TempService(out var store);
+        try
+        {
+            var cwd = Path.Combine(Path.GetTempPath(), "one-at-a-time-" + Guid.NewGuid().ToString("N"));
+            await svc.QueuePendingNewChatAsync("codex", cwd, customTitle: "First");
+
+            var secondId = await svc.QueuePendingNewChatAsync("codex", cwd.ToUpperInvariant(), customTitle: "Second");
+            Assert.AreEqual(1, svc.Store.PendingNewChats.Count);
+            Assert.AreEqual(secondId, svc.Store.PendingNewChats[0].IntentId);
+            Assert.AreEqual("Second", svc.Store.PendingNewChats[0].CustomTitle);
+        }
+        finally { if (File.Exists(store)) File.Delete(store); }
+    }
+
+    [TestMethod]
+    public async Task PendingNewChat_CancelByIntentLeavesOtherToolIntent()
+    {
+        var svc = TempService(out var store);
+        try
+        {
+            var cwd = Path.Combine(Path.GetTempPath(), "intent-cancel-" + Guid.NewGuid().ToString("N"));
+            var codexIntent = await svc.QueuePendingNewChatAsync("codex", cwd, customTitle: "Codex");
+            var claudeIntent = await svc.QueuePendingNewChatAsync("claude", cwd, customTitle: "Claude");
+
+            await svc.CancelPendingNewChatAsync(codexIntent);
+
+            Assert.AreEqual(1, svc.Store.PendingNewChats.Count);
+            Assert.AreEqual(claudeIntent, svc.Store.PendingNewChats[0].IntentId);
+            Assert.AreEqual("claude", svc.Store.PendingNewChats[0].Tool);
+        }
+        finally { if (File.Exists(store)) File.Delete(store); }
+    }
+
+    [TestMethod]
+    public async Task PendingNewChat_MalformedTimestampDoesNotBindOrThrow()
+    {
+        var svc = TempService(out var store);
+        try
+        {
+            var cwd = Path.Combine(Path.GetTempPath(), "bad-time-" + Guid.NewGuid().ToString("N"));
+            await svc.QueuePendingNewChatAsync("codex", cwd, customTitle: "Must not apply");
+            svc.Store.PendingNewChats[0].CreatedAt = "not-a-time";
+            var fresh = new ArchiveSession { Id = "candidate", Tool = "codex", Workspace = cwd, CreatedAt = DateTime.UtcNow.ToString("O") };
+
+            await svc.MergeScanAsync(new DiskScan(new List<ArchiveSession> { fresh }, new List<ArchiveSession>()), refreshList: false);
+
+            Assert.AreEqual(1, svc.Store.PendingNewChats.Count);
+            Assert.AreEqual("", svc.Store.Sessions["candidate"].CustomTitle);
         }
         finally { if (File.Exists(store)) File.Delete(store); }
     }
