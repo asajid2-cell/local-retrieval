@@ -424,6 +424,19 @@ public sealed class ArchiveSession : INotifyPropertyChanged
     [JsonPropertyName("archived")]
     public bool Archived { get; set; }
 
+    // Branch linkage. When this chat was created by the app's Branch action, BranchOfId is the PARENT
+    // chat's id and BranchedAt is when the clone was taken. Presence of BranchOfId ⇒ this is a branch.
+    // The parent link is also recoverable from the transcript's forkedFrom / forked_from_id marker, but
+    // this explicit pair is the app's durable record so the "⑂ branch of …" badge never gets confusing.
+    [JsonPropertyName("branchOfId")]
+    public string BranchOfId { get; set; } = "";
+
+    [JsonPropertyName("branchedAt")]
+    public string BranchedAt { get; set; } = "";
+
+    [JsonIgnore]
+    public bool IsBranch => !string.IsNullOrWhiteSpace(BranchOfId);
+
     [JsonIgnore]
     public string DisplayTitle => string.IsNullOrWhiteSpace(CustomTitle) ? Title : CustomTitle;
 

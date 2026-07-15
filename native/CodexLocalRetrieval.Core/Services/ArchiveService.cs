@@ -19,7 +19,7 @@ internal sealed class StoreGenerationConflictException(long expected, long actua
     public long Actual { get; } = actual;
 }
 
-public sealed class ArchiveService
+public sealed partial class ArchiveService
 {
     private const int CurrentIndexVersion = 17; // bump on any parser change to force a full re-parse
     private const int MaxIndexedFiles = 4000;
@@ -3320,6 +3320,12 @@ public sealed class ArchiveService
         {
             if (!incoming.SpecialPhrases.Contains(phrase, StringComparer.OrdinalIgnoreCase)) incoming.SpecialPhrases.Add(phrase);
         }
+        // Branch linkage is app-only metadata (the transcript's forkedFrom marker is a fallback, not the
+        // source of truth) — carry it across re-parses so a rescan never orphans a branch from its parent.
+        if (string.IsNullOrWhiteSpace(incoming.BranchOfId) && !string.IsNullOrWhiteSpace(existing.BranchOfId))
+            incoming.BranchOfId = existing.BranchOfId;
+        if (string.IsNullOrWhiteSpace(incoming.BranchedAt) && !string.IsNullOrWhiteSpace(existing.BranchedAt))
+            incoming.BranchedAt = existing.BranchedAt;
     }
 
     private Dictionary<string, ArchiveSession> FindSourcePathRekeys(IEnumerable<ArchiveSession> incoming)

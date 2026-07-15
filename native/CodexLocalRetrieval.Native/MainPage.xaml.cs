@@ -1514,6 +1514,20 @@ public sealed partial class MainPage : Page
         meta.Children.Add(new TextBlock { Text = session.DisplayDate, Foreground = MutedBrush(), FontSize = 12, VerticalAlignment = VerticalAlignment.Center });
         var dots = TagDots(session);
         if (dots is not null) meta.Children.Add(dots);
+        var branchBadge = BranchBadge(session);
+        if (branchBadge is not null) meta.Children.Add(branchBadge);
+        else
+        {
+            var branchCount = BranchCountOf(session);
+            if (branchCount > 0)
+                meta.Children.Add(new TextBlock
+                {
+                    Text = $"⑂ {branchCount}",
+                    Foreground = MutedBrush(),
+                    FontSize = 11,
+                    VerticalAlignment = VerticalAlignment.Center
+                });
+        }
 
         var titleStack = new StackPanel
         {
@@ -1645,6 +1659,11 @@ public sealed partial class MainPage : Page
         ToolTipService.SetToolTip(editInfo, "View all of this chat's info and edit its name and special phrases.");
         editInfo.Click += async (_, _) => await ChatInfoDialogAsync(session);
         flyout.Items.Add(editInfo);
+
+        var branch = new MenuFlyoutItem { Text = "Branch this chat" };
+        ToolTipService.SetToolTip(branch, "Clone this chat's exact history into a new, resumable branch linked to this original.");
+        branch.Click += async (_, _) => await BranchChatAsync(session);
+        flyout.Items.Add(branch);
 
         var pin = new MenuFlyoutItem { Text = session.Pinned ? "Unpin" : "Pin to top" };
         pin.Click += async (_, _) => { await _archive.TogglePinAsync(session); RenderCurrent(); };
@@ -2337,6 +2356,11 @@ public sealed partial class MainPage : Page
         ToolTipService.SetToolTip(editInfoItem, "View all of this chat's info and edit its name and special phrases.");
         editInfoItem.Click += async (_, _) => await ChatInfoDialogAsync(session);
         flyout.Items.Add(editInfoItem);
+
+        var branchItem = new MenuFlyoutItem { Text = "Branch this chat" };
+        ToolTipService.SetToolTip(branchItem, "Clone this chat's exact history into a new, resumable branch linked to this original.");
+        branchItem.Click += async (_, _) => await BranchChatAsync(session);
+        flyout.Items.Add(branchItem);
 
         var addToCollection = new MenuFlyoutSubItem { Text = "Add to collection" };
         BuildAddToCollectionItems(addToCollection.Items, new[] { session }, () => RenderCurrent());
