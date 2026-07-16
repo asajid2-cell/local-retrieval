@@ -581,11 +581,14 @@ public sealed partial class MainPage
             return new CodexLocalRetrieval.Core.Models.AgentCommandResult(false, "no resume command for this session.");
         }
 
+        // Only consult the live scan when the caller gave us no pid. `sessionLive` is initialized
+        // because the && short-circuits when a pid IS supplied, leaving the out-param unassigned.
+        var sessionLive = false;
         if (c.pid <= 0
             && !CodexLocalRetrieval.Core.Remote.RunningSessions.TryIsSessionLive(
                 session.Id,
                 session.Aliases,
-                out var sessionLive,
+                out sessionLive,
                 out var liveDetail))
         {
             RecordSessionEvent(
