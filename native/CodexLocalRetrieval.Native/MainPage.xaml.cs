@@ -1665,10 +1665,17 @@ public sealed partial class MainPage : Page
         branch.Click += async (_, _) => await BranchChatAsync(session);
         flyout.Items.Add(branch);
 
-        var template = new MenuFlyoutItem { Text = session.IsTemplate ? "Remove from templates" : "Add chat to templates" };
-        ToolTipService.SetToolTip(template, "Templates show in Start chat — spawn new chats that begin with this chat's context, any time.");
-        template.Click += async (_, _) => { await _archive.SetTemplateAsync(session, !session.IsTemplate); RenderCurrent(); };
-        flyout.Items.Add(template);
+        var checkpoint = new MenuFlyoutItem { Text = "Create checkpoint" };
+        ToolTipService.SetToolTip(checkpoint, "Save this chat's current state as an immutable starting point.");
+        checkpoint.Click += async (_, _) => await CreateCheckpointAsync(session);
+        flyout.Items.Add(checkpoint);
+
+        var manageCheckpoints = new MenuFlyoutItem
+        {
+            Text = $"Manage checkpoints ({_archive.TemplateSnapshotsForSource(session.Id).Count})"
+        };
+        manageCheckpoints.Click += async (_, _) => await ManageCheckpointsAsync(session);
+        flyout.Items.Add(manageCheckpoints);
 
         var pin = new MenuFlyoutItem { Text = session.Pinned ? "Unpin" : "Pin to top" };
         pin.Click += async (_, _) => { await _archive.TogglePinAsync(session); RenderCurrent(); };
@@ -2367,10 +2374,17 @@ public sealed partial class MainPage : Page
         branchItem.Click += async (_, _) => await BranchChatAsync(session);
         flyout.Items.Add(branchItem);
 
-        var templateItem = new MenuFlyoutItem { Text = session.IsTemplate ? "Remove from templates" : "Add chat to templates" };
-        ToolTipService.SetToolTip(templateItem, "Templates show in Start chat — spawn new chats that begin with this chat's context, any time.");
-        templateItem.Click += async (_, _) => { await _archive.SetTemplateAsync(session, !session.IsTemplate); RenderCurrent(); };
-        flyout.Items.Add(templateItem);
+        var checkpointItem = new MenuFlyoutItem { Text = "Create checkpoint" };
+        ToolTipService.SetToolTip(checkpointItem, "Save this chat's current state as an immutable starting point.");
+        checkpointItem.Click += async (_, _) => await CreateCheckpointAsync(session);
+        flyout.Items.Add(checkpointItem);
+
+        var manageCheckpointsItem = new MenuFlyoutItem
+        {
+            Text = $"Manage checkpoints ({_archive.TemplateSnapshotsForSource(session.Id).Count})"
+        };
+        manageCheckpointsItem.Click += async (_, _) => await ManageCheckpointsAsync(session);
+        flyout.Items.Add(manageCheckpointsItem);
 
         var addToCollection = new MenuFlyoutSubItem { Text = "Add to collection" };
         BuildAddToCollectionItems(addToCollection.Items, new[] { session }, () => RenderCurrent());

@@ -171,7 +171,14 @@ public sealed partial class ArchiveService
     public AppStoreData Store { get; private set; } = new();
     public ObservableCollection<ArchiveSession> Sessions { get; } = new();
 
-    public ArchiveService(string? storePath = null, bool useBundledStore = false)
+    public ArchiveService(
+        string? storePath = null,
+        bool useBundledStore = false,
+        string? codexSessionsRoot = null,
+        string? claudeSessionsRoot = null,
+        string? codexStateDbPath = null,
+        string? templatesRoot = null,
+        Func<ArchiveSession, string, string, bool>? codexThreadRegistrar = null)
     {
         _rootPath = FindProjectRoot();
         _bundledStorePath = Path.Combine(_rootPath, "data", "app-store.json");
@@ -181,6 +188,14 @@ public sealed partial class ArchiveService
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             "CodexLocalRetrieval",
             "app-store.json");
+        _codexSessionsRoot = codexSessionsRoot ?? DefaultCodexSessionsRoot;
+        _claudeSessionsRoot = claudeSessionsRoot ?? DefaultClaudeSessionsRoot;
+        _codexStateDbPath = codexStateDbPath ?? Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+            ".codex",
+            "state_5.sqlite");
+        _templatesRoot = templatesRoot ?? Path.Combine(Path.GetDirectoryName(_storePath)!, "templates");
+        _codexThreadRegistrar = codexThreadRegistrar ?? RegisterCodexThread;
     }
 
     internal ArchiveService(
@@ -194,6 +209,14 @@ public sealed partial class ArchiveService
 
     public async Task LoadAsync()
     {
+        await LoadStoreStateAsync();
+        await MigrateLegacyTemplatesAsync();
+        RefreshTemplateSnapshotCounts();
+        RefreshSessions(OrderedVisibleSessions(Store.Sessions.Values));
+    }
+
+    internal async Task LoadStoreStateAsync()
+    {
         if (File.Exists(_storePath) || StoreBackupFiles().Any())
         {
             await using var storeLock = await AcquireStoreLockAsync();
@@ -206,7 +229,6 @@ public sealed partial class ArchiveService
         _loadedGeneration = Store.Generation;
         NormalizeSettings();
         EnsureDecks();
-        RefreshSessions(OrderedVisibleSessions(Store.Sessions.Values));
     }
 
     private async Task<AppStoreData> LoadStoreWithRecoveryAsync()
@@ -310,6 +332,7 @@ public sealed partial class ArchiveService
 
     private static void NormalizeLoadedStore(AppStoreData data)
     {
+        data.TemplateSnapshots ??= new Dictionary<string, TemplateSnapshot>();
         foreach (var session in data.Sessions.Values)
             if (session.Text.Length > SearchTextCap) session.Text = session.Text[..SearchTextCap];
         foreach (var pending in data.PendingNewChats)
@@ -1722,8 +1745,11 @@ public sealed partial class ArchiveService
     public async Task<AgentCommandResult> ApplyAgentCommandAsync(AgentCommand cmd)
     {
         var op = NormalizeAgentOp(cmd.op);
+        if ((cmd.template == true || (op == "template" && cmd.template != false))
+            && string.IsNullOrWhiteSpace(cmd.requestId))
+            cmd.requestId = Guid.NewGuid().ToString("N");
         var retryOnConflict = op is "init" or "addsource" or "favorite" or "pin"
-            or "addselftoproject" or "rename" or "tag" or "untag" or "stash";
+            or "addselftoproject" or "rename" or "tag" or "untag" or "stash" or "template";
         for (var attempt = 0; ; attempt++)
         {
             try
@@ -1874,10 +1900,24 @@ public sealed partial class ArchiveService
                 var phrase = (cmd.phrase ?? "").Trim();
                 if (phrase.Length > 0 && AddSpecialPhrase(s, phrase)) did.Add($"codename \"{phrase}\"");
 
+                var checkpointChanged = false;
                 if (cmd.template == true)
                 {
-                    if (!s.IsTemplate) { s.IsTemplate = true; did.Add("added to templates"); }
-                    else did.Add("already a template");
+                    var checkpoint = await CreateTemplateSnapshotAsync(
+                        s,
+                        idempotencyKey: "agent:" + cmd.requestId);
+                    if (!checkpoint.Ok)
+                        return new AgentCommandResult(false, checkpoint.Message, inputId, s.Id);
+                    did.Add($"created checkpoint \"{checkpoint.Snapshot!.DisplayName}\"");
+                    checkpointChanged = true;
+                }
+                else if (cmd.template == false)
+                {
+                    var removed = await RemoveTemplateSnapshotsForSourceAsync(s.Id);
+                    cmd.TemplateRemovalCount += removed;
+                    var reported = cmd.TemplateRemovalCount;
+                    did.Add($"removed {reported} checkpoint{(reported == 1 ? "" : "s")}");
+                    checkpointChanged = removed > 0;
                 }
 
                 // Deck: resolve, or CREATE it if a brand-new name was given (ResolveDeckId alone silently
@@ -1913,13 +1953,19 @@ public sealed partial class ArchiveService
                     return new AgentCommandResult(false, "stash needs at least one of: name, collection, or phrase.", inputId, s.Id);
                 await SaveAsync();
                 ReapplyList();
-                return new AgentCommandResult(true, $"Stashed \"{s.DisplayTitle}\": {string.Join("; ", did)}.", inputId, s.Id, proj, persisted);
+                return new AgentCommandResult(
+                    true,
+                    $"Stashed \"{s.DisplayTitle}\": {string.Join("; ", did)}.",
+                    inputId,
+                    s.Id,
+                    proj,
+                    persisted || checkpointChanged);
             }
 
             case "info":
             {
                 // Read back everything the app knows about THIS chat (name, native title, collections,
-                // phrases, template/branch status) so a chat can check how it's filed.
+                // phrases, checkpoint count, and branch status) so a chat can check how it's filed.
                 var s = await ResolveOrIndexTargetAsync(cmd);
                 var inputId = ExplicitId(cmd);
                 if (s is null) return new AgentCommandResult(false, ResolveFailureHelp("info"), inputId);
@@ -1928,15 +1974,31 @@ public sealed partial class ArchiveService
 
             case "template":
             {
-                // Mark (or with template:false, unmark) THIS chat as a reusable template.
                 var s = await ResolveOrIndexTargetAsync(cmd);
                 var inputId = ExplicitId(cmd);
                 if (s is null) return new AgentCommandResult(false, ResolveFailureHelp("template"), inputId);
                 var want = cmd.template ?? true;
-                if (s.IsTemplate == want)
-                    return new AgentCommandResult(true, $"\"{s.DisplayTitle}\" is {(want ? "already" : "not")} a template.", inputId, s.Id, Persisted: false);
-                await SetTemplateAsync(s, want);
-                return new AgentCommandResult(true, want ? $"Added \"{s.DisplayTitle}\" to templates." : $"Removed \"{s.DisplayTitle}\" from templates.", inputId, s.Id, Persisted: true);
+                if (want)
+                {
+                    var checkpoint = await CreateTemplateSnapshotAsync(
+                        s,
+                        idempotencyKey: "agent:" + cmd.requestId);
+                    return new AgentCommandResult(
+                        checkpoint.Ok,
+                        checkpoint.Message,
+                        inputId,
+                        s.Id,
+                        Persisted: checkpoint.Ok);
+                }
+                var removed = await RemoveTemplateSnapshotsForSourceAsync(s.Id);
+                cmd.TemplateRemovalCount += removed;
+                var reported = cmd.TemplateRemovalCount;
+                return new AgentCommandResult(
+                    true,
+                    $"Removed {reported} checkpoint{(reported == 1 ? "" : "s")} from \"{s.DisplayTitle}\".",
+                    inputId,
+                    s.Id,
+                    Persisted: reported > 0);
             }
 
             default:
@@ -3326,6 +3388,7 @@ public sealed partial class ArchiveService
         Store.Settings.BundledHistoryAbsorbed = true;
         if (scan.FullRescan) await BackfillUserCountsAsync();   // recompute user counts the disk scan couldn't reach (backup-folder chats, previously-locked live files)
         Store.Settings.IndexVersion = CurrentIndexVersion;
+        RefreshTemplateSnapshotCounts();
         await SaveAsync();
         if (refreshList) ReapplyList();
         return scan.Disk.Count + recovered;
@@ -3397,6 +3460,9 @@ public sealed partial class ArchiveService
         }
         foreach (var collection in Store.Collections.Values) Replace(collection.SessionIds);
         foreach (var deleted in Store.DeletedCollections) Replace(deleted.Collection.SessionIds);
+        foreach (var snapshot in Store.TemplateSnapshots.Values)
+            if (string.Equals(snapshot.SourceSessionId, oldId, StringComparison.OrdinalIgnoreCase))
+                snapshot.SourceSessionId = newId;
     }
 
     private List<ArchiveSession> LoadBundledHistory(IProgress<string>? progress)

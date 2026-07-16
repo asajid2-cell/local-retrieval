@@ -22,12 +22,22 @@ public sealed partial class MainPage
         }
     }
 
-    // Start a fresh chat FROM a template: branch the template (so the new chat begins with its full
-    // context), apply the new chat's name / phrase / collection, then resume it in a terminal so the agent
-    // opens already carrying that context. Can be done any number of times, whenever.
-    private async Task StartFromTemplateAsync(ArchiveSession template, string chatName, string phrase, string collectionName, string? deckId)
+    private async Task CreateCheckpointAsync(ArchiveSession session)
     {
-        var result = await _archive.BranchSessionAsync(template);
+        SyncStatus.Text = $"Creating checkpoint from \"{Trim(session.DisplayTitle, 40)}\"...";
+        var result = await _archive.CreateTemplateSnapshotAsync(session);
+        SyncStatus.Text = result.Message;
+        RenderCurrent();
+    }
+
+    private async Task StartFromTemplateAsync(
+        TemplateSnapshot template,
+        string chatName,
+        string phrase,
+        string collectionName,
+        string? deckId)
+    {
+        var result = await _archive.SpawnTemplateAsync(template);
         if (!result.Ok || result.Branch is null) { SyncStatus.Text = result.Message; return; }
         var branch = result.Branch;
 
@@ -35,7 +45,7 @@ public sealed partial class MainPage
         if (name.Length > 0)
             await _archive.RenameSessionAsync(branch, name);
         else
-            await _archive.RenameSessionAsync(branch, template.DisplayTitle);   // no "(branch)" suffix for a template spawn
+            await _archive.RenameSessionAsync(branch, template.SourceTitle);
 
         var ph = (phrase ?? "").Trim();
         if (ph.Length > 0)
@@ -48,9 +58,119 @@ public sealed partial class MainPage
             await _archive.AddToCollectionAsync(branch, collectionName, deckId);
 
         RenderCurrent();
-        ResumeInTerminal(branch);   // open the agent with the template's context loaded
+        ResumeInTerminal(branch);
         var filed = string.IsNullOrWhiteSpace(collectionName) ? "" : $" (filed in \"{collectionName}\")";
-        SyncStatus.Text = $"Started a new chat from template \"{template.DisplayTitle}\"{filed}.";
+        SyncStatus.Text = $"Started a new chat from checkpoint \"{template.DisplayName}\"{filed}.";
+    }
+
+    private async Task ManageCheckpointsAsync(ArchiveSession session)
+    {
+        while (true)
+        {
+            var snapshots = _archive.TemplateSnapshotsForSource(session.Id);
+            var list = new ListView
+            {
+                MinWidth = 520,
+                MaxHeight = 360,
+                SelectionMode = ListViewSelectionMode.Single
+            };
+            foreach (var snapshot in snapshots)
+            {
+                var created = DateTime.TryParse(snapshot.CreatedAt, out var parsed)
+                    ? parsed.ToLocalTime().ToString("yyyy-MM-dd HH:mm")
+                    : snapshot.CreatedAt;
+                list.Items.Add(new ListViewItem
+                {
+                    Tag = snapshot,
+                    Content = new StackPanel
+                    {
+                        Spacing = 2,
+                        Children =
+                        {
+                            new TextBlock { Text = snapshot.DisplayName, FontWeight = FontWeights.SemiBold },
+                            new TextBlock
+                            {
+                                Text = $"{created} · source: {snapshot.SourceTitle}",
+                                Foreground = MutedBrush(),
+                                FontSize = 12
+                            }
+                        }
+                    }
+                });
+            }
+            if (list.Items.Count > 0) list.SelectedIndex = 0;
+
+            var action = "";
+            var spawn = new Button { Content = "Spawn chat", IsEnabled = list.Items.Count > 0 };
+            var rename = new Button { Content = "Rename", IsEnabled = list.Items.Count > 0 };
+            var delete = new Button { Content = "Delete", IsEnabled = list.Items.Count > 0 };
+            var actions = new StackPanel
+            {
+                Orientation = Orientation.Horizontal,
+                Spacing = 8,
+                Children = { spawn, rename, delete }
+            };
+            var content = new StackPanel { Spacing = 12, Children = { list, actions } };
+            if (snapshots.Count == 0)
+                content.Children.Insert(0, new TextBlock
+                {
+                    Text = "No checkpoints have been taken from this chat.",
+                    Foreground = MutedBrush()
+                });
+
+            var dialog = new ContentDialog
+            {
+                Title = $"Checkpoints for \"{Trim(session.DisplayTitle, 48)}\"",
+                Content = content,
+                CloseButtonText = "Close",
+                XamlRoot = XamlRoot
+            };
+            spawn.Click += (_, _) => { action = "spawn"; dialog.Hide(); };
+            rename.Click += (_, _) => { action = "rename"; dialog.Hide(); };
+            delete.Click += (_, _) => { action = "delete"; dialog.Hide(); };
+            await dialog.ShowAsync();
+            if (action.Length == 0) return;
+            if ((list.SelectedItem as ListViewItem)?.Tag is not TemplateSnapshot selected) continue;
+
+            if (action == "spawn")
+            {
+                await StartFromTemplateAsync(selected, "", "", "", null);
+                return;
+            }
+            if (action == "rename")
+            {
+                var input = new TextBox
+                {
+                    Text = selected.DisplayName,
+                    MinWidth = 420,
+                    CornerRadius = ControlCornerRadius()
+                };
+                var renameDialog = new ContentDialog
+                {
+                    Title = "Rename checkpoint",
+                    Content = input,
+                    PrimaryButtonText = "Save",
+                    CloseButtonText = "Cancel",
+                    DefaultButton = ContentDialogButton.Primary,
+                    XamlRoot = XamlRoot
+                };
+                if (await renameDialog.ShowAsync() == ContentDialogResult.Primary)
+                    await _archive.RenameTemplateSnapshotAsync(selected.Id, input.Text);
+                continue;
+            }
+
+            var confirm = new ContentDialog
+            {
+                Title = "Delete checkpoint?",
+                Content = $"\"{selected.DisplayName}\" will no longer be available as a starting point.",
+                PrimaryButtonText = "Delete",
+                CloseButtonText = "Cancel",
+                DefaultButton = ContentDialogButton.Close,
+                XamlRoot = XamlRoot
+            };
+            if (await confirm.ShowAsync() == ContentDialogResult.Primary)
+                await _archive.DeleteTemplateSnapshotAsync(selected.Id);
+        }
     }
 
     private void OpenParentOf(ArchiveSession branch)

@@ -65,7 +65,7 @@
                     VerticalAlignment="Center"
                     FontSize="12"
                     Foreground="{StaticResource AccentBrush}"
-                    ToolTipService.ToolTip="★ template · ⑂ branch"
+                    ToolTipService.ToolTip="★ checkpoint count · ! legacy checkpoint pending · ⑂ branch"
                     Text="{Binding ListMarks}" />
                 <TextBlock
                     Grid.Column="3"

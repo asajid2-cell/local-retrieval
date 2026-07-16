@@ -17,6 +17,9 @@ public sealed class AppStoreData
     [JsonPropertyName("sessions")]
     public Dictionary<string, ArchiveSession> Sessions { get; set; } = new();
 
+    [JsonPropertyName("templateSnapshots")]
+    public Dictionary<string, TemplateSnapshot> TemplateSnapshots { get; set; } = new();
+
     [JsonPropertyName("settings")]
     public ArchiveSettings Settings { get; set; } = new();
 
@@ -319,6 +322,51 @@ public sealed class DeletedCollection
     public string DeletedAt { get; set; } = "";
 }
 
+public sealed class TemplateSnapshot
+{
+    [JsonPropertyName("id")]
+    public string Id { get; set; } = "";
+
+    [JsonPropertyName("name")]
+    public string Name { get; set; } = "";
+
+    [JsonPropertyName("sourceSessionId")]
+    public string SourceSessionId { get; set; } = "";
+
+    [JsonPropertyName("sourceTitle")]
+    public string SourceTitle { get; set; } = "";
+
+    [JsonPropertyName("sourcePath")]
+    public string SourcePath { get; set; } = "";
+
+    [JsonPropertyName("snapshotPath")]
+    public string SnapshotPath { get; set; } = "";
+
+    [JsonPropertyName("tool")]
+    public string Tool { get; set; } = "";
+
+    [JsonPropertyName("workspace")]
+    public string Workspace { get; set; } = "";
+
+    [JsonPropertyName("workspaceName")]
+    public string WorkspaceName { get; set; } = "";
+
+    [JsonPropertyName("model")]
+    public string Model { get; set; } = "";
+
+    [JsonPropertyName("createdAt")]
+    public string CreatedAt { get; set; } = "";
+
+    [JsonPropertyName("capturedSourceLength")]
+    public long CapturedSourceLength { get; set; }
+
+    [JsonPropertyName("idempotencyKey")]
+    public string IdempotencyKey { get; set; } = "";
+
+    [JsonIgnore]
+    public string DisplayName => string.IsNullOrWhiteSpace(Name) ? SourceTitle : Name;
+}
+
 // The shape of an exported/downloaded collections backup - lightweight metadata only (no chat
 // content), so it stays tiny and portable and can rebuild your projects on any machine.
 public sealed class CollectionsBackup
@@ -434,15 +482,25 @@ public sealed class ArchiveSession : INotifyPropertyChanged
     [JsonPropertyName("branchedAt")]
     public string BranchedAt { get; set; } = "";
 
-    // A template is a chat the user curated as a reusable STARTING POINT: from the Start-chat dialog you
-    // spawn a fresh chat that begins with this chat's full context (implemented as a branch of it), as many
-    // times as you like, whenever you like. App-only flag.
+    // Legacy migration input only. New checkpoints live in AppStoreData.TemplateSnapshots and are never
+    // represented as sessions. The flag is cleared only after a private snapshot is durably persisted.
     private bool _isTemplate;
     [JsonPropertyName("isTemplate")]
-    public bool IsTemplate { get => _isTemplate; set { _isTemplate = value; Raise(); Raise(nameof(TemplateGlyph)); Raise(nameof(ListMarks)); } }
+    public bool IsTemplate { get => _isTemplate; set { _isTemplate = value; Raise(); Raise(nameof(ListMarks)); } }
 
+    private int _templateSnapshotCount;
     [JsonIgnore]
-    public string TemplateGlyph => IsTemplate ? "★" : "";
+    public int TemplateSnapshotCount
+    {
+        get => _templateSnapshotCount;
+        set
+        {
+            if (_templateSnapshotCount == value) return;
+            _templateSnapshotCount = value;
+            Raise();
+            Raise(nameof(ListMarks));
+        }
+    }
 
     [JsonIgnore]
     public bool IsBranch => !string.IsNullOrWhiteSpace(BranchOfId);
@@ -451,9 +509,11 @@ public sealed class ArchiveSession : INotifyPropertyChanged
     [JsonIgnore]
     public string BranchGlyph => IsBranch ? "⑂" : "";
 
-    // Combined sidebar marks: ★ for a template, ⑂ for a branch (a chat can be both).
+    // A legacy template flag with no snapshot is shown as pending migration, not as a checkpoint.
     [JsonIgnore]
-    public string ListMarks => (IsTemplate ? "★" : "") + (IsBranch ? "⑂" : "");
+    public string ListMarks =>
+        (TemplateSnapshotCount > 0 ? $"★{TemplateSnapshotCount}" : IsTemplate ? "!" : "")
+        + (IsBranch ? "⑂" : "");
 
     [JsonIgnore]
     public string DisplayTitle => string.IsNullOrWhiteSpace(CustomTitle) ? Title : CustomTitle;
@@ -557,7 +617,10 @@ public sealed class AgentCommand
     public int pid { get; set; }                    // tomux: the caller's host agent pid, for a reliable local kill
     public string? phrase { get; set; }             // stash: a searchable codename ("special phrase") to file this chat under
     public string? collection { get; set; }         // stash: the collection name (alias of project)
-    public bool? template { get; set; }             // stash: also mark this chat as a reusable template (Start-chat picker)
+    public bool? template { get; set; }             // true: create one checkpoint; false: remove all checkpoints for this chat
+
+    [JsonIgnore]
+    internal int TemplateRemovalCount { get; set; } // preserves the reported count across one generation-conflict replay
 }
 
 public sealed record AgentCommandResult(

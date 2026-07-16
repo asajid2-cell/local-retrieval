@@ -175,40 +175,46 @@ public class StashSkillTests
     }
 
     [TestMethod]
-    public async Task Stash_WithTemplateFlag_MarksCurrentChatAsTemplate()
+    public async Task Stash_WithTemplateFlag_CreatesOneCheckpointOutsideSessions()
     {
         var (svc, id, dir) = SeededService();
         try
         {
             var res = await svc.ApplyAgentCommandAsync(new AgentCommand
-            { op = "stash", id = id, tool = "claude", collection = "Corpus", template = true });
+            { op = "stash", id = id, tool = "claude", collection = "Corpus", template = true, requestId = "stash-template-once" });
             Assert.IsTrue(res.Ok, res.Message);
-            Assert.IsTrue(svc.Store.Sessions[id].IsTemplate, "the template flag was applied");
-            Assert.IsTrue(svc.Templates().Any(t => t.Id == id), "it shows up in Templates()");
-            StringAssert.Contains(res.Message, "templates");
+            Assert.AreEqual(1, svc.TemplateSnapshotsForSource(id).Count);
+            Assert.IsFalse(svc.Store.Sessions[id].IsTemplate, "the legacy flag is not the new storage mechanism");
+            Assert.IsFalse(svc.Store.Sessions.ContainsKey(svc.Templates().Single().Id));
+            StringAssert.Contains(res.Message, "checkpoint");
         }
         finally { Directory.Delete(dir, true); }
     }
 
     [TestMethod]
-    public async Task TemplateOp_TogglesAndReportsNoOp()
+    public async Task TemplateFalse_RemovesAllCheckpointsAndReportsCount()
     {
         var (svc, id, dir) = SeededService();
         try
         {
-            var on = await svc.ApplyAgentCommandAsync(new AgentCommand { op = "template", id = id, tool = "claude" });
+            var on = await svc.ApplyAgentCommandAsync(new AgentCommand
+                { op = "template", id = id, tool = "claude", requestId = "first" });
             Assert.IsTrue(on.Ok);
-            Assert.IsTrue(svc.Store.Sessions[id].IsTemplate);
+            var second = await svc.ApplyAgentCommandAsync(new AgentCommand
+                { op = "template", id = id, tool = "claude", requestId = "second" });
+            Assert.IsTrue(second.Ok);
+            Assert.AreEqual(2, svc.TemplateSnapshotsForSource(id).Count);
 
             var off = await svc.ApplyAgentCommandAsync(new AgentCommand { op = "template", id = id, tool = "claude", template = false });
             Assert.IsTrue(off.Ok);
-            Assert.IsFalse(svc.Store.Sessions[id].IsTemplate);
+            Assert.AreEqual(0, svc.TemplateSnapshotsForSource(id).Count);
+            StringAssert.Contains(off.Message, "Removed 2 checkpoints");
         }
         finally { Directory.Delete(dir, true); }
     }
 
     [TestMethod]
-    public async Task InfoOp_ReportsNameCollectionsPhrasesTemplate()
+    public async Task InfoOp_ReportsNameCollectionsPhrasesAndCheckpointCount()
     {
         var (svc, id, dir) = SeededService();
         try
@@ -221,8 +227,53 @@ public class StashSkillTests
             StringAssert.Contains(res.Message, "Context primer");
             StringAssert.Contains(res.Message, "Corpus");
             StringAssert.Contains(res.Message, "mux");
-            StringAssert.Contains(res.Message, "template: yes");
+            StringAssert.Contains(res.Message, "checkpoints: 1");
             StringAssert.Contains(res.Message, id);
+        }
+        finally { Directory.Delete(dir, true); }
+    }
+
+    [TestMethod]
+    public async Task StashTemplateTrue_CreatesExactlyOneDurableCheckpointDespiteRetry()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "clr-stash-retry-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            var id = "11111111-2222-3333-4444-555555555555";
+            var source = Path.Combine(dir, id + ".jsonl");
+            await File.WriteAllTextAsync(
+                source,
+                $"{{\"sessionId\":\"{id}\",\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"snapshot tip\"}}}}\n");
+            var store = Path.Combine(dir, "store.json");
+            var templates = Path.Combine(dir, "templates");
+            var seed = new ArchiveService(storePath: store, templatesRoot: templates);
+            seed.Store.Sessions[id] = new ArchiveSession
+                { Id = id, Tool = "claude", Title = "source", SourcePath = source };
+            await seed.SaveAsync();
+
+            var desktop = new ArchiveService(storePath: store, templatesRoot: templates);
+            var bridge = new ArchiveService(storePath: store, templatesRoot: templates);
+            await desktop.LoadAsync();
+            await bridge.LoadAsync();
+            desktop.Store.Settings.MultiplexApiPort = 8129;
+            await desktop.SaveAsync();
+
+            var result = await bridge.ApplyAgentCommandAsync(new AgentCommand
+            {
+                op = "stash",
+                id = id,
+                tool = "claude",
+                template = true,
+                requestId = "same-request-through-retry"
+            });
+
+            Assert.IsTrue(result.Ok, result.Message);
+            var reloaded = new ArchiveService(storePath: store, templatesRoot: templates);
+            await reloaded.LoadAsync();
+            Assert.AreEqual(1, reloaded.TemplateSnapshotsForSource(id).Count);
+            Assert.AreEqual(1, Directory.GetFiles(templates, "*.jsonl").Length);
+            Assert.AreEqual(8129, reloaded.Store.Settings.MultiplexApiPort);
         }
         finally { Directory.Delete(dir, true); }
     }

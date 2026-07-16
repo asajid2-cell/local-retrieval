@@ -1,179 +1,427 @@
-using System.Text.Json;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json.Nodes;
 using CodexLocalRetrieval.Core.Models;
 using Microsoft.Data.Sqlite;
 
 namespace CodexLocalRetrieval.Core.Services;
 
-// Branching = clone a chat's exact history into a NEW, independently-resumable session, tagged as a
-// branch and linked to its parent. It is the app's own version of the tool's fork/branch, plus a durable
-// snapshot: the clone is frozen at branch time and reopenable at any point via normal Resume.
 public sealed partial class ArchiveService
 {
-    public readonly record struct BranchResult(bool Ok, string Message, ArchiveSession? Branch);
+    private readonly string _codexSessionsRoot;
+    private readonly string _claudeSessionsRoot;
+    private readonly string _codexStateDbPath;
+    private readonly string _templatesRoot;
+    private readonly Func<ArchiveSession, string, string, bool> _codexThreadRegistrar;
 
-    // Clone `parent` into a new branch session. Per-tool the transcript is copied to a fresh resumable id
-    // (Claude: rewrite sessionId throughout + a forkedFrom marker; Codex: rewrite the session_meta id +
-    // register a threads row so `codex resume` can find it). The branch is registered, linked to the
-    // parent, and persisted. Returns the new session or a human-readable failure reason.
+    public readonly record struct BranchResult(bool Ok, string Message, ArchiveSession? Branch);
+    public readonly record struct TemplateSnapshotResult(bool Ok, string Message, TemplateSnapshot? Snapshot);
+
     public async Task<BranchResult> BranchSessionAsync(ArchiveSession parent)
     {
         if (parent is null) return new BranchResult(false, "No chat to branch.", null);
-
-        var srcPath = ResolveSessionSourcePath(parent);
-        if (string.IsNullOrWhiteSpace(srcPath) || !File.Exists(srcPath))
+        var sourcePath = ResolveSessionSourcePath(parent);
+        if (string.IsNullOrWhiteSpace(sourcePath) || !File.Exists(sourcePath))
             return new BranchResult(false, "This chat's transcript file isn't on disk, so it can't be branched.", null);
 
-        var tool = (parent.Tool ?? "").Trim().ToLowerInvariant();
-        var newId = Guid.NewGuid().ToString();
-        string newPath;
+        return await CreateNativeBranchAsync(
+            parent,
+            sourcePath,
+            string.IsNullOrWhiteSpace(parent.DisplayTitle) ? parent.Id : parent.DisplayTitle,
+            parent.Id);
+    }
+
+    public async Task<TemplateSnapshotResult> CreateTemplateSnapshotAsync(
+        ArchiveSession source,
+        string? name = null,
+        string? idempotencyKey = null)
+    {
+        if (source is null) return new TemplateSnapshotResult(false, "No chat to checkpoint.", null);
+        var sourcePath = ResolveSessionSourcePath(source);
+        if (string.IsNullOrWhiteSpace(sourcePath) || !File.Exists(sourcePath))
+            return new TemplateSnapshotResult(
+                false,
+                "This chat's transcript file isn't on disk. Its checkpoint is still pending and was not cleared.",
+                null);
+
+        var stableKey = (idempotencyKey ?? "").Trim();
+        if (stableKey.Length > 0)
+        {
+            var existing = Store.TemplateSnapshots.Values.FirstOrDefault(snapshot =>
+                string.Equals(snapshot.SourceSessionId, source.Id, StringComparison.OrdinalIgnoreCase)
+                && string.Equals(snapshot.IdempotencyKey, stableKey, StringComparison.Ordinal));
+            if (existing is not null)
+                return new TemplateSnapshotResult(true, $"Checkpoint \"{existing.DisplayName}\" already exists.", existing);
+        }
+
+        var snapshotId = stableKey.Length == 0
+            ? Guid.NewGuid().ToString("N")
+            : DeterministicSnapshotId(source.Id, stableKey);
+        if (Store.TemplateSnapshots.TryGetValue(snapshotId, out var byId))
+            return new TemplateSnapshotResult(true, $"Checkpoint \"{byId.DisplayName}\" already exists.", byId);
+
+        Directory.CreateDirectory(_templatesRoot);
+        var snapshotPath = Path.Combine(_templatesRoot, snapshotId + ".jsonl");
+        JsonlCloneResult capture;
+        if (File.Exists(snapshotPath))
+        {
+            var length = new FileInfo(snapshotPath).Length;
+            capture = new JsonlCloneResult(length, length, CountCompleteLines(snapshotPath));
+        }
+        else
+        {
+            capture = await JsonlTranscriptCloner.CloneAsync(sourcePath, snapshotPath);
+        }
+
+        if (capture.LineCount == 0)
+        {
+            TryDeleteFile(snapshotPath);
+            return new TemplateSnapshotResult(false, "The transcript has no complete JSONL records to checkpoint.", null);
+        }
+
+        var createdAt = File.GetCreationTimeUtc(snapshotPath);
+        if (createdAt.Year < 2000) createdAt = DateTime.UtcNow;
+        var title = string.IsNullOrWhiteSpace(source.DisplayTitle) ? source.Id : source.DisplayTitle;
+        var snapshot = new TemplateSnapshot
+        {
+            Id = snapshotId,
+            Name = string.IsNullOrWhiteSpace(name)
+                ? $"{title} — {createdAt.ToLocalTime():yyyy-MM-dd HH:mm}"
+                : name.Trim(),
+            SourceSessionId = source.Id,
+            SourceTitle = title,
+            SourcePath = sourcePath,
+            SnapshotPath = snapshotPath,
+            Tool = (source.Tool ?? "").Trim().ToLowerInvariant(),
+            Workspace = source.Workspace,
+            WorkspaceName = source.WorkspaceName,
+            Model = source.Model,
+            CreatedAt = createdAt.ToString("O"),
+            CapturedSourceLength = capture.CapturedSourceLength,
+            IdempotencyKey = stableKey
+        };
+
+        Store.TemplateSnapshots[snapshot.Id] = snapshot;
         try
         {
-            newPath = tool switch
+            await SaveAsync();
+        }
+        catch (StoreGenerationConflictException)
+        {
+            Store.TemplateSnapshots.Remove(snapshot.Id);
+            throw;
+        }
+        RefreshTemplateSnapshotCounts();
+        ReapplyList();
+        return new TemplateSnapshotResult(true, $"Created checkpoint \"{snapshot.DisplayName}\".", snapshot);
+    }
+
+    public async Task<BranchResult> SpawnTemplateAsync(TemplateSnapshot snapshot)
+    {
+        if (snapshot is null) return new BranchResult(false, "No checkpoint selected.", null);
+        if (!Store.TemplateSnapshots.TryGetValue(snapshot.Id, out var current))
+            return new BranchResult(false, "That checkpoint no longer exists.", null);
+        if (string.IsNullOrWhiteSpace(current.SnapshotPath) || !File.Exists(current.SnapshotPath))
+            return new BranchResult(false, "The checkpoint transcript is missing from disk.", null);
+
+        var parent = new ArchiveSession
+        {
+            Id = current.SourceSessionId,
+            Tool = current.Tool,
+            Title = current.SourceTitle,
+            Workspace = current.Workspace,
+            WorkspaceName = current.WorkspaceName,
+            Model = current.Model,
+            SourcePath = current.SourcePath
+        };
+        return await CreateNativeBranchAsync(parent, current.SnapshotPath, current.DisplayName, current.SourceSessionId);
+    }
+
+    public IReadOnlyList<TemplateSnapshot> Templates() =>
+        Store.TemplateSnapshots.Values
+            .OrderByDescending(snapshot => snapshot.CreatedAt, StringComparer.Ordinal)
+            .ToList();
+
+    public IReadOnlyList<TemplateSnapshot> TemplateSnapshotsForSource(string sourceSessionId) =>
+        Store.TemplateSnapshots.Values
+            .Where(snapshot => string.Equals(
+                snapshot.SourceSessionId,
+                sourceSessionId,
+                StringComparison.OrdinalIgnoreCase))
+            .OrderByDescending(snapshot => snapshot.CreatedAt, StringComparer.Ordinal)
+            .ToList();
+
+    public async Task<bool> RenameTemplateSnapshotAsync(string snapshotId, string name)
+    {
+        if (!Store.TemplateSnapshots.TryGetValue(snapshotId, out var snapshot)) return false;
+        var clean = (name ?? "").Trim();
+        if (clean.Length == 0 || string.Equals(snapshot.Name, clean, StringComparison.Ordinal)) return false;
+        snapshot.Name = clean;
+        await SaveAsync();
+        return true;
+    }
+
+    public async Task<bool> DeleteTemplateSnapshotAsync(string snapshotId)
+    {
+        if (!Store.TemplateSnapshots.Remove(snapshotId, out var snapshot)) return false;
+        try
+        {
+            await SaveAsync();
+        }
+        catch
+        {
+            Store.TemplateSnapshots[snapshotId] = snapshot;
+            throw;
+        }
+        TryDeleteFile(snapshot.SnapshotPath);
+        RefreshTemplateSnapshotCounts();
+        ReapplyList();
+        return true;
+    }
+
+    public async Task<int> RemoveTemplateSnapshotsForSourceAsync(string sourceSessionId)
+    {
+        var removed = Store.TemplateSnapshots.Values
+            .Where(snapshot => string.Equals(
+                snapshot.SourceSessionId,
+                sourceSessionId,
+                StringComparison.OrdinalIgnoreCase))
+            .ToList();
+        if (removed.Count == 0) return 0;
+        foreach (var snapshot in removed) Store.TemplateSnapshots.Remove(snapshot.Id);
+        try
+        {
+            await SaveAsync();
+        }
+        catch
+        {
+            foreach (var snapshot in removed) Store.TemplateSnapshots[snapshot.Id] = snapshot;
+            throw;
+        }
+        foreach (var snapshot in removed) TryDeleteFile(snapshot.SnapshotPath);
+        RefreshTemplateSnapshotCounts();
+        ReapplyList();
+        return removed.Count;
+    }
+
+    public async Task SetTemplateAsync(ArchiveSession session, bool isTemplate)
+    {
+        if (isTemplate)
+            await CreateTemplateSnapshotAsync(session);
+        else
+            await RemoveTemplateSnapshotsForSourceAsync(session.Id);
+    }
+
+    internal string DescribeSession(ArchiveSession session)
+    {
+        var collections = Store.Collections.Values
+            .Where(collection => collection.SessionIds.Contains(session.Id))
+            .Select(collection => collection.Name)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        var phrases = session.SpecialPhrases.Where(phrase => !string.IsNullOrWhiteSpace(phrase)).ToList();
+        var parent = session.IsBranch
+            ? (Store.Sessions.TryGetValue(session.BranchOfId, out var source)
+                ? $"\"{source.DisplayTitle}\""
+                : session.BranchOfId)
+            : "no";
+        var branchCount = Store.Sessions.Values.Count(candidate =>
+            !candidate.Archived
+            && string.Equals(candidate.BranchOfId, session.Id, StringComparison.OrdinalIgnoreCase));
+        var checkpointCount = TemplateSnapshotsForSource(session.Id).Count;
+        return $"Chat \"{session.DisplayTitle}\" [{session.Tool}]"
+             + $" · native name: {(string.IsNullOrWhiteSpace(session.Title) ? "(none)" : $"\"{session.Title}\"")}"
+             + $" · collections: {(collections.Count == 0 ? "none" : string.Join(", ", collections))}"
+             + $" · phrases: {(phrases.Count == 0 ? "none" : string.Join(", ", phrases))}"
+             + $" · checkpoints: {checkpointCount}"
+             + (session.IsTemplate ? " · legacy checkpoint migration: pending" : "")
+             + $" · branch of: {parent}"
+             + (branchCount > 0 ? $" · branches: {branchCount}" : "")
+             + $" · id: {session.Id}";
+    }
+
+    internal async Task MigrateLegacyTemplatesAsync()
+    {
+        for (var pass = 0; pass < 3; pass++)
+        {
+            var pendingIds = Store.Sessions.Values
+                .Where(session => session.IsTemplate)
+                .Select(session => session.Id)
+                .ToList();
+            if (pendingIds.Count == 0) return;
+
+            var restart = false;
+            foreach (var sessionId in pendingIds)
             {
-                "claude" => BranchClaudeTranscript(srcPath, parent.Id, newId),
-                "codex" => BranchCodexTranscript(srcPath, parent, newId),
+                if (!Store.Sessions.TryGetValue(sessionId, out var session) || !session.IsTemplate) continue;
+                try
+                {
+                    var snapshot = await CreateTemplateSnapshotAsync(
+                        session,
+                        idempotencyKey: "legacy-template:" + session.Id);
+                    if (!snapshot.Ok) continue;
+
+                    session.IsTemplate = false;
+                    await SaveAsync();
+                }
+                catch (StoreGenerationConflictException)
+                {
+                    await LoadStoreStateAsync();
+                    restart = true;
+                    break;
+                }
+            }
+            if (!restart) return;
+        }
+    }
+
+    internal void RefreshTemplateSnapshotCounts()
+    {
+        var counts = Store.TemplateSnapshots.Values
+            .GroupBy(snapshot => snapshot.SourceSessionId, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(group => group.Key, group => group.Count(), StringComparer.OrdinalIgnoreCase);
+        foreach (var session in Store.Sessions.Values)
+            session.TemplateSnapshotCount = counts.TryGetValue(session.Id, out var count) ? count : 0;
+    }
+
+    private async Task<BranchResult> CreateNativeBranchAsync(
+        ArchiveSession parent,
+        string sourcePath,
+        string displayTitle,
+        string parentId)
+    {
+        var tool = (parent.Tool ?? "").Trim().ToLowerInvariant();
+        var newId = Guid.NewGuid().ToString();
+        string destinationPath;
+        try
+        {
+            destinationPath = tool switch
+            {
+                "claude" => await CloneClaudeTranscriptAsync(sourcePath, parent.SourcePath, parentId, newId),
+                "codex" => await CloneCodexTranscriptAsync(sourcePath, parent, parentId, newId),
                 _ => throw new InvalidOperationException($"branching isn't supported for tool '{parent.Tool}'.")
             };
         }
-        catch (Exception ex)
+        catch (Exception error)
         {
-            return new BranchResult(false, $"Branch failed: {ex.Message}", null);
+            return new BranchResult(false, $"Branch failed: {error.Message}", null);
         }
 
-        var now = DateTime.UtcNow.ToString("o");
+        var now = DateTime.UtcNow.ToString("O");
         var branch = new ArchiveSession
         {
             Id = newId,
             Tool = tool,
             Title = parent.Title,
-            CustomTitle = string.IsNullOrWhiteSpace(parent.DisplayTitle) ? "" : parent.DisplayTitle + " (branch)",
-            SourcePath = newPath,
+            CustomTitle = string.IsNullOrWhiteSpace(displayTitle) ? "" : displayTitle + " (branch)",
+            SourcePath = destinationPath,
             Workspace = parent.Workspace,
             WorkspaceName = parent.WorkspaceName,
             Model = parent.Model,
-            CreatedAt = string.IsNullOrWhiteSpace(parent.CreatedAt) ? now : parent.CreatedAt,
+            CreatedAt = now,
             UpdatedAt = now,
-            MessageCount = parent.MessageCount,
-            UserMessageCount = parent.UserMessageCount,
-            Text = parent.Text,
-            BranchOfId = parent.Id,
+            BranchOfId = parentId,
             BranchedAt = now
         };
-        AddAlias(branch.Aliases, parent.Id);   // the parent id resolves against the branch too
+        AddAlias(branch.Aliases, parentId);
         Store.Sessions[newId] = branch;
-        await SaveAsync();
+        try
+        {
+            await SaveAsync();
+        }
+        catch
+        {
+            Store.Sessions.Remove(newId);
+            throw;
+        }
         ReapplyList();
-        return new BranchResult(true, $"Branched \"{parent.DisplayTitle}\".", branch);
+        return new BranchResult(true, $"Branched \"{displayTitle}\".", branch);
     }
-
-    // Mark / unmark a chat as a reusable template (a curated starting point spawned via branch).
-    public async Task SetTemplateAsync(ArchiveSession session, bool isTemplate)
-    {
-        if (session is null || session.IsTemplate == isTemplate) return;
-        session.IsTemplate = isTemplate;
-        await SaveAsync();
-        ReapplyList();
-    }
-
-    // Human-readable one-liner of how a chat is filed — used by the agent "info" op so a chat can check
-    // its own name, collections, phrases, template/branch status from the /stashme skill.
-    internal string DescribeSession(ArchiveSession s)
-    {
-        var cols = Store.Collections.Values
-            .Where(c => c.SessionIds.Contains(s.Id))
-            .Select(c => c.Name)
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .ToList();
-        var phrases = s.SpecialPhrases.Where(p => !string.IsNullOrWhiteSpace(p)).ToList();
-        var parent = s.IsBranch
-            ? (Store.Sessions.TryGetValue(s.BranchOfId, out var p) ? $"\"{p.DisplayTitle}\"" : s.BranchOfId)
-            : "no";
-        var branchCount = Store.Sessions.Values.Count(x =>
-            !x.Archived && string.Equals(x.BranchOfId, s.Id, StringComparison.OrdinalIgnoreCase));
-        return $"Chat \"{s.DisplayTitle}\" [{s.Tool}]"
-             + $" · native name: {(string.IsNullOrWhiteSpace(s.Title) ? "(none)" : $"\"{s.Title}\"")}"
-             + $" · collections: {(cols.Count == 0 ? "none" : string.Join(", ", cols))}"
-             + $" · phrases: {(phrases.Count == 0 ? "none" : string.Join(", ", phrases))}"
-             + $" · template: {(s.IsTemplate ? "yes" : "no")}"
-             + $" · branch of: {parent}"
-             + (branchCount > 0 ? $" · branches: {branchCount}" : "")
-             + $" · id: {s.Id}";
-    }
-
-    // The chats the user curated as templates, newest-updated first.
-    public IReadOnlyList<ArchiveSession> Templates() =>
-        Store.Sessions.Values
-            .Where(s => s.IsTemplate && !s.Archived)
-            .OrderByDescending(s => s.UpdatedAt, StringComparer.Ordinal)
-            .ToList();
 
     private string ResolveSessionSourcePath(ArchiveSession session)
     {
         if (string.IsNullOrEmpty(session.SourcePath)) return "";
-        return Path.IsPathRooted(session.SourcePath) ? session.SourcePath : Path.Combine(_rootPath, session.SourcePath);
+        return Path.IsPathRooted(session.SourcePath)
+            ? session.SourcePath
+            : Path.Combine(_rootPath, session.SourcePath);
     }
 
-    // Claude: a branch is a new <uuid>.jsonl in the SAME project folder, with sessionId rewritten to the
-    // new id on every line and a forkedFrom marker on the first line — exactly the shape `/branch` writes,
-    // so `claude --resume <newId>` reopens it with the full history.
-    private static string BranchClaudeTranscript(string srcPath, string parentId, string newId)
+    private async Task<string> CloneClaudeTranscriptAsync(
+        string sourcePath,
+        string nativeSourcePath,
+        string parentId,
+        string newId)
     {
-        var dir = Path.GetDirectoryName(srcPath) ?? throw new InvalidOperationException("transcript has no folder.");
-        var destPath = Path.Combine(dir, newId + ".jsonl");
-        var lines = File.ReadAllLines(srcPath);
+        var nativeDirectory = Path.GetDirectoryName(nativeSourcePath);
+        if (string.IsNullOrWhiteSpace(nativeDirectory))
+            nativeDirectory = _claudeSessionsRoot;
+        Directory.CreateDirectory(nativeDirectory);
+        var destinationPath = Path.Combine(nativeDirectory, newId + ".jsonl");
 
-        // The branch point is the tip of the parent's history (a full clone).
-        string? tipUuid = null;
-        for (int i = lines.Length - 1; i >= 0 && tipUuid is null; i--)
+        var capturedPath = Path.Combine(_templatesRoot, ".spawn-" + Guid.NewGuid().ToString("N") + ".jsonl");
+        Directory.CreateDirectory(_templatesRoot);
+        try
         {
-            if (string.IsNullOrWhiteSpace(lines[i])) continue;
-            if (JsonNode.Parse(lines[i]) is JsonObject o && o["uuid"] is JsonValue uv) tipUuid = uv.ToString();
-        }
-
-        var outLines = new List<string>(lines.Length);
-        var stampedFork = false;
-        foreach (var line in lines)
-        {
-            if (string.IsNullOrWhiteSpace(line)) { outLines.Add(line); continue; }
-            if (JsonNode.Parse(line) is not JsonObject obj) { outLines.Add(line); continue; }
-            if (obj.ContainsKey("sessionId")) obj["sessionId"] = newId;
-            if (!stampedFork)
+            await JsonlTranscriptCloner.CloneAsync(sourcePath, capturedPath);
+            var tipUuid = FindClaudeTipUuid(capturedPath);
+            var stampedFork = false;
+            await JsonlTranscriptCloner.CloneAsync(capturedPath, destinationPath, (_, line) =>
             {
-                obj["forkedFrom"] = new JsonObject { ["sessionId"] = parentId, ["messageUuid"] = tipUuid ?? "" };
-                stampedFork = true;
-            }
-            outLines.Add(obj.ToJsonString());
+                if (string.IsNullOrWhiteSpace(line) || JsonNode.Parse(line) is not JsonObject obj) return line;
+                if (obj.ContainsKey("sessionId")) obj["sessionId"] = newId;
+                if (!stampedFork)
+                {
+                    obj["forkedFrom"] = new JsonObject
+                    {
+                        ["sessionId"] = parentId,
+                        ["messageUuid"] = tipUuid
+                    };
+                    stampedFork = true;
+                }
+                return obj.ToJsonString();
+            });
         }
-        File.WriteAllText(destPath, string.Join("\n", outLines) + "\n");
-        return destPath;
+        finally
+        {
+            TryDeleteFile(capturedPath);
+        }
+        return destinationPath;
     }
 
-    // Codex: a branch is a copied rollout under ~/.codex/sessions/<Y>/<M>/<D> with a fresh id, and a
-    // matching row in state_5.sqlite so `codex resume <newId>` resolves it. Only the first line
-    // (session_meta) carries the id, so the (potentially huge) rest of the rollout is streamed verbatim.
-    private string BranchCodexTranscript(string srcPath, ArchiveSession parent, string newId)
+    private async Task<string> CloneCodexTranscriptAsync(
+        string sourcePath,
+        ArchiveSession parent,
+        string parentId,
+        string newId)
     {
         var now = DateTime.Now;
-        var root = DefaultCodexSessionsRoot;
-        var dir = Path.Combine(root, now.ToString("yyyy"), now.ToString("MM"), now.ToString("dd"));
-        Directory.CreateDirectory(dir);
-        var fileName = $"rollout-{now:yyyy-MM-ddTHH-mm-ss}-{newId}.jsonl";
-        var destPath = Path.Combine(dir, fileName);
+        var directory = Path.Combine(
+            _codexSessionsRoot,
+            now.ToString("yyyy"),
+            now.ToString("MM"),
+            now.ToString("dd"));
+        Directory.CreateDirectory(directory);
+        var destinationPath = Path.Combine(
+            directory,
+            $"rollout-{now:yyyy-MM-ddTHH-mm-ss}-{newId}.jsonl");
 
-        using (var reader = new StreamReader(srcPath))
-        using (var writer = new StreamWriter(destPath, append: false) { NewLine = "\n" })
+        try
         {
-            var first = reader.ReadLine();
-            if (first is null) throw new InvalidOperationException("the rollout is empty.");
-            writer.WriteLine(RewriteCodexSessionMeta(first, parent.Id, newId));
-            var buffer = new char[1 << 16];
-            int read;
-            while ((read = reader.Read(buffer, 0, buffer.Length)) > 0) writer.Write(buffer, 0, read);
+            await JsonlTranscriptCloner.CloneAsync(
+                sourcePath,
+                destinationPath,
+                (lineNumber, line) => lineNumber == 0
+                    ? RewriteCodexSessionMeta(line, parentId, newId)
+                    : line);
+            if (!_codexThreadRegistrar(parent, newId, destinationPath))
+                throw new InvalidOperationException("the source Codex thread row was not found or the new row could not be verified.");
         }
-
-        RegisterCodexBranchThread(parent, newId, destPath);
-        return destPath;
+        catch
+        {
+            TryDeleteFile(destinationPath);
+            throw;
+        }
+        return destinationPath;
     }
 
     internal static string RewriteCodexSessionMeta(string line, string parentId, string newId)
@@ -189,62 +437,138 @@ public sealed partial class ArchiveService
         return obj.ToJsonString();
     }
 
-    // Give the branch its own row in Codex's thread index. We CLONE the parent's row (or, if it's missing,
-    // the most recent row) so every NOT NULL column is satisfied, then override the identity + timestamps.
-    // Best-effort: a resume can still fall back to a rollout file scan, so a DB hiccup never aborts a branch.
-    private static void RegisterCodexBranchThread(ArchiveSession parent, string newId, string rolloutPath)
+    internal bool RegisterCodexThread(ArchiveSession parent, string newId, string rolloutPath)
     {
-        var dbPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".codex", "state_5.sqlite");
-        if (!File.Exists(dbPath)) return;
+        if (!File.Exists(_codexStateDbPath)) return false;
         try
         {
-            using var conn = new SqliteConnection(new SqliteConnectionStringBuilder { DataSource = dbPath }.ToString());
-            conn.Open();
+            using var connection = new SqliteConnection(
+                new SqliteConnectionStringBuilder { DataSource = _codexStateDbPath }.ToString());
+            connection.Open();
+            using var transaction = connection.BeginTransaction();
 
-            var cols = new List<string>();
-            using (var pragma = conn.CreateCommand())
+            var columns = new List<string>();
+            using (var pragma = connection.CreateCommand())
             {
+                pragma.Transaction = transaction;
                 pragma.CommandText = "pragma table_info(threads)";
-                using var r = pragma.ExecuteReader();
-                while (r.Read()) cols.Add(r.GetString(1));
+                using var reader = pragma.ExecuteReader();
+                while (reader.Read()) columns.Add(reader.GetString(1));
             }
-            if (cols.Count == 0) return;
+            if (columns.Count == 0) return false;
 
-            var row = ReadThreadRow(conn, cols, "select * from threads where id = $id", parent.Id)
-                      ?? ReadThreadRow(conn, cols, "select * from threads order by updated_at desc limit 1", null);
-            if (row is null) return;   // no template to satisfy NOT NULL columns; leave to file-scan resume
+            var row = ReadThreadRow(
+                connection,
+                transaction,
+                columns,
+                "select * from threads where id = $id limit 1",
+                parent.Id);
+            if (row is null) return false;
 
-            long nowS = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-            long nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-            void Set(string col, object? v) { if (row.ContainsKey(col)) row[col] = v; }
+            var nowSeconds = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            var nowMilliseconds = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            void Set(string column, object? value)
+            {
+                if (row.ContainsKey(column)) row[column] = value;
+            }
             row["id"] = newId;
-            row["rollout_path"] = rolloutPath;
-            Set("created_at", nowS); Set("updated_at", nowS); Set("recency_at", nowS);
-            Set("created_at_ms", nowMs); Set("updated_at_ms", nowMs); Set("recency_at_ms", nowMs);
-            Set("archived", 0L); Set("archived_at", null);
-            if (row.TryGetValue("title", out var t) && t is string ts && !string.IsNullOrWhiteSpace(ts))
-                row["title"] = ts + " (branch)";
+            Set("rollout_path", rolloutPath);
+            Set("created_at", nowSeconds);
+            Set("updated_at", nowSeconds);
+            Set("recency_at", nowSeconds);
+            Set("created_at_ms", nowMilliseconds);
+            Set("updated_at_ms", nowMilliseconds);
+            Set("recency_at_ms", nowMilliseconds);
+            Set("archived", 0L);
+            Set("archived_at", null);
+            if (row.TryGetValue("title", out var title)
+                && title is string text
+                && !string.IsNullOrWhiteSpace(text))
+                row["title"] = text + " (branch)";
 
-            var colList = string.Join(",", cols);
-            var paramList = string.Join(",", cols.Select((_, i) => "$p" + i));
-            using var ins = conn.CreateCommand();
-            ins.CommandText = $"insert or replace into threads ({colList}) values ({paramList})";
-            for (int i = 0; i < cols.Count; i++)
-                ins.Parameters.AddWithValue("$p" + i, row[cols[i]] ?? DBNull.Value);
-            ins.ExecuteNonQuery();
+            var columnList = string.Join(",", columns);
+            var parameterList = string.Join(",", columns.Select((_, index) => "$p" + index));
+            using (var insert = connection.CreateCommand())
+            {
+                insert.Transaction = transaction;
+                insert.CommandText = $"insert into threads ({columnList}) values ({parameterList})";
+                for (var index = 0; index < columns.Count; index++)
+                    insert.Parameters.AddWithValue("$p" + index, row[columns[index]] ?? DBNull.Value);
+                if (insert.ExecuteNonQuery() != 1) return false;
+            }
+
+            using var verify = connection.CreateCommand();
+            verify.Transaction = transaction;
+            verify.CommandText = "select rollout_path from threads where id = $id";
+            verify.Parameters.AddWithValue("$id", newId);
+            var verified = string.Equals(
+                verify.ExecuteScalar() as string,
+                rolloutPath,
+                StringComparison.OrdinalIgnoreCase);
+            if (!verified) return false;
+            transaction.Commit();
+            return true;
         }
-        catch { /* best-effort: the rollout file itself is enough for a mtime-scan resume */ }
+        catch
+        {
+            return false;
+        }
     }
 
-    private static Dictionary<string, object?>? ReadThreadRow(SqliteConnection conn, List<string> cols, string sql, string? id)
+    private static Dictionary<string, object?>? ReadThreadRow(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        List<string> columns,
+        string sql,
+        string id)
     {
-        using var cmd = conn.CreateCommand();
-        cmd.CommandText = sql;
-        if (id is not null) cmd.Parameters.AddWithValue("$id", id);
-        using var r = cmd.ExecuteReader();
-        if (!r.Read()) return null;
-        var map = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
-        for (int i = 0; i < cols.Count; i++) map[cols[i]] = r.IsDBNull(i) ? null : r.GetValue(i);
-        return map;
+        using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = sql;
+        command.Parameters.AddWithValue("$id", id);
+        using var reader = command.ExecuteReader();
+        if (!reader.Read()) return null;
+        var row = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
+        for (var index = 0; index < columns.Count; index++)
+            row[columns[index]] = reader.IsDBNull(index) ? null : reader.GetValue(index);
+        return row;
+    }
+
+    private static string FindClaudeTipUuid(string path)
+    {
+        string tip = "";
+        foreach (var line in SafeReadLines(path))
+        {
+            if (string.IsNullOrWhiteSpace(line)) continue;
+            try
+            {
+                if (JsonNode.Parse(line) is JsonObject obj && obj["uuid"] is JsonValue uuid)
+                    tip = uuid.ToString();
+            }
+            catch { }
+        }
+        return tip;
+    }
+
+    private static int CountCompleteLines(string path)
+    {
+        var count = 0;
+        using var stream = new FileStream(
+            path,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.ReadWrite | FileShare.Delete);
+        var buffer = new byte[64 * 1024];
+        int read;
+        while ((read = stream.Read(buffer, 0, buffer.Length)) > 0)
+            for (var index = 0; index < read; index++)
+                if (buffer[index] == (byte)'\n') count++;
+        return count;
+    }
+
+    private static string DeterministicSnapshotId(string sourceId, string idempotencyKey)
+    {
+        var bytes = SHA256.HashData(Encoding.UTF8.GetBytes(sourceId + "\n" + idempotencyKey));
+        return Convert.ToHexString(bytes).ToLowerInvariant()[..32];
     }
 }

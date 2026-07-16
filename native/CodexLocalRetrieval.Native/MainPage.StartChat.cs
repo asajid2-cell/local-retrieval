@@ -94,15 +94,23 @@ public sealed partial class MainPage
         }
         tool.SelectionChanged += (_, _) => UpdateToolMode();
 
-        // Start FROM a template: pick a curated chat and the new chat begins with its full context (a
-        // branch of it). Tool + folder then come from the template, so those fields are disabled.
+        // Start from an immutable checkpoint. Tool + folder come from its source chat.
         var templates = _archive.Templates();
         var templatePicker = new ComboBox { MinWidth = 320 };
         templatePicker.Items.Add(new ComboBoxItem { Content = "(none — start a blank chat)", Tag = null });
         foreach (var t in templates)
-            templatePicker.Items.Add(new ComboBoxItem { Content = t.DisplayTitle, Tag = t });
+        {
+            var created = DateTime.TryParse(t.CreatedAt, out var parsed)
+                ? parsed.ToLocalTime().ToString("yyyy-MM-dd HH:mm")
+                : t.CreatedAt;
+            templatePicker.Items.Add(new ComboBoxItem
+            {
+                Content = $"{t.DisplayName} · {created} · source: {t.SourceTitle}",
+                Tag = t
+            });
+        }
         templatePicker.SelectedIndex = 0;
-        ArchiveSession? SelectedTemplate() => (templatePicker.SelectedItem as ComboBoxItem)?.Tag as ArchiveSession;
+        TemplateSnapshot? SelectedTemplate() => (templatePicker.SelectedItem as ComboBoxItem)?.Tag as TemplateSnapshot;
         var templateNote = new TextBlock
         {
             Text = "Tool and folder come from the template.",
@@ -124,7 +132,7 @@ public sealed partial class MainPage
         var panel = new StackPanel { Spacing = 14, MinWidth = 500 };
         if (templates.Count > 0)
         {
-            panel.Children.Add(Labeled("Start from template", templatePicker));
+            panel.Children.Add(Labeled("Start from checkpoint", templatePicker));
             panel.Children.Add(templateNote);
         }
         panel.Children.Add(Labeled("Tool", tool));
@@ -144,8 +152,7 @@ public sealed partial class MainPage
         };
         if (await dialog.ShowAsync() != ContentDialogResult.Primary) return;
 
-        // From a template: spawn a branch that carries the template's context, apply this chat's name /
-        // phrase / collection, and resume it — tool + folder are inherited, so the rest of the flow is skipped.
+        // Spawn from the immutable checkpoint, then apply this chat's filing metadata.
         var chosenTemplate = SelectedTemplate();
         if (chosenTemplate is not null)
         {
