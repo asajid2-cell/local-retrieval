@@ -476,6 +476,7 @@ function renderDetail(v){
 function resumeCard(r){
   if(r.loading) return el('div',{class:'note'}, el('span',{class:'spin'}),' starting…');
   if(r.error) return el('div',{class:'err'}, 'Resume failed: '+r.error);
+  if(!r.launched&&!r.command) return el('div',{class:'err'}, 'Resume refused: '+(r.note||'No launch reason was returned.'));
   return el('div',{class:'msg'},
     el('div',{class:'who'}, r.launched ? 'Launched a terminal on the host ✓' : 'Run this to resume:'),
     el('div',{class:'evt',style:'margin:6px 0 0'}, r.command||'(no command)'),

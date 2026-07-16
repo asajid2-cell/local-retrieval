@@ -447,12 +447,30 @@ public static class RunningSessions
     // THE gate the app must consult before spawning a resume: is this chat (by id OR any lineage alias)
     // already being run by a live process? If so, launching another `--resume` makes two writers on one
     // transcript and (verified) Claude then SILENTLY drops writes → lost work. Never spawn when this is true.
-    public static bool IsSessionLive(string? sessionId, IEnumerable<string>? aliases = null)
+    public static bool TryIsSessionLive(
+        string? sessionId,
+        IEnumerable<string>? aliases,
+        out bool isLive,
+        out string detail)
+    {
+        isLive = false;
+        if (!TryAllLiveSessionIds(out var live, out detail)) return false;
+        isLive = IsSessionLive(sessionId, aliases, live);
+        return true;
+    }
+
+    public static bool IsSessionLive(
+        string? sessionId,
+        IEnumerable<string>? aliases,
+        ISet<string> liveIds)
     {
         var ids = new List<string?> { sessionId };
         if (aliases != null) ids.AddRange(aliases);
-        return !TryAllLiveSessionIds(out var live, out _) || AnyLive(ids, live);
+        return AnyLive(ids, liveIds);
     }
+
+    public static bool IsSessionLive(string? sessionId, IEnumerable<string>? aliases = null)
+        => !TryIsSessionLive(sessionId, aliases, out var isLive, out _) || isLive;
 
     public static bool IsLiveAgentProcess(string processName, string commandLine)
     {

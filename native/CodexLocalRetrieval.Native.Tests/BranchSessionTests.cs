@@ -1,5 +1,6 @@
 using System.Text.Json;
 using CodexLocalRetrieval.Core.Models;
+using CodexLocalRetrieval.Core.Remote;
 using CodexLocalRetrieval.Core.Services;
 using Microsoft.Data.Sqlite;
 
@@ -180,6 +181,130 @@ public sealed class BranchSessionTests
     }
 
     [TestMethod]
+    [DataRow("claude")]
+    [DataRow("codex")]
+    public async Task CheckpointsRemainPristineAndSpawnIndependentResumableChats(string tool)
+    {
+        using var fixture = new TemplateFixture(tool);
+        var source = fixture.Source;
+        var initialTurns = UserTurns(tool, source.SourcePath);
+        var initialThreadCount = tool == "codex" ? fixture.ThreadCount() : 0;
+
+        var t1 = (await fixture.Service.CreateTemplateSnapshotAsync(source, "T1")).Snapshot!;
+        var t1Bytes = await File.ReadAllBytesAsync(t1.SnapshotPath);
+
+        await fixture.AppendTurnAsync(source, "continued-after-t1");
+        var continuedTurns = UserTurns(tool, source.SourcePath);
+        var sourceAtT2 = await File.ReadAllBytesAsync(source.SourcePath);
+        var t2 = (await fixture.Service.CreateTemplateSnapshotAsync(source, "T2")).Snapshot!;
+        var t2Bytes = await File.ReadAllBytesAsync(t2.SnapshotPath);
+
+        var fromT1 = (await fixture.Service.SpawnTemplateAsync(t1)).Branch!;
+        var fromT2 = (await fixture.Service.SpawnTemplateAsync(t2)).Branch!;
+
+        CollectionAssert.AreEqual(initialTurns, UserTurns(tool, fromT1.SourcePath));
+        CollectionAssert.AreEqual(continuedTurns, UserTurns(tool, fromT2.SourcePath));
+        CollectionAssert.AreEqual(t1Bytes, await File.ReadAllBytesAsync(t1.SnapshotPath));
+        CollectionAssert.AreEqual(t2Bytes, await File.ReadAllBytesAsync(t2.SnapshotPath));
+        CollectionAssert.AreEqual(sourceAtT2, await File.ReadAllBytesAsync(source.SourcePath));
+        Assert.AreNotEqual(source.Id, fromT1.Id);
+        Assert.AreNotEqual(source.Id, fromT2.Id);
+        Assert.AreNotEqual(fromT1.Id, fromT2.Id);
+        Assert.AreNotEqual(fromT1.SourcePath, fromT2.SourcePath);
+        Assert.IsFalse(fromT1.Aliases.Contains(source.Id), "lineage must not be an identity alias");
+        Assert.IsFalse(fromT2.Aliases.Contains(source.Id), "lineage must not be an identity alias");
+
+        var exe = tool == "claude" ? "C:\\claude.exe" : "C:\\codex.exe";
+        var sourceLaunch = fixture.Service.BuildResumeLaunch(source, exeOverride: exe);
+        var t1Launch = fixture.Service.BuildResumeLaunch(fromT1, exeOverride: exe);
+        var t2Launch = fixture.Service.BuildResumeLaunch(fromT2, exeOverride: exe);
+        StringAssert.Contains(sourceLaunch.Arguments, source.Id);
+        StringAssert.Contains(t1Launch.Arguments, fromT1.Id);
+        StringAssert.Contains(t2Launch.Arguments, fromT2.Id);
+
+        var live = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { source.Id };
+        Assert.IsFalse(RunningSessions.IsSessionLive(fromT1.Id, fromT1.Aliases, live));
+        Assert.IsFalse(RunningSessions.IsSessionLive(fromT2.Id, fromT2.Aliases, live));
+        Assert.IsTrue(RunningSessions.IsSessionLive(source.Id, source.Aliases, live));
+
+        var claimRoot = Path.Combine(fixture.Root, "claims");
+        var claimOptions = new SessionLaunchClaims.Options(claimRoot);
+        Assert.IsTrue(SessionLaunchClaims.TryAcquire(
+            fromT1.Id, fromT1.Aliases, "checkpoint T1 launch", out var t1Claim, out var t1Detail,
+            id => live.Contains(id), claimOptions), t1Detail);
+        using (t1Claim)
+        {
+            Assert.IsTrue(SessionLaunchClaims.TryAcquire(
+                fromT2.Id, fromT2.Aliases, "checkpoint T2 launch", out var t2Claim, out var t2Detail,
+                id => live.Contains(id), claimOptions), t2Detail);
+            using (t2Claim)
+            {
+                Assert.AreEqual(2, Directory.GetFiles(claimRoot, "*.json").Length);
+            }
+        }
+
+        live.Clear();
+        live.Add(fromT1.Id);
+        Assert.IsFalse(RunningSessions.IsSessionLive(source.Id, source.Aliases, live));
+        Assert.IsFalse(RunningSessions.IsSessionLive(fromT2.Id, fromT2.Aliases, live));
+        Assert.IsTrue(SessionLaunchClaims.TryAcquire(
+            source.Id, source.Aliases, "original launch", out var sourceClaim, out var sourceDetail,
+            id => live.Contains(id), claimOptions), sourceDetail);
+        using (sourceClaim)
+        {
+            Assert.IsTrue(SessionLaunchClaims.TryAcquire(
+                fromT2.Id, fromT2.Aliases, "other checkpoint launch", out var otherClaim, out var otherDetail,
+                id => live.Contains(id), claimOptions), otherDetail);
+            otherClaim?.Dispose();
+        }
+
+        var remoteApi = new RemoteApi(
+            fixture.Service,
+            () => null,
+            allowLaunch: false,
+            resumeLaunchFactory: session => fixture.Service.BuildResumeLaunch(session, exeOverride: exe));
+        var remoteT2Json = JsonSerializer.Serialize(remoteApi.ResumeCommand(
+            fromT2.Id,
+            launch: true,
+            IntegrityOptions(live)));
+        using var remoteT2 = JsonDocument.Parse(remoteT2Json);
+        Assert.AreEqual(t2Launch.DisplayCommand, remoteT2.RootElement.GetProperty("command").GetString());
+        StringAssert.Contains(remoteT2.RootElement.GetProperty("note").GetString() ?? "", "Launch is disabled");
+
+        await fixture.AppendTurnAsync(source, "original-continued-after-spawns");
+        CollectionAssert.AreEqual(
+            continuedTurns.Concat(new[] { "original-continued-after-spawns" }).ToArray(),
+            UserTurns(tool, source.SourcePath));
+        CollectionAssert.AreEqual(initialTurns, UserTurns(tool, fromT1.SourcePath));
+        CollectionAssert.AreEqual(continuedTurns, UserTurns(tool, fromT2.SourcePath));
+        CollectionAssert.AreEqual(t1Bytes, await File.ReadAllBytesAsync(t1.SnapshotPath));
+        CollectionAssert.AreEqual(t2Bytes, await File.ReadAllBytesAsync(t2.SnapshotPath));
+
+        if (tool == "codex")
+        {
+            Assert.AreEqual(initialThreadCount + 2, fixture.ThreadCount());
+            Assert.AreEqual(fromT1.SourcePath, fixture.RolloutPath(fromT1.Id));
+            Assert.AreEqual(fromT2.SourcePath, fixture.RolloutPath(fromT2.Id));
+        }
+    }
+
+    [TestMethod]
+    public async Task Load_RemovesLegacyBranchParentIdentityAlias()
+    {
+        using var fixture = new TemplateFixture("claude");
+        var branch = (await fixture.Service.BranchSessionAsync(fixture.Source)).Branch!;
+        branch.Aliases.Add(fixture.Source.Id);
+        var json = JsonSerializer.Serialize(fixture.Service.Store);
+        await File.WriteAllTextAsync(fixture.StorePath, json);
+
+        var reloaded = fixture.NewService();
+        await reloaded.LoadStoreStateAsync();
+
+        Assert.IsFalse(reloaded.Store.Sessions[branch.Id].Aliases.Contains(fixture.Source.Id));
+        Assert.AreEqual(fixture.Source.Id, reloaded.Store.Sessions[branch.Id].BranchOfId);
+    }
+
+    [TestMethod]
     public async Task LegacyMigration_IsIdempotentAcrossRestartAndSaveConflict()
     {
         using var fixture = new TemplateFixture("claude", seedStore: false);
@@ -250,6 +375,44 @@ public sealed class BranchSessionTests
     private static string CodexMessage(string text) =>
         $"{{\"timestamp\":\"2026-07-16T12:00:00Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"user_message\",\"message\":\"{text}\"}}}}\n";
 
+    private static string[] UserTurns(string tool, string path)
+    {
+        var turns = new List<string>();
+        foreach (var line in File.ReadLines(path))
+        {
+            using var document = JsonDocument.Parse(line);
+            var root = document.RootElement;
+            if (tool == "claude"
+                && root.TryGetProperty("type", out var claudeType)
+                && claudeType.GetString() == "user"
+                && root.TryGetProperty("message", out var message)
+                && message.TryGetProperty("content", out var content)
+                && content.ValueKind == JsonValueKind.String)
+            {
+                turns.Add(content.GetString() ?? "");
+            }
+            else if (tool == "codex"
+                     && root.TryGetProperty("type", out var rootType)
+                     && rootType.GetString() == "event_msg"
+                     && root.TryGetProperty("payload", out var payload)
+                     && payload.TryGetProperty("type", out var payloadType)
+                     && payloadType.GetString() == "user_message"
+                     && payload.TryGetProperty("message", out var codexMessage))
+            {
+                turns.Add(codexMessage.GetString() ?? "");
+            }
+        }
+        return turns.ToArray();
+    }
+
+    private static SessionIntegrity.Options IntegrityOptions(ISet<string> liveIds) =>
+        new(
+            LiveIdsProvider: () => (
+                true,
+                new HashSet<string>(liveIds, StringComparer.OrdinalIgnoreCase),
+                "test live ids"),
+            FileExists: _ => true);
+
     private sealed class TemplateFixture : IDisposable
     {
         public TemplateFixture(string tool, bool seedStore = true)
@@ -296,6 +459,13 @@ public sealed class BranchSessionTests
         public string DbPath { get; }
         public ArchiveSession Source { get; }
         public ArchiveService Service { get; }
+
+        public Task AppendTurnAsync(ArchiveSession session, string text) =>
+            File.AppendAllTextAsync(
+                session.SourcePath,
+                Tool == "claude"
+                    ? ClaudeLine(session.Id, Guid.NewGuid().ToString("N"), text)
+                    : CodexMessage(text));
 
         public ArchiveService NewService() => new(
             storePath: StorePath,

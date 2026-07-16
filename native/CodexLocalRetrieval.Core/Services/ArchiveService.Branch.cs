@@ -323,7 +323,6 @@ public sealed partial class ArchiveService
             BranchOfId = parentId,
             BranchedAt = now
         };
-        AddAlias(branch.Aliases, parentId);
         Store.Sessions[newId] = branch;
         try
         {

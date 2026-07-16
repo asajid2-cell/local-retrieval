@@ -226,6 +226,7 @@ public sealed partial class ArchiveService
         {
             Store = await Task.Run(() => ReadStore(_bundledStorePath));
         }
+        NormalizeBranchIdentityAliases();
         _loadedGeneration = Store.Generation;
         NormalizeSettings();
         EnsureDecks();
@@ -582,6 +583,7 @@ public sealed partial class ArchiveService
 
             var previousGeneration = Store.Generation;
             var nextGeneration = checked(diskGeneration + 1);
+            NormalizeBranchIdentityAliases();
             Store.Generation = nextGeneration;
             var bytes = JsonSerializer.SerializeToUtf8Bytes(Store, _jsonOptions);
             try
@@ -3352,6 +3354,7 @@ public sealed partial class ArchiveService
             {
                 PreserveAppFields(existing, incoming);
             }
+            NormalizeBranchIdentityAliases(incoming);
             Store.Sessions[incoming.Id] = incoming;
             imported.Add(incoming.Id);
         }
@@ -3420,7 +3423,23 @@ public sealed partial class ArchiveService
             incoming.BranchOfId = existing.BranchOfId;
         if (string.IsNullOrWhiteSpace(incoming.BranchedAt) && !string.IsNullOrWhiteSpace(existing.BranchedAt))
             incoming.BranchedAt = existing.BranchedAt;
+        NormalizeBranchIdentityAliases(incoming);
         if (existing.IsTemplate) incoming.IsTemplate = true;
+    }
+
+    private void NormalizeBranchIdentityAliases()
+    {
+        foreach (var session in Store.Sessions.Values)
+            NormalizeBranchIdentityAliases(session);
+    }
+
+    private static void NormalizeBranchIdentityAliases(ArchiveSession session)
+    {
+        var parentId = (session.BranchOfId ?? "").Trim();
+        if (parentId.Length == 0) return;
+        for (var index = session.Aliases.Count - 1; index >= 0; index--)
+            if (string.Equals(session.Aliases[index], parentId, StringComparison.OrdinalIgnoreCase))
+                session.Aliases.RemoveAt(index);
     }
 
     private Dictionary<string, ArchiveSession> FindSourcePathRekeys(IEnumerable<ArchiveSession> incoming)

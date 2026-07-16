@@ -97,7 +97,7 @@ public sealed partial class MainPage
                     created.detail,
                     "warn",
                     details: new Dictionary<string, string> { ["muxName"] = name });
-                SyncStatus.Text = "Could not create the mux session - see log.";
+                SyncStatus.Text = "Could not create the mux session: " + created.detail;
                 return;
             }
             muxStarted = true;
@@ -174,7 +174,7 @@ public sealed partial class MainPage
                     ex.Message,
                     "error",
                     details: new Dictionary<string, string> { ["muxName"] = name });
-                SyncStatus.Text = "Could not start the mux session - see log.";
+                SyncStatus.Text = "Could not start the mux session: " + ex.Message;
             }
         }
         finally
@@ -581,7 +581,25 @@ public sealed partial class MainPage
             return new CodexLocalRetrieval.Core.Models.AgentCommandResult(false, "no resume command for this session.");
         }
 
-        if (c.pid <= 0 && CodexLocalRetrieval.Core.Remote.RunningSessions.IsSessionLive(session.Id, session.Aliases))
+        if (c.pid <= 0
+            && !CodexLocalRetrieval.Core.Remote.RunningSessions.TryIsSessionLive(
+                session.Id,
+                session.Aliases,
+                out var sessionLive,
+                out var liveDetail))
+        {
+            RecordSessionEvent(
+                session,
+                "tomux.refused.live-scan",
+                liveDetail,
+                "warn",
+                details: new Dictionary<string, string> { ["muxName"] = name });
+            return new CodexLocalRetrieval.Core.Models.AgentCommandResult(false,
+                "couldn't verify whether this chat is already live: " + liveDetail,
+                ResolvedSessionId: session.Id);
+        }
+
+        if (c.pid <= 0 && sessionLive)
         {
             RecordSessionEvent(
                 session,
