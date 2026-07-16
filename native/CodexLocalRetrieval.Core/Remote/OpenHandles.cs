@@ -92,7 +92,10 @@ public static class OpenHandles
     private const uint PROCESS_DUP_HANDLE = 0x0040;
     private const uint DUPLICATE_SAME_ACCESS = 0x0002;
     private const uint FILE_TYPE_DISK = 0x0001;
-    private const int MaxHandleTableBytes = 256 * 1024 * 1024;
+    // The full system handle table on a busy dev box (many agents/processes) can exceed a few hundred MB;
+    // a 256 MB ceiling made the scan throw -> the live-owner check failed closed -> resume was BLOCKED for
+    // every session. Give it real headroom (transient, freed immediately). Kept well under int.MaxValue.
+    private const int MaxHandleTableBytes = 1024 * 1024 * 1024;
 
     [StructLayout(LayoutKind.Sequential)]
     private struct SYSTEM_HANDLE_ENTRY
