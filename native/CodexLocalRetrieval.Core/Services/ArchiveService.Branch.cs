@@ -16,6 +16,7 @@ public sealed partial class ArchiveService
 
     public readonly record struct BranchResult(bool Ok, string Message, ArchiveSession? Branch);
     public readonly record struct TemplateSnapshotResult(bool Ok, string Message, TemplateSnapshot? Snapshot);
+    public readonly record struct SnapshotReaderResult(bool Ok, string Message, ArchiveSession? Reader);
 
     public async Task<BranchResult> BranchSessionAsync(ArchiveSession parent)
     {
@@ -28,7 +29,8 @@ public sealed partial class ArchiveService
             parent,
             sourcePath,
             string.IsNullOrWhiteSpace(parent.DisplayTitle) ? parent.Id : parent.DisplayTitle,
-            parent.Id);
+            parent.Id,
+            fromSnapshotId: "");
     }
 
     public async Task<TemplateSnapshotResult> CreateTemplateSnapshotAsync(
@@ -98,8 +100,10 @@ public sealed partial class ArchiveService
             Model = source.Model,
             CreatedAt = createdAt.ToString("O"),
             CapturedSourceLength = capture.CapturedSourceLength,
+            LineCount = capture.LineCount,
             IdempotencyKey = stableKey
         };
+        snapshot.MessageCount = await CountSnapshotMessagesAsync(snapshot);
 
         Store.TemplateSnapshots[snapshot.Id] = snapshot;
         try
@@ -134,7 +138,12 @@ public sealed partial class ArchiveService
             Model = current.Model,
             SourcePath = current.SourcePath
         };
-        return await CreateNativeBranchAsync(parent, current.SnapshotPath, current.DisplayName, current.SourceSessionId);
+        return await CreateNativeBranchAsync(
+            parent,
+            current.SnapshotPath,
+            current.DisplayName,
+            current.SourceSessionId,
+            current.Id);
     }
 
     public IReadOnlyList<TemplateSnapshot> Templates() =>
@@ -150,6 +159,52 @@ public sealed partial class ArchiveService
                 StringComparison.OrdinalIgnoreCase))
             .OrderByDescending(snapshot => snapshot.CreatedAt, StringComparer.Ordinal)
             .ToList();
+
+    public IReadOnlyList<ArchiveSession> BranchesForSnapshot(string snapshotId) =>
+        Store.Sessions.Values
+            .Where(session =>
+                !session.Archived
+                && string.Equals(session.FromSnapshotId, snapshotId, StringComparison.OrdinalIgnoreCase))
+            .OrderByDescending(session => session.UpdatedAt, StringComparer.Ordinal)
+            .ToList();
+
+    public static string TemplateSnapshotDisplayLabel(TemplateSnapshot snapshot)
+    {
+        var created = DateTime.TryParse(snapshot.CreatedAt, out var parsed)
+            ? parsed.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss")
+            : snapshot.CreatedAt;
+        var count = snapshot.MessageCount > 0
+            ? $"{snapshot.MessageCount} message{(snapshot.MessageCount == 1 ? "" : "s")}"
+            : $"{snapshot.LineCount} line{(snapshot.LineCount == 1 ? "" : "s")}";
+        var suffix = snapshot.Id.Length <= 8 ? snapshot.Id : snapshot.Id[..8];
+        return $"{snapshot.DisplayName} · {created} · {count} · {suffix}";
+    }
+
+    public async Task<SnapshotReaderResult> OpenTemplateSnapshotAsync(string snapshotId)
+    {
+        if (!Store.TemplateSnapshots.TryGetValue(snapshotId, out var snapshot))
+            return new SnapshotReaderResult(false, "That checkpoint no longer exists.", null);
+        if (string.IsNullOrWhiteSpace(snapshot.SnapshotPath) || !File.Exists(snapshot.SnapshotPath))
+            return new SnapshotReaderResult(false, "The checkpoint transcript is missing from disk.", null);
+
+        var reader = new ArchiveSession
+        {
+            Id = "snapshot:" + snapshot.Id,
+            Tool = snapshot.Tool,
+            Title = snapshot.DisplayName,
+            CustomTitle = TemplateSnapshotDisplayLabel(snapshot),
+            SourcePath = snapshot.SnapshotPath,
+            Workspace = snapshot.Workspace,
+            WorkspaceName = snapshot.WorkspaceName,
+            Model = snapshot.Model,
+            CreatedAt = snapshot.CreatedAt,
+            UpdatedAt = snapshot.CreatedAt,
+            IsReadOnlySnapshot = true,
+            ReadOnlySnapshotId = snapshot.Id
+        };
+        await EnsureContentAsync(reader);
+        return new SnapshotReaderResult(true, "Opened checkpoint read-only.", reader);
+    }
 
     public async Task<bool> RenameTemplateSnapshotAsync(string snapshotId, string name)
     {
@@ -284,11 +339,44 @@ public sealed partial class ArchiveService
             session.TemplateSnapshotCount = counts.TryGetValue(session.Id, out var count) ? count : 0;
     }
 
+    internal async Task BackfillTemplateSnapshotMetadataAsync()
+    {
+        var changed = false;
+        foreach (var snapshot in Store.TemplateSnapshots.Values)
+        {
+            if (string.IsNullOrWhiteSpace(snapshot.SnapshotPath) || !File.Exists(snapshot.SnapshotPath)) continue;
+            if (snapshot.LineCount <= 0)
+            {
+                snapshot.LineCount = CountCompleteLines(snapshot.SnapshotPath);
+                changed = true;
+            }
+            if (snapshot.MessageCount <= 0)
+            {
+                snapshot.MessageCount = await CountSnapshotMessagesAsync(snapshot);
+                changed = true;
+            }
+        }
+        if (changed) await SaveAsync();
+    }
+
+    private async Task<int> CountSnapshotMessagesAsync(TemplateSnapshot snapshot)
+    {
+        var reader = new ArchiveSession
+        {
+            Id = "snapshot-count:" + snapshot.Id,
+            Tool = snapshot.Tool,
+            SourcePath = snapshot.SnapshotPath
+        };
+        await EnsureContentAsync(reader);
+        return reader.MessageCount;
+    }
+
     private async Task<BranchResult> CreateNativeBranchAsync(
         ArchiveSession parent,
         string sourcePath,
         string displayTitle,
-        string parentId)
+        string parentId,
+        string fromSnapshotId = "")
     {
         var tool = (parent.Tool ?? "").Trim().ToLowerInvariant();
         var newId = Guid.NewGuid().ToString();
@@ -321,6 +409,7 @@ public sealed partial class ArchiveService
             CreatedAt = now,
             UpdatedAt = now,
             BranchOfId = parentId,
+            FromSnapshotId = fromSnapshotId,
             BranchedAt = now
         };
         Store.Sessions[newId] = branch;

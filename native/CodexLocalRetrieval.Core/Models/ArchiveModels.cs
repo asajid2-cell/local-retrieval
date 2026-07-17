@@ -360,6 +360,12 @@ public sealed class TemplateSnapshot
     [JsonPropertyName("capturedSourceLength")]
     public long CapturedSourceLength { get; set; }
 
+    [JsonPropertyName("messageCount")]
+    public int MessageCount { get; set; }
+
+    [JsonPropertyName("lineCount")]
+    public int LineCount { get; set; }
+
     [JsonPropertyName("idempotencyKey")]
     public string IdempotencyKey { get; set; } = "";
 
@@ -479,8 +485,19 @@ public sealed class ArchiveSession : INotifyPropertyChanged
     [JsonPropertyName("branchOfId")]
     public string BranchOfId { get; set; } = "";
 
+    // Exact immutable checkpoint used to create this branch. BranchOfId remains the source chat id so
+    // existing parent/descendant grouping and resumability semantics remain unchanged.
+    [JsonPropertyName("fromSnapshotId")]
+    public string FromSnapshotId { get; set; } = "";
+
     [JsonPropertyName("branchedAt")]
     public string BranchedAt { get; set; } = "";
+
+    [JsonIgnore]
+    public bool IsReadOnlySnapshot { get; set; }
+
+    [JsonIgnore]
+    public string ReadOnlySnapshotId { get; set; } = "";
 
     // Legacy migration input only. New checkpoints live in AppStoreData.TemplateSnapshots and are never
     // represented as sessions. The flag is cleared only after a private snapshot is durably persisted.

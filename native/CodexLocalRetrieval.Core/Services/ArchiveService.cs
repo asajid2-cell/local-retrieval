@@ -211,6 +211,7 @@ public sealed partial class ArchiveService
     {
         await LoadStoreStateAsync();
         await MigrateLegacyTemplatesAsync();
+        await BackfillTemplateSnapshotMetadataAsync();
         RefreshTemplateSnapshotCounts();
         RefreshSessions(OrderedVisibleSessions(Store.Sessions.Values));
     }
@@ -3421,6 +3422,8 @@ public sealed partial class ArchiveService
         // source of truth) — carry it across re-parses so a rescan never orphans a branch from its parent.
         if (string.IsNullOrWhiteSpace(incoming.BranchOfId) && !string.IsNullOrWhiteSpace(existing.BranchOfId))
             incoming.BranchOfId = existing.BranchOfId;
+        if (string.IsNullOrWhiteSpace(incoming.FromSnapshotId) && !string.IsNullOrWhiteSpace(existing.FromSnapshotId))
+            incoming.FromSnapshotId = existing.FromSnapshotId;
         if (string.IsNullOrWhiteSpace(incoming.BranchedAt) && !string.IsNullOrWhiteSpace(existing.BranchedAt))
             incoming.BranchedAt = existing.BranchedAt;
         NormalizeBranchIdentityAliases(incoming);
@@ -3532,6 +3535,8 @@ public sealed partial class ArchiveService
         // Claude resume is directory-scoped (it only finds the session under the launch dir's encoded
         // project folder), so it needs the recovered launch dir — not the recorded workspace subdir.
         var cwd = isClaude ? ResolveClaudeResumeDirectory(session) : ResolveWorkingDirectory(session);
+        if (session.IsReadOnlySnapshot)
+            return new ResumeLaunch("", "", cwd, "Refused: checkpoints are read-only and cannot be resumed.");
         if (!IsResumableId(id))
             return new ResumeLaunch("", "", cwd, "Refused: session id is not a safe token.");
 
@@ -3558,6 +3563,7 @@ public sealed partial class ArchiveService
 
     public bool CanBuildTrustedResumeLaunch(ArchiveSession session)
     {
+        if (session.IsReadOnlySnapshot) return false;
         var id = ResumeSessionId(session);
         if (!IsResumableId(id)) return false;
 

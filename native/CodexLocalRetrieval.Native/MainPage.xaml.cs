@@ -92,6 +92,7 @@ public sealed partial class MainPage : Page
     // re-parse now reads the file TAIL, so the newest user + agent messages show. Cheap and off-thread.
     private async Task FreshenOpenChatAsync(ArchiveSession s)
     {
+        if (s.IsReadOnlySnapshot) return;
         try
         {
             var beforeCount = s.MessageCount;
@@ -121,7 +122,7 @@ public sealed partial class MainPage : Page
 
     private async Task LiveTickAsync()
     {
-        if (_liveBusy || _screen != "Archive" || _selected is null || !_selected.ContentLoaded) return;
+        if (_liveBusy || _screen != "Archive" || _selected is null || _selected.IsReadOnlySnapshot || !_selected.ContentLoaded) return;
 
         // First sight of this chat -> set the baseline, don't repaint.
         if (!ReferenceEquals(_selected, _liveSession))
@@ -286,10 +287,11 @@ public sealed partial class MainPage : Page
     private void UpdateChrome()
     {
         bool sessionContext = _screen is "Archive" or "Source" or "Restore";
-        bool showRight = sessionContext && !_narrowLayout;   // fold the right rail when too narrow to fit
+        bool readOnlySnapshot = _selected?.IsReadOnlySnapshot == true;
+        bool showRight = sessionContext && !readOnlySnapshot && !_narrowLayout;   // fold the right rail when too narrow to fit
         RightColumnBorder.Visibility = showRight ? Visibility.Visible : Visibility.Collapsed;
         RightColumn.Width = showRight ? new GridLength(292) : new GridLength(0);
-        HeaderActions.Visibility = sessionContext ? Visibility.Visible : Visibility.Collapsed;
+        HeaderActions.Visibility = sessionContext && !readOnlySnapshot ? Visibility.Visible : Visibility.Collapsed;
     }
 
     // Header overflow menu: the same secondary actions as the right "Quick actions" rail, reachable
@@ -448,18 +450,41 @@ public sealed partial class MainPage : Page
 
     private void RenderArchive()
     {
-        ScreenLabel.Text = _selected is null
+        ScreenLabel.Text = _selected?.IsReadOnlySnapshot == true
+            ? "Immutable checkpoint - read-only archive reader"
+            : _selected is null
             ? "Archive reader"
             : $"{(string.Equals(_selected.Tool, "claude", StringComparison.OrdinalIgnoreCase) ? "Claude" : "Codex")} chat - archive reader";
         TitleText.Text = _selected?.DisplayTitle ?? "No chat selected";
         MainContent.Children.Clear();
-        RenderIntegrity();
-        RenderTags();
+        if (_selected?.IsReadOnlySnapshot != true)
+        {
+            RenderIntegrity();
+            RenderTags();
+        }
 
         if (_selected is null)
         {
             MainContent.Children.Add(EmptyBlock("No chats indexed", "Import a sessions folder to begin."));
             return;
+        }
+
+        if (_selected.IsReadOnlySnapshot)
+        {
+            MainContent.Children.Add(new Border
+            {
+                Background = PanelBrush(),
+                BorderBrush = LineBrush(),
+                BorderThickness = new Thickness(1),
+                CornerRadius = ControlCornerRadius(),
+                Padding = new Thickness(14, 10, 14, 10),
+                Child = new TextBlock
+                {
+                    Text = "Read-only checkpoint. This frozen transcript cannot be resumed or modified.",
+                    Foreground = MutedBrush(),
+                    TextWrapping = TextWrapping.Wrap
+                }
+            });
         }
 
         // New chat selected -> start fresh and jump to the newest messages once it renders.
@@ -481,7 +506,7 @@ public sealed partial class MainPage : Page
 
         // Content is cached (from index time or a prior open) — render it now, but force ONE fresh re-parse
         // per open so a chat NEVER shows a stale transcript from a previous session (the "3 days old" bug).
-        if (!_openFreshenDone)
+        if (!_openFreshenDone && !_selected.IsReadOnlySnapshot)
         {
             _openFreshenDone = true;
             _ = FreshenOpenChatAsync(_selected);

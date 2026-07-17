@@ -97,6 +97,92 @@ public sealed class BranchSessionTests
     }
 
     [TestMethod]
+    public async Task SpawnTemplateAsync_RecordsExactSnapshotLineage()
+    {
+        using var fixture = new TemplateFixture("claude");
+        var first = (await fixture.Service.CreateTemplateSnapshotAsync(fixture.Source, "same name")).Snapshot!;
+        await fixture.AppendTurnAsync(fixture.Source, "after-first");
+        var second = (await fixture.Service.CreateTemplateSnapshotAsync(fixture.Source, "same name")).Snapshot!;
+
+        var fromFirst = (await fixture.Service.SpawnTemplateAsync(first)).Branch!;
+        var fromSecond = (await fixture.Service.SpawnTemplateAsync(second)).Branch!;
+
+        Assert.AreEqual(fixture.Source.Id, fromFirst.BranchOfId);
+        Assert.AreEqual(fixture.Source.Id, fromSecond.BranchOfId);
+        Assert.AreEqual(first.Id, fromFirst.FromSnapshotId);
+        Assert.AreEqual(second.Id, fromSecond.FromSnapshotId);
+        Assert.AreNotEqual(fromFirst.FromSnapshotId, fromSecond.FromSnapshotId);
+    }
+
+    [TestMethod]
+    public async Task BranchesForSnapshot_ExcludesOtherSnapshotsAndLegacyBranches()
+    {
+        using var fixture = new TemplateFixture("claude");
+        var first = (await fixture.Service.CreateTemplateSnapshotAsync(fixture.Source, "T1")).Snapshot!;
+        await fixture.AppendTurnAsync(fixture.Source, "after-first");
+        var second = (await fixture.Service.CreateTemplateSnapshotAsync(fixture.Source, "T2")).Snapshot!;
+        var fromFirst = (await fixture.Service.SpawnTemplateAsync(first)).Branch!;
+        var fromSecond = (await fixture.Service.SpawnTemplateAsync(second)).Branch!;
+        var legacy = (await fixture.Service.BranchSessionAsync(fixture.Source)).Branch!;
+
+        CollectionAssert.AreEqual(
+            new[] { fromFirst.Id },
+            fixture.Service.BranchesForSnapshot(first.Id).Select(branch => branch.Id).ToArray());
+        CollectionAssert.AreEqual(
+            new[] { fromSecond.Id },
+            fixture.Service.BranchesForSnapshot(second.Id).Select(branch => branch.Id).ToArray());
+        Assert.AreEqual("", legacy.FromSnapshotId);
+        Assert.IsFalse(fixture.Service.BranchesForSnapshot(first.Id).Any(branch => branch.Id == legacy.Id));
+        Assert.IsFalse(fixture.Service.BranchesForSnapshot(second.Id).Any(branch => branch.Id == legacy.Id));
+    }
+
+    [TestMethod]
+    public async Task SnapshotDisplayLabels_AreDistinctAndIncludeSecondsAndCounts()
+    {
+        using var fixture = new TemplateFixture("claude");
+        var first = (await fixture.Service.CreateTemplateSnapshotAsync(fixture.Source, "same name")).Snapshot!;
+        await fixture.AppendTurnAsync(fixture.Source, "one-more-message");
+        var second = (await fixture.Service.CreateTemplateSnapshotAsync(fixture.Source, "same name")).Snapshot!;
+
+        var firstLabel = ArchiveService.TemplateSnapshotDisplayLabel(first);
+        var secondLabel = ArchiveService.TemplateSnapshotDisplayLabel(second);
+
+        Assert.AreNotEqual(firstLabel, secondLabel);
+        StringAssert.Matches(firstLabel, new System.Text.RegularExpressions.Regex(@"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}"));
+        StringAssert.Contains(firstLabel, $"{first.MessageCount} messages");
+        StringAssert.Contains(secondLabel, $"{second.MessageCount} messages");
+        Assert.IsTrue(second.MessageCount > first.MessageCount);
+        Assert.IsTrue(first.LineCount > 0);
+        Assert.IsTrue(second.LineCount > first.LineCount);
+    }
+
+    [TestMethod]
+    public async Task OpenTemplateSnapshotAsync_ParsesFrozenTranscriptReadOnly()
+    {
+        using var fixture = new TemplateFixture("claude");
+        var snapshot = (await fixture.Service.CreateTemplateSnapshotAsync(fixture.Source, "frozen")).Snapshot!;
+        var frozenText = await File.ReadAllTextAsync(snapshot.SnapshotPath);
+        await fixture.AppendTurnAsync(fixture.Source, "source-changed-later");
+
+        var opened = await fixture.Service.OpenTemplateSnapshotAsync(snapshot.Id);
+
+        Assert.IsTrue(opened.Ok, opened.Message);
+        Assert.IsNotNull(opened.Reader);
+        Assert.IsTrue(opened.Reader.IsReadOnlySnapshot);
+        Assert.AreEqual(snapshot.Id, opened.Reader.ReadOnlySnapshotId);
+        Assert.AreEqual(snapshot.SnapshotPath, opened.Reader.SourcePath);
+        Assert.AreEqual(snapshot.MessageCount, opened.Reader.MessageCount);
+        Assert.IsTrue(opened.Reader.ContentLoaded);
+        Assert.IsFalse(fixture.Service.Store.Sessions.ContainsKey(opened.Reader.Id));
+        var resume = fixture.Service.BuildResumeLaunch(opened.Reader, exeOverride: "C:\\claude.exe");
+        Assert.AreEqual("", resume.Exe);
+        StringAssert.Contains(resume.DisplayCommand, "read-only");
+        Assert.AreEqual(frozenText, await File.ReadAllTextAsync(snapshot.SnapshotPath));
+        Assert.IsFalse(opened.Reader.Messages.Any(message =>
+            message.Text.Contains("source-changed-later", StringComparison.Ordinal)));
+    }
+
+    [TestMethod]
     public async Task AppendingToSpawnedClaudeChat_DoesNotModifySnapshot()
     {
         using var fixture = new TemplateFixture("claude");
@@ -301,6 +387,26 @@ public sealed class BranchSessionTests
         await reloaded.LoadStoreStateAsync();
 
         Assert.IsFalse(reloaded.Store.Sessions[branch.Id].Aliases.Contains(fixture.Source.Id));
+        Assert.AreEqual(fixture.Source.Id, reloaded.Store.Sessions[branch.Id].BranchOfId);
+    }
+
+    [TestMethod]
+    public async Task Load_PreservesSnapshotLineageAcrossTranscriptReparse()
+    {
+        using var fixture = new TemplateFixture("claude");
+        var snapshot = (await fixture.Service.CreateTemplateSnapshotAsync(fixture.Source)).Snapshot!;
+        var branch = (await fixture.Service.SpawnTemplateAsync(snapshot)).Branch!;
+        await fixture.Service.SaveAsync();
+
+        var reloaded = fixture.NewService();
+        await reloaded.LoadStoreStateAsync();
+        reloaded.Store.Settings.Sources =
+        [
+            new SessionSource { Tool = "claude", Root = fixture.NativeRoot }
+        ];
+        await reloaded.SyncFromDiskAsync();
+
+        Assert.AreEqual(snapshot.Id, reloaded.Store.Sessions[branch.Id].FromSnapshotId);
         Assert.AreEqual(fixture.Source.Id, reloaded.Store.Sessions[branch.Id].BranchOfId);
     }
 

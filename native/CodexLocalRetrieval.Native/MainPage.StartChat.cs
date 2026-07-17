@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using CodexLocalRetrieval.Core.Models;
 using CodexLocalRetrieval.Core.Remote;
+using CodexLocalRetrieval.Core.Services;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Windows.Storage.Pickers;
@@ -100,12 +101,9 @@ public sealed partial class MainPage
         templatePicker.Items.Add(new ComboBoxItem { Content = "(none — start a blank chat)", Tag = null });
         foreach (var t in templates)
         {
-            var created = DateTime.TryParse(t.CreatedAt, out var parsed)
-                ? parsed.ToLocalTime().ToString("yyyy-MM-dd HH:mm")
-                : t.CreatedAt;
             templatePicker.Items.Add(new ComboBoxItem
             {
-                Content = $"{t.DisplayName} · {created} · source: {t.SourceTitle}",
+                Content = ArchiveService.TemplateSnapshotDisplayLabel(t) + $" · source: {t.SourceTitle}",
                 Tag = t
             });
         }
