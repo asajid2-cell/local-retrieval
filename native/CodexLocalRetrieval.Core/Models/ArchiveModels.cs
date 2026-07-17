@@ -635,6 +635,7 @@ public sealed class AgentCommand
     public string? phrase { get; set; }             // stash: a searchable codename ("special phrase") to file this chat under
     public string? collection { get; set; }         // stash: the collection name (alias of project)
     public bool? template { get; set; }             // true: create one checkpoint; false: remove all checkpoints for this chat
+    public string? templateName { get; set; }       // stash: optional name for the checkpoint created when template==true
 
     [JsonIgnore]
     internal int TemplateRemovalCount { get; set; } // preserves the reported count across one generation-conflict replay

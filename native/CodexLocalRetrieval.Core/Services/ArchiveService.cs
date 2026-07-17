@@ -1908,6 +1908,7 @@ public sealed partial class ArchiveService
                 {
                     var checkpoint = await CreateTemplateSnapshotAsync(
                         s,
+                        name: string.IsNullOrWhiteSpace(cmd.templateName) ? null : cmd.templateName.Trim(),
                         idempotencyKey: "agent:" + cmd.requestId);
                     if (!checkpoint.Ok)
                         return new AgentCommandResult(false, checkpoint.Message, inputId, s.Id);
@@ -1985,6 +1986,7 @@ public sealed partial class ArchiveService
                 {
                     var checkpoint = await CreateTemplateSnapshotAsync(
                         s,
+                        name: string.IsNullOrWhiteSpace(cmd.templateName) ? null : cmd.templateName.Trim(),
                         idempotencyKey: "agent:" + cmd.requestId);
                     return new AgentCommandResult(
                         checkpoint.Ok,
