@@ -935,7 +935,10 @@ public sealed partial class MainPage
                 return (false, detail);
             }
             if (doc.RootElement.TryGetProperty("t", out t) && t.GetString() == "created")
+            {
+                RecordMuxSessionOwner(canonicalId, identityAliases, name);
                 return (true, text);
+            }
             return (false, "unexpected muxd create response: " + Trim(text, 160));
         }
         catch (Exception ex) { return (false, ex.Message); }

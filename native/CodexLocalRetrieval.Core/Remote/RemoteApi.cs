@@ -202,9 +202,12 @@ public sealed class RemoteApi
                             WorkingDirectory = resume.WorkingDirectory,
                             UseShellExecute = true // open in its own terminal window on the host
                         };
-                        System.Diagnostics.Process.Start(psi);
+                        var wrapper = System.Diagnostics.Process.Start(psi);
                         launched = true;
                         lease?.MarkStarted("Started resume from remote API.");
+                        // Best-effort kill-target index; a wrapper is not the agent (see SessionOwnerRecords).
+                        if (!SessionOwnerRecords.TryWriteForProcess(session.Id, session.Aliases, wrapper, "server", out var recordDetail))
+                            Console.Error.WriteLine("owner record not written (server): " + recordDetail);
                     }
                     catch (Exception ex)
                     {

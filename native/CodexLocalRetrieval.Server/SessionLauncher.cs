@@ -13,7 +13,8 @@ public sealed class SessionLauncher
     private readonly bool _allow;
     private readonly string? _wt;
     private readonly SessionLaunchGovernor _launchGovernor;
-    private readonly Action<ProcessStartInfo> _startProcess;
+    private readonly Func<ProcessStartInfo, Process?> _startProcess;
+    private readonly SessionOwnerRecords.Options? _ownerRecordOptions;
 
     public SessionLauncher(
         string claudeExe,
@@ -22,10 +23,12 @@ public sealed class SessionLauncher
         Func<string, bool>? isSessionLive = null,
         SessionLaunchClaims.Options? claimOptions = null,
         SessionLaunchGovernor? launchGovernor = null,
-        Action<ProcessStartInfo>? startProcess = null,
+        Func<ProcessStartInfo, Process?>? startProcess = null,
         string? windowsTerminal = null,
-        bool discoverWindowsTerminal = true)
+        bool discoverWindowsTerminal = true,
+        SessionOwnerRecords.Options? ownerRecordOptions = null)
     {
+        _ownerRecordOptions = ownerRecordOptions;
         _claudeExe = claudeExe;
         _codexExe = codexExe;
         _allow = allowLaunch;
@@ -33,10 +36,7 @@ public sealed class SessionLauncher
         _launchGovernor = launchGovernor
             ?? new SessionLaunchGovernor(new SessionLaunchGovernorOptions(claimOptions, IsSessionLive: isSessionLive));
         _startProcess = startProcess ?? (psi =>
-        {
-            if (Process.Start(psi) is null)
-                throw new InvalidOperationException("process start returned no process");
-        });
+            Process.Start(psi) ?? throw new InvalidOperationException("process start returned no process"));
     }
 
     public bool Enabled => _allow;
@@ -115,8 +115,9 @@ public sealed class SessionLauncher
             {
                 try
                 {
-                    OpenTerminal(dir, exe, arguments);
+                    var wrapper = OpenTerminal(dir, exe, arguments);
                     lease?.MarkStarted("Opening terminal resume from server.");
+                    RecordOwner(id, aliases, wrapper, "server");
                 }
                 catch (Exception ex)
                 {
@@ -237,10 +238,22 @@ public sealed class SessionLauncher
         }
     }
 
+    // Best-effort note of the wrapper process this server started for a session. Nothing consumes it yet, and
+    // a wrapper is not the agent (see SessionOwnerRecords) - a failed write is logged and never fails a launch.
+    private void RecordOwner(string id, IReadOnlyList<string> aliases, Process? wrapper, string transport)
+    {
+        try
+        {
+            if (!SessionOwnerRecords.TryWriteForProcess(id, aliases, wrapper, transport, out var detail, _ownerRecordOptions))
+                Console.Error.WriteLine($"owner record not written ({transport}): {detail}");
+        }
+        catch (Exception ex) { Console.Error.WriteLine("owner record write threw: " + ex.Message); }
+    }
+
     private void OpenUri(string uri) =>
         _startProcess(new ProcessStartInfo { FileName = uri, UseShellExecute = true });
 
-    private void OpenTerminal(string dir, string exe, IReadOnlyList<string> arguments)
+    private Process? OpenTerminal(string dir, string exe, IReadOnlyList<string> arguments)
     {
         if (_wt is not null)
         {
@@ -253,8 +266,7 @@ public sealed class SessionLauncher
             psi.ArgumentList.Add(dir);
             psi.ArgumentList.Add(exe);
             foreach (var argument in arguments) psi.ArgumentList.Add(argument);
-            _startProcess(psi);
-            return;
+            return _startProcess(psi);
         }
 
         var fallback = new ProcessStartInfo
@@ -264,7 +276,7 @@ public sealed class SessionLauncher
             UseShellExecute = true,
         };
         foreach (var argument in arguments) fallback.ArgumentList.Add(argument);
-        _startProcess(fallback);
+        return _startProcess(fallback);
     }
 
     private static string WorkspaceUri(string dir) =>

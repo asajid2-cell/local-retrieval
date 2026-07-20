@@ -314,9 +314,11 @@ public sealed class SessionOpenServiceTests
             isSessionLive: _ => false,
             claimOptions: new(
                 RootDirectory: Path.Combine(Path.GetTempPath(), "clr-session-open-tests", Guid.NewGuid().ToString("N"))),
-            startProcess: psi => starts.Add(psi),
+            startProcess: psi => { starts.Add(psi); return null; },
             windowsTerminal: windowsTerminal,
-            discoverWindowsTerminal: false);
+            discoverWindowsTerminal: false,
+            ownerRecordOptions: new(
+                RootDirectory: Path.Combine(Path.GetTempPath(), "clr-session-open-tests", Guid.NewGuid().ToString("N"))));
 
     private static string FindRepoRoot()
     {

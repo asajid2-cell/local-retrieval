@@ -149,9 +149,10 @@ public sealed partial class MainPage
                         WorkingDirectory = cwd,
                         UseShellExecute = true
                     };
-                    Process.Start(psi);
+                    var wrapper = Process.Start(psi);
                     launchStarted = true;
                     lease?.MarkStarted("Started terminal resume.");
+                    RecordSessionOwner(session.Id, session.Aliases, wrapper, "terminal");
                 }
                 catch (Exception ex)
                 {
@@ -198,6 +199,31 @@ public sealed partial class MainPage
         {
             if (ReferenceEquals(_selected, session)) RenderIntegrity(force: true);
         }
+    }
+
+    // Best-effort note of the wrapper process this app started for a session. Nothing consumes it yet, and
+    // a wrapper is not the agent (see SessionOwnerRecords) - a failed write is logged and never blocks a launch.
+    private static void RecordSessionOwner(string? sessionId, IEnumerable<string>? aliases, Process? wrapper, string transport)
+    {
+        try
+        {
+            if (!SessionOwnerRecords.TryWriteForProcess(sessionId, aliases, wrapper, transport, out var detail))
+                Diag.Log($"Owner record not written ({transport}): {detail}");
+        }
+        catch (Exception ex) { Diag.Log("Owner record write threw " + ex); }
+    }
+
+    private static void RecordMuxSessionOwner(string? sessionId, IEnumerable<string>? aliases, string muxName)
+    {
+        try
+        {
+            // muxd publishes the shell pid to live-tabs.json asynchronously; if it isn't there yet we record
+            // pid 0 and move on rather than polling for it.
+            var shellPid = SessionOwnerRecords.TryReadMuxShellPid(muxName);
+            if (!SessionOwnerRecords.TryWrite(sessionId, aliases, shellPid, null, "muxd", out var detail, muxName: muxName))
+                Diag.Log($"Owner record not written (muxd {muxName}): {detail}");
+        }
+        catch (Exception ex) { Diag.Log("Owner record write threw " + ex); }
     }
 
     private static string BumpTooltip(ArchiveSession session) =>
