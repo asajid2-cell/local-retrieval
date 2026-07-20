@@ -274,12 +274,26 @@ public sealed class ArchitectureLaunchSurfaceTests
             "RunningSessions.cs"));
 
         Assert.DoesNotContain("_openHandleScanDisabled", running);
-        Assert.Contains("_openHandleScan", running);
-        Assert.Contains("OpenHandleCacheLifetime", running);
-        Assert.Contains("pids.IsSubsetOf(_openHandleCachePids)", running);
-        Assert.Contains("pids.IsSubsetOf(_openHandleScanPids)", running);
-        Assert.Contains("is still running; refusing to risk a second writer", running);
-        Assert.Contains("busy verifying another process set", running);
+
+        // The single-flight gate is GONE. It was the poison: one global scan, one pid-subset cache, and a 5s
+        // give-up meant a single slow scan made concurrent callers with disjoint pid sets refuse each other,
+        // and the abandoned task kept burning while holding the gate.
+        Assert.DoesNotContain("_openHandleScan", running);
+        Assert.DoesNotContain("OpenHandleScanTimeout", running);
+        Assert.DoesNotContain("pids.IsSubsetOf(_openHandleCachePids)", running);
+        Assert.DoesNotContain("pids.IsSubsetOf(_openHandleScanPids)", running);
+        Assert.DoesNotContain("is still running; refusing to risk a second writer", running);
+        Assert.DoesNotContain("busy verifying another process set", running);
+
+        // What replaced it: per-(pid, start-time) entries that COMPOSE, so different pid sets never contend.
+        Assert.Contains("_perPidTranscripts", running);
+        Assert.Contains("PerPidTranscriptCacheLifetime", running);
+        Assert.Contains("PerPidHandleTimeout", running);
+        Assert.Contains("ProcessOpenFiles.TryGetAliveIdentity", running);
+        // [F#8] only positive resolutions are cached — a failure must not fail-close every caller for a TTL.
+        Assert.Contains("CachePositiveTranscripts", running);
+        // The world scan survives one release behind a flag, and nothing else.
+        Assert.Contains("CODEXLOCAL_LEGACY_HANDLE_SCAN", running);
     }
 
     [TestMethod]

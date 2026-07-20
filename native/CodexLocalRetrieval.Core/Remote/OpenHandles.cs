@@ -58,9 +58,7 @@ public static class OpenHandles
                 {
                     if (GetFileType(dup) != FILE_TYPE_DISK) return;
                     var path = FinalPath(dup);
-                    if (path is null || !path.EndsWith(".jsonl", StringComparison.OrdinalIgnoreCase)) return;
-                    var low = path.Replace('/', '\\').ToLowerInvariant();
-                    if (!(low.Contains("\\.claude\\projects\\") || low.Contains("\\.codex\\sessions\\"))) return;
+                    if (path is null || !IsTranscriptPath(path)) return;
                     var id = SessionIdFromPath(path);
                     if (!string.IsNullOrEmpty(id) && !found.ContainsKey(id)) found[id] = pid;
                 }
@@ -77,9 +75,18 @@ public static class OpenHandles
         finally { foreach (var h in procHandles.Values) if (h != IntPtr.Zero) CloseHandle(h); }
     }
 
+    // A session TRANSCRIPT — the only handle kind either scan cares about. Shared with the per-pid scan
+    // (ProcessOpenFiles) so both paths match and identify transcripts identically.
+    internal static bool IsTranscriptPath(string path)
+    {
+        if (!path.EndsWith(".jsonl", StringComparison.OrdinalIgnoreCase)) return false;
+        var low = path.Replace('/', '\\').ToLowerInvariant();
+        return low.Contains("\\.claude\\projects\\") || low.Contains("\\.codex\\sessions\\");
+    }
+
     // The session id encoded in a transcript path: claude = the filename (a uuid); codex = the uuid suffix
     // of `rollout-<ts>-<uuid>.jsonl`.
-    private static string? SessionIdFromPath(string path)
+    internal static string? SessionIdFromPath(string path)
     {
         var name = Path.GetFileNameWithoutExtension(path);
         var m = Regex.Match(name, "([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$");
@@ -125,7 +132,7 @@ public static class OpenHandles
     [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     private static extern int GetFinalPathNameByHandle(IntPtr hFile, StringBuilder path, int cch, int flags);
 
-    private static string? FinalPath(IntPtr h)
+    internal static string? FinalPath(IntPtr h)
     {
         var sb = new StringBuilder(600);
         var n = GetFinalPathNameByHandle(h, sb, sb.Capacity, 0);

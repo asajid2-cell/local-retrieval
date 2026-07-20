@@ -14,14 +14,27 @@ namespace CodexLocalRetrieval.Core.Remote;
 // drive the same "running on PC" remote view + kills when the desktop app is closed. Windows-only.
 public static class RunningSessions
 {
-    private static readonly object OpenHandleScanGate = new();
-    private static Task<(bool Ok, Dictionary<string, int> Found, string Detail)>? _openHandleScan;
-    private static HashSet<int> _openHandleScanPids = new();
-    private static (bool Ok, Dictionary<string, int> Found, string Detail)? _openHandleCache;
-    private static HashSet<int> _openHandleCachePids = new();
-    private static DateTime _openHandleCacheAt;
-    private static readonly TimeSpan OpenHandleScanTimeout = TimeSpan.FromSeconds(5);
-    private static readonly TimeSpan OpenHandleCacheLifetime = TimeSpan.FromSeconds(30);
+    // Per-pid transcript cache keyed by (pid, process start time) — a reused pid is a different process and
+    // must never be served the old one's answer. Callers with DIFFERENT pid sets compose from these entries
+    // instead of sharing one global scan, so they can no longer refuse each other ("busy verifying another
+    // process set" is gone along with the single-flight gate and its 5s give-up).
+    // [F#8] ONLY positive resolutions are stored. A failed or unverifiable pid is never cached — a transient
+    // hiccup must not fail-close every caller for a whole TTL.
+    private static readonly object PerPidTranscriptGate = new();
+    private static readonly Dictionary<int, (DateTime StartTimeUtc, DateTime CachedAt, Dictionary<string, int> Sids)>
+        _perPidTranscripts = new();
+    private static readonly TimeSpan PerPidTranscriptCacheLifetime = TimeSpan.FromSeconds(3);
+    private static readonly TimeSpan PerPidHandleTimeout = TimeSpan.FromSeconds(1);
+
+    // The world scan stays reachable for one release: CODEXLOCAL_LEGACY_HANDLE_SCAN=1 restores it.
+    private static bool LegacyHandleScanEnabled
+    {
+        get
+        {
+            var v = (Environment.GetEnvironmentVariable("CODEXLOCAL_LEGACY_HANDLE_SCAN") ?? "").Trim();
+            return v == "1" || string.Equals(v, "true", StringComparison.OrdinalIgnoreCase);
+        }
+    }
     private static readonly System.Management.EnumerationOptions BoundedWmiOptions = new()
     {
         ReturnImmediately = true,
@@ -169,8 +182,16 @@ public static class RunningSessions
     }
 
     public static bool TryClaudeLiveSessionIds(HashSet<int>? livePids, out Dictionary<string, int> map, out string detail)
+        => TryClaudeLiveSessionIds(livePids, out map, out _, out detail);
+
+    public static bool TryClaudeLiveSessionIds(
+        HashSet<int>? livePids,
+        out Dictionary<string, int> map,
+        out HashSet<int> unverifiablePids,
+        out string detail)
     {
         map = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        unverifiablePids = new HashSet<int>();
         detail = "";
         var dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".claude", "sessions");
         if (!Directory.Exists(dir)) return true;
@@ -183,19 +204,44 @@ public static class RunningSessions
             return false;
         }
 
+        return TryReadClaudeRegistryFiles(files, livePids, out map, out unverifiablePids, out detail);
+    }
+
+    // An idle fresh claude (no --resume, no open transcript handle) is visible ONLY here, so an unreadable
+    // registry file may be HIDING a live owner and must not be silently skipped. But claude rewrites these
+    // files live, so most unreadable moments are a transient write race, not a real blocker: retry, and only
+    // then decide by the file's pid. Alive pid -> unverifiable (Start-class fails closed); dead pid -> skip.
+    // One unreadable file no longer fails the whole check unconditionally.
+    internal static bool TryReadClaudeRegistryFiles(
+        IEnumerable<string> files,
+        HashSet<int>? livePids,
+        out Dictionary<string, int> map,
+        out HashSet<int> unverifiablePids,
+        out string detail)
+    {
+        map = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        unverifiablePids = new HashSet<int>();
+        detail = "";
+        var unreadable = new List<string>();
+
         foreach (var f in files)
         {
-            if (livePids is not null &&
-                int.TryParse(Path.GetFileNameWithoutExtension(f), out var filePid) &&
-                !livePids.Contains(filePid))
-                continue;
+            var namePid = int.TryParse(Path.GetFileNameWithoutExtension(f), out var fp) ? fp : 0;
+            if (livePids is not null && namePid > 0 && !livePids.Contains(namePid)) continue;
+
+            if (!TryReadRegistryFileWithRetry(f, out var json, out var readError))
+            {
+                // The file's pid is the only identity we have when we cannot read the contents.
+                if (namePid > 0 && ProcessOpenFiles.IsAlive(namePid))
+                {
+                    unverifiablePids.Add(namePid);
+                    unreadable.Add(Path.GetFileName(f) + " (" + readError + ")");
+                }
+                continue;   // dead (or unidentifiable) pid: stale registry leftover, safe to skip
+            }
 
             try
             {
-                string json;
-                using (var rfs = new FileStream(f, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
-                using (var rsr = new StreamReader(rfs))
-                    json = rsr.ReadToEnd();
                 using var doc = JsonDocument.Parse(json);
                 var root = doc.RootElement;
                 var pid = root.TryGetProperty("pid", out var p) && p.TryGetInt32(out var pv) ? pv : 0;
@@ -204,13 +250,48 @@ public static class RunningSessions
                 if (livePids is not null && !livePids.Contains(pid)) continue;
                 if (!map.ContainsKey(sid!)) map[sid!] = pid;
             }
-            catch (Exception ex)
+            catch
             {
-                detail = "couldn't verify Claude live-session registry file " + Path.GetFileName(f) + " (" + ex.Message + "); refusing to risk a second writer";
-                return false;
+                // Readable but not parseable: same rule — only a LIVE pid makes it uncertainty.
+                if (namePid > 0 && ProcessOpenFiles.IsAlive(namePid))
+                {
+                    unverifiablePids.Add(namePid);
+                    unreadable.Add(Path.GetFileName(f) + " (unparseable)");
+                }
             }
         }
+
+        if (unverifiablePids.Count > 0)
+        {
+            detail = "Claude live-session registry is unreadable for still-running pids: "
+                   + string.Join(", ", unreadable)
+                   + "; ownership is unverified — this is not a confirmed live owner";
+            return false;
+        }
         return true;
+    }
+
+    private static bool TryReadRegistryFileWithRetry(string path, out string json, out string error)
+    {
+        json = "";
+        error = "";
+        for (var attempt = 0; attempt < 3; attempt++)
+        {
+            if (attempt > 0) Thread.Sleep(150);
+            try
+            {
+                // shared read (ReadWrite|Delete): claude writes these registry files live — the default
+                // deny-write share could block its update. Read without ever locking out the writer.
+                using var rfs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+                using var rsr = new StreamReader(rfs);
+                json = rsr.ReadToEnd();
+                return true;
+            }
+            catch (FileNotFoundException) { error = "file disappeared"; return false; }   // claude cleaned up; not a retry case
+            catch (DirectoryNotFoundException) { error = "directory disappeared"; return false; }
+            catch (Exception ex) { error = ex.Message; }
+        }
+        return false;
     }
 
     // Best-effort set of session ids a live claude/codex process is currently running on this PC, from
@@ -225,16 +306,28 @@ public static class RunningSessions
     }
 
     public static bool TryAllLiveSessionIds(out HashSet<string> live, out string detail)
+        => TryAllLiveSessionIds(out live, out _, out detail);
+
+    public static bool TryAllLiveSessionIds(out HashSet<string> live, out HashSet<int> unverifiablePids, out string detail)
     {
         live = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        if (!TryLiveSessionPids(out var livePids, out detail)) return false;
+        var ok = TryLiveSessionPids(out var livePids, out unverifiablePids, out detail);
         foreach (var id in livePids.Keys) live.Add(id);
-        return true;
+        return ok;
     }
 
     public static bool TryLiveSessionPids(out Dictionary<string, HashSet<int>> live, out string detail)
+        => TryLiveSessionPids(out live, out _, out detail);
+
+    // Structured variant: which pids blocked verification, so a refusal can say "unverified" instead of
+    // claiming a live owner it never found.
+    public static bool TryLiveSessionPids(
+        out Dictionary<string, HashSet<int>> live,
+        out HashSet<int> unverifiablePids,
+        out string detail)
     {
         live = new Dictionary<string, HashSet<int>>(StringComparer.OrdinalIgnoreCase);
+        unverifiablePids = new HashSet<int>();
         detail = "";
         var pids = new HashSet<int>();
         if (!TryScan(out var sessions, out detail)) return false;
@@ -243,15 +336,24 @@ public static class RunningSessions
             AddLivePid(live, s.SessionId, s.Pid);
             if (s.Pid > 0) pids.Add(s.Pid);
         }
-        if (!TryClaudeLiveSessionIds(pids, out var claudeLiveIds, out detail))
-            return false;
+        var ok = true;
+        if (!TryClaudeLiveSessionIds(pids, out var claudeLiveIds, out var registryUnverifiable, out var registryDetail))
+        {
+            unverifiablePids.UnionWith(registryUnverifiable);
+            detail = registryDetail;
+            ok = false;
+        }
         foreach (var kv in claudeLiveIds)
             AddLivePid(live, kv.Key, kv.Value);
-        if (!TryOpenTranscriptSessionIdsBounded(pids, out var openTranscriptIds, out detail))
-            return false;
+        if (!TryOpenTranscriptSessionIdsBounded(pids, out var openTranscriptIds, out var handleUnverifiable, out var handleDetail))
+        {
+            unverifiablePids.UnionWith(handleUnverifiable);
+            detail = string.IsNullOrEmpty(detail) ? handleDetail : detail + "; " + handleDetail;
+            ok = false;
+        }
         foreach (var kv in openTranscriptIds)
             AddLivePid(live, kv.Key, kv.Value);
-        return true;
+        return ok;
     }
 
     public static bool TryOpenTranscriptSessionIds(
@@ -340,80 +442,123 @@ public static class RunningSessions
         return true;
     }
 
+    // Structured per-pid result: WHICH pids are unverifiable is distinguishable from "nobody holds a
+    // transcript". Callers that must fail closed (Start/Resume/mux-create) read UnverifiablePids; the
+    // outcome-enum work threads it through as `Unverifiable` rather than a mislabelled "already running".
+    public static bool TryOpenTranscriptSessionIds(
+        IEnumerable<int> processIds,
+        out Dictionary<string, int> ids,
+        out HashSet<int> unverifiablePids,
+        out string detail)
+        => TryOpenTranscriptSessionIdsBounded(
+            new HashSet<int>(processIds.Where(pid => pid > 0)),
+            out ids,
+            out unverifiablePids,
+            out detail);
+
     private static bool TryOpenTranscriptSessionIdsBounded(HashSet<int> pids, out Dictionary<string, int> ids, out string detail)
+        => TryOpenTranscriptSessionIdsBounded(pids, out ids, out _, out detail);
+
+    private static bool TryOpenTranscriptSessionIdsBounded(
+        HashSet<int> pids,
+        out Dictionary<string, int> ids,
+        out HashSet<int> unverifiablePids,
+        out string detail)
     {
         ids = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        unverifiablePids = new HashSet<int>();
         detail = "";
         if (pids.Count == 0) return true;
 
-        try
+        if (LegacyHandleScanEnabled)
         {
-            Task<(bool Ok, Dictionary<string, int> Found, string Detail)>? task;
-            lock (OpenHandleScanGate)
+            if (OpenHandles.TryOpenTranscriptSessionIds(pids, out var legacyFound, out var legacyDetail))
             {
-                if (_openHandleScan is not null && _openHandleScan.IsCompleted)
-                {
-                    _openHandleCache = _openHandleScan.GetAwaiter().GetResult();
-                    _openHandleCachePids = new HashSet<int>(_openHandleScanPids);
-                    _openHandleCacheAt = DateTime.UtcNow;
-                    _openHandleScan = null;
-                }
-                if (_openHandleCache is not null
-                    && DateTime.UtcNow - _openHandleCacheAt <= OpenHandleCacheLifetime
-                    && pids.IsSubsetOf(_openHandleCachePids))
-                {
-                    if (!_openHandleCache.Value.Ok)
-                    {
-                        detail = _openHandleCache.Value.Detail;
-                        return false;
-                    }
-                    ids = FilterOpenHandleIds(_openHandleCache.Value.Found, pids);
-                    return true;
-                }
-                if (_openHandleScan is null)
-                {
-                    var scanPids = pids.ToArray();
-                    _openHandleScanPids = new HashSet<int>(scanPids);
-                    _openHandleScan = Task.Run(() =>
-                    {
-                        var ok = OpenHandles.TryOpenTranscriptSessionIds(scanPids, out var found, out var scanDetail);
-                        return (ok, found, scanDetail);
-                    });
-                }
-                task = pids.IsSubsetOf(_openHandleScanPids) ? _openHandleScan : null;
-            }
-            if (task is null)
-            {
-                detail = "open transcript handle scan is busy verifying another process set; refusing to risk a second writer";
-                return false;
-            }
-            if (task.Wait(OpenHandleScanTimeout))
-            {
-                var result = task.Result;
-                if (!result.Ok)
-                {
-                    detail = result.Detail;
-                    return false;
-                }
-                lock (OpenHandleScanGate)
-                {
-                    _openHandleCache = result;
-                    _openHandleCachePids = new HashSet<int>(_openHandleScanPids);
-                    _openHandleCacheAt = DateTime.UtcNow;
-                    if (ReferenceEquals(task, _openHandleScan)) _openHandleScan = null;
-                }
-                ids = FilterOpenHandleIds(result.Found, pids);
+                ids = FilterOpenHandleIds(legacyFound, pids);
                 return true;
             }
-
-            detail = "open transcript handle scan is still running; refusing to risk a second writer";
+            // The world scan can only fail wholesale, so it cannot attribute the failure to a pid.
+            unverifiablePids = new HashSet<int>(pids);
+            detail = legacyDetail;
             return false;
+        }
+
+        try
+        {
+            var result = new ProcessOpenFiles.ScanResult();
+            foreach (var pid in pids)
+            {
+                // A pid that isn't alive by the exit-code rule is DEAD: it drops out silently instead of
+                // vetoing the set. This is the swarm-churn case the old scan failed closed on.
+                if (!ProcessOpenFiles.TryGetAliveIdentity(pid, out var startedUtc))
+                {
+                    result.DeadPids.Add(pid);
+                    continue;
+                }
+                if (TryGetCachedTranscripts(pid, startedUtc, out var cached))
+                {
+                    foreach (var kv in cached)
+                        if (!result.Found.ContainsKey(kv.Key)) result.Found[kv.Key] = kv.Value;
+                    continue;
+                }
+                var inspection = ProcessOpenFiles.Inspect(pid, PerPidHandleTimeout);
+                ProcessOpenFiles.Merge(result, inspection);
+                if (inspection.Outcome == ProcessOpenFiles.PidOutcome.Resolved)
+                    CachePositiveTranscripts(pid, inspection.StartTimeUtc, inspection.Found);   // [F#8] positives only
+            }
+
+            ids = FilterOpenHandleIds(result.Found, pids);
+            unverifiablePids = result.UnverifiablePids;
+            if (!result.AllVerifiable)
+            {
+                detail = result.UnverifiableDetail();
+                return false;
+            }
+            return true;
         }
         catch (Exception ex)
         {
-            detail = "open transcript handle scan failed (" + ex.Message + "); refusing to risk a second writer";
+            unverifiablePids = new HashSet<int>(pids);
+            detail = "per-pid transcript handle check could not complete (" + ex.Message + "); ownership is unverified";
             return false;
         }
+    }
+
+    private static bool TryGetCachedTranscripts(int pid, DateTime startedUtc, out Dictionary<string, int> sids)
+    {
+        lock (PerPidTranscriptGate)
+        {
+            if (_perPidTranscripts.TryGetValue(pid, out var entry)
+                && entry.StartTimeUtc == startedUtc
+                && DateTime.UtcNow - entry.CachedAt <= PerPidTranscriptCacheLifetime)
+            {
+                sids = entry.Sids;
+                return true;
+            }
+        }
+        sids = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        return false;
+    }
+
+    private static void CachePositiveTranscripts(int pid, DateTime startedUtc, Dictionary<string, int> sids)
+    {
+        lock (PerPidTranscriptGate)
+        {
+            _perPidTranscripts[pid] = (startedUtc, DateTime.UtcNow, sids);
+            if (_perPidTranscripts.Count > 512)
+            {
+                var stale = _perPidTranscripts
+                    .Where(kv => DateTime.UtcNow - kv.Value.CachedAt > PerPidTranscriptCacheLifetime)
+                    .Select(kv => kv.Key)
+                    .ToArray();
+                foreach (var key in stale) _perPidTranscripts.Remove(key);
+            }
+        }
+    }
+
+    internal static void ResetPerPidTranscriptCache()
+    {
+        lock (PerPidTranscriptGate) _perPidTranscripts.Clear();
     }
 
     private static Dictionary<string, int> FilterOpenHandleIds(
