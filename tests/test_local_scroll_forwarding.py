@@ -1,11 +1,17 @@
 """Local-attach scroll forwarding: the "can't scroll the local mux terminal" fix.
 
-Root cause under test: a hosted agent TUI (claude/codex) holds the alternate screen (?1049h) —
-which has no conhost scrollback — and scrolls its own transcript only when it receives mouse
-wheel reports (?1000/1002/1003 + ?1006 SGR). The web terminal (xterm.js) forwards the wheel as
-those reports; the old muxctl attach dropped the wheel entirely (mouse input disabled, msvcrt
-key-only reader), so nothing could scroll. These tests drive the new forwarding path with
-realistic byte streams end to end (muxd replay -> muxctl tracker -> wheel bytes).
+Root cause under test: a hosted agent TUI (claude/codex) holds the alternate screen (?1049h),
+which has no conhost scrollback, and the old muxctl attach dropped the wheel entirely (mouse
+input disabled, msvcrt key-only reader), so nothing could scroll.
+
+The PROVEN scroll mechanism in this stack is the web frontend's: on the alternate screen it
+sends PageUp/PageDown per wheel event, rate-limited to one per 90ms (scrollAlternate() in
+multiplex-app-patch/public/index.html), and it strips ALL mouse reports from input. That is the
+local default (MUXCTL_WHEEL=pagekeys). SGR/urxvt/X10 wheel reports remain available as the
+standard mouse-tracking contract (MUXCTL_WHEEL=sgr, and always for mouse tracking without the
+alternate screen) but are NOT yet demonstrated to scroll claude/codex here. Exactly one
+mechanism may fire per notch. These tests drive the forwarding path with realistic byte streams
+end to end (muxd replay -> muxctl tracker -> wheel bytes).
 """
 import importlib
 import random
@@ -29,6 +35,8 @@ def session_output(s, data):
 
 # The exact shape captured from a LIVE claude session's muxd replay (2026-07-20):
 # prefix carries alt-screen state; the TUI's startup enables full mouse tracking + SGR.
+# (Enabling mouse tracking does NOT prove the TUI scrolls from wheel reports — the web
+# scrolls it with page keys while stripping reports.)
 LIVE_PREFIX = b"\x1b[?25h\x1b[?1049h\x1b[?2004h"
 CLAUDE_STARTUP = (b"\x1b[?1049h\x1b[?1h\x1b[?2004h\x1b[?1004h"
                   b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h")
@@ -93,11 +101,35 @@ class WheelTranslationTests(unittest.TestCase):
         t.ingest(stream)
         return t
 
-    def test_sgr_wheel_reports_match_web_terminal(self):
+    def test_alt_screen_default_is_page_keys_like_the_web(self):
+        # The web's scrollAlternate(): one PageUp/PageDown per wheel event — the only mechanism
+        # PROVEN to scroll claude/codex in this stack.
+        t = self._tracker(CLAUDE_STARTUP)                 # alt + full mouse tracking (claude)
+        self.assertEqual(muxctl.wheel_input_sequences(t, 1, 10, 5), b"\x1b[5~")
+        self.assertEqual(muxctl.wheel_input_sequences(t, -1, 10, 5), b"\x1b[6~")
+        bare = self._tracker(b"\x1b[?1049h")              # bare alt (less/vim, no tracking)
+        self.assertEqual(muxctl.wheel_input_sequences(bare, 1), b"\x1b[5~")
+        self.assertEqual(muxctl.wheel_input_sequences(bare, -1), b"\x1b[6~")
+
+    def test_page_key_is_single_even_for_a_burst(self):
+        # web parity: one page key per wheel EVENT (the translator adds the 90ms limiter)
         t = self._tracker(CLAUDE_STARTUP)
-        self.assertEqual(muxctl.wheel_input_sequences(t, 1, 10, 5), b"\x1b[<64;10;5M")
-        self.assertEqual(muxctl.wheel_input_sequences(t, -1, 10, 5), b"\x1b[<65;10;5M")
-        self.assertEqual(muxctl.wheel_input_sequences(t, 2, 1, 1), b"\x1b[<64;1;1M" * 2)
+        self.assertEqual(muxctl.wheel_input_sequences(t, 50, 1, 1), b"\x1b[5~")
+
+    def test_sgr_mode_sends_wheel_reports_on_a_tracking_alt_screen(self):
+        t = self._tracker(CLAUDE_STARTUP)
+        kw = {"alt_scroll": "sgr"}
+        self.assertEqual(muxctl.wheel_input_sequences(t, 1, 10, 5, **kw), b"\x1b[<64;10;5M")
+        self.assertEqual(muxctl.wheel_input_sequences(t, -1, 10, 5, **kw), b"\x1b[<65;10;5M")
+        self.assertEqual(muxctl.wheel_input_sequences(t, 2, 1, 1, **kw), b"\x1b[<64;1;1M" * 2)
+        self.assertEqual(muxctl.wheel_input_sequences(t, 50, 1, 1, **kw), b"\x1b[<64;1;1M" * 8)
+
+    def test_tracking_without_alt_screen_uses_reports_in_both_modes(self):
+        # page keys would be meaningless outside the alternate screen
+        t = self._tracker(b"\x1b[?1000h\x1b[?1006h")
+        self.assertEqual(muxctl.wheel_input_sequences(t, 1, 2, 3), b"\x1b[<64;2;3M")
+        self.assertEqual(muxctl.wheel_input_sequences(t, 1, 2, 3, alt_scroll="sgr"),
+                         b"\x1b[<64;2;3M")
 
     def test_x10_fallback_without_sgr(self):
         t = self._tracker(b"\x1b[?1000h")
@@ -108,40 +140,32 @@ class WheelTranslationTests(unittest.TestCase):
         t = self._tracker(b"\x1b[?1000h\x1b[?1015h")
         self.assertEqual(muxctl.wheel_input_sequences(t, -1, 2, 2), b"\x1b[97;2;2M")
 
-    def test_alt_screen_without_mouse_tracking_scrolls_via_arrows(self):
-        # xterm.js parity: no-scrollback buffer + no mouse tracking -> 3 arrow keys per notch.
+    def test_sgr_mode_bare_alt_screen_falls_back_to_arrows(self):
+        # xterm.js's own fallback: no-scrollback buffer + no tracking -> 3 arrows per notch
         t = self._tracker(b"\x1b[?1049h")
-        self.assertEqual(muxctl.wheel_input_sequences(t, 1), b"\x1b[A" * 3)
-        self.assertEqual(muxctl.wheel_input_sequences(t, -1), b"\x1b[B" * 3)
+        self.assertEqual(muxctl.wheel_input_sequences(t, 1, alt_scroll="sgr"), b"\x1b[A" * 3)
+        self.assertEqual(muxctl.wheel_input_sequences(t, -1, alt_scroll="sgr"), b"\x1b[B" * 3)
 
-    def test_alt_screen_arrows_honor_application_cursor_keys(self):
+    def test_sgr_mode_arrows_honor_application_cursor_keys(self):
         t = self._tracker(b"\x1b[?1049h\x1b[?1h")
-        self.assertEqual(muxctl.wheel_input_sequences(t, 1), b"\x1bOA" * 3)
+        self.assertEqual(muxctl.wheel_input_sequences(t, 1, alt_scroll="sgr"), b"\x1bOA" * 3)
 
-    def test_wheel_burst_is_capped(self):
-        t = self._tracker(CLAUDE_STARTUP)
-        self.assertEqual(muxctl.wheel_input_sequences(t, 50, 1, 1), b"\x1b[<64;1;1M" * 8)
+    def test_exactly_one_mechanism_fires_per_call(self):
+        # never page keys AND reports for the same notch, in any state x mode combination
+        for stream in (CLAUDE_STARTUP, b"\x1b[?1049h", b"\x1b[?1000h\x1b[?1006h", b""):
+            for mode in ("pagekeys", "sgr"):
+                seq = muxctl.wheel_input_sequences(self._tracker(stream), 1, 5, 5,
+                                                   alt_scroll=mode)
+                is_page = seq in (muxctl.PAGE_UP, muxctl.PAGE_DOWN)
+                has_report = b"\x1b[<" in seq or b"\x1b[M" in seq
+                has_arrow = b"\x1b[A" in seq or b"\x1bOA" in seq
+                self.assertLessEqual(int(is_page) + int(has_report) + int(has_arrow), 1,
+                                     (stream, mode, seq))
 
     def test_position_is_clamped_to_valid_cells(self):
         t = self._tracker(CLAUDE_STARTUP)
-        self.assertEqual(muxctl.wheel_input_sequences(t, 1, 0, -3), b"\x1b[<64;1;1M")
-
-
-class WheelDoubleScrollGuardTests(unittest.TestCase):
-    """MUXCTL_VT_INPUT=1 lets the terminal's VT layer synthesize alternate-scroll arrows itself;
-    our own bare-alt-screen fallback must then stand down so one notch never scrolls twice."""
-
-    def test_arrow_fallback_suppressed_only_on_bare_alt_screen(self):
-        t = muxctl.ScreenModeTracker()
-        t.ingest(b"\x1b[?1049h")
-        self.assertEqual(muxctl.wheel_input_sequences(t, 1, arrow_fallback=False), b"")
-        self.assertEqual(muxctl.wheel_input_sequences(t, 1, arrow_fallback=True), b"\x1b[A" * 3)
-
-    def test_mouse_tracking_reports_are_unaffected_by_the_guard(self):
-        t = muxctl.ScreenModeTracker()
-        t.ingest(CLAUDE_STARTUP)
-        self.assertEqual(muxctl.wheel_input_sequences(t, 1, 2, 2, arrow_fallback=False),
-                         b"\x1b[<64;2;2M")
+        self.assertEqual(muxctl.wheel_input_sequences(t, 1, 0, -3, alt_scroll="sgr"),
+                         b"\x1b[<64;1;1M")
 
 
 class X10EncodingThroughMuxdInputPathTests(unittest.TestCase):
@@ -151,7 +175,7 @@ class X10EncodingThroughMuxdInputPathTests(unittest.TestCase):
     def _x10(self, x, y):
         t = muxctl.ScreenModeTracker()
         t.ingest(b"\x1b[?1049h\x1b[?1000h")   # X10-style tracking, no SGR/urxvt
-        return muxctl.wheel_input_sequences(t, 1, x, y)
+        return muxctl.wheel_input_sequences(t, 1, x, y, alt_scroll="sgr")
 
     def test_large_coordinates_survive_utf8_decode(self):
         seq = self._x10(150, 100)
@@ -228,10 +252,11 @@ def _mouse_record(flags, button_state=0, x=0, y=0):
 
 
 class ConsoleInputTranslatorTests(unittest.TestCase):
-    def _translator(self, stream=CLAUDE_STARTUP):
+    def _translator(self, stream=CLAUDE_STARTUP, **kw):
         t = muxctl.ScreenModeTracker()
         t.ingest(stream)
-        return muxctl.ConsoleInputTranslator(t, cell_resolver=lambda pos: (pos.X + 1, pos.Y + 1))
+        return muxctl.ConsoleInputTranslator(
+            t, cell_resolver=lambda pos: (pos.X + 1, pos.Y + 1), **kw)
 
     def test_navigation_key_with_nul_unicode_char_sends_vt_not_nul(self):
         tr = self._translator()
@@ -255,8 +280,29 @@ class ConsoleInputTranslatorTests(unittest.TestCase):
         self.assertEqual(tr.feed(_mouse_record(0, button_state=1, x=4, y=4)), (b"", False))
         self.assertEqual(tr.feed(_mouse_record(0x0001, x=9, y=9)), (b"", False))  # MOUSE_MOVED
 
-    def test_wheel_event_forwards_sgr_report_and_accumulates_partials(self):
-        tr = self._translator()
+    def test_default_wheel_on_claude_sends_rate_limited_page_keys(self):
+        # web parity end to end: PageUp per notch, one per 90ms (scrollAlternate)
+        now = [100.0]
+        tr = self._translator(clock=lambda: now[0])
+        up = _mouse_record(muxctl.MOUSE_WHEELED, (120 & 0xFFFF) << 16, 7, 2)
+        down = _mouse_record(muxctl.MOUSE_WHEELED, (-120 & 0xFFFF) << 16, 7, 2)
+        self.assertEqual(tr.feed(up), (b"\x1b[5~", False))
+        now[0] += 0.05                                     # within the 90ms window: suppressed
+        self.assertEqual(tr.feed(up), (b"", False))
+        now[0] += 0.05                                     # window elapsed
+        self.assertEqual(tr.feed(down), (b"\x1b[6~", False))
+
+    def test_typed_page_keys_are_not_rate_limited(self):
+        now = [100.0]
+        tr = self._translator(clock=lambda: now[0])
+        up = _mouse_record(muxctl.MOUSE_WHEELED, (120 & 0xFFFF) << 16, 7, 2)
+        self.assertEqual(tr.feed(up), (b"\x1b[5~", False))
+        # a REAL PageUp keypress right after the wheel must never be swallowed
+        self.assertEqual(tr.feed(_key_record(0x21, "\x00")), (b"\x1b[5~", False))
+        self.assertEqual(tr.feed(_key_record(0x21, "\x00")), (b"\x1b[5~", False))
+
+    def test_sgr_mode_forwards_reports_and_accumulates_partials(self):
+        tr = self._translator(alt_scroll="sgr")
         self.assertEqual(tr.feed(_mouse_record(muxctl.MOUSE_WHEELED, (120 & 0xFFFF) << 16, 7, 2)),
                          (b"\x1b[<64;8;3M", False))
         self.assertEqual(tr.feed(_mouse_record(muxctl.MOUSE_WHEELED, (60 & 0xFFFF) << 16, 7, 2)),
@@ -265,6 +311,12 @@ class ConsoleInputTranslatorTests(unittest.TestCase):
                          (b"\x1b[<64;8;3M", False))
         self.assertEqual(tr.feed(_mouse_record(muxctl.MOUSE_WHEELED, (-120 & 0xFFFF) << 16, 7, 2)),
                          (b"\x1b[<65;8;3M", False))
+
+    def test_unknown_wheel_mode_falls_back_to_pagekeys(self):
+        tr = self._translator(alt_scroll="frobnicate")
+        self.assertEqual(tr.alt_scroll, "pagekeys")
+        self.assertEqual(tr.feed(_mouse_record(muxctl.MOUSE_WHEELED, (120 & 0xFFFF) << 16, 1, 1)),
+                         (b"\x1b[5~", False))
 
     def test_wheel_on_plain_shell_stays_silent(self):
         tr = self._translator(stream=b"PS C:\\> ")
@@ -298,14 +350,18 @@ class ConsoleInputTranslatorTests(unittest.TestCase):
         tr = self._translator()
         self.assertEqual(tr.feed(_key_record(0x41, "a", down=0)), (b"", False))
 
-    def test_vt_input_opt_in_suppresses_only_the_arrow_fallback(self):
-        t = muxctl.ScreenModeTracker()
-        t.ingest(b"\x1b[?1049h")
-        tr = muxctl.ConsoleInputTranslator(t, arrow_fallback=False)
+    def test_vt_input_opt_in_suppresses_all_wheel_synthesis(self):
+        # MUXCTL_VT_INPUT=1: the terminal's VT layer owns the wheel; we must emit NOTHING for
+        # mouse events in ANY state/mode, or one notch could scroll twice.
         wheel = _mouse_record(muxctl.MOUSE_WHEELED, (120 & 0xFFFF) << 16, 1, 1)
-        self.assertEqual(tr.feed(wheel), (b"", False))
-        t.ingest(b"\x1b[?1000h\x1b[?1006h")
-        self.assertEqual(tr.feed(wheel), (b"\x1b[<64;1;1M", False))
+        for stream in (CLAUDE_STARTUP, b"\x1b[?1049h", b"\x1b[?1000h\x1b[?1006h"):
+            for mode in ("pagekeys", "sgr"):
+                t = muxctl.ScreenModeTracker()
+                t.ingest(stream)
+                tr = muxctl.ConsoleInputTranslator(t, wheel_synthesis=False, alt_scroll=mode)
+                self.assertEqual(tr.feed(wheel), (b"", False), (stream, mode))
+                # keyboard input still flows
+                self.assertEqual(tr.feed(_key_record(0x41, "a")), (b"a", False))
 
 
 class MidSessionAttachEndToEndTests(unittest.TestCase):
@@ -318,7 +374,7 @@ class MidSessionAttachEndToEndTests(unittest.TestCase):
         for mode in (b"?1h", b"?1000h", b"?1002h", b"?1003h", b"?1006h", b"?1049h"):
             self.assertIn(b"\x1b[" + mode, prefix)
 
-    def test_attach_after_enables_scrolled_out_of_the_ring_still_forwards_sgr_wheel(self):
+    def test_attach_after_enables_scrolled_out_of_the_ring_still_scrolls(self):
         # Server side: the enables are followed by way more output than the local replay window,
         # so the raw ring tail no longer contains them — only the prefix can restore the state.
         state = muxd.TerminalReplayState()
@@ -333,7 +389,9 @@ class MidSessionAttachEndToEndTests(unittest.TestCase):
         t = muxctl.ScreenModeTracker()
         feed_chunked(t, replay, sizes=(4096,))
         self.assertTrue(t.wants_mouse_capture())
-        self.assertEqual(muxctl.wheel_input_sequences(t, 1, 40, 12), b"\x1b[<64;40;12M")
+        self.assertEqual(muxctl.wheel_input_sequences(t, 1, 40, 12), b"\x1b[5~")
+        self.assertEqual(muxctl.wheel_input_sequences(t, 1, 40, 12, alt_scroll="sgr"),
+                         b"\x1b[<64;40;12M")
 
     def test_sb_zero_attach_still_delivers_the_mode_prefix(self):
         # MUXCTL_SCROLLBACK=0 regression: gating the whole first frame on sb>0 dropped the mode
@@ -352,7 +410,9 @@ class MidSessionAttachEndToEndTests(unittest.TestCase):
         t = muxctl.ScreenModeTracker()
         t.ingest(payload)
         self.assertTrue(t.wants_mouse_capture())
-        self.assertEqual(muxctl.wheel_input_sequences(t, 1, 5, 5), b"\x1b[<64;5;5M")
+        self.assertEqual(muxctl.wheel_input_sequences(t, 1, 5, 5), b"\x1b[5~")   # proven default
+        self.assertEqual(muxctl.wheel_input_sequences(t, 1, 5, 5, alt_scroll="sgr"),
+                         b"\x1b[<64;5;5M")                                       # report contract
 
     def test_positive_sb_attach_replays_prefix_plus_content(self):
         s = make_session()

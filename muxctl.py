@@ -127,11 +127,13 @@ class ScreenModeTracker:
     """Mirror the hosted terminal's DEC private-mode state from its output stream.
 
     The local conhost window cannot scroll a full-screen TUI: the alternate screen buffer has no
-    scrollback, and the TUI (claude/codex) scrolls its transcript ONLY when it receives mouse wheel
-    reports — which is exactly what the web terminal (xterm.js) sends it. This tracker tells the
-    attach loop when the app owns scrolling (alt screen and/or mouse tracking active) so the wheel
-    can be captured and forwarded instead of dying against a scrollback-less buffer. muxd replays
-    the current mode state as a prefix on attach, so mid-session attaches land in the right state."""
+    scrollback, so scrolling only works if the wheel is translated into input the TUI understands.
+    The proven mechanism in this stack is the web frontend's: PageUp/PageDown per wheel event on
+    the alternate screen (its scrollAlternate(); it strips mouse reports entirely). This tracker
+    tells the attach loop when the app owns scrolling (alt screen and/or mouse tracking active) so
+    the wheel can be captured and translated instead of dying against a scrollback-less buffer.
+    muxd replays the current mode state as a prefix on attach, so mid-session attaches land in the
+    right state."""
 
     def __init__(self):
         self._lock = threading.Lock()
@@ -186,19 +188,34 @@ class ScreenModeTracker:
         return self._has(ALT_SCREEN_MODES | MOUSE_TRACK_MODES)
 
 
-def wheel_input_sequences(tracker, notches, cell_x=1, cell_y=1, arrow_fallback=True):
-    """Translate wheel notches (+up / -down) into the bytes the web terminal would send.
+PAGE_UP = b"\x1b[5~"
+PAGE_DOWN = b"\x1b[6~"
+ALT_SCROLL_MODES_ALLOWED = ("pagekeys", "sgr")
 
-    xterm.js parity: mouse tracking active -> one wheel report per notch (SGR when ?1006, urxvt
-    when ?1015, else X10); alternate screen without tracking -> 3 arrow keys per notch (SS3 under
-    DECCKM); normal screen without tracking -> nothing (the wheel is not captured there at all,
-    conhost scrolls its own scrollback natively). arrow_fallback=False suppresses the bare-alt-
-    screen arrows for terminals that synthesize alternate-scroll arrows themselves (VT input
-    opt-in), so one wheel notch can never scroll twice."""
+
+def wheel_input_sequences(tracker, notches, cell_x=1, cell_y=1, alt_scroll="pagekeys"):
+    """Translate wheel notches (+up / -down) into input bytes. Exactly ONE mechanism fires per
+    call — never two scroll sources for the same notch.
+
+    alt_scroll="pagekeys" (default): on the alternate screen send a single PageUp/PageDown per
+    wheel event. This is the mechanism PROVEN to scroll claude/codex in this stack — the web
+    frontend's scrollAlternate() does exactly this (and strips all mouse reports); the caller
+    rate-limits it like the web does (one per 90ms).
+
+    alt_scroll="sgr": standard mouse-tracking contract instead — one wheel report per notch (SGR
+    when ?1006, urxvt when ?1015, else X10) while the app tracks the mouse, and 3 arrow keys per
+    notch (SS3 under DECCKM) on a bare alternate screen (xterm.js's own fallback). Valid for a
+    TUI known to scroll from wheel reports, but NOT yet demonstrated for claude/codex here.
+
+    Mouse tracking active WITHOUT the alternate screen always uses the report contract (page keys
+    would be meaningless there). Normal screen without tracking -> nothing (the wheel is not even
+    captured; conhost scrolls its own scrollback natively)."""
     if not notches:
         return b""
     up = notches > 0
     count = min(8, abs(int(notches)))
+    if tracker.alt_screen and alt_scroll != "sgr":
+        return PAGE_UP if up else PAGE_DOWN
     if tracker.mouse_tracking:
         btn = 64 if up else 65
         x = max(1, int(cell_x))
@@ -210,11 +227,11 @@ def wheel_input_sequences(tracker, notches, cell_x=1, cell_y=1, arrow_fallback=T
         else:
             # X10 coordinate bytes can exceed 0x7F; muxd's input path decodes UTF-8
             # (Session.write) and the pty re-encodes it, so send the UTF-8 form of the
-            # latin-1 report chars (exactly what xterm.js produces over the websocket) —
-            # raw high bytes would decode to U+FFFD and corrupt the report.
+            # latin-1 report chars — raw high bytes would decode to U+FFFD and corrupt
+            # the report.
             seq = ("\x1b[M" + chr(32 + btn) + chr(32 + min(x, 222)) + chr(32 + min(y, 222))).encode("utf-8")
         return seq * count
-    if tracker.alt_screen and arrow_fallback:
+    if tracker.alt_screen:
         arrow = (b"\x1bO" if tracker.app_cursor_keys else b"\x1b[") + (b"A" if up else b"B")
         return arrow * (3 * count)
     return b""
@@ -262,10 +279,19 @@ class ConsoleInputTranslator:
     """Turn console INPUT_RECORDs into pty bytes. Kept out of the read thread so the decode
     (struct layout, wheel math, surrogate pairing) is testable against real console records."""
 
-    def __init__(self, tracker, cell_resolver=None, arrow_fallback=True):
+    PAGE_SCROLL_INTERVAL = 0.09      # web parity: scrollAlternate() sends one page key per 90ms
+
+    def __init__(self, tracker, cell_resolver=None, wheel_synthesis=True,
+                 alt_scroll="pagekeys", clock=time.monotonic):
         self.tracker = tracker
         self.cell = cell_resolver or (lambda pos: (1, 1))
-        self.arrow_fallback = arrow_fallback
+        # wheel_synthesis=False (MUXCTL_VT_INPUT opt-in): the terminal's VT layer owns the wheel
+        # (it synthesizes its own sequences), so we emit NOTHING for mouse events — one wheel
+        # notch must never produce two scroll sources.
+        self.wheel_synthesis = wheel_synthesis
+        self.alt_scroll = alt_scroll if alt_scroll in ALT_SCROLL_MODES_ALLOWED else "pagekeys"
+        self._clock = clock
+        self._page_scroll_at = 0.0
         self._pending_high = ""
         self._wheel_acc = 0
 
@@ -304,9 +330,9 @@ class ConsoleInputTranslator:
             return data * max(1, int(ke.wRepeatCount)), False
         if rec.EventType == MOUSE_EVENT_TYPE:
             me = rec.Event.MouseEvent
-            # Only the wheel is ever forwarded (web-terminal parity): click/motion reports are
-            # what caused the historic mouse-byte-flood injection bug.
-            if not (me.dwEventFlags & MOUSE_WHEELED):
+            # Only the wheel is ever translated (the web strips ALL mouse reports; click/motion
+            # reports are what caused the historic mouse-byte-flood injection bug).
+            if not (me.dwEventFlags & MOUSE_WHEELED) or not self.wheel_synthesis:
                 return b"", False
             self._wheel_acc += ctypes.c_short((me.dwButtonState >> 16) & 0xFFFF).value
             notches = int(self._wheel_acc / 120)
@@ -314,8 +340,13 @@ class ConsoleInputTranslator:
                 return b"", False
             self._wheel_acc -= notches * 120
             cx, cy = self.cell(me.dwMousePosition)
-            return wheel_input_sequences(self.tracker, notches, cx, cy,
-                                         arrow_fallback=self.arrow_fallback), False
+            seq = wheel_input_sequences(self.tracker, notches, cx, cy, alt_scroll=self.alt_scroll)
+            if seq in (PAGE_UP, PAGE_DOWN):
+                now = self._clock()
+                if now - self._page_scroll_at < self.PAGE_SCROLL_INTERVAL:
+                    return b"", False
+                self._page_scroll_at = now
+            return seq, False
         return b"", False
 
 
@@ -614,17 +645,19 @@ async def do_attach(name, create=False):
             hout = k.GetStdHandle(STD_OUTPUT_HANDLE)
             records = (INPUT_RECORD * 16)()
             got = ctypes.c_uint()
-            # Double-scroll safety on a BARE alt screen (less/vim without mouse tracking):
-            # alternate-scroll arrow synthesis lives in the VT-INPUT translation layer
-            # (conhost TerminalInput; Windows Terminal's own alternateScroll feeds the same
+            # Double-scroll safety: alternate-scroll synthesis lives in the VT-INPUT translation
+            # layer (conhost TerminalInput; Windows Terminal's alternateScroll feeds the same
             # ConPTY VT path). With ENABLE_VIRTUAL_TERMINAL_INPUT off — our default — a wheel
-            # notch surfaces as exactly ONE win32 MOUSE_EVENT and no synthesized arrow
-            # KEY_EVENTs, so our 3-arrows-per-notch is the only source. Under the legacy
-            # MUXCTL_VT_INPUT=1 opt-in the terminal may synthesize those arrows itself, so
-            # our own fallback is suppressed to keep one scroll source per notch.
+            # notch surfaces as exactly ONE win32 MOUSE_EVENT and no synthesized sequences, so
+            # our translation is the only source. Under the legacy MUXCTL_VT_INPUT=1 opt-in the
+            # terminal's VT layer owns the wheel, so our synthesis is disabled entirely.
+            # MUXCTL_WHEEL picks the alt-screen mechanism: "pagekeys" (default — PageUp/PageDown,
+            # the mechanism the web frontend PROVABLY scrolls claude/codex with) or "sgr"
+            # (standard mouse-report contract, for TUIs known to scroll from wheel reports).
             translator = ConsoleInputTranslator(
                 screen_modes, cell_resolver=lambda pos: viewport_cell(hout, pos),
-                arrow_fallback=not env_truthy("MUXCTL_VT_INPUT"))
+                wheel_synthesis=not env_truthy("MUXCTL_VT_INPUT"),
+                alt_scroll=os.environ.get("MUXCTL_WHEEL", "pagekeys").strip().lower())
             while True:
                 try:
                     if not k.ReadConsoleInputW(hin, records, len(records), ctypes.byref(got)):

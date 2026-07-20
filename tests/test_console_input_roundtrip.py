@@ -58,7 +58,10 @@ if not k.WriteConsoleInputW(hin, recs, len(recs), ctypes.byref(n)) or n.value !=
 
 tracker = muxctl.ScreenModeTracker()
 tracker.ingest(b"\x1b[?1049h\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h")
-tr = muxctl.ConsoleInputTranslator(tracker, cell_resolver=lambda pos: (pos.X + 1, pos.Y + 1))
+# alt_scroll="sgr" pins the report contract: this test validates struct layout and wheel-delta
+# decode math, which the page-key default (rate-limited) would hide behind its 90ms limiter.
+tr = muxctl.ConsoleInputTranslator(tracker, cell_resolver=lambda pos: (pos.X + 1, pos.Y + 1),
+                                   alt_scroll="sgr")
 
 out = bytearray()
 seen = 0
