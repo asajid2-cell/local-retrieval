@@ -4,12 +4,11 @@
 #   muxctl attach <name>    raw interactive attach (Ctrl-] to detach)
 #   muxctl open [name]      create/revive if needed, then attach (Ctrl-] to detach)
 #   muxctl kill <name>      kill and remove a local muxd session
-import asyncio, base64, json, sys, os, ctypes, threading, subprocess, time, shutil, contextlib, atexit, queue
+import asyncio, base64, json, sys, os, re, ctypes, threading, subprocess, time, shutil, contextlib, atexit, queue
 try:
     import websockets
 except ImportError:
     print("muxctl needs: pip install websockets"); sys.exit(1)
-import msvcrt
 
 URL = "ws://127.0.0.1:" + os.environ.get("MUXCTL_PORT", "7699")
 SHORT_TIMEOUT = float(os.environ.get("MUXCTL_TIMEOUT", "5"))
@@ -21,10 +20,21 @@ LOCAL_SCROLLBACK = max(0, int(os.environ.get("MUXCTL_SCROLLBACK", "60000")))
 def env_truthy(name):
     return os.environ.get(name, "").lower() in ("1", "true", "yes", "on")
 
-# extended-key scan codes (after 0x00/0xe0 prefix) -> VT sequences
-EXT = {b'H': b'\x1b[A', b'P': b'\x1b[B', b'M': b'\x1b[C', b'K': b'\x1b[D',
-       b'G': b'\x1b[H', b'O': b'\x1b[F', b'I': b'\x1b[5~', b'Q': b'\x1b[6~',
-       b'S': b'\x1b[3~', b'R': b'\x1b[2~', b'\x89': b'\x1b[Z'}
+# navigation keys (KEY_EVENT virtual-key codes) -> VT sequences (same bytes the old
+# msvcrt/scan-code table produced, so hosted-app key handling is unchanged)
+VK_TO_VT = {0x26: b'\x1b[A', 0x28: b'\x1b[B', 0x27: b'\x1b[C', 0x25: b'\x1b[D',
+            0x24: b'\x1b[H', 0x23: b'\x1b[F', 0x21: b'\x1b[5~', 0x22: b'\x1b[6~',
+            0x2E: b'\x1b[3~', 0x2D: b'\x1b[2~'}
+VK_TAB = 0x09
+SHIFT_PRESSED = 0x0010
+LEFT_ALT_PRESSED = 0x0002
+RIGHT_ALT_PRESSED = 0x0001
+LEFT_CTRL_PRESSED = 0x0008
+RIGHT_CTRL_PRESSED = 0x0004
+
+KEY_EVENT_TYPE = 0x0001
+MOUSE_EVENT_TYPE = 0x0002
+MOUSE_WHEELED = 0x0004
 
 STD_INPUT_HANDLE = -10
 STD_OUTPUT_HANDLE = -11
@@ -106,6 +116,225 @@ def terminal_attach_mode():
             k.SetConsoleMode(hin, in_mode.value)
         if have_out:
             k.SetConsoleMode(hout, out_mode.value)
+
+ALT_SCREEN_MODES = frozenset((47, 1047, 1049))
+MOUSE_TRACK_MODES = frozenset((9, 1000, 1002, 1003))
+PRIVATE_MODE_RE = re.compile(br"\x1b\[\?([0-9;]+)([hl])")
+
+
+class ScreenModeTracker:
+    """Mirror the hosted terminal's DEC private-mode state from its output stream.
+
+    The local conhost window cannot scroll a full-screen TUI: the alternate screen buffer has no
+    scrollback, and the TUI (claude/codex) scrolls its transcript ONLY when it receives mouse wheel
+    reports — which is exactly what the web terminal (xterm.js) sends it. This tracker tells the
+    attach loop when the app owns scrolling (alt screen and/or mouse tracking active) so the wheel
+    can be captured and forwarded instead of dying against a scrollback-less buffer. muxd replays
+    the current mode state as a prefix on attach, so mid-session attaches land in the right state."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._tail = b""
+        self.modes = set()
+
+    def ingest(self, data):
+        if not data:
+            return
+        with self._lock:
+            scan = self._tail + bytes(data)
+            for m in PRIVATE_MODE_RE.finditer(scan):
+                enabled = m.group(2) == b"h"
+                for raw in m.group(1).split(b";"):
+                    try:
+                        mode = int(raw)
+                    except ValueError:
+                        continue
+                    if enabled:
+                        self.modes.add(mode)
+                    else:
+                        self.modes.discard(mode)
+            self._tail = scan[-64:]
+
+    def _has(self, wanted):
+        with self._lock:
+            return bool(self.modes & wanted)
+
+    @property
+    def alt_screen(self):
+        return self._has(ALT_SCREEN_MODES)
+
+    @property
+    def mouse_tracking(self):
+        return self._has(MOUSE_TRACK_MODES)
+
+    @property
+    def sgr_mouse(self):
+        return self._has(frozenset((1006,)))
+
+    @property
+    def urxvt_mouse(self):
+        return self._has(frozenset((1015,)))
+
+    @property
+    def app_cursor_keys(self):
+        return self._has(frozenset((1,)))
+
+    def wants_mouse_capture(self):
+        # Only these states need the wheel: otherwise leave mouse input to conhost so its native
+        # scrollback (fed by muxd's replay) keeps working for plain shells.
+        return self._has(ALT_SCREEN_MODES | MOUSE_TRACK_MODES)
+
+
+def wheel_input_sequences(tracker, notches, cell_x=1, cell_y=1):
+    """Translate wheel notches (+up / -down) into the bytes the web terminal would send.
+
+    xterm.js parity: mouse tracking active -> one wheel report per notch (SGR when ?1006, urxvt
+    when ?1015, else X10); alternate screen without tracking -> 3 arrow keys per notch (SS3 under
+    DECCKM); normal screen without tracking -> nothing (the wheel is not captured there at all,
+    conhost scrolls its own scrollback natively)."""
+    if not notches:
+        return b""
+    up = notches > 0
+    count = min(8, abs(int(notches)))
+    if tracker.mouse_tracking:
+        btn = 64 if up else 65
+        x = max(1, int(cell_x))
+        y = max(1, int(cell_y))
+        if tracker.sgr_mouse:
+            seq = ("\x1b[<%d;%d;%dM" % (btn, x, y)).encode("ascii")
+        elif tracker.urxvt_mouse:
+            seq = ("\x1b[%d;%d;%dM" % (btn + 32, x, y)).encode("ascii")
+        else:
+            seq = b"\x1b[M" + bytes((32 + btn, 32 + min(x, 222), 32 + min(y, 222)))
+        return seq * count
+    if tracker.alt_screen:
+        arrow = (b"\x1bO" if tracker.app_cursor_keys else b"\x1b[") + (b"A" if up else b"B")
+        return arrow * (3 * count)
+    return b""
+
+
+def translate_key_event(vk, ch, ctrl_state):
+    """KEY_EVENT (key-down) -> bytes for the hosted pty, or None for keys with no mapping.
+    muxd decodes session input as UTF-8 (Session.write), so characters are UTF-8 encoded."""
+    if ch:
+        if vk == VK_TAB and (ctrl_state & SHIFT_PRESSED):
+            return b"\x1b[Z"
+        try:
+            data = ch.encode("utf-8")
+        except UnicodeEncodeError:
+            return None
+        alt = ctrl_state & (LEFT_ALT_PRESSED | RIGHT_ALT_PRESSED)
+        ctrl = ctrl_state & (LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED)
+        if alt and not ctrl and ch >= " " and ch != "\x7f":
+            return b"\x1b" + data          # plain Alt+printable; AltGr (ctrl+alt) stays a bare char
+        return data
+    return VK_TO_VT.get(vk)
+
+
+class KEY_EVENT_RECORD(ctypes.Structure):
+    _fields_ = [("bKeyDown", ctypes.c_int), ("wRepeatCount", ctypes.c_ushort),
+                ("wVirtualKeyCode", ctypes.c_ushort), ("wVirtualScanCode", ctypes.c_ushort),
+                ("UnicodeChar", ctypes.c_wchar), ("dwControlKeyState", ctypes.c_uint)]
+
+
+class MOUSE_EVENT_RECORD(ctypes.Structure):
+    _fields_ = [("dwMousePosition", COORD), ("dwButtonState", ctypes.c_uint),
+                ("dwControlKeyState", ctypes.c_uint), ("dwEventFlags", ctypes.c_uint)]
+
+
+class _INPUT_EVENT_UNION(ctypes.Union):
+    _fields_ = [("KeyEvent", KEY_EVENT_RECORD), ("MouseEvent", MOUSE_EVENT_RECORD),
+                ("_pad", ctypes.c_byte * 16)]
+
+
+class INPUT_RECORD(ctypes.Structure):
+    _fields_ = [("EventType", ctypes.c_ushort), ("Event", _INPUT_EVENT_UNION)]
+
+
+class ConsoleInputTranslator:
+    """Turn console INPUT_RECORDs into pty bytes. Kept out of the read thread so the decode
+    (struct layout, wheel math, surrogate pairing) is testable against real console records."""
+
+    def __init__(self, tracker, cell_resolver=None):
+        self.tracker = tracker
+        self.cell = cell_resolver or (lambda pos: (1, 1))
+        self._pending_high = ""
+        self._wheel_acc = 0
+
+    def feed(self, rec):
+        """One INPUT_RECORD -> (bytes for the session, detach requested)."""
+        if rec.EventType == KEY_EVENT_TYPE:
+            ke = rec.Event.KeyEvent
+            if not ke.bKeyDown:
+                return b"", False
+            ch = ke.UnicodeChar
+            if ch == "\x00":                              # no character (navigation/modifier key)
+                ch = ""
+            if ch and "\ud800" <= ch <= "\udbff":         # high surrogate: wait for its pair
+                self._pending_high = ch
+                return b"", False
+            if self._pending_high:
+                if ch and "\udc00" <= ch <= "\udfff":
+                    try:
+                        ch = (self._pending_high + ch).encode("utf-16-le", "surrogatepass").decode("utf-16-le")
+                    except Exception:
+                        ch = ""
+                self._pending_high = ""
+            if ch == "\x1d":                              # Ctrl-] = detach
+                return b"", True
+            data = translate_key_event(ke.wVirtualKeyCode, ch, ke.dwControlKeyState)
+            if not data:
+                return b"", False
+            return data * max(1, int(ke.wRepeatCount)), False
+        if rec.EventType == MOUSE_EVENT_TYPE:
+            me = rec.Event.MouseEvent
+            # Only the wheel is ever forwarded (web-terminal parity): click/motion reports are
+            # what caused the historic mouse-byte-flood injection bug.
+            if not (me.dwEventFlags & MOUSE_WHEELED):
+                return b"", False
+            self._wheel_acc += ctypes.c_short((me.dwButtonState >> 16) & 0xFFFF).value
+            notches = int(self._wheel_acc / 120)
+            if not notches:
+                return b"", False
+            self._wheel_acc -= notches * 120
+            cx, cy = self.cell(me.dwMousePosition)
+            return wheel_input_sequences(self.tracker, notches, cx, cy), False
+        return b"", False
+
+
+def set_mouse_capture(enabled):
+    """Toggle ENABLE_MOUSE_INPUT on the attach console. On = wheel events reach muxctl for
+    forwarding to the hosted app; off = conhost handles the wheel natively (viewport scrollback)."""
+    if os.name != "nt":
+        return
+    try:
+        k = ctypes.windll.kernel32
+        hin = k.GetStdHandle(STD_INPUT_HANDLE)
+        mode = ctypes.c_uint()
+        if not k.GetConsoleMode(hin, ctypes.byref(mode)):
+            return
+        if enabled:
+            next_mode = mode.value | ENABLE_MOUSE_INPUT | ENABLE_EXTENDED_FLAGS
+            next_mode &= ~ENABLE_QUICK_EDIT_MODE
+        else:
+            next_mode = (mode.value | ENABLE_EXTENDED_FLAGS) & ~ENABLE_MOUSE_INPUT
+        if next_mode != mode.value:
+            k.SetConsoleMode(hin, next_mode)
+    except Exception:
+        pass
+
+
+def viewport_cell(hout, position):
+    """Buffer coordinates of a mouse event -> 1-based viewport cell for a VT mouse report."""
+    info = CONSOLE_SCREEN_BUFFER_INFO()
+    left = top = 0
+    try:
+        if ctypes.windll.kernel32.GetConsoleScreenBufferInfo(hout, ctypes.byref(info)):
+            left, top = int(info.srWindow.Left), int(info.srWindow.Top)
+    except Exception:
+        pass
+    return max(1, int(position.X) - left + 1), max(1, int(position.Y) - top + 1)
+
 
 def term_size():
     # On Windows, os.get_terminal_size() can report the scrollback buffer width,
@@ -332,6 +561,14 @@ async def do_attach(name, create=False):
         sendq = asyncio.Queue()
         send_lock = asyncio.Lock()
         outq = queue.Queue()
+        screen_modes = ScreenModeTracker()
+        capture_state = {"on": None}
+
+        def sync_mouse_capture():
+            want = screen_modes.wants_mouse_capture()
+            if want != capture_state["on"]:
+                capture_state["on"] = want
+                set_mouse_capture(want)
 
         def output_thread():
             while True:
@@ -350,20 +587,29 @@ async def do_attach(name, create=False):
                 await ws.send(payload)
 
         def input_thread():
+            k = ctypes.windll.kernel32
+            hin = k.GetStdHandle(STD_INPUT_HANDLE)
+            hout = k.GetStdHandle(STD_OUTPUT_HANDLE)
+            records = (INPUT_RECORD * 16)()
+            got = ctypes.c_uint()
+            translator = ConsoleInputTranslator(
+                screen_modes, cell_resolver=lambda pos: viewport_cell(hout, pos))
             while True:
-                try: ch = msvcrt.getch()
-                except Exception: return
-                if ch in (b'\x00', b'\xe0'):
-                    seq = EXT.get(msvcrt.getch())
-                    if not seq: continue
-                    data = seq
-                elif ch == b'\x1d':                    # Ctrl-] = detach
-                    loop.call_soon_threadsafe(stop.set)
-                    loop.call_soon_threadsafe(sendq.put_nowait, None)
+                try:
+                    if not k.ReadConsoleInputW(hin, records, len(records), ctypes.byref(got)):
+                        return
+                except Exception:
                     return
-                else:
-                    data = ch
-                loop.call_soon_threadsafe(sendq.put_nowait, data)
+                out = bytearray()
+                for i in range(int(got.value)):
+                    data, detach = translator.feed(records[i])
+                    if detach:                                    # Ctrl-]
+                        loop.call_soon_threadsafe(stop.set)
+                        loop.call_soon_threadsafe(sendq.put_nowait, None)
+                        return
+                    out += data
+                if out:
+                    loop.call_soon_threadsafe(sendq.put_nowait, bytes(out))
         threading.Thread(target=input_thread, daemon=True).start()
 
         async def send_input():
@@ -396,6 +642,10 @@ async def do_attach(name, create=False):
                 async for raw in ws:
                     if isinstance(raw, (bytes, bytearray)):
                         data = bytes(raw)
+                        # Track alt-screen/mouse state from the FULL stream (including a suppressed
+                        # replay) so wheel forwarding matches the app's real state from frame one.
+                        screen_modes.ingest(data)
+                        sync_mouse_capture()
                         if first_binary:
                             first_binary = False
                             # Do NOT tail-truncate: muxd already bounds the replay server-side, and its FRONT
@@ -409,7 +659,10 @@ async def do_attach(name, create=False):
                     try: m = json.loads(raw)
                     except Exception: continue
                     if m.get("t") == "o":
-                        outq.put(base64.b64decode(m.get("d", "")))
+                        data = base64.b64decode(m.get("d", ""))
+                        screen_modes.ingest(data)
+                        sync_mouse_capture()
+                        outq.put(data)
                     elif m.get("t") == "err":
                         sys.stderr.write("\r\n[muxctl] " + m.get("m", "error") + "\r\n"); return
             finally:

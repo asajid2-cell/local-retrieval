@@ -911,7 +911,10 @@ ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)
 STALE_CSI_RE = re.compile(r"\[[0-?]*[ -/]*[@-~]")
 CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 PRIVATE_MODE_RE = re.compile(br"\x1b\[\?([0-9;]+)([hl])")
-REPLAY_PRIVATE_MODES = frozenset((47, 1047, 1049, 2004))
+# Alt-screen/bracketed-paste PLUS the mouse-tracking family: a viewer that attaches after the
+# app's ?1000h/?1006h scrolled out of the ring must still learn that the app owns the wheel,
+# or its wheel input falls back to arrow keys / dies entirely (the "can't scroll a TUI" bug).
+REPLAY_PRIVATE_MODES = frozenset((47, 1047, 1049, 2004, 9, 1000, 1002, 1003, 1005, 1006, 1007, 1015))
 
 
 def launch_candidate_ids(cmd="", ids=None):
