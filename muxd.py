@@ -915,7 +915,9 @@ PRIVATE_MODE_RE = re.compile(br"\x1b\[\?([0-9;]+)([hl])")
 # Alt-screen/bracketed-paste PLUS the mouse-tracking family: a viewer that attaches after the
 # app's ?1000h/?1006h scrolled out of the ring must still learn that the app owns the wheel,
 # or its wheel input falls back to arrow keys / dies entirely (the "can't scroll a TUI" bug).
-REPLAY_PRIVATE_MODES = frozenset((47, 1047, 1049, 2004, 9, 1000, 1002, 1003, 1005, 1006, 1007, 1015))
+# DECCKM (?1) rides along so viewers pick the right arrow encoding (SS3 vs CSI) for that fallback
+# and for real cursor keys; readline treats both forms as arrows, so a dead TUI can't wedge input.
+REPLAY_PRIVATE_MODES = frozenset((1, 47, 1047, 1049, 2004, 9, 1000, 1002, 1003, 1005, 1006, 1007, 1015))
 
 
 def launch_candidate_ids(cmd="", ids=None):
@@ -1242,6 +1244,15 @@ def fanout_local_output(session, data):
                 redraw_nudge(session)
             except Exception:
                 pass
+
+def attach_replay_payload(session, sb_limit):
+    """First frame for a new viewer. With scrollback disabled (sb<=0) the MODE PREFIX must still
+    go out: it is what tells the client the app owns the wheel (alt screen / mouse tracking).
+    Gating the whole frame on sb>0 silently resurrected the 'local terminal cannot scroll' bug
+    under MUXCTL_SCROLLBACK=0."""
+    if sb_limit > 0:
+        return session.scrollback(sb_limit)
+    return session.replay_state.prefix()
 
 def redraw_nudge(session):
     """Force a full repaint from a full-screen TUI by wiggling the PTY size (SIGWINCH) — alt-screen only,
@@ -3623,13 +3634,13 @@ async def main():
                     update_local_session_size(s, lq, first.get("cols"), first.get("rows") or 40)
                 try:
                     sb_limit = int(first.get("sb") if first.get("sb") is not None else LOCAL_SB_SEND)
-                    if sb_limit > 0:
-                        scrollback = await asyncio.get_running_loop().run_in_executor(
-                            None, lambda: s.scrollback(sb_limit)
-                        )
-                        await ws.send(scrollback)
-                        # Guarantee a full frame for an alt-screen TUI attached locally.
-                        await asyncio.get_running_loop().run_in_executor(None, redraw_nudge, s)
+                    replay = await asyncio.get_running_loop().run_in_executor(
+                        None, lambda: attach_replay_payload(s, sb_limit)
+                    )
+                    if replay:
+                        await ws.send(replay)
+                    # Guarantee a full frame for an alt-screen TUI attached locally.
+                    await asyncio.get_running_loop().run_in_executor(None, redraw_nudge, s)
                     async def pump():
                         while True:
                             data = await lq.get()

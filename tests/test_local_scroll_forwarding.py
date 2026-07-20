@@ -10,9 +10,21 @@ realistic byte streams end to end (muxd replay -> muxctl tracker -> wheel bytes)
 import importlib
 import random
 import unittest
+from unittest import mock
 
 muxctl = importlib.import_module("muxctl")
 muxd = importlib.import_module("muxd")
+
+
+def make_session():
+    """A real muxd.Session with no spawned pty: ring + replay state are fully live."""
+    return muxd.Session("t", "", None, 120, 30, None, None, spawn_now=False)
+
+
+def session_output(s, data):
+    """Exactly what Session._reader does with pty output (ring + replay state)."""
+    s.replay_state.ingest(data)
+    s._append_ring(data)
 
 
 # The exact shape captured from a LIVE claude session's muxd replay (2026-07-20):
@@ -113,6 +125,54 @@ class WheelTranslationTests(unittest.TestCase):
     def test_position_is_clamped_to_valid_cells(self):
         t = self._tracker(CLAUDE_STARTUP)
         self.assertEqual(muxctl.wheel_input_sequences(t, 1, 0, -3), b"\x1b[<64;1;1M")
+
+
+class WheelDoubleScrollGuardTests(unittest.TestCase):
+    """MUXCTL_VT_INPUT=1 lets the terminal's VT layer synthesize alternate-scroll arrows itself;
+    our own bare-alt-screen fallback must then stand down so one notch never scrolls twice."""
+
+    def test_arrow_fallback_suppressed_only_on_bare_alt_screen(self):
+        t = muxctl.ScreenModeTracker()
+        t.ingest(b"\x1b[?1049h")
+        self.assertEqual(muxctl.wheel_input_sequences(t, 1, arrow_fallback=False), b"")
+        self.assertEqual(muxctl.wheel_input_sequences(t, 1, arrow_fallback=True), b"\x1b[A" * 3)
+
+    def test_mouse_tracking_reports_are_unaffected_by_the_guard(self):
+        t = muxctl.ScreenModeTracker()
+        t.ingest(CLAUDE_STARTUP)
+        self.assertEqual(muxctl.wheel_input_sequences(t, 1, 2, 2, arrow_fallback=False),
+                         b"\x1b[<64;2;2M")
+
+
+class X10EncodingThroughMuxdInputPathTests(unittest.TestCase):
+    """X10 coordinate bytes are >0x7F on big terminals; muxd's input path UTF-8-decodes
+    (Session.write) and the pty re-encodes, so the report must survive that round trip."""
+
+    def _x10(self, x, y):
+        t = muxctl.ScreenModeTracker()
+        t.ingest(b"\x1b[?1049h\x1b[?1000h")   # X10-style tracking, no SGR/urxvt
+        return muxctl.wheel_input_sequences(t, 1, x, y)
+
+    def test_large_coordinates_survive_utf8_decode(self):
+        seq = self._x10(150, 100)
+        decoded = seq.decode("utf-8", "replace")
+        self.assertNotIn("�", decoded)
+        self.assertEqual(decoded, "\x1b[M" + chr(32 + 64) + chr(32 + 150) + chr(32 + 100))
+        self.assertEqual(decoded.encode("utf-8"), seq)
+
+    def test_end_to_end_through_session_write(self):
+        s = make_session()
+        captured = []
+        with mock.patch.object(s, "_enqueue_writer_item", side_effect=lambda item: captured.append(item) or True):
+            s.write(self._x10(180, 120))
+        self.assertEqual(len(captured), 1)
+        text = captured[0]
+        self.assertNotIn("�", text)
+        # the pty layer re-encodes UTF-8: the app receives the exact report chars
+        self.assertEqual(text, "\x1b[M" + chr(96) + chr(32 + 180) + chr(32 + 120))
+
+    def test_ascii_range_coordinates_are_plain_bytes(self):
+        self.assertEqual(self._x10(3, 4), b"\x1b[M" + bytes((32 + 64, 32 + 3, 32 + 4)))
 
 
 class KeyTranslationTests(unittest.TestCase):
@@ -216,15 +276,46 @@ class ConsoleInputTranslatorTests(unittest.TestCase):
         self.assertEqual(muxctl.ctypes.sizeof(muxctl.MOUSE_EVENT_RECORD), 16)
         self.assertEqual(muxctl.ctypes.sizeof(muxctl.INPUT_RECORD), 20)
 
+    def test_surrogate_pair_across_two_key_events_emits_one_utf8_char(self):
+        tr = self._translator()
+        high, low = "\ud83d", "\ude00"                       # U+1F600
+        self.assertEqual(tr.feed(_key_record(0x00, high)), (b"", False))
+        self.assertEqual(tr.feed(_key_record(0x00, low)), ("😀".encode("utf-8"), False))
+
+    def test_orphaned_high_surrogate_is_dropped_not_mangled(self):
+        tr = self._translator()
+        self.assertEqual(tr.feed(_key_record(0x00, "\ud83d")), (b"", False))
+        self.assertEqual(tr.feed(_key_record(0x41, "a")), (b"a", False))
+
+    def test_alt_numpad_character_arrives_on_alt_key_up(self):
+        tr = self._translator()
+        # composing digits show as VK_MENU-held key events with no char; the composed
+        # character rides the ALT key-UP record
+        self.assertEqual(tr.feed(_key_record(0x12, "\x00", down=1)), (b"", False))
+        self.assertEqual(tr.feed(_key_record(0x12, "é", down=0)), ("é".encode("utf-8"), False))
+
+    def test_non_alt_key_up_with_char_is_still_ignored(self):
+        tr = self._translator()
+        self.assertEqual(tr.feed(_key_record(0x41, "a", down=0)), (b"", False))
+
+    def test_vt_input_opt_in_suppresses_only_the_arrow_fallback(self):
+        t = muxctl.ScreenModeTracker()
+        t.ingest(b"\x1b[?1049h")
+        tr = muxctl.ConsoleInputTranslator(t, arrow_fallback=False)
+        wheel = _mouse_record(muxctl.MOUSE_WHEELED, (120 & 0xFFFF) << 16, 1, 1)
+        self.assertEqual(tr.feed(wheel), (b"", False))
+        t.ingest(b"\x1b[?1000h\x1b[?1006h")
+        self.assertEqual(tr.feed(wheel), (b"\x1b[<64;1;1M", False))
+
 
 class MidSessionAttachEndToEndTests(unittest.TestCase):
     """muxd replay -> muxctl tracker, for an attach long after the TUI's startup enables."""
 
-    def test_muxd_replay_prefix_now_restores_mouse_modes(self):
+    def test_muxd_replay_prefix_now_restores_mouse_modes_and_decckm(self):
         state = muxd.TerminalReplayState()
         state.ingest(CLAUDE_STARTUP)
         prefix = state.prefix()
-        for mode in (b"?1000h", b"?1002h", b"?1003h", b"?1006h", b"?1049h"):
+        for mode in (b"?1h", b"?1000h", b"?1002h", b"?1003h", b"?1006h", b"?1049h"):
             self.assertIn(b"\x1b[" + mode, prefix)
 
     def test_attach_after_enables_scrolled_out_of_the_ring_still_forwards_sgr_wheel(self):
@@ -243,6 +334,49 @@ class MidSessionAttachEndToEndTests(unittest.TestCase):
         feed_chunked(t, replay, sizes=(4096,))
         self.assertTrue(t.wants_mouse_capture())
         self.assertEqual(muxctl.wheel_input_sequences(t, 1, 40, 12), b"\x1b[<64;40;12M")
+
+    def test_sb_zero_attach_still_delivers_the_mode_prefix(self):
+        # MUXCTL_SCROLLBACK=0 regression: gating the whole first frame on sb>0 dropped the mode
+        # prefix, the client tracker never learned the app owns the wheel, and the original
+        # "can't scroll" bug came back under a knob.
+        s = make_session()
+        session_output(s, CLAUDE_STARTUP)
+        session_output(s, b"\x1b[2J\x1b[Htranscript body\r\n" * 100)
+
+        payload = muxd.attach_replay_payload(s, 0)
+        self.assertIn(b"\x1b[?1049h", payload)
+        self.assertIn(b"\x1b[?1000h", payload)
+        self.assertIn(b"\x1b[?1006h", payload)
+        self.assertNotIn(b"transcript body", payload)     # sb=0 means NO content replay
+
+        t = muxctl.ScreenModeTracker()
+        t.ingest(payload)
+        self.assertTrue(t.wants_mouse_capture())
+        self.assertEqual(muxctl.wheel_input_sequences(t, 1, 5, 5), b"\x1b[<64;5;5M")
+
+    def test_positive_sb_attach_replays_prefix_plus_content(self):
+        s = make_session()
+        session_output(s, CLAUDE_STARTUP)
+        session_output(s, b"\x1b[2J\x1b[Htranscript body\r\n" * 100)
+        payload = muxd.attach_replay_payload(s, 60000)
+        self.assertTrue(payload.startswith(s.replay_state.prefix()))
+        self.assertIn(b"transcript body", payload)
+
+    def test_mode_flapping_across_chunk_boundaries_lands_on_final_state(self):
+        # rapid h/l toggling, every sequence split mid-CSI: the tracker must end on the LAST
+        # state, never a stale intermediate one
+        stream = (b"\x1b[?1000h\x1b[?1000l" * 50 + b"\x1b[?1000h" +
+                  b"\x1b[?1049h\x1b[?1049l" * 50 + b"\x1b[?1049h" +
+                  b"\x1b[?1006h\x1b[?1006l")
+        for sizes in ((1,), (2,), (3,), (5,), (7,), (11,)):
+            t = muxctl.ScreenModeTracker()
+            feed_chunked(t, stream, sizes=sizes)
+            self.assertTrue(t.mouse_tracking, sizes)
+            self.assertTrue(t.alt_screen, sizes)
+            self.assertFalse(t.sgr_mouse, sizes)
+        st = muxd.TerminalReplayState()
+        st.ingest(stream)
+        self.assertEqual(st.private_modes & {1000, 1049, 1006}, {1000, 1049})
 
     def test_full_lifecycle_randomized_chunking(self):
         rng = random.Random(1049)

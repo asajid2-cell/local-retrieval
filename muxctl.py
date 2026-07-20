@@ -186,13 +186,15 @@ class ScreenModeTracker:
         return self._has(ALT_SCREEN_MODES | MOUSE_TRACK_MODES)
 
 
-def wheel_input_sequences(tracker, notches, cell_x=1, cell_y=1):
+def wheel_input_sequences(tracker, notches, cell_x=1, cell_y=1, arrow_fallback=True):
     """Translate wheel notches (+up / -down) into the bytes the web terminal would send.
 
     xterm.js parity: mouse tracking active -> one wheel report per notch (SGR when ?1006, urxvt
     when ?1015, else X10); alternate screen without tracking -> 3 arrow keys per notch (SS3 under
     DECCKM); normal screen without tracking -> nothing (the wheel is not captured there at all,
-    conhost scrolls its own scrollback natively)."""
+    conhost scrolls its own scrollback natively). arrow_fallback=False suppresses the bare-alt-
+    screen arrows for terminals that synthesize alternate-scroll arrows themselves (VT input
+    opt-in), so one wheel notch can never scroll twice."""
     if not notches:
         return b""
     up = notches > 0
@@ -206,9 +208,13 @@ def wheel_input_sequences(tracker, notches, cell_x=1, cell_y=1):
         elif tracker.urxvt_mouse:
             seq = ("\x1b[%d;%d;%dM" % (btn + 32, x, y)).encode("ascii")
         else:
-            seq = b"\x1b[M" + bytes((32 + btn, 32 + min(x, 222), 32 + min(y, 222)))
+            # X10 coordinate bytes can exceed 0x7F; muxd's input path decodes UTF-8
+            # (Session.write) and the pty re-encodes it, so send the UTF-8 form of the
+            # latin-1 report chars (exactly what xterm.js produces over the websocket) —
+            # raw high bytes would decode to U+FFFD and corrupt the report.
+            seq = ("\x1b[M" + chr(32 + btn) + chr(32 + min(x, 222)) + chr(32 + min(y, 222))).encode("utf-8")
         return seq * count
-    if tracker.alt_screen:
+    if tracker.alt_screen and arrow_fallback:
         arrow = (b"\x1bO" if tracker.app_cursor_keys else b"\x1b[") + (b"A" if up else b"B")
         return arrow * (3 * count)
     return b""
@@ -256,9 +262,10 @@ class ConsoleInputTranslator:
     """Turn console INPUT_RECORDs into pty bytes. Kept out of the read thread so the decode
     (struct layout, wheel math, surrogate pairing) is testable against real console records."""
 
-    def __init__(self, tracker, cell_resolver=None):
+    def __init__(self, tracker, cell_resolver=None, arrow_fallback=True):
         self.tracker = tracker
         self.cell = cell_resolver or (lambda pos: (1, 1))
+        self.arrow_fallback = arrow_fallback
         self._pending_high = ""
         self._wheel_acc = 0
 
@@ -267,6 +274,14 @@ class ConsoleInputTranslator:
         if rec.EventType == KEY_EVENT_TYPE:
             ke = rec.Event.KeyEvent
             if not ke.bKeyDown:
+                # Alt+numpad composition delivers its character on the ALT key-UP record;
+                # everything else on key-up is ignored (matching the old getch reader).
+                ch = ke.UnicodeChar
+                if ch and ch != "\x00" and ke.wVirtualKeyCode == 0x12:      # VK_MENU
+                    try:
+                        return ch.encode("utf-8"), False
+                    except UnicodeEncodeError:
+                        return b"", False
                 return b"", False
             ch = ke.UnicodeChar
             if ch == "\x00":                              # no character (navigation/modifier key)
@@ -299,7 +314,8 @@ class ConsoleInputTranslator:
                 return b"", False
             self._wheel_acc -= notches * 120
             cx, cy = self.cell(me.dwMousePosition)
-            return wheel_input_sequences(self.tracker, notches, cx, cy), False
+            return wheel_input_sequences(self.tracker, notches, cx, cy,
+                                         arrow_fallback=self.arrow_fallback), False
         return b"", False
 
 
@@ -326,7 +342,12 @@ def set_mouse_capture(enabled):
 
 
 def viewport_cell(hout, position):
-    """Buffer coordinates of a mouse event -> 1-based viewport cell for a VT mouse report."""
+    """Buffer coordinates of a mouse event -> 1-based viewport cell for a VT mouse report.
+
+    Legacy conhost reports MOUSE_EVENT positions in screen-BUFFER coordinates, so the viewport
+    origin (srWindow) must be subtracted; under Windows Terminal/ConPTY the buffer has no
+    scrollback margin (srWindow.Top/Left are 0) and the same math is the identity. Clamped to
+    >=1 so a stale viewport during a scroll race can never emit a non-positive coordinate."""
     info = CONSOLE_SCREEN_BUFFER_INFO()
     left = top = 0
     try:
@@ -593,8 +614,17 @@ async def do_attach(name, create=False):
             hout = k.GetStdHandle(STD_OUTPUT_HANDLE)
             records = (INPUT_RECORD * 16)()
             got = ctypes.c_uint()
+            # Double-scroll safety on a BARE alt screen (less/vim without mouse tracking):
+            # alternate-scroll arrow synthesis lives in the VT-INPUT translation layer
+            # (conhost TerminalInput; Windows Terminal's own alternateScroll feeds the same
+            # ConPTY VT path). With ENABLE_VIRTUAL_TERMINAL_INPUT off — our default — a wheel
+            # notch surfaces as exactly ONE win32 MOUSE_EVENT and no synthesized arrow
+            # KEY_EVENTs, so our 3-arrows-per-notch is the only source. Under the legacy
+            # MUXCTL_VT_INPUT=1 opt-in the terminal may synthesize those arrows itself, so
+            # our own fallback is suppressed to keep one scroll source per notch.
             translator = ConsoleInputTranslator(
-                screen_modes, cell_resolver=lambda pos: viewport_cell(hout, pos))
+                screen_modes, cell_resolver=lambda pos: viewport_cell(hout, pos),
+                arrow_fallback=not env_truthy("MUXCTL_VT_INPUT"))
             while True:
                 try:
                     if not k.ReadConsoleInputW(hin, records, len(records), ctypes.byref(got)):
@@ -638,22 +668,18 @@ async def do_attach(name, create=False):
                 await safe_send(json.dumps({"t": "resize", "cols": cur[0], "rows": cur[1]}))
 
         async def recv():
-            first_binary = True
             try:
                 async for raw in ws:
                     if isinstance(raw, (bytes, bytearray)):
                         data = bytes(raw)
-                        # Track alt-screen/mouse state from the FULL stream (including a suppressed
-                        # replay) so wheel forwarding matches the app's real state from frame one.
+                        # Track alt-screen/mouse state from the FULL stream so wheel forwarding
+                        # matches the app's real state from frame one.
                         screen_modes.ingest(data)
                         sync_mouse_capture()
-                        if first_binary:
-                            first_binary = False
-                            # Do NOT tail-truncate: muxd already bounds the replay server-side, and its FRONT
-                            # carries the mode prefix (alt-screen enter etc.). Cutting the front stripped the
-                            # prefix and started the screen mid-escape -> corrupted/black local attach.
-                            if LOCAL_SCROLLBACK == 0:
-                                data = b""
+                        # Never truncate or drop the first frame here: muxd bounds the replay
+                        # server-side (we sent "sb"), and even at sb=0 it sends a MODE-PREFIX-only
+                        # frame that must reach conhost so the screen state (alt-screen enter etc.)
+                        # is correct before live output.
                         if data:
                             outq.put(data)
                         continue
