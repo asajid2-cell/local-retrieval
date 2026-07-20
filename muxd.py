@@ -680,7 +680,8 @@ def _try_agent_cmdlines():
         ps = ("Get-CimInstance Win32_Process -Filter \"Name='claude.exe' or Name='codex.exe' or Name='node.exe'\" | "
               "Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress")
         r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
-                           capture_output=True, text=True, timeout=15)
+                           capture_output=True, text=True, timeout=15,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         if r.returncode != 0:
             return False, out, (r.stderr or r.stdout or "CIM process query failed").strip()
         data = json.loads(r.stdout) if r.stdout.strip() else []
