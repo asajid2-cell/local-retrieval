@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.Linq;
 using System.Management;
 using System.Text.Json;
@@ -128,49 +127,6 @@ public sealed partial class MainPage
         }
         catch { }
         return map;
-    }
-
-    // Kill the live agent for a session id (preferred) or an explicit pid — but ONLY if it resolves to one
-    // of OUR scanned claude/codex agents. Never an arbitrary process kill from the web.
-    private (bool ok, string detail) KillRunningSession(string? sessionId, int pid)
-    {
-        var sessions = GetRunningSessions();
-        var match = pid > 0
-            ? sessions.FirstOrDefault(s =>
-                s.Pid == pid
-                && (string.IsNullOrEmpty(sessionId)
-                    || string.Equals(s.SessionId, sessionId, StringComparison.OrdinalIgnoreCase)))
-            : (!string.IsNullOrEmpty(sessionId)
-                ? sessions.FirstOrDefault(s =>
-                    string.Equals(s.SessionId, sessionId, StringComparison.OrdinalIgnoreCase))
-                : null);
-        // No live match. Report "already gone" ONLY when confirmable — a failed/empty WMI scan would
-        // otherwise false-success every kill. Verify the pid directly; if alive, don't claim it's gone.
-        if (match is null)
-        {
-            if (pid > 0)
-            {
-                try { using var _ = Process.GetProcessById(pid); return (false, "still running but not a tracked claude/codex agent — not killed"); }
-                catch (ArgumentException) { return (true, "already gone"); }
-            }
-            return sessions.Count > 0 ? (true, "already gone") : (false, "couldn't verify — process scan returned nothing");
-        }
-        try
-        {
-            Process.GetProcessById(match.Pid).Kill(entireProcessTree: true);
-            InvalidateRunningCache();
-            Diag.Log($"Remote kill: {match.Tool} pid {match.Pid} (session {match.SessionId})");
-            return (true, $"killed {match.Tool} pid {match.Pid}");
-        }
-        catch (ArgumentException) { return (true, "already gone"); }   // raced out between scan and kill
-        catch (Exception ex) { return (false, $"kill failed: {ex.Message}"); }
-    }
-
-    private (bool ok, string detail) TryKillChat(int pid)
-    {
-        try { Process.GetProcessById(pid).Kill(entireProcessTree: true); InvalidateRunningCache(); return (true, "killed"); }
-        catch (ArgumentException) { InvalidateRunningCache(); return (true, "already gone"); }
-        catch (Exception ex) { Diag.Log($"Kill pid {pid} failed: " + ex.Message); return (false, ex.Message); }
     }
 
     private enum RelayMuxState { None, Hosted, Legacy }
