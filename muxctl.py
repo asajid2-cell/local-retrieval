@@ -104,9 +104,10 @@ def terminal_attach_mode():
         k.SetConsoleMode(hout, out_mode.value | ENABLE_PROCESSED_OUTPUT | ENABLE_WRAP_AT_EOL_OUTPUT |
                          ENABLE_VIRTUAL_TERMINAL_PROCESSING | DISABLE_NEWLINE_AUTO_RETURN)
     if have_in:
-        # Stay in classic key-input mode by default. VT/mouse/window input can make
-        # terminal-generated reports and mouse coordinates look like typed bytes to
-        # msvcrt.getch(), which then injects them into the hosted shell.
+        # Stay in classic key-event input mode by default: VT input turns terminal-generated
+        # reports into typed-looking bytes that get injected into the hosted shell. Mouse input
+        # starts OFF (conhost keeps native wheel scrollback for plain shells) and is toggled on
+        # by set_mouse_capture() only while the hosted app owns scrolling (alt screen / tracking).
         k.SetConsoleMode(hin, attach_input_mode(in_mode.value, env_truthy("MUXCTL_VT_INPUT")))
         flush_console_input()
     try:
