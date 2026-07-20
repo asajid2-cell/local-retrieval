@@ -88,15 +88,33 @@ public sealed partial class MainPage
         {
             // Guard against resuming a chat that's already running (locally or in a multiplex) - two
             // runs corrupt the transcript. Offers to kill the running copy first.
-            if (!await ConfirmRunOrKillAsync(session))
+            var guard = await ConfirmRunOrKillAsync(session);
+            if (guard.Outcome == RunGuardOutcome.Unverifiable)
             {
+                // NOT "already running" - the scan never got an answer. Recording this as a live owner
+                // would put a statement into the ledger that nothing ever verified.
+                RecordSessionEvent(
+                    session,
+                    "resume.refused.unverified",
+                    "Terminal resume refused because live-owner verification failed: " + guard.Detail,
+                    "warn",
+                    details: new Dictionary<string, string> { ["trigger"] = trigger });
+                SyncStatus.Text = "Refused - couldn't verify whether this chat is already running.";
+                return;
+            }
+            if (guard.Outcome == RunGuardOutcome.Cancelled || guard.Outcome == RunGuardOutcome.Live)
+            {
+                var takeoverFailed = guard.Outcome == RunGuardOutcome.Live;
                 RecordSessionEvent(
                     session,
                     "resume.refused.running",
-                    "Terminal resume cancelled because the session already had a live owner.",
+                    takeoverFailed
+                        ? "Terminal resume refused because the live owner could not be stopped: " + guard.Detail
+                        : "Terminal resume cancelled because the session already had a live owner.",
                     "warn",
                     details: new Dictionary<string, string> { ["trigger"] = trigger });
-                SyncStatus.Text = "Cancelled - already running.";
+                // On Live the guard already put the kill failure in SyncStatus - don't stomp it.
+                if (!takeoverFailed) SyncStatus.Text = "Cancelled - already running.";
                 return;
             }
 

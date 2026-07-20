@@ -75,15 +75,33 @@ public sealed partial class MainPage
                 return;
             }
             // Running locally (or elsewhere) right now? Don't let two copies fight over the transcript.
-            if (!await ConfirmRunOrKillAsync(session))
+            var guard = await ConfirmRunOrKillAsync(session);
+            if (guard.Outcome == CodexLocalRetrieval.Core.Remote.RunGuardOutcome.Unverifiable)
             {
+                // NOT "already running" - the scan never got an answer. Same honesty as tomux.refused.live-scan.
+                RecordSessionEvent(
+                    session,
+                    "mux.refused.unverified",
+                    "Mux start refused because live-owner verification failed: " + guard.Detail,
+                    "warn",
+                    details: new Dictionary<string, string> { ["muxName"] = name });
+                SyncStatus.Text = "Refused - couldn't verify whether this chat is already running.";
+                return;
+            }
+            if (guard.Outcome == CodexLocalRetrieval.Core.Remote.RunGuardOutcome.Cancelled
+                || guard.Outcome == CodexLocalRetrieval.Core.Remote.RunGuardOutcome.Live)
+            {
+                var takeoverFailed = guard.Outcome == CodexLocalRetrieval.Core.Remote.RunGuardOutcome.Live;
                 RecordSessionEvent(
                     session,
                     "mux.refused.running",
-                    "Mux start cancelled because the session already had a live owner.",
+                    takeoverFailed
+                        ? "Mux start refused because the live owner could not be stopped: " + guard.Detail
+                        : "Mux start cancelled because the session already had a live owner.",
                     "warn",
                     details: new Dictionary<string, string> { ["muxName"] = name });
-                SyncStatus.Text = "Cancelled - already running.";
+                // On Live the guard already put the kill failure in SyncStatus - don't stomp it.
+                if (!takeoverFailed) SyncStatus.Text = "Cancelled - already running.";
                 return;
             }
 

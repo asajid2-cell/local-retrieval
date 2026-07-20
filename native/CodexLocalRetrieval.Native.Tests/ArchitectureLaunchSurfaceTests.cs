@@ -375,6 +375,43 @@ public sealed class ArchitectureLaunchSurfaceTests
             "Co-pilot resume confirmation must not expose raw launch commands before integrity-gated user action.");
     }
 
+    // The guard's refusal reaches the ledger through these two call sites. An unverifiable scan must land
+    // on `*.refused.unverified`; if it ever falls back into the `*.refused.running` branch again, the app is
+    // writing "the session already had a live owner" about a scan that confirmed nothing.
+    [TestMethod]
+    public void LaunchGuardRefusals_RecordUnverifiedScansSeparatelyFromConfirmedLiveOwners()
+    {
+        var root = FindRepoRoot();
+        var sites = new[]
+        {
+            ("resume", Path.Combine(root, "native", "CodexLocalRetrieval.Native", "MainPage.Sessions.cs"), "resume"),
+            ("mux", Path.Combine(root, "native", "CodexLocalRetrieval.Native", "MainPage.Remote.cs"), "mux"),
+        };
+
+        foreach (var (label, file, kindPrefix) in sites)
+        {
+            var text = File.ReadAllText(file);
+
+            Assert.Contains("RunGuardOutcome.Unverifiable", text,
+                label + " must branch on the guard's outcome, not on a bare bool that hides why it refused.");
+            Assert.Contains("\"" + kindPrefix + ".refused.unverified\"", text,
+                label + " must record an unverified scan under its own event kind.");
+            Assert.Contains("\"" + kindPrefix + ".refused.running\"", text,
+                label + " must still record a CONFIRMED live owner as such.");
+
+            // The two branches must be disjoint: whatever block records `refused.running` must not be the
+            // block reached by Unverifiable. Slice the Unverifiable branch and assert the kind is absent.
+            var start = text.IndexOf("RunGuardOutcome.Unverifiable", StringComparison.Ordinal);
+            var end = text.IndexOf("\"" + kindPrefix + ".refused.running\"", start, StringComparison.Ordinal);
+            Assert.IsTrue(end > start, label + " must handle Unverifiable BEFORE the live-owner branch.");
+            var unverifiableBranch = text[start..end];
+
+            Assert.DoesNotContain("refused.running", unverifiableBranch);
+            Assert.DoesNotContain("already had a live owner", unverifiableBranch);
+            Assert.DoesNotContain("Cancelled - already running.", unverifiableBranch);
+        }
+    }
+
     private static string FindRepoRoot()
     {
         var dir = new DirectoryInfo(AppContext.BaseDirectory);

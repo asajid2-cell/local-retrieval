@@ -5,6 +5,7 @@ using System.Management;
 using System.Text.Json;
 using System.Threading.Tasks;
 using CodexLocalRetrieval.Core.Models;
+using CodexLocalRetrieval.Core.Remote;
 using CodexLocalRetrieval.Core.Services;
 using Microsoft.UI.Xaml.Controls;
 
@@ -195,8 +196,12 @@ public sealed partial class MainPage
 
     // Shared pre-launch guard for BOTH resume flows: for THIS chat, check local muxd first, then the
     // relay's explicit hosted/legacy state, plus a loose local agent process. If any are up, offer to
-    // kill it or cancel. Returns false to abort the launch.
-    private async Task<bool> ConfirmRunOrKillAsync(ArchiveSession session)
+    // kill it or cancel.
+    //
+    // Returns WHY it stopped, not just that it did. A bare bool made scan-failure indistinguishable from
+    // a confirmed live owner, and callers wrote the latter into the ledger for both — see RunGuardOutcome.
+    // The decision itself lives in Core's RunGuardClassifier; this method only does the I/O around it.
+    private async Task<RunGuardDecision> ConfirmRunOrKillAsync(ArchiveSession session)
     {
         var settings = _archive.Store.Settings;
         var target = (settings.MultiplexSshTarget ?? "").Trim();
@@ -211,27 +216,32 @@ public sealed partial class MainPage
         Dictionary<string, HashSet<int>> running;
         try
         {
+            // Threading is deliberate and load-bearing: Task.Run off the UI thread with a hard 6s cap.
             var scan = await Task.Run(() =>
             {
+                // STRUCTURED overload: which pids blocked verification, so the refusal can name them
+                // instead of claiming a live owner the scan never found.
                 var ok = CodexLocalRetrieval.Core.Remote.RunningSessions.TryLiveSessionPids(
                     out var live,
+                    out var unverifiablePids,
                     out var detail);
-                return (ok, live, detail);
+                return (ok, live, unverifiablePids, detail);
             }).WaitAsync(TimeSpan.FromSeconds(6));
-            if (!scan.ok)
+            var scanVerdict = RunGuardClassifier.ClassifyScan(scan.ok, timedOut: false, scan.unverifiablePids, scan.detail);
+            if (scanVerdict is not null)
             {
-                SyncStatus.Text = scan.detail;
-                Diag.Log("Mux launch guard refused: " + scan.detail);
-                return false;
+                SyncStatus.Text = scanVerdict.Value.Detail;
+                Diag.Log("Launch guard could not verify: " + scanVerdict.Value.Detail);
+                return scanVerdict.Value;
             }
             running = scan.live;
         }
         catch (TimeoutException)
         {
-            const string detail = "live-session verification timed out; refusing to risk a second writer";
-            SyncStatus.Text = detail;
-            Diag.Log("Mux launch guard refused: " + detail);
-            return false;
+            var verdict = RunGuardClassifier.ClassifyScan(false, timedOut: true, null, null)!.Value;
+            SyncStatus.Text = verdict.Detail;
+            Diag.Log("Launch guard could not verify: " + verdict.Detail);
+            return verdict;
         }
         // Match on the session id OR any of its aliases (a fork/resume writes a lineage id) so a live copy
         // started under a different id — but the SAME transcript — is still caught.
@@ -243,40 +253,50 @@ public sealed partial class MainPage
             .Where(pid => pid > 0)
             .Distinct()
             .ToArray();
-        // if a multiplex is up, the running process IS its agent (not a separate local one)
-        var localUp = localPids.Length > 0 && !muxUp;
-
-        if (!muxUp && !localUp) return true;   // nothing running -> proceed
+        // nothing running -> proceed. (If a multiplex is up, the running process IS its agent rather than
+        // a separate local copy, but either signal alone still means there's an owner to take over.)
+        if (!RunGuardClassifier.NeedsTakeoverPrompt(muxUp, localPids))
+            return new RunGuardDecision(RunGuardOutcome.Proceed, "");
 
         var where = localMuxUp ? "a local mux session"
                   : relayState == RelayMuxState.Hosted ? "a PC-hosted mux session reported by the relay"
                   : relayState == RelayMuxState.Legacy ? "a legacy relay-side session"
                   : "locally on this PC";
         var choice = await ConfirmAlreadyRunningAsync(Trim(session.DisplayTitle, 40), where);
-        if (choice == RunGuard.Cancel) return false;
+        var killOk = true;
+        var killDetail = "";
         if (choice == RunGuard.Kill)
         {
             if (localMuxUp)
             {
                 var deleted = await DeleteLocalMuxdSessionAsync(muxName);
-                if (!deleted.ok)
-                {
-                    SyncStatus.Text = "Could not kill the local mux session: " + deleted.detail;
-                    return false;
-                }
+                if (!deleted.ok) { killOk = false; killDetail = "Could not kill the local mux session: " + deleted.detail; }
             }
             else if (relayMuxUp)
             {
                 var deleted = await DeleteRelayMuxSessionAsync(target, settings.MultiplexApiPort, muxName);
-                if (!deleted.ok) { SyncStatus.Text = "Could not kill the relay-visible mux session: " + deleted.detail; return false; }
+                if (!deleted.ok) { killOk = false; killDetail = "Could not kill the relay-visible mux session: " + deleted.detail; }
             }
             foreach (var localPid in localPids)
             {
+                if (!killOk) break;
                 var killed = CodexLocalRetrieval.Core.Remote.RunningSessions.Kill(null, localPid);
-                if (!killed.ok) { SyncStatus.Text = "Could not kill the local running agent: " + killed.detail; return false; }
+                if (!killed.ok) { killOk = false; killDetail = "Could not kill the local running agent: " + killed.detail; }
             }
-            await Task.Delay(400);
+            // The owner is still there — this is a FAILED takeover of a confirmed live owner, not a cancel.
+            if (!killOk) SyncStatus.Text = killDetail;
+            else await Task.Delay(400);
         }
-        return true;
+
+        return RunGuardClassifier.Classify(
+            scanOk: true,
+            timedOut: false,
+            unverifiablePids: null,
+            scanDetail: null,
+            muxUp: muxUp,
+            localPids: localPids,
+            dialogChoice: choice == RunGuard.Kill ? RunGuardChoice.Kill : RunGuardChoice.Cancel,
+            killOk: killOk,
+            killDetail: killDetail);
     }
 }
