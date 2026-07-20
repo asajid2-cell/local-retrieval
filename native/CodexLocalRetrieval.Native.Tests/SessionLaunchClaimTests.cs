@@ -116,8 +116,12 @@ public class SessionLaunchClaimTests
         Assert.IsTrue(File.Exists(info.Path));
     }
 
+    // [F#2] This used to clear. It must not: the claim's owner is the APP that acquired it, and the
+    // `cmd /k -> claude` tree it launched outlives the app. Owner dead + unexpired + nothing tying a
+    // confirmed-dead wrapper to the claim means the writer may still be seconds from appearing inside the
+    // grace, so the janitor entry point waits it out instead of opening a double-writer window.
     [TestMethod]
-    public void TryClearAbandonedClaim_ClearsOwnerlessUnexpiredClaim()
+    public void TryClearAbandonedClaim_RefusesUnexpiredDeadOwnerWithNoOwnerRecord()
     {
         using var dir = TempClaimDir();
         var now = DateTimeOffset.UtcNow;
@@ -128,7 +132,12 @@ public class SessionLaunchClaimTests
         var info = SessionLaunchClaims.ReadClaimsForSession(
             "session-dead-owner", options: Options(dir.Path, now)).Single();
 
-        Assert.IsTrue(SessionLaunchClaims.TryClearAbandonedClaim(info, out _, now, _ => false));
+        Assert.IsFalse(SessionLaunchClaims.TryClearAbandonedClaim(info, out var clearDetail, now, _ => false));
+        StringAssert.Contains(clearDetail, "nothing ties a confirmed-dead launch");
+        Assert.IsTrue(File.Exists(info.Path));
+
+        // ...and it DOES clear once it is expired, which is tier 1 proper.
+        Assert.IsTrue(SessionLaunchClaims.TryClearAbandonedClaim(info, out _, now.AddMinutes(3), _ => false));
         Assert.IsFalse(File.Exists(info.Path));
     }
 
@@ -146,7 +155,10 @@ public class SessionLaunchClaimTests
         File.WriteAllText(reviewed.Path,
             $$"""{"SessionId":"session-replaced","CandidateIds":["session-replaced"],"OwnerPid":99999,"OwnerProcess":"new-owner","CreatedUtc":"{{now.AddSeconds(1):O}}","ExpiresUtc":"{{now.AddMinutes(5):O}}","Reason":"new"}""");
 
-        Assert.IsFalse(SessionLaunchClaims.TryClearAbandonedClaim(reviewed, out var clearDetail, now, _ => false));
+        // Grace waited out, so the tiers PERMIT the attempt — which is exactly when the SameClaim re-read after
+        // the quarantine move has to catch that the file on disk is now somebody else's reservation.
+        var waited = new ReclaimEvidence { Now = now, IsProcessAlive = _ => false, GraceWaitedOut = true };
+        Assert.IsFalse(SessionLaunchClaims.TryClearAbandonedClaim(reviewed, out var clearDetail, now, _ => false, waited));
         StringAssert.Contains(clearDetail, "changed during cleanup");
         Assert.IsTrue(File.Exists(reviewed.Path));
         StringAssert.Contains(File.ReadAllText(reviewed.Path), "new-owner");

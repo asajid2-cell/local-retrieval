@@ -12,6 +12,8 @@ public sealed partial class MainPage
     private SessionIntegritySummary? _integritySummary;
     private string _integritySessionKey = "";
     private DateTimeOffset _integrityBuiltAt;
+    private int _reclaimSeq;
+    private bool _reclaimRunning;
 
     private void RefreshIntegrity_Click(object sender, RoutedEventArgs e) => RenderIntegrity(force: true);
 
@@ -51,8 +53,8 @@ public sealed partial class MainPage
         SetRiskySessionActionsEnabled(!string.Equals(summary.Severity, "danger", StringComparison.OrdinalIgnoreCase));
 
         IntegrityItems.Children.Add(IntegrityHeadline(summary.Severity, summary.Headline));
-        if (CanSafelyUnblock(summary))
-            IntegrityItems.Children.Add(IntegrityUnblockButton());
+        if (CanReclaim(summary))
+            IntegrityItems.Children.Add(IntegrityReclaimButton());
         IntegrityItems.Children.Add(IntegrityMeta(summary));
 
         // Branch linkage — a branch links back to its original; a parent lists the branches taken off it.
@@ -84,101 +86,226 @@ public sealed partial class MainPage
                 $"{e.Kind}: {Trim(e.Summary, 92)}")));
     }
 
-    private bool CanSafelyUnblock(SessionIntegritySummary summary)
-    {
-        var dangerNames = summary.Checks.Where(c => c.Severity == "danger").Select(c => c.Name).ToList();
-        if (dangerNames.Count == 0 || dangerNames.Any(name => name is not ("Live owner" or "Launch claim")))
-            return false;
-        var exactClaim = SessionLaunchClaims.ReadClaimsForSession(summary.SessionId).Count > 0;
-        var exactOwner = RunningSessions.TryScan(out var running, out _)
-                         && running.Any(r => string.Equals(r.SessionId, summary.SessionId, StringComparison.OrdinalIgnoreCase));
-        return exactClaim || exactOwner;
-    }
+    // M7. Reclaim is the take-control op, so its affordance may never depend on the oracle that take-control
+    // exists to work around. ANY danger blocker offers it — including "could not verify" and the error-event
+    // case, which is precisely what the old exact-id + {Live owner, Launch claim} gating hid: one
+    // `resume.failed.terminal` in the ledger used to lock the recovery UI permanently.
+    private static bool CanReclaim(SessionIntegritySummary summary)
+        => string.Equals(summary.Severity, "danger", StringComparison.OrdinalIgnoreCase);
 
-    private Button IntegrityUnblockButton()
+    private Button IntegrityReclaimButton()
     {
         var button = new Button
         {
-            Content = "Unblock safely",
+            Content = "Reclaim",
             HorizontalAlignment = HorizontalAlignment.Stretch,
             Style = (Style)Resources["PrimaryPillButtonStyle"]
         };
-        ToolTipService.SetToolTip(button, "Stop verified owners, clear abandoned launch claims, then rerun every integrity check");
-        button.Click += async (_, _) => await UnblockSelectedSessionAsync();
+        ToolTipService.SetToolTip(button, "Take control: stop every owner of this chat, clear the reservations that are safe to clear, then relaunch it");
+        button.Click += async (_, _) => await ReclaimSelectedSessionAsync();
         return button;
     }
 
-    private async Task UnblockSelectedSessionAsync()
+    // M3/M4. The whole flow runs off the UI thread behind a sequence guard; only the dialogs and the final
+    // render come back. It addresses the FULL candidate set (id + every alias) everywhere — owner matching,
+    // claim reading, claim clearing, record reading — because the blocker logic matches aliases too, and an
+    // alias-held claim used to block forever while Unblock reported clean.
+    private async Task ReclaimSelectedSessionAsync()
     {
-        if (_selected is null) return;
+        if (_selected is null || _reclaimRunning) return;
         var session = _selected;
+        var candidateIds = ReclaimCandidateIds(session);
+
         var dialog = new ContentDialog
         {
-            Title = "Unblock this chat?",
+            Title = "Reclaim this chat?",
             Content = new TextBlock
             {
-                Text = "The app will stop only verified Claude/Codex owners for this chat, clear only expired or ownerless launch claims, then verify the chat again. It will not report success while any blocker remains.",
+                Text = "The app will stop every process it can tie to this chat, clear the launch reservations it is allowed to clear, prune stale mux custody, and relaunch it in a terminal. "
+                       + "A reservation held by a live owner is NOT force-cleared — you'll be asked what to do.",
                 TextWrapping = TextWrapping.Wrap,
                 MaxWidth = 460
             },
-            PrimaryButtonText = "Stop and verify",
+            PrimaryButtonText = "Reclaim",
             CloseButtonText = "Cancel",
             DefaultButton = ContentDialogButton.Close,
             XamlRoot = XamlRoot
         };
         if (await dialog.ShowAsync() != ContentDialogResult.Primary) return;
 
-        if (!RunningSessions.TryScan(out var running, out var scanDetail))
-        {
-            SyncStatus.Text = "Unblock stopped: " + scanDetail;
-            RenderIntegrity(force: true);
-            return;
-        }
+        var seq = ++_reclaimSeq;
+        _reclaimRunning = true;
+        SyncStatus.Text = "Reclaiming...";
 
-        foreach (var owner in running.Where(r =>
-                     string.Equals(r.SessionId, session.Id, StringComparison.OrdinalIgnoreCase)))
+        ReclaimReport report;
+        try
         {
-            var killed = RunningSessions.Kill(session.Id, owner.Pid, owner.StartedAt);
-            if (!killed.ok)
+            var options = new ReclaimOptions
             {
-                SyncStatus.Text = $"Unblock stopped at pid {owner.Pid}: {killed.detail}";
-                RenderIntegrity(force: true);
-                return;
-            }
-        }
+                CandidateIds = candidateIds,
+                Progress = message => Report(seq, message),
+                PruneMuxCurrent = ids => PruneMuxCustodyForReclaim(ids),
+                LaunchRequest = new SessionLaunchRequest(
+                    session.Id,
+                    session.Aliases,
+                    session.Tool,
+                    "native",
+                    "native terminal resume (reclaim)",
+                    "resume.refused.claim",
+                    "resume.started.terminal",
+                    "resume.failed.terminal",
+                    session.DisplayTitle,
+                    session.Workspace,
+                    new Dictionary<string, string> { ["trigger"] = "reclaim" }),
+                Launch = () => Task.FromResult(LaunchResumeWrapper(session)),
+                OnRefusal = refusal => AskReclaimRefusalAsync(session, refusal),
+                OnOverride = refusal =>
+                {
+                    // Ledgered BEFORE anything is forced: the operator owns this double-writer risk and the
+                    // record has to survive whatever happens next.
+                    RecordSessionEvent(
+                        session,
+                        "reclaim.override.double-writer-risk",
+                        "Operator forced a launch past a live launch reservation: " + refusal.EvidenceLine,
+                        "error",
+                        details: new Dictionary<string, string>
+                        {
+                            ["claim"] = refusal.Claim.Path,
+                            ["ownerPid"] = refusal.Claim.OwnerPid.ToString()
+                        });
+                    return Task.CompletedTask;
+                }
+            };
 
-        if (!RunningSessions.TryAllLiveSessionIds(out var afterKill, out var verifyDetail))
+            report = await Task.Run(() => SessionReclaim.ExecuteAsync(options));
+        }
+        catch (Exception ex)
         {
-            SyncStatus.Text = "Unblock could not verify owner exit: " + verifyDetail;
-            RenderIntegrity(force: true);
+            Diag.Log("Reclaim FAILED " + ex);
+            _reclaimRunning = false;
+            if (seq == _reclaimSeq) SyncStatus.Text = "Reclaim failed - see log.";
             return;
         }
-        if (afterKill.Contains(session.Id))
-        {
-            SyncStatus.Text = "Unblock stopped: a verified owner is still running.";
-            RenderIntegrity(force: true);
-            return;
-        }
 
-        var claims = SessionLaunchClaims.ReadClaimsForSession(session.Id);
-        foreach (var claim in claims)
-        {
-            Func<int, bool>? ownerAlive = claim.OwnerPid == Environment.ProcessId ? _ => false : null;
-            if (!SessionLaunchClaims.TryClearAbandonedClaim(claim, out var claimDetail, isProcessAlive: ownerAlive))
-            {
-                SyncStatus.Text = "Unblock stopped: " + claimDetail;
-                RenderIntegrity(force: true);
-                return;
-            }
-        }
+        _reclaimRunning = false;
+        if (seq != _reclaimSeq || !ReferenceEquals(_selected, session)) return;
 
+        RecordReclaimEvents(session, report);
         await SyncNowAsync(initial: false);
         RenderIntegrity(force: true);
-        if (_integritySummary is not null
-            && !string.Equals(_integritySummary.Severity, "danger", StringComparison.OrdinalIgnoreCase))
-            SyncStatus.Text = "Chat ownership is clean and verified.";
-        else
-            SyncStatus.Text = "Cleanup finished, but another integrity blocker remains. Nothing was relaunched.";
+        SyncStatus.Text = report.Headline;
+    }
+
+    private void Report(int seq, string message)
+    {
+        DispatcherQueue.TryEnqueue(() =>
+        {
+            if (seq == _reclaimSeq) SyncStatus.Text = message;
+        });
+    }
+
+    private static List<string> ReclaimCandidateIds(ArchiveSession session)
+    {
+        var ids = new List<string>();
+        void Add(string? id)
+        {
+            id = (id ?? "").Trim();
+            if (id.Length == 0) return;
+            if (!ids.Any(existing => string.Equals(existing, id, StringComparison.OrdinalIgnoreCase))) ids.Add(id);
+        }
+        Add(session.Id);
+        foreach (var alias in session.Aliases) Add(alias);
+        return ids;
+    }
+
+    // The refusal dialog states exactly what is known and nothing more: a verified pid when there is one, and
+    // an honest "owner unknown" when the scan could not answer. The DEFAULT path is waiting the reservation out.
+    private async Task<ReclaimRefusalChoice> AskReclaimRefusalAsync(ArchiveSession session, ReclaimRefusal refusal)
+    {
+        var tcs = new TaskCompletionSource<ReclaimRefusalChoice>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var enqueued = DispatcherQueue.TryEnqueue(async () =>
+        {
+            try
+            {
+                var dialog = new ContentDialog
+                {
+                    Title = "A live launch reservation holds this chat",
+                    Content = new TextBlock
+                    {
+                        Text = refusal.EvidenceLine + ".\n\n"
+                               + "Waiting the reservation out is safe: it expires within two minutes and the app then takes control. "
+                               + "Launching anyway risks two writers on the same transcript and silent message loss — it is recorded as an error in this chat's event log.",
+                        TextWrapping = TextWrapping.Wrap,
+                        MaxWidth = 460
+                    },
+                    PrimaryButtonText = "Wait for it to expire",
+                    SecondaryButtonText = "Launch anyway",
+                    CloseButtonText = "Stop",
+                    DefaultButton = ContentDialogButton.Primary,
+                    XamlRoot = XamlRoot
+                };
+                var result = await dialog.ShowAsync();
+                tcs.TrySetResult(result switch
+                {
+                    ContentDialogResult.Primary => ReclaimRefusalChoice.WaitForExpiry,
+                    ContentDialogResult.Secondary => ReclaimRefusalChoice.LaunchAnyway,
+                    _ => ReclaimRefusalChoice.Abort
+                });
+            }
+            catch (Exception ex)
+            {
+                Diag.Log("Reclaim refusal dialog failed: " + ex);
+                tcs.TrySetResult(ReclaimRefusalChoice.Abort);
+            }
+        });
+        // No dispatcher (window closing): refuse rather than silently force.
+        if (!enqueued) return ReclaimRefusalChoice.Abort;
+        RecordSessionEvent(
+            session,
+            "reclaim.refused.live-claim",
+            "Reclaim refused to force a live launch reservation: " + refusal.Detail,
+            "warn",
+            details: new Dictionary<string, string> { ["claim"] = refusal.Claim.Path });
+        return await tcs.Task;
+    }
+
+    private void RecordReclaimEvents(ArchiveSession session, ReclaimReport report)
+    {
+        RecordSessionEvent(
+            session,
+            "reclaim.kill",
+            report.KillOk ? "Reclaim stopped this chat's owners: " + report.KillDetail : "Reclaim could not stop every owner: " + report.KillDetail,
+            report.KillOk ? "info" : "warn");
+
+        foreach (var claim in report.Claims)
+        {
+            switch (claim.Outcome)
+            {
+                case ReclaimClearOutcome.Cleared:
+                    RecordSessionEvent(session, "reclaim.claim.cleared", claim.Detail, claim.Overridden ? "warn" : "info");
+                    break;
+                case ReclaimClearOutcome.LaunchInFlight:
+                    RecordSessionEvent(session, "reclaim.launch-in-flight", claim.Detail, "warn");
+                    break;
+                case ReclaimClearOutcome.RefusedAliveOwner:
+                    RecordSessionEvent(session, "reclaim.refused.live-claim", claim.Detail, "warn");
+                    break;
+                default:
+                    RecordSessionEvent(session, "reclaim.claim.failed", claim.Detail, "warn");
+                    break;
+            }
+        }
+
+        if (report.PrunedMuxTabs.Count > 0)
+            RecordSessionEvent(
+                session,
+                "reclaim.mux.pruned",
+                "Pruned stale mux custody for: " + string.Join(", ", report.PrunedMuxTabs));
+
+        if (report.Relaunched)
+            RecordSessionEvent(session, "reclaim.relaunched", "Reclaim relaunched this chat: " + report.RelaunchDetail);
+        else if (report.LostLaunchRace)
+            RecordSessionEvent(session, "reclaim.relaunch.lost-race", report.RelaunchDetail, "warn");
     }
 
     private bool RiskySessionActionBlocked()

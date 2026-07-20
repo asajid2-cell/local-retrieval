@@ -201,7 +201,18 @@ public sealed partial class MainPage
     // Returns WHY it stopped, not just that it did. A bare bool made scan-failure indistinguishable from
     // a confirmed live owner, and callers wrote the latter into the ledger for both — see RunGuardOutcome.
     // The decision itself lives in Core's RunGuardClassifier; this method only does the I/O around it.
-    private async Task<RunGuardDecision> ConfirmRunOrKillAsync(ArchiveSession session)
+    // The guard's verdict PLUS the pids it killed and watched exit by identity. The pids matter because a
+    // takeover the operator just confirmed may have stopped one of OUR launches, whose claim is retained for
+    // two minutes — [F#5] needs that concrete evidence to release the reservation instead of refusing the
+    // takeover it just performed.
+    private readonly record struct GuardResult(RunGuardDecision Decision, IReadOnlyList<int>? Killed = null)
+    {
+        public RunGuardOutcome Outcome => Decision.Outcome;
+        public string Detail => Decision.Detail;
+        public IReadOnlyList<int> KilledPids => Killed ?? Array.Empty<int>();
+    }
+
+    private async Task<GuardResult> ConfirmRunOrKillAsync(ArchiveSession session)
     {
         var settings = _archive.Store.Settings;
         var target = (settings.MultiplexSshTarget ?? "").Trim();
@@ -232,7 +243,7 @@ public sealed partial class MainPage
             {
                 SyncStatus.Text = scanVerdict.Value.Detail;
                 Diag.Log("Launch guard could not verify: " + scanVerdict.Value.Detail);
-                return scanVerdict.Value;
+                return new GuardResult(scanVerdict.Value);
             }
             running = scan.live;
         }
@@ -241,7 +252,7 @@ public sealed partial class MainPage
             var verdict = RunGuardClassifier.ClassifyScan(false, timedOut: true, null, null)!.Value;
             SyncStatus.Text = verdict.Detail;
             Diag.Log("Launch guard could not verify: " + verdict.Detail);
-            return verdict;
+            return new GuardResult(verdict);
         }
         // Match on the session id OR any of its aliases (a fork/resume writes a lineage id) so a live copy
         // started under a different id — but the SAME transcript — is still caught.
@@ -256,7 +267,7 @@ public sealed partial class MainPage
         // nothing running -> proceed. (If a multiplex is up, the running process IS its agent rather than
         // a separate local copy, but either signal alone still means there's an owner to take over.)
         if (!RunGuardClassifier.NeedsTakeoverPrompt(muxUp, localPids))
-            return new RunGuardDecision(RunGuardOutcome.Proceed, "");
+            return new GuardResult(new RunGuardDecision(RunGuardOutcome.Proceed, ""));
 
         var where = localMuxUp ? "a local mux session"
                   : relayState == RelayMuxState.Hosted ? "a PC-hosted mux session reported by the relay"
@@ -265,6 +276,7 @@ public sealed partial class MainPage
         var choice = await ConfirmAlreadyRunningAsync(Trim(session.DisplayTitle, 40), where);
         var killOk = true;
         var killDetail = "";
+        var killedPids = new List<int>();
         if (choice == RunGuard.Kill)
         {
             if (localMuxUp)
@@ -282,15 +294,17 @@ public sealed partial class MainPage
                 if (!killOk) break;
                 // Empty id set, not null: the pid IS the target here, and `null` is ambiguous between the two
                 // Kill overloads (single session id vs. the alias-aware candidate set).
-                var killed = CodexLocalRetrieval.Core.Remote.RunningSessions.Kill(Array.Empty<string>(), localPid);
-                if (!killed.ok) { killOk = false; killDetail = "Could not kill the local running agent: " + killed.detail; }
+                var killed = CodexLocalRetrieval.Core.Remote.RunningSessions.KillWithEvidence(Array.Empty<string>(), localPid);
+                if (!killed.Ok) { killOk = false; killDetail = "Could not kill the local running agent: " + killed.Detail; }
+                // Only pids Kill watched OUT by identity count as evidence — never a pid we merely asked to die.
+                else killedPids.AddRange(killed.ConfirmedExited.Select(k => k.Pid));
             }
             // The owner is still there — this is a FAILED takeover of a confirmed live owner, not a cancel.
             if (!killOk) SyncStatus.Text = killDetail;
             else await Task.Delay(400);
         }
 
-        return RunGuardClassifier.Classify(
+        return new GuardResult(RunGuardClassifier.Classify(
             scanOk: true,
             timedOut: false,
             unverifiablePids: null,
@@ -299,6 +313,6 @@ public sealed partial class MainPage
             localPids: localPids,
             dialogChoice: choice == RunGuard.Kill ? RunGuardChoice.Kill : RunGuardChoice.Cancel,
             killOk: killOk,
-            killDetail: killDetail);
+            killDetail: killDetail), killedPids);
     }
 }

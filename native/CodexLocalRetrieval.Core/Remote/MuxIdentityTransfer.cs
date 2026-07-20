@@ -4,7 +4,18 @@ namespace CodexLocalRetrieval.Core.Remote;
 
 public static class MuxIdentityTransfer
 {
-    public sealed record Result(bool Ok, string Detail, bool AlreadyOwned);
+    // `VerifiedExitedPids` are the local owners this transfer killed AND then watched leave the live set. They
+    // are the [F#5] tier-2 evidence the handoff paths need to clear the previous launch's retained claim before
+    // taking the new governor lease; without them a governed /tomux inside the 2-minute retention window is
+    // refused by the app's own leftover reservation.
+    public sealed record Result(
+        bool Ok,
+        string Detail,
+        bool AlreadyOwned,
+        IReadOnlyList<int>? VerifiedExitedPids = null)
+    {
+        public IReadOnlyList<int> ExitedPids => VerifiedExitedPids ?? Array.Empty<int>();
+    }
 
     private sealed record MuxRow(string Name, bool Alive, string SessionId, string[] Aliases);
 
@@ -103,8 +114,8 @@ public static class MuxIdentityTransfer
                 .Any(pid => !muxOwnedPids.Contains(pid));
             if (!remainingExternal)
                 return desiredAlive
-                    ? new(true, "external ownership cleared; desired mux owner will be relaunched", true)
-                    : new(true, "ownership transferred", false);
+                    ? new(true, "external ownership cleared; desired mux owner will be relaunched", true, pidsToStop)
+                    : new(true, "ownership transferred", false, pidsToStop);
             await Task.Delay(200);
         } while (DateTime.UtcNow < deadline);
 

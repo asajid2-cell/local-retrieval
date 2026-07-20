@@ -105,7 +105,29 @@ public sealed partial class MainPage
                 return;
             }
 
-            var created = await CreateLocalMuxdSessionAsync(name, command, session.Id, session.Aliases);
+            // [F#5] The guard may have just killed and verified out this chat's owner; if that owner was one of
+            // OUR launches, its claim is still retained. Clear it on that evidence before asking for a lease,
+            // or the governor refuses the very takeover the operator just confirmed.
+            if (guard.KilledPids.Count > 0)
+                ClearClaimsAfterVerifiedKill(session, session.Id, session.Aliases, guard.KilledPids, name);
+
+            var created = await GovernedCreateLocalMuxdSessionAsync(
+                new SessionLaunchRequest(
+                    session.Id,
+                    session.Aliases,
+                    session.Tool,
+                    "native",
+                    $"native mux start ({name})",
+                    "mux.refused.claim",
+                    "mux.started.local",
+                    "mux.failed",
+                    session.DisplayTitle,
+                    session.Workspace,
+                    new Dictionary<string, string> { ["muxName"] = name }),
+                name,
+                command,
+                session.Id,
+                session.Aliases);
             if (!created.ok)
             {
                 Diag.Log($"Mux create FAILED ({created.detail}) name={name}");
@@ -542,8 +564,23 @@ public sealed partial class MainPage
                     });
                 return (false, transferred.Detail);
             }
+            // [F#5] verified kill -> clear the tied (retained) claim before the lease is requested.
+            if (transferred.ExitedPids.Count > 0)
+                ClearClaimsAfterVerifiedKill(session, launch.SessionId, launch.Aliases, transferred.ExitedPids, name);
         }
-        var created = await CreateLocalMuxdSessionAsync(
+        var created = await GovernedCreateLocalMuxdSessionAsync(
+            new SessionLaunchRequest(
+                launch.SessionId,
+                launch.Aliases,
+                launch.Tool,
+                "native",
+                $"headless mux start ({name})",
+                "mux.refused.claim",
+                "mux.started.remote-command",
+                "mux.failed",
+                session?.DisplayTitle,
+                session?.Workspace,
+                new Dictionary<string, string> { ["muxName"] = name }),
             name,
             launch.Command,
             launch.SessionId,
@@ -651,9 +688,31 @@ public sealed partial class MainPage
                 ResolvedSessionId: session.Id);
         }
 
+        // [F#5] The transfer stopped the local caller and watched it exit. That is the tier-2 evidence that lets
+        // the previous launch's retained claim go, so the governed create below is not refused by our own
+        // reservation from two minutes ago. The pid-handoff logic above is untouched.
+        if (transferred.ExitedPids.Count > 0)
+            ClearClaimsAfterVerifiedKill(session, session.Id, session.Aliases, transferred.ExitedPids, name);
+
         var created = transferred.AlreadyOwned
             ? (ok: true, detail: "mux session already owns this identity")
-            : await CreateLocalMuxdSessionAsync(name, command, session.Id, session.Aliases);
+            : await GovernedCreateLocalMuxdSessionAsync(
+                new SessionLaunchRequest(
+                    session.Id,
+                    session.Aliases,
+                    session.Tool,
+                    "native",
+                    $"tomux handoff ({name})",
+                    "tomux.refused.claim",
+                    "tomux.completed",
+                    "tomux.failed",
+                    session.DisplayTitle,
+                    session.Workspace,
+                    new Dictionary<string, string> { ["muxName"] = name }),
+                name,
+                command,
+                session.Id,
+                session.Aliases);
         if (!created.ok)
         {
             RecordSessionEvent(
@@ -909,6 +968,93 @@ public sealed partial class MainPage
         }
         catch { }
         return false;
+    }
+
+    // H1: every writer-creation path goes through the governor, not just the terminal resume. The claim's own
+    // comment ("closes the check-then-spawn race across the GUI, headless server, and remote bridge") was
+    // aspirational while the GUI's own mux path never touched it — ConfirmRunOrKillAsync is a check, not a
+    // reservation, so two mux creates could still race each other into the same transcript.
+    private async Task<(bool ok, string detail)> GovernedCreateLocalMuxdSessionAsync(
+        SessionLaunchRequest request,
+        string name,
+        string command,
+        string? sessionId = null,
+        IEnumerable<string>? aliases = null,
+        string? intentId = null,
+        bool relaunch = false)
+    {
+        if (!_launchGovernor.TryAcquire(request, out var lease, out var claimDetail))
+            return (false, claimDetail);
+        using (lease)
+        {
+            var created = await CreateLocalMuxdSessionAsync(name, command, sessionId, aliases, intentId, relaunch);
+            if (created.ok) lease?.MarkStarted("Started mux-hosted session writer.");
+            else lease?.MarkFailed(created.detail);
+            return created;
+        }
+    }
+
+    // [F#5]. An app-launched session retains its claim for ~2 minutes, so once the handoff paths above are
+    // governed, a /tomux or a kill-and-takeover inside that window would be refused by the PREVIOUS launch's own
+    // leftover reservation — turning a working flow into a two-minute wait. A kill we verified by identity is
+    // exactly the tier-2 evidence the reclaim tiers accept, so the tied claim is cleared through that same
+    // mechanism. Nothing here force-clears a claim no verified kill is tied to.
+    private static void ClearClaimsAfterVerifiedKill(
+        ArchiveSession? session,
+        string? sessionId,
+        IEnumerable<string>? aliases,
+        IEnumerable<int> verifiedExitedPids,
+        string muxName)
+    {
+        try
+        {
+            var results = SessionReclaim.ClearClaimsTiedToVerifiedKills(sessionId, aliases, verifiedExitedPids);
+            foreach (var result in results)
+            {
+                if (result.Outcome == ReclaimClearOutcome.Cleared)
+                    RecordSessionEvent(
+                        session,
+                        "reclaim.claim.cleared",
+                        "Cleared the retained launch reservation tied to a verified kill: " + result.Detail,
+                        details: new Dictionary<string, string> { ["muxName"] = muxName });
+                else if (result.Outcome == ReclaimClearOutcome.LaunchInFlight)
+                    RecordSessionEvent(
+                        session,
+                        "reclaim.launch-in-flight",
+                        result.Detail,
+                        "warn",
+                        details: new Dictionary<string, string> { ["muxName"] = muxName });
+            }
+        }
+        catch (Exception ex) { Diag.Log("Tied-claim clear after verified kill failed: " + ex.Message); }
+    }
+
+    // Reclaim's stale-mux-custody step. A Current pointer is pruned ONLY when muxd itself confirms the tab is
+    // gone; if muxd can't be asked, nothing is pruned — "we couldn't reach muxd" is not "the tab is absent".
+    private IReadOnlyList<string> PruneMuxCustodyForReclaim(IReadOnlyList<string> candidateIds)
+    {
+        IReadOnlyCollection<string>? live = null;
+        try
+        {
+            var text = LocalMuxdRequestAsync(new { t = "ls" }).GetAwaiter().GetResult();
+            using var doc = JsonDocument.Parse(text);
+            var names = new List<string>();
+            foreach (var row in doc.RootElement.GetProperty("list").EnumerateArray())
+            {
+                var rowName = row.TryGetProperty("name", out var n) ? n.GetString() : null;
+                if (!string.IsNullOrWhiteSpace(rowName)) names.Add(rowName!);
+            }
+            live = names;
+        }
+        catch { live = null; }
+
+        var pruned = SessionReclaim.PruneStaleMuxCurrent(_archive.Store.MuxTabHistory, candidateIds, live);
+        if (pruned.Count > 0)
+        {
+            try { _archive.SaveAsync().GetAwaiter().GetResult(); }
+            catch (Exception ex) { Diag.Log("Mux custody prune could not be persisted: " + ex.Message); }
+        }
+        return pruned;
     }
 
     private async Task<(bool ok, string detail)> CreateLocalMuxdSessionAsync(

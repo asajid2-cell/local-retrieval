@@ -160,17 +160,10 @@ public sealed partial class MainPage
                 try
                 {
                     Diag.Log($"Resume launch [trigger={trigger}]: {launch.DisplayCommand} (cwd={cwd})");
-                    var psi = new ProcessStartInfo
-                    {
-                        FileName = "cmd.exe",
-                        Arguments = $"/k \"{launch.DisplayCommand}\"",
-                        WorkingDirectory = cwd,
-                        UseShellExecute = true
-                    };
-                    var wrapper = Process.Start(psi);
+                    var started = LaunchResumeWrapper(session);
+                    if (!started.Ok) throw new InvalidOperationException(started.Detail);
                     launchStarted = true;
                     lease?.MarkStarted("Started terminal resume.");
-                    RecordSessionOwner(session.Id, session.Aliases, wrapper, "terminal");
                 }
                 catch (Exception ex)
                 {
@@ -217,6 +210,29 @@ public sealed partial class MainPage
         {
             if (ReferenceEquals(_selected, session)) RenderIntegrity(force: true);
         }
+    }
+
+    // The terminal-start core of ResumeInTerminal, factored out so Reclaim's relaunch is literally the SAME
+    // launch — same wrapper shape, same owner record, same job-object assignment — instead of a second copy
+    // that would drift. The CALLER owns the reservation; this only starts the process. Safe off the UI thread:
+    // .NET runs a UseShellExecute start on its own STA thread when the caller isn't one.
+    private (bool Ok, string Detail) LaunchResumeWrapper(ArchiveSession session)
+    {
+        var launch = _archive.BuildResumeLaunch(session);
+        if (string.IsNullOrEmpty(launch.Exe)) return (false, launch.DisplayCommand);
+        var cwd = Directory.Exists(launch.WorkingDirectory)
+            ? launch.WorkingDirectory
+            : Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        var psi = new ProcessStartInfo
+        {
+            FileName = "cmd.exe",
+            Arguments = $"/k \"{launch.DisplayCommand}\"",
+            WorkingDirectory = cwd,
+            UseShellExecute = true
+        };
+        var wrapper = Process.Start(psi);
+        RecordSessionOwner(session.Id, session.Aliases, wrapper, "terminal");
+        return (true, launch.DisplayCommand);
     }
 
     // Best-effort note of the wrapper process this app started for a session, and the point where that wrapper

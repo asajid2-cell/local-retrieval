@@ -204,34 +204,151 @@ public static class SessionLaunchClaims
         return claims;
     }
 
+    // Every claim clear in the app now goes through the C1 tiers. This wrapper is the janitor-ish entry point
+    // (expired sweeps, opportunistic cleanup); it therefore gets [F#2] for free and can no longer silently
+    // clear an unexpired dead-owner claim whose writer may still be seconds from appearing inside the grace.
+    // Pass `evidence` when the caller has something concrete (a verified kill, a waited-out grace) to offer.
     public static bool TryClearAbandonedClaim(
         LaunchClaimInfo claim,
         out string detail,
         DateTimeOffset? now = null,
-        Func<int, bool>? isProcessAlive = null)
+        Func<int, bool>? isProcessAlive = null,
+        ReclaimEvidence? evidence = null)
+    {
+        var basis = evidence ?? ReclaimEvidence.None;
+        if (now is not null) basis = basis with { Now = now };
+        if (isProcessAlive is not null) basis = basis with { IsProcessAlive = isProcessAlive };
+        return TryReclaimClear(claim, basis, out detail) == ReclaimClearOutcome.Cleared;
+    }
+
+    // ---- C1 tiered force-clear (NORMATIVE, plan §2.2) ------------------------------------------------
+    //
+    // Tier 1 - expired claims clear freely. An UNEXPIRED claim whose owner is dead clears only when the
+    //          wrapper tied to it is ALSO confirmed dead by identity [F#2]: the claim's owner is the app that
+    //          acquired it, and the `cmd /k -> claude` tree it launched outlives the app. App dead + wrapper
+    //          alive (or no record at all) means the writer may be seconds from appearing - that is tier 2.
+    // Tier 2 - unexpired + owner alive (or unknown) REFUSES, unless something concretely tied to this claim was
+    //          killed and confirmed exited, or the grace was waited out. There is NO own-pid special case
+    //          [F#1]: a claim owned by Environment.ProcessId with this app alive refuses like any other.
+    // Tier 3 - a sharing violation on the quarantine move means a launcher is holding the claim stream open
+    //          mid-acquire. That is a legitimate launch in flight: abort this claim, never retry-force past it.
+    public static ReclaimClearOutcome TryReclaimClear(LaunchClaimInfo claim, ReclaimEvidence evidence, out string detail)
     {
         detail = "";
         if (claim is null || string.IsNullOrWhiteSpace(claim.Path))
         {
             detail = "launch claim path is missing";
-            return false;
+            return ReclaimClearOutcome.Failed;
         }
 
-        var current = now ?? DateTimeOffset.UtcNow;
-        var expired = claim.IsExpired(current);
-        var ownerAlive = claim.OwnerPid > 0 && (isProcessAlive ?? IsProcessAlive)(claim.OwnerPid);
-        if (!expired && ownerAlive)
+        evidence ??= ReclaimEvidence.None;
+        var now = evidence.EffectiveNow;
+
+        if (claim.IsExpired(now))
+            return Quarantine(claim, "expired claim cleared", out detail);
+
+        // Owner state. A claim with no readable owner pid is UNKNOWN, not dead - it gets tier-2 treatment.
+        var ownerKnown = claim.OwnerPid > 0;
+        var ownerAlive = ownerKnown && SafeAlive(evidence, claim.OwnerPid);
+
+        if (ownerKnown && !ownerAlive)
         {
-            detail = $"launch claim is still owned by {claim.OwnerProcess} pid {claim.OwnerPid}";
-            return false;
+            var (tied, wrapperDetail) = TiedWrappersConfirmedDead(claim, evidence);
+            if (tied)
+                return Quarantine(claim, "abandoned claim cleared (" + wrapperDetail + ")", out detail);
+            // Fall through to tier 2: the writer may still be spawning behind a dead app.
         }
 
+        // ---- tier 2 -----------------------------------------------------------------------------------
+        if (evidence.GraceWaitedOut)
+            return Quarantine(claim, "claim cleared after the reservation was waited out", out detail);
+
+        var killedTie = TiedKilledPid(claim, evidence);
+        if (killedTie is not null)
+            return Quarantine(claim, "claim cleared: " + killedTie + " was killed and confirmed exited", out detail);
+
+        detail = ownerAlive
+            ? $"launch claim is still owned by {claim.OwnerProcess} pid {claim.OwnerPid} (alive, verified)"
+            : ownerKnown
+                ? $"launch claim owner {claim.OwnerProcess} pid {claim.OwnerPid} is gone, but nothing ties a confirmed-dead launch to it yet"
+                : "launch claim owner is unknown - scan unverifiable";
+        return ReclaimClearOutcome.RefusedAliveOwner;
+    }
+
+    // [F#2]. "Confirmed dead by identity" = the recorded wrapper pid is gone, or the pid is alive but its start
+    // time no longer matches the record (so the pid was REUSED and our wrapper is dead). A record with a live
+    // wrapper, or a record with no start time to identify a live pid by, is NOT confirmation.
+    private static (bool Confirmed, string Detail) TiedWrappersConfirmedDead(LaunchClaimInfo claim, ReclaimEvidence evidence)
+    {
+        var records = evidence.RecordsFor(claim.CandidateIds)
+            .Where(r => r.WrapperPid > 0 && Overlaps(r.CandidateIds, claim.CandidateIds))
+            .ToList();
+        if (records.Count == 0) return (false, "no owner record ties a launch to this claim");
+
+        foreach (var record in records)
+        {
+            var (alive, start) = SafeIdentity(evidence, record.WrapperPid);
+            if (!alive) continue;                       // gone -> dead
+            if (record.WrapperStartTimeUtc is null)
+                return (false, $"recorded wrapper pid {record.WrapperPid} is alive with no start time to identify it by");
+            if (Math.Abs((start - record.WrapperStartTimeUtc.Value.UtcDateTime).TotalSeconds) <= 1)
+                return (false, $"recorded wrapper pid {record.WrapperPid} is still alive");
+            // identity mismatch -> the pid was reused; our wrapper is dead.
+        }
+        return (true, "the tied launch wrapper is confirmed dead");
+    }
+
+    // Tier-2 evidence: the recorded wrapper pid for this claim, or a killed pid whose matched session ids
+    // intersect the claim's candidate ids.
+    private static string? TiedKilledPid(LaunchClaimInfo claim, ReclaimEvidence evidence)
+    {
+        if (evidence.ConfirmedExitedPids.Count == 0) return null;
+        var wrapperPids = evidence.RecordsFor(claim.CandidateIds)
+            .Where(r => r.WrapperPid > 0 && Overlaps(r.CandidateIds, claim.CandidateIds))
+            .Select(r => r.WrapperPid)
+            .ToHashSet();
+
+        foreach (var killed in evidence.ConfirmedExitedPids)
+        {
+            if (killed.Pid <= 0) continue;
+            if (wrapperPids.Contains(killed.Pid)) return $"the recorded launch wrapper pid {killed.Pid}";
+            if (Overlaps(killed.SessionIds, claim.CandidateIds)) return $"pid {killed.Pid}";
+        }
+        return null;
+    }
+
+    private static bool Overlaps(IReadOnlyCollection<string>? a, IReadOnlyCollection<string>? b)
+    {
+        if (a is null || b is null) return false;
+        foreach (var left in a)
+            foreach (var right in b)
+                if (string.Equals(left, right, StringComparison.OrdinalIgnoreCase)) return true;
+        return false;
+    }
+
+    private static bool SafeAlive(ReclaimEvidence evidence, int pid)
+    {
+        // An unanswerable liveness probe must read as "alive" here: this decides whether to force-clear a
+        // reservation, so uncertainty has to fall on the refusing side.
+        try { return evidence.ProcessAlive(pid); }
+        catch { return true; }
+    }
+
+    private static (bool Alive, DateTime Start) SafeIdentity(ReclaimEvidence evidence, int pid)
+    {
+        try { return evidence.Identity(pid); }
+        catch { return (true, default); }
+    }
+
+    // The move mechanics are unchanged - the tiers decide WHETHER to attempt this, never how it works.
+    private static ReclaimClearOutcome Quarantine(LaunchClaimInfo claim, string successDetail, out string detail)
+    {
         try
         {
             if (!File.Exists(claim.Path))
             {
                 detail = "already gone";
-                return true;
+                return ReclaimClearOutcome.Cleared;
             }
             var quarantine = claim.Path + ".clearing-" + Guid.NewGuid().ToString("N");
             File.Move(claim.Path, quarantine);
@@ -244,18 +361,31 @@ public static class SessionLaunchClaims
                 }
                 catch { }
                 detail = "launch claim changed during cleanup; refusing to delete it";
-                return false;
+                return ReclaimClearOutcome.Failed;
             }
             File.Delete(quarantine);
-            detail = expired ? "expired claim cleared" : "abandoned claim cleared";
-            return true;
+            detail = successDetail;
+            return ReclaimClearOutcome.Cleared;
+        }
+        catch (IOException ex) when (IsSharingViolation(ex))
+        {
+            // TryAcquire holds the claim stream with FileShare.Read for the WHOLE acquire, so this is not an
+            // error condition - it is a launcher mid-acquisition, and the claim file stays exactly as it is.
+            detail = "a launch is already in flight for this chat; the reservation is held open by its launcher";
+            return ReclaimClearOutcome.LaunchInFlight;
         }
         catch (Exception ex)
         {
             detail = "claim cleanup failed: " + ex.Message;
-            return false;
+            return ReclaimClearOutcome.Failed;
         }
     }
+
+    private const int ErrorSharingViolation = unchecked((int)0x80070020);
+    private const int ErrorLockViolation = unchecked((int)0x80070021);
+
+    private static bool IsSharingViolation(IOException ex)
+        => ex.HResult == ErrorSharingViolation || ex.HResult == ErrorLockViolation;
 
     private static bool SameClaim(LaunchClaimInfo expected, ClaimMetadata? actual)
         => actual is not null
@@ -394,16 +524,9 @@ public static class SessionLaunchClaims
         catch { return "unknown"; }
     }
 
-    private static bool IsProcessAlive(int pid)
-    {
-        try
-        {
-            using var process = Process.GetProcessById(pid);
-            return !process.HasExited;
-        }
-        catch (ArgumentException) { return false; }
-        catch { return true; }
-    }
+    // (The old HasExited-based liveness helper is gone: every claim-clearing decision now routes through
+    // ReclaimEvidence, whose default is the exit-code rule [F#6] in ProcessOpenFiles.IsAlive. A pid that is
+    // merely openable — a zombie whose handle someone still holds — must never read as a live claim owner.)
 
     private static void ReleaseHeld(List<HeldClaimFile> held, bool deleteFiles)
     {

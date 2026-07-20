@@ -674,6 +674,18 @@ public static class RunningSessions
     // Kill deliberately does NOT call the global liveness oracle (TryLiveSessionPids / TryAllLiveSessionIds).
     // Take-control has to work precisely when the oracle is broken, so both resolution and verification use
     // only the signals below and the specific target pids.
+    // What Kill actually proved. `ConfirmedExited` is the primary targets it watched out BY IDENTITY - the only
+    // thing Reclaim's tier-2 force-clear is allowed to treat as "a process tied to this claim is really gone".
+    public sealed record KillResult(bool Ok, string Detail, IReadOnlyList<ReclaimKilledPid> ConfirmedExited)
+    {
+        // Callers that only care whether the kill worked keep reading it as the (ok, detail) pair it always was.
+        public void Deconstruct(out bool ok, out string detail)
+        {
+            ok = Ok;
+            detail = Detail;
+        }
+    }
+
     public static (bool ok, string detail) Kill(string? sessionId, int pid, string? expectedStartedUtc = null)
         => Kill(
             string.IsNullOrWhiteSpace(sessionId) ? Array.Empty<string>() : new[] { sessionId! },
@@ -684,7 +696,23 @@ public static class RunningSessions
         IReadOnlyCollection<string> candidateIds,
         int pid = 0,
         string? expectedStartedUtc = null)
-        => Kill(candidateIds, pid, expectedStartedUtc, signals: null);
+    {
+        var result = Kill(candidateIds, pid, expectedStartedUtc, signals: null);
+        return (result.Ok, result.Detail);
+    }
+
+    // `ownerRecords` exists so a caller with its own record root (Reclaim, tests) resolves the wrapper it
+    // actually recorded rather than whatever is under %LOCALAPPDATA%.
+    public static KillResult KillWithEvidence(
+        IReadOnlyCollection<string> candidateIds,
+        int pid = 0,
+        string? expectedStartedUtc = null,
+        SessionOwnerRecords.Options? ownerRecords = null)
+        => Kill(
+            candidateIds,
+            pid,
+            expectedStartedUtc,
+            ownerRecords is null ? null : new KillSignals(OwnerRecords: ownerRecords));
 
     // TEST SEAM: the WMI scan and the Claude registry are machine-global and cannot be arranged in-test
     // without touching real user state, so they are injectable. Everything else - the per-pid handle probe,
@@ -694,7 +722,7 @@ public static class RunningSessions
         Func<(bool Ok, Dictionary<string, int> Map, HashSet<int> Unverifiable, string Detail)>? ClaudeRegistry = null,
         SessionOwnerRecords.Options? OwnerRecords = null);
 
-    internal static (bool ok, string detail) Kill(
+    internal static KillResult Kill(
         IReadOnlyCollection<string>? candidateIds,
         int pid,
         string? expectedStartedUtc,
@@ -706,6 +734,10 @@ public static class RunningSessions
 
         // Targets carry the label that tied them to the session, so the detail can say WHY something was killed.
         var targets = new Dictionary<int, string>();
+        // ...and the session ids each target was matched on, so a later reclaim can tell whether a confirmed
+        // exit is tied to a specific claim rather than merely contemporaneous with it.
+        var targetSids = new Dictionary<int, HashSet<string>>();
+        var noEvidence = (IReadOnlyList<ReclaimKilledPid>)Array.Empty<ReclaimKilledPid>();
         var unanswered = new List<string>();   // signals that could not answer at all -> never report "already gone"
         var notes = new List<string>();        // reportable-but-not-fatal observations
 
@@ -718,10 +750,11 @@ public static class RunningSessions
         var scanSidMatches = scanRows
             .Where(s => !string.IsNullOrEmpty(s.SessionId) && ids.Contains(s.SessionId))
             .ToList();
-        foreach (var s in scanSidMatches) AddTarget(targets, s.Pid, s.Tool + " pid " + s.Pid + " (command line)");
+        foreach (var s in scanSidMatches)
+            AddTarget(targets, targetSids, s.Pid, s.Tool + " pid " + s.Pid + " (command line)", new[] { s.SessionId });
         // A pid-addressed kill with no session id at all (the mux handoff path) targets the scanned agent itself.
         if (pid > 0 && ids.Count == 0 && scanRows.Any(s => s.Pid == pid))
-            AddTarget(targets, pid, "agent pid " + pid + " (tracked agent)");
+            AddTarget(targets, targetSids, pid, "agent pid " + pid + " (tracked agent)", null);
 
         // ---- signal 4a: the owner record we wrote at launch -----------------------------------------
         // Read early even on the fast path: it is a cheap file read, and it carries both the wrapper pid the
@@ -743,7 +776,7 @@ public static class RunningSessions
             if (Math.Abs((actualStart - record.WrapperStartTimeUtc.Value.UtcDateTime).TotalSeconds) > 1)
                 continue;   // the pid was REUSED: our wrapper is dead. Answered, and emphatically not a target.
             verifiedWrappers[record.WrapperPid] = record;
-            AddTarget(targets, record.WrapperPid, "launch wrapper pid " + record.WrapperPid + " (owner record)");
+            AddTarget(targets, targetSids, record.WrapperPid, "launch wrapper pid " + record.WrapperPid + " (owner record)", record.CandidateIds);
         }
 
         // ---- signals 2 + 3: Claude's registry and the per-pid transcript probe ----------------------
@@ -761,13 +794,20 @@ public static class RunningSessions
                 notes.Add($"pid {p} alive but not inspectable - close it manually / elevated");
 
             var registryPids = new HashSet<int>();
+            var registrySids = new Dictionary<int, HashSet<string>>();
             foreach (var kv in registryMap)
-                if (ids.Contains(kv.Key) && kv.Value > 0) registryPids.Add(kv.Value);
+            {
+                if (!ids.Contains(kv.Key) || kv.Value <= 0) continue;
+                registryPids.Add(kv.Value);
+                if (!registrySids.TryGetValue(kv.Value, out var set))
+                    registrySids[kv.Value] = set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                set.Add(kv.Key);
+            }
             foreach (var p in registryPids)
             {
                 // A registry file outlives its process; only a still-live pid is a target.
                 if (!ProcessOpenFiles.IsAlive(p)) continue;
-                AddTarget(targets, p, "claude pid " + p + " (live-session registry)");
+                AddTarget(targets, targetSids, p, "claude pid " + p + " (live-session registry)", registrySids.GetValueOrDefault(p));
             }
 
             // Signal 3 runs over the BOUNDED pid set already in hand - never the whole machine. It is what
@@ -781,7 +821,7 @@ public static class RunningSessions
                 var probe = ProcessOpenFiles.Scan(probePids);
                 foreach (var kv in probe.Found)
                     if (ids.Contains(kv.Key) && kv.Value > 0 && ProcessOpenFiles.IsAlive(kv.Value))
-                        AddTarget(targets, kv.Value, "pid " + kv.Value + " (holds this transcript open)");
+                        AddTarget(targets, targetSids, kv.Value, "pid " + kv.Value + " (holds this transcript open)", new[] { kv.Key });
                 foreach (var p in probe.UnverifiablePids)
                 {
                     // Alive but uninspectable: never killed on a guess, always reported.
@@ -799,8 +839,8 @@ public static class RunningSessions
                 // A live pid tied to this session by NO signal stays untouched - Kill has never been a
                 // general-purpose process killer and still isn't.
                 if (ProcessOpenFiles.IsAlive(pid) || IsProcessAlive(pid))
-                    return (false, "still running but not a tracked claude/codex agent — not killed");
-                return (true, "already gone");
+                    return new KillResult(false, "still running but not a tracked claude/codex agent — not killed", noEvidence);
+                return new KillResult(true, "already gone", noEvidence);
             }
             targets = new Dictionary<int, string> { [pid] = why };
         }
@@ -808,9 +848,9 @@ public static class RunningSessions
         if (targets.Count == 0)
         {
             if (unanswered.Count > 0)
-                return (false, "couldn't verify — " + string.Join("; ", unanswered.Distinct()));
+                return new KillResult(false, "couldn't verify — " + string.Join("; ", unanswered.Distinct()), noEvidence);
             // Every signal answered, all of them empty: nothing is running this session.
-            return (true, Join("already gone", notes));
+            return new KillResult(true, Join("already gone", notes), noEvidence);
         }
 
         // ---- identity gate ---------------------------------------------------------------------------
@@ -821,7 +861,7 @@ public static class RunningSessions
             {
                 if (!ProcessOpenFiles.TryGetAliveIdentity(target, out var actual)) continue;   // already gone
                 if (Math.Abs((actual - expectedStart.UtcDateTime).TotalSeconds) > 1)
-                    return (false, "process identity changed before stop; refusing to kill a reused pid");
+                    return new KillResult(false, "process identity changed before stop; refusing to kill a reused pid", noEvidence);
             }
         }
 
@@ -879,25 +919,48 @@ public static class RunningSessions
                 Thread.Sleep(50);
             }
 
+            // Evidence is the primaries we watched OUT by identity - never a pid we merely asked to die. This is
+            // what Reclaim's tier-2 clear consumes, so a partial kill yields partial evidence, not a blanket
+            // "everything died".
+            var exited = targets.Keys
+                .Where(p => !livePrimaries.Contains(p))
+                .Select(p => new ReclaimKilledPid(
+                    p,
+                    watch.GetValueOrDefault(p),
+                    (IReadOnlyList<string>)(targetSids.TryGetValue(p, out var sids)
+                        ? sids.ToArray()
+                        : Array.Empty<string>())))
+                .ToArray();
+
             if (livePrimaries.Count > 0)
-                return (false, Join(
+                return new KillResult(false, Join(
                     "kill requested, but " + string.Join(", ", livePrimaries.Select(p => targets[p])) + " did not exit",
-                    notes));
+                    notes), exited);
 
             // Partial success is success. The things we set out to kill are confirmed dead by identity; a
             // descendant that outlived them (a detached editor, a spawned shell) is worth saying out loud but
             // is not a failed kill.
             if (liveDescendants.Count > 0)
                 notes.Add("descendant pids still alive: " + string.Join(", ", liveDescendants));
-            return (true, Join("killed " + string.Join(", ", targets.Values), notes));
+            return new KillResult(true, Join("killed " + string.Join(", ", targets.Values), notes), exited);
         }
-        catch (Exception ex) { return (false, $"kill failed: {ex.Message}"); }
+        catch (Exception ex) { return new KillResult(false, $"kill failed: {ex.Message}", noEvidence); }
     }
 
-    private static void AddTarget(Dictionary<int, string> targets, int pid, string label)
+    private static void AddTarget(
+        Dictionary<int, string> targets,
+        Dictionary<int, HashSet<string>> targetSids,
+        int pid,
+        string label,
+        IEnumerable<string>? sessionIds)
     {
         if (pid <= 0 || pid == Environment.ProcessId) return;
         if (!targets.ContainsKey(pid)) targets[pid] = label;
+        if (sessionIds is null) return;
+        if (!targetSids.TryGetValue(pid, out var set))
+            targetSids[pid] = set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var id in sessionIds)
+            if (!string.IsNullOrWhiteSpace(id)) set.Add(id.Trim());
     }
 
     private static string Join(string head, List<string> notes)
