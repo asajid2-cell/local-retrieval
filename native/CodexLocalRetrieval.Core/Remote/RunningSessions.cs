@@ -657,68 +657,283 @@ public static class RunningSessions
         return string.IsNullOrEmpty(name) ? "Unknown" : name.Replace(".exe", "");
     }
 
-    // Kill the live agent for a session id (preferred) or an explicit pid — but ONLY if it resolves to one
-    // of OUR scanned claude/codex processes (never an arbitrary pid).
+    // ---- Kill --------------------------------------------------------------------------------------
+    //
+    // The one real kill. Three things were broken and are fixed here:
+    //
+    //  1. TARGET RESOLUTION was the WMI command-line scan and nothing else, so an owner visible only through
+    //     Claude's registry or through an open transcript handle was INVISIBLE to Kill - and a sessionId-only
+    //     kill with an empty scan gave up ("process scan returned nothing"). Targets are now the UNION of four
+    //     signals, matched against the full candidate-id set (session id + aliases) rather than one id.
+    //  2. VERIFICATION was `IsProcessAlive(pid)` over a tree snapshot, so ONE reused pid anywhere in the tree
+    //     made a perfectly successful kill report failure forever. Exit is now decided by (pid, start time)
+    //     identity: a pid that came back as a different process means the one we killed is dead.
+    //  3. ALL-OR-NOTHING: a stray surviving descendant failed the whole kill. Success is now defined on the
+    //     PRIMARY targets (the agents/wrappers we resolved); surviving descendants are reported in the detail.
+    //
+    // Kill deliberately does NOT call the global liveness oracle (TryLiveSessionPids / TryAllLiveSessionIds).
+    // Take-control has to work precisely when the oracle is broken, so both resolution and verification use
+    // only the signals below and the specific target pids.
     public static (bool ok, string detail) Kill(string? sessionId, int pid, string? expectedStartedUtc = null)
+        => Kill(
+            string.IsNullOrWhiteSpace(sessionId) ? Array.Empty<string>() : new[] { sessionId! },
+            pid,
+            expectedStartedUtc);
+
+    public static (bool ok, string detail) Kill(
+        IReadOnlyCollection<string> candidateIds,
+        int pid = 0,
+        string? expectedStartedUtc = null)
+        => Kill(candidateIds, pid, expectedStartedUtc, signals: null);
+
+    // TEST SEAM: the WMI scan and the Claude registry are machine-global and cannot be arranged in-test
+    // without touching real user state, so they are injectable. Everything else - the per-pid handle probe,
+    // the owner records, the identity checks, the killing itself - runs for real.
+    internal sealed record KillSignals(
+        Func<(bool Ok, List<ArchiveService.RunningSessionInfo> Sessions, string Detail)>? Scan = null,
+        Func<(bool Ok, Dictionary<string, int> Map, HashSet<int> Unverifiable, string Detail)>? ClaudeRegistry = null,
+        SessionOwnerRecords.Options? OwnerRecords = null);
+
+    internal static (bool ok, string detail) Kill(
+        IReadOnlyCollection<string>? candidateIds,
+        int pid,
+        string? expectedStartedUtc,
+        KillSignals? signals)
     {
-        var sessions = Scan();
-        // A session id is not unique while a duplicate launch exists. When the caller supplies the
-        // clicked row's pid, that exact process is the target and the session id is only a consistency
-        // check. Never fall back to a sibling process that happens to resume the same chat.
-        var match = pid > 0
-            ? sessions.FirstOrDefault(s =>
-                s.Pid == pid
-                && (string.IsNullOrEmpty(sessionId)
-                    || string.Equals(s.SessionId, sessionId, StringComparison.OrdinalIgnoreCase)))
-            : (!string.IsNullOrEmpty(sessionId)
-                ? sessions.FirstOrDefault(s =>
-                    string.Equals(s.SessionId, sessionId, StringComparison.OrdinalIgnoreCase))
-                : null);
-        // No live match. "Already gone" is the desired end state — but only report it when we can CONFIRM
-        // the process is dead, otherwise a transient/failed WMI scan (which returns an empty list) would
-        // false-success EVERY kill. Verify the pid directly; if it's still alive, say so (don't claim gone).
-        if (match is null)
+        var ids = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var id in candidateIds ?? Array.Empty<string>())
+            if (!string.IsNullOrWhiteSpace(id)) ids.Add(id.Trim());
+
+        // Targets carry the label that tied them to the session, so the detail can say WHY something was killed.
+        var targets = new Dictionary<int, string>();
+        var unanswered = new List<string>();   // signals that could not answer at all -> never report "already gone"
+        var notes = new List<string>();        // reportable-but-not-fatal observations
+
+        // ---- signal 1: live command lines (WMI) -----------------------------------------------------
+        var (scanOk, sessions, scanDetail) = signals?.Scan is not null
+            ? signals.Scan()
+            : (TryScan(out var scanned, out var sd), scanned, sd);
+        if (!scanOk) unanswered.Add("the process scan could not complete (" + scanDetail + ")");
+        var scanRows = sessions.Where(s => s.Pid > 0).ToList();
+        var scanSidMatches = scanRows
+            .Where(s => !string.IsNullOrEmpty(s.SessionId) && ids.Contains(s.SessionId))
+            .ToList();
+        foreach (var s in scanSidMatches) AddTarget(targets, s.Pid, s.Tool + " pid " + s.Pid + " (command line)");
+        // A pid-addressed kill with no session id at all (the mux handoff path) targets the scanned agent itself.
+        if (pid > 0 && ids.Count == 0 && scanRows.Any(s => s.Pid == pid))
+            AddTarget(targets, pid, "agent pid " + pid + " (tracked agent)");
+
+        // ---- signal 4a: the owner record we wrote at launch -----------------------------------------
+        // Read early even on the fast path: it is a cheap file read, and it carries both the wrapper pid the
+        // probe below needs and the job name the kill mechanics prefer.
+        var records = ReadOwnerRecords(ids, signals?.OwnerRecords);
+        var verifiedWrappers = new Dictionary<int, SessionOwnerRecords.OwnerRecordInfo>();
+        foreach (var record in records)
         {
-            if (pid > 0)
+            if (record.WrapperPid <= 0) continue;
+            if (!ProcessOpenFiles.TryGetAliveIdentity(record.WrapperPid, out var actualStart))
+                continue;   // wrapper already exited - answered, and not a target
+            if (record.WrapperStartTimeUtc is null)
             {
-                try { using var _ = Process.GetProcessById(pid); return (false, "still running but not a tracked claude/codex agent — not killed"); }
-                catch (ArgumentException) { return (true, "already gone"); }   // pid confirmed not a live process
+                // A live pid we cannot pin to the launch that recorded it. Killing it could kill an unrelated
+                // process that inherited the pid, so it is NOT a target - and we must not claim "already gone".
+                unanswered.Add($"the recorded wrapper pid {record.WrapperPid} is alive but the record has no start time to identify it by");
+                continue;
             }
-            // session-id only: trust "gone" only if the scan actually returned data (so an empty scan ≠ success)
-            return sessions.Count > 0 ? (true, "already gone") : (false, "couldn't verify — process scan returned nothing");
+            if (Math.Abs((actualStart - record.WrapperStartTimeUtc.Value.UtcDateTime).TotalSeconds) > 1)
+                continue;   // the pid was REUSED: our wrapper is dead. Answered, and emphatically not a target.
+            verifiedWrappers[record.WrapperPid] = record;
+            AddTarget(targets, record.WrapperPid, "launch wrapper pid " + record.WrapperPid + " (owner record)");
         }
-        if (!string.IsNullOrWhiteSpace(expectedStartedUtc)
-            && !string.Equals(match.StartedAt, expectedStartedUtc, StringComparison.Ordinal))
-            return (false, "process identity changed before stop; refusing to kill a reused pid");
-        try
+
+        // ---- signals 2 + 3: Claude's registry and the per-pid transcript probe ----------------------
+        // Skipped when a pid-addressed kill is already tied by a cheaper signal: the stop button must not pay
+        // for a registry sweep plus a handle probe to kill a process the scan already identified.
+        var registryAnswered = true;
+        if (pid <= 0 || !targets.ContainsKey(pid))
         {
-            var processTree = SnapshotProcessTree(match.Pid);
-            using var process = Process.GetProcessById(match.Pid);
-            if (!string.IsNullOrWhiteSpace(expectedStartedUtc)
-                && DateTimeOffset.TryParse(expectedStartedUtc, out var expectedStart))
+            var (registryOk, registryMap, registryUnverifiable, registryDetail) = signals?.ClaudeRegistry is not null
+                ? signals.ClaudeRegistry()
+                : (TryClaudeLiveSessionIds(null, out var rm, out var ru, out var rd), rm, ru, rd);
+            registryAnswered = registryOk;
+            if (!registryOk) unanswered.Add("Claude's live-session registry could not be read (" + registryDetail + ")");
+            foreach (var p in registryUnverifiable)
+                notes.Add($"pid {p} alive but not inspectable - close it manually / elevated");
+
+            var registryPids = new HashSet<int>();
+            foreach (var kv in registryMap)
+                if (ids.Contains(kv.Key) && kv.Value > 0) registryPids.Add(kv.Value);
+            foreach (var p in registryPids)
             {
-                DateTimeOffset actualStart;
-                try { actualStart = process.StartTime.ToUniversalTime(); }
-                catch (Exception ex) { return (false, "couldn't revalidate process start time: " + ex.Message); }
-                if (Math.Abs((actualStart - expectedStart).TotalSeconds) > 1)
+                // A registry file outlives its process; only a still-live pid is a target.
+                if (!ProcessOpenFiles.IsAlive(p)) continue;
+                AddTarget(targets, p, "claude pid " + p + " (live-session registry)");
+            }
+
+            // Signal 3 runs over the BOUNDED pid set already in hand - never the whole machine. It is what
+            // catches an owner running under a DIFFERENT session id that nonetheless holds OUR transcript open.
+            var probePids = new HashSet<int>(scanRows.Select(s => s.Pid));
+            probePids.UnionWith(registryPids);
+            probePids.UnionWith(records.Where(r => r.WrapperPid > 0).Select(r => r.WrapperPid));
+            if (pid > 0) probePids.Add(pid);
+            if (ids.Count > 0 && probePids.Count > 0)
+            {
+                var probe = ProcessOpenFiles.Scan(probePids);
+                foreach (var kv in probe.Found)
+                    if (ids.Contains(kv.Key) && kv.Value > 0 && ProcessOpenFiles.IsAlive(kv.Value))
+                        AddTarget(targets, kv.Value, "pid " + kv.Value + " (holds this transcript open)");
+                foreach (var p in probe.UnverifiablePids)
+                {
+                    // Alive but uninspectable: never killed on a guess, always reported.
+                    notes.Add($"pid {p} alive but not inspectable - close it manually / elevated");
+                    unanswered.Add($"pid {p} is alive but its open files could not be read");
+                }
+            }
+        }
+
+        // ---- pid-addressed kills: that exact process is the target -----------------------------------
+        if (pid > 0)
+        {
+            if (!targets.TryGetValue(pid, out var why))
+            {
+                // A live pid tied to this session by NO signal stays untouched - Kill has never been a
+                // general-purpose process killer and still isn't.
+                if (ProcessOpenFiles.IsAlive(pid) || IsProcessAlive(pid))
+                    return (false, "still running but not a tracked claude/codex agent — not killed");
+                return (true, "already gone");
+            }
+            targets = new Dictionary<int, string> { [pid] = why };
+        }
+
+        if (targets.Count == 0)
+        {
+            if (unanswered.Count > 0)
+                return (false, "couldn't verify — " + string.Join("; ", unanswered.Distinct()));
+            // Every signal answered, all of them empty: nothing is running this session.
+            return (true, Join("already gone", notes));
+        }
+
+        // ---- identity gate ---------------------------------------------------------------------------
+        if (!string.IsNullOrWhiteSpace(expectedStartedUtc)
+            && DateTimeOffset.TryParse(expectedStartedUtc, out var expectedStart))
+        {
+            foreach (var target in targets.Keys)
+            {
+                if (!ProcessOpenFiles.TryGetAliveIdentity(target, out var actual)) continue;   // already gone
+                if (Math.Abs((actual - expectedStart.UtcDateTime).TotalSeconds) > 1)
                     return (false, "process identity changed before stop; refusing to kill a reused pid");
             }
-            process.Kill(entireProcessTree: true);
-            if (!process.WaitForExit(12_000))
-                return (false, $"kill requested, but {match.Tool} pid {match.Pid} did not exit");
-            var deadline = DateTime.UtcNow.AddSeconds(12);
-            while (DateTime.UtcNow < deadline)
+        }
+
+        try
+        {
+            // ---- snapshot: pid AND identity for every tree member -----------------------------------
+            // Capturing the start time here is what makes the 12s verify below immune to pid reuse. A member
+            // whose identity cannot be read at snapshot time is watched by bare pid, exactly as before.
+            var watch = new Dictionary<int, DateTime?>();
+            foreach (var target in targets.Keys)
+                foreach (var member in TrySnapshotProcessTree(target))
+                    if (!watch.ContainsKey(member))
+                        watch[member] = ProcessOpenFiles.TryGetAliveIdentity(member, out var st) ? st : null;
+
+            // ---- job kill first [F#7] ---------------------------------------------------------------
+            // The tree snapshot above has an unavoidable race: a child forked during the enumeration is not in
+            // it and survives a tree kill. Job membership has no such window, so when the launch was assigned
+            // to a job we take that route first and let the tree kill mop up whatever is left.
+            foreach (var record in verifiedWrappers.Values
+                         .Where(r => !string.IsNullOrWhiteSpace(r.JobName))
+                         .GroupBy(r => r.JobName!, StringComparer.Ordinal)
+                         .Select(g => g.First()))
             {
-                var alive = processTree.Where(IsProcessAlive).ToArray();
-                if (alive.Length == 0)
-                    return (true, $"killed {match.Tool} pid {match.Pid}; captured process-tree exit verified");
+                notes.Add(OwnerJobObjects.TryTerminate(record.JobName, out var jobDetail)
+                    ? "job kill: " + jobDetail
+                    : "job kill did not apply (" + jobDetail + ")");
+            }
+
+            foreach (var target in targets.Keys)
+            {
+                if (!ProcessOpenFiles.TryGetAliveIdentity(target, out _)) continue;   // job kill got it, or it raced out
+                try
+                {
+                    using var process = Process.GetProcessById(target);
+                    process.Kill(entireProcessTree: true);
+                }
+                catch (ArgumentException) { }   // exited between the identity check and the kill
+                catch (Exception ex) { notes.Add($"pid {target} could not be killed directly ({ex.Message})"); }
+            }
+
+            // ---- identity-checked verification (same 12s shape) --------------------------------------
+            var primaries = new HashSet<int>(targets.Keys);
+            var deadline = DateTime.UtcNow.AddSeconds(12);
+            List<int> livePrimaries;
+            List<int> liveDescendants;
+            while (true)
+            {
+                livePrimaries = primaries.Where(p => !HasExitedByIdentity(p, watch.GetValueOrDefault(p))).OrderBy(p => p).ToList();
+                liveDescendants = watch.Keys
+                    .Where(p => !primaries.Contains(p) && !HasExitedByIdentity(p, watch[p]))
+                    .OrderBy(p => p)
+                    .ToList();
+                if (livePrimaries.Count == 0 && liveDescendants.Count == 0) break;
+                if (DateTime.UtcNow >= deadline) break;
                 Thread.Sleep(50);
             }
-            var remaining = processTree.Where(IsProcessAlive).OrderBy(value => value).ToArray();
-            return (false, $"kill requested, but process-tree pids are still alive: {string.Join(", ", remaining)}");
+
+            if (livePrimaries.Count > 0)
+                return (false, Join(
+                    "kill requested, but " + string.Join(", ", livePrimaries.Select(p => targets[p])) + " did not exit",
+                    notes));
+
+            // Partial success is success. The things we set out to kill are confirmed dead by identity; a
+            // descendant that outlived them (a detached editor, a spawned shell) is worth saying out loud but
+            // is not a failed kill.
+            if (liveDescendants.Count > 0)
+                notes.Add("descendant pids still alive: " + string.Join(", ", liveDescendants));
+            return (true, Join("killed " + string.Join(", ", targets.Values), notes));
         }
-        catch (ArgumentException) { return (true, "already gone"); }   // raced out between scan and kill
         catch (Exception ex) { return (false, $"kill failed: {ex.Message}"); }
+    }
+
+    private static void AddTarget(Dictionary<int, string> targets, int pid, string label)
+    {
+        if (pid <= 0 || pid == Environment.ProcessId) return;
+        if (!targets.ContainsKey(pid)) targets[pid] = label;
+    }
+
+    private static string Join(string head, List<string> notes)
+    {
+        var extra = notes.Distinct().ToList();
+        return extra.Count == 0 ? head : head + "; note: " + string.Join("; ", extra);
+    }
+
+    private static IReadOnlyList<SessionOwnerRecords.OwnerRecordInfo> ReadOwnerRecords(
+        HashSet<string> ids,
+        SessionOwnerRecords.Options? options)
+    {
+        if (ids.Count == 0) return Array.Empty<SessionOwnerRecords.OwnerRecordInfo>();
+        try
+        {
+            var ordered = ids.ToList();
+            return SessionOwnerRecords.ReadRecordsForSession(ordered[0], ordered.Skip(1), options);
+        }
+        catch { return Array.Empty<SessionOwnerRecords.OwnerRecordInfo>(); }
+    }
+
+    // THE reused-pid fix. A pid alone cannot say whether the process we killed is gone: Windows hands pids out
+    // again within seconds under load, and the old check called a recycled pid "still alive" forever.
+    // Snapshot identity known -> gone when the pid is dead OR now belongs to a different process.
+    // Snapshot identity unknown -> fall back to the bare-pid check this used to do everywhere.
+    internal static bool HasExitedByIdentity(int pid, DateTime? snapshotStartUtc)
+    {
+        if (snapshotStartUtc is null) return !IsProcessAlive(pid);
+        if (!ProcessOpenFiles.TryGetAliveIdentity(pid, out var current)) return true;
+        return Math.Abs((current - snapshotStartUtc.Value).TotalSeconds) > 1;
+    }
+
+    private static HashSet<int> TrySnapshotProcessTree(int rootPid)
+    {
+        try { return SnapshotProcessTree(rootPid); }
+        catch { return new HashSet<int> { rootPid }; }   // WMI hiccup: watch at least the target itself
     }
 
     private static HashSet<int> SnapshotProcessTree(int rootPid)

@@ -280,7 +280,9 @@ public sealed partial class MainPage
             foreach (var localPid in localPids)
             {
                 if (!killOk) break;
-                var killed = CodexLocalRetrieval.Core.Remote.RunningSessions.Kill(null, localPid);
+                // Empty id set, not null: the pid IS the target here, and `null` is ambiguous between the two
+                // Kill overloads (single session id vs. the alias-aware candidate set).
+                var killed = CodexLocalRetrieval.Core.Remote.RunningSessions.Kill(Array.Empty<string>(), localPid);
                 if (!killed.ok) { killOk = false; killDetail = "Could not kill the local running agent: " + killed.detail; }
             }
             // The owner is still there — this is a FAILED takeover of a confirmed live owner, not a cancel.

@@ -119,7 +119,9 @@ public static class MuxIdentityTransfer
 
     private static (bool Ok, string Detail) KillOwner(int pid)
     {
-        var result = RunningSessions.Kill(null, pid);
+        // No candidate ids: this pid IS the target (the handoff already identified it), so the id set is empty
+        // rather than null - `null` is ambiguous between the two Kill overloads.
+        var result = RunningSessions.Kill(Array.Empty<string>(), pid);
         return (result.ok, result.detail);
     }
 

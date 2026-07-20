@@ -42,7 +42,8 @@ public static class SessionOwnerRecords
         string Transport,
         DateTimeOffset ClaimedAt,
         string? MuxName,
-        string Path);
+        string Path,
+        string? JobName = null);
 
     // Never throws and never fails a launch: returns false with a detail the caller logs.
     public static bool TryWrite(
@@ -53,7 +54,8 @@ public static class SessionOwnerRecords
         string transport,
         out string detail,
         string? muxName = null,
-        Options? options = null)
+        Options? options = null,
+        string? jobName = null)
     {
         detail = "";
         var ids = CandidateIds(sessionId, aliases);
@@ -80,7 +82,8 @@ public static class SessionOwnerRecords
             WrapperStartTimeUtc = wrapperStartTimeUtc,
             Transport = string.IsNullOrWhiteSpace(transport) ? "unknown" : transport.Trim(),
             ClaimedAt = options.EffectiveNow,
-            MuxName = string.IsNullOrWhiteSpace(muxName) ? null : muxName!.Trim()
+            MuxName = string.IsNullOrWhiteSpace(muxName) ? null : muxName!.Trim(),
+            JobName = string.IsNullOrWhiteSpace(jobName) ? null : jobName!.Trim()
         };
         var bytes = JsonSerializer.SerializeToUtf8Bytes(record, new JsonSerializerOptions { WriteIndented = true });
 
@@ -113,13 +116,19 @@ public static class SessionOwnerRecords
 
     // Terminal/server launches hand us the started Process; a wrapper that exits instantly makes both Id and
     // StartTime throw, so the record degrades to "no wrapper known" rather than blowing up the launch.
+    //
+    // This is also the single point where the wrapper is put into a named job object [F#7], because it is the
+    // only place with a real Process in hand (the muxd path goes through TryWrite and gets no job - muxd owns
+    // its own shells). Assignment is best-effort and its failure is recorded as `jobName: null`, which simply
+    // sends Kill down the snapshot tree-kill path; the launch itself is never affected.
     public static bool TryWriteForProcess(
         string? sessionId,
         IEnumerable<string>? aliases,
         Process? process,
         string transport,
         out string detail,
-        Options? options = null)
+        Options? options = null,
+        bool assignJobObject = true)
     {
         var pid = 0;
         DateTimeOffset? startedUtc = null;
@@ -130,7 +139,13 @@ public static class SessionOwnerRecords
             try { startedUtc = process.StartTime.ToUniversalTime(); }
             catch { startedUtc = null; }
         }
-        return TryWrite(sessionId, aliases, pid, startedUtc, transport, out detail, options: options);
+        string? jobName = null;
+        if (assignJobObject && process is not null)
+        {
+            try { jobName = OwnerJobObjects.TryAssign(process); }
+            catch { jobName = null; }
+        }
+        return TryWrite(sessionId, aliases, pid, startedUtc, transport, out detail, options: options, jobName: jobName);
     }
 
     // muxd writes live-tabs.json asynchronously, so the shell pid is usually NOT there yet at record time.
@@ -159,8 +174,9 @@ public static class SessionOwnerRecords
         catch { return 0; }
     }
 
-    // Read side exists for tests and for the Phase 2 consumers; nothing in the app reads these yet, and
-    // nothing may treat what it reads as a liveness verdict (see the type comment).
+    // Read by RunningSessions.Kill (target resolution signal 4) and by tests. Nothing may treat what it reads
+    // as a liveness verdict (see the type comment) - Kill only uses the wrapper pid AFTER proving, by start
+    // time, that the pid is still the process this record was written for.
     public static IReadOnlyList<OwnerRecordInfo> ReadRecordsForSession(
         string? sessionId,
         IEnumerable<string>? aliases = null,
@@ -187,7 +203,8 @@ public static class SessionOwnerRecords
                 data.Transport,
                 data.ClaimedAt,
                 data.MuxName,
-                path));
+                path,
+                data.JobName));
         }
         return records;
     }
@@ -239,5 +256,8 @@ public static class SessionOwnerRecords
         public string Transport { get; set; } = "";
         public DateTimeOffset ClaimedAt { get; set; }
         public string? MuxName { get; set; }
+        // The named job the wrapper was assigned to at launch [F#7]; null when assignment failed or the launch
+        // path had no Process to assign (muxd). Kill uses it for a race-free tied kill.
+        public string? JobName { get; set; }
     }
 }

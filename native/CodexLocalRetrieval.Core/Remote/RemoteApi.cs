@@ -205,7 +205,8 @@ public sealed class RemoteApi
                         var wrapper = System.Diagnostics.Process.Start(psi);
                         launched = true;
                         lease?.MarkStarted("Started resume from remote API.");
-                        // Best-effort kill-target index; a wrapper is not the agent (see SessionOwnerRecords).
+                        // Best-effort kill-target index, and where the wrapper joins its named job object
+                        // [F#7]; a wrapper is not the agent (see SessionOwnerRecords).
                         if (!SessionOwnerRecords.TryWriteForProcess(session.Id, session.Aliases, wrapper, "server", out var recordDetail))
                             Console.Error.WriteLine("owner record not written (server): " + recordDetail);
                     }

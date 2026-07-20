@@ -66,6 +66,101 @@ public class SessionOwnerRecordsTests
         Assert.AreEqual("muxd", record.Transport);
         Assert.AreEqual(claimedAt, record.ClaimedAt);
         Assert.AreEqual("clr-parent-id", record.MuxName);
+        Assert.IsNull(record.JobName, "a muxd record has no wrapper of ours to put in a job");
+    }
+
+    // [F#7] The job name is the kill handle for this launch: without it round-tripping, Kill silently falls
+    // back to the racy snapshot tree-kill.
+    [TestMethod]
+    public void TryWrite_RoundTripsTheJobName()
+    {
+        using var dir = TempOwnerDir();
+
+        Assert.IsTrue(SessionOwnerRecords.TryWrite(
+            "parent-id",
+            new[] { "child-id" },
+            wrapperPid: 1357,
+            wrapperStartTimeUtc: DateTimeOffset.UtcNow,
+            transport: "terminal",
+            out var detail,
+            options: Options(dir.Path),
+            jobName: @"Local\CodexLocalRetrieval-owner-1357-638000000000000000"), detail);
+
+        // Both the sid record and the alias record must carry it - an alias-addressed kill reads the alias file.
+        foreach (var id in new[] { "parent-id", "child-id" })
+        {
+            var record = SessionOwnerRecords.ReadRecordsForSession(id, options: Options(dir.Path)).Single();
+            Assert.AreEqual(@"Local\CodexLocalRetrieval-owner-1357-638000000000000000", record.JobName);
+        }
+    }
+
+    [TestMethod]
+    public void TryWrite_LeavesAnAbsentJobNameNull()
+    {
+        using var dir = TempOwnerDir();
+
+        Assert.IsTrue(SessionOwnerRecords.TryWrite(
+            "parent-id", null, 42, null, "terminal", out var detail, options: Options(dir.Path)), detail);
+        // Whitespace is not a job name either - Kill must be able to test it with a plain null check.
+        Assert.IsTrue(SessionOwnerRecords.TryWrite(
+            "blank-id", null, 42, null, "terminal", out var blankDetail,
+            options: Options(dir.Path), jobName: "   "), blankDetail);
+
+        Assert.IsNull(SessionOwnerRecords.ReadRecordsForSession("parent-id", options: Options(dir.Path)).Single().JobName);
+        Assert.IsNull(SessionOwnerRecords.ReadRecordsForSession("blank-id", options: Options(dir.Path)).Single().JobName);
+    }
+
+    // Records written before the job-object field existed must still read back cleanly.
+    [TestMethod]
+    public void ReadRecordsForSession_TreatsAPreJobObjectRecordAsHavingNoJob()
+    {
+        using var dir = TempOwnerDir();
+        File.WriteAllText(
+            Path.Combine(dir.Path, FileNameFor("parent-id")),
+            """{"SessionId":"parent-id","CandidateIds":["parent-id"],"WrapperPid":7,"Transport":"terminal"}""");
+
+        var record = SessionOwnerRecords.ReadRecordsForSession("parent-id", options: Options(dir.Path)).Single();
+        Assert.AreEqual(7, record.WrapperPid);
+        Assert.IsNull(record.JobName);
+    }
+
+    // The one place a real Process is in hand is the one place a job is assigned [F#7]; that assignment must
+    // stay opt-out so record-only tests never create job objects as a side effect.
+    [TestMethod]
+    public void TryWriteForProcess_AssignsAJobAndRecordsItsName()
+    {
+        if (!OperatingSystem.IsWindows()) Assert.Inconclusive("job objects are Windows-only.");
+        using var dir = TempOwnerDir();
+        using var wrapper = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+        {
+            FileName = "cmd.exe",
+            ArgumentList = { "/Q", "/K" },
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardInput = true,
+        })!;
+        try
+        {
+            Assert.IsTrue(SessionOwnerRecords.TryWriteForProcess(
+                "parent-id", null, wrapper, "terminal", out var detail, Options(dir.Path)), detail);
+
+            var record = SessionOwnerRecords.ReadRecordsForSession("parent-id", options: Options(dir.Path)).Single();
+            Assert.IsNotNull(record.JobName);
+            StringAssert.Contains(record.JobName!, wrapper.Id.ToString());
+            Assert.IsTrue(OwnerJobObjects.HoldsHandle(record.JobName),
+                "the creating handle must be held for the app's lifetime, or the job dies with its last member");
+
+            Assert.IsTrue(SessionOwnerRecords.TryWriteForProcess(
+                "other-id", null, wrapper, "terminal", out var optOut, Options(dir.Path), assignJobObject: false), optOut);
+            Assert.IsNull(
+                SessionOwnerRecords.ReadRecordsForSession("other-id", options: Options(dir.Path)).Single().JobName);
+
+            OwnerJobObjects.ReleaseHandle(record.JobName);
+        }
+        finally
+        {
+            try { if (!wrapper.HasExited) wrapper.Kill(entireProcessTree: true); } catch { }
+        }
     }
 
     [TestMethod]

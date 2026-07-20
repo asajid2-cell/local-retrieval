@@ -219,8 +219,10 @@ public sealed partial class MainPage
         }
     }
 
-    // Best-effort note of the wrapper process this app started for a session. Nothing consumes it yet, and
-    // a wrapper is not the agent (see SessionOwnerRecords) - a failed write is logged and never blocks a launch.
+    // Best-effort note of the wrapper process this app started for a session, and the point where that wrapper
+    // is put into a named job object [F#7] so a later Kill can take the launch down without a tree-enumeration
+    // race. A wrapper is not the agent (see SessionOwnerRecords); a failed write or a failed job assignment is
+    // logged and never blocks a launch - Kill just falls back to the snapshot tree kill.
     private static void RecordSessionOwner(string? sessionId, IEnumerable<string>? aliases, Process? wrapper, string transport)
     {
         try

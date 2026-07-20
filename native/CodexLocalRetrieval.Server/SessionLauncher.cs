@@ -238,8 +238,9 @@ public sealed class SessionLauncher
         }
     }
 
-    // Best-effort note of the wrapper process this server started for a session. Nothing consumes it yet, and
-    // a wrapper is not the agent (see SessionOwnerRecords) - a failed write is logged and never fails a launch.
+    // Best-effort note of the wrapper process this server started for a session, and the point where that
+    // wrapper is put into a named job object [F#7] for a race-free later Kill. A wrapper is not the agent (see
+    // SessionOwnerRecords); a failed write or job assignment is logged and never fails a launch.
     private void RecordOwner(string id, IReadOnlyList<string> aliases, Process? wrapper, string transport)
     {
         try
