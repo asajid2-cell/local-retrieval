@@ -76,9 +76,8 @@ function waitForWsText(ws, regex, label, timeoutMs = 4000) {
 }
 
 class RelayHarness {
-  constructor(env = {}) {
+  constructor() {
     this.proc = null;
-    this.env = env;
     this.tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-test-'));
     this.stdout = '';
     this.stderr = '';
@@ -99,7 +98,6 @@ class RelayHarness {
         MUX_HOST_SB_WAIT_MS: '40',
         MUX_COMMAND_LEASE_MS: '1000',
         HLAUTH_BASE: 'http://127.0.0.1:1',
-        ...this.env,
       },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
@@ -129,13 +127,13 @@ class RelayHarness {
     await this.start();
   }
 
-  async request(method, pathName, body, headers = {}) {
+  async request(method, pathName, body) {
     const opts = {
       method,
       hostname: '127.0.0.1',
       port: this.port,
       path: pathName,
-      headers: { ...headers },
+      headers: {},
     };
     let payload = null;
     if (body !== undefined) {
@@ -239,7 +237,7 @@ class FakeHost {
   }
 
   sendHello(sessions = []) {
-    this.ws.send(JSON.stringify({ t: 'hello', host: 'FAKEPC', protocol: 4, caps: HOST_CAPS, sessions }));
+    this.ws.send(JSON.stringify({ t: 'hello', host: 'FAKEPC', protocol: 3, caps: HOST_CAPS, sessions }));
   }
 
   sendSessions(list) {
@@ -250,10 +248,8 @@ class FakeHost {
     this.ws.send(JSON.stringify({ t: 'o', s: name, d: Buffer.from(text, 'utf8').toString('base64') }));
   }
 
-  sendScrollback(name, text = '', request = null) {
-    const sb = request || [...this.messages].reverse().find(message => message.t === 'sb' && message.s === name);
-    if (!sb || !sb.rid) throw new Error(`no correlated scrollback request for ${name}`);
-    this.ws.send(JSON.stringify({ t: 'sb', s: name, rid: sb.rid, d: Buffer.from(text, 'utf8').toString('base64') }));
+  sendScrollback(name, text = '') {
+    this.ws.send(JSON.stringify({ t: 'sb', s: name, d: Buffer.from(text, 'utf8').toString('base64') }));
   }
 
   sendKilled(name) {
@@ -1349,62 +1345,6 @@ test('host protocol rejects forbidden fields outside session payloads', async t 
   }, 'forbidden host frame disconnect');
 });
 
-test('auth decision cache is LRU-bounded', async t => {
-  const seen = [];
-  const auth = http.createServer((req, res) => {
-    seen.push(req.headers['x-session-token']);
-    res.setHeader('content-type', 'application/json');
-    res.end(JSON.stringify({ authenticated: true, user: { isOwner: true } }));
-  });
-  await new Promise(resolve => auth.listen(0, '127.0.0.1', resolve));
-  t.after(() => auth.close());
-
-  const h = new RelayHarness({
-    HLAUTH_BASE: `http://127.0.0.1:${auth.address().port}`,
-    MUX_AUTH_CACHE_MAX: '2',
-    MUX_AUTH_CACHE_TTL_MS: '5000',
-  });
-  await h.start();
-  t.after(async () => h.stop());
-  const headers = token => ({
-    'x-forwarded-for': '203.0.113.10',
-    cookie: `hl_session=${token}`,
-  });
-
-  for (const token of ['a', 'b', 'a', 'c', 'b']) {
-    assert.equal((await h.request('GET', '/api/health', undefined, headers(token))).status, 200);
-  }
-  assert.deepEqual(seen, ['a', 'b', 'c', 'b']);
-});
-
-test('auth decision cache expires entries', async t => {
-  const seen = [];
-  const auth = http.createServer((req, res) => {
-    seen.push(req.headers['x-session-token']);
-    res.setHeader('content-type', 'application/json');
-    res.end(JSON.stringify({ authenticated: true, user: { isOwner: true } }));
-  });
-  await new Promise(resolve => auth.listen(0, '127.0.0.1', resolve));
-  t.after(() => auth.close());
-
-  const h = new RelayHarness({
-    HLAUTH_BASE: `http://127.0.0.1:${auth.address().port}`,
-    MUX_AUTH_CACHE_TTL_MS: '1000',
-  });
-  await h.start();
-  t.after(async () => h.stop());
-  const headers = {
-    'x-forwarded-for': '203.0.113.10',
-    cookie: 'hl_session=expiry',
-  };
-
-  assert.equal((await h.request('GET', '/api/health', undefined, headers)).status, 200);
-  assert.equal((await h.request('GET', '/api/health', undefined, headers)).status, 200);
-  await sleep(1200);
-  assert.equal((await h.request('GET', '/api/health', undefined, headers)).status, 200);
-  assert.deepEqual(seen, ['expiry', 'expiry']);
-});
-
 test('malformed host candidates cannot replace an already validated host', async t => {
   const h = new RelayHarness();
   await h.start();
@@ -1414,10 +1354,8 @@ test('malformed host candidates cannot replace an already validated host', async
 
   for (const frame of [
     { t: 'sessions', list: [] },
-    { t: 'hello', host: 'OLDPC', protocol: 3, caps: HOST_CAPS, sessions: [] },
-    { t: 'hello', host: 'FUTUREPC', protocol: 5, caps: HOST_CAPS, sessions: [] },
-    { t: 'hello', host: 'FRACTIONALPC', protocol: 4.1, caps: HOST_CAPS, sessions: [] },
-    { t: 'hello', host: 'BADPC', protocol: 4, caps: HOST_CAPS, sessions: [shellSession('../bad-tab')] },
+    { t: 'hello', host: 'OLDPC', protocol: 2, caps: HOST_CAPS, sessions: [] },
+    { t: 'hello', host: 'BADPC', protocol: 3, caps: HOST_CAPS, sessions: [shellSession('../bad-tab')] },
   ]) {
     const candidate = new FakeHost(h.port);
     await candidate.connect();
@@ -1428,7 +1366,7 @@ test('malformed host candidates cannot replace an already validated host', async
     const health = await h.json('GET', '/api/health');
     assert.equal(health.host.connected, true);
     assert.equal(health.host.name, 'FAKEPC');
-    assert.equal(health.host.protocol, 4);
+    assert.equal(health.host.protocol, 3);
     const rows = await h.json('GET', '/api/sessions');
     assert.ok(rows.some(row => row.name === 'healthy-tab'));
   }
@@ -1598,7 +1536,7 @@ test('POST /api/sessions/:name/relaunch refuses sessions with no saved command',
   await host.assertNo(m => m.t === 'create' && m.s === 'plaincase', 'plain shell should not relaunch without a command');
 });
 
-test('POST /api/sessions/:name/relaunch transfers a matching local copy through the PC bridge', async t => {
+test('POST /api/sessions/:name/relaunch refuses matching local copy and does not start muxd', async t => {
   const h = new RelayHarness();
   await h.start();
   t.after(async () => h.stop());
@@ -1613,21 +1551,17 @@ test('POST /api/sessions/:name/relaunch transfers a matching local copy through 
     host: 'FAKEPC',
   });
 
-  const post = h.request('POST', '/api/sessions/takeover/relaunch', { sessionId: 'sid1', tool: 'codex' });
-  const queued = await waitFor(async () => {
-    const cmds = await leaseCommands(h);
-    return cmds.find(c => c.type === 'startmux' && c.sessionId === 'sid1');
-  }, 'takeover startmux command');
-  assert.equal(queued.takeover, true);
+  const res = await h.request('POST', '/api/sessions/takeover/relaunch', { sessionId: 'sid1', tool: 'codex' });
+
+  assert.equal(res.status, 409);
+  assert.match(res.body.error, /local copy is already running/);
+  assert.match(res.body.detail, /already running locally/);
+  const cmds = await leaseCommands(h);
+  assert.equal(cmds.filter(c => c.type === 'kill' && c.sessionId === 'sid1').length, 0);
   await host.assertNo(m => m.t === 'create' && m.s === 'takeover', 'local-owner relaunch should not create');
-  await ackLeased(h, queued, { ok: true, detail: 'ownership transferred' });
-  host.sendSessions([commandSession('takeover', 'sid1', 1235)]);
-  const res = await post;
-  assert.equal(res.status, 200);
-  assert.equal(res.body.stoppedLocal, true);
 });
 
-test('POST /api/sessions/:name/relaunch transfers a local copy matched through allChats', async t => {
+test('POST /api/sessions/:name/relaunch refuses local copy matched through allChats', async t => {
   const h = new RelayHarness();
   await h.start();
   t.after(async () => h.stop());
@@ -1643,17 +1577,14 @@ test('POST /api/sessions/:name/relaunch transfers a local copy matched through a
     host: 'FAKEPC',
   });
 
-  const post = h.request('POST', '/api/sessions/allchat-takeover/relaunch', { sessionId: 'sid-all', tool: 'codex' });
-  const queued = await waitFor(async () => {
-    const cmds = await leaseCommands(h);
-    return cmds.find(c => c.type === 'startmux' && c.sessionId === 'sid-all');
-  }, 'allChats takeover command');
-  assert.equal(queued.takeover, true);
+  const res = await h.request('POST', '/api/sessions/allchat-takeover/relaunch', { sessionId: 'sid-all', tool: 'codex' });
+
+  assert.equal(res.status, 409);
+  assert.match(res.body.error, /local copy is already running/);
+  assert.match(res.body.detail, /already running locally/);
+  const cmds = await leaseCommands(h);
+  assert.equal(cmds.filter(c => c.type === 'kill' && c.sessionId === 'sid-all').length, 0);
   await host.assertNo(m => m.t === 'create' && m.s === 'allchat-takeover', 'allChats local-owner relaunch should not create');
-  await ackLeased(h, queued, { ok: true, detail: 'ownership transferred' });
-  host.sendSessions([commandSession('allchat-takeover', 'sid-all', 4322)]);
-  const res = await post;
-  assert.equal(res.status, 200);
 });
 
 test('POST /api/sessions refuses generic create when the chat is already running locally', async t => {
@@ -1734,7 +1665,7 @@ test('relaunching a different opaque identity waits for the PC bridge and matchi
   assert.equal(res.status, 200);
 });
 
-test('POST /api/sessions/:name/relaunch transfers a local copy matched by alias', async t => {
+test('POST /api/sessions/:name/relaunch refuses local copy matched by alias', async t => {
   const h = new RelayHarness();
   await h.start();
   t.after(async () => h.stop());
@@ -1749,17 +1680,11 @@ test('POST /api/sessions/:name/relaunch transfers a local copy matched by alias'
     host: 'FAKEPC',
   });
 
-  const post = h.request('POST', '/api/sessions/alias-takeover/relaunch', { sessionId: 'parent-id', tool: 'codex' });
-  const queued = await waitFor(async () => {
-    const cmds = await leaseCommands(h);
-    return cmds.find(c => c.type === 'startmux' && c.sessionId === 'parent-id');
-  }, 'alias takeover command');
-  assert.equal(queued.takeover, true);
+  const res = await h.request('POST', '/api/sessions/alias-takeover/relaunch', { sessionId: 'parent-id', tool: 'codex' });
+
+  assert.equal(res.status, 409);
+  assert.match(res.body.detail, /already running locally/);
   await host.assertNo(m => m.t === 'create' && m.s === 'alias-takeover', 'alias local-owner relaunch should not create');
-  await ackLeased(h, queued, { ok: true, detail: 'ownership transferred' });
-  host.sendSessions([commandSession('alias-takeover', 'parent-id', 2203, ['child-id'])]);
-  const res = await post;
-  assert.equal(res.status, 200);
 });
 
 test('relay source has no boot command reconstruction or terminal-injection healer', () => {
@@ -1804,7 +1729,7 @@ test('autoheal toggle delegates only boolean policy to muxd and waits for host c
   await host.assertNo(m => m.t === 'i' && m.s === 'heal-takeover', 'relay must not inject recovery input');
 });
 
-test('unknown websocket tab fails closed and never creates an implicit shell', async t => {
+test('unknown websocket tab creates PC-local shell, bridges scrollback, input, and output', async t => {
   const h = new RelayHarness();
   await h.start();
   t.after(async () => h.stop());
@@ -1813,205 +1738,23 @@ test('unknown websocket tab fails closed and never creates an implicit shell', a
 
   const ws = new WebSocket(`ws://127.0.0.1:${h.port}/ws?session=webshell&cols=88&rows=22`);
   await once(ws, 'open');
-  const [code, reason] = await once(ws, 'close');
-  assert.equal(code, 1013);
-  assert.match(reason.toString(), /does not exist/i);
-  await host.assertNo(m => m.t === 'create' && m.s === 'webshell', 'unknown attach must not create');
-});
+  const create = await host.waitFor(m => m.t === 'create' && m.s === 'webshell', 'create webshell');
+  assert.equal(Object.prototype.hasOwnProperty.call(create, 'cmd'), false);
+  assert.equal(create.cols, 88);
+  assert.equal(create.rows, 22);
+  host.sendCreateResult(create, { session: shellSession('webshell') });
 
-test('concurrent viewers share one scrollback snapshot and each waiter receives it', async t => {
-  const h = new RelayHarness();
-  await h.start();
-  t.after(async () => h.stop());
-  const host = await h.connectHost([commandSession('shared-sb', 'shared-id', Date.now())]);
-  t.after(() => host.close());
+  const sb = await host.waitFor(m => m.t === 'sb' && m.s === 'webshell', 'scrollback request');
+  assert.equal(sb.max, 800000);
+  host.sendScrollback('webshell', 'SCROLLBACK\n');
 
-  const first = new WebSocket(`ws://127.0.0.1:${h.port}/ws?session=shared-sb&cols=80&rows=24`);
-  const second = new WebSocket(`ws://127.0.0.1:${h.port}/ws?session=shared-sb&cols=100&rows=30`);
-  await Promise.all([once(first, 'open'), once(second, 'open')]);
-  await host.waitFor(m => m.t === 'sb' && m.s === 'shared-sb', 'shared scrollback request');
-  await sleep(100);
-  assert.equal(host.messages.filter(m => m.t === 'sb' && m.s === 'shared-sb').length, 1);
+  ws.send('iWrite-Output WEB_OK\r');
+  const input = await host.waitFor(m => m.t === 'i' && m.s === 'webshell', 'input bridge');
+  assert.equal(Buffer.from(input.d, 'base64').toString('utf8'), 'Write-Output WEB_OK\r');
 
-  const firstPaint = waitForWsText(first, /SHARED_SNAPSHOT/, 'first waiter replay');
-  const secondPaint = waitForWsText(second, /SHARED_SNAPSHOT/, 'second waiter replay');
-  host.sendScrollback('shared-sb', 'SHARED_SNAPSHOT\r\n');
-  assert.match(await firstPaint, /SHARED_SNAPSHOT/);
-  assert.match(await secondPaint, /SHARED_SNAPSHOT/);
-  first.close();
-  second.close();
-});
-
-test('last viewer removal deletes session state so reconnect recomputes and re-requests', async t => {
-  const h = new RelayHarness();
-  await h.start();
-  t.after(async () => h.stop());
-  const host = await h.connectHost([commandSession('state-cleanup', 'cleanup-id', Date.now())]);
-  t.after(() => host.close());
-
-  const first = new WebSocket(`ws://127.0.0.1:${h.port}/ws?session=state-cleanup&cols=81&rows=25`);
-  await once(first, 'open');
-  await host.waitFor(m => m.t === 'sb' && m.s === 'state-cleanup', 'first scrollback request');
-  host.sendScrollback('state-cleanup', 'FIRST\r\n');
-  await host.waitFor(m => m.t === 'resize' && m.s === 'state-cleanup' && m.cols === 81, 'first resize');
-  const firstClosed = once(first, 'close');
-  first.close();
-  await firstClosed;
-
-  const second = new WebSocket(`ws://127.0.0.1:${h.port}/ws?session=state-cleanup&cols=81&rows=25`);
-  await once(second, 'open');
-  await waitFor(
-    () => host.messages.filter(m => m.t === 'sb' && m.s === 'state-cleanup').length === 2,
-    'second scrollback request',
-  );
-  await waitFor(
-    () => host.messages.filter(m => m.t === 'resize' && m.s === 'state-cleanup' && m.cols === 81).length === 2,
-    'second resize after state cleanup',
-  );
-  second.close();
-});
-
-test('viewer dimensions are clamped before they can resize the shared PTY', async t => {
-  const h = new RelayHarness();
-  await h.start();
-  t.after(async () => h.stop());
-  const headless = { ...commandSession('bounded-size', 'bounded-id'), cols: 0, rows: 0 };
-  const host = await h.connectHost([headless]);
-  t.after(() => host.close());
-
-  const ws = new WebSocket(`ws://127.0.0.1:${h.port}/ws?session=bounded-size&cols=100000&rows=90000`);
-  await once(ws, 'open');
-  const initial = await host.waitFor(
-    m => m.t === 'resize' && m.s === 'bounded-size',
-    'bounded initial resize',
-  );
-  assert.deepEqual({ cols: initial.cols, rows: initial.rows }, { cols: 1000, rows: 300 });
-
-  ws.send('v' + JSON.stringify({ cols: 999999, rows: 888888 }));
-  await sleep(100);
-  const resizes = host.messages.filter(m => m.t === 'resize' && m.s === 'bounded-size');
-  assert.equal(resizes.every(m => m.cols <= 1000 && m.rows <= 300), true);
-  ws.close();
-});
-
-test('a device size pin is removed durably when its last viewer disconnects', async t => {
-  const h = new RelayHarness();
-  await h.start();
-  t.after(async () => h.stop());
-  const host = await h.connectHost([commandSession('pin-cleanup', 'pin-id')]);
-  t.after(() => host.close());
-
-  const ws = new WebSocket(
-    `ws://127.0.0.1:${h.port}/ws?session=pin-cleanup&cols=80&rows=24&dev=phone&label=phone`,
-  );
-  await once(ws, 'open');
-  const sb = await host.waitFor(m => m.t === 'sb' && m.s === 'pin-cleanup', 'pin cleanup replay');
-  host.sendScrollback('pin-cleanup', 'READY\r\n', sb);
-  ws.send('P1');
-  await waitFor(() => {
-    const saved = new Map(JSON.parse(fs.readFileSync(path.join(h.tmp, 'pins.json'), 'utf8')));
-    return saved.has('pin-cleanup');
-  }, 'pin persisted');
-
-  const closed = once(ws, 'close');
-  ws.close();
-  await closed;
-  await waitFor(() => {
-    const saved = new Map(JSON.parse(fs.readFileSync(path.join(h.tmp, 'pins.json'), 'utf8')));
-    return !saved.has('pin-cleanup');
-  }, 'disconnected pin removed');
-});
-
-test('a lost scrollback response is retried with a fresh correlation id', async t => {
-  const h = new RelayHarness({ MUX_HOST_SB_REQUEST_TIMEOUT_MS: '150' });
-  await h.start();
-  t.after(async () => h.stop());
-  const host = await h.connectHost([commandSession('sb-retry', 'sb-retry-id')]);
-  t.after(() => host.close());
-
-  const ws = new WebSocket(`ws://127.0.0.1:${h.port}/ws?session=sb-retry&cols=80&rows=24`);
-  await once(ws, 'open');
-  const first = await host.waitFor(m => m.t === 'sb' && m.s === 'sb-retry', 'first scrollback request');
-  const second = await waitFor(() => {
-    const requests = host.messages.filter(m => m.t === 'sb' && m.s === 'sb-retry');
-    return requests.length >= 2 ? requests[1] : null;
-  }, 'retried scrollback request');
-  assert.notEqual(second.rid, first.rid);
-
-  const painted = waitForWsText(ws, /RETRIED_SNAPSHOT/, 'retried snapshot paint');
-  host.sendScrollback('sb-retry', 'RETRIED_SNAPSHOT\r\n', second);
-  assert.match(await painted, /RETRIED_SNAPSHOT/);
-  ws.close();
-});
-
-test('late scrollback from a disconnected viewer generation cannot paint its replacement', async t => {
-  const h = new RelayHarness();
-  await h.start();
-  t.after(async () => h.stop());
-  const host = await h.connectHost([commandSession('stale-sb', 'stale-id', Date.now())]);
-  t.after(() => host.close());
-
-  const first = new WebSocket(`ws://127.0.0.1:${h.port}/ws?session=stale-sb&cols=80&rows=24`);
-  await once(first, 'open');
-  const requestA = await host.waitFor(m => m.t === 'sb' && m.s === 'stale-sb', 'viewer A scrollback request');
-  const firstClosed = once(first, 'close');
-  first.close();
-  await firstClosed;
-
-  const second = new WebSocket(`ws://127.0.0.1:${h.port}/ws?session=stale-sb&cols=80&rows=24`);
-  await once(second, 'open');
-  const requestB = await waitFor(() => {
-    const requests = host.messages.filter(m => m.t === 'sb' && m.s === 'stale-sb');
-    return requests.length === 2 ? requests[1] : null;
-  }, 'viewer B scrollback request');
-  assert.notEqual(requestA.rid, requestB.rid);
-
-  let seen = '';
-  second.on('message', raw => { seen += raw.toString(); });
-  host.sendScrollback('stale-sb', 'STALE_GENERATION_A\r\n', requestA);
-  await sleep(150);
-  assert.doesNotMatch(seen, /STALE_GENERATION_A/);
-
-  const painted = waitForWsText(second, /CURRENT_GENERATION_B/, 'matching viewer B scrollback');
-  host.sendScrollback('stale-sb', 'CURRENT_GENERATION_B\r\n', requestB);
-  assert.match(await painted, /CURRENT_GENERATION_B/);
-  second.close();
-});
-
-test('viewer outbound high-water disconnects before queuing an oversized live frame', async t => {
-  const h = new RelayHarness({ MUX_VIEWER_HIGH_WATER_BYTES: '1024' });
-  await h.start();
-  t.after(async () => h.stop());
-  const host = await h.connectHost([commandSession('slow-viewer', 'slow-id', Date.now())]);
-  t.after(() => host.close());
-
-  const ws = new WebSocket(`ws://127.0.0.1:${h.port}/ws?session=slow-viewer&cols=80&rows=24`);
-  await once(ws, 'open');
-  await host.waitFor(m => m.t === 'sb' && m.s === 'slow-viewer', 'slow viewer scrollback');
-  const ready = waitForWsText(ws, /READY/, 'initial replay');
-  host.sendScrollback('slow-viewer', 'READY\r\n');
-  await ready;
-
-  const closed = once(ws, 'close');
-  host.sendOutput('slow-viewer', 'X'.repeat(2048));
-  await closed;
-});
-
-test('bounded initial replay is not rejected by the lower live-output high-water mark', async t => {
-  const h = new RelayHarness({ MUX_VIEWER_HIGH_WATER_BYTES: '1024' });
-  await h.start();
-  t.after(async () => h.stop());
-  const host = await h.connectHost([commandSession('replay-burst', 'replay-burst-id')]);
-  t.after(() => host.close());
-
-  const ws = new WebSocket(`ws://127.0.0.1:${h.port}/ws?session=replay-burst&cols=80&rows=24`);
-  await once(ws, 'open');
-  const request = await host.waitFor(m => m.t === 'sb' && m.s === 'replay-burst', 'large replay request');
-  const marker = 'REPLAY_SURVIVED';
-  const painted = waitForWsText(ws, new RegExp(marker), 'large replay marker');
-  host.sendScrollback('replay-burst', 'X'.repeat(2048) + marker, request);
-  assert.match(await painted, new RegExp(marker));
-  assert.equal(ws.readyState, WebSocket.OPEN);
+  const output = waitForWsText(ws, /WEB_OK/, 'webshell live output frame');
+  host.sendOutput('webshell', 'WEB_OK\r\n');
+  assert.match(await output, /WEB_OK/);
   ws.close();
 });
 
@@ -2034,24 +1777,6 @@ test('late scrollback after the sbWait timeout still paints the screen (black-sc
   const painted = waitForWsText(ws, /IDLE_SB_MARKER/, 'late scrollback replay reaches the client');
   host.sendScrollback('idlecase', 'IDLE_SB_MARKER screen contents\r\n');
   assert.match(await painted, /IDLE_SB_MARKER/);      // old code: dropped -> this times out (screen stays black)
-  ws.close();
-});
-
-test('viewer replay resets leaked alternate-screen and mouse modes before painting', async t => {
-  const h = new RelayHarness();
-  await h.start();
-  t.after(async () => h.stop());
-  const host = await h.connectHost([commandSession('mode-reset', 'mode-reset-id', Date.now())]);
-  t.after(() => host.close());
-
-  const ws = new WebSocket(`ws://127.0.0.1:${h.port}/ws?session=mode-reset&cols=80&rows=24`);
-  await once(ws, 'open');
-  await host.waitFor(m => m.t === 'sb' && m.s === 'mode-reset', 'mode reset scrollback request');
-  const reset = waitForWsText(ws, /\x1b\[\?1049l/, 'terminal private-mode reset');
-  const painted = waitForWsText(ws, /VISIBLE_AFTER_RESET/, 'mode reset replay');
-  host.sendScrollback('mode-reset', 'VISIBLE_AFTER_RESET\r\n');
-  assert.match(await reset, /\x1b\[\?1000l/);
-  assert.match(await painted, /VISIBLE_AFTER_RESET/);
   ws.close();
 });
 
@@ -2176,21 +1901,6 @@ test('terminal tab strip converts hovered wheel input to horizontal scrolling', 
   assert.match(html, /flexDirection/);
   assert.match(html, /tabs\.scrollLeft \+= px/);
   assert.match(html, /\}, \{passive:false\}\);/);
-});
-
-test('terminal attachment boundaries reset emulator and alternate-buffer scrolling', () => {
-  const html = fs.readFileSync(path.join(REPO, 'public', 'index.html'), 'utf8');
-  assert.match(html, /function scrollAlternate\(deltaY\)/);
-  assert.match(html, /deltaY<0 \? '\\x1b\[5~' : '\\x1b\[6~'/);
-  assert.match(html, /if \(!isRetry\) term\.reset\(\);\s*resetTerminalSurface\(\)/);
-  assert.match(html, /autoFreeze=false;\s*selectMode=false;\s*_frozenBuf=\[\]/);
-  assert.match(html, /\\x1b\[\?1049l\\x1b\[\?25h/);
-});
-
-test('terminal boot does not synthesize or attach a missing URL session', () => {
-  const html = fs.readFileSync(path.join(REPO, 'public', 'index.html'), 'utf8');
-  assert.doesNotMatch(html, /list\.push\(\{name:select/);
-  assert.match(html, /session not found/);
 });
 
 test('browser mutations use the shared durable intent journal', () => {

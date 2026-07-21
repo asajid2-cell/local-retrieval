@@ -2178,10 +2178,10 @@ test('terminal tab strip converts hovered wheel input to horizontal scrolling', 
   assert.match(html, /\}, \{passive:false\}\);/);
 });
 
-test('terminal attachment boundaries reset emulator and alternate-buffer scrolling', () => {
+test('terminal attachment boundaries reset emulator, freeze, and forwarded-wheel state', () => {
   const html = fs.readFileSync(path.join(REPO, 'public', 'index.html'), 'utf8');
-  assert.match(html, /function scrollAlternate\(deltaY\)/);
-  assert.match(html, /deltaY<0 \? '\\x1b\[5~' : '\\x1b\[6~'/);
+  assert.match(html, /if\(e\.__muxForwardedWheel\) return/);
+  assert.match(html, /Object\.defineProperty\(forwarded,\s*'__muxForwardedWheel'/);
   assert.match(html, /if \(!isRetry\) term\.reset\(\);\s*resetTerminalSurface\(\)/);
   assert.match(html, /autoFreeze=false;\s*selectMode=false;\s*_frozenBuf=\[\]/);
   assert.match(html, /\\x1b\[\?1049l\\x1b\[\?25h/);

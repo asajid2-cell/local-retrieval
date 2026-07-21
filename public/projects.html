@@ -246,6 +246,7 @@
     <pre class="mbody" id="mbody"></pre>
   </div>
 </div>
+<script src="intent-journal.js"></script>
 <script>
 const $ = s => document.querySelector(s);
 const LS = { get:(k,d)=>{ try{ return JSON.parse(localStorage.getItem(k)) ?? d; }catch(e){ return d; } }, set:(k,v)=>{ try{ localStorage.setItem(k, JSON.stringify(v)); }catch(e){} } };
@@ -290,7 +291,7 @@ function archiveChats(){ return Array.isArray(data && data.allChats) ? data.allC
 function structSig(d){
   const cols=(d&&d.collections)||[];
   const all=(d&&d.allChats)||[];
-  const chatSig=ch=>chatKey(ch)+'~'+(ch.title||'')+'~'+(ch.tool||'')+'~'+(ch.muxName||'')+'~'+(ch.muxCommand?'1':'0')+'~'+(ch.collection||'');
+  const chatSig=ch=>chatKey(ch)+'~'+(ch.title||'')+'~'+(ch.tool||'')+'~'+(ch.muxName||'')+'~'+(ch.collection||'');
   return cols.map(c=> (c.id||'')+':'+(c.name||'')+'#'+(c.chats||[]).map(chatSig).join(',')).join('|')+'||all#'+all.map(chatSig).join(',');
 }
 function indexChats(){ const m={}; archiveChats().forEach(ch=>{ m[chatKey(ch)]=ch; }); (data.collections||[]).forEach(c=>(c.chats||[]).forEach(ch=>{ m[chatKey(ch)]=ch; })); return m; }
@@ -332,7 +333,7 @@ function setBtnState(btn, ch, muxNames, runIds){
   btn.classList.remove('running','warn'); btn.disabled=false; btn.title='';
   if(inMux){ btn.textContent='Attach'; btn.classList.add('running'); }
   else if(blocked){ btn.textContent=blocked.hostProtocolOk===false?'Stale':'Blocked'; btn.disabled=true; btn.title=blockerDetail(blocked); }
-  else if(!ch.muxName || (!ch.muxCommand && !canRelaunchMuxName(ch.muxName))){ btn.textContent='Unavailable'; btn.disabled=true; btn.title='No remote-resume command for this chat - open it from the desktop app.'; }
+  else if(!ch.muxName || (!ch.id && !canRelaunchMuxName(ch.muxName))){ btn.textContent='Unavailable'; btn.disabled=true; btn.title='No trusted session identity is available for this chat.'; }
   else if(localRun){ btn.textContent='Take over'; btn.classList.add('warn'); }
   else btn.textContent='Resume remote';
   btn.onclick=()=>{ if(!btn.disabled) resume(ch, inMux, localRun); };
@@ -428,7 +429,7 @@ function openDetail(id, origin){
   }
   el.appendChild(head);
   if(!all.length){ const e2=document.createElement('div'); e2.className='projempty'; e2.textContent='No chats in this collection yet.'; el.appendChild(e2); }
-  else all.forEach(ch=> el.appendChild(chatNode(ch, id==='__all__' ? (ch.collection||ch.workspace||'') : '')));
+  else all.forEach(ch=> el.appendChild(chatNode(ch, id==='__all__' ? (ch.collection||ch.workspaceLabel||'') : '')));
   $('#viewList').hidden=true; $('#projsearch').hidden=true;
   el.hidden=false; el.scrollTop=0;
   $('#backproj').hidden=false; $('#brandword').textContent=id==='__all__'?'all chats':'project';
@@ -452,7 +453,7 @@ function applyFilter(){
   if(all.length){
     all.forEach(ch=>{
       const coll=ch.collection||'';
-      const hay=((ch.title||ch.id||'')+' '+coll+' '+(ch.workspace||'')).toLowerCase();
+      const hay=((ch.title||ch.id||'')+' '+coll+' '+(ch.workspaceLabel||'')).toLowerCase();
       if(hay.includes(q)) hits.push({ch, coll:coll||'All chats'});
     });
   } else {
@@ -532,8 +533,9 @@ function renameNative(s, row){
     stat.textContent='saving…';
     let id=null;
     try{
-      const r=await fetch('api/app-commands',{method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({type:'rename', sessionId:s.sessionId, tool:s.tool, title})});
+      const r=await postIntent('api/app-commands',
+        {type:'rename', sessionId:s.sessionId, tool:s.tool, title},
+        'rename-native');
       if(!r.ok) throw new Error(await apiError(r));
       id=(await r.json()).id;
     }catch(e){ stat.textContent='couldn’t send ('+(e.message||e)+')'; return; }
@@ -561,8 +563,9 @@ async function openTranscript(s){
   if(!bridgeLive()){ setModalBody('The PC bridge is not live right now, so it cannot read the transcript. Open the app or bridge and try again.'); return; }
   let id=null;
   try{
-    const r=await fetch('api/app-commands',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({type:'transcript', sessionId:s.sessionId, tool:s.tool})});
+    const r=await postIntent('api/app-commands',
+      {type:'transcript', sessionId:s.sessionId, tool:s.tool},
+      'transcript');
     if(!r.ok) throw new Error(await apiError(r));
     id=(await r.json()).id;
   }catch(e){ setModalBody('Could not request the transcript ('+(e.message||e)+').'); return; }
@@ -645,8 +648,9 @@ async function killSession(s, row, btn){
   // Local non-mux agents are controlled by the desktop app bridge.
   let id=null;
   try{
-    const r=await fetch('api/app-commands',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({type:'kill', sessionId:s.sessionId||'', pid:s.pid||0, label})});
+    const r=await postIntent('api/app-commands',
+      {type:'kill', sessionId:s.sessionId||'', pid:s.pid||0, label},
+      'kill-local');
     if(!r.ok) throw new Error(await apiError(r));
     id=(await r.json()).id;
   }catch(e){ btn.disabled=false; row.classList.remove('killing'); btn.textContent='Kill'; alert('Could not queue the kill ('+(e.message||e)+').'); return; }
@@ -743,7 +747,9 @@ async function submitWsCol(target){
   for(const t of _wsTabs){
     const tab = typeof t==='string' ? { name:t, muxName:t, sessionId:'' } : t;
     try{
-      const r=await fetch('api/app-commands',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({type:'addtocollection', muxName:tab.muxName||tab.name, sessionName:tab.name, sessionId:tab.sessionId||'', tool:tab.tool||'', collection:name, collectionId:target.collectionId||'', deckId:choice.deckId||'', deckName:choice.deckName||''})});
+      const r=await postIntent('api/app-commands',
+        {type:'addtocollection', muxName:tab.muxName||tab.name, sessionName:tab.name, sessionId:tab.sessionId||'', tool:tab.tool||'', collection:name, collectionId:target.collectionId||'', deckId:choice.deckId||'', deckName:choice.deckName||''},
+        'add-collection');
       if(!r.ok) throw new Error(await apiError(r));
       const queued=await r.json();
       const done=await awaitCmdResult(queued.id, 20000);
@@ -766,7 +772,9 @@ function runningSessionForChat(ch){
 async function stopLocalCopyForRelaunch(ch){
   const rs=runningSessionForChat(ch);
   if(!rs) return {ok:false, detail:'running process not identified'};
-  const r=await fetch('api/app-commands',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({type:'kill', sessionId:ch.id||'', pid:rs.pid||0, label:ch.title||ch.muxName})});
+  const r=await postIntent('api/app-commands',
+    {type:'kill', sessionId:ch.id||'', pid:rs.pid||0, label:ch.title||ch.muxName},
+    'kill-local');
   if(!r.ok) return {ok:false, detail:await apiError(r)};
   const queued=await r.json();
   return await awaitCmdResult(queued.id, 20000);
@@ -775,7 +783,7 @@ async function stopLocalCopyForRelaunch(ch){
 // ---- Relaunch collection: KILL any of a collection's chats currently running in multiplex, then restart
 // them all fresh (re-run each chat's resume command). Right-click a collection row, or the ↻ in the header.
 async function relaunchCollection(c){
-  const chats=(c.chats||[]).filter(ch=>ch.muxName && (ch.muxCommand || canRelaunchMuxName(ch.muxName)));
+  const chats=(c.chats||[]).filter(ch=>ch.muxName && (ch.id || canRelaunchMuxName(ch.muxName)));
   if(!chats.length){ alert('No resumable chats in “'+(c.name||'this collection')+'” — open them once from the desktop app to link them.'); return; }
   const blocked=chats.map(ch=>sessionBlocker(ch.muxName)).filter(Boolean);
   if(blocked.length){ alert('Cannot relaunch yet: '+blocked.length+' mux session'+(blocked.length!==1?'s are':' is')+' blocked/stale. Fix the blocker first; not falling back to a legacy path.'); return; }
@@ -785,8 +793,8 @@ async function relaunchCollection(c){
   let ok=0, fail=0;
   for(const ch of chats){
     try{
-      const body=ch.muxCommand?{command:ch.muxCommand}:{};
-      const res=await fetch('api/sessions/'+encodeURIComponent(ch.muxName)+'/relaunch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+      const body={sessionId:ch.id||'', tool:ch.tool||''};
+      const res=await postIntent('api/sessions/'+encodeURIComponent(ch.muxName)+'/relaunch',body,'relaunch');
       if(res.ok) ok++; else throw new Error(await apiError(res));
     }catch(e){ fail++; }
   }
@@ -812,45 +820,14 @@ function closeCollMenu(){ const m=document.getElementById('collmenu'); if(m) m.r
 document.addEventListener('click', e=>{ if(!e.target.closest('#collmenu')) closeCollMenu(); });
 document.addEventListener('keydown', e=>{ if(e.key==='Escape') closeCollMenu(); });
 
-async function legacyResume(ch, inMux, localRun){
-  const name=ch.muxName; if(!name){ alert('No remote-resume info for this chat'); return; }
-  if(!inMux){
-    if(!ch.muxCommand){ alert('No resume command for this chat — open it from the desktop app.'); return; }
-    // SAFE TAKE-OVER. If this chat is already running on the PC, starting a 2nd `claude --resume` of the
-    // same id = two writers on one transcript → Claude forks the new work into a hidden branch (that's the
-    // "branch glitch" that loses work). So we STOP the running copy first, then resume as the sole writer.
-    if(localRun){
-      const rs=(Array.isArray(data.runningSessions)?data.runningSessions:[]).find(r=>String(r.sessionId||'')===String(ch.id||''));
-      if(!confirm('“'+(ch.title||name)+'” is already running on your PC.\n\nTo avoid forking its transcript (which is how work gets lost), I’ll STOP the running copy first, then resume it here as the only writer.\n\nProceed?')) return;
-      if(rs){
-        // Single-writer rule: we MUST confirm the running copy is dead before resuming. If we can't,
-        // we ABORT (never fork). No "resume anyway" escape hatch — that's exactly what lost the work.
-        try{
-          const r=await fetch('api/app-commands',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({type:'kill', sessionId:ch.id||'', pid:rs.pid||0, label:ch.title||name})});
-          if(!r.ok) throw new Error(await apiError(r));
-          const ok=await awaitCmd((await r.json()).id, 15000);
-          if(!ok){ alert('Couldn’t confirm the running copy stopped — NOT resuming (that would fork and lose work). Kill it from the running view, then try again.'); return; }
-        }catch(e){ alert('Couldn’t stop the running copy ('+(e.message||e)+') — NOT resuming, to protect your transcript. Kill it manually first.'); return; }
-      } else {
-        // marked running but no pid we can target — refuse rather than risk a fork
-        alert('This chat looks like it’s running but I can’t identify the process to stop it safely. Kill it from the running view first, then resume.'); return;
-      }
-    }
-    try{ const res=await fetch('api/sessions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name, command:ch.muxCommand})});
-         if(!res.ok) throw new Error(await apiError(res)); }
-    catch(e){ alert('Could not start the remote session ('+(e.message||e)+').\nNot opening the terminal.'); return; }
-  }
-  location.href = './?s='+encodeURIComponent(name);
-}
-
 async function resume(ch, inMux, localRun){
   const name=ch.muxName; if(!name){ alert('No remote-resume info for this chat'); return; }
   if(inMux){ location.href = './?s='+encodeURIComponent(name); return; }
-  if(!ch.muxCommand && !canRelaunchMuxName(name)){ alert('No saved resume command for this chat - open it once from the desktop app.'); return; }
+  if(!ch.id && !canRelaunchMuxName(name)){ alert('No trusted session identity is available for this chat.'); return; }
   if(localRun && !confirm('"'+(ch.title||name)+'" is already running on your PC.\n\nI will stop that copy first, then restart it in mux so there is only one transcript writer.\n\nProceed?')) return;
   try{
-    const body=ch.muxCommand?{command:ch.muxCommand}:{};
-    const res=await fetch('api/sessions/'+encodeURIComponent(name)+'/relaunch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const body={sessionId:ch.id||'', tool:ch.tool||''};
+    const res=await postIntent('api/sessions/'+encodeURIComponent(name)+'/relaunch',body,'relaunch');
     if(!res.ok) throw new Error(await apiError(res));
   }
   catch(e){ alert('Could not relaunch the session ('+(e.message||e)+').\nNot opening the terminal.'); return; }
