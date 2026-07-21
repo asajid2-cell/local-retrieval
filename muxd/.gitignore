@@ -1,0 +1,10 @@
+muxd.env
+muxd.log*
+muxd-*.log
+muxd.crash
+sessions.json
+*.json.bak
+*.deploy-*.bak
+.token.tmp
+profile-backups/
+__pycache__/
