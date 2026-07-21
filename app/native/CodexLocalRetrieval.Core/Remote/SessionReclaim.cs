@@ -413,8 +413,16 @@ public static class SessionReclaim
         var refused = report.Claims.Count(c => c.Outcome == ReclaimClearOutcome.RefusedAliveOwner);
         if (refused > 0)
             return "A live launch reservation still holds this chat; nothing was relaunched.";
-        var failed = report.Claims.Count(c => c.Outcome == ReclaimClearOutcome.Failed);
-        if (failed > 0) return "A launch reservation could not be cleared; nothing was relaunched.";
+        var failedClaims = report.Claims.Where(c => c.Outcome == ReclaimClearOutcome.Failed).ToList();
+        if (failedClaims.Count > 0)
+        {
+            // Surface the actual reason instead of a generic line: the claim's Detail carries the cleanup error
+            // (e.g. "claim cleanup failed: The process cannot access the file because it is being used by another
+            // process"), which is what the operator needs to see in the status bar to know WHY nothing relaunched.
+            var reason = failedClaims[0].Detail;
+            if (failedClaims.Count > 1) reason += $" (+{failedClaims.Count - 1} more)";
+            return "A launch reservation could not be cleared (" + reason + "); nothing was relaunched.";
+        }
         if (report.LostLaunchRace) return LostRaceDetail + "; this chat was not launched twice.";
         if (report.Relaunched) return "Reclaimed and relaunched.";
         return report.KillOk

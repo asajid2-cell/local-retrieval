@@ -385,6 +385,70 @@ public class SessionReclaimTests
         Assert.IsGreaterThan(claim.CreatedUtc, relaunchClaim.CreatedUtc, "the reservation must be a new one, not the cleared one");
     }
 
+    // ---- the reclaim-strand repro: a clear that FAILS must be reported, not swallowed ----------------
+
+    // A real user hit this: reclaim cleared the danger (killed the owner) but its claim-file cleanup FAILED with
+    // a file-in-use error, so the reservation stayed on disk. The old headline collapsed that to the generic
+    // "A launch reservation could not be cleared; nothing was relaunched." — the operator never saw WHY. Here we
+    // force a genuine Failed clear (an expired claim whose quarantine delete throws because the file is
+    // read-only) and assert the report surfaces the actual cleanup detail. Then we assert the post-state — the
+    // reservation still present while overall severity has dropped to warn — still leaves Reclaim available.
+    [TestMethod]
+    public async Task Reclaim_WhenAClaimClearFails_SurfacesTheFailureDetail_AndKeepsReclaimAvailable()
+    {
+        RequireWindows();
+        var claimRoot = TempDir();
+        var now = DateTimeOffset.UtcNow;
+        const string sid = "session-clear-fails";
+
+        // An expired reservation (tier 1 clears it freely) whose file we mark read-only, so the quarantine move
+        // succeeds but the follow-up delete throws — the generic-catch Failed path with a real cleanup message.
+        var claim = WriteClaim(claimRoot, sid, ownerPid: 4242, now.AddMinutes(-5), now.AddMinutes(-3));
+        File.SetAttributes(claim.Path, File.GetAttributes(claim.Path) | FileAttributes.ReadOnly);
+
+        var launched = 0;
+        var report = await SessionReclaim.ExecuteAsync(new ReclaimOptions
+        {
+            CandidateIds = new[] { sid },
+            ClaimOptions = new SessionLaunchClaims.Options(RootDirectory: claimRoot),
+            Now = now,
+            // Hermetic: no real owner to hunt; the clear failure is the whole point.
+            Kill = _ => new RunningSessions.KillResult(true, "no owners", Array.Empty<ReclaimKilledPid>()),
+            LaunchRequest = Request(sid),
+            Launch = () => { Interlocked.Increment(ref launched); return Task.FromResult((true, "must not run")); },
+        });
+
+        // The clear failed and reported the actual reason...
+        var failed = report.Claims.Single();
+        Assert.AreEqual(ReclaimClearOutcome.Failed, failed.Outcome, failed.Detail);
+        StringAssert.Contains(failed.Detail, "claim cleanup failed", failed.Detail);
+
+        // ...and that reason now reaches the headline instead of the old generic line.
+        StringAssert.Contains(report.Headline, failed.Detail);
+        Assert.AreNotEqual(
+            "A launch reservation could not be cleared; nothing was relaunched.",
+            report.Headline,
+            "the failing reason must be surfaced, not collapsed to the generic line");
+
+        // Nothing was relaunched over an unresolved reservation.
+        Assert.AreEqual(0, launched, "a blocking claim must not relaunch");
+        Assert.IsFalse(report.Relaunched);
+        Assert.IsTrue(report.AnyClaimBlocking);
+
+        // Post-state: the danger is gone but the reservation is still on disk, so severity is only "warn". The
+        // Reclaim affordance must survive that drop — the exact state where the button used to disappear.
+        var postState = new SessionIntegritySummary
+        {
+            Severity = "warn",
+            LaunchClaims = new[]
+            {
+                new SessionIntegrityClaim(sid, new[] { sid }, 0, "seed", "", "test", Expired: true, failed.Path),
+            },
+        };
+        Assert.IsTrue(SessionIntegrity.ReclaimAvailable(postState),
+            "a still-present reservation must keep Reclaim available even after severity drops to warn");
+    }
+
     // ---- H1 + [F#5] ---------------------------------------------------------------------------------
 
     // Governed mux creates refuse (and say so in the ledger) when the lease cannot be taken...

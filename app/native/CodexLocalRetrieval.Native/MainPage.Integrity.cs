@@ -89,9 +89,13 @@ public sealed partial class MainPage
     // M7. Reclaim is the take-control op, so its affordance may never depend on the oracle that take-control
     // exists to work around. ANY danger blocker offers it — including "could not verify" and the error-event
     // case, which is precisely what the old exact-id + {Live owner, Launch claim} gating hid: one
-    // `resume.failed.terminal` in the ledger used to lock the recovery UI permanently.
+    // `resume.failed.terminal` in the ledger used to lock the recovery UI permanently. It also stays offered
+    // while any launch reservation is still on disk (expired or active) even after severity has dropped to
+    // "warn": a Reclaim that kills the live owner but then FAILS to delete the expired claim file must not
+    // remove the only affordance left to retry. The rule lives in Core (SessionIntegrity.ReclaimAvailable) so it
+    // is unit-testable; this just delegates.
     private static bool CanReclaim(SessionIntegritySummary summary)
-        => string.Equals(summary.Severity, "danger", StringComparison.OrdinalIgnoreCase);
+        => SessionIntegrity.ReclaimAvailable(summary);
 
     private Button IntegrityReclaimButton()
     {

@@ -149,6 +149,17 @@ public static class SessionIntegrity
         };
     }
 
+    // The Reclaim take-control affordance predicate, kept here so it is unit-testable away from the UI. Reclaim
+    // must stay reachable while ANY launch-claim integrity item is unresolved, not only while overall severity
+    // is "danger". After Reclaim kills a live owner (which clears the danger) but then FAILS to delete an expired
+    // claim file, severity drops to "warn" while the launch reservation is still on disk — the exact state in
+    // which the button used to vanish and strand the user with no way to retry. So: available on danger, OR
+    // whenever any launch reservation (expired or active) is still present for this session.
+    public static bool ReclaimAvailable(SessionIntegritySummary summary)
+        => summary is not null
+           && (string.Equals(summary.Severity, "danger", StringComparison.OrdinalIgnoreCase)
+               || summary.LaunchClaims.Count > 0);
+
     private static (bool Verified, HashSet<string> LiveIds, string Detail) DefaultLiveIds()
     {
         var verified = RunningSessions.TryAllLiveSessionIds(out var live, out var detail);

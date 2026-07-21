@@ -82,6 +82,52 @@ public sealed class SessionIntegrityTests
         Assert.IsTrue(summary.LaunchClaims[0].Expired);
     }
 
+    // The reclaim-strand repro: Reclaim killed the live owner (danger cleared) but its claim-file cleanup FAILED,
+    // so the only remaining launch-claim state is an EXPIRED reservation still on disk and overall severity has
+    // dropped to "warn". The take-control affordance must survive that drop — otherwise the panel keeps showing
+    // "Expired launch reservation files are still present" with no button left to retry.
+    [TestMethod]
+    public void ReclaimAvailable_StaysTrue_WhileAnExpiredLaunchReservationRemains()
+    {
+        using var claims = TempDir("integrity-claims");
+        var created = DateTimeOffset.Parse("2026-07-08T12:00:00Z");
+        var now = created.AddMinutes(3);
+        var (store, session) = Seed(filed: true);
+
+        Assert.IsTrue(SessionLaunchClaims.TryAcquire(
+            session.Id,
+            null,
+            "test expired claim",
+            out var claim,
+            out var detail,
+            _ => false,
+            new SessionLaunchClaims.Options(claims.Path, TimeSpan.FromMinutes(1), created)), detail);
+        claim!.RetainUntilExpiry();
+        claim.Dispose();
+
+        var summary = Build(store, session, claimRoot: claims.Path, now: now);
+
+        Assert.AreEqual("warn", summary.Severity, "an expired-only reservation scores warn, not danger");
+        Assert.IsTrue(summary.LaunchClaims[0].Expired);
+        Assert.IsTrue(SessionIntegrity.ReclaimAvailable(summary),
+            "Reclaim must stay available while a launch reservation is still on disk, even at warn severity");
+    }
+
+    // ...but the affordance must NOT become permanent noise: a warn with no launch reservation at all (here, an
+    // unfiled chat) offers no Reclaim, because there is nothing for take-control to take.
+    [TestMethod]
+    public void ReclaimAvailable_IsFalse_ForAWarnWithNoLaunchReservation()
+    {
+        var (store, session) = Seed(filed: false);
+
+        var summary = Build(store, session);
+
+        Assert.AreEqual("warn", summary.Severity, "an unfiled chat scores warn on Filing alone");
+        Assert.AreEqual(0, summary.LaunchClaims.Count);
+        Assert.IsFalse(SessionIntegrity.ReclaimAvailable(summary),
+            "with no danger and no reservation on disk there is nothing to reclaim");
+    }
+
     [TestMethod]
     public void Build_DangerWhenSourceFileIsMissing()
     {
