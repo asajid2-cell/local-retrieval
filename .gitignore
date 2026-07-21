@@ -3,3 +3,9 @@ node_modules/
 *.log
 artifacts/
 live-tabs.json
+
+# deploy backup noise
+*.backup-*
+*.bak
+*.pre-schema*
+*.pre-*hardening
