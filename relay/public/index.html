@@ -126,7 +126,7 @@
   /* "pan" = the shared window is wider than this screen: let the user drag horizontally.
      Vertical history belongs to xterm's scrollback, never to a browser wrapper scrollbar. */
   #term.pan { overflow-x:auto; overflow-y:hidden; touch-action:pan-x; }
-  #term.pan .xterm { width:max-content !important; min-width:100%; }
+  #term.pan .xterm, #term.pan .xterm-viewport, #term.pan .xterm-screen { width:max-content !important; }
   /* When the shared terminal is taller than the visible phone pane, scroll the host to the live rows.
      Do not transform .xterm itself; stale transforms can clip the renderer into a mostly black viewport. */
   #term.rowpan { overflow-y:auto; overscroll-behavior:contain; touch-action:pan-x pan-y; }
@@ -693,6 +693,7 @@
 
 <script src="vendor/xterm.js"></script>
 <script src="vendor/addon-fit.js"></script>
+<script src="intent-journal.js"></script>
 <script>
 const $ = s => document.querySelector(s);
 const base = location.pathname.replace(/\/[^/]*$/, '') || '';
@@ -715,8 +716,7 @@ function setMobileView(view, persist=true){
     b.setAttribute('aria-pressed', on?'true':'false');
   });
   if(isMobile() && view!=='sessions'){
-    scheduleViewportFit(0);
-    setTimeout(()=>{ try{ term.focus(); }catch(e){} }, 60);
+    setTimeout(()=>{ applyViewport(); try{ term.focus(); }catch(e){} }, 60);
   }
 }
 function syncMobileView(){
@@ -726,7 +726,7 @@ function syncMobileView(){
   else {
     MOBILE_VIEWS.forEach(v=>app.classList.remove('mobile-view-'+v));
     document.querySelectorAll('[data-mobile-view]').forEach(b=>{ b.classList.remove('active'); b.setAttribute('aria-pressed','false'); });
-    scheduleViewportFit(0);
+    setTimeout(applyViewport, 60);
   }
 }
 function initMobileViews(){
@@ -749,6 +749,8 @@ term.loadAddon(fit);
 term.open($('#term'));
 let paintHealTimer=0;
 let userScrolledAt=0, userScrollSerial=0;
+let viewportRestoreRaf=0, viewportRestoreGeneration=0, viewportRestoreApplying=false;
+let viewportRestoreOwner='', viewportRestoreCarriesWriteState=false;
 let lastPaintRecoverAt=0;
 function healTerminalPaint(){
   try{
@@ -844,23 +846,55 @@ function schedulePaintHeal(delay=60){
     requestAnimationFrame(()=>{ healTerminalPaint(); requestAnimationFrame(()=>{ healTerminalPaint(); verifyTerminalPaint('scheduled'); }); });
   }, delay);
 }
-function noteUserScroll(){ userScrolledAt=Date.now(); userScrollSerial++; }
+function cancelViewportRestore(){
+  viewportRestoreGeneration++;
+  if(viewportRestoreRaf) cancelAnimationFrame(viewportRestoreRaf);
+  viewportRestoreRaf=0;
+  viewportRestoreOwner='';
+  viewportRestoreCarriesWriteState=false;
+}
+function noteUserScroll(){
+  userScrolledAt=Date.now();
+  userScrollSerial++;
+  termWriteViewportState=null;
+  cancelViewportRestore();
+}
 function captureTermViewport(){
   try{
     const b=term.buffer.active;
     return { viewportY:b.viewportY, baseY:b.baseY, wasBottom:b.viewportY>=b.baseY };
   }catch(e){ return null; }
 }
-function restoreTermViewport(st, serial){
+function restoreTermViewport(st, serial, onDone, owner='generic'){
   if(!st) return;
-  requestAnimationFrame(()=>{
-    if(serial!==undefined && serial!==userScrollSerial) return;
+  const canceledOwner=viewportRestoreOwner;
+  const canceledCarriesWriteState=viewportRestoreCarriesWriteState;
+  cancelViewportRestore();
+  const carriesWriteState=owner==='write' || canceledOwner==='write' || canceledCarriesWriteState;
+  if(carriesWriteState && owner!=='write'){
+    termWriteViewportState=st;
+    termWriteScrollSerial=serial;
+  }
+  const generation=viewportRestoreGeneration;
+  viewportRestoreOwner=owner;
+  viewportRestoreCarriesWriteState=carriesWriteState;
+  viewportRestoreRaf=requestAnimationFrame(()=>{
+    viewportRestoreRaf=0;
+    viewportRestoreOwner='';
+    viewportRestoreCarriesWriteState=false;
+    if(generation!==viewportRestoreGeneration){ if(onDone) onDone(false); return; }
+    if(serial!==undefined && serial!==userScrollSerial){ if(onDone) onDone(false); return; }
     try{
       const b=term.buffer.active;
+      viewportRestoreApplying=true;
       if(st.wasBottom && Date.now()-userScrolledAt>500) term.scrollToBottom();
       else term.scrollToLine(Math.max(0, Math.min(st.viewportY, b.baseY)));
+      viewportRestoreApplying=false;
       showJump();
-    }catch(e){}
+      if(carriesWriteState && owner!=='write' && !termWriting && !termWriteQueue.length && termWriteViewportState===st)
+        termWriteViewportState=null;
+      if(onDone) onDone(true);
+    }catch(e){ viewportRestoreApplying=false; if(onDone) onDone(false); }
   });
 }
 function preserveTermViewport(fn){
@@ -874,14 +908,19 @@ let termWriteQueue = [];
 let termWriting = false;
 let termWriteEpoch = 0;
 let terminalWriteActive = 0;
+let termWriteViewportState = null;
+let termWriteScrollSerial = 0;
+let termWriteToken = 0;
+let activeTermWriteToken = 0;
+let lastWritePaintHealAt = 0;
+let _wedgeStrikes=0;
 let termWriteStartedAt = 0;   // when the in-flight term.write began — a wedged callback (no fire, no throw) is detected off this
 function clearTermWriteQueue(){
   termWriteEpoch++;
   termWriteQueue = [];
-  if(terminalWriteActive===0){
-    termWriting = false;
-    termWriteStartedAt = 0;
-  }
+  if(!termWriting) termWriteStartedAt = 0;
+  termWriteViewportState = null;
+  cancelViewportRestore();
 }
 function enqueueTermWrite(bytes){
   const src = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
@@ -895,27 +934,44 @@ function pumpTermWrite(){
   if(termWriting) return;
   while(termWriteQueue.length && termWriteQueue[0].epoch !== termWriteEpoch) termWriteQueue.shift();
   if(!termWriteQueue.length) return;
+  if(!termWriteViewportState){
+    termWriteViewportState = captureTermViewport();
+    termWriteScrollSerial = userScrollSerial;
+    lastWritePaintHealAt = Date.now();
+  }
   const item = termWriteQueue.shift();
+  const writeToken = ++termWriteToken;
+  activeTermWriteToken = writeToken;
   termWriting = true;
   termWriteStartedAt = Date.now();
-  const scrollState = captureTermViewport();
-  const scrollSerial = userScrollSerial;
   terminalWriteActive++;
   try{
     term.write(item.chunk, ()=>{
+      if(writeToken !== activeTermWriteToken) return;
       terminalWriteActive = Math.max(0, terminalWriteActive-1);
+      _wedgeStrikes=0;
       termWriting = false;
       termWriteStartedAt = 0;
-      if(item.epoch !== termWriteEpoch){
-        if(termWriteQueue.length) setTimeout(pumpTermWrite, 0);
+      if(item.epoch !== termWriteEpoch){ pumpTermWrite(); return; }
+      if(termWriteQueue.length){
+        if(Date.now()-lastWritePaintHealAt>250){
+          lastWritePaintHealAt=Date.now();
+          schedulePaintHeal(20);
+        }
+        setTimeout(pumpTermWrite, 0);
         return;
       }
-      restoreTermViewport(scrollState, scrollSerial);
-      schedulePaintHeal(20);
-      if(termWriteQueue.length) setTimeout(pumpTermWrite, 0);
-      else showJump();
+      const scrollState=termWriteViewportState, scrollSerial=termWriteScrollSerial;
+      lastWritePaintHealAt=Date.now();
+      restoreTermViewport(scrollState, scrollSerial, ()=>{
+        if(!termWriting && !termWriteQueue.length && termWriteViewportState===scrollState)
+          termWriteViewportState=null;
+      }, 'write');
+      schedulePaintHeal(40);
+      showJump();
     });
   }catch(e){
+    if(writeToken !== activeTermWriteToken) return;
     terminalWriteActive = Math.max(0, terminalWriteActive-1);
     termWriting = false;
     termWriteStartedAt = 0;
@@ -930,17 +986,18 @@ function pumpTermWrite(){
 // A document-level mouseup catches (1) the instant you release anywhere; a slow watchdog is the backstop
 // for both, so a stuck tab always self-heals within ~2s instead of needing a reload.
 document.addEventListener('mouseup', ()=>{ setTimeout(()=>{ if(autoFreeze && !selectMode && !(term.hasSelection && term.hasSelection())){ autoFreeze=false; flushFrozen(); } }, 0); }, true);
-let _wedgeStrikes=0;
 setInterval(()=>{
   if(autoFreeze && !selectMode && !(term.hasSelection && term.hasSelection())){ autoFreeze=false; flushFrozen(); }   // (1) lost-mouseup unfreeze
   if(termWriting && termWriteStartedAt && Date.now()-termWriteStartedAt > 4000){                                     // (2) wedged write pump
     _wedgeStrikes++;
+    activeTermWriteToken=++termWriteToken;
+    terminalWriteActive=0;
     termWriting=false; termWriteStartedAt=0; try{ term.refresh(0, Math.max(0, term.rows-1)); }catch(e){}
     // Resuming the pump usually clears it. If it wedges AGAIN next tick, the terminal itself is stuck —
     // escalate to a full re-attach (muxd replays scrollback, so nothing is lost) rather than stay frozen.
-    if(_wedgeStrikes>=2 && current){ _wedgeStrikes=0; reloadTerminal(true); }
+    if((_wedgeStrikes>=2 || !termWriteQueue.length) && current){ _wedgeStrikes=0; reloadTerminal(true); }
     else pumpTermWrite();
-  } else { _wedgeStrikes=0; }
+  }
 }, 2000);
 // Nuclear unstick for ANY frozen/unscrollable state: re-attach the session. The PC keeps running and
 // muxd replays the scrollback, so this only costs a ~1s repaint. Wired to Ctrl+Alt+R, the tab menu's
@@ -950,12 +1007,12 @@ function reloadTerminal(quiet){
   autoFreeze=false; selectMode=false; _frozenBuf=[]; _wedgeStrikes=0;
   $('#term').classList.remove('selecting');
   try{ term.clearSelection(); }catch(e){}
-  try{ term.write('\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l'); }catch(e){}   // clear any stuck mouse-tracking mode
+  try{ term.write('\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l\x1b[?2004l\x1b[?1049l\x1b[?25h'); }catch(e){}
   if(!quiet) flash('Reloading terminal…');
   connect(name, true);   // re-attach: CLEAR + scrollback replay + live, all client state reset
 }
 document.addEventListener('keydown', e=>{ if(e.ctrlKey && e.altKey && (e.key==='r'||e.key==='R')){ e.preventDefault(); e.stopPropagation(); reloadTerminal(); } }, true);
-window.__muxBuild='2026-07-15-wheelscroll';   // bump per web deploy so a loaded version is verifiable
+window.__muxBuild='2026-07-12-mobile-ime-viewport-hardening';   // bump per web deploy so a loaded version is verifiable
 try{ console.info('multiplex build', window.__muxBuild); }catch(e){}
 const helper = $('#term').querySelector('.xterm-helper-textarea');
 function hardenHelperTextarea(){
@@ -990,9 +1047,13 @@ hardenHelperTextarea();
 // the last value — backspaces (\x7f) for removed chars + the new tail — so typing, backspace, AND autocorrect
 // -replace all send the minimal correct edit. Capture-phase + stopImmediatePropagation keeps xterm from ALSO
 // forwarding the full buffer. Desktop is untouched (xterm's normal path). Opt out with ?legacyinput=1.
-let _taLast='', _taComposing=false;
+let _taLast='', _taComposing=false, _taCommittedValue='', _taCommittedAt=0;
+let mobileDeltaInstalled=false;
 const _mobileDeltaOn = !/[?&]legacyinput=1/.test(location.search);
-function resetTaDelta(clear){ _taLast=''; if(clear){ try{ const h=$('#term').querySelector('.xterm-helper-textarea'); if(h) h.value=''; }catch(e){} } }
+function resetTaDelta(clear){
+  _taLast=''; _taComposing=false; _taCommittedValue=''; _taCommittedAt=0;
+  if(clear){ try{ const h=$('#term').querySelector('.xterm-helper-textarea'); if(h) h.value=''; }catch(e){} }
+}
 function taFlushDelta(h){
   const v = h.value || '', prev = _taLast;
   let cp=0; const L=Math.min(v.length, prev.length);
@@ -1008,18 +1069,47 @@ function taFlushDelta(h){
   if(!out) return;
   markActive();
   if(autoFreeze && !selectMode){ autoFreeze=false; try{ term.clearSelection(); }catch(e){} flushFrozen(); }
-  _lastDeltaSendAt = Date.now();
   logMobileInputEvent('delta-send', { data: out, v, prev });
   send('i', out);
 }
-let _lastDeltaSendAt=0;
 function installMobileInputDelta(){
   const h=$('#term').querySelector('.xterm-helper-textarea'); if(!h || h.dataset.muxDelta) return;
   h.dataset.muxDelta='1';
+  mobileDeltaInstalled=_mobileDeltaOn;
   const on=()=>isMobile() && _mobileDeltaOn;
-  h.addEventListener('compositionstart', ()=>{ if(on()) _taComposing=true; }, true);
-  h.addEventListener('compositionend', ev=>{ if(!on()) return; _taComposing=false; taFlushDelta(h); ev.stopImmediatePropagation(); }, true);
-  h.addEventListener('input', ev=>{ if(!on()) return; taFlushDelta(h); ev.stopImmediatePropagation(); }, true);
+  h.addEventListener('compositionstart', ev=>{
+    if(!on()) return;
+    _taComposing=true;
+    ev.stopImmediatePropagation();
+  }, true);
+  h.addEventListener('compositionupdate', ev=>{ if(on()) ev.stopImmediatePropagation(); }, true);
+  h.addEventListener('compositionend', ev=>{
+    if(!on()) return;
+    _taComposing=false;
+    taFlushDelta(h);
+    _taCommittedValue=h.value||'';
+    _taCommittedAt=Date.now();
+    ev.stopImmediatePropagation();
+  }, true);
+  h.addEventListener('input', ev=>{
+    if(!on()) return;
+    if(_taComposing || ev.isComposing){
+      ev.stopImmediatePropagation();
+      return;
+    }
+    const v=h.value||'';
+    if(v===_taCommittedValue && Date.now()-_taCommittedAt<250){
+      _taCommittedValue='';
+      ev.stopImmediatePropagation();
+      return;
+    }
+    _taCommittedValue='';
+    taFlushDelta(h);
+    ev.stopImmediatePropagation();
+  }, true);
+  h.addEventListener('keydown', ev=>{
+    if(on() && ev.key && ev.key.length===1 && !ev.ctrlKey && !ev.altKey && !ev.metaKey) ev.stopImmediatePropagation();
+  }, true);
   // Enter/Escape go through xterm's keydown (we don't block those); resync our buffer to the fresh line after.
   h.addEventListener('keydown', ev=>{ if(on() && (ev.key==='Enter'||ev.key==='Escape')) setTimeout(()=>resetTaDelta(true), 0); }, true);
   h.addEventListener('blur', ()=>{ if(on()) resetTaDelta(true); }, true);
@@ -1078,8 +1168,7 @@ async function pasteImageToPrompt(blob, type){
     const list = await (await fetch(base+'/api/uploads?session='+encodeURIComponent(current))).json();
     const f = (Array.isArray(list)?list:[]).find(x=>x.name===name);
     if(!f || !f.id) throw new Error('upload not registered');
-    const path = await ensureOnPc({ id:f.id, name, keep:false });    // transfer to the PC (needs the app open, like file upload)
-    send('i', path);
+    await insertUploadIntoPrompt({ id:f.id, name, keep:false }, 'path');
     term.focus();
     flash('Pasted image → its PC path is in your prompt');
   }catch(err){ flash('Image paste failed: '+(err.message||err)); }
@@ -1138,7 +1227,7 @@ let wasRowOverflow=false;
 function alignTerminalSurface(){
   const host=$('#term'), xt=host.querySelector('.xterm');
   if(!xt) return;
-  const rowOverflow = !!(winSize && viewportFit && winSize.rows > viewportFit.rows+1);
+  const rowOverflow = !!(isMobile() && winSize && viewportFit && winSize.rows > viewportFit.rows+1);
   host.classList.toggle('rowpan', rowOverflow);
   if(!rowOverflow){
     xt.style.transform='';
@@ -1189,70 +1278,26 @@ function updateSizeBtn(){ const b=$('#sizebtn'); if(!b) return;
                 : 'Window size pinned to “'+(sizePinLabel||'another device')+'”. Tap to take over (pin to THIS device); long-press to pin another.')
     : 'Auto size (widest active device). Tap to pin the window to THIS device for everyone; long-press to pin another.';
 }
+let _altScrollAt=0;
+function scrollAlternate(deltaY){
+  const now=Date.now();
+  if(!deltaY || now-_altScrollAt<90) return;
+  _altScrollAt=now;
+  send('i', deltaY<0 ? '\x1b[5~' : '\x1b[6~');
+}
 
 // Measure (don't apply) what our screen can show, report it as 'v'; the server's 'd' drives term size.
-// Measurements are accepted only after the terminal is visible and the same geometry survives two frames.
-// This prevents display:none mobile views and half-laid-out tab switches from shrinking the shared PTY.
-let viewportTimer=0, layoutRaf=0, layoutGeneration=0;
-let pendingViewportKey='', pendingViewportCount=0, lastViewportReport='', lastViewportReportSocket=null;
-let _lastViewportResizeAt=0;
-function terminalSurfaceVisible(){
-  const host=$('#term');
-  if(!host || !host.isConnected || host.offsetParent===null) return false;
-  const cs=getComputedStyle(host), r=host.getBoundingClientRect();
-  return cs.display!=='none' && cs.visibility!=='hidden' && r.width>=120 && r.height>=80;
-}
-function reportViewport(dim){
-  viewportFit={cols:dim.cols, rows:dim.rows};
-  const key=dim.cols+'x'+dim.rows;
-  if(ws && ws.readyState===1 && current && (lastViewportReport!==key || lastViewportReportSocket!==ws)){
-    lastViewportReport=key;
-    lastViewportReportSocket=ws;
-    send('v', JSON.stringify({
-      cols:dim.cols, rows:dim.rows,
-      vis:document.visibilityState==='visible' && terminalSurfaceVisible(),
-      act:actFlag()
-    }));
-  }
-  applyPan();
-  updateMeta();
-}
-function runViewportMeasure(generation){
-  if(generation!==layoutGeneration || !terminalSurfaceVisible()) return;
+function doFit(){
   let dim=null; try{ dim=fit.proposeDimensions(); }catch(e){}
-  if(!dim || dim.cols<10 || dim.rows<3) return;
-  const key=dim.cols+'x'+dim.rows;
-  if(key!==pendingViewportKey){
-    pendingViewportKey=key;
-    pendingViewportCount=1;
-    scheduleViewportFit(0);
-    return;
-  }
-  pendingViewportCount++;
-  if(pendingViewportCount<2){ scheduleViewportFit(0); return; }
-  reportViewport({cols:dim.cols, rows:dim.rows});
+  if(dim && dim.cols && dim.rows){ viewportFit={cols:dim.cols, rows:dim.rows}; if(ws && ws.readyState===1 && current) send('v', JSON.stringify({cols:dim.cols, rows:dim.rows, vis:document.visibilityState==='visible', act:actFlag()})); }
+  applyPan(); updateMeta();
 }
-function scheduleViewportFit(delay=80){
-  if(viewportTimer) clearTimeout(viewportTimer);
-  viewportTimer=setTimeout(()=>{
-    viewportTimer=0;
-    const generation=++layoutGeneration;
-    if(layoutRaf) cancelAnimationFrame(layoutRaf);
-    layoutRaf=requestAnimationFrame(()=>requestAnimationFrame(()=>{
-      layoutRaf=0;
-      runViewportMeasure(generation);
-    }));
-  }, Math.max(0, delay));
-}
-function doFit(){ scheduleViewportFit(0); }
-function applyViewport(){
-  _lastViewportResizeAt=Date.now();
-  const vv=window.visualViewport;
-  if(vv && vv.height>0) $('#app').style.height = vv.height+'px';
-  scheduleViewportFit(0);
-}
+let viewportTimer=0;
+let _lastViewportResizeAt=0;
+function applyViewport(){ _lastViewportResizeAt=Date.now(); const vv=window.visualViewport; if(vv) $('#app').style.height = vv.height+'px'; preserveTermViewport(doFit); }
+function scheduleViewportFit(delay=80){ if(viewportTimer) clearTimeout(viewportTimer); viewportTimer=setTimeout(()=>{ viewportTimer=0; applyViewport(); }, delay); }
 if (window.visualViewport){ visualViewport.addEventListener('resize', ()=>scheduleViewportFit(isMobile()?140:40)); }
-new ResizeObserver(()=>scheduleViewportFit(0)).observe($('#term'));
+new ResizeObserver(()=>preserveTermViewport(doFit)).observe($('#term'));
 window.addEventListener('orientationchange', ()=>setTimeout(applyViewport,250));
 
 // ---- touch: drag to scroll terminal HISTORY (vertical) and PAN the wider-than-screen view (horizontal).
@@ -1276,8 +1321,7 @@ window.addEventListener('orientationchange', ()=>setTimeout(applyViewport,250));
         // no-op there ("can't read up"). Forward a wheel event instead and let xterm hand the app its
         // mouse-wheel / alternate-scroll sequence — the app scrolls its own transcript.
         if(term.buffer.active.type==='alternate'){
-          const we=host.querySelector('.xterm-screen')||host.querySelector('.xterm')||host;
-          try{ we.dispatchEvent(new WheelEvent('wheel',{deltaY:-lines*ch, deltaMode:0, bubbles:true, cancelable:true})); }catch(e){}
+          scrollAlternate(-lines*ch);
         } else {
           try{ term.scrollLines(-lines); }catch(e){}
         }
@@ -1296,10 +1340,9 @@ window.addEventListener('orientationchange', ()=>setTimeout(applyViewport,250));
 // event; only in the ALTERNATE buffer (full-screen TUI with no scrollback) do we forward the wheel so the
 // app scrolls its own view.
 $('#term').addEventListener('wheel', e=>{
-  if(!e.isTrusted) return;   // synthetic forwarding must reach xterm, not recurse through this capture handler
   if(!(e.deltaX || e.deltaY)) return;
   noteUserScroll();
-  const host=$('#term'), xt=host.querySelector('.xterm');
+  const host=$('#term');
   let alt=false; try{ alt = term.buffer.active.type==='alternate'; }catch(_){}
   if(!alt){
     const ch=(cellMetrics().h)||18;
@@ -1309,18 +1352,9 @@ $('#term').addEventListener('wheel', e=>{
     e.preventDefault(); e.stopPropagation();
     return;
   }
-  // Alternate buffer: hand the wheel to the app so it scrolls its own transcript.
-  if(xt && xt.contains(e.target)) return;   // xterm will handle the original trusted event itself
-  const target=(xt && !xt.contains(e.target)) ? (host.querySelector('.xterm-viewport')||xt) : (host.querySelector('.xterm-viewport'));
-  if(!target) return;
-  try{
-    target.dispatchEvent(new WheelEvent('wheel', {
-      deltaX:e.deltaX, deltaY:e.deltaY, deltaZ:e.deltaZ, deltaMode:e.deltaMode,
-      ctrlKey:e.ctrlKey, shiftKey:e.shiftKey, altKey:e.altKey, metaKey:e.metaKey,
-      bubbles:true, cancelable:true
-    }));
-    e.preventDefault();
-  }catch(_){}
+  // Alternate buffer: PageUp/PageDown is the portable TUI transcript-scroll contract.
+  scrollAlternate(e.deltaY);
+  e.preventDefault(); e.stopPropagation();
 }, {passive:false, capture:true});
 
 function setFont(px){ fontSize=Math.min(20,Math.max(11,px)); term.options.fontSize=fontSize; LS.set('mux_font',fontSize); doFit(); }
@@ -1433,19 +1467,13 @@ function stripMouseReports(s){
   if(!s || s.indexOf('\x1b') < 0) return s;
   return s
     .replace(/\x1b\[M[\s\S]{3}/g, '')      // X10 mouse: ESC [ M + 3 raw bytes
-    // SGR mouse (1006): ESC [ < Cb ; x ; y M/m. Strip the motion/drag/click flood, but KEEP wheel reports
-    // (Cb bit 6 = 64: up=64, down=65, +modifiers). A full-screen TUI on the ALT buffer (codex/claude) has
-    // no scrollback of its own, so the wheel report is the ONLY way it scrolls its transcript — dropping it
-    // is what made "can't scroll" on those sessions. Wheel is discrete + low-volume, so it never causes the
-    // per-move flood this guard exists to stop.
-    .replace(/\x1b\[<([0-9]+);[0-9]+;[0-9]+[Mm]/g, (m, cb) => ((+cb) & 64) ? m : '')
+    .replace(/\x1b\[<[0-9;]*[Mm]/g, '')    // SGR mouse (1006): ESC [ < b;x;y M/m
     .replace(/\x1b\[[0-9;]+M/g, '');        // urxvt/legacy (1015): ESC [ b;x;y M  (the [555;79;1M flood)
 }
 term.onData(d => {
   logMobileInputEvent('onData', { data:d });
   // If our mobile delta handler just forwarded this keystroke, xterm's own echo of the full buffer that
   // lands in the same tick is the duplicate — drop it. (Real pastes never coincide with a delta-send.)
-  if(isMobile() && _mobileDeltaOn && Date.now()-_lastDeltaSendAt < 60 && isPlainMobileText(d)) return;
   d = stripMouseReports(d);
   if(!d) return;
   const filtered = stripTerminalGeneratedReports(d);
@@ -1453,7 +1481,6 @@ term.onData(d => {
     d = filtered.out;
     if(!d) return;
   }
-  d = filterMobileTextInput(d);
   if(!d) return;
   markActive();
   if (autoFreeze && !selectMode) { autoFreeze=false; try{ term.clearSelection(); }catch(e){} flushFrozen(); }   // typing = you're done selecting → go live
@@ -1469,14 +1496,23 @@ function setStatus(state, text){ const s=$('#status'); s.className=''; if(state)
 let newLines=0;
 const atBottom = ()=> term.buffer.active.viewportY >= term.buffer.active.baseY;
 function showJump(){ const j=$('#jumplive'); if(newLines>0 && !atBottom()){ $('#jlcount').textContent = newLines>99?'99+ new':newLines+' new'; j.classList.add('show'); } else j.classList.remove('show'); }
-term.onScroll(()=>{ if(atBottom()){ newLines=0; showJump(); } });
+term.onScroll(()=>{
+  if(!viewportRestoreApplying && (!terminalWriteActive || !atBottom())) noteUserScroll();
+  if(atBottom()){ newLines=0; showJump(); }
+});
+$('#term').addEventListener('pointerdown', e=>{
+  if(e.target && e.target.closest && e.target.closest('.xterm-viewport')) noteUserScroll();
+}, true);
 // FORCE the view to the live bottom, from anywhere, on mobile or desktop. Clears any latched freeze/
 // selection first, flushes buffered output, then pins to the bottom across the next two frames so it lands
 // even while a write is settling. Bound to the ↓ keybar button, the desktop header ⤓ icon, and the pill.
 function forceJumpBottom(){
   if(autoFreeze || selectMode){ autoFreeze=false; selectMode=false; $('#term').classList.remove('selecting'); try{ term.clearSelection(); }catch(e){} flushFrozen(); }
   userScrolledAt=0;   // don't let the viewport-restore logic treat this as a recent manual scroll-up
-  const go=()=>{ try{ term.scrollToBottom(); }catch(e){} newLines=0; showJump(); };
+  const go=()=>{
+    try{ viewportRestoreApplying=true; term.scrollToBottom(); }catch(e){} finally{ viewportRestoreApplying=false; }
+    newLines=0; showJump();
+  };
   go();
   requestAnimationFrame(()=>{ go(); requestAnimationFrame(go); });
   term.focus();
@@ -1522,62 +1558,47 @@ function scheduleReconnect(name){
   reconnectTimer = setTimeout(()=>{ if(current===name) connect(name, true); }, reconnectDelay);
   reconnectDelay = Math.min(10000, reconnectDelay*1.7);
 }
-let attachGeneration=0;
-function afterTerminalParserDrain(generation, callback){
-  let done=false;
-  const finish=()=>{
-    if(done) return;
-    done=true;
-    if(generation===attachGeneration) callback();
-  };
-  try{ term.write('', finish); }catch(e){ finish(); }
-  setTimeout(finish, 2500);
-}
 function connect(name, isRetry){
   clearReconnect();
   const blocker = attachBlocker(findSession(name));
   if(blocker){ stopAttach(name, blocker); return; }
-  const generation=++attachGeneration;
   intentional = true;
   if (ws) { try{ ws.onclose=null; ws.close(); }catch(e){} ws=null; }
   intentional = false;
   current = name; LS.set('mux_last', name); markRead(name);
   $('#empty').style.display='none';
+  if (!isRetry) term.reset();
+  resetTerminalSurface();
   clearTermWriteQueue();
-  autoFreeze=false; _frozenBuf=[];   // never carry a frozen selection across a session switch
+  autoFreeze=false; selectMode=false; _frozenBuf=[];
+  $('#term').classList.remove('selecting');
+  try{ term.clearSelection(); }catch(e){}
+  buildKeybar();
   resetTaDelta(true);                // start the mobile input-delta buffer fresh on a session switch
   newLines=0; showJump();
+  const proto = location.protocol==='https:'?'wss:':'ws:';
   setStatus('busy', `connecting to <span class="name">${esc(name)}</span>&hellip;`);
+  doFit();
+  // per-socket token: a stale socket from a rapid switch/reconnect must never write or set status
+  const sock = ws = new WebSocket(`${proto}//${location.host}${base}/ws?session=${encodeURIComponent(name)}&cols=${(viewportFit&&viewportFit.cols)||term.cols}&rows=${(viewportFit&&viewportFit.rows)||term.rows}&dev=${encodeURIComponent(deviceId)}&label=${encodeURIComponent(deviceLabel)}`);
+  sock.binaryType='arraybuffer';
+  const fresh = ()=> ws===sock && current===name;
+  sock.onopen = () => { if(!fresh()) return; reconnectDelay=1000; setStatus('live', `<span class="name">${esc(name)}</span> &middot; live`); doFit(); term.focus(); };
+  sock.onmessage = e => { if(!fresh()) return;
+    if(typeof e.data==='string'){ onControl(e.data); return; }     // control frame: shared window size
+    if(isFrozen()){ _frozenBuf.push(new Uint8Array(e.data)); if(_frozenBuf.length>6000) _frozenBuf.splice(0, _frozenBuf.length-6000); return; }   // FROZEN for selection: buffer output; a repaint would wipe the highlight
+    const wasBottom=atBottom(); enqueueTermWrite(new Uint8Array(e.data)); markReadLive();
+    if(!wasBottom){ newLines += 1; showJump(); } };
+  sock.onclose = ev => {
+    if(ws===sock && current===name && !intentional){
+      const refused = closeRefusal(ev);
+      if(refused){ stopAttach(name, refused); return; }
+      scheduleReconnect(name);
+    }
+  };
+  sock.onerror = () => {};
   renderTabs();
   if(isMobile()) setMobileView('terminal');
-  scheduleViewportFit(0);
-  // Drain any already-submitted xterm parser work before resetting for the new tab. A stale callback from
-  // the previous session can no longer repaint or restore its viewport after this attachment begins.
-  afterTerminalParserDrain(generation, ()=>{
-    if (!isRetry) term.reset();
-    resetTerminalSurface();
-    lastViewportReport='';
-    lastViewportReportSocket=null;
-    scheduleViewportFit(0);
-    const proto = location.protocol==='https:'?'wss:':'ws:';
-    const sock = ws = new WebSocket(`${proto}//${location.host}${base}/ws?session=${encodeURIComponent(name)}&cols=${(viewportFit&&viewportFit.cols)||term.cols}&rows=${(viewportFit&&viewportFit.rows)||term.rows}&dev=${encodeURIComponent(deviceId)}&label=${encodeURIComponent(deviceLabel)}`);
-    sock.binaryType='arraybuffer';
-    const fresh = ()=> generation===attachGeneration && ws===sock && current===name;
-    sock.onopen = () => { if(!fresh()) return; reconnectDelay=1000; setStatus('live', `<span class="name">${esc(name)}</span> &middot; live`); scheduleViewportFit(0); term.focus(); };
-    sock.onmessage = e => { if(!fresh()) return;
-      if(typeof e.data==='string'){ onControl(e.data); return; }     // control frame: shared window size
-      if(isFrozen()){ _frozenBuf.push(new Uint8Array(e.data)); if(_frozenBuf.length>6000) _frozenBuf.splice(0, _frozenBuf.length-6000); return; }   // FROZEN for selection: buffer output; a repaint would wipe the highlight
-      const wasBottom=atBottom(); enqueueTermWrite(new Uint8Array(e.data)); markReadLive();
-      if(!wasBottom){ newLines += 1; showJump(); } };
-    sock.onclose = ev => {
-      if(fresh() && !intentional){
-        const refused = closeRefusal(ev);
-        if(refused){ stopAttach(name, refused); return; }
-        scheduleReconnect(name);
-      }
-    };
-    sock.onerror = () => {};
-  });
 }
 document.addEventListener('visibilitychange', ()=>{ if(document.visibilityState==='visible' && current && (!ws || ws.readyState>1)){ reconnectDelay=1000; connect(current, true); } });
 // activity heartbeat so the server's auto-size only weighs RECENTLY-ACTIVE devices (a backgrounded tab
@@ -1621,19 +1642,22 @@ async function loadSessions(select){
     // Transient fetch failure (server timeout / hiccup) — DON'T wipe the tabs to empty. Keep the
     // last-known sessions so the tab strip stays put; the next 4s poll retries. Honor an explicit select.
     list = (window._sessions||[]).slice();
-    if (select && !list.find(s=>s.name===select)) list.push({name:select, attached:false, activity:Date.now()});
     window._sessions = list;
     list.forEach(s => s.unread = (s.activity > (read[s.name]||0)) && s.name!==current);
     renderTabs();
-    if (select) connect(select);
+    if (select && list.find(s=>s.name===select)) connect(select);
     return;
   }
   window._sessions = list;
   if (current) { const cs=list.find(s=>s.name===current); if(cs){ read[current]=cs.activity; LS.set('mux_read',read); } }
   list.forEach(s => s.unread = (s.activity > (read[s.name]||0)) && s.name!==current);
-  if (select && !list.find(s=>s.name===select)) list.push({name:select, attached:false, activity:Date.now()});
   renderTabs();
-  if (select) { connect(select); return; }
+  if (select) {
+    if(list.find(s=>s.name===select)){ connect(select); return; }
+    history.replaceState(null,'',location.pathname);
+    LS.set('mux_last', null);
+    setStatus('warn', `<span class="name">${esc(select)}</span> &middot; session not found`);
+  }
   if (!current && list.length) {
     const choices = list.filter(s=>!attachBlocker(s));
     const last=LS.get('mux_last',null);
@@ -1752,7 +1776,7 @@ function pickTabColor(s){
   setTimeout(()=>document.addEventListener('click',close,true),0);
 }
 async function setTabColor(name,hex){
-  try{ await fetch(base+'/api/app-commands',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({type:'settabcolor',muxName:name,title:hex})}); flash(hex?'Tab color set':'Tab color cleared'); }
+  try{ await postIntent(base+'/api/app-commands',{type:'settabcolor',muxName:name,title:hex},'tab-color'); flash(hex?'Tab color set':'Tab color cleared'); }
   catch(e){ flash('Couldn’t set tab color'); }
 }
 document.addEventListener('click', e=>{ if(menuFor && !e.target.closest('#menu') && !e.target.closest('.kebab')) closeMenu(); });
@@ -1845,8 +1869,9 @@ async function submitAddCol(target){
   if(!_appLive){ flash('App went offline — can’t add now'); $('#addcoldlg').close(); return; }
   const btns=$('#addcoldlg').querySelectorAll('button'); btns.forEach(b=>b.disabled=true);
   try{
-    const r=await fetch(base+'/api/app-commands',{ method:'POST', headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({ type:'addtocollection', muxName:s.projectMuxName||s.muxName||s.name, sessionName:s.name, sessionId:s.sessionId||'', collection:name, collectionId:target.collectionId||'', deckId:choice.deckId||'', deckName:choice.deckName||'' }) });
+    const r=await postIntent(base+'/api/app-commands',
+      { type:'addtocollection', muxName:s.projectMuxName||s.muxName||s.name, sessionName:s.name, sessionId:s.sessionId||'', collection:name, collectionId:target.collectionId||'', deckId:choice.deckId||'', deckName:choice.deckName||'' },
+      'add-collection');
     if(!r.ok) throw new Error(await apiError(r));
     const queued=await r.json();
     const detail=await pollUploadCmd(queued.id, 20000);
@@ -1886,64 +1911,36 @@ async function killSession(name){
     loadSessions();
   }catch(e){ flash('Kill failed: '+(e.message||e)); loadSessions(); }
 }
-// Relaunch a session's AGENT. After a reboot an unarmed mux session may be listed but dormant. This
-// recreates the PC-hosted session fresh and re-runs the
-// chat's resume command — the workspace comes back identically. The command is matched from the projects
-// projection by session name, so it works for any session tied to a synced chat (no desktop app needed).
-async function legacyRelaunchSession(s){
-  let cmd=null, chObj=null, pj=null;
-  try{
-    pj=await (await fetch(base+'/api/projects',{headers:{'Content-Type':'application/json'}})).json();
-    for(const c of (pj.collections||[])){ for(const ch of (c.chats||[])){ if(ch.muxName===s.name && ch.muxCommand){ cmd=ch.muxCommand; chObj=ch; break; } } if(cmd) break; }
-  }catch(e){}
-  if(!cmd){ flash('No resume command for “'+s.name+'” — it isn’t tied to a synced chat (open it once from the desktop app to link it).'); return; }
-  // GUARD against the branch glitch: if this chat already has a LIVE agent elsewhere, relaunching starts a
-  // 2nd `claude --resume` of the same id → two writers fork the transcript and the new work hides in a
-  // branch. Block it; the user must kill the running copy first (single-writer rule).
-  if(chObj && pj && Array.isArray(pj.runningSessions) && pj.runningSessions.some(r=>String(r.sessionId||'')===String(chObj.id||''))){
-    flash('“'+s.name+'” is still running on your PC — relaunching would FORK its transcript (lost work). Kill the running copy first (Projects → running → Kill), then relaunch.');
-    return;
-  }
-  if(!confirm('Relaunch the agent for “'+s.name+'”?\n\nRe-runs its resume command on your PC (claude/codex --resume) — best after a reboot. The dead scrollback in this tab is cleared.')) return;
-  flash('Relaunching '+s.name+'…');
-  try{
-    const drop=await fetch(base+'/api/sessions/'+encodeURIComponent(s.name),{method:'DELETE'});   // drop the dead session
-    if(!drop.ok) throw new Error(await apiError(drop));
-    const res=await fetch(base+'/api/sessions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:s.name, command:cmd})});
-    if(!res.ok) throw new Error(await apiError(res));
-    connect(s.name);                                  // attach immediately; the hosted path queues/revives on muxd
-    loadSessions(s.name);
-    flash('Relaunched '+s.name+' — agent restarting');
-  }catch(e){ flash('Relaunch failed: '+(e.message||e)); loadSessions(); }
-}
 function flash(msg){ setStatus('', msg); setTimeout(()=>{ if(current) setStatus(ws&&ws.readyState===1?'live':'busy', `<span class="name">${esc(current)}</span> &middot; ${ws&&ws.readyState===1?'live':'reconnecting…'}`); }, 1400); }
 
-function syncedMuxCommand(name){
+function syncedChat(name){
   for(const c of (_appCollections||[])){
     for(const ch of (c.chats||[])){
-      if(ch.muxName===name && ch.muxCommand) return ch.muxCommand;
+      if(ch.muxName===name && ch.id) return ch;
     }
   }
-  return '';
+  return null;
 }
-async function refreshSyncedMuxCommand(name){
-  let cmd=syncedMuxCommand(name);
-  if(cmd) return cmd;
+async function refreshSyncedChat(name){
+  let chat=syncedChat(name);
+  if(chat) return chat;
   try{
     const p=await (await fetch(base+'/api/projects',{headers:{'Content-Type':'application/json'}})).json();
     _appLive=!!(p.appLive ?? p.live); _appCollections=Array.isArray(p.collections)?p.collections:[];
-    cmd=syncedMuxCommand(name);
+    chat=syncedChat(name);
   }catch(e){}
-  return cmd;
+  return chat;
 }
 async function relaunchSession(s){
-  const cmd=await refreshSyncedMuxCommand(s.name);
-  if(!cmd && !s.hasCommand){ flash('No saved resume command for "'+s.name+'". Open it once from the desktop app to link it.'); return; }
+  const chat=await refreshSyncedChat(s.name);
+  const sessionId=s.sessionId||(chat&&chat.id)||'';
+  const tool=s.tool||(chat&&chat.tool)||'';
+  if(!sessionId && !s.hasCommand){ flash('No trusted session identity is available for "'+s.name+'". Open it once from the desktop app to link it.'); return; }
   if(!confirm('Relaunch the agent for "'+s.name+'"?\n\nThis stops any matching running copy first, then restarts the mux session on your PC.')) return;
   flash('Relaunching '+s.name+'...');
   try{
-    const body=cmd?{command:cmd}:{};
-    const res=await fetch(base+'/api/sessions/'+encodeURIComponent(s.name)+'/relaunch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const body=sessionId?{sessionId,tool}:{};
+    const res=await postIntent(base+'/api/sessions/'+encodeURIComponent(s.name)+'/relaunch',body,'relaunch');
     if(!res.ok) throw new Error(await apiError(res));
     if(current===s.name) term.reset();
     connect(s.name);
@@ -1951,7 +1948,7 @@ async function relaunchSession(s){
     flash('Relaunched '+s.name+' - agent restarting');
   }catch(e){ flash('Relaunch failed: '+(e.message||e)); loadSessions(); }
 }
-// ---- manage tabs: bulk kill + export (names, session history, resume commands) ----------------------
+// ---- manage tabs: bulk kill + export (names and opaque session history) -----------------------------
 $('#managebtn').onclick=()=>{ $('#managecount').textContent=(window._sessions||[]).length; openDialog('#managedlg'); };
 $('#manageclose').onclick=()=>$('#managedlg').close();
 $('#exporttabs').onclick=()=>exportTabs();
@@ -1962,9 +1959,9 @@ function exportTabs(){
   list.forEach(s=>{
     L.push('== '+s.name+' ==');
     if(s.chatTitle) L.push('  current: '+s.chatTitle+(s.tool?(' ['+s.tool+']'):''));
-    if(s.muxCommand) L.push('  resume:  '+s.muxCommand);
+    if(s.sessionId) L.push('  session: '+s.sessionId);
     const hist=(s.tabHistory||[]);
-    if(hist.length){ L.push('  history:'); hist.forEach(h=> L.push('    - '+((h.title||h.id))+(h.tool?(' ['+h.tool+']'):'')+(h.muxCommand?('  |  '+h.muxCommand):''))); }
+    if(hist.length){ L.push('  history:'); hist.forEach(h=> L.push('    - '+((h.title||h.id))+(h.tool?(' ['+h.tool+']'):'')+(h.id?('  |  '+h.id):''))); }
     L.push('');
   });
   const blob=new Blob([L.join('\n')],{type:'text/plain'});
@@ -1984,7 +1981,7 @@ async function killAllTabs(){
     try{ const r=await fetch(base+'/api/sessions/'+encodeURIComponent(s.name),{method:'DELETE'}); if(r.ok) ok++; else fail++; }catch(e){ fail++; }
   }
   // Start fresh: also clear the app's per-tab session history so no stale/mislabeled entries linger.
-  if(_appLive){ try{ await fetch(base+'/api/app-commands',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({type:'cleartabhistory'})}); }catch(e){} }
+  if(_appLive){ try{ await postIntent(base+'/api/app-commands',{type:'cleartabhistory'},'clear-history'); }catch(e){} }
   if(current){ intentional=true; try{ if(ws) ws.close(); }catch(e){} intentional=false; current=null; try{ term.reset(); }catch(e){} $('#empty').style.display='flex'; setStatus('','All tabs deleted'); }
   flash('Deleted '+ok+' tab'+(ok!==1?'s':'')+(fail?(' · '+fail+' failed'):''));
   loadSessions();
@@ -1995,8 +1992,8 @@ $('#historyclose').onclick=()=>$('#historydlg').close();
 function openTabHistory(s){
   const list=$('#historylist'); list.innerHTML='';
   const entries=[];
-  if(s.sessionId) entries.push({ id:s.sessionId, tool:s.tool||'', title:s.chatTitle||s.name, muxCommand:'', current:true });
-  (s.tabHistory||[]).forEach(h=> entries.push({ id:h.id, tool:h.tool||'', title:h.title||h.id, muxCommand:h.muxCommand||'', current:false }));
+  if(s.sessionId) entries.push({ id:s.sessionId, tool:s.tool||'', title:s.chatTitle||s.name, current:true });
+  (s.tabHistory||[]).forEach(h=> entries.push({ id:h.id, tool:h.tool||'', title:h.title||h.id, current:false }));
   if(!entries.length){ const p=document.createElement('div'); p.className='hint'; p.textContent='This tab has no linked chat yet — open claude or codex in it and it starts tracking (needs the desktop app live).'; list.appendChild(p); }
   entries.forEach(e=>{
     const row=document.createElement('div'); row.className='histrow';
@@ -2014,8 +2011,8 @@ async function relaunchTabTo(name, e){
   if(!confirm('Relaunch tab "'+name+'" as:\n\n'+((e.title||e.id).slice(0,90))+'\n\nStops any running copy first, then starts that session on your PC.')) return;
   flash('Relaunching '+name+'…');
   try{
-    const body = e.muxCommand ? {command:e.muxCommand} : {};
-    const res=await fetch(base+'/api/sessions/'+encodeURIComponent(name)+'/relaunch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const body = {sessionId:e.id||'', tool:e.tool||''};
+    const res=await postIntent(base+'/api/sessions/'+encodeURIComponent(name)+'/relaunch',body,'relaunch');
     if(!res.ok) throw new Error(await apiError(res));
     if(current===name) term.reset();
     connect(name); loadSessions(name);
@@ -2028,7 +2025,6 @@ document.querySelectorAll('dialog').forEach(d=> d.addEventListener('close', ()=>
 
 // new session w/ profile
 let newProfile='shell';
-function profileCmd(p){ return p==='claude'?'claude':(p==='codex'?'codex':''); }
 function suggestName(p){ const base=p==='shell'?'shell':p; const names=(window._sessions||[]).map(s=>s.name); let n=base,i=1; while(names.includes(n)){ i++; n=base+i; } return n; }
 function setProfile(p){ newProfile=p; document.querySelectorAll('#profilechips .chip').forEach(c=>c.classList.toggle('active', c.dataset.profile===p)); $('#newname').value=suggestName(p); }
 $('#profilechips').querySelectorAll('.chip').forEach(c=> c.onclick=()=>setProfile(c.dataset.profile));
@@ -2039,9 +2035,10 @@ $('#closehelp').onclick = ()=>$('#helpdlg').close();
 $('#newname').addEventListener('keydown', e=>{ if(e.key==='Enter'){ e.preventDefault(); $('#createnew').click(); } });
 $('#createnew').onclick = async ()=>{
   const name=($('#newname').value||'').replace(/[^A-Za-z0-9_.-]/g,'').slice(0,40);
-  const cmd=profileCmd(newProfile); $('#newdlg').close(); if(!name) return;
+  $('#newdlg').close(); if(!name) return;
   try{
-    const r=await fetch(base+'/api/sessions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name, command:cmd})});
+    const body=newProfile==='shell'?{name}:{name,tool:newProfile};
+    const r=await postIntent(base+'/api/sessions',body,'create-session');
     if(!r.ok) throw new Error(await apiError(r));
     loadSessions(name);
   }catch(e){ flash('Create failed: '+(e.message||e)); loadSessions(); }
@@ -2084,11 +2081,11 @@ $('#dorename').onclick = async ()=>{
   if(sid){
     if(nat.trim() && nat!==origNat){
       did=true;
-      try{ const r=await fetch(base+'/api/app-commands',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({type:'rename', sessionId:sid, tool, title:nat})}); if(!r.ok) errs.push('native: '+await apiError(r)); }catch(e){ errs.push('native: '+(e.message||e)); }
+      try{ const r=await postIntent(base+'/api/app-commands',{type:'rename', sessionId:sid, tool, title:nat},'rename-native'); if(!r.ok) errs.push('native: '+await apiError(r)); }catch(e){ errs.push('native: '+(e.message||e)); }
     }
     if(app!==origApp){
       did=true;
-      try{ const r=await fetch(base+'/api/app-commands',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({type:'setapptitle', sessionId:sid, title:app})}); if(!r.ok) errs.push('app: '+await apiError(r)); }catch(e){ errs.push('app: '+(e.message||e)); }
+      try{ const r=await postIntent(base+'/api/app-commands',{type:'setapptitle', sessionId:sid, title:app},'rename-app'); if(!r.ok) errs.push('app: '+await apiError(r)); }catch(e){ errs.push('app: '+(e.message||e)); }
     }
     if(did && !_appLive) errs.push('desktop app is offline — the native/app name will apply when it’s next open');
   }
@@ -2185,13 +2182,12 @@ function renderWsDetail(body){
   } else { const s=document.createElement('span'); s.className='wsbigicon'; s.textContent=fileIcon(f); preview.appendChild(s); }
   const name=document.createElement('div'); name.className='wsdname'; name.textContent=f.name;
   const meta=document.createElement('div'); meta.className='wsdmeta';
-  const setMeta=()=>{ meta.textContent=fmtSize(f.size)+' · '+fileExt(f.name)+((f.onPc||f.pcPath)?' · on this PC':'')+(f.keep?' · kept':''); };
+  const setMeta=()=>{ meta.textContent=fmtSize(f.size)+' · '+fileExt(f.name)+(f.onPc?' · on this PC':'')+(f.keep?' · kept':''); };
   setMeta();
   const acts=document.createElement('div'); acts.className='wsdacts';
   const mk=(label,cls,on)=>{ const b=document.createElement('button'); b.type='button'; b.className='wsbtn'+(cls?' '+cls:''); b.textContent=label; b.onclick=on; return b; };
   acts.appendChild(mk('Add to prompt','primary', ()=>wsAdd(f)));
-  acts.appendChild(mk('⧉ path','', ()=>wsCopy(f,'path')));
-  if(f.image) acts.appendChild(mk('⧉ element','', ()=>wsCopy(f,'el')));
+  if(f.image) acts.appendChild(mk('Add as image','', ()=>wsAdd(f,'element')));
   const keepL=document.createElement('label'); keepL.className='wskeep'; keepL.title='Keep this file (otherwise it’s cleared when the PC restarts)';
   const kc=document.createElement('input'); kc.type='checkbox'; kc.checked=!!f.keep; kc.onchange=ev=>{ wsKeep(f, ev.target.checked); setMeta(); };
   keepL.appendChild(kc); keepL.appendChild(document.createTextNode(' keep')); acts.appendChild(keepL);
@@ -2219,29 +2215,23 @@ async function pollUploadCmd(id, timeoutMs){
   }
   return null;
 }
-// Pull the file to the PC (once) and return its PC path; the agent reads the real file from there.
-async function ensureOnPc(f){
-  if(f.pcPath) return f.pcPath;
+// The PC bridge transfers the file and inserts its local path directly into muxd.
+// The local path never returns to or persists on the relay/browser.
+async function insertUploadIntoPrompt(f, insert){
+  if(!current) throw new Error('open a mux session first');
   flash('Transferring “'+f.name+'” to the PC…');
-  const cmd=await fetch(base+'/api/app-commands',{ method:'POST', headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({ type:'fetchfile', uploadId:f.id, filename:f.name, keep:!!f.keep }) });
+  const cmd=await postIntent(base+'/api/app-commands',
+    { type:'fetchfile', uploadId:f.id, filename:f.name, keep:!!f.keep, muxName:current, insert:insert||'path' },
+    'fetch-file');
   if(!cmd.ok) throw new Error('queue HTTP '+cmd.status);
   const id=(await cmd.json()).id;
-  const path=await pollUploadCmd(id, 60000);
-  if(!path) throw new Error('no response from the PC app — is it open?');
-  f.pcPath=path; return path;
+  const detail=await pollUploadCmd(id, 60000);
+  if(!detail) throw new Error('no response from the PC app — is it open?');
+  f.onPc=true;
 }
-async function wsAdd(f){
-  try{ const path=await ensureOnPc(f); send('i', path); $('#uploaddlg').close(); term.focus(); flash('Added the file path to your prompt'); }
+async function wsAdd(f, insert){
+  try{ await insertUploadIntoPrompt(f, insert||'path'); $('#uploaddlg').close(); term.focus(); flash(insert==='element'?'Added the image to your prompt':'Added the file path to your prompt'); }
   catch(e){ flash('Couldn’t add: '+(e.message||e)); }
-}
-async function wsCopy(f,kind){
-  try{
-    const path=await ensureOnPc(f);
-    const text = kind==='el' ? (f.image?`![${f.name}](${path})`:`[${f.name}](${path})`) : path;
-    await (navigator.clipboard?navigator.clipboard.writeText(text):Promise.reject());
-    flash(kind==='el'?'Copied as element — Paste into your prompt':'Copied path — Paste into your prompt');
-  }catch(e){ flash('Copy failed: '+(e.message||e)); }
 }
 async function wsKeep(f, keep){ f.keep=keep; try{ await fetch(base+'/api/uploads/'+encodeURIComponent(f.id),{ method:'PATCH', headers:{'Content-Type':'application/json'}, body:JSON.stringify({keep}) }); }catch(e){} }
 async function wsDelete(f){ try{ await fetch(base+'/api/uploads/'+encodeURIComponent(f.id),{ method:'DELETE' }); }catch(e){} wsFiles=wsFiles.filter(x=>x.id!==f.id); wsSel=null; renderWorkspace(); }
@@ -2528,14 +2518,9 @@ initMobileViews();
 applyViewport();
 loadSessions(new URLSearchParams(location.search).get('s') || undefined);
 setInterval(()=>{ if(document.visibilityState==='visible') loadSessions(); }, 4000);
-document.addEventListener('visibilitychange', ()=>{
-  if(document.visibilityState==='visible'){
-    scheduleViewportFit(0);
-    schedulePaintHeal(80);
-  }
-});
-window.addEventListener('focus', ()=>{ scheduleViewportFit(0); schedulePaintHeal(80); });
-window.addEventListener('pageshow', ()=>{ scheduleViewportFit(0); schedulePaintHeal(80); });
+document.addEventListener('visibilitychange', ()=>{ if(document.visibilityState==='visible') schedulePaintHeal(80); });
+window.addEventListener('focus', ()=>schedulePaintHeal(80));
+window.addEventListener('pageshow', ()=>schedulePaintHeal(80));
 
 // ---- system health dot (P0 observability): polls /api/health → green ok / amber degraded / red down ----
 async function pollHealth(){

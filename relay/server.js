@@ -8,15 +8,40 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { execSync, execFile } = require('child_process');
-// crash-safe state writes: write a temp then rename (rename is atomic) so an unclean VPS reboot can't
-// leave a half-written pins/autoheal/projects/commands file (those reboots happen — see full-review.md).
-function atomicWrite(file, data) { try { fs.writeFileSync(file + '.tmp', data); fs.renameSync(file + '.tmp', file); } catch {} }
+const { durableJsonLoad, durableJsonWrite, durableWrite, fsyncDirectory } = require('./durable-state');
+// Every acknowledged state mutation commits through durable-state.js before it is published in memory.
 function hostTokenOk(t) { if (!HOST_TOKEN || !t || t.length !== HOST_TOKEN.length) return false; try { return crypto.timingSafeEqual(Buffer.from(t), Buffer.from(HOST_TOKEN)); } catch { return false; } }
 
 const app = express();
 const TEST_MODE = process.env.MUX_TEST_MODE === '1';
 const STATE_DIR = process.env.MUX_STATE_DIR || __dirname;
-try { fs.mkdirSync(STATE_DIR, { recursive: true }); } catch {}
+fs.mkdirSync(STATE_DIR, { recursive: true });
+let persistenceFailure = '';
+let persistenceBlocked = '';
+function requirePersistenceWritable() {
+  if (persistenceBlocked) throw new Error('persistence is blocked pending operator recovery: ' + persistenceBlocked);
+}
+function writeJsonState(file, value) {
+  requirePersistenceWritable();
+  durableJsonWrite(file, value);
+  persistenceFailure = '';
+}
+function writeBytesState(file, value) {
+  requirePersistenceWritable();
+  durableWrite(file, value);
+  persistenceFailure = '';
+}
+function recordPersistenceFailure(error) {
+  persistenceFailure = String(error && error.message || error || 'unknown persistence failure');
+  if (error && (error.unknown || error.recoveryError))
+    persistenceBlocked = persistenceFailure;
+  console.error('[persistence] ' + persistenceFailure);
+  return persistenceFailure;
+}
+function failPersistence(res, error) {
+  recordPersistenceFailure(error);
+  return res.status(503).json({ error: 'state persistence failed' });
+}
 app.use(express.json({ limit: '6mb' }));   // the desktop app pushes its whole projects projection
 app.use((err, req, res, next) => {
   if (err && err.type === 'entity.parse.failed') return res.status(400).json({ error: 'invalid JSON body' });
@@ -31,25 +56,32 @@ const HLAUTH_BASE = process.env.HLAUTH_BASE || 'http://127.0.0.1:4200';
 const HL_KEY = process.env.HL_INTERNAL_KEY || '';
 const HL_COOKIE = process.env.HLAUTH_COOKIE || 'hl_session';
 const HL_LOGIN = (process.env.HLAUTH_PUBLIC_BASE || 'https://harmonizerlabs.cc') + '/auth/login';
+const AUTH_CACHE_TTL_MS = Math.max(1, +process.env.MUX_AUTH_CACHE_TTL_MS || 60000);
+const AUTH_CACHE_MAX = Math.max(1, +process.env.MUX_AUTH_CACHE_MAX || 512);
 const _authCache = new Map();
-const AUTH_CACHE_MAX = 5000;   // bound the cache so a flood of distinct cookies can't grow memory unbounded (still caches negatives to avoid hammering hl-auth)
 function cookieVal(req, name) {
   const m = (req.headers.cookie || '').match(new RegExp('(?:^|;\\s*)' + name + '=([^;]+)'));
   return m ? decodeURIComponent(m[1]) : null;
 }
 async function isOwner(token) {
   if (!token) return false;
+  const now = Date.now();
+  for (const [cachedToken, entry] of _authCache) {
+    if (entry.exp <= now) _authCache.delete(cachedToken);
+  }
   const hit = _authCache.get(token);
-  if (hit && hit.exp > Date.now()) return hit.owner;
+  if (hit) {
+    _authCache.delete(token);
+    _authCache.set(token, hit);
+    return hit.owner;
+  }
   try {
     const r = await fetch(HLAUTH_BASE + '/internal/verify', { headers: { 'x-internal-key': HL_KEY, 'x-session-token': token } });
     const j = await r.json();
     const owner = !!(j.authenticated && j.user && j.user.isOwner);
-    if (_authCache.size >= AUTH_CACHE_MAX) {   // evict oldest (Map preserves insertion order) before inserting
-      const oldest = _authCache.keys().next().value;
-      if (oldest !== undefined) _authCache.delete(oldest);
-    }
-    _authCache.set(token, { exp: Date.now() + 60000, owner });
+    _authCache.delete(token);
+    while (_authCache.size >= AUTH_CACHE_MAX) _authCache.delete(_authCache.keys().next().value);
+    _authCache.set(token, { exp: Date.now() + AUTH_CACHE_TTL_MS, owner });
     return owner;
   } catch { return false; }
 }
@@ -59,16 +91,6 @@ function isTrustedLocal(req) {
   // which sets X-Forwarded-For, so it can never spoof this.
   const ra = req.socket.remoteAddress || '';
   return !req.headers['x-forwarded-for'] && (ra === '127.0.0.1' || ra === '::1' || ra === '::ffff:127.0.0.1');
-}
-// Cross-Site WebSocket Hijacking guard for /ws: WebSocket upgrades are NOT covered by CORS and the
-// browser auto-attaches the hl_session cookie, so a browser upgrade must present an allowlisted Origin.
-// A missing Origin is a non-browser client (tests/tools) — allowed only from trusted loopback.
-const ALLOWED_WS_ORIGINS = (process.env.ALLOWED_WS_ORIGINS || 'https://harmonizerlabs.cc')
-  .split(',').map(s => s.trim()).filter(Boolean);
-function wsOriginOk(req) {
-  const origin = req.headers.origin;
-  if (!origin) return isTrustedLocal(req);
-  return ALLOWED_WS_ORIGINS.includes(origin);
 }
 app.use(async (req, res, next) => {
   if (isTrustedLocal(req)) return next();
@@ -93,6 +115,15 @@ app.use(express.static(__dirname + '/public', {
 }));
 
 const SAFE = s => String(s || '').replace(/[^A-Za-z0-9_.-]/g, '').slice(0, 48);
+function strictMuxName(value) {
+  const raw = String(value || '').trim();
+  const safe = SAFE(raw);
+  return safe && safe === raw ? safe : '';
+}
+function opaqueIdentity(value) {
+  const raw = String(value || '').trim();
+  return raw && /^[A-Za-z0-9._-]+$/.test(raw) ? raw : '';
+}
 // ---- PC SESSION HOST link (P2/P3 — the ownership flip) ---------------------------------------------
 // muxd on the PC owns each session's ConPTY locally and dials OUT to us over one multiplexed WebSocket
 // (/host, token-gated). Sessions live on the PC: Wi-Fi drops / VPS reboots / relay deploys only cost the
@@ -105,35 +136,134 @@ const hostSessions = new Map();    // name -> { alive, created, lastOut, tail }
 // A just-created hosted session muxd hasn't reported back yet. A muxd status push (built before it
 // processed our `create`) must NOT evict this optimistic entry — otherwise the imminent /ws attach or a
 // boot-recreate sees no hosted session, makes a tmux TWIN, and two agents resume one transcript (A2 #1).
-const pendingCreates = new Map();  // name -> expiry ts
-function markPending(name) { pendingCreates.set(name, Date.now() + 8000); }
 // Clear-scrollback + clear-screen + home: prefixes a scrollback replay so a reconnecting viewer that
 // still shows the pre-drop screen doesn't get the replay stacked ON TOP of it (A2 #2/#3).
-const CLEAR_SCREEN = Buffer.from('\x1b[3J\x1b[2J\x1b[H');
+// The muxd ring contains raw PTY bytes and can begin after a TUI entered private modes.
+// Reset those modes before replay so stale alternate-screen/mouse state cannot poison a viewer.
+const CLEAR_SCREEN = Buffer.from(
+  '\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l\x1b[?2004l' +
+  '\x1b[?1049l\x1b[?25h\x1b[0m\x1b[3J\x1b[2J\x1b[H'
+);
 // Hosted sessions are PC-local first. Web attach must become live quickly; scrollback is a bounded
 // convenience replay, not something allowed to stall live terminal bytes for multiple seconds.
 const HOST_SB_BYTES = +process.env.MUX_HOST_SB_BYTES || 800000;
 const HOST_SB_WAIT_MS = +process.env.MUX_HOST_SB_WAIT_MS || 900;
-const REQUIRED_HOST_PROTOCOL = 2;
-const REQUIRED_HOST_CAPS = new Set(['create', 'kill', 'rename', 'heal', 'tail', 'scrollback']);
+const HOST_SB_REQUEST_TIMEOUT_MS = Math.max(
+  HOST_SB_WAIT_MS + 100,
+  +process.env.MUX_HOST_SB_REQUEST_TIMEOUT_MS || 3000,
+);
+const MAX_TERM_COLS = 1000;
+const MAX_TERM_ROWS = 300;
+function clampTermDimension(value, fallback, maximum) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 2
+    ? Math.min(maximum, Math.floor(parsed))
+    : fallback;
+}
+const REQUIRED_HOST_PROTOCOL = 4;
+const REQUIRED_HOST_CAPS = new Set(['create', 'createAck', 'kill', 'rename', 'heal', 'tail', 'scrollback']);
 let hostProtocol = { protocol: 0, caps: [] };
 const hostUp = () => !!(hostWs && hostWs.readyState === 1);
 function sendHost(obj) { if (hostUp()) { try { hostWs.send(JSON.stringify(obj)); return true; } catch {} } return false; }
 const hostedHas = name => hostUp() && hostSessions.has(name);
-function normalizedCommand(cmd) { return String(cmd || '').trim(); }
-function commandSig(cmd) {
-  const c = normalizedCommand(cmd);
-  return c ? crypto.createHash('sha256').update(c, 'utf8').digest('hex').slice(0, 16) : '';
+const pendingHostCreates = new Map();
+let _hostRequestSeq = 0;
+function normalizeHostSession(s) {
+  if (containsForbiddenRemoteKey(s)) return null;
+  const name = strictMuxName(s && s.name);
+  if (!name || name !== String(s && s.name || '')) return null;
+  const sessionId = String(s.sessionId || '').trim();
+  if (sessionId && !opaqueIdentity(sessionId)) return null;
+  const rawAliases = Array.isArray(s.aliases) ? s.aliases.map(value => String(value || '').trim()) : [];
+  if (rawAliases.some(value => value && !opaqueIdentity(value))) return null;
+  const aliases = Array.isArray(s.aliases)
+    ? rawAliases.filter(Boolean)
+        .filter(id => id.toLowerCase() !== sessionId.toLowerCase())
+        .filter((id, index, all) => all.findIndex(other => other.toLowerCase() === id.toLowerCase()) === index)
+    : [];
+  const alive = !!s.alive;
+  const hasCommand = !!s.hasCommand;
+  const shellOnly = Object.prototype.hasOwnProperty.call(s, 'shellOnly') ? !!s.shellOnly : (alive && !hasCommand);
+  const value = {
+    alive, created: s.created || 0, lastOut: s.lastOut || 0, tail: String(s.tail || ''),
+    cols: clampTermDimension(s.cols, 0, MAX_TERM_COLS),
+    rows: clampTermDimension(s.rows, 0, MAX_TERM_ROWS),
+    heal: !!s.heal, owner: !!s.owner,
+    localFirst: !!s.localFirst, localViewers: s.localViewers || 0,
+    hasCommand, shellOnly, ready: Object.prototype.hasOwnProperty.call(s, 'ready') ? !!s.ready : alive,
+    kind: String(s.kind || (alive ? (shellOnly ? 'shell' : 'command') : 'dormant')),
+    sessionId, aliases, identityPending: !!s.identityPending,
+    agentState: String(s.agentState || ''), agentLabel: String(s.agentLabel || ''),
+    agentDetail: String(s.agentDetail || ''), agentConfidence: String(s.agentConfidence || ''),
+  };
+  return value;
 }
-function hostedCompatibleWithCommand(existing, cmd) {
-  const requestedSig = commandSig(cmd);
-  if (!requestedSig) return true;
-  if (!existing || existing.alive === false) return false;
-  if (existing.shellOnly || existing.hasCommand === false) return false;
-  return !!existing.cmdSig && existing.cmdSig === requestedSig;
+function normalizeHostSessionList(list) {
+  if (list != null && !Array.isArray(list)) return null;
+  const incoming = new Map();
+  for (const session of (list || [])) {
+    const name = strictMuxName(session && session.name);
+    if (!name || name !== String(session && session.name || '') || incoming.has(name)) return null;
+    const value = normalizeHostSession(session);
+    if (!value) return null;
+    incoming.set(name, value);
+  }
+  return incoming;
+}
+function announcedHostProtocol(message) {
+  const announced = {
+    protocol: Number(message && message.protocol || 0),
+    caps: Array.isArray(message && message.caps) ? message.caps.map(String) : [],
+  };
+  if (!Number.isInteger(announced.protocol) || announced.protocol !== REQUIRED_HOST_PROTOCOL) return null;
+  const caps = new Set(announced.caps);
+  for (const required of REQUIRED_HOST_CAPS) if (!caps.has(required)) return null;
+  return announced;
+}
+function requestHostCreate(message, timeoutMs = 20000, suppliedIntentId = '') {
+  if (!hostUp()) return Promise.resolve({ ok: false, detail: 'PC mux host offline' });
+  const expectedName = strictMuxName(message && message.s);
+  if (!expectedName) return Promise.resolve({ ok: false, detail: 'invalid mux session name' });
+  const rid = commandIntentId(suppliedIntentId)
+    || 'hc' + Date.now().toString(36) + '-' + (++_hostRequestSeq).toString(36);
+  const fingerprint = crypto.createHash('sha256').update(stableJson(message)).digest('hex');
+  const existing = pendingHostCreates.get(rid);
+  if (existing) {
+    if (existing.expectedName !== expectedName || existing.fingerprint !== fingerprint)
+      return Promise.resolve({
+        ok: false,
+        status: 409,
+        error: 'intent id conflict',
+        detail: 'create intent id is already bound to a different payload',
+      });
+    return existing.promise;
+  }
+  const promise = new Promise(resolve => {
+    const timer = setTimeout(() => {
+      pendingHostCreates.delete(rid);
+      resolve({ ok: false, detail: 'muxd did not acknowledge the create request' });
+    }, timeoutMs);
+    pendingHostCreates.set(rid, {
+      expectedName,
+      fingerprint,
+      promise: null,
+      finish: result => {
+        clearTimeout(timer);
+        resolve(result);
+      },
+    });
+    if (!sendHost({ ...message, rid })) {
+      clearTimeout(timer);
+      pendingHostCreates.delete(rid);
+      resolve({ ok: false, detail: 'host socket closed before create could be sent' });
+    }
+  });
+  const pending = pendingHostCreates.get(rid);
+  if (pending) pending.promise = promise;
+  return promise;
 }
 function hostProtocolOk() {
-  if (!hostUp() || hostProtocol.protocol < REQUIRED_HOST_PROTOCOL) return false;
+  if (!hostUp() || hostProtocol.protocol !== REQUIRED_HOST_PROTOCOL) return false;
   const caps = new Set(hostProtocol.caps || []);
   for (const c of REQUIRED_HOST_CAPS) if (!caps.has(c)) return false;
   return true;
@@ -326,14 +456,15 @@ function listSessions() {
                   state: attn.state, agentState: attn.agentState, agentLabel: attn.agentLabel,
                   agentDetail: attn.agentDetail, agentConfidence: attn.agentConfidence,
                   needsAttention: !!attn.needsAttention, lastOutAgeMs: attn.lastOutAgeMs,
-                  autoheal: _healOn.has(name), hosted: true,
+                  autoheal: !!h.heal, hosted: true,
                   alive, dormant, detachedLocal, cols: h.cols || 0, rows: h.rows || 0,
                   hasCommand: !!h.hasCommand, shellOnly: !!h.shellOnly, ready: !!h.ready,
-                  kind: h.kind || (dormant ? 'dormant' : (h.shellOnly ? 'shell' : 'command')), cmdSig: h.cmdSig || '',
-                  sessionId: String(chat && chat.id || ''), tool: String(chat && chat.tool || ''),
+                  kind: h.kind || (dormant ? 'dormant' : (h.shellOnly ? 'shell' : 'command')),
+                  sessionId: String(chat && chat.id || h.sessionId || ''), aliases: Array.isArray(h.aliases) ? h.aliases : [],
+                  identityPending: !!h.identityPending,
+                  tool: String(chat && chat.tool || ''),
                   chatTitle: String(chat && chat.title || ''), projectMuxName: String(chat && chat.muxName || ''),
                   nativeTitle: String(chat && chat.nativeTitle || ''), appTitle: String(chat && chat.appTitle || ''),
-                  muxCommand: String(chat && chat.muxCommand || ''),   // the current chat's resume command (for copy/export)
                   chatLinked: !!chat,
                   tabColor: tabMetaFor(name).color, tabKind: tabMetaFor(name).kind,   // per-tab tint + "remote-resumed"
                   tabHistory: tabHistoryFor(name),   // past chats this tab has hosted → relaunch-picker + add-historical-to-collection
@@ -351,7 +482,7 @@ function listSessions() {
     list.push({ name, windows: 0, created: 0, attached: false, activity: 0, state: 'red',
                 agentState: 'blocked', agentLabel: 'legacy blocker', agentDetail: legacyDetail(name),
                 agentConfidence: 'high', needsAttention: true,
-                autoheal: _healOn.has(name), hosted: false, legacy: true, legacyBlocked: true,
+                autoheal: false, hosted: false, legacy: true, legacyBlocked: true,
                 detail: legacyDetail(name) });
   }
   const live = new Set(list.map(s => s.name));   // prune state memory for sessions that no longer exist
@@ -362,91 +493,148 @@ function listSessions() {
 
 app.get('/api/sessions', (req, res) => res.json(listSessions()));
 
-// Create (or reuse) a session, optionally injecting a command (e.g. a claude/codex resume) once the
-// shell is up. This is the "append multiplex setup, send the command in the multiplex" flow.
+function hasForbiddenRemoteField(body) { return containsForbiddenRemoteKey(body); }
+async function queueStartMuxAndWait(name, sessionId, tool, intentId = '', takeover = false) {
+  if (!takeover) {
+    const localOwner = ensureNoLocalOwnerForMuxName(name, sessionId);
+    if (!localOwner.ok) return { ok: false, status: 409, error: 'local copy is already running', detail: localOwner.detail };
+  }
+  let queued;
+  try {
+    queued = enqueueAppCommand({ intentId, type: 'startmux', muxName: name, sessionId, tool, takeover: !!takeover });
+  } catch (error) {
+    if (error.intentConflict)
+      return { ok: false, status: 409, error: 'intent id conflict', detail: error.message };
+    return {
+      ok: false,
+      status: 503,
+      error: 'state persistence failed',
+      detail: recordPersistenceFailure(error),
+    };
+  }
+  const command = queued.command;
+  const result = await waitForCommandResult(command.id, 30000);
+  if (!result.ok)
+    return {
+      ok: false,
+      status: result.retryable ? 504 : 409,
+      error: result.retryable ? 'PC bridge did not confirm mux start' : 'PC bridge refused mux start',
+      detail: result.detail,
+    };
+  const visible = await waitForHostState(() => {
+    const hosted = hostSessions.get(name);
+    if (!hosted || hosted.alive === false || !hosted.hasCommand) return null;
+    if (!sessionId) return hosted;
+    const ids = [hosted.sessionId, ...(Array.isArray(hosted.aliases) ? hosted.aliases : [])]
+      .filter(Boolean).map(id => String(id).toLowerCase());
+    return ids.includes(String(sessionId).toLowerCase()) ? hosted : null;
+  }, 15000);
+  if (!visible.ok)
+    return { ok: false, status: 504, error: 'PC bridge start was not visible on muxd', detail: visible.error };
+  return { ok: true, created: true, hosted: true, via: 'pc-bridge', session: visible.value };
+}
+
+// Create a blank shell directly in muxd, or ask the PC bridge to start a trusted fresh CLI by tool.
+// Executable commands never cross or persist on the relay.
 app.post('/api/sessions', async (req, res) => {
   const body = req.body || {};
-  const name = SAFE(body.name);
+  if (hasForbiddenRemoteField(body)) return res.status(400).json({ error: 'executable commands and local paths are forbidden' });
+  const name = strictMuxName(body.name);
   if (!name) return res.status(400).json({ error: 'name required' });
-  const hasCommand = Object.prototype.hasOwnProperty.call(body, 'command');
-  const cmd = typeof body.command === 'string' ? body.command : '';
   if (tmuxHas(name)) return failLegacy(res, name);
+  const tool = String(body.tool || '').toLowerCase();
+  const intentId = commandIntentId(body.intentId)
+    || 'session-' + Date.now().toString(36) + '-' + crypto.randomBytes(8).toString('hex');
+  if (body.intentId && !commandIntentId(body.intentId))
+    return res.status(400).json({ error: 'invalid intent id' });
+  if (tool && !['claude', 'codex'].includes(tool)) return res.status(400).json({ error: 'tool must be claude or codex' });
   const existing = hostSessions.get(name);
-  if (hostedHas(name) && existing && existing.alive !== false && hostedCompatibleWithCommand(existing, cmd)) return res.json({ ok: true, name, created: false, hosted: true, owner: !!existing.owner, hostProtocol: hostProtocol.protocol || 0 });
-  if (!hasCommand) return res.status(400).json({ error: 'command required to start a mux session' });
-  const localOwner = await ensureNoLocalOwnerForMuxName(name, cmd);
-  if (!localOwner.ok) return failHost(res, 409, 'local copy is already running', localOwner.detail);
-  if (!requireHostProtocol(res, 'refusing to start PC-local mux session')) return;
-  // Opaque create: muxd forbids executable commands/ids from the relay (anti-RCE) and resolves the
-  // command from its own manifest (or starts a bare shell). Send only {t,s,rid,cols,rows,heal}.
-  if (!sendHost({ t: 'create', s: name, rid: crypto.randomUUID(), cols: 140, rows: 40, heal: _healOn.has(name) })) {
-    return failHost(res, 503, 'PC mux host offline', 'host socket closed before create could be sent');
+  if (!tool && hostedHas(name) && existing && existing.alive !== false)
+    return res.json({ ok: true, name, created: false, hosted: true, owner: !!existing.owner, hostProtocol: hostProtocol.protocol || 0 });
+  if (tool) {
+    const result = await queueStartMuxAndWait(name, '', tool, intentId);
+    if (!result.ok) return failHost(res, result.status, result.error, result.detail);
+    return res.json({ ok: true, name, ...result, hostProtocol: hostProtocol.protocol || 0 });
   }
-  markPending(name);
-  hostSessions.set(name, { alive: true, created: Date.now(), lastOut: Date.now(), tail: '', heal: _healOn.has(name), cols: 140, rows: 40, owner: false, localFirst: false, localViewers: 0,
-                           hasCommand: !!normalizedCommand(cmd), shellOnly: !normalizedCommand(cmd), ready: true, kind: normalizedCommand(cmd) ? 'command' : 'shell', cmdSig: commandSig(cmd) });
-  const confirmed = await waitForHostState(() => {
-    const h = hostSessions.get(name);
-    return h && h.alive !== false && !pendingCreates.has(name) && hostedCompatibleWithCommand(h, cmd) ? h : null;
-  }, 15000);
-  if (!confirmed.ok) return failHost(res, 504, 'PC-local mux session not confirmed', confirmed.error);
-  res.json({ ok: true, name, created: true, hosted: true, owner: !!confirmed.value.owner, hostProtocol: hostProtocol.protocol || 0 });
+  if (!requireHostProtocol(res, 'refusing to start PC-local mux session')) return;
+  const result = await requestHostCreate(
+    { t: 'create', s: name, cols: 140, rows: 40, heal: false },
+    15000,
+    intentId,
+  );
+  if (!result.ok || !result.session)
+    return failHost(
+      res,
+      result.status || 504,
+      result.error || 'PC-local mux session not confirmed',
+      result.detail || 'muxd acknowledgement omitted the created session',
+    );
+  res.json({ ok: true, name, created: !!result.created, hosted: true, owner: !!(result.session && result.session.owner), hostProtocol: hostProtocol.protocol || 0 });
 });
 
 function hostSessionHasSavedCommand(h) {
   return !!(h && h.hasCommand && !h.shellOnly);
 }
 
-// Explicit relaunch is different from viewing/attaching a dormant tab. It may reuse muxd's saved
-// manifest command, but it must not remotely take over a matching local owner. If the app/headless
-// bridge reports a local writer for this chat, fail closed and let the user close or hand off locally.
+// Explicit relaunch is a user-confirmed ownership transfer. If a matching local writer exists, route
+// through the PC bridge so it can stop and verify that exact owner before muxd starts the replacement.
 app.post('/api/sessions/:name/relaunch', async (req, res) => {
-  const name = SAFE(req.params.name);
+  const name = strictMuxName(req.params.name);
   if (!name) return res.status(400).json({ error: 'name required' });
   if (tmuxHas(name)) return failLegacy(res, name);
   if (!requireHostCapability(res, 'relaunch', 'refusing to relaunch PC-local mux session')) return;
 
   const body = req.body || {};
-  const cmd = typeof body.command === 'string' ? body.command.trim() : '';
+  if (hasForbiddenRemoteField(body)) return res.status(400).json({ error: 'executable commands and local paths are forbidden' });
+  const requestedSessionId = body.sessionId ? opaqueIdentity(body.sessionId) : '';
+  const requestedTool = String(body.tool || '').trim().toLowerCase();
+  const intentId = commandIntentId(body.intentId)
+    || 'relaunch-' + Date.now().toString(36) + '-' + crypto.randomBytes(8).toString('hex');
+  if (body.intentId && !commandIntentId(body.intentId))
+    return res.status(400).json({ error: 'invalid intent id' });
+  if (body.sessionId && !requestedSessionId) return res.status(400).json({ error: 'invalid session identity' });
+  if (requestedTool && !['claude', 'codex'].includes(requestedTool))
+    return res.status(400).json({ error: 'tool must be claude or codex' });
   const existing = hostSessions.get(name);
-  if (!cmd && !hostSessionHasSavedCommand(existing)) {
+  const hostedIds = new Set([String(existing && existing.sessionId || ''), ...(Array.isArray(existing && existing.aliases) ? existing.aliases : [])].filter(Boolean).map(x => x.toLowerCase()));
+  const canUseSaved = hostSessionHasSavedCommand(existing)
+    && (!requestedSessionId || hostedIds.has(requestedSessionId.toLowerCase()));
+  if (!canUseSaved && !requestedSessionId) {
     return res.status(400).json({
-      error: 'no saved resume command',
-      detail: 'Open this chat from the desktop app once so muxd can save its resume command, or relaunch with an explicit command.',
+      error: 'session identity required',
+      detail: 'This mux tab has no saved command identity; choose a projected chat so the PC can resolve it locally.',
     });
   }
-
-  const localOwner = await ensureNoLocalOwnerForMuxName(name, cmd);
-  if (!localOwner.ok) return failHost(res, 409, 'local copy is already running', localOwner.detail);
-
-  const priorCreated = existing ? Number(existing.created || 0) : 0;
-  const cols = Number(body.cols) || Number(existing && existing.cols) || 140;
-  const rows = Number(body.rows) || Number(existing && existing.rows) || 40;
-  markPending(name);
-  // Opaque relaunch: muxd reuses its own saved manifest command for this session; the relay never
-  // sends the executable. Send only {t,s,rid,cols,rows,heal,relaunch}.
-  if (!sendHost({ t: 'create', s: name, rid: crypto.randomUUID(), cols, rows, heal: _healOn.has(name), relaunch: true })) {
-    pendingCreates.delete(name);
-    return failHost(res, 503, 'PC mux host offline', 'host socket closed before relaunch could be sent');
+  const localOwner = ensureNoLocalOwnerForMuxName(name, requestedSessionId || String(existing && existing.sessionId || ''));
+  if (!canUseSaved || !localOwner.ok) {
+    const bridgeSessionId = requestedSessionId || String(existing && existing.sessionId || '');
+    const bridgeTool = requestedTool || String(existing && existing.tool || '');
+    const result = await queueStartMuxAndWait(name, bridgeSessionId, bridgeTool, intentId, !localOwner.ok);
+    if (!result.ok) return failHost(res, result.status, result.error, result.detail);
+    return res.json({ ok: true, name, created: true, relaunched: true, hosted: true,
+      stoppedLocal: !localOwner.ok, via: 'pc-bridge', hostProtocol: hostProtocol.protocol || 0 });
   }
-  const confirmed = await waitForHostState(() => {
-    const h = hostSessions.get(name);
-    if (!h || h.alive === false || pendingCreates.has(name)) return null;
-    const commandOk = cmd ? hostedCompatibleWithCommand(h, cmd) : hostSessionHasSavedCommand(h);
-    if (!commandOk) return null;
-    if (priorCreated && Number(h.created || 0) === priorCreated) return null;
-    return h;
-  }, 20000);
-  if (!confirmed.ok) return failHost(res, 504, 'PC-local mux relaunch not confirmed', confirmed.error);
+  const createFrame = { t: 'create', s: name, relaunch: true };
+  if (Number(body.cols) > 0) createFrame.cols = Number(body.cols);
+  if (Number(body.rows) > 0) createFrame.rows = Number(body.rows);
+  const result = await requestHostCreate(createFrame, 20000, intentId);
+  if (!result.ok)
+    return failHost(
+      res,
+      result.status || 504,
+      result.error || 'PC-local mux relaunch not confirmed',
+      result.detail,
+    );
   res.json({ ok: true, name, created: true, relaunched: true, hosted: true,
-             stoppedLocal: false, owner: !!confirmed.value.owner,
+             stoppedLocal: false, owner: !!(result.session && result.session.owner),
              hostProtocol: hostProtocol.protocol || 0 });
 });
 
 // Tail preview of a session's live pane (on demand: long-press / hover / palette) so you can tell what
 // a session is doing before attaching — last N lines, name-sanitized.
 app.get('/api/sessions/:name/tail', async (req, res) => {
-  const name = SAFE(req.params.name);
+  const name = strictMuxName(req.params.name);
+  if (!name) return res.status(400).json({ error: 'invalid session name' });
   const lines = Math.min(200, Math.max(1, +req.query.lines || 14));
   if (tmuxHas(name)) return failLegacy(res, name);
   if (hostedHas(name)) {   // hosted: pull a proper-depth tail from muxd (fallback to the cached status tail)
@@ -460,25 +648,47 @@ app.get('/api/sessions/:name/tail', async (req, res) => {
 
 // Rename a session (keeps it running) — "close tab" must never be the only way to manage a session.
 app.patch('/api/sessions/:name', async (req, res) => {
-  const name = SAFE(req.params.name);
-  const to = SAFE(req.body && req.body.name);
+  const name = strictMuxName(req.params.name);
+  const to = strictMuxName(req.body && req.body.name);
+  if (!name) return res.status(400).json({ error: 'invalid session name' });
   if (!to) return res.status(400).json({ error: 'name required' });
   if (to === name) return res.json({ ok: true, name: to });
   if (tmuxHas(to)) return failLegacy(res, to);
   if (hostSessions.has(to)) return res.status(409).json({ error: 'name already in use' });
-  // A2 #8: rename must carry the tab's auto-resume + pin state, or an armed tab silently loses them.
-  const migrate = () => {
-    if (_healOn.has(name)) { _healOn.delete(name); _healOn.add(to); saveHealOn(); }
-    if (_heal.has(name)) { _heal.set(to, _heal.get(name)); _heal.delete(name); }
-    if (pins.has(name)) { pins.set(to, pins.get(name)); pins.delete(name); savePins(); }
-  };
   if (hostedHas(name)) {   // E1: hosted rename → muxd renames the session key (keeps the pty), we migrate state
     if (tmuxHas(name)) return failLegacy(res, name);
     if (!requireHostProtocol(res, 'refusing to rename a hosted session')) return;
-    if (!sendHost({ t: 'rename', s: name, to })) return failHost(res, 503, 'PC mux host offline', 'host socket closed before rename could be sent');
+    let intent;
+    try {
+      intent = beginRenameIntent(name, to);
+      if (!intent) return res.status(409).json({ error: 'another rename involving this session is pending' });
+      applyRenameIntentPins(intent, true);
+    } catch (error) {
+      try {
+        reconcileRenameIntents();
+      } catch (reconcileError) {
+        return failPersistence(res, reconcileError);
+      }
+      return failPersistence(res, error);
+    }
+    if (!sendHost({ t: 'rename', s: name, to })) {
+      try {
+        applyRenameIntentPins(intent, false);
+        completeRenameIntent(intent.id);
+      } catch (error) {
+        return failPersistence(res, error);
+      }
+      return failHost(res, 503, 'PC mux host offline', 'host socket closed before rename could be sent');
+    }
     const confirmed = await waitForHostState(() => hostSessions.has(to) && !hostSessions.has(name), 6000);
-    if (!confirmed.ok) return failHost(res, 504, 'muxd rename not confirmed', confirmed.error);
-    migrate();
+    if (!confirmed.ok) {
+      return failHost(res, 504, 'muxd rename not confirmed', confirmed.error);
+    }
+    try {
+      completeRenameIntent(intent.id);
+    } catch (error) {
+      return failPersistence(res, error);
+    }
     const st = sessions.get(name); if (st) { for (const c of st.clients.values()) { try { c.ws.close(4001, 'renamed'); } catch {} } sessions.delete(name); }  // viewers reconnect under the new name
     return res.json({ ok: true, name: to, hosted: true });
   }
@@ -487,7 +697,8 @@ app.patch('/api/sessions/:name', async (req, res) => {
 });
 
 app.delete('/api/sessions/:name', async (req, res) => {
-  const name = SAFE(req.params.name);
+  const name = strictMuxName(req.params.name);
+  if (!name) return res.status(400).json({ error: 'invalid session name' });
   if (tmuxHas(name)) return failLegacy(res, name);
   if (hostedHas(name)) {
     if (!requireHostProtocol(res, 'refusing to kill a hosted session')) return;
@@ -495,41 +706,25 @@ app.delete('/api/sessions/:name', async (req, res) => {
     const confirmed = await waitForHostState(() => !hostSessions.has(name), 6000);
     if (!confirmed.ok) return failHost(res, 504, 'muxd kill not confirmed', confirmed.error);
   }
-  _healOn.delete(name); _heal.delete(name); saveHealOn();   // drop its auto-resume preference too
   res.json({ ok: true });
 });
 
-// PER-TAB auto-resume toggle. On = the watchdog re-runs THIS session's resume command if its agent dies
-// while working (max 3×/10min, idle sessions left alone). Persisted by name → survives restarts/relaunches.
+// PER-TAB auto-resume toggle. muxd persists and enforces the policy locally.
 app.post('/api/sessions/:name/autoheal', async (req, res) => {
-  const name = SAFE(req.params.name);
+  const name = strictMuxName(req.params.name);
   if (!name) return res.status(400).json({ error: 'name required' });
   const on = !!(req.body && req.body.on);
-  const wasOn = _healOn.has(name);
   if (tmuxHas(name)) return failLegacy(res, name);
-  if (on) _healOn.add(name); else { _healOn.delete(name); _heal.delete(name); }
-  saveHealOn();
-  if (hostedHas(name)) {
-    if (!requireHostProtocol(res, 'refusing to change hosted auto-resume')) {
-      if (wasOn) _healOn.add(name); else { _healOn.delete(name); _heal.delete(name); }
-      saveHealOn();
-      return;
-    }
-    if (!sendHost({ t: 'heal', s: name, on })) {
-      if (wasOn) _healOn.add(name); else { _healOn.delete(name); _heal.delete(name); }
-      saveHealOn();
-      return failHost(res, 503, 'PC mux host offline', 'host socket closed before auto-resume change could be sent');
-    }
-    const confirmed = await waitForHostState(() => {
-      const h = hostSessions.get(name);
-      return h && !!h.heal === on ? h : null;
-    }, 6000);
-    if (!confirmed.ok) {
-      if (wasOn) _healOn.add(name); else { _healOn.delete(name); _heal.delete(name); }
-      saveHealOn();
-      return failHost(res, 504, 'muxd auto-resume change not confirmed', confirmed.error);
-    }
-  }
+  if (!hostedHas(name)) return res.status(404).json({ error: 'session not found' });
+  if (!requireHostProtocol(res, 'refusing to change hosted auto-resume')) return;
+  if (!sendHost({ t: 'heal', s: name, on }))
+    return failHost(res, 503, 'PC mux host offline', 'host socket closed before auto-resume change could be sent');
+  const confirmed = await waitForHostState(() => {
+    const h = hostSessions.get(name);
+    return h && !!h.heal === on ? h : null;
+  }, 6000);
+  if (!confirmed.ok)
+    return failHost(res, 504, 'muxd auto-resume change not confirmed', confirmed.error);
   res.json({ ok: true, name, autoheal: on });
 });
 
@@ -537,8 +732,171 @@ app.post('/api/sessions/:name/autoheal', async (req, res) => {
 // the web can show your projects and resume chats remotely. POST is loopback-only (the app reaches in
 // over its own SSH); GET is owner-gated (the web). `live` = the app pushed within the last ~45s. ------
 const PROJECTS_FILE = STATE_DIR + '/projects.json';
-let _projects = { decks: [], collections: [], allChats: [], host: '', syncedAt: 0, runningSessions: [], runningVerified: false, runningVerificationDetail: '' };
-try { _projects = JSON.parse(fs.readFileSync(PROJECTS_FILE, 'utf8')); } catch {}
+const PROJECTION_SCHEMA_VERSION = 3;
+const FORBIDDEN_REMOTE_KEYS = new Set([
+  'muxcommand', 'command', 'cmd', 'cwd', 'pcpath', 'path', 'sourcepath',
+  'workspace', 'workingdirectory', 'exe', 'executable', 'arguments',
+]);
+function containsForbiddenRemoteKey(value) {
+  if (!value || typeof value !== 'object') return false;
+  if (Array.isArray(value)) return value.some(containsForbiddenRemoteKey);
+  for (const [key, child] of Object.entries(value))
+    if (FORBIDDEN_REMOTE_KEYS.has(String(key).toLowerCase()) || containsForbiddenRemoteKey(child)) return true;
+  return false;
+}
+function projectionHasInvalidIdentity(body) {
+  const chats = [];
+  for (const collection of (Array.isArray(body && body.collections) ? body.collections : []))
+    chats.push(...(Array.isArray(collection && collection.chats) ? collection.chats : []));
+  chats.push(...(Array.isArray(body && body.allChats) ? body.allChats : []));
+  for (const chat of chats) {
+    if (chat && chat.id && !opaqueIdentity(chat.id)) return true;
+    if (chat && chat.muxName && !strictMuxName(chat.muxName)) return true;
+    if (Array.isArray(chat && chat.aliases) && chat.aliases.some(alias => alias && !opaqueIdentity(alias))) return true;
+  }
+  for (const running of (Array.isArray(body && body.runningSessions) ? body.runningSessions : []))
+    if (running && running.sessionId && !opaqueIdentity(running.sessionId)) return true;
+  const tabs = body && body.muxTabChats;
+  if (tabs && typeof tabs === 'object' && !Array.isArray(tabs)) {
+    for (const [name, tab] of Object.entries(tabs)) {
+      if (!strictMuxName(name)) return true;
+      if (tab && tab.id && !opaqueIdentity(tab.id)) return true;
+      for (const history of (Array.isArray(tab && tab.history) ? tab.history : []))
+        if (history && history.id && !opaqueIdentity(history.id)) return true;
+    }
+  }
+  const tabMeta = body && body.muxTabMeta;
+  if (tabMeta && typeof tabMeta === 'object' && !Array.isArray(tabMeta))
+    for (const name of Object.keys(tabMeta))
+      if (!strictMuxName(name)) return true;
+  return false;
+}
+const text = (v, max = 500) => String(v || '').slice(0, max);
+function normalizeChat(chat) {
+  chat = chat || {};
+  const id = opaqueIdentity(chat.id);
+  return {
+    id,
+    aliases: (Array.isArray(chat.aliases) ? chat.aliases : [])
+      .map(opaqueIdentity).filter(Boolean)
+      .filter(alias => alias.toLowerCase() !== id.toLowerCase())
+      .filter((alias, index, all) => all.findIndex(other => other.toLowerCase() === alias.toLowerCase()) === index)
+      .slice(0, 64),
+    title: text(chat.title),
+    nativeTitle: text(chat.nativeTitle), appTitle: text(chat.appTitle), tool: text(chat.tool, 20),
+    muxName: strictMuxName(chat.muxName), running: !!chat.running, updatedAt: text(chat.updatedAt, 64),
+    workspaceLabel: text(chat.workspaceLabel, 200), collection: chat.collection == null ? null : text(chat.collection, 200),
+    collectionDeckId: chat.collectionDeckId == null ? null : text(chat.collectionDeckId, 200),
+    collectionDeck: chat.collectionDeck == null ? null : text(chat.collectionDeck, 200),
+  };
+}
+function normalizeRunning(row) {
+  row = row || {};
+  return {
+    pid: Number(row.pid) || 0, tool: text(row.tool, 20), sessionId: opaqueIdentity(row.sessionId),
+    parent: text(row.parent, 200), startedAt: text(row.startedAt, 64),
+    title: row.title == null ? null : text(row.title), collection: row.collection == null ? null : text(row.collection, 200),
+    collectionDeckId: row.collectionDeckId == null ? null : text(row.collectionDeckId, 200),
+    collectionDeck: row.collectionDeck == null ? null : text(row.collectionDeck, 200),
+    realTitle: row.realTitle == null ? null : text(row.realTitle),
+  };
+}
+function normalizeMuxTabChats(value) {
+  const out = {};
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return out;
+  for (const [rawName, raw] of Object.entries(value)) {
+    const name = strictMuxName(rawName);
+    if (!name || !raw || typeof raw !== 'object') continue;
+    out[name] = {
+      id: opaqueIdentity(raw.id), tool: text(raw.tool, 20), title: text(raw.title),
+      history: (Array.isArray(raw.history) ? raw.history : []).slice(0, 30).map(h => ({
+        id: opaqueIdentity(h && h.id), tool: text(h && h.tool, 20), title: text(h && h.title),
+        at: text(h && h.at, 64),
+      })).filter(h => h.id),
+    };
+  }
+  return out;
+}
+function normalizeMuxTabMeta(value) {
+  const out = {};
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return out;
+  for (const [rawName, raw] of Object.entries(value)) {
+    const name = strictMuxName(rawName);
+    if (!name || !raw || typeof raw !== 'object' || Array.isArray(raw)) continue;
+    out[name] = { color: text(raw.color, 32), kind: text(raw.kind, 64) };
+  }
+  return out;
+}
+function emptyProjects() {
+  return {
+    schemaVersion: PROJECTION_SCHEMA_VERSION, decks: [], collections: [], allChats: [], host: '',
+    syncedAt: 0, appSyncedAt: 0, runningSyncedAt: 0, runningSessions: [],
+    muxTabChats: {}, muxTabMeta: {}, runningVerified: false, runningVerificationDetail: '',
+  };
+}
+function normalizeProjects(body, previous = emptyProjects()) {
+  const now = Date.now();
+  return {
+    schemaVersion: PROJECTION_SCHEMA_VERSION,
+    decks: (Array.isArray(body.decks) ? body.decks : []).map(d => ({ id: text(d && d.id, 200), name: text(d && d.name, 200) })),
+    collections: (Array.isArray(body.collections) ? body.collections : []).map(c => ({
+      id: text(c && c.id, 200), name: text(c && c.name, 200), deckId: text(c && c.deckId, 200),
+      deckName: text(c && c.deckName, 200), chats: (Array.isArray(c && c.chats) ? c.chats : []).map(normalizeChat),
+    })),
+    allChats: (Array.isArray(body.allChats) ? body.allChats : []).map(normalizeChat),
+    runningSessions: (Array.isArray(body.runningSessions) ? body.runningSessions : []).map(normalizeRunning),
+    muxTabChats: normalizeMuxTabChats(body.muxTabChats),
+    muxTabMeta: normalizeMuxTabMeta(body.muxTabMeta),
+    runningVerified: body.runningVerified === true,
+    runningVerificationDetail: text(body.runningVerificationDetail, 1000),
+    host: text(body.host, 200),
+    syncedAt: now, appSyncedAt: now, runningSyncedAt: now,
+  };
+}
+function validPersistedProjection(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  if (!Array.isArray(value.decks)
+      || !Array.isArray(value.collections)
+      || !Array.isArray(value.allChats)
+      || !Array.isArray(value.runningSessions)) return false;
+  if (!Object.prototype.hasOwnProperty.call(value, 'schemaVersion')) return true;
+  return value.schemaVersion === PROJECTION_SCHEMA_VERSION
+    && !containsForbiddenRemoteKey(value)
+    && !projectionHasInvalidIdentity(value);
+}
+let _projects = emptyProjects();
+{
+  const loaded = durableJsonLoad(
+    PROJECTS_FILE,
+    null,
+    validPersistedProjection,
+  );
+  const legacyProjection = !!loaded
+    && typeof loaded === 'object'
+    && !Array.isArray(loaded)
+    && !Object.prototype.hasOwnProperty.call(loaded, 'schemaVersion');
+  if (legacyProjection) {
+    // Pre-schema projections contain the same user-facing collections but may also carry old
+    // command/path fields. Normalize through the strict allowlist instead of refusing startup.
+    _projects = normalizeProjects(loaded);
+  } else if (
+    loaded
+    && loaded.schemaVersion === PROJECTION_SCHEMA_VERSION
+    && !containsForbiddenRemoteKey(loaded)
+    && !projectionHasInvalidIdentity(loaded)
+  ) {
+    _projects = normalizeProjects(loaded);
+  }
+  // A relay restart invalidates process-liveness assertions. Keep display data, but require a
+  // fresh desktop/headless push before ownership-sensitive actions trust it.
+  _projects.syncedAt = 0;
+  _projects.appSyncedAt = 0;
+  _projects.runningSyncedAt = 0;
+  _projects.runningVerified = false;
+}
+// Rewrite recognized state through the allowlist on every boot. Invalid state is recovered by
+// durableJsonLoad from its backup or fails startup without overwriting the primary.
+writeJsonState(PROJECTS_FILE, _projects);
 function appSyncedAt() { return _projects.appSyncedAt || _projects.syncedAt || 0; }
 function runningSyncedAt() { return _projects.runningSyncedAt || _projects.syncedAt || 0; }
 function appLive() { return Date.now() - appSyncedAt() < 45000; }
@@ -548,8 +906,7 @@ function projectsHealth() {
   const now = Date.now();
   const appAt = appSyncedAt();
   const runningAt = runningSyncedAt();
-  let pendingCommands = 0;
-  try { pruneCommands(); pendingCommands = _commands.filter(c => c.status === 'pending').length; } catch {}
+  const pendingCommands = _commands.filter(c => c.status === 'pending' || c.status === 'leased').length;
   return {
     appLive: appAt > 0 && now - appAt < 45000,
     bridgeLive: runningAt > 0 && now - runningAt < 45000,
@@ -581,60 +938,15 @@ function chatIds(chat) {
   if (Array.isArray(chat && chat.Aliases)) for (const a of chat.Aliases) add(a);
   return ids;
 }
-function commandTokens(command) {
-  const tokens = [];
-  const re = /"([^"]*)"|'([^']*)'|(\S+)/g;
-  let m;
-  while ((m = re.exec(String(command || ''))) !== null) tokens.push(m[1] ?? m[2] ?? m[3] ?? '');
-  return tokens.filter(Boolean);
-}
-function parseResumeSessionId(command) {
-  const tokens = commandTokens(command);
-  for (let i = 0; i < tokens.length; i++) {
-    const t = path.basename(tokens[i]).toLowerCase();
-    if (t === 'codex' || t === 'codex.exe') {
-      const resumeAt = tokens.findIndex((x, j) => j > i && String(x).toLowerCase() === 'resume');
-      if (resumeAt >= 0) {
-        for (let j = resumeAt + 1; j < tokens.length; j++) {
-          const v = String(tokens[j] || '');
-          if (!v || v.startsWith('-')) continue;
-          return v;
-        }
-      }
-    }
-    if (t === 'claude' || t === 'claude.exe') {
-      for (let j = i + 1; j < tokens.length - 1; j++)
-        if (String(tokens[j]).toLowerCase() === '--resume') return String(tokens[j + 1] || '');
-    }
-  }
-  const codex = String(command || '').match(/\bcodex(?:\.exe)?\b[\s\S]*?\bresume\b(?:\s+--[^\s]+)*\s+["']?([^"'\s;]+)/i);
-  if (codex) return codex[1];
-  const claude = String(command || '').match(/\bclaude(?:\.exe)?\b[\s\S]*?\b--resume\s+["']?([^"'\s;]+)/i);
-  return claude ? claude[1] : '';
-}
-function projectedChatCandidates(name, command = '') {
-  const muxName = SAFE(name);
-  const sig = commandSig(command);
-  const sid = parseResumeSessionId(command).toLowerCase();
+function projectedChatCandidates(name, sessionId = '') {
+  const muxName = strictMuxName(name);
+  const sid = String(sessionId || '').toLowerCase();
   return allProjectedChats().filter(chat => {
     if (!chat) return false;
     if (muxName && String(chat.muxName || '') === muxName) return true;
-    if (sig && commandSig(chat.muxCommand || '') === sig) return true;
     if (sid && chatIds(chat).some(id => id.toLowerCase() === sid)) return true;
     return false;
   });
-}
-function resumeCandidateIds(name, command = '') {
-  const ids = [];
-  const add = id => {
-    id = String(id || '').trim();
-    if (!id) return;
-    if (!ids.some(x => x.toLowerCase() === id.toLowerCase())) ids.push(id);
-  };
-  add(parseResumeSessionId(command));
-  for (const chat of projectedChatCandidates(name, command))
-    for (const id of chatIds(chat)) add(id);
-  return ids;
 }
 function locallyRunningMuxName(name) {
   if (!runningVerified()) return false;
@@ -665,26 +977,27 @@ function tabHistoryFor(name) {
   const t = mtc && name && typeof mtc === 'object' ? mtc[name] : null;
   const hist = t && Array.isArray(t.history) ? t.history : [];
   return hist.filter(h => h && h.id).slice(0, 30).map(h => ({
-    id: String(h.id), tool: String(h.tool || ''), title: String(h.title || h.id),
-    muxCommand: String(h.muxCommand || ''), at: String(h.at || ''),
+    id: String(h.id), tool: String(h.tool || ''), title: String(h.title || h.id), at: String(h.at || ''),
   }));
 }
 function projectedChatForHosted(hosted, name) {
-  const sig = String(hosted && hosted.cmdSig || '');
-  if (sig) {
-    for (const chat of allProjectedChats()) {
-      if (commandSig(chat && chat.muxCommand || '') === sig) return chat;
-    }
-  }
+  const hostedIds = new Set([
+    String(hosted && hosted.sessionId || ''),
+    ...(Array.isArray(hosted && hosted.aliases) ? hosted.aliases : []),
+  ].filter(Boolean).map(id => id.toLowerCase()));
+  if (hostedIds.size)
+    for (const chat of allProjectedChats())
+      if (chatIds(chat).some(id => hostedIds.has(id.toLowerCase()))) return chat;
+  if (hostedIds.size) return null;
   // Shell-launched tab (no muxd command) → the app's deterministic resolver linked it to its LIVE chat
   // (agent matched to this tab by ancestor pid; id from the resume flag or the tab's newest transcript).
   const mtc = _projects && _projects.muxTabChats;
   const t = mtc && name && typeof mtc === 'object' ? mtc[name] : null;
-  if (t && t.id) return { id: String(t.id), tool: String(t.tool || ''), title: String(t.title || name), muxName: String(name), muxCommand: String(t.muxCommand || '') };
+  if (t && t.id) return { id: String(t.id), tool: String(t.tool || ''), title: String(t.title || name), muxName: String(name) };
   return null;
 }
 function runningChatForMuxName(name) {
-  const muxName = SAFE(name);
+  const muxName = strictMuxName(name);
   if (!muxName || !runningVerified()) return null;
   const running = Array.isArray(_projects.runningSessions) ? _projects.runningSessions : [];
   if (!running.length) return null;
@@ -696,11 +1009,11 @@ function runningChatForMuxName(name) {
   }
   return null;
 }
-function ensureNoLocalOwnerForMuxName(name, command = '') {
-  const resumeId = parseResumeSessionId(command);
-  const candidates = projectedChatCandidates(name, command);
+function ensureNoLocalOwnerForMuxName(name, sessionId = '') {
+  const requestedId = String(sessionId || '').trim();
+  const candidates = projectedChatCandidates(name, requestedId);
   if (!runningVerified()) {
-    if (resumeId || candidates.length)
+    if (requestedId || candidates.length)
       return { ok: false, stopped: false, detail: 'could not verify local running sessions'
           + (_projects.runningVerificationDetail ? ` (${_projects.runningVerificationDetail})` : '')
           + '; refusing remote resume because it could create a second writer.' };
@@ -712,9 +1025,9 @@ function ensureNoLocalOwnerForMuxName(name, command = '') {
     const run = chatIds(chat).map(id => byId.get(id.toLowerCase())).find(Boolean);
     if (run) return localOwnerRefusal(name, chat, run);
   }
-  if (resumeId) {
-    const run = byId.get(String(resumeId).toLowerCase());
-    if (run) return localOwnerRefusal(name, { id: resumeId, title: name }, run);
+  if (requestedId) {
+    const run = byId.get(requestedId.toLowerCase());
+    if (run) return localOwnerRefusal(name, { id: requestedId, title: name }, run);
   }
   const found = runningChatForMuxName(name);
   if (!found) return { ok: true, stopped: false };
@@ -754,27 +1067,27 @@ function normalizedAllChatsForCurrentRunning() {
   }));
 }
 app.post('/api/projects', (req, res) => {
-  if (!isTrustedLocal(req)) return res.status(403).json({ error: 'forbidden' });   // bridge (loopback) only — feeds the double-writer safety gate
   const b = req.body || {};
-  const now = Date.now();
-  _projects = {
-    decks: Array.isArray(b.decks) ? b.decks : [],
-    collections: Array.isArray(b.collections) ? b.collections : [],
-    allChats: Array.isArray(b.allChats) ? b.allChats : [],
-    runningSessions: Array.isArray(b.runningSessions) ? b.runningSessions : [],
-    muxTabChats: (b.muxTabChats && typeof b.muxTabChats === 'object') ? b.muxTabChats : {},   // {tabName: {id,tool,muxCommand,title}} — links shell-launched tabs to their live chat
-    muxTabMeta: (b.muxTabMeta && typeof b.muxTabMeta === 'object') ? b.muxTabMeta : {},   // {tabName: {color,kind}} — per-tab tint + remote-resumed flag
-    runningVerified: b.runningVerified === true,
-    runningVerificationDetail: String(b.runningVerificationDetail || ''),
-    host: String(b.host || ''),
-    syncedAt: now, appSyncedAt: now, runningSyncedAt: now,
-  };
-  atomicWrite(PROJECTS_FILE, JSON.stringify(_projects));
-  res.json({ ok: true, syncedAt: _projects.syncedAt });
+  if (Number(b.schemaVersion) !== PROJECTION_SCHEMA_VERSION)
+    return res.status(409).json({ error: 'projection schema mismatch', expected: PROJECTION_SCHEMA_VERSION });
+  if (containsForbiddenRemoteKey(b))
+    return res.status(400).json({ error: 'projection contains executable command or local path fields' });
+  if (projectionHasInvalidIdentity(b))
+    return res.status(400).json({ error: 'projection contains an invalid opaque identity' });
+  const candidate = normalizeProjects(b, _projects);
+  try {
+    writeJsonState(PROJECTS_FILE, candidate);
+  } catch (error) {
+    if (error.committed) _projects = candidate;
+    return failPersistence(res, error);
+  }
+  _projects = candidate;
+  res.json({ ok: true, syncedAt: candidate.syncedAt });
 });
 app.get('/api/projects', (req, res) => {
   const a = appSyncedAt(), r = runningSyncedAt();
   res.json({
+    schemaVersion: PROJECTION_SCHEMA_VERSION,
     decks: Array.isArray(_projects.decks) ? _projects.decks : [],
     collections: normalizedCollectionsForCurrentRunning(), host: _projects.host || '',
     allChats: normalizedAllChatsForCurrentRunning(),
@@ -793,166 +1106,32 @@ app.get('/api/projects', (req, res) => {
 app.post('/api/running', (req, res) => {
   if (!isTrustedLocal(req)) return res.status(403).json({ error: 'forbidden' });
   const b = req.body || {};
-  _projects.runningSessions = Array.isArray(b.runningSessions) ? b.runningSessions : [];
-  _projects.runningVerified = b.runningVerified === true;
-  _projects.runningVerificationDetail = String(b.runningVerificationDetail || '');
-  if (b.host) _projects.host = String(b.host);
-  _projects.runningSyncedAt = Date.now();   // bridge-only: do not make GUI-owned collection commands look available
-  atomicWrite(PROJECTS_FILE, JSON.stringify(_projects));
-  res.json({ ok: true, runningSyncedAt: _projects.runningSyncedAt });
+  if (Number(b.schemaVersion) !== PROJECTION_SCHEMA_VERSION)
+    return res.status(409).json({ error: 'projection schema mismatch', expected: PROJECTION_SCHEMA_VERSION });
+  if (containsForbiddenRemoteKey(b))
+    return res.status(400).json({ error: 'running projection contains local path fields' });
+  if (projectionHasInvalidIdentity(b))
+    return res.status(400).json({ error: 'running projection contains an invalid opaque identity' });
+  const candidate = {
+    ..._projects,
+    runningSessions: (Array.isArray(b.runningSessions) ? b.runningSessions : []).map(normalizeRunning),
+    runningVerified: b.runningVerified === true,
+    runningVerificationDetail: String(b.runningVerificationDetail || ''),
+    host: b.host ? String(b.host) : _projects.host,
+    runningSyncedAt: Date.now(),
+  };
+  try {
+    writeJsonState(PROJECTS_FILE, candidate);
+  } catch (error) {
+    if (error.committed) _projects = candidate;
+    return failPersistence(res, error);
+  }
+  _projects = candidate;
+  res.json({ ok: true, runningSyncedAt: candidate.runningSyncedAt });
 });
 
-// ---- AUTO-HEAL (redundancy): auto-resume a managed agent session that DIED WHILE WORKING ----------------
-// A CLI agent (codex especially) can get killed out from under its terminal; a VS Code agent has no
-// terminal so it survives. So we watch each opted-in hosted muxd session and, when its agent clearly CRASHED —
-// its "working" frame froze (a live agent's timer always ticks), or it exited to a shell right after
-// working (red just after green) — we re-run that session's OWN resume command. Idle (yellow) agents and
-// clean quits-from-idle are left alone. Settle delay + max 3 relaunches / 10min then GIVE UP, so a session
-// that dies on every launch can't spin forever. ★ PER-TAB opt-in: only sessions the user enabled (in
-// _healOn) are watched + relaunched — toggle via POST /api/sessions/:name/autoheal. MUX_AUTOHEAL=0 = master off.
-const _heal = new Map();   // name -> { lastTail, lastChange, lastGreen, deaths[], lastRelaunch, gaveUp }
-const AUTOHEAL_FILE = STATE_DIR + '/autoheal.json';
-let _healOn = new Set();    // session names OPTED IN to auto-resume (per-tab, persisted across restarts)
-try { _healOn = new Set(JSON.parse(fs.readFileSync(AUTOHEAL_FILE, 'utf8'))); } catch {}
-function saveHealOn() { atomicWrite(AUTOHEAL_FILE, JSON.stringify([..._healOn])); }
-function muxCommandFor(name) {
-  let found = null;
-  const scan = (o) => {
-    if (found || !o || typeof o !== 'object') return;
-    if (Array.isArray(o)) { for (const x of o) scan(x); return; }
-    if (o.muxName === name && o.muxCommand) { found = String(o.muxCommand); return; }
-    for (const k of Object.keys(o)) scan(o[k]);
-  };
-  try { scan(_projects.collections); } catch {}
-  return found;
-}
-function autoHealTick() {
-  let names = hostProtocolOk() ? [...hostSessions.keys()] : [];
-  if (!names.length) return;
-  const now = Date.now();
-  for (const name of names) {
-    if (!_healOn.has(name)) continue;   // per-tab opt-in: only watch/relaunch sessions the user turned on
-    const hosted = hostSessions.get(name);
-    if (!hosted) continue;
-    let content = String(hosted.tail || '');
-    const state = paneAgentState(name, content);                         // green(working)/yellow(idle agent)/red/white
-    const lines = content.replace(/\s+$/, '').split('\n');
-    const tail = lines.slice(-14).join('\n');
-    const lastLine = (lines.filter(l => l.trim()).pop() || '').trim();
-    const everAgent = (_sessState.get(name) || {}).everAgent;
-    const cmd = muxCommandFor(name);
-    const h = _heal.get(name) || { lastTail: tail, lastChange: now, acts: [], lastAct: 0, gaveUp: false, hadGoal: false, phase: null, resumedGoal: false };
-    if (tail !== h.lastTail) { h.lastTail = tail; h.lastChange = now; }
-
-    // Track whether this session is pursuing a codex/claude GOAL, so recovery can DEFER to the goal
-    // loop/hook (which re-prompts on its own) instead of pasting its own "continue" that would fight it.
-    if (state === 'green' || state === 'yellow') {
-      if (/pursuing goal|\/goal\s+(active|running)/i.test(tail) && !/goal achieved|goal (complete|done|cleared)/i.test(tail)) h.hadGoal = true;
-      else if (/goal achieved|goal (complete|done|cleared)|no active goal/i.test(tail)) h.hadGoal = false;
-    }
-
-    // DEATH = the pane is sitting at a SHELL PROMPT (the agent process is gone). Unambiguous: a live agent's
-    // last line is its composer/footer, NEVER a shell prompt — so this cannot mis-fire on a slow turn.
-    // (We removed the old "green but unchanged 45s = dead" rule: a long tool call / deep-think looks exactly
-    // like that, and Ctrl-C'ing it mid-turn — then typing the resume into the live composer — was THE bug.)
-    const atPS   = /^(PS\s+)?[A-Za-z]:\\[^>]*>$/.test(lastLine);          // PC PowerShell prompt (ssh held, agent exited)
-    const atBash = /^[\w.\-]+@[\w.\-]+:[^#$]*[#$]$/.test(lastLine);       // VPS bash prompt (the ssh-back itself dropped)
-    // Only recover a tab we've PERSONALLY watched go alive→dead (everAgent). This is the opt-in contract:
-    // on server/watcher startup a tab that's ALREADY dead is left alone — we never auto-start tabs on boot,
-    // we only restart a tab that died while we were watching it.
-    const atShell = everAgent && (atPS || atBash);
-    h.acts = h.acts.filter(t => now - t < 600000);
-
-    if (!atShell) {
-      // ALIVE (or a resume still loading). NEVER interrupt it.
-      if (state === 'green' || state === 'yellow') h.gaveUp = false;      // healthy again → clear the give-up latch
-      // Post-resume re-engagement: a freshly-resumed agent sits idle at its composer. If it was NOT on a
-      // goal, nudge it to continue; if it WAS, leave it — the goal loop/hook re-prompts it on its own.
-      if (h.phase === 'resumed') {
-        if (now - h.lastAct > 90000) { h.phase = null; }                 // gave the resume long enough
-        else if (now - h.lastAct > 6000) {
-          if (state === 'green') { h.phase = null; }                     // already working again → done
-          else if (state === 'yellow') {
-            if (h.resumedGoal) { console.log(`[autoheal] ${name}: resumed with an active goal → leaving it to the goal hook`); }
-            else {
-              const NUDGE = 'Continue exactly what you were working on before the session was interrupted.';
-              try {
-                sendHost({ t: 'i', s: name, d: Buffer.from(NUDGE + '\r', 'utf8').toString('base64') });
-                console.log(`[autoheal] ${name}: resumed (no active goal) → nudged it to continue`);
-              } catch (e) {}
-            }
-            h.phase = null;
-          }
-        }
-      }
-      _heal.set(name, h); continue;
-    }
-
-    // --- AT A SHELL PROMPT: the agent exited. Recover it (no Ctrl-C — there is nothing running to interrupt). ---
-    if (!cmd || h.gaveUp) { _heal.set(name, h); continue; }
-    if (now - h.lastAct < 9000) { _heal.set(name, h); continue; }        // let the previous action settle
-    if (h.acts.length >= 5) { if (!h.gaveUp) { h.gaveUp = true; console.log(`[autoheal] ${name}: GAVE UP (5 recovery actions/10min — PC or network likely down)`); } _heal.set(name, h); continue; }
-
-    const localOwner = ensureNoLocalOwnerForMuxName(name, cmd);
-    if (!localOwner.ok) {
-      console.log(`[autoheal] ${name}: ${localOwner.detail}`);
-      _heal.set(name, h); continue;
-    }
-
-    try {
-      sendHost({ t: 'i', s: name, d: Buffer.from('cls; ' + cmd + '\r', 'utf8').toString('base64') });
-      h.acts.push(now); h.lastAct = now; h.phase = 'resumed'; h.resumedGoal = h.hadGoal;
-      console.log('[autoheal] ' + name + ': hosted agent exited -> resumed' + (h.hadGoal ? ' (goal active -> will defer to goal hook)' : ' (no goal -> will nudge to continue)') + ' (' + h.acts.length + '/5)');
-    } catch (e) { console.log(`[autoheal] ${name}: recovery action failed: ${e.message}`); }
-    _heal.set(name, h);
-  }
-  const live = new Set(names);
-  for (const k of _heal.keys()) if (!live.has(k)) _heal.delete(k);
-}
-if (!TEST_MODE && process.env.MUX_AUTOHEAL !== '0') setInterval(autoHealTick, 12000);
-
-// ---- BOOT-RECREATE (P0): on relay start, recreate every ARMED session (autoheal.json) as a PC-hosted
-// muxd session when the host is connected and protocol-current. STRICTLY opt-in: never creates a session
-// the user didn't arm. Legacy tmux names are blockers only; the relay never recreates or reuses tmux.
-function bootRecreate() {
-  if (!_healOn.size) return;
-  const legacy = new Set(legacyTmuxNames());
-  let n = 0;
-  for (const name of _healOn) {
-    if (hostedHas(name)) continue;                                       // lives on the PC host → NEVER make a tmux twin (double-resume corrupts the transcript)
-    if (legacy.has(name)) { console.log(`[boot-recreate] ${name}: ${legacyDetail(name)} - skipped`); continue; }
-    const cmd = muxCommandFor(name);
-    if (!cmd) { console.log(`[boot-recreate] ${name}: armed but no resume command (not in a synced collection) — skipped`); continue; }
-    try {
-      if (hostProtocolOk()) {
-        const localOwner = ensureNoLocalOwnerForMuxName(name, cmd);
-        if (!localOwner.ok) { console.log(`[boot-recreate] ${name}: ${localOwner.detail} - skipped`); continue; }
-        // recoveries land on the SAFE path: recreate as a PC-hosted session (muxd runs the resume)
-        sendHost({ t: 'create', s: name, cmd, ids: resumeCandidateIds(name, cmd), cols: 140, rows: 40, heal: true });
-        markPending(name);
-        hostSessions.set(name, { alive: true, created: Date.now(), lastOut: Date.now(), tail: '', heal: true,
-                                 hasCommand: !!normalizedCommand(cmd), shellOnly: !normalizedCommand(cmd), ready: true,
-                                 kind: normalizedCommand(cmd) ? 'command' : 'shell', cmdSig: commandSig(cmd) });
-        n++; console.log(`[boot-recreate] ${name}: recreated HOSTED + resume queued`);
-      } else if (hostUp()) {
-        console.log(`[boot-recreate] ${name}: ${hostProtocolDetail()} - skipped`);
-      } else {
-        console.log(`[boot-recreate] ${name}: PC mux host down - skipped`);
-      }
-    } catch (e) { console.log(`[boot-recreate] ${name}: failed: ${e.message}`); }
-  }
-  if (n) console.log(`[boot-recreate] restored ${n} armed session(s) after a wipe`);
-}
-if (TEST_MODE) {
-  app.post('/__test/autoheal', (req, res) => {
-    _healOn = new Set(Array.isArray(req.body && req.body.names) ? req.body.names.map(SAFE).filter(Boolean) : []);
-    res.json({ ok: true, names: [..._healOn] });
-  });
-  app.post('/__test/autoheal-tick', (req, res) => { autoHealTick(); res.json({ ok: true }); });
-  app.post('/__test/boot-recreate', (req, res) => { bootRecreate(); res.json({ ok: true }); });
-}
-if (!TEST_MODE) setTimeout(bootRecreate, 25000);  // let _healOn load AND give muxd time to reconnect+hello first, so
-                                  // hosted sessions are visible before any armed recreate is attempted
+// muxd is the sole owner of persisted launch commands, boot recovery, and self-heal.
+// The relay only toggles muxd policy and forwards explicit, opaque control intent.
 
 // ---- PC reachability probe + /api/health (P0 observability, D7). A lightweight TCP-connect to the PC's
 // sshd port (no ssh process spawn) so health can report whether the ssh-back is even reachable + its RTT —
@@ -987,17 +1166,21 @@ app.get('/api/health', (req, res) => {
   let tmuxAvailable = false;
   try { execSync(`tmux -V`, { encoding: 'utf8', timeout: 1500 }); tmuxAvailable = true; } catch {}
   const legacyNames = legacyTmuxNames();
-  let gaveUp = 0; for (const h of _heal.values()) if (h.gaveUp) gaveUp++;
+  const armed = [...hostSessions.values()].filter(h => h && h.heal).length;
+  const gaveUp = 0;
   const projects = projectsHealth();
   // A2 #9: if the PC host is down, armed sessions are hosted-and-unreachable (can't be healed) → surface
   // that as degraded instead of a falsely-green dot. Legacy tmux names are also degraded blockers.
-  let hostedArmedDown = !hostUp() ? _healOn.size : 0;
+  const hostedArmedDown = 0;
   const degraded = TEST_MODE
-    ? (!hostUp() || !hostProtocolOk() || legacyNames.length > 0)
-    : (!hostUp() || !hostProtocolOk() || _pcHealth.reachable === false || gaveUp > 0 || hostedArmedDown > 0 || legacyNames.length > 0 || !projects.bridgeLive);
+    ? (!hostUp() || !hostProtocolOk() || legacyNames.length > 0 || !!persistenceFailure || renameIntents.length > 0 || uploadRecoveryWarnings.length > 0)
+    : (!hostUp() || !hostProtocolOk() || _pcHealth.reachable === false || gaveUp > 0 || hostedArmedDown > 0 || legacyNames.length > 0 || !projects.bridgeLive || !!persistenceFailure || renameIntents.length > 0 || uploadRecoveryWarnings.length > 0);
   res.json({ ok: !degraded, degraded, uptimeSec: Math.round(process.uptime()), tmuxAvailable, sessions: hostSessions.size,
-             legacySessions: legacyNames.length, legacyNames, legacyPolicy: 'blocked', armed: _healOn.size, gaveUp, hostedArmedDown, pc: _pcHealth,
+             legacySessions: legacyNames.length, legacyNames, legacyPolicy: 'blocked', armed, gaveUp, hostedArmedDown, pc: _pcHealth,
              projects,
+             persistence: { ok: !persistenceFailure && !persistenceBlocked, detail: persistenceBlocked || persistenceFailure, blocked: !!persistenceBlocked },
+             pendingRenameIntents: renameIntents.length,
+             uploadRecoveryWarnings,
              host: { connected: hostUp(), name: hostLabel, sessions: hostSessions.size, protocol: hostProtocol.protocol, caps: hostProtocol.caps, protocolOk: hostProtocolOk() },
              node: process.version, at: Date.now() });
 });
@@ -1006,72 +1189,330 @@ app.get('/api/health', (req, res) => {
 // Today: "kill" a live agent session. Enqueue is owner-gated (the global auth middleware above); pull +
 // ack are loopback-only (only the app, reaching in over its own SSH, can read the queue or run anything).
 const COMMANDS_FILE = STATE_DIR + '/app-commands.json';
+const COMMAND_LEASE_MS = Math.max(100, Number(process.env.MUX_COMMAND_LEASE_MS) || 120000);
+const COMMAND_TERMINAL_RETENTION_MS = Math.max(
+  24 * 60 * 60 * 1000,
+  Number(process.env.MUX_COMMAND_TERMINAL_RETENTION_MS) || 90 * 24 * 60 * 60 * 1000,
+);
+const COMMAND_TERMINAL_LIMIT = Math.max(
+  1000,
+  Number(process.env.MUX_COMMAND_TERMINAL_LIMIT) || 10000,
+);
+const COMMAND_REPLAY_POLICY = new Map([
+  ['kill', 'refused'],
+  ['transcript', 'read-only'],
+  ['fetchfile', 'intent-fenced'],
+  ['rename', 'idempotent'],
+  ['setapptitle', 'idempotent'],
+  ['addtocollection', 'idempotent'],
+  ['startmux', 'intent-fenced'],
+  ['cleartabhistory', 'idempotent'],
+  ['settabcolor', 'idempotent'],
+]);
 let _commands = [];
-try { _commands = JSON.parse(fs.readFileSync(COMMANDS_FILE, 'utf8')); } catch {}
-function saveCommands() { atomicWrite(COMMANDS_FILE, JSON.stringify(_commands)); }
-function pruneCommands() { const cut = Date.now() - 10 * 60 * 1000; _commands = _commands.filter(c => (c.ts || 0) > cut); }
+function commandIntentId(value) {
+  const raw = String(value || '').trim();
+  return /^[A-Za-z0-9._-]{1,128}$/.test(raw) ? raw : '';
+}
+function stableJson(value) {
+  if (Array.isArray(value)) return '[' + value.map(stableJson).join(',') + ']';
+  if (value && typeof value === 'object') {
+    return '{' + Object.keys(value).sort().map(key => JSON.stringify(key) + ':' + stableJson(value[key])).join(',') + '}';
+  }
+  return JSON.stringify(value);
+}
+function commandFingerprint(command) {
+  const payload = {
+    type: String(command.type || ''), sessionId: String(command.sessionId || ''),
+    tool: String(command.tool || ''), pid: Number(command.pid) || 0,
+    uploadId: String(command.uploadId || ''), filename: String(command.filename || ''),
+    title: String(command.title || ''), keep: !!command.keep, label: String(command.label || ''),
+    muxName: String(command.muxName || ''), sessionName: String(command.sessionName || ''),
+    insert: String(command.insert || ''), collection: String(command.collection || ''),
+    collectionId: String(command.collectionId || ''), deckId: String(command.deckId || ''),
+    deck: String(command.deck || ''), deckName: String(command.deckName || ''),
+    takeover: !!command.takeover,
+  };
+  return crypto.createHash('sha256').update(stableJson(payload)).digest('hex');
+}
+function commandOutcomeDetail(type, status, onPc = false) {
+  if (status === 'pending' || status === 'leased') return '';
+  if (type === 'fetchfile') {
+    if (status === 'done') return 'downloaded to PC';
+    return onPc ? 'downloaded to PC but prompt insertion failed' : 'file download failed';
+  }
+  const labels = {
+    startmux: ['mux session started', 'PC bridge could not start mux session'],
+    kill: ['session stopped', 'PC bridge could not stop session'],
+    transcript: ['transcript opened', 'PC bridge could not open transcript'],
+    rename: ['session renamed', 'PC bridge could not rename session'],
+    setapptitle: ['title updated', 'PC bridge could not update title'],
+    addtocollection: ['collection updated', 'PC bridge could not update collection'],
+    cleartabhistory: ['tab history cleared', 'PC bridge could not clear tab history'],
+    settabcolor: ['tab color updated', 'PC bridge could not update tab color'],
+  };
+  const pair = labels[type] || ['command completed', 'PC bridge command failed'];
+  return status === 'done' ? pair[0] : pair[1];
+}
+{
+  const loadedCommands = durableJsonLoad(COMMANDS_FILE, [], Array.isArray);
+  if (!Array.isArray(loadedCommands)) throw new Error('persisted app command queue must be an array');
+  _commands = loadedCommands.map(c => {
+    const status = ['pending', 'leased', 'done', 'failed'].includes(String(c.status))
+      ? String(c.status)
+      : 'failed';
+    const command = {
+    id: opaqueIdentity(c.id), intentId: commandIntentId(c.intentId) || commandIntentId(c.id),
+    type: String(c.type || ''),
+    replayPolicy: String(c.replayPolicy || COMMAND_REPLAY_POLICY.get(String(c.type || '')) || ''),
+    sessionId: opaqueIdentity(c.sessionId),
+    tool: ['claude', 'codex'].includes(String(c.tool || '').toLowerCase()) ? String(c.tool).toLowerCase() : '',
+    pid: Number(c.pid) || 0,
+    uploadId: /^u[a-z0-9]+-[a-z0-9]+$/i.test(String(c.uploadId || '')) ? String(c.uploadId) : '',
+    filename: String(c.filename || '').replace(/\\/g, '/').split('/').pop().slice(0, 120),
+    title: String(c.title || '').slice(0, 200), keep: !!c.keep,
+    label: String(c.label || ''), muxName: strictMuxName(c.muxName), sessionName: strictMuxName(c.sessionName),
+    insert: String(c.insert || ''), collection: String(c.collection || '').slice(0, 200),
+    collectionId: String(c.collectionId || '').slice(0, 200), deckId: String(c.deckId || '').slice(0, 200),
+    deck: String(c.deck || '').slice(0, 200), deckName: String(c.deckName || '').slice(0, 200),
+    takeover: !!c.takeover,
+    ts: Number(c.ts) || 0,
+    status,
+    detail: commandOutcomeDetail(
+      String(c.type || ''),
+      status,
+      !!c.onPc,
+    ),
+    doneAt: Number(c.doneAt) || 0,
+    leaseOwner: status === 'leased' ? commandIntentId(c.leaseOwner) : '',
+    leaseToken: status === 'leased' || status === 'done' || status === 'failed'
+      ? commandIntentId(c.leaseToken)
+      : '',
+    leaseExpiresAt: status === 'leased' ? Number(c.leaseExpiresAt) || 0 : 0,
+    attempt: Math.max(0, Number(c.attempt) || 0),
+  };
+    command.fingerprint = /^[a-f0-9]{64}$/.test(String(c.fingerprint || ''))
+      ? String(c.fingerprint)
+      : commandFingerprint(command);
+    return command;
+  }).filter(c => c.id && c.intentId);
+}
+function saveCommands(candidate = _commands) { writeJsonState(COMMANDS_FILE, candidate); }
+function compactCommands(candidate, now = Date.now()) {
+  const live = candidate.filter(command => command.status === 'pending' || command.status === 'leased');
+  const terminal = candidate
+    .filter(command => command.status === 'done' || command.status === 'failed')
+    .filter(command => now - (Number(command.doneAt) || Number(command.ts) || 0) <= COMMAND_TERMINAL_RETENTION_MS)
+    .sort((a, b) => (Number(b.doneAt) || Number(b.ts) || 0) - (Number(a.doneAt) || Number(a.ts) || 0))
+    .slice(0, COMMAND_TERMINAL_LIMIT);
+  const keep = new Set([...live, ...terminal]);
+  return candidate.filter(command => keep.has(command));
+}
+function commitCommands(candidate) {
+  candidate = compactCommands(candidate);
+  try {
+    saveCommands(candidate);
+  } catch (error) {
+    if (error.committed) _commands = candidate;
+    throw error;
+  }
+  _commands = candidate;
+}
+_commands = compactCommands(_commands);
+saveCommands(_commands);
 let _cmdSeq = 0;
 function enqueueAppCommand(b) {
-  pruneCommands();
   const id = 'c' + Date.now().toString(36) + '-' + (++_cmdSeq).toString(36);
-  const cmd = { id, type: String(b.type || ''), sessionId: String(b.sessionId || ''), tool: String(b.tool || ''),
+  const intentId = commandIntentId(b.intentId) || id;
+  const type = String(b.type || '');
+  const replayPolicy = COMMAND_REPLAY_POLICY.get(type) || '';
+  if (!replayPolicy) throw new Error('command type has no declared replay policy');
+  const cmd = { id, intentId, type, replayPolicy,
+                sessionId: String(b.sessionId || ''), tool: String(b.tool || ''),
                 pid: Number(b.pid) || 0, uploadId: String(b.uploadId || ''), filename: String(b.filename || ''),
                 title: String(b.title || '').slice(0, 200), keep: !!b.keep, label: String(b.label || ''),
-                muxName: String(b.muxName || ''), sessionName: String(b.sessionName || ''), muxCommand: String(b.muxCommand || ''),
+                muxName: String(b.muxName || ''), sessionName: String(b.sessionName || ''), insert: String(b.insert || ''),
                 collection: String(b.collection || '').slice(0, 200), collectionId: String(b.collectionId || '').slice(0, 200),
                 deckId: String(b.deckId || '').slice(0, 200), deck: String(b.deck || '').slice(0, 200),
-                deckName: String(b.deckName || '').slice(0, 200), ts: Date.now(), status: 'pending', detail: '' };
-  _commands.push(cmd); saveCommands();
-  return cmd;
+                deckName: String(b.deckName || '').slice(0, 200), takeover: !!b.takeover,
+                ts: Date.now(), status: 'pending', detail: '',
+                doneAt: 0, leaseOwner: '', leaseToken: '', leaseExpiresAt: 0, attempt: 0 };
+  cmd.fingerprint = commandFingerprint(cmd);
+  const existing = _commands.find(command => command.intentId === intentId);
+  if (existing) {
+    if (existing.fingerprint !== cmd.fingerprint) {
+      const error = new Error('intent id is already bound to a different command payload');
+      error.intentConflict = true;
+      throw error;
+    }
+    return { command: existing, deduplicated: true };
+  }
+  const candidate = [..._commands, cmd];
+  commitCommands(candidate);
+  return { command: cmd, deduplicated: false };
 }
 function waitForCommandResult(id, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   return new Promise(resolve => {
     const tick = () => {
       const c = _commands.find(x => x.id === id);
-      if (c && c.status !== 'pending') return resolve({ ok: c.status === 'done', detail: c.detail || '' });
-      if (Date.now() >= deadline) return resolve({ ok: false, detail: 'timeout waiting for PC bridge ack' });
+      if (c && c.status === 'done') return resolve({ ok: true, retryable: false, detail: c.detail || '' });
+      if (c && c.status === 'failed') return resolve({ ok: false, retryable: false, detail: c.detail || '' });
+      if (Date.now() >= deadline)
+        return resolve({ ok: false, retryable: true, detail: 'timeout waiting for PC bridge ack' });
       setTimeout(tick, 200);
     };
     tick();
   });
 }
-const ALLOWED_CMDS = new Set(['kill', 'transcript', 'fetchfile', 'rename', 'setapptitle', 'addtocollection', 'startmux', 'cleartabhistory', 'settabcolor']);
 app.post('/api/app-commands', (req, res) => {     // web (owner) enqueues
   const b = req.body || {};
-  if (!ALLOWED_CMDS.has(b.type)) return res.status(400).json({ error: 'unsupported command' });
+  if (hasForbiddenRemoteField(b)) return res.status(400).json({ error: 'executable commands and local paths are forbidden' });
+  if (!COMMAND_REPLAY_POLICY.has(b.type)) return res.status(400).json({ error: 'unsupported command' });
+  const sessionId = b.sessionId ? opaqueIdentity(b.sessionId) : '';
+  const muxName = b.muxName ? strictMuxName(b.muxName) : '';
+  const sessionName = b.sessionName ? strictMuxName(b.sessionName) : '';
+  const tool = String(b.tool || '').trim().toLowerCase();
+  if (b.intentId && !commandIntentId(b.intentId))
+    return res.status(400).json({ error: 'invalid intent id' });
+  if (b.sessionId && !sessionId) return res.status(400).json({ error: 'invalid session identity' });
+  if (b.muxName && !muxName) return res.status(400).json({ error: 'invalid mux session name' });
+  if (b.sessionName && !sessionName) return res.status(400).json({ error: 'invalid mux session name' });
+  if (tool && !['claude', 'codex'].includes(tool)) return res.status(400).json({ error: 'tool must be claude or codex' });
+  b.sessionId = sessionId;
+  b.muxName = muxName;
+  b.sessionName = sessionName;
+  b.tool = tool;
+  b.replayPolicy = COMMAND_REPLAY_POLICY.get(b.type);
   if (b.type === 'kill' && !b.sessionId && !b.pid) return res.status(400).json({ error: 'sessionId or pid required' });
   if (b.type === 'transcript' && !b.sessionId) return res.status(400).json({ error: 'sessionId required' });
   if (b.type === 'fetchfile' && !b.uploadId) return res.status(400).json({ error: 'uploadId required' });
+  if (b.type === 'fetchfile' && b.insert && !['path', 'element'].includes(String(b.insert).toLowerCase()))
+    return res.status(400).json({ error: 'fetchfile insert must be path or element' });
+  if (b.type === 'fetchfile' && b.insert && !(b.muxName || b.sessionName))
+    return res.status(400).json({ error: 'fetchfile insertion requires muxName/sessionName' });
+  if (b.type === 'fetchfile') {
+    const uploadId = String(b.uploadId || '');
+    if (!/^u[a-z0-9]+-[a-z0-9]+$/i.test(uploadId))
+      return res.status(400).json({ error: 'invalid uploadId' });
+    const upload = _uploads.find(item => item.id === uploadId);
+    if (!upload) return res.status(404).json({ error: 'upload not found' });
+    b.filename = upload.name;
+    b.keep = !!upload.keep;
+  }
   if (b.type === 'rename' && (!b.sessionId || !String(b.title || '').trim())) return res.status(400).json({ error: 'sessionId and title required' });
   if (b.type === 'setapptitle' && !b.sessionId) return res.status(400).json({ error: 'sessionId required' });   // empty title = clear the app override
   if (b.type === 'addtocollection' && (!(b.muxName || b.sessionName) || !(String(b.collection || '').trim() || String(b.collectionId || '').trim()))) return res.status(400).json({ error: 'muxName/sessionName and collection required' });
   if (b.type === 'addtocollection' && !appLive()) return res.status(409).json({ error: 'desktop app is not live; collection changes are disabled' });
   if (b.type === 'startmux' && !(b.muxName || b.sessionName)) return res.status(400).json({ error: 'muxName/sessionName required' });
+  if (b.type === 'startmux' && !b.sessionId && !['claude', 'codex'].includes(String(b.tool || '').toLowerCase()))
+    return res.status(400).json({ error: 'startmux requires sessionId or tool' });
   if (b.type === 'startmux') {
-    const localOwner = ensureNoLocalOwnerForMuxName(b.muxName || b.sessionName, b.muxCommand || '');
+    const localOwner = ensureNoLocalOwnerForMuxName(b.muxName || b.sessionName, b.sessionId || '');
     if (!localOwner.ok) return res.status(409).json({ error: 'local copy is already running', detail: localOwner.detail });
   }
-  const cmd = enqueueAppCommand(b);
-  res.json({ ok: true, id: cmd.id });
+  let queued;
+  try {
+    queued = enqueueAppCommand(b);
+  } catch (error) {
+    if (error.intentConflict) return res.status(409).json({ error: error.message });
+    return failPersistence(res, error);
+  }
+  res.json({
+    ok: true,
+    id: queued.command.id,
+    intentId: queued.command.intentId,
+    status: queued.command.status,
+    deduplicated: queued.deduplicated,
+  });
 });
-app.get('/api/app-commands', (req, res) => {      // app (loopback) pulls pending
+app.post('/api/app-commands/lease', (req, res) => {
   if (!isTrustedLocal(req)) return res.status(403).json({ error: 'forbidden' });
-  pruneCommands();
-  res.json(_commands.filter(c => c.status === 'pending'));
+  const owner = commandIntentId(req.body && req.body.owner);
+  if (!owner) return res.status(400).json({ error: 'valid lease owner required' });
+  const limit = Math.max(1, Math.min(16, Number(req.body && req.body.limit) || 8));
+  const leaseMs = TEST_MODE && Number(req.body && req.body.leaseMs)
+    ? Math.max(50, Math.min(COMMAND_LEASE_MS, Number(req.body.leaseMs)))
+    : COMMAND_LEASE_MS;
+  const now = Date.now();
+  let changed = false;
+  const candidate = _commands.map(command => {
+    if (command.status !== 'leased' || command.leaseExpiresAt > now) return command;
+    changed = true;
+    return { ...command, status: 'pending', leaseOwner: '', leaseToken: '', leaseExpiresAt: 0 };
+  });
+  const leased = [];
+  for (let index = 0; index < candidate.length && leased.length < limit; index++) {
+    const command = candidate[index];
+    if (command.status !== 'pending') continue;
+    const updated = {
+      ...command,
+      status: 'leased',
+      leaseOwner: owner,
+      leaseToken: crypto.randomBytes(18).toString('base64url'),
+      leaseExpiresAt: now + leaseMs,
+      attempt: (Number(command.attempt) || 0) + 1,
+    };
+    candidate[index] = updated;
+    leased.push(updated);
+    changed = true;
+  }
+  try {
+    if (changed) commitCommands(candidate);
+  } catch (error) {
+    return failPersistence(res, error);
+  }
+  res.json(leased);
+});
+app.get('/api/app-commands', (req, res) => {
+  if (!isTrustedLocal(req)) return res.status(403).json({ error: 'forbidden' });
+  return res.status(410).json({ error: 'unleased command pulls are disabled; use POST /api/app-commands/lease' });
 });
 app.post('/api/app-commands/:id/ack', (req, res) => {   // app (loopback) reports a result
   if (!isTrustedLocal(req)) return res.status(403).json({ error: 'forbidden' });
-  const c = _commands.find(x => x.id === req.params.id);
-  if (c) {
-    c.status = (req.body && req.body.ok) ? 'done' : 'failed'; c.detail = String((req.body && req.body.detail) || ''); c.doneAt = Date.now(); saveCommands();
-    // a successful fetchfile carries the PC path it landed at — remember it on the workspace entry.
-    if (c.type === 'fetchfile' && req.body && req.body.ok && c.uploadId) {
-      const u = _uploads.find(x => x.id === c.uploadId);
-      if (u) { u.pcPath = c.detail; saveUploadsMeta(); }
-    }
+  const index = _commands.findIndex(x => x.id === req.params.id);
+  if (index < 0) return res.status(404).json({ error: 'command not found' });
+  const prior = _commands[index];
+  const leaseToken = commandIntentId(req.body && req.body.leaseToken);
+  const status = (req.body && req.body.ok) ? 'done' : 'failed';
+  if (prior.status === 'done' || prior.status === 'failed') {
+    if (!leaseToken || leaseToken !== prior.leaseToken || status !== prior.status)
+      return res.status(409).json({ error: 'terminal command outcome is immutable' });
+    return res.json({ ok: true, status: prior.status, deduplicated: true });
   }
-  res.json({ ok: true });
+  if (
+    prior.status !== 'leased'
+    || !leaseToken
+    || leaseToken !== prior.leaseToken
+    || prior.leaseExpiresAt <= Date.now()
+  ) {
+    return res.status(409).json({ error: 'lease token is missing, stale, or expired' });
+  }
+  const updated = {
+    ...prior,
+    status,
+    detail: commandOutcomeDetail(prior.type, status, !!(req.body && req.body.onPc)),
+    doneAt: Date.now(),
+    leaseExpiresAt: 0,
+  };
+  if (updated.type === 'fetchfile' && updated.status === 'done' && updated.insert)
+    updated.detail = 'downloaded to PC and inserted into the mux prompt';
+  try {
+    if (updated.type === 'fetchfile' && req.body && req.body.onPc === true && updated.uploadId) {
+      const uploadIndex = _uploads.findIndex(x => x.id === updated.uploadId);
+      if (uploadIndex >= 0) {
+        const uploads = _uploads.slice();
+        uploads[uploadIndex] = { ...uploads[uploadIndex], onPc: true };
+        commitUploads(uploads);
+      }
+    }
+    const candidate = _commands.slice();
+    candidate[index] = updated;
+    commitCommands(candidate);
+  } catch (error) {
+    return failPersistence(res, error);
+  }
+  res.json({ ok: true, status: updated.status, deduplicated: false });
 });
 app.get('/api/app-commands/:id', (req, res) => {  // web (owner) polls a command's outcome
   const c = _commands.find(x => x.id === req.params.id);
@@ -1083,22 +1524,131 @@ app.get('/api/app-commands/:id', (req, res) => {  // web (owner) polls a command
 // (scp, via a `fetchfile` command) and points the model at the local path. Deliberately NOT routed
 // through the terminal/tmux. Owner-gated by the global middleware; size-capped; pruned after an hour.
 const UPLOADS_DIR = STATE_DIR + '/uploads';
-try { fs.mkdirSync(UPLOADS_DIR, { recursive: true }); } catch {}
+fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 const UPLOADS_META = STATE_DIR + '/uploads-meta.json';
-let _uploads = [];
-try { _uploads = JSON.parse(fs.readFileSync(UPLOADS_META, 'utf8')); } catch {}
-function saveUploadsMeta() { atomicWrite(UPLOADS_META, JSON.stringify(_uploads)); }
+const uploadIdPattern = /^u[a-z0-9]+-[a-z0-9]+$/i;
+const uploadTombstonePattern = /^(u[a-z0-9]+-[a-z0-9]+)\.deleting-[a-z0-9]+$/i;
 const uploadDir = id => UPLOADS_DIR + '/' + String(id).replace(/[^A-Za-z0-9_.-]/g, '');
+let uploadRecoveryWarnings = [];
+const isSafeUploadName = name => (
+  typeof name === 'string'
+  && /^[A-Za-z0-9._-]{1,120}$/.test(name)
+  && name !== '.'
+  && name !== '..'
+);
+const validUploadMetadata = value => (
+  Array.isArray(value)
+  && value.every(upload => (
+    upload
+    && typeof upload === 'object'
+    && uploadIdPattern.test(String(upload.id || ''))
+    && isSafeUploadName(upload.name)
+    && (!upload.session || !!strictMuxName(upload.session))
+    && Number.isFinite(Number(upload.ts))
+    && Number.isFinite(Number(upload.size))
+  ))
+);
+let _uploads = [];
+{
+  const loadedUploads = durableJsonLoad(UPLOADS_META, [], validUploadMetadata);
+  if (!Array.isArray(loadedUploads)) throw new Error('persisted upload metadata must be an array');
+  _uploads = loadedUploads.map(u => ({
+    id: String(u.id || ''), name: String(u.name || ''), session: String(u.session || ''),
+    ts: Number(u.ts) || 0, size: Number(u.size) || 0, keep: !!u.keep, onPc: !!u.onPc,
+  })).filter(u => uploadIdPattern.test(u.id));
+}
+function saveUploadsMeta(candidate = _uploads) { writeJsonState(UPLOADS_META, candidate); }
+function commitUploads(candidate) {
+  try {
+    saveUploadsMeta(candidate);
+  } catch (error) {
+    if (error.committed) _uploads = candidate;
+    throw error;
+  }
+  _uploads = candidate;
+}
+function reconcileUploadStorageOnBoot() {
+  const metadataIds = new Set();
+  for (const upload of _uploads) {
+    if (metadataIds.has(upload.id))
+      throw new Error('duplicate persisted upload id: ' + upload.id);
+    metadataIds.add(upload.id);
+  }
+
+  const tombstones = new Map();
+  for (const entry of fs.readdirSync(UPLOADS_DIR, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    const match = uploadTombstonePattern.exec(entry.name);
+    if (!match) continue;
+    const list = tombstones.get(match[1]) || [];
+    list.push(entry.name);
+    tombstones.set(match[1], list);
+  }
+
+  let changed = false;
+  for (const [id, names] of tombstones) {
+    names.sort().reverse();
+    const original = uploadDir(id);
+    if (metadataIds.has(id) && !fs.existsSync(original)) {
+      fs.renameSync(UPLOADS_DIR + '/' + names.shift(), original);
+      changed = true;
+    }
+    for (const name of names) {
+      fs.rmSync(UPLOADS_DIR + '/' + name, { recursive: true, force: true });
+      changed = true;
+    }
+  }
+
+  for (const entry of fs.readdirSync(UPLOADS_DIR, { withFileTypes: true })) {
+    if (!entry.isDirectory() || !uploadIdPattern.test(entry.name)) continue;
+    if (!metadataIds.has(entry.name)) {
+      fs.rmSync(UPLOADS_DIR + '/' + entry.name, { recursive: true, force: true });
+      changed = true;
+    }
+  }
+
+  const survivors = [];
+  for (const upload of _uploads) {
+    try {
+      const directory = uploadDir(upload.id);
+      const directoryStat = fs.lstatSync(directory);
+      if (!directoryStat.isDirectory() || directoryStat.isSymbolicLink())
+        throw new Error('storage is not a real directory');
+      const file = directory + '/' + upload.name;
+      const fileStat = fs.lstatSync(file);
+      if (!fileStat.isFile() || fileStat.isSymbolicLink())
+        throw new Error('bytes are missing or unsafe');
+      survivors.push(upload);
+    } catch (error) {
+      const warning = `quarantined upload ${upload.id}: ${error.message}`;
+      uploadRecoveryWarnings.push(warning);
+      console.error('[uploads] ' + warning);
+      try { fs.rmSync(uploadDir(upload.id), { recursive: true, force: true }); } catch {}
+      changed = true;
+    }
+  }
+  _uploads = survivors;
+  if (changed) fsyncDirectory(UPLOADS_DIR);
+}
+reconcileUploadStorageOnBoot();
+saveUploadsMeta(_uploads);
 const isImage = n => /\.(png|jpe?g|gif|webp|bmp|svg|heic)$/i.test(n || '');
-function dropUpload(u) { try { fs.rmSync(uploadDir(u.id), { recursive: true, force: true }); } catch {} }
+function dropUpload(u) {
+  try { fs.rmSync(uploadDir(u.id), { recursive: true, force: true }); }
+  catch (error) { console.error(`[uploads] deferred cleanup failed for ${u.id}: ${error.message}`); }
+}
 // "leave" (not kept) files are temporary: drop them on restart and after an hour. "keep" files persist.
 function pruneUploads(all) {
   const cut = Date.now() - 60 * 60 * 1000;
   const survivors = [];
+  const removed = [];
   for (const u of _uploads) {
-    if (!u.keep && (all || (u.ts || 0) < cut)) dropUpload(u); else survivors.push(u);
+    if (!u.keep && (all || (u.ts || 0) < cut)) removed.push(u); else survivors.push(u);
   }
-  if (survivors.length !== _uploads.length) { _uploads = survivors; saveUploadsMeta(); }
+  if (survivors.length !== _uploads.length) {
+    commitUploads(survivors);
+    for (const upload of removed) dropUpload(upload);
+  }
 }
 pruneUploads(true);   // restart sweep: non-kept uploads disappear
 let _upSeq = 0;
@@ -1106,23 +1656,44 @@ let _upSeq = 0;
 app.post('/api/upload', express.raw({ type: '*/*', limit: '64mb' }), (req, res) => {
   const raw = req.body;
   if (!raw || !raw.length) return res.status(400).json({ error: 'empty body' });
-  const safe = (String(req.query.name || 'file').replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 120)) || 'file';
-  const session = SAFE(req.query.session || '');
+  const candidateName = String(req.query.name || 'file').replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 120);
+  const safe = isSafeUploadName(candidateName) ? candidateName : 'file';
+  const rawSession = String(req.query.session || '');
+  const session = rawSession ? strictMuxName(rawSession) : '';
+  if (rawSession && !session) return res.status(400).json({ error: 'invalid session name' });
   const keep = req.query.keep === '1';
-  pruneUploads(false);
+  try {
+    pruneUploads(false);
+  } catch (error) {
+    return failPersistence(res, error);
+  }
   const id = 'u' + Date.now().toString(36) + '-' + (++_upSeq).toString(36);
-  try { fs.mkdirSync(uploadDir(id), { recursive: true }); fs.writeFileSync(uploadDir(id) + '/' + safe, raw); }
-  catch (e) { return res.status(500).json({ error: 'write failed' }); }
-  const u = { id, name: safe, session, ts: Date.now(), size: raw.length, keep, pcPath: '' };
-  _uploads.push(u); saveUploadsMeta();
+  try {
+    fs.mkdirSync(uploadDir(id), { recursive: false });
+    fsyncDirectory(UPLOADS_DIR);
+    writeBytesState(uploadDir(id) + '/' + safe, raw);
+  } catch (error) {
+    dropUpload({ id });
+    return failPersistence(res, error);
+  }
+  const u = { id, name: safe, session, ts: Date.now(), size: raw.length, keep, onPc: false };
+  const candidate = [..._uploads, u];
+  try {
+    commitUploads(candidate);
+  } catch (error) {
+    if (!error.committed) dropUpload(u);
+    return failPersistence(res, error);
+  }
   res.json({ ok: true, uploadId: id, filename: safe, size: raw.length, keep });
 });
 // The workspace: files uploaded for a session (newest first). Drives the file panel + thumbnails.
 app.get('/api/uploads', (req, res) => {
-  const session = SAFE(req.query.session || '');
+  const rawSession = String(req.query.session || '');
+  const session = rawSession ? strictMuxName(rawSession) : '';
+  if (rawSession && !session) return res.status(400).json({ error: 'invalid session name' });
   const list = _uploads.filter(u => !session || u.session === session)
     .sort((a, b) => (b.ts || 0) - (a.ts || 0))
-    .map(u => ({ id: u.id, name: u.name, size: u.size, keep: !!u.keep, ts: u.ts, image: isImage(u.name), onPc: !!u.pcPath, pcPath: u.pcPath || '' }));
+    .map(u => ({ id: u.id, name: u.name, size: u.size, keep: !!u.keep, ts: u.ts, image: isImage(u.name), onPc: !!u.onPc }));
   res.json(list);
 });
 app.get('/api/uploads/:id/raw', (req, res) => {
@@ -1131,14 +1702,53 @@ app.get('/api/uploads/:id/raw', (req, res) => {
   res.sendFile(uploadDir(u.id) + '/' + u.name, {}, e => { if (e && !res.headersSent) res.status(404).end(); });
 });
 app.patch('/api/uploads/:id', (req, res) => {
-  const u = _uploads.find(x => x.id === req.params.id);
-  if (!u) return res.status(404).json({ error: 'not found' });
-  if (req.body && typeof req.body.keep === 'boolean') { u.keep = req.body.keep; saveUploadsMeta(); }
-  res.json({ ok: true, keep: u.keep });
+  const index = _uploads.findIndex(x => x.id === req.params.id);
+  if (index < 0) return res.status(404).json({ error: 'not found' });
+  if (req.body && typeof req.body.keep === 'boolean') {
+    const candidate = _uploads.slice();
+    candidate[index] = { ...candidate[index], keep: req.body.keep };
+    try {
+      commitUploads(candidate);
+    } catch (error) {
+      return failPersistence(res, error);
+    }
+  }
+  res.json({ ok: true, keep: _uploads[index].keep });
 });
 app.delete('/api/uploads/:id', (req, res) => {
   const i = _uploads.findIndex(x => x.id === req.params.id);
-  if (i >= 0) { dropUpload(_uploads[i]); _uploads.splice(i, 1); saveUploadsMeta(); }
+  if (i >= 0) {
+    const removed = _uploads[i];
+    const candidate = _uploads.filter((_, index) => index !== i);
+    const originalDir = uploadDir(removed.id);
+    const tombstoneDir = originalDir + '.deleting-' + Date.now().toString(36);
+    let staged = false;
+    try {
+      if (fs.existsSync(originalDir)) {
+        fs.renameSync(originalDir, tombstoneDir);
+        fsyncDirectory(UPLOADS_DIR);
+        staged = true;
+      }
+      commitUploads(candidate);
+    } catch (error) {
+      if (error.committed) {
+        if (staged) {
+          try { fs.rmSync(tombstoneDir, { recursive: true, force: true }); } catch {}
+        }
+        return failPersistence(res, error);
+      }
+      if (staged) {
+        try { fs.renameSync(tombstoneDir, originalDir); } catch (rollbackError) {
+          console.error(`[uploads] delete rollback failed for ${removed.id}: ${rollbackError.message}`);
+        }
+      }
+      return failPersistence(res, error);
+    }
+    if (staged) {
+      try { fs.rmSync(tombstoneDir, { recursive: true, force: true }); }
+      catch (error) { console.error(`[uploads] tombstone cleanup failed for ${removed.id}: ${error.message}`); }
+    }
+  }
   res.json({ ok: true });
 });
 
@@ -1149,12 +1759,7 @@ const wss = new WebSocketServer({ noServer: true });
 const wssHost = new WebSocketServer({ noServer: true });
 server.on('upgrade', (req, socket, head) => {
   const p = (req.url || '').split('?')[0];
-  if (p === '/ws') {
-    // Reject cross-site WebSocket hijacking BEFORE the handshake — a foreign/absent-from-remote Origin
-    // never gets a 101, so a hostile page in the owner's browser can't open a credentialed terminal socket.
-    if (!wsOriginOk(req)) { try { socket.destroy(); } catch {} return; }
-    wss.handleUpgrade(req, socket, head, ws => wss.emit('connection', ws, req));
-  }
+  if (p === '/ws') wss.handleUpgrade(req, socket, head, ws => wss.emit('connection', ws, req));
   else if (p === '/host') {
     // reject a bad /host token BEFORE completing the handshake (constant-time) — no 101, no 'open'
     let ok = false; try { ok = hostTokenOk(new URL(req.url, 'http://x').searchParams.get('token')); } catch {}
@@ -1168,92 +1773,156 @@ wssHost.on('connection', (ws, req) => {
   const u = new URL(req.url, 'http://x');
   if (!hostTokenOk(u.searchParams.get('token'))) { try { ws.close(1008, 'bad token'); } catch {} return; }
   try { req.socket.setNoDelay(true); } catch {}                       // low-latency: no Nagle on the host link
-  if (hostWs && hostWs !== ws) { try { hostWs.close(); } catch {} }   // newest link wins (old zombie replaced)
-  hostWs = ws;
-  console.log('[host] PC session host connected');
+  let helloAccepted = false;
+  console.log('[host] PC session host candidate connected');
   ws.on('message', raw => {
     let m; try { m = JSON.parse(raw.toString()); } catch { return; }
-    if (m.t === 'hello' || m.t === 'sessions') {
-      if (m.t === 'hello') {
-        hostLabel = String(m.host || 'pc');
-        hostProtocol = { protocol: Number(m.protocol || 0), caps: Array.isArray(m.caps) ? m.caps.map(String) : [] };
-        console.log(`[host] hello from ${hostLabel} (${(m.sessions || []).length} session(s), protocol ${hostProtocol.protocol || 'unknown'})`);
+    if (containsForbiddenRemoteKey(m)) {
+      console.log('[host] rejected path/command-bearing protocol frame');
+      try { ws.close(1008, 'host frame violated protocol'); } catch {}
+      return;
+    }
+    if (m.t === 'hello') {
+      const announced = announcedHostProtocol(m);
+      const incoming = normalizeHostSessionList(m.sessions);
+      if (!announced || !incoming) {
+        console.log('[host] rejected incompatible or malformed hello');
+        try { ws.close(1008, 'host hello violated protocol'); } catch {}
+        return;
       }
-      const list = m.t === 'hello' ? m.sessions : m.list;
-      const reported = new Set(), incoming = new Map();
-      for (const s of (list || [])) {
-        const n = SAFE(s.name);
-        if (n) {
-          const alive = !!s.alive;
-          const hasCommand = !!s.hasCommand;
-          const shellOnly = Object.prototype.hasOwnProperty.call(s, 'shellOnly') ? !!s.shellOnly : (alive && !hasCommand);
-          reported.add(n);
-          incoming.set(n, { alive, created: s.created || 0, lastOut: s.lastOut || 0, tail: String(s.tail || ''),
-                            cols: s.cols || 0, rows: s.rows || 0, heal: !!s.heal, owner: !!s.owner,
-                            localFirst: !!s.localFirst, localViewers: s.localViewers || 0,
-                            hasCommand, shellOnly, ready: Object.prototype.hasOwnProperty.call(s, 'ready') ? !!s.ready : alive,
-                            kind: String(s.kind || (alive ? (shellOnly ? 'shell' : 'command') : 'dormant')),
-                            cmdSig: String(s.cmdSig || ''),
-                            agentState: String(s.agentState || ''), agentLabel: String(s.agentLabel || ''),
-                            agentDetail: String(s.agentDetail || ''), agentConfidence: String(s.agentConfidence || '') });
-        }
+      const prior = hostWs;
+      hostWs = ws;
+      helloAccepted = true;
+      hostLabel = opaqueIdentity(m.host) || 'pc';
+      hostProtocol = announced;
+      hostSessions.clear();
+      for (const [name, value] of incoming) hostSessions.set(name, value);
+      console.log(`[host] hello from ${hostLabel} (${hostSessions.size} session(s), protocol ${hostProtocol.protocol})`);
+      if (prior && prior !== ws) {
+        try { prior.close(1000, 'replaced by validated host connection'); } catch {}
       }
-      // A2 #1: don't let a status push evict an optimistic create muxd hasn't reported yet; confirm/expire pendings.
-      for (const [n, exp] of [...pendingCreates]) {
-        if (Date.now() > exp || reported.has(n)) pendingCreates.delete(n);
-        else if (hostSessions.has(n) && !incoming.has(n)) incoming.set(n, hostSessions.get(n));
+      for (const [name, st] of sessions) {
+        st.cur = null;
+        clearScrollbackRequest(st);
+        const waiter = [...st.sbWaiters].map(id => st.clients.get(id)).find(Boolean);
+        if (waiter && hostSessions.has(name)) requestSessionScrollback(name, st, waiter);
+      }
+      for (const name of hostSessions.keys()) recompute(name);
+      reconcileRenameIntentsFromHost();
+      const legacy = new Set(legacyTmuxNames());
+      const twins = [...hostSessions.keys()].filter(name => legacy.has(name));
+      if (twins.length) console.log(`[legacy] hosted/legacy name conflict(s): ${twins.join(', ')} - relay will refuse web attach/manage until cleaned manually`);
+      return;
+    }
+    if (!helloAccepted || hostWs !== ws) {
+      console.log('[host] rejected frame before validated hello');
+      try { ws.close(1008, 'validated hello required'); } catch {}
+      return;
+    }
+    if (m.t === 'sessions') {
+      const incoming = normalizeHostSessionList(m.list);
+      if (!incoming) {
+        console.log('[host] rejected malformed session list');
+        try { ws.close(1008, 'host session list violated protocol'); } catch {}
+        return;
       }
       hostSessions.clear();
       for (const [n, v] of incoming) hostSessions.set(n, v);
-      if (m.t === 'hello') {
-        // A2 #4: muxd (re)connected — its ptys were re-spawned at their own size, so our per-session
-        // resize dedup (st.cur) is stale. Clear it and re-assert sizes so viewers aren't stuck at old dims.
-        for (const st of sessions.values()) st.cur = null;
-        for (const n of hostSessions.keys()) recompute(n);
-        const legacy = new Set(legacyTmuxNames());
-        const twins = [...hostSessions.keys()].filter(n => legacy.has(n));
-        if (twins.length) console.log(`[legacy] hosted/legacy name conflict(s): ${twins.join(', ')} - relay will refuse web attach/manage until cleaned manually`);
+      reconcileRenameIntentsFromHost();
+    } else if (m.t === 'createResult') {
+      const rid = String(m.rid || '');
+      const pending = pendingHostCreates.get(rid);
+      if (!pending) return;
+      pendingHostCreates.delete(rid);
+      const responseName = strictMuxName(m.s);
+      if (responseName !== pending.expectedName) {
+        pending.finish({ ok: false, created: false, detail: 'muxd acknowledgement identity did not match the request', session: null });
+        return;
       }
+      let session = null;
+      if (m.ok && m.session) session = normalizeHostSession(m.session);
+      if (m.ok && (!session || responseName !== strictMuxName(m.session && m.session.name))) {
+        pending.finish({ ok: false, created: false, detail: 'muxd acknowledgement omitted a valid matching session', session: null });
+        return;
+      }
+      if (session) hostSessions.set(responseName, session);
+      pending.finish({
+        ok: !!m.ok,
+        created: !!m.created,
+        status: m.ok ? 200 : (m.retryable ? 503 : 409),
+        error: m.ok ? '' : (m.retryable ? 'muxd create outcome is uncertain' : 'muxd refused the create request'),
+        retryable: !!m.retryable,
+        detail: m.ok ? '' : String(m.detail || 'muxd refused the create request'),
+        session,
+      });
     } else if (m.t === 'o') {
-      const n = SAFE(m.s); const h = hostSessions.get(n); if (h) h.lastOut = Date.now();
+      const n = strictMuxName(m.s); const h = hostSessions.get(n); if (h) h.lastOut = Date.now();
       const st = sessions.get(n); if (!st) return;
       const buf = Buffer.from(m.d || '', 'base64');
       for (const c of st.clients.values()) {
         if (!c.hosted || c.ws.readyState !== 1) continue;
         if (c.sbWait) {
           (c.q = c.q || []).push(buf); c.qBytes = (c.qBytes || 0) + buf.length;
-          // Flood while still waiting for scrollback: relieve memory WITHOUT blanking. Go live over
-          // whatever's on screen (an alt-screen TUI emits cursor-addressed diffs, NOT a repaint, so a
-          // CLEAR here just black-screens it). Do NOT set sbDone — the real scrollback still arrives and
-          // delivers as CLEAR+full-replay, which is what actually paints the whole screen.
+          // Flood while still waiting for scrollback: relieve memory, but NEVER blank-and-drop.
+          // The live stream itself repaints a TUI, so go live now — clear once (a fresh attach
+          // starts clean) and replay what we buffered. wentLive means a late sb is dropped, but
+          // only because real output is already painting the screen (never leaves it black).
           if (c.qBytes > 2000000 || c.q.length > 4000) {
             c.sbWait = false; c.wentLive = true;
-            try { for (const q of c.q) c.ws.send(q); } catch {}
+            st.sbWaiters.delete(c.id);
+            if (sendViewer(n, st, c, CLEAR_SCREEN, true)) {
+              for (const q of c.q) if (!sendViewer(n, st, c, q, true)) break;
+            }
             c.q = []; c.qBytes = 0;
           }
           continue;
         }
-        try { c.ws.send(buf); c.wentLive = true; } catch {}
+        c.wentLive = true;
+        st.sbWaiters.delete(c.id);
+        sendViewer(n, st, c, buf);
       }
     } else if (m.t === 'sb') {
-      const n = SAFE(m.s); const st = sessions.get(n); if (!st) return;
+      const n = strictMuxName(m.s); const st = sessions.get(n); if (!st) return;
+      if (!st.sbInFlight || String(m.rid || '') !== st.sbRid) return;
       const buf = Buffer.from(m.d || '', 'base64');
-      for (const c of st.clients.values()) {
-        // Deliver this client's replay EXACTLY ONCE, gated by sbDone — NOT by wentLive. A client that
-        // already went live over a stale screen (timeout/overflow, or an alt-screen TUI whose diffs
-        // arrived first) still needs its scrollback to actually paint the full screen; dropping it on
-        // wentLive is what left an active TUI black-with-a-fragment. sbDone (not wentLive) also stops a
-        // NEW client's sb from re-clearing already-painted viewers.
-        if (!c.hosted || c.sbDone) continue;
-        c.sbWait = false; c.wentLive = true; c.sbDone = true;
-        try { c.ws.send(CLEAR_SCREEN); c.ws.send(buf); for (const q of (c.q || [])) c.ws.send(q); } catch {}  // clear → full replay → queued-live
+      const waiters = [...st.sbWaiters];
+      st.sbWaiters.clear();
+      clearScrollbackRequest(st);
+      for (const id of waiters) {
+        const c = st.clients.get(id);
+        // Deliver the replay unless live output has already painted (wentLive). Crucially this
+        // fires EVEN IF the sbWait timeout already elapsed: the timeout no longer blanks the
+        // screen, so a late sb is the only thing that paints an idle session. Dropping it here
+        // (the old `!c.sbWait` guard) is exactly what left an idle terminal black.
+        if (!c || !c.hosted || c.wentLive) continue;
+        c.sbWait = false; c.wentLive = true;
+        if (sendViewer(n, st, c, CLEAR_SCREEN, true) && sendViewer(n, st, c, buf, true)) {
+          for (const q of (c.q || [])) if (!sendViewer(n, st, c, q, true)) break;
+        }
         c.q = []; c.qBytes = 0;
       }
     } else if (m.t === 'tailr') { const f = pendingTails.get(m.rid); if (f) { pendingTails.delete(m.rid); f(String(m.text || '')); }
-    } else if (m.t === 'killed') { hostSessions.delete(SAFE(m.s)); }
+    } else if (m.t === 'killed') {
+      const n = strictMuxName(m.s);
+      hostSessions.delete(n);
+      deleteSessionViewerState(n, 'session ended');
+    }
   });
   const ka = setInterval(() => { if (ws.readyState === 1) { try { ws.ping(); } catch {} } }, 20000);
-  ws.on('close', () => { clearInterval(ka); if (hostWs === ws) { hostWs = null; hostProtocol = { protocol: 0, caps: [] }; console.log('[host] PC session host disconnected'); } });
+  ws.on('close', () => {
+    clearInterval(ka);
+    if (hostWs === ws) {
+      hostWs = null; hostProtocol = { protocol: 0, caps: [] };
+      for (const st of sessions.values()) {
+        clearScrollbackRequest(st);
+      }
+      for (const [rid, pending] of pendingHostCreates) {
+        pendingHostCreates.delete(rid);
+        pending.finish({ ok: false, created: false, detail: 'PC mux host disconnected before acknowledgement', session: null });
+      }
+      console.log('[host] PC session host disconnected');
+    }
+  });
 });
 
 // ---- shared window sizing + DEVICE-IDENTITY PINNING (multi-client mirror, ONE stable size) --------
@@ -1265,19 +1934,226 @@ wssHost.on('connection', (ws, req) => {
 // viewers only, so a backgrounded desktop tab in another room can't force your phone to pan forever.
 const PINS_FILE = STATE_DIR + '/pins.json';
 let pins = new Map();   // session -> { deviceId, label, cols, rows, at }
-try { pins = new Map(JSON.parse(fs.readFileSync(PINS_FILE, 'utf8'))); } catch {}
+{
+  const loadedPins = durableJsonLoad(
+    PINS_FILE,
+    [],
+    value => Array.isArray(value) && value.every(entry => Array.isArray(entry) && entry.length === 2),
+  );
+  if (!Array.isArray(loadedPins)) throw new Error('persisted pin state must be an entry array');
+  pins = new Map(loadedPins);
+}
 let _pinsDirty = false;
-function savePins() { try { fs.writeFileSync(PINS_FILE + '.tmp', JSON.stringify([...pins])); fs.renameSync(PINS_FILE + '.tmp', PINS_FILE); _pinsDirty = false; } catch {} }
-setInterval(() => { if (_pinsDirty) savePins(); }, 20000);
+function savePins(candidate = pins) {
+  try {
+    writeJsonState(PINS_FILE, [...candidate]);
+  } catch (error) {
+    if (error.committed) {
+      pins = candidate;
+      _pinsDirty = false;
+    }
+    throw error;
+  }
+  pins = candidate;
+  _pinsDirty = false;
+}
+const RENAME_INTENTS_FILE = STATE_DIR + '/rename-intents.json';
+let renameIntents = durableJsonLoad(
+  RENAME_INTENTS_FILE,
+  [],
+  value => Array.isArray(value) && value.every(intent => (
+    intent
+    && typeof intent === 'object'
+    && /^[A-Za-z0-9._-]{1,128}$/.test(String(intent.id || ''))
+    && !!strictMuxName(intent.from)
+    && !!strictMuxName(intent.to)
+    && intent.from !== intent.to
+    && typeof intent.fromHadPin === 'boolean'
+    && typeof intent.toHadPin === 'boolean'
+  )),
+);
+function saveRenameIntents(candidate = renameIntents) {
+  try {
+    writeJsonState(RENAME_INTENTS_FILE, candidate);
+  } catch (error) {
+    if (error.committed) renameIntents = candidate;
+    throw error;
+  }
+  renameIntents = candidate;
+}
+function beginRenameIntent(from, to) {
+  if (renameIntents.some(intent => (
+    intent.from === from || intent.to === from || intent.from === to || intent.to === to
+  ))) return null;
+  const intent = {
+    id: 'r' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10),
+    from,
+    to,
+    fromHadPin: pins.has(from),
+    fromPin: pins.has(from) ? pins.get(from) : null,
+    toHadPin: pins.has(to),
+    toPin: pins.has(to) ? pins.get(to) : null,
+    createdAt: Date.now(),
+  };
+  saveRenameIntents([...renameIntents, intent]);
+  return intent;
+}
+function applyRenameIntentPins(intent, renamed) {
+  if (!intent.fromHadPin && !intent.toHadPin) return;
+  const candidate = new Map(pins);
+  candidate.delete(intent.from);
+  candidate.delete(intent.to);
+  if (renamed) {
+    if (intent.fromHadPin) candidate.set(intent.to, intent.fromPin);
+    else if (intent.toHadPin) candidate.set(intent.to, intent.toPin);
+  } else {
+    if (intent.fromHadPin) candidate.set(intent.from, intent.fromPin);
+    if (intent.toHadPin) candidate.set(intent.to, intent.toPin);
+  }
+  savePins(candidate);
+}
+function completeRenameIntent(id) {
+  const candidate = renameIntents.filter(intent => intent.id !== id);
+  if (candidate.length === renameIntents.length) return;
+  saveRenameIntents(candidate);
+}
+function reconcileRenameIntents() {
+  for (const intent of [...renameIntents]) {
+    const oldExists = hostSessions.has(intent.from);
+    const newExists = hostSessions.has(intent.to);
+    if (oldExists === newExists) continue;
+    applyRenameIntentPins(intent, newExists);
+    completeRenameIntent(intent.id);
+  }
+}
+function reconcileRenameIntentsFromHost() {
+  try {
+    reconcileRenameIntents();
+  } catch (error) {
+    persistenceFailure = String(error && error.message || error);
+    if (!error.committed) persistenceBlocked = persistenceFailure;
+    console.error('[persistence] rename-intent reconciliation failed: ' + persistenceFailure);
+  }
+}
+savePins(pins);
+saveRenameIntents(renameIntents);
+setInterval(() => {
+  if (!_pinsDirty) return;
+  try { savePins(new Map(pins)); }
+  catch (error) {
+    persistenceFailure = String(error && error.message || error);
+    console.error('[persistence] pin retry failed: ' + persistenceFailure);
+  }
+}, 20000);
 const ACTIVE_MS = +process.env.MUX_ACTIVE_MS || 180000;   // "recently active" window that auto-size considers (3 min; env-overridable for tests)
-const PIN_HOLD_MS = 600000; // hold an absent pinned device's last size before falling back to auto (10 min)
+const VIEWER_HIGH_WATER_BYTES = Math.max(1024, +process.env.MUX_VIEWER_HIGH_WATER_BYTES || 4 * 1024 * 1024);
+const VIEWER_REPLAY_BURST_BYTES = HOST_SB_BYTES + 2000000 + CLEAR_SCREEN.length;
 
-const sessions = new Map(); // name -> { clients: Map<id,Client>, cur }
+const sessions = new Map(); // name -> { clients: Map<id,Client>, cur, sbInFlight, sbRid, sbWaiters, sbRequestTimer }
 let _cid = 0;
+let _scrollbackRequestSeq = 0;
 function sessionState(name) {
   let st = sessions.get(name);
-  if (!st) { st = { clients: new Map(), cur: null }; sessions.set(name, st); }
+  if (!st) {
+    st = {
+      clients: new Map(), cur: null, sbInFlight: false, sbRid: '',
+      sbWaiters: new Set(), sbRequestTimer: null,
+    };
+    sessions.set(name, st);
+  }
   return st;
+}
+function deleteEmptySessionState(name, st) {
+  if (st.clients.size === 0 && sessions.get(name) === st) {
+    clearScrollbackRequest(st);
+    sessions.delete(name);
+  }
+}
+function clearPinForDisconnectedDevice(name, st, client) {
+  const deviceId = client.deviceId || ('sock-' + client.id);
+  let pin = pins.get(name);
+  if (!pin || pin.deviceId !== deviceId) return;
+  const stillConnected = [...st.clients.values()].some(
+    other => (other.deviceId || ('sock-' + other.id)) === deviceId,
+  );
+  if (stillConnected) return;
+  const candidate = new Map(pins);
+  candidate.delete(name);
+  commitBestEffortPinCleanup(candidate, 'disconnected pin cleanup');
+}
+function commitBestEffortPinCleanup(candidate, context) {
+  try {
+    savePins(candidate);
+  } catch (error) {
+    pins = candidate;
+    _pinsDirty = true;
+    persistenceFailure = String(error && error.message || error);
+    console.error(`[persistence] ${context} retry scheduled: ${persistenceFailure}`);
+  }
+}
+function removeViewer(name, st, client) {
+  if (client.removed) return;
+  client.removed = true;
+  if (client.ka) clearInterval(client.ka);
+  if (client.sbTimer) clearTimeout(client.sbTimer);
+  st.clients.delete(client.id);
+  st.sbWaiters.delete(client.id);
+  clearPinForDisconnectedDevice(name, st, client);
+  deleteEmptySessionState(name, st);
+}
+function deleteSessionViewerState(name, reason) {
+  const st = sessions.get(name);
+  if (!st) return;
+  for (const client of [...st.clients.values()]) {
+    removeViewer(name, st, client);
+    try { client.ws.close(1013, reason); } catch {}
+  }
+  sessions.delete(name);
+}
+function viewerBytes(data) {
+  return Buffer.isBuffer(data) ? data.length : Buffer.byteLength(String(data));
+}
+function sendViewer(name, st, client, data, replayBurst = false) {
+  if (client.removed || client.ws.readyState !== 1) return false;
+  const limit = VIEWER_HIGH_WATER_BYTES + (replayBurst ? VIEWER_REPLAY_BURST_BYTES : 0);
+  if (client.ws.bufferedAmount + viewerBytes(data) > limit) {
+    removeViewer(name, st, client);
+    try { client.ws.terminate(); } catch {}
+    return false;
+  }
+  try {
+    client.ws.send(data);
+    return true;
+  } catch {
+    removeViewer(name, st, client);
+    try { client.ws.terminate(); } catch {}
+    return false;
+  }
+}
+function clearScrollbackRequest(st) {
+  if (st.sbRequestTimer) clearTimeout(st.sbRequestTimer);
+  st.sbRequestTimer = null;
+  st.sbInFlight = false;
+  st.sbRid = '';
+}
+function requestSessionScrollback(name, st, client) {
+  st.sbWaiters.add(client.id);
+  if (st.sbInFlight) return true;
+  st.sbInFlight = true;
+  st.sbRid = 'sb' + Date.now().toString(36) + '-' + (++_scrollbackRequestSeq).toString(36);
+  const rid = st.sbRid;
+  if (sendHost({ t: 'sb', s: name, rid, max: HOST_SB_BYTES })) {
+    st.sbRequestTimer = setTimeout(() => {
+      if (sessions.get(name) !== st || !st.sbInFlight || st.sbRid !== rid) return;
+      clearScrollbackRequest(st);
+      const waiter = [...st.sbWaiters].map(id => st.clients.get(id)).find(Boolean);
+      if (waiter && hostSessions.has(name)) requestSessionScrollback(name, st, waiter);
+    }, HOST_SB_REQUEST_TIMEOUT_MS);
+    return true;
+  }
+  clearScrollbackRequest(st);
+  st.sbWaiters.delete(client.id);
+  return false;
 }
 function isActive(c) { return c.visible !== false || (Date.now() - (c.lastActive || c.connAt || 0) < ACTIVE_MS); }
 function widest(list) { let b = list[0]; for (const c of list) if (c.vcols > b.vcols || (c.vcols === b.vcols && c.vrows > b.vrows)) b = c; return b; }
@@ -1294,9 +2170,18 @@ function targetSize(st, name) {
   const pin = pins.get(name);
   if (pin) {
     const onDev = all.filter(c => (c.deviceId || ('sock-' + c.id)) === pin.deviceId);
-    if (onDev.length) { const c = widest(onDev); if (c.vcols !== pin.cols || c.vrows !== pin.rows) { pin.cols = c.vcols; pin.rows = c.vrows; _pinsDirty = true; } return { cols: c.vcols, rows: c.vrows, pin }; }
-    if (Date.now() - (pin.at || 0) < PIN_HOLD_MS && pin.cols > 1) return { cols: pin.cols, rows: pin.rows, pin };  // pinned device away → hold its size (grace)
-    pins.delete(name); savePins();   // grace expired → drop the pin, fall to auto
+    if (onDev.length) {
+      const c = widest(onDev);
+      if (c.vcols !== pin.cols || c.vrows !== pin.rows) {
+        pin = { ...pin, cols: c.vcols, rows: c.vrows };
+        pins.set(name, pin);
+        _pinsDirty = true;
+      }
+      return { cols: c.vcols, rows: c.vrows, pin };
+    }
+    const candidate = new Map(pins);
+    candidate.delete(name);
+    commitBestEffortPinCleanup(candidate, 'stale pin cleanup');
   }
   if (!all.length) return null;
   const active = all.filter(isActive);
@@ -1306,7 +2191,8 @@ function targetSize(st, name) {
 function recompute(name) {
   const st = sessions.get(name); if (!st) return;
   const sz = targetSize(st, name); if (!sz) return;
-  const cols = Math.max(2, sz.cols | 0), rows = Math.max(2, sz.rows | 0);
+  const cols = clampTermDimension(sz.cols, 2, MAX_TERM_COLS);
+  const rows = clampTermDimension(sz.rows, 2, MAX_TERM_ROWS);
   for (const c of st.clients.values()) { if (c.term) try { c.term.resize(cols, rows); } catch {} }
   // Hosted sessions are local-first: if muxd already reports a PTY size, web viewers follow it
   // and never resize the PC PTY. Only pending brand-new web-created sessions may send an initial size.
@@ -1320,13 +2206,15 @@ function recompute(name) {
     const mine = pinned && sz.pin.deviceId === (c.deviceId || ('sock-' + c.id));
     const mode = sz.hostedSize ? 'local' : (pinned ? 'pinned' : 'auto');
     const modeLabel = sz.hostedSize ? `local · ${cols}×${rows}` : (pinned ? `📌 ${pinLabel} · ${cols}×${rows}` : `auto · ${cols}×${rows}`);
-    try { c.ws.send('d' + JSON.stringify({ cols, rows, mode, pinLabel, mine, modeLabel, me: c.id, clients })); } catch {}
+    sendViewer(name, st, c, 'd' + JSON.stringify({ cols, rows, mode, pinLabel, mine, modeLabel, me: c.id, clients }));
   }
 }
 function pinToDevice(name, client, on) {
-  if (on) pins.set(name, { deviceId: client.deviceId || ('sock-' + client.id), label: client.label || 'this device', cols: client.vcols, rows: client.vrows, at: Date.now() });
-  else pins.delete(name);
-  savePins(); recompute(name);
+  const candidate = new Map(pins);
+  if (on) candidate.set(name, { deviceId: client.deviceId || ('sock-' + client.id), label: client.label || 'this device', cols: client.vcols, rows: client.vrows, at: Date.now() });
+  else candidate.delete(name);
+  savePins(candidate);
+  recompute(name);
 }
 function pinToDeviceId(name, deviceId) {   // long-press: pin to ANY listed device
   const st = sessions.get(name); if (!st) return;
@@ -1345,7 +2233,16 @@ function applyActivity(client, o) {
 // Shared sizing/pin/activity message handler for BOTH paths ('i' input stays with each caller).
 function handleClientMsg(name, client, s) {
   const t = s[0];
-  if (t === 'v' || t === 'r') { try { const o = JSON.parse(s.slice(1)); if (o.cols) client.vcols = Math.max(2, o.cols | 0); if (o.rows) client.vrows = Math.max(2, o.rows | 0); applyActivity(client, o); } catch {} recompute(name); return true; }
+  if (t === 'v' || t === 'r') {
+    try {
+      const o = JSON.parse(s.slice(1));
+      if (o.cols != null) client.vcols = clampTermDimension(o.cols, client.vcols, MAX_TERM_COLS);
+      if (o.rows != null) client.vrows = clampTermDimension(o.rows, client.vrows, MAX_TERM_ROWS);
+      applyActivity(client, o);
+    } catch {}
+    recompute(name);
+    return true;
+  }
   if (t === 'h') { try { applyActivity(client, JSON.parse(s.slice(1))); } catch {} return true; }
   if (t === 'P') { const arg = s.slice(1); if (arg && arg[0] === '#') pinToDeviceId(name, arg.slice(1)); else pinToDevice(name, client, arg !== '0'); return true; }
   if (t === 's') { cycleMode(name, client); return true; }
@@ -1356,10 +2253,10 @@ wss.on('connection', async (ws, req) => {
   if (!isTrustedLocal(req) && !(await isOwner(cookieVal(req, HL_COOKIE)))) { try { ws.close(1008, 'unauthorized'); } catch {} return; }
   try { req.socket.setNoDelay(true); } catch {}                       // low-latency keystrokes: no Nagle on the viewer link
   const u = new URL(req.url, 'http://x');
-  const name = SAFE(u.searchParams.get('session'));
+  const name = strictMuxName(u.searchParams.get('session'));
   if (!name) return ws.close();
-  const vcols = Math.max(2, +u.searchParams.get('cols') || 100);
-  const vrows = Math.max(2, +u.searchParams.get('rows') || 30);
+  const vcols = clampTermDimension(u.searchParams.get('cols'), 100, MAX_TERM_COLS);
+  const vrows = clampTermDimension(u.searchParams.get('rows'), 30, MAX_TERM_ROWS);
   const deviceId = (u.searchParams.get('dev') || '').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 40);   // persistent device identity for pinning
   const label = (u.searchParams.get('label') || '').replace(/[^\w .·/+-]/g, '').slice(0, 32) || 'device';
 
@@ -1371,8 +2268,8 @@ wss.on('connection', async (ws, req) => {
     try { ws.close(1013, legacyDetail(name)); } catch {}
     return;
   }
-  if (hostUp() && (hostSessions.has(name) || pendingCreates.has(name) || !legacyBlocked)) {
-    const known = hostSessions.get(name);
+  if (hostUp() && (hostSessions.has(name) || !legacyBlocked)) {
+    let known = hostSessions.get(name);
     if (known && !hostProtocolOk()) {
       try { ws.close(1013, hostProtocolDetail()); } catch {}
       return;
@@ -1382,35 +2279,31 @@ wss.on('connection', async (ws, req) => {
       return;
     }
     if (!known) {
-      if (!hostProtocolOk()) {
-        try { ws.close(1013, hostProtocolDetail()); } catch {}
-        return;
-      }
-      if (!sendHost({ t: 'create', s: name, rid: crypto.randomUUID(), cols: vcols, rows: vrows, heal: _healOn.has(name) })) {   // opaque create (muxd forbids cmd/ids, requires rid)
-        try { ws.close(1013, 'PC mux host offline'); } catch {}
-        return;
-      }
-      markPending(name);
+      try { ws.close(1013, 'Mux session does not exist. Create it explicitly before attaching.'); } catch {}
+      return;
     }
     const id = 'c' + (++_cid);
     const st = sessionState(name);
-    const client = { id, ws, term: null, hosted: true, vcols, vrows, sbWait: true, wentLive: false, sbDone: false, sbTok: ++_cid, q: [], qBytes: 0, deviceId, label, visible: true, lastActive: Date.now(), connAt: Date.now() };
+    const client = { id, ws, term: null, hosted: true, vcols, vrows, sbWait: true, wentLive: false, sbTok: ++_cid, q: [], qBytes: 0, deviceId, label, visible: true, lastActive: Date.now(), connAt: Date.now() };
     st.clients.set(id, client);
-    if (!sendHost({ t: 'sb', s: name, max: HOST_SB_BYTES })) {           // bounded replay; live bytes queue briefly behind it
-      st.clients.delete(id);
+    if (!requestSessionScrollback(name, st, client)) {                   // one snapshot shared by every concurrent waiter
+      removeViewer(name, st, client);
       try { ws.close(1013, 'PC mux host offline'); } catch {}
       return;
     }
-    // Scrollback slow/large: relieve the wait WITHOUT blanking. Flow buffered diffs over whatever's on
-    // screen; leave an idle session as-is. Do NOT set sbDone or CLEAR — the real sb, whenever it lands,
-    // still delivers as CLEAR+full-replay to paint the whole screen. (Blanking here + dropping the late
-    // sb was the dominant black-with-a-fragment bug for active alt-screen TUIs.)
-    setTimeout(() => {
+    // Scrollback slow/large: relieve the wait WITHOUT blanking the screen. If live output was
+    // buffered, flow it now (a TUI repaints). If the session is idle (nothing buffered), leave the
+    // screen as-is and keep waiting — wentLive stays false so the sb reply (or the next live byte)
+    // still paints it. Blanking here and then dropping the late sb was the black-screen bug.
+    client.sbTimer = setTimeout(() => {
       if (!client.sbWait) return;
       client.sbWait = false;
       if (client.q && client.q.length) {
         client.wentLive = true;
-        try { for (const q of client.q) ws.send(q); } catch {}
+        st.sbWaiters.delete(client.id);
+        if (sendViewer(name, st, client, CLEAR_SCREEN, true)) {
+          for (const q of client.q) if (!sendViewer(name, st, client, q, true)) break;
+        }
         client.q = []; client.qBytes = 0;
       }
     }, HOST_SB_WAIT_MS);
@@ -1426,8 +2319,8 @@ wss.on('connection', async (ws, req) => {
       }
       handleClientMsg(name, client, s);
     });
-    const ka = setInterval(() => { if (ws.readyState === 1) { try { ws.ping(); } catch {} } }, 25000);
-    ws.on('close', () => { clearInterval(ka); st.clients.delete(id); recompute(name); });
+    client.ka = setInterval(() => { if (ws.readyState === 1) { try { ws.ping(); } catch {} } }, 25000);
+    ws.on('close', () => { removeViewer(name, st, client); recompute(name); });
     return;
   }
 
