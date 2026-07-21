@@ -713,7 +713,9 @@ an exploitable or user-visible failure in this audit.
   normally with **7/7 tests passed**.
 - Focused bridge tests:
   `dotnet test native/CodexLocalRetrieval.Native.Tests/CodexLocalRetrieval.Native.Tests.csproj --no-restore --filter "FullyQualifiedName~ArchiveServiceTests|FullyQualifiedName~RemoteCommandProtocolTests|FullyQualifiedName~RemoteUploadTransferTests|FullyQualifiedName~ArchitectureLaunchSurfaceTests"`:
-  **145/145 tests passed**.
+  the earlier focused run reported **145/145 tests passed**. A repeat run in the
+  final pass did not terminate within three minutes and its audit-owned
+  `dotnet`/`testhost` tree was stopped; no second result was claimed.
 - Direct extraction/probes of the client functions confirmed:
   `repeatedWholePhrase("abcdeabcdeabcde") => "abcde"`;
   SGR wheel reports are preserved; X10 and urxvt/1015 wheel reports are
@@ -794,3 +796,187 @@ arbitrary relay-provided launch command text is not executed, because
 `startmux` rebuilds the command locally. That positive control does not remove
 the relay queue's authorization/provenance problem for the trusted actions it
 can request.
+
+## Append-only completion for the four pending audit items
+
+This addendum is authoritative for the requested web-client/desktop-bridge
+completion, verification notes, and deployment ordering. It preserves findings
+1-32 above and adds only gaps found in the final pass.
+
+### Additional confirmed findings
+
+#### 33. Mobile IME composition is flushed before composition is complete [MEDIUM]
+
+- **Evidence:** `_taComposing` is assigned at `public/index.html:993` and
+  `index.html:1020-1021` but is never read. Every `input` event calls
+  `taFlushDelta` at `index.html:1022`, including intermediate composition
+  updates. The capture handler then stops `compositionend` after xterm may have
+  observed `compositionstart`.
+- **Why it matters:** CJK, accent, handwriting, and predictive IMEs can send
+  partial text or leave xterm's composition helper in the wrong state. The
+  UTF-16 deletion issue in S2 compounds this for emoji and combining text.
+- **Fix:** Own both composition boundaries consistently, ignore `input` while
+  composing, send only the committed value at `compositionend`, and compute
+  replacement edits by grapheme/code point rather than UTF-16 code unit.
+
+#### 34. The command-free projection conflicts with relay relaunch consumers [MEDIUM]
+
+- **Evidence:** `BuildProjectsProjectionJson` intentionally omits `command` and
+  `muxCommand` (`ArchiveService.cs:3791-3815`; asserted by
+  `ArchiveServiceTests.cs:1073-1100`). The relay still reads `muxCommand` at
+  `server.js:331-336`, `server.js:660-679`, `server.js:814-823`, and
+  `server.js:920-927`; the web client expects it at
+  `public/index.html:1921-1946` and `index.html:1996-2018`.
+- **Why it matters:** A historical-chat relaunch can send an empty command and
+  fall back to the tab's currently saved muxd command, relaunching the wrong
+  chat. Boot recreation and auto-heal also cannot derive a resume command from
+  the current projection.
+- **Fix:** Keep the projection command-free. Send a versioned intent containing
+  `{sessionId, tool, muxName, intentId}` and resolve the executable/resume
+  command only inside the authenticated PC bridge. Remove the relay/client
+  `muxCommand` fallback contract.
+
+#### 35. HTML is no-store, but its unversioned vendor assets are cacheable [LOW]
+
+- **Evidence:** `server.js:85-93` applies no-store headers only to `.html`.
+  `public/index.html:10` and `index.html:694-695` load unversioned
+  `vendor/xterm.css`, `vendor/xterm.js`, and `vendor/addon-fit.js`. A local
+  header probe returned `public, max-age=0` plus `ETag`/`Last-Modified` for
+  those files, while `index.html` returned
+  `no-store, no-cache, must-revalidate, proxy-revalidate`.
+- **Why it matters:** A normal navigation gets fresh inline application code,
+  but the vendor files are stored and revalidated; they do not meet a strict
+  "cannot cache" deployment contract. Finding 25F separately covers already
+  open pages, which never fetch the new inline code.
+- **Fix:** Use content-hashed vendor filenames referenced by the HTML, or apply
+  no-store to every shipped client asset. Keep the visible build/protocol check
+  so open tabs can require a reload after deployment.
+
+#### 36. Workspace failures and overlapping polls can render false empty/stale state [LOW]
+
+- **Evidence:** `loadWorkspace` converts every fetch/JSON failure to `wsFiles=[]`
+  at `public/index.html:2138-2142`, so the dialog renders a healthy `No files`
+  state. `loadSessions` is started every four seconds at `index.html:2530`
+  without an abort controller or response generation; manual calls can overlap
+  the poll.
+- **Why it matters:** Relay/auth failures look like valid empty data, and a slow
+  older response can overwrite a newer state.
+- **Fix:** Track loading/error/last-good states separately, add request
+  deadlines, abort superseded requests, and apply results only when their
+  generation is current.
+
+### Web-client conclusion
+
+- Findings 25A-25F, 31-33, 35, and 36 cover the requested XSS, frame validation,
+  blank/scroll recovery, viewport, mobile input, stale-deploy, mouse, and
+  empty/error-state review.
+- Session names and titles are generally written with `textContent` or `esc`.
+  The confirmed server-data XSS is the `setStatus(...).innerHTML` path in 25A.
+- Reload, reconnect, write/paint watchdog, jump-to-bottom, and scrollback replay
+  paths exist. They recover ordinary blank/frozen views, but cannot repair the
+  silently gapped byte stream in 25C.
+
+### Desktop-bridge conclusion
+
+- `POST /api/projects` carries schema/machine metadata, decks, collections, up
+  to 500 `allChats`, running-session verification/process metadata,
+  `muxTabChats`, and tab metadata. It carries session IDs, tool, mux name,
+  title/alias/workspace labels, and running flags, but no arbitrary shell
+  command.
+- The projection therefore carries a launch *intent*, not executable text.
+  `startmux` reconstructs the command through trusted local archive/tool paths.
+  Finding 34 is a correctness mismatch, not projection command injection.
+- Findings 8A and 8B are the command-poll result: the relay's legacy queue is
+  incompatible with both lease-based bridge pollers, and `ALLOWED_CMDS` at
+  `server.js:1035-1047` limits only command type. It does not authenticate
+  command provenance or authorize argument values. Ambient VPS loopback trust
+  is therefore not an acceptable bridge credential.
+- `ReadCodexRolloutPath` is parameterized, so the session ID is not SQL
+  injection. S1 remains because the returned path is not canonicalized or
+  constrained to an expected Codex rollout root before transcript reading.
+
+## Suspected or unconfirmed findings: final list
+
+- **Mouse compatibility:** X10/1015 wheel loss is proven at the filter, but the
+  deployed TUIs' negotiated mode was not observed. Force each mouse mode in an
+  alternate-buffer test app and record the bytes received for wheel/click/move.
+- **Mobile IME impact:** The composition logic is defective by inspection; the
+  exact visible corruption needs Android/iOS tests with CJK, accents, emoji,
+  autocorrect, and composition replacement while recording terminal bytes.
+- **Rollout path boundary:** Inspect the SQLite/rollout ACLs, then place an
+  out-of-root path in a disposable database and request its transcript. The
+  expected fixed behavior is rejection before any file open.
+- **Ambient loopback blast radius:** Run relay and muxd probes as the actual
+  hosted-sandbox identity. This confirms whether its effective network/token
+  restrictions currently block the code-level authority in findings 2-4/8B.
+
+## Verification addendum
+
+- `node --check server.js`: exit 0.
+- Extracted the single inline script from `public/index.html` and compiled it
+  with `new Function`: `inline script parse: ok (1 block)`.
+- Extracted the shipped `stripMouseReports` function and ran focused inputs:
+  `sgrWheel` was preserved; `sgrClick`, `x10Wheel`, and `urxvtWheel` returned
+  empty strings.
+- Header probe: HTML returned no-store/no-cache; all three vendor files returned
+  `public, max-age=0` with validators.
+- Static source comparison confirmed the bridge lease/replay fields are absent
+  from the relay, the projection omits raw commands, and relay/web relaunch
+  paths still consume `muxCommand`.
+- The aggregate test results and the ordinary `npm test` non-termination are
+  recorded in the main verification section above. All audit-owned timed-out
+  Node and .NET process trees were stopped.
+
+## Open questions: deployment decisions
+
+1. Is the intended relaunch contract command-free ID intent, or should the
+   projection again expose resume commands? The safer design is command-free.
+2. Which bridge is authoritative in production: the GUI poller, the headless
+   poller, or exactly one elected consumer? Lease ownership depends on this.
+3. Should client assets use immutable hashed names or universal no-store?
+4. Which mobile browsers/keyboards and mouse protocols are release-supported?
+
+## Suggested fix order by deployment constraint
+
+### Safe anytime
+
+1. **[MEDIUM]** Copy a fixed `public/index.html` with the 25A-25F/31/33/36
+   changes: remove the status HTML sink, validate frames, byte-bound queues,
+   resync after drops, fix viewport/IME/dedup/mouse behavior, and show real
+   error states. This is a static copy and needs no service restart; already
+   open viewers must reload.
+2. **[MEDIUM/LOW]** Make the projection/command protocol tests authoritative,
+   add hashed vendor assets, rollout-path validation, upload-ID validation, and
+   projection byte limits. These can be prepared and tested before any outage.
+
+### Needs VPS firewall or nginx
+
+3. **[HIGH]** Immediately firewall direct public access to relay port 7682 while
+   preserving nginx and the SSH loopback bridge path. Add nginx body/rate limits
+   and reload nginx gracefully.
+4. **[HIGH/MEDIUM]** Terminate the relay-to-muxd path with authenticated TLS,
+   remove query-string credentials, then rotate the host token after both ends
+   are ready.
+
+### Needs relay restart
+
+5. **[HIGH]** Use one coordinated relay outage to bind to `127.0.0.1`, remove
+   ambient loopback owner trust, add distinct scoped nginx/bridge credentials,
+   and deploy one versioned lease/ack protocol with provenance, expiry,
+   idempotency, and strict per-command schemas. This restart drops web viewers,
+   so batch these changes.
+6. **[MEDIUM]** In the same restart, deploy graceful shutdown, operation
+   generations/tombstones, async legacy probes, auth/upgrade rate controls, and
+   the remaining relay bounds. Verify viewer reconnect and bridge compatibility
+   before reopening command enqueue.
+
+### Needs muxd restart
+
+7. **[HIGH]** Wait for a no-active-session window, then authenticate the muxd
+   control channel (prefer an ACL'd named pipe), restrict/rotate `muxd.env`, and
+   deploy persistent custody if logoff survival is required.
+8. **[HIGH/MEDIUM]** In that same muxd window, separate WMI/CIM from the control
+   executor, release the global lock before durable writes, bound recovery from
+   wedged child processes, and add protocol/range/idempotency enforcement.
+   Reconnect the host and run create/input/resize/kill/recovery smoke tests
+   before allowing new sessions.
