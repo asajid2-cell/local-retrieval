@@ -4,6 +4,7 @@ uploads-meta.json
 projects.json
 app-commands.json
 autoheal.json
+rename-intents.json
 *.log
 *.bak-*
 server.js.bak*
