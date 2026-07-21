@@ -1,0 +1,889 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0a0a0c">
+<title>multiplex — projects</title>
+<style>
+  /* Standalone Projects browser — deliberately NO terminal/xterm on this page (xterm's render loop
+     corrupts list compositing when they share a document). Resume deep-links back into the terminal.
+     ARCHITECTURE — master/detail, NOT an inline accordion. A tall collection body opening inline
+     shifts the painted content below it by hundreds of px, and Chromium's GPU raster fails to
+     re-rasterize the shifted glyphs (box borders repaint, text doesn't — verified). So we never
+     expand inline: the list is a flat set of collection rows (no large reflow), and tapping a
+     collection SWAPS to a detail view (the list is hidden, so there's no painted content to shift).
+     Each view is either static or a fresh small paint — the failure mode is removed by construction. */
+  :root {
+    --bg:#0a0a0c; --panel:#101014; --panel-2:#16161b; --raised:#20202a;
+    --line:#23232b; --line-soft:#1b1b22; --txt:#ededf0; --muted:#9494a0; --faint:#6a6a76;
+    --rose:#fb7185; --rose-dim:rgba(251,113,133,.14); --live:#34d399; --warn:#fbbf24;
+    --sp1:4px; --sp2:8px; --sp3:12px; --sp4:16px; --r-s:7px; --r-m:9px;
+  }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  :focus-visible { outline:2px solid var(--rose); outline-offset:2px; border-radius:var(--r-s); }
+  html,body { margin:0; height:100%; background:var(--bg); color:var(--txt);
+    font:500 14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; overscroll-behavior:none; -webkit-text-size-adjust:100%; }
+  body { position:fixed; inset:0; }
+  #app { display:flex; flex-direction:column; height:100dvh; min-height:0; }
+  #topbar { flex:0 0 auto; display:flex; align-items:center; gap:var(--sp2);
+    padding:var(--sp2) var(--sp3); padding-top:max(var(--sp2),env(safe-area-inset-top));
+    background:var(--panel); border-bottom:1px solid var(--line); }
+  .brand { display:flex; align-items:center; gap:var(--sp2); min-width:0; }
+  .brand .glyph { width:19px; height:19px; flex:0 0 auto; }
+  .brand .wordmark { font-weight:600; font-size:15px; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .spacer { flex:1 1 auto; }
+  .topbtn { display:inline-flex; align-items:center; gap:6px; height:38px; padding:0 var(--sp3);
+    border-radius:var(--r-m); border:1px solid var(--line); background:var(--panel-2); color:var(--txt);
+    font:600 13px/1 inherit; text-decoration:none; cursor:pointer; flex:0 0 auto; }
+  .topbtn:hover { border-color:var(--rose); }
+  #backproj[hidden] { display:none; }
+  #syncbar { flex:0 0 auto; display:flex; align-items:center; gap:var(--sp2); padding:var(--sp2) var(--sp3);
+    background:var(--panel); border-bottom:1px solid var(--line); font-size:12.5px; color:var(--muted); }
+  #syncbar .sdot { width:8px; height:8px; border-radius:50%; background:var(--faint); flex:0 0 auto; }
+  #syncbar.live .sdot { background:var(--live); box-shadow:0 0 0 3px rgba(52,211,153,.15); }
+  #syncbar.stale .sdot { background:var(--warn); }
+  #syncbar #synctext { flex:1 1 auto; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  #syncbar .b { color:var(--txt); font-weight:600; }
+  .pill { flex:0 0 auto; height:30px; padding:0 var(--sp3); border-radius:99px; font:600 12px/1 inherit; cursor:pointer;
+    display:inline-flex; align-items:center; gap:6px; }
+  .pill[hidden] { display:none; }
+  #refreshpill { border:1px solid var(--rose); background:var(--rose-dim); color:var(--rose); }
+  #refreshpill:hover { background:var(--rose); color:#1a0a0e; }
+  #runpill { border:1px solid var(--warn); background:rgba(251,191,36,.12); color:var(--warn); }
+  #runpill:hover { background:var(--warn); color:#1a1206; }
+  #runpill .rdot { width:7px; height:7px; border-radius:50%; background:var(--warn); box-shadow:0 0 0 3px rgba(251,191,36,.18); }
+  #projsearch { flex:0 0 auto; padding:var(--sp2) var(--sp3); background:var(--panel); border-bottom:1px solid var(--line); }
+  #projsearch[hidden] { display:none; }
+  #projfilter { width:100%; height:38px; padding:0 var(--sp3); border-radius:var(--r-m); border:1px solid var(--line);
+    background:var(--panel-2); color:var(--txt); font:500 14px -apple-system,Segoe UI,Roboto,sans-serif; }
+  #projfilter:focus { outline:none; border-color:var(--rose); }
+  #wscoldlg { border:1px solid var(--line); border-radius:14px; background:var(--panel); color:var(--fg,#ededf0); width:min(440px,92vw); padding:18px; }
+  #wscoldlg::backdrop { background:rgba(0,0,0,.55); }
+  #wscoldlg h3 { margin:0 0 8px; font-size:16px; }
+  #wscoldlg .dlghint { color:var(--muted); font-size:12.5px; margin:0 0 12px; line-height:1.45; }
+  .wscollist { display:flex; flex-direction:column; gap:6px; max-height:44vh; overflow:auto; margin:0 0 12px; }
+  .wscolitem { text-align:left; padding:9px 12px; border-radius:8px; border:1px solid var(--line); background:var(--bg,#0e0e12); color:var(--fg,#ededf0); font-size:13.5px; cursor:pointer; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .wscolitem:hover { background:var(--raised,#1c1c22); }
+  #wscoldlg .dlgrow { display:flex; gap:8px; align-items:center; margin-top:8px; }
+  #wscoldlg .dlgrow[hidden] { display:none; }
+  #wscolnew { flex:1 1 auto; min-width:0; height:38px; padding:0 12px; border-radius:8px; border:1px solid var(--line); background:var(--bg,#0e0e12); color:var(--fg,#ededf0); }
+  #wscolnew:focus { outline:none; border-color:var(--rose); }
+  #wsdecksel, #wsdecknew { flex:1 1 auto; min-width:0; height:38px; padding:0 12px; border-radius:8px; border:1px solid var(--line); background:var(--bg,#0e0e12); color:var(--fg,#ededf0); }
+  #wsdecksel:focus, #wsdecknew:focus { outline:none; border-color:var(--rose); }
+  .wslabel { flex:0 0 62px; color:var(--muted); font-size:12.5px; }
+  #wscoldlg button { height:38px; padding:0 14px; border-radius:8px; border:1px solid var(--line); background:var(--panel); color:var(--fg,#ededf0); cursor:pointer; flex:0 0 auto; }
+  #wscoldlg button.prim { background:var(--rose); color:#1a0a0e; border-color:var(--rose); font-weight:600; }
+
+  .view { flex:1 1 auto; min-height:0; overflow-y:auto; padding:var(--sp3); display:flex; flex-direction:column; gap:var(--sp2); }
+  .view[hidden] { display:none; }
+
+  /* collection rows (master) — single line each, so filtering never makes a large reflow */
+  .crow { display:flex; align-items:center; gap:var(--sp3); width:100%; min-height:56px; padding:var(--sp3) var(--sp4);
+    border:1px solid var(--line); border-radius:var(--r-m); background:var(--panel); color:var(--txt);
+    font:inherit; text-align:left; cursor:pointer; }
+  .crow:hover { background:var(--panel-2); border-color:#2c2c36; }
+  .crow.nomatch { display:none; }
+  .crow .cname { font-weight:600; font-size:14.5px; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .crow .crun { flex:0 0 auto; width:7px; height:7px; border-radius:50%; background:var(--warn); box-shadow:0 0 0 3px rgba(251,191,36,.14); }
+  .crow .crun[hidden] { display:none; }
+  .crow .ccount { margin-left:auto; flex:0 0 auto; color:var(--faint); font-size:12.5px; white-space:nowrap; }
+  .crow .cgo { flex:0 0 auto; width:16px; height:16px; color:var(--faint); }
+
+  /* detail header (the open collection) */
+  .dhead { display:flex; align-items:baseline; gap:var(--sp2); padding:2px var(--sp1) var(--sp1); }
+  .dhead .dname { font-weight:700; font-size:16px; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .dhead .dcount { color:var(--faint); font-size:12.5px; white-space:nowrap; }
+
+  /* chat rows (detail + search results) */
+  .chat { display:flex; align-items:center; gap:var(--sp2); min-height:52px; padding:var(--sp2) var(--sp3);
+    border:1px solid var(--line); border-radius:var(--r-m); background:var(--panel); }
+  .chat .tool { flex:0 0 auto; font:600 10px/1 ui-monospace,monospace; padding:4px 6px; border-radius:5px; background:var(--raised); color:var(--muted); }
+  .chat .ctitle { flex:1 1 auto; min-width:0; overflow:hidden; }
+  .chat .ctitle .t { display:block; font-size:13.5px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .chat .ctitle .sub { display:block; font-size:11.5px; color:var(--faint); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .resume { flex:0 0 auto; height:36px; padding:0 var(--sp3); border-radius:var(--r-s); border:1px solid var(--rose);
+    background:var(--rose-dim); color:var(--rose); font:600 12.5px/1 inherit; cursor:pointer; }
+  .resume:hover { background:var(--rose); color:#1a0a0e; }
+  .resume.running { border-color:var(--live); background:rgba(52,211,153,.12); color:var(--live); }
+  .resume.running:hover { background:var(--live); color:#0a1a12; }
+  .resume.warn { border-color:var(--warn); background:rgba(251,191,36,.12); color:var(--warn); }
+  .resume.warn:hover { background:var(--warn); color:#1a1206; }
+  .resume:disabled { opacity:.55; cursor:not-allowed; border-color:var(--line); background:transparent; color:var(--faint); }
+  .resume:disabled:hover { background:transparent; color:var(--faint); }
+
+  .projempty { margin:auto; text-align:center; color:var(--muted); font-size:13.5px; line-height:1.6; padding:var(--sp4); max-width:42ch; }
+  .projempty[hidden] { display:none; }
+  .reslabel { color:var(--faint); font-size:12px; padding:2px var(--sp1); }
+
+  /* running-session rows (the "Running on PC" view) */
+  .runrow { display:flex; align-items:center; gap:var(--sp2); min-height:56px; padding:var(--sp2) var(--sp3);
+    border:1px solid var(--line); border-radius:var(--r-m); background:var(--panel); }
+  .runrow .tool { flex:0 0 auto; font:600 10px/1 ui-monospace,monospace; padding:4px 6px; border-radius:5px; background:var(--raised); color:var(--muted); }
+  .runrow .rmeta { flex:1 1 auto; min-width:0; }
+  .runrow .rmeta .t { display:block; font-size:13.5px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .runrow .rmeta .realname { display:block; font-size:12px; color:var(--rose); opacity:.85; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .runrow .rmeta .realname[hidden] { display:none; }
+  .runrow .rmeta .sub { display:block; font-size:11.5px; color:var(--faint); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .runrow.killing { opacity:.6; }
+  .ractions { flex:0 0 auto; display:flex; gap:var(--sp2); }
+  .openbtn, .killbtn, .renbtn { flex:0 0 auto; height:36px; padding:0 var(--sp3); border-radius:var(--r-s); font:600 12.5px/1 inherit; cursor:pointer; }
+  .openbtn { border:1px solid var(--line); background:var(--panel-2); color:var(--txt); }
+  .openbtn:hover { border-color:var(--rose); }
+  .renbtn { border:1px solid var(--line); background:var(--panel-2); color:var(--muted); min-width:36px; padding:0 10px; }
+  .renbtn:hover { border-color:var(--rose); color:var(--txt); }
+  .openbtn:disabled, .renbtn:disabled { opacity:.45; cursor:default; border-color:var(--line); }
+  .openbtn:disabled:hover, .renbtn:disabled:hover { border-color:var(--line); color:var(--muted); }
+  .killbtn { border:1px solid var(--rose); background:transparent; color:var(--rose); }
+  .killbtn:hover { background:var(--rose); color:#1a0a0e; }
+  .killbtn:disabled { opacity:.55; cursor:default; background:transparent; }
+  .killbtn.done { border-color:var(--faint); color:var(--faint); }
+  /* inline native-name editor inside a running row */
+  .renedit { display:flex; flex-wrap:wrap; align-items:center; gap:6px; margin-top:6px; }
+  .renedit .reninput { flex:1 1 160px; min-width:0; height:34px; padding:0 10px; border-radius:var(--r-s);
+    border:1px solid var(--rose); background:var(--bg); color:var(--txt); font:13px/1 inherit; }
+  .renedit .rensave, .renedit .rencancel { height:34px; padding:0 12px; border-radius:var(--r-s); font:600 12px/1 inherit; cursor:pointer; border:1px solid var(--line); background:var(--panel-2); color:var(--txt); }
+  .renedit .rensave { border-color:var(--rose); color:var(--rose); }
+  .renedit .renstat { flex:1 1 100%; font-size:11.5px; color:var(--faint); }
+
+  /* transcript modal (fixed overlay — no list relayout, so paint-safe) */
+  .modal { position:fixed; inset:0; z-index:50; display:flex; align-items:center; justify-content:center;
+    padding:var(--sp3); background:rgba(0,0,0,.6); }
+  .modal[hidden] { display:none; }
+  .msheet { display:flex; flex-direction:column; width:min(100%,720px); max-height:85dvh; background:var(--panel);
+    border:1px solid var(--line); border-radius:var(--r-m); overflow:hidden; }
+  .mhead { flex:0 0 auto; display:flex; align-items:center; gap:var(--sp2); padding:var(--sp3);
+    border-bottom:1px solid var(--line); }
+  .mhead .mtitle { flex:1 1 auto; min-width:0; font-weight:600; font-size:14px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .mbody { flex:1 1 auto; margin:0; overflow:auto; padding:var(--sp3); white-space:pre-wrap; overflow-wrap:anywhere;
+    font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace; color:var(--txt); }
+  #mobileNav { display:none; }
+  #mobileNav a, #mobileNav button {
+    min-width:0; min-height:48px; padding:6px 4px; border:none; border-radius:var(--r-m);
+    background:transparent; color:var(--muted); font:600 11.5px/1.1 inherit; text-decoration:none;
+    display:flex; flex-direction:column; align-items:center; justify-content:center; gap:4px; cursor:pointer;
+  }
+  #mobileNav svg { width:18px; height:18px; flex:0 0 auto; }
+  #mobileNav .active { background:var(--raised); color:var(--txt); }
+  #mobileNav button:disabled { opacity:.42; cursor:default; }
+  @media (pointer:coarse) { .resume { height:42px; } .crow { min-height:60px; } .chat { min-height:58px; } .runrow { min-height:62px; } .openbtn, .killbtn, .renbtn { height:42px; } .renedit .reninput, .renedit .rensave, .renedit .rencancel { height:42px; } }
+  @media (max-width:59.99rem) {
+    #mobileNav {
+      display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:var(--sp1);
+      flex:0 0 auto; padding:var(--sp1) var(--sp2); padding-bottom:max(var(--sp1),env(safe-area-inset-bottom));
+      background:var(--panel); border-top:1px solid var(--line);
+    }
+    #topbar > a.topbtn { display:none; }
+    #syncbar { flex-wrap:wrap; align-items:center; }
+    #synctext { flex:1 1 100%; }
+    #syncbar .pill { min-height:40px; flex:1 1 auto; justify-content:center; }
+    .view { padding:var(--sp3); }
+    .crow, .chat, .runrow { flex:0 0 auto; }
+    .chat { align-items:flex-start; flex-wrap:wrap; }
+    .chat .ctitle { flex:1 1 calc(100% - 3rem); }
+    .chat .resume { flex:1 1 100%; }
+    .runrow {
+      display:grid; grid-template-columns:auto minmax(0,1fr);
+      grid-template-areas:"tool meta" "actions actions"; align-items:start; row-gap:var(--sp2);
+    }
+    .runrow .tool { grid-area:tool; }
+    .runrow .rmeta { grid-area:meta; }
+    .ractions { grid-area:actions; width:100%; display:flex; gap:var(--sp2); }
+    .openbtn, .killbtn, .renbtn { flex:1 1 0; min-width:0; }
+    .dhead { align-items:flex-start; flex-wrap:wrap; }
+    .dhead .dname { flex:1 1 auto; }
+    .modal { align-items:stretch; padding:var(--sp2); padding-top:max(var(--sp2),env(safe-area-inset-top)); padding-bottom:max(var(--sp2),env(safe-area-inset-bottom)); }
+    .msheet { max-height:none; height:100%; }
+  }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="topbar">
+    <button id="backproj" class="topbtn" type="button" hidden>&lsaquo; Projects</button>
+    <div class="brand">
+      <svg class="glyph" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+        <rect x="2.5" y="4.5" width="19" height="15" rx="3" stroke="#fb7185" stroke-width="1.6"/>
+        <path d="M6.5 9.5l3 2.5-3 2.5" stroke="#fb7185" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+        <path d="M12.5 15h5" stroke="#9494a0" stroke-width="1.6" stroke-linecap="round"/>
+      </svg>
+      <span class="wordmark" id="brandword">projects</span>
+    </div>
+    <div class="spacer"></div>
+    <a class="topbtn" href="./">&lsaquo; Terminal</a>
+  </div>
+  <div id="syncbar"><span class="sdot"></span><span id="synctext">checking sync&hellip;</span><button id="wscolbtn" class="pill" type="button" title="Add all your open remote tabs to a collection (new or existing) — save your current workspace">&#43; Tabs &rarr; collection</button><button id="runpill" class="pill" type="button" hidden><span class="rdot"></span><span id="runcount">0</span> running on PC</button><button id="refreshpill" class="pill" type="button" hidden>&#8635; New chats — refresh</button></div>
+  <div id="projsearch"><input id="projfilter" placeholder="Search projects &amp; chats…" autocapitalize="off" autocomplete="off" spellcheck="false"></div>
+  <div id="viewList" class="view"></div>
+  <div id="viewDetail" class="view" hidden></div>
+  <nav id="mobileNav" aria-label="Mobile views">
+    <a href="./" aria-label="Terminal">
+      <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><rect x="3.5" y="5" width="17" height="14" rx="2" stroke="currentColor" stroke-width="1.7"/><path d="M7 10l3 2-3 2M12.5 15h4" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      <span>Terminal</span>
+    </a>
+    <a class="active" href="projects.html" aria-current="page" aria-label="Projects">
+      <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M3 7a2 2 0 012-2h3.6a2 2 0 011.5.7L12 7.5h7a2 2 0 012 2V17a2 2 0 01-2 2H5a2 2 0 01-2-2V7z" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></svg>
+      <span>Projects</span>
+    </a>
+    <button id="mobileRunNav" type="button" aria-label="Running sessions" disabled>
+      <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M8 5l10 7-10 7V5z" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></svg>
+      <span>Running</span>
+    </button>
+  </nav>
+</div>
+<dialog id="wscoldlg">
+  <h3>Save open tabs to a collection</h3>
+  <p class="dlghint">Files <b id="wscolcount">0 tabs</b> — <b>every open tab</b> in multiplex — into a deck. Chat-linked tabs keep their chat; shell-launched tabs are saved as named markers. Works only while the desktop app is open (it owns your collections). Reopen chat-linked ones later with <b>↻ Relaunch</b>.</p>
+  <div id="wscollist" class="wscollist"></div>
+  <div class="dlgrow"><label class="wslabel" for="wsdecksel">Deck</label><select id="wsdecksel"></select></div>
+  <div class="dlgrow" id="wsdecknewrow" hidden><label class="wslabel" for="wsdecknew">New deck</label><input id="wsdecknew" placeholder="deck name" autocapitalize="off" autocomplete="off" spellcheck="false"></div>
+  <div class="dlgrow"><input id="wscolnew" placeholder="new collection name…" autocapitalize="off" autocomplete="off" spellcheck="false"><button id="wscolcreate" type="button" class="prim">Create &amp; add</button></div>
+  <div class="dlgrow" style="justify-content:flex-end"><button id="wscolcancel" type="button">Cancel</button></div>
+</dialog>
+<div id="tmodal" class="modal" hidden role="dialog" aria-modal="true" aria-label="Transcript">
+  <div class="msheet">
+    <div class="mhead"><span class="mtitle"></span><button id="mclose" class="topbtn" type="button">Close</button></div>
+    <pre class="mbody" id="mbody"></pre>
+  </div>
+</div>
+<script src="intent-journal.js"></script>
+<script>
+const $ = s => document.querySelector(s);
+const LS = { get:(k,d)=>{ try{ return JSON.parse(localStorage.getItem(k)) ?? d; }catch(e){ return d; } }, set:(k,v)=>{ try{ localStorage.setItem(k, JSON.stringify(v)); }catch(e){} } };
+const esc = s => String(s).replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+let data={collections:[]}, sessions=[], built=false, sig=null, curDetail=null, detailOrigin=null;
+const rows=[];           // master rows: [{id,name,crow,crun,total,coll}]
+const visibleChats=[];   // currently-rendered detail/search chat rows: [{key,ch,btn}]
+let _markRowsPending=false;
+function queueMarkRows(){
+  if(_markRowsPending) return;
+  _markRowsPending=true;
+  requestAnimationFrame(()=>{ _markRowsPending=false; markScrollportRows(); });
+}
+function markScrollportRows(){
+  for(const view of [$('#viewList'), $('#viewDetail')]){
+    if(!view || view.hidden) continue;
+    const vr=view.getBoundingClientRect();
+    for(const row of view.querySelectorAll('.crow,.chat,.runrow')){
+      const r=row.getBoundingClientRect();
+      const fullyVisible = r.top >= vr.top - 1 && r.bottom <= vr.bottom + 1;
+      if(fullyVisible) row.removeAttribute('data-destruct-ignore');
+      else row.setAttribute('data-destruct-ignore','');
+    }
+  }
+}
+
+function ago(ts){ const s=Math.floor((Date.now()-ts)/1000); if(s<60)return s+'s ago'; if(s<3600)return Math.floor(s/60)+'m ago'; if(s<86400)return Math.floor(s/3600)+'h ago'; return Math.floor(s/86400)+'d ago'; }
+function appLive(d=data){ return !!(d && (d.appLive ?? d.live)); }
+function bridgeLive(d=data){ return !!(d && (d.bridgeLive ?? d.live)); }
+function renderSync(d){
+  const sb=$('#syncbar'); sb.classList.remove('live','stale');
+  const live = appLive(d), bridge = bridgeLive(d), stamp = d.appSyncedAt ?? d.syncedAt;
+  if(live){ sb.classList.add('live'); $('#synctext').innerHTML = `<span class="b">Synced</span> &middot; desktop app live${d.host?` &middot; ${esc(d.host)}`:''}`; }
+  else if(stamp){ sb.classList.add('stale'); $('#synctext').innerHTML = `<span class="b">Last app sync ${ago(stamp)}</span> &middot; desktop app closed${bridge?' &middot; PC bridge live':''}`; }
+  else $('#synctext').textContent = 'Not synced yet - open the desktop app to push your projects here';
+}
+const chatKey = ch => String(ch.id||ch.muxName||ch.title||'');
+function archiveChats(){ return Array.isArray(data && data.allChats) ? data.allChats : []; }
+// Signature of everything VISIBLE/structural except `running` (which changes constantly and is
+// applied in place). A rename / new chat / changed command flips this -> we show the refresh pill
+// rather than mutating the live list (a fresh page is the only guaranteed-clean repaint).
+function structSig(d){
+  const cols=(d&&d.collections)||[];
+  const all=(d&&d.allChats)||[];
+  const chatSig=ch=>chatKey(ch)+'~'+(ch.title||'')+'~'+(ch.tool||'')+'~'+(ch.muxName||'')+'~'+(ch.collection||'');
+  return cols.map(c=> (c.id||'')+':'+(c.name||'')+'#'+(c.chats||[]).map(chatSig).join(',')).join('|')+'||all#'+all.map(chatSig).join(',');
+}
+function indexChats(){ const m={}; archiveChats().forEach(ch=>{ m[chatKey(ch)]=ch; }); (data.collections||[]).forEach(c=>(c.chats||[]).forEach(ch=>{ m[chatKey(ch)]=ch; })); return m; }
+const goSvg = '<svg class="cgo" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M9 6l6 6-6 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+
+// A chat counts as "running locally" ONLY if its id is in the LIVE runningSessions list (the same
+// source as the "N running on PC" pill). We deliberately ignore the per-chat `running` flag baked into
+// the collections snapshot: after a PC restart the bridge refreshes runningSessions but NOT that
+// snapshot, so the baked flag goes stale and falsely marks dead sessions as live ("Take over" / amber dot).
+function liveRunIds(){ return new Set((data && Array.isArray(data.runningSessions) ? data.runningSessions : []).map(r=>String(r.sessionId||'')).filter(Boolean)); }
+function chatLive(ch, runIds){ return !!ch && !!ch.id && runIds.has(String(ch.id)); }
+// Resolve the mux session name hosting a running agent, so we can end it through muxd and keep
+// the relay/manifest/session list in sync. Matches the agent's sessionId to a chat's muxName.
+function muxNameForSession(s){
+  if(s && s.muxName) return s.muxName;
+  const sid=String((s&&s.sessionId)||''); if(!sid) return '';
+  for(const c of ((data&&data.collections)||[])) for(const ch of (c.chats||[])){ if(String(ch.id||'')===sid && ch.muxName) return ch.muxName; }
+  return '';
+}
+function sessionBlocker(name){
+  if(!name) return null;
+  return (sessions||[]).find(s => s && s.name===name && (s.legacyBlocked || s.legacyTwin || s.hostProtocolOk===false)) || null;
+}
+function muxSession(name){ return (sessions||[]).find(s=>s && s.name===name) || null; }
+function isActionableMuxSession(s){ return !!(s && s.hosted && s.alive!==false && !s.dormant && !s.legacyBlocked && !s.legacyTwin && s.hostProtocolOk!==false); }
+function actionableMuxNames(){ return new Set((sessions||[]).filter(isActionableMuxSession).map(s=>s.name)); }
+function canRelaunchMuxName(name){
+  const s=muxSession(name);
+  return !!(s && s.hosted && s.hasCommand && !sessionBlocker(name));
+}
+function blockerDetail(s){ return (s && (s.detail || s.legacyDetail || s.hostProtocolDetail)) || 'mux session is blocked by stale protocol or legacy tmux state'; }
+
+// Resume button state. inMux=already a running multiplex (Attach); localRun=running locally,
+// not in mux (Take over); missing name/command and not in mux => nothing to resume (Unavailable).
+function setBtnState(btn, ch, muxNames, runIds){
+  runIds = runIds || liveRunIds();
+  const blocked=ch.muxName ? sessionBlocker(ch.muxName) : null;
+  const inMux=ch.muxName&&!blocked&&muxNames.has(ch.muxName); const localRun=chatLive(ch, runIds)&&!inMux&&!blocked;
+  btn.classList.remove('running','warn'); btn.disabled=false; btn.title='';
+  if(inMux){ btn.textContent='Attach'; btn.classList.add('running'); }
+  else if(blocked){ btn.textContent=blocked.hostProtocolOk===false?'Stale':'Blocked'; btn.disabled=true; btn.title=blockerDetail(blocked); }
+  else if(!ch.muxName || (!ch.id && !canRelaunchMuxName(ch.muxName))){ btn.textContent='Unavailable'; btn.disabled=true; btn.title='No trusted session identity is available for this chat.'; }
+  else if(localRun){ btn.textContent='Take over'; btn.classList.add('warn'); }
+  else btn.textContent='Resume remote';
+  btn.onclick=()=>{ if(!btn.disabled) resume(ch, inMux, localRun); };
+  return { inMux, localRun };
+}
+
+function chatNode(ch, withColl){
+  const row=document.createElement('div'); row.className='chat';
+  row.innerHTML=`<span class="tool"></span><span class="ctitle"><span class="t"></span>${withColl?'<span class="sub"></span>':''}</span><button class="resume" type="button"></button>`;
+  row.querySelector('.tool').textContent=(ch.tool==='claude')?'CL':'CX';
+  row.querySelector('.t').textContent=ch.title||ch.id||'chat';
+  if(withColl) row.querySelector('.sub').textContent=withColl;
+  const btn=row.querySelector('.resume');
+  setBtnState(btn, ch, actionableMuxNames());
+  visibleChats.push({ key:chatKey(ch), ch, btn });
+  return row;
+}
+
+// ---- master list (built once) ----
+function buildList(){
+  const el=$('#viewList'); el.innerHTML=''; rows.length=0;
+  const cols=(data&&data.collections)||[];
+  const allArchive=archiveChats();
+  const withChats=cols.filter(c=>(c.chats||[]).length);
+  if(!withChats.length && !allArchive.length){
+    const msg = cols.length
+      ? 'Your synced projects don’t have any resumable chats yet.<br>Start a chat in the desktop app — it’ll show up here to resume remotely.'
+      : 'No projects synced yet.<br>Open the desktop app — it pushes your collections &amp; chats here so you can resume them remotely.';
+    el.innerHTML=`<div class="projempty">${msg}</div>`; built=true; queueMarkRows(); return;
+  }
+  if(allArchive.length){
+    const c={id:'__all__', name:'All chats', chats:allArchive};
+    const crow=document.createElement('button'); crow.type='button'; crow.className='crow';
+    crow.innerHTML=`<span class="cname"></span><span class="crun" hidden title="has a running chat"></span><span class="ccount"></span>${goSvg}`;
+    crow.querySelector('.cname').textContent='All chats';
+    crow.querySelector('.ccount').textContent=`${allArchive.length} indexed chat${allArchive.length!==1?'s':''}`;
+    crow.setAttribute('aria-label', `All indexed chats, ${allArchive.length} chat${allArchive.length!==1?'s':''}`);
+    crow.onclick=()=>openDetail('__all__', crow);
+    el.appendChild(crow);
+    rows.push({ id:'__all__', name:'all chats indexed archive sessions', crow, crun:crow.querySelector('.crun'), total:allArchive.length, coll:c });
+  }
+  withChats.forEach(c=>{
+    const all=c.chats||[];
+    const crow=document.createElement('button'); crow.type='button'; crow.className='crow';
+    crow.innerHTML=`<span class="cname"></span><span class="crun" hidden title="has a running chat"></span><span class="ccount"></span>${goSvg}`;
+    crow.querySelector('.cname').textContent=c.name||'Untitled';
+    crow.querySelector('.ccount').textContent=`${all.length} chat${all.length!==1?'s':''}`;
+    crow.setAttribute('aria-label', `${c.name||'Untitled'}, ${all.length} chat${all.length!==1?'s':''}`);
+    crow.onclick=()=>openDetail(c.id, crow);
+    crow.oncontextmenu=(e)=>{ e.preventDefault(); openCollMenu(c, e.clientX, e.clientY); };   // right-click → Relaunch collection
+    let clp; crow.addEventListener('touchstart', (e)=>{ clp=setTimeout(()=>{ const t=e.touches[0]; openCollMenu(c, t?t.clientX:60, t?t.clientY:120); }, 550); }, {passive:true});
+    crow.addEventListener('touchend', ()=>clearTimeout(clp)); crow.addEventListener('touchmove', ()=>clearTimeout(clp));
+    el.appendChild(crow);
+    rows.push({ id:c.id, name:String(c.name||'').toLowerCase(), crow, crun:crow.querySelector('.crun'), total:all.length, coll:c });
+  });
+  const em=document.createElement('div'); em.className='projempty'; em.id='nomatch'; em.hidden=true; em.textContent='No projects or chats match your search.'; el.appendChild(em);
+  built=true; applyRunning(); queueMarkRows();
+}
+
+// in-place: per-collection running dot on the master list
+function applyRunning(){
+  const muxNames=actionableMuxNames(); const runIds=liveRunIds();
+  const byId={}; (data.collections||[]).forEach(c=>{ byId[c.id]=c; });
+  if(archiveChats().length) byId.__all__={id:'__all__', name:'All chats', chats:archiveChats()};
+  rows.forEach(r=>{
+    const c=byId[r.id]||r.coll; r.coll=c;
+    const anyRun=(c.chats||[]).some(ch=> chatLive(ch, runIds) || (ch.muxName && muxNames.has(ch.muxName)));
+    r.crun.hidden=!anyRun;
+  });
+}
+// in-place: resume-button state on the visible detail/search rows (no layout shift -> paint-safe)
+function applyRunningVisible(){
+  const muxNames=actionableMuxNames(); const runIds=liveRunIds(); const idx=indexChats();
+  visibleChats.forEach(v=>{ const ch=idx[v.key]||v.ch; v.ch=ch; setBtnState(v.btn, ch, muxNames, runIds); });
+}
+
+// ---- detail view (fresh small paint per open; list hidden so nothing painted shifts) ----
+function openDetail(id, origin){
+  const c=id==='__all__' ? {id:'__all__', name:'All chats', chats:archiveChats()} : (data.collections||[]).find(x=>x.id===id); if(!c) return;
+  curDetail=id; detailOrigin=origin||null; visibleChats.length=0;
+  const el=$('#viewDetail'); el.innerHTML='';
+  const head=document.createElement('div'); head.className='dhead';
+  head.innerHTML=`<span class="dname"></span><span class="dcount"></span>`;
+  head.querySelector('.dname').textContent=c.name||'Untitled';
+  const all=c.chats||[]; head.querySelector('.dcount').textContent=`${all.length} chat${all.length!==1?'s':''}`;
+  head.style.display='flex'; head.style.alignItems='center'; head.style.gap='8px';
+  if(id!=='__all__'){
+    const rlb=document.createElement('button'); rlb.type='button';
+    rlb.style.cssText='margin-left:auto;padding:6px 12px;font-size:13px;border-radius:8px;border:1px solid var(--line,#2c2c33);background:var(--panel,#17171c);color:var(--fg,#ededf0);cursor:pointer;white-space:nowrap;flex:0 0 auto';
+    rlb.textContent='↻ Relaunch'; rlb.title='Kill any of this collection’s chats running in multiplex and restart them all';
+    rlb.onclick=()=>relaunchCollection(c);
+    head.appendChild(rlb);
+  }
+  el.appendChild(head);
+  if(!all.length){ const e2=document.createElement('div'); e2.className='projempty'; e2.textContent='No chats in this collection yet.'; el.appendChild(e2); }
+  else all.forEach(ch=> el.appendChild(chatNode(ch, id==='__all__' ? (ch.collection||ch.workspaceLabel||'') : '')));
+  $('#viewList').hidden=true; $('#projsearch').hidden=true;
+  el.hidden=false; el.scrollTop=0;
+  $('#backproj').hidden=false; $('#brandword').textContent=id==='__all__'?'all chats':'project';
+  $('#backproj').focus();
+  queueMarkRows();
+}
+function showList(){
+  curDetail=null; visibleChats.length=0;
+  $('#viewDetail').hidden=true; $('#viewDetail').innerHTML='';
+  $('#viewList').hidden=false; $('#projsearch').hidden=false;
+  $('#backproj').hidden=true; $('#brandword').textContent='projects';
+  queueMarkRows();
+}
+
+// ---- search: results render in the DETAIL surface (fresh small paint), list stays static ----
+function applyFilter(){
+  const q=($('#projfilter').value||'').toLowerCase().trim();
+  if(!q){ if(curDetail==='__search__') showList(); return; }
+  const hits=[];
+  const all=archiveChats();
+  if(all.length){
+    all.forEach(ch=>{
+      const coll=ch.collection||'';
+      const hay=((ch.title||ch.id||'')+' '+coll+' '+(ch.workspaceLabel||'')).toLowerCase();
+      if(hay.includes(q)) hits.push({ch, coll:coll||'All chats'});
+    });
+  } else {
+    (data.collections||[]).forEach(c=>{ const cn=String(c.name||''); (c.chats||[]).forEach(ch=>{
+      const hay=((ch.title||ch.id||'')+' '+cn).toLowerCase();
+      if(hay.includes(q)) hits.push({ch, coll:cn});
+    }); });
+  }
+  visibleChats.length=0;
+  const el=$('#viewDetail'); el.innerHTML='';
+  const lbl=document.createElement('div'); lbl.className='reslabel'; lbl.textContent=`${hits.length} match${hits.length!==1?'es':''} for “${q}”`; el.appendChild(lbl);
+  if(!hits.length){ const em=document.createElement('div'); em.className='projempty'; em.textContent='No projects or chats match your search.'; el.appendChild(em); }
+  else hits.forEach(h=> el.appendChild(chatNode(h.ch, h.coll)));
+  curDetail='__search__';
+  $('#viewList').hidden=true; el.hidden=false; el.scrollTop=0;
+  $('#backproj').hidden=false; $('#brandword').textContent='search';
+  queueMarkRows();
+}
+
+// ---- Running on PC: list every live claude/codex agent (incl. background VS Code) + kill any of them ----
+function updateRunPill(){
+  const n=(data && bridgeLive() && Array.isArray(data.runningSessions)) ? data.runningSessions.length : 0;
+  $('#runcount').textContent=n;
+  $('#runpill').hidden = (n===0);
+  const mb=$('#mobileRunNav');
+  if(mb){
+    mb.disabled = (n===0);
+    mb.querySelector('span').textContent = n ? `${n} running` : 'Running';
+  }
+}
+function runRow(s){
+  const row=document.createElement('div'); row.className='runrow';
+  row.innerHTML=`<span class="tool"></span><span class="rmeta"><span class="t"></span><span class="realname" title="the chat's own Claude/Codex name — tap ✎ to rename"></span><span class="sub"></span></span><div class="ractions"><button class="renbtn" type="button" aria-label="Rename native name" title="Rename the chat's own Claude/Codex name">&#9998;</button><button class="openbtn" type="button">Open</button><button class="killbtn" type="button">Kill</button></div>`;
+  row.querySelector('.tool').textContent=(s.tool==='codex')?'CX':'CL';
+  // primary = our collection name if we have one, else the tool's OWN name, else a generic label
+  const primary = s.title || s.realTitle || ('Unsaved '+(s.tool==='codex'?'Codex':'Claude')+' session');
+  row.querySelector('.t').textContent = primary;
+  const rn=row.querySelector('.realname');
+  if(s.realTitle && s.realTitle!==primary) rn.textContent = s.realTitle;   // the real claude/codex name, in addition to ours
+  else rn.hidden = true;
+  const bits=[];
+  if(s.parent) bits.push(s.parent);
+  if(s.startedAt){ const t=Date.parse(s.startedAt); if(!isNaN(t)) bits.push(ago(t)); }
+  if(s.collection) bits.push(s.collection);
+  if(s.pid) bits.push('pid '+s.pid);
+  if(s.sessionId) bits.push(String(s.sessionId).slice(0,8));
+  row.querySelector('.sub').textContent = bits.join(' · ');
+  const openBtn=row.querySelector('.openbtn'), renBtn=row.querySelector('.renbtn');
+  if(s.sessionId){
+    openBtn.onclick = ()=> openTranscript(s);
+    renBtn.onclick = ()=> renameNative(s, row);
+  } else {
+    // No transcript id yet (a fresh agent that hasn't been identified) — Open/Rename would 400.
+    openBtn.disabled = true; openBtn.title = 'No transcript id yet — type in the session, then hit refresh.';
+    renBtn.disabled = true;  renBtn.title  = 'No transcript id yet — type in the session, then hit refresh.';
+  }
+  row.querySelector('.killbtn').onclick = (ev)=> killSession(s, row, ev.currentTarget);
+  return row;
+}
+
+// Edit the chat's OWN Claude/Codex name from the phone: inline editor -> enqueue a `rename` command the
+// desktop app actions (writes Codex's thread title / a Claude custom-title), poll the result.
+function renameNative(s, row){
+  if(row.querySelector('.renedit')) return;                 // already editing
+  if(!bridgeLive()){ flash(row, 'PC bridge is not live - open the app or bridge and try again.'); return; }
+  const rmeta=row.querySelector('.rmeta');
+  const editor=document.createElement('div'); editor.className='renedit';
+  editor.innerHTML=`<input class="reninput" type="text" maxlength="200" autocapitalize="off" spellcheck="false"><button class="rensave" type="button">Save</button><button class="rencancel" type="button">Cancel</button><span class="renstat"></span>`;
+  const input=editor.querySelector('.reninput'), stat=editor.querySelector('.renstat');
+  input.value = s.realTitle || s.title || '';
+  rmeta.appendChild(editor); input.focus(); input.select();
+  const close=()=>editor.remove();
+  editor.querySelector('.rencancel').onclick=close;
+  editor.querySelector('.reninput').addEventListener('keydown', e=>{ if(e.key==='Escape') close(); if(e.key==='Enter') editor.querySelector('.rensave').click(); });
+  editor.querySelector('.rensave').onclick=async()=>{
+    const title=input.value.trim(); if(!title){ close(); return; }
+    stat.textContent='saving…';
+    let id=null;
+    try{
+      const r=await postIntent('api/app-commands',
+        {type:'rename', sessionId:s.sessionId, tool:s.tool, title},
+        'rename-native');
+      if(!r.ok) throw new Error(await apiError(r));
+      id=(await r.json()).id;
+    }catch(e){ stat.textContent='couldn’t send ('+(e.message||e)+')'; return; }
+    const t0=Date.now();
+    const poll=async()=>{
+      if(Date.now()-t0>30000){ stat.textContent='no response from the PC'; return; }
+      let c=null; try{ c=await (await fetch('api/app-commands/'+encodeURIComponent(id))).json(); }catch(e){}
+      if(c && c.status==='done'){ s.realTitle=title; const rn=row.querySelector('.realname'); rn.hidden=false; rn.textContent=title; close(); return; }
+      if(c && c.status==='failed'){ stat.textContent=c.detail||'rename failed'; return; }
+      setTimeout(poll, 1000);
+    };
+    setTimeout(poll, 1000);
+  };
+}
+function flash(row, msg){ const sub=row.querySelector('.sub'); if(!sub) return; const old=sub.textContent; sub.textContent=msg; setTimeout(()=>{ sub.textContent=old; }, 2600); }
+
+// ---- transcript modal: "Open" asks the app to read the session's transcript tail, shown in an overlay ----
+function showModal(title, body){ $('#tmodal .mtitle').textContent=title; $('#mbody').textContent=body; $('#tmodal').hidden=false; }
+function closeModal(){ $('#tmodal').hidden=true; $('#mbody').textContent=''; }
+function setModalBody(text){ $('#mbody').textContent=text; }
+async function openTranscript(s){
+  const title = s.title || s.realTitle || (s.tool==='codex'?'Codex':'Claude')+' session';
+  showModal(title, 'Loading transcript…');
+  if(!s.sessionId){ setModalBody('This session hasn’t been identified yet (no transcript id). Type something in it on the PC, then hit “New chats — refresh”.'); return; }
+  if(!bridgeLive()){ setModalBody('The PC bridge is not live right now, so it cannot read the transcript. Open the app or bridge and try again.'); return; }
+  let id=null;
+  try{
+    const r=await postIntent('api/app-commands',
+      {type:'transcript', sessionId:s.sessionId, tool:s.tool},
+      'transcript');
+    if(!r.ok) throw new Error(await apiError(r));
+    id=(await r.json()).id;
+  }catch(e){ setModalBody('Could not request the transcript ('+(e.message||e)+').'); return; }
+  const t0=Date.now();
+  const poll=async()=>{
+    if($('#tmodal').hidden) return;                                    // user closed it — stop polling
+    if(Date.now()-t0>30000){ setModalBody('No response from the desktop app — is it open and synced?'); return; }
+    let c=null; try{ c=await (await fetch('api/app-commands/'+encodeURIComponent(id))).json(); }catch(e){}
+    if(c && (c.status==='done'||c.status==='failed')){ setModalBody(c.detail||'(empty transcript)'); return; }
+    setTimeout(poll, 1200);
+  };
+  setTimeout(poll, 1200);
+}
+function openRunning(){
+  const list=(data && Array.isArray(data.runningSessions)) ? data.runningSessions : [];
+  curDetail='__running__'; detailOrigin=$('#runpill');
+  const el=$('#viewDetail'); el.innerHTML='';
+  const head=document.createElement('div'); head.className='dhead';
+  head.innerHTML=`<span class="dname"></span><span class="dcount"></span>`;
+  head.querySelector('.dname').textContent='Running on '+(data.host||'this PC');
+  head.querySelector('.dcount').textContent=`${list.length} agent${list.length!==1?'s':''}`;
+  el.appendChild(head);
+  const note=document.createElement('div'); note.className='reslabel';
+  note.textContent='Live claude/codex agents on your PC — including forgotten background VS Code sessions. “Kill” ends that session here.';
+  el.appendChild(note);
+  if(!list.length){ const e2=document.createElement('div'); e2.className='projempty'; e2.textContent='No agents running right now.'; el.appendChild(e2); }
+  else list.forEach(s=> el.appendChild(runRow(s)));
+  $('#viewList').hidden=true; $('#projsearch').hidden=true;
+  el.hidden=false; el.scrollTop=0;
+  $('#backproj').hidden=false; $('#brandword').textContent='running';
+  $('#backproj').focus();
+  queueMarkRows();
+}
+async function apiError(r){
+  let msg='HTTP '+r.status;
+  try{
+    const j=await r.json();
+    if(j && (j.error || j.detail)) msg=(j.error||msg)+(j.detail?': '+j.detail:'');
+  }catch(e){}
+  return msg;
+}
+async function killSession(s, row, btn){
+  const label = s.title || ('session '+String(s.sessionId||'').slice(0,8));
+  if(!confirm(`Kill the ${s.tool==='codex'?'Codex':'Claude'} agent for “${label}”?\n\n${s.parent||'Unknown'} · pid ${s.pid||'?'}\nThis ends that running session on your PC.`)) return;
+  btn.disabled=true; btn.textContent='Killing…'; row.classList.add('killing');
+  // Mux-hosted sessions must be killed through the mux API so muxd, the relay, and the manifest agree.
+  // If that path fails, stop and show the error instead of falling through to a local-agent kill.
+  const mux=muxNameForSession(s);
+  if(mux){
+    let live=null;
+    try{
+      const lr=await fetch('api/sessions');
+      if(!lr.ok) throw new Error(await apiError(lr));
+      live=await lr.json();
+      if(!Array.isArray(live)) throw new Error('sessions response was not an array');
+    }catch(e){
+      btn.disabled=false; row.classList.remove('killing'); btn.textContent='Kill';
+      alert('Could not verify whether this is a mux session ('+(e.message||e)+'). Not falling back to local kill.');
+      return;
+    }
+    if(live.some(x=> x && x.name===mux)){
+      const blocked=live.find(x=>x && x.name===mux && (x.legacyBlocked || x.legacyTwin || x.hostProtocolOk===false));
+      if(blocked){
+        btn.disabled=false; row.classList.remove('killing'); btn.textContent='Kill';
+        alert('Mux session is blocked/stale ('+blockerDetail(blocked)+'). Not falling back to local kill.');
+        return;
+      }
+      try{
+        const drop=await fetch('api/sessions/'+encodeURIComponent(mux),{method:'DELETE'});
+        if(!drop.ok) throw new Error(await apiError(drop));
+        btn.textContent='Killed'; btn.classList.add('done'); btn.disabled=true; row.classList.remove('killing');
+        setTimeout(()=>{ row.remove(); afterKill(); }, 700); return;
+      }catch(e){
+        btn.disabled=false; row.classList.remove('killing'); btn.textContent='Kill';
+        alert('Could not kill the mux session ('+(e.message||e)+'). Not falling back to local kill.');
+        return;
+      }
+    }
+  }
+  // Local non-mux agents are controlled by the desktop app bridge.
+  let id=null;
+  try{
+    const r=await postIntent('api/app-commands',
+      {type:'kill', sessionId:s.sessionId||'', pid:s.pid||0, label},
+      'kill-local');
+    if(!r.ok) throw new Error(await apiError(r));
+    id=(await r.json()).id;
+  }catch(e){ btn.disabled=false; row.classList.remove('killing'); btn.textContent='Kill'; alert('Could not queue the kill ('+(e.message||e)+').'); return; }
+  const t0=Date.now();
+  const poll=async()=>{
+    if(Date.now()-t0>30000){ row.classList.remove('killing'); btn.disabled=false; btn.textContent='Kill'; alert('No response from the desktop app — is it open and synced?'); return; }
+    let c=null; try{ c=await (await fetch('api/app-commands/'+encodeURIComponent(id))).json(); }catch(e){}
+    if(c && c.status==='done'){ const gone=/already gone|raced/i.test(c.detail||''); btn.textContent=gone?'Gone':'Killed'; btn.classList.add('done'); btn.disabled=true; row.classList.remove('killing');
+      setTimeout(()=>{ row.remove(); afterKill(); }, 700); return; }
+    if(c && c.status==='failed'){ row.classList.remove('killing'); btn.disabled=false; btn.textContent='Kill'; alert('Kill failed: '+(c.detail||'unknown')); return; }
+    setTimeout(poll, 800);
+  };
+  setTimeout(poll, 800);
+}
+function afterKill(){
+  const left=$('#viewDetail').querySelectorAll('.runrow').length;
+  const dc=$('#viewDetail .dcount'); if(dc) dc.textContent=`${left} agent${left!==1?'s':''}`;
+  if(!left){ const e2=document.createElement('div'); e2.className='projempty'; e2.textContent='No agents running now.'; $('#viewDetail').appendChild(e2); }
+  queueMarkRows();
+}
+
+// Wait for an enqueued app-command to finish (kill/etc.).
+async function awaitCmdResult(id, ms){
+  const t0=Date.now();
+  while(Date.now()-t0<(ms||12000)){
+    await new Promise(s=>setTimeout(s,900));
+    let c=null; try{ c=await (await fetch('api/app-commands/'+encodeURIComponent(id))).json(); }catch(e){}
+    if(c && c.status==='done') return { ok:true, detail:c.detail||'' };
+    if(c && c.status==='failed') return { ok:false, detail:c.detail||'command failed' };
+  }
+  return { ok:false, detail:'timed out waiting for the desktop app' };
+}
+async function awaitCmd(id, ms){
+  return (await awaitCmdResult(id, ms)).ok;
+}
+// ---- Save open tabs → collection: file EVERY open multiplex tab into a (new/existing) collection so you can
+// snapshot your current workspace, then reopen it all later via the collection's ↻ Relaunch button. -------
+let _wsTabs=[];
+function allDecks(){
+  const seen=new Set(), out=[];
+  const add=(id,name)=>{ id=String(id||'main'); name=String(name||'Main'); if(seen.has(id)) return; seen.add(id); out.push({id,name}); };
+  (Array.isArray(data.decks)?data.decks:[]).forEach(d=>add(d.id,d.name));
+  add('main','Main');
+  (data.collections||[]).forEach(c=>add(c.deckId||'main', c.deckName||'Main'));
+  return out;
+}
+function deckLabel(id){
+  const d=allDecks().find(x=>String(x.id)===String(id||'main'));
+  return d ? d.name : 'Main';
+}
+function wsDeckChoice(){
+  const sel=$('#wsdecksel');
+  if(!sel) return { deckId:'main', deckName:'Main' };
+  if(sel.value==='__new__') return { deckId:'', deckName:($('#wsdecknew').value||'').trim() };
+  return { deckId:sel.value||'main', deckName:deckLabel(sel.value||'main') };
+}
+function setDeckNewVisible(){
+  const isNew=$('#wsdecksel') && $('#wsdecksel').value==='__new__';
+  $('#wsdecknewrow').hidden=!isNew;
+  if(isNew) setTimeout(()=>$('#wsdecknew').focus(),30);
+}
+function addWorkspaceToCollection(){
+  if(!appLive()){ alert('Open the desktop app first - it owns your collections, so this cannot drift out of sync.'); return; }
+  const open=(sessions||[]).filter(s=>s && s.name);
+  // EVERY open tab, not just chat-linked ones. Shell-launched tabs (a bare `mux` you ran claude/codex in)
+  // have no indexed chat; the desktop app files them as a named "mux-tab" placeholder so the whole open
+  // working set is captured. (dormant placeholders that never ran are still skipped — nothing to save.)
+  _wsTabs=open
+    .filter(s=>s.alive!==false)
+    .map(s=>({ name:s.name, muxName:s.projectMuxName||s.name, sessionId:s.sessionId||'', title:s.chatTitle||s.name, tool:s.tool||'', linked:!!(s.sessionId||s.projectMuxName) }));
+  if(!_wsTabs.length){ alert('No open remote tabs to add — open some sessions in the terminal first.'); return; }
+  const list=$('#wscollist'); list.innerHTML='';
+  const cols=(data.collections||[]);
+  if(!cols.length){ const p=document.createElement('div'); p.className='projempty'; p.textContent='No collections yet — type a name below to make one.'; list.appendChild(p); }
+  cols.forEach(c=>{ const b=document.createElement('button'); b.type='button'; b.className='wscolitem'; b.textContent=(c.deckName||deckLabel(c.deckId))+' / '+(c.name||'Untitled')+' · '+((c.chats||[]).length)+' chats'; b.onclick=()=>submitWsCol({collection:c.name||'Untitled', collectionId:c.id||'', deckId:c.deckId||'main', deckName:c.deckName||deckLabel(c.deckId)}); list.appendChild(b); });
+  const sel=$('#wsdecksel'); sel.innerHTML='';
+  allDecks().forEach(d=>{ const o=document.createElement('option'); o.value=d.id; o.textContent=d.name; sel.appendChild(o); });
+  const newOpt=document.createElement('option'); newOpt.value='__new__'; newOpt.textContent='New deck...'; sel.appendChild(newOpt);
+  sel.onchange=setDeckNewVisible; setDeckNewVisible();
+  const dormant=open.length-_wsTabs.length;
+  $('#wscolcount').textContent=_wsTabs.length+' open tab'+(_wsTabs.length!==1?'s':'')+(dormant?(' ('+dormant+' dormant skipped)'):'');
+  $('#wscolnew').value=''; $('#wsdecknew').value=''; $('#wscoldlg').showModal(); setTimeout(()=>$('#wscolnew').focus(),60);
+}
+async function submitWsCol(target){
+  if(typeof target==='string') target={collection:target};
+  target=target||{};
+  const choice=target.collectionId ? { deckId:target.deckId||'main', deckName:target.deckName||deckLabel(target.deckId) } : wsDeckChoice();
+  const name=(target.collection||$('#wscolnew').value||'').trim();
+  if(!name){ alert('Pick a collection or type a new name'); return; }
+  if(!target.collectionId && !choice.deckId && !choice.deckName){ alert('Pick a deck or type a new deck name'); return; }
+  if(!appLive()){ alert('App went offline - cannot add now'); return; }
+  const btns=$('#wscoldlg').querySelectorAll('button'); btns.forEach(b=>b.disabled=true);
+  let ok=0, fail=0; const details=[];
+  for(const t of _wsTabs){
+    const tab = typeof t==='string' ? { name:t, muxName:t, sessionId:'' } : t;
+    try{
+      const r=await postIntent('api/app-commands',
+        {type:'addtocollection', muxName:tab.muxName||tab.name, sessionName:tab.name, sessionId:tab.sessionId||'', tool:tab.tool||'', collection:name, collectionId:target.collectionId||'', deckId:choice.deckId||'', deckName:choice.deckName||''},
+        'add-collection');
+      if(!r.ok) throw new Error(await apiError(r));
+      const queued=await r.json();
+      const done=await awaitCmdResult(queued.id, 20000);
+      if(done.ok) ok++;
+      else { fail++; details.push(tab.name+': '+done.detail); }
+    }
+    catch(e){ fail++; details.push(tab.name+': '+(e.message||e)); }
+  }
+  btns.forEach(b=>b.disabled=false); $('#wscoldlg').close();
+  let msg='Added '+ok+' of your '+_wsTabs.length+' open tab'+(_wsTabs.length!==1?'s':'')+' to "'+name+'" on '+(choice.deckName||deckLabel(choice.deckId))+'.';
+  if(fail) msg+='\n\nFailed/skipped '+fail+':\n'+details.slice(0,6).join('\n')+(details.length>6?'\n...':'');
+  else msg+='\n\nThe desktop app confirmed the collection update.';
+  alert(msg);
+  setTimeout(()=>location.reload(), fail ? 800 : 1800);
+}
+
+function runningSessionForChat(ch){
+  return (Array.isArray(data.runningSessions)?data.runningSessions:[]).find(r=>String(r.sessionId||'')===String(ch.id||'')) || null;
+}
+async function stopLocalCopyForRelaunch(ch){
+  const rs=runningSessionForChat(ch);
+  if(!rs) return {ok:false, detail:'running process not identified'};
+  const r=await postIntent('api/app-commands',
+    {type:'kill', sessionId:ch.id||'', pid:rs.pid||0, label:ch.title||ch.muxName},
+    'kill-local');
+  if(!r.ok) return {ok:false, detail:await apiError(r)};
+  const queued=await r.json();
+  return await awaitCmdResult(queued.id, 20000);
+}
+
+// ---- Relaunch collection: KILL any of a collection's chats currently running in multiplex, then restart
+// them all fresh (re-run each chat's resume command). Right-click a collection row, or the ↻ in the header.
+async function relaunchCollection(c){
+  const chats=(c.chats||[]).filter(ch=>ch.muxName && (ch.id || canRelaunchMuxName(ch.muxName)));
+  if(!chats.length){ alert('No resumable chats in “'+(c.name||'this collection')+'” — open them once from the desktop app to link them.'); return; }
+  const blocked=chats.map(ch=>sessionBlocker(ch.muxName)).filter(Boolean);
+  if(blocked.length){ alert('Cannot relaunch yet: '+blocked.length+' mux session'+(blocked.length!==1?'s are':' is')+' blocked/stale. Fix the blocker first; not falling back to a legacy path.'); return; }
+  const muxNames=actionableMuxNames(); const runIds=liveRunIds();
+  const localOnly=chats.filter(ch=>chatLive(ch,runIds) && !muxNames.has(ch.muxName));
+  if(!confirm('Relaunch “'+(c.name||'collection')+'”?\n\nKills any matching multiplex sessions'+(localOnly.length?(' and '+localOnly.length+' local PC cop'+(localOnly.length===1?'y':'ies')):'')+', then restarts '+chats.length+' chat'+(chats.length!==1?'s':'')+' fresh.')) return;
+  let ok=0, fail=0;
+  for(const ch of chats){
+    try{
+      const body={sessionId:ch.id||'', tool:ch.tool||''};
+      const res=await postIntent('api/sessions/'+encodeURIComponent(ch.muxName)+'/relaunch',body,'relaunch');
+      if(res.ok) ok++; else throw new Error(await apiError(res));
+    }catch(e){ fail++; }
+  }
+  alert('Relaunched '+ok+'/'+chats.length+' in “'+(c.name||'collection')+'”'+(fail?(' · '+fail+' failed'):'')+'.');
+  setTimeout(()=>location.reload(), 900);
+}
+function openCollMenu(c, x, y){
+  closeCollMenu();
+  const m=document.createElement('div'); m.id='collmenu'; m.setAttribute('role','menu');
+  m.style.cssText='position:fixed;z-index:300;background:var(--panel,#17171c);border:1px solid var(--line,#2c2c33);border-radius:10px;padding:6px;min-width:190px;box-shadow:0 10px 30px rgba(0,0,0,.55)';
+  const b=document.createElement('button'); b.type='button'; b.setAttribute('role','menuitem');
+  b.style.cssText='display:block;width:100%;text-align:left;padding:10px 12px;background:none;border:0;color:var(--fg,#ededf0);font:inherit;font-size:14px;border-radius:7px;cursor:pointer';
+  b.textContent='↻ Relaunch collection';
+  b.onmouseenter=()=>b.style.background='rgba(255,255,255,.08)'; b.onmouseleave=()=>b.style.background='none';
+  b.onclick=()=>{ closeCollMenu(); relaunchCollection(c); };
+  m.appendChild(b); document.body.appendChild(m);
+  const mw=m.offsetWidth, mh=m.offsetHeight;
+  m.style.left=Math.max(8, Math.min(x, window.innerWidth-mw-8))+'px';
+  m.style.top=Math.max(8, Math.min(y, window.innerHeight-mh-8))+'px';
+  setTimeout(()=>b.focus(),0);
+}
+function closeCollMenu(){ const m=document.getElementById('collmenu'); if(m) m.remove(); }
+document.addEventListener('click', e=>{ if(!e.target.closest('#collmenu')) closeCollMenu(); });
+document.addEventListener('keydown', e=>{ if(e.key==='Escape') closeCollMenu(); });
+
+async function resume(ch, inMux, localRun){
+  const name=ch.muxName; if(!name){ alert('No remote-resume info for this chat'); return; }
+  if(inMux){ location.href = './?s='+encodeURIComponent(name); return; }
+  if(!ch.id && !canRelaunchMuxName(name)){ alert('No trusted session identity is available for this chat.'); return; }
+  if(localRun && !confirm('"'+(ch.title||name)+'" is already running on your PC.\n\nI will stop that copy first, then restart it in mux so there is only one transcript writer.\n\nProceed?')) return;
+  try{
+    const body={sessionId:ch.id||'', tool:ch.tool||''};
+    const res=await postIntent('api/sessions/'+encodeURIComponent(name)+'/relaunch',body,'relaunch');
+    if(!res.ok) throw new Error(await apiError(res));
+  }
+  catch(e){ alert('Could not relaunch the session ('+(e.message||e)+').\nNot opening the terminal.'); return; }
+  location.href = './?s='+encodeURIComponent(name);
+}
+
+function goBack(){
+  const wasSearch = curDetail==='__search__';
+  const origin = detailOrigin;
+  if(wasSearch) $('#projfilter').value='';
+  showList();
+  if(wasSearch) $('#projfilter').focus();
+  else if(origin && document.contains(origin)) origin.focus();
+  else { const f=$('#viewList .crow'); if(f) f.focus(); }
+}
+$('#backproj').onclick = goBack;
+$('#projfilter').addEventListener('input', applyFilter);
+$('#refreshpill').onclick = ()=> location.reload();
+$('#wscolbtn').onclick = addWorkspaceToCollection;
+$('#wscolcreate').onclick = ()=> submitWsCol($('#wscolnew').value);
+$('#wscolcancel').onclick = ()=> $('#wscoldlg').close();
+$('#wscolnew').addEventListener('keydown', e=>{ if(e.key==='Enter'){ e.preventDefault(); submitWsCol($('#wscolnew').value); } });
+$('#runpill').onclick = openRunning;
+$('#mobileRunNav').onclick = ()=>{ if(!$('#mobileRunNav').disabled) openRunning(); };
+$('#mclose').onclick = closeModal;
+$('#tmodal').addEventListener('click', e=>{ if(e.target===$('#tmodal')) closeModal(); });   // backdrop click closes
+document.addEventListener('keydown', e=>{
+  if(e.key!=='Escape') return;
+  if(!$('#tmodal').hidden){ e.preventDefault(); closeModal(); return; }   // modal first
+  if(curDetail!==null){ e.preventDefault(); goBack(); }
+});
+
+async function load(){
+  let nd=null, nsess=null;
+  try{ nd = await (await fetch('api/projects',{headers:{'Content-Type':'application/json'}})).json(); }catch(e){}
+  try{ nsess = await (await fetch('api/sessions',{headers:{'Content-Type':'application/json'}})).json(); }catch(e){}
+  if(!built){ data = nd||{collections:[]}; sessions = nsess||[]; sig=structSig(data); renderSync(data); buildList(); updateRunPill(); return; }
+  if(nd===null && nsess===null) return;                    // both fetches failed — keep showing what we have
+  const newSig = structSig(nd||data);
+  if(nd && newSig!==sig){                                  // content/structure drift -> freeze the list (don't mutate it),
+    data.runningSessions=nd.runningSessions; data.live=nd.live; data.appLive=nd.appLive; data.bridgeLive=nd.bridgeLive;
+    data.syncedAt=nd.syncedAt; data.appSyncedAt=nd.appSyncedAt; data.runningSyncedAt=nd.runningSyncedAt; data.host=nd.host;  // but keep the running info fresh
+    renderSync(nd); updateRunPill(); $('#refreshpill').hidden=false; return;
+  }
+  if(nd) data=nd; if(nsess) sessions=nsess;                // same structure -> safe to adopt fresh running data
+  renderSync(data);
+  updateRunPill();
+  applyRunning();                                          // master crun dots, in place
+  if(curDetail!==null && curDetail!=='__running__') applyRunningVisible();   // visible detail/search resume buttons, in place
+  queueMarkRows();
+}
+load();
+setInterval(()=>{ if(document.visibilityState==='visible') load(); }, 12000);
+$('#viewList').addEventListener('scroll', queueMarkRows, {passive:true});
+$('#viewDetail').addEventListener('scroll', queueMarkRows, {passive:true});
+window.addEventListener('resize', queueMarkRows);
+</script>
+</body>
+</html>
