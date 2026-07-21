@@ -1,0 +1,26 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0-windows10.0.26100.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RunSettingsFilePath>$(MSBuildProjectDirectory)\default.runsettings</RunSettingsFilePath>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="MSTest" Version="4.0.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Using Include="Microsoft.VisualStudio.TestTools.UnitTesting" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\CodexLocalRetrieval.Core\CodexLocalRetrieval.Core.csproj" />
+    <ProjectReference Include="..\CodexLocalRetrieval.ProcessJobProbe\CodexLocalRetrieval.ProcessJobProbe.csproj"
+                      ReferenceOutputAssembly="false" />
+    <ProjectReference Include="..\CodexLocalRetrieval.Server\CodexLocalRetrieval.Server.csproj" />
+  </ItemGroup>
+
+</Project>

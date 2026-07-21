@@ -1,0 +1,436 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<Page
+    x:Class="CodexLocalRetrieval_Native.MainPage"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+    xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+    Background="{StaticResource AmoledBrush}"
+    mc:Ignorable="d">
+
+    <Page.Resources>
+        <Style x:Key="PillButtonStyle" TargetType="Button">
+            <Setter Property="MinHeight" Value="40" />
+            <Setter Property="Padding" Value="16,0" />
+            <Setter Property="CornerRadius" Value="12" />
+            <Setter Property="BorderBrush" Value="{StaticResource LineBrush}" />
+            <Setter Property="BorderThickness" Value="1" />
+            <Setter Property="Background" Value="{StaticResource PanelBrush}" />
+            <Setter Property="Foreground" Value="{StaticResource TextStrongBrush}" />
+            <Setter Property="FontSize" Value="14" />
+        </Style>
+
+        <Style x:Key="PrimaryPillButtonStyle" BasedOn="{StaticResource PillButtonStyle}" TargetType="Button">
+            <Setter Property="Background" Value="{StaticResource AccentBrush}" />
+            <Setter Property="BorderBrush" Value="{StaticResource AccentBrush}" />
+            <Setter Property="Foreground" Value="Black" />
+            <Setter Property="FontWeight" Value="SemiBold" />
+        </Style>
+
+        <Style x:Key="IconButtonStyle" TargetType="Button">
+            <Setter Property="Width" Value="42" />
+            <Setter Property="Height" Value="42" />
+            <Setter Property="MinWidth" Value="42" />
+            <Setter Property="MinHeight" Value="42" />
+            <Setter Property="Padding" Value="0" />
+            <Setter Property="CornerRadius" Value="21" />
+            <Setter Property="BorderBrush" Value="{StaticResource LineBrush}" />
+            <Setter Property="BorderThickness" Value="1" />
+            <Setter Property="Background" Value="{StaticResource PanelBrush}" />
+            <Setter Property="Foreground" Value="{StaticResource TextStrongBrush}" />
+        </Style>
+
+        <DataTemplate x:Key="SessionTemplate">
+            <Grid MinHeight="40" Padding="12,6">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+                <TextBlock
+                    Width="14"
+                    VerticalAlignment="Center"
+                    Foreground="{StaticResource AccentBrush}"
+                    Text="{Binding PinGlyph}" />
+                <TextBlock
+                    Grid.Column="1"
+                    MaxLines="1"
+                    Text="{Binding ListTitle}"
+                    TextTrimming="CharacterEllipsis" />
+                <TextBlock
+                    Grid.Column="2"
+                    Margin="6,0,0,0"
+                    VerticalAlignment="Center"
+                    FontSize="12"
+                    Foreground="{StaticResource AccentBrush}"
+                    ToolTipService.ToolTip="★ checkpoint count · ! legacy checkpoint pending · ⑂ branch"
+                    Text="{Binding ListMarks}" />
+                <TextBlock
+                    Grid.Column="3"
+                    Margin="8,0,0,0"
+                    VerticalAlignment="Center"
+                    FontSize="10"
+                    Opacity="0.65"
+                    Foreground="{StaticResource TextMutedBrush}"
+                    Text="{Binding ToolShort}" />
+                <TextBlock
+                    Grid.Column="4"
+                    Margin="8,0,0,0"
+                    VerticalAlignment="Center"
+                    Foreground="{StaticResource TextMutedBrush}"
+                    Text="{Binding DisplayDate}" />
+            </Grid>
+        </DataTemplate>
+    </Page.Resources>
+
+    <Grid>
+        <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="308" />
+            <ColumnDefinition Width="*" />
+            <ColumnDefinition x:Name="RightColumn" Width="292" />
+        </Grid.ColumnDefinitions>
+
+        <Border
+            Grid.Column="0"
+            BorderBrush="{StaticResource LineBrush}"
+            BorderThickness="0,0,1,0"
+            Background="{StaticResource AmoledBrush}"
+            Padding="14">
+            <Grid>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="*" />
+                    <RowDefinition Height="Auto" />
+                </Grid.RowDefinitions>
+
+                <Button
+                    x:Name="BackButton"
+                    Margin="2,6,0,0"
+                    HorizontalAlignment="Left"
+                    Click="Back_Click"
+                    Style="{StaticResource IconButtonStyle}">
+                    <FontIcon
+                        FontFamily="Segoe Fluent Icons"
+                        FontSize="18"
+                        Glyph="&#xE72B;" />
+                </Button>
+
+                <StackPanel Grid.Row="1" Margin="0,22,0,14" Spacing="8">
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+                        <TextBox
+                            x:Name="SearchBox"
+                            Height="42"
+                            CornerRadius="12"
+                            KeyDown="SearchBox_KeyDown"
+                            PlaceholderText="Search chats"
+                            TextChanged="SearchBox_TextChanged" />
+                        <Button
+                            x:Name="TagFilterButton"
+                            Grid.Column="1"
+                            Width="42"
+                            Height="42"
+                            Margin="8,0,0,0"
+                            Click="TagFilter_Click"
+                            Style="{StaticResource IconButtonStyle}"
+                            ToolTipService.ToolTip="Filter chats by tag">
+                            <FontIcon FontFamily="Segoe Fluent Icons" FontSize="16" Glyph="&#xE71C;" />
+                        </Button>
+                    </Grid>
+                    <ScrollViewer
+                        x:Name="TagFilterScroller"
+                        HorizontalScrollBarVisibility="Auto"
+                        HorizontalScrollMode="Auto"
+                        VerticalScrollBarVisibility="Disabled"
+                        Visibility="Collapsed">
+                        <StackPanel x:Name="TagFilterBar" Orientation="Horizontal" Spacing="6" />
+                    </ScrollViewer>
+                </StackPanel>
+
+                <StackPanel Grid.Row="2" Spacing="8">
+                    <Button Click="StartChat_Click" Style="{StaticResource PrimaryPillButtonStyle}">
+                        <StackPanel Orientation="Horizontal" Spacing="10">
+                            <FontIcon FontFamily="Segoe Fluent Icons" FontSize="15" Foreground="Black" Glyph="&#xE710;" />
+                            <TextBlock Text="Start chat" />
+                        </StackPanel>
+                    </Button>
+                    <Button x:Name="ArchiveButton" Click="Nav_Click" Style="{StaticResource PrimaryPillButtonStyle}" Tag="Archive">
+                        <StackPanel Orientation="Horizontal" Spacing="10">
+                            <SymbolIcon Symbol="Library" />
+                            <TextBlock Text="Archive" />
+                        </StackPanel>
+                    </Button>
+                    <Button Click="Nav_Click" Style="{StaticResource PillButtonStyle}" Tag="Search">
+                        <StackPanel Orientation="Horizontal" Spacing="10">
+                            <SymbolIcon Symbol="Find" />
+                            <TextBlock Text="Deep search" />
+                        </StackPanel>
+                    </Button>
+                    <Button Click="Nav_Click" Style="{StaticResource PillButtonStyle}" Tag="Ask">
+                        <StackPanel Orientation="Horizontal" Spacing="10">
+                            <SymbolIcon Symbol="Message" />
+                            <TextBlock Text="Co-pilot" />
+                        </StackPanel>
+                    </Button>
+                    <Button Click="Nav_Click" Style="{StaticResource PillButtonStyle}" Tag="Workspaces">
+                        <StackPanel Orientation="Horizontal" Spacing="10">
+                            <SymbolIcon Symbol="Folder" />
+                            <TextBlock Text="Workspaces" />
+                        </StackPanel>
+                    </Button>
+                    <Button Click="Nav_Click" Style="{StaticResource PillButtonStyle}" Tag="Collections">
+                        <StackPanel Orientation="Horizontal" Spacing="10">
+                            <SymbolIcon Symbol="AllApps" />
+                            <TextBlock Text="Collections" />
+                        </StackPanel>
+                    </Button>
+                    <Button Click="Nav_Click" Style="{StaticResource PillButtonStyle}" Tag="Running">
+                        <StackPanel Orientation="Horizontal" Spacing="10">
+                            <SymbolIcon Symbol="Play" />
+                            <TextBlock Text="Running" />
+                        </StackPanel>
+                    </Button>
+                    <Button Click="Nav_Click" Style="{StaticResource PillButtonStyle}" Tag="Phrases">
+                        <StackPanel Orientation="Horizontal" Spacing="10">
+                            <FontIcon FontFamily="Segoe Fluent Icons" FontSize="15" Glyph="&#xE8EC;" />
+                            <TextBlock Text="Phrases" />
+                        </StackPanel>
+                    </Button>
+                    <Button Click="Nav_Click" Style="{StaticResource PillButtonStyle}" Tag="Custody">
+                        <StackPanel Orientation="Horizontal" Spacing="10">
+                            <FontIcon FontFamily="Segoe Fluent Icons" FontSize="15" Glyph="&#xE72E;" />
+                            <TextBlock Text="Custody" />
+                        </StackPanel>
+                    </Button>
+                    <Button Click="Nav_Click" Style="{StaticResource PillButtonStyle}" Tag="Settings">
+                        <StackPanel Orientation="Horizontal" Spacing="10">
+                            <SymbolIcon Symbol="Setting" />
+                            <TextBlock Text="Settings" />
+                        </StackPanel>
+                    </Button>
+                </StackPanel>
+
+                <!-- Extended selection: plain click opens a chat; Ctrl/Shift-click builds a multi-selection
+                     (right-click one of them -> Add all to a collection). See SessionList_SelectionChanged. -->
+                <ListView
+                    x:Name="SessionList"
+                    Grid.Row="3"
+                    Margin="0,18,0,0"
+                    Background="Transparent"
+                    BorderThickness="0"
+                    ItemTemplate="{StaticResource SessionTemplate}"
+                    RightTapped="SessionList_RightTapped"
+                    SelectionChanged="SessionList_SelectionChanged"
+                    SelectionMode="Extended" />
+
+                <StackPanel Grid.Row="4" Spacing="10">
+                    <Button
+                        x:Name="SyncButton"
+                        HorizontalAlignment="Stretch"
+                        Click="Sync_Click"
+                        Style="{StaticResource PillButtonStyle}">
+                        <StackPanel Orientation="Horizontal" Spacing="10">
+                            <SymbolIcon Symbol="Sync" />
+                            <TextBlock Text="Sync sessions" />
+                        </StackPanel>
+                    </Button>
+                    <TextBlock
+                        x:Name="SyncStatus"
+                        FontSize="12"
+                        Foreground="{StaticResource TextMutedBrush}"
+                        Text="Source files stay untouched."
+                        TextWrapping="Wrap" />
+                </StackPanel>
+            </Grid>
+        </Border>
+
+        <Grid Grid.Column="1">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="*" />
+            </Grid.RowDefinitions>
+            <Border
+                BorderBrush="{StaticResource LineBrush}"
+                BorderThickness="0,0,0,1"
+                Padding="24,14">
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+                    <StackPanel>
+                        <TextBlock
+                            x:Name="ScreenLabel"
+                            FontSize="12"
+                            Foreground="{StaticResource TextMutedBrush}"
+                            Text="Archive reader" />
+                        <TextBlock
+                            x:Name="TitleText"
+                            MaxLines="2"
+                            TextTrimming="CharacterEllipsis"
+                            FontSize="24"
+                            FontWeight="SemiBold"
+                            Foreground="{StaticResource TextStrongBrush}" />
+                    </StackPanel>
+                    <StackPanel x:Name="HeaderActions" Grid.Column="1" Orientation="Horizontal" Spacing="10">
+                        <Button
+                            x:Name="MsgViewToggle"
+                            Click="MsgViewToggle_Click"
+                            Style="{StaticResource PillButtonStyle}"
+                            ToolTipService.ToolTip="Cycle what the transcript shows: everything / agent messages only / your messages only">
+                            <TextBlock x:Name="MsgViewToggleText" Text="View: all" />
+                        </Button>
+                        <Button
+                            Click="JumpPrevUser_Click"
+                            Style="{StaticResource PillButtonStyle}"
+                            ToolTipService.ToolTip="Jump to your previous message (repeat to step back through your messages)">
+                            <StackPanel Orientation="Horizontal" Spacing="6">
+                                <FontIcon FontFamily="Segoe Fluent Icons" FontSize="12" Glyph="&#xE70E;" />
+                                <TextBlock Text="Your msg" />
+                            </StackPanel>
+                        </Button>
+                        <Button
+                            Click="JumpStart_Click"
+                            Style="{StaticResource PillButtonStyle}"
+                            ToolTipService.ToolTip="Jump to the very first message, then scroll down">
+                            <TextBlock Text="Start" />
+                        </Button>
+                        <Button Click="CopyContext_Click" Style="{StaticResource PillButtonStyle}">
+                            <StackPanel Orientation="Horizontal" Spacing="8">
+                                <SymbolIcon Symbol="Copy" />
+                                <TextBlock Text="Copy context" />
+                            </StackPanel>
+                        </Button>
+                        <Button
+                            x:Name="HeaderMoreButton"
+                            Click="HeaderMore_Click"
+                            Style="{StaticResource IconButtonStyle}"
+                            ToolTipService.ToolTip="More actions">
+                            <FontIcon FontFamily="Segoe Fluent Icons" FontSize="16" Glyph="&#xE712;" />
+                        </Button>
+                        <Button Click="ResumeInTerminal_Click" Style="{StaticResource PrimaryPillButtonStyle}">
+                            <StackPanel Orientation="Horizontal" Spacing="8">
+                                <FontIcon
+                                    FontFamily="Segoe Fluent Icons"
+                                    FontSize="15"
+                                    Foreground="Black"
+                                    Glyph="&#xE756;" />
+                                <TextBlock Text="Resume in terminal" />
+                            </StackPanel>
+                        </Button>
+                    </StackPanel>
+                </Grid>
+            </Border>
+
+            <ScrollViewer x:Name="MainScroller" Grid.Row="1" ViewChanged="MainScroller_ViewChanged">
+                <StackPanel x:Name="MainContent" Padding="28,26" Spacing="18" />
+            </ScrollViewer>
+        </Grid>
+
+        <Border
+            x:Name="RightColumnBorder"
+            Grid.Column="2"
+            Margin="18,26,18,18"
+            Padding="16,16,16,8"
+            VerticalAlignment="Stretch"
+            BorderBrush="{StaticResource LineBrush}"
+            BorderThickness="1"
+            Background="{StaticResource PanelBrush}"
+            CornerRadius="12">
+            <ScrollViewer
+                HorizontalScrollBarVisibility="Disabled"
+                VerticalScrollBarVisibility="Auto">
+            <StackPanel x:Name="RightPanel" Spacing="12">
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+                    <TextBlock
+                        VerticalAlignment="Center"
+                        FontSize="18"
+                        FontWeight="SemiBold"
+                        Foreground="{StaticResource TextStrongBrush}"
+                        Text="Integrity" />
+                    <Button
+                        Grid.Column="1"
+                        Padding="8,4"
+                        Click="RefreshIntegrity_Click"
+                        Style="{StaticResource PillButtonStyle}"
+                        ToolTipService.ToolTip="Refresh custody checks for this chat">
+                        <SymbolIcon Symbol="Refresh" />
+                    </Button>
+                </Grid>
+                <StackPanel x:Name="IntegrityItems" Spacing="6" />
+                <Border Height="1" Background="{StaticResource LineBrush}" />
+                <TextBlock
+                    FontSize="18"
+                    FontWeight="SemiBold"
+                    Foreground="{StaticResource TextStrongBrush}"
+                    Text="Quick actions" />
+                <Button
+                    x:Name="ResumeTerminalButton"
+                    Click="ResumeInTerminal_Click"
+                    Content="Resume in terminal"
+                    HorizontalAlignment="Stretch"
+                    Style="{StaticResource PrimaryPillButtonStyle}" />
+                <Button
+                    x:Name="ResumeMultiplexButton"
+                    Click="ResumeInMultiplex_Click"
+                    Content="Start multiplex"
+                    ToolTipService.ToolTip="Start this chat in multiplex and open a local terminal attached to it."
+                    HorizontalAlignment="Stretch"
+                    Style="{StaticResource PillButtonStyle}" />
+                <Button
+                    x:Name="ResumeHeadlessMultiplexButton"
+                    Click="ResumeInHeadlessMultiplex_Click"
+                    Content="Start headless multiplex"
+                    ToolTipService.ToolTip="Start this chat in multiplex without opening a local terminal; attach later with mux &lt;name&gt;."
+                    HorizontalAlignment="Stretch"
+                    Style="{StaticResource PillButtonStyle}" />
+                <Button
+                    x:Name="AddToProjectButton"
+                    Click="AddToProject_Click"
+                    Content="Add to project"
+                    HorizontalAlignment="Stretch"
+                    Style="{StaticResource PillButtonStyle}" />
+                <Button Click="CopyContext_Click" Content="Copy resume prompt" HorizontalAlignment="Stretch" Style="{StaticResource PillButtonStyle}" />
+                <Button x:Name="CopyCommandButton" Click="CopyCommand_Click" Content="Copy resume command" ToolTipService.ToolTip="Copy the CLI command that resumes this chat (codex resume &lt;id&gt; / claude --resume &lt;id&gt;)" HorizontalAlignment="Stretch" Style="{StaticResource PillButtonStyle}" />
+                <Button Click="CopyPath_Click" Content="Copy chat path" HorizontalAlignment="Stretch" Style="{StaticResource PillButtonStyle}" />
+                <Button Click="CopyCode_Click" Content="Copy all code" HorizontalAlignment="Stretch" Style="{StaticResource PillButtonStyle}" />
+                <Button Click="Restore_Click" Content="Build restore packet" HorizontalAlignment="Stretch" Style="{StaticResource PillButtonStyle}" />
+                <Button Click="Source_Click" Content="Inspect raw events" HorizontalAlignment="Stretch" Style="{StaticResource PillButtonStyle}" />
+                <Grid Margin="0,6,0,0">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+                    <TextBlock
+                        VerticalAlignment="Center"
+                        FontSize="16"
+                        FontWeight="SemiBold"
+                        Foreground="{StaticResource TextStrongBrush}"
+                        Text="Tags" />
+                    <Button
+                        x:Name="AddTagButton"
+                        Grid.Column="1"
+                        Padding="10,4"
+                        Click="AddTag_Click"
+                        Style="{StaticResource PillButtonStyle}"
+                        ToolTipService.ToolTip="Add a tag to this chat">
+                        <TextBlock FontSize="12" Text="+ Tag" />
+                    </Button>
+                </Grid>
+                <StackPanel x:Name="TagsItems" Spacing="6" />
+            </StackPanel>
+            </ScrollViewer>
+        </Border>
+    </Grid>
+</Page>

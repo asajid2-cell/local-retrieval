@@ -1,0 +1,10 @@
+{
+  "profiles": {
+    "CodexLocalRetrieval.Native (Package)": {
+      "commandName": "MsixPackage"
+    },
+    "CodexLocalRetrieval.Native (Unpackaged)": {
+      "commandName": "Project"
+    }
+  }
+}

@@ -1,0 +1,119 @@
+{
+  "sessions": {
+    "fixture-a": {
+      "id": "fixture-a",
+      "title": "Recover archived project notes",
+      "customTitle": "",
+      "sourcePath": "data/fixtures/session-a.jsonl",
+      "createdAt": "2026-05-21T18:00:00.000Z",
+      "updatedAt": "2026-05-21T18:02:00.000Z",
+      "workspace": "C:\\Projects\\demo-workspace",
+      "workspaceName": "demo-workspace",
+      "model": "local-demo",
+      "messages": [
+        {
+          "id": "sample-a-user",
+          "role": "user",
+          "text": "Recover archived project notes without modifying the original source files.",
+          "timestamp": "2026-05-21T18:01:00.000Z",
+          "codeBlocks": []
+        },
+        {
+          "id": "sample-a-assistant",
+          "role": "assistant",
+          "text": "Build a read-only index, show the transcript, and keep metadata changes in the app store only.\n\n```powershell\nGet-ChildItem .\\sample-sessions -Filter *.jsonl -Recurse\n```",
+          "timestamp": "2026-05-21T18:02:00.000Z",
+          "codeBlocks": [
+            {
+              "language": "powershell",
+              "code": "Get-ChildItem .\\sample-sessions -Filter *.jsonl -Recurse"
+            }
+          ]
+        }
+      ],
+      "codeBlocks": [
+        {
+          "language": "powershell",
+          "code": "Get-ChildItem .\\sample-sessions -Filter *.jsonl -Recurse"
+        }
+      ],
+      "text": "Recover archived project notes without modifying the original source files.\n\nBuild a read-only index, show the transcript, and keep metadata changes in the app store only.",
+      "tags": [
+        "archive",
+        "code"
+      ],
+      "reviewed": false,
+      "starred": false,
+      "pinned": true,
+      "archived": false
+    },
+    "fixture-b": {
+      "id": "fixture-b",
+      "title": "Resume implementation chat",
+      "customTitle": "",
+      "sourcePath": "data/fixtures/session-b.jsonl",
+      "createdAt": "2026-05-22T19:00:00.000Z",
+      "updatedAt": "2026-05-22T19:02:00.000Z",
+      "workspace": "C:\\Projects\\restore-demo",
+      "workspaceName": "restore-demo",
+      "model": "local-demo",
+      "messages": [
+        {
+          "id": "sample-b-user",
+          "role": "user",
+          "text": "Resume a previous implementation chat and copy the important code blocks.",
+          "timestamp": "2026-05-22T19:01:00.000Z",
+          "codeBlocks": []
+        },
+        {
+          "id": "sample-b-assistant",
+          "role": "assistant",
+          "text": "Use a restore packet with summary, source path, and code snippets.\n\n```ts\nexport function score(value: number) {\n  return value * 2;\n}\n```",
+          "timestamp": "2026-05-22T19:02:00.000Z",
+          "codeBlocks": [
+            {
+              "language": "ts",
+              "code": "export function score(value: number) {\n  return value * 2;\n}"
+            }
+          ]
+        }
+      ],
+      "codeBlocks": [
+        {
+          "language": "ts",
+          "code": "export function score(value: number) {\n  return value * 2;\n}"
+        }
+      ],
+      "text": "Resume a previous implementation chat and copy the important code blocks.\n\nUse a restore packet with summary, source path, and code snippets.",
+      "tags": [
+        "archive",
+        "code"
+      ],
+      "reviewed": false,
+      "starred": false,
+      "pinned": false,
+      "archived": false
+    }
+  },
+  "settings": {
+    "theme": "amoled",
+    "accent": "rose",
+    "accentHex": "#fb7185",
+    "radius": "compact",
+    "density": "comfortable",
+    "readOnlySourceMode": true,
+    "panelRadius": 12,
+    "controlRadius": 12
+  },
+  "collections": {
+    "demo": {
+      "id": "demo",
+      "name": "Demo",
+      "sessionIds": [
+        "fixture-a",
+        "fixture-b"
+      ],
+      "color": "#fb7185"
+    }
+  }
+}

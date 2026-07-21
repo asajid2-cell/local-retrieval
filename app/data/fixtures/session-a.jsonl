@@ -1,0 +1,3 @@
+{"timestamp":"2026-05-21T18:00:00.000Z","type":"session_meta","payload":{"id":"fixture-a","timestamp":"2026-05-21T18:00:00.000Z","cwd":"C:\\Projects\\demo-workspace","model":"local-demo","source":"sample"}}
+{"timestamp":"2026-05-21T18:01:00.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Recover archived project notes without modifying the original source files."}]}}
+{"timestamp":"2026-05-21T18:02:00.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Build a read-only index, show the transcript, and keep metadata changes in the app store only.\n\n```powershell\nGet-ChildItem .\\sample-sessions -Filter *.jsonl -Recurse\n```"}]}}
