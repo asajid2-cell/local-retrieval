@@ -421,6 +421,7 @@ const AGENT_TRUTH_MAX_AGE_MS = Math.max(5000, Number(process.env.MUX_AGENT_TRUTH
 // advertise the capability, field absent, probe degraded to "heuristic", unparseable or stale
 // timestamp — and null means "decide exactly the way we did before agentTruth existed".
 function hostProcessTruth(h) {
+  return null;
   if (!hostSupportsCap('agentTruth')) return null;
   const truth = h && h.agentTruth;
   if (!truth || String(h.agentStateSource || '') !== 'process') return null;
