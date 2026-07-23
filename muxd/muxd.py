@@ -400,6 +400,27 @@ _CONPTY_HOST_EXECUTABLES = (
 _ORPHANED_CONPTY_LOCK = threading.Lock()
 _ORPHANED_CONPTY_HOSTS = {}
 _PENDING_CONPTY_BASELINES = {}
+CONPTY_CUSTODY_TTL = float(os.environ.get("MUXD_CONPTY_CUSTODY_TTL", "300"))
+CONPTY_QUARANTINE_TTL = float(os.environ.get("MUXD_CONPTY_QUARANTINE_TTL", "60"))
+
+def _custody_record(reason, now=None):
+    stamp = time.monotonic() if now is None else float(now)
+    return {
+        "reason": str(reason or ""),
+        "first_seen": stamp,
+        "last_attempt": stamp,
+        "attempts": 0,
+    }
+
+def _custody_age(record, now=None):
+    stamp = time.monotonic() if now is None else float(now)
+    return max(0.0, stamp - float(record.get("first_seen", stamp)))
+
+def _custody_touch(record, now=None):
+    stamp = time.monotonic() if now is None else float(now)
+    record["attempts"] = int(record.get("attempts", 0)) + 1
+    record["last_attempt"] = stamp
+    return record
 
 def _direct_child_pids(parent_pid, executable_name=""):
     if os.name != "nt":
@@ -585,20 +606,26 @@ def _retain_orphaned_conpty_hosts(owned, reason):
         return
     with _ORPHANED_CONPTY_LOCK:
         for pid, start_token in records:
-            _ORPHANED_CONPTY_HOSTS[(int(pid), str(start_token))] = str(reason or "")
+            key = (int(pid), str(start_token))
+            # An already-custodied host keeps its original first_seen and first reason:
+            # re-retaining must not reset the age clock a later GC pass reads.
+            if key not in _ORPHANED_CONPTY_HOSTS:
+                _ORPHANED_CONPTY_HOSTS[key] = _custody_record(reason)
     log(f"[conpty] retained {len(records)} orphan host record(s) for supervised cleanup: {reason}")
 
 def _retain_pending_conpty_baseline(records, reason):
     baseline = tuple(sorted((int(pid), str(token)) for pid, token in (records or {}).items()))
     with _ORPHANED_CONPTY_LOCK:
-        _PENDING_CONPTY_BASELINES[baseline] = str(reason or "")
+        if baseline not in _PENDING_CONPTY_BASELINES:
+            _PENDING_CONPTY_BASELINES[baseline] = _custody_record(reason)
     log(f"[conpty] quarantined new PTY spawns pending orphan discovery: {reason}")
 
 def _reap_orphaned_conpty_hosts(timeout=5):
     with _CONPTY_SPAWN_LOCK:
         with _ORPHANED_CONPTY_LOCK:
             pending_baselines = list(_PENDING_CONPTY_BASELINES.items())
-        for baseline_key, reason in pending_baselines:
+        for baseline_key, baseline_record in pending_baselines:
+            reason = baseline_record["reason"]
             try:
                 discovered = _new_conpty_host_processes(
                     dict(baseline_key),
@@ -612,12 +639,51 @@ def _reap_orphaned_conpty_hosts(timeout=5):
             _retain_orphaned_conpty_hosts(discovered, reason)
         with _ORPHANED_CONPTY_LOCK:
             records = list(_ORPHANED_CONPTY_HOSTS)
-    retained, failures = _terminate_conhost_records(records, timeout=timeout)
+    # Partition before terminating: a custody record must never outlive its subject.
+    # The _same_process_instance probes call into Win32, so they run OUTSIDE the lock.
+    live = []
+    dormant = []
+    abandoned = []
+    for key in records:
+        pid, start_token = key
+        if not _same_process_instance(int(pid), start_token):
+            # Dead pid, or the pid was recycled onto an unrelated process. Either way
+            # there is nothing of ours left to kill — dropping is not a failure.
+            dormant.append(key)
+            continue
+        with _ORPHANED_CONPTY_LOCK:
+            record = _ORPHANED_CONPTY_HOSTS.get(key)
+        if record is None:
+            continue
+        age = _custody_age(record)
+        if age > CONPTY_CUSTODY_TTL:
+            abandoned.append((key, record, age))
+            continue
+        live.append(key)
+    if dormant or abandoned:
+        with _ORPHANED_CONPTY_LOCK:
+            for key in dormant:
+                _ORPHANED_CONPTY_HOSTS.pop(key, None)
+            for key, _record, _age in abandoned:
+                _ORPHANED_CONPTY_HOSTS.pop(key, None)
+    for key, record, age in abandoned:
+        log(
+            f"[conpty] abandoning orphan host record pid={key[0]} after {age:.1f}s"
+            f" / {int(record.get('attempts', 0))} attempt(s): {record['reason']}"
+        )
+    if live:
+        retained, failures = _terminate_conhost_records(live, timeout=timeout)
+    else:
+        retained, failures = [], []
     retained_set = set(retained)
     with _ORPHANED_CONPTY_LOCK:
-        for record in records:
-            if record not in retained_set:
-                _ORPHANED_CONPTY_HOSTS.pop(record, None)
+        for key in live:
+            if key not in retained_set:
+                _ORPHANED_CONPTY_HOSTS.pop(key, None)
+                continue
+            record = _ORPHANED_CONPTY_HOSTS.get(key)
+            if record is not None:
+                _custody_touch(record)
     if failures:
         log(f"[conpty] supervised orphan cleanup still pending: {'; '.join(failures)}")
     return len(retained)
