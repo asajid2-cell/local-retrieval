@@ -97,3 +97,84 @@ test('r.1.6.2 static: index.html routes residue mutations through sendIntent wit
   has(/sendIntent\('PATCH',[^\n]*\/api\/uploads\//);
   has(/sendIntent\('DELETE',[^\n]*\/api\/uploads\//);
 });
+
+// ===========================================================================
+// r.1.6.3 — intent-journal exactly-once integration (session.kill + autoheal)
+// Drives a real relay child through the extracted harness. Proves that a
+// byte-identical replay of a mutating request with the same intentId returns
+// the STORED {code, body} while the side effect fires exactly once (frames are
+// COUNTED, not merely awaited), and that reusing an intentId for a different
+// operation is rejected 409. Depends on relay/server.js withMutationIntent
+// wiring: DELETE /api/sessions/:name ('session.kill'), POST .../autoheal
+// ('session.autoheal').
+// ===========================================================================
+
+const { RelayHarness } = require('./helpers/intent-harness');
+
+function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
+
+// Mirror of relay.test.js's shellSession shape — enough for the relay to treat
+// the name as a live hosted session (hostedHas === true).
+function shellSession(name) {
+  return { name, alive: true, created: 1000, lastOut: 1000, cols: 100, rows: 30, hasCommand: false, shellOnly: true, ready: true, kind: 'shell', sessionId: '', aliases: [] };
+}
+
+test('r.1.6.3 integration: session.kill intent replays exactly-once and rejects fingerprint reuse', async t => {
+  const h = new RelayHarness();
+  await h.start();
+  t.after(async () => h.stop());
+  const host = await h.connectHost([shellSession('kill-intent')]);
+  t.after(() => host.close());
+
+  // (a) First kill: no COMPLETED record yet, so the raw handler runs, ships the
+  // kill frame to muxd, and blocks until the hosted row is confirmed gone.
+  const first = h.request('DELETE', '/api/sessions/kill-intent', { intentId: 't-kill-1' });
+  await host.waitFor(m => m.t === 'kill' && m.s === 'kill-intent', 'kill frame');
+  host.sendKilled('kill-intent');
+  const firstRes = await first;
+  assert.equal(firstRes.status, 200);
+  assert.deepEqual(firstRes.body, { ok: true });
+
+  // Byte-identical replay: intentId 't-kill-1' is now COMPLETED, so the stored
+  // {code, body} is replayed and the handler is skipped entirely.
+  const replayRes = await h.request('DELETE', '/api/sessions/kill-intent', { intentId: 't-kill-1' });
+  assert.equal(replayRes.status, firstRes.status);
+  assert.deepEqual(replayRes.body, firstRes.body);
+
+  // Exactly-once side effect: COUNT kill frames (a re-run would emit a second).
+  await sleep(150);
+  const killFrames = host.messages.filter(m => m.t === 'kill' && m.s === 'kill-intent');
+  assert.equal(killFrames.length, 1, `expected exactly one kill frame, got ${killFrames.length}`);
+
+  // (c) Same intentId, different session name => different fingerprint => 409.
+  const conflict = await h.request('DELETE', '/api/sessions/kill-other', { intentId: 't-kill-1' });
+  assert.equal(conflict.status, 409);
+  assert.deepEqual(conflict.body, { error: 'intent id already used for a different operation' });
+});
+
+test('r.1.6.3 integration: session.autoheal intent replays exactly-once', async t => {
+  const h = new RelayHarness();
+  await h.start();
+  t.after(async () => h.stop());
+  const host = await h.connectHost([shellSession('heal-intent')]);
+  t.after(() => host.close());
+
+  // (b) First autoheal on: raw handler pushes the boolean heal policy to muxd
+  // and waits for the host to echo the new heal state back.
+  const first = h.request('POST', '/api/sessions/heal-intent/autoheal', { on: true, intentId: 't-heal-1' });
+  await host.waitFor(m => m.t === 'heal' && m.s === 'heal-intent', 'heal frame');
+  host.sendSessions([{ ...shellSession('heal-intent'), heal: true }]);
+  const firstRes = await first;
+  assert.equal(firstRes.status, 200);
+  assert.deepEqual(firstRes.body, { ok: true, name: 'heal-intent', autoheal: true });
+
+  // Byte-identical replay: COMPLETED record replays the stored response, handler skipped.
+  const replayRes = await h.request('POST', '/api/sessions/heal-intent/autoheal', { on: true, intentId: 't-heal-1' });
+  assert.equal(replayRes.status, firstRes.status);
+  assert.deepEqual(replayRes.body, firstRes.body);
+
+  // The autoheal policy changed exactly once — COUNT heal frames pushed to muxd.
+  await sleep(150);
+  const healFrames = host.messages.filter(m => m.t === 'heal' && m.s === 'heal-intent');
+  assert.equal(healFrames.length, 1, `expected exactly one heal frame, got ${healFrames.length}`);
+});
