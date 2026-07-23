@@ -201,7 +201,7 @@ class LiveSessionHygieneTests(_LiveMuxdMixin, unittest.TestCase):
         self.assert_no_probe_sessions(baseline, "a wall-clamp run (exit 5)")
 
 
->
+class BaselineDocTests(unittest.TestCase):
     """The measured numbers must be recorded, not just produced and thrown away."""
 
     def test_baseline_doc_records_the_measurement(self):
