@@ -344,29 +344,24 @@ test('a double-tap collapses into one resume at the relay, not behind a disabled
 });
 
 test('a leased+acked resume ends with the new tab in the list and selected', async t => {
-  const { h, picker } = await bootPicker(t);
-  const host = new FakeHost(h.port);
-  await host.connect();
-  t.after(() => host.close());
-
+  // ONE relay, ONE host: the stub does what index.html's loadSessions does — refresh, then select.
+  let h;
   const selected = [];
   let tabs = [];
-  const withTabs = h; // the stub does what index.html's loadSessions does: refresh, then select.
-  const pickerWithTabs = (await bootPicker(t, {
+  const booted = await bootPicker(t, {
     deps: {
       loadSessions: async name => {
         selected.push(name);
-        const res = await withTabs.request('GET', '/api/sessions', undefined, OWNER_HEADERS);
+        const res = await h.request('GET', '/api/sessions', undefined, OWNER_HEADERS);
         tabs = Array.isArray(res.body) ? res.body : [];
       },
     },
-  }));
-  // Drive the picker that shares this relay+host pair.
-  const p = pickerWithTabs.picker;
-  const hostForP = new FakeHost(pickerWithTabs.h.port);
-  await hostForP.connect();
-  t.after(() => hostForP.close());
-  const withTabsH = pickerWithTabs.h;
+  });
+  h = booted.h;
+  const p = booted.picker;
+  const host = new FakeHost(h.port);
+  await host.connect();
+  t.after(() => host.close());
 
   await p.load();
   const chat = p.visible()[0];
@@ -374,13 +369,13 @@ test('a leased+acked resume ends with the new tab in the list and selected', asy
   const resuming = p.resume(chat);
   // The real host starts the session first, then acks — so the tab exists by the time we refresh.
   const leased = await waitFor(async () => {
-    const res = await withTabsH.lease();
+    const res = await h.lease();
     return res.body.length ? res.body[0] : null;
   }, 'startmux lease');
   assert.equal(leased.type, 'startmux');
-  hostForP.sendSessions([session('mux-1', 'chat-1')]);
+  host.sendSessions([session('mux-1', 'chat-1')]);
   await sleep(150);
-  const acked = await withTabsH.ack(leased.id, leased.leaseToken, true);
+  const acked = await h.ack(leased.id, leased.leaseToken, true);
   assert.equal(acked.status, 200);
 
   const outcome = await resuming;
@@ -388,7 +383,6 @@ test('a leased+acked resume ends with the new tab in the list and selected', asy
   assert.equal(outcome.detail, 'mux session started');
   assert.deepEqual(selected, ['mux-1'], 'the resume must SELECT the tab it just created');
   assert.ok(tabs.some(s => s.name === 'mux-1'), `tab list must contain mux-1; got ${JSON.stringify(tabs.map(s => s.name))}`);
-  picker; host; tabs;
 });
 
 test('a refused resume surfaces the PC-side detail, not a bare status code', async t => {
