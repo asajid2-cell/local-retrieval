@@ -74,6 +74,13 @@ public sealed class LedgerReadTests
         // The scan path is the one that runs the byte screen, so a probe that finds nothing has to be proven
         // to find nothing for the right reason: at least one probe must return events on both paths.
         Assert.IsGreaterThan(0, SessionEventLedger.ReadForSession("alias-child", max: 50, options: options).Count);
+
+        // Non-vacuity for the non-ASCII probes — these are exactly the ids the ASCII-only screen used to drop.
+        // Each count would be 0 (empty on BOTH paths, so AssertSameEvents alone stays green) before the guard.
+        // The mixed set must return BOTH the ASCII primary's event and the non-ASCII alias's, not just one.
+        Assert.IsGreaterThan(0, SessionEventLedger.ReadForSession("SESSION-É", max: 50, options: options).Count);
+        Assert.IsGreaterThan(0, SessionEventLedger.ReadForSession("café-session", max: 50, options: options).Count);
+        Assert.HasCount(2, SessionEventLedger.ReadForSession("uni-parent", ["SÉANCE"], 50, options));
     }
 
     [TestMethod]
@@ -122,6 +129,14 @@ public sealed class LedgerReadTests
         new("device-name-id", "nul", null, 50),
         new("absent", "no-such-session", null, 50),
         new("case-insensitive", "QUIET-ONE", null, 50),
+        // Non-ASCII ids: TryIndexKey admits only [A-Za-z0-9._~-], so every non-ASCII id is unindexable and is
+        // forced down the screened scan. Before the BuildIdScreen non-ASCII guard the ASCII-only fold silently
+        // dropped an id that matched only via Unicode case folding, so ReadForSession returned FEWER events
+        // than the unscreened reader. Each probe still equals its scan; the count assertions in the identity
+        // test prove they are not passing vacuously (empty == empty).
+        new("nonascii-casefold", "SESSION-É", null, 50),   // stored "session-é": matches only via non-ASCII case fold
+        new("nonascii-verbatim", "café-session", null, 50),
+        new("nonascii-alias", "uni-parent", ["SÉANCE"], 50), // ASCII primary + non-ASCII (case-differing) alias
     ];
 
     private static void AssertSameEvents(IReadOnlyList<SessionEvent> expected, IReadOnlyList<SessionEvent> actual, string probe)
@@ -186,6 +201,15 @@ public sealed class LedgerReadTests
             SessionEventLedger.Create("linked.csv", "detail csv", "holder-2", details: new Dictionary<string, string> { ["peers"] = "csv-a, csv-b, csv-c" }), out var d7, july), d7);
         for (var i = 0; i < 9; i++)
             Assert.IsTrue(SessionEventLedger.TryAppend(SessionEventLedger.Create("chatty." + i, "chatter " + i, "chatty"), out var dc, july), dc);
+
+        // Non-ASCII session ids. Unindexable (TryIndexKey rejects them), so answerable only via the screened
+        // scan. "session-é" and the "SÉANCE" alias are probed in the OTHER case, which matches only
+        // through Unicode case folding the ASCII-only byte screen cannot do; "café-session" is probed
+        // verbatim.
+        Assert.IsTrue(SessionEventLedger.TryAppend(SessionEventLedger.Create("accent.lower", "accented stored id", "session-é"), out var u1, july), u1);
+        Assert.IsTrue(SessionEventLedger.TryAppend(SessionEventLedger.Create("accent.verbatim", "accented stored id", "café-session"), out var u2, july), u2);
+        Assert.IsTrue(SessionEventLedger.TryAppend(SessionEventLedger.Create("uni.parent", "ascii primary of a mixed alias set", "uni-parent"), out var u3, july), u3);
+        Assert.IsTrue(SessionEventLedger.TryAppend(SessionEventLedger.Create("uni.alias", "non-ascii alias member", "séance"), out var u4, july), u4);
 
         // Written behind the ledger's back, so only a backfill (or the scan) can see them.
         var julyFile = Path.Combine(root, "events-2026-07.jsonl");
