@@ -309,7 +309,14 @@ function requestHostTail(name, lines) {
   const rid = 'r' + (++_rid);
   return new Promise(resolve => {
     const to = setTimeout(() => { pendingTails.delete(rid); resolve(null); }, 2500);
-    pendingTails.set(rid, txt => { clearTimeout(to); resolve(txt); });
+    // TRUST: a tail is terminal truth, so muxd may sign it. The relay never validates the signature
+    // (it holds no key and is not the trusted origin) — it only remembers the latest one per session so
+    // the fleet glance can hand it to the client that CAN verify it. No sig ⇒ forget the stale one.
+    pendingTails.set(rid, (txt, sig) => {
+      clearTimeout(to);
+      if (sig) _tailSigs.set(name, sig); else _tailSigs.delete(name);
+      resolve(txt);
+    });
     sendHost({ t: 'tail', s: name, lines, rid });
   });
 }
@@ -522,7 +529,9 @@ async function fleetSnippetFor(name, cachedTail) {
 }
 app.get('/api/fleet', async (req, res) => {
   const rows = listSessions();
-  for (const k of _fleetCache.keys()) if (!rows.some(r => r.name === k)) _fleetCache.delete(k);
+  const liveNames = new Set(rows.map(r => r.name));
+  for (const k of _fleetCache.keys()) if (!liveNames.has(k)) _fleetCache.delete(k);
+  for (const k of _tailSigs.keys()) if (!liveNames.has(k)) _tailSigs.delete(k);
   const snippets = await Promise.all(rows.map(row => row.hosted
     ? fleetSnippetFor(row.name, (hostSessions.get(row.name) || {}).tail)
     : Promise.resolve({ snippet: '', sig: '', degraded: true })));
@@ -1949,7 +1958,7 @@ wssHost.on('connection', (ws, req) => {
         }
         c.q = []; c.qBytes = 0;
       }
-    } else if (m.t === 'tailr') { const f = pendingTails.get(m.rid); if (f) { pendingTails.delete(m.rid); f(String(m.text || '')); }
+    } else if (m.t === 'tailr') { const f = pendingTails.get(m.rid); if (f) { pendingTails.delete(m.rid); f(String(m.text || ''), String(m.sig || '')); }
     } else if (m.t === 'killed') {
       const n = strictMuxName(m.s);
       hostSessions.delete(n);
