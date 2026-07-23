@@ -1637,6 +1637,9 @@ function createMouseGuard(){
       blocked = true;
       modes = Object.create(null);   // we are about to send DECRST, so our mirror says "off" too — that
                                      // keeps the next real DECSET a true transition, so we can re-arm
+      tail = [];                     // …and drop the carry with it: a DECSET already consumed from this
+                                     // chunk still sits in those 64 bytes, and re-scanning it against the
+                                     // just-cleared map would read as a fresh off→on and re-arm us instantly
     }
     return { leaked, tracking:tracking(), blocked };
   }
