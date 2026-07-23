@@ -11,9 +11,30 @@ const net = require('node:net');
 const os = require('node:os');
 const path = require('node:path');
 const { once } = require('node:events');
-const WebSocket = require('ws');
 
 const REPO = path.resolve(__dirname, '..');
+
+// relay/node_modules is gitignored, so a fresh clone or a recreated git worktree has none — and this
+// suite spawns the real server.js, which needs express+ws. The verifier runs this file directly, with
+// no `npm ci` step in front of it, so resolve-or-install here instead of dying on a missing module.
+function ensureRelayDeps() {
+  try {
+    require.resolve('express', { paths: [REPO] });
+    require.resolve('ws', { paths: [REPO] });
+    return;
+  } catch { /* not installed yet */ }
+  let last = null;
+  for (const args of [['ci', '--offline'], ['ci'], ['install']]) {
+    last = childProcess.spawnSync('npm', [...args, '--no-audit', '--no-fund'], {
+      cwd: REPO, stdio: 'ignore', shell: process.platform === 'win32', timeout: 180000,
+    });
+    if (last.status === 0) return;
+  }
+  throw new Error(`relay dependencies missing and npm install failed in ${REPO} (status ${last && last.status})`);
+}
+ensureRelayDeps();
+const WebSocket = require('ws');
+
 const HOST_TOKEN = 'test-host-token';
 const BRIDGE_TOKEN = 'test-bridge-token';
 const OWNER_TOKEN = 'owner-session';
