@@ -40,6 +40,11 @@ const FORBIDDEN_REMOTE_KEYS = new Set([
 ]);
 const PRINCIPAL_AUTH_MAX_BYTES = 4096;
 
+// reader.js runs inside a vm context, so the objects and arrays it returns carry that context's
+// intrinsics. assert/strict's deepEqual compares prototypes by reference, so a structurally identical
+// reader value never matches a host-side literal. Re-root the value in this realm before comparing.
+const plain = value => JSON.parse(JSON.stringify(value));
+
 function forbiddenKeyIn(value, trail = '') {
   if (!value || typeof value !== 'object') return '';
   if (Array.isArray(value)) return value.map((v, i) => forbiddenKeyIn(v, `${trail}[${i}]`)).find(Boolean) || '';
@@ -271,12 +276,12 @@ test('loadPages() surfaces the absent/expired state from the real 404 instead of
     assert.match(raw.body.error, /no transcript pages for this session/);
 
     const absent = await reader.loadPages(sessionId);
-    assert.deepEqual(absent, { pages: [], expired: true });
+    assert.deepEqual(plain(absent), { pages: [], expired: true });
 
     // ...and the same shape is what render() turns into the "expired, press Refresh" surface.
     const doc = { createElement: tag => ({ tag, className: '', textContent: '', children: [], appendChild(c) { this.children.push(c); return c; }, setAttribute() {} }) };
     const mount = doc.createElement('div');
-    assert.deepEqual(reader.render(doc, mount, absent), { count: 0, expired: true });
+    assert.deepEqual(plain(reader.render(doc, mount, absent)), { count: 0, expired: true });
   });
 });
 
@@ -316,7 +321,7 @@ test('the enqueue body refresh() mints is accepted by the real relay and stored 
     assert.equal(queued.type, 'transcriptfetch');
     assert.equal(queued.replayPolicy, 'read-only');
     assert.equal(queued.sessionId, sessionId);
-    assert.deepEqual(queued.principalAuth, envelope);
+    assert.deepEqual(queued.principalAuth, plain(envelope));
 
     // Non-vacuity: the same endpoint really does refuse a drifted envelope, so the 200 above is earned.
     const empty = await h.request('POST', '/api/app-commands',
@@ -361,12 +366,12 @@ test('refresh() round-trips through a real bridge lease/push/ack and loads the p
     assert.equal(result.pages.length, 2, 'both parked pages are loaded, not just the first');
     assert.equal(result.totalPages, 2);
     assert.ok(Number.isFinite(result.expiresAt) && result.expiresAt > Date.now());
-    assert.deepEqual(reader.orderedMessages(result.pages).map(m => m.text),
+    assert.deepEqual(plain(reader.orderedMessages(result.pages).map(m => m.text)),
       ['first', 'second', 'third', 'fourth']);
 
     const doc = { createElement: tag => ({ tag, className: '', textContent: '', children: [], appendChild(c) { this.children.push(c); return c; }, setAttribute() {} }) };
     const mount = doc.createElement('div');
-    assert.deepEqual(reader.render(doc, mount, result), { count: 4, empty: false });
+    assert.deepEqual(plain(reader.render(doc, mount, result)), { count: 4, empty: false });
   });
 });
 
@@ -394,6 +399,6 @@ test('a bridge-signed FAILED ack is never shown as success, even with pages alre
     // call the fetch done without a bridge-signed 'done'.
     const stored = await reader.loadPages(sessionId);
     assert.equal(stored.pages.length, 1);
-    assert.deepEqual(reader.orderedMessages(stored.pages).map(m => m.text), ['partial capture']);
+    assert.deepEqual(plain(reader.orderedMessages(stored.pages).map(m => m.text)), ['partial capture']);
   });
 });
