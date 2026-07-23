@@ -353,18 +353,29 @@ public static class SessionEventLedger
     //
     // Needles are matched against the raw ledger bytes, so they must be spelled the way the writer spelled
     // them: both the verbatim UTF-8 id AND its JSON-encoded form, because JavaScriptEncoder.Default escapes
-    // '+', '<', '&' and everything non-ASCII as \uXXXX. Comparison is ASCII-case-folded on both sides, which
-    // also collapses + against +. The screen is deliberately conservative in ONE direction only:
-    // it may admit a line that does not match (the real EventMatchesAnyId then rejects it). The one shape it
-    // can wrongly reject is an id only recoverable after Clean() strips an embedded control character from a
-    // longer raw value \u2014 control characters are JSON-escaped on the way out, so this cannot arise from
-    // anything this ledger wrote.
+    // '+', '<', '&' and everything non-ASCII as \uXXXX. Comparison is ASCII-case-folded on both sides.
+    //
+    // INVARIANT: the screen is engaged ONLY when every candidate id is pure ASCII \u2014 BuildIdScreen returns
+    // null for any non-ASCII candidate, which the caller reads as "no screening" and runs the exact legacy
+    // unscreened scan. Within ASCII its folding is exactly OrdinalIgnoreCase, the same fold EventMatchesAnyId
+    // uses, so it can never wrongly reject a line the real filter would keep. The non-ASCII bail-out closes
+    // two ways that guarantee would otherwise fail: (1) an id only recoverable after Clean() strips an
+    // embedded control character from a longer raw value (control characters are JSON-escaped on the way out,
+    // so this cannot arise from anything this ledger wrote); and (2) an id that matches only via non-ASCII
+    // case folding, e.g. an uppercase accented id probed against its lowercase-accented stored form \u2014
+    // LowerAscii folds only 'A'-'Z', so the raw needle and its \uXXXX form both differ from the hay in bytes
+    // ASCII folding never equates (the escaped hex digits, not just ASCII case).
     private static byte[][]? BuildIdScreen(IEnumerable<string> ids)
     {
         var needles = new List<byte[]>();
         foreach (var id in ids)
         {
             if (string.IsNullOrEmpty(id)) continue;
+            // Any non-ASCII candidate would need Unicode case folding to match; the screen folds ASCII only,
+            // so it would silently drop such an id. Disable screening for the whole read and fall back to the
+            // exact legacy unscreened scan, restoring equivalence with EventMatchesAnyId by construction.
+            foreach (var ch in id)
+                if (ch > (char)0x7F) return null;
             AddNeedle(needles, Encoding.UTF8.GetBytes(id));
             var encoded = JsonSerializer.Serialize(id, JsonOptions);
             if (encoded.Length > 2) AddNeedle(needles, Encoding.UTF8.GetBytes(encoded[1..^1]));
