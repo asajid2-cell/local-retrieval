@@ -12,7 +12,9 @@ from __future__ import annotations
 import asyncio
 import base64
 import collections
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import sys
@@ -722,6 +724,157 @@ class BudgetEnforcementTests(unittest.TestCase):
             self.assertEqual(probe.relay_enabled(), want, value)
         os.environ.pop("MUXD_VPS_TESTS", None)
         self.assertFalse(probe.relay_enabled())
+
+
+# ------------------------------------------------------- reporting contract (r.3.5.2)
+
+class _RunsMainMixin:
+    """Shared fakes: patch the series coroutines and capture the probe's stdout."""
+
+    def _local_samples(self, rtts):
+        async def fake_series(port, samples, per_sample_timeout, deadline, keep_session=False):
+            return list(rtts)
+
+        ProbePatch(self, run_local_series=fake_series)
+
+    def _signed_unavailable(self):
+        async def unavailable(port, samples, per_sample_timeout, deadline):
+            raise probe.ProbeError("no trust plumbing on this branch",
+                                   probe.EXIT_SIGNED_UNAVAILABLE)
+
+        ProbePatch(self, run_signed_series=unavailable)
+
+    def _main(self, argv):
+        """Return (exit_code, stdout). stderr is left alone - it is the human channel."""
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = probe.main(argv)
+        return code, buf.getvalue()
+
+
+class SignedDiagnosticsTests(_RunsMainMixin, unittest.TestCase):
+    """An unmeasurable signed path must not swallow the series the user asked for."""
+
+    def test_local_numbers_survive_an_unavailable_signed_path(self):
+        self._signed_unavailable()
+        self._local_samples([7.0] * 10)
+        code, out = self._main(["--local", "--signed", "--samples", "10"])
+        self.assertEqual(code, probe.EXIT_SIGNED_UNAVAILABLE)
+        self.assertIn("local muxd ws", out)
+        for field in ("p50=", "p95=", "p99="):
+            self.assertIn(field, out)
+        self.assertIn("7.00", out)          # the numbers really are there, not just the labels
+        self.assertIn("DIAGNOSTIC ONLY", out)
+
+    def test_over_budget_diagnostic_does_not_downgrade_exit_four(self):
+        self._signed_unavailable()
+        self._local_samples([9999.0] * 10)
+        code, out = self._main(["--local", "--signed", "--samples", "10",
+                                "--budget-p95-ms", "50"])
+        self.assertEqual(code, probe.EXIT_SIGNED_UNAVAILABLE)
+        self.assertNotEqual(code, probe.EXIT_OVER_BUDGET)
+        self.assertIn("local muxd ws", out)
+
+    def test_other_probe_errors_from_the_signed_path_still_propagate(self):
+        async def unreachable(port, samples, per_sample_timeout, deadline):
+            raise probe.ProbeError("muxd unreachable", probe.EXIT_MUXD_UNREACHABLE)
+
+        ProbePatch(self, run_signed_series=unreachable)
+        self._local_samples([1.0] * 10)
+        code, _ = self._main(["--local", "--signed", "--samples", "10"])
+        self.assertEqual(code, probe.EXIT_MUXD_UNREACHABLE)
+
+
+class JsonArtifactTests(_RunsMainMixin, unittest.TestCase):
+    """--json-out is the machine-readable record; --json keeps its stdout-only behaviour."""
+
+    SERIES_FIELDS = ("label", "count", "p50", "p95", "p99", "min", "max", "mean",
+                     "budget_p95_ms", "enforced")
+
+    @staticmethod
+    def _read(path):
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+
+    def test_json_out_writes_the_whole_record_and_creates_parents(self):
+        self._local_samples([5.0] * 20)
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "nested", "deeper", "probe.json")
+            code, _ = self._main(["--local", "--samples", "20", "--json-out", out])
+            self.assertEqual(code, probe.EXIT_OK)
+            self.assertTrue(os.path.isfile(out), out)
+            doc = self._read(out)
+            self.assertEqual(doc["exit_code"], code)
+            self.assertFalse(doc["signed_available"])
+            self.assertEqual(len(doc["series"]), 1)
+            series = doc["series"][0]
+            for field in self.SERIES_FIELDS:
+                self.assertIn(field, series)
+            self.assertEqual(series["count"], 20)
+            self.assertEqual(series["label"], "local muxd ws")
+            self.assertAlmostEqual(series["p95"], 5.0)
+            self.assertEqual(series["budget_p95_ms"], probe.DEFAULT_LOCAL_BUDGET_MS)
+            self.assertTrue(series["enforced"])
+
+    def test_artifact_is_written_on_the_over_budget_exit(self):
+        self._local_samples([400.0] * 20)
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "over.json")
+            code, _ = self._main(["--local", "--samples", "20", "--budget-p95-ms", "50",
+                                  "--json-out", out])
+            self.assertEqual(code, probe.EXIT_OVER_BUDGET)
+            doc = self._read(out)
+            self.assertEqual(doc["exit_code"], probe.EXIT_OVER_BUDGET)
+            self.assertEqual(doc["series"][0]["count"], 20)
+
+    def test_artifact_is_written_when_the_signed_path_is_unavailable(self):
+        self._signed_unavailable()
+        self._local_samples([5.0] * 15)
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "signed.json")
+            code, _ = self._main(["--local", "--signed", "--samples", "15", "--json-out", out])
+            self.assertEqual(code, probe.EXIT_SIGNED_UNAVAILABLE)
+            doc = self._read(out)
+            self.assertEqual(doc["exit_code"], code)
+            self.assertFalse(doc["signed_available"])
+            self.assertEqual(doc["series"][0]["count"], 15)
+            self.assertFalse(doc["series"][0]["enforced"])
+
+    def test_bare_json_flag_still_only_prints(self):
+        self._local_samples([5.0] * 10)
+        code, out = self._main(["--local", "--samples", "10", "--json"])
+        self.assertEqual(code, probe.EXIT_OK)
+        payload = json.loads(out[out.index("["):])   # the stdout blob is still a bare list
+        self.assertEqual(payload[0]["count"], 10)
+        self.assertEqual(payload[0]["label"], "local muxd ws")
+
+
+class RelayBudgetIsolationTests(unittest.TestCase):
+    """--budget-p95-ms is local/signed only: a loopback budget must never judge a WAN hop."""
+
+    def setUp(self):
+        old = os.environ.get("MUXD_VPS_TESTS")
+        os.environ["MUXD_VPS_TESTS"] = "1"
+        self.addCleanup(lambda: os.environ.__setitem__("MUXD_VPS_TESTS", old)
+                        if old is not None else os.environ.pop("MUXD_VPS_TESTS", None))
+
+        async def fake_relay(port, samples, per_sample_timeout, deadline):
+            return [110.0] * 20
+
+        ProbePatch(self, run_relay_series=fake_relay)
+
+    def _main(self, argv):
+        with contextlib.redirect_stdout(io.StringIO()):
+            return probe.main(argv)
+
+    def test_tight_local_budget_does_not_leak_into_the_relay_series(self):
+        self.assertEqual(self._main(["--relay", "--samples", "20", "--budget-p95-ms", "50"]),
+                         probe.EXIT_OK)
+
+    def test_the_explicit_relay_budget_is_the_one_that_binds(self):
+        self.assertEqual(self._main(["--relay", "--samples", "20", "--budget-p95-ms", "50",
+                                     "--relay-budget-p95-ms", "100"]),
+                         probe.EXIT_OVER_BUDGET)
 
 
 class GitignoreHygieneTests(unittest.TestCase):
