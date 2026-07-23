@@ -1579,7 +1579,12 @@ const TRANSCRIPT_MAX_PAGES = 32;                                   // matches th
 const TRANSCRIPT_MAX_PAGE_BYTES = 256 * 1024;                      // app targets <=200KB; this is the fence
 const TRANSCRIPT_MAX_SESSION_BYTES = TRANSCRIPT_MAX_PAGES * TRANSCRIPT_MAX_PAGE_BYTES;   // 8 MiB
 const TRANSCRIPT_MAX_SESSIONS = 8;
-const TRANSCRIPT_TTL_MS = Math.max(60000, Number(process.env.MUX_TRANSCRIPT_TTL_MS) || 15 * 60 * 1000);
+// Floored at a minute in production so a real fetch has time to page in; tests may shorten it to prove
+// the window actually closes (same escape hatch shape as the command lease duration).
+const TRANSCRIPT_TTL_MS = Math.max(
+  TEST_MODE ? 200 : 60000,
+  Number(process.env.MUX_TRANSCRIPT_TTL_MS) || 15 * 60 * 1000,
+);
 const validTranscriptStore = value => (
   Array.isArray(value)
   && value.every(record => (
