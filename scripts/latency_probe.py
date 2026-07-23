@@ -33,6 +33,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -363,7 +364,9 @@ def echo_child_command(child_path, python=None):
 
 
 def probe_session_name(prefix="latprobe"):
-    return "%s-%d-%d" % (prefix, os.getpid(), time.time_ns() % 1000000)
+    # uuid4, not a clock: Windows' time_ns() only ticks every ~15.6 ms, so back-to-back
+    # calls would collide and two probes could fight over one session name.
+    return "%s-%d-%s" % (prefix, os.getpid(), uuid.uuid4().hex[:8])
 
 
 async def wait_for_ready(transport, token=READY_TOKEN, timeout=25.0, deadline=None):
@@ -580,6 +583,25 @@ async def run_signed_series(port, samples, per_sample_timeout, deadline):
 
 # --------------------------------------------------------------------------- cli
 
+def write_json_artifact(path, signed_available, exit_code, series):
+    """Write the machine-readable run record for CI/dashboards.
+
+    Written on every path that measured at least one series - including the over-budget and
+    signed-unavailable exits - so a failing run is still inspectable without scraping stdout.
+    """
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    payload = {
+        "signed_available": bool(signed_available),
+        "exit_code": int(exit_code),
+        "series": series,
+    }
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2)
+        fh.write("\n")
+
+
 def build_parser():
     p = argparse.ArgumentParser(
         prog="latency_probe",
@@ -592,10 +614,12 @@ def build_parser():
     p.add_argument("--samples", type=int, default=DEFAULT_SAMPLES,
                    help="samples per series (default %d)" % DEFAULT_SAMPLES)
     p.add_argument("--budget-p95-ms", type=float, default=None,
-                   help="p95 budget in ms (default %.0f local / %.0f relay)"
-                        % (DEFAULT_LOCAL_BUDGET_MS, DEFAULT_RELAY_BUDGET_MS))
+                   help="p95 budget in ms for the local and signed series only "
+                        "(default %.0f); the relay has its own knob"
+                        % DEFAULT_LOCAL_BUDGET_MS)
     p.add_argument("--relay-budget-p95-ms", type=float, default=None,
-                   help="separate p95 budget for the relay series")
+                   help="p95 budget in ms for the relay series (default %.0f)"
+                        % DEFAULT_RELAY_BUDGET_MS)
     p.add_argument("--timeout", type=float, default=120.0,
                    help="hard wall clamp in seconds for the whole probe (default 120)")
     p.add_argument("--per-sample-timeout", type=float, default=3.0,
@@ -603,6 +627,9 @@ def build_parser():
     p.add_argument("--port", type=int, default=MUXCTL_PORT,
                    help="local muxd port (default $MUXCTL_PORT or 7699)")
     p.add_argument("--json", action="store_true", help="emit the summaries as JSON too")
+    p.add_argument("--json-out", metavar="PATH", default=None,
+                   help="write the run record (series + exit code) as JSON to PATH "
+                        "(parent directories are created)")
     return p
 
 
@@ -613,17 +640,33 @@ async def run(args):
         raise ProbeError("--timeout must be > 0", EXIT_ERROR)
     deadline = time.monotonic() + args.timeout
     local_budget = args.budget_p95_ms if args.budget_p95_ms is not None else DEFAULT_LOCAL_BUDGET_MS
-    relay_budget = args.relay_budget_p95_ms
-    if relay_budget is None:
-        relay_budget = args.budget_p95_ms if args.budget_p95_ms is not None else DEFAULT_RELAY_BUDGET_MS
+    # --budget-p95-ms is the local/signed budget ONLY. Letting it fall through to the relay judged
+    # an internet round trip against a loopback number: a 50ms local budget fails any WAN hop.
+    relay_budget = (args.relay_budget_p95_ms if args.relay_budget_p95_ms is not None
+                    else DEFAULT_RELAY_BUDGET_MS)
 
     want_local = args.local or not (args.relay or args.signed)
     reports = []
+    signed_available = False
+    pending_code = None
 
     if args.signed:
-        # authoritative series first: if the enforced path cannot be measured, say so loudly
-        signed = await run_signed_series(args.port, args.samples, args.per_sample_timeout, deadline)
-        reports.append((summarize("signed (enforced)", signed), local_budget, True))
+        # authoritative series first: if the enforced path cannot be measured, say so loudly - but
+        # keep going. An unmeasurable signed path is a verdict about the signed path, not a reason
+        # to throw away the diagnostic series the user explicitly asked for.
+        try:
+            signed = await run_signed_series(args.port, args.samples, args.per_sample_timeout,
+                                             deadline)
+        except ProbeError as e:
+            if e.code != EXIT_SIGNED_UNAVAILABLE:
+                raise
+            pending_code = EXIT_SIGNED_UNAVAILABLE
+            sys.stderr.write("[probe] signed (enforced) series UNAVAILABLE - reporting the "
+                             "remaining series as DIAGNOSTIC ONLY and exiting %d: %s\n"
+                             % (EXIT_SIGNED_UNAVAILABLE, e))
+        else:
+            signed_available = True
+            reports.append((summarize("signed (enforced)", signed), local_budget, True))
 
     if want_local:
         samples = await run_local_series(args.port, args.samples, args.per_sample_timeout, deadline)
@@ -638,27 +681,41 @@ async def run(args):
             reports.append((summarize("relay ws", samples), relay_budget, not args.signed))
 
     if not reports:
+        if pending_code is not None:
+            return pending_code
         raise ProbeError("no series ran", EXIT_ERROR)
 
     print("latency_probe - input->echo round trip (measure-only; no tuning in this probe)")
     for summary, budget, enforced in reports:
         print(format_summary(summary, budget, enforced))
-    if args.signed:
+    if signed_available:
         print("  note: the signed series is authoritative; unsigned series are diagnostic only.")
+    elif args.signed:
+        print("  note: the signed series could NOT be measured here - everything above is "
+              "DIAGNOSTIC ONLY and this run exits %d." % EXIT_SIGNED_UNAVAILABLE)
     else:
         print("  note: no signed series in this run - these numbers are DIAGNOSTIC ONLY; the "
               "enforced (signed) path is the shipping path.")
+    series = [{"budget_p95_ms": b, "enforced": e, **s} for s, b, e in reports]
     if args.json:
-        print(json.dumps([{"budget_p95_ms": b, "enforced": e, **s} for s, b, e in reports],
-                         indent=2))
+        print(json.dumps(series, indent=2))
 
     over = [s for s, b, e in reports if e and (not s["count"] or s["p95"] > b)]
-    if over:
-        for s in over:
-            print("BUDGET FAILURE: %s p95=%s exceeds budget" % (s["label"], s["p95"]),
-                  file=sys.stderr)
-        return EXIT_OVER_BUDGET
-    return EXIT_OK
+    for s in over:
+        print("BUDGET FAILURE: %s p95=%s exceeds budget" % (s["label"], s["p95"]),
+              file=sys.stderr)
+
+    if pending_code is not None:
+        # 'unmeasurable' outranks 'slow': a diagnostic series blowing its budget must not rewrite
+        # the verdict that the enforced path could not be measured at all.
+        code = pending_code
+    elif over:
+        code = EXIT_OVER_BUDGET
+    else:
+        code = EXIT_OK
+    if args.json_out:
+        write_json_artifact(args.json_out, signed_available, code, series)
+    return code
 
 
 def main(argv=None):
