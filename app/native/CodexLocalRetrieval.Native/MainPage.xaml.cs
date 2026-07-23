@@ -212,7 +212,7 @@ public sealed partial class MainPage : Page
 
     // Live in-memory filter as you type (title + capped content + all active filters). The deeper
     // full-transcript phrase search is heavy, so it runs on ENTER only (see SearchBox_KeyDown), not per key.
-    private void SearchBox_TextChanged(object sender, TextChangedEventArgs e) => ApplyFilters();
+    private void SearchBox_TextChanged(object sender, TextChangedEventArgs e) => SearchDebouncer.Post(SearchBox.Text);
 
     // Kept for callers that pre-set SearchBox.Text (e.g. capture replay); routes through the unified
     // text + tag filter so an active tag filter is always respected.

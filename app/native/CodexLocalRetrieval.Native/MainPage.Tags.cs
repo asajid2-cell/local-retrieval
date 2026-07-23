@@ -110,8 +110,21 @@ public sealed partial class MainPage
         _filterCollectionId is not null && _archive.Store.Collections.TryGetValue(_filterCollectionId, out var c) ? c.Name : null;
 
     // ---- Chat list: unified text + compound tag filter ---------------------------------------
+
+    // Every keystroke used to run ApplyFilters synchronously; this collapses a burst of typing into one
+    // filter pass 150 ms after you stop. The dispatcher hop is injected (the debouncer's timer fires on
+    // the thread pool, but every UI touch below must happen on the UI thread).
+    private TrailingDebouncer<string>? _searchDebouncer;
+    internal TrailingDebouncer<string> SearchDebouncer => _searchDebouncer ??= new TrailingDebouncer<string>(
+        // The posted text is the debounce key; ApplyFilters re-reads the live box, which by definition
+        // holds that same last-typed value by the time the trailing edge fires.
+        _ => ApplyFilters(),
+        TrailingDebouncer<string>.DefaultDelay,
+        run => DispatcherQueue.TryEnqueue(() => run()));
+
     private void ApplyFilters()
     {
+        var previousId = _selected?.Id;
         var results = _archive.FilterChats(CurrentChatFilter());
         // last-user / first-user sorts flip each visible row's title to what YOU said.
         var titleMode = (_dateMode == "last-user" || _dateMode == "first-user") ? _dateMode : "";
@@ -120,9 +133,28 @@ public sealed partial class MainPage
         var preserve = _dateMode.Length > 0 || !string.IsNullOrWhiteSpace(SearchBox.Text);
         _archive.RefreshSessions(results, preserveOrder: preserve);
         SelectFirstSession();
-        RenderCurrent();
         RenderTagFilterBar();
-        if (_screen == "Search" && !string.IsNullOrWhiteSpace(_deepSearchQuery)) RenderSearch(_deepSearchQuery);   // keep deep-search results in sync with the funnel
+        // NARROW RENDER: filtering touches the session list and the tag strip, nothing else. A full-screen
+        // rebuild here re-ran whatever page you were on for every keystroke — on Running that meant a fresh
+        // host probe/SSH spawn per key. The transcript pane is only stale if the selection actually moved.
+        if (!string.Equals(previousId, _selected?.Id, StringComparison.OrdinalIgnoreCase)) RenderSelectedSessionPane();
+        // The search page IS a view of the filter, so it stays live — one pane, not the whole screen.
+        if (_screen == "Search") RenderSearch(string.IsNullOrWhiteSpace(_deepSearchQuery) ? SearchBox.Text : _deepSearchQuery);
+    }
+
+    // The only screens whose body is a view of the SELECTED chat. Re-rendering one of these is the
+    // narrow equivalent of RenderCurrent() for a selection change — no nav chrome, no page switch,
+    // and nothing at all on the screens (Running, Ask, Collections…) that don't follow the selection.
+    private void RenderSelectedSessionPane()
+    {
+        switch (_screen)
+        {
+            case "Archive": RenderArchive(); break;
+            case "Source": RenderSource(); break;
+            case "Restore": RenderRestore(); break;
+            default: return;
+        }
+        UpdateChrome();   // the right rail / header actions hide for a read-only snapshot, so they follow selection
     }
 
     // Re-run the ACTIVE filter WITHOUT changing your selection — used after a mutation (add-to-collection,
