@@ -258,6 +258,9 @@ public sealed partial class MainPage
     private bool _syncPushing;
     private bool _cmdPolling;
     private readonly string _commandLeaseOwner = RemoteCommandProtocol.LeaseOwner("gui");
+    // At-most-once fence for intent-fenced polled commands (fetchfile/startmux): a redelivered intent
+    // replays its recorded ack instead of downloading/starting a second time.
+    private readonly RemoteCommandProtocol.IntentLedger _commandIntents = new();
     private bool _tabTracking;
 
     public void StartProjectSync()
@@ -384,9 +387,14 @@ public sealed partial class MainPage
                 if (string.IsNullOrEmpty(c.id)) continue;
                 (bool ok, string detail) res;
                 var onPc = false;
-                if (!RemoteCommandProtocol.IsReplaySafe(c.type, c.replayPolicy))
+                // ONE gate, before any side effect: replay policy AND (for intent-fenced types) a live
+                // lease token + a stable intent id that has not already been delivered.
+                var admission = _commandIntents.Admit(c.type, c.replayPolicy, c.intentId, c.leaseToken, out var gated);
+                if (admission != RemoteCommandAdmission.Execute)
                 {
-                    res = (false, "command replay policy is missing or invalid");
+                    if (admission == RemoteCommandAdmission.Refused)
+                        Diag.Log($"Remote command REFUSED (envelope): type='{c.type}' id={c.id} — {gated.detail}");
+                    res = gated;
                 }
                 else if (string.Equals(c.type, "kill", StringComparison.OrdinalIgnoreCase))
                 {
@@ -471,6 +479,7 @@ public sealed partial class MainPage
                     added = true;   // re-push so the web re-tints
                 }
                 else res = (false, "unknown command");
+                if (admission == RemoteCommandAdmission.Execute) _commandIntents.Record(c.intentId, res.ok, res.detail);
                 var ackJson = JsonSerializer.Serialize(new { leaseToken = c.leaseToken, ok = res.ok, detail = res.detail, onPc });
                 await AckCommandAsync(target, port, c.id, ackJson);
             }
@@ -586,7 +595,8 @@ public sealed partial class MainPage
             launch.SessionId,
             launch.Aliases,
             intentId,
-            relaunch: takeover);
+            relaunch: takeover,
+            allowLocalIntentMint: false);   // polled command: never substitute a locally minted intent
         RecordSessionEvent(
             session,
             created.ok ? "mux.started.remote-command" : "mux.refused.remote-command",
@@ -981,13 +991,14 @@ public sealed partial class MainPage
         string? sessionId = null,
         IEnumerable<string>? aliases = null,
         string? intentId = null,
-        bool relaunch = false)
+        bool relaunch = false,
+        bool allowLocalIntentMint = true)
     {
         if (!_launchGovernor.TryAcquire(request, out var lease, out var claimDetail))
             return (false, claimDetail);
         using (lease)
         {
-            var created = await CreateLocalMuxdSessionAsync(name, command, sessionId, aliases, intentId, relaunch);
+            var created = await CreateLocalMuxdSessionAsync(name, command, sessionId, aliases, intentId, relaunch, allowLocalIntentMint);
             if (created.ok) lease?.MarkStarted("Started mux-hosted session writer.");
             else lease?.MarkFailed(created.detail);
             return created;
@@ -1063,8 +1074,14 @@ public sealed partial class MainPage
         string? sessionId = null,
         IEnumerable<string>? aliases = null,
         string? intentId = null,
-        bool relaunch = false)
+        bool relaunch = false,
+        bool allowLocalIntentMint = true)
     {
+        // A freshly minted intent is only honest for a start this GUI originated. Minting one for a POLLED
+        // command would hand muxd a brand-new intent on every redelivery, defeating its dedup — so a remote
+        // start with no intent is refused here as well as at the poller's envelope gate.
+        if (!allowLocalIntentMint && !RemoteCommandProtocol.IsWellFormedEnvelopeToken(intentId))
+            return (false, "remote mux start refused: the command carried no usable intent id");
         try
         {
             var cap = await EnsureLocalMuxdCapabilityAsync("create");

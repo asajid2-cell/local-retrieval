@@ -34,6 +34,8 @@ public sealed class RemoteBridge
     private readonly Func<Task<IReadOnlyList<ArchiveService.PendingMuxBinding>>>? _resolvePendingMuxBindings;
     private readonly IProcessContainment? _processContainment;
     private readonly string _commandLeaseOwner = RemoteCommandProtocol.LeaseOwner("headless");
+    // At-most-once fence for intent-fenced polled commands — see MainPage.Remote.cs for the GUI twin.
+    private readonly RemoteCommandProtocol.IntentLedger _commandIntents = new();
 
     private const string SshHardenOpts = "-o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3";
     private static readonly TimeSpan SshHardTimeout = TimeSpan.FromSeconds(30);
