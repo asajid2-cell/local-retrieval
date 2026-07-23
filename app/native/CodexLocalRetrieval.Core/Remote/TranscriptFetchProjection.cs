@@ -166,5 +166,4 @@ public static class TranscriptFetchProjection
     // the last emoji/CJK character of a truncated message.
     private static int CutAt(string text, int index)
         => index > 0 && index < text.Length && char.IsLowSurrogate(text[index]) ? index - 1 : index;
-    }
 }

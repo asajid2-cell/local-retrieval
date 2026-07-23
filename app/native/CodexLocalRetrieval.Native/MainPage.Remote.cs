@@ -571,6 +571,12 @@ public sealed partial class MainPage
         public string? deck { get; set; }
         public string? deckName { get; set; }
         public bool takeover { get; set; }
+
+        // transcriptfetch only: the relay mints a scoped, short-lived credential when it queues the
+        // command and bounds the fetch with a TTL. Neither is stored in AppSettings — the app holds
+        // no standing authority to write transcript history, only what a single lease grants it.
+        public string? bridgeToken { get; set; }
+        public int ttlMs { get; set; }
     }
 
     private async Task<(bool ok, string detail)> StartMuxHeadlessFromIntentAsync(
