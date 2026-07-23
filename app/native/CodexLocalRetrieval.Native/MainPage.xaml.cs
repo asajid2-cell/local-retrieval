@@ -19,7 +19,20 @@ public sealed partial class MainPage : Page
     private readonly AiChatService _ai = new();
     private readonly SessionLaunchGovernor _launchGovernor = new();
     private readonly Stack<string> _backStack = new();
-    private ArchiveSession? _selected;
+    private ArchiveSession? _selectedField;
+    // Selection is the live reader's target, so every assignment re-points the watch through this one
+    // hook — no beat is needed to notice a different chat got opened. Assign first, THEN arm, so
+    // ArmLiveWatch always reads the new selection and can never re-enter this setter.
+    private ArchiveSession? _selected
+    {
+        get => _selectedField;
+        set
+        {
+            if (ReferenceEquals(_selectedField, value)) return;
+            _selectedField = value;
+            ArmLiveWatch();
+        }
+    }
     private string _screen = "Archive";
     private Windows.UI.Color _accentColor = Windows.UI.Color.FromArgb(255, 251, 113, 133);
     private int _panelRadius = 12;
@@ -78,10 +91,9 @@ public sealed partial class MainPage : Page
         }
     }
 
-    // Live reader: while a chat is open, poll its source transcript and tail new turns as the agent
+    // Live reader: while a chat is open, watch its source transcript and tail new turns as the agent
     // writes them - so you watch a rollout fill in. We only auto-follow when you're at the bottom; if
     // you scroll up to read history, we leave you there until you return to the latest.
-    private Microsoft.UI.Dispatching.DispatcherQueueTimer? _liveTimer;
     private DateTime _liveMtime = DateTime.MinValue;
     private ArchiveSession? _liveSession;
     private bool _liveBusy;
@@ -121,17 +133,13 @@ public sealed partial class MainPage : Page
 
     private void StartLiveReader()
     {
-        // The transcript is now read when the FILE CHANGES, not on a blind 1.5 s beat: FileWatchService
-        // raises the agent's writes as events and keeps a 5 s fallback poll behind them (60 s once the
-        // chat goes quiet) so a volume that drops change notifications still catches up on its own.
+        // The transcript is read when the FILE CHANGES, never on a beat: FileWatchService raises the
+        // agent's writes as events and keeps a 5 s fallback poll behind them (60 s once the chat goes
+        // quiet) so a volume that drops change notifications still catches up on its own.
         //
-        // This tick survives only to re-point the watcher when you open a different chat. It touches no
-        // disk at all — one reference comparison — because `_selected` is assigned from a great many
-        // places and hooking every one of them is how a live reader silently stops being live.
-        _liveTimer = DispatcherQueue.CreateTimer();
-        _liveTimer.Interval = TimeSpan.FromMilliseconds(1000);
-        _liveTimer.Tick += (_, _) => ArmLiveWatch();
-        _liveTimer.Start();
+        // Re-pointing the watcher is event-driven too — the `_selected` setter and Navigate() both call
+        // ArmLiveWatch — so this only has to arm the chat that's already open at startup.
+        ArmLiveWatch();
     }
 
     private void ArmLiveWatch()
@@ -277,6 +285,7 @@ public sealed partial class MainPage : Page
         }
 
         _screen = target;
+        ArmLiveWatch();   // the watch only runs on the Archive screen; leaving it drops the watch, returning re-points it
         RenderCurrent();
     }
 
