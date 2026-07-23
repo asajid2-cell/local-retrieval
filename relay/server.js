@@ -485,8 +485,27 @@ function attentionEpisodeState(name) {
   const state = String(attn && attn.agentState || '');
   return (state === 'attention' || state === 'stopped') ? state : '';
 }
+// ---- PER-SESSION NOTIFICATION MUTE ---------------------------------------------------------------
+// Muting a session does NOT stop the episode state machine — the episode still opens, settles and
+// closes, only the outgoing push is swallowed. That way unmuting never dumps a backlog of stale buzzes
+// for a session that has been waiting all night; you get the NEXT episode. Mutes are keyed by session
+// name and are deliberately NOT pruned when the session disappears: a tab you silenced stays silenced
+// across kill/relaunch, which is the whole point of a per-session mute.
+const NOTIFY_MUTES_FILE = STATE_DIR + '/notify-mutes.json';
+const notifyMutes = new Set();
+{
+  const loaded = durableJsonLoad(
+    NOTIFY_MUTES_FILE,
+    [],
+    value => Array.isArray(value) && value.every(entry => !!strictMuxName(entry)),
+  );
+  if (!Array.isArray(loaded)) throw new Error('persisted notify-mute state must be a name array');
+  for (const name of loaded) notifyMutes.add(String(name));
+}
+function saveNotifyMutes() { writeJsonState(NOTIFY_MUTES_FILE, [...notifyMutes]); }
 function pushAttentionEpisode(name, state, heldMs) {
   if (!attentionNotifier.enabled) return;
+  if (notifyMutes.has(name)) return;                     // muted: the episode is consumed, silently
   const h = hostSessions.get(name) || {};
   const label = String(h.agentLabel || '') || (state === 'stopped' ? 'agent stopped' : 'waiting for you');
   const detail = String(h.agentDetail || '');
@@ -568,6 +587,7 @@ function listSessions() {
                   state: attn.state, agentState: attn.agentState, agentLabel: attn.agentLabel,
                   agentDetail: attn.agentDetail, agentConfidence: attn.agentConfidence,
                   needsAttention: !!attn.needsAttention, lastOutAgeMs: attn.lastOutAgeMs,
+                  notifyMuted: notifyMutes.has(name),   // per-session phone-push mute (attention episodes)
                   autoheal: !!h.heal, hosted: true,
                   alive, dormant, detachedLocal, cols: h.cols || 0, rows: h.rows || 0,
                   hasCommand: !!h.hasCommand, shellOnly: !!h.shellOnly, ready: !!h.ready,
@@ -593,7 +613,7 @@ function listSessions() {
     if (list.some(s => s.name === name)) continue;
     list.push({ name, windows: 0, created: 0, attached: false, activity: 0, state: 'red',
                 agentState: 'blocked', agentLabel: 'legacy blocker', agentDetail: legacyDetail(name),
-                agentConfidence: 'high', needsAttention: true,
+                agentConfidence: 'high', needsAttention: true, notifyMuted: notifyMutes.has(name),
                 autoheal: false, hosted: false, legacy: true, legacyBlocked: true,
                 detail: legacyDetail(name) });
   }
@@ -838,6 +858,27 @@ app.post('/api/sessions/:name/autoheal', async (req, res) => {
   if (!confirmed.ok)
     return failHost(res, 504, 'muxd auto-resume change not confirmed', confirmed.error);
   res.json({ ok: true, name, autoheal: on });
+});
+
+// PER-TAB attention-notification mute. Owner-gated by the global middleware above like every other
+// /api route. Unlike autoheal this never touches muxd: the mute lives entirely in relay state, so it
+// still works while the PC host is offline (which is exactly when you want to silence a stuck tab).
+app.post('/api/sessions/:name/notify', (req, res) => {
+  const name = strictMuxName(req.params.name);
+  if (!name) return res.status(400).json({ error: 'name required' });
+  if (!req.body || typeof req.body.on !== 'boolean')
+    return res.status(400).json({ error: 'on must be a boolean' });
+  const on = req.body.on;
+  const wasMuted = notifyMutes.has(name);
+  if (wasMuted === on) {                                 // muted+on, or unmuted+off => a real change
+    if (on) notifyMutes.delete(name); else notifyMutes.add(name);
+    try { saveNotifyMutes(); }
+    catch (error) {
+      if (on) notifyMutes.add(name); else notifyMutes.delete(name);   // memory must match the disk
+      return res.status(503).json({ error: 'state persistence failed', detail: recordPersistenceFailure(error) });
+    }
+  }
+  res.json({ ok: true, name, notify: on, notifyMuted: !on });
 });
 
 // --- project sync: the desktop app pushes its collections/chats projection here while it's open, so
