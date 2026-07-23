@@ -180,7 +180,7 @@ async def measure_series(transport, samples, per_sample_timeout=3.0, deadline=No
         _check_wall(deadline)
         # drain anything the child emitted on its own before starting the clock
         while True:
-            pending = await transport.recv(0.0)
+            pending = await transport.recv(drain_timeout)
             if not pending:
                 break
         marker = matcher.arm(matcher.marker_for(i))
