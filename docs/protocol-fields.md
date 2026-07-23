@@ -186,9 +186,10 @@ Produced by `session_payload()` (`muxd/muxd.py:2266`), consumed by `normalizeHos
 `localFirst`, `owner`, `hasCommand`, `shellOnly`, `ready`, `kind`, `sessionId`, `aliases`,
 `identityPending`, `agentState`, `agentLabel`, `agentDetail`, `agentConfidence`.
 
-muxd additionally emits `lifecycle`, `childPid`, `needsAttention`, `lastOutAgeMs`, `agentTruth`,
-and `agentStateSource`; the relay does not currently forward them. `kind` is one of `command` /
-`shell` / `dormant`.
+muxd additionally emits `lifecycle`, `childPid`, `needsAttention`, and `lastOutAgeMs`, which the relay
+does not forward. It also emits `agentTruth` and `agentStateSource`, which the relay *does* keep: they
+survive `normalizeHostSession()` and drive the state dot and the `healEligible` recovery gate on
+`/api/sessions` (see below). `kind` is one of `command` / `shell` / `dormant`.
 
 #### Process truth (`agentTruth` capability)
 

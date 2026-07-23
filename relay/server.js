@@ -205,9 +205,16 @@ function normalizeHostSession(s) {
   };
   return value;
 }
-function withoutAgentTruth(s) {
-  if (!s || typeof s !== 'object' || Array.isArray(s)) return s;
-  const { agentTruth, ...rest } = s;
+// Every `agentTruth` subtree removed, at any depth — the scan runs on what is left. The subtree is not
+// exempt from scrutiny, it is scrutinised differently: normalizeAgentTruth() rebuilds it from a
+// four-field allow-list and re-sanitizes `exe` down to a bare image name, so nothing path- or
+// command-shaped inside it can ever reach hostSessions no matter what the PC put there.
+function withoutAgentTruth(value) {
+  if (Array.isArray(value)) return value.map(withoutAgentTruth);
+  if (!value || typeof value !== 'object') return value;
+  const rest = {};
+  for (const [key, child] of Object.entries(value))
+    if (key !== 'agentTruth') rest[key] = withoutAgentTruth(child);
   return rest;
 }
 function normalizeAgentTruth(truth) {
@@ -1845,7 +1852,9 @@ wssHost.on('connection', (ws, req) => {
   console.log('[host] PC session host candidate connected');
   ws.on('message', raw => {
     let m; try { m = JSON.parse(raw.toString()); } catch { return; }
-    if (containsForbiddenRemoteKey(m)) {
+    // "exe" is a forbidden remote key, and agentTruth legitimately carries one — scanning the raw frame
+    // would close the link on every hello a truth-capable muxd sends. See withoutAgentTruth().
+    if (containsForbiddenRemoteKey(withoutAgentTruth(m))) {
       console.log('[host] rejected path/command-bearing protocol frame');
       try { ws.close(1008, 'host frame violated protocol'); } catch {}
       return;
