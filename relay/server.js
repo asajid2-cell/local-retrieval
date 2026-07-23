@@ -493,6 +493,54 @@ function listSessions() {
 
 app.get('/api/sessions', (req, res) => res.json(listSessions()));
 
+// FLEET GLANCE: one request answers "what is every session doing right now" — every /api/sessions row
+// plus a hard-bounded tail snippet. Snippets ride the same muxd tail command as the per-session
+// preview, so they are terminal truth (muxd signs them; the trusted-origin client verifies the sig we
+// pass through here — the relay only relays and briefly caches the plaintext). The glance must NEVER
+// be the slow path: fetches fan out in parallel (total latency ≈ one 2.5s tail timeout, not N of them),
+// a short cache absorbs refresh bursts, and a host that is offline or silent degrades each row to its
+// last-known state + cached tail instead of failing the request.
+const FLEET_SNIPPET_LINES = 2;
+const FLEET_SNIPPET_BYTES = 2048;
+const FLEET_CACHE_MS = 5000;
+const _fleetCache = new Map();   // name -> { at, snippet, sig, degraded }
+const _tailSigs = new Map();     // name -> muxd's signature over the last tail it sent
+function fleetSnippet(text) {
+  const lines = String(text == null ? '' : text).replace(/\s+$/, '').split('\n');
+  const snippet = lines.slice(-FLEET_SNIPPET_LINES).join('\n');
+  return snippet.length > FLEET_SNIPPET_BYTES ? snippet.slice(-FLEET_SNIPPET_BYTES) : snippet;
+}
+async function fleetSnippetFor(name, cachedTail) {
+  const hit = _fleetCache.get(name);
+  if (hit && Date.now() - hit.at < FLEET_CACHE_MS) return hit;
+  const live = hostSupportsCap('tail') ? await requestHostTail(name, FLEET_SNIPPET_LINES) : null;
+  const degraded = live == null;
+  const entry = { at: Date.now(), snippet: fleetSnippet(degraded ? cachedTail : live),
+                  sig: degraded ? '' : String(_tailSigs.get(name) || ''), degraded };
+  _fleetCache.set(name, entry);
+  return entry;
+}
+app.get('/api/fleet', async (req, res) => {
+  const rows = listSessions();
+  for (const k of _fleetCache.keys()) if (!rows.some(r => r.name === k)) _fleetCache.delete(k);
+  const snippets = await Promise.all(rows.map(row => row.hosted
+    ? fleetSnippetFor(row.name, (hostSessions.get(row.name) || {}).tail)
+    : Promise.resolve({ snippet: '', sig: '', degraded: true })));
+  res.json({
+    hostUp: hostUp(),
+    hostProtocolOk: hostProtocolOk(),
+    snippetLines: FLEET_SNIPPET_LINES,
+    snippetBytes: FLEET_SNIPPET_BYTES,
+    at: Date.now(),
+    sessions: rows.map((row, i) => ({
+      ...row,
+      snippet: snippets[i].snippet,
+      snippetSig: snippets[i].sig,
+      snippetDegraded: !!snippets[i].degraded,
+    })),
+  });
+});
+
 function hasForbiddenRemoteField(body) { return containsForbiddenRemoteKey(body); }
 async function queueStartMuxAndWait(name, sessionId, tool, intentId = '', takeover = false) {
   if (!takeover) {
