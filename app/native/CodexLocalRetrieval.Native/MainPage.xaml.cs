@@ -85,6 +85,13 @@ public sealed partial class MainPage : Page
     private DateTime _liveMtime = DateTime.MinValue;
     private ArchiveSession? _liveSession;
     private bool _liveBusy;
+    private IFileWatchRegistration? _liveWatch;
+    private string _liveWatchPath = "";
+
+    // One watch service for the whole page: the live transcript, the agent inbox and new-chat detection
+    // all ride it, and it keeps ONE FileSystemWatcher per top-level directory underneath.
+    private FileWatchService? _fileWatchService;
+    private FileWatchService FileWatch => _fileWatchService ??= new FileWatchService();
     private bool _openFreshenDone;   // one fresh re-parse per chat-open, so a cached transcript is never stale
 
     // Force a fresh re-parse of the just-opened chat from disk, then repaint if it actually changed. This
@@ -114,15 +121,47 @@ public sealed partial class MainPage : Page
 
     private void StartLiveReader()
     {
+        // The transcript is now read when the FILE CHANGES, not on a blind 1.5 s beat: FileWatchService
+        // raises the agent's writes as events and keeps a 5 s fallback poll behind them (60 s once the
+        // chat goes quiet) so a volume that drops change notifications still catches up on its own.
+        //
+        // This tick survives only to re-point the watcher when you open a different chat. It touches no
+        // disk at all — one reference comparison — because `_selected` is assigned from a great many
+        // places and hooking every one of them is how a live reader silently stops being live.
         _liveTimer = DispatcherQueue.CreateTimer();
-        _liveTimer.Interval = TimeSpan.FromMilliseconds(1500);
-        _liveTimer.Tick += async (_, _) => await LiveTickAsync();
+        _liveTimer.Interval = TimeSpan.FromMilliseconds(1000);
+        _liveTimer.Tick += (_, _) => ArmLiveWatch();
         _liveTimer.Start();
+    }
+
+    private void ArmLiveWatch()
+    {
+        var path = _screen == "Archive" && _selected is { IsReadOnlySnapshot: false } ? _selected.SourcePath ?? "" : "";
+        if (string.Equals(path, _liveWatchPath, StringComparison.OrdinalIgnoreCase) && (_liveWatch is not null || path.Length == 0)) return;
+
+        _liveWatch?.Dispose();
+        _liveWatch = null;
+        _liveWatchPath = path;
+        if (path.Length == 0) return;
+
+        try
+        {
+            _liveWatch = FileWatch.WatchFile(path, () =>
+                DispatcherQueue.TryEnqueue(async () => await LiveTickAsync()));
+        }
+        catch (Exception ex) { Diag.Log("Live watch arm: " + ex.Message); _liveWatchPath = ""; return; }
+
+        DispatcherQueue.TryEnqueue(async () => await LiveTickAsync());   // baseline this chat now
     }
 
     private async Task LiveTickAsync()
     {
-        if (_liveBusy || _screen != "Archive" || _selected is null || _selected.IsReadOnlySnapshot || !_selected.ContentLoaded) return;
+        if (_liveBusy || _screen != "Archive" || _selected is null || _selected.IsReadOnlySnapshot || !_selected.ContentLoaded)
+        {
+            // Declined, not consumed — make the watcher re-deliver instead of treating this as handled.
+            _liveWatch?.Rearm();
+            return;
+        }
 
         // First sight of this chat -> set the baseline, don't repaint.
         if (!ReferenceEquals(_selected, _liveSession))
@@ -134,7 +173,13 @@ public sealed partial class MainPage : Page
 
         var mtime = _archive.SourceWriteTimeUtc(_selected);
         if (mtime <= _liveMtime) return;                                   // nothing new on disk
-        if (MainScroller.ScrollableHeight - MainScroller.VerticalOffset > 120) return;  // reading history; don't yank
+        if (MainScroller.ScrollableHeight - MainScroller.VerticalOffset > 120)
+        {
+            // Reading history; don't yank. Re-arm so returning to the bottom picks the new turns up on
+            // the next fallback poll rather than waiting for the agent to write again.
+            _liveWatch?.Rearm();
+            return;
+        }
 
         _liveBusy = true;
         try

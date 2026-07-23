@@ -15,6 +15,9 @@ public static class PerfCounters
     private static long _transcriptBytesRead;
     private static long _projectionSerializes;
     private static long _ledgerBytesRead;
+    private static long _inboxBytesRead;
+    private static long _fileWatchEvents;
+    private static long _fileWatchFallbackPolls;
 
     /// One SearchText(session) interpolation — recomposed per session per term today.
     public static void SearchTextComposed(long count = 1) => Interlocked.Add(ref _searchTextCompositions, count);
@@ -34,6 +37,16 @@ public static class PerfCounters
     /// Bytes pulled off disk while replaying session/event ledgers.
     public static void LedgerBytesRead(long bytes) => Interlocked.Add(ref _ledgerBytesRead, bytes);
 
+    /// Bytes pulled off disk while reading the agent inbox — the whole point of the byte-offset cursor
+    /// is that this tracks the size of the APPEND, not the size of the file.
+    public static void InboxBytesRead(long bytes) => Interlocked.Add(ref _inboxBytesRead, bytes);
+
+    /// One FileSystemWatcher notification accepted by FileWatchService (pre-debounce).
+    public static void FileWatchEvent(long count = 1) => Interlocked.Add(ref _fileWatchEvents, count);
+
+    /// One fallback stat poll — the safety net that runs when no event arrives.
+    public static void FileWatchFallbackPoll(long count = 1) => Interlocked.Add(ref _fileWatchFallbackPolls, count);
+
     /// Zero every counter. Call immediately before a measured region; counters are process-wide.
     public static void Reset()
     {
@@ -43,6 +56,9 @@ public static class PerfCounters
         Interlocked.Exchange(ref _transcriptBytesRead, 0);
         Interlocked.Exchange(ref _projectionSerializes, 0);
         Interlocked.Exchange(ref _ledgerBytesRead, 0);
+        Interlocked.Exchange(ref _inboxBytesRead, 0);
+        Interlocked.Exchange(ref _fileWatchEvents, 0);
+        Interlocked.Exchange(ref _fileWatchFallbackPolls, 0);
     }
 
     /// Current values keyed by their contract names. Ordinal-sorted so artifacts diff cleanly.
@@ -54,5 +70,8 @@ public static class PerfCounters
         ["transcriptBytesRead"] = Interlocked.Read(ref _transcriptBytesRead),
         ["projectionSerializes"] = Interlocked.Read(ref _projectionSerializes),
         ["ledgerBytesRead"] = Interlocked.Read(ref _ledgerBytesRead),
+        ["inboxBytesRead"] = Interlocked.Read(ref _inboxBytesRead),
+        ["fileWatchEvents"] = Interlocked.Read(ref _fileWatchEvents),
+        ["fileWatchFallbackPolls"] = Interlocked.Read(ref _fileWatchFallbackPolls),
     };
 }
