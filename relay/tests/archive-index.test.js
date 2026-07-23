@@ -223,15 +223,24 @@ test('reaching the socket is not authorization: every wrong principal is refused
   );
 
   // Read route: owner cookie or nothing. Loopback alone and the bridge credential are refused.
-  assert.equal((await h.read(null)).status, 403);
+  // Refusal splits the way HTTP means it to: 401 when no owner credential was presented at all,
+  // 403 when one was presented and is not the owner's. Presenting a bridge bearer instead of a
+  // cookie is the former — the bridge credential buys nothing on a browser route.
+  assert.equal((await h.read(null)).status, 401);
   assert.equal((await h.read('some-other-user')).status, 403);
   assert.equal(
     (await h.request('GET', '/api/archive-index', undefined, {
       'x-forwarded-for': '203.0.113.7',
       authorization: `Bearer ${BRIDGE_TOKEN}`,
     })).status,
-    403,
+    401,
   );
+
+  // The load-bearing one for the read route: a BARE loopback GET carries no forwarding header, so the
+  // process-wide gate waves it through as "trusted local". The route itself must still refuse it —
+  // otherwise deleting its owner check would leave the whole suite green. Same for a bare loopback push.
+  assert.equal((await h.request('GET', '/api/archive-index', undefined, {})).status, 403);
+  assert.equal((await h.request('POST', '/api/archive-index', body, {})).status, 403);
 
   // None of those refusals may have left state behind.
   const got = await h.read();
