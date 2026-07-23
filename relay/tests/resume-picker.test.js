@@ -375,8 +375,7 @@ test('a leased+acked resume ends with the new tab in the list and selected', asy
   assert.equal(leased.type, 'startmux');
   host.sendSessions([session('mux-1', 'chat-1')]);
   await sleep(150);
-  const acked = await h.ack(leased.id, leased.leaseToken, true);
-  assert.equal(acked.status, 200);
+  assert.equal((await h.ack(leased.id, leased.leaseToken, true)).status, 200);
 
   const outcome = await resuming;
   assert.equal(outcome.state, 'done');
