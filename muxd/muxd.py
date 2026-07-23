@@ -3840,6 +3840,10 @@ async def main():
                             kind, name, data = await outq.get()
                             if kind == "o":
                                 await ws.send(json.dumps({"t": "o", "s": name, "d": base64.b64encode(data).decode()}))
+                            elif kind == "resync":
+                                # This session alone blew its egress budget; its backlog was dropped at a
+                                # frame boundary. Tell the relay to repaint from scrollback, not from a gap.
+                                await ws.send(json.dumps({"t": "resync", "s": name}))
                             elif kind == "dead":
                                 await ws.send(json.dumps({"t": "sessions", "list": sess_list()}))
 
