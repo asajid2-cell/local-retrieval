@@ -1162,6 +1162,8 @@ async function pasteImageToPrompt(blob, type){
     flash('Uploading pasted image…');
     const ext = ((type.split('/')[1]||'png')).replace('jpeg','jpg').replace('svg+xml','svg');
     const name = 'paste-'+Date.now()+'.'+ext;
+    // raw-fetch-allowlist: the body is the raw image bytes, so there is no JSON envelope to carry an
+    // intentId. A duplicate lands as a second upload the user can see and delete — not a lost action.
     const up = await fetch(base+'/api/upload?session='+encodeURIComponent(current)+'&keep=0&name='+encodeURIComponent(name),
       { method:'POST', headers:{'Content-Type':'application/octet-stream'}, body: blob });
     if(!up.ok) throw new Error('upload HTTP '+up.status);
@@ -1974,7 +1976,7 @@ async function submitAddCol(target){
 // dies while working. Persisted server-side by session name (survives restarts + relaunches).
 function toggleAutoheal(s){
   const on = !s.autoheal;
-  fetch(base+'/api/sessions/'+encodeURIComponent(s.name)+'/autoheal',{ method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({on}) })
+  sendIntent('POST', base+'/api/sessions/'+encodeURIComponent(s.name)+'/autoheal', {on}, 'autoheal')
     .then(async r=>{ if(!r.ok) throw new Error(await apiError(r)); return r.json(); })
     .then(()=>{ s.autoheal=on; const t=(window._sessions||[]).find(x=>x.name===s.name); if(t) t.autoheal=on; renderTabs();
       flash(on?'⟳ Auto-resume ON for “'+s.name+'” — it’ll relaunch if the agent dies while working':'Auto-resume off for “'+s.name+'”'); })
@@ -1990,7 +1992,7 @@ async function apiError(r){
 }
 async function killSession(name){
   try{
-    const r=await fetch(base+'/api/sessions/'+encodeURIComponent(name),{method:'DELETE'});
+    const r=await sendIntent('DELETE', base+'/api/sessions/'+encodeURIComponent(name), null, 'kill');
     if(!r.ok) throw new Error(await apiError(r));
     if(current===name){ intentional=true; current=null; if(ws){try{ws.close();}catch(e){}} term.reset(); $('#empty').style.display='flex'; setStatus('','Session ended'); }
     loadSessions();
@@ -2063,7 +2065,7 @@ async function killAllTabs(){
   flash('Deleting '+list.length+' tabs…');
   let ok=0, fail=0;
   for(const s of list){
-    try{ const r=await fetch(base+'/api/sessions/'+encodeURIComponent(s.name),{method:'DELETE'}); if(r.ok) ok++; else fail++; }catch(e){ fail++; }
+    try{ const r=await sendIntent('DELETE', base+'/api/sessions/'+encodeURIComponent(s.name), null, 'kill-all'); if(r.ok) ok++; else fail++; }catch(e){ fail++; }
   }
   // Start fresh: also clear the app's per-tab session history so no stale/mislabeled entries linger.
   if(_appLive){ try{ await postIntent(base+'/api/app-commands',{type:'cleartabhistory'},'clear-history'); }catch(e){} }
@@ -2177,7 +2179,7 @@ $('#dorename').onclick = async ()=>{
   // Multiplex tab name last (it may re-attach the terminal under the new name).
   if(to && from && to!==from){
     did=true;
-    let ok=false, err=''; try{ const r=await fetch(base+'/api/sessions/'+encodeURIComponent(from),{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:to})}); ok=r.ok; if(!ok) err=await apiError(r); }catch(e){ err=e.message||String(e); }
+    let ok=false, err=''; try{ const r=await sendIntent('PATCH', base+'/api/sessions/'+encodeURIComponent(from), {name:to}, 'rename-mux'); ok=r.ok; if(!ok) err=await apiError(r); }catch(e){ err=e.message||String(e); }
     if(!ok){ errs.push('multiplex: '+err); }
     else{
       if(read[from]!=null){ read[to]=read[from]; delete read[from]; LS.set('mux_read',read); }   // migrate read-state
@@ -2284,6 +2286,8 @@ async function wsUploadFiles(files){
   const keep = $('#wskeepnew').checked ? '1':'0';
   if(!$('#uploaddlg').open){ wsSel=null; openDialog('#uploaddlg'); }
   for(const f of files){
+    // raw-fetch-allowlist: same as the paste path — the request body IS the file, so the intent journal
+    // (which sends a JSON envelope) cannot wrap it. Duplicates are visible files, not silent damage.
     try{ await fetch(base+'/api/upload?session='+encodeURIComponent(current||'')+'&keep='+keep+'&name='+encodeURIComponent(f.name),
       { method:'POST', headers:{'Content-Type':'application/octet-stream'}, body:f }); }
     catch(e){ flash('Upload failed: '+(e.message||e)); }
@@ -2318,8 +2322,8 @@ async function wsAdd(f, insert){
   try{ await insertUploadIntoPrompt(f, insert||'path'); $('#uploaddlg').close(); term.focus(); flash(insert==='element'?'Added the image to your prompt':'Added the file path to your prompt'); }
   catch(e){ flash('Couldn’t add: '+(e.message||e)); }
 }
-async function wsKeep(f, keep){ f.keep=keep; try{ await fetch(base+'/api/uploads/'+encodeURIComponent(f.id),{ method:'PATCH', headers:{'Content-Type':'application/json'}, body:JSON.stringify({keep}) }); }catch(e){} }
-async function wsDelete(f){ try{ await fetch(base+'/api/uploads/'+encodeURIComponent(f.id),{ method:'DELETE' }); }catch(e){} wsFiles=wsFiles.filter(x=>x.id!==f.id); wsSel=null; renderWorkspace(); }
+async function wsKeep(f, keep){ f.keep=keep; try{ await sendIntent('PATCH', base+'/api/uploads/'+encodeURIComponent(f.id), {keep}, 'upload-keep'); }catch(e){} }
+async function wsDelete(f){ try{ await sendIntent('DELETE', base+'/api/uploads/'+encodeURIComponent(f.id), null, 'upload-delete'); }catch(e){} wsFiles=wsFiles.filter(x=>x.id!==f.id); wsSel=null; renderWorkspace(); }
 
 // ---- expanded touch keybar -------------------------------------------------------------------------
 // Phones can't do key combos or navigation from the soft keyboard, so the bar provides: sticky
