@@ -400,6 +400,83 @@ _CONPTY_HOST_EXECUTABLES = (
 _ORPHANED_CONPTY_LOCK = threading.Lock()
 _ORPHANED_CONPTY_HOSTS = {}
 _PENDING_CONPTY_BASELINES = {}
+# Baselines the reaper gave up on. Diagnostic only: nothing reads this to make a decision, so a
+# quarantine that can never resolve degrades into a log line instead of wedging every future spawn.
+_ABANDONED_CONPTY_BASELINES = []
+CONPTY_ABANDONED_BASELINE_LIMIT = 16
+CONPTY_CUSTODY_TTL = float(os.environ.get("MUXD_CONPTY_CUSTODY_TTL", "300"))
+CONPTY_QUARANTINE_TTL = float(os.environ.get("MUXD_CONPTY_QUARANTINE_TTL", "60"))
+CONPTY_QUARANTINE_MAX_ATTEMPTS = 5
+# Last emission of each recurring "still pending" line, so unchanged state stops narrating
+# itself every reap. One slot PER KIND, not one shared slot: both lines can fire inside the
+# same reap pass with different signatures, and a single slot would see them alternate and
+# never suppress anything. Transition lines (abandoning / quarantine expired) never come here.
+_LAST_CUSTODY_EMISSION = {
+    "discovery": {"sig": None, "at": 0.0, "repeats": 0},
+    "cleanup": {"sig": None, "at": 0.0, "repeats": 0},
+}
+CONPTY_EMISSION_INTERVAL = 60.0
+CONPTY_REAPER_INTERVAL = 5.0
+CONPTY_REAPER_MAX_INTERVAL = 30.0
+
+def _custody_record(reason, now=None):
+    stamp = time.monotonic() if now is None else float(now)
+    return {
+        "reason": str(reason or ""),
+        "first_seen": stamp,
+        "last_attempt": stamp,
+        "attempts": 0,
+    }
+
+def _custody_age(record, now=None):
+    stamp = time.monotonic() if now is None else float(now)
+    return max(0.0, stamp - float(record.get("first_seen", stamp)))
+
+def _custody_touch(record, now=None):
+    stamp = time.monotonic() if now is None else float(now)
+    record["attempts"] = int(record.get("attempts", 0)) + 1
+    record["last_attempt"] = stamp
+    return record
+
+def _custody_emission_signature(retained=(), failures=()):
+    """The observable custody state a 'still pending' line is reporting on. Two passes that
+    produce the same signature are saying the same thing, so only the first needs to speak."""
+    with _ORPHANED_CONPTY_LOCK:
+        pending = tuple(sorted(_PENDING_CONPTY_BASELINES))
+    return (tuple(sorted(retained)), tuple(failures), pending)
+
+def _emit_custody_pending(kind, signature, message, now=None):
+    """Log a recurring custody line only when its state changed, or once per
+    CONPTY_EMISSION_INTERVAL while it has not — a permanently stuck record then reports once a
+    minute instead of 720 times an hour. Suppressed repeats are counted onto the next line."""
+    slot = _LAST_CUSTODY_EMISSION[kind]
+    stamp = time.monotonic() if now is None else float(now)
+    if slot["sig"] == signature and stamp - float(slot["at"]) < CONPTY_EMISSION_INTERVAL:
+        slot["repeats"] = int(slot.get("repeats", 0)) + 1
+        return False
+    repeats = int(slot.get("repeats", 0))
+    slot["sig"] = signature
+    slot["at"] = stamp
+    slot["repeats"] = 0
+    log(f"{message} (repeated {repeats}x)" if repeats else message)
+    return True
+
+def _reaper_tick_signature(retained_count):
+    """What the reaper tick compares between passes: a reap that changed nothing at all
+    produces an identical signature, including the count it still holds."""
+    with _ORPHANED_CONPTY_LOCK:
+        hosts = tuple(sorted(_ORPHANED_CONPTY_HOSTS))
+        pending = tuple(sorted(_PENDING_CONPTY_BASELINES))
+    return (int(retained_count), hosts, pending)
+
+def _reaper_backoff(prev_sig, sig, prev_delay):
+    """Sleep before the next reap. Any progress — a changed signature, a newly retained
+    record — snaps back to CONPTY_REAPER_INTERVAL; a reap that moved nothing doubles toward
+    CONPTY_REAPER_MAX_INTERVAL so a hopeless record cannot spin the executor every 5s."""
+    if prev_sig is None or sig != prev_sig:
+        return CONPTY_REAPER_INTERVAL
+    delay = float(prev_delay or CONPTY_REAPER_INTERVAL)
+    return min(CONPTY_REAPER_MAX_INTERVAL, max(CONPTY_REAPER_INTERVAL, delay * 2.0))
 
 def _direct_child_pids(parent_pid, executable_name=""):
     if os.name != "nt":
@@ -585,41 +662,115 @@ def _retain_orphaned_conpty_hosts(owned, reason):
         return
     with _ORPHANED_CONPTY_LOCK:
         for pid, start_token in records:
-            _ORPHANED_CONPTY_HOSTS[(int(pid), str(start_token))] = str(reason or "")
+            key = (int(pid), str(start_token))
+            # An already-custodied host keeps its original first_seen and first reason:
+            # re-retaining must not reset the age clock a later GC pass reads.
+            if key not in _ORPHANED_CONPTY_HOSTS:
+                _ORPHANED_CONPTY_HOSTS[key] = _custody_record(reason)
     log(f"[conpty] retained {len(records)} orphan host record(s) for supervised cleanup: {reason}")
 
 def _retain_pending_conpty_baseline(records, reason):
     baseline = tuple(sorted((int(pid), str(token)) for pid, token in (records or {}).items()))
     with _ORPHANED_CONPTY_LOCK:
-        _PENDING_CONPTY_BASELINES[baseline] = str(reason or "")
+        if baseline not in _PENDING_CONPTY_BASELINES:
+            _PENDING_CONPTY_BASELINES[baseline] = _custody_record(reason)
     log(f"[conpty] quarantined new PTY spawns pending orphan discovery: {reason}")
 
 def _reap_orphaned_conpty_hosts(timeout=5):
     with _CONPTY_SPAWN_LOCK:
         with _ORPHANED_CONPTY_LOCK:
             pending_baselines = list(_PENDING_CONPTY_BASELINES.items())
-        for baseline_key, reason in pending_baselines:
+        for baseline_key, baseline_record in pending_baselines:
+            reason = baseline_record["reason"]
             try:
                 discovered = _new_conpty_host_processes(
                     dict(baseline_key),
                     timeout=min(1.0, max(0.1, timeout)),
                 )
             except OSError as error:
-                log(f"[conpty] orphan discovery still pending: {error}")
+                # Enumeration failed again — the same fault that created this baseline. Age it, and
+                # once it is hopeless drop it so spawns resume; a leaked host beats a dead daemon.
+                _custody_touch(baseline_record)
+                age = _custody_age(baseline_record)
+                attempts = int(baseline_record.get("attempts", 0))
+                if age > CONPTY_QUARANTINE_TTL or attempts >= CONPTY_QUARANTINE_MAX_ATTEMPTS:
+                    with _ORPHANED_CONPTY_LOCK:
+                        _PENDING_CONPTY_BASELINES.pop(baseline_key, None)
+                        _ABANDONED_CONPTY_BASELINES.append({
+                            "baseline": baseline_key,
+                            "reason": reason,
+                            "age": age,
+                            "attempts": attempts,
+                            "error": str(error),
+                        })
+                        del _ABANDONED_CONPTY_BASELINES[:-CONPTY_ABANDONED_BASELINE_LIMIT]
+                    log(
+                        f"[conpty] quarantine expired after {age:.1f}s / {attempts} attempt(s), "
+                        f"resuming spawns (orphan hosts may have leaked): {reason}"
+                    )
+                    continue
+                _emit_custody_pending(
+                    "discovery",
+                    _custody_emission_signature(failures=(str(error),)),
+                    f"[conpty] orphan discovery still pending: {error}",
+                )
                 continue
             with _ORPHANED_CONPTY_LOCK:
                 _PENDING_CONPTY_BASELINES.pop(baseline_key, None)
             _retain_orphaned_conpty_hosts(discovered, reason)
         with _ORPHANED_CONPTY_LOCK:
             records = list(_ORPHANED_CONPTY_HOSTS)
-    retained, failures = _terminate_conhost_records(records, timeout=timeout)
+    # Partition before terminating: a custody record must never outlive its subject.
+    # The _same_process_instance probes call into Win32, so they run OUTSIDE the lock.
+    live = []
+    dormant = []
+    abandoned = []
+    for key in records:
+        pid, start_token = key
+        if not _same_process_instance(int(pid), start_token):
+            # Dead pid, or the pid was recycled onto an unrelated process. Either way
+            # there is nothing of ours left to kill — dropping is not a failure.
+            dormant.append(key)
+            continue
+        with _ORPHANED_CONPTY_LOCK:
+            record = _ORPHANED_CONPTY_HOSTS.get(key)
+        if record is None:
+            continue
+        age = _custody_age(record)
+        if age > CONPTY_CUSTODY_TTL:
+            abandoned.append((key, record, age))
+            continue
+        live.append(key)
+    if dormant or abandoned:
+        with _ORPHANED_CONPTY_LOCK:
+            for key in dormant:
+                _ORPHANED_CONPTY_HOSTS.pop(key, None)
+            for key, _record, _age in abandoned:
+                _ORPHANED_CONPTY_HOSTS.pop(key, None)
+    for key, record, age in abandoned:
+        log(
+            f"[conpty] abandoning orphan host record pid={key[0]} after {age:.1f}s"
+            f" / {int(record.get('attempts', 0))} attempt(s): {record['reason']}"
+        )
+    if live:
+        retained, failures = _terminate_conhost_records(live, timeout=timeout)
+    else:
+        retained, failures = [], []
     retained_set = set(retained)
     with _ORPHANED_CONPTY_LOCK:
-        for record in records:
-            if record not in retained_set:
-                _ORPHANED_CONPTY_HOSTS.pop(record, None)
+        for key in live:
+            if key not in retained_set:
+                _ORPHANED_CONPTY_HOSTS.pop(key, None)
+                continue
+            record = _ORPHANED_CONPTY_HOSTS.get(key)
+            if record is not None:
+                _custody_touch(record)
     if failures:
-        log(f"[conpty] supervised orphan cleanup still pending: {'; '.join(failures)}")
+        _emit_custody_pending(
+            "cleanup",
+            _custody_emission_signature(retained, failures),
+            f"[conpty] supervised orphan cleanup still pending: {'; '.join(failures)}",
+        )
     return len(retained)
 
 def _release_pty_conhosts(pty, session_name="?", timeout=3):
@@ -1482,9 +1633,13 @@ class Session:
             direct_cmd = True
         with _CONPTY_SPAWN_LOCK:
             with _ORPHANED_CONPTY_LOCK:
+                # Expired baselines are popped by the reaper, so a non-empty dict means a LIVE
+                # quarantine. Deliberately no expiry check here: this runs under the spawn lock.
                 if _PENDING_CONPTY_BASELINES:
+                    blocking = next(iter(_PENDING_CONPTY_BASELINES.values()))
                     raise RuntimeError(
-                        "ConPTY custody is quarantined pending orphan-host discovery"
+                        "ConPTY custody is quarantined pending orphan-host discovery: "
+                        f"{blocking.get('reason', '')}"
                     )
             conpty_hosts_before = _conpty_host_process_records(os.getpid())
             try:
@@ -3466,18 +3621,28 @@ async def main():
     start_supervised_background(background_tasks, "loop-monitor", loop_monitor)
 
     async def conpty_orphan_reaper_tick():
+        delay = CONPTY_REAPER_INTERVAL
+        last_sig = None
         while True:
-            await asyncio.sleep(5)
+            await asyncio.sleep(delay)
             with _ORPHANED_CONPTY_LOCK:
                 pending = bool(
                     _ORPHANED_CONPTY_HOSTS
                     or _PENDING_CONPTY_BASELINES
                 )
-            if pending:
-                await asyncio.get_running_loop().run_in_executor(
-                    None,
-                    _reap_orphaned_conpty_hosts,
-                )
+            if not pending:
+                # Nothing in custody: no executor dispatch at all, and the next record to
+                # arrive gets reaped at the base interval rather than a backed-off one.
+                delay = CONPTY_REAPER_INTERVAL
+                last_sig = None
+                continue
+            retained = await asyncio.get_running_loop().run_in_executor(
+                None,
+                _reap_orphaned_conpty_hosts,
+            )
+            sig = _reaper_tick_signature(retained)
+            delay = _reaper_backoff(last_sig, sig, delay)
+            last_sig = sig
     start_supervised_background(
         background_tasks,
         "conpty-orphan-reaper",
