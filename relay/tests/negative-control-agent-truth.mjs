@@ -51,16 +51,15 @@ const original = fs.readFileSync(serverPath, 'utf8');
 const backupPath = path.join(os.tmpdir(), `relay-server-negctl-${process.pid}.js.bak`);
 fs.writeFileSync(backupPath, original, 'utf8');
 
-const EOL = original.includes('\r\n') ? '\r\n' : '\n';
-const ANCHOR = anchorFor(EOL);
-const NEUTERED = neuterFor(EOL);
-
-const occurrences = original.split(ANCHOR).length - 1;
-assert.equal(occurrences, 1,
-  `anchor must appear exactly once in relay/server.js, found ${occurrences}. Anchor:\n${ANCHOR}`);
-
 let red;
 try {
+  const EOL = original.includes('\r\n') ? '\r\n' : '\n';
+  const ANCHOR = anchorFor(EOL);
+  const NEUTERED = neuterFor(EOL);
+  const occurrences = original.split(ANCHOR).length - 1;
+  assert.equal(occurrences, 1,
+    `anchor must appear exactly once in relay/server.js, found ${occurrences}. Anchor:\n${ANCHOR}`);
+
   fs.writeFileSync(serverPath, original.replace(ANCHOR, NEUTERED), 'utf8');
   assert.equal(fs.readFileSync(serverPath, 'utf8').includes(NEUTERED), true,
     'neutered server.js was not written to disk');
@@ -71,7 +70,7 @@ try {
     `The suite does not exercise the agentTruth feature.\n${red.out}`);
   for (const name of RED_TESTS) {
     assert.equal(red.out.includes(`not ok`) && red.out.includes(name), true,
-      `expected TAP output to contain a failing entry for: ${name}`);
+      `expected TAP output to contain a failing entry for: ${name}\n${red.out}`);
     const line = red.out.split('\n').find(l => l.includes(name) && /^\s*(not ok|ok)\b/.test(l.trim()));
     assert.equal(line !== undefined && line.trim().startsWith('not ok'), true,
       `expected "not ok" for test: ${name}\ngot line: ${line === undefined ? '<none>' : line.trim()}`);
