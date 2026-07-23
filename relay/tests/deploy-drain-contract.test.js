@@ -5,7 +5,10 @@ const path = require('node:path');
 
 const REPO = path.resolve(__dirname, '..');
 const SCRIPT = path.resolve(__dirname, '..', '..', 'scripts', 'deploy-relay.sh');
-const source = fs.readFileSync(SCRIPT, 'utf8');
+// deploy-relay.sh is stored with CRLF terminators. Normalize once, here: a trailing '\r' is not
+// matched by '.' , so every line-anchored regex below (comment stripping, `^\s*drain_wait\s*$`)
+// would silently no-op against the raw text.
+const source = fs.readFileSync(SCRIPT, 'utf8').replace(/\r\n/g, '\n');
 
 // Comments explain WHY the restart is SIGTERM-first and name SIGKILL to rule it out, so the
 // hard-kill assertion looks at commands only.
