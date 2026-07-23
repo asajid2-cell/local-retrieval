@@ -1441,6 +1441,9 @@ class Session:
         self.owner_key = ""
         self.identity_pending = False
         self.lifecycle = "active" if spawn_now else "dormant"
+        self.last_alive_utc = ""
+        self.custody_expires_utc = ""
+        custody_refresh(self)
         self.child_pid = 0
         self.child_start_token = ""
         self.stop_disposition = ""
@@ -1776,6 +1779,9 @@ class OwnerSession:
         self.owner_key = str(owner_key or "")
         self.identity_pending = False
         self.lifecycle = "active"
+        self.last_alive_utc = ""
+        self.custody_expires_utc = ""
+        custody_refresh(self)
         self.child_pid = 0
         self.child_start_token = ""
         self.stop_disposition = ""
@@ -2060,6 +2066,63 @@ def gc_expired_custody(source=None, now=None):
     for name in reclaimed:
         source.pop(name, None)
     return reclaimed
+
+def restore_manifest_sessions(records, target=None, loop=None, outq=None):
+    # Boot's manifest rehydration, lifted out of main() so tests can drive the REAL restore path:
+    # boot runs inside main() behind a live relay link and has no unit-test seam. Behaviour is
+    # unchanged from the inline loop it replaces.
+    target = sessions if target is None else target
+    restored_names = []
+    for name, m in records.items():
+        if not strict_mux_name(name) or name in target:
+            continue
+        heal = bool(m.get("heal"))
+        mcmd = m.get("cmd", "")
+        ids = m.get("ids") if isinstance(m.get("ids"), list) else []
+        aliases = m.get("aliases") if isinstance(m.get("aliases"), list) else []
+        try:
+            restored = Session(
+                name, mcmd, m.get("cwd", ""), m.get("cols", 140), m.get("rows", 40),
+                loop, outq, heal=heal, spawn_now=False, ids=ids,
+                session_id=m.get("sessionId", ""), aliases=aliases
+            )
+            restored.expected_owner = bool(m.get("owner"))
+            restored.owner_key = str(m.get("ownerKey", "") or "")
+            restored.identity_pending = bool(m.get("identityPending"))
+            restored.lifecycle = str(m.get("lifecycle", "active") or "active")
+            if restored.lifecycle not in ("active", "dormant", "starting", "stopping", "failed"):
+                restored.lifecycle = "failed"
+            restored.child_pid = int(m.get("childPid", 0) or 0)
+            restored.child_start_token = str(m.get("childStartToken", "") or "")
+            restored.stop_disposition = str(m.get("stopDisposition", "") or "")
+            if restored.stop_disposition not in ("", "remove", "replace"):
+                restored.stop_disposition = ""
+            restored.user_killed = bool(m.get("userKilled", False))
+            restored.generation_id = str(m.get("generationId", "") or restored.generation_id)
+            restored.operation_key = str(m.get("operationKey", "") or "")
+            restored.operation_fingerprint = str(m.get("operationFingerprint", "") or "")
+            restored.operation_created = bool(m.get("operationCreated", False))
+            restored.last_alive_utc = str(m.get("lastAliveUtc", "") or "")
+            restored.custody_expires_utc = str(m.get("custodyExpiresUtc", "") or "")
+            custody_seed(restored)   # pre-custody record: full TTL, not instant reclamation
+            restored.deaths = [
+                float(value)
+                for value in (m.get("deaths") if isinstance(m.get("deaths"), list) else [])
+                if isinstance(value, (int, float))
+            ][-16:]
+        except Exception as error:
+            raise RuntimeError(f"could not restore durable session {name}") from error
+        target[name] = restored
+        restored_names.append(name)
+    return restored_names
+
+def boot_removes_record(restored):
+    # A durable stop intent that boot must complete: the user killed it, or it was mid-`stopping`
+    # with a `remove` disposition. Separate from custody GC, and it runs first.
+    return bool(getattr(restored, "user_killed", False)) or (
+        str(getattr(restored, "lifecycle", "active") or "active") == "stopping"
+        and str(getattr(restored, "stop_disposition", "") or "") == "remove"
+    )
 
 def session_records_payload(source=None):
     source = sessions if source is None else source
@@ -3456,45 +3519,7 @@ async def main():
     # liveness runs a PowerShell CIM query (blocking) — NEVER call it on the event-loop thread or muxd
     # freezes and hosted sessions drop. Always hop to a worker thread.
     boot_manifest = manifest_load()
-    boot_names = []
-    for name, m in boot_manifest.items():
-        if not strict_mux_name(name) or name in sessions:
-            continue
-        heal = bool(m.get("heal"))
-        mcmd = m.get("cmd", "")
-        ids = m.get("ids") if isinstance(m.get("ids"), list) else []
-        aliases = m.get("aliases") if isinstance(m.get("aliases"), list) else []
-        try:
-            restored = Session(
-                name, mcmd, m.get("cwd", ""), m.get("cols", 140), m.get("rows", 40),
-                loop, outq, heal=heal, spawn_now=False, ids=ids,
-                session_id=m.get("sessionId", ""), aliases=aliases
-            )
-            restored.expected_owner = bool(m.get("owner"))
-            restored.owner_key = str(m.get("ownerKey", "") or "")
-            restored.identity_pending = bool(m.get("identityPending"))
-            restored.lifecycle = str(m.get("lifecycle", "active") or "active")
-            if restored.lifecycle not in ("active", "dormant", "starting", "stopping", "failed"):
-                restored.lifecycle = "failed"
-            restored.child_pid = int(m.get("childPid", 0) or 0)
-            restored.child_start_token = str(m.get("childStartToken", "") or "")
-            restored.stop_disposition = str(m.get("stopDisposition", "") or "")
-            if restored.stop_disposition not in ("", "remove", "replace"):
-                restored.stop_disposition = ""
-            restored.user_killed = bool(m.get("userKilled", False))
-            restored.generation_id = str(m.get("generationId", "") or restored.generation_id)
-            restored.operation_key = str(m.get("operationKey", "") or "")
-            restored.operation_fingerprint = str(m.get("operationFingerprint", "") or "")
-            restored.operation_created = bool(m.get("operationCreated", False))
-            restored.deaths = [
-                float(value)
-                for value in (m.get("deaths") if isinstance(m.get("deaths"), list) else [])
-                if isinstance(value, (int, float))
-            ][-16:]
-        except Exception as error:
-            raise RuntimeError(f"could not restore durable session {name}") from error
-        sessions[name] = restored
-        boot_names.append(name)
+    boot_names = restore_manifest_sessions(boot_manifest, sessions, loop, outq)
 
     # Reconcile only after every durable record is represented in memory. Any save below is therefore
     # authoritative for the whole manifest and cannot erase entries that happened to sort later.
@@ -3516,11 +3541,7 @@ async def main():
                     raise RuntimeError(
                         f"could not reconcile unresolved {restored.lifecycle} session {name}: {detail}"
                     )
-                remove_record = restored.user_killed or (
-                    restored.lifecycle == "stopping"
-                    and restored.stop_disposition == "remove"
-                )
-                if remove_record:
+                if boot_removes_record(restored):
                     sessions.pop(name, None)
                     await manifest_save_async(sessions)
                     log(f"[boot] completed durable stop intent for {name}")
@@ -3557,6 +3578,25 @@ async def main():
         except Exception as e:
             log(f"[boot] {name} failed: {e}")
 
+    # Custody GC runs AFTER reconciliation, so a record only faces the TTL once its real lifecycle is
+    # settled: a `starting` tab that boot demoted to dormant is judged as dormant, not as whatever the
+    # crash left behind. Anything reclaimed here was already invisible to the relay (the same
+    # `custody_reclaimable` predicate filters live_tabs_snapshot and sess_list).
+    reclaimed_at_boot = gc_expired_custody(sessions)
+    if reclaimed_at_boot:
+        await manifest_save_async(sessions)
+        log(f"[boot] custody expired; reclaimed {len(reclaimed_at_boot)}: {', '.join(reclaimed_at_boot)}")
+
+    async def custody_gc_tick():
+        # muxd can stay up for weeks — a boot-only sweep would let dormant records accrue the whole
+        # time. Same predicate, same protections, just on a timer.
+        while True:
+            await asyncio.sleep(CUSTODY_GC_INTERVAL_SECONDS)
+            reclaimed = gc_expired_custody(sessions)
+            if reclaimed:
+                await manifest_save_async(sessions)
+                log(f"[custody] reclaimed {len(reclaimed)} expired: {', '.join(reclaimed)}")
+
     async def self_heal_tick():
         # a session whose SHELL died (pty EOF) is useless — recreate + re-run its resume (max 3/10min).
         while True:
@@ -3584,6 +3624,7 @@ async def main():
                     elif created:
                         log(f"[heal] {s.name} shell died -> respawned + resume queued")
     start_supervised_background(background_tasks, "self-heal", self_heal_tick)
+    start_supervised_background(background_tasks, "custody-gc", custody_gc_tick)
 
     async def flush_out():
         # coalesce each session's output into ONE ws frame per ~12ms tick — far fewer frames/less b64+JSON
@@ -3858,6 +3899,7 @@ async def main():
                     async def pump_status():
                         while True:
                             await asyncio.sleep(5)
+                            refresh_live_custody()   # a session that is alive right now cannot go stale
                             try: await asyncio.get_running_loop().run_in_executor(None, write_live_tabs)   # off-loop file write
                             except Exception: pass
                             await ws.send(json.dumps({"t": "sessions", "list": sess_list()}))
