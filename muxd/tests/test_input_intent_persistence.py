@@ -9,6 +9,9 @@ validate, JSON-encode, compact, reload, replay.
 
 import importlib
 import json
+import os
+import shutil
+import tempfile
 import unittest
 
 host_input_intent = importlib.import_module("host_input_intent")
@@ -83,6 +86,27 @@ def keyed(principal):
 
 
 class DurableInputIntentPersistence(unittest.TestCase):
+    def setUp(self):
+        self.original_manifest = muxd.MANIFEST
+        self.original_intent_records = dict(muxd.intent_records)
+        self.original_sessions = dict(muxd.sessions)
+        self.temp_dir = tempfile.mkdtemp()
+        muxd.MANIFEST = os.path.join(self.temp_dir, "sessions.json")
+        muxd.intent_records.clear()
+        muxd.sessions.clear()
+
+    def tearDown(self):
+        muxd.MANIFEST = self.original_manifest
+        muxd.intent_records.clear()
+        muxd.intent_records.update(self.original_intent_records)
+        muxd.sessions.clear()
+        muxd.sessions.update(self.original_sessions)
+        shutil.rmtree(self.temp_dir)
+
+    def write_manifest(self, payload):
+        with open(muxd.MANIFEST, "w", encoding="utf-8") as stream:
+            stream.write(json.dumps(payload))
+
     def test_terminal_record_passes_manifest_validation(self):
         principal = make_principal()
         key = keyed(principal)
@@ -150,6 +174,87 @@ class DurableInputIntentPersistence(unittest.TestCase):
         self.assertEqual(disposition, host_input_intent.REPLAY_UNCERTAIN)
         self.assertEqual(refusal["t"], "err")
 
+    def test_manifest_payload_keeps_wide_terminal_record(self):
+        principal = make_principal(principal_id=WIDE, intent_id=WIDE)
+        key = keyed(principal)
+        now = muxd.time.time()
+        expected = {key: terminal_record(principal, created=now, updated=now)}
+        muxd.intent_records.update(expected)
+
+        payload = muxd.manifest_payload()
+
+        self.assertTrue(muxd.valid_manifest(payload))
+        self.assertIn(key, payload["intents"])
+        self.assertEqual(payload["intents"], expected)
+
+    def test_manifest_round_trip_restores_wide_terminal_record_and_replay(self):
+        principal = make_principal(principal_id=WIDE, intent_id=WIDE)
+        key = keyed(principal)
+        now = muxd.time.time()
+        expected = {key: terminal_record(principal, created=now, updated=now)}
+        muxd.intent_records.update(expected)
+        payload = muxd.manifest_payload()
+        self.write_manifest(payload)
+        muxd.intent_records.clear()
+
+        muxd.manifest_load()
+
+        self.assertEqual(muxd.intent_records, expected)
+        self.assertEqual(
+            host_input_intent.replay_decision(
+                muxd.intent_records[key], principal.intent_fingerprint
+            ),
+            (host_input_intent.REPLAY_CACHED, {"t": "input-ok", "s": "work"}),
+        )
+
+    def test_manifest_round_trip_restores_wide_reserve_record_and_replay(self):
+        principal = make_principal(principal_id=WIDE, intent_id=WIDE)
+        key = keyed(principal)
+        expected = {key: reserve_record(principal)}
+        expected_bytes = json.dumps(
+            expected[key], sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        muxd.intent_records.update(expected)
+        payload = muxd.manifest_payload()
+        self.write_manifest(payload)
+        muxd.intent_records.clear()
+
+        muxd.manifest_load()
+
+        self.assertEqual(muxd.intent_records, expected)
+        self.assertEqual(
+            json.dumps(
+                muxd.intent_records[key], sort_keys=True, separators=(",", ":")
+            ).encode("utf-8"),
+            expected_bytes,
+        )
+        self.assertEqual(
+            host_input_intent.replay_decision(
+                muxd.intent_records[key], principal.intent_fingerprint
+            )[0],
+            host_input_intent.REPLAY_UNCERTAIN,
+        )
+
+    def test_manifest_load_rejects_invalid_intent_status(self):
+        principal = make_principal()
+        invalid_record = terminal_record(principal, status="donezo")
+        payload = {
+            "version": 2,
+            "sessions": {
+                "work": {
+                    "cmd": "bash",
+                    "cwd": "/tmp",
+                    "cols": 80,
+                    "rows": 24,
+                    "heal": True,
+                }
+            },
+            "intents": {keyed(principal): invalid_record},
+        }
+        self.write_manifest(payload)
+
+        with self.assertRaisesRegex(OSError, "invalid persisted state shape"):
+            muxd.manifest_load()
 
     def test_reserve_record_passes_manifest_validation(self):
         for principal in (make_principal(), make_principal(principal_id=WIDE, intent_id=WIDE)):
