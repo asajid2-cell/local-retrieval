@@ -1,5 +1,6 @@
 using CodexLocalRetrieval.Core.Models;
 using CodexLocalRetrieval.Core.Remote;
+using CodexLocalRetrieval.Core.Services;
 using Microsoft.UI.Text;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
@@ -9,15 +10,48 @@ namespace CodexLocalRetrieval_Native;
 
 public sealed partial class MainPage
 {
-    private SessionIntegritySummary? _integritySummary;
-    private string _integritySessionKey = "";
-    private DateTimeOffset _integrityBuiltAt;
+    // 5s TTL, same window the old inline staleness check used.
+    private readonly StaleGuardedRefresher<SessionIntegritySummary> _integrity = new(TimeSpan.FromSeconds(5));
     private int _reclaimSeq;
     private bool _reclaimRunning;
 
     private void RefreshIntegrity_Click(object sender, RoutedEventArgs e) => RenderIntegrity(force: true);
 
+    // B4. The integrity oracle walks the store, the process table and the claim files; run on the UI thread
+    // that is a freeze the user reads as the app hanging. So this paints the CACHED panel for this chat first
+    // and never waits: the rebuild goes off-thread behind a monotonic sequence guard and repaints only if it
+    // is still the newest answer to the newest question. Same shape as RenderCustodyPage/LoadCustodyAsync.
     private void RenderIntegrity(bool force = false)
+    {
+        if (_selected is null)
+        {
+            _integrity.Invalidate();
+            PaintIntegrity(null, checking: false);
+            return;
+        }
+
+        var session = _selected;
+        var key = IntegrityKey(session);
+        var store = _archive.Store;
+        var checking = force || _integrity.NeedsRefresh(key);
+
+        PaintIntegrity(_integrity.CurrentFor(key), checking);
+        if (!checking) return;
+        _ = RefreshIntegrityAsync(session, key, store, force);
+    }
+
+    private async Task RefreshIntegrityAsync(ArchiveSession session, string key, AppStoreData store, bool force)
+    {
+        var outcome = await _integrity.RefreshAsync(key, () => SessionIntegrity.Build(store, session), force);
+
+        // Superseded by a newer refresh, or the selection moved on while we were building: either way this
+        // answer is no longer about what is on screen, and painting it would be a lie with a fresh timestamp.
+        if (!outcome.IsCurrent || !ReferenceEquals(_selected, session)) return;
+        if (outcome.Error is not null) Diag.Log("RenderIntegrity failed: " + outcome.Error);
+        PaintIntegrity(outcome.Value, checking: false);
+    }
+
+    private void PaintIntegrity(SessionIntegritySummary? summary, bool checking)
     {
         IntegrityItems.Children.Clear();
         if (_selected is null)
@@ -27,32 +61,24 @@ public sealed partial class MainPage
             return;
         }
 
-        var key = IntegrityKey(_selected);
-        var stale = DateTimeOffset.UtcNow - _integrityBuiltAt > TimeSpan.FromSeconds(5);
-        if (force || _integritySummary is null || !string.Equals(_integritySessionKey, key, StringComparison.Ordinal) || stale)
+        // Start-class actions stay off until a COMPLETED build says this chat is clear. Unverified is not
+        // clear, and neither is mid-verification — so they disable while checking instead of the click
+        // blocking on a synchronous build.
+        SetRiskySessionActionsEnabled(
+            !checking
+            && summary is not null
+            && !string.Equals(summary.Severity, "danger", StringComparison.OrdinalIgnoreCase));
+
+        if (summary is null)
         {
-            try
-            {
-                _integritySummary = SessionIntegrity.Build(_archive.Store, _selected);
-                _integritySessionKey = key;
-                _integrityBuiltAt = DateTimeOffset.UtcNow;
-            }
-            catch (Exception ex)
-            {
-                Diag.Log("RenderIntegrity failed: " + ex);
-                _integritySummary = null;
-                _integritySessionKey = "";
-                SetRiskySessionActionsEnabled(false);
-                IntegrityItems.Children.Add(IntegrityHeadline("danger", "Integrity checks failed. Refusing to treat this chat as clear."));
-                return;
-            }
+            IntegrityItems.Children.Add(checking
+                ? IntegrityChip("Checking integrity...")
+                : IntegrityHeadline("danger", "Integrity checks failed. Refusing to treat this chat as clear."));
+            return;
         }
 
-        var summary = _integritySummary;
-        if (summary is null) return;
-        SetRiskySessionActionsEnabled(!string.Equals(summary.Severity, "danger", StringComparison.OrdinalIgnoreCase));
-
         IntegrityItems.Children.Add(IntegrityHeadline(summary.Severity, summary.Headline));
+        if (checking) IntegrityItems.Children.Add(IntegrityChip("Checking integrity..."));
         if (CanReclaim(summary))
             IntegrityItems.Children.Add(IntegrityReclaimButton());
         IntegrityItems.Children.Add(IntegrityMeta(summary));
@@ -312,11 +338,17 @@ public sealed partial class MainPage
             RecordSessionEvent(session, "reclaim.relaunch.lost-race", report.RelaunchDetail, "warn");
     }
 
+    // B4. Async-aware: the click never waits on the oracle. It answers from the last COMPLETED build and kicks
+    // an off-thread re-verification, which disables the start-class buttons for its duration. With no
+    // completed build for this chat the answer is "blocked" — fail closed, exactly as the synchronous version
+    // did when Build threw.
     private bool RiskySessionActionBlocked()
     {
+        if (_selected is null) return true;
+        var summary = _integrity.CurrentFor(IntegrityKey(_selected));
         RenderIntegrity(force: true);
-        return _integritySummary is null
-               || string.Equals(_integritySummary.Severity, "danger", StringComparison.OrdinalIgnoreCase);
+        return summary is null
+               || string.Equals(summary.Severity, "danger", StringComparison.OrdinalIgnoreCase);
     }
 
     private void SetRiskySessionActionsEnabled(bool enabled)
