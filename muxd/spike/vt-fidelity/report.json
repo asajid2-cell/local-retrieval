@@ -64,12 +64,12 @@
           "pass": false
         },
         "throughput": {
-          "value": 384559,
+          "value": 389093,
           "gate": 5242880,
           "pass": false
         }
       },
-      "throughputMBPerSec": 0.367,
+      "throughputMBPerSec": 0.371,
       "version": "?",
       "note": "pyte Screen.resize truncates columns; it does not reflow wrapped lines. The reflow number below is a real measurement of that gap, not a harness artifact."
     },
@@ -94,12 +94,12 @@
           "pass": true
         },
         "throughput": {
-          "value": 70285615,
+          "value": 74896531,
           "gate": 5242880,
           "pass": true
         }
       },
-      "throughputMBPerSec": 67.03,
+      "throughputMBPerSec": 71.427,
       "role": "oracle",
       "oracleSelfIdentity": true,
       "note": "cellFidelity/reflow are identity by construction (this candidate IS the oracle). Independent signals: throughput, native reflow on resize, and serializeRoundTripPct per fixture (SerializeAddon emits replayable VT)."
@@ -120,8 +120,8 @@
           "cellsTotal": 1920,
           "cursorMatch": false,
           "reflowFidelityPct": 96.875,
-          "throughputBytesPerSec": 306096,
-          "ingestMs": 0.385,
+          "throughputBytesPerSec": 313580,
+          "ingestMs": 0.376,
           "error": null
         },
         "xterm-headless": {
@@ -132,8 +132,8 @@
           "reflowIsNative": true,
           "serializeRoundTripPct": 100,
           "serializeBytes": 64,
-          "throughputBytesPerSec": 8221,
-          "ingestMs": 14.354,
+          "throughputBytesPerSec": 8116,
+          "ingestMs": 14.539,
           "error": null
         }
       },
@@ -153,8 +153,8 @@
           "cellsTotal": 1920,
           "cursorMatch": true,
           "reflowFidelityPct": 99.219,
-          "throughputBytesPerSec": 351406,
-          "ingestMs": 0.299,
+          "throughputBytesPerSec": 373002,
+          "ingestMs": 0.282,
           "error": null
         },
         "xterm-headless": {
@@ -165,8 +165,8 @@
           "reflowIsNative": true,
           "serializeRoundTripPct": 100,
           "serializeBytes": 21,
-          "throughputBytesPerSec": 7313,
-          "ingestMs": 14.358,
+          "throughputBytesPerSec": 6756,
+          "ingestMs": 15.543,
           "error": null
         }
       },
@@ -186,8 +186,8 @@
           "cellsTotal": 3000,
           "cursorMatch": true,
           "reflowFidelityPct": 100,
-          "throughputBytesPerSec": 616489,
-          "ingestMs": 1.226,
+          "throughputBytesPerSec": 611008,
+          "ingestMs": 1.237,
           "error": null
         },
         "xterm-headless": {
@@ -198,8 +198,8 @@
           "reflowIsNative": true,
           "serializeRoundTripPct": 100,
           "serializeBytes": 656,
-          "throughputBytesPerSec": 51280,
-          "ingestMs": 14.743,
+          "throughputBytesPerSec": 52975,
+          "ingestMs": 14.271,
           "error": null
         }
       },
@@ -219,8 +219,8 @@
           "cellsTotal": 1920,
           "cursorMatch": true,
           "reflowFidelityPct": 100,
-          "throughputBytesPerSec": 379961,
-          "ingestMs": 0.355,
+          "throughputBytesPerSec": 386156,
+          "ingestMs": 0.35,
           "error": null
         },
         "xterm-headless": {
@@ -231,8 +231,8 @@
           "reflowIsNative": true,
           "serializeRoundTripPct": 100,
           "serializeBytes": 133,
-          "throughputBytesPerSec": 9240,
-          "ingestMs": 14.611,
+          "throughputBytesPerSec": 8704,
+          "ingestMs": 15.51,
           "error": null
         }
       },
@@ -252,8 +252,8 @@
           "cellsTotal": 480,
           "cursorMatch": true,
           "reflowFidelityPct": 80.833,
-          "throughputBytesPerSec": 353463,
-          "ingestMs": 0.631,
+          "throughputBytesPerSec": 357831,
+          "ingestMs": 0.623,
           "error": null
         },
         "xterm-headless": {
@@ -264,8 +264,8 @@
           "reflowIsNative": true,
           "serializeRoundTripPct": 100,
           "serializeBytes": 148,
-          "throughputBytesPerSec": 19505,
-          "ingestMs": 11.433,
+          "throughputBytesPerSec": 15237,
+          "ingestMs": 14.636,
           "error": null
         }
       },
@@ -285,8 +285,8 @@
           "cellsTotal": 600,
           "cursorMatch": true,
           "reflowFidelityPct": 100,
-          "throughputBytesPerSec": 381220,
-          "ingestMs": 0.249,
+          "throughputBytesPerSec": 366937,
+          "ingestMs": 0.259,
           "error": null
         },
         "xterm-headless": {
@@ -297,8 +297,8 @@
           "reflowIsNative": true,
           "serializeRoundTripPct": 100,
           "serializeBytes": 85,
-          "throughputBytesPerSec": 6506,
-          "ingestMs": 14.601,
+          "throughputBytesPerSec": 6533,
+          "ingestMs": 14.541,
           "error": null
         }
       },
@@ -318,8 +318,8 @@
           "cellsTotal": 1440,
           "cursorMatch": true,
           "reflowFidelityPct": 98.438,
-          "throughputBytesPerSec": 332803,
-          "ingestMs": 0.817,
+          "throughputBytesPerSec": 321817,
+          "ingestMs": 0.845,
           "error": null
         },
         "xterm-headless": {
@@ -330,8 +330,8 @@
           "reflowIsNative": true,
           "serializeRoundTripPct": 100,
           "serializeBytes": 127,
-          "throughputBytesPerSec": 18407,
-          "ingestMs": 14.777,
+          "throughputBytesPerSec": 18647,
+          "ingestMs": 14.587,
           "error": null
         }
       },
@@ -351,8 +351,8 @@
           "cellsTotal": 840,
           "cursorMatch": true,
           "reflowFidelityPct": 100,
-          "throughputBytesPerSec": 368443,
-          "ingestMs": 1.173,
+          "throughputBytesPerSec": 381356,
+          "ingestMs": 1.133,
           "error": null
         },
         "xterm-headless": {
@@ -363,8 +363,8 @@
           "reflowIsNative": true,
           "serializeRoundTripPct": 100,
           "serializeBytes": 251,
-          "throughputBytesPerSec": 29530,
-          "ingestMs": 14.629,
+          "throughputBytesPerSec": 596685,
+          "ingestMs": 0.724,
           "error": null
         }
       },
@@ -384,8 +384,8 @@
           "cellsTotal": 1920,
           "cursorMatch": true,
           "reflowFidelityPct": 100,
-          "throughputBytesPerSec": 506701,
-          "ingestMs": 844.959,
+          "throughputBytesPerSec": 515630,
+          "ingestMs": 830.328,
           "error": null
         },
         "xterm-headless": {
@@ -396,8 +396,8 @@
           "reflowIsNative": true,
           "serializeRoundTripPct": 100,
           "serializeBytes": 2430,
-          "throughputBytesPerSec": 55087042,
-          "ingestMs": 7.772,
+          "throughputBytesPerSec": 28909956,
+          "ingestMs": 14.81,
           "error": null
         }
       },
@@ -417,8 +417,8 @@
           "cellsTotal": 600,
           "cursorMatch": true,
           "reflowFidelityPct": 100,
-          "throughputBytesPerSec": 553165,
-          "ingestMs": 0.163,
+          "throughputBytesPerSec": 636943,
+          "ingestMs": 0.141,
           "error": null
         },
         "xterm-headless": {
@@ -429,8 +429,8 @@
           "reflowIsNative": true,
           "serializeRoundTripPct": 100,
           "serializeBytes": 40,
-          "throughputBytesPerSec": 6177,
-          "ingestMs": 14.569,
+          "throughputBytesPerSec": 5747,
+          "ingestMs": 15.659,
           "error": null
         }
       },
@@ -450,8 +450,8 @@
           "cellsTotal": 5600,
           "cursorMatch": false,
           "reflowFidelityPct": 64.406,
-          "throughputBytesPerSec": 323520,
-          "ingestMs": 57.65,
+          "throughputBytesPerSec": 358908,
+          "ingestMs": 51.966,
           "error": null
         },
         "xterm-headless": {
@@ -462,8 +462,8 @@
           "reflowIsNative": true,
           "serializeRoundTripPct": 100,
           "serializeBytes": 8,
-          "throughputBytesPerSec": 1202778,
-          "ingestMs": 15.507,
+          "throughputBytesPerSec": 1284557,
+          "ingestMs": 14.519,
           "error": null
         }
       },
@@ -483,8 +483,8 @@
           "cellsTotal": 3200,
           "cursorMatch": false,
           "reflowFidelityPct": 97.656,
-          "throughputBytesPerSec": 379210,
-          "ingestMs": 1.203,
+          "throughputBytesPerSec": 417353,
+          "ingestMs": 1.093,
           "error": null
         },
         "xterm-headless": {
@@ -495,8 +495,8 @@
           "reflowIsNative": true,
           "serializeRoundTripPct": 100,
           "serializeBytes": 246,
-          "throughputBytesPerSec": 30457,
-          "ingestMs": 14.972,
+          "throughputBytesPerSec": 31810,
+          "ingestMs": 14.335,
           "error": null
         }
       },
@@ -516,8 +516,8 @@
           "cellsTotal": 960,
           "cursorMatch": true,
           "reflowFidelityPct": 100,
-          "throughputBytesPerSec": 360862,
-          "ingestMs": 3.553,
+          "throughputBytesPerSec": 378138,
+          "ingestMs": 3.39,
           "error": null
         },
         "xterm-headless": {
@@ -528,8 +528,8 @@
           "reflowIsNative": true,
           "serializeRoundTripPct": 100,
           "serializeBytes": 58,
-          "throughputBytesPerSec": 86110,
-          "ingestMs": 14.888,
+          "throughputBytesPerSec": 85938,
+          "ingestMs": 14.918,
           "error": null
         }
       },
@@ -549,8 +549,8 @@
           "cellsTotal": 5600,
           "cursorMatch": true,
           "reflowFidelityPct": 11.594,
-          "throughputBytesPerSec": 389762,
-          "ingestMs": 15.807,
+          "throughputBytesPerSec": 381477,
+          "ingestMs": 16.15,
           "error": null
         },
         "xterm-headless": {
@@ -561,8 +561,8 @@
           "reflowIsNative": true,
           "serializeRoundTripPct": 100,
           "serializeBytes": 6156,
-          "throughputBytesPerSec": 420133,
-          "ingestMs": 14.664,
+          "throughputBytesPerSec": 464371,
+          "ingestMs": 13.267,
           "error": null
         }
       },
@@ -582,8 +582,8 @@
           "cellsTotal": 1800,
           "cursorMatch": true,
           "reflowFidelityPct": 100,
-          "throughputBytesPerSec": 628966,
-          "ingestMs": 0.882,
+          "throughputBytesPerSec": 609823,
+          "ingestMs": 0.91,
           "error": null
         },
         "xterm-headless": {
@@ -594,8 +594,8 @@
           "reflowIsNative": true,
           "serializeRoundTripPct": 100,
           "serializeBytes": 525,
-          "throughputBytesPerSec": 52256,
-          "ingestMs": 10.621,
+          "throughputBytesPerSec": 37669,
+          "ingestMs": 14.734,
           "error": null
         }
       },
@@ -615,8 +615,8 @@
           "cellsTotal": 5600,
           "cursorMatch": true,
           "reflowFidelityPct": 62.406,
-          "throughputBytesPerSec": 543849,
-          "ingestMs": 3.104,
+          "throughputBytesPerSec": 514383,
+          "ingestMs": 3.282,
           "error": null
         },
         "xterm-headless": {
@@ -627,8 +627,8 @@
           "reflowIsNative": true,
           "serializeRoundTripPct": 100,
           "serializeBytes": 1114,
-          "throughputBytesPerSec": 117289,
-          "ingestMs": 14.392,
+          "throughputBytesPerSec": 111773,
+          "ingestMs": 15.102,
           "error": null
         }
       },
@@ -648,8 +648,8 @@
           "cellsTotal": 4800,
           "cursorMatch": true,
           "reflowFidelityPct": 100,
-          "throughputBytesPerSec": 384559,
-          "ingestMs": 4004.585,
+          "throughputBytesPerSec": 389093,
+          "ingestMs": 3957.923,
           "error": null
         },
         "xterm-headless": {
@@ -660,8 +660,8 @@
           "reflowIsNative": true,
           "serializeRoundTripPct": 100,
           "serializeBytes": 367851,
-          "throughputBytesPerSec": 70285615,
-          "ingestMs": 21.911,
+          "throughputBytesPerSec": 74896531,
+          "ingestMs": 20.562,
           "error": null
         }
       },
@@ -681,8 +681,8 @@
           "cellsTotal": 5608,
           "cursorMatch": false,
           "reflowFidelityPct": 84.352,
-          "throughputBytesPerSec": 436760,
-          "ingestMs": 13.525,
+          "throughputBytesPerSec": 428211,
+          "ingestMs": 13.795,
           "error": null
         },
         "xterm-headless": {
@@ -693,8 +693,8 @@
           "reflowIsNative": true,
           "serializeRoundTripPct": 100,
           "serializeBytes": 42,
-          "throughputBytesPerSec": 430608,
-          "ingestMs": 13.718,
+          "throughputBytesPerSec": 1952598,
+          "ingestMs": 3.025,
           "error": null
         }
       },
@@ -714,8 +714,8 @@
           "cellsTotal": 1003,
           "cursorMatch": false,
           "reflowFidelityPct": 99.251,
-          "throughputBytesPerSec": 587827,
-          "ingestMs": 0.577,
+          "throughputBytesPerSec": 592865,
+          "ingestMs": 0.572,
           "error": null
         },
         "xterm-headless": {
@@ -726,8 +726,8 @@
           "reflowIsNative": true,
           "serializeRoundTripPct": 100,
           "serializeBytes": 339,
-          "throughputBytesPerSec": 300000,
-          "ingestMs": 1.13,
+          "throughputBytesPerSec": 22755,
+          "ingestMs": 14.898,
           "error": null
         }
       },
