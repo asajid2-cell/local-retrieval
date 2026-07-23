@@ -295,3 +295,206 @@ public sealed class RemoteApiTests
         StringAssert.Contains(json, "already running");
     }
 }
+
+// The command pollers' admission behaviour. Both pollers (MainPage.Remote.cs PollCommandsAsync, the GUI
+// twin, and RemoteBridge.cs PollAndProcessAsync, headless) run ONE gate — IntentLedger.Admit — before any
+// handler, so driving that gate in the pollers' own loop shape IS driving their decision. The source-level
+// tests below pin that equivalence so the simulation cannot drift away from the shipped pollers.
+[TestClass]
+public sealed class RemoteApiCommandPollerTests
+{
+    private sealed record PolledCommand(string id, string type, string replayPolicy, string intentId, string leaseToken);
+
+    private sealed record PolledAck(string commandId, string leaseToken, bool ok, string detail);
+
+    // The exact loop body both pollers share: gate -> (only if admitted) side effect -> record -> ack.
+    private sealed class PollerHarness
+    {
+        private readonly RemoteCommandProtocol.IntentLedger _commandIntents = new();
+        public List<string> SideEffects { get; } = new();
+        public List<PolledAck> Acks { get; } = new();
+
+        public void Deliver(params PolledCommand[] batch)
+        {
+            foreach (var c in batch)
+            {
+                if (string.IsNullOrEmpty(c.id)) continue;
+                (bool ok, string detail) res;
+                var admission = _commandIntents.Admit(c.type, c.replayPolicy, c.intentId, c.leaseToken, out var gated);
+                if (admission != RemoteCommandAdmission.Execute)
+                {
+                    res = gated;
+                }
+                else
+                {
+                    // stand-ins for FetchAndInsertAsync / StartMuxHeadless*: reaching here IS the side effect
+                    SideEffects.Add($"{c.type}:{c.intentId}");
+                    res = (true, $"{c.type} executed");
+                }
+                if (admission == RemoteCommandAdmission.Execute) _commandIntents.Record(c.intentId, res.ok, res.detail);
+                Acks.Add(new PolledAck(c.id, c.leaseToken, res.ok, res.detail));
+            }
+        }
+    }
+
+    private static PolledCommand Fenced(string id, string type, string intentId, string leaseToken)
+        => new(id, type, "intent-fenced", intentId, leaseToken);
+
+    [DataTestMethod]
+    [DataRow("fetchfile")]
+    [DataRow("startmux")]
+    public void Poller_RefusesAnIntentFencedCommandWithNoLeaseToken_NoSideEffect(string type)
+    {
+        var poller = new PollerHarness();
+
+        poller.Deliver(Fenced("c1", type, "intent-1", ""));
+
+        Assert.AreEqual(0, poller.SideEffects.Count, "a leaseless command must not reach the handler");
+        Assert.AreEqual(1, poller.Acks.Count, "the relay still has to be told, or the command is stuck");
+        Assert.IsFalse(poller.Acks[0].ok);
+        StringAssert.Contains(poller.Acks[0].detail, "lease token");
+    }
+
+    [DataTestMethod]
+    [DataRow("fetchfile")]
+    [DataRow("startmux")]
+    public void Poller_RefusesAnIntentFencedCommandWithNoIntentId_NoSideEffect(string type)
+    {
+        var poller = new PollerHarness();
+
+        // "" is what the DTOs deserialize to when the field is absent — an old relay or a hand-rolled body
+        poller.Deliver(Fenced("c1", type, "", "lease-1"), Fenced("c2", type, "  ", "lease-1"), Fenced("c3", type, "bad intent", "lease-1"));
+
+        Assert.AreEqual(0, poller.SideEffects.Count, "an intent-less command must not reach the handler");
+        Assert.AreEqual(3, poller.Acks.Count);
+        Assert.IsTrue(poller.Acks.TrueForAll(a => !a.ok), "every refusal must ack as failed");
+        StringAssert.Contains(poller.Acks[0].detail, "intent id");
+        StringAssert.Contains(poller.Acks[2].detail, "malformed");
+    }
+
+    [DataTestMethod]
+    [DataRow("fetchfile")]
+    [DataRow("startmux")]
+    public void Poller_ExecutesOnceForAValidEnvelope_AndDedupsARedelivery(string type)
+    {
+        var poller = new PollerHarness();
+
+        // the relay re-leases an unacked command under a FRESH lease token but the SAME intent id
+        poller.Deliver(Fenced("c1", type, "intent-1", "lease-1"));
+        poller.Deliver(Fenced("c2", type, "intent-1", "lease-2"));
+
+        CollectionAssert.AreEqual(new[] { $"{type}:intent-1" }, poller.SideEffects, "the redelivery must not run a second time");
+        Assert.AreEqual(2, poller.Acks.Count, "the duplicate still gets acked, or the relay retries forever");
+        Assert.IsTrue(poller.Acks[1].ok, "the dedup ack replays the original outcome");
+        Assert.AreEqual(poller.Acks[0].detail, poller.Acks[1].detail);
+        Assert.AreEqual("lease-2", poller.Acks[1].leaseToken, "the ack echoes THIS delivery's lease, not the original");
+    }
+
+    [TestMethod]
+    public void Poller_KeepsRunningIdempotentCommandsAndRefusesAWrongPolicy()
+    {
+        var poller = new PollerHarness();
+
+        poller.Deliver(
+            new PolledCommand("c1", "rename", "idempotent", "", ""),          // no envelope needed
+            new PolledCommand("c2", "rename", "idempotent", "", ""),          // and redelivery may re-run
+            new PolledCommand("c3", "fetchfile", "idempotent", "i", "l"),     // fenced type, wrong policy
+            new PolledCommand("c4", "future-mutation", "idempotent", "i", "l"));
+
+        CollectionAssert.AreEqual(new[] { "rename:", "rename:" }, poller.SideEffects);
+        Assert.IsFalse(poller.Acks[2].ok);
+        StringAssert.Contains(poller.Acks[2].detail, "replay policy");
+        Assert.IsFalse(poller.Acks[3].ok);
+    }
+
+    // ---- fetchfile contract regression -------------------------------------------------------------
+
+    // RemoteUploadTransfer.InsertDownloadedPathAsync: an insert-mode-less fetchfile reports the download in
+    // its status Detail and must NEVER push a prompt into a mux tab. The envelope gate sits in front of this
+    // path, so it is exactly the behaviour a valid-envelope fetchfile is allowed to have.
+    [TestMethod]
+    public async Task FetchFile_WithoutAnInsertMode_ReportsTheDownloadAndInsertsNothing()
+    {
+        var muxCalls = 0;
+        Task<string> MuxRequest(object _) { muxCalls++; return Task.FromResult("{\"ok\":true}"); }
+
+        foreach (var insert in new string?[] { null, "", "   " })
+        {
+            var result = await RemoteUploadTransfer.InsertDownloadedPathAsync(
+                Path.Combine(Path.GetTempPath(), "report.pdf"),
+                "report.pdf",
+                "mux-tab-a",
+                insert,
+                "intent-1",
+                MuxRequest);
+
+            Assert.IsTrue(result.Ok);
+            Assert.AreEqual("downloaded to PC", result.Detail, "the Detail IS the user-facing status for a no-insert fetch");
+            Assert.IsTrue(result.OnPc);
+        }
+        Assert.AreEqual(0, muxCalls, "a fetchfile with no insert mode must never write to a mux tab");
+    }
+
+    // ---- the shipped pollers really are gated this way ---------------------------------------------
+
+    [DataTestMethod]
+    [DataRow("native/CodexLocalRetrieval.Native/MainPage.Remote.cs", "private async Task PollCommandsAsync")]
+    [DataRow("native/CodexLocalRetrieval.Core/Remote/RemoteBridge.cs", "private async Task PollAndProcessAsync")]
+    public void BothPollers_GateOnTheIntentLedgerBeforeAnySideEffect(string relativePath, string pollerSignature)
+    {
+        var source = File.ReadAllText(Path.Combine(FindRepoRoot(), relativePath.Replace('/', Path.DirectorySeparatorChar)));
+        var start = source.IndexOf(pollerSignature, StringComparison.Ordinal);
+        Assert.IsGreaterThanOrEqualTo(0, start, $"{relativePath} no longer declares {pollerSignature}");
+        var poller = source[start..];
+
+        var admit = poller.IndexOf("_commandIntents.Admit(c.type, c.replayPolicy, c.intentId, c.leaseToken", StringComparison.Ordinal);
+        Assert.IsGreaterThanOrEqualTo(0, admit, "the poller must run the full envelope gate, not just a policy check");
+
+        foreach (var sideEffect in new[] { "RemoteUploadTransfer.", "StartMuxHeadless" })
+        {
+            var handler = poller.IndexOf(sideEffect, StringComparison.Ordinal);
+            Assert.IsGreaterThanOrEqualTo(0, handler, $"{sideEffect} handler is missing from the poller");
+            Assert.IsTrue(handler > admit, $"{sideEffect} must run AFTER the envelope gate, never before it");
+        }
+
+        var record = poller.IndexOf("_commandIntents.Record(", StringComparison.Ordinal);
+        var ack = poller.IndexOf("await AckCommandAsync(", StringComparison.Ordinal);
+        Assert.IsGreaterThanOrEqualTo(0, record, "the outcome must be recorded so a redelivery can replay it");
+        Assert.IsTrue(record > admit && ack > record, "record the outcome after execution and before the ack");
+        StringAssert.Contains(poller[admit..ack], "RemoteCommandAdmission.Execute", "only an Execute admission may run a handler");
+
+        // the bare policy check is no longer a gate on its own anywhere in the poller
+        Assert.IsFalse(
+            poller[..ack].Contains("RemoteCommandProtocol.IsReplaySafe", StringComparison.Ordinal),
+            "IsReplaySafe alone must not gate a polled command — it proves semantics, not currency");
+    }
+
+    // A polled start must never substitute a freshly minted local intent: muxd would see a brand-new intent
+    // on every redelivery and its dedup would be defeated.
+    [TestMethod]
+    public void RemoteStartMux_NeverMintsALocalIntent()
+    {
+        var remote = File.ReadAllText(Path.Combine(
+            FindRepoRoot(), "native", "CodexLocalRetrieval.Native", "MainPage.Remote.cs"));
+
+        StringAssert.Contains(remote, "allowLocalIntentMint: false", "the polled startmux path must opt out of minting");
+        var guard = remote.IndexOf("if (!allowLocalIntentMint && !RemoteCommandProtocol.IsWellFormedEnvelopeToken(intentId))", StringComparison.Ordinal);
+        Assert.IsGreaterThanOrEqualTo(0, guard, "the raw mux-create must refuse a mint-less start with no usable intent");
+
+        var mint = remote.IndexOf("RemoteCommandProtocol.NewIntent(", guard, StringComparison.Ordinal);
+        Assert.IsGreaterThanOrEqualTo(0, mint, "the GUI-originated start still mints its own intent");
+        Assert.IsTrue(mint > guard, "the refusal must come BEFORE the mint, or the remote path mints anyway");
+    }
+
+    private static string FindRepoRoot()
+    {
+        var dir = new DirectoryInfo(AppContext.BaseDirectory);
+        while (dir is not null)
+        {
+            if (File.Exists(Path.Combine(dir.FullName, "CodexLocalRetrieval.sln")))
+                return dir.FullName;
+            dir = dir.Parent;
+        }
+        throw new DirectoryNotFoundException("Could not find CodexLocalRetrieval.sln from " + AppContext.BaseDirectory);
+    }
+}
