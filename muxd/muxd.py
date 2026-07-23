@@ -19,6 +19,7 @@ import faulthandler
 try: faulthandler.enable(open(os.path.join(os.path.expanduser("~"), "muxd", "muxd.crash"), "a"))
 except Exception: pass
 from winpty import PtyProcess
+import host_input_intent
 
 HOME = os.path.expanduser("~")
 DIR = os.path.join(HOME, "muxd")
@@ -904,7 +905,11 @@ CLAIM_ROOT = ENV.get("LAUNCH_CLAIM_ROOT") or os.path.join(
 )
 CLAIM_TTL_SECONDS = max(10, int(ENV.get("LAUNCH_CLAIM_TTL_SECONDS", "120")))
 PROTOCOL = 4
-CAPS = ["ls", "info", "create", "createAck", "bind", "input", "open", "attach", "kill", "rename", "heal", "tail", "scrollback", "resize", "owner", "relaunch"]
+CAPS = ["ls", "info", "create", "createAck", "bind", "input", "open", "attach", "kill", "rename", "heal", "tail", "scrollback", "resize", "owner", "relaunch", "inputDurable"]
+# The relay is a conduit, not an authority: a host-link `i` frame only reaches the PTY when it
+# carries a principal-signed input.durable proof this endpoint verifies. Empty until pairing
+# provisions a principal, which means "refuse everything" — the correct posture, not a gap.
+PRINCIPAL_ENDPOINT = host_input_intent.PrincipalEndpoint()
 STARTED = time.time()
 AGENT_WORKING_FRESH = float(ENV.get("AGENT_WORKING_FRESH", "25"))
 AGENT_STARTING_GRACE = float(ENV.get("AGENT_STARTING_GRACE", "45"))
@@ -2644,8 +2649,13 @@ async def main():
                 )
             return result
 
-    async def execute_input_intent(first, session, data, scope="local"):
-        supplied = first.get("intentId")
+    async def execute_input_intent(first, session, data, scope="local", principal=None):
+        # A verified principal replaces the caller-declared scope outright. `scope="relay"` said
+        # "the relay asked for this", which is not an identity; `principal:<id>` names who
+        # authorized it, so two principals can never collide on one intent id.
+        if principal is not None:
+            scope = principal.intent_scope
+        supplied = first.get("intentId") if principal is None else principal.intent_id
         request_id = intent_id(supplied)
         if supplied and not request_id:
             return {"t": "err", "m": "invalid intent id"}
@@ -2666,12 +2676,17 @@ async def main():
             data,
             scope,
             request_id,
+            principal,
         )
 
     @state_mutation
-    async def execute_durable_input_intent(first, session, data, scope, request_id):
+    async def execute_durable_input_intent(first, session, data, scope, request_id, principal=None):
         key = intent_key(scope, "input", request_id)
-        fingerprint = intent_fingerprint(first)
+        # For a signed intent the replay identity is the authorized tuple
+        # (principalId, keyId, sessionUuid, intentId, bodySha256) — not the frame shape. A
+        # reconnect re-signs with a fresh issuedAtMs, and that is the same operation; different
+        # bytes under the same intent id are not, and still fail closed below.
+        fingerprint = principal.intent_fingerprint if principal is not None else intent_fingerprint(first)
         async with operation_lock(key):
             record = intent_records.get(key)
             if record is not None:
