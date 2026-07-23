@@ -48,6 +48,7 @@ public sealed class LedgerReadTests
         PerfRecord.Measure("ledger.readForSession.quiet.bytesRead", bytesRead, "bytes");
         PerfRecord.Measure("ledger.readForSession.backfill.ms", backfillWatch.Elapsed.TotalMilliseconds, "ms");
         PerfRecord.Measure("ledger.readForSession.backfill.bytesRead", backfillBytes, "bytes");
+        PerfRecord.Counters("ledger.readForSession");
 
         Assert.HasCount(2, events);
         Assert.AreEqual("target.newer", events[0].Kind);
