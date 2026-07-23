@@ -334,4 +334,95 @@ public sealed class TranscriptFetchTests
         Assert.IsTrue(RemoteCommandProtocol.IsReplaySafe("transcriptfetch", "read-only"));
         Assert.IsFalse(RemoteCommandProtocol.IsReplaySafe("transcriptfetch", "idempotent"));
     }
+
+    // ---- AdmitFetch: the trust fence itself ------------------------------------------------
+    // MainPage is pure I/O wiring; the decision lives here, so these are the tests that actually
+    // hold the amendment "one explicit opaque session id and a bounded fetch TTL; never bulk-mirror".
+
+    private const string GoodToken = "brdg_ABCDEFGHIJKLMNOP0123456789";
+
+    [TestMethod]
+    public void AdmitFetch_AdmitsAWellFormedRequest()
+    {
+        var a = TranscriptFetchProjection.AdmitFetch(Sid, GoodToken, 30_000);
+        Assert.IsTrue(a.Allowed);
+        Assert.AreEqual("", a.Reason);
+    }
+
+    [TestMethod]
+    public void AdmitFetch_TrimsSurroundingWhitespaceOnTheId()
+    {
+        Assert.IsTrue(TranscriptFetchProjection.AdmitFetch("  " + Sid + "  ", GoodToken, 30_000).Allowed);
+    }
+
+    [DataRow(null)]
+    [DataRow("")]
+    [DataRow("   ")]
+    [DataRow("a b")]           // space
+    [DataRow("a\"b")]          // quote
+    [DataRow("a'b")]
+    [DataRow("../etc/passwd")] // slash + traversal
+    [DataRow("a\rb")]
+    [DataRow("a\nb")]
+    [DataRow("a;rm -rf /")]
+    [DataTestMethod]
+    public void AdmitFetch_RejectsAnIdThatIsNotOpaque(string? id)
+    {
+        var a = TranscriptFetchProjection.AdmitFetch(id, GoodToken, 30_000);
+        Assert.IsFalse(a.Allowed);
+        Assert.AreEqual("transcript fetch needs one explicit opaque session id", a.Reason);
+    }
+
+    [DataRow(null)]
+    [DataRow("")]
+    [DataRow("short")]                 // under the 8-char floor
+    [DataRow("has spaces in it")]
+    [DataRow("bad\ntoken-value-here")]
+    [DataTestMethod]
+    public void AdmitFetch_RejectsACredentialThatIsNotScoped(string? token)
+    {
+        var a = TranscriptFetchProjection.AdmitFetch(Sid, token, 30_000);
+        Assert.IsFalse(a.Allowed);
+        Assert.AreEqual("transcript fetch needs a scoped bridge credential", a.Reason);
+    }
+
+    [DataRow(0)]
+    [DataRow(-1)]
+    [DataRow(TranscriptFetchProjection.MaxFetchTtlMs + 1)]
+    [DataRow(int.MaxValue)]
+    [DataTestMethod]
+    public void AdmitFetch_RejectsAnUnboundedTtl(int ttlMs)
+    {
+        var a = TranscriptFetchProjection.AdmitFetch(Sid, GoodToken, ttlMs);
+        Assert.IsFalse(a.Allowed);
+        Assert.AreEqual(
+            $"transcript fetch needs a bounded ttlMs in 1..{TranscriptFetchProjection.MaxFetchTtlMs}",
+            a.Reason);
+    }
+
+    [DataRow(1)]
+    [DataRow(TranscriptFetchProjection.MaxFetchTtlMs)]
+    [DataTestMethod]
+    public void AdmitFetch_TtlBoundsAreInclusive(int ttlMs)
+    {
+        Assert.IsTrue(TranscriptFetchProjection.AdmitFetch(Sid, GoodToken, ttlMs).Allowed);
+    }
+
+    // Order matters: an operator debugging a bad request should be told about the id first, because
+    // a bad id is the failure that means "this is not a scoped single-chat read at all".
+    [TestMethod]
+    public void AdmitFetch_ReportsTheSessionIdReasonFirstWhenEverythingIsWrong()
+    {
+        var a = TranscriptFetchProjection.AdmitFetch("bad id/../", "x", 0);
+        Assert.IsFalse(a.Allowed);
+        Assert.AreEqual("transcript fetch needs one explicit opaque session id", a.Reason);
+    }
+
+    [TestMethod]
+    public void AdmitFetch_ReportsTheCredentialReasonBeforeTheTtlReason()
+    {
+        var a = TranscriptFetchProjection.AdmitFetch(Sid, "x", 0);
+        Assert.IsFalse(a.Allowed);
+        Assert.AreEqual("transcript fetch needs a scoped bridge credential", a.Reason);
+    }
 }

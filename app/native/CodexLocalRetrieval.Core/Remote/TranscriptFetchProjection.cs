@@ -37,6 +37,27 @@ public static class TranscriptFetchProjection
 
     public static bool IsCredential(string? token) => !string.IsNullOrEmpty(token) && Credential.IsMatch(token);
 
+    // A fetch is bounded in time as well as in scope: 10 minutes is generous for 32 pages over ssh
+    // and still stops a stale lease from dribbling history out indefinitely.
+    public const int MaxFetchTtlMs = 10 * 60 * 1000;
+
+    public sealed record FetchAdmission(bool Allowed, string Reason);
+
+    // The BINDING trust fence for transcriptfetch: one explicit opaque session id, a scoped bridge
+    // credential, and a bounded TTL — never a bulk mirror of history. Evaluated in a fixed order so
+    // the operator-visible reason is deterministic; the reason strings are the wire text MainPage
+    // returns, so they must not drift.
+    public static FetchAdmission AdmitFetch(string? sessionId, string? bridgeToken, int ttlMs)
+    {
+        if (!IsOpaqueId(sessionId?.Trim()))
+            return new FetchAdmission(false, "transcript fetch needs one explicit opaque session id");
+        if (!IsCredential(bridgeToken))
+            return new FetchAdmission(false, "transcript fetch needs a scoped bridge credential");
+        if (ttlMs <= 0 || ttlMs > MaxFetchTtlMs)
+            return new FetchAdmission(false, $"transcript fetch needs a bounded ttlMs in 1..{MaxFetchTtlMs}");
+        return new FetchAdmission(true, "");
+    }
+
     // Redaction honours app/REMOTE.md: direct reads ship raw over the user's own authenticated
     // channel unless CLR_REMOTE_REDACT_READS=1, which scrubs secret shapes out of message bodies.
     public static bool RedactReadsEnabled()

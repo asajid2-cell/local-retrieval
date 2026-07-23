@@ -495,12 +495,8 @@ public sealed partial class MainPage
     private async Task<(bool ok, string detail)> PushTranscriptPagesAsync(string target, int port, AppCommand c)
     {
         var sessionId = (c.sessionId ?? "").Trim();
-        if (!TranscriptFetchProjection.IsOpaqueId(sessionId))
-            return (false, "transcript fetch needs one explicit opaque session id");
-        if (!TranscriptFetchProjection.IsCredential(c.bridgeToken))
-            return (false, "transcript fetch needs a scoped bridge credential");
-        if (c.ttlMs <= 0 || c.ttlMs > MaxTranscriptFetchTtlMs)
-            return (false, $"transcript fetch needs a bounded ttlMs in 1..{MaxTranscriptFetchTtlMs}");
+        var admission = TranscriptFetchProjection.AdmitFetch(sessionId, c.bridgeToken, c.ttlMs);
+        if (!admission.Allowed) return (false, admission.Reason);
 
         var session = _archive.ResolveSessionByIdOrAlias(sessionId, c.tool);
         if (session is null) return (false, "chat not in this app's archive");
@@ -531,8 +527,6 @@ public sealed partial class MainPage
         Diag.Log($"Transcript fetch pushed {pushed} page(s) for session={sessionId} redact={redact}");
         return (true, $"pushed {pushed} page(s){(redact ? " (redacted)" : "")}");
     }
-
-    private const int MaxTranscriptFetchTtlMs = 10 * 60 * 1000;
 
     private static async Task AckCommandAsync(string target, int port, string commandId, string ackJson)
     {
