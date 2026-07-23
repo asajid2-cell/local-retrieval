@@ -350,8 +350,8 @@ public sealed class ArchitectureLaunchSurfaceTests
                 text.Contains("c.intentId", StringComparison.Ordinal),
                 Path.GetFileName(file) + " must propagate the relay intent into muxd.");
             Assert.IsTrue(
-                text.Contains("RemoteCommandProtocol.IsReplaySafe", StringComparison.Ordinal),
-                Path.GetFileName(file) + " must refuse command types without an explicit replay policy.");
+                text.Contains("_commandIntents.Admit(c.type, c.replayPolicy, c.intentId, c.leaseToken", StringComparison.Ordinal),
+                Path.GetFileName(file) + " must refuse commands whose replay policy is missing or invalid, and — for intent-fenced types — whose lease token or intent id is missing or malformed.");
             Assert.IsTrue(
                 text.Contains("AckCommandAsync", StringComparison.Ordinal),
                 Path.GetFileName(file) + " must retry acknowledgement with the same fenced lease token.");
