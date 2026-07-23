@@ -1209,6 +1209,13 @@ WATCHDOG_STARTED = False
 
 
 SESSION_OUT_BUDGET_BYTES = max(65536, int(ENV.get("RELAY_SESSION_OUT_BUDGET", str(1 << 20))))
+# Frame bound per session, a BACKSTOP behind the byte budget. A byte budget alone does not bound
+# the ENTRY count: a million 1-byte chunks fit inside a 1MiB budget and cost a million deque slots.
+# Deliberately loose (not 64): the byte budget is the real policy, and anything tight enough to
+# fire on ordinary backlog would gap quiet sessions — a session sitting on 200 short lines while
+# the link stalls is not flooding. At 4096 frames this can only win the race when the average
+# chunk is under 256B, i.e. exactly the pathology the byte budget cannot see.
+RELAY_SESSION_QUEUE_MAX = max(8, int(ENV.get("RELAY_SESSION_QUEUE_MAX", "4096")))
 
 class RelayOutQueue:
     """Per-session, byte-bounded relay egress drained ROUND-ROBIN into the relay ws.
@@ -1229,16 +1236,47 @@ class RelayOutQueue:
 
     _MAX_TRACKED = 256
 
-    def __init__(self, budget=None):
+    def __init__(self, budget=None, maxsize=None):
         self.budget = int(budget or SESSION_OUT_BUDGET_BYTES)
+        self.maxsize = int(maxsize or RELAY_SESSION_QUEUE_MAX)
         self._queues = {}            # session name -> deque of (kind, name, data)
         self._bytes = {}             # session name -> queued output bytes
         self._order = []             # round-robin ring, insertion-ordered
         self._cursor = 0
+        self._control = collections.deque()   # every non-"o" kind; drained BEFORE terminal bytes
+        self._dropped = {}           # session name -> chunks this session alone lost
         self._resync_pending = set()
         self._wake = asyncio.Event()
-        self.dropped = 0
         self.resyncs = 0
+
+    @property
+    def dropped(self):
+        return sum(self._dropped.values())
+
+    @dropped.setter
+    def dropped(self, value):
+        # The reconnect reset does `outq.dropped = 0`; that must zero every shard's tally.
+        self._dropped.clear()
+        if value:
+            self._dropped[""] = int(value)
+
+    def per_session_dropped(self):
+        """{session name: chunks dropped} for shards that actually lost something.
+
+        A single global counter could not answer the only question that matters when output goes
+        missing: WHICH tab is flooding."""
+        return {k: v for k, v in self._dropped.items() if v}
+
+    def forget(self, name):
+        """Drop a gone session's shard. Its queued output can never be delivered anywhere."""
+        key = name or ""
+        self._queues.pop(key, None)
+        self._bytes.pop(key, None)
+        self._dropped.pop(key, None)
+        self._resync_pending.discard(key)
+        if key in self._order:
+            self._order = [k for k in self._order if k != key]
+            self._cursor = 0
 
     def _track(self, key):
         q = self._queues.get(key)
@@ -1259,24 +1297,31 @@ class RelayOutQueue:
         if idle:
             self._order = [k for k in self._order if k not in set(idle)]
             self._cursor = 0
+        for k in [k for k, v in self._dropped.items() if not v]:
+            self._dropped.pop(k, None)
 
     def put_nowait(self, item):
         kind, name, data = item
         key = name or ""
+        if kind != "o":
+            # Control frames ride their own shard. A `("dead", name, "")` is a session-list refresh;
+            # queued behind a flooding tab's terminal bytes it arrives seconds late, so the relay
+            # shows a zombie session the whole time. It is never dropped and never waits on bytes.
+            self._control.append((kind, key, data))
+            self._wake.set()
+            return True
         q = self._track(key)
         size = len(data) if isinstance(data, (bytes, bytearray, memoryview)) else 0
-        if kind == "o" and self._bytes[key] + size > self.budget:
-            # This session alone blew its budget. Drop ITS backlog at frame boundaries and keep
-            # every non-output frame (a lost "dead" would leave a zombie in the relay's list).
-            self.dropped += sum(1 for queued in q if queued[0] == "o")
-            keep = [queued for queued in q if queued[0] != "o"]
+        if self._bytes[key] + size > self.budget or len(q) >= self.maxsize:
+            # This session alone blew its budget (bytes OR frames). Drop ITS backlog at frame
+            # boundaries; control frames were never in here to lose.
+            self._dropped[key] = self._dropped.get(key, 0) + len(q)
             q.clear()
-            q.extend(keep)
             self._bytes[key] = 0
             if key not in self._resync_pending:
                 self._resync_pending.add(key)
                 self.resyncs += 1
-                q.append(("resync", key, b""))
+                self._control.append(("resync", key, b""))
             self._wake.set()
             return False           # the overflowing chunk goes too; the resync replay supersedes it
         q.append((kind, key, data))
@@ -1285,6 +1330,11 @@ class RelayOutQueue:
         return True
 
     def _pop(self):
+        if self._control:
+            item = self._control.popleft()
+            if item[0] == "resync":
+                self._resync_pending.discard(item[1])
+            return item
         total = len(self._order)
         for step in range(total):
             index = (self._cursor + step) % total
@@ -1319,10 +1369,16 @@ class RelayOutQueue:
             await self._wake.wait()
 
     def qsize(self):
-        return sum(len(q) for q in self._queues.values())
+        return len(self._control) + sum(len(q) for q in self._queues.values())
 
     def empty(self):
         return self.qsize() == 0
+
+
+# The relay-egress fanout role is played by RelayOutQueue itself: it already owns one shard per
+# session plus a control shard and drains them round-robin, so a separate wrapper would only be a
+# second sharding layer over an already-sharded queue.
+RelayFanout = RelayOutQueue
 
 LOCAL_VIEWER_QUEUE_MAX = 64          # ~768ms of link/loop-lag tolerance (was 4 = ~48ms -> spurious detaches)
 LOCAL_VIEWER_SLOW = object()
