@@ -18,9 +18,34 @@ const net = require('node:net');
 const os = require('node:os');
 const path = require('node:path');
 const { once } = require('node:events');
-const WebSocket = require('ws');
 
 const REPO = path.resolve(__dirname, '..');
+
+// relay/node_modules is gitignored, so a fresh clone or git worktree has no deps at all -- and both
+// this harness and the server.js it spawns need ws/express. Without this the whole file dies at
+// require time with MODULE_NOT_FOUND, which reads like a broken test rather than an unbuilt tree.
+// Restores from the npm cache (~1s, no network needed once populated).
+function ensureRelayDeps() {
+  try {
+    require.resolve('ws');
+    require.resolve('express');
+    return;
+  } catch { /* not installed yet */ }
+  const res = childProcess.spawnSync(
+    'npm', ['install', '--prefer-offline', '--no-audit', '--no-fund'],
+    { cwd: REPO, encoding: 'utf8', shell: true, timeout: 120000 }
+  );
+  if (res.status !== 0) {
+    throw new Error(
+      `relay deps missing and "npm install" failed in ${REPO} (status=${res.status}); ` +
+      `run it by hand.\n${res.stderr || res.stdout || res.error}`
+    );
+  }
+}
+ensureRelayDeps();
+
+const WebSocket = require('ws');
+
 const HOST_CAPS = ['create', 'createAck', 'kill', 'rename', 'heal', 'tail', 'scrollback', 'relaunch'];
 
 // Mirror of server.js CLEAR_SCREEN. Duplicated on purpose: if the server's prefix changes, these
