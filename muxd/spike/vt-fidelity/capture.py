@@ -39,7 +39,8 @@ DEFAULT_MAX = 800_000      # brief: t:'sb' max
 
 # ---------------------------------------------------------------- fixtures
 
-def write_fixture(name, data: bytes, *, cols, rows, source, desc, recorded_real):
+def write_fixture(name, data: bytes, *, cols, rows, source, desc, recorded_real,
+                  capture_method):
     os.makedirs(OUTDIR, exist_ok=True)
     binp = os.path.join(OUTDIR, name + ".bin")
     with open(binp, "wb") as f:
@@ -52,6 +53,8 @@ def write_fixture(name, data: bytes, *, cols, rows, source, desc, recorded_real)
         "bytes": len(data),
         "source": source,
         "desc": desc,
+        # "live-muxd" | "conpty-<preset>" — how these bytes were obtained.
+        "captureMethod": capture_method,
         # Orchestrator flag: true means these bytes are a transcript of a real
         # session on this runner and must be reviewed before being committed.
         "containsRecordedSessionContent": bool(recorded_real),
@@ -65,15 +68,22 @@ def write_fixture(name, data: bytes, *, cols, rows, source, desc, recorded_real)
 
 # ---------------------------------------------------------------- live ws
 
-async def _ws_connect():
+def _ws_connect():
+    """Return the awaitable async context manager websockets.connect() hands back.
+
+    Deliberately NOT `async def` + `await`: pre-awaiting connect() yields a bare
+    connection object, which under the installed websockets release does not
+    implement __aenter__ ("does not support the asynchronous context manager
+    protocol"). Callers must do `async with _ws_connect() as ws:`.
+    """
     import websockets
-    return await websockets.connect(
+    return websockets.connect(
         f"ws://127.0.0.1:{LOCAL_PORT}", max_size=None, open_timeout=6
     )
 
 
 async def list_sessions():
-    async with await _ws_connect() as ws:
+    async with _ws_connect() as ws:
         await ws.send(json.dumps({"t": "ls"}))
         return json.loads(await asyncio.wait_for(ws.recv(), 6)).get("list", [])
 
@@ -102,7 +112,7 @@ async def capture_live(session, fixture, maxb, tail_ms):
     The attach frame deliberately omits `cols`: sending it would call
     update_local_session_size and RESIZE THE LIVE SESSION (ledger).
     """
-    async with await _ws_connect() as ws:
+    async with _ws_connect() as ws:
         await ws.send(json.dumps({"t": "attach", "s": session, "sb": maxb}))
         buf = bytearray()
         deadline = time.time() + max(tail_ms, 1500) / 1000.0
@@ -125,44 +135,64 @@ async def capture_live(session, fixture, maxb, tail_ms):
 
 # ---------------------------------------------------------------- conpty
 
-def _drive(cmdline, cols, rows, script, settle=0.35):
-    """Run cmdline (argv list) under a real ConPTY, apply `script`, return bytes."""
+def _drive(cmdline, cols, rows, script, settle=0.6):
+    """Run cmdline (argv list) under a real ConPTY, apply `script`, return bytes.
+
+    PtyProcess.read() BLOCKS when the child has produced nothing ("Can block if
+    there is nothing to read" — pywinpty docstring), so draining it from the
+    same thread that paces the script makes every timing window unbounded: a
+    quiet child wedges the capture forever. The reader therefore lives on its
+    own daemon thread and the script thread only ever sleeps.
+    """
+    import threading
+
     from winpty import PtyProcess
 
     # pywinpty resolves argv[0] itself; a pre-quoted command string fails
     # its executable lookup, so always hand it a list.
     pty = PtyProcess.spawn(cmdline, dimensions=(rows, cols))
     out = bytearray()
+    lock = threading.Lock()
+    stop = threading.Event()
 
-    def pump(seconds):
-        end = time.time() + seconds
-        while time.time() < end:
+    def reader():
+        while not stop.is_set():
             try:
                 data = pty.read(8192)
-            except Exception:
-                return False
+            except Exception:          # EOFError once the terminal closes
+                return
             if data:
-                out.extend(data.encode("utf-8", "replace"))   # muxd.py:1541
+                # muxd.py:1541 — pywinpty hands back str, muxd stores utf-8.
+                chunk = data.encode("utf-8", "replace")
+                with lock:
+                    out.extend(chunk)
             else:
-                time.sleep(0.02)
-        return True
+                time.sleep(0.01)
 
-    pump(settle)
+    th = threading.Thread(target=reader, daemon=True)
+    th.start()
+
+    time.sleep(settle)
     for keys, wait in script:
+        if not pty.isalive():
+            break
         try:
             if keys:
                 pty.write(keys)
         except Exception:
             break
-        if not pump(wait):
-            break
-    pump(settle)
+        time.sleep(wait)
+    time.sleep(settle)
+
+    stop.set()
     try:
         if pty.isalive():
             pty.terminate(force=True)
     except Exception:
         pass
-    return bytes(out)
+    th.join(timeout=1.0)
+    with lock:
+        return bytes(out)
 
 
 def preset_pager_alt():
@@ -187,7 +217,7 @@ def preset_tui_alt():
     """Scripted alt-screen TUI (stands in for the curses demo; no _curses on Windows)."""
     demo = os.path.join(HERE, "tui_demo.py")
     data = _drive(
-        f'"{sys.executable}" -u "{demo}"', 140, 40,
+        [sys.executable, "-u", demo], 140, 40,
         [("\r", 0.3)] * 8,
     )
     return data, 140, 40, "tui_demo.py under ConPTY", \
@@ -197,7 +227,7 @@ def preset_tui_alt():
 def preset_shell_plain():
     """Plain normal-buffer shell session."""
     data = _drive(
-        "cmd.exe", 140, 40,
+        ["cmd.exe"], 140, 40,
         [("echo vt-fidelity plain shell capture\r", 0.4),
          ("ver\r", 0.4),
          ("dir /w\r", 0.6),
@@ -239,10 +269,21 @@ def main():
         if not data:
             print(f"NO BYTES from live session {a.live!r}", file=sys.stderr)
             return 1
+        # Geometry comes from the session record, not the attach frame: asking
+        # for a size over ws would resize the live session.
+        cols, rows = 80, 24
+        try:
+            for s in asyncio.run(list_sessions()):
+                if s.get("name") == a.live:
+                    cols = s.get("cols") or cols
+                    rows = s.get("rows") or rows
+                    break
+        except Exception:
+            pass
         write_fixture(a.fixture or ("live-" + a.live[:28]), data,
-                      cols=80, rows=24, source=f"live muxd session {a.live}",
+                      cols=cols, rows=rows, source=f"live muxd session {a.live}",
                       desc="recorded muxd scrollback replay payload",
-                      recorded_real=True)
+                      recorded_real=True, capture_method="live-muxd")
         return
 
     todo = []
@@ -269,7 +310,8 @@ def main():
             continue
         # ConPTY presets record scripted programs, not human session content.
         write_fixture(name, data, cols=cols, rows=rows, source=source,
-                      desc=desc, recorded_real=False)
+                      desc=desc, recorded_real=False,
+                      capture_method=f"conpty-{name}")
 
     if a.auto:
         try:
@@ -289,7 +331,7 @@ def main():
                           cols=s.get("cols") or 80, rows=s.get("rows") or 24,
                           source=f"live muxd session {nm} (kind={s.get('kind')})",
                           desc="recorded muxd scrollback replay payload",
-                          recorded_real=True)
+                          recorded_real=True, capture_method="live-muxd")
 
 
 if __name__ == "__main__":
