@@ -529,6 +529,9 @@
       <button class="icon compose-desktop" id="uploadbtn" title="Upload &amp; attach a file (pictures, PDFs, zips)" aria-label="Upload and attach a file">
         <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M21 11.5l-8.6 8.6a5 5 0 01-7.1-7.1l8.6-8.6a3.5 3.5 0 014.9 4.9l-8.5 8.5a2 2 0 01-2.8-2.8l7.8-7.8" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
       </button>
+      <button class="icon" id="resumebtn" title="Resume a past chat from the PC archive" aria-label="Resume a past chat">
+        <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M4 12a8 8 0 108-8 8 8 0 00-5.7 2.3L4 8.5M4 4v4.5h4.5M12 8v4.5l3 1.8" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </button>
       <button class="icon" id="managebtn" title="Manage tabs (delete all / export)" aria-label="Manage tabs">
         <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h10" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
       </button>
@@ -694,6 +697,7 @@
 <script src="vendor/xterm.js"></script>
 <script src="vendor/addon-fit.js"></script>
 <script src="intent-journal.js"></script>
+<script src="picker.js"></script>
 <script>
 const $ = s => document.querySelector(s);
 const base = location.pathname.replace(/\/[^/]*$/, '') || '';
