@@ -209,6 +209,35 @@ def verify_signature(public_key, signed_bytes, signature):
     return True
 
 
+# Durable-replay dispositions. The execution endpoint persists (principal, fingerprint, outcome)
+# and this decides what a second arrival of the same intent id means.
+REPLAY_FRESH = "fresh"
+REPLAY_CACHED = "cached"
+REPLAY_CONFLICT = "conflict"
+REPLAY_UNCERTAIN = "uncertain"
+
+
+def replay_decision(record, fingerprint):
+    """Decide what to do with an intent id that already has a persisted record.
+
+    Returns `(disposition, result_frame)`; `result_frame` is None only for REPLAY_FRESH, meaning
+    the caller must actually perform the write. The uncertain case is the important one: if the
+    outcome was never durably observed, muxd refuses rather than guessing. Re-writing bytes that
+    may already have reached the PTY is worse than an honest refusal — the client can re-key the
+    intent, but nobody can un-type a command.
+    """
+    if not record:
+        return REPLAY_FRESH, None
+    if record.get("fingerprint") != fingerprint:
+        return REPLAY_CONFLICT, {"t": "err", "m": "intent id is already bound to a different payload"}
+    if record.get("status") in ("completed", "failed"):
+        return REPLAY_CACHED, dict(record.get("result") or {})
+    return REPLAY_UNCERTAIN, {
+        "t": "err",
+        "m": "input outcome is uncertain; the PTY write was not replayed",
+    }
+
+
 def session_uuid_of(session):
     """The contract's sessionUuid is muxd-generated and immutable. `session_id` is the agent
     transcript/resume identity and is explicitly NOT it — binding proofs to that would let a
