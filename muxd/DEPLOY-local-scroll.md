@@ -62,8 +62,6 @@ agent-cmdline probe), so merging does not revert the running behavior.
   report flood but deliberately KEEPS wheel reports (SGR `Cb` bit 6 — `((+cb) & 64) ? m : ''`).
   That exemption is exactly how an alternate-buffer TUI scrolls from the web surface: it has no
   scrollback of its own, so the wheel report is the only thing that moves its transcript. This is
-  state *fidelity*: the same session freshly attached before the
-  ring rotated always behaved this way.
 - **DECCKM (`?1`) replayed:** viewers now pick the correct arrow encoding (SS3 vs CSI). If a TUI
   dies without resetting it, readline accepts both arrow forms, so a shell can't get wedged.
 - **`MUXCTL_VT_INPUT=1` opt-in:** muxctl disables ALL of its wheel synthesis under this env var
