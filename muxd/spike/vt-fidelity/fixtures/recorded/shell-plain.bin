@@ -1,0 +1,25 @@
+[1t[c[?1004h[?9001h[?7l[?7hMicrosoft Windows [Version 10.0.26200.8875]
+(c) Microsoft Corporation. All rights reserved.
+
+Z:\328\CMPUT328-A2\codexworks\301\mux-local-retrieval\.orch\worktrees\r.3.9.1>[4;79Hecho vt-fidelity plain shell capture[4;115H
+]0;C:\WINDOWS\system32\cmd.exe - echo  vt-fidelity plain shell capture\vt-fidelity plain shell capture
+]0;C:\WINDOWS\system32\cmd.exe\
+Z:\328\CMPUT328-A2\codexworks\301\mux-local-retrieval\.orch\worktrees\r.3.9.1>[7;79Hver[7;82H
+]0;C:\WINDOWS\system32\cmd.exe - ver\
+Microsoft Windows [Version 10.0.26200.8875]
+]0;C:\WINDOWS\system32\cmd.exe\
+Z:\328\CMPUT328-A2\codexworks\301\mux-local-retrieval\.orch\worktrees\r.3.9.1>[11;79Hdir /w[11;85H
+]0;C:\WINDOWS\system32\cmd.exe - dir  /w\ Volume in drive Z is big
+ Volume Serial Number is 0095-3CDD
+
+ Directory of Z:\328\CMPUT328-A2\codexworks\301\mux-local-retrieval\.orch\worktrees\r.3.9.1
+
+[.]          [..]         .gitignore   [app]        [campaign]   [muxd]       README.md    [relay]      [scripts]    
+               2 File(s)            855 bytes
+               7 Dir(s)  51,693,797,376 bytes free
+]0;C:\WINDOWS\system32\cmd.exe\
+Z:\328\CMPUT328-A2\codexworks\301\mux-local-retrieval\.orch\worktrees\r.3.9.1>[21;79Hecho %CD%[21;88H
+]0;C:\WINDOWS\system32\cmd.exe - echo  Z:\328\CMPUT328-A2\codexworks\301\mux-local-retrieval\.orch\worktrees\r.3.9.1\Z:\328\CMPUT328-A2\codexworks\301\mux-local-retrieval\.orch\worktrees\r.3.9.1
+]0;C:\WINDOWS\system32\cmd.exe\
+Z:\328\CMPUT328-A2\codexworks\301\mux-local-retrieval\.orch\worktrees\r.3.9.1>[24;79Hexit[24;83H
+]0;C:\WINDOWS\system32\cmd.exe - exit\]0;C:\WINDOWS\system32\cmd.exe\

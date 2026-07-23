@@ -1,0 +1,342 @@
+[1t[c[?1004h[?9001h[?1049h[22;0;0t[40;1H[?1h=# muxd — PC-local terminal session host for the multiplex.[m
+#[m
+# THE POINT (from full-review.md): the agent's console must be owned by THIS machine, not by an[m
+# ssh pipe from the VPS. muxd owns a ConPTY per session; claude/codex live in it. Wi-Fi drops,[m
+# VPS reboots, relay deploys — the agent never notices; viewers just reattach. muxd dials OUT[m
+# to the VPS relay (no inbound port on the PC) and multiplexes all sessions over one WebSocket.[m
+#[m
+# Protocol (JSON text frames over ws):[m
+#   muxd -> relay:  hello{host,sessions} . sessions{list} . o{s,d:b64} . sb{s,d:b64} . killed{s} . pong[m
+#   relay -> muxd:  create{s,rid,cols,rows,relaunch,heal} . i{s,d:b64} . resize{s,cols,rows} .[m
+#                    kill{s} . rename{s,to} . heal{s,on} . tail{s,rid,lines} . sb{s} . ping[m
+#[m
+# State: sessions.json manifest (resume commands) -> muxd restart / PC reboot lists unarmed sessions[m
+# as dormant placeholders. Only sessions explicitly armed with heal auto-start.[m
+import asyncio, base64, collections, ctypes, gc, glob, hashlib, json, os, queue, re, socket, ssl, subprocess, sys, tempfile, threading, time[m , traceback[m
+from ctypes import wintypes[m
+from datetime import datetime, timedelta, timezone[m
+import faulthandler[m
+try: faulthandler.enable(open(os.path.join(os.path.expanduser("~"), "muxd", "muxd.crash"), "a"))[m
+except Exception: pass[m
+from winpty import PtyProcess[m
+[m
+HOME = os.path.expanduser("~")[m
+DIR = os.path.join(HOME, "muxd")[m
+MANIFEST = os.path.join(DIR, "sessions.json")[m
+LOG = os.path.join(DIR, "muxd.log")[m
+ENVF = os.path.join(DIR, "muxd.env")[m
+# {name: {pid, cwd, alive}} — the desktop app reads this to link a live claude/codex process to its mux[m
+# TAB by walking the process's ancestor pids to a shell pid here (deterministic; no folder guessing). Lets[m
+# a shell-launched agent be added to a collection / relaunched by its real chat id.[m
+LIVE_TABS = os.path.join(DIR, "live-tabs.json")[m
+[m
+_DURABLE_TEMP_SEQUENCE = 0[m
+[m
+def _durable_checkpoint(fault, stage, path):[m
+    if fault is not None:[m
+        fault(stage, path)[m
+    fault_file = os.environ.get("MUXD_TEST_PERSIST_FAULT_FILE", "")[m
+[7mZ:\328\CMPUT328-A2\codexworks\301\mux-local-retrieval\.orch\worktrees\r.3.9.1\muxd\muxd.py[27m[K[K    if not fault_file or not os.path.exists(fault_file):[m
+        return[m
+    try:[m
+        with open(fault_file, encoding="utf-8") as stream:[m
+            requested = json.load(stream)[m
+    except Exception:[m
+        return[m
+    if ([m
+        isinstance(requested, dict)[m
+        and requested.get("stage") == stage[m
+        and (not requested.get("file") or requested.get("file") == os.path.basename(path))[m
+    ):[m
+        remaining = int(requested.get("after", 0) or 0)[m
+        if remaining > 0:[m
+            requested["after"] = remaining - 1[m
+            try:[m
+                with open(fault_file, "w", encoding="utf-8") as stream:[m
+                    json.dump(requested, stream)[m
+            except OSError:[m
+                pass[m
+            return[m
+        try:[m
+            os.remove(fault_file)[m
+        except OSError:[m
+            pass[m
+        delay_ms = max(0, int(requested.get("delayMs", 0) or 0))[m
+        if delay_ms:[m
+            time.sleep(delay_ms / 1000)[m
+        if requested.get("fail", True):[m
+            raise OSError(f"injected persistence failure at {stage} for {os.path.basename(path)}")[m
+        return[m
+[m
+def _replace_write_through(source, destination):[m
+    if os.name != "nt":[m
+        os.replace(source, destination)[m
+        return[m
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)[m
+    move = kernel32.MoveFileExW[m
+    move.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD][m
+:[K[K    move.restype = wintypes.BOOL[m
+    flags = 0x1 | 0x8  # MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH[m
+    if not move(source, destination, flags):[m
+        raise ctypes.WinError(ctypes.get_last_error())[m
+[m
+def _fsync_directory(directory):[m
+    if os.name == "nt":[m
+        return[m
+    fd = os.open(directory, os.O_RDONLY)[m
+    try:[m
+        os.fsync(fd)[m
+    finally:[m
+        os.close(fd)[m
+[m
+def _durable_commit_bytes(path, payload, fault=None):[m
+    global _DURABLE_TEMP_SEQUENCE[m
+    directory = os.path.dirname(path) or "."[m
+    os.makedirs(directory, exist_ok=True)[m
+    _DURABLE_TEMP_SEQUENCE += 1[m
+    tmp = f"{path}.{os.getpid()}.{_DURABLE_TEMP_SEQUENCE}.tmp"[m
+    replaced = False[m
+    try:[m
+        _durable_checkpoint(fault, "before_write", path)[m
+        with open(tmp, "xb", buffering=0) as stream:[m
+            stream.write(payload)[m
+            _durable_checkpoint(fault, "before_file_fsync", path)[m
+            os.fsync(stream.fileno())[m
+        _durable_checkpoint(fault, "before_replace", path)[m
+        _replace_write_through(tmp, path)[m
+        replaced = True[m
+        _durable_checkpoint(fault, "before_directory_fsync", path)[m
+        _fsync_directory(directory)[m
+        _durable_checkpoint(fault, "before_readback", path)[m
+        with open(path, "rb") as stream:[m
+            committed = stream.read()[m
+        if committed != payload:[m
+            raise OSError("committed state did not read back identically: " + path)[m
+    except Exception as exc:[m
+        exc.target = path[m
+:[K[K...skipping...
+                                tail = await asyncio.get_running_loop().run_in_executor([m
+                                    None,[m
+                                    lambda current=session, count=lines: current.tail_text([m
+                                        nbytes=200000,[m
+                                        lines=count,[m
+                                    ),[m
+                                )[m
+                                await ws.send(json.dumps({"t": "tailr", "rid": m.get("rid", ""), "text": tail}))[m
+                            elif t == "kill" and name in sessions:[m
+                                ok, detail = await remove_session(name, by_user=True)[m
+                                if not ok:[m
+                                    log(f"[{name}] remote stop failed: {detail}")[m
+                                    await ws.send(json.dumps({"t": "sessions", "list": sess_list(), "notice": "session stop failed"}))[m
+                                    continue[m
+                                await ws.send(json.dumps({"t": "killed", "s": name}))[m
+                                await ws.send(json.dumps({"t": "sessions", "list": sess_list()}))[m
+                    finally:[m
+                        for tk in tasks: tk.cancel()[m
+                        clear_remote_size_ownership()[m
+            except Exception as e:[m
+                log(f"relay link ({cand}) dropped/failed: {type(e).__name__}: {e}")[m
+            # try next candidate immediately; back off only after all fail[m
+        await asyncio.sleep(backoff)[m
+        backoff = min(15, backoff * 2)[m
+[m
+if __name__ == "__main__":[m
+    os.makedirs(DIR, exist_ok=True)[m
+    log("=== muxd starting ===")[m
+    ok, detail = acquire_single_instance()[m
+    if not ok:[m
+        _log_now("FATAL: refusing to start duplicate muxd: " + detail)[m
+        sys.exit(0)[m
+    if not TOKEN or not RELAYS:[m
+        log("FATAL: muxd.env needs MUX_HOST_TOKEN and RELAY_LAN/RELAY_PUBLIC"); sys.exit(1)[m
+    while True:                      # top-level crash guard: muxd must never die quietly[m
+        try: asyncio.run(main())[m
+        except KeyboardInterrupt: sys.exit(0)[m
+        except Exception:[m
+            log("CRASH:\n" + traceback.format_exc()); time.sleep(3)[m
+[K[H[2J[HM    fault_file = os.environ.get("MUXD_TEST_PERSIST_FAULT_FILE", "")[m
+[HM        fault(stage, path)[m
+[HM    if fault is not None:[m
+[HMdef _durable_checkpoint(fault, stage, path):[m
+[HM[m
+[HM_DURABLE_TEMP_SEQUENCE = 0[m
+[HM[m
+[HMLIVE_TABS = os.path.join(DIR, "live-tabs.json")[m
+[HM# a shell-launched agent be added to a collection / relaunched by its real chat id.[m
+[HM# TAB by walking the process's ancestor pids to a shell pid here (deterministic; no folder guessing). Lets[m
+[HM# {name: {pid, cwd, alive}} — the desktop app reads this to link a live claude/codex process to its mux[m
+[HMENVF = os.path.join(DIR, "muxd.env")[m
+[HMLOG = os.path.join(DIR, "muxd.log")[m
+[HMMANIFEST = os.path.join(DIR, "sessions.json")[m
+[HMDIR = os.path.join(HOME, "muxd")[m
+[HMHOME = os.path.expanduser("~")[m
+[HM[m
+[HMfrom winpty import PtyProcess[m
+[HMexcept Exception: pass[m
+[HMtry: faulthandler.enable(open(os.path.join(os.path.expanduser("~"), "muxd", "muxd.crash"), "a"))[m
+[HMimport faulthandler[m
+[HMfrom datetime import datetime, timedelta, timezone[m
+[HMfrom ctypes import wintypes[m
+[HM, traceback[m
+[HMimport asyncio, base64, collections, ctypes, gc, glob, hashlib, json, os, queue, re, socket, ssl, subprocess, sys, tempfile, threading, time[m[HM# as dormant placeholders. Only sessions explicitly armed with heal auto-start.[m
+[HM# State: sessions.json manifest (resume commands) -> muxd restart / PC reboot lists unarmed sessions[m
+[HM#[m
+[HM#                    kill{s} . rename{s,to} . heal{s,on} . tail{s,rid,lines} . sb{s} . ping[m
+[HM#   relay -> muxd:  create{s,rid,cols,rows,relaunch,heal} . i{s,d:b64} . resize{s,cols,rows} .[m
+[HM#   muxd -> relay:  hello{host,sessions} . sessions{list} . o{s,d:b64} . sb{s,d:b64} . killed{s} . pong[m
+[HM# Protocol (JSON text frames over ws):[m
+[HM#[m
+[HM# to the VPS relay (no inbound port on the PC) and multiplexes all sessions over one WebSocket.[m
+[HM# VPS reboots, relay deploys — the agent never notices; viewers just reattach. muxd dials OUT[m
+[HM# ssh pipe from the VPS. muxd owns a ConPTY per session; claude/codex live in it. Wi-Fi drops,[m
+[HM# THE POINT (from full-review.md): the agent's console must be owned by THIS machine, not by an[m
+[HM#[m
+[HM# muxd — PC-local terminal session host for the multiplex.[m
+[40;1H[K/[Kdd[Kee[Kff[K[1;1H[K# muxd — PC-local terminal session host for the multiplex.[m
+[2;1H[K#[m
+[3;1H[K# THE POINT (from full-review.md): the agent's console must be owned by THIS machine, not by an[m
+[4;1H[K# ssh pipe from the VPS. muxd owns a ConPTY per session; claude/codex live in it. Wi-Fi drops,[m
+[5;1H[K# VPS reboots, relay deploys — the agent never notices; viewers just reattach. muxd dials OUT[m
+[6;1H[K# to the VPS relay (no inbound port on the PC) and multiplexes all sessions over one WebSocket.[m
+[7;1H[K#[m
+[8;1H[K# Protocol (JSON text frames over ws):[m
+[9;1H[K#   muxd -> relay:  hello{host,sessions} . sessions{list} . o{s,d:b64} . sb{s,d:b64} . killed{s} . pong[m
+[10;1H[K#   relay -> muxd:  create{s,rid,cols,rows,relaunch,heal} . i{s,d:b64} . resize{s,cols,rows} .[m
+[11;1H[K#                    kill{s} . rename{s,to} . heal{s,on} . tail{s,rid,lines} . sb{s} . ping[m
+[12;1H[K#[m
+[13;1H[K# State: sessions.json manifest (resume commands) -> muxd restart / PC reboot lists unarmed sessions[m
+[14;1H[K# as dormant placeholders. Only sessions explicitly armed with heal auto-start.[m
+[15;1H[Kimport asyncio, base64, collections, ctypes, gc, glob, hashlib, json, os, queue, re, socket, ssl, subprocess, sys, tempfile, threading, time[m [16;1H[K, traceback[m
+[17;1H[Kfrom ctypes import wintypes[m
+[18;1H[Kfrom datetime import datetime, timedelta, timezone[m
+[19;1H[Kimport faulthandler[m
+[20;1H[Ktry: faulthandler.enable(open(os.path.join(os.path.expanduser("~"), "muxd", "muxd.crash"), "a"))[m
+[21;1H[Kexcept Exception: pass[m
+[22;1H[Kfrom winpty import PtyProcess[m
+[23;1H[K[m
+[24;1H[KHOME = os.path.expanduser("~")[m
+[25;1H[KDIR = os.path.join(HOME, "muxd")[m
+[26;1H[KMANIFEST = os.path.join(DIR, "sessions.json")[m
+[27;1H[KLOG = os.path.join(DIR, "muxd.log")[m
+[28;1H[KENVF = os.path.join(DIR, "muxd.env")[m
+[29;1H[K# {name: {pid, cwd, alive}} — the desktop app reads this to link a live claude/codex process to its mux[m
+[30;1H[K# TAB by walking the process's ancestor pids to a shell pid here (deterministic; no folder guessing). Lets[m
+[31;1H[K# a shell-launched agent be added to a collection / relaunched by its real chat id.[m
+[32;1H[KLIVE_TABS = os.path.join(DIR, "live-tabs.json")[m
+[33;1H[K[m
+[34;1H[K_DURABLE_TEMP_SEQUENCE = 0[m
+[35;1H[K[m
+[36;1H[Kdef _durable_checkpoint(fault, stage, path):[m
+[37;1H[K    if fault is not None:[m
+[38;1H[K        fault(stage, path)[m
+[39;1H[K    fault_file = os.environ.get("MUXD_TEST_PERSIST_FAULT_FILE", "")[m
+[40;1H[1;1H[K# muxd — PC-local terminal session host for the multiplex.[m
+[2;1H[K#[m
+[3;1H[K# THE POINT (from full-review.md): the agent's console must be owned by THIS machine, not by an[m
+[4;1H[K# ssh pipe from the VPS. muxd owns a ConPTY per session; claude/codex live in it. Wi-Fi drops,[m
+[5;1H[K# VPS reboots, relay deploys — the agent never notices; viewers just reattach. muxd dials OUT[m
+[6;1H[K# to the VPS relay (no inbound port on the PC) and multiplexes all sessions over one WebSocket.[m
+[7;1H[K#[m
+[8;1H[K# Protocol (JSON text frames over ws):[m
+[9;1H[K#   muxd -> relay:  hello{host,sessions} . sessions{list} . o{s,d:b64} . sb{s,d:b64} . killed{s} . pong[m
+[10;1H[K#   relay -> muxd:  create{s,rid,cols,rows,relaunch,heal} . i{s,d:b64} . resize{s,cols,rows} .[m
+[11;1H[K#                    kill{s} . rename{s,to} . heal{s,on} . tail{s,rid,lines} . sb{s} . ping[m
+[12;1H[K#[m
+[13;1H[K# State: sessions.json manifest (resume commands) -> muxd restart / PC reboot lists unarmed sessions[m
+[14;1H[K# as dormant placeholders. Only sessions explicitly armed with heal auto-start.[m
+[15;1H[Kimport asyncio, base64, collections, ctypes, gc, glob, hashlib, json, os, queue, re, socket, ssl, subprocess, sys, tempfile, threading, time[m [16;1H[K, traceback[m
+[17;1H[Kfrom ctypes import wintypes[m
+[18;1H[Kfrom datetime import datetime, timedelta, timezone[m
+[19;1H[Kimport faulthandler[m
+[20;1H[Ktry: faulthandler.enable(open(os.path.join(os.path.expanduser("~"), "muxd", "muxd.crash"), "a"))[m
+[21;1H[Kexcept Exception: pass[m
+[22;1H[Kfrom winpty import PtyProcess[m
+[23;1H[K[m
+[24;1H[KHOME = os.path.expanduser("~")[m
+[25;1H[KDIR = os.path.join(HOME, "muxd")[m
+[26;1H[KMANIFEST = os.path.join(DIR, "sessions.json")[m
+[27;1H[KLOG = os.path.join(DIR, "muxd.log")[m
+[28;1H[KENVF = os.path.join(DIR, "muxd.env")[m
+[29;1H[K# {name: {pid, cwd, alive}} — the desktop app reads this to link a live claude/codex process to its mux[m
+[30;1H[K# TAB by walking the process's ancestor pids to a shell pid here (deterministic; no folder guessing). Lets[m
+[31;1H[K# a shell-launched agent be added to a collection / relaunched by its real chat id.[m
+[32;1H[KLIVE_TABS = os.path.join(DIR, "live-tabs.json")[m
+[33;1H[K[m
+[34;1H[K_DURABLE_TEMP_SEQUENCE = 0[m
+[35;1H[K[m
+[36;1H[K[7mdef[27m _durable_checkpoint(fault, stage, path):[m
+[37;1H[K    if fault is not None:[m
+[38;1H[K        fault(stage, path)[m
+[39;1H[K    fault_file = os.environ.get("MUXD_TEST_PERSIST_FAULT_FILE", "")[m
+[40;1H    if not fault_file or not os.path.exists(fault_file):[m
+        return[m
+    try:[m
+        with open(fault_file, encoding="utf-8") as stream:[m
+            requested = json.load(stream)[m
+    except Exception:[m
+        return[m
+    if ([m
+        isinstance(requested, dict)[m
+        and requested.get("stage") == stage[m
+        and (not requested.get("file") or requested.get("file") == os.path.basename(path))[m
+    ):[m
+        remaining = int(requested.get("after", 0) or 0)[m
+        if remaining > 0:[m
+            requested["after"] = remaining - 1[m
+            try:[m
+                with open(fault_file, "w", encoding="utf-8") as stream:[m
+                    json.dump(requested, stream)[m
+            except OSError:[m
+                pass[m
+            return[m
+        try:[m
+            os.remove(fault_file)[m
+        except OSError:[m
+            pass[m
+        delay_ms = max(0, int(requested.get("delayMs", 0) or 0))[m
+        if delay_ms:[m
+            time.sleep(delay_ms / 1000)[m
+        if requested.get("fail", True):[m
+            raise OSError(f"injected persistence failure at {stage} for {os.path.basename(path)}")[m
+        return[m
+[m
+[7mdef[27m _replace_write_through(source, destination):[m
+    if os.name != "nt":[m
+        os.replace(source, destination)[m
+[K/[K        return[m
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)[m
+    move = kernel32.MoveFileExW[m
+    move.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD][m
+    move.restype = wintypes.BOOL[m
+    flags = 0x1 | 0x8  # MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH[m
+    if not move(source, destination, flags):[m
+        raise ctypes.WinError(ctypes.get_last_error())[m
+[m
+[7mdef[27m _fsync_directory(directory):[m
+    if os.name == "nt":[m
+        return[m
+    fd = os.open(directory, os.O_RDONLY)[m
+    try:[m
+        os.fsync(fd)[m
+    finally:[m
+        os.close(fd)[m
+[m
+[7mdef[27m _durable_commit_bytes(path, payload, fault=None):[m
+    global _DURABLE_TEMP_SEQUENCE[m
+    directory = os.path.dirname(path) or "."[m
+    os.makedirs(directory, exist_ok=True)[m
+    _DURABLE_TEMP_SEQUENCE += 1[m
+    tmp = f"{path}.{os.getpid()}.{_DURABLE_TEMP_SEQUENCE}.tmp"[m
+    replaced = False[m
+    try:[m
+        _durable_checkpoint(fault, "before_write", path)[m
+        with open(tmp, "xb", buffering=0) as stream:[m
+            stream.write(payload)[m
+            _durable_checkpoint(fault, "before_file_fsync", path)[m
+            os.fsync(stream.fileno())[m
+        _durable_checkpoint(fault, "before_replace", path)[m
+        _replace_write_through(tmp, path)[m
+        replaced = True[m
+        _durable_checkpoint(fault, "before_directory_fsync", path)[m
+        _fsync_directory(directory)[m
+[K[?1l>[?1049l[23;0;0t
