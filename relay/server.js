@@ -1100,6 +1100,129 @@ app.get('/api/projects', (req, res) => {
     live: Date.now() - r < 45000,
   });
 });
+
+// --- ARCHIVE INDEX: the resumable-chat picker's catalogue -------------------------------------------
+// The desktop bridge pushes a capped, opaque-id-only index of resumable chats; the browser reads it to
+// offer "resume this chat over there". Two DIFFERENT principals, two DIFFERENT credentials:
+//   POST  = the desktop bridge, proving itself with the scoped MUX_BRIDGE_TOKEN (Authorization: Bearer).
+//   GET   = the browser owner, proving itself with the hl_session owner cookie.
+// Ambient loopback is NOT authorization here: reaching the socket says nothing about who is calling.
+// An owner cookie cannot push, a bridge credential cannot read, and neither is the host-link token.
+const ARCHIVE_INDEX_FILE = STATE_DIR + '/archive-index.json';
+const ARCHIVE_INDEX_SCHEMA_VERSION = 1;
+const ARCHIVE_INDEX_MAX_ROWS = 500;
+const ARCHIVE_INDEX_MAX_BYTES = 2 * 1024 * 1024;
+const ARCHIVE_INDEX_LIVE_MS = 45000;
+// `cwd` is deliberately allowed here (a display string the picker shows) while every other executable
+// or local-path key stays forbidden — the app-side contract carries cwd and nothing else path-shaped.
+const ARCHIVE_INDEX_FORBIDDEN_KEYS = new Set([...FORBIDDEN_REMOTE_KEYS].filter(k => k !== 'cwd'));
+function archiveIndexHasForbiddenKey(value) {
+  if (!value || typeof value !== 'object') return false;
+  if (Array.isArray(value)) return value.some(archiveIndexHasForbiddenKey);
+  for (const [key, child] of Object.entries(value))
+    if (ARCHIVE_INDEX_FORBIDDEN_KEYS.has(String(key).toLowerCase()) || archiveIndexHasForbiddenKey(child)) return true;
+  return false;
+}
+// A distinct scoped credential for bridge-only routes. Unset => the route is closed, not open; equal to
+// the host-link token => also closed, because interchangeable credentials are not scoped credentials.
+const BRIDGE_TOKEN = process.env.MUX_BRIDGE_TOKEN || '';
+const BRIDGE_TOKEN_USABLE = !!BRIDGE_TOKEN && BRIDGE_TOKEN !== HOST_TOKEN;
+if (BRIDGE_TOKEN && !BRIDGE_TOKEN_USABLE)
+  console.error('[bridge] MUX_BRIDGE_TOKEN must differ from MUX_HOST_TOKEN; bridge routes stay closed');
+function bearerCredential(req) {
+  const m = /^Bearer[ \t]+(\S+)$/i.exec(String(req.headers.authorization || '').trim());
+  return m ? m[1] : '';
+}
+function bridgeTokenOk(t) {
+  if (!BRIDGE_TOKEN_USABLE || !t || t.length !== BRIDGE_TOKEN.length) return false;
+  try { return crypto.timingSafeEqual(Buffer.from(t), Buffer.from(BRIDGE_TOKEN)); } catch { return false; }
+}
+// Returns null when the caller is the bridge; otherwise the response has already been sent.
+function refuseUnlessBridge(req, res) {
+  if (!BRIDGE_TOKEN_USABLE) return res.status(503).json({ error: 'bridge credential not configured' });
+  if (!bridgeTokenOk(bearerCredential(req))) return res.status(403).json({ error: 'bridge credential required' });
+  return null;
+}
+function emptyArchiveIndex() {
+  return { schemaVersion: ARCHIVE_INDEX_SCHEMA_VERSION, host: '', chats: [], updatedAt: 0 };
+}
+function normalizeArchiveChat(chat) {
+  const c = chat && typeof chat === 'object' && !Array.isArray(chat) ? chat : {};
+  const updatedAt = Number(c.updatedAt);
+  return {
+    id: opaqueIdentity(c.id),
+    title: text(c.title, 200),
+    tool: text(c.tool, 40),
+    cwd: text(c.cwd, 300),
+    workspaceLabel: text(c.workspaceLabel, 200),
+    updatedAt: Number.isFinite(updatedAt) && updatedAt > 0 ? Math.floor(updatedAt) : 0,
+    muxName: strictMuxName(c.muxName),
+    resumable: c.resumable === true,
+  };
+}
+function validArchiveChat(row) {
+  return !!row.id && !!row.title && !!row.tool && row.updatedAt > 0;
+}
+function validPersistedArchiveIndex(value) {
+  return !!value && typeof value === 'object' && !Array.isArray(value)
+    && value.schemaVersion === ARCHIVE_INDEX_SCHEMA_VERSION
+    && Array.isArray(value.chats)
+    && value.chats.length <= ARCHIVE_INDEX_MAX_ROWS
+    && !archiveIndexHasForbiddenKey(value);
+}
+let _archiveIndex = durableJsonLoad(ARCHIVE_INDEX_FILE, null, validPersistedArchiveIndex) || emptyArchiveIndex();
+// `updatedAt` is data recency and survives a restart; liveness does not. Same doctrine as the projection
+// above: after a relay restart the picker still lists chats, but must not claim the app is answering
+// until a push lands on THIS process.
+let _archiveIndexPushedAt = 0;
+function archiveIndexLive() { return _archiveIndexPushedAt > 0 && Date.now() - _archiveIndexPushedAt < ARCHIVE_INDEX_LIVE_MS; }
+app.post('/api/archive-index', (req, res) => {
+  const refusal = refuseUnlessBridge(req, res);
+  if (refusal) return refusal;
+  const b = req.body || {};
+  if (Number(b.schemaVersion) !== ARCHIVE_INDEX_SCHEMA_VERSION)
+    return res.status(409).json({ error: 'archive index schema mismatch', expected: ARCHIVE_INDEX_SCHEMA_VERSION });
+  const declared = Number(req.headers['content-length'] || 0);
+  if (declared > ARCHIVE_INDEX_MAX_BYTES || Buffer.byteLength(JSON.stringify(b)) > ARCHIVE_INDEX_MAX_BYTES)
+    return res.status(413).json({ error: 'archive index too large', maxBytes: ARCHIVE_INDEX_MAX_BYTES });
+  if (!Array.isArray(b.chats))
+    return res.status(400).json({ error: 'archive index requires a chats array' });
+  if (b.chats.length > ARCHIVE_INDEX_MAX_ROWS)
+    return res.status(413).json({ error: 'archive index too many rows', maxRows: ARCHIVE_INDEX_MAX_ROWS });
+  if (archiveIndexHasForbiddenKey(b))
+    return res.status(400).json({ error: 'archive index contains executable command or local path fields' });
+  const chats = b.chats.map(normalizeArchiveChat);
+  if (!chats.every(validArchiveChat))
+    return res.status(400).json({ error: 'archive index row missing an opaque id, title, tool, or updatedAt' });
+  const candidate = {
+    schemaVersion: ARCHIVE_INDEX_SCHEMA_VERSION,
+    host: text(b.host, 200),
+    chats,
+    updatedAt: Date.now(),
+  };
+  try {
+    writeJsonState(ARCHIVE_INDEX_FILE, candidate);
+  } catch (error) {
+    if (error.committed) { _archiveIndex = candidate; _archiveIndexPushedAt = candidate.updatedAt; }
+    return failPersistence(res, error);
+  }
+  _archiveIndex = candidate;
+  _archiveIndexPushedAt = candidate.updatedAt;
+  res.json({ ok: true, count: chats.length, updatedAt: candidate.updatedAt });
+});
+app.get('/api/archive-index', async (req, res) => {
+  if (!(await isOwner(cookieVal(req, HL_COOKIE)))) return res.status(403).json({ error: 'owner only' });
+  const updatedAt = _archiveIndex.updatedAt || 0;
+  res.json({
+    schemaVersion: ARCHIVE_INDEX_SCHEMA_VERSION,
+    host: _archiveIndex.host || '',
+    chats: Array.isArray(_archiveIndex.chats) ? _archiveIndex.chats : [],
+    count: Array.isArray(_archiveIndex.chats) ? _archiveIndex.chats.length : 0,
+    updatedAt,
+    ageMs: updatedAt > 0 ? Date.now() - updatedAt : null,
+    appLive: archiveIndexLive(),
+  });
+});
 // LIGHT partial update: the always-on headless server keeps the running list + `live` fresh when the
 // heavy desktop app is closed, WITHOUT clobbering the collections projection the app last pushed. Loopback
 // only (the server reaches in over its own SSH, same as the app's /api/projects push).
