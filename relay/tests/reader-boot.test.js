@@ -118,39 +118,23 @@ const flush = () => new Promise(r => setImmediate(r));
 // Run the shipped bootstrap against a recording MuxReader and a stub location.
 function bootReader(search, muxOverrides){
   const dom = makeDom();
-  const calls = { loadPages: [], refresh: [], render: [] };
   const MuxReader = Object.assign({
-    loadPages: async (id) => { calls.loadPages.push(id); return { pages: [{ text: 'hi' }] }; },
-    refresh: async (id) => { calls.refresh.push(id); return { ok: true, pages: [] }; },
-    render: (d, mount, view) => { calls.render.push({ d, mount, view }); },
+    loadPages: async (id) => ({ pages: [{ text: 'hi' }] }),
+    refresh: async (id) => ({ ok: true, pages: [] }),
+    render: (d, mount, view) => {},
   }, muxOverrides || {});
-  const wrapped = {
-    loadPages: (...a) => { calls.loadPages.push(a[0]); return MuxReader.loadPages(...a); },
-    refresh: (...a) => { calls.refresh.push(a[0]); return MuxReader.refresh(...a); },
-    render: (...a) => { calls.render.push({ mount: a[1], view: a[2] }); return MuxReader.render(...a); },
-  };
-  if (muxOverrides){ // overrides record through the wrapper only, so don't double-count the defaults
-    calls.loadPages.length = 0; calls.refresh.length = 0; calls.render.length = 0;
-  }
+  const rec = { loadPages: [], refresh: [], render: [] };
   const sandbox = {
     document: dom.doc,
-    MuxReader: wrapped,
+    MuxReader: {
+      loadPages: (id) => { rec.loadPages.push(id); return MuxReader.loadPages(id); },
+      refresh: (id) => { rec.refresh.push(id); return MuxReader.refresh(id); },
+      render: (d, m, v) => { rec.render.push({ mount: m, view: v }); return MuxReader.render(d, m, v); },
+    },
     location: { search, href: 'http://relay.local/reader.html' + search },
     URLSearchParams,
     console,
     setTimeout,
-  };
-  // defaults also push into calls via MuxReader itself; strip the duplicate bookkeeping by using the wrapper only
-  sandbox.MuxReader = {
-    loadPages: (id) => MuxReader.loadPages(id),
-    refresh: (id) => MuxReader.refresh(id),
-    render: (d, m, v) => MuxReader.render(d, m, v),
-  };
-  const rec = { loadPages: [], refresh: [], render: [] };
-  sandbox.MuxReader = {
-    loadPages: (id) => { rec.loadPages.push(id); return MuxReader.loadPages(id); },
-    refresh: (id) => { rec.refresh.push(id); return MuxReader.refresh(id); },
-    render: (d, m, v) => { rec.render.push({ mount: m, view: v }); return MuxReader.render(d, m, v); },
   };
   vm.runInNewContext(extractBootstrap(), sandbox, { filename: 'reader.html#bootstrap' });
   return { dom, rec, status: () => dom.byId.get('status'), btn: () => dom.byId.get('refresh') };
@@ -175,7 +159,8 @@ test('(b) no session param: empty state, guidance, #refresh disabled, no refresh
   assert.equal(b.rec.loadPages.length, 0, 'loaded pages with no session id');
   assert.equal(b.rec.refresh.length, 0, 'asked the PC for a transcript with no session id');
   assert.equal(b.rec.render.length, 1, 'empty state not rendered');
-  assert.deepEqual(b.rec.render[0].view, { pages: [] }, 'empty state view is not an empty page list');
+  // Normalize the vm-created object so strict comparison is safe across realms.
+  assert.deepEqual(JSON.parse(JSON.stringify(b.rec.render[0].view)), { pages: [] }, 'empty state view is not an empty page list');
   assert.match(b.status().textContent, /No chat selected/);
   assert.equal(b.btn().disabled, true, '#refresh left enabled with nothing to refresh');
 });
