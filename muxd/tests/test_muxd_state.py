@@ -894,6 +894,30 @@ class MuxdStateTests(unittest.TestCase):
                 muxd.CLAIM_ROOT = old_root
                 muxd._pid_alive = old_alive
 
+    def test_launch_claim_sweep_keeps_fresh_muxd_claim_whose_pid_is_unreadable(self):
+        old_root = muxd.CLAIM_ROOT
+        old_alive = muxd._pid_alive
+        with tempfile.TemporaryDirectory(prefix="muxd-sweep-nopid-") as root:
+            try:
+                muxd.CLAIM_ROOT = root
+                muxd._pid_alive = lambda pid: False
+                # a muxd claim we cannot check: no OwnerPid at all, and a non-numeric one. Neither is
+                # PROOF the owner died, and both are still inside their TTL -> hands off.
+                missing = self._write_claim(root, "nopid-id", owner="muxd", expires_in=900, OwnerPid=None)
+                garbage = self._write_claim(root, "badpid-id", owner="muxd", expires_in=900, OwnerPid="n/a")
+
+                removed, quarantined, kept = muxd.sweep_launch_claims()
+
+                self.assertEqual([], removed)
+                self.assertEqual([], quarantined)
+                self.assertEqual(sorted([missing, garbage]), sorted(kept))
+                # ...but they are not immortal: the TTL still retires them once it lapses.
+                stale = self._write_claim(root, "oldnopid-id", owner="muxd", expires_in=-1, OwnerPid=None)
+                self.assertEqual([stale], muxd.sweep_launch_claims()[0])
+            finally:
+                muxd.CLAIM_ROOT = old_root
+                muxd._pid_alive = old_alive
+
     def test_launch_claim_sweep_quarantines_malformed_claims_without_deleting_them(self):
         old_root = muxd.CLAIM_ROOT
         with tempfile.TemporaryDirectory(prefix="muxd-sweep-bad-") as root:

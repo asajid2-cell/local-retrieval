@@ -1210,7 +1210,9 @@ def sweep_launch_claims(now=None):
     duplicate writer on a live agent session, which is the exact corruption CLAIM_ROOT exists
     to prevent:
       * ExpiresUtc <= now                    -> delete (the writer itself promised it'd be gone)
-      * OwnerProcess == 'muxd' + dead pid    -> delete (that was us; nobody is coming back)
+      * OwnerProcess == 'muxd' + dead pid    -> delete (that was us; nobody is coming back). The pid
+                                                must be readable AND provably dead — a muxd claim with
+                                                a missing/garbage OwnerPid is unverifiable, not dead.
       * unreadable / not a JSON object       -> quarantine to *.claim.bad, NEVER delete
       * anything else                        -> keep, even when the owner can't be verified;
                                                 claims without a parseable ExpiresUtc fall back to
@@ -1248,9 +1250,14 @@ def sweep_launch_claims(now=None):
             continue
 
         expired = _claim_expiry(path, metadata) <= now
+        try:
+            owner_pid = int(metadata.get("OwnerPid"))
+        except (TypeError, ValueError):
+            owner_pid = 0                              # no usable pid == unverifiable, NOT proven dead
         dead_muxd_owner = (
             str(metadata.get("OwnerProcess") or "").lower() == "muxd"
-            and not _pid_alive(metadata.get("OwnerPid"))
+            and owner_pid > 0
+            and not _pid_alive(owner_pid)
         )
         if not (expired or dead_muxd_owner):
             kept.append(path)
