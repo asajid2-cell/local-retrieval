@@ -9,7 +9,12 @@ const path = require('path');
 const crypto = require('crypto');
 const { execSync, execFile } = require('child_process');
 const { durableJsonLoad, durableJsonWrite, durableWrite, fsyncDirectory } = require('./durable-state');
+const { createRetention, pruneTranscripts: pruneTranscriptRetention } = require('./retention');
 // Every acknowledged state mutation commits through durable-state.js before it is published in memory.
+// Global state retention (the periodic whole-directory pass) lives in retention.js; it is installed
+// after the stores it prunes are declared. Until then every gauge reads as null.
+let _retention = null;
+function retentionGauges() { return _retention ? _retention.gauges() : null; }
 function hostTokenOk(t) { if (!HOST_TOKEN || !t || t.length !== HOST_TOKEN.length) return false; try { return crypto.timingSafeEqual(Buffer.from(t), Buffer.from(HOST_TOKEN)); } catch { return false; } }
 
 const app = express();
@@ -1190,6 +1195,7 @@ app.get('/api/health', (req, res) => {
   const armed = [...hostSessions.values()].filter(h => h && h.heal).length;
   const gaveUp = 0;
   const projects = projectsHealth();
+  const retention = retentionGauges();
   // A2 #9: if the PC host is down, armed sessions are hosted-and-unreachable (can't be healed) → surface
   // that as degraded instead of a falsely-green dot. Legacy tmux names are also degraded blockers.
   const hostedArmedDown = 0;
@@ -1202,6 +1208,11 @@ app.get('/api/health', (req, res) => {
              persistence: { ok: !persistenceFailure && !persistenceBlocked, detail: persistenceBlocked || persistenceFailure, blocked: !!persistenceBlocked },
              pendingRenameIntents: renameIntents.length,
              uploadRecoveryWarnings,
+             // State growth is observable BEFORE it is a problem: total bytes on disk plus a
+             // size/count gauge per store, and plaintext exposure kept separate from the opaque
+             // signed envelopes we hold in custody but never read.
+             stateDirBytes: retention ? retention.stateDirBytes : null,
+             retention,
              host: { connected: hostUp(), name: hostLabel, sessions: hostSessions.size, protocol: hostProtocol.protocol, caps: hostProtocol.caps, protocolOk: hostProtocolOk() },
              node: process.version, at: Date.now() });
 });
@@ -1694,9 +1705,12 @@ app.post('/api/transcripts/:sessionId', (req, res) => {
     expiresAt: now + TRANSCRIPT_TTL_MS,
     pageList,
   };
-  const candidate = [...others, record]
-    .sort((a, b) => (Number(b.updatedAt) || 0) - (Number(a.updatedAt) || 0))
-    .slice(0, TRANSCRIPT_MAX_SESSIONS);
+  const candidate = enforceTranscriptRetention(
+    [...others, record]
+      .sort((a, b) => (Number(b.updatedAt) || 0) - (Number(a.updatedAt) || 0))
+      .slice(0, TRANSCRIPT_MAX_SESSIONS),
+    now,
+  );
   try {
     commitTranscripts(candidate);
   } catch (error) {
@@ -1733,6 +1747,30 @@ app.get('/api/transcripts/:sessionId', (req, res) => {   // owner-gated by the g
     messages: found.messages,
   });
 });
+
+// --- state retention: the global fence over every store above -------------------------------------
+// Installed here because it prunes the transcript store and the command journal, so both must already
+// exist. Two triggers: a pass at boot and one every 6h, plus inline enforcement on the accept path of
+// a transcript push (below) so a burst of pushes can never outrun the timer. Nothing is deleted by
+// this module directly — it hands back a candidate set that commits through the same writeJsonState
+// discipline as every other mutation, and it stands down entirely while persistence is blocked.
+_retention = createRetention({
+  stateDir: STATE_DIR,
+  transcripts: () => _transcripts,
+  commands: () => _commands,
+  commitTranscripts: candidate => commitTranscripts(candidate),
+  commitCommands: candidate => commitCommands(candidate),
+  blocked: () => !!persistenceBlocked,
+  onError: (error, store) => { recordPersistenceFailure(error); console.error('[retention] ' + store + ': ' + error.message); },
+});
+// The push path is bounded by TRANSCRIPT_MAX_SESSIONS per its own leaf; this adds the global caps on
+// top so an accepted page can never leave the store over budget even between sweeps.
+function enforceTranscriptRetention(candidate, now = Date.now()) {
+  if (!_retention) return candidate;
+  return pruneTranscriptRetention(candidate, _retention.config, now).kept;
+}
+_retention.sweep();
+_retention.start();
 
 // --- file upload side-channel: phone -> VPS (stored here) -> the desktop app pulls it down to the PC
 // (scp, via a `fetchfile` command) and points the model at the local path. Deliberately NOT routed
