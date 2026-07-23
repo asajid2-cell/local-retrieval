@@ -192,12 +192,14 @@ fi
 [ -n "$ARCHIVE_NAME" ] || ARCHIVE_NAME="$DEFAULT_NAME"
 
 ARCHIVE="$STAGE/$ARCHIVE_NAME"
-tar -czf "$ARCHIVE" -C "$STAGE" relay-state
+# cd first and name the archive relatively: tar reads an -f argument containing a
+# colon as a remote host:path spec, which a drive-lettered TMPDIR would trip over.
+( cd -- "$STAGE" && tar -czf "$ARCHIVE_NAME" relay-state )
 
 if [ "$VERIFY" -eq 1 ]; then
   RESTORE="$STAGE/restore"
   mkdir -p -- "$RESTORE"
-  tar -xzf "$ARCHIVE" -C "$RESTORE"
+  ( cd -- "$RESTORE" && tar -xzf "../$ARCHIVE_NAME" )
   [ -d "$RESTORE/relay-state" ] || die "verify: archive has no relay-state/ root"
   refuse_secrets "$RESTORE"
   ( cd -- "$RESTORE/relay-state" && "${SHA[@]}" -c MANIFEST.sha256 >/dev/null ) \
