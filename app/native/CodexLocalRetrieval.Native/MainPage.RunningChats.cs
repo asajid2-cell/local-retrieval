@@ -28,7 +28,14 @@ public sealed partial class MainPage
     private List<ArchiveService.RunningSessionInfo>? _runningCache;
     private DateTime _runningCacheAt;
     private readonly object _runningCacheLock = new();
-    private void InvalidateRunningCache() { lock (_runningCacheLock) _runningCache = null; }
+    // [F#4] The GUI's own cache and Core's burst scan cache answer the same question from two layers, so they
+    // must go stale together: dropping only this one leaves the resume guards and claim checks still reading a
+    // pre-kill world through Core.
+    private void InvalidateRunningCache()
+    {
+        lock (_runningCacheLock) _runningCache = null;
+        RunningSessions.InvalidateScanCache();
+    }
 
     private List<ArchiveService.RunningSessionInfo> GetRunningSessions()
     {
