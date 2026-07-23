@@ -628,7 +628,7 @@ class BudgetEnforcementTests(unittest.TestCase):
                          probe.EXIT_OK)
 
     def test_over_budget_exits_non_zero(self):
-        self._with_local_samples([10.0] * 190 + [400.0] * 10)
+        self._with_local_samples([10.0] * 180 + [400.0] * 20)
         self.assertEqual(probe.main(["--local", "--samples", "200", "--budget-p95-ms", "50"]),
                          probe.EXIT_OVER_BUDGET)
 
@@ -722,6 +722,17 @@ class BudgetEnforcementTests(unittest.TestCase):
             self.assertEqual(probe.relay_enabled(), want, value)
         os.environ.pop("MUXD_VPS_TESTS", None)
         self.assertFalse(probe.relay_enabled())
+
+
+class GitignoreHygieneTests(unittest.TestCase):
+    """Running this suite writes scripts/__pycache__/; the repo-root ignore must cover it."""
+
+    def test_repo_root_gitignore_ignores_pycache(self):
+        path = os.path.join(REPO_ROOT, ".gitignore")
+        self.assertTrue(os.path.isfile(path), path)
+        with open(path, "r", encoding="utf-8") as fh:
+            lines = [line.strip() for line in fh]
+        self.assertIn("__pycache__/", lines)
 
 
 if __name__ == "__main__":
