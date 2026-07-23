@@ -400,8 +400,13 @@ _CONPTY_HOST_EXECUTABLES = (
 _ORPHANED_CONPTY_LOCK = threading.Lock()
 _ORPHANED_CONPTY_HOSTS = {}
 _PENDING_CONPTY_BASELINES = {}
+# Baselines the reaper gave up on. Diagnostic only: nothing reads this to make a decision, so a
+# quarantine that can never resolve degrades into a log line instead of wedging every future spawn.
+_ABANDONED_CONPTY_BASELINES = []
+CONPTY_ABANDONED_BASELINE_LIMIT = 16
 CONPTY_CUSTODY_TTL = float(os.environ.get("MUXD_CONPTY_CUSTODY_TTL", "300"))
 CONPTY_QUARANTINE_TTL = float(os.environ.get("MUXD_CONPTY_QUARANTINE_TTL", "60"))
+CONPTY_QUARANTINE_MAX_ATTEMPTS = 5
 
 def _custody_record(reason, now=None):
     stamp = time.monotonic() if now is None else float(now)
@@ -632,6 +637,27 @@ def _reap_orphaned_conpty_hosts(timeout=5):
                     timeout=min(1.0, max(0.1, timeout)),
                 )
             except OSError as error:
+                # Enumeration failed again — the same fault that created this baseline. Age it, and
+                # once it is hopeless drop it so spawns resume; a leaked host beats a dead daemon.
+                _custody_touch(baseline_record)
+                age = _custody_age(baseline_record)
+                attempts = int(baseline_record.get("attempts", 0))
+                if age > CONPTY_QUARANTINE_TTL or attempts >= CONPTY_QUARANTINE_MAX_ATTEMPTS:
+                    with _ORPHANED_CONPTY_LOCK:
+                        _PENDING_CONPTY_BASELINES.pop(baseline_key, None)
+                        _ABANDONED_CONPTY_BASELINES.append({
+                            "baseline": baseline_key,
+                            "reason": reason,
+                            "age": age,
+                            "attempts": attempts,
+                            "error": str(error),
+                        })
+                        del _ABANDONED_CONPTY_BASELINES[:-CONPTY_ABANDONED_BASELINE_LIMIT]
+                    log(
+                        f"[conpty] quarantine expired after {age:.1f}s / {attempts} attempt(s), "
+                        f"resuming spawns (orphan hosts may have leaked): {reason}"
+                    )
+                    continue
                 log(f"[conpty] orphan discovery still pending: {error}")
                 continue
             with _ORPHANED_CONPTY_LOCK:
@@ -1548,9 +1574,13 @@ class Session:
             direct_cmd = True
         with _CONPTY_SPAWN_LOCK:
             with _ORPHANED_CONPTY_LOCK:
+                # Expired baselines are popped by the reaper, so a non-empty dict means a LIVE
+                # quarantine. Deliberately no expiry check here: this runs under the spawn lock.
                 if _PENDING_CONPTY_BASELINES:
+                    blocking = next(iter(_PENDING_CONPTY_BASELINES.values()))
                     raise RuntimeError(
-                        "ConPTY custody is quarantined pending orphan-host discovery"
+                        "ConPTY custody is quarantined pending orphan-host discovery: "
+                        f"{blocking.get('reason', '')}"
                     )
             conpty_hosts_before = _conpty_host_process_records(os.getpid())
             try:

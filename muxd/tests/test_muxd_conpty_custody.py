@@ -195,5 +195,170 @@ class ConptyCustodyGarbageCollectionTests(unittest.TestCase):
         )
 
 
+class ConptyQuarantineExpiryTests(unittest.TestCase):
+    """A baseline whose enumeration never recovers must stop blocking spawns."""
+
+    def setUp(self):
+        muxd._ORPHANED_CONPTY_HOSTS.clear()
+        muxd._PENDING_CONPTY_BASELINES.clear()
+        muxd._ABANDONED_CONPTY_BASELINES.clear()
+
+    def tearDown(self):
+        muxd._ORPHANED_CONPTY_HOSTS.clear()
+        muxd._PENDING_CONPTY_BASELINES.clear()
+        muxd._ABANDONED_CONPTY_BASELINES.clear()
+
+    def _reap_with_failing_enumeration(self, times, logs):
+        with mock.patch.object(
+            muxd,
+            "_new_conpty_host_processes",
+            side_effect=OSError("toolhelp snapshot failed"),
+        ), mock.patch.object(muxd, "log", side_effect=logs.append):
+            for _ in range(times):
+                muxd._reap_orphaned_conpty_hosts(timeout=1)
+
+    def test_permanent_enumeration_failure_expires_the_quarantine(self):
+        muxd._retain_pending_conpty_baseline({7: "a"}, "failed spawn for tab-1")
+        self.assertEqual(1, len(muxd._PENDING_CONPTY_BASELINES))
+        logs = []
+        self._reap_with_failing_enumeration(5, logs)
+        self.assertEqual({}, muxd._PENDING_CONPTY_BASELINES)
+        expiry = [line for line in logs if "quarantine expired" in line]
+        self.assertEqual(1, len(expiry), logs)
+        self.assertIn("5 attempt(s)", expiry[0])
+        self.assertIn("resuming spawns (orphan hosts may have leaked)", expiry[0])
+        self.assertIn("failed spawn for tab-1", expiry[0])
+        self.assertEqual(1, len(muxd._ABANDONED_CONPTY_BASELINES))
+        abandoned = muxd._ABANDONED_CONPTY_BASELINES[0]
+        self.assertEqual(((7, "a"),), abandoned["baseline"])
+        self.assertEqual("failed spawn for tab-1", abandoned["reason"])
+        self.assertEqual(5, abandoned["attempts"])
+        self.assertIn("toolhelp snapshot failed", abandoned["error"])
+
+    def test_quarantine_holds_until_the_attempt_budget_is_spent(self):
+        muxd._retain_pending_conpty_baseline({7: "a"}, "failed spawn for tab-1")
+        logs = []
+        self._reap_with_failing_enumeration(4, logs)
+        self.assertEqual(1, len(muxd._PENDING_CONPTY_BASELINES))
+        self.assertEqual([], muxd._ABANDONED_CONPTY_BASELINES)
+        self.assertEqual(4, len([line for line in logs if "still pending" in line]))
+
+    def test_age_alone_expires_the_quarantine_before_the_attempt_budget(self):
+        with mock.patch.object(muxd.time, "monotonic", return_value=1000.0):
+            muxd._retain_pending_conpty_baseline({7: "a"}, "aborted spawn for tab-2")
+        logs = []
+        with mock.patch.object(
+            muxd.time,
+            "monotonic",
+            return_value=1000.0 + muxd.CONPTY_QUARANTINE_TTL + 1.0,
+        ):
+            self._reap_with_failing_enumeration(1, logs)
+        self.assertEqual({}, muxd._PENDING_CONPTY_BASELINES)
+        expiry = [line for line in logs if "quarantine expired" in line]
+        self.assertEqual(1, len(expiry), logs)
+        self.assertIn("1 attempt(s)", expiry[0])
+        self.assertEqual(1, len(muxd._ABANDONED_CONPTY_BASELINES))
+
+    def test_baseline_that_resolves_is_not_recorded_as_abandoned(self):
+        muxd._retain_pending_conpty_baseline({7: "a"}, "failed spawn for tab-3")
+        attempts = {"n": 0}
+
+        def flaky(previous_records, timeout=1.0):
+            attempts["n"] += 1
+            if attempts["n"] < 2:
+                raise OSError("toolhelp snapshot failed")
+            return [(9, "spawned")]
+
+        logs = []
+        with mock.patch.object(
+            muxd, "_new_conpty_host_processes", side_effect=flaky
+        ), mock.patch.object(
+            # The synthetic pid is not a live host of ours, so the dormant-record GC
+            # would drop it before the terminate path; keep it LIVE for this test.
+            muxd,
+            "_same_process_instance",
+            return_value=True,
+        ), mock.patch.object(
+            muxd,
+            "_terminate_conhost_records",
+            side_effect=lambda owned, timeout=3: (list(owned), ["still running"]),
+        ), mock.patch.object(muxd, "log", side_effect=logs.append):
+            muxd._reap_orphaned_conpty_hosts(timeout=1)
+            muxd._reap_orphaned_conpty_hosts(timeout=1)
+        self.assertEqual({}, muxd._PENDING_CONPTY_BASELINES)
+        self.assertEqual([], muxd._ABANDONED_CONPTY_BASELINES)
+        self.assertEqual([], [line for line in logs if "quarantine expired" in line])
+        # The success path still hands the baseline's reason to the orphan record.
+        self.assertEqual(
+            "failed spawn for tab-3",
+            muxd._ORPHANED_CONPTY_HOSTS[(9, "spawned")]["reason"],
+        )
+
+    def test_abandoned_baselines_are_bounded(self):
+        limit = muxd.CONPTY_ABANDONED_BASELINE_LIMIT
+        for index in range(limit + 3):
+            muxd._retain_pending_conpty_baseline({index: "a"}, f"spawn {index}")
+            self._reap_with_failing_enumeration(5, [])
+        self.assertEqual(limit, len(muxd._ABANDONED_CONPTY_BASELINES))
+        self.assertEqual(
+            f"spawn {limit + 2}",
+            muxd._ABANDONED_CONPTY_BASELINES[-1]["reason"],
+        )
+
+
+class ConptySpawnGateTests(unittest.TestCase):
+    """The spawn gate stays a cheap truthiness check, but names what is blocking."""
+
+    def setUp(self):
+        muxd._PENDING_CONPTY_BASELINES.clear()
+
+    def tearDown(self):
+        muxd._PENDING_CONPTY_BASELINES.clear()
+
+    def test_gate_message_names_the_blocking_reason(self):
+        muxd._retain_pending_conpty_baseline({7: "a"}, "failed spawn for tab-9")
+        session = muxd.Session.__new__(muxd.Session)
+        session.name = "tab-10"
+        session.cmd = ""
+        session.rows = 24
+        session.cols = 80
+        session.cwd = None
+        with self.assertRaises(RuntimeError) as caught:
+            session.spawn()
+        message = str(caught.exception)
+        self.assertIn("ConPTY custody is quarantined pending orphan-host discovery", message)
+        self.assertIn("failed spawn for tab-9", message)
+
+    def test_gate_opens_once_the_baseline_is_gone(self):
+        muxd._retain_pending_conpty_baseline({7: "a"}, "failed spawn for tab-9")
+        logs = []
+        with mock.patch.object(
+            muxd,
+            "_new_conpty_host_processes",
+            side_effect=OSError("toolhelp snapshot failed"),
+        ), mock.patch.object(muxd, "log", side_effect=logs.append):
+            for _ in range(5):
+                muxd._reap_orphaned_conpty_hosts(timeout=1)
+        self.assertEqual({}, muxd._PENDING_CONPTY_BASELINES)
+        # Gate is now open: reaching PtyProcess.spawn proves the RuntimeError no longer fires.
+        session = muxd.Session.__new__(muxd.Session)
+        session.name = "tab-10"
+        session.cmd = ""
+        session.rows = 24
+        session.cols = 80
+        session.cwd = None
+        with mock.patch.object(
+            muxd.PtyProcess, "spawn", side_effect=RuntimeError("reached the real spawn")
+        ), mock.patch.object(muxd, "_conpty_host_process_records", return_value={}), \
+                mock.patch.object(
+                    muxd, "_new_conpty_host_processes", return_value=[]
+                ), mock.patch.object(
+                    muxd, "_terminate_conhost_records", return_value=([], [])
+                ), mock.patch.object(muxd, "log", side_effect=logs.append):
+            with self.assertRaises(RuntimeError) as caught:
+                session.spawn()
+        self.assertEqual("reached the real spawn", str(caught.exception))
+
+
 if __name__ == "__main__":
     unittest.main()
