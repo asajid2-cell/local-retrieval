@@ -33,6 +33,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -363,7 +364,9 @@ def echo_child_command(child_path, python=None):
 
 
 def probe_session_name(prefix="latprobe"):
-    return "%s-%d-%d" % (prefix, os.getpid(), time.time_ns() % 1000000)
+    # uuid4, not a clock: Windows' time_ns() only ticks every ~15.6 ms, so back-to-back
+    # calls would collide and two probes could fight over one session name.
+    return "%s-%d-%s" % (prefix, os.getpid(), uuid.uuid4().hex[:8])
 
 
 async def wait_for_ready(transport, token=READY_TOKEN, timeout=25.0, deadline=None):
