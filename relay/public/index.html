@@ -2225,14 +2225,12 @@ function openCompose(){ openDialog('#composedlg'); setTimeout(()=>$('#composetex
 // Compose closes only once the text is SENT or QUEUED. Closing on a dead socket used to eat the whole
 // message — you watched the dialog vanish and nothing arrived. If it can't go anywhere, the dialog stays
 // open with your text still in it.
-function composeDelivery(){
-  if (ws && ws.readyState===1) return 'sent';
-  return inputQueue ? 'queued' : 'dropped';
-}
 function submitCompose(withEnter){
   const t=$('#composetext').value;
   if(!t){ $('#composedlg').close(); term.focus(); return 'sent'; }
-  const status = composeDelivery();
+  // A live socket goes now; a dead one can still be HELD, but only if this origin holds a signing key —
+  // without one there is no honest way to deliver the text later, so we say so instead of pretending.
+  const status = (ws && ws.readyState===1) ? 'sent' : (inputQueue ? 'queued' : 'dropped');
   if(status==='dropped'){ flash('Not sent - no connection. Your text is still here.'); return 'dropped'; }
   term.paste(t);
   if(withEnter) send('i','\r');

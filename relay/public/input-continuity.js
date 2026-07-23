@@ -67,7 +67,11 @@
       return !!(signer && typeof signer.signInput === 'function');
     }
 
-    function evictForRoom(size) {
+    function evictForRoom(size, at) {
+      // Expiry is evaluated LAZILY, at flush. Reaping it here too would let a later keystroke silently
+      // absorb an earlier one's expiry — the reconnect that drops it is the moment the user needs told.
+      // The one exception is cap pressure: bytes that can no longer be delivered lose their slot first.
+      if (bufferedBytes + size > capBytes) pruneExpired(at);
       // Oldest-first: the bytes you typed longest ago are the ones you are least likely to still mean.
       while (buffer.length && bufferedBytes + size > capBytes) {
         const gone = buffer.shift();
@@ -119,8 +123,7 @@
         say('drop', 'Input too large for the reconnect buffer — NOT sent', { bytes: size, capBytes });
         return 'dropped';
       }
-      pruneExpired(at);
-      evictForRoom(size);
+      evictForRoom(size, at);
       buffer.push({ bytes, capturedAt: at, expiresAt: at + ttlMs, size });
       bufferedBytes += size;
       stats.queued += 1;
