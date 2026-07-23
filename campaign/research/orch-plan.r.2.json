@@ -1,0 +1,490 @@
+[
+  {
+    "title": "Extract fake-host test harness into relay/tests/harness.js",
+    "kind": "build",
+    "tier": "default",
+    "deps": [],
+    "goal": "Factor the inline test infrastructure of relay/tests/relay.test.js (helpers L15-76: HOST_CAPS, freePort, waitFor, leaseCommands, ackLeased, waitForWsText; class RelayHarness L78-213; class FakeHost L215-294) into relay/tests/harness.js exporting all of them, and make relay.test.js require('./harness'). Zero behavior change; no server.js edits. Every other relay-test leaf imports this module.",
+    "verifier": "cd relay && node --test --test-force-exit --test-timeout=120000 tests/relay.test.js && node -e \"const fs=require('fs'),s=fs.readFileSync('tests/relay.test.js','utf8');if(!s.includes(`require('./harness')`)||s.includes('class FakeHost'))process.exit(1)\"",
+    "reads": [
+      {
+        "path": "relay/tests/relay.test.js",
+        "span": "1-320"
+      }
+    ]
+  },
+  {
+    "title": "Shared ntfy push transport module relay/notify.js (cross-prong seam module)",
+    "kind": "build",
+    "tier": "default",
+    "deps": [],
+    "goal": "Create relay/notify.js: createNotifier({url, fetchImpl}) reading MUX_NTFY_URL by default, exposing async push({title, body, tags, priority, click}) that POSTs to the ntfy topic URL with a 5s timeout, returns {ok, status|error} and NEVER throws; a no-op (ok:false, disabled:true) when no URL is configured. Pure transport: no episode/dedupe logic — event-source owners implement their own episode semantics. This module is shared with the adversarial prong's ops-health alerts; keep the API exactly as stated. Test needs no fake host: boot a local http.createServer capture target and point the notifier at it.",
+    "verifier": "cd relay && node --test --test-force-exit --test-timeout=20000 tests/notify-transport.test.js",
+    "reads": [
+      {
+        "path": "relay/server.js",
+        "span": "1-130"
+      },
+      {
+        "path": "relay/durable-state.js",
+        "span": "1-207"
+      }
+    ]
+  },
+  {
+    "title": "muxd: durable input-intent frame on the relay host link",
+    "kind": "build",
+    "tier": "default",
+    "deps": [],
+    "goal": "SEQUENCING: the root r.2 node does not expand until final trust leaf r.16 is folded, completing root trust leaves r.5 through r.16. Extend the already-defined principalAuthV1 host-link contract with durable input-intent execution: accept only a signed input.durable envelope carrying exact bodyB64 bytes, principalId/keyId, sessionUuid, intentId, ACL revision, lease epoch, expiry, and signature; pass the verified principal identity into execute_input_intent instead of scope='relay'; persist fingerprint/outcome for exact replay and refuse uncertain outcomes. A correct replayPolicy proves operation semantics, not who authorized the operation. muxd endpoint verification from trust leaf 4 remains the authority and proofless frames must return principal-proof-required with zero PTY writes. Add the input capability/frames to the protocol-4 registry and test cached exact replay, different-body rejection, uncertain refusal, expired proof, wrong session, and proofless rejection.",
+    "verifier": "cd muxd && timeout 120 python -m unittest discover -s tests -p \"test_host_input_intent*.py\"",
+    "reads": [
+      {
+        "path": "muxd/muxd.py",
+        "span": "2600-2760"
+      },
+      {
+        "path": "muxd/muxd.py",
+        "span": "3560-3900"
+      },
+      {
+        "path": "muxd/tests/test_muxd_state.py",
+        "span": "312-490"
+      }
+    ]
+  },
+  {
+    "title": "App: recent-chats archive index projection + push",
+    "kind": "build",
+    "tier": "default",
+    "deps": [],
+    "goal": "Core: ArchiveService.BuildArchiveIndexJson — a reshape of the existing ChatProjection pipeline (ArchiveService.cs:3884-3909, resumable-gated by CanBuildTrustedResumeLaunch 3566-3578, recency-ordered, cap 500) emitting {schemaVersion:1, host, chats:[{id, title, tool, cwd, workspaceLabel, updatedAt, muxName, resumable:true}]}; add cwd (on the model, not yet projected). Native: a sibling of PushProjectsAsync (MainPage.Remote.cs:320-354) POSTing it over RunSshAsync curl-stdin to loopback POST /api/archive-index on the same 30s sync timer (StartProjectSync L263-283). Opaque ids only (app/PLAN.md items 5-6): no commands, no local paths beyond cwd display strings. Mirror the five BuildProjectsProjectionJson_* tests (ArchiveServiceTests.cs:1061-1181); new MSTest class with no RealStore/LiveCodex category auto-runs in the gate. ArchiveService.cs is a god-file: touch only the projection region ~3855-3990. Contract pinned identically in the relay-side leaf (r.2 child 5) — keep field names identical. MERGE-ORDER: branch from main AFTER the perf prong's ArchiveService partial split lands — the projection pipeline then lives in ArchiveService.Projection.cs and CanBuildTrustedResumeLaunch in ArchiveService.Launch.cs; work in those partials.\n\nTRUST AMENDMENT: the projection push uses the scoped bridge credential from trust leaf 10. Any remote start/open/mutation action originating from this index carries a trust leaf 11 principal proof; plaintext index disclosure to the relay remains accepted.",
+    "verifier": "dotnet test app/native/CodexLocalRetrieval.Native.Tests/CodexLocalRetrieval.Native.Tests.csproj -c Release --filter \"FullyQualifiedName~ArchiveIndexTests\" --blame-hang --blame-hang-timeout 3m",
+    "reads": [
+      {
+        "path": "app/native/CodexLocalRetrieval.Native/MainPage.Remote.cs",
+        "span": "250-500"
+      },
+      {
+        "path": "app/native/CodexLocalRetrieval.Native/MainPage.Remote.cs",
+        "span": "800-870"
+      },
+      {
+        "path": "app/native/CodexLocalRetrieval.Core/Services/ArchiveService.cs",
+        "span": "3550-3600"
+      },
+      {
+        "path": "app/native/CodexLocalRetrieval.Core/Services/ArchiveService.cs",
+        "span": "3850-3990"
+      },
+      {
+        "path": "app/native/CodexLocalRetrieval.Native.Tests/ArchiveServiceTests.cs",
+        "span": "1000-1200"
+      },
+      {
+        "path": "app/PLAN.md",
+        "span": "1-13"
+      }
+    ]
+  },
+  {
+    "title": "Relay: accept + serve the archive index",
+    "kind": "build",
+    "tier": "default",
+    "deps": [],
+    "goal": "Mirror the /api/projects pattern (server.js:1069-1087): bridge-credential POST /api/archive-index validating shape ({schemaVersion, chats[]} with id/title/tool/updatedAt; cap 500 rows, reject oversized bodies), persisted via writeJsonState; owner-gated GET /api/archive-index serving it with an updatedAt/appLive-style freshness field (appLive() pattern at server.js:902). Contract pinned in the app-side leaf (r.2 child 4) — keep field names identical. Test: bridge-credential push accepted (harness requests are loopback — wrong or absent bridge credential rejected), served owner-gated, survives harness.restart(), oversized/invalid shape rejected.\n\nTRUST AMENDMENT: ambient loopback is not authorization. Browser owner cookies cannot call the bridge push route, and the bridge credential cannot open browser or host-link routes.",
+    "verifier": "cd relay && node --test --test-force-exit --test-timeout=60000 tests/archive-index.test.js",
+    "reads": [
+      {
+        "path": "relay/server.js",
+        "span": "860-1130"
+      },
+      {
+        "path": "relay/tests/harness.js",
+        "estTokens": 7000
+      }
+    ]
+  },
+  {
+    "title": "App: transcriptfetch command -> paged clean-transcript push",
+    "kind": "build",
+    "tier": "default",
+    "deps": [],
+    "goal": "Add a 'transcriptfetch' arm to the app command dispatch (MainPage.Remote.cs PollCommandsAsync L391-473): given the leased command's opaque sessionId, project the chat via the headless Core reader ArchiveService.ExtractReaderMessagesAsync (ArchiveService.cs:3239+, tolerant of half-written live tails) into paged JSON ({schemaVersion:1, sessionId, page, pages, messages:[{role, text, ts}]}, <=200KB/page, <=32 pages newest-first), honoring app/REMOTE.md redaction (redact message bodies when CLR_REMOTE_REDACT_READS=1); push each page over RunSshAsync curl-stdin to the scoped bridge-credential POST /api/transcripts/:sessionId on the relay, then ack ok. Opaque ids only (PLAN items 5-6). Do NOT return pages via ack detail — the relay discards app-supplied detail (server.js:1491-1497). Test fixtures: Claude + Codex JSONL incl. a truncated in-flight last line; assert page structure, size caps, redaction-on. Existing reader tests to mirror: TranscriptShareTests, RolloutAndLiveMappingTests. Page-JSON contract pinned identically in the relay-side leaf (r.2 child 7). MERGE-ORDER: branch from main AFTER the perf prong's ArchiveService partial split lands — ExtractReaderMessagesAsync then lives in ArchiveService.Parse.cs (its PollCommandsAsync anchor is method-name-stable; current line is :359); work in that partial.\n\nTRUST AMENDMENT: transcriptfetch is an archive.read operation. Both GUI and headless pollers verify the signed client principal envelope and current resource membership before reading. The request must name one explicit opaque session id and a bounded fetch TTL; never bulk-mirror history. This records the accepted widening from live-screen exposure to requested archived-history exposure.",
+    "verifier": "dotnet test app/native/CodexLocalRetrieval.Native.Tests/CodexLocalRetrieval.Native.Tests.csproj -c Release --filter \"FullyQualifiedName~TranscriptFetchTests\" --blame-hang --blame-hang-timeout 3m",
+    "reads": [
+      {
+        "path": "app/native/CodexLocalRetrieval.Native/MainPage.Remote.cs",
+        "span": "350-500"
+      },
+      {
+        "path": "app/native/CodexLocalRetrieval.Core/Services/ArchiveService.cs",
+        "span": "3200-3450"
+      },
+      {
+        "path": "app/REMOTE.md",
+        "span": "1-127"
+      },
+      {
+        "path": "app/PLAN.md",
+        "span": "1-13"
+      }
+    ]
+  },
+  {
+    "title": "Relay: transcriptfetch command type + transcript page store",
+    "kind": "build",
+    "tier": "default",
+    "deps": [],
+    "goal": "(1) Register 'transcriptfetch' in COMMAND_REPLAY_POLICY (server.js:1201-1211) as 'read-only', require sessionId at enqueue (mirror the transcript rule at 1388), add outcome labels (commandOutcomeDetail 1238-1256); no commandFingerprint change needed (sessionId already hashed). (2) Bridge-credential POST /api/transcripts/:sessionId accepting the paged JSON from the app-side leaf (validate shape, bound total bytes ~8MB/session, keep latest fetch only), persisted under STATE_DIR via writeJsonState; owner-gated GET /api/transcripts/:sessionId?page=N. Test: enqueue transcriptfetch -> lease/ack via harness helpers (using the scoped bridge credential); page push with the scoped bridge credential accepted; absent or wrong credential rejected; pages served owner-gated; survive harness.restart(); oversized page rejected. Page-JSON contract pinned identically in the app-side leaf (r.2 child 6).\n\nTRUST AMENDMENT: replayPolicy stays a semantics/dedup field, not authorization. Enqueue requires an opaque principal-auth envelope that the relay stores unchanged for trust leaf 11 verification. Transcript pages are retained only for an explicitly requested id with a bounded TTL, not as a bulk mirror.",
+    "verifier": "cd relay && node --test --test-force-exit --test-timeout=60000 tests/transcript-fetch.test.js",
+    "reads": [
+      {
+        "path": "relay/server.js",
+        "span": "1190-1530"
+      },
+      {
+        "path": "relay/tests/harness.js",
+        "estTokens": 7000
+      }
+    ]
+  },
+  {
+    "title": "Attention-episode push notifications",
+    "kind": "build",
+    "tier": "default",
+    "deps": [
+      "1",
+      "2"
+    ],
+    "goal": "In relay/server.js, add a session-attention episode detector: on each host sessions update (handler at server.js:1822-1830 feeding hostSessions), classify sessions via the existing attention computation (server.js:386-440); when a hosted session enters needsAttention (attention/stopped) and HOLDS it for a settle window (env MUX_NOTIFY_SETTLE_MS, default 20000; shrinkable in MUX_TEST_MODE), push once via notify.js (session name, agentLabel, deep link); re-notify only after the state clears and re-enters (one push per episode). Persist episode state via writeJsonState so a relay restart mid-episode does not re-fire. Do NOT alert on host-link-down or heal-give-up — those are the adversarial prong's ops-health edges. Test: harness + capture server; fake host drives working->attention->working->attention: exactly 1 POST per episode after settle, 0 while working, flap under settle window -> 0, harness.restart() mid-episode -> no duplicate. Human-checklist item: one live ntfy phone drill at campaign end; MUX_NTFY_URL provisioning is an ops item, not a leaf blocker.",
+    "verifier": "cd relay && node --test --test-force-exit --test-timeout=60000 tests/notify.test.js",
+    "reads": [
+      {
+        "path": "relay/server.js",
+        "span": "380-445"
+      },
+      {
+        "path": "relay/server.js",
+        "span": "1800-1840"
+      },
+      {
+        "path": "relay/notify.js",
+        "estTokens": 2500
+      },
+      {
+        "path": "relay/tests/harness.js",
+        "estTokens": 7000
+      }
+    ]
+  },
+  {
+    "title": "Relay durable send endpoint POST /api/sessions/:name/send",
+    "kind": "build",
+    "tier": "default",
+    "deps": [
+      "1",
+      "3"
+    ],
+    "goal": "New owner-gated route in relay/server.js: POST /api/sessions/:name/send accepts one opaque, already signed input.durable envelope from the trusted client origin. Validate only transport/schema bounds and route/session availability, preserve the exact signed body bytes, principal/key ids, sessionUuid, intentId, expiry, ACL/lease epochs, and signature byte-for-byte, forward over the host link, and correlate the muxd-signed result by rid. The relay never accepts raw {text,intentId}, never constructs bodyB64 or authority fields, and never signs. Map verified input-ok to 200; muxd typed errors to bounded 4xx/502; host down/cap missing to retryable 503. Tests: missing envelope -> 400 before host traffic; valid envelope is byte-identical at FakeHost; relay mutation is rejected by muxd; exact replay returns cached success; proofless/wrong-session/expired envelopes never write the PTY.",
+    "verifier": "cd relay && node --test --test-force-exit --test-timeout=60000 tests/send-endpoint.test.js",
+    "reads": [
+      {
+        "path": "relay/server.js",
+        "span": "200-340"
+      },
+      {
+        "path": "relay/server.js",
+        "span": "2280-2330"
+      },
+      {
+        "path": "relay/tests/harness.js",
+        "estTokens": 7000
+      },
+      {
+        "path": "relay/public/intent-journal.js",
+        "span": "1-103"
+      }
+    ]
+  },
+  {
+    "title": "Fleet glance screen + GET /api/fleet",
+    "kind": "build",
+    "tier": "default",
+    "deps": [
+      "1"
+    ],
+    "goal": "Server: GET /api/fleet (owner-gated) returning every session's /api/sessions row PLUS a bounded tail snippet (last ~2 lines, <=2KB each) fetched via the existing tail host command (server.js:305-313, 2.5s timeout; short in-memory cache ~5s; host offline -> rows degrade to state-only and the endpoint still 200s fast). UI: a fleet view in the mobile-nav slot (index.html:575-592) — one row per session: state chip, agentLabel, last-output age, snippet, autoheal badge; tap attaches. Logic in relay/public/fleet.js; index.html wiring only. Test: all sessions in one request with snippet <= cap against fake host; host offline -> 200 with state-only rows, bounded latency; vm/string asserts for fleet.js rendering N rows with state class + snippet.\n\nTRUST AMENDMENT: tail/output snippets are terminal truth. muxd signs them and the trusted-origin client verifies before display; the relay still sees and may cache the plaintext.",
+    "verifier": "cd relay && node --test --test-force-exit --test-timeout=60000 tests/fleet-view.test.js",
+    "reads": [
+      {
+        "path": "relay/server.js",
+        "span": "290-330"
+      },
+      {
+        "path": "relay/public/index.html",
+        "span": "560-600"
+      },
+      {
+        "path": "relay/public/index.html",
+        "span": "1720-1810"
+      },
+      {
+        "path": "relay/tests/harness.js",
+        "estTokens": 7000
+      }
+    ]
+  },
+  {
+    "title": "Needs-attention chip + per-session notification mute",
+    "kind": "build",
+    "tier": "default",
+    "deps": [
+      "8"
+    ],
+    "goal": "Server: POST /api/sessions/:name/notify {on:boolean} (owner-gated by the global middleware), persisted via writeJsonState; muted sessions are skipped by the episode notifier (r.2 child 8); mute state surfaced in /api/sessions rows. UI: render a distinct 'needs attention' chip (not just the colored dot) in renderTabs (index.html:1756-1808) keyed off s.state==='yellow'||'red' (the client never sees needsAttention — the server pre-reduces attention into s.state), plus a mute toggle in the session UI; ship chip/toggle logic in a small relay/public/attention-ui.js module wired from index.html. Test: mute -> drive episode -> 0 POSTs; unmute -> next episode -> 1; toggle survives harness.restart(). UI side: vm-load attention-ui.js (pattern relay.test.js:2196-2292) + string-structure asserts on index.html wiring (client-layout section() pattern).",
+    "verifier": "cd relay && node --test --test-force-exit --test-timeout=60000 tests/notify-toggle.test.js",
+    "reads": [
+      {
+        "path": "relay/server.js",
+        "span": "380-445"
+      },
+      {
+        "path": "relay/public/index.html",
+        "span": "1750-1810"
+      },
+      {
+        "path": "relay/tests/harness.js",
+        "estTokens": 7000
+      },
+      {
+        "path": "relay/tests/client-layout.test.js",
+        "span": "1-53"
+      }
+    ]
+  },
+  {
+    "title": "Upgrade the existing composer dialog to the durable send path",
+    "kind": "build",
+    "tier": "default",
+    "deps": [
+      "9"
+    ],
+    "goal": "Upgrade the existing composer dialog to the trusted durable-send path. composer.js calls principal-auth.js to create a fresh signed input.durable envelope for the exact text/session and submits that envelope to /api/sessions/:name/send through postIntent. Remove the raw term.paste/unsigned fallback completely; attackers choose the weakest accepted path. Preserve busy/failed/sent states and capped local history. Tests prove one signing call and one postIntent, signing or receipt failure keeps the dialog actionable, history recall works, the private key is never handled by composer.js, and no raw fallback button/path exists. Human checklist: phone IME feel.",
+    "verifier": "cd relay && node --test --test-force-exit --test-timeout=20000 tests/composer-ui.test.js",
+    "reads": [
+      {
+        "path": "relay/public/index.html",
+        "span": "650-700"
+      },
+      {
+        "path": "relay/public/index.html",
+        "span": "2180-2210"
+      },
+      {
+        "path": "relay/public/intent-journal.js",
+        "span": "1-103"
+      },
+      {
+        "path": "relay/public/composer.js",
+        "estTokens": 6000
+      }
+    ]
+  },
+  {
+    "title": "Send-when-idle UI and relay mirror over muxd-owned signed delegation",
+    "kind": "build",
+    "tier": "default",
+    "deps": [
+      "8",
+      "9"
+    ],
+    "goal": "Build the value/UI layer for trust leaf 7, not a relay execution authority. The trusted client signs exact text, sessionUuid, condition working->idle|attention, notBefore, expiresAt <=24h, maxExecutions=1, intentId, and lease behavior; the relay forwards the opaque delegation to muxd and stores only a bounded non-authoritative display/notification mirror. muxd owns durable storage, local idleness evaluation, lease acquisition/steal, execute-once, and signed status; cancel is another signed intent. UI shows queued count, expiry, signed completion, and cancellation. Tests prove the relay cannot trigger early delivery or alter text/condition/expiry, restart preserves only the mirror while muxd preserves authority, two items retain signed FIFO order, cancellation/expiry win, and a forged relay status is not shown as success.",
+    "verifier": "cd relay && node --test --test-force-exit --test-timeout=60000 tests/deferred-send.test.js",
+    "reads": [
+      {
+        "path": "relay/server.js",
+        "span": "380-445"
+      },
+      {
+        "path": "relay/tests/harness.js",
+        "estTokens": 7000
+      },
+      {
+        "path": "relay/public/composer.js",
+        "estTokens": 6000
+      }
+    ]
+  },
+  {
+    "title": "Quick-reply chips above the composer",
+    "kind": "build",
+    "tier": "default",
+    "deps": [
+      "12"
+    ],
+    "goal": "Editable one-tap canned prompts rendered above the composer and stored per browser. Every tap asks principal-auth.js for a fresh signed input.durable or input.raw frame bound to the current session and submits through the trusted composer path; no chip reuses a prior signature or sends raw text to the relay. Tests prove defaults render, one tap produces exactly one fresh signing call and one send, session changes invalidate reuse, and edited chips persist.",
+    "verifier": "cd relay && node --test --test-force-exit --test-timeout=20000 tests/quick-replies.test.js",
+    "reads": [
+      {
+        "path": "relay/public/composer.js",
+        "estTokens": 6000
+      },
+      {
+        "path": "relay/public/index.html",
+        "span": "560-600"
+      }
+    ]
+  },
+  {
+    "title": "Phone resume-from-archive picker",
+    "kind": "build",
+    "tier": "default",
+    "deps": [
+      "4",
+      "5"
+    ],
+    "goal": "Web UI picker (relay/public/picker.js + index.html wiring): search box client-filtering GET /api/archive-index rows; tap a chat -> postIntent(base+'/api/app-commands', {type:'startmux', sessionId, tool, muxName}, 'resume') using the EXISTING intent-fenced startmux command (allow-listed server.js:1201-1211; enqueue validation 1407-1413 incl. the local-owner 409) -> poll GET /api/app-commands/:id -> on done, refresh sessions and select the new hosted tab; surface ack detail on failure (e.g. 'local copy is already running') and a queued/offline state when the app is not live (appLive-style freshness from the archive-index endpoint). Test: seed index via the scoped bridge-credential POST; double-tap -> second enqueue returns deduplicated:true (intent-journal reuses the intentId; server.js:1341-1348); lease+ack via harness leaseCommands/ackLeased; fake host adds the session -> tab list contains it; app-offline -> queued/failed state shown, not silence. vm-test picker.js; string-assert index.html wiring.\n\nTRUST AMENDMENT: startmux is authorized only by a signed session.create principal proof carried unchanged through the relay and verified by the desktop bridge and muxd. intentId/leaseToken/replayPolicy retain only dedupe/work-distribution meaning.",
+    "verifier": "cd relay && node --test --test-force-exit --test-timeout=60000 tests/resume-picker.test.js",
+    "reads": [
+      {
+        "path": "relay/public/index.html",
+        "span": "560-700"
+      },
+      {
+        "path": "relay/public/intent-journal.js",
+        "span": "1-103"
+      },
+      {
+        "path": "relay/server.js",
+        "span": "1195-1420"
+      },
+      {
+        "path": "relay/tests/harness.js",
+        "estTokens": 7000
+      }
+    ]
+  },
+  {
+    "title": "Reader view: relay/public/reader.html",
+    "kind": "build",
+    "tier": "default",
+    "deps": [
+      "7"
+    ],
+    "goal": "A SEPARATE page relay/public/reader.html + reader.js (pinned: not index.html — express.static serves it automatically at /reader.html, server.js:107-115): renders GET /api/transcripts/:sessionId pages as a clean reader (role-classed bubbles, tool-call collapse, newest-last), 'refresh' triggers a new transcriptfetch enqueue via postIntent + repolls, PC-bridge-offline renders a helpful fallback. Entry points: a 'Read as transcript' link on session tabs and picker rows (few-line index.html wiring only). vm-load reader.js with fixture pages -> N message nodes with role classes; refresh re-fetches (mocked); offline fixture -> fallback text. Human-checklist: reader readability on the phone.\n\nTRUST AMENDMENT: refresh creates a signed archive.read/transcriptfetch intent at the trusted origin. Reader content remains plaintext relay exposure by accepted decision; any success/terminal truth shown to the user must come from a verified muxd/bridge-signed response.",
+    "verifier": "cd relay && node --test --test-force-exit --test-timeout=20000 tests/reader-ui.test.js",
+    "reads": [
+      {
+        "path": "relay/public/reader.html",
+        "estTokens": 3000
+      },
+      {
+        "path": "relay/public/intent-journal.js",
+        "span": "1-103"
+      },
+      {
+        "path": "relay/public/index.html",
+        "span": "1750-1810"
+      },
+      {
+        "path": "relay/tests/harness.js",
+        "estTokens": 7000
+      }
+    ]
+  },
+  {
+    "title": "Widen the relay-tests gate to the whole tests directory",
+    "kind": "build",
+    "tier": "default",
+    "deps": [
+      "8",
+      "9"
+    ],
+    "goal": "Edit app/tools/run_gates.ps1 relay-tests gate (currently node --test tests\\relay.test.js only) to run the full suite bounded: node --test --test-force-exit --test-timeout=120000 tests\\ so every campaign-added relay/tests/*.test.js is gate-visible; keep the '# pass ' positive marker. Do not change the dotnet/muxd gates (they auto-discover). Verify the widened invocation is green against the repo relay tree. SCHEDULE LAST among relay leaves (deps bias it late; the prong fold-up reruns it post-merge, which is the real proof). Timeout note: relay.test.js legitimately takes 72-78s total — the file-level budget must be >=120s, NOT the 20s the base plans assumed. The gate executes in the EXTERNAL checkout C:/Users/Ahmed/multiplex-app-patch — the acceptance runner must sync/deploy before the real gate run. If the adversarial prong claims gate-file ownership, convert this leaf to a registration request to them.\n\nTRUST AMENDMENT: root trust leaves r.5 through r.16 are already folded before this gate runs. The widened tests directory must include trust client/conduit/signed-output tests and the real trust smoke; this gate is renumbered relative to r.1 because the obsolete security planner was removed.",
+    "verifier": "cd relay && node --test --test-force-exit --test-timeout=120000 tests/ && grep -q -- \"--test-force-exit\" ../app/tools/run_gates.ps1",
+    "reads": [
+      {
+        "path": "app/tools/run_gates.ps1",
+        "span": "1-173"
+      },
+      {
+        "path": "relay/tests/wheel-scroll.test.js",
+        "span": "1-59"
+      }
+    ]
+  },
+  {
+    "title": "Relay state retention: transcript-store and command-journal caps + STATE_DIR gauges",
+    "kind": "build",
+    "tier": "default",
+    "deps": [
+      "7"
+    ],
+    "goal": "relay/retention.js wired into server.js: a retention pass at boot and every 6h (timer; interval shrinkable in MUX_TEST_MODE), plus inline enforcement at transcript-push accept time. (1) Transcript page store: global caps across sessions — keep newest <=20 sessions by fetch time AND total <=256MB (both env-tunable); prune oldest whole-session stores beyond either cap; the per-session bounds from the transcript-store leaf are unchanged. (2) App-commands journal: prune terminal-outcome commands older than 14 days, always retaining the newest 200; NEVER prune a command in a non-terminal state. Dedupe-horizon note, stated and tested: pruning a terminal record re-enables replay of its intentId — acceptable because the client intent-journal's retry horizon is minutes (3 attempts, 250/750ms backoff, 256-record cap) and 14 days is orders of magnitude beyond any real redelivery. (3) Archive index, episode state, deferred-send queue: already bounded — the sweep asserts their invariants, prunes nothing. (4) /api/health gains stateDirBytes plus per-store size/count gauges so growth is observable before it is a problem. All mutations through writeJsonState/unlink under the existing persistence discipline (persistenceBlocked respected). Tests (tests/retention.test.js, harness): fabricate 25 session transcript stores with skewed ages/sizes -> sweep -> newest 20 kept, total under cap, oldest deleted; fabricate 500 aged terminal commands + 5 in-flight -> in-flight all survive, newest-200 floor holds; a deduplicated:true response still returned for an intentId inside the horizon; gauges present and accurate; harness.restart() mid-state -> sweep converges to the same bounds.\n\nTRUST AMENDMENT: app-command and send mirrors retain opaque signed envelopes only; never persist browser private keys, pairing secrets, muxd identity secrets, or reusable local/host credentials. Retention gauges report plaintext transcript/archive exposure and signed-envelope bytes separately.",
+    "verifier": "cd relay && node --test --test-force-exit --test-timeout=60000 tests/retention.test.js",
+    "reads": [
+      {
+        "path": "relay/server.js",
+        "span": "1190-1530"
+      },
+      {
+        "path": "relay/durable-state.js",
+        "span": "1-207"
+      },
+      {
+        "path": "relay/tests/harness.js",
+        "estTokens": 7000
+      }
+    ]
+  },
+  {
+    "title": "muxd durable input-intent journal retention",
+    "kind": "build",
+    "tier": "default",
+    "deps": [
+      "3"
+    ],
+    "goal": "Prune the persisted input-intent records that the host-link input leaf makes routine. Per session: keep completed/error records for max(7 days, newest 512); NEVER prune a record in the uncertain/in-flight state — refusing unsafe replay is its entire purpose and it must survive any sweep; drop a session's records when the session is deleted. Sweep runs at daemon start and on session GC, bounded work per pass, inside the same persistence discipline as the durable machinery (muxd.py:2672-2723). Replay semantics unchanged inside the horizon. Tests: fabricated journal (N old completed + 1 uncertain + fresh completed) -> sweep -> uncertain and fresh survive, old completed gone; replay of a surviving completed intentId returns the cached result; replay of the uncertain intentId still refuses; replay of a PRUNED intentId re-executes (the documented horizon behavior, asserted so it is a decision, not a surprise); session delete removes its records.\n\nTRUST AMENDMENT: retained records bind principalId, keyId, sessionUuid, intentId, and bodySha256. Pruning never turns an expired/revoked proof into a valid one; a pruned intent may re-execute only after a new currently valid authorization proof.",
+    "verifier": "cd muxd && timeout 120 python -m unittest discover -s tests -p \"test_intent_retention*.py\"",
+    "reads": [
+      {
+        "path": "muxd/muxd.py",
+        "span": "2600-2760"
+      },
+      {
+        "path": "muxd/tests/test_muxd_state.py",
+        "span": "312-490"
+      }
+    ]
+  },
+  {
+    "title": "Three-process e2e smoke: browser-protocol client -> relay -> muxd -> ConPTY and back",
+    "kind": "build",
+    "tier": "default",
+    "deps": [
+      "1",
+      "9"
+    ],
+    "goal": "tests/e2e-smoke.test.js: spawn the real relay, real muxd, and real ConPTY child with temp state and free ports, using a test principal plus the trusted-client protocol implementation already built in r.7. Connect a plain ws client that performs signed channel.open. Assert host hello/caps; create/claim a test session through signed session.create; signed input.raw with a unique marker echoes back in a verified muxd-signed output frame; signed resize succeeds; POST /api/sessions/:name/send with a second signed input.durable marker returns a verified signed result and echoes; kill uses a signed manage intent; clean teardown. Include the negative composition control: a syntactically valid proofless legacy input reaches muxd, returns principal-proof-required, and produces no echo. Fail red if muxd is absent, never skip, bound every step, and kill both child processes in finally. This is the functional composition smoke retained from the design revision; trust leaf 12 remains the broader hostile-relay/security smoke.",
+    "verifier": "cd relay && node --test --test-force-exit --test-timeout=120000 tests/e2e-smoke.test.js",
+    "reads": [
+      {
+        "path": "relay/tests/harness.js",
+        "estTokens": 7000
+      },
+      {
+        "path": "muxd/muxd.py",
+        "span": "3770-3873"
+      },
+      {
+        "path": "relay/server.js",
+        "span": "200-340"
+      },
+      {
+        "path": "muxd/tests/test_vps_smoke.py",
+        "span": "1-283"
+      }
+    ]
+  }
+]
