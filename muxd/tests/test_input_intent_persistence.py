@@ -58,6 +58,26 @@ def terminal_record(principal, status="completed", result=None, created=NOW, upd
     return record
 
 
+def reserve_record(principal, created=NOW, updated=NOW):
+    """Exactly what execute_durable_input_intent persists on the RESERVE path (muxd.py:2712-2724).
+
+    This is the record actually on disk if muxd dies between reserving an intent and settling it —
+    status "dispatching", empty result. execute_durable_input_intent never writes the literal
+    "uncertain"; "dispatching" is the real crash-window record the durability story hangs on.
+    """
+    record = {
+        "kind": "input",
+        "session": "work",
+        "fingerprint": principal.intent_fingerprint,
+        "status": "dispatching",
+        "result": {},
+        "createdAt": created,
+        "updatedAt": updated,
+    }
+    record["principal"] = principal.journal_record("dispatching")
+    return record
+
+
 def keyed(principal):
     return muxd.intent_key(principal.intent_scope, "input", principal.intent_id)
 
@@ -129,6 +149,59 @@ class DurableInputIntentPersistence(unittest.TestCase):
         disposition, refusal = host_input_intent.replay_decision(reloaded, principal.intent_fingerprint)
         self.assertEqual(disposition, host_input_intent.REPLAY_UNCERTAIN)
         self.assertEqual(refusal["t"], "err")
+
+
+    def test_reserve_record_passes_manifest_validation(self):
+        for principal in (make_principal(), make_principal(principal_id=WIDE, intent_id=WIDE)):
+            self.assertTrue(muxd.valid_intent_records({keyed(principal): reserve_record(principal)}))
+
+    def test_reserve_record_survives_the_whole_manifest(self):
+        """One bad intent record rejects the sessions too — assert the dispatching one does not."""
+        for principal in (make_principal(), make_principal(principal_id=WIDE, intent_id=WIDE)):
+            manifest = {
+                "version": 2,
+                "sessions": {"work": {"cmd": "bash", "cwd": "/tmp", "cols": 80, "rows": 24, "heal": True}},
+                "intents": {keyed(principal): reserve_record(principal)},
+            }
+            self.assertTrue(muxd.valid_manifest(manifest))
+
+    def test_reserve_record_is_plain_json(self):
+        """The principal sub-object from journal_record() must survive JSON or persistence throws."""
+        for principal in (make_principal(), make_principal(principal_id=WIDE, intent_id=WIDE)):
+            record = reserve_record(principal)
+            self.assertEqual(
+                record,
+                {
+                    "kind": "input",
+                    "session": "work",
+                    "fingerprint": principal.intent_fingerprint,
+                    "status": "dispatching",
+                    "result": {},
+                    "createdAt": NOW,
+                    "updatedAt": NOW,
+                    "principal": principal.journal_record("dispatching"),
+                },
+            )
+            self.assertEqual(json.loads(json.dumps(record)), record)
+
+    def test_compaction_never_ages_out_a_reserve_record(self):
+        """Forgetting an unsettled outcome silently converts an honest refusal into re-typing."""
+        for principal in (make_principal(), make_principal(principal_id=WIDE, intent_id=WIDE)):
+            record = reserve_record(principal)
+            ancient = NOW + muxd.INTENT_TERMINAL_RETENTION_SECONDS * 10
+            kept = muxd.compact_intent_records({keyed(principal): record}, now=ancient)
+            self.assertEqual(kept, {keyed(principal): record})
+
+    def test_reloaded_reserve_record_is_uncertain_and_conflict_aware(self):
+        for principal in (make_principal(), make_principal(principal_id=WIDE, intent_id=WIDE)):
+            reloaded = json.loads(json.dumps(reserve_record(principal)))
+            disposition, frame = host_input_intent.replay_decision(reloaded, principal.intent_fingerprint)
+            self.assertEqual(disposition, host_input_intent.REPLAY_UNCERTAIN)
+            self.assertEqual(frame["t"], "err")
+            self.assertEqual(
+                host_input_intent.replay_decision(reloaded, "f" * 64)[0],
+                host_input_intent.REPLAY_CONFLICT,
+            )
 
 
 if __name__ == "__main__":
