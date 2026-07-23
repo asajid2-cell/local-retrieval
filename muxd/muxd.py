@@ -639,12 +639,51 @@ def _reap_orphaned_conpty_hosts(timeout=5):
             _retain_orphaned_conpty_hosts(discovered, reason)
         with _ORPHANED_CONPTY_LOCK:
             records = list(_ORPHANED_CONPTY_HOSTS)
-    retained, failures = _terminate_conhost_records(records, timeout=timeout)
+    # Partition before terminating: a custody record must never outlive its subject.
+    # The _same_process_instance probes call into Win32, so they run OUTSIDE the lock.
+    live = []
+    dormant = []
+    abandoned = []
+    for key in records:
+        pid, start_token = key
+        if not _same_process_instance(int(pid), start_token):
+            # Dead pid, or the pid was recycled onto an unrelated process. Either way
+            # there is nothing of ours left to kill — dropping is not a failure.
+            dormant.append(key)
+            continue
+        with _ORPHANED_CONPTY_LOCK:
+            record = _ORPHANED_CONPTY_HOSTS.get(key)
+        if record is None:
+            continue
+        age = _custody_age(record)
+        if age > CONPTY_CUSTODY_TTL:
+            abandoned.append((key, record, age))
+            continue
+        live.append(key)
+    if dormant or abandoned:
+        with _ORPHANED_CONPTY_LOCK:
+            for key in dormant:
+                _ORPHANED_CONPTY_HOSTS.pop(key, None)
+            for key, _record, _age in abandoned:
+                _ORPHANED_CONPTY_HOSTS.pop(key, None)
+    for key, record, age in abandoned:
+        log(
+            f"[conpty] abandoning orphan host record pid={key[0]} after {age:.1f}s"
+            f" / {int(record.get('attempts', 0))} attempt(s): {record['reason']}"
+        )
+    if live:
+        retained, failures = _terminate_conhost_records(live, timeout=timeout)
+    else:
+        retained, failures = [], []
     retained_set = set(retained)
     with _ORPHANED_CONPTY_LOCK:
-        for record in records:
-            if record not in retained_set:
-                _ORPHANED_CONPTY_HOSTS.pop(record, None)
+        for key in live:
+            if key not in retained_set:
+                _ORPHANED_CONPTY_HOSTS.pop(key, None)
+                continue
+            record = _ORPHANED_CONPTY_HOSTS.get(key)
+            if record is not None:
+                _custody_touch(record)
     if failures:
         log(f"[conpty] supervised orphan cleanup still pending: {'; '.join(failures)}")
     return len(retained)

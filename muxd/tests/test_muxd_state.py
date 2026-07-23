@@ -1457,7 +1457,14 @@ class MuxdAsyncTests(unittest.IsolatedAsyncioTestCase):
             muxd._ORPHANED_CONPTY_HOSTS.clear()
         try:
             muxd._retain_orphaned_conpty_hosts([record], "test failure")
+            # The reaper now GCs dormant records before terminating, so this fake
+            # pid must claim to still be its original process instance for the
+            # retain-until-success path to be exercised at all.
             with mock.patch.object(
+                muxd,
+                "_same_process_instance",
+                return_value=True,
+            ), mock.patch.object(
                 muxd,
                 "_terminate_process_instance",
                 side_effect=[(False, "still alive"), (True, "process exited")],
