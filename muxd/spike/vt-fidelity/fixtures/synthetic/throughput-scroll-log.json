@@ -1,0 +1,9 @@
+{
+  "name": "throughput-scroll-log",
+  "corpus": "synthetic",
+  "cols": 120,
+  "rows": 40,
+  "bytes": 1540000,
+  "source": "gen_synthetic.py",
+  "desc": "~1.6MB coloured scrolling log \u2014 ingest throughput probe"
+}

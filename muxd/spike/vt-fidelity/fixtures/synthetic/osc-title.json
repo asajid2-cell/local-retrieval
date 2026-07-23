@@ -1,0 +1,9 @@
+{
+  "name": "osc-title",
+  "corpus": "synthetic",
+  "cols": 60,
+  "rows": 10,
+  "bytes": 90,
+  "source": "gen_synthetic.py",
+  "desc": "OSC 0/2 window title, BEL- and ST-terminated"
+}

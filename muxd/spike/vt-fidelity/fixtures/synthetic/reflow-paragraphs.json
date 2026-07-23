@@ -1,0 +1,9 @@
+{
+  "name": "reflow-paragraphs",
+  "corpus": "synthetic",
+  "cols": 140,
+  "rows": 40,
+  "bytes": 6161,
+  "source": "gen_synthetic.py",
+  "desc": "long soft-wrapped paragraphs \u2014 the reflow-on-resize probe"
+}

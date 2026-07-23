@@ -1,0 +1,9 @@
+{
+  "name": "decstbm-regions",
+  "corpus": "synthetic",
+  "cols": 60,
+  "rows": 24,
+  "bytes": 272,
+  "source": "gen_synthetic.py",
+  "desc": "DECSTBM region with IL/DL/SU/SD then region reset"
+}

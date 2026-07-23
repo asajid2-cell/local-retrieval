@@ -1,0 +1,9 @@
+{
+  "name": "erase-ed-el",
+  "corpus": "synthetic",
+  "cols": 60,
+  "rows": 14,
+  "bytes": 432,
+  "source": "gen_synthetic.py",
+  "desc": "EL 0/1/2 and ED 0/1 against a painted grid"
+}

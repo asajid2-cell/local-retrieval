@@ -1,0 +1,9 @@
+{
+  "name": "cursor-motion",
+  "corpus": "synthetic",
+  "cols": 80,
+  "rows": 24,
+  "bytes": 135,
+  "source": "gen_synthetic.py",
+  "desc": "CUP/CUU/CUD/CUF/CUB/CHA/VPA/HVP, DECSC/DECRC, RI, HT"
+}
