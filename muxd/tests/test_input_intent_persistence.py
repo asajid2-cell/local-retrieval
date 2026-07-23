@@ -169,6 +169,19 @@ class DurableInputIntentPersistence(unittest.TestCase):
         """The principal sub-object from journal_record() must survive JSON or persistence throws."""
         for principal in (make_principal(), make_principal(principal_id=WIDE, intent_id=WIDE)):
             record = reserve_record(principal)
+            self.assertEqual(
+                record,
+                {
+                    "kind": "input",
+                    "session": "work",
+                    "fingerprint": principal.intent_fingerprint,
+                    "status": "dispatching",
+                    "result": {},
+                    "createdAt": NOW,
+                    "updatedAt": NOW,
+                    "principal": principal.journal_record("dispatching"),
+                },
+            )
             self.assertEqual(json.loads(json.dumps(record)), record)
 
     def test_compaction_never_ages_out_a_reserve_record(self):
