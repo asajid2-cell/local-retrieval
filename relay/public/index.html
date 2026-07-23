@@ -290,6 +290,21 @@
   dialog p.hint { margin:0 0 var(--sp3); font-size:13px; color:var(--muted); line-height:1.5; }
   .managebtns { display:flex; flex-direction:column; gap:8px; margin:6px 0 12px; }
   .managebtns .act.wide { text-align:left; }
+  /* Resume-from-archive picker. Every state gets a visible line: the one thing this dialog must never
+     do is stay silent about whether the PC is listening. */
+  .resumelive { font-size:.78rem; opacity:.75; margin:0 0 6px; }
+  .resumelive.live { color:var(--live,#34d399); opacity:.9; }
+  .resumelive.offline, .resumelive.empty { color:var(--warn,#fbbf24); }
+  .resumelive.error { color:var(--rose,#fb7185); }
+  .resumerow { display:flex; flex-direction:column; align-items:flex-start; gap:2px; text-align:left; }
+  .resumerow.busy { opacity:.55; pointer-events:none; }
+  .resumetitle { font-weight:600; }
+  .resumemeta { font-size:.75rem; opacity:.65; }
+  .resumestatus { font-size:.8rem; min-height:1.15em; margin:6px 0 0; }
+  .resumestatus.busy { opacity:.7; }
+  .resumestatus.ok { color:var(--live,#34d399); }
+  .resumestatus.warn { color:var(--warn,#fbbf24); }
+  .resumestatus.bad { color:var(--rose,#fb7185); }
   .act.danger { border-color:var(--rose,#fb7185); color:var(--rose,#fb7185); }
   .histrow { display:flex; align-items:center; gap:10px; padding:8px 4px; border-bottom:1px solid var(--line); }
   .histlabel { flex:1; min-width:0; font-size:13px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
@@ -692,6 +707,16 @@
     <div class="grow"></div>
     <button class="act primary" id="wsdone" type="button">Done</button>
   </div>
+</dialog>
+
+<dialog id="resumedlg">
+  <h3>Resume a past chat</h3>
+  <p class="hint">Every chat your PC can bring back. Tap one and the desktop app resumes it here as a multiplex tab — the PC does the resuming, this phone only asks. Filtering happens on this device; what you type never leaves it.</p>
+  <p class="resumelive" id="resumelive"></p>
+  <input id="resumeq" placeholder="Search your chats…" autocapitalize="off" autocomplete="off" spellcheck="false" inputmode="search">
+  <div id="resumelist" class="addcollist"></div>
+  <p class="resumestatus" id="resumestatus"></p>
+  <div class="row"><div class="grow"></div><button class="act" id="resumeclose" type="button">Close</button></div>
 </dialog>
 
 <script src="vendor/xterm.js"></script>
@@ -2039,6 +2064,11 @@ async function relaunchSession(s){
 }
 // ---- manage tabs: bulk kill + export (names and opaque session history) -----------------------------
 $('#managebtn').onclick=()=>{ $('#managecount').textContent=(window._sessions||[]).length; openDialog('#managedlg'); };
+
+// Resume-from-archive picker (picker.js owns #resumedlg and wires #resumebtn itself). We hand it the
+// page's own helpers so a finished resume ends with the new tab SELECTED, not just a toast — and it
+// goes out through postIntent, so a double-tap collapses into one resume at the relay.
+if(window.MuxResumePicker) MuxResumePicker.install({ base, postIntent, loadSessions, flash, openDialog });
 $('#manageclose').onclick=()=>$('#managedlg').close();
 $('#exporttabs').onclick=()=>exportTabs();
 $('#killalltabs').onclick=()=>killAllTabs();
