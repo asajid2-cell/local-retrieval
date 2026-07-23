@@ -1817,6 +1817,7 @@ function openMenu(s, anchor){
     `<button data-a="addcol">➕ Add to collection</button>`+
     `<button data-a="relaunch">↻ Relaunch agent</button>`+
     `<button data-a="history">⏱ Session history</button>`+
+    `<button data-a="reader">📖 Read as transcript</button>`+
     `<button data-a="autoheal"></button>`+
     `<button data-a="opencmd">⌨ Copy local-open command</button>`+
     `<button data-a="reload">↻ Reload terminal (unfreeze)</button>`+
@@ -1873,6 +1874,7 @@ function menuAction(a, s){
   else if(a==='autoheal') toggleAutoheal(s);
   else if(a==='relaunch') relaunchSession(s);
   else if(a==='history') openTabHistory(s);
+  else if(a==='reader') openReader(s.sessionId||'', s.chatTitle||s.name);
   else if(a==='opencmd'){ navigator.clipboard?.writeText('mux '+s.name).then(()=>flash('Open command copied — paste it in a fresh local terminal')).catch(()=>{}); }
   else if(a==='reload'){ if(current===s.name) reloadTerminal(); else connect(s.name); }
   else if(a==='rename'){ openRenameDialog(s); }
@@ -2087,7 +2089,8 @@ function openTabHistory(s){
     const acts=document.createElement('div'); acts.className='histacts';
     const rb=document.createElement('button'); rb.className='act'; rb.textContent='Relaunch'; rb.onclick=()=>{ $('#historydlg').close(); relaunchTabTo(s.name, e); };
     const cb=document.createElement('button'); cb.className='act'; cb.textContent='+ Collection'; cb.onclick=()=>{ $('#historydlg').close(); addToCollection({ name:s.name, projectMuxName:s.name, muxName:s.name, sessionId:e.id, tool:e.tool, chatTitle:e.title }); };
-    acts.appendChild(rb); acts.appendChild(cb); row.appendChild(label); row.appendChild(acts); list.appendChild(row);
+    const tb=document.createElement('button'); tb.className='act'; tb.textContent='Read as transcript'; tb.onclick=()=>{ $('#historydlg').close(); openReader(e.id, e.title||s.name); };
+    acts.appendChild(rb); acts.appendChild(cb); acts.appendChild(tb); row.appendChild(label); row.appendChild(acts); list.appendChild(row);
   });
   openDialog('#historydlg');
 }
