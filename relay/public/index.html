@@ -155,8 +155,12 @@
   /* Scrollback is real history, so give it a real scrollbar: thin, themed, draggable with a mouse.
      Nothing here changes xterm's sizing internals - only the bar the browser already paints. */
   #term .xterm-viewport {
-    scrollbar-width:thin; scrollbar-color:var(--raised-2) transparent; overscroll-behavior:contain;
+    scrollbar-width:thin; scrollbar-color:var(--raised-2) transparent;
   }
+  /* Containment only when #term is NOT the pan host. With .rowpan the shared terminal is taller than the
+     phone pane and #term itself scrolls; containing the inner viewport would swallow the chained touch
+     drag at the end of scrollback and stall the pan. */
+  #term:not(.rowpan) .xterm-viewport { overscroll-behavior:contain; }
   /* WebKit only paints a styled bar for a real pointer. Touch keeps its native overlay scrollbar: styling
      ::-webkit-scrollbar on iOS pins a permanent bar that eats viewport width and fights the pan gestures. */
   @media (hover:hover) and (pointer:fine) {
@@ -173,7 +177,7 @@
   #term.altbuf .xterm-viewport::-webkit-scrollbar { width:0; height:0; }
   /* compact scroll readout, stacked above the jump-to-live pill in the same terminal corner */
   #scrollstate {
-    position:absolute; right:14px; bottom:56px; z-index:6; pointer-events:none;
+    position:absolute; right:14px; bottom:56px; z-index:4; pointer-events:none;
     display:inline-flex; align-items:center; gap:6px; height:22px; padding:0 var(--sp2);
     border-radius:999px; border:1px solid var(--line); background:var(--panel-2); color:var(--muted);
     font:600 11.5px/1 ui-monospace,monospace; font-variant-numeric:tabular-nums; white-space:nowrap;
@@ -595,7 +599,7 @@
         <button data-profile="shell"><span class="rose">›</span> Start shell</button>
       </span>
     </div>
-    <div id="scrollstate" hidden aria-live="polite"><span id="scrolltext"></span></div>
+    <div id="scrollstate" hidden aria-hidden="true"><span id="scrolltext"></span></div>
     <button id="jumplive" aria-label="Jump to live"><span id="jlcount">new</span> ↓</button>
   </main>
 
@@ -1607,9 +1611,15 @@ function scrollPositionLabel(viewportY, baseY, rows){
 // viewport has nothing to scroll, so we hide the bar (via #term.altbuf) and show an 'app scroll' chip
 // instead — a dead scrollbar is worse than none. Returns the label it settled on so it can be tested.
 // onRender fires every frame, so the settled state is memoised: identical state does zero DOM writes.
+// onRender runs per frame, so the three nodes are resolved once and cached; they are static for the life of
+// the document. We only re-query while one is still missing (script can run before the node is parsed).
 let lastAffordance=null;
+let affHost=null, affChip=null, affText=null;
 function applyScrollAffordance(){
-  const host=$('#term'), chip=$('#scrollstate'), txt=$('#scrolltext');
+  if(!affHost || !affChip || !affText){
+    affHost=$('#term'); affChip=$('#scrollstate'); affText=$('#scrolltext');
+  }
+  const host=affHost, chip=affChip, txt=affText;
   if(!host || !chip || !txt) return null;
   let buf=null, alt=false;
   try{ buf = term.buffer.active; alt = buf.type==='alternate'; }catch(e){}
