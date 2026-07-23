@@ -122,6 +122,6 @@
 
   "asserted_by": {
     "muxctl": "muxd/tests/test_local_scroll_forwarding.py",
-    "web": "relay/tests/wheel-scroll.test.js"
+    "web": "relay/tests/scroll-parity-web.test.js"
   }
 }
