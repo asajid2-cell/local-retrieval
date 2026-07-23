@@ -111,6 +111,59 @@ public sealed class LedgerReadTests
         AssertSameEvents(SessionEventLedger.ReadForSessionScanOnly("alias-parent", max: 50, options: options), after, "post-append");
     }
 
+    // TryAppend records the sidecar index entry BEFORE writing the event bytes, all under one per-file mutex.
+    // The existing SessionEventLedgerTests only proves the ledger FILE ends uncorrupted; nothing proves the
+    // index offsets are right afterwards. A wrong offset recorded under contention makes TryReadEventAt's
+    // re-verification (EventMatchesAnyId) silently DROP the hit, so the index read returns fewer events than
+    // the scan while every file-level test stays green. This is the assertion the scan-vs-index equivalence
+    // catches: the scan path never consults the index, so identity between the two pins every offset.
+    [TestMethod]
+    [Timeout(120_000)]
+    public void TryAppend_ConcurrentAppendsKeepSidecarIndexConsistent()
+    {
+        using var dir = NewTempDir();
+        // One month => one monthly file => one mutex, so all 64 appends genuinely contend.
+        var options = new SessionEventLedger.Options(dir.Path, DateTimeOffset.Parse("2026-07-08T00:00:00Z"));
+
+        Parallel.For(0, 64, i =>
+        {
+            var appended = SessionEventLedger.TryAppend(
+                SessionEventLedger.Create("event." + i, "summary " + i, "s-" + i, sessionIds: ["s-" + i, "shared-alias"]),
+                out var detail, options);
+            Assert.IsTrue(appended, detail);
+        });
+
+        // (a) Every per-session id resolves to exactly its own single event.
+        for (var i = 0; i < 64; i++)
+        {
+            var one = SessionEventLedger.ReadForSession("s-" + i, max: 50, options: options);
+            Assert.HasCount(1, one);
+            Assert.AreEqual("event." + i, one[0].Kind);
+        }
+
+        // (b) The shared alias sees all 64, each event exactly once.
+        var shared = SessionEventLedger.ReadForSession("shared-alias", max: 200, options: options);
+        Assert.HasCount(64, shared);
+        Assert.HasCount(64, shared.Select(e => e.Kind).Distinct().ToList());
+
+        // (c) A sample of per-session ids: the index-backed read must equal the scan (which ignores the index
+        // entirely). This is what a wrong recorded offset breaks — the index read would drop or misplace it.
+        for (var i = 0; i < 64; i += 8)
+        {
+            var id = "s-" + i;
+            AssertSameEvents(
+                SessionEventLedger.ReadForSessionScanOnly(id, max: 50, options: options),
+                SessionEventLedger.ReadForSession(id, max: 50, options: options),
+                id);
+        }
+
+        // (d) The shared-alias read must also match its scan — pinning membership AND newest-first ordering.
+        AssertSameEvents(
+            SessionEventLedger.ReadForSessionScanOnly("shared-alias", max: 200, options: options),
+            shared,
+            "shared-alias");
+    }
+
     private sealed record Probe(string Name, string? Id, string[]? Aliases, int Max);
 
     private static IEnumerable<Probe> MixedProbes() =>
