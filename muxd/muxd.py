@@ -407,6 +407,17 @@ CONPTY_ABANDONED_BASELINE_LIMIT = 16
 CONPTY_CUSTODY_TTL = float(os.environ.get("MUXD_CONPTY_CUSTODY_TTL", "300"))
 CONPTY_QUARANTINE_TTL = float(os.environ.get("MUXD_CONPTY_QUARANTINE_TTL", "60"))
 CONPTY_QUARANTINE_MAX_ATTEMPTS = 5
+# Last emission of each recurring "still pending" line, so unchanged state stops narrating
+# itself every reap. One slot PER KIND, not one shared slot: both lines can fire inside the
+# same reap pass with different signatures, and a single slot would see them alternate and
+# never suppress anything. Transition lines (abandoning / quarantine expired) never come here.
+_LAST_CUSTODY_EMISSION = {
+    "discovery": {"sig": None, "at": 0.0, "repeats": 0},
+    "cleanup": {"sig": None, "at": 0.0, "repeats": 0},
+}
+CONPTY_EMISSION_INTERVAL = 60.0
+CONPTY_REAPER_INTERVAL = 5.0
+CONPTY_REAPER_MAX_INTERVAL = 30.0
 
 def _custody_record(reason, now=None):
     stamp = time.monotonic() if now is None else float(now)
@@ -426,6 +437,46 @@ def _custody_touch(record, now=None):
     record["attempts"] = int(record.get("attempts", 0)) + 1
     record["last_attempt"] = stamp
     return record
+
+def _custody_emission_signature(retained=(), failures=()):
+    """The observable custody state a 'still pending' line is reporting on. Two passes that
+    produce the same signature are saying the same thing, so only the first needs to speak."""
+    with _ORPHANED_CONPTY_LOCK:
+        pending = tuple(sorted(_PENDING_CONPTY_BASELINES))
+    return (tuple(sorted(retained)), tuple(failures), pending)
+
+def _emit_custody_pending(kind, signature, message, now=None):
+    """Log a recurring custody line only when its state changed, or once per
+    CONPTY_EMISSION_INTERVAL while it has not — a permanently stuck record then reports once a
+    minute instead of 720 times an hour. Suppressed repeats are counted onto the next line."""
+    slot = _LAST_CUSTODY_EMISSION[kind]
+    stamp = time.monotonic() if now is None else float(now)
+    if slot["sig"] == signature and stamp - float(slot["at"]) < CONPTY_EMISSION_INTERVAL:
+        slot["repeats"] = int(slot.get("repeats", 0)) + 1
+        return False
+    repeats = int(slot.get("repeats", 0))
+    slot["sig"] = signature
+    slot["at"] = stamp
+    slot["repeats"] = 0
+    log(f"{message} (repeated {repeats}x)" if repeats else message)
+    return True
+
+def _reaper_tick_signature(retained_count):
+    """What the reaper tick compares between passes: a reap that changed nothing at all
+    produces an identical signature, including the count it still holds."""
+    with _ORPHANED_CONPTY_LOCK:
+        hosts = tuple(sorted(_ORPHANED_CONPTY_HOSTS))
+        pending = tuple(sorted(_PENDING_CONPTY_BASELINES))
+    return (int(retained_count), hosts, pending)
+
+def _reaper_backoff(prev_sig, sig, prev_delay):
+    """Sleep before the next reap. Any progress — a changed signature, a newly retained
+    record — snaps back to CONPTY_REAPER_INTERVAL; a reap that moved nothing doubles toward
+    CONPTY_REAPER_MAX_INTERVAL so a hopeless record cannot spin the executor every 5s."""
+    if prev_sig is None or sig != prev_sig:
+        return CONPTY_REAPER_INTERVAL
+    delay = float(prev_delay or CONPTY_REAPER_INTERVAL)
+    return min(CONPTY_REAPER_MAX_INTERVAL, max(CONPTY_REAPER_INTERVAL, delay * 2.0))
 
 def _direct_child_pids(parent_pid, executable_name=""):
     if os.name != "nt":
@@ -658,7 +709,11 @@ def _reap_orphaned_conpty_hosts(timeout=5):
                         f"resuming spawns (orphan hosts may have leaked): {reason}"
                     )
                     continue
-                log(f"[conpty] orphan discovery still pending: {error}")
+                _emit_custody_pending(
+                    "discovery",
+                    _custody_emission_signature(failures=(str(error),)),
+                    f"[conpty] orphan discovery still pending: {error}",
+                )
                 continue
             with _ORPHANED_CONPTY_LOCK:
                 _PENDING_CONPTY_BASELINES.pop(baseline_key, None)
@@ -711,7 +766,11 @@ def _reap_orphaned_conpty_hosts(timeout=5):
             if record is not None:
                 _custody_touch(record)
     if failures:
-        log(f"[conpty] supervised orphan cleanup still pending: {'; '.join(failures)}")
+        _emit_custody_pending(
+            "cleanup",
+            _custody_emission_signature(retained, failures),
+            f"[conpty] supervised orphan cleanup still pending: {'; '.join(failures)}",
+        )
     return len(retained)
 
 def _release_pty_conhosts(pty, session_name="?", timeout=3):
@@ -3562,18 +3621,28 @@ async def main():
     start_supervised_background(background_tasks, "loop-monitor", loop_monitor)
 
     async def conpty_orphan_reaper_tick():
+        delay = CONPTY_REAPER_INTERVAL
+        last_sig = None
         while True:
-            await asyncio.sleep(5)
+            await asyncio.sleep(delay)
             with _ORPHANED_CONPTY_LOCK:
                 pending = bool(
                     _ORPHANED_CONPTY_HOSTS
                     or _PENDING_CONPTY_BASELINES
                 )
-            if pending:
-                await asyncio.get_running_loop().run_in_executor(
-                    None,
-                    _reap_orphaned_conpty_hosts,
-                )
+            if not pending:
+                # Nothing in custody: no executor dispatch at all, and the next record to
+                # arrive gets reaped at the base interval rather than a backed-off one.
+                delay = CONPTY_REAPER_INTERVAL
+                last_sig = None
+                continue
+            retained = await asyncio.get_running_loop().run_in_executor(
+                None,
+                _reap_orphaned_conpty_hosts,
+            )
+            sig = _reaper_tick_signature(retained)
+            delay = _reaper_backoff(last_sig, sig, delay)
+            last_sig = sig
     start_supervised_background(
         background_tasks,
         "conpty-orphan-reaper",

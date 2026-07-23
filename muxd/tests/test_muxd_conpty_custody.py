@@ -6,6 +6,13 @@ from unittest import mock
 muxd = importlib.import_module("muxd")
 
 
+def _reset_custody_emission():
+    """The emission filter is module state and several tests reuse the same custody keys —
+    without this a later test's first line looks like a repeat of an earlier test's."""
+    for slot in muxd._LAST_CUSTODY_EMISSION.values():
+        slot.update({"sig": None, "at": 0.0, "repeats": 0})
+
+
 class ConptyCustodyRecordTests(unittest.TestCase):
     """Custody entries carry an age so a later pass can expire them."""
 
@@ -66,10 +73,12 @@ class ConptyCustodyReapTests(unittest.TestCase):
     def setUp(self):
         muxd._ORPHANED_CONPTY_HOSTS.clear()
         muxd._PENDING_CONPTY_BASELINES.clear()
+        _reset_custody_emission()
 
     def tearDown(self):
         muxd._ORPHANED_CONPTY_HOSTS.clear()
         muxd._PENDING_CONPTY_BASELINES.clear()
+        _reset_custody_emission()
 
     def test_reap_empties_orphans_when_termination_succeeds(self):
         muxd._retain_orphaned_conpty_hosts([(1234, "tok"), (5678, "tok2")], "why")
@@ -114,10 +123,12 @@ class ConptyCustodyGarbageCollectionTests(unittest.TestCase):
     def setUp(self):
         muxd._ORPHANED_CONPTY_HOSTS.clear()
         muxd._PENDING_CONPTY_BASELINES.clear()
+        _reset_custody_emission()
 
     def tearDown(self):
         muxd._ORPHANED_CONPTY_HOSTS.clear()
         muxd._PENDING_CONPTY_BASELINES.clear()
+        _reset_custody_emission()
 
     def test_dormant_record_is_dropped_without_any_terminate_attempt(self):
         muxd._retain_orphaned_conpty_hosts([(1234, "tok")], "why")
@@ -202,11 +213,13 @@ class ConptyQuarantineExpiryTests(unittest.TestCase):
         muxd._ORPHANED_CONPTY_HOSTS.clear()
         muxd._PENDING_CONPTY_BASELINES.clear()
         muxd._ABANDONED_CONPTY_BASELINES.clear()
+        _reset_custody_emission()
 
     def tearDown(self):
         muxd._ORPHANED_CONPTY_HOSTS.clear()
         muxd._PENDING_CONPTY_BASELINES.clear()
         muxd._ABANDONED_CONPTY_BASELINES.clear()
+        _reset_custody_emission()
 
     def _reap_with_failing_enumeration(self, times, logs):
         with mock.patch.object(
@@ -241,7 +254,8 @@ class ConptyQuarantineExpiryTests(unittest.TestCase):
         self._reap_with_failing_enumeration(4, logs)
         self.assertEqual(1, len(muxd._PENDING_CONPTY_BASELINES))
         self.assertEqual([], muxd._ABANDONED_CONPTY_BASELINES)
-        self.assertEqual(4, len([line for line in logs if "still pending" in line]))
+        # The 4 attempts observe identical state, so only the first one narrates it.
+        self.assertEqual(1, len([line for line in logs if "still pending" in line]))
 
     def test_age_alone_expires_the_quarantine_before_the_attempt_budget(self):
         with mock.patch.object(muxd.time, "monotonic", return_value=1000.0):
@@ -311,9 +325,11 @@ class ConptySpawnGateTests(unittest.TestCase):
 
     def setUp(self):
         muxd._PENDING_CONPTY_BASELINES.clear()
+        _reset_custody_emission()
 
     def tearDown(self):
         muxd._PENDING_CONPTY_BASELINES.clear()
+        _reset_custody_emission()
 
     def test_gate_message_names_the_blocking_reason(self):
         muxd._retain_pending_conpty_baseline({7: "a"}, "failed spawn for tab-9")
@@ -358,6 +374,174 @@ class ConptySpawnGateTests(unittest.TestCase):
             with self.assertRaises(RuntimeError) as caught:
                 session.spawn()
         self.assertEqual("reached the real spawn", str(caught.exception))
+
+
+class ConptyStaleEmissionFilterTests(unittest.TestCase):
+    """A dead record must stop narrating state that has not changed."""
+
+    def setUp(self):
+        muxd._ORPHANED_CONPTY_HOSTS.clear()
+        muxd._PENDING_CONPTY_BASELINES.clear()
+        _reset_custody_emission()
+
+    def tearDown(self):
+        muxd._ORPHANED_CONPTY_HOSTS.clear()
+        muxd._PENDING_CONPTY_BASELINES.clear()
+        _reset_custody_emission()
+
+    def _reap(self, clock, times, logs):
+        """Run the reaper `times` times at a frozen clock against a permanently stuck host."""
+        with mock.patch.object(
+            muxd.time, "monotonic", return_value=clock
+        ), mock.patch.object(
+            muxd, "_same_process_instance", return_value=True
+        ), mock.patch.object(
+            muxd,
+            "_terminate_conhost_records",
+            side_effect=lambda owned, timeout=3: (list(owned), ["still running"]),
+        ), mock.patch.object(muxd, "log", side_effect=logs.append):
+            for _ in range(times):
+                muxd._reap_orphaned_conpty_hosts(timeout=1)
+
+    @staticmethod
+    def _pending(logs):
+        return [line for line in logs if "still pending" in line]
+
+    def test_unchanged_state_emits_exactly_one_line_across_five_reaps(self):
+        with mock.patch.object(muxd.time, "monotonic", return_value=500.0):
+            muxd._retain_orphaned_conpty_hosts([(1234, "tok")], "why")
+        logs = []
+        self._reap(500.0, 5, logs)
+        pending = self._pending(logs)
+        self.assertEqual(1, len(pending), logs)
+        self.assertEqual(
+            "[conpty] supervised orphan cleanup still pending: still running", pending[0]
+        )
+        self.assertEqual(4, muxd._LAST_CUSTODY_EMISSION["cleanup"]["repeats"])
+
+    def test_elapsed_interval_re_emits_once_carrying_the_repeat_count(self):
+        with mock.patch.object(muxd.time, "monotonic", return_value=500.0):
+            muxd._retain_orphaned_conpty_hosts([(1234, "tok")], "why")
+        logs = []
+        self._reap(500.0, 5, logs)
+        later = []
+        self._reap(500.0 + muxd.CONPTY_EMISSION_INTERVAL + 1.0, 1, later)
+        pending = self._pending(later)
+        self.assertEqual(1, len(pending), later)
+        self.assertEqual(
+            "[conpty] supervised orphan cleanup still pending: still running (repeated 4x)",
+            pending[0],
+        )
+        # And the freshly emitted line restarts the window, not a second one right after.
+        again = []
+        self._reap(500.0 + muxd.CONPTY_EMISSION_INTERVAL + 2.0, 1, again)
+        self.assertEqual([], self._pending(again), again)
+
+    def test_changed_retained_set_emits_immediately(self):
+        with mock.patch.object(muxd.time, "monotonic", return_value=500.0):
+            muxd._retain_orphaned_conpty_hosts([(1234, "tok")], "why")
+        logs = []
+        self._reap(500.0, 3, logs)
+        self.assertEqual(1, len(self._pending(logs)), logs)
+        with mock.patch.object(muxd.time, "monotonic", return_value=500.0):
+            muxd._retain_orphaned_conpty_hosts([(5678, "tok2")], "another")
+        changed = []
+        self._reap(500.0, 1, changed)
+        pending = self._pending(changed)
+        # Same instant, same interval — the state itself changed, so it speaks now.
+        self.assertEqual(1, len(pending), changed)
+        self.assertIn("(repeated 2x)", pending[0])
+
+    def test_transition_lines_bypass_the_filter(self):
+        with mock.patch.object(muxd.time, "monotonic", return_value=1000.0):
+            muxd._retain_orphaned_conpty_hosts([(2, "b")], "stuck host")
+        logs = []
+        self._reap(1000.0, 2, logs)
+        self.assertEqual(1, len(self._pending(logs)), logs)
+        # Seed an already-expired record: its one-shot drop must not be swallowed by the
+        # suppression that is currently silencing the unchanged 'still pending' line.
+        muxd._ORPHANED_CONPTY_HOSTS[(1, "a")] = muxd._custody_record(
+            "long dead", now=1000.0 - muxd.CONPTY_CUSTODY_TTL - 10.0
+        )
+        third = []
+        self._reap(1000.0, 1, third)
+        self.assertEqual([], self._pending(third), third)
+        abandoning = [line for line in third if "abandoning orphan host record" in line]
+        self.assertEqual(1, len(abandoning), third)
+        self.assertIn("pid=1", abandoning[0])
+        self.assertIn("long dead", abandoning[0])
+
+    def test_quarantine_and_cleanup_lines_suppress_independently(self):
+        # Both stale emitters fire in the same pass; a shared slot would see their
+        # signatures alternate and suppress neither.
+        with mock.patch.object(muxd.time, "monotonic", return_value=2000.0):
+            muxd._retain_orphaned_conpty_hosts([(1234, "tok")], "why")
+            muxd._retain_pending_conpty_baseline({7: "a"}, "failed spawn")
+        logs = []
+        with mock.patch.object(
+            muxd.time, "monotonic", return_value=2000.0
+        ), mock.patch.object(
+            muxd, "_same_process_instance", return_value=True
+        ), mock.patch.object(
+            muxd, "_new_conpty_host_processes", side_effect=OSError("snapshot failed")
+        ), mock.patch.object(
+            muxd,
+            "_terminate_conhost_records",
+            side_effect=lambda owned, timeout=3: (list(owned), ["still running"]),
+        ), mock.patch.object(muxd, "log", side_effect=logs.append):
+            for _ in range(4):
+                muxd._reap_orphaned_conpty_hosts(timeout=1)
+        self.assertEqual(
+            1, len([line for line in logs if "orphan discovery still pending" in line]), logs
+        )
+        self.assertEqual(
+            1, len([line for line in logs if "cleanup still pending" in line]), logs
+        )
+
+
+class ConptyReaperBackoffTests(unittest.TestCase):
+    """A reap that changes nothing must not re-run every 5 seconds forever."""
+
+    def setUp(self):
+        muxd._ORPHANED_CONPTY_HOSTS.clear()
+        muxd._PENDING_CONPTY_BASELINES.clear()
+
+    def tearDown(self):
+        muxd._ORPHANED_CONPTY_HOSTS.clear()
+        muxd._PENDING_CONPTY_BASELINES.clear()
+
+    def test_first_pass_uses_the_base_interval(self):
+        self.assertEqual(
+            muxd.CONPTY_REAPER_INTERVAL,
+            muxd._reaper_backoff(None, (1, (), ()), muxd.CONPTY_REAPER_MAX_INTERVAL),
+        )
+
+    def test_stalled_passes_grow_toward_the_ceiling_and_stop(self):
+        sig = (1, (((1234, "tok"),)), ())
+        delay = muxd.CONPTY_REAPER_INTERVAL
+        seen = []
+        for _ in range(6):
+            delay = muxd._reaper_backoff(sig, sig, delay)
+            seen.append(delay)
+        self.assertEqual([10.0, 20.0, 30.0, 30.0, 30.0, 30.0], seen)
+        self.assertLessEqual(max(seen), muxd.CONPTY_REAPER_MAX_INTERVAL)
+
+    def test_changed_signature_resets_to_the_base_interval(self):
+        self.assertEqual(
+            muxd.CONPTY_REAPER_INTERVAL,
+            muxd._reaper_backoff((1, (), ()), (2, (), ()), 30.0),
+        )
+
+    def test_a_newly_retained_record_changes_the_tick_signature(self):
+        stalled = muxd._reaper_tick_signature(0)
+        muxd._retain_orphaned_conpty_hosts([(1234, "tok")], "why")
+        fresh = muxd._reaper_tick_signature(1)
+        self.assertNotEqual(stalled, fresh)
+        self.assertEqual(
+            muxd.CONPTY_REAPER_INTERVAL, muxd._reaper_backoff(stalled, fresh, 30.0)
+        )
+        # ...and an identical follow-up pass backs off again from that reset.
+        self.assertEqual(10.0, muxd._reaper_backoff(fresh, fresh, 5.0))
 
 
 if __name__ == "__main__":
