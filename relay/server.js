@@ -646,8 +646,103 @@ app.get('/api/sessions/:name/tail', async (req, res) => {
   res.status(404).json({ error: 'session not found' });
 });
 
+// --- durable mutation intents ------------------------------------------------------------------
+// Direct (non-queued) mutations — kill, rename, auto-resume, upload keep/delete — are as replay-prone
+// as the queued app commands: a phone that loses the response retries, and without a dedup key the
+// second request executes again. Clients carry an intentId from the browser intent journal; we record
+// the first outcome under it and replay that outcome instead of re-running the handler. Same intentId
+// + different payload is a client bug, so it is refused (409) rather than silently executing.
+// Retryable outcomes (the ones the journal deliberately retries) drop the record so the retry runs.
+const MUTATION_INTENTS_FILE = STATE_DIR + '/mutation-intents.json';
+const MUTATION_INTENT_LIMIT = 512;
+const MUTATION_INTENT_RETENTION_MS = 24 * 60 * 60 * 1000;
+const MUTATION_INTENT_INFLIGHT_MS = 30000;
+// An in-flight record that survived a restart was never observed to finish, so it is NOT replayable:
+// only completed outcomes are reloaded, and anything else re-executes on the client's next retry.
+let _mutationIntents = (durableJsonLoad(MUTATION_INTENTS_FILE, [], Array.isArray) || [])
+  .filter(record => record && typeof record === 'object')
+  .map(record => ({
+    intentId: commandIntentId(record.intentId),
+    fingerprint: /^[a-f0-9]{64}$/.test(String(record.fingerprint || '')) ? String(record.fingerprint) : '',
+    ts: Number(record.ts) || 0,
+    inflight: false,
+    code: Number(record.code) || 0,
+    body: record.body && typeof record.body === 'object' ? record.body : null,
+  }))
+  .filter(record => record.intentId && record.fingerprint && record.code >= 200 && record.code < 400);
+function mutationFingerprint(scope, payload) {
+  return crypto.createHash('sha256').update(scope + '\n' + stableJson(payload)).digest('hex');
+}
+function mutationIntentRetryable(code) {
+  return code === 408 || code === 425 || code === 429 || code >= 500;
+}
+function compactMutationIntents(candidate, now = Date.now()) {
+  return candidate
+    .filter(record => record.inflight || now - record.ts <= MUTATION_INTENT_RETENTION_MS)
+    .slice(-MUTATION_INTENT_LIMIT);
+}
+function commitMutationIntents(candidate) {
+  candidate = compactMutationIntents(candidate);
+  try {
+    writeJsonState(MUTATION_INTENTS_FILE, candidate);
+  } catch (error) {
+    if (error.committed) _mutationIntents = candidate;
+    throw error;
+  }
+  _mutationIntents = candidate;
+}
+// Wrap a mutating route so a client-supplied intentId makes it exactly-once. No intentId => the raw
+// legacy path, unchanged, so an older cached page keeps working.
+function withMutationIntent(scope, fingerprintOf, handler) {
+  return async (req, res) => {
+    const intentId = commandIntentId(req.body && req.body.intentId);
+    if (!intentId) return await handler(req, res);
+    const fingerprint = mutationFingerprint(scope, fingerprintOf(req));
+    const now = Date.now();
+    const existing = _mutationIntents.find(record => record.intentId === intentId);
+    if (existing) {
+      if (existing.fingerprint !== fingerprint)
+        return res.status(409).json({ error: 'intent id already used for a different operation' });
+      if (!existing.inflight) return res.status(existing.code).json(existing.body);
+      if (now - existing.ts <= MUTATION_INTENT_INFLIGHT_MS)
+        return res.status(409).json({ error: 'operation already in flight' });
+    }
+    const claimed = { intentId, fingerprint, ts: now, inflight: true, code: 0, body: null };
+    try {
+      commitMutationIntents([..._mutationIntents.filter(r => r.intentId !== intentId), claimed]);
+    } catch (error) {
+      return failPersistence(res, error);
+    }
+    let settled = false;
+    const settle = body => {
+      const code = res.statusCode || 200;
+      const next = _mutationIntents.filter(record => record.intentId !== intentId);
+      if (!mutationIntentRetryable(code))
+        next.push({ ...claimed, ts: Date.now(), inflight: false, code, body: body && typeof body === 'object' ? body : null });
+      try {
+        commitMutationIntents(next);
+      } catch (error) {
+        // The response is already on its way out; losing the ledger write must not swallow it.
+        _mutationIntents = next;
+        console.error('[intents] could not record mutation outcome: ' + (error && error.message || error));
+      }
+    };
+    const sendJson = res.json.bind(res);
+    res.json = body => { if (!settled) { settled = true; settle(body); } return sendJson(body); };
+    try {
+      return await handler(req, res);
+    } catch (error) {
+      if (!settled) { settled = true; res.statusCode = 500; settle(null); }
+      throw error;
+    }
+  };
+}
+
 // Rename a session (keeps it running) — "close tab" must never be the only way to manage a session.
-app.patch('/api/sessions/:name', async (req, res) => {
+app.patch('/api/sessions/:name', withMutationIntent('session.rename', req => ({
+  name: strictMuxName(req.params.name),
+  to: strictMuxName(req.body && req.body.name),
+}), async (req, res) => {
   const name = strictMuxName(req.params.name);
   const to = strictMuxName(req.body && req.body.name);
   if (!name) return res.status(400).json({ error: 'invalid session name' });
@@ -694,9 +789,11 @@ app.patch('/api/sessions/:name', async (req, res) => {
   }
   if (tmuxHas(name)) return failLegacy(res, name);
   res.status(404).json({ error: 'session not found' });
-});
+}));
 
-app.delete('/api/sessions/:name', async (req, res) => {
+app.delete('/api/sessions/:name', withMutationIntent('session.kill', req => ({
+  name: strictMuxName(req.params.name),
+}), async (req, res) => {
   const name = strictMuxName(req.params.name);
   if (!name) return res.status(400).json({ error: 'invalid session name' });
   if (tmuxHas(name)) return failLegacy(res, name);
@@ -707,10 +804,13 @@ app.delete('/api/sessions/:name', async (req, res) => {
     if (!confirmed.ok) return failHost(res, 504, 'muxd kill not confirmed', confirmed.error);
   }
   res.json({ ok: true });
-});
+}));
 
 // PER-TAB auto-resume toggle. muxd persists and enforces the policy locally.
-app.post('/api/sessions/:name/autoheal', async (req, res) => {
+app.post('/api/sessions/:name/autoheal', withMutationIntent('session.autoheal', req => ({
+  name: strictMuxName(req.params.name),
+  on: !!(req.body && req.body.on),
+}), async (req, res) => {
   const name = strictMuxName(req.params.name);
   if (!name) return res.status(400).json({ error: 'name required' });
   const on = !!(req.body && req.body.on);
@@ -726,7 +826,7 @@ app.post('/api/sessions/:name/autoheal', async (req, res) => {
   if (!confirmed.ok)
     return failHost(res, 504, 'muxd auto-resume change not confirmed', confirmed.error);
   res.json({ ok: true, name, autoheal: on });
-});
+}));
 
 // --- project sync: the desktop app pushes its collections/chats projection here while it's open, so
 // the web can show your projects and resume chats remotely. POST is loopback-only (the app reaches in
@@ -1701,7 +1801,10 @@ app.get('/api/uploads/:id/raw', (req, res) => {
   if (!u) return res.status(404).end();
   res.sendFile(uploadDir(u.id) + '/' + u.name, {}, e => { if (e && !res.headersSent) res.status(404).end(); });
 });
-app.patch('/api/uploads/:id', (req, res) => {
+app.patch('/api/uploads/:id', withMutationIntent('upload.keep', req => ({
+  id: String(req.params.id),
+  keep: req.body && typeof req.body.keep === 'boolean' ? req.body.keep : null,
+}), (req, res) => {
   const index = _uploads.findIndex(x => x.id === req.params.id);
   if (index < 0) return res.status(404).json({ error: 'not found' });
   if (req.body && typeof req.body.keep === 'boolean') {
@@ -1714,8 +1817,10 @@ app.patch('/api/uploads/:id', (req, res) => {
     }
   }
   res.json({ ok: true, keep: _uploads[index].keep });
-});
-app.delete('/api/uploads/:id', (req, res) => {
+}));
+app.delete('/api/uploads/:id', withMutationIntent('upload.delete', req => ({
+  id: String(req.params.id),
+}), (req, res) => {
   const i = _uploads.findIndex(x => x.id === req.params.id);
   if (i >= 0) {
     const removed = _uploads[i];
@@ -1750,7 +1855,7 @@ app.delete('/api/uploads/:id', (req, res) => {
     }
   }
   res.json({ ok: true });
-});
+}));
 
 const server = http.createServer(app);
 // noServer + manual routing: two path-bound WebSocketServers on one http server BOTH grab 'upgrade'
