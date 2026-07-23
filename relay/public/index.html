@@ -1012,7 +1012,7 @@ function reloadTerminal(quiet){
   connect(name, true);   // re-attach: CLEAR + scrollback replay + live, all client state reset
 }
 document.addEventListener('keydown', e=>{ if(e.ctrlKey && e.altKey && (e.key==='r'||e.key==='R')){ e.preventDefault(); e.stopPropagation(); reloadTerminal(); } }, true);
-window.__muxBuild='2026-07-12-mobile-ime-viewport-hardening';   // bump per web deploy so a loaded version is verifiable
+window.__muxBuild='2026-07-23-mouse-report-guard-v2-click-forwarding';   // bump per web deploy so a loaded version is verifiable
 try{ console.info('multiplex build', window.__muxBuild); }catch(e){}
 const helper = $('#term').querySelector('.xterm-helper-textarea');
 function hardenHelperTextarea(){
@@ -1520,28 +1520,189 @@ function filterMobileTextInput(s){
   return out;
 }
 // Mouse-tracking flood guard. A TUI (codex/claude) enables mouse reporting (DECSET 1000/1002/1003) and,
-// if it exits WITHOUT disabling it, xterm keeps emitting a report for every mouse move — which the shell
+// if it exits WITHOUT disabling it, xterm keeps emitting a report for every mouse MOVE — which the shell
 // underneath echoes back as `[<b;x;y;M` garbage, floods the pty, and can drop/kill the session (the "mouse
-// thing"). The web multiplex is a keyboard surface; we never need to forward mouse reports, so strip them
-// from the input stream entirely. Kills the flood at the source regardless of a stuck/leaked mouse mode.
-function stripMouseReports(s){
+// thing"). The flood is a MOTION flood, so motion reports are dropped unconditionally, forever.
+// Discrete press/release reports are a different animal: they are what click-to-position/focus needs, they
+// are one-per-click, and they can never flood. So they ARE forwarded — but only while the output-side
+// tracker below has actually seen an app take the mouse, and only until the leak detector catches the
+// session echoing our own reports back (which proves nothing is consuming them).
+const MOUSE_DISABLE_SEQ = '\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l';
+function stripMouseReports(s, trackingActive){
   if(!s || s.indexOf('\x1b') < 0) return s;
   return s
     .replace(/\x1b\[M[\s\S]{3}/g, '')      // X10 mouse: ESC [ M + 3 raw bytes
-    // SGR mouse (1006): ESC [ < Cb ; x ; y M/m. Strip the motion/drag/click flood, but KEEP wheel reports
-    // (Cb bit 6 = 64: up=64, down=65, +modifiers). A full-screen TUI on the ALT buffer (codex/claude) has
-    // no scrollback of its own, so the wheel report is the ONLY way it scrolls its transcript — dropping it
-    // is what made "can't scroll" on those sessions. Wheel is discrete + low-volume, so it never causes the
-    // per-move flood this guard exists to stop.
-    .replace(/\x1b\[<([0-9]+);[0-9]+;[0-9]+[Mm]/g, (m, cb) => ((+cb) & 64) ? m : '')
+    // SGR mouse (1006): ESC [ < Cb ; x ; y M/m.
+    //  · Cb bit 5 (32) = MOTION/drag → always dropped. This is the historic flood; nothing needs it.
+    //  · Cb bit 6 (64) = WHEEL (up=64, down=65, +modifiers) → always kept. A full-screen TUI on the ALT
+    //    buffer has no scrollback of its own, so the wheel report is the ONLY way it scrolls its
+    //    transcript — dropping it is what made "can't scroll" on codex/claude sessions.
+    //  · anything else = discrete PRESS/RELEASE → kept ONLY when `trackingActive`. Omitting the argument
+    //    denies, so any caller that has not proven an app is tracking cannot reopen the leaked-mode flood.
+    .replace(/\x1b\[<([0-9]+);[0-9]+;[0-9]+[Mm]/g, (m, cb) => {
+      const b = +cb;
+      if(b & 32) return '';
+      if(b & 64) return m;
+      return trackingActive ? m : '';
+    })
     .replace(/\x1b\[[0-9;]+M/g, '');        // urxvt/legacy (1015): ESC [ b;x;y M  (the [555;79;1M flood)
+}
+// True for exactly one discrete press/release SGR report — the class this guard newly forwards. Motion is
+// gone by now and wheel keeps its own long-standing path, so this is the narrow test for "route it through
+// the signed mouse seam and arm the leak detector against it".
+function isClickReport(s){
+  const m = /^\x1b\[<([0-9]+);[0-9]+;[0-9]+[Mm]$/.exec(s || '');
+  if(!m) return false;
+  const b = +m[1];
+  return !(b & 32) && !(b & 64);
+}
+// Output-side mirror of muxd's ScreenModeTracker (muxctl.py:126-188): read the SESSION's own output for
+// DECSET/DECRST of the mouse modes, carrying a 64-byte tail so a sequence split across two frames still
+// parses. Two jobs: (1) say whether an app is really tracking, which is what gates click forwarding above;
+// (2) the leak detector — if the session echoes back a report we forwarded moments ago, no app consumed it
+// and we are watching the flood start, so the caller disables the modes at the source, forwarding stops,
+// and it re-arms only when a fresh DECSET proves a real app took the mouse again.
+// Self-contained on purpose (clock injected, no globals): relay/tests runs it straight out of this file.
+function createMouseGuard(){
+  const TRACK = [9, 1000, 1002, 1003];    // 1006 is the SGR-encoding flag, tracked but not "tracking"
+  const ECHO_WINDOW_MS = 1500;
+  const TAIL_MAX = 64;
+  const PENDING_MAX = 32;
+  let tail = [];          // trailing bytes of the last chunk; re-scanned, so mode set/clear stays idempotent
+  let modes = Object.create(null);
+  let blocked = false;    // a leak was caught — forward nothing until a fresh DECSET re-arms us
+  let pending = [];       // {report, at} press/release reports we forwarded, waiting to be caught echoed
+  let leaks = 0;
+
+  const tracking = () => TRACK.some(m => modes[m]);
+  function reader(chunk){
+    return typeof chunk === 'string'
+      ? { length: chunk.length, at: i => chunk.charCodeAt(i) & 0xff }
+      : { length: chunk.length, at: i => chunk[i] };
+  }
+  function asText(chunk){
+    if(typeof chunk === 'string') return chunk;
+    let out = '';
+    for(let i = 0; i < chunk.length; i += 4096) out += String.fromCharCode.apply(null, Array.prototype.slice.call(chunk, i, i + 4096));
+    return out;
+  }
+  function ingestOutput(chunk, now){
+    if(!chunk || !chunk.length) return { leaked:false, tracking:tracking(), blocked };
+    const body = reader(chunk);
+    const n = tail.length + body.length;
+    const at = i => (i < tail.length ? tail[i] : body.at(i - tail.length));
+    for(let i = 0; i < n; i++){
+      if(at(i) !== 0x1b) continue;                      // ESC
+      let j = i + 1;
+      if(j >= n) break;
+      if(at(j) !== 0x5b) continue;                      // '['
+      if(++j >= n) break;
+      if(at(j) !== 0x3f) continue;                      // '?' — private mode
+      j++;
+      let num = -1, end = -1; const seen = [];
+      for(; j < n; j++){
+        const c = at(j);
+        if(c >= 0x30 && c <= 0x39){ num = (num < 0 ? 0 : num) * 10 + (c - 0x30); continue; }
+        if(c === 0x3b){ if(num >= 0) seen.push(num); num = -1; continue; }
+        if(c === 0x68 || c === 0x6c){ if(num >= 0) seen.push(num); end = j; }
+        break;
+      }
+      if(end < 0) continue;                             // truncated (the tail carries it) or junk
+      const enable = at(end) === 0x68;
+      for(const mode of seen){
+        if(mode !== 1006 && TRACK.indexOf(mode) < 0) continue;
+        if(enable){
+          if(!modes[mode]) blocked = false;             // a genuine off→on DECSET is the ONLY re-arm
+          modes[mode] = true;
+        } else delete modes[mode];
+      }
+      i = end;
+    }
+    // Carry the last 64 bytes exactly like muxctl does, so a split sequence is seen on the next chunk.
+    const carry = [];
+    for(let i = Math.max(0, n - TAIL_MAX); i < n; i++) carry.push(at(i));
+    tail = carry;
+
+    let leaked = false;
+    if(pending.length){
+      pending = pending.filter(p => (now - p.at) <= ECHO_WINDOW_MS);
+      if(pending.length){
+        const text = asText(chunk);                     // only pay the decode inside the echo window
+        leaked = pending.some(p => text.indexOf(p.report) >= 0);
+      }
+    }
+    if(leaked){
+      leaks++;
+      pending = [];
+      blocked = true;
+      modes = Object.create(null);   // we are about to send DECRST, so our mirror says "off" too — that
+                                     // keeps the next real DECSET a true transition, so we can re-arm
+    }
+    return { leaked, tracking:tracking(), blocked };
+  }
+  // Register what we just forwarded so the detector can catch it coming back. Wheel reports are NOT
+  // registered: wheel forwarding is proven, pre-existing behaviour and must not be armed against itself.
+  function noteForwarded(text, now){
+    if(!text) return;
+    const re = /\x1b\[<([0-9]+);[0-9]+;[0-9]+[Mm]/g;
+    let m;
+    while((m = re.exec(text))){
+      const b = +m[1];
+      if((b & 32) || (b & 64)) continue;
+      pending.push({ report:m[0], at:now });
+    }
+    if(pending.length > PENDING_MAX) pending = pending.slice(-PENDING_MAX);
+  }
+  function reset(){ tail = []; modes = Object.create(null); blocked = false; pending = []; }
+  return {
+    ingestOutput, noteForwarded, reset,
+    inputAllowed: () => !blocked && tracking(),
+    stats: () => ({ tracking:tracking(), blocked, leaks, pending:pending.length, modes:Object.keys(modes).map(Number) }),
+  };
+}
+const mouseGuard = createMouseGuard();
+try{ window.__muxMouseGuard = mouseGuard; }catch(e){}
+// TRUST SEAM. Every mouse-originated write — a forwarded click/release and the leak detector's DECRST —
+// leaves through here so it is signed as input.raw for the current session/channel/lease epoch. Nothing on
+// the mouse path calls send('i', …) directly. principal-auth.js (r.2 trust leaf) installs the signer; until
+// it lands the write goes out unsigned exactly as it does today. A signer that is present and THROWS sends
+// nothing: a failed signature must never silently degrade into an unsigned frame.
+function sendMouseInput(data){
+  if(!data) return false;
+  let signer = null;
+  try{ signer = window.principalAuth; }catch(e){ signer = null; }
+  if(signer && typeof signer.signInputRaw === 'function'){
+    try{
+      const signed = signer.signInputRaw({ kind:'input.raw', session:current, data });
+      if(signed && typeof signed.then === 'function') signed.then(frame => { if(frame) send('i', frame); }, () => {});
+      else if(signed) send('i', signed);
+      return true;
+    }catch(e){ return false; }
+  }
+  send('i', data);
+  return true;
+}
+// Called for every session-output frame (frozen or live) before anything else can swallow it.
+function noteSessionOutput(bytes){
+  const r = mouseGuard.ingestOutput(bytes, Date.now());
+  if(r.leaked) sendMouseInput(MOUSE_DISABLE_SEQ);
+  return r;
 }
 term.onData(d => {
   logMobileInputEvent('onData', { data:d });
   // If our mobile delta handler just forwarded this keystroke, xterm's own echo of the full buffer that
   // lands in the same tick is the duplicate — drop it. (Real pastes never coincide with a delta-send.)
-  d = stripMouseReports(d);
+  d = stripMouseReports(d, mouseGuard.inputAllowed());
   if(!d) return;
+  if(isClickReport(d)){
+    // A press/release survived the guard, so an app really is tracking. It is not a keystroke: it skips the
+    // mobile-echo/modifier machinery, is registered with the leak detector so an echo of it is caught, and
+    // leaves through the signed mouse seam. Wheel reports keep their existing, proven path below untouched.
+    mouseGuard.noteForwarded(d, Date.now());
+    markActive();
+    sendMouseInput(d);
+    return;
+  }
   const filtered = stripTerminalGeneratedReports(d);
   if(filtered.dropped){
     d = filtered.out;
@@ -1661,6 +1822,7 @@ function connect(name, isRetry){
   afterTerminalParserDrain(generation, ()=>{
     if (!isRetry) term.reset();
     resetTerminalSurface();
+    mouseGuard.reset();      // a new attach knows nothing about the old session's mouse modes
     lastViewportReport='';
     lastViewportReportSocket=null;
     scheduleViewportFit(0);
@@ -1672,8 +1834,10 @@ function connect(name, isRetry){
     sock.onopen = () => { if(!fresh()) return; reconnectDelay=1000; setStatus('live', `<span class="name">${esc(name)}</span> &middot; live`); scheduleViewportFit(0); term.focus(); };
     sock.onmessage = e => { if(!fresh()) return;
       if(typeof e.data==='string'){ onControl(e.data); return; }     // control frame: shared window size
-      if(isFrozen()){ _frozenBuf.push(new Uint8Array(e.data)); if(_frozenBuf.length>6000) _frozenBuf.splice(0, _frozenBuf.length-6000); return; }   // FROZEN for selection: buffer output; a repaint would wipe the highlight
-      const wasBottom=atBottom(); enqueueTermWrite(new Uint8Array(e.data)); markReadLive();
+      const out = new Uint8Array(e.data);
+      noteSessionOutput(out);   // mouse-mode tracking + leak detection, BEFORE the frozen path can swallow it
+      if(isFrozen()){ _frozenBuf.push(out); if(_frozenBuf.length>6000) _frozenBuf.splice(0, _frozenBuf.length-6000); return; }   // FROZEN for selection: buffer output; a repaint would wipe the highlight
+      const wasBottom=atBottom(); enqueueTermWrite(out); markReadLive();
       if(!wasBottom){ newLines += 1; showJump(); } };
     sock.onclose = ev => {
       if(fresh() && !intentional){
