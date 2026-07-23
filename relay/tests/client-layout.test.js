@@ -136,6 +136,32 @@ test('scroll position label reports top, middle and bottom honestly', () => {
   assert.equal(scrollPositionLabel(-5, 100, 30), 'top · 100 up');
 });
 
+test('scroll-affordance hygiene preserves touch pan, quiet readout, and cached layout', () => {
+  const viewport = section('#term .xterm-viewport {', '}');
+  assert.doesNotMatch(viewport, /overscroll-behavior/);
+  // #term is also the .rowpan pan host, so containment on the unconditional inner-viewport rule
+  // would swallow the touch drag that must chain out to the host scroll.
+  assert.match(source, /#term:not\(\.rowpan\) \.xterm-viewport \{[^}]*overscroll-behavior:\s*contain/);
+
+  const chip = section('<div id="scrollstate"', '>');
+  assert.match(chip, /aria-hidden="true"/);
+  assert.doesNotMatch(chip, /aria-live/);
+  // The chip is a decorative readout that would otherwise announce a new string on every tick of a
+  // scroll drag; #jumplive is the actionable control.
+
+  const stateZ = section('#scrollstate {', '}').match(/z-index:\s*(\d+)/);
+  const emptyZ = section('#empty {', '}').match(/z-index:\s*(\d+)/);
+  assert.ok(stateZ);
+  assert.ok(emptyZ);
+  assert.ok(Number(stateZ[1]) < Number(emptyZ[1]));
+  // Both are children of <main id="term">, so the chip must paint under the start-screen overlay.
+
+  const aff = section('function scrollPositionLabel', 'term.onScroll(');
+  assert.ok((aff.match(/\$\('#scrollstate'\)/g) || []).length <= 1);
+  // applyScrollAffordance is wired to term.onRender, so it runs once per rendered frame and the
+  // lookup must be resolved once and cached.
+});
+
 test('tab switches drain old parser work and reject stale write callbacks', () => {
   const writes = section('function clearTermWriteQueue', '// FREEZE SAFETY-VALVE');
   assert.match(writes, /item\.epoch !== termWriteEpoch/);
