@@ -694,6 +694,7 @@
 <script src="vendor/xterm.js"></script>
 <script src="vendor/addon-fit.js"></script>
 <script src="intent-journal.js"></script>
+<script src="input-continuity.js"></script>
 <script>
 const $ = s => document.querySelector(s);
 const base = location.pathname.replace(/\/[^/]*$/, '') || '';
@@ -1177,7 +1178,28 @@ async function pasteImageToPrompt(blob, type){
 let ws=null, current=null, intentional=false, reconnectDelay=1000, reconnectTimer=null;
 const mods = { ctrl:false, alt:false, shift:false };   // sticky touch-keybar modifiers (combine, one-shot)
 let read = LS.get('mux_read', {});
-const send = (t,d) => { if (ws && ws.readyState===1) ws.send(t+d); };
+// Reconnect buffer for input typed while the socket is down. It lives in the TRUSTED CLIENT ORIGIN
+// (input-continuity.js) and holds PLAINTEXT ONLY — the relay never stores a keystroke or any signing
+// authority. It arms only once this origin actually holds a signing key: there is no unsigned fallback,
+// so with no signer we drop exactly as we always did rather than queue bytes we could never deliver.
+const inputQueue = (function(){
+  const auth = (typeof window!=='undefined') && (window.muxPrincipalAuth || null);
+  if (typeof createInputContinuity !== 'function' || !auth || typeof auth.signInput !== 'function') return null;
+  return createInputContinuity({
+    signer: auth,
+    transport: auth.transport,
+    verifyAccept: auth.verifyAccept && auth.verifyAccept.bind(auth),
+    verifyAttachReplay: auth.verifyAttachReplay && auth.verifyAttachReplay.bind(auth),
+    notice: n => { if(n && (n.kind==='drop' || n.kind==='halt' || n.kind==='error')) flash(n.message); },
+  });
+})();
+// 'sent' | 'queued' | 'dropped'. Only input ('i') is ever buffered; a resize/heartbeat replayed minutes
+// late is noise, and the sender emits a current one on reattach anyway.
+const send = (t,d) => {
+  if (ws && ws.readyState===1) { ws.send(t+d); return 'sent'; }
+  if (t==='i' && inputQueue) { inputQueue.capture(d); return 'queued'; }
+  return 'dropped';
+};
 
 // ---- shared-window sizing (client side) ----
 // The server holds every attached client at ONE size (the widest viewport by default, or a pinned one).
@@ -1669,13 +1691,18 @@ function connect(name, isRetry){
     const sock = ws = new WebSocket(`${proto}//${location.host}${base}/ws?session=${encodeURIComponent(name)}&cols=${(viewportFit&&viewportFit.cols)||term.cols}&rows=${(viewportFit&&viewportFit.rows)||term.rows}&dev=${encodeURIComponent(deviceId)}&label=${encodeURIComponent(deviceLabel)}`);
     sock.binaryType='arraybuffer';
     const fresh = ()=> generation===attachGeneration && ws===sock && current===name;
-    sock.onopen = () => { if(!fresh()) return; reconnectDelay=1000; setStatus('live', `<span class="name">${esc(name)}</span> &middot; live`); scheduleViewportFit(0); term.focus(); };
+    sock.onopen = () => { if(!fresh()) return; reconnectDelay=1000; setStatus('live', `<span class="name">${esc(name)}</span> &middot; live`); scheduleViewportFit(0); term.focus();
+      // Fresh socket => fresh signing channel. The queue opens+verifies its own channel.accept and attach
+      // replay before it flushes anything; the old channel id and its sequence are burned, never reused.
+      if(inputQueue) inputQueue.reconnect().catch(err => flash('Buffered input not flushed: '+(err&&err.message||err)));
+    };
     sock.onmessage = e => { if(!fresh()) return;
       if(typeof e.data==='string'){ onControl(e.data); return; }     // control frame: shared window size
       if(isFrozen()){ _frozenBuf.push(new Uint8Array(e.data)); if(_frozenBuf.length>6000) _frozenBuf.splice(0, _frozenBuf.length-6000); return; }   // FROZEN for selection: buffer output; a repaint would wipe the highlight
       const wasBottom=atBottom(); enqueueTermWrite(new Uint8Array(e.data)); markReadLive();
       if(!wasBottom){ newLines += 1; showJump(); } };
     sock.onclose = ev => {
+      if(inputQueue) inputQueue.disconnect('socket closed');   // burn the channel; buffered plaintext stays here
       if(fresh() && !intentional){
         const refused = closeRefusal(ev);
         if(refused){ stopAttach(name, refused); return; }
@@ -2195,8 +2222,26 @@ function openCompose(){ openDialog('#composedlg'); setTimeout(()=>$('#composetex
 // Send composed/pasted text through xterm's OWN paste path (term.paste) — it wraps the block in bracketed
 // paste (when the agent supports it) so codex/claude ingest it as ONE paste. The old raw send('i',t) dumped
 // the whole burst at once; the agent mis-parsed a big/multiline burst and dropped its HEAD ("first half cut").
-$('#sendcompose').onclick = ()=>{ const t=$('#composetext').value; $('#composedlg').close(); if(t) term.paste(t); term.focus(); };
-$('#sendcomposeenter').onclick = ()=>{ const t=$('#composetext').value; $('#composedlg').close(); if(t){ term.paste(t); send('i','\r'); } term.focus(); };
+// Compose closes only once the text is SENT or QUEUED. Closing on a dead socket used to eat the whole
+// message — you watched the dialog vanish and nothing arrived. If it can't go anywhere, the dialog stays
+// open with your text still in it.
+function composeDelivery(){
+  if (ws && ws.readyState===1) return 'sent';
+  return inputQueue ? 'queued' : 'dropped';
+}
+function submitCompose(withEnter){
+  const t=$('#composetext').value;
+  if(!t){ $('#composedlg').close(); term.focus(); return 'sent'; }
+  const status = composeDelivery();
+  if(status==='dropped'){ flash('Not sent - no connection. Your text is still here.'); return 'dropped'; }
+  term.paste(t);
+  if(withEnter) send('i','\r');
+  $('#composedlg').close();
+  term.focus();
+  return status;
+}
+$('#sendcompose').onclick = ()=>submitCompose(false);
+$('#sendcomposeenter').onclick = ()=>submitCompose(true);
 
 // ---- file workspace: a mini file explorer for per-session uploads. Browse a thumbnail GRID,
 // tap a file to OPEN it (big preview + all its actions), and switch scope between THIS session and
