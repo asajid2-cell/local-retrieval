@@ -120,6 +120,14 @@ def terminal_attach_mode():
 
 ALT_SCREEN_MODES = frozenset((47, 1047, 1049))
 MOUSE_TRACK_MODES = frozenset((9, 1000, 1002, 1003))
+SGR_MOUSE_MODES = frozenset((1006,))
+URXVT_MOUSE_MODES = frozenset((1015,))
+APP_CURSOR_MODES = frozenset((1,))
+ALTERNATE_SCROLL_MODES = frozenset((1007,))    # DECSET 1007: wheel -> arrow keys on the alt screen
+# Every mode the wheel decision keys on. Must stay a subset of muxd.REPLAY_PRIVATE_MODES, or a
+# mid-session attach would classify into a different scroll-parity cell than a fresh one.
+TRACKED_MODES = (ALT_SCREEN_MODES | MOUSE_TRACK_MODES | SGR_MOUSE_MODES | URXVT_MOUSE_MODES
+                 | APP_CURSOR_MODES | ALTERNATE_SCROLL_MODES)
 PRIVATE_MODE_RE = re.compile(br"\x1b\[\?([0-9;]+)([hl])")
 
 
@@ -172,15 +180,21 @@ class ScreenModeTracker:
 
     @property
     def sgr_mouse(self):
-        return self._has(frozenset((1006,)))
+        return self._has(SGR_MOUSE_MODES)
 
     @property
     def urxvt_mouse(self):
-        return self._has(frozenset((1015,)))
+        return self._has(URXVT_MOUSE_MODES)
 
     @property
     def app_cursor_keys(self):
-        return self._has(frozenset((1,)))
+        return self._has(APP_CURSOR_MODES)
+
+    @property
+    def alternate_scroll(self):
+        """DECSET 1007: the app asked the terminal to translate the wheel into arrow keys while
+        the alternate screen is up. Inert on the normal screen (nothing consults it there)."""
+        return self._has(ALTERNATE_SCROLL_MODES)
 
     def wants_mouse_capture(self):
         # Only these states need the wheel: otherwise leave mouse input to conhost so its native
@@ -190,31 +204,36 @@ class ScreenModeTracker:
 
 PAGE_UP = b"\x1b[5~"
 PAGE_DOWN = b"\x1b[6~"
-ALT_SCROLL_MODES_ALLOWED = ("pagekeys", "sgr")
+ALT_SCROLL_MODES_ALLOWED = ("sgr", "pagekeys")
+DEFAULT_ALT_SCROLL = "sgr"       # real-terminal priority; MUXCTL_WHEEL=pagekeys forces the old order
 
 
-def wheel_input_sequences(tracker, notches, cell_x=1, cell_y=1, alt_scroll="pagekeys"):
+def wheel_input_sequences(tracker, notches, cell_x=1, cell_y=1, alt_scroll=DEFAULT_ALT_SCROLL):
     """Translate wheel notches (+up / -down) into input bytes. Exactly ONE mechanism fires per
-    call — never two scroll sources for the same notch.
+    call — never two scroll sources for the same notch. Every state/mechanism pair is pinned by
+    the shared vector table `docs/scroll-parity.json` (asserted cell-by-cell in
+    muxd/tests/test_local_scroll_forwarding.py); change behavior there first.
 
-    alt_scroll="pagekeys" (default): on the alternate screen send a single PageUp/PageDown per
-    wheel event. This is the mechanism PROVEN to scroll claude/codex in this stack — the web
-    frontend's scrollAlternate() does exactly this (and strips all mouse reports); the caller
-    rate-limits it like the web does (one per 90ms).
+    alt_scroll="sgr" (default) is what a real local terminal does, in priority order:
+      1. app tracks the mouse -> one wheel report per notch (SGR when ?1006, urxvt when ?1015,
+         else X10), INCLUDING on the alternate screen. This is the codex/claude state, and the
+         web surface already delivers it (index.html's stripMouseReports keeps wheel reports).
+      2. bare alternate screen WITH DECSET 1007 (alternateScroll) -> 3 arrow keys per notch
+         (SS3 under DECCKM), matching xterm/xterm.js.
+      3. bare alternate screen WITHOUT 1007 -> a single PageUp/PageDown per wheel event. A real
+         terminal drops the notch here; we keep the page key as a compatibility fallback so
+         bare-alt pagers (less, man) still scroll. The caller rate-limits it to one per 90ms.
+      4. normal screen, no tracking -> nothing (the wheel is not even captured; conhost scrolls
+         its own scrollback natively).
 
-    alt_scroll="sgr": standard mouse-tracking contract instead — one wheel report per notch (SGR
-    when ?1006, urxvt when ?1015, else X10) while the app tracks the mouse, and 3 arrow keys per
-    notch (SS3 under DECCKM) on a bare alternate screen (xterm.js's own fallback). Valid for a
-    TUI known to scroll from wheel reports, but NOT yet demonstrated for claude/codex here.
-
-    Mouse tracking active WITHOUT the alternate screen always uses the report contract (page keys
-    would be meaningless there). Normal screen without tracking -> nothing (the wheel is not even
-    captured; conhost scrolls its own scrollback natively)."""
+    alt_scroll="pagekeys" (MUXCTL_WHEEL=pagekeys) forces the pre-flip order: the alternate screen
+    always takes a page key, even when the app tracks the mouse. Compatibility escape hatch for a
+    TUI that scrolls from page keys but not from wheel reports."""
     if not notches:
         return b""
     up = notches > 0
     count = min(8, abs(int(notches)))
-    if tracker.alt_screen and alt_scroll != "sgr":
+    if alt_scroll == "pagekeys" and tracker.alt_screen:
         return PAGE_UP if up else PAGE_DOWN
     if tracker.mouse_tracking:
         btn = 64 if up else 65
@@ -232,8 +251,12 @@ def wheel_input_sequences(tracker, notches, cell_x=1, cell_y=1, alt_scroll="page
             seq = ("\x1b[M" + chr(32 + btn) + chr(32 + min(x, 222)) + chr(32 + min(y, 222))).encode("utf-8")
         return seq * count
     if tracker.alt_screen:
-        arrow = (b"\x1bO" if tracker.app_cursor_keys else b"\x1b[") + (b"A" if up else b"B")
-        return arrow * (3 * count)
+        if tracker.alternate_scroll:
+            arrow = (b"\x1bO" if tracker.app_cursor_keys else b"\x1b[") + (b"A" if up else b"B")
+            return arrow * (3 * count)
+        # No 1007: xterm would drop the notch. Page keys are our compatibility fallback so a bare
+        # alt-screen pager still scrolls locally (one per EVENT, rate-limited by the caller).
+        return PAGE_UP if up else PAGE_DOWN
     return b""
 
 
@@ -282,14 +305,14 @@ class ConsoleInputTranslator:
     PAGE_SCROLL_INTERVAL = 0.09      # web parity: scrollAlternate() sends one page key per 90ms
 
     def __init__(self, tracker, cell_resolver=None, wheel_synthesis=True,
-                 alt_scroll="pagekeys", clock=time.monotonic):
+                 alt_scroll=DEFAULT_ALT_SCROLL, clock=time.monotonic):
         self.tracker = tracker
         self.cell = cell_resolver or (lambda pos: (1, 1))
         # wheel_synthesis=False (MUXCTL_VT_INPUT opt-in): the terminal's VT layer owns the wheel
         # (it synthesizes its own sequences), so we emit NOTHING for mouse events — one wheel
         # notch must never produce two scroll sources.
         self.wheel_synthesis = wheel_synthesis
-        self.alt_scroll = alt_scroll if alt_scroll in ALT_SCROLL_MODES_ALLOWED else "pagekeys"
+        self.alt_scroll = alt_scroll if alt_scroll in ALT_SCROLL_MODES_ALLOWED else DEFAULT_ALT_SCROLL
         self._clock = clock
         self._page_scroll_at = 0.0
         self._pending_high = ""
@@ -651,13 +674,13 @@ async def do_attach(name, create=False):
             # notch surfaces as exactly ONE win32 MOUSE_EVENT and no synthesized sequences, so
             # our translation is the only source. Under the legacy MUXCTL_VT_INPUT=1 opt-in the
             # terminal's VT layer owns the wheel, so our synthesis is disabled entirely.
-            # MUXCTL_WHEEL picks the alt-screen mechanism: "pagekeys" (default — PageUp/PageDown,
-            # the mechanism the web frontend PROVABLY scrolls claude/codex with) or "sgr"
-            # (standard mouse-report contract, for TUIs known to scroll from wheel reports).
+            # MUXCTL_WHEEL picks the wheel contract: "sgr" (default — real-terminal priority:
+            # mouse tracking wins, then 1007 arrows, then page keys on a bare alt screen) or
+            # "pagekeys" (forced compatibility: the alternate screen always takes a page key).
             translator = ConsoleInputTranslator(
                 screen_modes, cell_resolver=lambda pos: viewport_cell(hout, pos),
                 wheel_synthesis=not env_truthy("MUXCTL_VT_INPUT"),
-                alt_scroll=os.environ.get("MUXCTL_WHEEL", "pagekeys").strip().lower())
+                alt_scroll=os.environ.get("MUXCTL_WHEEL", DEFAULT_ALT_SCROLL).strip().lower())
             while True:
                 try:
                     if not k.ReadConsoleInputW(hin, records, len(records), ctypes.byref(got)):
