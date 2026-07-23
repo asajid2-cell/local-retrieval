@@ -65,6 +65,8 @@ function fakeEl() {
       add: c => classes.add(c),
       remove: c => classes.delete(c),
       contains: c => classes.has(c),
+      toggle: (c, force) => (force === undefined ? (classes.has(c) ? classes.delete(c) : classes.add(c))
+        : force ? classes.add(c) : classes.delete(c)),
     },
   };
 }
@@ -115,6 +117,11 @@ test('alternate buffer swaps the dead scrollbar for an honest "app scroll" chip'
   buffer.active.viewportY = 100;
   applyScrollAffordance();
   assert.equal(chip.hidden, true);
+
+  // onRender fires every frame, so an unchanged state must not touch the DOM at all
+  txt.textContent = 'SENTINEL';
+  assert.equal(applyScrollAffordance(), 'live · bottom', 'the label is still reported when memoised');
+  assert.equal(txt.textContent, 'SENTINEL', 'unchanged scroll state must do zero DOM writes');
 });
 
 test('scroll position label reports top, middle and bottom honestly', () => {

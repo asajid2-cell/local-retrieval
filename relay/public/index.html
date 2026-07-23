@@ -1606,24 +1606,23 @@ function scrollPositionLabel(viewportY, baseY, rows){
 // Keeps the scrollbar and the readout honest about which buffer is on screen. On the alternate screen the
 // viewport has nothing to scroll, so we hide the bar (via #term.altbuf) and show an 'app scroll' chip
 // instead — a dead scrollbar is worse than none. Returns the label it settled on so it can be tested.
+// onRender fires every frame, so the settled state is memoised: identical state does zero DOM writes.
+let lastAffordance=null;
 function applyScrollAffordance(){
   const host=$('#term'), chip=$('#scrollstate'), txt=$('#scrolltext');
   if(!host || !chip || !txt) return null;
   let buf=null, alt=false;
   try{ buf = term.buffer.active; alt = buf.type==='alternate'; }catch(e){}
-  if(alt){
-    host.classList.add('altbuf');
-    chip.classList.add('app');
-    txt.textContent = 'app scroll';
-    chip.hidden = false;
-    return 'app scroll';
-  }
-  host.classList.remove('altbuf');
-  chip.classList.remove('app');
-  const label = buf ? scrollPositionLabel(buf.viewportY, buf.baseY, term.rows) : 'no scrollback';
+  const label = alt ? 'app scroll'
+    : (buf ? scrollPositionLabel(buf.viewportY, buf.baseY, term.rows) : 'no scrollback');
+  const key = (alt?'a:':'n:') + label;
+  if(key===lastAffordance) return label;
+  lastAffordance = key;
+  host.classList.toggle('altbuf', alt);
+  chip.classList.toggle('app', alt);
   txt.textContent = label;
   // At the live bottom (or with no history at all) the chip is noise — the pill already covers "go live".
-  chip.hidden = (label==='live · bottom' || label==='no scrollback');
+  chip.hidden = !alt && (label==='live · bottom' || label==='no scrollback');
   return label;
 }
 try{ term.buffer.onBufferChange(()=>applyScrollAffordance()); }catch(e){}
