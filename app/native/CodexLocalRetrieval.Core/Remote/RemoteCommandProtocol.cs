@@ -22,6 +22,7 @@ public static class RemoteCommandProtocol
         {
             "kill" => "refused",
             "transcript" => "read-only",
+            "transcriptfetch" => "read-only",
             "fetchfile" => "intent-fenced",
             "rename" => "idempotent",
             "setapptitle" => "idempotent",

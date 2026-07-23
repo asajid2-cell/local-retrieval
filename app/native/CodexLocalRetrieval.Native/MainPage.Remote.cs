@@ -415,6 +415,10 @@ public sealed partial class MainPage
                     var text = await Task.Run(() => ReadTranscriptTail(c.tool ?? "claude", c.sessionId ?? "", 7000));
                     res = (true, text);
                 }
+                else if (string.Equals(c.type, "transcriptfetch", StringComparison.OrdinalIgnoreCase))
+                {
+                    res = await PushTranscriptPagesAsync(target, port, c);
+                }
                 else if (string.Equals(c.type, "rename", StringComparison.OrdinalIgnoreCase))
                 {
                     var status = await _archive.RenameNativeByIdAsync(c.tool ?? "claude", c.sessionId ?? "", c.title ?? "");
@@ -479,6 +483,56 @@ public sealed partial class MainPage
         catch (Exception ex) { Diag.Log("PollCommands failed: " + ex.Message); }
         finally { _cmdPolling = false; }
     }
+
+    // transcriptfetch — an archive.read for ONE explicitly named chat. The relay has already verified
+    // the signed client principal envelope and that principal's current membership of the resource;
+    // what this side enforces is the rest of the fence: the id must be opaque, the leased command must
+    // carry a scoped bridge credential and a bounded fetch TTL, and we ship the clean transcript in
+    // capped pages. Never a bulk mirror of history — one id, one chat, one bounded window.
+    //
+    // The pages go to the relay's own store over our owner-only ssh; the ack carries only a count,
+    // because the relay discards app-supplied ack detail (server.js:1491-1497).
+    private async Task<(bool ok, string detail)> PushTranscriptPagesAsync(string target, int port, AppCommand c)
+    {
+        var sessionId = (c.sessionId ?? "").Trim();
+        if (!TranscriptFetchProjection.IsOpaqueId(sessionId))
+            return (false, "transcript fetch needs one explicit opaque session id");
+        if (!TranscriptFetchProjection.IsCredential(c.bridgeToken))
+            return (false, "transcript fetch needs a scoped bridge credential");
+        if (c.ttlMs <= 0 || c.ttlMs > MaxTranscriptFetchTtlMs)
+            return (false, $"transcript fetch needs a bounded ttlMs in 1..{MaxTranscriptFetchTtlMs}");
+
+        var session = _archive.ResolveSessionByIdOrAlias(sessionId, c.tool);
+        if (session is null) return (false, "chat not in this app's archive");
+
+        var user = await _archive.ExtractReaderMessagesAsync(session, "user");
+        var assistant = await _archive.ExtractReaderMessagesAsync(session, "assistant");
+        var merged = TranscriptFetchProjection.MergeChronological(user, assistant);
+        var redact = TranscriptFetchProjection.RedactReadsEnabled();
+        var pages = TranscriptFetchProjection.BuildPages(sessionId, merged, redact);
+        if (pages.Count == 0) return (true, "no readable messages in that chat");
+
+        string remote;
+        try { remote = TranscriptFetchProjection.PushCommand(port, sessionId, c.bridgeToken!); }
+        catch (ArgumentException ex) { return (false, ex.Message); }
+
+        // The TTL bounds the whole fetch, not each hop: once it lapses we stop pushing rather than
+        // keep writing history the requester is no longer entitled to.
+        var deadline = Stopwatch.StartNew();
+        var pushed = 0;
+        foreach (var page in pages)
+        {
+            if (deadline.ElapsedMilliseconds > c.ttlMs)
+                return (false, $"transcript fetch TTL lapsed after {pushed}/{pages.Count} page(s)");
+            var (code, outText) = await RunSshAsync(target, remote, page.Json);
+            if (code != 0) return (false, $"page {page.Page}/{page.Pages} push failed rc={code} {outText.Trim()}");
+            pushed++;
+        }
+        Diag.Log($"Transcript fetch pushed {pushed} page(s) for session={sessionId} redact={redact}");
+        return (true, $"pushed {pushed} page(s){(redact ? " (redacted)" : "")}");
+    }
+
+    private const int MaxTranscriptFetchTtlMs = 10 * 60 * 1000;
 
     private static async Task AckCommandAsync(string target, int port, string commandId, string ackJson)
     {
