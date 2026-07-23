@@ -903,6 +903,20 @@ CLAIM_ROOT = ENV.get("LAUNCH_CLAIM_ROOT") or os.path.join(
     "launch-claims",
 )
 CLAIM_TTL_SECONDS = max(10, int(ENV.get("LAUNCH_CLAIM_TTL_SECONDS", "120")))
+# Custody TTL: how long a session record muxd is no longer running stays on the books. A dormant tab
+# is a promise to relaunch; a record nobody has touched for a day is landfill that the relay would
+# keep showing forever. os.environ wins over .env so an operator can shorten it for one run.
+CUSTODY_TTL_SECONDS = max(
+    60, int(os.environ.get("MUX_CUSTODY_TTL_S") or ENV.get("MUX_CUSTODY_TTL_S") or "86400")
+)
+# identityPending means a launch is mid-flight with no captured identity yet — reclaiming it would
+# orphan a process nobody can find again, so it survives its deadline by this much.
+CUSTODY_IDENTITY_GRACE_SECONDS = max(
+    30, int(os.environ.get("MUX_CUSTODY_IDENTITY_GRACE_S") or ENV.get("MUX_CUSTODY_IDENTITY_GRACE_S") or "900")
+)
+CUSTODY_GC_INTERVAL_SECONDS = max(
+    30, int(os.environ.get("MUX_CUSTODY_GC_INTERVAL_S") or ENV.get("MUX_CUSTODY_GC_INTERVAL_S") or "600")
+)
 PROTOCOL = 4
 CAPS = ["ls", "info", "create", "createAck", "bind", "input", "open", "attach", "kill", "rename", "heal", "tail", "scrollback", "resize", "owner", "relaunch"]
 STARTED = time.time()
@@ -1957,6 +1971,96 @@ def start_watchdog_thread():
 
     threading.Thread(target=run, name="muxd-watchdog", daemon=True).start()
 
+def custody_now(now=None):
+    return time.time() if now is None else float(now)
+
+def custody_stamp(epoch):
+    return datetime.fromtimestamp(float(epoch), timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+def custody_epoch(stamp):
+    # 0.0 means "no custody stamp" — that is NOT the same as expired (see custody_expired).
+    text = str(stamp or "").strip()
+    if not text:
+        return 0.0
+    try:
+        parsed = datetime.fromisoformat(text[:-1] + "+00:00" if text.endswith("Z") else text)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return float(parsed.timestamp())
+    except Exception:
+        return 0.0
+
+def _custody_field(record, key, attr, default=None):
+    if isinstance(record, dict):
+        return record.get(key, default)
+    return getattr(record, attr, default)
+
+def custody_deadline(record):
+    return custody_epoch(_custody_field(record, "custodyExpiresUtc", "custody_expires_utc", ""))
+
+def custody_refresh(session, now=None, ttl=None):
+    at = custody_now(now)
+    session.last_alive_utc = custody_stamp(at)
+    session.custody_expires_utc = custody_stamp(at + float(CUSTODY_TTL_SECONDS if ttl is None else ttl))
+    return session.custody_expires_utc
+
+def custody_seed(session, now=None, ttl=None):
+    # A record persisted before custody existed carries no deadline. Seeding it a full TTL means the
+    # first boot after the upgrade lists every dormant tab exactly as before instead of eating them.
+    if custody_deadline(session) > 0:
+        return False
+    custody_refresh(session, now=now, ttl=ttl)
+    return True
+
+def custody_expired(record, now=None):
+    deadline = custody_deadline(record)
+    return deadline > 0 and custody_now(now) >= deadline
+
+def custody_protected(record, now=None):
+    alive = _custody_field(record, "alive", "alive", None)
+    if callable(alive):
+        try:
+            alive = bool(alive())
+        except Exception:
+            alive = False
+    if bool(alive):
+        return True
+    if _custody_field(record, "_launch_claim", "_launch_claim", None) is not None:
+        return True
+    if list(_custody_field(record, "claimPaths", "claim_paths", []) or []):
+        return True
+    if bool(_custody_field(record, "identityPending", "identity_pending", False)):
+        return custody_now(now) < custody_deadline(record) + CUSTODY_IDENTITY_GRACE_SECONDS
+    return False
+
+def custody_reclaimable(record, now=None):
+    """The one predicate: a reclaimable record is GC'd AND never emitted, so the relay can never
+    see a row muxd is about to delete. Only parked lifecycles are ever reclaimable."""
+    lifecycle = str(_custody_field(record, "lifecycle", "lifecycle", "active") or "active")
+    if lifecycle not in ("dormant", "failed"):
+        return False
+    return custody_expired(record, now) and not custody_protected(record, now)
+
+def refresh_live_custody(source=None, now=None, ttl=None):
+    source = sessions if source is None else source
+    refreshed = []
+    for name, s in list(source.items()):
+        try:
+            alive = bool(s.alive())
+        except Exception:
+            alive = False
+        if alive:
+            custody_refresh(s, now=now, ttl=ttl)
+            refreshed.append(name)
+    return refreshed
+
+def gc_expired_custody(source=None, now=None):
+    source = sessions if source is None else source
+    reclaimed = [name for name, s in list(source.items()) if custody_reclaimable(s, now)]
+    for name in reclaimed:
+        source.pop(name, None)
+    return reclaimed
+
 def session_records_payload(source=None):
     source = sessions if source is None else source
     return {
@@ -1976,6 +2080,8 @@ def session_records_payload(source=None):
             "operationKey": str(getattr(s, "operation_key", "") or ""),
             "operationFingerprint": str(getattr(s, "operation_fingerprint", "") or ""),
             "operationCreated": bool(getattr(s, "operation_created", False)),
+            "lastAliveUtc": str(getattr(s, "last_alive_utc", "") or ""),
+            "custodyExpiresUtc": str(getattr(s, "custody_expires_utc", "") or ""),
             "deaths": [float(value) for value in list(getattr(s, "deaths", []) or [])[-16:]]}
         for n, s in source.items()
     }
@@ -2026,6 +2132,8 @@ def valid_session_records(value):
         and isinstance(record.get("operationKey", ""), str)
         and isinstance(record.get("operationFingerprint", ""), str)
         and isinstance(record.get("operationCreated", False), bool)
+        and isinstance(record.get("lastAliveUtc", ""), str)
+        and isinstance(record.get("custodyExpiresUtc", ""), str)
         for name, record in value.items()
     )
 
@@ -2085,6 +2193,8 @@ _PERSISTED_SESSION_FIELDS = (
     "operation_created",
     "deaths",
     "user_killed",
+    "last_alive_utc",
+    "custody_expires_utc",
 )
 
 def persisted_session_snapshot(session):
@@ -2106,9 +2216,11 @@ def restore_persisted_session(session, snapshot):
     session._launch_claim = snapshot["_launch_claim"]
     session.claim_paths = list(snapshot["claim_paths"])
 
-def live_tabs_snapshot():
+def live_tabs_snapshot(now=None):
     out = {}
     for n, s in sessions.items():
+        if custody_reclaimable(s, now):
+            continue    # custody expired: filtered, never labelled — this record is about to be GC'd
         pid = 0
         try:
             p = getattr(s, "pty", None)
@@ -2298,8 +2410,10 @@ def needs_relaunch_for_command(prev, requested_cmd):
         return True
     return command_sig(getattr(prev, "cmd", "")) != command_sig(requested)
 
-def sess_list():
-    return [session_payload(n, s) for n, s in sessions.items()]
+def sess_list(now=None):
+    # Custody-expired records are dropped outright: the relay keeps showing every UNexpired dormant
+    # row for relaunch, and never a row muxd has already written off.
+    return [session_payload(n, s) for n, s in sessions.items() if not custody_reclaimable(s, now)]
 
 async def spawn_session_off_loop(s):
     await asyncio.get_running_loop().run_in_executor(None, s.spawn)
