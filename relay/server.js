@@ -2387,3 +2387,15 @@ function drainForRestart(signal) {
   }, 750).unref();
 }
 process.on('SIGTERM', () => drainForRestart('SIGTERM'));
+// Windows cannot deliver SIGTERM to a running process at all — libuv turns kill('SIGTERM') into
+// TerminateProcess, so the handler above provably never runs there (even self-signalling just dies).
+// Production is Linux, but the dev machine is not, and a drain nobody can test is a drain that rots.
+// So: a second door, opened only under MUX_TEST_MODE and only over an IPC channel the parent had to
+// create at spawn time — in a deploy there is no channel and no test mode, so it cannot be reached.
+if (TEST_MODE && process.send) {
+  process.on('message', m => {
+    if (!m || m.t !== 'drain') return;
+    try { process.channel.unref(); } catch {}   // else the IPC handle alone keeps the loop alive forever
+    drainForRestart('SIGTERM');
+  });
+}

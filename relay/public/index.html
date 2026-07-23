@@ -1679,7 +1679,14 @@ function connect(name, isRetry){
       if(fresh() && !intentional){
         const refused = closeRefusal(ev);
         if(refused){ stopAttach(name, refused); return; }
+        // 1012 SERVICE_RESTART: the relay is draining for a deploy, not failing. It IS coming back in
+        // about a second, so skip the backoff walk entirely - shortest fuse, and say why out loud so a
+        // deploy reads as a blink instead of a dead terminal. flash() goes AFTER scheduleReconnect
+        // because scheduleReconnect sets its own 'reconnecting' status and would eat the toast.
+        const restarting = !!(ev && ev.code===1012);
+        if(restarting) reconnectDelay = 500;
         scheduleReconnect(name);
+        if(restarting) flash('relay restarting…');
       }
     };
     sock.onerror = () => {};
