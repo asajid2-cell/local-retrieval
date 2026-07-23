@@ -4,8 +4,34 @@
 // wiring, notify.js transport, or the episode ledger all show up here.
 const assert = require('node:assert/strict');
 const http = require('node:http');
+const path = require('node:path');
+const { execFileSync } = require('node:child_process');
 const { test } = require('node:test');
 const { once } = require('node:events');
+
+// relay/node_modules is gitignored, so a freshly created git worktree has none and requiring the
+// harness dies with "Cannot find module 'ws'" before a single test runs. Provision once, up front,
+// so this file stands alone as a verifier no matter which checkout it is run from.
+(function ensureRelayDeps() {
+  const relayDir = path.resolve(__dirname, '..');
+  try {
+    require.resolve('ws', { paths: [relayDir] });
+    return;
+  } catch { /* not installed yet */ }
+  // On Windows npm is a .cmd shim, and since the CVE-2024-27980 fix spawning one without a shell
+  // throws EINVAL — so the shell is required there, not cosmetic.
+  const isWindows = process.platform === 'win32';
+  try {
+    execFileSync(isWindows ? 'npm.cmd' : 'npm', ['ci', '--no-audit', '--no-fund'], {
+      cwd: relayDir,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      shell: isWindows,
+    });
+  } catch (err) {
+    const detail = [err.stdout, err.stderr].map(b => (b ? b.toString() : '')).join('').trim();
+    throw new Error(`could not install relay deps (npm ci in ${relayDir}): ${err.message}\n${detail}`);
+  }
+})();
 
 const { RelayHarness, freePort, sleep, waitFor } = require('./harness');
 
