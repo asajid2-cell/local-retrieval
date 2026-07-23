@@ -1161,7 +1161,8 @@ function probePc() {
   sock.on('error', () => done(false));
   sock.on('timeout', () => done(false));
 }
-if (!TEST_MODE) { setTimeout(probePc, 2000); setInterval(probePc, 30000); }
+let _probeBootTimer = null, _probeTimer = null;   // held so the restart drain can let the event loop empty
+if (!TEST_MODE) { _probeBootTimer = setTimeout(probePc, 2000); _probeTimer = setInterval(probePc, 30000); }
 app.get('/api/health', (req, res) => {
   let tmuxAvailable = false;
   try { execSync(`tmux -V`, { encoding: 'utf8', timeout: 1500 }); tmuxAvailable = true; } catch {}
@@ -1757,7 +1758,9 @@ const server = http.createServer(app);
 // and the non-matching one aborts the handshake with a 400 before the right one sees it.
 const wss = new WebSocketServer({ noServer: true });
 const wssHost = new WebSocketServer({ noServer: true });
+let draining = false;              // set by the SIGTERM restart drain at the bottom of this file
 server.on('upgrade', (req, socket, head) => {
+  if (draining) { try { socket.destroy(); } catch {} return; }   // a restarting relay accepts no new links
   const p = (req.url || '').split('?')[0];
   if (p === '/ws') wss.handleUpgrade(req, socket, head, ws => wss.emit('connection', ws, req));
   else if (p === '/host') {
@@ -2037,7 +2040,7 @@ function reconcileRenameIntentsFromHost() {
 }
 savePins(pins);
 saveRenameIntents(renameIntents);
-setInterval(() => {
+const _pinRetryTimer = setInterval(() => {
   if (!_pinsDirty) return;
   try { savePins(new Map(pins)); }
   catch (error) {
@@ -2332,3 +2335,55 @@ const PORT = +process.env.PORT || 7682;
 // the port to the LAN). Loopback-trust semantics are unchanged — a LAN caller is NOT trusted-local and
 // still hits the hl-auth owner gate for everything except /host-with-token.
 server.listen(PORT, '0.0.0.0', () => console.log('multiplex-app on 0.0.0.0:' + PORT));
+
+// ---- RESTART DRAIN: a deploy must be invisible, not a black hole --------------------------------
+// A deploy sends SIGTERM. With no handler node dies mid-frame: every socket is reset, the browser sees
+// an abnormal 1006 and walks its exponential backoff, and a live terminal looks dead for ~10s. Instead
+// we drain: refuse new upgrades, flush the only in-memory-dirty durable state, close every viewer with
+// 1012 "restarting" (index.html maps that to a 500ms reconnect fuse + a toast), and close the muxd host
+// link LAST so the PC never learns the viewers are gone before they actually are. Everything is torn
+// down so the loop empties on its own; the 5s timer is an unref'd backstop, not the expected path.
+function flushDurableStateForRestart() {
+  // Every acknowledged mutation already committed through durable-state.js before it was published in
+  // memory — pins are the one value allowed to lag behind (coalesced by a 20s retry timer), so they are
+  // the only thing a restart can actually lose.
+  if (!_pinsDirty) return;
+  try { savePins(new Map(pins)); }
+  catch (error) { console.error('[drain] pin flush failed: ' + String(error && error.message || error)); }
+}
+function drainForRestart(signal) {
+  if (draining) return;
+  draining = true;
+  setTimeout(() => process.exit(0), 5000).unref();   // unref'd: never hold the loop open just to die
+  console.log(`[drain] ${signal}: refusing upgrades, closing viewers with 1012 restarting`);
+
+  try { server.close(); } catch {}                   // stop listening; already-upgraded sockets survive
+  try { server.closeIdleConnections(); } catch {}    // idle keep-alive HTTP would otherwise pin the loop
+  flushDurableStateForRestart();
+  clearInterval(_pinRetryTimer);
+  if (_probeBootTimer) clearTimeout(_probeBootTimer);
+  if (_probeTimer) clearInterval(_probeTimer);
+
+  const viewers = new Set(wss.clients);
+  for (const st of sessions.values()) {
+    if (st.sbRequestTimer) { clearTimeout(st.sbRequestTimer); st.sbRequestTimer = null; }
+    for (const client of st.clients.values()) {
+      if (client.ka) { clearInterval(client.ka); client.ka = null; }
+      viewers.add(client.ws);
+    }
+  }
+  for (const ws of viewers) { try { ws.close(1012, 'restarting'); } catch {} }
+
+  const host = hostWs;
+  for (const ws of wssHost.clients) if (ws !== host) { try { ws.close(1012, 'restarting'); } catch {} }
+  if (host) { try { host.close(1012, 'restarting'); } catch {} }   // host link closed last, always
+
+  // grace for those close frames to reach the wire, then force the rest down so the loop can empty
+  setTimeout(() => {
+    for (const ws of viewers) { try { ws.terminate(); } catch {} }
+    for (const ws of wssHost.clients) { try { ws.terminate(); } catch {} }
+    try { wss.close(); } catch {}
+    try { wssHost.close(); } catch {}
+  }, 750).unref();
+}
+process.on('SIGTERM', () => drainForRestart('SIGTERM'));
