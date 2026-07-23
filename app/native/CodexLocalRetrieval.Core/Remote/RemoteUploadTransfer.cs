@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using CodexLocalRetrieval.Core.Agents;
 
 namespace CodexLocalRetrieval.Core.Remote;
@@ -10,6 +11,81 @@ public sealed record RemoteUploadResult(bool Ok, string Detail, bool OnPc);
 public static class RemoteUploadTransfer
 {
     private static readonly TimeSpan TransferTimeout = TimeSpan.FromSeconds(30);
+
+    // The upload id arrives over the relay, so the executing end treats it as untrusted input:
+    // a strict token charset, the relay's own minting shape, and a resolved-path containment
+    // check all have to agree before the id reaches Path.Combine or the scp remote path.
+    private static readonly Regex UploadIdCharset =
+        new(@"^[A-Za-z0-9._-]{1,64}$", RegexOptions.CultureInvariant);
+
+    // Mirrors relay/server.js uploadIdPattern; ids are minted there as 'u' + base36 + '-' + base36.
+    private static readonly Regex RelayUploadIdShape =
+        new(@"^u[a-z0-9]+-[a-z0-9]+$", RegexOptions.CultureInvariant | RegexOptions.IgnoreCase);
+
+    /// <summary>
+    /// Resolves the per-upload directory for <paramref name="uploadId"/> under
+    /// <paramref name="destRoot"/> without touching the filesystem. Returns false with a
+    /// user-facing <paramref name="detail"/> when the id is not a legal token or when it would
+    /// resolve outside the upload root.
+    /// </summary>
+    public static bool TryResolveUploadDirectory(
+        string destRoot,
+        string? uploadId,
+        out string destDir,
+        out string detail)
+    {
+        destDir = "";
+        if (string.IsNullOrWhiteSpace(uploadId))
+        {
+            detail = "file download refused: missing upload id";
+            return false;
+        }
+
+        if (!UploadIdCharset.IsMatch(uploadId))
+        {
+            detail = "file download refused: upload id is not a valid token";
+            return false;
+        }
+
+        // Containment runs on the broadest set that can reach it — before the narrower format
+        // rules below — so the security-critical invariant is exercised rather than shadowed.
+        string rootFull;
+        string candidateFull;
+        try
+        {
+            rootFull = Path.TrimEndingDirectorySeparator(Path.GetFullPath(destRoot));
+            candidateFull = Path.GetFullPath(Path.Combine(rootFull, uploadId));
+        }
+        catch
+        {
+            detail = "file download refused: upload id does not resolve to a usable folder";
+            return false;
+        }
+
+        var prefix = rootFull + Path.DirectorySeparatorChar;
+        if (candidateFull.Length <= prefix.Length
+            || !candidateFull.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+        {
+            detail = "file download refused: upload id resolves outside the upload folder";
+            return false;
+        }
+
+        if (uploadId[0] == '.')
+        {
+            detail = "file download refused: upload id is not a valid token";
+            return false;
+        }
+
+        if (!RelayUploadIdShape.IsMatch(uploadId))
+        {
+            detail = "file download refused: upload id does not match the expected upload id format";
+            return false;
+        }
+
+        destDir = candidateFull;
+        detail = "";
+        return true;
+    }
 
     public static async Task<RemoteUploadResult> FetchAndInsertAsync(
         string target,
@@ -21,14 +97,15 @@ public static class RemoteUploadTransfer
         string intentId,
         Func<object, Task<string>> muxRequest)
     {
-        if (string.IsNullOrWhiteSpace(uploadId))
-            return new RemoteUploadResult(false, "file download refused: missing upload id", false);
-
         var safe = SanitizeFilename(filename);
         var destRoot = keep
             ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "CodexMultiplexUploads")
             : Path.Combine(Path.GetTempPath(), "multiplex-uploads");
-        var destDir = Path.Combine(destRoot, uploadId);
+
+        // Validate before any filesystem or scp side effect.
+        if (!TryResolveUploadDirectory(destRoot, uploadId, out var destDir, out var refusal))
+            return new RemoteUploadResult(false, refusal, false);
+
         try
         {
             Directory.CreateDirectory(destDir);
