@@ -1327,21 +1327,60 @@ class RelayOutQueue:
 LOCAL_VIEWER_QUEUE_MAX = 64          # ~768ms of link/loop-lag tolerance (was 4 = ~48ms -> spurious detaches)
 LOCAL_VIEWER_SLOW = object()
 
+class LocalViewerQueue(asyncio.Queue):
+    """Per-local-viewer output queue that makes a dropped chunk an OBSERVABLE fact.
+
+    The overflow policy is unchanged and deliberate: a brief lag must NOT detach a local terminal
+    (that was the "[muxctl] detached" bug), so a full queue evicts its OLDEST chunk rather than
+    refusing the newest. What was missing is the accounting. The drop used to happen inline in
+    fanout_local_output and leave no trace anywhere; the only healing was redraw_nudge, which
+    returns immediately unless the session holds the alternate screen — so an ordinary shell
+    viewer rendered a screen with a hole in it and nothing, anywhere, knew.
+
+    Every eviction now lands in dropped_chunks / dropped_bytes, and gap_seq counts GAP EPISODES
+    rather than evictions: one contiguous burst of drops is a single gap (fifty back-to-back
+    evictions while the reader is stalled are one hole in the stream, not fifty), and gap_seq only
+    advances again once an offer has succeeded in between. gap_seq is strictly monotonic across
+    the queue's life and never decreases, so a resync consumer can compare it against the last
+    value it acted on and tell a fresh gap from one it has already healed.
+
+    Subclasses asyncio.Queue so the consumer side (`await lq.get()`, the LOCAL_VIEWER_SLOW
+    sentinel, sizing) is untouched — only producers move to offer()."""
+
+    def __init__(self, maxsize=LOCAL_VIEWER_QUEUE_MAX):
+        super().__init__(maxsize=maxsize)
+        self.dropped_chunks = 0
+        self.dropped_bytes = 0
+        self.gap_seq = 0
+        self._gap_open = False
+
+    def offer(self, data):
+        """Enqueue `data`, evicting the oldest chunk if full. True == lossless, False == a gap."""
+        if not self.full():
+            self.put_nowait(data)
+            self._gap_open = False
+            return True
+        try:
+            evicted = self.get_nowait()
+        except asyncio.QueueEmpty:
+            evicted = None
+        if evicted is not None:
+            try:
+                self.dropped_bytes += len(evicted)
+            except TypeError:
+                pass                       # sentinels (LOCAL_VIEWER_SLOW) have no length
+        self.dropped_chunks += 1
+        if not self._gap_open:
+            self.gap_seq += 1              # one contiguous burst of drops == one gap episode
+            self._gap_open = True
+        self.put_nowait(data)
+        return False
+
 def fanout_local_output(session, data):
     for local_queue in list(session.local):
-        try:
-            local_queue.put_nowait(data)
-        except asyncio.QueueFull:
-            # A brief lag must NOT detach a local terminal (that was the "[muxctl] detached" bug). Drop the
-            # OLDEST chunk to make room, keep the viewer, and nudge a full repaint so the momentary gap heals.
-            try:
-                local_queue.get_nowait()
-            except asyncio.QueueEmpty:
-                pass
-            try:
-                local_queue.put_nowait(data)
-            except asyncio.QueueFull:
-                pass
+        if not local_queue.offer(data):
+            # The viewer lost a chunk. Keep nudging a full repaint so the gap still heals on the
+            # alternate screen exactly as before; the explicit resync frame supersedes this later.
             try:
                 redraw_nudge(session)
             except Exception:
@@ -3731,7 +3770,7 @@ async def main():
                     s, err, _created = await ensure_local_session(first, False)
                 if err:
                     await ws.send(json.dumps({"t": "err", "m": err})); return
-                lq = asyncio.Queue(maxsize=LOCAL_VIEWER_QUEUE_MAX); s.local.add(lq)
+                lq = LocalViewerQueue(); s.local.add(lq)
                 if first.get("cols"):
                     update_local_session_size(s, lq, first.get("cols"), first.get("rows") or 40)
                 try:
