@@ -188,23 +188,53 @@ public sealed class StaleGuardedRefresherTests
     }
 
     [TestMethod]
-    public void ConcurrentRefreshes_LeaveExactlyTheNewestPublished_AndNoStuckInFlight()
+    public void ConcurrentRefreshes_LeaveOneConsistentPublishedAnswer_AndNoStuckInFlight()
     {
+        const int Racers = 64;
         var refresher = new StaleGuardedRefresher<Box>(ttl: TimeSpan.Zero);
         var tasks = new List<Task<RefreshOutcome<Box>>>();
-        for (var i = 0; i < 64; i++)
+        for (var i = 0; i < Racers; i++)
         {
             var n = i;
-            tasks.Add(Task.Run(() => refresher.RefreshAsync("key-" + n, () => new Box("v" + n), force: true)).Unwrap());
+            tasks.Add(Task.Run(() => refresher.RefreshAsync("key-" + n, () => new Box("v" + n), force: true)));
         }
 
-        Wait(Task.WhenAll(tasks), "64 racing refreshes");
+        Wait(Task.WhenAll(tasks), $"{Racers} racing refreshes");
+        var outcomes = tasks.Select(t => t.Result).ToList();
 
-        Assert.AreEqual(1, tasks.Count(t => t.Result.IsCurrent), "exactly one refresh may publish");
+        // Deliberately NOT "exactly one publishes": these are 64 distinct keys, and nothing forces them to
+        // overlap. If refresh i lands before refresh i+1 is even dispatched, i legitimately publishes and
+        // reports IsCurrent — so anywhere from 1 to 64 outcomes may be current. Asserting 1 is a coin flip.
+        // What must hold under EVERY interleaving is below.
+        Assert.AreEqual(Racers, refresher.BuildCount, "distinct keys never coalesce — every refresh must build");
+        Assert.IsTrue(outcomes.Any(o => o.IsCurrent), "the last refresh to claim a sequence must publish");
         Assert.IsFalse(refresher.IsRefreshing, "the in-flight slot leaked");
-        Assert.IsNotNull(refresher.Current);
-        var winner = tasks.Single(t => t.Result.IsCurrent);
-        Assert.AreEqual(winner.Result.Key, refresher.CurrentKey);
-        Assert.AreEqual(winner.Result.Value?.Value, refresher.Current?.Value);
+
+        // The published answer belongs to exactly one key, and it is that key's own value — a superseded
+        // build must never publish another key's answer under the winner's name.
+        Assert.IsNotNull(refresher.Current, "nothing was published at all");
+        var currentKey = refresher.CurrentKey;
+        Assert.IsTrue(
+            currentKey.StartsWith("key-", StringComparison.Ordinal),
+            $"the published key '{currentKey}' is not one of key-0..key-{Racers - 1}");
+        var parsed = int.TryParse(currentKey.Substring(4), out var winner);
+        Assert.IsTrue(
+            parsed && winner >= 0 && winner < Racers,
+            $"the published key '{currentKey}' is not one of key-0..key-{Racers - 1}");
+        Assert.AreEqual("v" + winner, refresher.Current!.Value, "the published value belongs to another key");
+
+        // Every outcome carries its own key's value, whether or not it won.
+        foreach (var outcome in outcomes)
+        {
+            Assert.IsNotNull(outcome.Value, $"{outcome.Key} returned no value");
+            Assert.AreEqual(
+                "v" + outcome.Key.Substring(4),
+                outcome.Value!.Value,
+                $"{outcome.Key} was answered with another key's build");
+        }
+
+        var published = outcomes.Where(o => string.Equals(o.Key, currentKey, StringComparison.Ordinal)).ToList();
+        Assert.AreEqual(1, published.Count, "the published key must belong to exactly one refresh");
+        Assert.IsTrue(published[0].IsCurrent, "the refresh that owns the published value reported itself stale");
     }
 }
