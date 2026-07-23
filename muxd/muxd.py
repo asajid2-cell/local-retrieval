@@ -903,6 +903,7 @@ CLAIM_ROOT = ENV.get("LAUNCH_CLAIM_ROOT") or os.path.join(
     "launch-claims",
 )
 CLAIM_TTL_SECONDS = max(10, int(ENV.get("LAUNCH_CLAIM_TTL_SECONDS", "120")))
+CLAIM_SWEEP_SECONDS = max(15, int(ENV.get("LAUNCH_CLAIM_SWEEP_SECONDS", "60")))
 PROTOCOL = 4
 CAPS = ["ls", "info", "create", "createAck", "bind", "input", "open", "attach", "kill", "rename", "heal", "tail", "scrollback", "resize", "owner", "relaunch"]
 STARTED = time.time()
@@ -1191,6 +1192,100 @@ def acquire_launch_claim(cmd="", ids=None, reason="muxd session launch", live=No
         LaunchClaim(candidate_ids, held).release()
         return None, "refused: " + conflict_detail(conflict)
     return LaunchClaim(candidate_ids, held), "reserved"
+
+
+def _quarantine_claim_path(path):
+    # <id>-<digest>.claim.json -> <id>-<digest>.claim.bad, so a poisoned file stops being read as a
+    # claim (the sweep and acquire both only look at *.claim.json) without ever being destroyed.
+    base = path[:-len(".json")] if path.lower().endswith(".claim.json") else path
+    return base + ".bad"
+
+
+def sweep_launch_claims(now=None):
+    """Garbage-collect abandoned launch claims out of the SHARED claim directory.
+
+    Claim files are self-describing, so muxd can reap the whole directory without knowing which
+    process wrote each one (the WinUI app writes claims here too). The rules are deliberately
+    conservative — a stale claim only costs a refused launch, a wrongly-deleted one costs a
+    duplicate writer on a live agent session, which is the exact corruption CLAIM_ROOT exists
+    to prevent:
+      * ExpiresUtc <= now                    -> delete (the writer itself promised it'd be gone)
+      * OwnerProcess == 'muxd' + dead pid    -> delete (that was us; nobody is coming back)
+      * unreadable / not a JSON object       -> quarantine to *.claim.bad, NEVER delete
+      * anything else                        -> keep, even when the owner can't be verified;
+                                                claims without a parseable ExpiresUtc fall back to
+                                                mtime + TTL, so a fresh one is never touched.
+    Returns (removed, quarantined, kept) as lists of paths. Safe to call repeatedly: a second pass
+    over the same directory is a no-op.
+    """
+    now = now or datetime.now(timezone.utc)
+    removed, quarantined, kept = [], [], []
+    try:
+        names = sorted(os.listdir(CLAIM_ROOT))
+    except FileNotFoundError:
+        return removed, quarantined, kept
+    except OSError as e:
+        log(f"launch-claim sweep could not read {CLAIM_ROOT}: {e}")
+        return removed, quarantined, kept
+
+    for name in names:
+        if not name.lower().endswith(".claim.json"):
+            continue                                   # already-quarantined *.claim.bad included
+        path = os.path.join(CLAIM_ROOT, name)
+        if not os.path.isfile(path):
+            continue
+
+        metadata = _read_claim_metadata(path)
+        if metadata is None:
+            target = _quarantine_claim_path(path)
+            try:
+                os.replace(path, target)               # replace, not rename: re-quarantining is idempotent
+                quarantined.append(target)
+                log(f"launch-claim sweep quarantined unreadable claim {name} -> {os.path.basename(target)}")
+            except OSError as e:
+                kept.append(path)
+                log(f"launch-claim sweep could not quarantine {name}: {e}")
+            continue
+
+        expired = _claim_expiry(path, metadata) <= now
+        dead_muxd_owner = (
+            str(metadata.get("OwnerProcess") or "").lower() == "muxd"
+            and not _pid_alive(metadata.get("OwnerPid"))
+        )
+        if not (expired or dead_muxd_owner):
+            kept.append(path)
+            continue
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass                                       # someone else reaped it; same outcome
+        except OSError as e:
+            kept.append(path)
+            log(f"launch-claim sweep could not remove {name}: {e}")
+            continue
+        removed.append(path)
+        log(f"launch-claim sweep removed {'expired' if expired else 'dead-owner'} claim {name}")
+
+    return removed, quarantined, kept
+
+
+_CLAIM_SWEEP_LAST = 0.0
+
+
+def maybe_sweep_launch_claims(force=False):
+    # The status pump ticks every ~5s but the sweep only needs ~60s granularity, and a relay
+    # reconnect restarts that pump — so the divider is a monotonic clock rather than a tick
+    # counter, and reconnect churn can't turn the sweep into a hot loop over the claim directory.
+    global _CLAIM_SWEEP_LAST
+    now = time.monotonic()
+    if not force and _CLAIM_SWEEP_LAST and (now - _CLAIM_SWEEP_LAST) < CLAIM_SWEEP_SECONDS:
+        return None
+    _CLAIM_SWEEP_LAST = now
+    try:
+        return sweep_launch_claims()
+    except Exception as e:                             # a sweep failure must never kill the pump
+        log(f"launch-claim sweep failed: {e}")
+        return None
 
 
 WATCH = {
@@ -3336,6 +3431,13 @@ async def main():
                 return False, detail
         return True, "unresolved child processes are stopped"
 
+    # Reap abandoned launch claims BEFORE boot-arming: a PC reboot or a muxd crash leaves claim files
+    # behind whose owner pid is long gone, and an unswept one would refuse the very session it was
+    # protecting. Off-loop — the sweep stats pids and touches disk.
+    swept = await asyncio.get_running_loop().run_in_executor(None, lambda: maybe_sweep_launch_claims(True))
+    if swept and (swept[0] or swept[1]):
+        log(f"[boot] launch-claim sweep: {len(swept[0])} removed, {len(swept[1])} quarantined, {len(swept[2])} kept")
+
     # boot policy (user-specified): agents NEVER auto-start on a fresh boot unless the session was
     # ARMED (auto-resume on). Armed -> recreate + resume now. Unarmed -> a dead placeholder tab that
     # stays dormant until an explicit create/relaunch sends a non-empty resume command.
@@ -3745,6 +3847,10 @@ async def main():
                         while True:
                             await asyncio.sleep(5)
                             try: await asyncio.get_running_loop().run_in_executor(None, write_live_tabs)   # off-loop file write
+                            except Exception: pass
+                            # divided cadence: the pump ticks every 5s, the claim sweep self-throttles
+                            # to CLAIM_SWEEP_SECONDS (~60s). Off-loop: it stats pids and touches disk.
+                            try: await asyncio.get_running_loop().run_in_executor(None, maybe_sweep_launch_claims)
                             except Exception: pass
                             await ws.send(json.dumps({"t": "sessions", "list": sess_list()}))
 
