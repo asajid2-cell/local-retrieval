@@ -9,6 +9,7 @@ scripts/deploy-muxd.ps1 to what muxd.py/muxctl.py actually import.
 import ast
 import os
 import re
+import tempfile
 import unittest
 
 MUXD_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -34,35 +35,82 @@ def imported_names(path):
     return names
 
 
-def local_sibling_modules():
+def local_sibling_modules(muxd_dir=MUXD_DIR):
     """Imported names that resolve to a sibling .py in muxd/ — the ones a deploy must carry."""
     found = {}
     for entry in ENTRYPOINTS:
-        for name in imported_names(os.path.join(MUXD_DIR, entry)):
-            if os.path.exists(os.path.join(MUXD_DIR, name + ".py")):
+        for name in imported_names(os.path.join(muxd_dir, entry)):
+            if os.path.exists(os.path.join(muxd_dir, name + ".py")):
                 found.setdefault(name + ".py", set()).add(entry)
     return found
 
 
-def deploy_file_list():
+def deploy_file_list(script_path=DEPLOY_SCRIPT):
     """The '<name>.py' entries inside the `$files = @(...)` literal of deploy-muxd.ps1."""
-    text = read(DEPLOY_SCRIPT)
+    text = read(script_path)
     match = re.search(r"\$files\s*=\s*@\(([^)]*)\)", text)
-    assert match, "no `$files = @(...)` literal found in %s" % DEPLOY_SCRIPT
+    assert match, "no `$files = @(...)` literal found in %s" % script_path
     return set(re.findall(r"'([^']+)'", match.group(1)))
+
+
+def missing_from_manifest(muxd_dir=MUXD_DIR, script_path=DEPLOY_SCRIPT):
+    required = local_sibling_modules(muxd_dir)
+    return sorted(set(required) - deploy_file_list(script_path))
 
 
 class TestDeployManifest(unittest.TestCase):
     def test_every_local_sibling_module_is_deployed(self):
         deployed = deploy_file_list()
         required = local_sibling_modules()
-        missing = sorted(set(required) - deployed)
+        missing = missing_from_manifest()
         self.assertEqual(
             missing, [],
             "scripts/deploy-muxd.ps1 $files is missing local module(s) %s, imported by %s — "
             "deploying without them leaves the live runtime dying at startup on ModuleNotFoundError"
             % (", ".join(missing), ", ".join(sorted(n for m in missing for n in required[m]))),
         )
+
+    def test_manifest_check_catches_a_newly_imported_local_module(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with open(os.path.join(temp_dir, "muxd.py"), "w", encoding="utf-8") as fh:
+                fh.write("import os\nimport newmod\n")
+            with open(os.path.join(temp_dir, "muxctl.py"), "w", encoding="utf-8") as fh:
+                fh.write("import sys\n")
+            with open(os.path.join(temp_dir, "newmod.py"), "w", encoding="utf-8") as fh:
+                fh.write("# synthetic local module\n")
+            script_path = os.path.join(temp_dir, "deploy-muxd.ps1")
+            with open(script_path, "w", encoding="utf-8") as fh:
+                fh.write("$files = @('muxd.py','muxctl.py')   # runtime code only\n")
+
+            missing = missing_from_manifest(temp_dir, script_path)
+            required = local_sibling_modules(temp_dir)
+            self.assertEqual(missing, ["newmod.py"])
+            with self.assertRaises(self.failureException) as failure:
+                self.assertEqual(
+                    missing, [],
+                    "scripts/deploy-muxd.ps1 $files is missing local module(s) %s, imported by %s - "
+                    "deploying without them leaves the live runtime dying at startup on ModuleNotFoundError"
+                    % (", ".join(missing), ", ".join(
+                        sorted(n for n in missing for n in required[n])
+                    )),
+                )
+            self.assertIn("newmod.py", str(failure.exception))
+            self.assertIn("muxd.py", str(failure.exception))
+
+    def test_manifest_check_ignores_stdlib_and_third_party_imports(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with open(os.path.join(temp_dir, "muxd.py"), "w", encoding="utf-8") as fh:
+                fh.write(
+                    "import os\nimport json\nimport asyncio\n"
+                    "from websockets import connect\n"
+                )
+            with open(os.path.join(temp_dir, "muxctl.py"), "w", encoding="utf-8") as fh:
+                fh.write("import sys\n")
+            script_path = os.path.join(temp_dir, "deploy-muxd.ps1")
+            with open(script_path, "w", encoding="utf-8") as fh:
+                fh.write("$files = @('muxd.py','muxctl.py')   # runtime code only\n")
+
+            self.assertEqual(missing_from_manifest(temp_dir, script_path), [])
 
     def test_host_input_intent_is_covered(self):
         required = local_sibling_modules()
