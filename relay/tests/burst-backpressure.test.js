@@ -276,18 +276,32 @@ test('flood past the viewer high-water mark terminates the stalled viewer and ke
   }
   const expectedBuf = Buffer.concat(expected);
 
-  console.error('DIAG after flood: slow.bytes=%d slow.closed=%s slow.rs=%s fast.bytes=%d/%d',
-    slow.bytes, slow.closed, slow.ws.readyState, fast.bytes, expectedBuf.length);
-  await sleep(2000);
-  console.error('DIAG +2s: slow.bytes=%d slow.closed=%s fast.bytes=%d', slow.bytes, slow.closed, fast.bytes);
-  await waitFor(() => slow.closed, 'stalled viewer terminated', 20000);
   await waitFor(() => fast.bytes >= expectedBuf.length, 'healthy viewer drained the whole flood', 30000);
+
+  // The stalled socket stopped accepting bytes long before the flood ended -- that stall is what
+  // drives the relay's bufferedAmount past the high-water mark.
+  const slowSocketRead = (slow.ws._socket && slow.ws._socket.bytesRead) || 0;
+  assert.ok(
+    slowSocketRead < TOTAL / 2,
+    `stalled viewer socket should have wedged, but read ${slowSocketRead} of ${TOTAL}`,
+  );
+
+  // A paused stream cannot observe its own close, so resume to collect the verdict: whatever the
+  // relay managed to push before cutting the socket, plus the close itself.
+  slow.ws.resume();
+  await waitFor(() => slow.closed, 'stalled viewer terminated', 20000);
 
   // TERMINATED, not gapped: the relay cut the socket rather than dropping bytes into a live stream.
   assert.equal(slow.closed, true, 'stalled viewer must be terminated once it passes the high-water mark');
   assert.ok(
     slow.bytes < TOTAL,
     `stalled viewer should have been cut off mid-flood, got ${slow.bytes} of ${TOTAL}`,
+  );
+  // The bytes it did get are a clean prefix -- sendViewer either delivers a whole frame or kills the
+  // socket, so a surviving viewer never sees a hole punched in the middle of the stream.
+  assert.ok(
+    expectedBuf.subarray(0, slow.bytes).equals(slow.received()),
+    'terminated viewer must have received an unbroken prefix, never a gapped stream',
   );
 
   // The healthy viewer must be untouched by its peer's death: same bytes, same order, no holes.
