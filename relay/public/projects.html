@@ -634,7 +634,7 @@ async function killSession(s, row, btn){
         return;
       }
       try{
-        const drop=await fetch('api/sessions/'+encodeURIComponent(mux),{method:'DELETE'});
+        const drop=await sendIntent('DELETE', 'api/sessions/'+encodeURIComponent(mux), null, 'projects-kill');
         if(!drop.ok) throw new Error(await apiError(drop));
         btn.textContent='Killed'; btn.classList.add('done'); btn.disabled=true; row.classList.remove('killing');
         setTimeout(()=>{ row.remove(); afterKill(); }, 700); return;
