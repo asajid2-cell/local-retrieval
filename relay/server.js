@@ -92,8 +92,24 @@ function isTrustedLocal(req) {
   const ra = req.socket.remoteAddress || '';
   return !req.headers['x-forwarded-for'] && (ra === '127.0.0.1' || ra === '::1' || ra === '::ffff:127.0.0.1');
 }
+// Loopback is NOT a trust boundary on this host: containers run with network_mode: host and share
+// 127.0.0.1, so any compromised app satisfies isTrustedLocal(). Loopback therefore only admits the
+// narrow desktop-bridge data routes below (each re-checks isTrustedLocal itself) and never grants
+// terminal or general API access. Everything else requires the owner cookie.
+const LOCAL_BRIDGE_ROUTES = [
+  { m: 'GET',  p: /^\/api\/health\/?$/ },        // multiplex-healthcheck.timer polls this from loopback
+  { m: 'POST', p: /^\/api\/projects\/?$/ },
+  { m: 'POST', p: /^\/api\/running\/?$/ },
+  { m: 'GET',  p: /^\/api\/app-commands\/?$/ },
+  { m: 'POST', p: /^\/api\/app-commands\/lease\/?$/ },
+  { m: 'POST', p: /^\/api\/app-commands\/[^/]+\/ack\/?$/ },
+];
+function isLocalBridgeRoute(req) {
+  const p = String(req.originalUrl || req.url || '').split('?')[0];
+  return LOCAL_BRIDGE_ROUTES.some(r => r.m === req.method && r.p.test(p));
+}
 app.use(async (req, res, next) => {
-  if (isTrustedLocal(req)) return next();
+  if (isTrustedLocal(req) && isLocalBridgeRoute(req)) return next();   // loopback admits ONLY the desktop-bridge routes
   if (await isOwner(cookieVal(req, HL_COOKIE))) return next();
   const tok = cookieVal(req, HL_COOKIE);
   if (!tok) {
@@ -2250,7 +2266,7 @@ function handleClientMsg(name, client, s) {
 }
 
 wss.on('connection', async (ws, req) => {
-  if (!isTrustedLocal(req) && !(await isOwner(cookieVal(req, HL_COOKIE)))) { try { ws.close(1008, 'unauthorized'); } catch {} return; }
+  if (!(await isOwner(cookieVal(req, HL_COOKIE)))) { try { ws.close(1008, 'unauthorized'); } catch {} return; }   // terminal attach is owner-only; loopback is not a credential
   try { req.socket.setNoDelay(true); } catch {}                       // low-latency keystrokes: no Nagle on the viewer link
   const u = new URL(req.url, 'http://x');
   const name = strictMuxName(u.searchParams.get('session'));
