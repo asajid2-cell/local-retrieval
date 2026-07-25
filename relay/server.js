@@ -108,6 +108,25 @@ function isLocalBridgeRoute(req) {
   const p = String(req.originalUrl || req.url || '').split('?')[0];
   return LOCAL_BRIDGE_ROUTES.some(r => r.m === req.method && r.p.test(p));
 }
+// Dedicated dispatch capability for the ops-bot fix factory. Deliberately narrow: it authorises
+// exactly ONE route (POST /api/sessions/:name/relaunch) for an allowlisted session name, and
+// nothing else. It is NOT the hl-auth service key and NOT an owner session, so a compromised
+// ops-bot cannot use it to list sessions, attach a terminal, upload, or enqueue app-commands.
+// muxd still resolves the command from its own manifest, so the relay never carries an executable.
+const DISPATCH_KEY = process.env.MUX_DISPATCH_KEY || '';
+const DISPATCH_SESSIONS = new Set(String(process.env.MUX_DISPATCH_SESSIONS || 'fixbot-worker')
+  .split(',').map(s => s.trim()).filter(Boolean));
+function dispatchRouteOk(req) {
+  if (!DISPATCH_KEY || req.method !== 'POST') return false;
+  const p = String(req.originalUrl || req.url || '').split('?')[0];
+  const m = p.match(/^\/api\/sessions\/([^/]+)\/relaunch\/?$/);
+  if (!m) return false;
+  let name; try { name = decodeURIComponent(m[1]); } catch { return false; }
+  if (!DISPATCH_SESSIONS.has(name)) return false;
+  const t = String(req.headers['x-mux-dispatch-key'] || '');
+  if (t.length !== DISPATCH_KEY.length) return false;
+  try { return crypto.timingSafeEqual(Buffer.from(t), Buffer.from(DISPATCH_KEY)); } catch { return false; }
+}
 // Cross-Site WebSocket Hijacking guard for /ws: WebSocket upgrades are NOT covered by CORS and the
 // browser auto-attaches the hl_session cookie, so a browser upgrade must present an allowlisted Origin.
 // A missing Origin is a non-browser client (tests/tools) — allowed only under TEST_MODE.
@@ -120,6 +139,7 @@ function wsOriginOk(req) {
 }
 app.use(async (req, res, next) => {
   if (isTrustedLocal(req) && isLocalBridgeRoute(req)) return next();   // loopback admits ONLY the desktop-bridge routes
+  if (dispatchRouteOk(req)) return next();   // scoped fix-factory dispatch capability
   if (await isOwner(cookieVal(req, HL_COOKIE))) return next();
   const tok = cookieVal(req, HL_COOKIE);
   if (!tok) {
