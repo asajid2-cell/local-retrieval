@@ -466,6 +466,38 @@ public sealed class BranchSessionTests
     }
 
     [TestMethod]
+    public async Task BranchSessionAsync_Claude_RecoversFromNulCorruptedLine()
+    {
+        using var fixture = new TemplateFixture("claude");
+        // Reproduce crash corruption: an unclean shutdown flushes the file SIZE but loses in-flight
+        // write-back pages, leaving a run of NUL (0x00) bytes at the start of a line. Strict parsing
+        // then throws "'0x00' is an invalid start of a value. LineNumber: 0 | BytePositionInLine: 0"
+        // and the whole branch fails. The clone must strip the NUL and best-effort recover instead.
+        await File.AppendAllTextAsync(fixture.Source.SourcePath, "\0\0\0\0\0\0\0\0\n"); // an all-NUL (fully lost) line
+        await File.AppendAllTextAsync(
+            fixture.Source.SourcePath,
+            "\0\0" + ClaudeLine(fixture.Source.Id, "u3", "post-corruption-tip")); // NUL-prefixed, otherwise-valid line
+
+        var result = await fixture.Service.BranchSessionAsync(fixture.Source);
+
+        Assert.IsTrue(result.Ok, result.Message);
+        Assert.IsNotNull(result.Branch);
+        var bytes = await File.ReadAllBytesAsync(result.Branch!.SourcePath);
+        Assert.IsTrue(Array.IndexOf(bytes, (byte)0) < 0, "branch transcript must not carry NUL corruption forward");
+        var text = System.Text.Encoding.UTF8.GetString(bytes);
+        StringAssert.Contains(text, "post-corruption-tip"); // the recoverable line survived the NUL strip
+        StringAssert.Contains(text, result.Branch.Id);
+    }
+
+    [TestMethod]
+    public void RewriteCodexSessionMeta_NulCorruptedLine_DoesNotThrow()
+    {
+        // The codex line-0 rewrite must also tolerate a NUL/garbage line without throwing.
+        var output = ArchiveService.RewriteCodexSessionMeta("\0\0\0not json\0", "old-id", "new-id");
+        Assert.IsNotNull(output);
+    }
+
+    [TestMethod]
     public async Task BranchSessionAsync_MissingTranscript_FailsCleanly()
     {
         var service = new ArchiveService(useBundledStore: true);

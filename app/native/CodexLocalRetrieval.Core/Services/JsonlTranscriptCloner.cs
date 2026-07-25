@@ -61,6 +61,11 @@ internal static class JsonlTranscriptCloner
                             Array.Resize(ref lineBytes, lineBytes.Length - 1);
 
                         var line = Encoding.UTF8.GetString(lineBytes);
+                        // A NUL (0x00) byte is never valid inside a JSONL transcript line — it only appears when a
+                        // source file was left partially written / zero-filled (e.g. an unclean shutdown). Strip it
+                        // so a corrupt line cannot crash JSON parsing downstream (System.Text.Json throws
+                        // "'0x00' is an invalid start of a value" on the first NUL) and best-effort recovers the rest.
+                        if (line.IndexOf('\0') >= 0) line = line.Replace("\0", string.Empty);
                         if (transform is not null) line = transform(lineCount, line);
                         var output = Encoding.UTF8.GetBytes(line);
                         await destination.WriteAsync(output);

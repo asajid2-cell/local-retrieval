@@ -455,7 +455,11 @@ public sealed partial class ArchiveService
             var stampedFork = false;
             await JsonlTranscriptCloner.CloneAsync(capturedPath, destinationPath, (_, line) =>
             {
-                if (string.IsNullOrWhiteSpace(line) || JsonNode.Parse(line) is not JsonObject obj) return line;
+                if (string.IsNullOrWhiteSpace(line)) return line;
+                JsonObject? obj;
+                // A corrupt/malformed line must not abort the whole branch — pass it through unchanged.
+                try { obj = JsonNode.Parse(line) as JsonObject; } catch { return line; }
+                if (obj is null) return line;
                 if (obj.ContainsKey("sessionId")) obj["sessionId"] = newId;
                 if (!stampedFork)
                 {
@@ -514,7 +518,11 @@ public sealed partial class ArchiveService
 
     internal static string RewriteCodexSessionMeta(string line, string parentId, string newId)
     {
-        if (JsonNode.Parse(line) is not JsonObject obj) return line;
+        if (string.IsNullOrWhiteSpace(line)) return line;
+        JsonObject? obj;
+        // A corrupt/malformed session-meta line must not abort the branch — pass it through unchanged.
+        try { obj = JsonNode.Parse(line) as JsonObject; } catch { return line; }
+        if (obj is null) return line;
         if (obj["payload"] is JsonObject payload)
         {
             if (payload.ContainsKey("id")) payload["id"] = newId;
