@@ -94,6 +94,14 @@ foreach ($pidValue in $oldPids) {
 $restartStarted = $false
 try {
     Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+    # Kill the matched muxd/conpty processes DIRECTLY. Stopping the task only ends the process it
+    # launched; since muxd now runs under a launcher chain (wscript -> powershell -> keysafe ->
+    # Start-Process pythonw) that injects MUX_HOST_TOKEN, the leaf pythonw is orphaned by a task-stop
+    # rather than killed. Killing the pids we already resolved is correct regardless of how muxd was
+    # launched, and unwinds the launcher chain as the -Wait parent sees its child exit.
+    foreach ($pidValue in @($oldPids + $oldHostPids)) {
+        Stop-Process -Id $pidValue -Force -ErrorAction SilentlyContinue
+    }
     Wait-ForCondition {
         $remaining = @(
             $oldPids + $oldHostPids |

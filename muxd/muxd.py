@@ -886,7 +886,9 @@ def loadenv():
     return env
 
 ENV = loadenv()
-TOKEN = ENV.get("MUX_HOST_TOKEN", "")
+# Prefer the token from the process environment (keysafe injects it as MUX_HOST_TOKEN at launch, so
+# it never sits plaintext-at-rest); fall back to muxd.env for dev/manual runs.
+TOKEN = os.environ.get("MUX_HOST_TOKEN") or ENV.get("MUX_HOST_TOKEN", "")
 RELAYS = [u for u in [ENV.get("RELAY_LAN", ""), ENV.get("RELAY_PUBLIC", "")] if u]
 DEFAULT_CWD = ENV.get("DEFAULT_CWD", r"Z:\328\CMPUT328-A2\codexworks\301")
 LOCAL_PORT = int(ENV.get("LOCAL_PORT", "7699"))   # muxctl local-attach loopback port
@@ -3888,7 +3890,7 @@ if __name__ == "__main__":
         _log_now("FATAL: refusing to start duplicate muxd: " + detail)
         sys.exit(0)
     if not TOKEN or not RELAYS:
-        log("FATAL: muxd.env needs MUX_HOST_TOKEN and RELAY_LAN/RELAY_PUBLIC"); sys.exit(1)
+        log("FATAL: need MUX_HOST_TOKEN (keysafe-injected env, or muxd.env) and RELAY_LAN/RELAY_PUBLIC"); sys.exit(1)
     while True:                      # top-level crash guard: muxd must never die quietly
         try: asyncio.run(main())
         except KeyboardInterrupt: sys.exit(0)
