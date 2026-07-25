@@ -38,6 +38,7 @@
       "app_cursor_input_down": "\u001bOB",
       "per": "notch",
       "repeat": 3,
+      "max_notches_per_event": 8,
       "app_cursor_mode": 1,
       "who_scrolls": "the hosted app, as if arrow keys were typed",
       "note": "xterm's alternateScroll (DECSET 1007) contract; SS3 form when DECCKM (?1) is set. 3 keys per notch matches xterm.js."
@@ -121,6 +122,6 @@
 
   "asserted_by": {
     "muxctl": "muxd/tests/test_local_scroll_forwarding.py",
-    "web": "relay/tests/wheel-scroll.test.js"
+    "web": "relay/tests/scroll-parity-web.test.js"
   }
 }

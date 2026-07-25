@@ -136,7 +136,8 @@ def render_mechanism(name, modes_on, notches, x, y, app_cursor=False):
     if name == "arrows":
         prefix = "app_cursor_input_" if app_cursor else "app_input_"
         key = prefix + ("up" if up else "down")
-        return spec[key].encode("utf-8") * (spec["repeat"] * count)
+        return spec[key].encode("utf-8") * (
+            spec["repeat"] * min(spec["max_notches_per_event"], count))
     if name == "wheel_report":
         btn = spec["buttons"]["up" if up else "down"]
         enc = min((e for e in spec["encodings"]
