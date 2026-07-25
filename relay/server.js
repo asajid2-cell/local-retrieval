@@ -108,6 +108,16 @@ function isLocalBridgeRoute(req) {
   const p = String(req.originalUrl || req.url || '').split('?')[0];
   return LOCAL_BRIDGE_ROUTES.some(r => r.m === req.method && r.p.test(p));
 }
+// Cross-Site WebSocket Hijacking guard for /ws: WebSocket upgrades are NOT covered by CORS and the
+// browser auto-attaches the hl_session cookie, so a browser upgrade must present an allowlisted Origin.
+// A missing Origin is a non-browser client (tests/tools) — allowed only under TEST_MODE.
+const ALLOWED_WS_ORIGINS = (process.env.ALLOWED_WS_ORIGINS || 'https://harmonizerlabs.cc')
+  .split(',').map(s => s.trim()).filter(Boolean);
+function wsOriginOk(req) {
+  const origin = req.headers.origin;
+  if (!origin) return TEST_MODE;   // no Origin = not a browser; /ws is browser-only in prod
+  return ALLOWED_WS_ORIGINS.includes(origin);
+}
 app.use(async (req, res, next) => {
   if (isTrustedLocal(req) && isLocalBridgeRoute(req)) return next();   // loopback admits ONLY the desktop-bridge routes
   if (await isOwner(cookieVal(req, HL_COOKIE))) return next();
@@ -1775,7 +1785,12 @@ const wss = new WebSocketServer({ noServer: true });
 const wssHost = new WebSocketServer({ noServer: true });
 server.on('upgrade', (req, socket, head) => {
   const p = (req.url || '').split('?')[0];
-  if (p === '/ws') wss.handleUpgrade(req, socket, head, ws => wss.emit('connection', ws, req));
+  if (p === '/ws') {
+    // Reject cross-site WebSocket hijacking BEFORE the handshake — a foreign/absent-in-prod Origin
+    // never gets a 101, so a hostile page in the owner's browser can't open a credentialed terminal socket.
+    if (!wsOriginOk(req)) { try { socket.destroy(); } catch {} return; }
+    wss.handleUpgrade(req, socket, head, ws => wss.emit('connection', ws, req));
+  }
   else if (p === '/host') {
     // reject a bad /host token BEFORE completing the handshake (constant-time) — no 101, no 'open'
     let ok = false; try { ok = hostTokenOk(new URL(req.url, 'http://x').searchParams.get('token')); } catch {}
