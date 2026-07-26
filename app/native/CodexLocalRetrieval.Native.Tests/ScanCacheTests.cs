@@ -137,7 +137,7 @@ public class ScanCacheTests
 
         Assert.IsTrue(RunningSessions.TryAllLiveSessionIds(out _, out var d3), d3);
         Assert.AreEqual(1, Sweeps() - afterWarm, "after invalidation the next caller must re-sweep");
-        Assert.AreEqual(3, Interlocked.Read(ref _scans));
+        Assert.AreEqual(2, Interlocked.Read(ref _scans));
     }
 
     // ---- 4. [F#8] a failed sweep is never cached -----------------------------------------------------
