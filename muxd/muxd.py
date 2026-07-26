@@ -2222,8 +2222,8 @@ def gc_expired_custody(source=None, now=None):
         source.pop(name, None)
     return reclaimed
 
-def restore_manifest_sessions(records, target=None, loop=None, outq=None):
-    # Boot's manifest rehydration, lifted out of main() so tests can drive the REAL restore path:
+def restore_manifest_sessions(records, target=None, loop=None, outq=None, now=None):
+# Boot's manifest rehydration, lifted out of main() so tests can drive the REAL restore path:
     # boot runs inside main() behind a live relay link and has no unit-test seam. Behaviour is
     # unchanged from the inline loop it replaces.
     target = sessions if target is None else target
@@ -2259,7 +2259,7 @@ def restore_manifest_sessions(records, target=None, loop=None, outq=None):
             restored.operation_created = bool(m.get("operationCreated", False))
             restored.last_alive_utc = str(m.get("lastAliveUtc", "") or "")
             restored.custody_expires_utc = str(m.get("custodyExpiresUtc", "") or "")
-            custody_seed(restored)   # pre-custody record: full TTL, not instant reclamation
+            custody_seed(restored, now=now)   # pre-custody record: full TTL, not instant reclamation
             restored.deaths = [
                 float(value)
                 for value in (m.get("deaths") if isinstance(m.get("deaths"), list) else [])
