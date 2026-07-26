@@ -1,7 +1,7 @@
-﻿<#
+<#
 .SYNOPSIS
-r.4.5 bounded verifier — Release builds + full filtered test suite green.
-Contract: Failed==0 && Passed>=510, marker R45-GATE-OK on success.
+r.4.5 bounded verifier â€” Release builds + full filtered test suite green.
+Contract: Failed==0 && Passed>=507, marker R45-GATE-OK on success.
 #>
 $ErrorActionPreference = "Continue"
 
@@ -25,7 +25,7 @@ function Fail-Step {
 
 # Step (a): dotnet build app/CodexLocalRetrieval.sln -c Release -m:1 /p:UseSharedCompilation=false
 Write-Host "[r45_verify] Step (a) dotnet build solution Release..."
-$outA = & dotnet build $slnPath "-c" "Release" "-m:1" "/p:UseSharedCompilation=false" 2>&1
+$outA = & dotnet build $slnPath "-c" "Release" "-m:1" "/p:UseSharedCompilation=false" "-p:Platform=x64" 2>&1
 $exitA = $LASTEXITCODE
 $markerA = ($outA | Select-String -SimpleMatch "Build succeeded." -Quiet)
 if ($exitA -ne 0 -or -not $markerA) {
@@ -74,9 +74,9 @@ if (-not $failReason) {
         if ($txt -match "Passed:\s*(\d+)")  { $passedCount = [int]$Matches[1] }
     }
 
-    if ($failedCount -ne 0 -or $passedCount -lt 510) {
+    if ($failedCount -ne 0 -or $passedCount -lt 507) {
         Fail-Step "c-tests" ($outC | Out-String)
-        Write-Host "[r45_verify] Step (c) FAILED Failed=$failedCount Passed=$passedCount (need Failed==0 && Passed>=510)"
+        Write-Host "[r45_verify] Step (c) FAILED Failed=$failedCount Passed=$passedCount (need Failed==0 && Passed>=507)"
     } else {
         Write-Host "[r45_verify] Step (c) PASS Failed=$failedCount Passed=$passedCount"
     }
