@@ -20,6 +20,7 @@ DOC = DOC_PATH.read_text(encoding="utf-8")
 STALE_CLAIMS = (
     "strips ALL mouse reports",
     "strips all mouse reports",
+    "KEEPS wheel reports",
     "The proven mechanism in this stack is PAGE KEYS",
     "2026-07-15-wheelscroll",
     "~line 1466",
@@ -56,6 +57,20 @@ class DeployDocParityTest(unittest.TestCase):
                       "wheel exemption (SGR Cb bit 6) missing from stripMouseReports")
         self.assertIn(r"\x1b\[M", body, "X10 mouse-report strip missing")
         self.assertIn(r"\x1b\[[0-9;]+M", body, "urxvt/1015 mouse-report strip missing")
+
+    def test_doc_states_x10_and_urxvt_stripped_wholesale(self):
+        self.assertIn("strips X10 reports", DOC,
+                      "doc must state X10 reports are stripped wholesale")
+        self.assertIn("urxvt/1015", DOC,
+                      "doc must state urxvt/1015 reports are stripped wholesale")
+        self.assertIn("wholesale", DOC,
+                      "doc must state stripping is wholesale")
+        self.assertIn("only an app negotiating SGR", DOC,
+                      "doc must state that only SGR wheel reports reach the pty")
+
+    def test_doc_completes_dangling_sentence(self):
+        self.assertIn("state *fidelity*", DOC,
+                      "doc must complete the dangling sentence with 'state *fidelity*'")
 
     def test_documented_default_matches_code(self):
         import muxctl

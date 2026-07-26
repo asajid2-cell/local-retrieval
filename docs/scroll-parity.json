@@ -1,5 +1,5 @@
 {
-  "$comment": "Scroll-parity vector table. The single source of truth for what a wheel notch does on EVERY terminal state, on BOTH surfaces. Asserted by muxd/tests/test_local_scroll_forwarding.py (muxctl cells + structure) and relay/tests/wheel-scroll.test.js (web cells). Edit this file to change scroll behavior; the tests will tell you what must follow.",
+  "$comment": "Scroll-parity vector table. The single source of truth for what a wheel notch does on EVERY terminal state, on BOTH surfaces. Asserted by muxd/tests/test_local_scroll_forwarding.py (muxctl cells + structure) and relay/tests/scroll-parity-web.test.js (web cells). Edit this file to change scroll behavior; the tests will tell you what must follow.",
   "version": 1,
   "state_axes": {
     "surface": ["muxctl", "web"],
