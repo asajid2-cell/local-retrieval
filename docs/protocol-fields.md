@@ -1,4 +1,4 @@
-# muxd ↔ relay protocol field & capability registry
+﻿# muxd ↔ relay protocol field & capability registry
 
 Every WebSocket frame type, field, and capability string on the muxd (PC host) ↔ relay link is
 registered here. This file is the single place to look up what is already taken and the single
@@ -193,6 +193,13 @@ mux name and rejects the whole session if it fails, but does **not** copy it int
 object — the caller keys the session map by it (`relay/server.js:207`). A new session field is not
 like `name`; add it to the returned object literal.
 
+
+### Manifest-only custody fields
+
+Custody TTL fields (`lastAliveUtc`, `custodyExpiresUtc`) exist only in the durable session manifest.
+They **must not** appear in `session_payload()` (the relay allow-list at `relay/server.js:171`)
+because the relay has no need to see muxd-internal expiry timers and their presence would violate
+the payload shape contract.
 ### Reserved — signed request/response/error shapes (trust amendment)
 
 Optional envelope fields for the capabilities above. Absent unless the peer advertised the

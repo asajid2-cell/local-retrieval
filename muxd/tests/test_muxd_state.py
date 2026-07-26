@@ -1732,7 +1732,7 @@ class CustodyTtlTests(unittest.TestCase):
     def boot(self, records):
         # Drives the real boot path in order: restore -> durable stop intents -> custody GC.
         restored = {}
-        muxd.restore_manifest_sessions(records, restored, None, None)
+        muxd.restore_manifest_sessions(records, restored, None, None, now=self.NOW)
         for name in [n for n, s in restored.items() if muxd.boot_removes_record(s)]:
             restored.pop(name)
         muxd.gc_expired_custody(restored, now=self.NOW)
@@ -1764,8 +1764,8 @@ class CustodyTtlTests(unittest.TestCase):
 
         with mock.patch.object(muxd, "sessions", restored), \
              mock.patch.object(muxd.time, "time", lambda: self.NOW):
-            snapshot_names = [tab.get("name") for tab in muxd.live_tabs_snapshot()]
-            listed_names = [tab.get("s") for tab in muxd.sess_list()]
+            snapshot_names = sorted(muxd.live_tabs_snapshot())
+            listed_names = [tab.get("name") for tab in muxd.sess_list()]
 
         # Pinned contract: filtered entirely, never labelled — unexpired dormant rows still relaunch.
         self.assertEqual(snapshot_names, ["mux-fresh"])
