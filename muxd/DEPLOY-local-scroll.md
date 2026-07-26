@@ -31,8 +31,10 @@ there first.
 restores the old alt-screen-first order (the alternate screen always takes a page key, even when
 the app tracks the mouse), for a TUI that scrolls from page keys but not from wheel reports. An
 unrecognized `MUXCTL_WHEEL` value normalizes back to `sgr`. Mode `1007` is in muxctl's
-`TRACKED_MODES` and was already in `muxd.REPLAY_PRIVATE_MODES`, so this flip is muxctl-only and
-takes effect on the next attach. **Exactly one mechanism fires per notch in every state/mode
+`TRACKED_MODES` and was already in `muxd.REPLAY_PRIVATE_MODES`, so this sgr-priority flip is muxctl-only and
+takes effect on the next attach — no daemon restart needed for the flip itself.
+(The muxd restart in “Required order” below covers the separate `muxd.py`
+replay-prefix change and full mode fidelity for long-lived sessions.) **Exactly one mechanism fires per notch in every state/mode
 combination** (unit-tested exhaustively). Plain shells keep conhost's native wheel scrollback
 untouched (the wheel is not even captured there).
 
@@ -58,10 +60,13 @@ agent-cmdline probe), so merging does not revert the running behavior.
 - **Web text selection (decided, no code change):** replaying `?1000h..?1006h` to the web xterm
   means selection needs Shift-drag while a TUI has the mouse — xterm/tmux convention, and the web
   UI already documents it ("If the app has grabbed the mouse, hold Shift to select"). Its input
-  filter (`stripMouseReports`, `relay/public/index.html:1527-1538`) strips the motion/drag/click
-  report flood but deliberately KEEPS wheel reports (SGR `Cb` bit 6 — `((+cb) & 64) ? m : ''`).
-  That exemption is exactly how an alternate-buffer TUI scrolls from the web surface: it has no
-  scrollback of its own, so the wheel report is the only thing that moves its transcript. This is
+  filter (`stripMouseReports`, `relay/public/index.html:1527-1538`) strips X10 reports
+  (`\x1b[M` + 3 bytes) and urxvt/1015 reports (`\x1b[b;x;yM`-form) wholesale — wheel forms
+  included. Only the SGR (?1006) wheel exemption survives: the `((+cb) & 64) ? m : ''` guard
+  keeps wheel reports while still stripping the motion/drag/click flood, so from the web
+  surface only an app negotiating SGR scrolls from wheel reports; X10 or urxvt wheel never
+  reaches the pty. This is state *fidelity*: the same session freshly attached before the
+  ring rotated always behaved this way.
 - **DECCKM (`?1`) replayed:** viewers now pick the correct arrow encoding (SS3 vs CSI). If a TUI
   dies without resetting it, readline accepts both arrow forms, so a shell can't get wedged.
 - **`MUXCTL_VT_INPUT=1` opt-in:** muxctl disables ALL of its wheel synthesis under this env var
