@@ -191,5 +191,69 @@ class AgentTruthTests(unittest.TestCase):
             self.assertLessEqual(muxd._AGENT_TRUTH_INFLIGHT, muxd.AGENT_TRUTH_MAX_INFLIGHT)
 
 
+    # ---- timeout enforcement: capacity recovery without manual release ----------
+
+    def test_hung_probe_recovers_capacity_after_timeout(self):
+        """Two hung probes must not permanently exhaust the executor.
+
+        After AGENT_TRUTH_PROBE_TIMEOUT the inflight count must recover on its
+        own -- no manual event release -- so a fresh session can still be probed.
+        This is the contract the adversarial review called out: a genuinely hung
+        syscall must not starve every other session forever.
+        """
+        released = threading.Event()
+        entered1 = threading.Event()
+        entered2 = threading.Event()
+        real = muxd._agent_truth_probe
+
+        def hung_probe(pid, start_token, previous=None):
+            if not entered1.is_set():
+                entered1.set()
+            elif not entered2.is_set():
+                entered2.set()
+            released.wait(60)          # wedged; never returns until cleanup
+            return dict(muxd.AGENT_TRUTH_UNKNOWN), 0, 0
+
+        muxd._agent_truth_probe = hung_probe
+        self.addCleanup(drain_inflight)
+        self.addCleanup(released.set)
+        self.addCleanup(lambda: setattr(muxd, "_agent_truth_probe", real))
+
+        # Session 1 -- trigger first hung probe
+        sess1 = TruthSession(child_pid=os.getpid(), child_start_token="tok1")
+        muxd.session_payload(sess1.name, sess1)
+        self.assertTrue(entered1.wait(5), "first probe was never scheduled")
+
+        # Session 2 (different cache key) -- trigger second hung probe
+        sess2 = TruthSession(child_pid=os.getpid() + 1, child_start_token="tok2")
+        muxd.session_payload(sess2.name, sess2)
+        self.assertTrue(entered2.wait(5), "second probe was never scheduled")
+
+        # Both executor workers are now wedged.  A third unique session
+        # can not even be scheduled until inflight drops below the cap.
+        with muxd._AGENT_TRUTH_LOCK:
+            self.assertEqual(muxd._AGENT_TRUTH_INFLIGHT, 2,
+                             "expected both inflight slots consumed")
+
+        # Wait for the probe timeout + a small buffer.  The timeout is
+        # enforced by _agent_truth_refresh's daemon-thread .join, so
+        # inflight MUST recover here without anyone calling released.set().
+        time.sleep(muxd.AGENT_TRUTH_PROBE_TIMEOUT + 1.0)
+
+        with muxd._AGENT_TRUTH_LOCK:
+            self.assertEqual(muxd._AGENT_TRUTH_INFLIGHT, 0,
+                             "inflight count did not recover after probe timeout -- "
+                             "the timeout is not enforced or the counter is stuck")
+
+        # Now restore the real probe and verify a fresh session works.
+        muxd._agent_truth_probe = real
+        sess3 = TruthSession(child_pid=os.getpid(), child_start_token="tok3")
+        payload3 = poll_payload(
+            sess3, lambda p: p["agentStateSource"] == "process", timeout=20)
+        self.assertEqual(payload3["agentStateSource"], "process",
+                         "a fresh session could not be probed after timeout recovery")
+        self.assertTrue(drain_inflight())
+
+
 if __name__ == "__main__":
     unittest.main()

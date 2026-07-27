@@ -1245,8 +1245,30 @@ def _agent_truth_refresh(key, pid, start_token, previous):
     truth, cpu, agent_pid = AGENT_TRUTH_UNKNOWN, 0, 0
     ok = False
     try:
-        truth, cpu, agent_pid = _agent_truth_probe(pid, start_token, previous)
-        ok = True
+        # Run the probe in a fresh daemon thread so it can be abandoned if
+        # it hangs.  _agent_truth_probe touches kernel32 / psutil syscalls
+        # that can wedge (hung process handle, frozen snapshot) -- the
+        # bounded .join below is the ONLY enforcement of
+        # AGENT_TRUTH_PROBE_TIMEOUT.
+        result = {}
+        def _run_probe():
+            try:
+                t, c, a = _agent_truth_probe(pid, start_token, previous)
+                result["truth"], result["cpu"], result["agent_pid"] = t, c, a
+                result["ok"] = True
+            except Exception as exc:
+                result["error"] = exc
+        probe_thread = threading.Thread(target=_run_probe, daemon=True)
+        probe_thread.start()
+        probe_thread.join(timeout=AGENT_TRUTH_PROBE_TIMEOUT)
+        if probe_thread.is_alive():
+            log(f"agent-truth probe timed out after {AGENT_TRUTH_PROBE_TIMEOUT}s for pid {pid}")
+            # Thread abandoned as daemon; inflight counter recovers in finally.
+        elif result.get("error"):
+            raise result["error"]
+        else:
+            truth, cpu, agent_pid = result["truth"], result["cpu"], result["agent_pid"]
+            ok = True
     except Exception as error:
         log(f"agent-truth probe failed for pid {pid}: {error}")
     finally:
