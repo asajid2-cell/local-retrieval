@@ -209,7 +209,10 @@ test('r.1.6.4 integration: session.rename intent replays exactly-once and preser
   assert.equal(replayRes.status, firstRes.status);
   assert.deepEqual(replayRes.body, firstRes.body);
 
-  // Exactly-once side effect: original host received exactly ONE rename frame
+  // Exactly-once side effect: replay must NOT emit a rename frame to the NEW host
+  await host2.assertNo(m => m.t === 'rename' && m.s === 'rename-from', 'no rename frame on host2 during replay');
+
+  // Original (disconnected) host received exactly ONE rename frame (before restart)
   await sleep(150);
   const renameFrames = host.messages.filter(m => m.t === 'rename' && m.s === 'rename-from');
   assert.equal(renameFrames.length, 1, `expected exactly one rename frame, got ${renameFrames.length}`);
