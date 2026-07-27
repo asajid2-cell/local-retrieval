@@ -1,4 +1,4 @@
-// Multiplex app: relays browser terminals to muxd on the Windows PC. muxd owns the ConPTY sessions
+﻿// Multiplex app: relays browser terminals to muxd on the Windows PC. muxd owns the ConPTY sessions
 // locally; this VPS mirrors them and stores lightweight web state. Legacy tmux sessions are reported
 // only as blocking diagnostics. They are never created, attached, renamed, or killed by this relay.
 const express = require('express');
@@ -9,6 +9,8 @@ const path = require('path');
 const crypto = require('crypto');
 const { execSync, execFile } = require('child_process');
 const { durableJsonLoad, durableJsonWrite, durableWrite, fsyncDirectory } = require('./durable-state');
+const { createHealthAlerts, startHealthAlerts } = require("./health-alerts");
+const { createNotifier } = require("./notify");
 // Every acknowledged state mutation commits through durable-state.js before it is published in memory.
 function hostTokenOk(t) { if (!HOST_TOKEN || !t || t.length !== HOST_TOKEN.length) return false; try { return crypto.timingSafeEqual(Buffer.from(t), Buffer.from(HOST_TOKEN)); } catch { return false; } }
 
@@ -101,7 +103,7 @@ app.use(async (req, res, next) => {
     if ((req.headers.accept || '').includes('text/html')) return res.redirect(HL_LOGIN + '?next=' + encodeURIComponent(prefix));
     return res.status(401).json({ error: 'login required' });
   }
-  return res.status(403).send('Forbidden — owner only.');
+  return res.status(403).send('Forbidden â€” owner only.');
 });
 
 app.use(express.static(__dirname + '/public', {
@@ -124,17 +126,17 @@ function opaqueIdentity(value) {
   const raw = String(value || '').trim();
   return raw && /^[A-Za-z0-9._-]+$/.test(raw) ? raw : '';
 }
-// ---- PC SESSION HOST link (P2/P3 — the ownership flip) ---------------------------------------------
+// ---- PC SESSION HOST link (P2/P3 â€” the ownership flip) ---------------------------------------------
 // muxd on the PC owns each session's ConPTY locally and dials OUT to us over one multiplexed WebSocket
 // (/host, token-gated). Sessions live on the PC: Wi-Fi drops / VPS reboots / relay deploys only cost the
-// VIEWER a blip — the agent never notices. If this link is down, creation/attach fail loudly instead of
+// VIEWER a blip â€” the agent never notices. If this link is down, creation/attach fail loudly instead of
 // making a VPS tmux twin that can silently diverge.
 const HOST_TOKEN = process.env.MUX_HOST_TOKEN || '';
 let hostWs = null;                 // the PC's muxd link (one at a time; newest wins)
 let hostLabel = '';
 const hostSessions = new Map();    // name -> { alive, created, lastOut, tail }
 // A just-created hosted session muxd hasn't reported back yet. A muxd status push (built before it
-// processed our `create`) must NOT evict this optimistic entry — otherwise the imminent /ws attach or a
+// processed our `create`) must NOT evict this optimistic entry â€” otherwise the imminent /ws attach or a
 // boot-recreate sees no hosted session, makes a tmux TWIN, and two agents resume one transcript (A2 #1).
 // Clear-scrollback + clear-screen + home: prefixes a scrollback replay so a reconnecting viewer that
 // still shows the pre-drop screen doesn't get the replay stacked ON TOP of it (A2 #2/#3).
@@ -302,7 +304,7 @@ function waitForHostState(check, timeoutMs = 6000) {
 function failHost(res, status, error, detail) {
   return res.status(status).json({ ok: false, error, detail: detail || '' });
 }
-// E4: on-demand deep tail from muxd (previews) — request/response correlated by rid, 2.5s timeout.
+// E4: on-demand deep tail from muxd (previews) â€” request/response correlated by rid, 2.5s timeout.
 const pendingTails = new Map(); let _rid = 0;
 function requestHostTail(name, lines) {
   if (!hostUp()) return Promise.resolve(null);
@@ -334,8 +336,8 @@ function failLegacy(res, name) {
 //   red    = stopped/blocker: command returned to a shell, legacy conflict, detached mirror, etc.
 const _sessState = new Map();   // name -> { everAgent }  (lets a bare shell read RED instead of WHITE)
 const _stateCache = new Map();  // name -> { at, state }   throttle hosted-tail classification bursts
-                                 // polls (4s interval × several clients) must not spawn a subprocess per call
-// NOTE: named paneAgentState (NOT sessionState) — there's already a sessionState() for window-sizing below.
+                                 // polls (4s interval Ã— several clients) must not spawn a subprocess per call
+// NOTE: named paneAgentState (NOT sessionState) â€” there's already a sessionState() for window-sizing below.
 function paneAgentState(name, content) {
   if (content === undefined) {
     const cached = _stateCache.get(name);
@@ -345,12 +347,12 @@ function paneAgentState(name, content) {
   const mem = _sessState.get(name) || { everAgent: false };
   // Only the TAIL (bottom status line + footer) is reliable: a turn in flight shows "esc to interrupt"
   // there, and an idle agent shows its footer there. Scanning the whole pane would false-green an idle
-  // agent off a previous turn's "(45s · 12k tokens)" left in scrollback (validated against live sessions).
+  // agent off a previous turn's "(45s Â· 12k tokens)" left in scrollback (validated against live sessions).
   // Strip trailing blank/newline padding so the window isn't off-by-one, and widen to 10 lines so the live status line ABOVE
   // the input box + footer is included (that's where "esc to interrupt" sits during a turn).
   const tail = content.replace(/\s+$/, '').split('\n').slice(-10).join('\n');
   const working = /esc to inter|still thinking/i.test(tail);
-  const agentUI = working || /⏵⏵|auto mode (on|off)|for agents|shift\+tab to cycle|\? for shortcuts|\/goal (active|paused)|\b(gpt-[0-9][\w.-]*|opus [0-9]|sonnet [0-9]|haiku [0-9])\b/i.test(tail);
+  const agentUI = working || /âµâµ|auto mode (on|off)|for agents|shift\+tab to cycle|\? for shortcuts|\/goal (active|paused)|\b(gpt-[0-9][\w.-]*|opus [0-9]|sonnet [0-9]|haiku [0-9])\b/i.test(tail);
   if (agentUI) mem.everAgent = true;
   _sessState.set(name, mem);
   const state = working ? 'green' : agentUI ? 'yellow' : (mem.everAgent ? 'red' : 'white');
@@ -467,7 +469,7 @@ function listSessions() {
                   nativeTitle: String(chat && chat.nativeTitle || ''), appTitle: String(chat && chat.appTitle || ''),
                   chatLinked: !!chat,
                   tabColor: tabMetaFor(name).color, tabKind: tabMetaFor(name).kind,   // per-tab tint + "remote-resumed"
-                  tabHistory: tabHistoryFor(name),   // past chats this tab has hosted → relaunch-picker + add-historical-to-collection
+                  tabHistory: tabHistoryFor(name),   // past chats this tab has hosted â†’ relaunch-picker + add-historical-to-collection
                   localViewers: h.localViewers || 0, localFirst: !!h.localFirst,
                   detail: detachedLocal ? 'Local agent process is still running, but the muxd mirror is detached. New muxrun sessions re-register automatically; restart this one through mux to restore web terminal control.'
                          : dormant ? 'Dormant mux session: no shell or agent is running until you relaunch it or run mux locally.' : '',
@@ -631,7 +633,7 @@ app.post('/api/sessions/:name/relaunch', async (req, res) => {
 });
 
 // Tail preview of a session's live pane (on demand: long-press / hover / palette) so you can tell what
-// a session is doing before attaching — last N lines, name-sanitized.
+// a session is doing before attaching â€” last N lines, name-sanitized.
 app.get('/api/sessions/:name/tail', async (req, res) => {
   const name = strictMuxName(req.params.name);
   if (!name) return res.status(400).json({ error: 'invalid session name' });
@@ -646,7 +648,7 @@ app.get('/api/sessions/:name/tail', async (req, res) => {
   res.status(404).json({ error: 'session not found' });
 });
 
-// Rename a session (keeps it running) — "close tab" must never be the only way to manage a session.
+// Rename a session (keeps it running) â€” "close tab" must never be the only way to manage a session.
 app.patch('/api/sessions/:name', async (req, res) => {
   const name = strictMuxName(req.params.name);
   const to = strictMuxName(req.body && req.body.name);
@@ -655,7 +657,7 @@ app.patch('/api/sessions/:name', async (req, res) => {
   if (to === name) return res.json({ ok: true, name: to });
   if (tmuxHas(to)) return failLegacy(res, to);
   if (hostSessions.has(to)) return res.status(409).json({ error: 'name already in use' });
-  if (hostedHas(name)) {   // E1: hosted rename → muxd renames the session key (keeps the pty), we migrate state
+  if (hostedHas(name)) {   // E1: hosted rename â†’ muxd renames the session key (keeps the pty), we migrate state
     if (tmuxHas(name)) return failLegacy(res, name);
     if (!requireHostProtocol(res, 'refusing to rename a hosted session')) return;
     let intent;
@@ -989,7 +991,7 @@ function projectedChatForHosted(hosted, name) {
     for (const chat of allProjectedChats())
       if (chatIds(chat).some(id => hostedIds.has(id.toLowerCase()))) return chat;
   if (hostedIds.size) return null;
-  // Shell-launched tab (no muxd command) → the app's deterministic resolver linked it to its LIVE chat
+  // Shell-launched tab (no muxd command) â†’ the app's deterministic resolver linked it to its LIVE chat
   // (agent matched to this tab by ancestor pid; id from the resume flag or the tab's newest transcript).
   const mtc = _projects && _projects.muxTabChats;
   const t = mtc && name && typeof mtc === 'object' ? mtc[name] : null;
@@ -1134,13 +1136,13 @@ app.post('/api/running', (req, res) => {
 // The relay only toggles muxd policy and forwards explicit, opaque control intent.
 
 // ---- PC reachability probe + /api/health (P0 observability, D7). A lightweight TCP-connect to the PC's
-// sshd port (no ssh process spawn) so health can report whether the ssh-back is even reachable + its RTT —
-// the Jul 2 .146→.154 DHCP orphaning would have shown here instantly as pc.reachable=false.
+// sshd port (no ssh process spawn) so health can report whether the ssh-back is even reachable + its RTT â€”
+// the Jul 2 .146â†’.154 DHCP orphaning would have shown here instantly as pc.reachable=false.
 let _winHost = '192.168.1.146';
 try { const _c = fs.readFileSync((process.env.HOME || '') + '/.ssh/config', 'utf8'); const _m = _c.match(/Host\s+win\b[\s\S]*?HostName\s+(\S+)/i); if (_m) _winHost = _m[1]; } catch {}
 let _pcHealth = TEST_MODE ? { reachable: true, rttMs: 0, host: 'test', at: Date.now() } : { reachable: null, rttMs: null, host: _winHost, at: 0 };
-// When the PC becomes unreachable, it may just have moved to a new DHCP IP (Jul 2: .146→.154 orphaned the
-// fleet). Kick the MAC-based resolver (runs the ping-sweep in its own subprocess — never blocks this loop),
+// When the PC becomes unreachable, it may just have moved to a new DHCP IP (Jul 2: .146â†’.154 orphaned the
+// fleet). Kick the MAC-based resolver (runs the ping-sweep in its own subprocess â€” never blocks this loop),
 // then reload the (possibly updated) HostName so the next ssh-back + boot-recreate target the new address.
 let _lastReresolve = 0;
 function reresolveWin() {
@@ -1149,7 +1151,7 @@ function reresolveWin() {
     try {
       const c = fs.readFileSync((process.env.HOME || '') + '/.ssh/config', 'utf8');
       const m = c.match(/Host\s+win\b[\s\S]*?HostName\s+(\S+)/i);
-      if (m && m[1] !== _winHost) { console.log(`[dhcp] PC moved → win now ${m[1]} (was ${_winHost})`); _winHost = m[1]; setTimeout(probePc, 500); }
+      if (m && m[1] !== _winHost) { console.log(`[dhcp] PC moved â†’ win now ${m[1]} (was ${_winHost})`); _winHost = m[1]; setTimeout(probePc, 500); }
     } catch {}
   });
 }
@@ -1162,28 +1164,33 @@ function probePc() {
   sock.on('timeout', () => done(false));
 }
 if (!TEST_MODE) { setTimeout(probePc, 2000); setInterval(probePc, 30000); }
-app.get('/api/health', (req, res) => {
+function healthSnapshot() {
   let tmuxAvailable = false;
-  try { execSync(`tmux -V`, { encoding: 'utf8', timeout: 1500 }); tmuxAvailable = true; } catch {}
+  try { execSync(`tmux -V`, { encoding: "utf8", timeout: 1500 }); tmuxAvailable = true; } catch {}
   const legacyNames = legacyTmuxNames();
   const armed = [...hostSessions.values()].filter(h => h && h.heal).length;
   const gaveUp = 0;
   const projects = projectsHealth();
-  // A2 #9: if the PC host is down, armed sessions are hosted-and-unreachable (can't be healed) → surface
-  // that as degraded instead of a falsely-green dot. Legacy tmux names are also degraded blockers.
+  // A2 #9: if the PC host is down, armed sessions are hosted-and-unreachable (can't be healed)
+  // surface that as degraded instead of a falsely-green dot. Legacy tmux names are also degraded blockers.
   const hostedArmedDown = 0;
   const degraded = TEST_MODE
     ? (!hostUp() || !hostProtocolOk() || legacyNames.length > 0 || !!persistenceFailure || renameIntents.length > 0 || uploadRecoveryWarnings.length > 0)
     : (!hostUp() || !hostProtocolOk() || _pcHealth.reachable === false || gaveUp > 0 || hostedArmedDown > 0 || legacyNames.length > 0 || !projects.bridgeLive || !!persistenceFailure || renameIntents.length > 0 || uploadRecoveryWarnings.length > 0);
-  res.json({ ok: !degraded, degraded, uptimeSec: Math.round(process.uptime()), tmuxAvailable, sessions: hostSessions.size,
-             legacySessions: legacyNames.length, legacyNames, legacyPolicy: 'blocked', armed, gaveUp, hostedArmedDown, pc: _pcHealth,
-             projects,
-             persistence: { ok: !persistenceFailure && !persistenceBlocked, detail: persistenceBlocked || persistenceFailure, blocked: !!persistenceBlocked },
-             pendingRenameIntents: renameIntents.length,
-             uploadRecoveryWarnings,
-             host: { connected: hostUp(), name: hostLabel, sessions: hostSessions.size, protocol: hostProtocol.protocol, caps: hostProtocol.caps, protocolOk: hostProtocolOk() },
-             node: process.version, at: Date.now() });
+  return { ok: !degraded, degraded, uptimeSec: Math.round(process.uptime()), tmuxAvailable, sessions: hostSessions.size,
+           legacySessions: legacyNames.length, legacyNames, legacyPolicy: "blocked", armed, gaveUp, hostedArmedDown, pc: _pcHealth,
+           projects,
+           persistence: { ok: !persistenceFailure && !persistenceBlocked, detail: persistenceBlocked || persistenceFailure, blocked: !!persistenceBlocked },
+           pendingRenameIntents: renameIntents.length,
+           uploadRecoveryWarnings,
+           host: { connected: hostUp(), name: hostLabel, sessions: hostSessions.size, protocol: hostProtocol.protocol, caps: hostProtocol.caps, protocolOk: hostProtocolOk() },
+           node: process.version, at: Date.now() };
+}
+
+app.get('/api/health', (req, res) => {
+  res.json(healthSnapshot());
 });
+
 
 // --- app command queue: the owner (web) enqueues actions for the desktop app; the app polls + acks them.
 // Today: "kill" a live agent session. Enqueue is owner-gated (the global auth middleware above); pull +
@@ -1761,14 +1768,14 @@ server.on('upgrade', (req, socket, head) => {
   const p = (req.url || '').split('?')[0];
   if (p === '/ws') wss.handleUpgrade(req, socket, head, ws => wss.emit('connection', ws, req));
   else if (p === '/host') {
-    // reject a bad /host token BEFORE completing the handshake (constant-time) — no 101, no 'open'
+    // reject a bad /host token BEFORE completing the handshake (constant-time) â€” no 101, no 'open'
     let ok = false; try { ok = hostTokenOk(new URL(req.url, 'http://x').searchParams.get('token')); } catch {}
     if (!ok) { try { socket.destroy(); } catch {} return; }
     wssHost.handleUpgrade(req, socket, head, ws => wssHost.emit('connection', ws, req));
   } else socket.destroy();
 });
 
-// ---- the PC session host's inbound link (muxd dials US — no inbound port on the PC) ---------------
+// ---- the PC session host's inbound link (muxd dials US â€” no inbound port on the PC) ---------------
 wssHost.on('connection', (ws, req) => {
   const u = new URL(req.url, 'http://x');
   if (!hostTokenOk(u.searchParams.get('token'))) { try { ws.close(1008, 'bad token'); } catch {} return; }
@@ -1864,7 +1871,7 @@ wssHost.on('connection', (ws, req) => {
         if (c.sbWait) {
           (c.q = c.q || []).push(buf); c.qBytes = (c.qBytes || 0) + buf.length;
           // Flood while still waiting for scrollback: relieve memory, but NEVER blank-and-drop.
-          // The live stream itself repaints a TUI, so go live now — clear once (a fresh attach
+          // The live stream itself repaints a TUI, so go live now â€” clear once (a fresh attach
           // starts clean) and replay what we buffered. wentLive means a late sb is dropped, but
           // only because real output is already painting the screen (never leaves it black).
           if (c.qBytes > 2000000 || c.q.length > 4000) {
@@ -1928,9 +1935,9 @@ wssHost.on('connection', (ws, req) => {
 // ---- shared window sizing + DEVICE-IDENTITY PINNING (multi-client mirror, ONE stable size) --------
 // One shared size per session (tmux can't per-client-size a shared window; we hold every viewer at the
 // server-chosen size and each PANs if it's bigger than their screen). PIN = "prefer THIS device": the
-// pinned device's viewport drives the size for EVERYONE — last-pinner-wins — and it's keyed to a
+// pinned device's viewport drives the size for EVERYONE â€” last-pinner-wins â€” and it's keyed to a
 // persistent deviceId (localStorage), so a Wi-Fi blip / reconnect / relay restart does NOT lose the pin
-// (the old code pinned a connection id → gone on every reconnect). No pin = auto over the RECENTLY-ACTIVE
+// (the old code pinned a connection id â†’ gone on every reconnect). No pin = auto over the RECENTLY-ACTIVE
 // viewers only, so a backgrounded desktop tab in another room can't force your phone to pan forever.
 const PINS_FILE = STATE_DIR + '/pins.json';
 let pins = new Map();   // session -> { deviceId, label, cols, rows, at }
@@ -2205,7 +2212,7 @@ function recompute(name) {
     if (c.ws.readyState !== 1) continue;
     const mine = pinned && sz.pin.deviceId === (c.deviceId || ('sock-' + c.id));
     const mode = sz.hostedSize ? 'local' : (pinned ? 'pinned' : 'auto');
-    const modeLabel = sz.hostedSize ? `local · ${cols}×${rows}` : (pinned ? `📌 ${pinLabel} · ${cols}×${rows}` : `auto · ${cols}×${rows}`);
+    const modeLabel = sz.hostedSize ? `local Â· ${cols}Ã—${rows}` : (pinned ? `ðŸ“Œ ${pinLabel} Â· ${cols}Ã—${rows}` : `auto Â· ${cols}Ã—${rows}`);
     sendViewer(name, st, c, 'd' + JSON.stringify({ cols, rows, mode, pinLabel, mine, modeLabel, me: c.id, clients }));
   }
 }
@@ -2221,7 +2228,7 @@ function pinToDeviceId(name, deviceId) {   // long-press: pin to ANY listed devi
   const c = [...st.clients.values()].find(x => (x.deviceId || ('sock-' + x.id)) === deviceId);
   if (c) pinToDevice(name, c, true);
 }
-function cycleMode(name, client) {   // the size chip / legacy 's': toggle pin-to-ME ↔ auto (last-pinner-wins)
+function cycleMode(name, client) {   // the size chip / legacy 's': toggle pin-to-ME â†” auto (last-pinner-wins)
   const pin = pins.get(name);
   const mine = pin && client && pin.deviceId === (client.deviceId || ('sock-' + client.id));
   pinToDevice(name, client, !mine);
@@ -2258,9 +2265,9 @@ wss.on('connection', async (ws, req) => {
   const vcols = clampTermDimension(u.searchParams.get('cols'), 100, MAX_TERM_COLS);
   const vrows = clampTermDimension(u.searchParams.get('rows'), 30, MAX_TERM_ROWS);
   const deviceId = (u.searchParams.get('dev') || '').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 40);   // persistent device identity for pinning
-  const label = (u.searchParams.get('label') || '').replace(/[^\w .·/+-]/g, '').slice(0, 32) || 'device';
+  const label = (u.searchParams.get('label') || '').replace(/[^\w .Â·/+-]/g, '').slice(0, 32) || 'device';
 
-  // ---- PC-HOSTED attach: bridge this viewer to muxd (no tmux, no ssh — the session lives on the PC).
+  // ---- PC-HOSTED attach: bridge this viewer to muxd (no tmux, no ssh â€” the session lives on the PC).
   // Unknown web tabs create an empty PC-local muxd shell. That preserves the old pleasant multiplex flow
   // while keeping ownership local to the PC instead of the VPS.
   const legacyBlocked = tmuxHas(name);
@@ -2293,7 +2300,7 @@ wss.on('connection', async (ws, req) => {
     }
     // Scrollback slow/large: relieve the wait WITHOUT blanking the screen. If live output was
     // buffered, flow it now (a TUI repaints). If the session is idle (nothing buffered), leave the
-    // screen as-is and keep waiting — wentLive stays false so the sb reply (or the next live byte)
+    // screen as-is and keep waiting â€” wentLive stays false so the sb reply (or the next live byte)
     // still paints it. Blanking here and then dropping the late sb was the black-screen bug.
     client.sbTimer = setTimeout(() => {
       if (!client.sbWait) return;
@@ -2329,6 +2336,16 @@ wss.on('connection', async (ws, req) => {
 
 const PORT = +process.env.PORT || 7682;
 // 0.0.0.0: the PC's muxd dials us directly over the LAN (ws://<vps>:7682/host, token-gated; ufw scopes
-// the port to the LAN). Loopback-trust semantics are unchanged — a LAN caller is NOT trusted-local and
+// the port to the LAN). Loopback-trust semantics are unchanged â€” a LAN caller is NOT trusted-local and
 // still hits the hl-auth owner gate for everything except /host-with-token.
 server.listen(PORT, '0.0.0.0', () => console.log('multiplex-app on 0.0.0.0:' + PORT));
+
+// --- ops alerts: push on degraded-health edge transitions (r.1.17) ---
+// Secret (ntfy topic URL) lives in /etc/multiplex-app.env as MUX_ALERT_NTFY_URL.
+// The topic IS the credential — never committed, never logged.
+if (process.env.MUX_ALERT_NTFY_URL) {
+  startHealthAlerts({
+    notifier: createNotifier({ url: process.env.MUX_ALERT_NTFY_URL }),
+    getHealth: healthSnapshot,
+  });
+}
