@@ -32,7 +32,7 @@
     if (SAFE_MUX.test(pushed)) return pushed;
     // The 48-char ceiling is a length rule, not a verdict on the name: a long-but-clean name is the
     // user's own, so trim it rather than swap in a derived one they never chose and cannot recognize.
-    if (pushed && sanitizeMuxName(pushed) === pushed.slice(0, 48)) return pushed.slice(0, 48);
+    if (/^[A-Za-z0-9_.-]+$/.test(pushed)) return pushed.slice(0, 48);
     var derived = sanitizeMuxName((c.tool || 'chat') + '-' + (c.id || ''));
     // A derived name of bare separators ('-') would resume a tab the user cannot recognize and ask the
     // PC for a session literally named '-'; without a letter or digit there is no name to resume.
