@@ -26,6 +26,104 @@ public static class RunningSessions
     private static readonly TimeSpan PerPidTranscriptCacheLifetime = TimeSpan.FromSeconds(3);
     private static readonly TimeSpan PerPidHandleTimeout = TimeSpan.FromSeconds(1);
 
+    // ---- burst scan cache -----------------------------------------------------------------------------
+    // One remote refresh fires integrity + custody + claim checks back to back, and each one used to pay for
+    // its own WMI world sweep plus its own walk of Claude's live-session registry. They ask the same question
+    // microseconds apart, so within one burst they now share ONE answer. Same discipline as the per-pid
+    // transcript cache above: short TTL, explicit invalidation, and [F#8] a FAILED sweep is never stored — a
+    // transient WMI hiccup must not fail-close every caller for a whole TTL.
+    //
+    // The cache is deliberately PRIVATE and reachable only through TryLiveSessionPids. TryScan and
+    // TryClaudeLiveSessionIds stay raw, so Kill (which calls them directly) keeps its oracle-free promise:
+    // take-control must work precisely when the shared view is stale or broken.
+    private static readonly object ScanCacheGate = new();
+    private static readonly TimeSpan ScanCacheLifetime = TimeSpan.FromSeconds(3);
+    private static (DateTime CachedAt, List<ArchiveService.RunningSessionInfo> Sessions, string Detail)? _scanCache;
+    private static (DateTime CachedAt, HashSet<int>? Key, Dictionary<string, int> Map, string Detail)? _registryCache;
+    // Bumped by InvalidateScanCache. A sweep that started BEFORE an invalidation describes the pre-kill world,
+    // so its result is discarded rather than stored — otherwise a kill could be undone by an in-flight read.
+    private static long _scanCacheEpoch;
+
+    // TEST SEAM (mirrors KillSignals): WMI and Claude's registry are machine-global and cannot be arranged
+    // in-test without touching real user state, so the two sweep sources are injectable. Null = the real thing.
+    internal sealed record ScanSources(
+        Func<(bool Ok, List<ArchiveService.RunningSessionInfo> Sessions, string Detail)>? Scan = null,
+        Func<HashSet<int>?, (bool Ok, Dictionary<string, int> Map, HashSet<int> Unverifiable, string Detail)>? ClaudeRegistry = null);
+
+    internal static ScanSources? ScanSourceOverride;
+
+    /// Drop the burst scan cache. [F#4] Every site that kills or creates an agent calls this, so the next
+    /// liveness question re-sweeps instead of reporting the world as it was before the mutation.
+    public static void InvalidateScanCache()
+    {
+        Interlocked.Increment(ref _scanCacheEpoch);
+        lock (ScanCacheGate)
+        {
+            _scanCache = null;
+            _registryCache = null;
+        }
+    }
+
+    // The WMI world sweep, cached. `bypassCache` forces a fresh sweep AND refreshes the entry for everyone
+    // else: [F#3] the post-claim re-check is the one caller whose whole job is to see the newest possible world.
+    private static (bool Ok, List<ArchiveService.RunningSessionInfo> Sessions, string Detail) CachedScan(bool bypassCache)
+    {
+        if (!bypassCache)
+            lock (ScanCacheGate)
+                if (_scanCache is { } hit && DateTime.UtcNow - hit.CachedAt <= ScanCacheLifetime)
+                    return (true, new List<ArchiveService.RunningSessionInfo>(hit.Sessions), hit.Detail);
+
+        var epoch = Interlocked.Read(ref _scanCacheEpoch);
+        var source = ScanSourceOverride?.Scan;
+        var (ok, sessions, detail) = source is not null
+            ? source()
+            : (TryScan(out var scanned, out var scanDetail), scanned, scanDetail);
+        sessions ??= new List<ArchiveService.RunningSessionInfo>();
+        if (!ok) return (false, sessions, detail);   // [F#8] a failed sweep is NEVER cached
+
+        lock (ScanCacheGate)
+            if (Interlocked.Read(ref _scanCacheEpoch) == epoch)
+                _scanCache = (DateTime.UtcNow, new List<ArchiveService.RunningSessionInfo>(sessions), detail);
+        return (true, sessions, detail);
+    }
+
+    // Claude's live-session registry, cached. The entry is keyed by the pid set it was filtered against, so a
+    // caller asking about a DIFFERENT set of pids re-reads rather than inheriting someone else's filter.
+    private static (bool Ok, Dictionary<string, int> Map, HashSet<int> Unverifiable, string Detail) CachedClaudeRegistry(
+        HashSet<int>? livePids,
+        bool bypassCache)
+    {
+        if (!bypassCache)
+            lock (ScanCacheGate)
+                if (_registryCache is { } hit
+                    && DateTime.UtcNow - hit.CachedAt <= ScanCacheLifetime
+                    && SamePidKey(hit.Key, livePids))
+                    return (true, new Dictionary<string, int>(hit.Map, StringComparer.OrdinalIgnoreCase), new HashSet<int>(), hit.Detail);
+
+        var epoch = Interlocked.Read(ref _scanCacheEpoch);
+        var source = ScanSourceOverride?.ClaudeRegistry;
+        var (ok, map, unverifiable, detail) = source is not null
+            ? source(livePids)
+            : (TryClaudeLiveSessionIds(livePids, out var rm, out var ru, out var rd), rm, ru, rd);
+        map ??= new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        unverifiable ??= new HashSet<int>();
+        // [F#8] Only a clean read is cached. An unverifiable pid means a live owner may be HIDDEN from this
+        // answer, and re-serving that for a whole TTL would turn one write race into a burst-wide blind spot.
+        if (!ok) return (false, map, unverifiable, detail);
+
+        lock (ScanCacheGate)
+            if (Interlocked.Read(ref _scanCacheEpoch) == epoch)
+                _registryCache = (
+                    DateTime.UtcNow,
+                    livePids is null ? null : new HashSet<int>(livePids),
+                    new Dictionary<string, int>(map, StringComparer.OrdinalIgnoreCase),
+                    detail);
+        return (true, map, unverifiable, detail);
+    }
+
+    private static bool SamePidKey(HashSet<int>? cached, HashSet<int>? asked)
+        => cached is null ? asked is null : asked is not null && cached.SetEquals(asked);
+
     // The world scan stays reachable for one release: CODEXLOCAL_LEGACY_HANDLE_SCAN=1 restores it.
     private static bool LegacyHandleScanEnabled
     {
@@ -51,6 +149,9 @@ public static class RunningSessions
     {
         list = new List<ArchiveService.RunningSessionInfo>();
         detail = "";
+        // One world sweep, counted once whether it costs one CIM query or two. This is the number the burst
+        // cache exists to hold down, so it must tick per SWEEP, not per query.
+        PerfCounters.WmiSweep();
 
         // pid -> process name, so we can label each agent's parent (a single cheap scan).
         var names = new Dictionary<int, string>();
@@ -305,13 +406,20 @@ public static class RunningSessions
         return live;
     }
 
-    public static bool TryAllLiveSessionIds(out HashSet<string> live, out string detail)
-        => TryAllLiveSessionIds(out live, out _, out detail);
+    // `bypassCache: true` forces a fresh sweep instead of reusing this burst's shared answer. [F#3] The ONLY
+    // caller entitled to it is the post-claim re-check in SessionLaunchClaims: it holds the reservation and is
+    // asking whether the world changed underneath it, which a cached answer cannot tell it by construction.
+    public static bool TryAllLiveSessionIds(out HashSet<string> live, out string detail, bool bypassCache = false)
+        => TryAllLiveSessionIds(out live, out _, out detail, bypassCache);
 
-    public static bool TryAllLiveSessionIds(out HashSet<string> live, out HashSet<int> unverifiablePids, out string detail)
+    public static bool TryAllLiveSessionIds(
+        out HashSet<string> live,
+        out HashSet<int> unverifiablePids,
+        out string detail,
+        bool bypassCache = false)
     {
         live = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var ok = TryLiveSessionPids(out var livePids, out unverifiablePids, out detail);
+        var ok = TryLiveSessionPids(out var livePids, out unverifiablePids, out detail, bypassCache);
         foreach (var id in livePids.Keys) live.Add(id);
         return ok;
     }
@@ -324,20 +432,24 @@ public static class RunningSessions
     public static bool TryLiveSessionPids(
         out Dictionary<string, HashSet<int>> live,
         out HashSet<int> unverifiablePids,
-        out string detail)
+        out string detail,
+        bool bypassCache = false)
     {
         live = new Dictionary<string, HashSet<int>>(StringComparer.OrdinalIgnoreCase);
         unverifiablePids = new HashSet<int>();
         detail = "";
         var pids = new HashSet<int>();
-        if (!TryScan(out var sessions, out detail)) return false;
+        var (scanOk, sessions, scanDetail) = CachedScan(bypassCache);
+        detail = scanDetail;
+        if (!scanOk) return false;
         foreach (var s in sessions)
         {
             AddLivePid(live, s.SessionId, s.Pid);
             if (s.Pid > 0) pids.Add(s.Pid);
         }
         var ok = true;
-        if (!TryClaudeLiveSessionIds(pids, out var claudeLiveIds, out var registryUnverifiable, out var registryDetail))
+        var (registryOk, claudeLiveIds, registryUnverifiable, registryDetail) = CachedClaudeRegistry(pids, bypassCache);
+        if (!registryOk)
         {
             unverifiablePids.UnionWith(registryUnverifiable);
             detail = registryDetail;
@@ -722,7 +834,21 @@ public static class RunningSessions
         Func<(bool Ok, Dictionary<string, int> Map, HashSet<int> Unverifiable, string Detail)>? ClaudeRegistry = null,
         SessionOwnerRecords.Options? OwnerRecords = null);
 
+    // [F#4] Every success path — "already gone" as much as a confirmed tree kill — ends with the burst cache
+    // dropped, so the next liveness question cannot report the process we just removed as still running. The
+    // invalidation happens AFTER the kill decided, never inside it: Kill's own signals stay uncached (:674).
     internal static KillResult Kill(
+        IReadOnlyCollection<string>? candidateIds,
+        int pid,
+        string? expectedStartedUtc,
+        KillSignals? signals)
+    {
+        var result = KillCore(candidateIds, pid, expectedStartedUtc, signals);
+        if (result.Ok) InvalidateScanCache();
+        return result;
+    }
+
+    private static KillResult KillCore(
         IReadOnlyCollection<string>? candidateIds,
         int pid,
         string? expectedStartedUtc,
