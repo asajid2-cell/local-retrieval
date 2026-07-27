@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -14,11 +14,11 @@ namespace CodexLocalRetrieval.Core.Remote;
 // drive the same "running on PC" remote view + kills when the desktop app is closed. Windows-only.
 public static class RunningSessions
 {
-    // Per-pid transcript cache keyed by (pid, process start time) — a reused pid is a different process and
+    // Per-pid transcript cache keyed by (pid, process start time) â€” a reused pid is a different process and
     // must never be served the old one's answer. Callers with DIFFERENT pid sets compose from these entries
     // instead of sharing one global scan, so they can no longer refuse each other ("busy verifying another
     // process set" is gone along with the single-flight gate and its 5s give-up).
-    // [F#8] ONLY positive resolutions are stored. A failed or unverifiable pid is never cached — a transient
+    // [F#8] ONLY positive resolutions are stored. A failed or unverifiable pid is never cached â€” a transient
     // hiccup must not fail-close every caller for a whole TTL.
     private static readonly object PerPidTranscriptGate = new();
     private static readonly Dictionary<int, (DateTime StartTimeUtc, DateTime CachedAt, Dictionary<string, int> Sids)>
@@ -30,7 +30,7 @@ public static class RunningSessions
     // One remote refresh fires integrity + custody + claim checks back to back, and each one used to pay for
     // its own WMI world sweep plus its own walk of Claude's live-session registry. They ask the same question
     // microseconds apart, so within one burst they now share ONE answer. Same discipline as the per-pid
-    // transcript cache above: short TTL, explicit invalidation, and [F#8] a FAILED sweep is never stored — a
+    // transcript cache above: short TTL, explicit invalidation, and [F#8] a FAILED sweep is never stored â€” a
     // transient WMI hiccup must not fail-close every caller for a whole TTL.
     //
     // The cache is deliberately PRIVATE and reachable only through TryLiveSessionPids. TryScan and
@@ -41,7 +41,7 @@ public static class RunningSessions
     private static (DateTime CachedAt, List<ArchiveService.RunningSessionInfo> Sessions, string Detail)? _scanCache;
     private static (DateTime CachedAt, HashSet<int>? Key, Dictionary<string, int> Map, string Detail)? _registryCache;
     // Bumped by InvalidateScanCache. A sweep that started BEFORE an invalidation describes the pre-kill world,
-    // so its result is discarded rather than stored — otherwise a kill could be undone by an in-flight read.
+    // so its result is discarded rather than stored â€” otherwise a kill could be undone by an in-flight read.
     private static long _scanCacheEpoch;
 
     // TEST SEAM (mirrors KillSignals): WMI and Claude's registry are machine-global and cannot be arranged
@@ -133,6 +133,16 @@ public static class RunningSessions
             return v == "1" || string.Equals(v, "true", StringComparison.OrdinalIgnoreCase);
         }
     }
+
+    // The WMI process scan stays reachable for one release: CODEXLOCAL_LEGACY_PROCESS_SCAN=1 restores it.
+    private static bool LegacyProcessScanEnabled
+    {
+        get
+        {
+            var v = (Environment.GetEnvironmentVariable("CODEXLOCAL_LEGACY_PROCESS_SCAN") ?? "").Trim();
+            return v == "1" || string.Equals(v, "true", StringComparison.OrdinalIgnoreCase);
+        }
+    }
     private static readonly System.Management.EnumerationOptions BoundedWmiOptions = new()
     {
         ReturnImmediately = true,
@@ -147,6 +157,12 @@ public static class RunningSessions
 
     public static bool TryScan(out List<ArchiveService.RunningSessionInfo> list, out string detail)
     {
+        if (!LegacyProcessScanEnabled)
+        {
+            PerfCounters.WmiSweep();
+            return ProcessSnapshot.TryScan(out list, out detail);
+        }
+
         list = new List<ArchiveService.RunningSessionInfo>();
         detail = "";
         // One world sweep, counted once whether it costs one CIM query or two. This is the number the burst
@@ -200,6 +216,9 @@ public static class RunningSessions
     // shell muxd spawned (a claude/codex is a child of that shell) and link agent -> tab deterministically.
     public static Dictionary<int, int> ProcessParentMap()
     {
+        if (!LegacyProcessScanEnabled)
+            return ProcessSnapshot.ParentMap();
+
         var map = new Dictionary<int, int>();
         try
         {
@@ -217,10 +236,13 @@ public static class RunningSessions
     }
 
     // Live claude/codex agents with their PARENT pid, any resume id parsed from the command line, and the
-    // process START TIME (UTC) — used to correlate a FRESH agent (launched without --resume) to the exact
+    // process START TIME (UTC) â€” used to correlate a FRESH agent (launched without --resume) to the exact
     // transcript it created at launch, so its tab's session history is right even in a shared folder.
     public static List<(int Pid, int Ppid, string Tool, string SessionId, DateTime StartedUtc)> ScanAgentsWithPpid()
     {
+        if (!LegacyProcessScanEnabled)
+            return ProcessSnapshot.AgentsWithPpid();
+
         var list = new List<(int, int, string, string, DateTime)>();
         try
         {
@@ -246,7 +268,7 @@ public static class RunningSessions
     }
 
     // Claude Code's OWN per-live-process registry: ~/.claude/sessions/<pid>.json = { pid, sessionId, cwd,
-    // status, ... } for EVERY live claude session — including IDLE ones and FORKED/branch ones whose id
+    // status, ... } for EVERY live claude session â€” including IDLE ones and FORKED/branch ones whose id
     // isn't on the command line. This is the ground truth for "is this claude session live?" (claude
     // open-append-closes its transcript, so a file-handle/mtime check can't see an idle one). Stale entries
     // (process already gone) are dropped when `livePids` is supplied. Returns sessionId -> pid.
@@ -261,7 +283,7 @@ public static class RunningSessions
             {
                 try
                 {
-                    // shared read (ReadWrite|Delete): claude writes these registry files live — the default
+                    // shared read (ReadWrite|Delete): claude writes these registry files live â€” the default
                     // deny-write share could block its update. Read without ever locking out the writer.
                     string json;
                     using (var rfs = new FileStream(f, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
@@ -353,7 +375,7 @@ public static class RunningSessions
             }
             catch
             {
-                // Readable but not parseable: same rule — only a LIVE pid makes it uncertainty.
+                // Readable but not parseable: same rule â€” only a LIVE pid makes it uncertainty.
                 if (namePid > 0 && ProcessOpenFiles.IsAlive(namePid))
                 {
                     unverifiablePids.Add(namePid);
@@ -366,7 +388,7 @@ public static class RunningSessions
         {
             detail = "Claude live-session registry is unreadable for still-running pids: "
                    + string.Join(", ", unreadable)
-                   + "; ownership is unverified — this is not a confirmed live owner";
+                   + "; ownership is unverified â€” this is not a confirmed live owner";
             return false;
         }
         return true;
@@ -381,7 +403,7 @@ public static class RunningSessions
             if (attempt > 0) Thread.Sleep(150);
             try
             {
-                // shared read (ReadWrite|Delete): claude writes these registry files live — the default
+                // shared read (ReadWrite|Delete): claude writes these registry files live â€” the default
                 // deny-write share could block its update. Read without ever locking out the writer.
                 using var rfs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
                 using var rsr = new StreamReader(rfs);
@@ -517,24 +539,32 @@ public static class RunningSessions
             return false;
         }
 
-        var parents = new Dictionary<int, int>();
-        try
+        Dictionary<int, int> parents;
+        if (!LegacyProcessScanEnabled)
         {
-            using var searcher = new ManagementObjectSearcher(
-                new ManagementScope(@"\\.\root\cimv2"),
-                new ObjectQuery("SELECT ProcessId, ParentProcessId FROM Win32_Process"),
-                BoundedWmiOptions);
-            foreach (ManagementObject mo in searcher.Get())
-            {
-                var pid = Convert.ToInt32(mo["ProcessId"]);
-                var parent = Convert.ToInt32(mo["ParentProcessId"]);
-                if (pid > 0) parents[pid] = parent;
-            }
+            parents = ProcessSnapshot.ParentMap();
         }
-        catch (Exception ex)
+        else
         {
-            detail = "could not verify mux process ancestry: " + ex.Message;
-            return false;
+            parents = new Dictionary<int, int>();
+            try
+            {
+                using var searcher = new ManagementObjectSearcher(
+                    new ManagementScope(@"\\.\root\cimv2"),
+                    new ObjectQuery("SELECT ProcessId, ParentProcessId FROM Win32_Process"),
+                    BoundedWmiOptions);
+                foreach (ManagementObject mo in searcher.Get())
+                {
+                    var pid = Convert.ToInt32(mo["ProcessId"]);
+                    var parent = Convert.ToInt32(mo["ParentProcessId"]);
+                    if (pid > 0) parents[pid] = parent;
+                }
+            }
+            catch (Exception ex)
+            {
+                detail = "could not verify mux process ancestry: " + ex.Message;
+                return false;
+            }
         }
 
         foreach (var candidate in candidatePids.Where(pid => pid > 0).Distinct())
@@ -548,7 +578,6 @@ public static class RunningSessions
                     owned.Add(candidate);
                     break;
                 }
-                if (!parents.TryGetValue(current, out current)) break;
             }
         }
         return true;
@@ -703,7 +732,7 @@ public static class RunningSessions
 
     // THE gate the app must consult before spawning a resume: is this chat (by id OR any lineage alias)
     // already being run by a live process? If so, launching another `--resume` makes two writers on one
-    // transcript and (verified) Claude then SILENTLY drops writes → lost work. Never spawn when this is true.
+    // transcript and (verified) Claude then SILENTLY drops writes â†’ lost work. Never spawn when this is true.
     public static bool TryIsSessionLive(
         string? sessionId,
         IEnumerable<string>? aliases,
@@ -834,7 +863,7 @@ public static class RunningSessions
         Func<(bool Ok, Dictionary<string, int> Map, HashSet<int> Unverifiable, string Detail)>? ClaudeRegistry = null,
         SessionOwnerRecords.Options? OwnerRecords = null);
 
-    // [F#4] Every success path — "already gone" as much as a confirmed tree kill — ends with the burst cache
+    // [F#4] Every success path â€” "already gone" as much as a confirmed tree kill â€” ends with the burst cache
     // dropped, so the next liveness question cannot report the process we just removed as still running. The
     // invalidation happens AFTER the kill decided, never inside it: Kill's own signals stay uncached (:674).
     internal static KillResult Kill(
@@ -965,7 +994,7 @@ public static class RunningSessions
                 // A live pid tied to this session by NO signal stays untouched - Kill has never been a
                 // general-purpose process killer and still isn't.
                 if (ProcessOpenFiles.IsAlive(pid) || IsProcessAlive(pid))
-                    return new KillResult(false, "still running but not a tracked claude/codex agent — not killed", noEvidence);
+                    return new KillResult(false, "still running but not a tracked claude/codex agent â€” not killed", noEvidence);
                 return new KillResult(true, "already gone", noEvidence);
             }
             targets = new Dictionary<int, string> { [pid] = why };
@@ -974,7 +1003,7 @@ public static class RunningSessions
         if (targets.Count == 0)
         {
             if (unanswered.Count > 0)
-                return new KillResult(false, "couldn't verify — " + string.Join("; ", unanswered.Distinct()), noEvidence);
+                return new KillResult(false, "couldn't verify â€” " + string.Join("; ", unanswered.Distinct()), noEvidence);
             // Every signal answered, all of them empty: nothing is running this session.
             return new KillResult(true, Join("already gone", notes), noEvidence);
         }
@@ -1127,6 +1156,9 @@ public static class RunningSessions
 
     private static HashSet<int> SnapshotProcessTree(int rootPid)
     {
+        if (!LegacyProcessScanEnabled)
+            return ProcessSnapshot.Tree(rootPid);
+
         var children = new Dictionary<int, List<int>>();
         using var searcher = new ManagementObjectSearcher(
             new ManagementScope(@"\\.\root\cimv2"),

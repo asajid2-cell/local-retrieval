@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Management;
@@ -11,8 +11,8 @@ using Microsoft.UI.Xaml.Controls;
 
 namespace CodexLocalRetrieval_Native;
 
-// Don't double-run a chat. Resuming a chat that's ALREADY running — in a local terminal or inside a
-// multiplex (which runs the agent on this PC via SSH-back) — makes two processes append to the same
+// Don't double-run a chat. Resuming a chat that's ALREADY running â€” in a local terminal or inside a
+// multiplex (which runs the agent on this PC via SSH-back) â€” makes two processes append to the same
 // transcript/rollout and corrupts it. We scan live claude/codex processes for the session id each is
 // resuming (off their command lines) and guard the resume flows: attach instead of re-injecting, or
 // ask to kill the running copy before taking over.
@@ -20,7 +20,7 @@ public sealed partial class MainPage
 {
     // Every live claude/codex agent process on this PC, with enough context to identify it on the web:
     // which chat it's resuming (SessionId), where it lives (parent: VS Code / Terminal / Multiplex / app),
-    // its pid and start time. This is the source of truth for "what's actually running" — including
+    // its pid and start time. This is the source of truth for "what's actually running" â€” including
     // forgotten background VS Code sessions the user can't otherwise see.
     // PERF: two WMI process sweeps per call (~100-300ms each) and several callers per poll cycle
     // (resume guards, remote pushes, the Running page). A 4s cache collapses a burst into ONE sweep;
@@ -51,38 +51,7 @@ public sealed partial class MainPage
 
     private List<ArchiveService.RunningSessionInfo> GetRunningSessionsUncached()
     {
-        var list = new List<ArchiveService.RunningSessionInfo>();
-        try
-        {
-            // pid -> process name, so we can label each agent's parent (a single cheap scan).
-            var names = new Dictionary<int, string>();
-            try
-            {
-                using var all = new ManagementObjectSearcher("SELECT ProcessId, Name FROM Win32_Process");
-                foreach (ManagementObject mo in all.Get())
-                    try { names[Convert.ToInt32(mo["ProcessId"])] = mo["Name"]?.ToString() ?? ""; } catch { }
-            }
-            catch { }
-
-            using var searcher = new ManagementObjectSearcher(
-                "SELECT ProcessId, ParentProcessId, CommandLine, CreationDate, Name FROM Win32_Process WHERE Name='claude.exe' OR Name='codex.exe'");
-            foreach (ManagementObject mo in searcher.Get())
-            {
-                var cl = mo["CommandLine"]?.ToString() ?? "";
-                var procName = mo["Name"]?.ToString() ?? "";
-                if (!CodexLocalRetrieval.Core.Remote.RunningSessions.IsLiveAgentProcess(procName, cl)) continue;
-                var sid = ArchiveService.ParseResumedSessionId(cl) ?? "";
-                var name = procName.ToLowerInvariant();
-                var tool = name.Contains("codex") ? "codex" : "claude";
-                var pid = 0; try { pid = Convert.ToInt32(mo["ProcessId"]); } catch { }
-                var ppid = 0; try { ppid = Convert.ToInt32(mo["ParentProcessId"]); } catch { }
-                var parent = LabelParent(names.TryGetValue(ppid, out var pn) ? pn : "");
-                var started = "";
-                try { started = ManagementDateTimeConverter.ToDateTime(mo["CreationDate"]?.ToString()).ToUniversalTime().ToString("O"); } catch { }
-                if (pid > 0) list.Add(new ArchiveService.RunningSessionInfo(pid, tool, sid, parent, started, ""));
-            }
-        }
-        catch (Exception ex) { Diag.Log("GetRunningSessions failed: " + ex.Message); }
+        CodexLocalRetrieval.Core.Remote.RunningSessions.TryScan(out var list, out _);
         return list;
     }
 
@@ -108,19 +77,19 @@ public sealed partial class MainPage
             if (!string.IsNullOrEmpty(r.SessionId) && !map.ContainsKey(r.SessionId))
                 map[r.SessionId] = r.Pid;   // resumed sessions carry their id on the command line
         }
-        // GROUND TRUTH for sessions whose id ISN'T on the command line — a chat forked/started locally
+        // GROUND TRUTH for sessions whose id ISN'T on the command line â€” a chat forked/started locally
         // without --resume, or one sitting IDLE in the background. This is what stops two live copies of the
         // same session (a double-writer that loses progress). Two reliable sources, unioned:
         var livePids = new HashSet<int>(pids);
-        //  • Claude keeps its OWN registry (~/.claude/sessions/<pid>.json) of every live session, idle or
-        //    forked — claude open-append-closes its transcript so a file check can't see an idle one.
+        //  â€¢ Claude keeps its OWN registry (~/.claude/sessions/<pid>.json) of every live session, idle or
+        //    forked â€” claude open-append-closes its transcript so a file check can't see an idle one.
         try
         {
             foreach (var kv in CodexLocalRetrieval.Core.Remote.RunningSessions.ClaudeLiveSessionIds(livePids))
                 if (!map.ContainsKey(kv.Key)) map[kv.Key] = kv.Value;
         }
         catch { }
-        //  • Codex holds its rollout file OPEN for the whole session, so which transcript each agent has open
+        //  â€¢ Codex holds its rollout file OPEN for the whole session, so which transcript each agent has open
         //    is the ground truth there (also catches a claude that's mid-write).
         try
         {
@@ -154,7 +123,7 @@ public sealed partial class MainPage
             {
                 if (!s.TryGetProperty("name", out var n) || !string.Equals(n.GetString(), name, StringComparison.OrdinalIgnoreCase))
                     continue;
-                // A DORMANT session (e.g. every tab after a reboot) is just a placeholder — NOT a running
+                // A DORMANT session (e.g. every tab after a reboot) is just a placeholder â€” NOT a running
                 // agent. Treat it as none so resume doesn't false-warn "already running / kill it"; the
                 // separate local-process check still fires if the chat is actually running on this PC.
                 var alive = s.TryGetProperty("alive", out var a) && a.ValueKind == JsonValueKind.True;
@@ -206,11 +175,11 @@ public sealed partial class MainPage
     // kill it or cancel.
     //
     // Returns WHY it stopped, not just that it did. A bare bool made scan-failure indistinguishable from
-    // a confirmed live owner, and callers wrote the latter into the ledger for both — see RunGuardOutcome.
+    // a confirmed live owner, and callers wrote the latter into the ledger for both â€” see RunGuardOutcome.
     // The decision itself lives in Core's RunGuardClassifier; this method only does the I/O around it.
     // The guard's verdict PLUS the pids it killed and watched exit by identity. The pids matter because a
     // takeover the operator just confirmed may have stopped one of OUR launches, whose claim is retained for
-    // two minutes — [F#5] needs that concrete evidence to release the reservation instead of refusing the
+    // two minutes â€” [F#5] needs that concrete evidence to release the reservation instead of refusing the
     // takeover it just performed.
     private readonly record struct GuardResult(RunGuardDecision Decision, IReadOnlyList<int>? Killed = null)
     {
@@ -262,7 +231,7 @@ public sealed partial class MainPage
             return new GuardResult(verdict);
         }
         // Match on the session id OR any of its aliases (a fork/resume writes a lineage id) so a live copy
-        // started under a different id — but the SAME transcript — is still caught.
+        // started under a different id â€” but the SAME transcript â€” is still caught.
         var ids = new HashSet<string>(session.Aliases, StringComparer.OrdinalIgnoreCase);
         if (!string.IsNullOrWhiteSpace(session.Id)) ids.Add(session.Id);
         var localPids = ids
@@ -303,10 +272,10 @@ public sealed partial class MainPage
                 // Kill overloads (single session id vs. the alias-aware candidate set).
                 var killed = CodexLocalRetrieval.Core.Remote.RunningSessions.KillWithEvidence(Array.Empty<string>(), localPid);
                 if (!killed.Ok) { killOk = false; killDetail = "Could not kill the local running agent: " + killed.Detail; }
-                // Only pids Kill watched OUT by identity count as evidence — never a pid we merely asked to die.
+                // Only pids Kill watched OUT by identity count as evidence â€” never a pid we merely asked to die.
                 else killedPids.AddRange(killed.ConfirmedExited.Select(k => k.Pid));
             }
-            // The owner is still there — this is a FAILED takeover of a confirmed live owner, not a cancel.
+            // The owner is still there â€” this is a FAILED takeover of a confirmed live owner, not a cancel.
             if (!killOk) SyncStatus.Text = killDetail;
             else await Task.Delay(400);
         }
