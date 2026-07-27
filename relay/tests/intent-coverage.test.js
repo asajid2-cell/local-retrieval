@@ -109,7 +109,7 @@ test('r.1.6.2 static: index.html routes residue mutations through sendIntent wit
 // ('session.autoheal').
 // ===========================================================================
 
-const { RelayHarness } = require('./helpers/intent-harness');
+const { RelayHarness, FakeHost } = require('./helpers/intent-harness');
 
 function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 
@@ -177,4 +177,54 @@ test('r.1.6.3 integration: session.autoheal intent replays exactly-once', async 
   await sleep(150);
   const healFrames = host.messages.filter(m => m.t === 'heal' && m.s === 'heal-intent');
   assert.equal(healFrames.length, 1, `expected exactly one heal frame, got ${healFrames.length}`);
+});
+
+// ===========================================================================
+// r.1.6.4 - session.rename PATCH exactly-once replay + legacy no-intentId path
+// ===========================================================================
+
+test('r.1.6.4 integration: session.rename intent replays exactly-once and preserves legacy path', async t => {
+  const h = new RelayHarness();
+  await h.start();
+  t.after(async () => h.stop());
+  const host = await h.connectHost([shellSession('rename-from')]);
+  t.after(() => host.close());
+
+  // (a) First rename with intentId
+  const first = h.request('PATCH', '/api/sessions/rename-from', { name: 'rename-to', intentId: 't-rename-1' });
+  await host.waitFor(m => m.t === 'rename' && m.s === 'rename-from' && m.to === 'rename-to', 'rename frame');
+  host.sendSessions([shellSession('rename-to')]);
+  const firstRes = await first;
+  assert.equal(firstRes.status, 200);
+  assert.deepEqual(firstRes.body, { ok: true, name: 'rename-to', hosted: true });
+
+  // (b) Restart + byte-identical replay
+  await h.restart();
+  const host2 = new FakeHost(h.port);
+  await host2.connect();
+  host2.sendHello([shellSession('rename-to')]);
+  t.after(() => host2.close());
+
+  const replayRes = await h.request('PATCH', '/api/sessions/rename-from', { name: 'rename-to', intentId: 't-rename-1' });
+  assert.equal(replayRes.status, firstRes.status);
+  assert.deepEqual(replayRes.body, firstRes.body);
+
+  // Exactly-once side effect: original host received exactly ONE rename frame
+  await sleep(150);
+  const renameFrames = host.messages.filter(m => m.t === 'rename' && m.s === 'rename-from');
+  assert.equal(renameFrames.length, 1, `expected exactly one rename frame, got ${renameFrames.length}`);
+
+  // (c) Same intentId, different fingerprint -> 409
+  const conflict = await h.request('PATCH', '/api/sessions/rename-from', { name: 'rename-other', intentId: 't-rename-1' });
+  assert.equal(conflict.status, 409);
+  assert.deepEqual(conflict.body, { error: 'intent id already used for a different operation' });
+
+  // (d) Legacy no-intentId path still works
+  host2.sendSessions([shellSession('rename-to')]);
+  const legacy = h.request('PATCH', '/api/sessions/rename-to', { name: 'rename-back' });
+  await host2.waitFor(m => m.t === 'rename' && m.s === 'rename-to' && m.to === 'rename-back', 'legacy rename frame');
+  host2.sendSessions([shellSession('rename-back')]);
+  const legacyRes = await legacy;
+  assert.equal(legacyRes.status, 200);
+  assert.deepEqual(legacyRes.body, { ok: true, name: 'rename-back', hosted: true });
 });
