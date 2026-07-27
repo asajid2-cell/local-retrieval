@@ -18,6 +18,7 @@
     --txt:#ededf0; --muted:#9494a0; --faint:#6a6a76;
     --rose:#fb7185; --rose-dim:rgba(251,113,133,.14);
     --live:#34d399; --warn:#fbbf24;
+    --info:#60a5fa;
     --sp1:4px; --sp2:8px; --sp3:12px; --sp4:16px;
     --r-s:7px; --r-m:9px; --r-l:14px;
   }
@@ -212,6 +213,7 @@
 
   /* ---- projects view (synced from the desktop app) ---- */
   #projects { grid-area:term; display:none; flex-direction:column; min-height:0; min-width:0; background:var(--bg); }
+  #fleetList { grid-area:term; display:none; flex-direction:column; min-height:0; min-width:0; overflow:auto; background:var(--bg); }
   #app.projects #term { display:none; }
   #app.projects #projects { display:flex; }
   #app.projects #tabwrap, #app.projects #status, #app.projects #keybar { display:none; }
@@ -257,6 +259,29 @@
   .chat .rdot { display:none; width:7px; height:7px; border-radius:50%; background:var(--warn); box-shadow:0 0 0 3px rgba(251,191,36,.14); flex:0 0 auto; }
   .chat.run .rdot { display:block; }
   #projempty, .projempty { margin:auto; text-align:center; color:var(--muted); font-size:13.5px; line-height:1.6; padding:var(--sp4); }
+
+  /* ---- fleet glance ---- */
+  .fleet-row { width:100%; min-height:44px; text-align:left; display:flex; flex-direction:column; gap:var(--sp1); padding:var(--sp2) var(--sp3); background:var(--raised); border:1px solid var(--line); border-radius:var(--r-s); cursor:pointer; color:var(--txt); font:inherit; }
+  .fleet-row:active { background:var(--raised-2); }
+  .fleet-head { display:flex; align-items:center; gap:var(--sp2); min-width:0; }
+  .fleet-chip { width:8px; height:8px; border-radius:50%; flex:0 0 auto; }
+  .fleet-name { font-weight:600; font-size:13px; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .fleet-label { font-size:11px; color:var(--muted); flex:0 0 auto; }
+  .fleet-age { font-size:11px; color:var(--faint); margin-left:auto; flex:0 0 auto; }
+  .fleet-badges { display:flex; gap:var(--sp1); flex-wrap:wrap; }
+  .fleet-badge { font-size:10px; padding:1px 6px; border-radius:var(--r-s); background:var(--panel); color:var(--muted); }
+  .fleet-autoheal { color:var(--warn); }
+  .fleet-degraded { color:var(--rose); }
+  .fleet-signed { color:var(--live); }
+  .fleet-snippet { font:12px/1.5 ui-monospace,"Cascadia Code","Source Code Pro",Menlo,Consolas,monospace; margin:0; white-space:pre-wrap; overflow:hidden; display:-webkit-box; -webkit-box-orient:vertical; -webkit-line-clamp:2; line-clamp:2; color:var(--muted); }
+  .fleet-empty { padding:var(--sp4) var(--sp3); color:var(--muted); text-align:center; }
+  .fleet-state-green .fleet-chip { background:var(--live); }
+  .fleet-state-amber .fleet-chip { background:var(--warn); }
+  .fleet-state-red .fleet-chip { background:var(--rose); }
+  .fleet-state-grey .fleet-chip { background:var(--muted); }
+  .fleet-state-gray .fleet-chip { background:var(--muted); }
+  .fleet-state-blue .fleet-chip { background:var(--info); }
+  .fleet-state-unknown .fleet-chip { background:var(--faint); }
 
   /* ---- popover menu (tab kebab) ---- */
   #menu {
@@ -432,7 +457,7 @@
       grid-template-areas:"topbar" "term" "status" "mobileNav";
     }
     #mobileNav {
-      grid-area:mobileNav; display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:var(--sp1);
+      grid-area:mobileNav; display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:var(--sp1);
       padding:var(--sp1) var(--sp2); padding-bottom:max(var(--sp1),env(safe-area-inset-bottom));
       background:var(--panel); border-top:1px solid var(--line); min-width:0;
     }
@@ -476,6 +501,13 @@
     #app.mobile-view-sessions .newtab::before {
       content:"New session"; color:var(--rose); font-size:14px; font-weight:600; line-height:1;
     }
+
+    #app.mobile-view-fleet {
+      grid-template-rows:auto minmax(0,1fr) auto auto;
+      grid-template-areas:"topbar" "term" "status" "mobileNav";
+    }
+    #app.mobile-view-fleet #term, #app.mobile-view-fleet #keybar, #app.mobile-view-fleet #tabwrap { display:none; }
+    #app.mobile-view-fleet #fleetList { display:flex; }
 
     #app.mobile-view-terminal {
       grid-template-rows:auto minmax(0,1fr) auto auto;
@@ -570,6 +602,8 @@
     <button id="jumplive" aria-label="Jump to live"><span id="jlcount">new</span> ↓</button>
   </main>
 
+  <div id="fleetList" aria-label="Fleet glance"></div>
+
   <div id="status"><span class="sdot"></span><span id="statustext">connecting&hellip;</span><span class="meta" id="statusmeta"></span></div>
   <div id="keybar"></div>
   <nav id="mobileNav" aria-label="Mobile views">
@@ -580,6 +614,10 @@
     <button type="button" data-mobile-view="terminal" aria-label="Terminal" aria-pressed="false">
       <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><rect x="3.5" y="5" width="17" height="14" rx="2" stroke="currentColor" stroke-width="1.7"/><path d="M7 10l3 2-3 2M12.5 15h4" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
       <span>Terminal</span>
+    </button>
+    <button type="button" data-mobile-view="fleet" aria-label="Fleet" aria-pressed="false">
+      <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1.5" stroke="currentColor" stroke-width="1.7"/><rect x="14" y="3" width="7" height="7" rx="1.5" stroke="currentColor" stroke-width="1.7"/><rect x="3" y="14" width="7" height="7" rx="1.5" stroke="currentColor" stroke-width="1.7"/><rect x="14" y="14" width="7" height="7" rx="1.5" stroke="currentColor" stroke-width="1.7"/></svg>
+      <span>Fleet</span>
     </button>
     <a class="projects" href="projects.html" aria-label="Projects">
       <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M3 7a2 2 0 012-2h3.6a2 2 0 011.5.7L12 7.5h7a2 2 0 012 2V17a2 2 0 01-2 2H5a2 2 0 01-2-2V7z" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></svg>
@@ -694,16 +732,26 @@
 <script src="vendor/xterm.js"></script>
 <script src="vendor/addon-fit.js"></script>
 <script src="intent-journal.js"></script>
+<script src="fleet.js"></script>
 <script>
 const $ = s => document.querySelector(s);
 const base = location.pathname.replace(/\/[^/]*$/, '') || '';
 const api = p => fetch(base + '/api/' + p, { headers:{'Content-Type':'application/json'} });
 const LS = { get:(k,d)=>{ try{ return JSON.parse(localStorage.getItem(k)) ?? d; }catch(e){ return d; } }, set:(k,v)=>{ try{ localStorage.setItem(k, JSON.stringify(v)); }catch(e){} } };
 const mobileMQ = window.matchMedia ? window.matchMedia('(max-width: 59.99rem)') : {matches:false,addEventListener:()=>{},addListener:()=>{}};
-const MOBILE_VIEWS = ['sessions','terminal','keys'];
+const MOBILE_VIEWS = ['sessions','fleet','terminal','keys'];
 let mobileView = LS.get('mux_mobile_view','terminal');
 if(!MOBILE_VIEWS.includes(mobileView)) mobileView='terminal';
 const isMobile = () => !!mobileMQ.matches;
+let fleetPollInterval = null;
+
+function refreshFleet(){
+  if(!window.MuxFleet || !$("#fleetList")) return;
+  MuxFleet.fetchFleet(base).then(function(data){
+    MuxFleet.renderFleet($("#fleetList"), data);
+  }).catch(function(){});
+}
+
 function setMobileView(view, persist=true){
   if(!MOBILE_VIEWS.includes(view)) view='terminal';
   mobileView=view;
@@ -715,7 +763,16 @@ function setMobileView(view, persist=true){
     b.classList.toggle('active', on);
     b.setAttribute('aria-pressed', on?'true':'false');
   });
-  if(isMobile() && view!=='sessions'){
+  if(isMobile() && view==='fleet'){
+    refreshFleet();
+    if(!fleetPollInterval) fleetPollInterval = setInterval(function(){
+      if(!isMobile() || mobileView!=='fleet'){ clearInterval(fleetPollInterval); fleetPollInterval = null; return; }
+      refreshFleet();
+    }, 5000);
+  } else {
+    if(fleetPollInterval){ clearInterval(fleetPollInterval); fleetPollInterval = null; }
+  }
+  if(isMobile() && view!=='sessions' && view!=='fleet'){
     setTimeout(()=>{ applyViewport(); try{ term.focus(); }catch(e){} }, 60);
   }
 }
@@ -731,6 +788,7 @@ function syncMobileView(){
 }
 function initMobileViews(){
   document.querySelectorAll('[data-mobile-view]').forEach(b=> b.onclick=()=>setMobileView(b.dataset.mobileView));
+  if(window.MuxFleet) MuxFleet.attachFleet($("#fleetList"), function(name){ setMobileView("terminal"); connect(name, false); });
   if(mobileMQ.addEventListener) mobileMQ.addEventListener('change', syncMobileView);
   else if(mobileMQ.addListener) mobileMQ.addListener(syncMobileView);
   syncMobileView();
