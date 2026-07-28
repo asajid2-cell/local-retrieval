@@ -1556,7 +1556,13 @@ term.onData(d => {
 });
 
 // ---- status ----
-function setStatus(state, text){ const s=$('#status'); s.className=''; if(state) s.classList.add(state); $('#statustext').innerHTML=text; }
+function setStatusState(state){ const s=$('#status'); s.className=''; if(state) s.classList.add(state); }
+// TEXT-ONLY status writer. Everything caller-supplied lands here — session names, API/bridge
+// error details, filenames — so a hostile string can never become markup in the status bar.
+function setStatus(state, text){ setStatusState(state); $('#statustext').textContent = text==null?'':String(text); }
+// The ONLY status writer that renders markup. Call it with a literal template whose every
+// ${…} is esc()-wrapped; never hand it a string that came from a caller, the API, or muxd.
+function setStatusHtml(state, html){ setStatusState(state); $('#statustext').innerHTML = html; }
 
 // ---- jump-to-live ----
 let newLines=0;
@@ -1608,7 +1614,7 @@ function stopAttach(name, reason){
   current = null;
   LS.set('mux_last', null);
   $('#empty').style.display='flex';
-  setStatus('warn', `<span class="name">${esc(name)}</span> &middot; ${esc(reason || 'session is not attachable')}`);
+  setStatusHtml('warn', `<span class="name">${esc(name)}</span> &middot; ${esc(reason || 'session is not attachable')}`);
   renderTabs();
 }
 function closeRefusal(ev){
@@ -1620,7 +1626,7 @@ function closeRefusal(ev){
 function scheduleReconnect(name){
   clearReconnect();
   if (document.visibilityState!=='visible') return;
-  setStatus('busy', `<span class="name">${esc(name)}</span> &middot; reconnecting&hellip;`);
+  setStatusHtml('busy', `<span class="name">${esc(name)}</span> &middot; reconnecting&hellip;`);
   reconnectTimer = setTimeout(()=>{ if(current===name) connect(name, true); }, reconnectDelay);
   reconnectDelay = Math.min(10000, reconnectDelay*1.7);
 }
@@ -1652,7 +1658,7 @@ function connect(name, isRetry){
   buildKeybar();
   resetTaDelta(true);                // start the mobile input-delta buffer fresh on a session switch
   newLines=0; showJump();
-  setStatus('busy', `connecting to <span class="name">${esc(name)}</span>&hellip;`);
+  setStatusHtml('busy', `connecting to <span class="name">${esc(name)}</span>&hellip;`);
   renderTabs();
   if(isMobile()) setMobileView('terminal');
   scheduleViewportFit(0);
@@ -1669,7 +1675,7 @@ function connect(name, isRetry){
     const sock = ws = new WebSocket(`${proto}//${location.host}${base}/ws?session=${encodeURIComponent(name)}&cols=${(viewportFit&&viewportFit.cols)||term.cols}&rows=${(viewportFit&&viewportFit.rows)||term.rows}&dev=${encodeURIComponent(deviceId)}&label=${encodeURIComponent(deviceLabel)}`);
     sock.binaryType='arraybuffer';
     const fresh = ()=> generation===attachGeneration && ws===sock && current===name;
-    sock.onopen = () => { if(!fresh()) return; reconnectDelay=1000; setStatus('live', `<span class="name">${esc(name)}</span> &middot; live`); scheduleViewportFit(0); term.focus(); };
+    sock.onopen = () => { if(!fresh()) return; reconnectDelay=1000; setStatusHtml('live', `<span class="name">${esc(name)}</span> &middot; live`); scheduleViewportFit(0); term.focus(); };
     sock.onmessage = e => { if(!fresh()) return;
       if(typeof e.data==='string'){ onControl(e.data); return; }     // control frame: shared window size
       if(isFrozen()){ _frozenBuf.push(new Uint8Array(e.data)); if(_frozenBuf.length>6000) _frozenBuf.splice(0, _frozenBuf.length-6000); return; }   // FROZEN for selection: buffer output; a repaint would wipe the highlight
@@ -1741,7 +1747,7 @@ async function loadSessions(select){
     if(list.find(s=>s.name===select)){ connect(select); return; }
     history.replaceState(null,'',location.pathname);
     LS.set('mux_last', null);
-    setStatus('warn', `<span class="name">${esc(select)}</span> &middot; session not found`);
+    setStatusHtml('warn', `<span class="name">${esc(select)}</span> &middot; session not found`);
   }
   if (!current && list.length) {
     const choices = list.filter(s=>!attachBlocker(s));
@@ -1751,7 +1757,7 @@ async function loadSessions(select){
     setStatus('warn', 'No live sessions to attach. Dormant tabs are ready to relaunch from Projects or with mux locally.');
     return;
   }
-  if (!current && !list.length) setStatus('', 'No sessions &mdash; tap + to start one');
+  if (!current && !list.length) setStatus('', 'No sessions — tap + to start one');
 }
 function renderTabs(){
   const list = window._sessions||[];
@@ -1789,14 +1795,14 @@ function renderTabs(){
     }
     if (s.legacyTwin || s.legacyBlocked) t.title += ' - legacy tmux blocker';
     t.querySelector('.kebab').setAttribute('aria-label', 'Actions for '+s.name);
-    t.onclick = (ev)=>{ if(ev.target.closest('.kebab')) return; if(s.legacyBlocked){ setStatus('warn', esc(s.detail || 'Legacy tmux blocker')); return; } connect(s.name); };
+    t.onclick = (ev)=>{ if(ev.target.closest('.kebab')) return; if(s.legacyBlocked){ setStatus('warn', s.detail || 'Legacy tmux blocker'); return; } connect(s.name); };
     t.onkeydown = (ev)=>{
-      if((ev.key==='Enter'||ev.key===' ') && !ev.target.closest('.kebab')){ ev.preventDefault(); if(s.legacyBlocked) setStatus('warn', esc(s.detail || 'Legacy tmux blocker')); else connect(s.name); }
+      if((ev.key==='Enter'||ev.key===' ') && !ev.target.closest('.kebab')){ ev.preventDefault(); if(s.legacyBlocked) setStatus('warn', s.detail || 'Legacy tmux blocker'); else connect(s.name); }
       else if(ev.key==='Delete'||ev.key==='Backspace'||ev.key==='ContextMenu'){ ev.preventDefault(); openMenu(s, t.querySelector('.kebab')); }   // keyboard route to actions
     };
     t.querySelector('.kebab').onclick = (ev)=>{ ev.stopPropagation(); openMenu(s, ev.currentTarget); };
     if (s.dormant) {
-      const dormantMsg = () => setStatus('warn', esc(s.detail || 'Dormant session - relaunch from Projects or run mux locally.'));
+      const dormantMsg = () => setStatus('warn', s.detail || 'Dormant session - relaunch from Projects or run mux locally.');
       t.onclick = (ev)=>{ if(ev.target.closest('.kebab')) return; dormantMsg(); };
       t.onkeydown = (ev)=>{ if((ev.key==='Enter'||ev.key===' ') && !ev.target.closest('.kebab')){ ev.preventDefault(); dormantMsg(); } else if(ev.key==='Delete'||ev.key==='Backspace'||ev.key==='ContextMenu'){ ev.preventDefault(); openMenu(s, t.querySelector('.kebab')); } };
     }
@@ -1996,7 +2002,9 @@ async function killSession(name){
     loadSessions();
   }catch(e){ flash('Kill failed: '+(e.message||e)); loadSessions(); }
 }
-function flash(msg){ setStatus('', msg); setTimeout(()=>{ if(current) setStatus(ws&&ws.readyState===1?'live':'busy', `<span class="name">${esc(current)}</span> &middot; ${ws&&ws.readyState===1?'live':'reconnecting…'}`); }, 1400); }
+// flash() text is frequently attacker-influenced (collection names, API/bridge error details,
+// uploaded filenames) — it goes out as text; only the live-status restore renders markup.
+function flash(msg){ setStatus('', msg); setTimeout(()=>{ if(current) setStatusHtml(ws&&ws.readyState===1?'live':'busy', `<span class="name">${esc(current)}</span> &middot; ${esc(ws&&ws.readyState===1?'live':'reconnecting…')}`); }, 1400); }
 
 function syncedChat(name){
   for(const c of (_appCollections||[])){
