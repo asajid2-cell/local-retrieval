@@ -400,6 +400,83 @@ _CONPTY_HOST_EXECUTABLES = (
 _ORPHANED_CONPTY_LOCK = threading.Lock()
 _ORPHANED_CONPTY_HOSTS = {}
 _PENDING_CONPTY_BASELINES = {}
+# Baselines the reaper gave up on. Diagnostic only: nothing reads this to make a decision, so a
+# quarantine that can never resolve degrades into a log line instead of wedging every future spawn.
+_ABANDONED_CONPTY_BASELINES = []
+CONPTY_ABANDONED_BASELINE_LIMIT = 16
+CONPTY_CUSTODY_TTL = float(os.environ.get("MUXD_CONPTY_CUSTODY_TTL", "300"))
+CONPTY_QUARANTINE_TTL = float(os.environ.get("MUXD_CONPTY_QUARANTINE_TTL", "60"))
+CONPTY_QUARANTINE_MAX_ATTEMPTS = 5
+# Last emission of each recurring "still pending" line, so unchanged state stops narrating
+# itself every reap. One slot PER KIND, not one shared slot: both lines can fire inside the
+# same reap pass with different signatures, and a single slot would see them alternate and
+# never suppress anything. Transition lines (abandoning / quarantine expired) never come here.
+_LAST_CUSTODY_EMISSION = {
+    "discovery": {"sig": None, "at": 0.0, "repeats": 0},
+    "cleanup": {"sig": None, "at": 0.0, "repeats": 0},
+}
+CONPTY_EMISSION_INTERVAL = 60.0
+CONPTY_REAPER_INTERVAL = 5.0
+CONPTY_REAPER_MAX_INTERVAL = 30.0
+
+def _custody_record(reason, now=None):
+    stamp = time.monotonic() if now is None else float(now)
+    return {
+        "reason": str(reason or ""),
+        "first_seen": stamp,
+        "last_attempt": stamp,
+        "attempts": 0,
+    }
+
+def _custody_age(record, now=None):
+    stamp = time.monotonic() if now is None else float(now)
+    return max(0.0, stamp - float(record.get("first_seen", stamp)))
+
+def _custody_touch(record, now=None):
+    stamp = time.monotonic() if now is None else float(now)
+    record["attempts"] = int(record.get("attempts", 0)) + 1
+    record["last_attempt"] = stamp
+    return record
+
+def _custody_emission_signature(retained=(), failures=()):
+    """The observable custody state a 'still pending' line is reporting on. Two passes that
+    produce the same signature are saying the same thing, so only the first needs to speak."""
+    with _ORPHANED_CONPTY_LOCK:
+        pending = tuple(sorted(_PENDING_CONPTY_BASELINES))
+    return (tuple(sorted(retained)), tuple(failures), pending)
+
+def _emit_custody_pending(kind, signature, message, now=None):
+    """Log a recurring custody line only when its state changed, or once per
+    CONPTY_EMISSION_INTERVAL while it has not — a permanently stuck record then reports once a
+    minute instead of 720 times an hour. Suppressed repeats are counted onto the next line."""
+    slot = _LAST_CUSTODY_EMISSION[kind]
+    stamp = time.monotonic() if now is None else float(now)
+    if slot["sig"] == signature and stamp - float(slot["at"]) < CONPTY_EMISSION_INTERVAL:
+        slot["repeats"] = int(slot.get("repeats", 0)) + 1
+        return False
+    repeats = int(slot.get("repeats", 0))
+    slot["sig"] = signature
+    slot["at"] = stamp
+    slot["repeats"] = 0
+    log(f"{message} (repeated {repeats}x)" if repeats else message)
+    return True
+
+def _reaper_tick_signature(retained_count):
+    """What the reaper tick compares between passes: a reap that changed nothing at all
+    produces an identical signature, including the count it still holds."""
+    with _ORPHANED_CONPTY_LOCK:
+        hosts = tuple(sorted(_ORPHANED_CONPTY_HOSTS))
+        pending = tuple(sorted(_PENDING_CONPTY_BASELINES))
+    return (int(retained_count), hosts, pending)
+
+def _reaper_backoff(prev_sig, sig, prev_delay):
+    """Sleep before the next reap. Any progress — a changed signature, a newly retained
+    record — snaps back to CONPTY_REAPER_INTERVAL; a reap that moved nothing doubles toward
+    CONPTY_REAPER_MAX_INTERVAL so a hopeless record cannot spin the executor every 5s."""
+    if prev_sig is None or sig != prev_sig:
+        return CONPTY_REAPER_INTERVAL
+    delay = float(prev_delay or CONPTY_REAPER_INTERVAL)
+    return min(CONPTY_REAPER_MAX_INTERVAL, max(CONPTY_REAPER_INTERVAL, delay * 2.0))
 
 def _direct_child_pids(parent_pid, executable_name=""):
     if os.name != "nt":
@@ -585,41 +662,115 @@ def _retain_orphaned_conpty_hosts(owned, reason):
         return
     with _ORPHANED_CONPTY_LOCK:
         for pid, start_token in records:
-            _ORPHANED_CONPTY_HOSTS[(int(pid), str(start_token))] = str(reason or "")
+            key = (int(pid), str(start_token))
+            # An already-custodied host keeps its original first_seen and first reason:
+            # re-retaining must not reset the age clock a later GC pass reads.
+            if key not in _ORPHANED_CONPTY_HOSTS:
+                _ORPHANED_CONPTY_HOSTS[key] = _custody_record(reason)
     log(f"[conpty] retained {len(records)} orphan host record(s) for supervised cleanup: {reason}")
 
 def _retain_pending_conpty_baseline(records, reason):
     baseline = tuple(sorted((int(pid), str(token)) for pid, token in (records or {}).items()))
     with _ORPHANED_CONPTY_LOCK:
-        _PENDING_CONPTY_BASELINES[baseline] = str(reason or "")
+        if baseline not in _PENDING_CONPTY_BASELINES:
+            _PENDING_CONPTY_BASELINES[baseline] = _custody_record(reason)
     log(f"[conpty] quarantined new PTY spawns pending orphan discovery: {reason}")
 
 def _reap_orphaned_conpty_hosts(timeout=5):
     with _CONPTY_SPAWN_LOCK:
         with _ORPHANED_CONPTY_LOCK:
             pending_baselines = list(_PENDING_CONPTY_BASELINES.items())
-        for baseline_key, reason in pending_baselines:
+        for baseline_key, baseline_record in pending_baselines:
+            reason = baseline_record["reason"]
             try:
                 discovered = _new_conpty_host_processes(
                     dict(baseline_key),
                     timeout=min(1.0, max(0.1, timeout)),
                 )
             except OSError as error:
-                log(f"[conpty] orphan discovery still pending: {error}")
+                # Enumeration failed again — the same fault that created this baseline. Age it, and
+                # once it is hopeless drop it so spawns resume; a leaked host beats a dead daemon.
+                _custody_touch(baseline_record)
+                age = _custody_age(baseline_record)
+                attempts = int(baseline_record.get("attempts", 0))
+                if age > CONPTY_QUARANTINE_TTL or attempts >= CONPTY_QUARANTINE_MAX_ATTEMPTS:
+                    with _ORPHANED_CONPTY_LOCK:
+                        _PENDING_CONPTY_BASELINES.pop(baseline_key, None)
+                        _ABANDONED_CONPTY_BASELINES.append({
+                            "baseline": baseline_key,
+                            "reason": reason,
+                            "age": age,
+                            "attempts": attempts,
+                            "error": str(error),
+                        })
+                        del _ABANDONED_CONPTY_BASELINES[:-CONPTY_ABANDONED_BASELINE_LIMIT]
+                    log(
+                        f"[conpty] quarantine expired after {age:.1f}s / {attempts} attempt(s), "
+                        f"resuming spawns (orphan hosts may have leaked): {reason}"
+                    )
+                    continue
+                _emit_custody_pending(
+                    "discovery",
+                    _custody_emission_signature(failures=(str(error),)),
+                    f"[conpty] orphan discovery still pending: {error}",
+                )
                 continue
             with _ORPHANED_CONPTY_LOCK:
                 _PENDING_CONPTY_BASELINES.pop(baseline_key, None)
             _retain_orphaned_conpty_hosts(discovered, reason)
         with _ORPHANED_CONPTY_LOCK:
             records = list(_ORPHANED_CONPTY_HOSTS)
-    retained, failures = _terminate_conhost_records(records, timeout=timeout)
+    # Partition before terminating: a custody record must never outlive its subject.
+    # The _same_process_instance probes call into Win32, so they run OUTSIDE the lock.
+    live = []
+    dormant = []
+    abandoned = []
+    for key in records:
+        pid, start_token = key
+        if not _same_process_instance(int(pid), start_token):
+            # Dead pid, or the pid was recycled onto an unrelated process. Either way
+            # there is nothing of ours left to kill — dropping is not a failure.
+            dormant.append(key)
+            continue
+        with _ORPHANED_CONPTY_LOCK:
+            record = _ORPHANED_CONPTY_HOSTS.get(key)
+        if record is None:
+            continue
+        age = _custody_age(record)
+        if age > CONPTY_CUSTODY_TTL:
+            abandoned.append((key, record, age))
+            continue
+        live.append(key)
+    if dormant or abandoned:
+        with _ORPHANED_CONPTY_LOCK:
+            for key in dormant:
+                _ORPHANED_CONPTY_HOSTS.pop(key, None)
+            for key, _record, _age in abandoned:
+                _ORPHANED_CONPTY_HOSTS.pop(key, None)
+    for key, record, age in abandoned:
+        log(
+            f"[conpty] abandoning orphan host record pid={key[0]} after {age:.1f}s"
+            f" / {int(record.get('attempts', 0))} attempt(s): {record['reason']}"
+        )
+    if live:
+        retained, failures = _terminate_conhost_records(live, timeout=timeout)
+    else:
+        retained, failures = [], []
     retained_set = set(retained)
     with _ORPHANED_CONPTY_LOCK:
-        for record in records:
-            if record not in retained_set:
-                _ORPHANED_CONPTY_HOSTS.pop(record, None)
+        for key in live:
+            if key not in retained_set:
+                _ORPHANED_CONPTY_HOSTS.pop(key, None)
+                continue
+            record = _ORPHANED_CONPTY_HOSTS.get(key)
+            if record is not None:
+                _custody_touch(record)
     if failures:
-        log(f"[conpty] supervised orphan cleanup still pending: {'; '.join(failures)}")
+        _emit_custody_pending(
+            "cleanup",
+            _custody_emission_signature(retained, failures),
+            f"[conpty] supervised orphan cleanup still pending: {'; '.join(failures)}",
+        )
     return len(retained)
 
 def _release_pty_conhosts(pty, session_name="?", timeout=3):
@@ -905,6 +1056,20 @@ CLAIM_ROOT = ENV.get("LAUNCH_CLAIM_ROOT") or os.path.join(
     "launch-claims",
 )
 CLAIM_TTL_SECONDS = max(10, int(ENV.get("LAUNCH_CLAIM_TTL_SECONDS", "120")))
+# Custody TTL: how long a session record muxd is no longer running stays on the books. A dormant tab
+# is a promise to relaunch; a record nobody has touched for a day is landfill that the relay would
+# keep showing forever. os.environ wins over .env so an operator can shorten it for one run.
+CUSTODY_TTL_SECONDS = max(
+    60, int(os.environ.get("MUX_CUSTODY_TTL_S") or ENV.get("MUX_CUSTODY_TTL_S") or "86400")
+)
+# identityPending means a launch is mid-flight with no captured identity yet — reclaiming it would
+# orphan a process nobody can find again, so it survives its deadline by this much.
+CUSTODY_IDENTITY_GRACE_SECONDS = max(
+    30, int(os.environ.get("MUX_CUSTODY_IDENTITY_GRACE_S") or ENV.get("MUX_CUSTODY_IDENTITY_GRACE_S") or "900")
+)
+CUSTODY_GC_INTERVAL_SECONDS = max(
+    30, int(os.environ.get("MUX_CUSTODY_GC_INTERVAL_S") or ENV.get("MUX_CUSTODY_GC_INTERVAL_S") or "600")
+)
 PROTOCOL = 4
 CAPS = ["ls", "info", "create", "createAck", "bind", "input", "open", "attach", "kill", "rename", "heal", "tail", "scrollback", "resize", "owner", "relaunch"]
 STARTED = time.time()
@@ -1429,6 +1594,9 @@ class Session:
         self.owner_key = ""
         self.identity_pending = False
         self.lifecycle = "active" if spawn_now else "dormant"
+        self.last_alive_utc = ""
+        self.custody_expires_utc = ""
+        custody_refresh(self)
         self.child_pid = 0
         self.child_start_token = ""
         self.stop_disposition = ""
@@ -1467,9 +1635,13 @@ class Session:
             direct_cmd = True
         with _CONPTY_SPAWN_LOCK:
             with _ORPHANED_CONPTY_LOCK:
+                # Expired baselines are popped by the reaper, so a non-empty dict means a LIVE
+                # quarantine. Deliberately no expiry check here: this runs under the spawn lock.
                 if _PENDING_CONPTY_BASELINES:
+                    blocking = next(iter(_PENDING_CONPTY_BASELINES.values()))
                     raise RuntimeError(
-                        "ConPTY custody is quarantined pending orphan-host discovery"
+                        "ConPTY custody is quarantined pending orphan-host discovery: "
+                        f"{blocking.get('reason', '')}"
                     )
             conpty_hosts_before = _conpty_host_process_records(os.getpid())
             try:
@@ -1764,6 +1936,9 @@ class OwnerSession:
         self.owner_key = str(owner_key or "")
         self.identity_pending = False
         self.lifecycle = "active"
+        self.last_alive_utc = ""
+        self.custody_expires_utc = ""
+        custody_refresh(self)
         self.child_pid = 0
         self.child_start_token = ""
         self.stop_disposition = ""
@@ -1959,6 +2134,153 @@ def start_watchdog_thread():
 
     threading.Thread(target=run, name="muxd-watchdog", daemon=True).start()
 
+def custody_now(now=None):
+    return time.time() if now is None else float(now)
+
+def custody_stamp(epoch):
+    return datetime.fromtimestamp(float(epoch), timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+def custody_epoch(stamp):
+    # 0.0 means "no custody stamp" — that is NOT the same as expired (see custody_expired).
+    text = str(stamp or "").strip()
+    if not text:
+        return 0.0
+    try:
+        parsed = datetime.fromisoformat(text[:-1] + "+00:00" if text.endswith("Z") else text)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return float(parsed.timestamp())
+    except Exception:
+        return 0.0
+
+def _custody_field(record, key, attr, default=None):
+    if isinstance(record, dict):
+        return record.get(key, default)
+    return getattr(record, attr, default)
+
+def custody_deadline(record):
+    return custody_epoch(_custody_field(record, "custodyExpiresUtc", "custody_expires_utc", ""))
+
+def custody_refresh(session, now=None, ttl=None):
+    at = custody_now(now)
+    session.last_alive_utc = custody_stamp(at)
+    session.custody_expires_utc = custody_stamp(at + float(CUSTODY_TTL_SECONDS if ttl is None else ttl))
+    return session.custody_expires_utc
+
+def custody_seed(session, now=None, ttl=None):
+    # A record persisted before custody existed carries no deadline. Seeding it a full TTL means the
+    # first boot after the upgrade lists every dormant tab exactly as before instead of eating them.
+    if custody_deadline(session) > 0:
+        return False
+    custody_refresh(session, now=now, ttl=ttl)
+    return True
+
+def custody_expired(record, now=None):
+    deadline = custody_deadline(record)
+    return deadline > 0 and custody_now(now) >= deadline
+
+def custody_protected(record, now=None):
+    alive = _custody_field(record, "alive", "alive", None)
+    if callable(alive):
+        try:
+            alive = bool(alive())
+        except Exception:
+            alive = False
+    if bool(alive):
+        return True
+    if _custody_field(record, "_launch_claim", "_launch_claim", None) is not None:
+        return True
+    if list(_custody_field(record, "claimPaths", "claim_paths", []) or []):
+        return True
+    if bool(_custody_field(record, "identityPending", "identity_pending", False)):
+        return custody_now(now) < custody_deadline(record) + CUSTODY_IDENTITY_GRACE_SECONDS
+    return False
+
+def custody_reclaimable(record, now=None):
+    """The one predicate: a reclaimable record is GC'd AND never emitted, so the relay can never
+    see a row muxd is about to delete. Only parked lifecycles are ever reclaimable."""
+    lifecycle = str(_custody_field(record, "lifecycle", "lifecycle", "active") or "active")
+    if lifecycle not in ("dormant", "failed"):
+        return False
+    return custody_expired(record, now) and not custody_protected(record, now)
+
+def refresh_live_custody(source=None, now=None, ttl=None):
+    source = sessions if source is None else source
+    refreshed = []
+    for name, s in list(source.items()):
+        try:
+            alive = bool(s.alive())
+        except Exception:
+            alive = False
+        if alive:
+            custody_refresh(s, now=now, ttl=ttl)
+            refreshed.append(name)
+    return refreshed
+
+def gc_expired_custody(source=None, now=None):
+    source = sessions if source is None else source
+    reclaimed = [name for name, s in list(source.items()) if custody_reclaimable(s, now)]
+    for name in reclaimed:
+        source.pop(name, None)
+    return reclaimed
+
+def restore_manifest_sessions(records, target=None, loop=None, outq=None, now=None):
+# Boot's manifest rehydration, lifted out of main() so tests can drive the REAL restore path:
+    # boot runs inside main() behind a live relay link and has no unit-test seam. Behaviour is
+    # unchanged from the inline loop it replaces.
+    target = sessions if target is None else target
+    restored_names = []
+    for name, m in records.items():
+        if not strict_mux_name(name) or name in target:
+            continue
+        heal = bool(m.get("heal"))
+        mcmd = m.get("cmd", "")
+        ids = m.get("ids") if isinstance(m.get("ids"), list) else []
+        aliases = m.get("aliases") if isinstance(m.get("aliases"), list) else []
+        try:
+            restored = Session(
+                name, mcmd, m.get("cwd", ""), m.get("cols", 140), m.get("rows", 40),
+                loop, outq, heal=heal, spawn_now=False, ids=ids,
+                session_id=m.get("sessionId", ""), aliases=aliases
+            )
+            restored.expected_owner = bool(m.get("owner"))
+            restored.owner_key = str(m.get("ownerKey", "") or "")
+            restored.identity_pending = bool(m.get("identityPending"))
+            restored.lifecycle = str(m.get("lifecycle", "active") or "active")
+            if restored.lifecycle not in ("active", "dormant", "starting", "stopping", "failed"):
+                restored.lifecycle = "failed"
+            restored.child_pid = int(m.get("childPid", 0) or 0)
+            restored.child_start_token = str(m.get("childStartToken", "") or "")
+            restored.stop_disposition = str(m.get("stopDisposition", "") or "")
+            if restored.stop_disposition not in ("", "remove", "replace"):
+                restored.stop_disposition = ""
+            restored.user_killed = bool(m.get("userKilled", False))
+            restored.generation_id = str(m.get("generationId", "") or restored.generation_id)
+            restored.operation_key = str(m.get("operationKey", "") or "")
+            restored.operation_fingerprint = str(m.get("operationFingerprint", "") or "")
+            restored.operation_created = bool(m.get("operationCreated", False))
+            restored.last_alive_utc = str(m.get("lastAliveUtc", "") or "")
+            restored.custody_expires_utc = str(m.get("custodyExpiresUtc", "") or "")
+            custody_seed(restored, now=now)   # pre-custody record: full TTL, not instant reclamation
+            restored.deaths = [
+                float(value)
+                for value in (m.get("deaths") if isinstance(m.get("deaths"), list) else [])
+                if isinstance(value, (int, float))
+            ][-16:]
+        except Exception as error:
+            raise RuntimeError(f"could not restore durable session {name}") from error
+        target[name] = restored
+        restored_names.append(name)
+    return restored_names
+
+def boot_removes_record(restored):
+    # A durable stop intent that boot must complete: the user killed it, or it was mid-`stopping`
+    # with a `remove` disposition. Separate from custody GC, and it runs first.
+    return bool(getattr(restored, "user_killed", False)) or (
+        str(getattr(restored, "lifecycle", "active") or "active") == "stopping"
+        and str(getattr(restored, "stop_disposition", "") or "") == "remove"
+    )
+
 def session_records_payload(source=None):
     source = sessions if source is None else source
     return {
@@ -1978,6 +2300,8 @@ def session_records_payload(source=None):
             "operationKey": str(getattr(s, "operation_key", "") or ""),
             "operationFingerprint": str(getattr(s, "operation_fingerprint", "") or ""),
             "operationCreated": bool(getattr(s, "operation_created", False)),
+            "lastAliveUtc": str(getattr(s, "last_alive_utc", "") or ""),
+            "custodyExpiresUtc": str(getattr(s, "custody_expires_utc", "") or ""),
             "deaths": [float(value) for value in list(getattr(s, "deaths", []) or [])[-16:]]}
         for n, s in source.items()
     }
@@ -2028,6 +2352,8 @@ def valid_session_records(value):
         and isinstance(record.get("operationKey", ""), str)
         and isinstance(record.get("operationFingerprint", ""), str)
         and isinstance(record.get("operationCreated", False), bool)
+        and isinstance(record.get("lastAliveUtc", ""), str)
+        and isinstance(record.get("custodyExpiresUtc", ""), str)
         for name, record in value.items()
     )
 
@@ -2087,6 +2413,8 @@ _PERSISTED_SESSION_FIELDS = (
     "operation_created",
     "deaths",
     "user_killed",
+    "last_alive_utc",
+    "custody_expires_utc",
 )
 
 def persisted_session_snapshot(session):
@@ -2108,9 +2436,11 @@ def restore_persisted_session(session, snapshot):
     session._launch_claim = snapshot["_launch_claim"]
     session.claim_paths = list(snapshot["claim_paths"])
 
-def live_tabs_snapshot():
+def live_tabs_snapshot(now=None):
     out = {}
     for n, s in sessions.items():
+        if custody_reclaimable(s, now):
+            continue    # custody expired: filtered, never labelled — this record is about to be GC'd
         pid = 0
         try:
             p = getattr(s, "pty", None)
@@ -2300,8 +2630,10 @@ def needs_relaunch_for_command(prev, requested_cmd):
         return True
     return command_sig(getattr(prev, "cmd", "")) != command_sig(requested)
 
-def sess_list():
-    return [session_payload(n, s) for n, s in sessions.items()]
+def sess_list(now=None):
+    # Custody-expired records are dropped outright: the relay keeps showing every UNexpired dormant
+    # row for relaunch, and never a row muxd has already written off.
+    return [session_payload(n, s) for n, s in sessions.items() if not custody_reclaimable(s, now)]
 
 async def spawn_session_off_loop(s):
     await asyncio.get_running_loop().run_in_executor(None, s.spawn)
@@ -3291,18 +3623,28 @@ async def main():
     start_supervised_background(background_tasks, "loop-monitor", loop_monitor)
 
     async def conpty_orphan_reaper_tick():
+        delay = CONPTY_REAPER_INTERVAL
+        last_sig = None
         while True:
-            await asyncio.sleep(5)
+            await asyncio.sleep(delay)
             with _ORPHANED_CONPTY_LOCK:
                 pending = bool(
                     _ORPHANED_CONPTY_HOSTS
                     or _PENDING_CONPTY_BASELINES
                 )
-            if pending:
-                await asyncio.get_running_loop().run_in_executor(
-                    None,
-                    _reap_orphaned_conpty_hosts,
-                )
+            if not pending:
+                # Nothing in custody: no executor dispatch at all, and the next record to
+                # arrive gets reaped at the base interval rather than a backed-off one.
+                delay = CONPTY_REAPER_INTERVAL
+                last_sig = None
+                continue
+            retained = await asyncio.get_running_loop().run_in_executor(
+                None,
+                _reap_orphaned_conpty_hosts,
+            )
+            sig = _reaper_tick_signature(retained)
+            delay = _reaper_backoff(last_sig, sig, delay)
+            last_sig = sig
     start_supervised_background(
         background_tasks,
         "conpty-orphan-reaper",
@@ -3344,45 +3686,7 @@ async def main():
     # liveness runs a PowerShell CIM query (blocking) — NEVER call it on the event-loop thread or muxd
     # freezes and hosted sessions drop. Always hop to a worker thread.
     boot_manifest = manifest_load()
-    boot_names = []
-    for name, m in boot_manifest.items():
-        if not strict_mux_name(name) or name in sessions:
-            continue
-        heal = bool(m.get("heal"))
-        mcmd = m.get("cmd", "")
-        ids = m.get("ids") if isinstance(m.get("ids"), list) else []
-        aliases = m.get("aliases") if isinstance(m.get("aliases"), list) else []
-        try:
-            restored = Session(
-                name, mcmd, m.get("cwd", ""), m.get("cols", 140), m.get("rows", 40),
-                loop, outq, heal=heal, spawn_now=False, ids=ids,
-                session_id=m.get("sessionId", ""), aliases=aliases
-            )
-            restored.expected_owner = bool(m.get("owner"))
-            restored.owner_key = str(m.get("ownerKey", "") or "")
-            restored.identity_pending = bool(m.get("identityPending"))
-            restored.lifecycle = str(m.get("lifecycle", "active") or "active")
-            if restored.lifecycle not in ("active", "dormant", "starting", "stopping", "failed"):
-                restored.lifecycle = "failed"
-            restored.child_pid = int(m.get("childPid", 0) or 0)
-            restored.child_start_token = str(m.get("childStartToken", "") or "")
-            restored.stop_disposition = str(m.get("stopDisposition", "") or "")
-            if restored.stop_disposition not in ("", "remove", "replace"):
-                restored.stop_disposition = ""
-            restored.user_killed = bool(m.get("userKilled", False))
-            restored.generation_id = str(m.get("generationId", "") or restored.generation_id)
-            restored.operation_key = str(m.get("operationKey", "") or "")
-            restored.operation_fingerprint = str(m.get("operationFingerprint", "") or "")
-            restored.operation_created = bool(m.get("operationCreated", False))
-            restored.deaths = [
-                float(value)
-                for value in (m.get("deaths") if isinstance(m.get("deaths"), list) else [])
-                if isinstance(value, (int, float))
-            ][-16:]
-        except Exception as error:
-            raise RuntimeError(f"could not restore durable session {name}") from error
-        sessions[name] = restored
-        boot_names.append(name)
+    boot_names = restore_manifest_sessions(boot_manifest, sessions, loop, outq)
 
     # Reconcile only after every durable record is represented in memory. Any save below is therefore
     # authoritative for the whole manifest and cannot erase entries that happened to sort later.
@@ -3404,11 +3708,7 @@ async def main():
                     raise RuntimeError(
                         f"could not reconcile unresolved {restored.lifecycle} session {name}: {detail}"
                     )
-                remove_record = restored.user_killed or (
-                    restored.lifecycle == "stopping"
-                    and restored.stop_disposition == "remove"
-                )
-                if remove_record:
+                if boot_removes_record(restored):
                     sessions.pop(name, None)
                     await manifest_save_async(sessions)
                     log(f"[boot] completed durable stop intent for {name}")
@@ -3445,6 +3745,25 @@ async def main():
         except Exception as e:
             log(f"[boot] {name} failed: {e}")
 
+    # Custody GC runs AFTER reconciliation, so a record only faces the TTL once its real lifecycle is
+    # settled: a `starting` tab that boot demoted to dormant is judged as dormant, not as whatever the
+    # crash left behind. Anything reclaimed here was already invisible to the relay (the same
+    # `custody_reclaimable` predicate filters live_tabs_snapshot and sess_list).
+    reclaimed_at_boot = gc_expired_custody(sessions)
+    if reclaimed_at_boot:
+        await manifest_save_async(sessions)
+        log(f"[boot] custody expired; reclaimed {len(reclaimed_at_boot)}: {', '.join(reclaimed_at_boot)}")
+
+    async def custody_gc_tick():
+        # muxd can stay up for weeks — a boot-only sweep would let dormant records accrue the whole
+        # time. Same predicate, same protections, just on a timer.
+        while True:
+            await asyncio.sleep(CUSTODY_GC_INTERVAL_SECONDS)
+            reclaimed = gc_expired_custody(sessions)
+            if reclaimed:
+                await manifest_save_async(sessions)
+                log(f"[custody] reclaimed {len(reclaimed)} expired: {', '.join(reclaimed)}")
+
     async def self_heal_tick():
         # a session whose SHELL died (pty EOF) is useless — recreate + re-run its resume (max 3/10min).
         while True:
@@ -3472,6 +3791,7 @@ async def main():
                     elif created:
                         log(f"[heal] {s.name} shell died -> respawned + resume queued")
     start_supervised_background(background_tasks, "self-heal", self_heal_tick)
+    start_supervised_background(background_tasks, "custody-gc", custody_gc_tick)
 
     async def flush_out():
         # coalesce each session's output into ONE ws frame per ~12ms tick — far fewer frames/less b64+JSON
@@ -3746,6 +4066,7 @@ async def main():
                     async def pump_status():
                         while True:
                             await asyncio.sleep(5)
+                            refresh_live_custody()   # a session that is alive right now cannot go stale
                             try: await asyncio.get_running_loop().run_in_executor(None, write_live_tabs)   # off-loop file write
                             except Exception: pass
                             await ws.send(json.dumps({"t": "sessions", "list": sess_list()}))

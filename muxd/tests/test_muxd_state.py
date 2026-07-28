@@ -1457,7 +1457,14 @@ class MuxdAsyncTests(unittest.IsolatedAsyncioTestCase):
             muxd._ORPHANED_CONPTY_HOSTS.clear()
         try:
             muxd._retain_orphaned_conpty_hosts([record], "test failure")
+            # The reaper now GCs dormant records before terminating, so this fake
+            # pid must claim to still be its original process instance for the
+            # retain-until-success path to be exercised at all.
             with mock.patch.object(
+                muxd,
+                "_same_process_instance",
+                return_value=True,
+            ), mock.patch.object(
                 muxd,
                 "_terminate_process_instance",
                 side_effect=[(False, "still alive"), (True, "process exited")],
@@ -1703,6 +1710,133 @@ class MuxdAsyncTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(sess.spawned)
         finally:
             muxd.Session = original
+
+
+class CustodyTtlTests(unittest.TestCase):
+    """Session records carry an explicit custody lifecycle: alive sessions keep refreshing their
+    deadline, parked ones expire, and an expired record is GC'd *and* never emitted."""
+
+    NOW = 1_800_000_000.0
+
+    def record(self, lifecycle="dormant", expires_delta=None, **extra):
+        record = {
+            "cmd": "", "cwd": r"Z:\tmp", "cols": 100, "rows": 30,
+            "heal": False, "owner": False, "lifecycle": lifecycle,
+        }
+        if expires_delta is not None:
+            record["lastAliveUtc"] = muxd.custody_stamp(self.NOW + expires_delta - muxd.CUSTODY_TTL_SECONDS)
+            record["custodyExpiresUtc"] = muxd.custody_stamp(self.NOW + expires_delta)
+        record.update(extra)
+        return record
+
+    def boot(self, records):
+        # Drives the real boot path in order: restore -> durable stop intents -> custody GC.
+        restored = {}
+        muxd.restore_manifest_sessions(records, restored, None, None, now=self.NOW)
+        for name in [n for n, s in restored.items() if muxd.boot_removes_record(s)]:
+            restored.pop(name)
+        muxd.gc_expired_custody(restored, now=self.NOW)
+        return restored
+
+    def test_boot_retains_alive_and_fresh_dormant_and_reclaims_expired_and_user_killed(self):
+        survivors = self.boot({
+            "mux-alive": self.record(lifecycle="active", expires_delta=3600),
+            "mux-fresh": self.record(lifecycle="dormant", expires_delta=3600),
+            "mux-stale": self.record(lifecycle="dormant", expires_delta=-1),
+            "mux-killed": self.record(lifecycle="dormant", expires_delta=3600, userKilled=True),
+        })
+
+        self.assertEqual(sorted(survivors), ["mux-alive", "mux-fresh"])
+
+    def test_record_without_custody_stamps_is_seeded_not_reclaimed(self):
+        # The first boot after the upgrade must list every pre-custody dormant tab, not eat them.
+        survivors = self.boot({"mux-legacy": self.record(lifecycle="dormant")})
+
+        self.assertEqual(sorted(survivors), ["mux-legacy"])
+        self.assertGreater(muxd.custody_deadline(survivors["mux-legacy"]), self.NOW)
+
+    def test_expired_records_are_absent_from_live_tabs_snapshot_and_sess_list(self):
+        restored = {}
+        muxd.restore_manifest_sessions({
+            "mux-fresh": self.record(lifecycle="dormant", expires_delta=3600),
+            "mux-stale": self.record(lifecycle="dormant", expires_delta=-1),
+        }, restored, None, None)
+
+        with mock.patch.object(muxd, "sessions", restored), \
+             mock.patch.object(muxd.time, "time", lambda: self.NOW):
+            snapshot_names = sorted(muxd.live_tabs_snapshot())
+            listed_names = [tab.get("name") for tab in muxd.sess_list()]
+
+        # Pinned contract: filtered entirely, never labelled — unexpired dormant rows still relaunch.
+        self.assertEqual(snapshot_names, ["mux-fresh"])
+        self.assertEqual(listed_names, ["mux-fresh"])
+
+    def test_status_pump_refreshes_custody_for_alive_sessions_only(self):
+        alive = FakeSession(alive=True)
+        alive.lifecycle = "active"
+        dormant = FakeSession(alive=False)
+        dormant.lifecycle = "dormant"
+        muxd.custody_refresh(alive, now=self.NOW - 10_000)
+        muxd.custody_refresh(dormant, now=self.NOW - 10_000)
+        stale_deadline = muxd.custody_deadline(dormant)
+
+        refreshed = muxd.refresh_live_custody({"mux-a": alive, "mux-d": dormant}, now=self.NOW)
+
+        self.assertEqual(refreshed, ["mux-a"])
+        self.assertEqual(muxd.custody_deadline(alive), self.NOW + muxd.CUSTODY_TTL_SECONDS)
+        self.assertEqual(muxd.custody_epoch(alive.last_alive_utc), self.NOW)
+        self.assertEqual(muxd.custody_deadline(dormant), stale_deadline)
+
+    def test_claim_holder_and_pending_identity_survive_expiry(self):
+        claim = FakeSession(alive=False)
+        claim.lifecycle = "dormant"
+        claim._launch_claim = object()
+        paths = FakeSession(alive=False)
+        paths.lifecycle = "dormant"
+        paths.claim_paths = [r"Z:\tmp\claim"]
+        pending = FakeSession(alive=False)
+        pending.lifecycle = "dormant"
+        pending.identity_pending = True
+        doomed = FakeSession(alive=False)
+        doomed.lifecycle = "failed"
+        source = {"mux-claim": claim, "mux-paths": paths, "mux-pending": pending, "mux-doomed": doomed}
+        for session in source.values():
+            muxd.custody_refresh(session, now=self.NOW - muxd.CUSTODY_TTL_SECONDS - 1)
+
+        reclaimed = muxd.gc_expired_custody(source, now=self.NOW)
+
+        self.assertEqual(reclaimed, ["mux-doomed"])
+        self.assertEqual(sorted(source), ["mux-claim", "mux-paths", "mux-pending"])
+
+    def test_pending_identity_is_reclaimable_once_its_grace_window_closes(self):
+        pending = FakeSession(alive=False)
+        pending.lifecycle = "dormant"
+        pending.identity_pending = True
+        muxd.custody_refresh(pending, now=self.NOW - muxd.CUSTODY_TTL_SECONDS - 1)
+        source = {"mux-pending": pending}
+
+        self.assertEqual(
+            muxd.gc_expired_custody(source, now=self.NOW + muxd.CUSTODY_IDENTITY_GRACE_SECONDS),
+            ["mux-pending"],
+        )
+
+    def test_custody_fields_round_trip_through_the_manifest_contract(self):
+        session = FakeSession(alive=True)
+        session.lifecycle = "active"
+        muxd.custody_refresh(session, now=self.NOW)
+
+        payload = muxd.session_records_payload({"mux-a": session})
+
+        self.assertEqual(payload["mux-a"]["lastAliveUtc"], muxd.custody_stamp(self.NOW))
+        self.assertEqual(
+            payload["mux-a"]["custodyExpiresUtc"],
+            muxd.custody_stamp(self.NOW + muxd.CUSTODY_TTL_SECONDS),
+        )
+        self.assertTrue(muxd.valid_session_records(payload))
+        # Schema-additive: a peer that never learned custody still writes a valid manifest.
+        legacy = {name: {k: v for k, v in rec.items() if not k.startswith(("lastAlive", "custody"))}
+                  for name, rec in payload.items()}
+        self.assertTrue(muxd.valid_session_records(legacy))
 
 
 if __name__ == "__main__":
