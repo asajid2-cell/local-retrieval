@@ -252,7 +252,11 @@ const hostedHas = name => hostUp() && hostSessions.has(name);
 const pendingHostCreates = new Map();
 let _hostRequestSeq = 0;
 function normalizeHostSession(s) {
-  if (containsForbiddenRemoteKey(s)) return null;
+  // agentTruth carries an "exe" key, which the forbidden-remote-key scan reads as the PC smuggling an
+  // executable path into the relay — and a hit there closes the whole host link with 1008. It is a bare
+  // image name (re-sanitized to one in normalizeAgentTruth), so scan the payload WITHOUT that subtree
+  // instead of rejecting every session muxd reports.
+  if (containsForbiddenRemoteKey(withoutAgentTruth(s))) return null;
   const name = strictMuxName(s && s.name);
   if (!name || name !== String(s && s.name || '')) return null;
   const sessionId = String(s.sessionId || '').trim();
@@ -278,8 +282,35 @@ function normalizeHostSession(s) {
     sessionId, aliases, identityPending: !!s.identityPending,
     agentState: String(s.agentState || ''), agentLabel: String(s.agentLabel || ''),
     agentDetail: String(s.agentDetail || ''), agentConfidence: String(s.agentConfidence || ''),
+    // OS-verified process truth (muxd cap "agentTruth"). Additive on protocol 4: a host that does not
+    // send it leaves both of these falsy and every downstream decision falls back to today's behavior.
+    agentStateSource: String(s.agentStateSource || ''), agentTruth: normalizeAgentTruth(s.agentTruth),
   };
   return value;
+}
+// Every `agentTruth` subtree removed, at any depth — the scan runs on what is left. The subtree is not
+// exempt from scrutiny, it is scrutinised differently: normalizeAgentTruth() rebuilds it from a
+// four-field allow-list and re-sanitizes `exe` down to a bare image name, so nothing path- or
+// command-shaped inside it can ever reach hostSessions no matter what the PC put there.
+function withoutAgentTruth(value) {
+  if (Array.isArray(value)) return value.map(withoutAgentTruth);
+  if (!value || typeof value !== 'object') return value;
+  const rest = {};
+  for (const [key, child] of Object.entries(value))
+    if (key !== 'agentTruth') rest[key] = withoutAgentTruth(child);
+  return rest;
+}
+function normalizeAgentTruth(truth) {
+  if (!truth || typeof truth !== 'object' || Array.isArray(truth)) return null;
+  // Bare image name only ("claude.exe"). Anything with a separator, space or quote is not an image name
+  // and is dropped to '' — the relay must never end up holding something command-shaped from the PC.
+  const exe = String(truth.exe || '').trim();
+  return {
+    procAlive: !!truth.procAlive,
+    cpuActiveRecent: !!truth.cpuActiveRecent,
+    exe: /^[A-Za-z0-9._+-]{1,60}$/.test(exe) ? exe : '',
+    checkedUtc: String(truth.checkedUtc || '').slice(0, 64),
+  };
 }
 function normalizeHostSessionList(list) {
   if (list != null && !Array.isArray(list)) return null;
@@ -472,6 +503,22 @@ function tailLooksAtShellPrompt(tail) {
     /^[\w.\-]+@[\w.\-]+:[^#$]{0,180}[#$]\s*$/.test(l)
   );
 }
+// A probe older than this is not evidence any more — the process could have died (or been relaunched)
+// in the gap. Applied symmetrically so a host clock running ahead of the relay does not look "fresh
+// forever" in one direction and permanently stale in the other.
+const AGENT_TRUTH_MAX_AGE_MS = Math.max(5000, Number(process.env.MUX_AGENT_TRUTH_MAX_AGE_MS || 45000));
+// Fresh OS-level process truth from muxd, or null. Null covers every degraded case — host too old to
+// advertise the capability, field absent, probe degraded to "heuristic", unparseable or stale
+// timestamp — and null means "decide exactly the way we did before agentTruth existed".
+function hostProcessTruth(h) {
+  if (!hostSupportsCap('agentTruth')) return null;
+  const truth = h && h.agentTruth;
+  if (!truth || String(h.agentStateSource || '') !== 'process') return null;
+  const checked = Date.parse(truth.checkedUtc || '');
+  if (!Number.isFinite(checked)) return null;
+  if (Math.abs(Date.now() - checked) > AGENT_TRUTH_MAX_AGE_MS) return null;
+  return truth;
+}
 function hostAgentStatus(h) {
   const s = String(h && h.agentState || '').toLowerCase();
   if (!['working', 'attention', 'stopped', 'neutral', 'dormant'].includes(s)) return null;
@@ -484,6 +531,9 @@ function hostAgentStatus(h) {
     agentDetail: String(h.agentDetail || ''),
     agentConfidence: String(h.agentConfidence || 'medium'),
     needsAttention: s === 'attention' || s === 'stopped',
+    // "stopped" is the host's heuristic read of a footer and is NOT proof of death; only an explicit
+    // dormant declaration (muxd knows there is no process) opens the death-recovery gate here.
+    healEligible: s === 'dormant',
   };
 }
 function attentionStatusForHosted(name, h, opts = {}) {
@@ -492,19 +542,33 @@ function attentionStatusForHosted(name, h, opts = {}) {
     agentDetail: 'agent process is alive locally, but muxd mirror is detached', agentConfidence: 'high',
     needsAttention: true,
   };
+  // Explicit host dormancy is the one death signal that predates agentTruth and is still authoritative:
+  // muxd is telling us the session has no process at all, so recovery is warranted without a probe.
   if (opts.dormant || !h || h.alive === false) return {
     state: 'dormant', agentState: 'dormant', agentLabel: 'dormant',
     agentDetail: 'no shell or agent is running until you relaunch it', agentConfidence: 'high',
-    needsAttention: false,
+    needsAttention: false, healEligible: true,
   };
   if (!h.hasCommand || h.shellOnly) return {
     state: 'white', agentState: 'neutral', agentLabel: 'plain shell',
     agentDetail: 'live terminal, no agent command registered', agentConfidence: 'high',
     needsAttention: false,
   };
+  // Precedence: fresh OS truth > host heuristic (agentState) > our own pane regex. The OS is the only
+  // source that can prove death, so it is also the only thing besides host dormancy that may mark a
+  // session heal-eligible — a footer that merely LOOKS like a shell prompt never gets to kill an agent.
+  const truth = hostProcessTruth(h);
+  if (truth && !truth.procAlive) return {
+    state: 'red', agentState: 'stopped', agentLabel: 'agent stopped',
+    agentDetail: 'muxd confirms the agent process tree is gone' + (truth.exe ? ` (last seen: ${truth.exe})` : ''),
+    agentConfidence: 'high', needsAttention: true, agentStateSource: 'process', healEligible: true,
+  };
+  const procAlive = !!(truth && truth.procAlive);
   const provided = hostAgentStatus(h);
-  if (provided) return provided;
-  if (tailLooksAtShellPrompt(h.tail || '')) return {
+  // A live process outranks a "stopped" call from either heuristic: the host's own footer read and our
+  // pane regex both false-red on an agent that has simply printed something prompt-shaped.
+  if (provided && !(procAlive && provided.state === 'red')) return provided;
+  if (!provided && !procAlive && tailLooksAtShellPrompt(h.tail || '')) return {
     state: 'red', agentState: 'stopped', agentLabel: 'agent stopped',
     agentDetail: 'the command-backed session returned to a shell prompt', agentConfidence: 'high',
     needsAttention: true,
@@ -514,18 +578,25 @@ function attentionStatusForHosted(name, h, opts = {}) {
   const created = Number(h.created || 0);
   const lastOutAgeMs = lastOut ? now - lastOut : NaN;
   const createdAgeMs = created ? now - created : NaN;
+  const source = procAlive ? { agentStateSource: 'process' } : {};
   if ((Number.isFinite(lastOutAgeMs) && lastOutAgeMs <= AGENT_WORKING_FRESH_MS) ||
       (Number.isFinite(createdAgeMs) && createdAgeMs <= AGENT_STARTING_GRACE_MS)) {
     return {
       state: 'green', agentState: 'working', agentLabel: 'agent working',
       agentDetail: 'terminal output updated ' + fmtAge(lastOutAgeMs), agentConfidence: 'medium',
-      needsAttention: false, lastOutAgeMs,
+      needsAttention: false, lastOutAgeMs, ...source,
     };
   }
+  // A quiet agent that is still burning CPU is thinking, not waiting for you — only the OS can see that.
+  if (procAlive && truth.cpuActiveRecent) return {
+    state: 'green', agentState: 'working', agentLabel: 'agent working',
+    agentDetail: 'no terminal output for ' + fmtAge(lastOutAgeMs) + ', but the agent process is using CPU',
+    agentConfidence: 'high', needsAttention: false, lastOutAgeMs, ...source,
+  };
   return {
     state: 'yellow', agentState: 'attention', agentLabel: 'waiting for you',
     agentDetail: 'no terminal output for ' + fmtAge(lastOutAgeMs), agentConfidence: 'medium',
-    needsAttention: true, lastOutAgeMs,
+    needsAttention: true, lastOutAgeMs, ...source,
   };
 }
 // ---- ATTENTION EPISODES -> one phone push per episode ---------------------------------------------
@@ -679,6 +750,10 @@ function listSessions() {
                   agentDetail: attn.agentDetail, agentConfidence: attn.agentConfidence,
                   needsAttention: !!attn.needsAttention, lastOutAgeMs: attn.lastOutAgeMs,
                   notifyMuted: notifyMutes.has(name),   // per-session phone-push mute (attention episodes)
+                  agentStateSource: String(attn.agentStateSource || ''),
+                  // Death-recovery gate: true only when the OS says the process tree is gone, or muxd
+                  // itself declared the session dormant. Never set off a pane-regex read alone.
+                  healEligible: !!attn.healEligible,
                   autoheal: !!h.heal, hosted: true,
                   alive, dormant, detachedLocal, cols: h.cols || 0, rows: h.rows || 0,
                   hasCommand: !!h.hasCommand, shellOnly: !!h.shellOnly, ready: !!h.ready,
@@ -2541,7 +2616,9 @@ wssHost.on('connection', (ws, req) => {
   console.log('[host] PC session host candidate connected');
   ws.on('message', raw => {
     let m; try { m = JSON.parse(raw.toString()); } catch { return; }
-    if (containsForbiddenRemoteKey(m)) {
+    // "exe" is a forbidden remote key, and agentTruth legitimately carries one — scanning the raw frame
+    // would close the link on every hello a truth-capable muxd sends. See withoutAgentTruth().
+    if (containsForbiddenRemoteKey(withoutAgentTruth(m))) {
       console.log('[host] rejected path/command-bearing protocol frame');
       try { ws.close(1008, 'host frame violated protocol'); } catch {}
       return;
