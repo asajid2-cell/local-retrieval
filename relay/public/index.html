@@ -1830,6 +1830,7 @@ function openMenu(s, anchor){
     `<button data-a="addcol">➕ Add to collection</button>`+
     `<button data-a="relaunch">↻ Relaunch agent</button>`+
     `<button data-a="history">⏱ Session history</button>`+
+    `<button data-a="reader">📖 Read as transcript</button>`+
     `<button data-a="autoheal"></button>`+
     `<button data-a="mute"></button>`+
     `<button data-a="opencmd">⌨ Copy local-open command</button>`+
@@ -1845,6 +1846,8 @@ function openMenu(s, anchor){
   const addB=m.querySelector('[data-a="addcol"]');
   if(!_appLive){ addB.disabled=true; addB.title='Open the desktop app to add to a collection (it owns your collections, so this can’t drift out of sync)'; }
   else if(!chatBackedSession(s)){ addB.disabled=true; addB.title='This tab is not linked to a chat, so it cannot be filed into a collection'; }
+  const rdB=m.querySelector('[data-a="reader"]');
+  if(!s.sessionId){ rdB.disabled=true; rdB.title='This tab is not linked to a chat yet, so there is no transcript to read'; }
   const ahB=m.querySelector('[data-a="autoheal"]');
   ahB.textContent = s.autoheal ? '⟳ Auto-resume: ON' : '⟳ Auto-resume: off';
   ahB.classList.toggle('on', !!s.autoheal);
@@ -1892,6 +1895,7 @@ function menuAction(a, s){
   else if(a==='mute') toggleNotifyMute(s);
   else if(a==='relaunch') relaunchSession(s);
   else if(a==='history') openTabHistory(s);
+  else if(a==='reader') openReader(s.sessionId||'', s.chatTitle||s.name);
   else if(a==='opencmd'){ navigator.clipboard?.writeText('mux '+s.name).then(()=>flash('Open command copied — paste it in a fresh local terminal')).catch(()=>{}); }
   else if(a==='reload'){ if(current===s.name) reloadTerminal(); else connect(s.name); }
   else if(a==='rename'){ openRenameDialog(s); }
@@ -2105,6 +2109,14 @@ async function killAllTabs(){
 // ---- tab session history: every chat a tab has hosted (current + historical), each relaunchable and
 // filable into a collection — so switching agents / opening a bare shell never loses the old session. ----
 $('#historyclose').onclick=()=>$('#historydlg').close();
+// Hand a chat off to the reader page. Deliberately a NAVIGATION, not an embed: reader.html is a separate
+// document (own styles, no xterm/websocket) so a long transcript can never stall the live terminal.
+function openReader(sessionId, title){
+  if(!sessionId){ flash('This tab has no linked chat yet — open claude or codex in it first.'); return; }
+  const url = base+'/reader.html?session='+encodeURIComponent(sessionId)+(title?'&title='+encodeURIComponent(String(title).slice(0,120)):'');
+  const tab = window.open(url,'_blank');                 // new tab keeps the terminal alive behind it…
+  if(!tab) location.href = url;                          // …but a phone popup-blocker just navigates instead
+}
 function openTabHistory(s){
   const list=$('#historylist'); list.innerHTML='';
   const entries=[];
@@ -2118,7 +2130,8 @@ function openTabHistory(s){
     const acts=document.createElement('div'); acts.className='histacts';
     const rb=document.createElement('button'); rb.className='act'; rb.textContent='Relaunch'; rb.onclick=()=>{ $('#historydlg').close(); relaunchTabTo(s.name, e); };
     const cb=document.createElement('button'); cb.className='act'; cb.textContent='+ Collection'; cb.onclick=()=>{ $('#historydlg').close(); addToCollection({ name:s.name, projectMuxName:s.name, muxName:s.name, sessionId:e.id, tool:e.tool, chatTitle:e.title }); };
-    acts.appendChild(rb); acts.appendChild(cb); row.appendChild(label); row.appendChild(acts); list.appendChild(row);
+    const tb=document.createElement('button'); tb.className='act'; tb.textContent='Read as transcript'; tb.onclick=()=>{ $('#historydlg').close(); openReader(e.id, e.title||s.name); };
+    acts.appendChild(rb); acts.appendChild(cb); acts.appendChild(tb); row.appendChild(label); row.appendChild(acts); list.appendChild(row);
   });
   openDialog('#historydlg');
 }

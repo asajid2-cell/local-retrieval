@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark light">
+<title>Transcript · multiplex</title>
+<!--
+  Reader view. A SEPARATE page from index.html on purpose: index.html is a live terminal (xterm, websocket,
+  byte pipe), this is a document you read on a phone. express.static serves it at /reader.html and the
+  owner gate in server.js covers it like every other page.
+  Entry: /reader.html?session=<sessionId>&title=<label>
+-->
+<style>
+  :root{
+    --bg:#0b0d10; --panel:#12161b; --line:#232a33; --fg:#e6edf3; --dim:#93a1b1;
+    --user:#4c7dff; --agent:#2ea043; --tool:#8b6cff; --sys:#b08800;
+    --sp2:8px; --sp3:12px; --sp4:16px;
+  }
+  @media (prefers-color-scheme: light){
+    :root{ --bg:#f6f8fa; --panel:#fff; --line:#d8dee4; --fg:#1f2328; --dim:#5b6875; }
+  }
+  *{ box-sizing:border-box; }
+  html,body{ margin:0; background:var(--bg); color:var(--fg); }
+  body{
+    font:16px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    padding:0 env(safe-area-inset-right) calc(env(safe-area-inset-bottom) + var(--sp4)) env(safe-area-inset-left);
+    -webkit-text-size-adjust:100%;
+  }
+  header{
+    position:sticky; top:0; z-index:2; background:var(--bg); border-bottom:1px solid var(--line);
+    padding:calc(env(safe-area-inset-top) + var(--sp3)) var(--sp4) var(--sp3);
+    display:flex; gap:var(--sp3); align-items:center; flex-wrap:wrap;
+  }
+  header h1{ font-size:17px; margin:0; font-weight:600; flex:1 1 12ch; min-width:0;
+             overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  a.back{ color:var(--dim); text-decoration:none; font-size:15px; }
+  button{
+    font:inherit; font-size:15px; color:var(--fg); background:var(--panel);
+    border:1px solid var(--line); border-radius:8px; padding:8px 14px; min-height:40px; cursor:pointer;
+  }
+  button[disabled]{ opacity:.55; cursor:default; }
+  #status{ padding:var(--sp2) var(--sp4); color:var(--dim); font-size:14px; }
+  #status.warn{ color:#e3b341; }
+  #status.err{ color:#f85149; }
+  main{ max-width:44rem; margin:0 auto; padding:var(--sp2) var(--sp3); }
+  .msg{
+    background:var(--panel); border:1px solid var(--line); border-left:3px solid var(--line);
+    border-radius:10px; padding:10px var(--sp3); margin:0 0 var(--sp3);
+  }
+  .msg .who{ font-size:12px; letter-spacing:.04em; text-transform:uppercase; color:var(--dim); }
+  .msg .when{ font-size:11px; color:var(--dim); opacity:.7; }
+  .msg .body{ white-space:pre-wrap; overflow-wrap:anywhere; margin-top:6px;
+              font-variant-ligatures:none; }
+  .role-user{ border-left-color:var(--user); }
+  .role-assistant{ border-left-color:var(--agent); }
+  .role-tool{ border-left-color:var(--tool); }
+  .role-system,.role-other{ border-left-color:var(--sys); }
+  /* tool calls stay folded: the reader is for the conversation, not the machinery */
+  details.tool-call > summary{ cursor:pointer; list-style:revert; }
+  details.tool-call > .body,
+  details.tool-call > .when{ display:none; }
+  details.tool-call[open] > .body,
+  details.tool-call[open] > .when{ display:block; }
+  details.tool-call > .body{ font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:13px; }
+  .fallback{ background:var(--panel); border:1px solid var(--line); border-radius:10px;
+             padding:var(--sp4); color:var(--dim); }
+  .fallback.offline{ border-color:#e3b341; }
+  .fallback-detail{ color:var(--dim); font-size:13px; padding:var(--sp2) var(--sp4); }
+  .exposure{ color:var(--dim); font-size:12px; padding:var(--sp2) var(--sp4) var(--sp4); max-width:44rem; margin:0 auto; }
+</style>
+</head>
+<body>
+<header>
+  <a class="back" href="./" aria-label="Back to terminal">‹ Back</a>
+  <h1 id="title">Transcript</h1>
+  <button id="refresh" type="button">Refresh</button>
+</header>
+<div id="status" role="status" aria-live="polite">Loading…</div>
+<main id="transcript"></main>
+<p class="exposure">Transcript text is stored on the relay in plaintext for a few minutes so you can read it here.</p>
+
+<script src="intent-journal.js"></script>
+<script src="reader.js"></script>
+<script>
+(function(){
+  const params = new URLSearchParams(location.search);
+  const sessionId = params.get('session') || '';
+  const label = params.get('title') || '';
+  const mount = document.getElementById('transcript');
+  const statusEl = document.getElementById('status');
+  const refreshBtn = document.getElementById('refresh');
+  if (label) document.getElementById('title').textContent = label;
+
+  function say(text, kind){ statusEl.textContent = text; statusEl.className = kind || ''; }
+
+  async function show(){
+    try{
+      const view = await MuxReader.loadPages(sessionId);
+      MuxReader.render(document, mount, view);
+      if (view.expired) say('Nothing parked here right now.');
+      else say((view.pages||[]).length + ' page' + ((view.pages||[]).length===1?'':'s') + ' loaded.');
+    }catch(e){
+      MuxReader.render(document, mount, { pages: [] });
+      say('Could not load: ' + (e.message||e), 'err');
+    }
+  }
+
+  async function doRefresh(){
+    refreshBtn.disabled = true;
+    say('Asking your PC for the transcript…');
+    try{
+      const result = await MuxReader.refresh(sessionId);
+      // Only a bridge-acked terminal status counts as success — a queued command is not a fetched chat.
+      if (result.offline){ MuxReader.render(document, mount, { offline:true, health: result.health }); say('PC bridge offline.', 'warn'); }
+      else if (result.pending) say('Requested — your PC has not answered yet. Try again in a moment.', 'warn');
+      else if (result.failed) say('Your PC could not fetch it' + (result.detail ? ': ' + result.detail : '.'), 'err');
+      else if (!result.ok) say('Could not request it: ' + (result.error||'unknown error'), 'err');
+      else { MuxReader.render(document, mount, result); say(result.detail || 'Transcript fetched.'); }
+    }catch(e){
+      say('Refresh failed: ' + (e.message||e), 'err');
+    }finally{
+      refreshBtn.disabled = false;
+    }
+  }
+  refreshBtn.addEventListener('click', doRefresh);
+
+  if (!sessionId){
+    MuxReader.render(document, mount, { pages: [] });
+    say('No chat selected — open this from a session tab.', 'warn');
+    refreshBtn.disabled = true;
+  } else {
+    show();
+  }
+})();
+</script>
+</body>
+</html>

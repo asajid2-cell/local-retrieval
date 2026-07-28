@@ -94,6 +94,7 @@ function isTrustedLocal(req) {
   const ra = req.socket.remoteAddress || '';
   return !req.headers['x-forwarded-for'] && (ra === '127.0.0.1' || ra === '::1' || ra === '::ffff:127.0.0.1');
 }
+<<<<<<< HEAD
 // Loopback is NOT a trust boundary on this host: containers run with network_mode: host and share
 // 127.0.0.1, so any compromised app satisfies isTrustedLocal(). Loopback therefore only admits the
 // narrow desktop-bridge data routes below (each re-checks isTrustedLocal itself) and never grants
@@ -139,7 +140,33 @@ function wsOriginOk(req) {
   if (!origin) return TEST_MODE;   // no Origin = not a browser; /ws is browser-only in prod
   return ALLOWED_WS_ORIGINS.includes(origin);
 }
+// A credential SCOPED to one job: the desktop app pushes transcript pages with it, and it authorizes
+// nothing else. Derived from the host credential so it never equals it, and it buys no read back — the
+// GET side stays owner-only. Fails closed: no host credential and no explicit override = no pushes.
+const TRANSCRIPT_BRIDGE_TOKEN = String(
+  process.env.MUX_TRANSCRIPT_BRIDGE_TOKEN
+  || (process.env.MUX_HOST_TOKEN
+    ? crypto.createHash('sha256').update('mux-transcript-bridge:v1:' + process.env.MUX_HOST_TOKEN).digest('hex')
+    : ''),
+);
+const TRANSCRIPT_BRIDGE_HEADER = 'x-mux-transcript-bridge';
+function transcriptBridgeTokenOk(value) {
+  const t = String(value || '');
+  if (!TRANSCRIPT_BRIDGE_TOKEN || !t || t.length !== TRANSCRIPT_BRIDGE_TOKEN.length) return false;
+  try { return crypto.timingSafeEqual(Buffer.from(t), Buffer.from(TRANSCRIPT_BRIDGE_TOKEN)); } catch { return false; }
+}
+function isTranscriptBridgePush(req) {
+  return req.method === 'POST'
+    && /^\/api\/transcripts\/[^/]+$/.test(String(req.path || ''))
+    && transcriptBridgeTokenOk(req.headers[TRANSCRIPT_BRIDGE_HEADER]);
+}
 app.use(async (req, res, next) => {
+  // INTEGRATION NOTE: r.2.16 arrived with a blanket `if (isTrustedLocal(req)) return next();` here.
+  // That bypass was deliberately REMOVED on master — containers run network_mode: host and share
+  // 127.0.0.1, so loopback is not a trust boundary and any compromised app satisfied it. Restoring it
+  // while merging would have silently undone that fix, so the narrow route list below stands and the
+  // transcript push gets its own scoped, token-checked exemption instead.
+  if (isTranscriptBridgePush(req)) return next();   // re-verified in the route; see the transcript store
   if (isTrustedLocal(req) && isLocalBridgeRoute(req)) return next();   // loopback admits ONLY the desktop-bridge routes
   if (dispatchRouteOk(req)) return next();   // scoped fix-factory dispatch capability
   if (await isOwner(cookieVal(req, HL_COOKIE))) return next();
@@ -1408,6 +1435,7 @@ const COMMAND_TERMINAL_LIMIT = Math.max(
 const COMMAND_REPLAY_POLICY = new Map([
   ['kill', 'refused'],
   ['transcript', 'read-only'],
+  ['transcriptfetch', 'read-only'],
   ['fetchfile', 'intent-fenced'],
   ['rename', 'idempotent'],
   ['setapptitle', 'idempotent'],
@@ -1442,6 +1470,19 @@ function commandFingerprint(command) {
   };
   return crypto.createHash('sha256').update(stableJson(payload)).digest('hex');
 }
+// The client's proof of who authorized an operation. OPAQUE here on purpose: the relay bounds its size,
+// stores it byte-stable, and hands it back on lease so the enforcing side can verify it. replayPolicy has
+// always described an operation's SEMANTICS (dedup/replay safety); it has never described authorization,
+// and a relay-minted lease token is not authority either. Read-only commands still need a principal.
+const PRINCIPAL_AUTH_MAX_BYTES = 4096;
+const COMMAND_REQUIRES_PRINCIPAL_AUTH = new Set(['transcriptfetch']);
+function principalAuthEnvelope(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  let text;
+  try { text = JSON.stringify(value); } catch { return null; }
+  if (!text || text === '{}' || Buffer.byteLength(text, 'utf8') > PRINCIPAL_AUTH_MAX_BYTES) return null;
+  return JSON.parse(text);
+}
 function commandOutcomeDetail(type, status, onPc = false) {
   if (status === 'pending' || status === 'leased') return '';
   if (type === 'fetchfile') {
@@ -1452,6 +1493,7 @@ function commandOutcomeDetail(type, status, onPc = false) {
     startmux: ['mux session started', 'PC bridge could not start mux session'],
     kill: ['session stopped', 'PC bridge could not stop session'],
     transcript: ['transcript opened', 'PC bridge could not open transcript'],
+    transcriptfetch: ['transcript ready to read here', 'PC bridge could not fetch the transcript'],
     rename: ['session renamed', 'PC bridge could not rename session'],
     setapptitle: ['title updated', 'PC bridge could not update title'],
     addtocollection: ['collection updated', 'PC bridge could not update collection'],
@@ -1483,6 +1525,7 @@ function commandOutcomeDetail(type, status, onPc = false) {
     collectionId: String(c.collectionId || '').slice(0, 200), deckId: String(c.deckId || '').slice(0, 200),
     deck: String(c.deck || '').slice(0, 200), deckName: String(c.deckName || '').slice(0, 200),
     takeover: !!c.takeover,
+    principalAuth: principalAuthEnvelope(c.principalAuth),
     ts: Number(c.ts) || 0,
     status,
     detail: commandOutcomeDetail(
@@ -1542,8 +1585,14 @@ function enqueueAppCommand(b) {
                 collection: String(b.collection || '').slice(0, 200), collectionId: String(b.collectionId || '').slice(0, 200),
                 deckId: String(b.deckId || '').slice(0, 200), deck: String(b.deck || '').slice(0, 200),
                 deckName: String(b.deckName || '').slice(0, 200), takeover: !!b.takeover,
+                principalAuth: principalAuthEnvelope(b.principalAuth),
                 ts: Date.now(), status: 'pending', detail: '',
                 doneAt: 0, leaseOwner: '', leaseToken: '', leaseExpiresAt: 0, attempt: 0 };
+  if (COMMAND_REQUIRES_PRINCIPAL_AUTH.has(type) && !cmd.principalAuth) {
+    const error = new Error('command type requires a principal auth envelope');
+    error.principalAuthRequired = true;
+    throw error;
+  }
   cmd.fingerprint = commandFingerprint(cmd);
   const existing = _commands.find(command => command.intentId === intentId);
   if (existing) {
@@ -1593,6 +1642,9 @@ app.post('/api/app-commands', (req, res) => {     // web (owner) enqueues
   b.replayPolicy = COMMAND_REPLAY_POLICY.get(b.type);
   if (b.type === 'kill' && !b.sessionId && !b.pid) return res.status(400).json({ error: 'sessionId or pid required' });
   if (b.type === 'transcript' && !b.sessionId) return res.status(400).json({ error: 'sessionId required' });
+  if (b.type === 'transcriptfetch' && !b.sessionId) return res.status(400).json({ error: 'sessionId required' });
+  if (b.type === 'transcriptfetch' && !principalAuthEnvelope(b.principalAuth))
+    return res.status(400).json({ error: 'transcriptfetch requires a principal auth envelope' });
   if (b.type === 'fetchfile' && !b.uploadId) return res.status(400).json({ error: 'uploadId required' });
   if (b.type === 'fetchfile' && b.insert && !['path', 'element'].includes(String(b.insert).toLowerCase()))
     return res.status(400).json({ error: 'fetchfile insert must be path or element' });
@@ -1623,6 +1675,7 @@ app.post('/api/app-commands', (req, res) => {     // web (owner) enqueues
     queued = enqueueAppCommand(b);
   } catch (error) {
     if (error.intentConflict) return res.status(409).json({ error: error.message });
+    if (error.principalAuthRequired) return res.status(400).json({ error: error.message });
     return failPersistence(res, error);
   }
   res.json({
@@ -1725,6 +1778,173 @@ app.get('/api/app-commands/:id', (req, res) => {  // web (owner) polls a command
   const c = _commands.find(x => x.id === req.params.id);
   if (!c) return res.status(404).json({ error: 'not found' });
   res.json({ id: c.id, status: c.status, detail: c.detail || '' });
+});
+
+// --- transcript page store: PC archive -> VPS (briefly) -> the owner's browser -------------------
+// A `transcriptfetch` command is the ONLY thing that authorizes parking a chat's archived pages here.
+// The app pushes them page-by-page with the scoped bridge credential; we keep exactly the newest fetch
+// for that one explicitly requested session id and drop it on a bounded TTL. This is a courier, not a
+// mirror: nothing is retained for a session nobody asked for, and the widening from live-screen bytes
+// to archived history is deliberately fenced by the request that asked for it.
+const TRANSCRIPTS_FILE = STATE_DIR + '/transcripts.json';
+const TRANSCRIPT_SCHEMA_VERSION = 1;
+const TRANSCRIPT_MAX_PAGES = 32;                                   // matches the app-side pager
+const TRANSCRIPT_MAX_PAGE_BYTES = 256 * 1024;                      // app targets <=200KB; this is the fence
+const TRANSCRIPT_MAX_SESSION_BYTES = TRANSCRIPT_MAX_PAGES * TRANSCRIPT_MAX_PAGE_BYTES;   // 8 MiB
+const TRANSCRIPT_MAX_SESSIONS = 8;
+// Floored at a minute in production so a real fetch has time to page in; tests may shorten it to prove
+// the window actually closes (same escape hatch shape as the command lease duration).
+const TRANSCRIPT_TTL_MS = Math.max(
+  TEST_MODE ? 200 : 60000,
+  Number(process.env.MUX_TRANSCRIPT_TTL_MS) || 15 * 60 * 1000,
+);
+const validTranscriptStore = value => (
+  Array.isArray(value)
+  && value.every(record => (
+    record
+    && typeof record === 'object'
+    && !!opaqueIdentity(record.sessionId)
+    && !!opaqueIdentity(record.fetchId)
+    && Number.isFinite(Number(record.pages))
+    && Number.isFinite(Number(record.expiresAt))
+    && Array.isArray(record.pageList)
+  ))
+);
+let _transcripts = [];
+{
+  const loaded = durableJsonLoad(TRANSCRIPTS_FILE, [], validTranscriptStore);
+  if (!Array.isArray(loaded)) throw new Error('persisted transcript store must be an array');
+  _transcripts = loaded.map(record => ({
+    sessionId: opaqueIdentity(record.sessionId),
+    fetchId: opaqueIdentity(record.fetchId),
+    pages: Number(record.pages) || 0,
+    bytes: Number(record.bytes) || 0,
+    updatedAt: Number(record.updatedAt) || 0,
+    expiresAt: Number(record.expiresAt) || 0,
+    pageList: (Array.isArray(record.pageList) ? record.pageList : [])
+      .filter(page => page && typeof page === 'object' && Number.isInteger(Number(page.page)))
+      .map(page => ({
+        page: Number(page.page),
+        bytes: Number(page.bytes) || 0,
+        messages: normalizeTranscriptMessages(page.messages),
+      })),
+  })).filter(record => record.sessionId && record.fetchId);
+}
+function normalizeTranscriptMessages(messages) {
+  return (Array.isArray(messages) ? messages : []).map(message => {
+    const kept = { role: String(message.role || ''), text: String(message.text || '') };
+    if (message.ts !== undefined && message.ts !== null && Number.isFinite(Number(message.ts)))
+      kept.ts = Number(message.ts);
+    return kept;
+  });
+}
+function liveTranscripts(now = Date.now()) {
+  return _transcripts.filter(record => record.expiresAt > now);
+}
+function commitTranscripts(candidate) {
+  writeJsonState(TRANSCRIPTS_FILE, candidate);
+  _transcripts = candidate;
+}
+function transcriptPageProblem(body, sessionId) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return 'transcript page must be a JSON object';
+  if (Number(body.schemaVersion) !== TRANSCRIPT_SCHEMA_VERSION) return 'unsupported transcript schema version';
+  if (opaqueIdentity(body.sessionId) !== sessionId) return 'page session identity does not match the request';
+  const pages = Number(body.pages);
+  const page = Number(body.page);
+  if (!Number.isInteger(pages) || pages < 1 || pages > TRANSCRIPT_MAX_PAGES)
+    return 'pages must be an integer in 1..' + TRANSCRIPT_MAX_PAGES;
+  if (!Number.isInteger(page) || page < 1 || page > pages) return 'page must be an integer in 1..pages';
+  if (!Array.isArray(body.messages)) return 'messages must be an array';
+  for (const message of body.messages) {
+    if (!message || typeof message !== 'object' || Array.isArray(message)) return 'each message must be an object';
+    if (typeof message.role !== 'string' || !message.role) return 'each message needs a role';
+    if (typeof message.text !== 'string') return 'each message needs text';
+    if (message.ts !== undefined && message.ts !== null && !Number.isFinite(Number(message.ts)))
+      return 'message ts must be numeric';
+  }
+  return '';
+}
+// The fetch that asked for this session, if it is still inside the retention window. No request, no store.
+function authorizingTranscriptFetch(sessionId, now = Date.now()) {
+  return _commands
+    .filter(command => command.type === 'transcriptfetch'
+      && command.sessionId === sessionId
+      && now - (Number(command.ts) || 0) <= TRANSCRIPT_TTL_MS)
+    .sort((a, b) => (Number(b.ts) || 0) - (Number(a.ts) || 0))[0] || null;
+}
+app.post('/api/transcripts/:sessionId', (req, res) => {
+  if (!TRANSCRIPT_BRIDGE_TOKEN) return res.status(503).json({ error: 'transcript bridge credential is not configured' });
+  if (!transcriptBridgeTokenOk(req.headers[TRANSCRIPT_BRIDGE_HEADER]))
+    return res.status(403).json({ error: 'scoped transcript bridge credential required' });
+  const sessionId = opaqueIdentity(req.params.sessionId);
+  if (!sessionId) return res.status(400).json({ error: 'invalid session identity' });
+  const body = req.body;
+  let bodyBytes = 0;
+  try { bodyBytes = Buffer.byteLength(JSON.stringify(body === undefined ? null : body), 'utf8'); } catch { bodyBytes = Infinity; }
+  if (bodyBytes > TRANSCRIPT_MAX_PAGE_BYTES) return res.status(413).json({ error: 'transcript page is too large' });
+  const problem = transcriptPageProblem(body, sessionId);
+  if (problem) return res.status(400).json({ error: problem });
+  const now = Date.now();
+  const authorizing = authorizingTranscriptFetch(sessionId, now);
+  if (!authorizing) return res.status(409).json({ error: 'no live transcriptfetch request for this session' });
+  const others = liveTranscripts(now).filter(record => record.sessionId !== sessionId);
+  const prior = liveTranscripts(now).find(record => record.sessionId === sessionId);
+  // A different authorizing fetch (or a re-page) means the old capture is stale — keep only the newest.
+  const reuse = prior && prior.fetchId === authorizing.id && prior.pages === Number(body.pages);
+  const stored = { page: Number(body.page), bytes: 0, messages: normalizeTranscriptMessages(body.messages) };
+  stored.bytes = Buffer.byteLength(JSON.stringify(stored), 'utf8');
+  const pageList = (reuse ? prior.pageList : []).filter(page => page.page !== stored.page).concat([stored])
+    .sort((a, b) => a.page - b.page);
+  const bytes = pageList.reduce((sum, page) => sum + (Number(page.bytes) || 0), 0);
+  if (bytes > TRANSCRIPT_MAX_SESSION_BYTES)
+    return res.status(413).json({ error: 'transcript exceeds the per-session byte budget' });
+  const record = {
+    sessionId,
+    fetchId: authorizing.id,
+    pages: Number(body.pages),
+    bytes,
+    updatedAt: now,
+    expiresAt: now + TRANSCRIPT_TTL_MS,
+    pageList,
+  };
+  const candidate = [...others, record]
+    .sort((a, b) => (Number(b.updatedAt) || 0) - (Number(a.updatedAt) || 0))
+    .slice(0, TRANSCRIPT_MAX_SESSIONS);
+  try {
+    commitTranscripts(candidate);
+  } catch (error) {
+    return failPersistence(res, error);
+  }
+  res.json({
+    ok: true,
+    sessionId,
+    page: stored.page,
+    pages: record.pages,
+    storedPages: record.pageList.map(page => page.page),
+    bytes: record.bytes,
+    expiresAt: record.expiresAt,
+  });
+});
+app.get('/api/transcripts/:sessionId', (req, res) => {   // owner-gated by the global middleware
+  const sessionId = opaqueIdentity(req.params.sessionId);
+  if (!sessionId) return res.status(400).json({ error: 'invalid session identity' });
+  const now = Date.now();
+  const record = liveTranscripts(now).find(entry => entry.sessionId === sessionId);
+  if (!record) return res.status(404).json({ error: 'no transcript pages for this session' });
+  const available = record.pageList.map(page => page.page).sort((a, b) => a - b);
+  const requested = req.query.page === undefined ? available[0] : Number(req.query.page);
+  if (!Number.isInteger(requested)) return res.status(400).json({ error: 'page must be an integer' });
+  const found = record.pageList.find(page => page.page === requested);
+  if (!found) return res.status(404).json({ error: 'transcript page is not stored' });
+  res.json({
+    schemaVersion: TRANSCRIPT_SCHEMA_VERSION,
+    sessionId,
+    page: found.page,
+    pages: record.pages,
+    availablePages: available,
+    expiresAt: record.expiresAt,
+    messages: found.messages,
+  });
 });
 
 // --- file upload side-channel: phone -> VPS (stored here) -> the desktop app pulls it down to the PC
