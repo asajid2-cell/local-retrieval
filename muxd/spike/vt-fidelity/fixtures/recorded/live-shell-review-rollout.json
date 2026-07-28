@@ -1,0 +1,11 @@
+{
+  "name": "live-shell-review-rollout",
+  "corpus": "recorded",
+  "cols": 80,
+  "rows": 24,
+  "bytes": 428142,
+  "source": "live muxd session review-rollout-session-progr-2de3c0dd",
+  "desc": "recorded muxd scrollback replay payload",
+  "captureMethod": "live-muxd",
+  "containsRecordedSessionContent": true
+}

@@ -1,0 +1,9 @@
+{
+  "name": "altscreen-live-tui",
+  "corpus": "synthetic",
+  "cols": 100,
+  "rows": 30,
+  "bytes": 756,
+  "source": "gen_synthetic.py",
+  "desc": "alt-screen box-drawing TUI parked in alt buffer (codex/claude shape)"
+}

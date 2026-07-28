@@ -1,0 +1,9 @@
+{
+  "name": "altscreen-47-1047",
+  "corpus": "synthetic",
+  "cols": 80,
+  "rows": 24,
+  "bytes": 105,
+  "source": "gen_synthetic.py",
+  "desc": "legacy alt-screen spellings 47 and 1047"
+}

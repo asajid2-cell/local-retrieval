@@ -1,0 +1,11 @@
+{
+  "name": "tui-alt",
+  "corpus": "recorded",
+  "cols": 140,
+  "rows": 40,
+  "bytes": 5907,
+  "source": "tui_demo.py under ConPTY",
+  "desc": "alt-screen TUI: 1049/1/2004/1000/1002/1006, DECSTBM, SGR 256+truecolor, wide chars",
+  "captureMethod": "conpty-tui-alt",
+  "containsRecordedSessionContent": false
+}

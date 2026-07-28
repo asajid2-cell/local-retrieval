@@ -1,0 +1,9 @@
+{
+  "name": "decckm-1",
+  "corpus": "synthetic",
+  "cols": 60,
+  "rows": 10,
+  "bytes": 95,
+  "source": "gen_synthetic.py",
+  "desc": "DECCKM set/reset \u2014 arrow-key encoding a replayed viewer must inherit"
+}

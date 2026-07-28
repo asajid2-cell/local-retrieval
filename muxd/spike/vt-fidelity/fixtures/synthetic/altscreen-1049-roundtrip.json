@@ -1,0 +1,9 @@
+{
+  "name": "altscreen-1049-roundtrip",
+  "corpus": "synthetic",
+  "cols": 80,
+  "rows": 24,
+  "bytes": 118,
+  "source": "gen_synthetic.py",
+  "desc": "1049 enter/paint/leave; primary buffer must be intact"
+}
