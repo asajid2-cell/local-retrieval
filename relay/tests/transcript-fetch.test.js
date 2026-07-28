@@ -35,6 +35,19 @@ function freePort() {
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
+// relay/node_modules is gitignored, so a freshly created worktree has none and every spawn below would
+// die with "Cannot find module 'express'" — visible only as an opaque start timeout. Install once.
+let depsReady = false;
+function ensureDeps() {
+  if (depsReady) return;
+  try {
+    require.resolve('express', { paths: [REPO] });
+  } catch {
+    childProcess.execSync('npm install --no-audit --no-fund --loglevel=error', { cwd: REPO, stdio: 'inherit' });
+  }
+  depsReady = true;
+}
+
 async function waitFor(fn, label, timeoutMs = 5000) {
   const started = Date.now();
   let last;
@@ -60,6 +73,7 @@ class RelayHarness {
   }
 
   async start() {
+    ensureDeps();
     this.port = await freePort();
     this.proc = childProcess.spawn(process.execPath, ['server.js'], {
       cwd: REPO,
@@ -79,7 +93,12 @@ class RelayHarness {
     });
     this.proc.stdout.on('data', d => { this.stdout += d.toString(); });
     this.proc.stderr.on('data', d => { this.stderr += d.toString(); });
-    await waitFor(() => this.stdout.includes(`multiplex-app on 0.0.0.0:${this.port}`), 'relay start', 8000);
+    try {
+      await waitFor(() => this.stdout.includes(`multiplex-app on 0.0.0.0:${this.port}`), 'relay start', 8000);
+    } catch (err) {
+      // Never let a boot failure hide behind a bare timeout — the child's stderr is the actual cause.
+      throw new Error(`${err.message}\n--- relay stderr ---\n${this.stderr}\n--- relay stdout ---\n${this.stdout}`);
+    }
   }
 
   async stopProcess() {
