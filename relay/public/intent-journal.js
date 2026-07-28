@@ -14,8 +14,8 @@
     return value;
   }
 
-  function signature(url, payload) {
-    return String(url) + '\n' + JSON.stringify(canonical(payload || {}));
+  function signature(method, url, payload) {
+    return String(method) + ' ' + String(url) + '\n' + JSON.stringify(canonical(payload || {}));
   }
 
   function newIntent(prefix) {
@@ -39,8 +39,8 @@
     storage.setItem(JOURNAL_KEY, JSON.stringify(journal));
   }
 
-  function acquire(url, payload, prefix) {
-    const operation = signature(url, payload);
+  function acquire(method, url, payload, prefix) {
+    const operation = signature(method, url, payload);
     let lastError = null;
     for (const storage of stores()) {
       try {
@@ -76,14 +76,17 @@
     return status === 408 || status === 425 || status === 429 || status >= 500;
   }
 
-  async function postIntent(url, payload, prefix) {
-    const acquired = acquire(url, payload, prefix);
+  // Every mutating browser request goes through here, whatever its verb: DELETE/PATCH are exactly as
+  // replay-prone as POST once a phone drops the response, and the relay dedupes them all on intentId.
+  async function sendIntent(method, url, payload, prefix) {
+    const verb = String(method || 'POST').toUpperCase();
+    const acquired = acquire(verb, url, payload, prefix);
     const body = { ...(payload || {}), intentId: acquired.intentId };
     let lastError = null;
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
         const response = await fetch(url, {
-          method: 'POST',
+          method: verb,
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(body),
         });
@@ -98,5 +101,6 @@
     throw lastError || new Error('remote operation failed');
   }
 
-  global.postIntent = postIntent;
+  global.sendIntent = sendIntent;
+  global.postIntent = (url, payload, prefix) => sendIntent('POST', url, payload, prefix);
 })(globalThis);
