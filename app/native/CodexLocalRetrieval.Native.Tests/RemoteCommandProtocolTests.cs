@@ -12,6 +12,7 @@ public sealed class RemoteCommandProtocolTests
     [DataRow("fetchfile", "intent-fenced")]
     [DataRow("startmux", "intent-fenced")]
     [DataRow("transcript", "read-only")]
+    [DataRow("transcriptfetch", "read-only")]
     [DataRow("kill", "refused")]
     public void IsReplaySafe_AcceptsOnlyDeclaredCommandPolicyPairs(string type, string policy)
     {
