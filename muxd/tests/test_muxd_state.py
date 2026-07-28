@@ -810,6 +810,196 @@ class MuxdStateTests(unittest.TestCase):
                 muxd.CLAIM_ROOT = old_root
                 muxd.try_live_session_ids = old_scan
 
+    @staticmethod
+    def _write_claim(root, session_id, owner="muxd", pid=None, expires_in=120, raw=None, **extra):
+        path = os.path.join(root, muxd.claim_file_name(session_id))
+        if raw is not None:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(raw)
+            return path
+        now = datetime.now(timezone.utc)
+        body = {
+            "SessionId": session_id,
+            "CandidateIds": [session_id],
+            "OwnerPid": os.getpid() if pid is None else pid,
+            "OwnerProcess": owner,
+            "CreatedUtc": now.isoformat().replace("+00:00", "Z"),
+            "Reason": "sweep test",
+        }
+        if expires_in is not None:
+            body["ExpiresUtc"] = (now + timedelta(seconds=expires_in)).isoformat().replace("+00:00", "Z")
+        body.update(extra)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(body, f)
+        return path
+
+    def test_launch_claim_sweep_deletes_self_declared_expired_claims(self):
+        old_root = muxd.CLAIM_ROOT
+        with tempfile.TemporaryDirectory(prefix="muxd-sweep-expired-") as root:
+            try:
+                muxd.CLAIM_ROOT = root
+                # a LIVE non-muxd owner: its own ExpiresUtc is still the contract, so it goes.
+                stale = self._write_claim(root, "stale-id", owner="CodexLocalRetrieval", expires_in=-5)
+
+                removed, quarantined, kept = muxd.sweep_launch_claims()
+
+                self.assertEqual([stale], removed)
+                self.assertEqual([], quarantined)
+                self.assertEqual([], kept)
+                self.assertEqual([], os.listdir(root))
+            finally:
+                muxd.CLAIM_ROOT = old_root
+
+    def test_launch_claim_sweep_keeps_unexpired_claims_even_when_owner_is_unverifiable(self):
+        old_root = muxd.CLAIM_ROOT
+        old_alive = muxd._pid_alive
+        with tempfile.TemporaryDirectory(prefix="muxd-sweep-keep-") as root:
+            try:
+                muxd.CLAIM_ROOT = root
+                muxd._pid_alive = lambda pid: int(pid) == os.getpid()
+                mine = self._write_claim(root, "live-muxd-id", owner="muxd")
+                # foreign owner, pid we cannot prove is alive -> still inside its TTL, hands off.
+                foreign = self._write_claim(root, "app-id", owner="CodexLocalRetrieval", pid=os.getpid() + 77777)
+                # no ExpiresUtc at all -> mtime + TTL, and this file was just written.
+                undated = self._write_claim(root, "undated-id", owner="CodexLocalRetrieval", pid=1, expires_in=None)
+
+                removed, quarantined, kept = muxd.sweep_launch_claims()
+
+                self.assertEqual([], removed)
+                self.assertEqual([], quarantined)
+                self.assertEqual(sorted([mine, foreign, undated]), sorted(kept))
+                self.assertEqual(3, len(os.listdir(root)))
+            finally:
+                muxd.CLAIM_ROOT = old_root
+                muxd._pid_alive = old_alive
+
+    def test_launch_claim_sweep_deletes_unexpired_claim_of_dead_muxd_owner(self):
+        old_root = muxd.CLAIM_ROOT
+        old_alive = muxd._pid_alive
+        with tempfile.TemporaryDirectory(prefix="muxd-sweep-dead-") as root:
+            try:
+                muxd.CLAIM_ROOT = root
+                muxd._pid_alive = lambda pid: False
+                orphan = self._write_claim(root, "crashed-id", owner="muxd", pid=4242, expires_in=900)
+                # identical shape, but NOT ours: a dead-looking foreign pid is not proof of abandonment.
+                foreign = self._write_claim(root, "app-id", owner="CodexLocalRetrieval", pid=4242, expires_in=900)
+
+                removed, quarantined, kept = muxd.sweep_launch_claims()
+
+                self.assertEqual([orphan], removed)
+                self.assertEqual([], quarantined)
+                self.assertEqual([foreign], kept)
+                self.assertEqual([os.path.basename(foreign)], os.listdir(root))
+            finally:
+                muxd.CLAIM_ROOT = old_root
+                muxd._pid_alive = old_alive
+
+    def test_launch_claim_sweep_keeps_fresh_muxd_claim_whose_pid_is_unreadable(self):
+        old_root = muxd.CLAIM_ROOT
+        old_alive = muxd._pid_alive
+        with tempfile.TemporaryDirectory(prefix="muxd-sweep-nopid-") as root:
+            try:
+                muxd.CLAIM_ROOT = root
+                muxd._pid_alive = lambda pid: False
+                # a muxd claim we cannot check: no OwnerPid at all, and a non-numeric one. Neither is
+                # PROOF the owner died, and both are still inside their TTL -> hands off.
+                missing = self._write_claim(root, "nopid-id", owner="muxd", expires_in=900, OwnerPid=None)
+                garbage = self._write_claim(root, "badpid-id", owner="muxd", expires_in=900, OwnerPid="n/a")
+
+                removed, quarantined, kept = muxd.sweep_launch_claims()
+
+                self.assertEqual([], removed)
+                self.assertEqual([], quarantined)
+                self.assertEqual(sorted([missing, garbage]), sorted(kept))
+                # ...but they are not immortal: the TTL still retires them once it lapses.
+                stale = self._write_claim(root, "oldnopid-id", owner="muxd", expires_in=-1, OwnerPid=None)
+                self.assertEqual([stale], muxd.sweep_launch_claims()[0])
+            finally:
+                muxd.CLAIM_ROOT = old_root
+                muxd._pid_alive = old_alive
+
+    def test_launch_claim_sweep_quarantines_malformed_claims_without_deleting_them(self):
+        old_root = muxd.CLAIM_ROOT
+        with tempfile.TemporaryDirectory(prefix="muxd-sweep-bad-") as root:
+            try:
+                muxd.CLAIM_ROOT = root
+                truncated = self._write_claim(root, "torn-id", raw='{"SessionId": "torn-id"')
+                not_object = self._write_claim(root, "listy-id", raw="[1, 2, 3]")
+
+                removed, quarantined, kept = muxd.sweep_launch_claims()
+
+                self.assertEqual([], removed)
+                self.assertEqual([], kept)
+                self.assertEqual(
+                    sorted([truncated[: -len(".json")] + ".bad", not_object[: -len(".json")] + ".bad"]),
+                    sorted(quarantined),
+                )
+                for path in quarantined:
+                    self.assertTrue(path.endswith(".claim.bad"))
+                    self.assertTrue(os.path.isfile(path))
+                self.assertFalse(os.path.exists(truncated))
+                # evidence is preserved verbatim, never destroyed
+                with open(truncated[: -len(".json")] + ".bad", encoding="utf-8") as f:
+                    self.assertEqual('{"SessionId": "torn-id"', f.read())
+            finally:
+                muxd.CLAIM_ROOT = old_root
+
+    def test_launch_claim_sweep_is_idempotent(self):
+        old_root = muxd.CLAIM_ROOT
+        old_alive = muxd._pid_alive
+        with tempfile.TemporaryDirectory(prefix="muxd-sweep-idem-") as root:
+            try:
+                muxd.CLAIM_ROOT = root
+                muxd._pid_alive = lambda pid: int(pid) == os.getpid()
+                self._write_claim(root, "stale-id", owner="muxd", expires_in=-1)
+                self._write_claim(root, "dead-id", owner="muxd", pid=4242, expires_in=900)
+                self._write_claim(root, "bad-id", raw="not json at all")
+                keeper = self._write_claim(root, "keep-id", owner="muxd")
+
+                first = muxd.sweep_launch_claims()
+                self.assertEqual(2, len(first[0]))
+                self.assertEqual(1, len(first[1]))
+                self.assertEqual([keeper], first[2])
+                after_first = sorted(os.listdir(root))
+
+                second = muxd.sweep_launch_claims()
+
+                self.assertEqual(([], [], [keeper]), second)
+                self.assertEqual(after_first, sorted(os.listdir(root)))
+            finally:
+                muxd.CLAIM_ROOT = old_root
+                muxd._pid_alive = old_alive
+
+    def test_launch_claim_sweep_tolerates_a_missing_claim_directory(self):
+        old_root = muxd.CLAIM_ROOT
+        with tempfile.TemporaryDirectory(prefix="muxd-sweep-gone-") as root:
+            try:
+                muxd.CLAIM_ROOT = os.path.join(root, "never-created")
+                self.assertEqual(([], [], []), muxd.sweep_launch_claims())
+            finally:
+                muxd.CLAIM_ROOT = old_root
+
+    def test_launch_claim_sweep_throttles_to_its_own_cadence(self):
+        old_root = muxd.CLAIM_ROOT
+        old_last = muxd._CLAIM_SWEEP_LAST
+        with tempfile.TemporaryDirectory(prefix="muxd-sweep-cadence-") as root:
+            try:
+                muxd.CLAIM_ROOT = root
+                muxd._CLAIM_SWEEP_LAST = 0.0
+                self._write_claim(root, "stale-id", owner="CodexLocalRetrieval", expires_in=-5)
+
+                self.assertIsNotNone(muxd.maybe_sweep_launch_claims())
+                # a 5s status-pump tick must NOT re-walk the directory before the ~60s divider
+                self._write_claim(root, "stale-two", owner="CodexLocalRetrieval", expires_in=-5)
+                self.assertIsNone(muxd.maybe_sweep_launch_claims())
+                self.assertEqual(1, len(os.listdir(root)))
+                # boot forces one regardless of when the last sweep ran
+                self.assertEqual(1, len(muxd.maybe_sweep_launch_claims(True)[0]))
+                self.assertEqual([], os.listdir(root))
+            finally:
+                muxd.CLAIM_ROOT = old_root
+                muxd._CLAIM_SWEEP_LAST = old_last
+
     def test_single_instance_mutex_refuses_duplicate_muxd(self):
         class FakeCall:
             def __init__(self, result):
