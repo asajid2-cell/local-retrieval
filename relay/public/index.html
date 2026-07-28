@@ -1510,20 +1510,66 @@ $('#term').addEventListener('wheel', e=>{
 function setFont(px){ fontSize=Math.min(20,Math.max(11,px)); term.options.fontSize=fontSize; LS.set('mux_font',fontSize); doFit(); }
 function updateMeta(){ $('#statusmeta').textContent = current ? `${term.cols}×${term.rows}${$('#term').classList.contains('pan')?' · pan':''}` : ''; }
 
-function takeTerminalReport(s){
-  let m = s.match(/^\x1b\[\?[0-9;]*c/); if(m) return m[0].length;      // primary DA, e.g. ESC[?1;2c
-  m = s.match(/^\x1b\[>[0-9;]*c/); if(m) return m[0].length;           // secondary DA
-  m = s.match(/^\x1b\[[0-9;]*R/); if(m) return m[0].length;            // cursor-position report
-  m = s.match(/^\x1b\[[0-9;?]*n/); if(m) return m[0].length;           // device/status report
-  m = s.match(/^\x1b\][0-9;]+;[^\x07\x1b]*(?:\x07|\x1b\\)/); if(m) return m[0].length; // OSC color/title report
+// Length of the terminal-generated report starting at `at` (0 if there isn't one). This used to be five
+// anchored regexes against s.slice(i); the OSC one — ESC ] [0-9;]+ ; [^BEL/ESC]* (BEL|ESC\) — backtracked
+// superquadratically on an unterminated run of semicolons (20k chars = 201ms, 80k = 4.9s), and it ran on
+// EVERY keystroke and paste via term.onData, so a paste-sized chunk froze the UI thread for minutes.
+// This is a single forward scan with the identical accepted language, and it takes an index instead of a
+// slice so the caller stops allocating a fresh tail string per character.
+function takeTerminalReport(s, at){
+  const i = at|0, len = s.length;
+  if(s.charCodeAt(i) !== 0x1b) return 0;
+  const c = s[i+1];
+  if(c === '['){
+    const p = s[i+2];
+    if(p === '?' || p === '>'){                     // primary / secondary DA, e.g. ESC[?1;2c
+      let k = i+3, ch;
+      while(k < len && ((ch=s.charCodeAt(k)) === 0x3b || (ch >= 0x30 && ch <= 0x39))) k++;
+      if(s[k] === 'c') return k+1-i;
+    }
+    let k = i+2, ch;
+    while(k < len && ((ch=s.charCodeAt(k)) === 0x3b || (ch >= 0x30 && ch <= 0x39))) k++;
+    if(s[k] === 'R') return k+1-i;                  // cursor-position report
+    k = i+2;
+    while(k < len && ((ch=s.charCodeAt(k)) === 0x3b || ch === 0x3f || (ch >= 0x30 && ch <= 0x39))) k++;
+    if(s[k] === 'n') return k+1-i;                  // device/status report
+    return 0;
+  }
+  if(c === ']'){
+    // OSC color/title report: ESC ] <params> <text> (BEL | ESC \). The params are one run of [0-9;] that
+    // must carry a ';' past its first character (the old `[0-9;]+;`); whichever ';' the regex backtracked
+    // onto, the rest is `[^BEL/ESC]*` — which can never give a char back that satisfies the terminator —
+    // so the match is decided by the FIRST BEL/ESC after the run. One scan finds it.
+    let k = i+2, semi = false, ch;
+    while(k < len){
+      ch = s.charCodeAt(k);
+      if(ch === 0x3b){ if(k > i+2) semi = true; }
+      else if(ch < 0x30 || ch > 0x39) break;
+      k++;
+    }
+    if(!semi) return 0;
+    while(k < len){
+      ch = s.charCodeAt(k);
+      if(ch === 0x07) return k+1-i;                 // BEL terminator
+      if(ch === 0x1b) return s[k+1] === '\\' ? k+2-i : 0;   // ST terminator
+      k++;
+    }
+    return 0;
+  }
   return 0;
 }
 function stripTerminalGeneratedReports(s){
-  let out='', dropped=false;
-  for(let i=0;i<s.length;){
-    const n=takeTerminalReport(s.slice(i));
-    if(n){ dropped=true; i+=n; continue; }
-    out += s[i++];
+  if(!s) return { out:s||'', dropped:false };
+  let esc = s.indexOf('\x1b');
+  if(esc < 0) return { out:s, dropped:false };      // the common case: no report can start, so don't scan
+  let out='', dropped=false, i=0;
+  while(i < s.length){
+    if(esc < 0){ out += s.slice(i); break; }        // no ESC left — take the whole tail in one go
+    if(esc > i){ out += s.slice(i, esc); i = esc; }
+    const n = takeTerminalReport(s, i);
+    if(n){ dropped = true; i += n; }
+    else { out += s[i]; i++; }
+    esc = s.indexOf('\x1b', i);
   }
   return { out, dropped };
 }
