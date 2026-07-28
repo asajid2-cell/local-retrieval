@@ -100,6 +100,11 @@
   .tab .pcchip.stale { color:var(--warn); border-color:rgba(251,191,36,.45); }
   .tab .pcchip.legacy { color:var(--rose); border-color:rgba(251,113,133,.5); }
   .tab .pcchip.remote { color:#e879f9; border-color:rgba(232,121,249,.5); }   /* resumed-remote (from /tomux) */
+  /* Needs-attention chip: the dot is a hint, this is the word. Own class (not .pcchip) so the STALE
+     rewrite below keeps targeting the PC chip no matter what order the chips render in. */
+  .tab .attnchip { font-size:8px; font-weight:700; letter-spacing:.04em; color:var(--warn); border:1px solid rgba(251,191,36,.55); background:rgba(251,191,36,.10); border-radius:4px; padding:0 3px; line-height:1.5; flex:0 0 auto; }
+  .tab .attnchip.stopped { color:var(--rose); border-color:rgba(251,113,133,.6); background:rgba(251,113,133,.10); }
+  .tab .attnchip.muted { opacity:.55; }   /* still waiting — just not buzzing your phone */
   .colorpop .swrow { display:flex; gap:6px; padding:6px 4px; flex-wrap:wrap; }
   .colorpop .sw { width:26px; height:26px; border-radius:7px; border:1px solid var(--line); cursor:pointer; padding:0; }
   .colorpop .clr { width:100%; }
@@ -694,6 +699,7 @@
 <script src="vendor/xterm.js"></script>
 <script src="vendor/addon-fit.js"></script>
 <script src="intent-journal.js"></script>
+<script src="attention-ui.js"></script>
 <script>
 const $ = s => document.querySelector(s);
 const base = location.pathname.replace(/\/[^/]*$/, '') || '';
@@ -1773,7 +1779,8 @@ function renderTabs(){
     t.title = s.name + (st?' · '+st:'') + detail + conf;
     const chips = `${s.hosted?'<span class="pcchip" title="Runs on your PC — survives network/VPS failures">PC</span>':''}`+
       `${s.legacyTwin?'<span class="pcchip legacy" title="Legacy tmux session with the same name exists on the VPS">TWIN</span>':''}`+
-      `${s.legacyBlocked?'<span class="pcchip legacy" title="Legacy tmux diagnostic only — relay refuses to attach/manage it">LEGACY</span>':''}`;
+      `${s.legacyBlocked?'<span class="pcchip legacy" title="Legacy tmux diagnostic only — relay refuses to attach/manage it">LEGACY</span>':''}`+
+      MuxAttentionUi.attentionChipHtml(s);   // last: keeps '.pcchip' first for the STALE rewrite below
     t.innerHTML = `<span class="dot"></span><span class="nm"></span>${chips}<button class="kebab" tabindex="-1">⋯</button>`;
     t.querySelector('.nm').textContent = s.name;
     // Per-tab tint (like a PowerShell tab color) + a resumed-remote marker (default magenta if no color set).
@@ -1824,6 +1831,7 @@ function openMenu(s, anchor){
     `<button data-a="relaunch">↻ Relaunch agent</button>`+
     `<button data-a="history">⏱ Session history</button>`+
     `<button data-a="autoheal"></button>`+
+    `<button data-a="mute"></button>`+
     `<button data-a="opencmd">⌨ Copy local-open command</button>`+
     `<button data-a="reload">↻ Reload terminal (unfreeze)</button>`+
     `<button data-a="rename">✎ Rename</button>`+
@@ -1842,6 +1850,10 @@ function openMenu(s, anchor){
   ahB.classList.toggle('on', !!s.autoheal);
   ahB.title = s.autoheal ? 'This tab auto-restarts its agent if it dies while working (max 3×/10min). Tap to turn off.'
                          : 'Turn on to auto-restart this tab’s agent if it dies while working.';
+  const muteB=m.querySelector('[data-a="mute"]');
+  muteB.textContent = MuxAttentionUi.muteToggleLabel(s);
+  muteB.title = MuxAttentionUi.muteToggleTitle(s);
+  muteB.classList.toggle('on', !s.notifyMuted);
   m.querySelectorAll('button').forEach(b=> b.onclick=()=>{ menuAction(b.dataset.a, s); closeMenu(); });
   const r=anchor.getBoundingClientRect(); const mw=Math.min(220, window.innerWidth-16);
   m.style.width=mw+'px'; m.style.left=Math.max(8, Math.min(r.left, window.innerWidth-mw-8))+'px';
@@ -1877,6 +1889,7 @@ function menuAction(a, s){
   if(a==='open') connect(s.name);
   else if(a==='addcol') addToCollection(s);
   else if(a==='autoheal') toggleAutoheal(s);
+  else if(a==='mute') toggleNotifyMute(s);
   else if(a==='relaunch') relaunchSession(s);
   else if(a==='history') openTabHistory(s);
   else if(a==='opencmd'){ navigator.clipboard?.writeText('mux '+s.name).then(()=>flash('Open command copied — paste it in a fresh local terminal')).catch(()=>{}); }
@@ -1985,6 +1998,16 @@ function toggleAutoheal(s){
     .then(()=>{ s.autoheal=on; const t=(window._sessions||[]).find(x=>x.name===s.name); if(t) t.autoheal=on; renderTabs();
       flash(on?'⟳ Auto-resume ON for “'+s.name+'” — it’ll relaunch if the agent dies while working':'Auto-resume off for “'+s.name+'”'); })
     .catch(e=>flash('Toggle failed: '+(e.message||e)));
+}
+// Per-session phone-push mute. The attention-episode detector keeps running for a muted tab — only the
+// push is swallowed — so unmuting buzzes on the NEXT episode instead of replaying an old one.
+function toggleNotifyMute(s){
+  const on = !!s.notifyMuted;                     // currently muted -> the toggle turns notifications ON
+  MuxAttentionUi.sendNotifyToggle(base, s.name, on)
+    .then(()=>{ s.notifyMuted = !on; MuxAttentionUi.applyNotifyState(window._sessions||[], s.name, !on); renderTabs();
+      flash(on?'🔔 Notifications on for “'+s.name+'” — the next time it needs you, your phone buzzes'
+              :'🔕 Muted “'+s.name+'” — it still shows NEEDS YOU here, but your phone stays quiet'); })
+    .catch(e=>flash('Mute toggle failed: '+(e.message||e)));
 }
 async function apiError(r){
   let msg='HTTP '+r.status;

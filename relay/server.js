@@ -486,6 +486,138 @@ function attentionStatusForHosted(name, h, opts = {}) {
     needsAttention: true, lastOutAgeMs,
   };
 }
+// ---- ATTENTION EPISODES -> one phone push per episode ---------------------------------------------
+// An "episode" is one continuous stretch of a hosted session needing the human (agentState attention
+// or stopped). We push ONCE per episode, and only after the state has HELD for a settle window, so the
+// half-second yellow flicker between an agent's turns never buzzes a phone. The state has to clear
+// (back to working/neutral/dormant) and re-enter before another push is allowed. Episodes are
+// persisted, so a relay restart mid-episode does not re-fire a push the human already got.
+// Deliberately NOT episodes here: host-link-down and heal-give-up. Those are ops-health alerts on the
+// separate health lane; folding them in would let a VPS blip masquerade as "your agent is waiting".
+// createNotifier is required once at the top of the file — the attention lane and the ops-health lane
+// both use the same transport, and two independent leaves each added their own top-level require here.
+const attentionNotifier = createNotifier();
+const NOTIFY_SETTLE_MS = Math.max(TEST_MODE ? 10 : 1000, Number(process.env.MUX_NOTIFY_SETTLE_MS) || 20000);
+// Deep link matches what the web UI's "copy link" builds (public/index.html): <base>/?s=<name>.
+const NOTIFY_LINK_BASE = String(process.env.MUX_PUBLIC_BASE || process.env.HLAUTH_PUBLIC_BASE || '').trim().replace(/\/+$/, '');
+const ATTENTION_EPISODES_FILE = STATE_DIR + '/attention-episodes.json';
+const attentionEpisodes = new Map();   // name -> { since, notified }
+{
+  const loaded = durableJsonLoad(
+    ATTENTION_EPISODES_FILE,
+    [],
+    value => Array.isArray(value) && value.every(entry => (
+      Array.isArray(entry) && entry.length === 2
+      && !!strictMuxName(entry[0])
+      && entry[1] && typeof entry[1] === 'object'
+      && Number.isFinite(Number(entry[1].since))
+      && typeof entry[1].notified === 'boolean'
+    )),
+  );
+  if (!Array.isArray(loaded)) throw new Error('persisted attention-episode state must be an entry array');
+  for (const [name, episode] of loaded)
+    attentionEpisodes.set(name, { since: Number(episode.since) || 0, notified: !!episode.notified });
+}
+function saveAttentionEpisodes() {
+  // A push ledger must never take the host link down: record the failure like every other writer does
+  // and keep serving. Worst case a restart re-pushes one episode, which beats dropping muxd's frame.
+  try { writeJsonState(ATTENTION_EPISODES_FILE, [...attentionEpisodes]); }
+  catch (error) { recordPersistenceFailure(error); }
+}
+// '' unless this session is in an episode-worthy state. Reuses the tab-dot classifier verbatim so the
+// phone and the browser can never disagree about who is waiting.
+function attentionEpisodeState(name) {
+  const h = hostSessions.get(name);
+  if (!h) return '';
+  const dormant = h.alive === false;
+  const attn = attentionStatusForHosted(name, h, { dormant, detachedLocal: dormant && locallyRunningMuxName(name) });
+  const state = String(attn && attn.agentState || '');
+  return (state === 'attention' || state === 'stopped') ? state : '';
+}
+// ---- PER-SESSION NOTIFICATION MUTE ---------------------------------------------------------------
+// Muting a session does NOT stop the episode state machine — the episode still opens, settles and
+// closes, only the outgoing push is swallowed. That way unmuting never dumps a backlog of stale buzzes
+// for a session that has been waiting all night; you get the NEXT episode. Mutes are keyed by session
+// name and are deliberately NOT pruned when the session disappears: a tab you silenced stays silenced
+// across kill/relaunch, which is the whole point of a per-session mute.
+const NOTIFY_MUTES_FILE = STATE_DIR + '/notify-mutes.json';
+const notifyMutes = new Set();
+{
+  const loaded = durableJsonLoad(
+    NOTIFY_MUTES_FILE,
+    [],
+    value => Array.isArray(value) && value.every(entry => !!strictMuxName(entry)),
+  );
+  if (!Array.isArray(loaded)) throw new Error('persisted notify-mute state must be a name array');
+  for (const name of loaded) notifyMutes.add(String(name));
+}
+function saveNotifyMutes() { writeJsonState(NOTIFY_MUTES_FILE, [...notifyMutes]); }
+function pushAttentionEpisode(name, state, heldMs) {
+  if (!attentionNotifier.enabled) return;
+  if (notifyMutes.has(name)) return;                     // muted: the episode is consumed, silently
+  const h = hostSessions.get(name) || {};
+  const label = String(h.agentLabel || '') || (state === 'stopped' ? 'agent stopped' : 'waiting for you');
+  const detail = String(h.agentDetail || '');
+  const click = NOTIFY_LINK_BASE ? NOTIFY_LINK_BASE + '/?s=' + encodeURIComponent(name) : '';
+  attentionNotifier.push({
+    title: name + ' - ' + label,
+    body: `${name}: ${label}${detail ? ' (' + detail + ')' : ''}\nheld ${Math.round(heldMs / 1000)}s${click ? '\n' + click : ''}`,
+    tags: [state === 'stopped' ? 'octagonal_sign' : 'bell'],
+    priority: state === 'stopped' ? 'high' : 'default',
+    click,
+  }).then(result => {
+    if (result && !result.ok && !result.disabled)
+      console.error(`[notify] attention push for ${name} failed: ${result.error || result.status}`);
+  }).catch(() => {});
+}
+let attentionSweepTimer = null;   // { timer, at } — one pending re-check, always the earliest due one
+function scheduleAttentionSweep(delayMs) {
+  if (!Number.isFinite(delayMs)) return;                 // nothing pending -> hold no timer at all
+  const at = Date.now() + delayMs;
+  if (attentionSweepTimer && attentionSweepTimer.at <= at) return;
+  if (attentionSweepTimer) clearTimeout(attentionSweepTimer.timer);
+  const timer = setTimeout(() => {
+    attentionSweepTimer = null;
+    try { sweepAttentionEpisodes(); }
+    catch (error) { console.error('[notify] attention sweep failed: ' + (error && error.message || error)); }
+  }, Math.max(1, delayMs));
+  if (typeof timer.unref === 'function') timer.unref();  // never hold the process open for a maybe-push
+  attentionSweepTimer = { timer, at };
+}
+// Runs on every host session update AND on its own settle timer: the settle window has to be able to
+// elapse without muxd sending another frame, or a session that goes quiet and stays quiet never fires.
+function sweepAttentionEpisodes() {
+  if (!hostUp()) return;                                 // link-down is the health lane's alert, not ours
+  const now = Date.now();
+  let dirty = false;
+  let soonestMs = Infinity;
+  for (const name of [...attentionEpisodes.keys()]) {
+    if (!hostSessions.has(name)) { attentionEpisodes.delete(name); dirty = true; }
+  }
+  for (const name of hostSessions.keys()) {
+    const state = attentionEpisodeState(name);
+    const open = attentionEpisodes.get(name);
+    if (!state) {
+      if (open) { attentionEpisodes.delete(name); dirty = true; }   // cleared: the next entry may push
+      continue;
+    }
+    if (!open) {
+      attentionEpisodes.set(name, { since: now, notified: false });
+      dirty = true;
+      soonestMs = Math.min(soonestMs, NOTIFY_SETTLE_MS);
+      continue;
+    }
+    if (open.notified) continue;                         // already buzzed for THIS episode
+    const heldMs = now - open.since;
+    if (heldMs < NOTIFY_SETTLE_MS) { soonestMs = Math.min(soonestMs, NOTIFY_SETTLE_MS - heldMs); continue; }
+    open.notified = true;
+    dirty = true;
+    pushAttentionEpisode(name, state, heldMs);
+  }
+  if (dirty) saveAttentionEpisodes();
+  scheduleAttentionSweep(soonestMs);
+}
+
 function listSessions() {
   let list = [];
   const legacy = new Set(legacyTmuxNames());
@@ -504,6 +636,7 @@ function listSessions() {
                   state: attn.state, agentState: attn.agentState, agentLabel: attn.agentLabel,
                   agentDetail: attn.agentDetail, agentConfidence: attn.agentConfidence,
                   needsAttention: !!attn.needsAttention, lastOutAgeMs: attn.lastOutAgeMs,
+                  notifyMuted: notifyMutes.has(name),   // per-session phone-push mute (attention episodes)
                   autoheal: !!h.heal, hosted: true,
                   alive, dormant, detachedLocal, cols: h.cols || 0, rows: h.rows || 0,
                   hasCommand: !!h.hasCommand, shellOnly: !!h.shellOnly, ready: !!h.ready,
@@ -529,7 +662,7 @@ function listSessions() {
     if (list.some(s => s.name === name)) continue;
     list.push({ name, windows: 0, created: 0, attached: false, activity: 0, state: 'red',
                 agentState: 'blocked', agentLabel: 'legacy blocker', agentDetail: legacyDetail(name),
-                agentConfidence: 'high', needsAttention: true,
+                agentConfidence: 'high', needsAttention: true, notifyMuted: notifyMutes.has(name),
                 autoheal: false, hosted: false, legacy: true, legacyBlocked: true,
                 detail: legacyDetail(name) });
   }
@@ -774,6 +907,27 @@ app.post('/api/sessions/:name/autoheal', async (req, res) => {
   if (!confirmed.ok)
     return failHost(res, 504, 'muxd auto-resume change not confirmed', confirmed.error);
   res.json({ ok: true, name, autoheal: on });
+});
+
+// PER-TAB attention-notification mute. Owner-gated by the global middleware above like every other
+// /api route. Unlike autoheal this never touches muxd: the mute lives entirely in relay state, so it
+// still works while the PC host is offline (which is exactly when you want to silence a stuck tab).
+app.post('/api/sessions/:name/notify', (req, res) => {
+  const name = strictMuxName(req.params.name);
+  if (!name) return res.status(400).json({ error: 'name required' });
+  if (!req.body || typeof req.body.on !== 'boolean')
+    return res.status(400).json({ error: 'on must be a boolean' });
+  const on = req.body.on;
+  const wasMuted = notifyMutes.has(name);
+  if (wasMuted === on) {                                 // muted+on, or unmuted+off => a real change
+    if (on) notifyMutes.delete(name); else notifyMutes.add(name);
+    try { saveNotifyMutes(); }
+    catch (error) {
+      if (on) notifyMutes.add(name); else notifyMutes.delete(name);   // memory must match the disk
+      return res.status(503).json({ error: 'state persistence failed', detail: recordPersistenceFailure(error) });
+    }
+  }
+  res.json({ ok: true, name, notify: on, notifyMuted: !on });
 });
 
 // --- project sync: the desktop app pushes its collections/chats projection here while it's open, so
@@ -1867,6 +2021,7 @@ wssHost.on('connection', (ws, req) => {
       }
       for (const name of hostSessions.keys()) recompute(name);
       reconcileRenameIntentsFromHost();
+      sweepAttentionEpisodes();
       const legacy = new Set(legacyTmuxNames());
       const twins = [...hostSessions.keys()].filter(name => legacy.has(name));
       if (twins.length) console.log(`[legacy] hosted/legacy name conflict(s): ${twins.join(', ')} - relay will refuse web attach/manage until cleaned manually`);
@@ -1887,6 +2042,7 @@ wssHost.on('connection', (ws, req) => {
       hostSessions.clear();
       for (const [n, v] of incoming) hostSessions.set(n, v);
       reconcileRenameIntentsFromHost();
+      sweepAttentionEpisodes();
     } else if (m.t === 'createResult') {
       const rid = String(m.rid || '');
       const pending = pendingHostCreates.get(rid);
