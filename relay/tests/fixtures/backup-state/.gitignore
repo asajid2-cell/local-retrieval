@@ -1,0 +1,4 @@
+# These fixtures are deliberately named like live relay state, so the repo-root
+# `*.bak` rule and relay/.gitignore's `projects.json`/`pins.json`/... rules would
+# otherwise swallow them. Re-include everything in this directory.
+!*

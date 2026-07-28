@@ -1,0 +1,35 @@
+[Unit]
+Description=Back up multiplex relay durable state off-box to the PC
+Documentation=file:///home/harmonizer/multiplex-app/ops/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=harmonizer
+Group=harmonizer
+
+# --verify proves a restore roundtrip against the freshly built archive BEFORE it is
+# sent, so a corrupt or empty backup fails the unit instead of silently replacing a
+# good one on the far side.
+ExecStart=/usr/local/bin/mux-backup-state.sh --state-dir /home/harmonizer/multiplex-app --verify
+
+# The script builds its archive under TMPDIR and refuses to include anything outside
+# its allowlist, so it needs no write access to the relay's state dir.
+ProtectSystem=strict
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+ReadOnlyPaths=/home/harmonizer/multiplex-app
+
+# A failed backup is not an emergency, but it must be visible.
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target
