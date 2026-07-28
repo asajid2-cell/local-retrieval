@@ -79,6 +79,7 @@ missing any of them fails `hostProtocolOk()` and the relay treats it as protocol
 | `resize` | optional | Host accepts `resize` and applies remote PTY geometry. |
 | `owner` | optional | Host reports/steers session ownership (`owner-ok`). |
 | `relaunch` | optional | Host honours the `relaunch` flag on `create`. |
+| `agentTruth` | optional | Host probes the OS about the session's own process tree and emits `agentTruth` + `agentStateSource` on every session payload. Advisory only: it never replaces `agentState`, and a stale or failed probe degrades to `agentStateSource: "heuristic"`. |
 
 ### Reserved — terminal model (native prong)
 
@@ -185,8 +186,28 @@ Produced by `session_payload()` (`muxd/muxd.py:2266`), consumed by `normalizeHos
 `localFirst`, `owner`, `hasCommand`, `shellOnly`, `ready`, `kind`, `sessionId`, `aliases`,
 `identityPending`, `agentState`, `agentLabel`, `agentDetail`, `agentConfidence`.
 
-muxd additionally emits `lifecycle`, `childPid`, `needsAttention`, and `lastOutAgeMs`; the relay
-does not currently forward them. `kind` is one of `command` / `shell` / `dormant`.
+muxd additionally emits `lifecycle`, `childPid`, `needsAttention`, `lastOutAgeMs`, `agentTruth`,
+and `agentStateSource`; the relay does not currently forward them. `kind` is one of `command` /
+`shell` / `dormant`.
+
+#### Process truth (`agentTruth` capability)
+
+Additive on protocol 4 — a host without the `agentTruth` capability simply omits both fields, and a
+consumer must treat their absence as `"heuristic"`.
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `agentStateSource` | string | `"process"` when `agentTruth` is a fresh OS answer; `"heuristic"` when the probe is missing, stale, or failed. `agentState` is authoritative either way. |
+| `agentTruth` | object | Always present when the capability is advertised; all-falsy (`AGENT_TRUTH_UNKNOWN`) when unknown. |
+| `agentTruth.procAlive` | bool | The session's `childPid` process tree is really alive, fenced against pid reuse by the recorded creation time. |
+| `agentTruth.cpuActiveRecent` | bool | Subtree kernel+user CPU rose since the previous probe. False on the first probe — absence of evidence, not evidence of idleness. |
+| `agentTruth.exe` | string | Image name of the deepest non-ConPTY-host descendant — the process a human would call "the agent". `""` when unknown. |
+| `agentTruth.checkedUtc` | string | ISO-8601 `Z` timestamp of the probe that produced this answer; `""` when never probed. |
+
+Probes run on a dedicated bounded executor (`AGENT_TRUTH_MAX_INFLIGHT`), are cached for
+`AGENT_TRUTH_TTL` (≥ 10 s), time out at `AGENT_TRUTH_PROBE_TIMEOUT` (≤ 3 s), and are never awaited
+on the request path or under the state lock. A wedged probe therefore costs a session its
+`"process"` source, never its responsiveness.
 
 `name` is the exception to the allow-list shape: `normalizeHostSession()` validates it as a strict
 mux name and rejects the whole session if it fails, but does **not** copy it into the returned

@@ -13,6 +13,7 @@
 # State: sessions.json manifest (resume commands) -> muxd restart / PC reboot lists unarmed sessions
 # as dormant placeholders. Only sessions explicitly armed with heal auto-start.
 import asyncio, base64, collections, ctypes, gc, glob, hashlib, json, os, queue, re, socket, ssl, subprocess, sys, tempfile, threading, time, traceback
+import concurrent.futures
 from ctypes import wintypes
 from datetime import datetime, timedelta, timezone
 import faulthandler
@@ -1071,10 +1072,22 @@ CUSTODY_GC_INTERVAL_SECONDS = max(
     30, int(os.environ.get("MUX_CUSTODY_GC_INTERVAL_S") or ENV.get("MUX_CUSTODY_GC_INTERVAL_S") or "600")
 )
 PROTOCOL = 4
-CAPS = ["ls", "info", "create", "createAck", "bind", "input", "open", "attach", "kill", "rename", "heal", "tail", "scrollback", "resize", "owner", "relaunch"]
+CAPS = ["ls", "info", "create", "createAck", "bind", "input", "open", "attach", "kill", "rename", "heal", "tail", "scrollback", "resize", "owner", "relaunch", "agentTruth"]
 STARTED = time.time()
 AGENT_WORKING_FRESH = float(ENV.get("AGENT_WORKING_FRESH", "25"))
 AGENT_STARTING_GRACE = float(ENV.get("AGENT_STARTING_GRACE", "45"))
+# --- process-truth probe budget -------------------------------------------------
+# A session payload is built on the event loop, several times a second, for every
+# session. Asking the OS "is the agent really alive" is a syscall storm, so the
+# answer is cached and refreshed OFF the loop by a tiny dedicated executor. Nothing
+# on the request path ever waits for a probe: a missing or stale answer degrades to
+# the heuristic ladder instead of blocking.
+AGENT_TRUTH_TTL = max(10.0, float(ENV.get("AGENT_TRUTH_TTL", "10")))          # refresh no faster than this
+AGENT_TRUTH_MAX_AGE = max(AGENT_TRUTH_TTL * 3, float(ENV.get("AGENT_TRUTH_MAX_AGE", "30")))  # older => heuristic
+AGENT_TRUTH_PROBE_TIMEOUT = min(3.0, max(0.5, float(ENV.get("AGENT_TRUTH_PROBE_TIMEOUT", "3"))))
+AGENT_TRUTH_MAX_INFLIGHT = 2        # hard ceiling on concurrent probes; a wedged probe cannot pile up
+AGENT_TRUTH_MAX_PIDS = 400          # bounded subtree walk
+AGENT_TRUTH_MAX_DEPTH = 12
 ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]")
 STALE_CSI_RE = re.compile(r"\[[0-?]*[ -/]*[@-~]")
 CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
@@ -1206,7 +1219,7 @@ def _without_ignored_live(live, ignored):
     return ok, filtered, detail
 
 
-def _pid_descends_from(pid, ancestor_pid):
+def _pid_descends_from(pid, ancestor_pid, timeout=15):
     try:
         pid = int(pid)
         ancestor_pid = int(ancestor_pid)
@@ -1229,7 +1242,7 @@ def _pid_descends_from(pid, ancestor_pid):
             ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
             capture_output=True,
             text=True,
-            timeout=15,
+            timeout=max(0.5, float(timeout)),
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         if result.returncode != 0:
@@ -1238,6 +1251,249 @@ def _pid_descends_from(pid, ancestor_pid):
         return True if value == "true" else False if value == "false" else None
     except Exception:
         return None
+
+
+_AGENT_TRUTH_LOCK = threading.Lock()      # guards the cache dict ONLY - never held across a probe
+_AGENT_TRUTH_CACHE = {}                   # (pid, start_token) -> entry
+_AGENT_TRUTH_INFLIGHT = 0
+_AGENT_TRUTH_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=AGENT_TRUTH_MAX_INFLIGHT, thread_name_prefix="agent-truth"
+)
+AGENT_TRUTH_UNKNOWN = {"procAlive": False, "cpuActiveRecent": False, "exe": "", "checkedUtc": ""}
+
+
+def _process_rows():
+    """(pid, parentPid, exe) for every process, from one Toolhelp32 snapshot.
+
+    Same machinery `_direct_child_pids` uses, walked once instead of once per parent:
+    a descendant probe that re-snapshots per level costs O(depth) snapshots for nothing.
+    """
+    if os.name != "nt":
+        return []
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_snapshot = kernel32.CreateToolhelp32Snapshot
+    create_snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    create_snapshot.restype = wintypes.HANDLE
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [wintypes.HANDLE]
+    close_handle.restype = wintypes.BOOL
+    snapshot = create_snapshot(0x00000002, 0)  # TH32CS_SNAPPROCESS
+    if snapshot == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    entry = _PROCESSENTRY32W()
+    entry.dwSize = ctypes.sizeof(entry)
+    rows = []
+    try:
+        first = kernel32.Process32FirstW
+        first.argtypes = [wintypes.HANDLE, ctypes.POINTER(_PROCESSENTRY32W)]
+        first.restype = wintypes.BOOL
+        next_entry = kernel32.Process32NextW
+        next_entry.argtypes = [wintypes.HANDLE, ctypes.POINTER(_PROCESSENTRY32W)]
+        next_entry.restype = wintypes.BOOL
+        ctypes.set_last_error(0)
+        if not first(snapshot, ctypes.byref(entry)):
+            error = ctypes.get_last_error()
+            if error == 18:  # ERROR_NO_MORE_FILES
+                return []
+            raise ctypes.WinError(error)
+        while True:
+            rows.append((int(entry.th32ProcessID), int(entry.th32ParentProcessID), str(entry.szExeFile or "")))
+            ctypes.set_last_error(0)
+            if not next_entry(snapshot, ctypes.byref(entry)):
+                error = ctypes.get_last_error()
+                if error not in (0, 18):
+                    raise ctypes.WinError(error)
+                break
+        return rows
+    finally:
+        close_handle(snapshot)
+
+
+def _process_cpu_100ns(pid):
+    """Kernel+user CPU consumed by one pid, in 100ns ticks. 0 when unreadable."""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return 0
+    if pid <= 0 or os.name != "nt":
+        return 0
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        open_process = kernel32.OpenProcess
+        open_process.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        open_process.restype = wintypes.HANDLE
+        get_process_times = kernel32.GetProcessTimes
+        get_process_times.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
+        get_process_times.restype = wintypes.BOOL
+        handle = open_process(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return 0
+        try:
+            created, exited, kernel, user = (wintypes.FILETIME() for _ in range(4))
+            if not get_process_times(handle, ctypes.byref(created), ctypes.byref(exited),
+                                     ctypes.byref(kernel), ctypes.byref(user)):
+                return 0
+            total = 0
+            for part in (kernel, user):
+                total += (int(part.dwHighDateTime) << 32) | int(part.dwLowDateTime)
+            return total
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception:
+        return 0
+
+
+def _agent_truth_subtree(root_pid, rows):
+    """Bounded descendant walk. Returns (pids, exe, agentPid) where exe/agentPid name the
+    deepest non-ConPTY-host descendant - the process a human would call "the agent"."""
+    children = {}
+    names = {}
+    for pid, parent, exe in rows:
+        names[pid] = exe
+        children.setdefault(parent, []).append(pid)
+    if root_pid not in names:
+        return [], "", 0
+    pids = [root_pid]
+    best = (-1, root_pid, names.get(root_pid, ""))
+    seen = {root_pid}
+    frontier = [(root_pid, 0)]
+    while frontier and len(pids) < AGENT_TRUTH_MAX_PIDS:
+        pid, depth = frontier.pop(0)
+        if depth >= AGENT_TRUTH_MAX_DEPTH:
+            continue
+        for child in sorted(children.get(pid, [])):
+            if child in seen or child == pid or len(pids) >= AGENT_TRUTH_MAX_PIDS:
+                continue
+            seen.add(child)
+            pids.append(child)
+            frontier.append((child, depth + 1))
+            exe = names.get(child, "")
+            if exe.lower() in _CONPTY_HOST_EXECUTABLES:
+                continue
+            if depth + 1 > best[0]:
+                best = (depth + 1, child, exe)
+    return pids, best[2], best[1]
+
+
+def _agent_truth_probe(pid, start_token, previous=None):
+    """Off-loop, bounded. Answers whether the session's process tree is REALLY alive."""
+    checked = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    if start_token and not _same_process_instance(pid, start_token):
+        # The pid we recorded is gone (or was recycled onto somebody else's process).
+        return {"procAlive": False, "cpuActiveRecent": False, "exe": "", "checkedUtc": checked}, 0, 0
+    try:
+        rows = _process_rows()
+    except Exception as error:
+        log(f"agent-truth snapshot failed for pid {pid}: {error}")
+        rows = None
+    if rows is None:
+        # Snapshot unavailable: fall back to the per-pid ancestry walk, capped at the
+        # probe budget, to re-confirm the descendant we saw last time.
+        agent_pid = int((previous or {}).get("agentPid", 0) or 0)
+        alive = _pid_alive(pid)
+        if not alive and agent_pid > 0 and _pid_alive(agent_pid):
+            alive = _pid_descends_from(agent_pid, pid, timeout=AGENT_TRUTH_PROBE_TIMEOUT) is True
+        return ({"procAlive": bool(alive), "cpuActiveRecent": False,
+                 "exe": str((previous or {}).get("exe", "") or "") if alive else "",
+                 "checkedUtc": checked}, 0, 0)
+    pids, exe, agent_pid = _agent_truth_subtree(int(pid), rows)
+    alive = bool(pids) or _pid_alive(pid)
+    if not alive:
+        return {"procAlive": False, "cpuActiveRecent": False, "exe": "", "checkedUtc": checked}, 0, 0
+    cpu = sum(_process_cpu_100ns(p) for p in pids)
+    prev_cpu = int((previous or {}).get("cpu", 0) or 0)
+    had_prev = prev_cpu > 0
+    return ({"procAlive": True, "cpuActiveRecent": bool(had_prev and cpu > prev_cpu),
+             "exe": exe, "checkedUtc": checked}, cpu, agent_pid)
+
+
+def _agent_truth_refresh(key, pid, start_token, previous):
+    global _AGENT_TRUTH_INFLIGHT
+    truth, cpu, agent_pid = AGENT_TRUTH_UNKNOWN, 0, 0
+    ok = False
+    try:
+        # Run the probe in a fresh daemon thread so it can be abandoned if
+        # it hangs.  _agent_truth_probe touches kernel32 / psutil syscalls
+        # that can wedge (hung process handle, frozen snapshot) -- the
+        # bounded .join below is the ONLY enforcement of
+        # AGENT_TRUTH_PROBE_TIMEOUT.
+        result = {}
+        def _run_probe():
+            try:
+                t, c, a = _agent_truth_probe(pid, start_token, previous)
+                result["truth"], result["cpu"], result["agent_pid"] = t, c, a
+                result["ok"] = True
+            except Exception as exc:
+                result["error"] = exc
+        probe_thread = threading.Thread(target=_run_probe, daemon=True)
+        probe_thread.start()
+        probe_thread.join(timeout=AGENT_TRUTH_PROBE_TIMEOUT)
+        if probe_thread.is_alive():
+            log(f"agent-truth probe timed out after {AGENT_TRUTH_PROBE_TIMEOUT}s for pid {pid}")
+            # Thread abandoned as daemon; inflight counter recovers in finally.
+        elif result.get("error"):
+            raise result["error"]
+        else:
+            truth, cpu, agent_pid = result["truth"], result["cpu"], result["agent_pid"]
+            ok = True
+    except Exception as error:
+        log(f"agent-truth probe failed for pid {pid}: {error}")
+    finally:
+        with _AGENT_TRUTH_LOCK:
+            _AGENT_TRUTH_INFLIGHT = max(0, _AGENT_TRUTH_INFLIGHT - 1)
+            entry = _AGENT_TRUTH_CACHE.get(key) or {}
+            entry["inflight"] = False
+            if ok:
+                entry["truth"] = truth
+                entry["cpu"] = cpu
+                entry["agentPid"] = agent_pid
+                entry["exe"] = truth.get("exe", "")
+                entry["at"] = time.monotonic()
+            _AGENT_TRUTH_CACHE[key] = entry
+
+
+def _agent_truth_schedule(key, pid, start_token, entry):
+    global _AGENT_TRUTH_INFLIGHT
+    if _AGENT_TRUTH_INFLIGHT >= AGENT_TRUTH_MAX_INFLIGHT:
+        return          # a wedged probe degrades this session to 'heuristic'; it never queues threads
+    _AGENT_TRUTH_INFLIGHT += 1
+    entry["inflight"] = True
+    _AGENT_TRUTH_CACHE[key] = entry
+    previous = dict(entry)
+    try:
+        _AGENT_TRUTH_EXECUTOR.submit(_agent_truth_refresh, key, pid, start_token, previous)
+    except Exception as error:
+        _AGENT_TRUTH_INFLIGHT = max(0, _AGENT_TRUTH_INFLIGHT - 1)
+        entry["inflight"] = False
+        log(f"agent-truth probe could not be scheduled for pid {pid}: {error}")
+
+
+def session_agent_truth(sess, now=None):
+    """(agentTruth, agentStateSource) for a session payload. NEVER blocks and is
+    never called with the state lock held for anything but a dict read: a stale or
+    failed probe reports 'heuristic' and lets `session_agent_status` stand."""
+    if now is None:
+        now = time.monotonic()
+    try:
+        pid = int(getattr(sess, "child_pid", 0) or 0)
+    except (TypeError, ValueError):
+        pid = 0
+    start_token = str(getattr(sess, "child_start_token", "") or "")
+    if pid <= 0:
+        return dict(AGENT_TRUTH_UNKNOWN), "heuristic"
+    key = (pid, start_token)
+    with _AGENT_TRUTH_LOCK:
+        entry = _AGENT_TRUTH_CACHE.get(key)
+        if entry is None:
+            entry = {"truth": None, "at": 0.0, "cpu": 0, "agentPid": 0, "exe": "", "inflight": False}
+        age = now - float(entry.get("at", 0.0) or 0.0) if entry.get("at") else float("inf")
+        if age >= AGENT_TRUTH_TTL and not entry.get("inflight"):
+            _agent_truth_schedule(key, pid, start_token, entry)
+        truth = entry.get("truth")
+    if not truth or age > AGENT_TRUTH_MAX_AGE:
+        # Never probed, or the last answer is too old to be evidence of anything now.
+        return (dict(truth) if truth else dict(AGENT_TRUTH_UNKNOWN)), "heuristic"
+    return dict(truth), "process"
 
 
 def session_owned_live_ids(session, live):
@@ -2604,6 +2860,14 @@ def session_payload(name, sess):
     kind = "command" if has_cmd else ("shell" if alive else "dormant")
     tail = sess.tail_text()
     agent = session_agent_status(sess, alive=alive, tail=tail)
+    # Process truth is advisory and additive: it reports what the OS says about the
+    # session's own process tree. It never overrides the heuristic ladder above - when
+    # the probe is stale or failed, agentStateSource says 'heuristic' and agentState
+    # stands on its own.
+    try:
+        agent_truth, agent_source = session_agent_truth(sess)
+    except Exception:
+        agent_truth, agent_source = dict(AGENT_TRUTH_UNKNOWN), "heuristic"
     return {"name": name, "alive": alive, "created": int(sess.created * 1000),
             "lastOut": int(sess.last_out * 1000), "cols": sess.cols, "rows": sess.rows,
             "tail": tail, "heal": sess.heal, "localViewers": len(sess.local),
@@ -2617,7 +2881,8 @@ def session_payload(name, sess):
             "childPid": int(getattr(sess, "child_pid", 0) or 0),
             "agentState": agent["agentState"], "agentLabel": agent["agentLabel"],
             "agentDetail": agent["agentDetail"], "agentConfidence": agent["agentConfidence"],
-            "needsAttention": agent["needsAttention"], "lastOutAgeMs": agent.get("lastOutAgeMs", 0)}
+            "needsAttention": agent["needsAttention"], "lastOutAgeMs": agent.get("lastOutAgeMs", 0),
+            "agentTruth": agent_truth, "agentStateSource": agent_source}
 
 def needs_relaunch_for_command(prev, requested_cmd):
     requested = normalized_cmd(requested_cmd)
