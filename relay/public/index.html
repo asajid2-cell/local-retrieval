@@ -1024,10 +1024,11 @@ function pumpTermWrite(){
 //  (2) the term.write callback never fired (xterm wedged under a burst), so termWriting stays true and the
 //      whole write queue stalls — new bytes arrive (the "N new" pill climbs) but nothing paints.
 // A document-level mouseup catches (1) the instant you release anywhere; a slow watchdog is the backstop
-// for both, so a stuck tab always self-heals within ~2s instead of needing a reload.
-document.addEventListener('mouseup', ()=>{ setTimeout(()=>{ if(autoFreeze && !selectMode && !(term.hasSelection && term.hasSelection())){ autoFreeze=false; flushFrozen(); } }, 0); }, true);
+// for both, so a stuck tab always self-heals within ~2s instead of needing a reload. Both go through
+// maybeUnfreezeSelection() so the drag-latch rule (a live highlight always wins) has exactly one home.
+document.addEventListener('mouseup', ()=>{ setTimeout(maybeUnfreezeSelection, 0); }, true);
 setInterval(()=>{
-  if(autoFreeze && !selectMode && !(term.hasSelection && term.hasSelection())){ autoFreeze=false; flushFrozen(); }   // (1) lost-mouseup unfreeze
+  maybeUnfreezeSelection();                                                                                           // (1) lost-mouseup unfreeze
   if(termWriting && termWriteStartedAt && Date.now()-termWriteStartedAt > 4000){                                     // (2) wedged write pump
     _wedgeStrikes++;
     activeTermWriteToken=++termWriteToken;
@@ -1052,7 +1053,10 @@ function reloadTerminal(quiet){
   connect(name, true);   // re-attach: CLEAR + scrollback replay + live, all client state reset
 }
 document.addEventListener('keydown', e=>{ if(e.ctrlKey && e.altKey && (e.key==='r'||e.key==='R')){ e.preventDefault(); e.stopPropagation(); reloadTerminal(); } }, true);
-window.__muxBuild='2026-07-23-visible-scrollbar-honest-alt-scroll';   // bump per web deploy so a loaded version is verifiable
+// One stamp for the whole integrated build. Every leaf bumps this line to its own feature name, so it
+// collides on every index.html merge; naming it for the integration keeps the marker honest about what
+// is actually loaded rather than crediting whichever leaf merged last.
+window.__muxBuild='2026-07-27-campaign-integration';   // bump per web deploy so a loaded version is verifiable
 try{ console.info('multiplex build', window.__muxBuild); }catch(e){}
 const helper = $('#term').querySelector('.xterm-helper-textarea');
 function hardenHelperTextarea(){
@@ -1161,24 +1165,72 @@ if (location.search.includes('demo')) { window.__term = term; window.__dropws = 
 // second and wipes any highlight, so the instant a drag/selection starts we FREEZE incoming output (buffer
 // it) and flush it back the moment the selection is cleared — no need to press "Sel" first. Touch keeps the
 // explicit Sel toggle (a touch-drag means "scroll"). If the app has grabbed the mouse, hold Shift to select.
+//
+// The latch rule, stated once: A LIVE HIGHLIGHT ALWAYS WINS. Every unfreeze path asks
+// maybeUnfreezeSelection() first, so nothing — a stray mouseup, the 2s freeze watchdog, an out-of-order
+// selectionchange — can flush buffered output through a drag that is still in progress. That is what lets
+// you drag 30 lines out of a streaming build log without a repaint eating the selection halfway down.
+let autoCopyOnSelect = false;   // opt-in: finishing a drag-select copies it (the X11 habit); persisted in LS
+function getAutoCopyOnSelect(){ return LS.get('mux_autocopy', false) === true; }
+function setAutoCopyOnSelect(on){
+  autoCopyOnSelect = on === true;
+  LS.set('mux_autocopy', autoCopyOnSelect);
+  return autoCopyOnSelect;
+}
+autoCopyOnSelect = getAutoCopyOnSelect();
+function termHasSelection(){ try{ return !!(term.hasSelection && term.hasSelection()); }catch(e){ return false; } }
+// The ONLY way output goes live again after a selection freeze. Returns true if it actually unfroze.
+function maybeUnfreezeSelection(){
+  if(!autoFreeze || selectMode) return false;   // selectMode is the phone's explicit Sel toggle — it owns its own unfreeze
+  if(termHasSelection()) return false;          // drag-latch: text is still highlighted → stay frozen
+  autoFreeze = false;
+  flushFrozen();
+  return true;
+}
+// Wired to term.onSelectionChange: a selection born from a plain mouse drag latches the freeze exactly like
+// the explicit Sel toggle does, and clearing it (click away / new click) goes live again + replays.
+function selectionFreezeSync(){
+  if(termHasSelection()){
+    if(!selectMode) autoFreeze = true;
+    return true;
+  }
+  maybeUnfreezeSelection();
+  return false;
+}
+// Auto-copy-on-select only fires when a gesture ENDS on a real selection, never mid-drag.
+function autoCopyIfArmed(){
+  if(!autoCopyOnSelect || !termHasSelection()) return false;
+  copySelectionNow();
+  return true;
+}
+// Copy the current selection; resolves true if the clipboard took it. When the clipboard API refuses
+// (plain-http origin, denied permission, no user gesture) we do NOT dead-end on "copy failed" — we open the
+// copy overlay, whose plain <pre> takes a native Ctrl/⌘+C with no permission dance.
 function copySelectionNow(){
-  const t = term.getSelection ? term.getSelection() : '';
-  if(!t) return;
-  (navigator.clipboard?navigator.clipboard.writeText(t):Promise.reject())
-    .then(()=>flash('Copied selection'),()=>flash('Copy failed — clipboard blocked (needs HTTPS)'));
+  let t = '';
+  try{ t = term.getSelection ? term.getSelection() : ''; }catch(e){ t = ''; }
+  if(!t) return Promise.resolve(false);
+  const write = (navigator.clipboard && navigator.clipboard.writeText)
+    ? navigator.clipboard.writeText(t)
+    : Promise.reject(new Error('no clipboard API'));
+  return Promise.resolve(write).then(
+    ()=>{ flash('Copied selection'); return true; },
+    ()=>{ flash('Clipboard blocked — press Ctrl/⌘+C here'); try{ openCopyView(); }catch(e){} return false; },
+  );
 }
 (function(){
   const scr = $('#term');
   // freeze as soon as the mouse goes down, so the drag-select can't be repainted away mid-gesture
   scr.addEventListener('mousedown', e=>{ if(e.button===0 && !selectMode) autoFreeze=true; }, true);
-  // a click that makes no selection (just focusing) must go live again + replay whatever was buffered
-  scr.addEventListener('mouseup', ()=>{ setTimeout(()=>{ if(autoFreeze && !selectMode && !(term.hasSelection&&term.hasSelection())){ autoFreeze=false; flushFrozen(); } }, 0); }, true);
-  // clearing the selection (click away / new click) → live again + replay
-  term.onSelectionChange(()=>{
-    const has = term.hasSelection && term.hasSelection();
-    if(has){ if(!selectMode) autoFreeze=true; }
-    else if(autoFreeze && !selectMode){ autoFreeze=false; flushFrozen(); }
-  });
+  // a click that makes no selection (just focusing) goes live again + replays whatever was buffered;
+  // a drag that DID select stays frozen and, if auto-copy is armed, copies itself on release
+  scr.addEventListener('mouseup', ()=>{ setTimeout(()=>{ if(!maybeUnfreezeSelection()) autoCopyIfArmed(); }, 0); }, true);
+  // xterm's own selection signal: growing or clearing the highlight re-latches or releases the freeze
+  term.onSelectionChange(selectionFreezeSync);
+  // NOTE: no contextmenu handler here, on purpose. Over #term the browser's own right-click menu
+  // (Copy / Paste / Search) is the desktop escape hatch when the clipboard API is blocked, and it is the
+  // one gesture users expect to work on a live selection — calling
+  // preventDefault to put a custom menu there is exactly what makes a web terminal feel un-native.
 })();
 
 // ---- IMAGE PASTE: a terminal can't take inline image bytes (codex/claude then say "no image found, try
@@ -2542,8 +2594,23 @@ function openHelp(){
       <li><b>Esc Tab ⇧Tab ⏎ ↑↓←→</b> core keys. <b>⇧Tab</b> cycles Claude/Codex auto-mode.</li>
       <li><b>^</b> ctrl-shortcuts (^C ^R ^L…) &nbsp;·&nbsp; <b>nav</b> Home/End/PgUp… &nbsp;·&nbsp; <b>Fn</b> F-keys &nbsp;·&nbsp; <b>{ }</b> symbols &nbsp;·&nbsp; <b>★</b> your custom buttons.</li>
       <li>On the terminal: <b>drag up/down</b> to scroll history, <b>drag sideways</b> to pan when a bigger screen is connected.</li>
+      <li><b>Desktop selection:</b> just <b>drag</b> — output auto-freezes so a live repaint can't wipe the highlight, and resumes the moment you click away. <b>Ctrl/⌘+Shift+C</b> copies it; right-click still opens the browser's own Copy menu.</li>
+      <li><b>Shift+drag</b> selects inside a full-screen app that has grabbed the mouse — codex/claude in a <i>tracking</i> (alt-screen) session send every drag to the app, so Shift is what hands the gesture back to the browser.</li>
     </ul>`;
   body.appendChild(help);
+
+  // Selection settings live next to the button legend — this is the app's only settings surface.
+  const sel=document.createElement('div'); sel.className='helpsec';
+  const selh=document.createElement('h3'); selh.textContent='Selection & copy'; sel.appendChild(selh);
+  const acrow=document.createElement('label'); acrow.className='hint';
+  acrow.style.display='flex'; acrow.style.gap='8px'; acrow.style.alignItems='flex-start';
+  const acbox=document.createElement('input'); acbox.type='checkbox'; acbox.id='autocopysel';
+  acbox.checked=getAutoCopyOnSelect();
+  acbox.onchange=()=>{ setAutoCopyOnSelect(acbox.checked); flash(acbox.checked?'Auto-copy on select: ON':'Auto-copy on select: OFF'); };
+  acrow.appendChild(acbox);
+  acrow.appendChild(document.createTextNode('Auto-copy on select — releasing a drag copies the highlight straight to the clipboard (the X11 habit). Off by default.'));
+  sel.appendChild(acrow);
+  body.appendChild(sel);
 
   const cs=document.createElement('div'); cs.className='helpsec';
   const h=document.createElement('h3'); h.textContent='Custom buttons (★)'; cs.appendChild(h);
@@ -2675,9 +2742,10 @@ term.attachCustomKeyEventHandler(e=>{
   // It deliberately shadows readline's rarely-used digit-argument; we keep ONLY this + F11 so we don't
   // swallow Alt-letter / Esc-bracket sequences that shells, vim, and tmux rely on.
   if(e.altKey && !e.ctrlKey && !e.metaKey && /^[1-9]$/.test(e.key)){ const s=(window._sessions||[])[+e.key-1]; if(s){ connect(s.name); return false; } }
-  // Ctrl/Cmd+C copies the selection (like every terminal) instead of only sending ^C; Ctrl+Shift+C always copies.
+  // Ctrl/Cmd+C copies the selection (like every terminal) instead of only sending ^C; Ctrl/Cmd+Shift+C
+  // always copies — the one binding that never collides with ^C, so it works mid-stream on either platform.
   const _isC = (e.key==='c'||e.key==='C');
-  if(_isC && e.ctrlKey && e.shiftKey){ copySelectionNow(); return false; }
+  if(_isC && (e.ctrlKey||e.metaKey) && e.shiftKey){ copySelectionNow(); return false; }
   if(_isC && (e.ctrlKey||e.metaKey) && !e.altKey && !e.shiftKey && term.hasSelection && term.hasSelection()){ copySelectionNow(); return false; }
   if(e.key==='F11'){ toggleZen(); return false; }
   return true;
