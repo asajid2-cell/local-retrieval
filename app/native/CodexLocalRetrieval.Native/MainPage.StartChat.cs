@@ -264,7 +264,7 @@ public sealed partial class MainPage
 
         var filing = targetCollection is null ? "" : $" in \"{targetCollection.Name}\"";
         SyncStatus.Text = $"Started {ToolLabel(toolKey)} in {cwd}. It will be named and filed{filing} after its first transcript is indexed.";
-        PollFileNewChatAsync(pendingIntentId, targetCollection?.Name ?? "");
+        PollFileNewChatAsync(pendingIntentId, targetCollection?.Name ?? "", toolKey);
     }
 
     private TextBox Field(string automationName, string placeholder)
@@ -289,22 +289,53 @@ public sealed partial class MainPage
         }
     };
 
-    private async void PollFileNewChatAsync(string intentId, string collectionName)
+    // A new chat used to be hunted by a blind full SyncNowAsync every 5 s for two minutes — 24 rescans
+    // of the whole archive to notice one file appearing. The transcript lands in the tool's own session
+    // root, so watch THAT and sync only when a .jsonl actually shows up there. The wait is still capped
+    // so a root we could not watch (or a tool that writes somewhere unexpected) still converges.
+    private async void PollFileNewChatAsync(string intentId, string collectionName, string toolKey)
     {
-        for (var i = 0; i < 24; i++)
+        var signal = new SemaphoreSlim(0);
+        var watches = new List<IFileWatchRegistration>();
+        try
         {
-            await Task.Delay(5000);
-            try { await SyncNowAsync(initial: false); } catch (Exception ex) { Diag.Log("Pending chat sync poll: " + ex.Message); }
-            var pending = _archive.Store.PendingNewChats.Any(p =>
-                string.Equals(p.IntentId, intentId, StringComparison.Ordinal));
-            if (!pending)
+            foreach (var src in _archive.EffectiveSources())
             {
-                RenderCurrent();
-                SyncStatus.Text = collectionName.Length > 0
-                    ? $"The new chat is named and filed in \"{collectionName}\"."
-                    : "The new chat is named and indexed.";
-                return;
+                if (toolKey.Length > 0 && !string.Equals(src.Tool, toolKey, StringComparison.OrdinalIgnoreCase)) continue;
+                if (string.IsNullOrWhiteSpace(src.Root) || !Directory.Exists(src.Root)) continue;
+                try { watches.Add(FileWatch.WatchDirectory(src.Root, "*.jsonl", recurse: true, () => { try { signal.Release(); } catch { } })); }
+                catch (Exception ex) { Diag.Log("Pending chat watch " + src.Root + ": " + ex.Message); }
             }
+        }
+        catch (Exception ex) { Diag.Log("Pending chat roots: " + ex.Message); }
+
+        // With a watcher the wake is the event and this is only a backstop; with none it IS the poll.
+        var wake = watches.Count > 0 ? TimeSpan.FromSeconds(30) : TimeSpan.FromSeconds(5);
+        var deadline = DateTime.UtcNow.AddSeconds(120);
+        try
+        {
+            while (DateTime.UtcNow < deadline)
+            {
+                await signal.WaitAsync(wake);
+                while (signal.Wait(0)) { }        // a burst of writes is one reason to sync, not many
+
+                try { await SyncNowAsync(initial: false); } catch (Exception ex) { Diag.Log("Pending chat sync poll: " + ex.Message); }
+                var pending = _archive.Store.PendingNewChats.Any(p =>
+                    string.Equals(p.IntentId, intentId, StringComparison.Ordinal));
+                if (!pending)
+                {
+                    RenderCurrent();
+                    SyncStatus.Text = collectionName.Length > 0
+                        ? $"The new chat is named and filed in \"{collectionName}\"."
+                        : "The new chat is named and indexed.";
+                    return;
+                }
+            }
+        }
+        finally
+        {
+            foreach (var w in watches) { try { w.Dispose(); } catch { } }
+            signal.Dispose();
         }
     }
 
