@@ -1516,7 +1516,11 @@ function probePc() {
   sock.on('error', () => done(false));
   sock.on('timeout', () => done(false));
 }
-if (!TEST_MODE) { setTimeout(probePc, 2000); setInterval(probePc, 30000); }
+let _probeBootTimer = null, _probeTimer = null;   // held so the restart drain can let the event loop empty
+if (!TEST_MODE) { _probeBootTimer = setTimeout(probePc, 2000); _probeTimer = setInterval(probePc, 30000); }
+// r.1.4.3 opened an `app.get('/api/health', ...)` here, but r.1.17 had already lifted this body out
+// into healthSnapshot() so the ops-alert lane could read health without going through HTTP — and it
+// registers the route below. Taking both openers would have bound /api/health twice.
 function healthSnapshot() {
   let tmuxAvailable = false;
   try { execSync(`tmux -V`, { encoding: "utf8", timeout: 1500 }); tmuxAvailable = true; } catch {}
@@ -2310,7 +2314,9 @@ const server = http.createServer(app);
 // and the non-matching one aborts the handshake with a 400 before the right one sees it.
 const wss = new WebSocketServer({ noServer: true });
 const wssHost = new WebSocketServer({ noServer: true });
+let draining = false;              // set by the SIGTERM restart drain at the bottom of this file
 server.on('upgrade', (req, socket, head) => {
+  if (draining) { try { socket.destroy(); } catch {} return; }   // a restarting relay accepts no new links
   const p = (req.url || '').split('?')[0];
   if (p === '/ws') {
     // Reject cross-site WebSocket hijacking BEFORE the handshake — a foreign/absent-in-prod Origin
@@ -2618,7 +2624,7 @@ function reconcileRenameIntentsFromHost() {
 }
 savePins(pins);
 saveRenameIntents(renameIntents);
-setInterval(() => {
+const _pinRetryTimer = setInterval(() => {
   if (!_pinsDirty) return;
   try { savePins(new Map(pins)); }
   catch (error) {
@@ -2949,5 +2955,69 @@ if (process.env.MUX_ALERT_NTFY_URL) {
   startHealthAlerts({
     notifier: createNotifier({ url: process.env.MUX_ALERT_NTFY_URL }),
     getHealth: healthSnapshot,
+  });
+}
+
+// ---- RESTART DRAIN: a deploy must be invisible, not a black hole --------------------------------
+// A deploy sends SIGTERM. With no handler node dies mid-frame: every socket is reset, the browser sees
+// an abnormal 1006 and walks its exponential backoff, and a live terminal looks dead for ~10s. Instead
+// we drain: refuse new upgrades, flush the only in-memory-dirty durable state, close every viewer with
+// 1012 "restarting" (index.html maps that to a 500ms reconnect fuse + a toast), and close the muxd host
+// link LAST so the PC never learns the viewers are gone before they actually are. Everything is torn
+// down so the loop empties on its own; the 5s timer is an unref'd backstop, not the expected path.
+function flushDurableStateForRestart() {
+  // Every acknowledged mutation already committed through durable-state.js before it was published in
+  // memory — pins are the one value allowed to lag behind (coalesced by a 20s retry timer), so they are
+  // the only thing a restart can actually lose.
+  if (!_pinsDirty) return;
+  try { savePins(new Map(pins)); }
+  catch (error) { console.error('[drain] pin flush failed: ' + String(error && error.message || error)); }
+}
+function drainForRestart(signal) {
+  if (draining) return;
+  draining = true;
+  setTimeout(() => process.exit(0), 5000).unref();   // unref'd: never hold the loop open just to die
+  console.log(`[drain] ${signal}: refusing upgrades, closing viewers with 1012 restarting`);
+
+  try { server.close(); } catch {}                   // stop listening; already-upgraded sockets survive
+  try { server.closeIdleConnections(); } catch {}    // idle keep-alive HTTP would otherwise pin the loop
+  flushDurableStateForRestart();
+  clearInterval(_pinRetryTimer);
+  if (_probeBootTimer) clearTimeout(_probeBootTimer);
+  if (_probeTimer) clearInterval(_probeTimer);
+
+  const viewers = new Set(wss.clients);
+  for (const st of sessions.values()) {
+    if (st.sbRequestTimer) { clearTimeout(st.sbRequestTimer); st.sbRequestTimer = null; }
+    for (const client of st.clients.values()) {
+      if (client.ka) { clearInterval(client.ka); client.ka = null; }
+      viewers.add(client.ws);
+    }
+  }
+  for (const ws of viewers) { try { ws.close(1012, 'restarting'); } catch {} }
+
+  const host = hostWs;
+  for (const ws of wssHost.clients) if (ws !== host) { try { ws.close(1012, 'restarting'); } catch {} }
+  if (host) { try { host.close(1012, 'restarting'); } catch {} }   // host link closed last, always
+
+  // grace for those close frames to reach the wire, then force the rest down so the loop can empty
+  setTimeout(() => {
+    for (const ws of viewers) { try { ws.terminate(); } catch {} }
+    for (const ws of wssHost.clients) { try { ws.terminate(); } catch {} }
+    try { wss.close(); } catch {}
+    try { wssHost.close(); } catch {}
+  }, 750).unref();
+}
+process.on('SIGTERM', () => drainForRestart('SIGTERM'));
+// Windows cannot deliver SIGTERM to a running process at all — libuv turns kill('SIGTERM') into
+// TerminateProcess, so the handler above provably never runs there (even self-signalling just dies).
+// Production is Linux, but the dev machine is not, and a drain nobody can test is a drain that rots.
+// So: a second door, opened only under MUX_TEST_MODE and only over an IPC channel the parent had to
+// create at spawn time — in a deploy there is no channel and no test mode, so it cannot be reached.
+if (TEST_MODE && process.send) {
+  process.on('message', m => {
+    if (!m || m.t !== 'drain') return;
+    try { process.channel.unref(); } catch {}   // else the IPC handle alone keeps the loop alive forever
+    drainForRestart('SIGTERM');
   });
 }
