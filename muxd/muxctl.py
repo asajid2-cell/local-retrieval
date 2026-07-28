@@ -51,15 +51,35 @@ ENABLE_WRAP_AT_EOL_OUTPUT = 0x0002
 ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
 DISABLE_NEWLINE_AUTO_RETURN = 0x0008
 
-def attach_input_mode(current, vt_input=False):
+def mouse_capture_mode(current, enabled, vt_input=False):
+    """The mouse half of the attach console mode: wheel capture and QuickEdit are one switch.
+
+    Capture ON (hosted app owns scrolling — alt screen / mouse tracking): conhost must hand us the
+    wheel, and QuickEdit has to go, because with it on conhost swallows the drag as a selection.
+    Capture OFF (plain shell on the normal buffer): conhost owns the wheel AND the selection again,
+    so QuickEdit comes back — that is what makes native drag-select + Enter-to-copy work in a local
+    attach, and its pause-output-during-a-drag behaviour is the local terminal semantics we want.
+    VT input is a different contract (terminal-generated reports, no conhost mouse handling), so it
+    never gets QuickEdit."""
+    next_mode = current | ENABLE_EXTENDED_FLAGS  # required for QuickEdit changes to stick at all
+    if enabled:
+        next_mode = (next_mode | ENABLE_MOUSE_INPUT) & ~ENABLE_QUICK_EDIT_MODE
+    elif vt_input:
+        next_mode &= ~(ENABLE_MOUSE_INPUT | ENABLE_QUICK_EDIT_MODE)
+    else:
+        next_mode = (next_mode | ENABLE_QUICK_EDIT_MODE) & ~ENABLE_MOUSE_INPUT
+    return next_mode
+
+
+def attach_input_mode(current, vt_input=False, mouse_capture=False):
     next_mode = current | ENABLE_EXTENDED_FLAGS
-    next_mode &= ~(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_QUICK_EDIT_MODE |
-                   ENABLE_WINDOW_INPUT | ENABLE_MOUSE_INPUT | ENABLE_PROCESSED_INPUT)
+    next_mode &= ~(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT |
+                   ENABLE_WINDOW_INPUT | ENABLE_PROCESSED_INPUT)
     if vt_input:
         next_mode |= ENABLE_VIRTUAL_TERMINAL_INPUT
     else:
         next_mode &= ~ENABLE_VIRTUAL_TERMINAL_INPUT
-    return next_mode
+    return mouse_capture_mode(next_mode, mouse_capture, vt_input=vt_input)
 
 def flush_console_input():
     if os.name != "nt":
@@ -106,8 +126,9 @@ def terminal_attach_mode():
     if have_in:
         # Stay in classic key-event input mode by default: VT input turns terminal-generated
         # reports into typed-looking bytes that get injected into the hosted shell. Mouse input
-        # starts OFF (conhost keeps native wheel scrollback for plain shells) and is toggled on
-        # by set_mouse_capture() only while the hosted app owns scrolling (alt screen / tracking).
+        # starts OFF (conhost keeps native wheel scrollback AND QuickEdit drag-select for plain
+        # shells) and is toggled on by set_mouse_capture() only while the hosted app owns scrolling
+        # (alt screen / tracking). The finally-block below restores the entering mode exactly.
         k.SetConsoleMode(hin, attach_input_mode(in_mode.value, env_truthy("MUXCTL_VT_INPUT")))
         flush_console_input()
     try:
@@ -374,8 +395,9 @@ class ConsoleInputTranslator:
 
 
 def set_mouse_capture(enabled):
-    """Toggle ENABLE_MOUSE_INPUT on the attach console. On = wheel events reach muxctl for
-    forwarding to the hosted app; off = conhost handles the wheel natively (viewport scrollback)."""
+    """Toggle wheel capture on the attach console. On = wheel events reach muxctl for forwarding to
+    the hosted app (QuickEdit off, or conhost eats the drag); off = conhost handles the wheel and
+    the selection natively again (viewport scrollback + QuickEdit drag-select)."""
     if os.name != "nt":
         return
     try:
@@ -384,11 +406,7 @@ def set_mouse_capture(enabled):
         mode = ctypes.c_uint()
         if not k.GetConsoleMode(hin, ctypes.byref(mode)):
             return
-        if enabled:
-            next_mode = mode.value | ENABLE_MOUSE_INPUT | ENABLE_EXTENDED_FLAGS
-            next_mode &= ~ENABLE_QUICK_EDIT_MODE
-        else:
-            next_mode = (mode.value | ENABLE_EXTENDED_FLAGS) & ~ENABLE_MOUSE_INPUT
+        next_mode = mouse_capture_mode(mode.value, enabled, vt_input=env_truthy("MUXCTL_VT_INPUT"))
         if next_mode != mode.value:
             k.SetConsoleMode(hin, next_mode)
     except Exception:
