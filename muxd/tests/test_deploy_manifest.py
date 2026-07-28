@@ -9,6 +9,9 @@ scripts/deploy-muxd.ps1 to what muxd.py/muxctl.py actually import.
 import ast
 import os
 import re
+import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -21,6 +24,33 @@ ENTRYPOINTS = ("muxd.py", "muxctl.py")
 def read(path):
     with open(path, "r", encoding="utf-8") as fh:
         return fh.read()
+
+
+def extract_preflight_source(script_path=DEPLOY_SCRIPT):
+    """Return the Python source embedded in deploy-muxd.ps1's here-string."""
+    lines = read(script_path).splitlines()
+    opener = next(
+        (index for index, line in enumerate(lines) if line.rstrip().endswith("@'")),
+        None,
+    )
+    assert opener is not None, "deploy-muxd.ps1 is missing the preflight here-string opener"
+    closer = next(
+        (index for index in range(opener + 1, len(lines)) if lines[index].strip() == "'@"),
+        None,
+    )
+    assert closer is not None, "deploy-muxd.ps1 is missing the preflight here-string closer"
+    return "\n".join(lines[opener + 1:closer]) + "\n"
+
+
+def run_preflight(src, dst):
+    """Run the extracted preflight through stdin, matching deploy-muxd.ps1."""
+    result = subprocess.run(
+        [sys.executable, "-", src, dst],
+        input=extract_preflight_source(),
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode, result.stdout + result.stderr
 
 
 def imported_names(path):
@@ -59,6 +89,100 @@ def missing_from_manifest(muxd_dir=MUXD_DIR, script_path=DEPLOY_SCRIPT):
 
 
 class TestDeployManifest(unittest.TestCase):
+    def test_preflight_refuses_when_a_local_module_is_missing_from_dst(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            src = os.path.join(temp_dir, "src")
+            dst = os.path.join(temp_dir, "dst")
+            os.mkdir(src)
+            os.mkdir(dst)
+            for name, content in (
+                ("muxd.py", "import os\nimport sidecar\n"),
+                ("muxctl.py", "import sys\n"),
+                ("sidecar.py", "# synthetic local module\n"),
+            ):
+                with open(os.path.join(src, name), "w", encoding="utf-8") as fh:
+                    fh.write(content)
+            for name in ("muxd.py", "muxctl.py"):
+                shutil.copyfile(os.path.join(src, name), os.path.join(dst, name))
+
+            returncode, output = run_preflight(src, dst)
+
+            self.assertNotEqual(returncode, 0)
+            self.assertIn("sidecar.py", output)
+
+    def test_preflight_passes_when_dst_is_complete(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            src = os.path.join(temp_dir, "src")
+            dst = os.path.join(temp_dir, "dst")
+            os.mkdir(src)
+            os.mkdir(dst)
+            for name, content in (
+                ("muxd.py", "import os\nimport sidecar\n"),
+                ("muxctl.py", "import sys\n"),
+                ("sidecar.py", "# synthetic local module\n"),
+            ):
+                with open(os.path.join(src, name), "w", encoding="utf-8") as fh:
+                    fh.write(content)
+                shutil.copyfile(os.path.join(src, name), os.path.join(dst, name))
+
+            returncode, _ = run_preflight(src, dst)
+
+            self.assertEqual(returncode, 0)
+
+    def test_preflight_ignores_stdlib_imports(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            src = os.path.join(temp_dir, "src")
+            dst = os.path.join(temp_dir, "dst")
+            os.mkdir(src)
+            os.mkdir(dst)
+            for name, content in (
+                ("muxd.py", "import os\nimport json\nimport asyncio\n"),
+                ("muxctl.py", "import sys\n"),
+            ):
+                with open(os.path.join(src, name), "w", encoding="utf-8") as fh:
+                    fh.write(content)
+                shutil.copyfile(os.path.join(src, name), os.path.join(dst, name))
+
+            returncode, _ = run_preflight(src, dst)
+
+            self.assertEqual(returncode, 0)
+
+    def test_preflight_refuses_when_an_entrypoint_is_missing_from_dst(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            src = os.path.join(temp_dir, "src")
+            dst = os.path.join(temp_dir, "dst")
+            os.mkdir(src)
+            os.mkdir(dst)
+            for name, content in (
+                ("muxd.py", "import os\n"),
+                ("muxctl.py", "import sys\n"),
+            ):
+                with open(os.path.join(src, name), "w", encoding="utf-8") as fh:
+                    fh.write(content)
+            shutil.copyfile(os.path.join(src, "muxd.py"), os.path.join(dst, "muxd.py"))
+
+            returncode, output = run_preflight(src, dst)
+
+            self.assertNotEqual(returncode, 0)
+            self.assertIn("muxctl.py", output)
+
+    def test_deploy_script_propagates_preflight_failure(self):
+        text = read(DEPLOY_SCRIPT)
+        refusal = re.search(
+            r"\$preflight\s*\|\s*python\s+-\s+\$src\s+\$dst\s*\r?\n"
+            r"\s*if\s*\(\$LASTEXITCODE\s*-ne\s*0\)[\s\S]*?\bexit\s+1\b",
+            text,
+        )
+        self.assertIsNotNone(
+            refusal,
+            "the preflight invocation must be followed by a LASTEXITCODE check that exits 1",
+        )
+        self.assertLess(
+            refusal.end(),
+            text.index("Start-ScheduledTask"),
+            "preflight refusal must appear before Start-ScheduledTask",
+        )
+
     def test_every_local_sibling_module_is_deployed(self):
         deployed = deploy_file_list()
         required = local_sibling_modules()
