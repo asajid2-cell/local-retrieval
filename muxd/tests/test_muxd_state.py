@@ -269,7 +269,7 @@ class MuxdStateTests(unittest.TestCase):
 
     def test_slow_local_viewer_drops_oldest_and_keeps_viewer(self):
         session = FakeSession()
-        local_queue = asyncio.Queue(maxsize=1)
+        local_queue = muxd.LocalViewerQueue(maxsize=1)
         local_queue.put_nowait(b"old")
         session.local.add(local_queue)
 

@@ -2467,6 +2467,20 @@ wssHost.on('connection', (ws, req) => {
       const n = strictMuxName(m.s);
       const raw = leaseConduit.cacheLeaseNotice(n, typeof m.f === 'string' ? m.f : '');
       if (raw) broadcastLeaseNotice(n, raw);
+    } else if (m.t === 'resync') {
+      // muxd blew THIS session's ~1MiB egress budget and dropped its own backlog at a frame
+      // boundary. The gap is unrecoverable from the stream, so repaint from truth: CLEAR +
+      // scrollback replay for this session's viewers only — no other session lost a byte.
+      const n = strictMuxName(m.s); const st = sessions.get(n); if (!st) return;
+      clearScrollbackRequest(st);                 // supersede any in-flight (pre-gap) request
+      let asked = false;
+      for (const c of st.clients.values()) {
+        if (!c.hosted || c.ws.readyState !== 1) continue;
+        c.sbWait = true; c.wentLive = false; c.q = []; c.qBytes = 0;
+        asked = requestSessionScrollback(n, st, c) || asked;
+      }
+      // Host unreachable: never strand viewers buffering forever — go live and let output repaint.
+      if (!asked) for (const c of st.clients.values()) { c.sbWait = false; c.wentLive = true; }
     } else if (m.t === 'tailr') { const f = pendingTails.get(m.rid); if (f) { pendingTails.delete(m.rid); f(String(m.text || '')); }
     } else if (m.t === 'killed') {
       const n = strictMuxName(m.s);

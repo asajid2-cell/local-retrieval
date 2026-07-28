@@ -80,6 +80,7 @@ missing any of them fails `hostProtocolOk()` and the relay treats it as protocol
 | `owner` | optional | Host reports/steers session ownership (`owner-ok`). |
 | `relaunch` | optional | Host honours the `relaunch` flag on `create`. |
 | `agentTruth` | optional | Host probes the OS about the session's own process tree and emits `agentTruth` + `agentStateSource` on every session payload. Advisory only: it never replaces `agentState`, and a stale or failed probe degrades to `agentStateSource: "heuristic"`. |
+| `resync` | optional | Host emits `resync` when one session's byte-bounded egress queue overflows and its backlog was dropped at a frame boundary. A relay that lacks the handler simply ignores the frame and shows the gap; it is deliberately **not** in `REQUIRED_HOST_CAPS`, so older hosts keep connecting. |
 
 ### Reserved — terminal model (native prong)
 
@@ -126,6 +127,7 @@ dispatch chain and are ignored.
 | `createResult` | Acknowledgement of a `create`, correlated by `rid`. |
 | `tailr` | Answer to `tail`, correlated by `rid`. |
 | `killed` | A session ended; relay drops it and tears down viewer state. |
+| `resync` | This session's output backlog was dropped at a frame boundary (its per-session egress budget overflowed). Relay repaints that session's viewers with `CLEAR` + a scrollback replay; other sessions are untouched. |
 
 ### relay → muxd (`relay/server.js:255,313,674,705,720,2145,2200,2314`)
 
@@ -158,6 +160,7 @@ literals stay globally unique: `info`, `ls`, `err`, `killed`, `owner-ok`, `bind-
 | `sessions` | `notice` | string | Optional. Set when a durability step failed (heal/rename/stop not persisted). |
 | `o` | `s` | string | Session name. |
 | `o` | `d` | string | base64 output bytes. |
+| `resync` | `s` | string | Session name. The only field; carries no payload — the replay is what restores the screen. |
 | `sb` (both ways) | `s` | string | Session name. |
 | `sb` (both ways) | `rid` | string | Correlation id; the relay drops a reply whose `rid` does not match the in-flight request. |
 | `sb` → muxd | `max` | int | Byte cap on the replay; defaults to `SB_SEND`. |

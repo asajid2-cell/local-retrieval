@@ -1073,7 +1073,7 @@ CUSTODY_GC_INTERVAL_SECONDS = max(
 )
 CLAIM_SWEEP_SECONDS = max(15, int(ENV.get("LAUNCH_CLAIM_SWEEP_SECONDS", "60")))
 PROTOCOL = 4
-CAPS = ["ls", "info", "create", "createAck", "bind", "input", "open", "attach", "kill", "rename", "heal", "tail", "scrollback", "resize", "owner", "relaunch", "agentTruth"]
+CAPS = ["ls", "info", "create", "createAck", "bind", "input", "open", "attach", "kill", "rename", "heal", "tail", "scrollback", "resize", "owner", "relaunch", "agentTruth", "resync"]
 STARTED = time.time()
 AGENT_WORKING_FRESH = float(ENV.get("AGENT_WORKING_FRESH", "25"))
 AGENT_STARTING_GRACE = float(ENV.get("AGENT_STARTING_GRACE", "45"))
@@ -1733,38 +1733,179 @@ WATCH_LOCK = threading.Lock()
 WATCHDOG_STARTED = False
 
 
-class RelayOutQueue(asyncio.Queue):
-    """Bound relay backlog so an outage cannot exhaust memory and kill hosted sessions."""
+SESSION_OUT_BUDGET_BYTES = max(65536, int(ENV.get("RELAY_SESSION_OUT_BUDGET", str(1 << 20))))
 
-    def __init__(self, maxsize=64):
-        super().__init__(maxsize=maxsize)
+class RelayOutQueue:
+    """Per-session, byte-bounded relay egress drained ROUND-ROBIN into the relay ws.
+
+    The old single shared queue (maxsize 64, silent tail-drop) let ONE flooding session starve
+    every other: `yes` in tab A filled all 64 slots each 12ms tick, so tab B's 100 lines were
+    dropped on the floor with nothing but a counter to show for it. Now each session owns its own
+    ~1MiB budget and its own deque; a flood can only ever exhaust its OWN budget.
+
+    On per-session overflow we drop only THAT session's queued output — whole coalesced frames,
+    which is a frame boundary, so a partial escape sequence can never egress — and enqueue an
+    explicit `{"t":"resync","s":name}` frame. The relay answers it with CLEAR + scrollback replay
+    for that session's viewers, so the gap self-heals into a correct screen instead of silently
+    corrupting one. Bounded memory is kept; the silence is what's gone.
+
+    Keeps the asyncio.Queue surface the call sites already use (put_nowait / get_nowait / await
+    get() / .dropped), so only pump_out grows a branch."""
+
+    _MAX_TRACKED = 256
+
+    def __init__(self, budget=None):
+        self.budget = int(budget or SESSION_OUT_BUDGET_BYTES)
+        self._queues = {}            # session name -> deque of (kind, name, data)
+        self._bytes = {}             # session name -> queued output bytes
+        self._order = []             # round-robin ring, insertion-ordered
+        self._cursor = 0
+        self._resync_pending = set()
+        self._wake = asyncio.Event()
         self.dropped = 0
+        self.resyncs = 0
+
+    def _track(self, key):
+        q = self._queues.get(key)
+        if q is None:
+            if len(self._order) >= self._MAX_TRACKED:
+                self._prune_idle()
+            q = self._queues[key] = collections.deque()
+            self._bytes[key] = 0
+            self._order.append(key)
+        return q
+
+    def _prune_idle(self):
+        idle = [k for k in self._order if not self._queues.get(k)]
+        for k in idle:
+            self._queues.pop(k, None)
+            self._bytes.pop(k, None)
+            self._resync_pending.discard(k)
+        if idle:
+            self._order = [k for k in self._order if k not in set(idle)]
+            self._cursor = 0
 
     def put_nowait(self, item):
-        if self.full():
-            self.dropped += 1
-            return False
-        super().put_nowait(item)
+        kind, name, data = item
+        key = name or ""
+        q = self._track(key)
+        size = len(data) if isinstance(data, (bytes, bytearray, memoryview)) else 0
+        if kind == "o" and self._bytes[key] + size > self.budget:
+            # This session alone blew its budget. Drop ITS backlog at frame boundaries and keep
+            # every non-output frame (a lost "dead" would leave a zombie in the relay's list).
+            self.dropped += sum(1 for queued in q if queued[0] == "o")
+            keep = [queued for queued in q if queued[0] != "o"]
+            q.clear()
+            q.extend(keep)
+            self._bytes[key] = 0
+            if key not in self._resync_pending:
+                self._resync_pending.add(key)
+                self.resyncs += 1
+                q.append(("resync", key, b""))
+            self._wake.set()
+            return False           # the overflowing chunk goes too; the resync replay supersedes it
+        q.append((kind, key, data))
+        self._bytes[key] = self._bytes[key] + size
+        self._wake.set()
         return True
+
+    def _pop(self):
+        total = len(self._order)
+        for step in range(total):
+            index = (self._cursor + step) % total
+            key = self._order[index]
+            q = self._queues.get(key)
+            if not q:
+                continue
+            item = q.popleft()
+            if item[0] == "o":
+                self._bytes[key] = max(0, self._bytes[key] - len(item[2]))
+            elif item[0] == "resync":
+                self._resync_pending.discard(key)
+            self._cursor = (index + 1) % total
+            return item
+        return None
+
+    def get_nowait(self):
+        item = self._pop()
+        if item is None:
+            raise asyncio.QueueEmpty
+        return item
+
+    async def get(self):
+        while True:
+            item = self._pop()
+            if item is not None:
+                return item
+            self._wake.clear()
+            item = self._pop()          # re-check: a producer may have raced the clear
+            if item is not None:
+                return item
+            await self._wake.wait()
+
+    def qsize(self):
+        return sum(len(q) for q in self._queues.values())
+
+    def empty(self):
+        return self.qsize() == 0
 
 LOCAL_VIEWER_QUEUE_MAX = 64          # ~768ms of link/loop-lag tolerance (was 4 = ~48ms -> spurious detaches)
 LOCAL_VIEWER_SLOW = object()
 
+class LocalViewerQueue(asyncio.Queue):
+    """Per-local-viewer output queue that makes a dropped chunk an OBSERVABLE fact.
+
+    The overflow policy is unchanged and deliberate: a brief lag must NOT detach a local terminal
+    (that was the "[muxctl] detached" bug), so a full queue evicts its OLDEST chunk rather than
+    refusing the newest. What was missing is the accounting. The drop used to happen inline in
+    fanout_local_output and leave no trace anywhere; the only healing was redraw_nudge, which
+    returns immediately unless the session holds the alternate screen — so an ordinary shell
+    viewer rendered a screen with a hole in it and nothing, anywhere, knew.
+
+    Every eviction now lands in dropped_chunks / dropped_bytes, and gap_seq counts GAP EPISODES
+    rather than evictions: one contiguous burst of drops is a single gap (fifty back-to-back
+    evictions while the reader is stalled are one hole in the stream, not fifty), and gap_seq only
+    advances again once an offer has succeeded in between. gap_seq is strictly monotonic across
+    the queue's life and never decreases, so a resync consumer can compare it against the last
+    value it acted on and tell a fresh gap from one it has already healed.
+
+    Subclasses asyncio.Queue so the consumer side (`await lq.get()`, the LOCAL_VIEWER_SLOW
+    sentinel, sizing) is untouched — only producers move to offer()."""
+
+    def __init__(self, maxsize=LOCAL_VIEWER_QUEUE_MAX):
+        super().__init__(maxsize=maxsize)
+        self.dropped_chunks = 0
+        self.dropped_bytes = 0
+        self.gap_seq = 0
+        self._gap_open = False
+
+    def offer(self, data):
+        """Enqueue `data`, evicting the oldest chunk if full. True == lossless, False == a gap."""
+        if not self.full():
+            self.put_nowait(data)
+            self._gap_open = False
+            return True
+        try:
+            evicted = self.get_nowait()
+        except asyncio.QueueEmpty:
+            evicted = None
+        if evicted is not None:
+            try:
+                self.dropped_bytes += len(evicted)
+            except TypeError:
+                pass                       # sentinels (LOCAL_VIEWER_SLOW) have no length
+        self.dropped_chunks += 1
+        if not self._gap_open:
+            self.gap_seq += 1              # one contiguous burst of drops == one gap episode
+            self._gap_open = True
+        self.put_nowait(data)
+        return False
+
 def fanout_local_output(session, data):
     for local_queue in list(session.local):
-        try:
-            local_queue.put_nowait(data)
-        except asyncio.QueueFull:
-            # A brief lag must NOT detach a local terminal (that was the "[muxctl] detached" bug). Drop the
-            # OLDEST chunk to make room, keep the viewer, and nudge a full repaint so the momentary gap heals.
-            try:
-                local_queue.get_nowait()
-            except asyncio.QueueEmpty:
-                pass
-            try:
-                local_queue.put_nowait(data)
-            except asyncio.QueueFull:
-                pass
+        if not local_queue.offer(data):
+            # The viewer lost a chunk. Keep nudging a full repaint so the gap still heals on the
+            # alternate screen exactly as before; the explicit resync frame supersedes this later.
             try:
                 redraw_nudge(session)
             except Exception:
@@ -4325,7 +4466,7 @@ async def main():
                     s, err, _created = await ensure_local_session(first, False)
                 if err:
                     await ws.send(json.dumps({"t": "err", "m": err})); return
-                lq = asyncio.Queue(maxsize=LOCAL_VIEWER_QUEUE_MAX); s.local.add(lq)
+                lq = LocalViewerQueue(); s.local.add(lq)
                 if first.get("cols"):
                     update_local_session_size(s, lq, first.get("cols"), first.get("rows") or 40)
                 try:
@@ -4434,6 +4575,10 @@ async def main():
                             kind, name, data = await outq.get()
                             if kind == "o":
                                 await ws.send(json.dumps({"t": "o", "s": name, "d": base64.b64encode(data).decode()}))
+                            elif kind == "resync":
+                                # This session alone blew its egress budget; its backlog was dropped at a
+                                # frame boundary. Tell the relay to repaint from scrollback, not from a gap.
+                                await ws.send(json.dumps({"t": "resync", "s": name}))
                             elif kind == "dead":
                                 await ws.send(json.dumps({"t": "sessions", "list": sess_list()}))
 
