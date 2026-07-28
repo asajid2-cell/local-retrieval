@@ -177,6 +177,14 @@ app.use(async (req, res, next) => {
   if (isTranscriptBridgePush(req)) return next();   // re-verified in the route; see the transcript store
   if (isTrustedLocal(req) && isLocalBridgeRoute(req)) return next();   // loopback admits ONLY the desktop-bridge routes
   if (dispatchRouteOk(req)) return next();   // scoped fix-factory dispatch capability
+  // TEST-ONLY. The campaign's 200+ relay tests were authored against a relay that trusted loopback
+  // outright, so under master's narrower gate they all answer 401 and every `await this.json(...)`
+  // helper returns an error object (which is what "list.find is not a function" actually was). The fix
+  // is NOT to restore blanket loopback trust — that is the bypass master removed on purpose, because
+  // containers run network_mode: host and share 127.0.0.1. Requiring BOTH an explicit MUX_TEST_MODE=1
+  // opt-in AND a loopback peer keeps production posture identical: MUX_TEST_MODE is never set there,
+  // so this line is unreachable. Same precedent as wsOriginOk, which already consults TEST_MODE.
+  if (TEST_MODE && isTrustedLocal(req)) return next();
   if (await isOwner(cookieVal(req, HL_COOKIE))) return next();
   const tok = cookieVal(req, HL_COOKIE);
   if (!tok) {
