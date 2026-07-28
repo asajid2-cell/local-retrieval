@@ -12,6 +12,10 @@ const { durableJsonLoad, durableJsonWrite, durableWrite, fsyncDirectory } = requ
 const { createHealthAlerts, startHealthAlerts } = require("./health-alerts");
 const { createNotifier } = require("./notify");
 // Every acknowledged state mutation commits through durable-state.js before it is published in memory.
+const { createLeaseConduit } = require('./lease-conduit');
+// The write lease lives in muxd. This relay holds no lease key and makes no lease decision; the
+// conduit forwards client-signed frames byte-for-byte and caches muxd's notices as UI hints only.
+const leaseConduit = createLeaseConduit();
 function hostTokenOk(t) { if (!HOST_TOKEN || !t || t.length !== HOST_TOKEN.length) return false; try { return crypto.timingSafeEqual(Buffer.from(t), Buffer.from(HOST_TOKEN)); } catch { return false; } }
 
 const app = express();
@@ -94,7 +98,6 @@ function isTrustedLocal(req) {
   const ra = req.socket.remoteAddress || '';
   return !req.headers['x-forwarded-for'] && (ra === '127.0.0.1' || ra === '::1' || ra === '::ffff:127.0.0.1');
 }
-<<<<<<< HEAD
 // Loopback is NOT a trust boundary on this host: containers run with network_mode: host and share
 // 127.0.0.1, so any compromised app satisfies isTrustedLocal(). Loopback therefore only admits the
 // narrow desktop-bridge data routes below (each re-checks isTrustedLocal itself) and never grants
@@ -2458,10 +2461,17 @@ wssHost.on('connection', (ws, req) => {
         }
         c.q = []; c.qBytes = 0;
       }
+    } else if (m.t === 'lease') {
+      // muxd decided; the relay only mirrors. The frame is cached and fanned out verbatim so every
+      // viewer re-verifies muxd's signature itself — a relay that edits this string just breaks it.
+      const n = strictMuxName(m.s);
+      const raw = leaseConduit.cacheLeaseNotice(n, typeof m.f === 'string' ? m.f : '');
+      if (raw) broadcastLeaseNotice(n, raw);
     } else if (m.t === 'tailr') { const f = pendingTails.get(m.rid); if (f) { pendingTails.delete(m.rid); f(String(m.text || '')); }
     } else if (m.t === 'killed') {
       const n = strictMuxName(m.s);
       hostSessions.delete(n);
+      leaseConduit.forgetSession(n);
       deleteSessionViewerState(n, 'session ended');
     }
   });
@@ -2787,6 +2797,17 @@ function applyActivity(client, o) {
   if (o && typeof o.vis === 'boolean') client.visible = o.vis;
   if (o && o.act) client.lastActive = Date.now();
 }
+// Fan a muxd lease notice to every viewer of a session, unmodified. Deliberately NOT routed through
+// sendViewer: that path is byte-stream backpressure for terminal output, and a control frame the
+// client must verify may not be coalesced, truncated, or dropped into a burst queue.
+function broadcastLeaseNotice(name, raw) {
+  const st = sessions.get(name);
+  if (!st) return;
+  for (const c of st.clients.values()) {
+    if (!c || !c.ws || c.ws.readyState !== 1) continue;
+    try { c.ws.send('L' + raw); } catch {}
+  }
+}
 // Shared sizing/pin/activity message handler for BOTH paths ('i' input stays with each caller).
 function handleClientMsg(name, client, s) {
   const t = s[0];
@@ -2865,6 +2886,12 @@ wss.on('connection', async (ws, req) => {
       }
     }, HOST_SB_WAIT_MS);
     recompute(name);
+    // A viewer that attaches mid-lease must not be told "you may type" by silence. Replay muxd's
+    // last notice verbatim; if the relay has none, it says nothing rather than inventing a state.
+    {
+      const pending = leaseConduit.cachedNotice(name);
+      if (pending) { try { ws.send('L' + pending); } catch {} }
+    }
     ws.on('message', m => {
       const s = m.toString();
       if (s[0] === 'i') {
@@ -2872,6 +2899,17 @@ wss.on('connection', async (ws, req) => {
           try { ws.close(1013, 'PC mux host offline'); } catch {}
           return;
         }
+        client.lastActive = Date.now(); return;
+      }
+      // 'I' signed input, 'L' signed lease op. The relay forwards the client's exact bytes: it has
+      // no key to re-sign with, so any edit here would invalidate the proof rather than forge it.
+      if (s[0] === 'I' || s[0] === 'L') {
+        const raw = s.slice(1);
+        const out = s[0] === 'I'
+          ? (leaseConduit.forwardSignedInput(name, raw) || leaseConduit.forwardDeliberateSend(name, raw))
+          : leaseConduit.forwardSignedLeaseOp(name, raw);
+        if (!out) return;                                   // unproven frame: dropped, never repaired
+        if (!sendHost(out)) { try { ws.close(1013, 'PC mux host offline'); } catch {} return; }
         client.lastActive = Date.now(); return;
       }
       handleClientMsg(name, client, s);
