@@ -20,6 +20,7 @@ import faulthandler
 try: faulthandler.enable(open(os.path.join(os.path.expanduser("~"), "muxd", "muxd.crash"), "a"))
 except Exception: pass
 from winpty import PtyProcess
+import host_input_intent
 
 HOME = os.path.expanduser("~")
 DIR = os.path.join(HOME, "muxd")
@@ -1073,7 +1074,26 @@ CUSTODY_GC_INTERVAL_SECONDS = max(
 )
 CLAIM_SWEEP_SECONDS = max(15, int(ENV.get("LAUNCH_CLAIM_SWEEP_SECONDS", "60")))
 PROTOCOL = 4
-CAPS = ["ls", "info", "create", "createAck", "bind", "input", "open", "attach", "kill", "rename", "heal", "tail", "scrollback", "resize", "owner", "relaunch", "agentTruth", "resync"]
+CAPS = ["ls", "info", "create", "createAck", "bind", "input", "open", "attach", "kill", "rename", "heal", "tail", "scrollback", "resize", "owner", "relaunch", "agentTruth", "resync", "inputDurable"]
+# The relay is a conduit, not an authority: a host-link `i` frame only reaches the PTY when it
+# carries a principal-signed input.durable proof this endpoint verifies. Empty until pairing
+# provisions a principal, which means "refuse everything" — the correct posture, not a gap.
+PRINCIPAL_ENDPOINT = host_input_intent.PrincipalEndpoint()
+
+def authorize_relay_input(frame, session, endpoint=None, now_ms=None):
+    """Gate one relay host-link `i` frame. Returns `(principal, body, refusal)`.
+
+    Deliberately does NOT consult MUX_AUTHZ_MODE. An audit mode that still performed the write
+    would be exactly the proofless PTY write this endpoint exists to remove; the knob stays for
+    endpoints where "observe first" is a real option, and this is not one of them.
+    """
+    return host_input_intent.verify_host_input_frame(
+        frame,
+        endpoint=PRINCIPAL_ENDPOINT if endpoint is None else endpoint,
+        session=session,
+        now_ms=int(time.time() * 1000) if now_ms is None else now_ms,
+    )
+
 STARTED = time.time()
 AGENT_WORKING_FRESH = float(ENV.get("AGENT_WORKING_FRESH", "25"))
 AGENT_STARTING_GRACE = float(ENV.get("AGENT_STARTING_GRACE", "45"))
@@ -3542,8 +3562,13 @@ async def main():
                 )
             return result
 
-    async def execute_input_intent(first, session, data, scope="local"):
-        supplied = first.get("intentId")
+    async def execute_input_intent(first, session, data, scope="local", principal=None):
+        # A verified principal replaces the caller-declared scope outright. `scope="relay"` said
+        # "the relay asked for this", which is not an identity; `principal:<id>` names who
+        # authorized it, so two principals can never collide on one intent id.
+        if principal is not None:
+            scope = principal.intent_scope
+        supplied = first.get("intentId") if principal is None else principal.intent_id
         request_id = intent_id(supplied)
         if supplied and not request_id:
             return {"t": "err", "m": "invalid intent id"}
@@ -3564,23 +3589,21 @@ async def main():
             data,
             scope,
             request_id,
+            principal,
         )
 
     @state_mutation
-    async def execute_durable_input_intent(first, session, data, scope, request_id):
+    async def execute_durable_input_intent(first, session, data, scope, request_id, principal=None):
         key = intent_key(scope, "input", request_id)
-        fingerprint = intent_fingerprint(first)
+        # For a signed intent the replay identity is the authorized tuple
+        # (principalId, keyId, sessionUuid, intentId, bodySha256) — not the frame shape. A
+        # reconnect re-signs with a fresh issuedAtMs, and that is the same operation; different
+        # bytes under the same intent id are not, and still fail closed below.
+        fingerprint = principal.intent_fingerprint if principal is not None else intent_fingerprint(first)
         async with operation_lock(key):
-            record = intent_records.get(key)
-            if record is not None:
-                if record.get("fingerprint") != fingerprint:
-                    return {"t": "err", "m": "intent id is already bound to a different payload"}
-                if record.get("status") in ("completed", "failed"):
-                    return dict(record.get("result") or {})
-                return {
-                    "t": "err",
-                    "m": "input outcome is uncertain; the PTY write was not replayed",
-                }
+            _, settled = host_input_intent.replay_decision(intent_records.get(key), fingerprint)
+            if settled is not None:
+                return settled
 
             if session is None or not session.alive():
                 return {"t": "err", "m": "session is not live: " + strict_mux_name(first.get("s", ""))}
@@ -3593,6 +3616,10 @@ async def main():
                 "createdAt": time.time(),
                 "updatedAt": time.time(),
             }
+            # Who authorized the bytes is persisted with the outcome, so an exact replay can be
+            # settled from the record alone without re-consulting a possibly-revoked principal.
+            if principal is not None:
+                record["principal"] = principal.journal_record("dispatching")
             try:
                 await persist_intent(key, record)
             except Exception as error:
@@ -3611,6 +3638,8 @@ async def main():
                 "result": result,
                 "updatedAt": time.time(),
             }
+            if principal is not None:
+                terminal["principal"] = principal.journal_record(terminal["status"])
             try:
                 await persist_intent(key, terminal)
             except Exception as error:
@@ -4719,7 +4748,23 @@ async def main():
                                         "notice": "auto-resume policy was not persisted",
                                     }))
                             elif t == "i" and name in sessions:
-                                sessions[name].write(base64.b64decode(m.get("d", "")))
+                                # A refusal returns before any write, so a frame without an
+                                # accepted proof performs zero PTY writes.
+                                input_session = sessions[name]
+                                principal, body, refusal = authorize_relay_input(m, input_session)
+                                if refusal is not None:
+                                    log(f"[{name}] input refused: {refusal.code}: {refusal.detail}")
+                                    await ws.send(json.dumps(refusal.frame(name)))
+                                else:
+                                    outcome = await execute_input_intent(
+                                        m, input_session, body, principal=principal
+                                    )
+                                    if outcome.get("t") == "err":
+                                        await ws.send(json.dumps({
+                                            **outcome,
+                                            "s": name,
+                                            "intentId": principal.intent_id,
+                                        }))
                             elif t == "resize" and name in sessions:
                                 apply_remote_session_size(sessions[name], m)
                             elif t == "sb" and name in sessions:
