@@ -1,0 +1,127 @@
+{
+  "$comment": "Scroll-parity vector table. The single source of truth for what a wheel notch does on EVERY terminal state, on BOTH surfaces. Asserted by muxd/tests/test_local_scroll_forwarding.py (muxctl cells + structure) and relay/tests/scroll-parity-web.test.js (web cells). Edit this file to change scroll behavior; the tests will tell you what must follow.",
+  "version": 1,
+  "state_axes": {
+    "surface": ["muxctl", "web"],
+    "screen": ["normal", "alt"],
+    "tracking": [false, true],
+    "alt_scroll_1007": [false, true]
+  },
+  "model": "A real local terminal (Windows Terminal / iTerm2 / xterm) resolves a wheel notch in this priority order: (1) app tracks the mouse -> wheel reports, even on the alternate screen; (2) bare alternate screen with DECSET 1007 -> arrow keys; (3) bare alternate screen without 1007 -> nothing the app can see; (4) normal screen -> the terminal scrolls its own scrollback and the app never sees the wheel. muxctl follows this order, substituting page keys for case (3) as a deliberate compatibility fallback (see `divergences`).",
+
+  "mechanisms": {
+    "host_scrollback": {
+      "app_input": "",
+      "per": "event",
+      "who_scrolls": "the terminal host's own scrollback (conhost viewport for muxctl, xterm.js scrollback for web)",
+      "note": "The hosted app never sees the notch. muxctl does not even capture mouse input in this state (ScreenModeTracker.wants_mouse_capture() is false)."
+    },
+    "none": {
+      "app_input": "",
+      "per": "event",
+      "who_scrolls": "nobody",
+      "note": "A real terminal drops the notch: the alternate screen has no scrollback and the app asked for neither reports nor alternate-scroll."
+    },
+    "page_keys": {
+      "app_input_up": "\u001b[5~",
+      "app_input_down": "\u001b[6~",
+      "per": "event",
+      "repeat": 1,
+      "rate_limit_ms": 90,
+      "who_scrolls": "the hosted app, as if PageUp/PageDown were typed",
+      "note": "Compatibility fallback, not real-terminal behavior. One key per wheel EVENT (never per notch), rate-limited by ConsoleInputTranslator.PAGE_SCROLL_INTERVAL. Mirrors the web's touch-surface scrollAlternate()."
+    },
+    "arrows": {
+      "app_input_up": "\u001b[A",
+      "app_input_down": "\u001b[B",
+      "app_cursor_input_up": "\u001bOA",
+      "app_cursor_input_down": "\u001bOB",
+      "per": "notch",
+      "repeat": 3,
+      "max_notches_per_event": 8,
+      "app_cursor_mode": 1,
+      "who_scrolls": "the hosted app, as if arrow keys were typed",
+      "note": "xterm's alternateScroll (DECSET 1007) contract; SS3 form when DECCKM (?1) is set. 3 keys per notch matches xterm.js."
+    },
+    "wheel_report": {
+      "per": "notch",
+      "repeat": 1,
+      "max_notches_per_event": 8,
+      "who_scrolls": "the hosted app, from a real mouse-wheel report",
+      "buttons": {"up": 64, "down": 65},
+      "encodings": [
+        {"style": "sgr", "detected_by_mode": 1006, "format": "\u001b[<{button};{x};{y}M", "precedence": 1},
+        {"style": "urxvt", "detected_by_mode": 1015, "format": "\u001b[{button_plus_32};{x};{y}M", "precedence": 2},
+        {"style": "x10", "detected_by_mode": null, "format": "\u001b[M{chr32_button}{chr32_x}{chr32_y}", "precedence": 3,
+         "note": "Coordinate bytes can exceed 0x7F; muxd's Session.write UTF-8-decodes input, so muxctl emits the UTF-8 encoding of the latin-1 report chars and clamps x,y to 222."}
+      ],
+      "coords": {"origin": 1, "clamped_min": 1}
+    }
+  },
+
+  "cells": [
+    {"surface": "muxctl", "screen": "normal", "tracking": false, "alt_scroll_1007": false, "modes_on": [],             "mechanism": "host_scrollback", "why": "Normal buffer, app wants nothing: conhost scrolls its own viewport (fed by muxd's ring replay)."},
+    {"surface": "muxctl", "screen": "normal", "tracking": false, "alt_scroll_1007": true,  "modes_on": [1007],         "mechanism": "host_scrollback", "why": "1007 only governs the alternate screen; on the normal buffer it is inert."},
+    {"surface": "muxctl", "screen": "normal", "tracking": true,  "alt_scroll_1007": false, "modes_on": [1000],         "mechanism": "wheel_report",    "why": "An app tracking the mouse outside the alternate screen owns the wheel — page keys would be meaningless there."},
+    {"surface": "muxctl", "screen": "normal", "tracking": true,  "alt_scroll_1007": true,  "modes_on": [1000, 1007],   "mechanism": "wheel_report",    "why": "Tracking outranks 1007 exactly as in a real terminal."},
+    {"surface": "muxctl", "screen": "alt",    "tracking": false, "alt_scroll_1007": false, "modes_on": [1049],         "mechanism": "page_keys",       "why": "COMPAT FALLBACK: a real terminal drops this notch; muxctl sends one rate-limited page key so bare-alt pagers (less, man) still scroll. See divergences[0]."},
+    {"surface": "muxctl", "screen": "alt",    "tracking": false, "alt_scroll_1007": true,  "modes_on": [1049, 1007],   "mechanism": "arrows",          "why": "The app opted into alternate-scroll; xterm sends 3 arrows per notch (SS3 under DECCKM)."},
+    {"surface": "muxctl", "screen": "alt",    "tracking": true,  "alt_scroll_1007": false, "modes_on": [1049, 1000],   "mechanism": "wheel_report",    "why": "The claude/codex state. Tracking wins over the alternate screen — this is the priority flip r.3.1 landed."},
+    {"surface": "muxctl", "screen": "alt",    "tracking": true,  "alt_scroll_1007": true,  "modes_on": [1049, 1000, 1007], "mechanism": "wheel_report", "why": "Tracking outranks 1007; the app scrolls its own transcript from the report."},
+
+    {"surface": "web", "screen": "normal", "tracking": false, "alt_scroll_1007": false, "modes_on": [],           "mechanism": "host_scrollback", "why": "index.html capture-phase wheel router scrolls xterm's scrollback itself and stops the event.", "anchor": "relay/public/index.html:1393-1419"},
+    {"surface": "web", "screen": "normal", "tracking": false, "alt_scroll_1007": true,  "modes_on": [1007],       "mechanism": "host_scrollback", "why": "1007 is inert on the normal buffer.", "anchor": "relay/public/index.html:1393-1419"},
+    {"surface": "web", "screen": "normal", "tracking": true,  "alt_scroll_1007": false, "modes_on": [1000],       "mechanism": "host_scrollback", "why": "DELIBERATE: the router runs at capture phase precisely so a stuck/leaked tracking mode can never eat the wheel and freeze the scrollback. See divergences[1].", "anchor": "relay/public/index.html:1388-1406"},
+    {"surface": "web", "screen": "normal", "tracking": true,  "alt_scroll_1007": true,  "modes_on": [1000, 1007], "mechanism": "host_scrollback", "why": "Same capture-phase guard.", "anchor": "relay/public/index.html:1388-1406"},
+    {"surface": "web", "screen": "alt",    "tracking": false, "alt_scroll_1007": false, "modes_on": [1049],       "mechanism": "none",            "why": "Router forwards the trusted wheel to xterm; xterm has no scrollback on the alternate buffer and the app asked for nothing.", "anchor": "relay/public/index.html:1407-1418"},
+    {"surface": "web", "screen": "alt",    "tracking": false, "alt_scroll_1007": true,  "modes_on": [1049, 1007], "mechanism": "arrows",          "why": "xterm.js's built-in alternateScroll handling of the forwarded wheel.", "anchor": "relay/public/index.html:1407-1418"},
+    {"surface": "web", "screen": "alt",    "tracking": true,  "alt_scroll_1007": false, "modes_on": [1049, 1000], "mechanism": "wheel_report",    "why": "xterm emits the SGR wheel report and stripMouseReports KEEPS wheel reports (Cb bit 6) while still stripping the motion/click flood.", "anchor": "relay/public/index.html:1527-1538"},
+    {"surface": "web", "screen": "alt",    "tracking": true,  "alt_scroll_1007": true,  "modes_on": [1049, 1000, 1007], "mechanism": "wheel_report", "why": "Tracking outranks 1007 inside xterm too.", "anchor": "relay/public/index.html:1527-1538"}
+  ],
+
+  "muxctl_overrides": {
+    "MUXCTL_WHEEL=pagekeys": {
+      "why": "Forced compatibility mode: keeps the pre-r.3.1 alt-screen-first order for a TUI that is known to scroll from page keys but not from wheel reports. Only alternate-screen cells change; normal-screen behavior is identical to the default.",
+      "cells": [
+        {"screen": "normal", "tracking": false, "alt_scroll_1007": false, "mechanism": "host_scrollback"},
+        {"screen": "normal", "tracking": false, "alt_scroll_1007": true,  "mechanism": "host_scrollback"},
+        {"screen": "normal", "tracking": true,  "alt_scroll_1007": false, "mechanism": "wheel_report"},
+        {"screen": "normal", "tracking": true,  "alt_scroll_1007": true,  "mechanism": "wheel_report"},
+        {"screen": "alt",    "tracking": false, "alt_scroll_1007": false, "mechanism": "page_keys"},
+        {"screen": "alt",    "tracking": false, "alt_scroll_1007": true,  "mechanism": "page_keys"},
+        {"screen": "alt",    "tracking": true,  "alt_scroll_1007": false, "mechanism": "page_keys"},
+        {"screen": "alt",    "tracking": true,  "alt_scroll_1007": true,  "mechanism": "page_keys"}
+      ]
+    }
+  },
+
+  "divergences": [
+    {
+      "cell": "muxctl/alt/tracking=false/1007=false",
+      "muxctl": "page_keys",
+      "web": "none",
+      "accepted": true,
+      "why": "muxctl keeps the rate-limited page key as a compatibility fallback so bare-alt pagers still scroll from the wheel on the local attach. The web surface defers to xterm.js, which implements the real-terminal contract (drop the notch). Deliberate, not a bug: setting MUXCTL_WHEEL= any other value cannot reach the web surface, and the local attach has no other way to scroll a bare-alt pager."
+    },
+    {
+      "cell": "web/normal/tracking=true/*",
+      "muxctl": "wheel_report",
+      "web": "host_scrollback",
+      "accepted": true,
+      "why": "The web router is capture-phase by design: a TUI that leaked DECSET 1000 and died would otherwise permanently freeze the web scrollback, with no local console to fall back on. Locally, conhost's viewport is still reachable and the flood guard lives in stripMouseReports, so muxctl can afford the faithful behavior."
+    }
+  ],
+
+  "invariants": [
+    "exactly-one-mechanism: every cell names exactly ONE mechanism; a single wheel notch never produces two scroll sources (no page key AND a report, no report AND arrows).",
+    "tracking-wins: whenever tracking=true, the mechanism is wheel_report on any surface/screen where the app sees the wheel at all.",
+    "normal-screen-is-the-host's: on screen=normal with tracking=false the mechanism is host_scrollback on both surfaces, so plain shells keep native scrollback.",
+    "tracked-modes-are-replayed: every DEC private mode this table keys on is in muxd.REPLAY_PRIVATE_MODES, so a mid-session attach classifies into the same cell as a fresh one.",
+    "vt-input-opt-in-emits-nothing: under MUXCTL_VT_INPUT=1 muxctl emits NO wheel bytes in any cell — the terminal's VT layer owns the wheel."
+  ],
+
+  "asserted_by": {
+    "muxctl": "muxd/tests/test_local_scroll_forwarding.py",
+    "web": "relay/tests/scroll-parity-web.test.js"
+  }
+}
