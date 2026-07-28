@@ -127,7 +127,7 @@ public static class SessionLaunchClaims
             }
         }
 
-        if (!TryCheckAnyLive(ids, isSessionLive, out live, out liveId, out detail))
+        if (!TryCheckAnyLive(ids, isSessionLive, out live, out liveId, out detail, bypassCache: true))
         {
             ReleaseHeld(held, deleteFiles: true);
             return false;
@@ -395,12 +395,16 @@ public static class SessionLaunchClaims
            && expected.ExpiresUtc == actual.ExpiresUtc
            && expected.CandidateIds.SequenceEqual(actual.CandidateIds, StringComparer.Ordinal);
 
+    // [F#3] `bypassCache` is true for the POST-claim re-check only. The pre-check may ride the burst cache with
+    // everyone else, but once the reservation is held the whole question is "did the world change in the last
+    // few milliseconds" — and a cached answer is, by construction, unable to say.
     private static bool TryCheckAnyLive(
         IReadOnlyList<string> candidateIds,
         Func<string, bool>? isSessionLive,
         out bool live,
         out string liveId,
-        out string detail)
+        out string detail,
+        bool bypassCache = false)
     {
         live = false;
         detail = "";
@@ -422,7 +426,7 @@ public static class SessionLaunchClaims
             return true;
         }
 
-        var verified = RunningSessions.TryAllLiveSessionIds(out var liveIds, out var verificationDetail);
+        var verified = RunningSessions.TryAllLiveSessionIds(out var liveIds, out var verificationDetail, bypassCache);
         foreach (var id in candidateIds)
             if (liveIds.Contains(id)) { live = true; liveId = id; return true; }
         if (!verified)

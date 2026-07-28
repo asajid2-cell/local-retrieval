@@ -1193,7 +1193,10 @@ public sealed partial class MainPage
             var text = await LocalMuxdRequestAsync(new { t = "kill", s = name });
             using var doc = JsonDocument.Parse(text);
             if (doc.RootElement.TryGetProperty("t", out var t) && t.GetString() == "killed")
+            {
+                RunningSessions.InvalidateScanCache();   // [F#4] the mux session is gone; don't serve the old sweep
                 return (true, "killed");
+            }
             if (doc.RootElement.TryGetProperty("t", out t) && t.GetString() == "err")
                 return (false, doc.RootElement.TryGetProperty("m", out var m) ? m.GetString() ?? "muxd error" : "muxd error");
             return (false, "unexpected muxd kill response: " + Trim(text, 160));
