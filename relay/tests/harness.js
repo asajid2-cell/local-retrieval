@@ -253,6 +253,14 @@ class FakeHost {
     this.ws.send(JSON.stringify({ t: 'sb', s: name, rid: sb.rid, d: Buffer.from(text, 'utf8').toString('base64') }));
   }
 
+  // NOTE the wire shape differs from scrollback: `tailr` carries PLAIN text, not base64 `d`, plus an
+  // optional muxd signature the relay passes through without validating.
+  sendTail(name, text = '', { sig = '', request = null } = {}) {
+    const req = request || [...this.messages].reverse().find(message => message.t === 'tail' && message.s === name);
+    if (!req || !req.rid) throw new Error(`no correlated tail request for ${name}`);
+    this.ws.send(JSON.stringify({ t: 'tailr', s: name, rid: req.rid, text, sig }));
+  }
+
   sendKilled(name) {
     this.ws.send(JSON.stringify({ t: 'killed', s: name }));
   }
