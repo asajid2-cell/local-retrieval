@@ -1,0 +1,737 @@
+{
+  "schema": "vt-fidelity/1",
+  "generatedBy": "muxd/spike/vt-fidelity/harness.mjs",
+  "node": "v22.20.0",
+  "corpusDir": "muxd/spike/vt-fidelity/fixtures",
+  "oracle": "xterm-headless",
+  "reflowProbe": {
+    "fromCols": 140,
+    "toCols": 80
+  },
+  "gate": {
+    "syntheticCellPct": 99.5,
+    "recordedCellPct": 99,
+    "reflowPct": 98,
+    "throughputBytesPerSec": 5242880
+  },
+  "throughputMethod": {
+    "mode": "bulk-single-write",
+    "repeats": 3,
+    "warmup": true,
+    "measuredOnFixture": "throughput-scroll-log",
+    "measuredOnBytes": 1540000,
+    "aggregate": "best-of-repeats",
+    "excludes": [
+      "process-spawn",
+      "file-io",
+      "serialize",
+      "reflow-resize"
+    ]
+  },
+  "totals": {
+    "fixtures": 19,
+    "synthetic": 15,
+    "recorded": 4,
+    "bytes": 2005407,
+    "fixturesWithRecordedSessionContent": [
+      "live-shell-review-rollout"
+    ]
+  },
+  "candidates": {
+    "pyte": {
+      "go": false,
+      "verdict": "NO-GO",
+      "failed": [
+        "syntheticCell",
+        "recordedCell",
+        "reflow",
+        "throughput"
+      ],
+      "checks": {
+        "syntheticCell": {
+          "value": 99.351,
+          "gate": 99.5,
+          "pass": false
+        },
+        "recordedCell": {
+          "value": 92.678,
+          "gate": 99,
+          "pass": false
+        },
+        "reflow": {
+          "value": 89.212,
+          "gate": 98,
+          "pass": false
+        },
+        "throughput": {
+          "value": 389093,
+          "gate": 5242880,
+          "pass": false
+        }
+      },
+      "throughputMBPerSec": 0.371,
+      "version": "?",
+      "note": "pyte Screen.resize truncates columns; it does not reflow wrapped lines. The reflow number below is a real measurement of that gap, not a harness artifact."
+    },
+    "xterm-headless": {
+      "go": true,
+      "verdict": "GO",
+      "failed": [],
+      "checks": {
+        "syntheticCell": {
+          "value": 100,
+          "gate": 99.5,
+          "pass": true
+        },
+        "recordedCell": {
+          "value": 100,
+          "gate": 99,
+          "pass": true
+        },
+        "reflow": {
+          "value": 100,
+          "gate": 98,
+          "pass": true
+        },
+        "throughput": {
+          "value": 74896531,
+          "gate": 5242880,
+          "pass": true
+        }
+      },
+      "throughputMBPerSec": 71.427,
+      "role": "oracle",
+      "oracleSelfIdentity": true,
+      "note": "cellFidelity/reflow are identity by construction (this candidate IS the oracle). Independent signals: throughput, native reflow on resize, and serializeRoundTripPct per fixture (SerializeAddon emits replayable VT)."
+    }
+  },
+  "fixtures": [
+    {
+      "name": "altscreen-1049-roundtrip",
+      "corpus": "synthetic",
+      "bytes": 118,
+      "geometry": "80x24",
+      "desc": "1049 enter/paint/leave; primary buffer must be intact",
+      "containsRecordedSessionContent": false,
+      "candidates": {
+        "pyte": {
+          "cellFidelityPct": 96.875,
+          "cellsMatched": 1860,
+          "cellsTotal": 1920,
+          "cursorMatch": false,
+          "reflowFidelityPct": 96.875,
+          "throughputBytesPerSec": 313580,
+          "ingestMs": 0.376,
+          "error": null
+        },
+        "xterm-headless": {
+          "cellFidelityPct": 100,
+          "oracleSelfIdentity": true,
+          "cursorMatch": true,
+          "reflowFidelityPct": 100,
+          "reflowIsNative": true,
+          "serializeRoundTripPct": 100,
+          "serializeBytes": 64,
+          "throughputBytesPerSec": 8116,
+          "ingestMs": 14.539,
+          "error": null
+        }
+      },
+      "oracleAltScreen": false
+    },
+    {
+      "name": "altscreen-47-1047",
+      "corpus": "synthetic",
+      "bytes": 105,
+      "geometry": "80x24",
+      "desc": "legacy alt-screen spellings 47 and 1047",
+      "containsRecordedSessionContent": false,
+      "candidates": {
+        "pyte": {
+          "cellFidelityPct": 99.219,
+          "cellsMatched": 1905,
+          "cellsTotal": 1920,
+          "cursorMatch": true,
+          "reflowFidelityPct": 99.219,
+          "throughputBytesPerSec": 373002,
+          "ingestMs": 0.282,
+          "error": null
+        },
+        "xterm-headless": {
+          "cellFidelityPct": 100,
+          "oracleSelfIdentity": true,
+          "cursorMatch": true,
+          "reflowFidelityPct": 100,
+          "reflowIsNative": true,
+          "serializeRoundTripPct": 100,
+          "serializeBytes": 21,
+          "throughputBytesPerSec": 6756,
+          "ingestMs": 15.543,
+          "error": null
+        }
+      },
+      "oracleAltScreen": false
+    },
+    {
+      "name": "altscreen-live-tui",
+      "corpus": "synthetic",
+      "bytes": 756,
+      "geometry": "100x30",
+      "desc": "alt-screen box-drawing TUI parked in alt buffer (codex/claude shape)",
+      "containsRecordedSessionContent": false,
+      "candidates": {
+        "pyte": {
+          "cellFidelityPct": 100,
+          "cellsMatched": 3000,
+          "cellsTotal": 3000,
+          "cursorMatch": true,
+          "reflowFidelityPct": 100,
+          "throughputBytesPerSec": 611008,
+          "ingestMs": 1.237,
+          "error": null
+        },
+        "xterm-headless": {
+          "cellFidelityPct": 100,
+          "oracleSelfIdentity": true,
+          "cursorMatch": true,
+          "reflowFidelityPct": 100,
+          "reflowIsNative": true,
+          "serializeRoundTripPct": 100,
+          "serializeBytes": 656,
+          "throughputBytesPerSec": 52975,
+          "ingestMs": 14.271,
+          "error": null
+        }
+      },
+      "oracleAltScreen": true
+    },
+    {
+      "name": "cursor-motion",
+      "corpus": "synthetic",
+      "bytes": 135,
+      "geometry": "80x24",
+      "desc": "CUP/CUU/CUD/CUF/CUB/CHA/VPA/HVP, DECSC/DECRC, RI, HT",
+      "containsRecordedSessionContent": false,
+      "candidates": {
+        "pyte": {
+          "cellFidelityPct": 100,
+          "cellsMatched": 1920,
+          "cellsTotal": 1920,
+          "cursorMatch": true,
+          "reflowFidelityPct": 100,
+          "throughputBytesPerSec": 386156,
+          "ingestMs": 0.35,
+          "error": null
+        },
+        "xterm-headless": {
+          "cellFidelityPct": 100,
+          "oracleSelfIdentity": true,
+          "cursorMatch": true,
+          "reflowFidelityPct": 100,
+          "reflowIsNative": true,
+          "serializeRoundTripPct": 100,
+          "serializeBytes": 133,
+          "throughputBytesPerSec": 8704,
+          "ingestMs": 15.51,
+          "error": null
+        }
+      },
+      "oracleAltScreen": false
+    },
+    {
+      "name": "decawm-wrap",
+      "corpus": "synthetic",
+      "bytes": 223,
+      "geometry": "40x12",
+      "desc": "DECAWM on (wrap) vs off (clamp) over the right margin",
+      "containsRecordedSessionContent": false,
+      "candidates": {
+        "pyte": {
+          "cellFidelityPct": 100,
+          "cellsMatched": 480,
+          "cellsTotal": 480,
+          "cursorMatch": true,
+          "reflowFidelityPct": 80.833,
+          "throughputBytesPerSec": 357831,
+          "ingestMs": 0.623,
+          "error": null
+        },
+        "xterm-headless": {
+          "cellFidelityPct": 100,
+          "oracleSelfIdentity": true,
+          "cursorMatch": true,
+          "reflowFidelityPct": 100,
+          "reflowIsNative": true,
+          "serializeRoundTripPct": 100,
+          "serializeBytes": 148,
+          "throughputBytesPerSec": 15237,
+          "ingestMs": 14.636,
+          "error": null
+        }
+      },
+      "oracleAltScreen": false
+    },
+    {
+      "name": "decckm-1",
+      "corpus": "synthetic",
+      "bytes": 95,
+      "geometry": "60x10",
+      "desc": "DECCKM set/reset — arrow-key encoding a replayed viewer must inherit",
+      "containsRecordedSessionContent": false,
+      "candidates": {
+        "pyte": {
+          "cellFidelityPct": 100,
+          "cellsMatched": 600,
+          "cellsTotal": 600,
+          "cursorMatch": true,
+          "reflowFidelityPct": 100,
+          "throughputBytesPerSec": 366937,
+          "ingestMs": 0.259,
+          "error": null
+        },
+        "xterm-headless": {
+          "cellFidelityPct": 100,
+          "oracleSelfIdentity": true,
+          "cursorMatch": true,
+          "reflowFidelityPct": 100,
+          "reflowIsNative": true,
+          "serializeRoundTripPct": 100,
+          "serializeBytes": 85,
+          "throughputBytesPerSec": 6533,
+          "ingestMs": 14.541,
+          "error": null
+        }
+      },
+      "oracleAltScreen": false
+    },
+    {
+      "name": "decstbm-regions",
+      "corpus": "synthetic",
+      "bytes": 272,
+      "geometry": "60x24",
+      "desc": "DECSTBM region with IL/DL/SU/SD then region reset",
+      "containsRecordedSessionContent": false,
+      "candidates": {
+        "pyte": {
+          "cellFidelityPct": 97.917,
+          "cellsMatched": 1410,
+          "cellsTotal": 1440,
+          "cursorMatch": true,
+          "reflowFidelityPct": 98.438,
+          "throughputBytesPerSec": 321817,
+          "ingestMs": 0.845,
+          "error": null
+        },
+        "xterm-headless": {
+          "cellFidelityPct": 100,
+          "oracleSelfIdentity": true,
+          "cursorMatch": true,
+          "reflowFidelityPct": 100,
+          "reflowIsNative": true,
+          "serializeRoundTripPct": 100,
+          "serializeBytes": 127,
+          "throughputBytesPerSec": 18647,
+          "ingestMs": 14.587,
+          "error": null
+        }
+      },
+      "oracleAltScreen": false
+    },
+    {
+      "name": "erase-ed-el",
+      "corpus": "synthetic",
+      "bytes": 432,
+      "geometry": "60x14",
+      "desc": "EL 0/1/2 and ED 0/1 against a painted grid",
+      "containsRecordedSessionContent": false,
+      "candidates": {
+        "pyte": {
+          "cellFidelityPct": 100,
+          "cellsMatched": 840,
+          "cellsTotal": 840,
+          "cursorMatch": true,
+          "reflowFidelityPct": 100,
+          "throughputBytesPerSec": 381356,
+          "ingestMs": 1.133,
+          "error": null
+        },
+        "xterm-headless": {
+          "cellFidelityPct": 100,
+          "oracleSelfIdentity": true,
+          "cursorMatch": true,
+          "reflowFidelityPct": 100,
+          "reflowIsNative": true,
+          "serializeRoundTripPct": 100,
+          "serializeBytes": 251,
+          "throughputBytesPerSec": 596685,
+          "ingestMs": 0.724,
+          "error": null
+        }
+      },
+      "oracleAltScreen": false
+    },
+    {
+      "name": "live-shell-review-rollout",
+      "corpus": "recorded",
+      "bytes": 428142,
+      "geometry": "80x24",
+      "desc": "recorded muxd scrollback replay payload",
+      "containsRecordedSessionContent": true,
+      "candidates": {
+        "pyte": {
+          "cellFidelityPct": 100,
+          "cellsMatched": 1920,
+          "cellsTotal": 1920,
+          "cursorMatch": true,
+          "reflowFidelityPct": 100,
+          "throughputBytesPerSec": 515630,
+          "ingestMs": 830.328,
+          "error": null
+        },
+        "xterm-headless": {
+          "cellFidelityPct": 100,
+          "oracleSelfIdentity": true,
+          "cursorMatch": true,
+          "reflowFidelityPct": 100,
+          "reflowIsNative": true,
+          "serializeRoundTripPct": 100,
+          "serializeBytes": 2430,
+          "throughputBytesPerSec": 28909956,
+          "ingestMs": 14.81,
+          "error": null
+        }
+      },
+      "oracleAltScreen": true
+    },
+    {
+      "name": "osc-title",
+      "corpus": "synthetic",
+      "bytes": 90,
+      "geometry": "60x10",
+      "desc": "OSC 0/2 window title, BEL- and ST-terminated",
+      "containsRecordedSessionContent": false,
+      "candidates": {
+        "pyte": {
+          "cellFidelityPct": 100,
+          "cellsMatched": 600,
+          "cellsTotal": 600,
+          "cursorMatch": true,
+          "reflowFidelityPct": 100,
+          "throughputBytesPerSec": 636943,
+          "ingestMs": 0.141,
+          "error": null
+        },
+        "xterm-headless": {
+          "cellFidelityPct": 100,
+          "oracleSelfIdentity": true,
+          "cursorMatch": true,
+          "reflowFidelityPct": 100,
+          "reflowIsNative": true,
+          "serializeRoundTripPct": 100,
+          "serializeBytes": 40,
+          "throughputBytesPerSec": 5747,
+          "ingestMs": 15.659,
+          "error": null
+        }
+      },
+      "oracleAltScreen": false
+    },
+    {
+      "name": "pager-alt",
+      "corpus": "recorded",
+      "bytes": 18651,
+      "geometry": "140x40",
+      "desc": "alt-screen pager: 1049 enter/leave, full repaints, reverse-video status line",
+      "containsRecordedSessionContent": false,
+      "candidates": {
+        "pyte": {
+          "cellFidelityPct": 79.661,
+          "cellsMatched": 4461,
+          "cellsTotal": 5600,
+          "cursorMatch": false,
+          "reflowFidelityPct": 64.406,
+          "throughputBytesPerSec": 358908,
+          "ingestMs": 51.966,
+          "error": null
+        },
+        "xterm-headless": {
+          "cellFidelityPct": 100,
+          "oracleSelfIdentity": true,
+          "cursorMatch": true,
+          "reflowFidelityPct": 100,
+          "reflowIsNative": true,
+          "serializeRoundTripPct": 100,
+          "serializeBytes": 8,
+          "throughputBytesPerSec": 1284557,
+          "ingestMs": 14.519,
+          "error": null
+        }
+      },
+      "oracleAltScreen": false
+    },
+    {
+      "name": "private-modes-sweep",
+      "corpus": "synthetic",
+      "bytes": 456,
+      "geometry": "80x40",
+      "desc": "set/reset each REPLAY_PRIVATE_MODES mode with text between",
+      "containsRecordedSessionContent": false,
+      "candidates": {
+        "pyte": {
+          "cellFidelityPct": 97.656,
+          "cellsMatched": 3125,
+          "cellsTotal": 3200,
+          "cursorMatch": false,
+          "reflowFidelityPct": 97.656,
+          "throughputBytesPerSec": 417353,
+          "ingestMs": 1.093,
+          "error": null
+        },
+        "xterm-headless": {
+          "cellFidelityPct": 100,
+          "oracleSelfIdentity": true,
+          "cursorMatch": true,
+          "reflowFidelityPct": 100,
+          "reflowIsNative": true,
+          "serializeRoundTripPct": 100,
+          "serializeBytes": 246,
+          "throughputBytesPerSec": 31810,
+          "ingestMs": 14.335,
+          "error": null
+        }
+      },
+      "oracleAltScreen": false
+    },
+    {
+      "name": "progress-cr-churn",
+      "corpus": "synthetic",
+      "bytes": 1282,
+      "geometry": "60x16",
+      "desc": "CR/EL2 progress bar plus CUU-based in-place redraw",
+      "containsRecordedSessionContent": false,
+      "candidates": {
+        "pyte": {
+          "cellFidelityPct": 100,
+          "cellsMatched": 960,
+          "cellsTotal": 960,
+          "cursorMatch": true,
+          "reflowFidelityPct": 100,
+          "throughputBytesPerSec": 378138,
+          "ingestMs": 3.39,
+          "error": null
+        },
+        "xterm-headless": {
+          "cellFidelityPct": 100,
+          "oracleSelfIdentity": true,
+          "cursorMatch": true,
+          "reflowFidelityPct": 100,
+          "reflowIsNative": true,
+          "serializeRoundTripPct": 100,
+          "serializeBytes": 58,
+          "throughputBytesPerSec": 85938,
+          "ingestMs": 14.918,
+          "error": null
+        }
+      },
+      "oracleAltScreen": false
+    },
+    {
+      "name": "reflow-paragraphs",
+      "corpus": "synthetic",
+      "bytes": 6161,
+      "geometry": "140x40",
+      "desc": "long soft-wrapped paragraphs — the reflow-on-resize probe",
+      "containsRecordedSessionContent": false,
+      "candidates": {
+        "pyte": {
+          "cellFidelityPct": 100,
+          "cellsMatched": 5600,
+          "cellsTotal": 5600,
+          "cursorMatch": true,
+          "reflowFidelityPct": 11.594,
+          "throughputBytesPerSec": 381477,
+          "ingestMs": 16.15,
+          "error": null
+        },
+        "xterm-headless": {
+          "cellFidelityPct": 100,
+          "oracleSelfIdentity": true,
+          "cursorMatch": true,
+          "reflowFidelityPct": 100,
+          "reflowIsNative": true,
+          "serializeRoundTripPct": 100,
+          "serializeBytes": 6156,
+          "throughputBytesPerSec": 464371,
+          "ingestMs": 13.267,
+          "error": null
+        }
+      },
+      "oracleAltScreen": false
+    },
+    {
+      "name": "sgr-256-truecolor",
+      "corpus": "synthetic",
+      "bytes": 555,
+      "geometry": "90x20",
+      "desc": "SGR 16/bright/256/truecolor fg+bg and attribute toggles",
+      "containsRecordedSessionContent": false,
+      "candidates": {
+        "pyte": {
+          "cellFidelityPct": 100,
+          "cellsMatched": 1800,
+          "cellsTotal": 1800,
+          "cursorMatch": true,
+          "reflowFidelityPct": 100,
+          "throughputBytesPerSec": 609823,
+          "ingestMs": 0.91,
+          "error": null
+        },
+        "xterm-headless": {
+          "cellFidelityPct": 100,
+          "oracleSelfIdentity": true,
+          "cursorMatch": true,
+          "reflowFidelityPct": 100,
+          "reflowIsNative": true,
+          "serializeRoundTripPct": 100,
+          "serializeBytes": 525,
+          "throughputBytesPerSec": 37669,
+          "ingestMs": 14.734,
+          "error": null
+        }
+      },
+      "oracleAltScreen": false
+    },
+    {
+      "name": "shell-plain",
+      "corpus": "recorded",
+      "bytes": 1688,
+      "geometry": "140x40",
+      "desc": "plain shell on the normal buffer: prompts, echoed input, scrolling output",
+      "containsRecordedSessionContent": false,
+      "candidates": {
+        "pyte": {
+          "cellFidelityPct": 100,
+          "cellsMatched": 5600,
+          "cellsTotal": 5600,
+          "cursorMatch": true,
+          "reflowFidelityPct": 62.406,
+          "throughputBytesPerSec": 514383,
+          "ingestMs": 3.282,
+          "error": null
+        },
+        "xterm-headless": {
+          "cellFidelityPct": 100,
+          "oracleSelfIdentity": true,
+          "cursorMatch": true,
+          "reflowFidelityPct": 100,
+          "reflowIsNative": true,
+          "serializeRoundTripPct": 100,
+          "serializeBytes": 1114,
+          "throughputBytesPerSec": 111773,
+          "ingestMs": 15.102,
+          "error": null
+        }
+      },
+      "oracleAltScreen": false
+    },
+    {
+      "name": "throughput-scroll-log",
+      "corpus": "synthetic",
+      "bytes": 1540000,
+      "geometry": "120x40",
+      "desc": "~1.6MB coloured scrolling log — ingest throughput probe",
+      "containsRecordedSessionContent": false,
+      "candidates": {
+        "pyte": {
+          "cellFidelityPct": 100,
+          "cellsMatched": 4800,
+          "cellsTotal": 4800,
+          "cursorMatch": true,
+          "reflowFidelityPct": 100,
+          "throughputBytesPerSec": 389093,
+          "ingestMs": 3957.923,
+          "error": null
+        },
+        "xterm-headless": {
+          "cellFidelityPct": 100,
+          "oracleSelfIdentity": true,
+          "cursorMatch": true,
+          "reflowFidelityPct": 100,
+          "reflowIsNative": true,
+          "serializeRoundTripPct": 100,
+          "serializeBytes": 367851,
+          "throughputBytesPerSec": 74896531,
+          "ingestMs": 20.562,
+          "error": null
+        }
+      },
+      "oracleAltScreen": false
+    },
+    {
+      "name": "tui-alt",
+      "corpus": "recorded",
+      "bytes": 5907,
+      "geometry": "140x40",
+      "desc": "alt-screen TUI: 1049/1/2004/1000/1002/1006, DECSTBM, SGR 256+truecolor, wide chars",
+      "containsRecordedSessionContent": false,
+      "candidates": {
+        "pyte": {
+          "cellFidelityPct": 91.049,
+          "cellsMatched": 5106,
+          "cellsTotal": 5608,
+          "cursorMatch": false,
+          "reflowFidelityPct": 84.352,
+          "throughputBytesPerSec": 428211,
+          "ingestMs": 13.795,
+          "error": null
+        },
+        "xterm-headless": {
+          "cellFidelityPct": 100,
+          "oracleSelfIdentity": true,
+          "cursorMatch": true,
+          "reflowFidelityPct": 100,
+          "reflowIsNative": true,
+          "serializeRoundTripPct": 100,
+          "serializeBytes": 42,
+          "throughputBytesPerSec": 1952598,
+          "ingestMs": 3.025,
+          "error": null
+        }
+      },
+      "oracleAltScreen": false
+    },
+    {
+      "name": "utf8-wide-emoji",
+      "corpus": "synthetic",
+      "bytes": 339,
+      "geometry": "50x20",
+      "desc": "wide CJK, emoji, combining marks, box drawing, wide char at margin",
+      "containsRecordedSessionContent": false,
+      "candidates": {
+        "pyte": {
+          "cellFidelityPct": 98.604,
+          "cellsMatched": 989,
+          "cellsTotal": 1003,
+          "cursorMatch": false,
+          "reflowFidelityPct": 99.251,
+          "throughputBytesPerSec": 592865,
+          "ingestMs": 0.572,
+          "error": null
+        },
+        "xterm-headless": {
+          "cellFidelityPct": 100,
+          "oracleSelfIdentity": true,
+          "cursorMatch": true,
+          "reflowFidelityPct": 100,
+          "reflowIsNative": true,
+          "serializeRoundTripPct": 100,
+          "serializeBytes": 339,
+          "throughputBytesPerSec": 22755,
+          "ingestMs": 14.898,
+          "error": null
+        }
+      },
+      "oracleAltScreen": false
+    }
+  ]
+}

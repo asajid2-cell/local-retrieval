@@ -9,6 +9,15 @@
 // construction and are flagged oracleSelfIdentity. Its independent signals are
 // throughput and the SerializeAddon round-trip (serialize -> replay -> compare).
 //
+// Throughput is measured, for BOTH candidates, as: one untimed warmup ingest,
+// then REPEATS timed repeats of the same fixture in the same process against a
+// freshly constructed terminal/screen, reporting the best (minimum) repeat.
+// Each timed ingest is a SINGLE bulk write -- awaiting xterm's write callback
+// per 8KB chunk costs an event-loop round-trip per chunk and would measure the
+// scheduler, not the parser. The headline number is the largest fixture's, not
+// a corpus aggregate: summing ingestMs over 15 tiny fixtures charges their
+// fixed startup cost against the total. See report.throughputMethod.
+//
 //   node harness.mjs --corpus ./fixtures --out ./report.json
 
 import { createRequire } from 'node:module';
@@ -26,6 +35,7 @@ const { SerializeAddon } = require('@xterm/addon-serialize');
 const REFLOW_FROM = 140;   // brief: ingest at 140 cols...
 const REFLOW_TO = 80;      // ...resize to 80 and compare
 const SCROLLBACK = 5000;
+const REPEATS = 3;         // timed ingest repeats per fixture, after a warmup
 
 // GO thresholds (brief).
 const GATE = {
@@ -105,17 +115,41 @@ function write(term, data) {
   return new Promise((res) => term.write(data, res));
 }
 
-async function xtermProbe(fixture, { cols, rows, resizeTo }) {
+// One timed bulk ingest into a FRESH terminal: a single term.write() of the
+// whole buffer and exactly ONE completion callback awaited. Terminal
+// construction is outside the clock; nothing is serialized or resized. Note
+// that queueing the chunks unawaited is NOT an option -- xterm's WriteBuffer
+// throws past 50 queued chunks ('write data discarded').
+async function timedIngest(data, cols, rows) {
+  const term = newTerm(cols, rows);
+  const t0 = process.hrtime.bigint();
+  await write(term, data);
+  const ms = Number(process.hrtime.bigint() - t0) / 1e6;
+  term.dispose();
+  return ms;
+}
+
+async function bestOfIngest(data, cols, rows, repeats) {
+  await timedIngest(data, cols, rows);   // warmup, discarded
+  let best = Infinity;
+  for (let i = 0; i < repeats; i++) best = Math.min(best, await timedIngest(data, cols, rows));
+  return best;
+}
+
+async function xtermProbe(fixture, { cols, rows, resizeTo, timed }) {
   const data = readFileSync(fixture.path);
   const term = newTerm(cols, rows);
   const ser = new SerializeAddon();
   term.loadAddon(ser);
 
+  // Correctness pass: chunked at muxd's 8192-byte pty read size. Untimed --
+  // the per-chunk await here is what made the old measurement meaningless.
   const t0 = process.hrtime.bigint();
   for (let i = 0; i < data.length; i += 8192) await write(term, data.subarray(i, i + 8192));
-  const ingestMs = Number(process.hrtime.bigint() - t0) / 1e6;
+  let ingestMs = Number(process.hrtime.bigint() - t0) / 1e6;
 
   const native = readScreen(term, rows);
+  if (timed) ingestMs = await bestOfIngest(data, cols, rows, REPEATS);
   const out = { ...native, ingestMs, bytes: data.length };
 
   if (resizeTo && resizeTo !== cols) {
@@ -182,16 +216,18 @@ async function main() {
   if (!fixtures.length) throw new Error(`no .bin fixtures under ${corpusDir}`);
 
   // One python spawn for the whole corpus: native + reflow job per fixture.
+  // Only the native job is timed -- the reflow job exists for the resize
+  // comparison and its ingest number is never reported.
   const jobs = [];
   for (const f of fixtures) {
-    jobs.push({ name: `${f.name}#native`, path: f.path, cols: f.cols, rows: f.rows, reflowCols: 0 });
-    jobs.push({ name: `${f.name}#reflow`, path: f.path, cols: REFLOW_FROM, rows: f.rows, reflowCols: REFLOW_TO });
+    jobs.push({ name: `${f.name}#native`, path: f.path, cols: f.cols, rows: f.rows, reflowCols: 0, repeats: REPEATS });
+    jobs.push({ name: `${f.name}#reflow`, path: f.path, cols: REFLOW_FROM, rows: f.rows, reflowCols: REFLOW_TO, repeats: 0 });
   }
   const pyte = pyteProbe(jobs);
 
   const rows = [];
   for (const f of fixtures) {
-    const oNative = await xtermProbe(f, { cols: f.cols, rows: f.rows });
+    const oNative = await xtermProbe(f, { cols: f.cols, rows: f.rows, timed: true });
     const oReflow = await xtermProbe(f, { cols: REFLOW_FROM, rows: f.rows, resizeTo: REFLOW_TO });
     const pNative = pyte.byName.get(`${f.name}#native`);
     const pReflow = pyte.byName.get(`${f.name}#reflow`);
@@ -236,10 +272,22 @@ async function main() {
   const byCorpus = (c, cand, key) =>
     rows.filter((r) => r.corpus === c).map((r) => r.candidates[cand][key]).filter((v) => typeof v === 'number');
   const totalBytes = rows.reduce((a, r) => a + r.bytes, 0);
-  const aggThroughput = (cand) => {
-    const ms = rows.reduce((a, r) => a + (r.candidates[cand].ingestMs || 0), 0);
-    return Math.round(totalBytes / Math.max(ms / 1000, 0.001));
+
+  // The headline throughput is the LARGEST fixture's, measured best-of-repeats.
+  // Dividing total bytes by summed ingestMs (the previous aggregate) charges 15
+  // tiny fixtures' fixed per-ingest cost against the corpus and buries the one
+  // fixture big enough to actually measure a parser.
+  const largest = rows.reduce((a, r) => (r.bytes > a.bytes ? r : a));
+  const throughputMethod = {
+    mode: 'bulk-single-write',
+    repeats: REPEATS,
+    warmup: true,
+    measuredOnFixture: largest.name,
+    measuredOnBytes: largest.bytes,
+    aggregate: 'best-of-repeats',
+    excludes: ['process-spawn', 'file-io', 'serialize', 'reflow-resize'],
   };
+  const headlineThroughput = (cand) => largest.candidates[cand].throughputBytesPerSec;
 
   const candidates = {};
   for (const cand of ['pyte', 'xterm-headless']) {
@@ -247,7 +295,7 @@ async function main() {
     const rec = mean(byCorpus('recorded', cand, 'cellFidelityPct'));
     const hasRec = rows.some((r) => r.corpus === 'recorded');
     const reflow = mean(rows.map((r) => r.candidates[cand].reflowFidelityPct).filter((v) => typeof v === 'number'));
-    const thr = aggThroughput(cand);
+    const thr = headlineThroughput(cand);
     const checks = {
       syntheticCell: { value: pct(synth), gate: GATE.syntheticCellPct, pass: synth >= GATE.syntheticCellPct },
       recordedCell: { value: pct(rec), gate: GATE.recordedCellPct, pass: hasRec && rec >= GATE.recordedCellPct },
@@ -285,6 +333,7 @@ async function main() {
     oracle: 'xterm-headless',
     reflowProbe: { fromCols: REFLOW_FROM, toCols: REFLOW_TO },
     gate: GATE,
+    throughputMethod,
     totals: {
       fixtures: rows.length,
       synthetic: rows.filter((r) => r.corpus === 'synthetic').length,
@@ -302,6 +351,8 @@ async function main() {
       + `rec=${v.checks.recordedCell.value}% reflow=${v.checks.reflow.value}% `
       + `thr=${v.throughputMBPerSec}MB/s${v.failed.length ? '  failed: ' + v.failed.join(',') : ''}`);
   }
+  console.log(`throughput: ${throughputMethod.mode}, best of ${REPEATS} after warmup, `
+    + `on ${throughputMethod.measuredOnFixture} (${throughputMethod.measuredOnBytes} bytes)`);
   console.log(`${rows.length} fixtures (${report.totals.bytes} bytes) -> ${outPath}`);
 }
 
