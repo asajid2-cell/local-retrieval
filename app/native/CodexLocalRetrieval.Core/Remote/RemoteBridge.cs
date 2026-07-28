@@ -34,6 +34,8 @@ public sealed class RemoteBridge
     private readonly Func<Task<IReadOnlyList<ArchiveService.PendingMuxBinding>>>? _resolvePendingMuxBindings;
     private readonly IProcessContainment? _processContainment;
     private readonly string _commandLeaseOwner = RemoteCommandProtocol.LeaseOwner("headless");
+    // At-most-once fence for intent-fenced polled commands — see MainPage.Remote.cs for the GUI twin.
+    private readonly RemoteCommandProtocol.IntentLedger _commandIntents = new();
 
     private const string SshHardenOpts = "-o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3";
     private static readonly TimeSpan SshHardTimeout = TimeSpan.FromSeconds(30);
@@ -177,9 +179,14 @@ public sealed class RemoteBridge
             if (string.IsNullOrEmpty(c.id)) continue;
             (bool ok, string detail) res;
             var onPc = false;
-            if (!RemoteCommandProtocol.IsReplaySafe(c.type, c.replayPolicy))
+            // ONE gate, before any side effect: replay policy AND (for intent-fenced types) a live lease
+            // token + a stable intent id that has not already been delivered.
+            var admission = _commandIntents.Admit(c.type, c.replayPolicy, c.intentId, c.leaseToken, out var gated);
+            if (admission != RemoteCommandAdmission.Execute)
             {
-                res = (false, "command replay policy is missing or invalid");
+                if (admission == RemoteCommandAdmission.Refused)
+                    _log($"Remote command REFUSED (envelope): type='{c.type}' id={c.id} — {gated.detail}");
+                res = gated;
             }
             else switch ((c.type ?? "").ToLowerInvariant())
             {
@@ -233,6 +240,7 @@ public sealed class RemoteBridge
                 default:
                     res = (false, "unknown command"); break;
             }
+            if (admission == RemoteCommandAdmission.Execute) _commandIntents.Record(c.intentId, res.ok, res.detail);
             var ackJson = JsonSerializer.Serialize(new { leaseToken = c.leaseToken, ok = res.ok, detail = res.detail, onPc });
             await AckCommandAsync(s, c.id, ackJson);
         }
