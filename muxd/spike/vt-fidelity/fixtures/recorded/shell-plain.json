@@ -1,0 +1,11 @@
+{
+  "name": "shell-plain",
+  "corpus": "recorded",
+  "cols": 140,
+  "rows": 40,
+  "bytes": 1688,
+  "source": "cmd.exe under ConPTY",
+  "desc": "plain shell on the normal buffer: prompts, echoed input, scrolling output",
+  "captureMethod": "conpty-shell-plain",
+  "containsRecordedSessionContent": false
+}

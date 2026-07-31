@@ -1,0 +1,9 @@
+{
+  "name": "utf8-wide-emoji",
+  "corpus": "synthetic",
+  "cols": 50,
+  "rows": 20,
+  "bytes": 339,
+  "source": "gen_synthetic.py",
+  "desc": "wide CJK, emoji, combining marks, box drawing, wide char at margin"
+}

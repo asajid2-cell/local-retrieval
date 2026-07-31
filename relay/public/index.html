@@ -18,6 +18,7 @@
     --txt:#ededf0; --muted:#9494a0; --faint:#6a6a76;
     --rose:#fb7185; --rose-dim:rgba(251,113,133,.14);
     --live:#34d399; --warn:#fbbf24;
+    --info:#60a5fa;
     --sp1:4px; --sp2:8px; --sp3:12px; --sp4:16px;
     --r-s:7px; --r-m:9px; --r-l:14px;
   }
@@ -100,6 +101,11 @@
   .tab .pcchip.stale { color:var(--warn); border-color:rgba(251,191,36,.45); }
   .tab .pcchip.legacy { color:var(--rose); border-color:rgba(251,113,133,.5); }
   .tab .pcchip.remote { color:#e879f9; border-color:rgba(232,121,249,.5); }   /* resumed-remote (from /tomux) */
+  /* Needs-attention chip: the dot is a hint, this is the word. Own class (not .pcchip) so the STALE
+     rewrite below keeps targeting the PC chip no matter what order the chips render in. */
+  .tab .attnchip { font-size:8px; font-weight:700; letter-spacing:.04em; color:var(--warn); border:1px solid rgba(251,191,36,.55); background:rgba(251,191,36,.10); border-radius:4px; padding:0 3px; line-height:1.5; flex:0 0 auto; }
+  .tab .attnchip.stopped { color:var(--rose); border-color:rgba(251,113,133,.6); background:rgba(251,113,133,.10); }
+  .tab .attnchip.muted { opacity:.55; }   /* still waiting — just not buzzing your phone */
   .colorpop .swrow { display:flex; gap:6px; padding:6px 4px; flex-wrap:wrap; }
   .colorpop .sw { width:26px; height:26px; border-radius:7px; border:1px solid var(--line); cursor:pointer; padding:0; }
   .colorpop .clr { width:100%; }
@@ -152,6 +158,38 @@
     background:var(--rose); color:#1a0a0e; font:600 13px/1 inherit; cursor:pointer; box-shadow:0 6px 20px rgba(0,0,0,.5);
   }
   #jumplive.show { display:inline-flex; }
+  /* Scrollback is real history, so give it a real scrollbar: thin, themed, draggable with a mouse.
+     Nothing here changes xterm's sizing internals - only the bar the browser already paints. */
+  #term .xterm-viewport {
+    scrollbar-width:thin; scrollbar-color:var(--raised-2) transparent;
+  }
+  /* Containment only when #term is NOT the pan host. With .rowpan the shared terminal is taller than the
+     phone pane and #term itself scrolls; containing the inner viewport would swallow the chained touch
+     drag at the end of scrollback and stall the pan. */
+  #term:not(.rowpan) .xterm-viewport { overscroll-behavior:contain; }
+  /* WebKit only paints a styled bar for a real pointer. Touch keeps its native overlay scrollbar: styling
+     ::-webkit-scrollbar on iOS pins a permanent bar that eats viewport width and fights the pan gestures. */
+  @media (hover:hover) and (pointer:fine) {
+  #term .xterm-viewport::-webkit-scrollbar { width:10px; background:transparent; }
+  #term .xterm-viewport::-webkit-scrollbar-track { background:transparent; }
+  #term .xterm-viewport::-webkit-scrollbar-thumb {
+    background:var(--raised-2); background-clip:content-box; border:2px solid transparent; border-radius:999px;
+  }
+  #term .xterm-viewport::-webkit-scrollbar-thumb:hover { background:var(--rose); background-clip:content-box; }
+  }
+  /* Alternate screen (vim, less, htop) scrolls itself - xterm's viewport has no scrollback to move, so a
+     visible bar there is a dead control that lies about what dragging it will do. Hide it and SAY so. */
+  #term.altbuf .xterm-viewport { scrollbar-width:none; }
+  #term.altbuf .xterm-viewport::-webkit-scrollbar { width:0; height:0; }
+  /* compact scroll readout, stacked above the jump-to-live pill in the same terminal corner */
+  #scrollstate {
+    position:absolute; right:14px; bottom:56px; z-index:4; pointer-events:none;
+    display:inline-flex; align-items:center; gap:6px; height:22px; padding:0 var(--sp2);
+    border-radius:999px; border:1px solid var(--line); background:var(--panel-2); color:var(--muted);
+    font:600 11.5px/1 ui-monospace,monospace; font-variant-numeric:tabular-nums; white-space:nowrap;
+  }
+  #scrollstate[hidden] { display:none; }
+  #scrollstate.app { border-color:var(--warn); color:var(--warn); }
 
   /* ---- workbench status strip ---- */
   #status {
@@ -212,6 +250,7 @@
 
   /* ---- projects view (synced from the desktop app) ---- */
   #projects { grid-area:term; display:none; flex-direction:column; min-height:0; min-width:0; background:var(--bg); }
+  #fleetList { grid-area:term; display:none; flex-direction:column; min-height:0; min-width:0; overflow:auto; background:var(--bg); }
   #app.projects #term { display:none; }
   #app.projects #projects { display:flex; }
   #app.projects #tabwrap, #app.projects #status, #app.projects #keybar { display:none; }
@@ -258,6 +297,29 @@
   .chat.run .rdot { display:block; }
   #projempty, .projempty { margin:auto; text-align:center; color:var(--muted); font-size:13.5px; line-height:1.6; padding:var(--sp4); }
 
+  /* ---- fleet glance ---- */
+  .fleet-row { width:100%; min-height:44px; text-align:left; display:flex; flex-direction:column; gap:var(--sp1); padding:var(--sp2) var(--sp3); background:var(--raised); border:1px solid var(--line); border-radius:var(--r-s); cursor:pointer; color:var(--txt); font:inherit; }
+  .fleet-row:active { background:var(--raised-2); }
+  .fleet-head { display:flex; align-items:center; gap:var(--sp2); min-width:0; }
+  .fleet-chip { width:8px; height:8px; border-radius:50%; flex:0 0 auto; }
+  .fleet-name { font-weight:600; font-size:13px; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .fleet-label { font-size:11px; color:var(--muted); flex:0 0 auto; }
+  .fleet-age { font-size:11px; color:var(--faint); margin-left:auto; flex:0 0 auto; }
+  .fleet-badges { display:flex; gap:var(--sp1); flex-wrap:wrap; }
+  .fleet-badge { font-size:10px; padding:1px 6px; border-radius:var(--r-s); background:var(--panel); color:var(--muted); }
+  .fleet-autoheal { color:var(--warn); }
+  .fleet-degraded { color:var(--rose); }
+  .fleet-signed { color:var(--live); }
+  .fleet-snippet { font:12px/1.5 ui-monospace,"Cascadia Code","Source Code Pro",Menlo,Consolas,monospace; margin:0; white-space:pre-wrap; overflow:hidden; display:-webkit-box; -webkit-box-orient:vertical; -webkit-line-clamp:2; line-clamp:2; color:var(--muted); }
+  .fleet-empty { padding:var(--sp4) var(--sp3); color:var(--muted); text-align:center; }
+  .fleet-state-green .fleet-chip { background:var(--live); }
+  .fleet-state-amber .fleet-chip { background:var(--warn); }
+  .fleet-state-red .fleet-chip { background:var(--rose); }
+  .fleet-state-grey .fleet-chip { background:var(--muted); }
+  .fleet-state-gray .fleet-chip { background:var(--muted); }
+  .fleet-state-blue .fleet-chip { background:var(--info); }
+  .fleet-state-unknown .fleet-chip { background:var(--faint); }
+
   /* ---- popover menu (tab kebab) ---- */
   #menu {
     position:fixed; z-index:50; min-width:180px; padding:var(--sp1); border:1px solid var(--line);
@@ -290,6 +352,21 @@
   dialog p.hint { margin:0 0 var(--sp3); font-size:13px; color:var(--muted); line-height:1.5; }
   .managebtns { display:flex; flex-direction:column; gap:8px; margin:6px 0 12px; }
   .managebtns .act.wide { text-align:left; }
+  /* Resume-from-archive picker. Every state gets a visible line: the one thing this dialog must never
+     do is stay silent about whether the PC is listening. */
+  .resumelive { font-size:.78rem; opacity:.75; margin:0 0 6px; }
+  .resumelive.live { color:var(--live,#34d399); opacity:.9; }
+  .resumelive.offline, .resumelive.empty { color:var(--warn,#fbbf24); }
+  .resumelive.error { color:var(--rose,#fb7185); }
+  .resumerow { display:flex; flex-direction:column; align-items:flex-start; gap:2px; text-align:left; }
+  .resumerow.busy { opacity:.55; pointer-events:none; }
+  .resumetitle { font-weight:600; }
+  .resumemeta { font-size:.75rem; opacity:.65; }
+  .resumestatus { font-size:.8rem; min-height:1.15em; margin:6px 0 0; }
+  .resumestatus.busy { opacity:.7; }
+  .resumestatus.ok { color:var(--live,#34d399); }
+  .resumestatus.warn { color:var(--warn,#fbbf24); }
+  .resumestatus.bad { color:var(--rose,#fb7185); }
   .act.danger { border-color:var(--rose,#fb7185); color:var(--rose,#fb7185); }
   .histrow { display:flex; align-items:center; gap:10px; padding:8px 4px; border-bottom:1px solid var(--line); }
   .histlabel { flex:1; min-width:0; font-size:13px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
@@ -432,7 +509,7 @@
       grid-template-areas:"topbar" "term" "status" "mobileNav";
     }
     #mobileNav {
-      grid-area:mobileNav; display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:var(--sp1);
+      grid-area:mobileNav; display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:var(--sp1);
       padding:var(--sp1) var(--sp2); padding-bottom:max(var(--sp1),env(safe-area-inset-bottom));
       background:var(--panel); border-top:1px solid var(--line); min-width:0;
     }
@@ -476,6 +553,13 @@
     #app.mobile-view-sessions .newtab::before {
       content:"New session"; color:var(--rose); font-size:14px; font-weight:600; line-height:1;
     }
+
+    #app.mobile-view-fleet {
+      grid-template-rows:auto minmax(0,1fr) auto auto;
+      grid-template-areas:"topbar" "term" "status" "mobileNav";
+    }
+    #app.mobile-view-fleet #term, #app.mobile-view-fleet #keybar, #app.mobile-view-fleet #tabwrap { display:none; }
+    #app.mobile-view-fleet #fleetList { display:flex; }
 
     #app.mobile-view-terminal {
       grid-template-rows:auto minmax(0,1fr) auto auto;
@@ -529,6 +613,9 @@
       <button class="icon compose-desktop" id="uploadbtn" title="Upload &amp; attach a file (pictures, PDFs, zips)" aria-label="Upload and attach a file">
         <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M21 11.5l-8.6 8.6a5 5 0 01-7.1-7.1l8.6-8.6a3.5 3.5 0 014.9 4.9l-8.5 8.5a2 2 0 01-2.8-2.8l7.8-7.8" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
       </button>
+      <button class="icon" id="resumebtn" title="Resume a past chat from the PC archive" aria-label="Resume a past chat">
+        <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M4 12a8 8 0 108-8 8 8 0 00-5.7 2.3L4 8.5M4 4v4.5h4.5M12 8v4.5l3 1.8" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </button>
       <button class="icon" id="managebtn" title="Manage tabs (delete all / export)" aria-label="Manage tabs">
         <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h10" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
       </button>
@@ -567,8 +654,11 @@
         <button data-profile="shell"><span class="rose">›</span> Start shell</button>
       </span>
     </div>
+    <div id="scrollstate" hidden aria-hidden="true"><span id="scrolltext"></span></div>
     <button id="jumplive" aria-label="Jump to live"><span id="jlcount">new</span> ↓</button>
   </main>
+
+  <div id="fleetList" aria-label="Fleet glance"></div>
 
   <div id="status"><span class="sdot"></span><span id="statustext">connecting&hellip;</span><span class="meta" id="statusmeta"></span></div>
   <div id="keybar"></div>
@@ -580,6 +670,10 @@
     <button type="button" data-mobile-view="terminal" aria-label="Terminal" aria-pressed="false">
       <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><rect x="3.5" y="5" width="17" height="14" rx="2" stroke="currentColor" stroke-width="1.7"/><path d="M7 10l3 2-3 2M12.5 15h4" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
       <span>Terminal</span>
+    </button>
+    <button type="button" data-mobile-view="fleet" aria-label="Fleet" aria-pressed="false">
+      <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1.5" stroke="currentColor" stroke-width="1.7"/><rect x="14" y="3" width="7" height="7" rx="1.5" stroke="currentColor" stroke-width="1.7"/><rect x="3" y="14" width="7" height="7" rx="1.5" stroke="currentColor" stroke-width="1.7"/><rect x="14" y="14" width="7" height="7" rx="1.5" stroke="currentColor" stroke-width="1.7"/></svg>
+      <span>Fleet</span>
     </button>
     <a class="projects" href="projects.html" aria-label="Projects">
       <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M3 7a2 2 0 012-2h3.6a2 2 0 011.5.7L12 7.5h7a2 2 0 012 2V17a2 2 0 01-2 2H5a2 2 0 01-2-2V7z" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></svg>
@@ -691,19 +785,43 @@
   </div>
 </dialog>
 
+<dialog id="resumedlg">
+  <h3>Resume a past chat</h3>
+  <p class="hint">Every chat your PC can bring back. Tap one and the desktop app resumes it here as a multiplex tab — the PC does the resuming, this phone only asks. Filtering happens on this device; what you type never leaves it.</p>
+  <p class="resumelive" id="resumelive"></p>
+  <input id="resumeq" placeholder="Search your chats…" autocapitalize="off" autocomplete="off" spellcheck="false" inputmode="search">
+  <div id="resumelist" class="addcollist"></div>
+  <p class="resumestatus" id="resumestatus"></p>
+  <div class="row"><div class="grow"></div><button class="act" id="resumeclose" type="button">Close</button></div>
+</dialog>
+
 <script src="vendor/xterm.js"></script>
 <script src="vendor/addon-fit.js"></script>
 <script src="intent-journal.js"></script>
+<script src="attention-ui.js"></script>
+<script src="input-lease.js"></script>
+<script src="input-continuity.js"></script>
+<script src="picker.js"></script>
+<script src="fleet.js"></script>
 <script>
 const $ = s => document.querySelector(s);
 const base = location.pathname.replace(/\/[^/]*$/, '') || '';
 const api = p => fetch(base + '/api/' + p, { headers:{'Content-Type':'application/json'} });
 const LS = { get:(k,d)=>{ try{ return JSON.parse(localStorage.getItem(k)) ?? d; }catch(e){ return d; } }, set:(k,v)=>{ try{ localStorage.setItem(k, JSON.stringify(v)); }catch(e){} } };
 const mobileMQ = window.matchMedia ? window.matchMedia('(max-width: 59.99rem)') : {matches:false,addEventListener:()=>{},addListener:()=>{}};
-const MOBILE_VIEWS = ['sessions','terminal','keys'];
+const MOBILE_VIEWS = ['sessions','fleet','terminal','keys'];
 let mobileView = LS.get('mux_mobile_view','terminal');
 if(!MOBILE_VIEWS.includes(mobileView)) mobileView='terminal';
 const isMobile = () => !!mobileMQ.matches;
+let fleetPollInterval = null;
+
+function refreshFleet(){
+  if(!window.MuxFleet || !$("#fleetList")) return;
+  MuxFleet.fetchFleet(base).then(function(data){
+    MuxFleet.renderFleet($("#fleetList"), data);
+  }).catch(function(){});
+}
+
 function setMobileView(view, persist=true){
   if(!MOBILE_VIEWS.includes(view)) view='terminal';
   mobileView=view;
@@ -715,7 +833,16 @@ function setMobileView(view, persist=true){
     b.classList.toggle('active', on);
     b.setAttribute('aria-pressed', on?'true':'false');
   });
-  if(isMobile() && view!=='sessions'){
+  if(isMobile() && view==='fleet'){
+    refreshFleet();
+    if(!fleetPollInterval) fleetPollInterval = setInterval(function(){
+      if(!isMobile() || mobileView!=='fleet'){ clearInterval(fleetPollInterval); fleetPollInterval = null; return; }
+      refreshFleet();
+    }, 5000);
+  } else {
+    if(fleetPollInterval){ clearInterval(fleetPollInterval); fleetPollInterval = null; }
+  }
+  if(isMobile() && view!=='sessions' && view!=='fleet'){
     setTimeout(()=>{ applyViewport(); try{ term.focus(); }catch(e){} }, 60);
   }
 }
@@ -731,6 +858,7 @@ function syncMobileView(){
 }
 function initMobileViews(){
   document.querySelectorAll('[data-mobile-view]').forEach(b=> b.onclick=()=>setMobileView(b.dataset.mobileView));
+  if(window.MuxFleet) MuxFleet.attachFleet($("#fleetList"), function(name){ setMobileView("terminal"); connect(name, false); });
   if(mobileMQ.addEventListener) mobileMQ.addEventListener('change', syncMobileView);
   else if(mobileMQ.addListener) mobileMQ.addListener(syncMobileView);
   syncMobileView();
@@ -984,10 +1112,11 @@ function pumpTermWrite(){
 //  (2) the term.write callback never fired (xterm wedged under a burst), so termWriting stays true and the
 //      whole write queue stalls — new bytes arrive (the "N new" pill climbs) but nothing paints.
 // A document-level mouseup catches (1) the instant you release anywhere; a slow watchdog is the backstop
-// for both, so a stuck tab always self-heals within ~2s instead of needing a reload.
-document.addEventListener('mouseup', ()=>{ setTimeout(()=>{ if(autoFreeze && !selectMode && !(term.hasSelection && term.hasSelection())){ autoFreeze=false; flushFrozen(); } }, 0); }, true);
+// for both, so a stuck tab always self-heals within ~2s instead of needing a reload. Both go through
+// maybeUnfreezeSelection() so the drag-latch rule (a live highlight always wins) has exactly one home.
+document.addEventListener('mouseup', ()=>{ setTimeout(maybeUnfreezeSelection, 0); }, true);
 setInterval(()=>{
-  if(autoFreeze && !selectMode && !(term.hasSelection && term.hasSelection())){ autoFreeze=false; flushFrozen(); }   // (1) lost-mouseup unfreeze
+  maybeUnfreezeSelection();                                                                                           // (1) lost-mouseup unfreeze
   if(termWriting && termWriteStartedAt && Date.now()-termWriteStartedAt > 4000){                                     // (2) wedged write pump
     _wedgeStrikes++;
     activeTermWriteToken=++termWriteToken;
@@ -1012,7 +1141,7 @@ function reloadTerminal(quiet){
   connect(name, true);   // re-attach: CLEAR + scrollback replay + live, all client state reset
 }
 document.addEventListener('keydown', e=>{ if(e.ctrlKey && e.altKey && (e.key==='r'||e.key==='R')){ e.preventDefault(); e.stopPropagation(); reloadTerminal(); } }, true);
-window.__muxBuild='2026-07-12-mobile-ime-viewport-hardening';   // bump per web deploy so a loaded version is verifiable
+window.__muxBuild='2026-07-27-campaign-integration';   // bump per web deploy so a loaded version is verifiable
 try{ console.info('multiplex build', window.__muxBuild); }catch(e){}
 const helper = $('#term').querySelector('.xterm-helper-textarea');
 function hardenHelperTextarea(){
@@ -1121,24 +1250,72 @@ if (location.search.includes('demo')) { window.__term = term; window.__dropws = 
 // second and wipes any highlight, so the instant a drag/selection starts we FREEZE incoming output (buffer
 // it) and flush it back the moment the selection is cleared — no need to press "Sel" first. Touch keeps the
 // explicit Sel toggle (a touch-drag means "scroll"). If the app has grabbed the mouse, hold Shift to select.
+//
+// The latch rule, stated once: A LIVE HIGHLIGHT ALWAYS WINS. Every unfreeze path asks
+// maybeUnfreezeSelection() first, so nothing — a stray mouseup, the 2s freeze watchdog, an out-of-order
+// selectionchange — can flush buffered output through a drag that is still in progress. That is what lets
+// you drag 30 lines out of a streaming build log without a repaint eating the selection halfway down.
+let autoCopyOnSelect = false;   // opt-in: finishing a drag-select copies it (the X11 habit); persisted in LS
+function getAutoCopyOnSelect(){ return LS.get('mux_autocopy', false) === true; }
+function setAutoCopyOnSelect(on){
+  autoCopyOnSelect = on === true;
+  LS.set('mux_autocopy', autoCopyOnSelect);
+  return autoCopyOnSelect;
+}
+autoCopyOnSelect = getAutoCopyOnSelect();
+function termHasSelection(){ try{ return !!(term.hasSelection && term.hasSelection()); }catch(e){ return false; } }
+// The ONLY way output goes live again after a selection freeze. Returns true if it actually unfroze.
+function maybeUnfreezeSelection(){
+  if(!autoFreeze || selectMode) return false;   // selectMode is the phone's explicit Sel toggle — it owns its own unfreeze
+  if(termHasSelection()) return false;          // drag-latch: text is still highlighted → stay frozen
+  autoFreeze = false;
+  flushFrozen();
+  return true;
+}
+// Wired to term.onSelectionChange: a selection born from a plain mouse drag latches the freeze exactly like
+// the explicit Sel toggle does, and clearing it (click away / new click) goes live again + replays.
+function selectionFreezeSync(){
+  if(termHasSelection()){
+    if(!selectMode) autoFreeze = true;
+    return true;
+  }
+  maybeUnfreezeSelection();
+  return false;
+}
+// Auto-copy-on-select only fires when a gesture ENDS on a real selection, never mid-drag.
+function autoCopyIfArmed(){
+  if(!autoCopyOnSelect || !termHasSelection()) return false;
+  copySelectionNow();
+  return true;
+}
+// Copy the current selection; resolves true if the clipboard took it. When the clipboard API refuses
+// (plain-http origin, denied permission, no user gesture) we do NOT dead-end on "copy failed" — we open the
+// copy overlay, whose plain <pre> takes a native Ctrl/⌘+C with no permission dance.
 function copySelectionNow(){
-  const t = term.getSelection ? term.getSelection() : '';
-  if(!t) return;
-  (navigator.clipboard?navigator.clipboard.writeText(t):Promise.reject())
-    .then(()=>flash('Copied selection'),()=>flash('Copy failed — clipboard blocked (needs HTTPS)'));
+  let t = '';
+  try{ t = term.getSelection ? term.getSelection() : ''; }catch(e){ t = ''; }
+  if(!t) return Promise.resolve(false);
+  const write = (navigator.clipboard && navigator.clipboard.writeText)
+    ? navigator.clipboard.writeText(t)
+    : Promise.reject(new Error('no clipboard API'));
+  return Promise.resolve(write).then(
+    ()=>{ flash('Copied selection'); return true; },
+    ()=>{ flash('Clipboard blocked — press Ctrl/⌘+C here'); try{ openCopyView(); }catch(e){} return false; },
+  );
 }
 (function(){
   const scr = $('#term');
   // freeze as soon as the mouse goes down, so the drag-select can't be repainted away mid-gesture
   scr.addEventListener('mousedown', e=>{ if(e.button===0 && !selectMode) autoFreeze=true; }, true);
-  // a click that makes no selection (just focusing) must go live again + replay whatever was buffered
-  scr.addEventListener('mouseup', ()=>{ setTimeout(()=>{ if(autoFreeze && !selectMode && !(term.hasSelection&&term.hasSelection())){ autoFreeze=false; flushFrozen(); } }, 0); }, true);
-  // clearing the selection (click away / new click) → live again + replay
-  term.onSelectionChange(()=>{
-    const has = term.hasSelection && term.hasSelection();
-    if(has){ if(!selectMode) autoFreeze=true; }
-    else if(autoFreeze && !selectMode){ autoFreeze=false; flushFrozen(); }
-  });
+  // a click that makes no selection (just focusing) goes live again + replays whatever was buffered;
+  // a drag that DID select stays frozen and, if auto-copy is armed, copies itself on release
+  scr.addEventListener('mouseup', ()=>{ setTimeout(()=>{ if(!maybeUnfreezeSelection()) autoCopyIfArmed(); }, 0); }, true);
+  // xterm's own selection signal: growing or clearing the highlight re-latches or releases the freeze
+  term.onSelectionChange(selectionFreezeSync);
+  // NOTE: no contextmenu handler here, on purpose. Over #term the browser's own right-click menu
+  // (Copy / Paste / Search) is the desktop escape hatch when the clipboard API is blocked, and it is the
+  // one gesture users expect to work on a live selection — calling
+  // preventDefault to put a custom menu there is exactly what makes a web terminal feel un-native.
 })();
 
 // ---- IMAGE PASTE: a terminal can't take inline image bytes (codex/claude then say "no image found, try
@@ -1162,6 +1339,8 @@ async function pasteImageToPrompt(blob, type){
     flash('Uploading pasted image…');
     const ext = ((type.split('/')[1]||'png')).replace('jpeg','jpg').replace('svg+xml','svg');
     const name = 'paste-'+Date.now()+'.'+ext;
+    // raw-fetch-allowlist: the body is the raw image bytes, so there is no JSON envelope to carry an
+    // intentId. A duplicate lands as a second upload the user can see and delete — not a lost action.
     const up = await fetch(base+'/api/upload?session='+encodeURIComponent(current)+'&keep=0&name='+encodeURIComponent(name),
       { method:'POST', headers:{'Content-Type':'application/octet-stream'}, body: blob });
     if(!up.ok) throw new Error('upload HTTP '+up.status);
@@ -1177,7 +1356,28 @@ async function pasteImageToPrompt(blob, type){
 let ws=null, current=null, intentional=false, reconnectDelay=1000, reconnectTimer=null;
 const mods = { ctrl:false, alt:false, shift:false };   // sticky touch-keybar modifiers (combine, one-shot)
 let read = LS.get('mux_read', {});
-const send = (t,d) => { if (ws && ws.readyState===1) ws.send(t+d); };
+// Reconnect buffer for input typed while the socket is down. It lives in the TRUSTED CLIENT ORIGIN
+// (input-continuity.js) and holds PLAINTEXT ONLY — the relay never stores a keystroke or any signing
+// authority. It arms only once this origin actually holds a signing key: there is no unsigned fallback,
+// so with no signer we drop exactly as we always did rather than queue bytes we could never deliver.
+const inputQueue = (function(){
+  const auth = (typeof window!=='undefined') && (window.muxPrincipalAuth || null);
+  if (typeof createInputContinuity !== 'function' || !auth || typeof auth.signInput !== 'function') return null;
+  return createInputContinuity({
+    signer: auth,
+    transport: auth.transport,
+    verifyAccept: auth.verifyAccept && auth.verifyAccept.bind(auth),
+    verifyAttachReplay: auth.verifyAttachReplay && auth.verifyAttachReplay.bind(auth),
+    notice: n => { if(n && (n.kind==='drop' || n.kind==='halt' || n.kind==='error')) flash(n.message); },
+  });
+})();
+// 'sent' | 'queued' | 'dropped'. Only input ('i') is ever buffered; a resize/heartbeat replayed minutes
+// late is noise, and the sender emits a current one on reattach anyway.
+const send = (t,d) => {
+  if (ws && ws.readyState===1) { ws.send(t+d); return 'sent'; }
+  if (t==='i' && inputQueue) { inputQueue.capture(d); return 'queued'; }
+  return 'dropped';
+};
 
 // ---- shared-window sizing (client side) ----
 // The server holds every attached client at ONE size (the widest viewport by default, or a pinned one).
@@ -1421,20 +1621,66 @@ $('#term').addEventListener('wheel', e=>{
 function setFont(px){ fontSize=Math.min(20,Math.max(11,px)); term.options.fontSize=fontSize; LS.set('mux_font',fontSize); doFit(); }
 function updateMeta(){ $('#statusmeta').textContent = current ? `${term.cols}×${term.rows}${$('#term').classList.contains('pan')?' · pan':''}` : ''; }
 
-function takeTerminalReport(s){
-  let m = s.match(/^\x1b\[\?[0-9;]*c/); if(m) return m[0].length;      // primary DA, e.g. ESC[?1;2c
-  m = s.match(/^\x1b\[>[0-9;]*c/); if(m) return m[0].length;           // secondary DA
-  m = s.match(/^\x1b\[[0-9;]*R/); if(m) return m[0].length;            // cursor-position report
-  m = s.match(/^\x1b\[[0-9;?]*n/); if(m) return m[0].length;           // device/status report
-  m = s.match(/^\x1b\][0-9;]+;[^\x07\x1b]*(?:\x07|\x1b\\)/); if(m) return m[0].length; // OSC color/title report
+// Length of the terminal-generated report starting at `at` (0 if there isn't one). This used to be five
+// anchored regexes against s.slice(i); the OSC one — ESC ] [0-9;]+ ; [^BEL/ESC]* (BEL|ESC\) — backtracked
+// superquadratically on an unterminated run of semicolons (20k chars = 201ms, 80k = 4.9s), and it ran on
+// EVERY keystroke and paste via term.onData, so a paste-sized chunk froze the UI thread for minutes.
+// This is a single forward scan with the identical accepted language, and it takes an index instead of a
+// slice so the caller stops allocating a fresh tail string per character.
+function takeTerminalReport(s, at){
+  const i = at|0, len = s.length;
+  if(s.charCodeAt(i) !== 0x1b) return 0;
+  const c = s[i+1];
+  if(c === '['){
+    const p = s[i+2];
+    if(p === '?' || p === '>'){                     // primary / secondary DA, e.g. ESC[?1;2c
+      let k = i+3, ch;
+      while(k < len && ((ch=s.charCodeAt(k)) === 0x3b || (ch >= 0x30 && ch <= 0x39))) k++;
+      if(s[k] === 'c') return k+1-i;
+    }
+    let k = i+2, ch;
+    while(k < len && ((ch=s.charCodeAt(k)) === 0x3b || (ch >= 0x30 && ch <= 0x39))) k++;
+    if(s[k] === 'R') return k+1-i;                  // cursor-position report
+    k = i+2;
+    while(k < len && ((ch=s.charCodeAt(k)) === 0x3b || ch === 0x3f || (ch >= 0x30 && ch <= 0x39))) k++;
+    if(s[k] === 'n') return k+1-i;                  // device/status report
+    return 0;
+  }
+  if(c === ']'){
+    // OSC color/title report: ESC ] <params> <text> (BEL | ESC \). The params are one run of [0-9;] that
+    // must carry a ';' past its first character (the old `[0-9;]+;`); whichever ';' the regex backtracked
+    // onto, the rest is `[^BEL/ESC]*` — which can never give a char back that satisfies the terminator —
+    // so the match is decided by the FIRST BEL/ESC after the run. One scan finds it.
+    let k = i+2, semi = false, ch;
+    while(k < len){
+      ch = s.charCodeAt(k);
+      if(ch === 0x3b){ if(k > i+2) semi = true; }
+      else if(ch < 0x30 || ch > 0x39) break;
+      k++;
+    }
+    if(!semi) return 0;
+    while(k < len){
+      ch = s.charCodeAt(k);
+      if(ch === 0x07) return k+1-i;                 // BEL terminator
+      if(ch === 0x1b) return s[k+1] === '\\' ? k+2-i : 0;   // ST terminator
+      k++;
+    }
+    return 0;
+  }
   return 0;
 }
 function stripTerminalGeneratedReports(s){
-  let out='', dropped=false;
-  for(let i=0;i<s.length;){
-    const n=takeTerminalReport(s.slice(i));
-    if(n){ dropped=true; i+=n; continue; }
-    out += s[i++];
+  if(!s) return { out:s||'', dropped:false };
+  let esc = s.indexOf('\x1b');
+  if(esc < 0) return { out:s, dropped:false };      // the common case: no report can start, so don't scan
+  let out='', dropped=false, i=0;
+  while(i < s.length){
+    if(esc < 0){ out += s.slice(i); break; }        // no ESC left — take the whole tail in one go
+    if(esc > i){ out += s.slice(i, esc); i = esc; }
+    const n = takeTerminalReport(s, i);
+    if(n){ dropped = true; i += n; }
+    else { out += s[i]; i++; }
+    esc = s.indexOf('\x1b', i);
   }
   return { out, dropped };
 }
@@ -1520,28 +1766,192 @@ function filterMobileTextInput(s){
   return out;
 }
 // Mouse-tracking flood guard. A TUI (codex/claude) enables mouse reporting (DECSET 1000/1002/1003) and,
-// if it exits WITHOUT disabling it, xterm keeps emitting a report for every mouse move — which the shell
+// if it exits WITHOUT disabling it, xterm keeps emitting a report for every mouse MOVE — which the shell
 // underneath echoes back as `[<b;x;y;M` garbage, floods the pty, and can drop/kill the session (the "mouse
-// thing"). The web multiplex is a keyboard surface; we never need to forward mouse reports, so strip them
-// from the input stream entirely. Kills the flood at the source regardless of a stuck/leaked mouse mode.
-function stripMouseReports(s){
+// thing"). The flood is a MOTION flood, so motion reports are dropped unconditionally, forever.
+// Discrete press/release reports are a different animal: they are what click-to-position/focus needs, they
+// are one-per-click, and they can never flood. So they ARE forwarded — but only while the output-side
+// tracker below has actually seen an app take the mouse, and only until the leak detector catches the
+// session echoing our own reports back (which proves nothing is consuming them).
+const MOUSE_DISABLE_SEQ = '\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l';
+function stripMouseReports(s, trackingActive){
   if(!s || s.indexOf('\x1b') < 0) return s;
   return s
     .replace(/\x1b\[M[\s\S]{3}/g, '')      // X10 mouse: ESC [ M + 3 raw bytes
-    // SGR mouse (1006): ESC [ < Cb ; x ; y M/m. Strip the motion/drag/click flood, but KEEP wheel reports
-    // (Cb bit 6 = 64: up=64, down=65, +modifiers). A full-screen TUI on the ALT buffer (codex/claude) has
-    // no scrollback of its own, so the wheel report is the ONLY way it scrolls its transcript — dropping it
-    // is what made "can't scroll" on those sessions. Wheel is discrete + low-volume, so it never causes the
-    // per-move flood this guard exists to stop.
-    .replace(/\x1b\[<([0-9]+);[0-9]+;[0-9]+[Mm]/g, (m, cb) => ((+cb) & 64) ? m : '')
+    // SGR mouse (1006): ESC [ < Cb ; x ; y M/m.
+    //  · Cb bit 5 (32) = MOTION/drag → always dropped. This is the historic flood; nothing needs it.
+    //  · Cb bit 6 (64) = WHEEL (up=64, down=65, +modifiers) → always kept. A full-screen TUI on the ALT
+    //    buffer has no scrollback of its own, so the wheel report is the ONLY way it scrolls its
+    //    transcript — dropping it is what made "can't scroll" on codex/claude sessions.
+    //  · anything else = discrete PRESS/RELEASE → kept ONLY when `trackingActive`. Omitting the argument
+    //    denies, so any caller that has not proven an app is tracking cannot reopen the leaked-mode flood.
+    .replace(/\x1b\[<([0-9]+);[0-9]+;[0-9]+[Mm]/g, (m, cb) => {
+      const b = +cb;
+      if(b & 32) return '';
+      if(b & 64) return m;
+      return trackingActive ? m : '';
+    })
     .replace(/\x1b\[[0-9;]+M/g, '');        // urxvt/legacy (1015): ESC [ b;x;y M  (the [555;79;1M flood)
+}
+// True for exactly one discrete press/release SGR report — the class this guard newly forwards. Motion is
+// gone by now and wheel keeps its own long-standing path, so this is the narrow test for "route it through
+// the signed mouse seam and arm the leak detector against it".
+function isClickReport(s){
+  const m = /^\x1b\[<([0-9]+);[0-9]+;[0-9]+[Mm]$/.exec(s || '');
+  if(!m) return false;
+  const b = +m[1];
+  return !(b & 32) && !(b & 64);
+}
+// Output-side mirror of muxd's ScreenModeTracker (muxctl.py:126-188): read the SESSION's own output for
+// DECSET/DECRST of the mouse modes, carrying a 64-byte tail so a sequence split across two frames still
+// parses. Two jobs: (1) say whether an app is really tracking, which is what gates click forwarding above;
+// (2) the leak detector — if the session echoes back a report we forwarded moments ago, no app consumed it
+// and we are watching the flood start, so the caller disables the modes at the source, forwarding stops,
+// and it re-arms only when a fresh DECSET proves a real app took the mouse again.
+// Self-contained on purpose (clock injected, no globals): relay/tests runs it straight out of this file.
+function createMouseGuard(){
+  const TRACK = [9, 1000, 1002, 1003];    // 1006 is the SGR-encoding flag, tracked but not "tracking"
+  const ECHO_WINDOW_MS = 1500;
+  const TAIL_MAX = 64;
+  const PENDING_MAX = 32;
+  let tail = [];          // trailing bytes of the last chunk; re-scanned, so mode set/clear stays idempotent
+  let modes = Object.create(null);
+  let blocked = false;    // a leak was caught — forward nothing until a fresh DECSET re-arms us
+  let pending = [];       // {report, at} press/release reports we forwarded, waiting to be caught echoed
+  let leaks = 0;
+
+  const tracking = () => TRACK.some(m => modes[m]);
+  function reader(chunk){
+    return typeof chunk === 'string'
+      ? { length: chunk.length, at: i => chunk.charCodeAt(i) & 0xff }
+      : { length: chunk.length, at: i => chunk[i] };
+  }
+  function asText(chunk){
+    if(typeof chunk === 'string') return chunk;
+    let out = '';
+    for(let i = 0; i < chunk.length; i += 4096) out += String.fromCharCode.apply(null, Array.prototype.slice.call(chunk, i, i + 4096));
+    return out;
+  }
+  function ingestOutput(chunk, now){
+    if(!chunk || !chunk.length) return { leaked:false, tracking:tracking(), blocked };
+    const body = reader(chunk);
+    const n = tail.length + body.length;
+    const at = i => (i < tail.length ? tail[i] : body.at(i - tail.length));
+    for(let i = 0; i < n; i++){
+      if(at(i) !== 0x1b) continue;                      // ESC
+      let j = i + 1;
+      if(j >= n) break;
+      if(at(j) !== 0x5b) continue;                      // '['
+      if(++j >= n) break;
+      if(at(j) !== 0x3f) continue;                      // '?' — private mode
+      j++;
+      let num = -1, end = -1; const seen = [];
+      for(; j < n; j++){
+        const c = at(j);
+        if(c >= 0x30 && c <= 0x39){ num = (num < 0 ? 0 : num) * 10 + (c - 0x30); continue; }
+        if(c === 0x3b){ if(num >= 0) seen.push(num); num = -1; continue; }
+        if(c === 0x68 || c === 0x6c){ if(num >= 0) seen.push(num); end = j; }
+        break;
+      }
+      if(end < 0) continue;                             // truncated (the tail carries it) or junk
+      const enable = at(end) === 0x68;
+      for(const mode of seen){
+        if(mode !== 1006 && TRACK.indexOf(mode) < 0) continue;
+        if(enable){
+          if(!modes[mode]) blocked = false;             // a genuine off→on DECSET is the ONLY re-arm
+          modes[mode] = true;
+        } else delete modes[mode];
+      }
+      i = end;
+    }
+    // Carry the last 64 bytes exactly like muxctl does, so a split sequence is seen on the next chunk.
+    const carry = [];
+    for(let i = Math.max(0, n - TAIL_MAX); i < n; i++) carry.push(at(i));
+    tail = carry;
+
+    let leaked = false;
+    if(pending.length){
+      pending = pending.filter(p => (now - p.at) <= ECHO_WINDOW_MS);
+      if(pending.length){
+        const text = asText(chunk);                     // only pay the decode inside the echo window
+        leaked = pending.some(p => text.indexOf(p.report) >= 0);
+      }
+    }
+    if(leaked){
+      leaks++;
+      pending = [];
+      blocked = true;
+      modes = Object.create(null);   // we are about to send DECRST, so our mirror says "off" too — that
+                                     // keeps the next real DECSET a true transition, so we can re-arm
+      tail = [];                     // …and drop the carry with it: a DECSET already consumed from this
+                                     // chunk still sits in those 64 bytes, and re-scanning it against the
+                                     // just-cleared map would read as a fresh off→on and re-arm us instantly
+    }
+    return { leaked, tracking:tracking(), blocked };
+  }
+  // Register what we just forwarded so the detector can catch it coming back. Wheel reports are NOT
+  // registered: wheel forwarding is proven, pre-existing behaviour and must not be armed against itself.
+  function noteForwarded(text, now){
+    if(!text) return;
+    const re = /\x1b\[<([0-9]+);[0-9]+;[0-9]+[Mm]/g;
+    let m;
+    while((m = re.exec(text))){
+      const b = +m[1];
+      if((b & 32) || (b & 64)) continue;
+      pending.push({ report:m[0], at:now });
+    }
+    if(pending.length > PENDING_MAX) pending = pending.slice(-PENDING_MAX);
+  }
+  function reset(){ tail = []; modes = Object.create(null); blocked = false; pending = []; }
+  return {
+    ingestOutput, noteForwarded, reset,
+    inputAllowed: () => !blocked && tracking(),
+    stats: () => ({ tracking:tracking(), blocked, leaks, pending:pending.length, modes:Object.keys(modes).map(Number) }),
+  };
+}
+const mouseGuard = createMouseGuard();
+try{ window.__muxMouseGuard = mouseGuard; }catch(e){}
+// TRUST SEAM. Every mouse-originated write — a forwarded click/release and the leak detector's DECRST —
+// leaves through here so it is signed as input.raw for the current session/channel/lease epoch. Nothing on
+// the mouse path calls send('i', …) directly. principal-auth.js (r.2 trust leaf) installs the signer; until
+// it lands the write goes out unsigned exactly as it does today. A signer that is present and THROWS sends
+// nothing: a failed signature must never silently degrade into an unsigned frame.
+function sendMouseInput(data){
+  if(!data) return false;
+  let signer = null;
+  try{ signer = window.principalAuth; }catch(e){ signer = null; }
+  if(signer && typeof signer.signInputRaw === 'function'){
+    try{
+      const signed = signer.signInputRaw({ kind:'input.raw', session:current, data });
+      if(signed && typeof signed.then === 'function') signed.then(frame => { if(frame) send('i', frame); }, () => {});
+      else if(signed) send('i', signed);
+      return true;
+    }catch(e){ return false; }
+  }
+  send('i', data);
+  return true;
+}
+// Called for every session-output frame (frozen or live) before anything else can swallow it.
+function noteSessionOutput(bytes){
+  const r = mouseGuard.ingestOutput(bytes, Date.now());
+  if(r.leaked) sendMouseInput(MOUSE_DISABLE_SEQ);
+  return r;
 }
 term.onData(d => {
   logMobileInputEvent('onData', { data:d });
   // If our mobile delta handler just forwarded this keystroke, xterm's own echo of the full buffer that
   // lands in the same tick is the duplicate — drop it. (Real pastes never coincide with a delta-send.)
-  d = stripMouseReports(d);
+  d = stripMouseReports(d, mouseGuard.inputAllowed());
   if(!d) return;
+  if(isClickReport(d)){
+    // A press/release survived the guard, so an app really is tracking. It is not a keystroke: it skips the
+    // mobile-echo/modifier machinery, is registered with the leak detector so an echo of it is caught, and
+    // leaves through the signed mouse seam. Wheel reports keep their existing, proven path below untouched.
+    mouseGuard.noteForwarded(d, Date.now());
+    markActive();
+    sendMouseInput(d);
+    return;
+  }
   const filtered = stripTerminalGeneratedReports(d);
   if(filtered.dropped){
     d = filtered.out;
@@ -1556,15 +1966,64 @@ term.onData(d => {
 });
 
 // ---- status ----
-function setStatus(state, text){ const s=$('#status'); s.className=''; if(state) s.classList.add(state); $('#statustext').innerHTML=text; }
+function setStatusState(state){ const s=$('#status'); s.className=''; if(state) s.classList.add(state); }
+// TEXT-ONLY status writer. Everything caller-supplied lands here — session names, API/bridge
+// error details, filenames — so a hostile string can never become markup in the status bar.
+function setStatus(state, text){ setStatusState(state); $('#statustext').textContent = text==null?'':String(text); }
+// The ONLY status writer that renders markup. Call it with a literal template whose every
+// ${…} is esc()-wrapped; never hand it a string that came from a caller, the API, or muxd.
+function setStatusHtml(state, html){ setStatusState(state); $('#statustext').innerHTML = html; }
 
 // ---- jump-to-live ----
 let newLines=0;
 const atBottom = ()=> term.buffer.active.viewportY >= term.buffer.active.baseY;
 function showJump(){ const j=$('#jumplive'); if(newLines>0 && !atBottom()){ $('#jlcount').textContent = newLines>99?'99+ new':newLines+' new'; j.classList.add('show'); } else j.classList.remove('show'); }
+// ---- scroll affordance: a visible bar you can trust, or an honest chip saying you can't ----
+// Pure on purpose: geometry in, human string out, no DOM. viewportY = top row of the visible window,
+// baseY = that row when pinned live, so baseY-viewportY is exactly how many rows back you are.
+function scrollPositionLabel(viewportY, baseY, rows){
+  const base = Math.max(0, Number(baseY)||0);
+  const y = Math.min(base, Math.max(0, Number(viewportY)||0));
+  const back = base - y;
+  if(base===0) return 'no scrollback';
+  if(back===0) return 'live · bottom';
+  if(y===0) return 'top · ' + back + ' up';
+  return Math.round((y/base)*100) + '% · ' + back + ' up';
+}
+// Keeps the scrollbar and the readout honest about which buffer is on screen. On the alternate screen the
+// viewport has nothing to scroll, so we hide the bar (via #term.altbuf) and show an 'app scroll' chip
+// instead — a dead scrollbar is worse than none. Returns the label it settled on so it can be tested.
+// onRender fires every frame, so the settled state is memoised: identical state does zero DOM writes.
+// onRender runs per frame, so the three nodes are resolved once and cached; they are static for the life of
+// the document. We only re-query while one is still missing (script can run before the node is parsed).
+let lastAffordance=null;
+let affHost=null, affChip=null, affText=null;
+function applyScrollAffordance(){
+  if(!affHost || !affChip || !affText){
+    affHost=$('#term'); affChip=$('#scrollstate'); affText=$('#scrolltext');
+  }
+  const host=affHost, chip=affChip, txt=affText;
+  if(!host || !chip || !txt) return null;
+  let buf=null, alt=false;
+  try{ buf = term.buffer.active; alt = buf.type==='alternate'; }catch(e){}
+  const label = alt ? 'app scroll'
+    : (buf ? scrollPositionLabel(buf.viewportY, buf.baseY, term.rows) : 'no scrollback');
+  const key = (alt?'a:':'n:') + label;
+  if(key===lastAffordance) return label;
+  lastAffordance = key;
+  host.classList.toggle('altbuf', alt);
+  chip.classList.toggle('app', alt);
+  txt.textContent = label;
+  // At the live bottom (or with no history at all) the chip is noise — the pill already covers "go live".
+  chip.hidden = !alt && (label==='live · bottom' || label==='no scrollback');
+  return label;
+}
+try{ term.buffer.onBufferChange(()=>applyScrollAffordance()); }catch(e){}
+try{ term.onRender(()=>applyScrollAffordance()); }catch(e){}
 term.onScroll(()=>{
   if(!viewportRestoreApplying && (!terminalWriteActive || !atBottom())) noteUserScroll();
   if(atBottom()){ newLines=0; showJump(); }
+  applyScrollAffordance();
 });
 $('#term').addEventListener('pointerdown', e=>{
   if(e.target && e.target.closest && e.target.closest('.xterm-viewport')) noteUserScroll();
@@ -1608,7 +2067,7 @@ function stopAttach(name, reason){
   current = null;
   LS.set('mux_last', null);
   $('#empty').style.display='flex';
-  setStatus('warn', `<span class="name">${esc(name)}</span> &middot; ${esc(reason || 'session is not attachable')}`);
+  setStatusHtml('warn', `<span class="name">${esc(name)}</span> &middot; ${esc(reason || 'session is not attachable')}`);
   renderTabs();
 }
 function closeRefusal(ev){
@@ -1620,7 +2079,7 @@ function closeRefusal(ev){
 function scheduleReconnect(name){
   clearReconnect();
   if (document.visibilityState!=='visible') return;
-  setStatus('busy', `<span class="name">${esc(name)}</span> &middot; reconnecting&hellip;`);
+  setStatusHtml('busy', `<span class="name">${esc(name)}</span> &middot; reconnecting&hellip;`);
   reconnectTimer = setTimeout(()=>{ if(current===name) connect(name, true); }, reconnectDelay);
   reconnectDelay = Math.min(10000, reconnectDelay*1.7);
 }
@@ -1652,7 +2111,7 @@ function connect(name, isRetry){
   buildKeybar();
   resetTaDelta(true);                // start the mobile input-delta buffer fresh on a session switch
   newLines=0; showJump();
-  setStatus('busy', `connecting to <span class="name">${esc(name)}</span>&hellip;`);
+  setStatusHtml('busy', `connecting to <span class="name">${esc(name)}</span>&hellip;`);
   renderTabs();
   if(isMobile()) setMobileView('terminal');
   scheduleViewportFit(0);
@@ -1661,6 +2120,7 @@ function connect(name, isRetry){
   afterTerminalParserDrain(generation, ()=>{
     if (!isRetry) term.reset();
     resetTerminalSurface();
+    mouseGuard.reset();      // a new attach knows nothing about the old session's mouse modes
     lastViewportReport='';
     lastViewportReportSocket=null;
     scheduleViewportFit(0);
@@ -1669,17 +2129,33 @@ function connect(name, isRetry){
     const sock = ws = new WebSocket(`${proto}//${location.host}${base}/ws?session=${encodeURIComponent(name)}&cols=${(viewportFit&&viewportFit.cols)||term.cols}&rows=${(viewportFit&&viewportFit.rows)||term.rows}&dev=${encodeURIComponent(deviceId)}&label=${encodeURIComponent(deviceLabel)}`);
     sock.binaryType='arraybuffer';
     const fresh = ()=> generation===attachGeneration && ws===sock && current===name;
-    sock.onopen = () => { if(!fresh()) return; reconnectDelay=1000; setStatus('live', `<span class="name">${esc(name)}</span> &middot; live`); scheduleViewportFit(0); term.focus(); };
+    // setStatusHtml, not setStatus: r.3.8 was written against the pre-rename helper, and setStatus sets
+    // textContent — it would render this markup as literal text. Its inputQueue.reconnect() is kept.
+    sock.onopen = () => { if(!fresh()) return; reconnectDelay=1000; setStatusHtml('live', `<span class="name">${esc(name)}</span> &middot; live`); scheduleViewportFit(0); term.focus();
+      // Fresh socket => fresh signing channel. The queue opens+verifies its own channel.accept and attach
+      // replay before it flushes anything; the old channel id and its sequence are burned, never reused.
+      if(inputQueue) inputQueue.reconnect().catch(err => flash('Buffered input not flushed: '+(err&&err.message||err)));
+    };
     sock.onmessage = e => { if(!fresh()) return;
       if(typeof e.data==='string'){ onControl(e.data); return; }     // control frame: shared window size
-      if(isFrozen()){ _frozenBuf.push(new Uint8Array(e.data)); if(_frozenBuf.length>6000) _frozenBuf.splice(0, _frozenBuf.length-6000); return; }   // FROZEN for selection: buffer output; a repaint would wipe the highlight
-      const wasBottom=atBottom(); enqueueTermWrite(new Uint8Array(e.data)); markReadLive();
+      const out = new Uint8Array(e.data);
+      noteSessionOutput(out);   // mouse-mode tracking + leak detection, BEFORE the frozen path can swallow it
+      if(isFrozen()){ _frozenBuf.push(out); if(_frozenBuf.length>6000) _frozenBuf.splice(0, _frozenBuf.length-6000); return; }   // FROZEN for selection: buffer output; a repaint would wipe the highlight
+      const wasBottom=atBottom(); enqueueTermWrite(out); markReadLive();
       if(!wasBottom){ newLines += 1; showJump(); } };
     sock.onclose = ev => {
+      if(inputQueue) inputQueue.disconnect('socket closed');   // burn the channel; buffered plaintext stays here
       if(fresh() && !intentional){
         const refused = closeRefusal(ev);
         if(refused){ stopAttach(name, refused); return; }
+        // 1012 SERVICE_RESTART: the relay is draining for a deploy, not failing. It IS coming back in
+        // about a second, so skip the backoff walk entirely - shortest fuse, and say why out loud so a
+        // deploy reads as a blink instead of a dead terminal. flash() goes AFTER scheduleReconnect
+        // because scheduleReconnect sets its own 'reconnecting' status and would eat the toast.
+        const restarting = !!(ev && ev.code===1012);
+        if(restarting) reconnectDelay = 500;
         scheduleReconnect(name);
+        if(restarting) flash('relay restarting…');
       }
     };
     sock.onerror = () => {};
@@ -1741,7 +2217,7 @@ async function loadSessions(select){
     if(list.find(s=>s.name===select)){ connect(select); return; }
     history.replaceState(null,'',location.pathname);
     LS.set('mux_last', null);
-    setStatus('warn', `<span class="name">${esc(select)}</span> &middot; session not found`);
+    setStatusHtml('warn', `<span class="name">${esc(select)}</span> &middot; session not found`);
   }
   if (!current && list.length) {
     const choices = list.filter(s=>!attachBlocker(s));
@@ -1751,7 +2227,7 @@ async function loadSessions(select){
     setStatus('warn', 'No live sessions to attach. Dormant tabs are ready to relaunch from Projects or with mux locally.');
     return;
   }
-  if (!current && !list.length) setStatus('', 'No sessions &mdash; tap + to start one');
+  if (!current && !list.length) setStatus('', 'No sessions — tap + to start one');
 }
 function renderTabs(){
   const list = window._sessions||[];
@@ -1767,7 +2243,8 @@ function renderTabs(){
     t.title = s.name + (st?' · '+st:'') + detail + conf;
     const chips = `${s.hosted?'<span class="pcchip" title="Runs on your PC — survives network/VPS failures">PC</span>':''}`+
       `${s.legacyTwin?'<span class="pcchip legacy" title="Legacy tmux session with the same name exists on the VPS">TWIN</span>':''}`+
-      `${s.legacyBlocked?'<span class="pcchip legacy" title="Legacy tmux diagnostic only — relay refuses to attach/manage it">LEGACY</span>':''}`;
+      `${s.legacyBlocked?'<span class="pcchip legacy" title="Legacy tmux diagnostic only — relay refuses to attach/manage it">LEGACY</span>':''}`+
+      MuxAttentionUi.attentionChipHtml(s);   // last: keeps '.pcchip' first for the STALE rewrite below
     t.innerHTML = `<span class="dot"></span><span class="nm"></span>${chips}<button class="kebab" tabindex="-1">⋯</button>`;
     t.querySelector('.nm').textContent = s.name;
     // Per-tab tint (like a PowerShell tab color) + a resumed-remote marker (default magenta if no color set).
@@ -1789,14 +2266,14 @@ function renderTabs(){
     }
     if (s.legacyTwin || s.legacyBlocked) t.title += ' - legacy tmux blocker';
     t.querySelector('.kebab').setAttribute('aria-label', 'Actions for '+s.name);
-    t.onclick = (ev)=>{ if(ev.target.closest('.kebab')) return; if(s.legacyBlocked){ setStatus('warn', esc(s.detail || 'Legacy tmux blocker')); return; } connect(s.name); };
+    t.onclick = (ev)=>{ if(ev.target.closest('.kebab')) return; if(s.legacyBlocked){ setStatus('warn', s.detail || 'Legacy tmux blocker'); return; } connect(s.name); };
     t.onkeydown = (ev)=>{
-      if((ev.key==='Enter'||ev.key===' ') && !ev.target.closest('.kebab')){ ev.preventDefault(); if(s.legacyBlocked) setStatus('warn', esc(s.detail || 'Legacy tmux blocker')); else connect(s.name); }
+      if((ev.key==='Enter'||ev.key===' ') && !ev.target.closest('.kebab')){ ev.preventDefault(); if(s.legacyBlocked) setStatus('warn', s.detail || 'Legacy tmux blocker'); else connect(s.name); }
       else if(ev.key==='Delete'||ev.key==='Backspace'||ev.key==='ContextMenu'){ ev.preventDefault(); openMenu(s, t.querySelector('.kebab')); }   // keyboard route to actions
     };
     t.querySelector('.kebab').onclick = (ev)=>{ ev.stopPropagation(); openMenu(s, ev.currentTarget); };
     if (s.dormant) {
-      const dormantMsg = () => setStatus('warn', esc(s.detail || 'Dormant session - relaunch from Projects or run mux locally.'));
+      const dormantMsg = () => setStatus('warn', s.detail || 'Dormant session - relaunch from Projects or run mux locally.');
       t.onclick = (ev)=>{ if(ev.target.closest('.kebab')) return; dormantMsg(); };
       t.onkeydown = (ev)=>{ if((ev.key==='Enter'||ev.key===' ') && !ev.target.closest('.kebab')){ ev.preventDefault(); dormantMsg(); } else if(ev.key==='Delete'||ev.key==='Backspace'||ev.key==='ContextMenu'){ ev.preventDefault(); openMenu(s, t.querySelector('.kebab')); } };
     }
@@ -1817,7 +2294,9 @@ function openMenu(s, anchor){
     `<button data-a="addcol">➕ Add to collection</button>`+
     `<button data-a="relaunch">↻ Relaunch agent</button>`+
     `<button data-a="history">⏱ Session history</button>`+
+    `<button data-a="reader">📖 Read as transcript</button>`+
     `<button data-a="autoheal"></button>`+
+    `<button data-a="mute"></button>`+
     `<button data-a="opencmd">⌨ Copy local-open command</button>`+
     `<button data-a="reload">↻ Reload terminal (unfreeze)</button>`+
     `<button data-a="rename">✎ Rename</button>`+
@@ -1831,11 +2310,17 @@ function openMenu(s, anchor){
   const addB=m.querySelector('[data-a="addcol"]');
   if(!_appLive){ addB.disabled=true; addB.title='Open the desktop app to add to a collection (it owns your collections, so this can’t drift out of sync)'; }
   else if(!chatBackedSession(s)){ addB.disabled=true; addB.title='This tab is not linked to a chat, so it cannot be filed into a collection'; }
+  const rdB=m.querySelector('[data-a="reader"]');
+  if(!s.sessionId){ rdB.disabled=true; rdB.title='This tab is not linked to a chat yet, so there is no transcript to read'; }
   const ahB=m.querySelector('[data-a="autoheal"]');
   ahB.textContent = s.autoheal ? '⟳ Auto-resume: ON' : '⟳ Auto-resume: off';
   ahB.classList.toggle('on', !!s.autoheal);
   ahB.title = s.autoheal ? 'This tab auto-restarts its agent if it dies while working (max 3×/10min). Tap to turn off.'
                          : 'Turn on to auto-restart this tab’s agent if it dies while working.';
+  const muteB=m.querySelector('[data-a="mute"]');
+  muteB.textContent = MuxAttentionUi.muteToggleLabel(s);
+  muteB.title = MuxAttentionUi.muteToggleTitle(s);
+  muteB.classList.toggle('on', !s.notifyMuted);
   m.querySelectorAll('button').forEach(b=> b.onclick=()=>{ menuAction(b.dataset.a, s); closeMenu(); });
   const r=anchor.getBoundingClientRect(); const mw=Math.min(220, window.innerWidth-16);
   m.style.width=mw+'px'; m.style.left=Math.max(8, Math.min(r.left, window.innerWidth-mw-8))+'px';
@@ -1871,8 +2356,10 @@ function menuAction(a, s){
   if(a==='open') connect(s.name);
   else if(a==='addcol') addToCollection(s);
   else if(a==='autoheal') toggleAutoheal(s);
+  else if(a==='mute') toggleNotifyMute(s);
   else if(a==='relaunch') relaunchSession(s);
   else if(a==='history') openTabHistory(s);
+  else if(a==='reader') openReader(s.sessionId||'', s.chatTitle||s.name);
   else if(a==='opencmd'){ navigator.clipboard?.writeText('mux '+s.name).then(()=>flash('Open command copied — paste it in a fresh local terminal')).catch(()=>{}); }
   else if(a==='reload'){ if(current===s.name) reloadTerminal(); else connect(s.name); }
   else if(a==='rename'){ openRenameDialog(s); }
@@ -1974,11 +2461,21 @@ async function submitAddCol(target){
 // dies while working. Persisted server-side by session name (survives restarts + relaunches).
 function toggleAutoheal(s){
   const on = !s.autoheal;
-  fetch(base+'/api/sessions/'+encodeURIComponent(s.name)+'/autoheal',{ method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({on}) })
+  sendIntent('POST', base+'/api/sessions/'+encodeURIComponent(s.name)+'/autoheal', {on}, 'autoheal')
     .then(async r=>{ if(!r.ok) throw new Error(await apiError(r)); return r.json(); })
     .then(()=>{ s.autoheal=on; const t=(window._sessions||[]).find(x=>x.name===s.name); if(t) t.autoheal=on; renderTabs();
       flash(on?'⟳ Auto-resume ON for “'+s.name+'” — it’ll relaunch if the agent dies while working':'Auto-resume off for “'+s.name+'”'); })
     .catch(e=>flash('Toggle failed: '+(e.message||e)));
+}
+// Per-session phone-push mute. The attention-episode detector keeps running for a muted tab — only the
+// push is swallowed — so unmuting buzzes on the NEXT episode instead of replaying an old one.
+function toggleNotifyMute(s){
+  const on = !!s.notifyMuted;                     // currently muted -> the toggle turns notifications ON
+  MuxAttentionUi.sendNotifyToggle(base, s.name, on)
+    .then(()=>{ s.notifyMuted = !on; MuxAttentionUi.applyNotifyState(window._sessions||[], s.name, !on); renderTabs();
+      flash(on?'🔔 Notifications on for “'+s.name+'” — the next time it needs you, your phone buzzes'
+              :'🔕 Muted “'+s.name+'” — it still shows NEEDS YOU here, but your phone stays quiet'); })
+    .catch(e=>flash('Mute toggle failed: '+(e.message||e)));
 }
 async function apiError(r){
   let msg='HTTP '+r.status;
@@ -1990,13 +2487,15 @@ async function apiError(r){
 }
 async function killSession(name){
   try{
-    const r=await fetch(base+'/api/sessions/'+encodeURIComponent(name),{method:'DELETE'});
+    const r=await sendIntent('DELETE', base+'/api/sessions/'+encodeURIComponent(name), null, 'kill');
     if(!r.ok) throw new Error(await apiError(r));
     if(current===name){ intentional=true; current=null; if(ws){try{ws.close();}catch(e){}} term.reset(); $('#empty').style.display='flex'; setStatus('','Session ended'); }
     loadSessions();
   }catch(e){ flash('Kill failed: '+(e.message||e)); loadSessions(); }
 }
-function flash(msg){ setStatus('', msg); setTimeout(()=>{ if(current) setStatus(ws&&ws.readyState===1?'live':'busy', `<span class="name">${esc(current)}</span> &middot; ${ws&&ws.readyState===1?'live':'reconnecting…'}`); }, 1400); }
+// flash() text is frequently attacker-influenced (collection names, API/bridge error details,
+// uploaded filenames) — it goes out as text; only the live-status restore renders markup.
+function flash(msg){ setStatus('', msg); setTimeout(()=>{ if(current) setStatusHtml(ws&&ws.readyState===1?'live':'busy', `<span class="name">${esc(current)}</span> &middot; ${esc(ws&&ws.readyState===1?'live':'reconnecting…')}`); }, 1400); }
 
 function syncedChat(name){
   for(const c of (_appCollections||[])){
@@ -2035,6 +2534,11 @@ async function relaunchSession(s){
 }
 // ---- manage tabs: bulk kill + export (names and opaque session history) -----------------------------
 $('#managebtn').onclick=()=>{ $('#managecount').textContent=(window._sessions||[]).length; openDialog('#managedlg'); };
+
+// Resume-from-archive picker (picker.js owns #resumedlg and wires #resumebtn itself). We hand it the
+// page's own helpers so a finished resume ends with the new tab SELECTED, not just a toast — and it
+// goes out through postIntent, so a double-tap collapses into one resume at the relay.
+if(window.MuxResumePicker) MuxResumePicker.install({ base, postIntent, loadSessions, flash, openDialog });
 $('#manageclose').onclick=()=>$('#managedlg').close();
 $('#exporttabs').onclick=()=>exportTabs();
 $('#killalltabs').onclick=()=>killAllTabs();
@@ -2063,7 +2567,7 @@ async function killAllTabs(){
   flash('Deleting '+list.length+' tabs…');
   let ok=0, fail=0;
   for(const s of list){
-    try{ const r=await fetch(base+'/api/sessions/'+encodeURIComponent(s.name),{method:'DELETE'}); if(r.ok) ok++; else fail++; }catch(e){ fail++; }
+    try{ const r=await sendIntent('DELETE', base+'/api/sessions/'+encodeURIComponent(s.name), null, 'kill-all'); if(r.ok) ok++; else fail++; }catch(e){ fail++; }
   }
   // Start fresh: also clear the app's per-tab session history so no stale/mislabeled entries linger.
   if(_appLive){ try{ await postIntent(base+'/api/app-commands',{type:'cleartabhistory'},'clear-history'); }catch(e){} }
@@ -2074,6 +2578,14 @@ async function killAllTabs(){
 // ---- tab session history: every chat a tab has hosted (current + historical), each relaunchable and
 // filable into a collection — so switching agents / opening a bare shell never loses the old session. ----
 $('#historyclose').onclick=()=>$('#historydlg').close();
+// Hand a chat off to the reader page. Deliberately a NAVIGATION, not an embed: reader.html is a separate
+// document (own styles, no xterm/websocket) so a long transcript can never stall the live terminal.
+function openReader(sessionId, title){
+  if(!sessionId){ flash('This tab has no linked chat yet — open claude or codex in it first.'); return; }
+  const url = base+'/reader.html?session='+encodeURIComponent(sessionId)+(title?'&title='+encodeURIComponent(String(title).slice(0,120)):'');
+  const tab = window.open(url,'_blank');                 // new tab keeps the terminal alive behind it…
+  if(!tab) location.href = url;                          // …but a phone popup-blocker just navigates instead
+}
 function openTabHistory(s){
   const list=$('#historylist'); list.innerHTML='';
   const entries=[];
@@ -2087,7 +2599,8 @@ function openTabHistory(s){
     const acts=document.createElement('div'); acts.className='histacts';
     const rb=document.createElement('button'); rb.className='act'; rb.textContent='Relaunch'; rb.onclick=()=>{ $('#historydlg').close(); relaunchTabTo(s.name, e); };
     const cb=document.createElement('button'); cb.className='act'; cb.textContent='+ Collection'; cb.onclick=()=>{ $('#historydlg').close(); addToCollection({ name:s.name, projectMuxName:s.name, muxName:s.name, sessionId:e.id, tool:e.tool, chatTitle:e.title }); };
-    acts.appendChild(rb); acts.appendChild(cb); row.appendChild(label); row.appendChild(acts); list.appendChild(row);
+    const tb=document.createElement('button'); tb.className='act'; tb.textContent='Read as transcript'; tb.onclick=()=>{ $('#historydlg').close(); openReader(e.id, e.title||s.name); };
+    acts.appendChild(rb); acts.appendChild(cb); acts.appendChild(tb); row.appendChild(label); row.appendChild(acts); list.appendChild(row);
   });
   openDialog('#historydlg');
 }
@@ -2177,7 +2690,7 @@ $('#dorename').onclick = async ()=>{
   // Multiplex tab name last (it may re-attach the terminal under the new name).
   if(to && from && to!==from){
     did=true;
-    let ok=false, err=''; try{ const r=await fetch(base+'/api/sessions/'+encodeURIComponent(from),{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:to})}); ok=r.ok; if(!ok) err=await apiError(r); }catch(e){ err=e.message||String(e); }
+    let ok=false, err=''; try{ const r=await sendIntent('PATCH', base+'/api/sessions/'+encodeURIComponent(from), {name:to}, 'rename-mux'); ok=r.ok; if(!ok) err=await apiError(r); }catch(e){ err=e.message||String(e); }
     if(!ok){ errs.push('multiplex: '+err); }
     else{
       if(read[from]!=null){ read[to]=read[from]; delete read[from]; LS.set('mux_read',read); }   // migrate read-state
@@ -2195,8 +2708,24 @@ function openCompose(){ openDialog('#composedlg'); setTimeout(()=>$('#composetex
 // Send composed/pasted text through xterm's OWN paste path (term.paste) — it wraps the block in bracketed
 // paste (when the agent supports it) so codex/claude ingest it as ONE paste. The old raw send('i',t) dumped
 // the whole burst at once; the agent mis-parsed a big/multiline burst and dropped its HEAD ("first half cut").
-$('#sendcompose').onclick = ()=>{ const t=$('#composetext').value; $('#composedlg').close(); if(t) term.paste(t); term.focus(); };
-$('#sendcomposeenter').onclick = ()=>{ const t=$('#composetext').value; $('#composedlg').close(); if(t){ term.paste(t); send('i','\r'); } term.focus(); };
+// Compose closes only once the text is SENT or QUEUED. Closing on a dead socket used to eat the whole
+// message — you watched the dialog vanish and nothing arrived. If it can't go anywhere, the dialog stays
+// open with your text still in it.
+function submitCompose(withEnter){
+  const t=$('#composetext').value;
+  if(!t){ $('#composedlg').close(); term.focus(); return 'sent'; }
+  // A live socket goes now; a dead one can still be HELD, but only if this origin holds a signing key —
+  // without one there is no honest way to deliver the text later, so we say so instead of pretending.
+  const status = (ws && ws.readyState===1) ? 'sent' : (inputQueue ? 'queued' : 'dropped');
+  if(status==='dropped'){ flash('Not sent - no connection. Your text is still here.'); return 'dropped'; }
+  term.paste(t);
+  if(withEnter) send('i','\r');
+  $('#composedlg').close();
+  term.focus();
+  return status;
+}
+$('#sendcompose').onclick = ()=>submitCompose(false);
+$('#sendcomposeenter').onclick = ()=>submitCompose(true);
 
 // ---- file workspace: a mini file explorer for per-session uploads. Browse a thumbnail GRID,
 // tap a file to OPEN it (big preview + all its actions), and switch scope between THIS session and
@@ -2284,6 +2813,8 @@ async function wsUploadFiles(files){
   const keep = $('#wskeepnew').checked ? '1':'0';
   if(!$('#uploaddlg').open){ wsSel=null; openDialog('#uploaddlg'); }
   for(const f of files){
+    // raw-fetch-allowlist: same as the paste path — the request body IS the file, so the intent journal
+    // (which sends a JSON envelope) cannot wrap it. Duplicates are visible files, not silent damage.
     try{ await fetch(base+'/api/upload?session='+encodeURIComponent(current||'')+'&keep='+keep+'&name='+encodeURIComponent(f.name),
       { method:'POST', headers:{'Content-Type':'application/octet-stream'}, body:f }); }
     catch(e){ flash('Upload failed: '+(e.message||e)); }
@@ -2318,8 +2849,8 @@ async function wsAdd(f, insert){
   try{ await insertUploadIntoPrompt(f, insert||'path'); $('#uploaddlg').close(); term.focus(); flash(insert==='element'?'Added the image to your prompt':'Added the file path to your prompt'); }
   catch(e){ flash('Couldn’t add: '+(e.message||e)); }
 }
-async function wsKeep(f, keep){ f.keep=keep; try{ await fetch(base+'/api/uploads/'+encodeURIComponent(f.id),{ method:'PATCH', headers:{'Content-Type':'application/json'}, body:JSON.stringify({keep}) }); }catch(e){} }
-async function wsDelete(f){ try{ await fetch(base+'/api/uploads/'+encodeURIComponent(f.id),{ method:'DELETE' }); }catch(e){} wsFiles=wsFiles.filter(x=>x.id!==f.id); wsSel=null; renderWorkspace(); }
+async function wsKeep(f, keep){ f.keep=keep; try{ await sendIntent('PATCH', base+'/api/uploads/'+encodeURIComponent(f.id), {keep}, 'upload-keep'); }catch(e){} }
+async function wsDelete(f){ try{ await sendIntent('DELETE', base+'/api/uploads/'+encodeURIComponent(f.id), null, 'upload-delete'); }catch(e){} wsFiles=wsFiles.filter(x=>x.id!==f.id); wsSel=null; renderWorkspace(); }
 
 // ---- expanded touch keybar -------------------------------------------------------------------------
 // Phones can't do key combos or navigation from the soft keyboard, so the bar provides: sticky
@@ -2421,8 +2952,23 @@ function openHelp(){
       <li><b>Esc Tab ⇧Tab ⏎ ↑↓←→</b> core keys. <b>⇧Tab</b> cycles Claude/Codex auto-mode.</li>
       <li><b>^</b> ctrl-shortcuts (^C ^R ^L…) &nbsp;·&nbsp; <b>nav</b> Home/End/PgUp… &nbsp;·&nbsp; <b>Fn</b> F-keys &nbsp;·&nbsp; <b>{ }</b> symbols &nbsp;·&nbsp; <b>★</b> your custom buttons.</li>
       <li>On the terminal: <b>drag up/down</b> to scroll history, <b>drag sideways</b> to pan when a bigger screen is connected.</li>
+      <li><b>Desktop selection:</b> just <b>drag</b> — output auto-freezes so a live repaint can't wipe the highlight, and resumes the moment you click away. <b>Ctrl/⌘+Shift+C</b> copies it; right-click still opens the browser's own Copy menu.</li>
+      <li><b>Shift+drag</b> selects inside a full-screen app that has grabbed the mouse — codex/claude in a <i>tracking</i> (alt-screen) session send every drag to the app, so Shift is what hands the gesture back to the browser.</li>
     </ul>`;
   body.appendChild(help);
+
+  // Selection settings live next to the button legend — this is the app's only settings surface.
+  const sel=document.createElement('div'); sel.className='helpsec';
+  const selh=document.createElement('h3'); selh.textContent='Selection & copy'; sel.appendChild(selh);
+  const acrow=document.createElement('label'); acrow.className='hint';
+  acrow.style.display='flex'; acrow.style.gap='8px'; acrow.style.alignItems='flex-start';
+  const acbox=document.createElement('input'); acbox.type='checkbox'; acbox.id='autocopysel';
+  acbox.checked=getAutoCopyOnSelect();
+  acbox.onchange=()=>{ setAutoCopyOnSelect(acbox.checked); flash(acbox.checked?'Auto-copy on select: ON':'Auto-copy on select: OFF'); };
+  acrow.appendChild(acbox);
+  acrow.appendChild(document.createTextNode('Auto-copy on select — releasing a drag copies the highlight straight to the clipboard (the X11 habit). Off by default.'));
+  sel.appendChild(acrow);
+  body.appendChild(sel);
 
   const cs=document.createElement('div'); cs.className='helpsec';
   const h=document.createElement('h3'); h.textContent='Custom buttons (★)'; cs.appendChild(h);
@@ -2554,9 +3100,10 @@ term.attachCustomKeyEventHandler(e=>{
   // It deliberately shadows readline's rarely-used digit-argument; we keep ONLY this + F11 so we don't
   // swallow Alt-letter / Esc-bracket sequences that shells, vim, and tmux rely on.
   if(e.altKey && !e.ctrlKey && !e.metaKey && /^[1-9]$/.test(e.key)){ const s=(window._sessions||[])[+e.key-1]; if(s){ connect(s.name); return false; } }
-  // Ctrl/Cmd+C copies the selection (like every terminal) instead of only sending ^C; Ctrl+Shift+C always copies.
+  // Ctrl/Cmd+C copies the selection (like every terminal) instead of only sending ^C; Ctrl/Cmd+Shift+C
+  // always copies — the one binding that never collides with ^C, so it works mid-stream on either platform.
   const _isC = (e.key==='c'||e.key==='C');
-  if(_isC && e.ctrlKey && e.shiftKey){ copySelectionNow(); return false; }
+  if(_isC && (e.ctrlKey||e.metaKey) && e.shiftKey){ copySelectionNow(); return false; }
   if(_isC && (e.ctrlKey||e.metaKey) && !e.altKey && !e.shiftKey && term.hasSelection && term.hasSelection()){ copySelectionNow(); return false; }
   if(e.key==='F11'){ toggleZen(); return false; }
   return true;

@@ -1,0 +1,28 @@
+# gitmap allowlist — synthetic test fixtures ONLY.
+#
+# Every entry below was opened and read before being listed. A secret scanner is only worth having if a
+# suppression costs more effort than fixing the finding, so each line records WHY the match is not a
+# credential. Never add an entry to make a commit go through.
+#
+# Format: <detector-id>:<path>[:<fingerprint>]
+
+# Placeholder API keys in a transcript-fetch test. Both are literal alphabet sequences
+# (ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789) appended to a real-looking prefix, which is exactly what a
+# synthetic fixture looks like and exactly what a real key does not.
+openai-key:app/native/CodexLocalRetrieval.Native.Tests/TranscriptFetchTests.cs:be8381ecf7f2
+github-token:app/native/CodexLocalRetrieval.Native.Tests/TranscriptFetchTests.cs:65c3ebbc31c6
+
+# The same test asserts the built command carries an Authorization header; the token is the synthetic
+# "bridge-token-abcdefgh12345678". The assertion is the point — it proves the header is constructed.
+authorization-literal:app/native/CodexLocalRetrieval.Native.Tests/TranscriptFetchTests.cs:464c953fdc85
+
+# NEGATIVE assertion, not a secret. retention.test.js:456 iterates a list of forbidden substrings (key and
+# secret field names, a PEM armour header, and the host token) and asserts the journal contains NONE of them.
+# The scanner matched the needle that this test exists to prove is absent. Deliberately NOT quoting the list
+# here: an earlier version of this comment reproduced it verbatim and tripped the same detector on this file.
+private-key-block:relay/tests/retention.test.js:b846fdb2d23a
+
+# 79-byte fixture whose content begins "FIXTUR...". Consumed by relay/tests/backup-state.test.js, whose
+# SECRETS list drives a test that secret-bearing files are NOT captured into backups. A real credential
+# here would defeat the test's own purpose.
+credential-file-path:relay/tests/fixtures/backup-state/local-control.cred

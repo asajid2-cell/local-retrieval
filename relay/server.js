@@ -1,4 +1,4 @@
-// Multiplex app: relays browser terminals to muxd on the Windows PC. muxd owns the ConPTY sessions
+﻿// Multiplex app: relays browser terminals to muxd on the Windows PC. muxd owns the ConPTY sessions
 // locally; this VPS mirrors them and stores lightweight web state. Legacy tmux sessions are reported
 // only as blocking diagnostics. They are never created, attached, renamed, or killed by this relay.
 const express = require('express');
@@ -9,7 +9,18 @@ const path = require('path');
 const crypto = require('crypto');
 const { execSync, execFile } = require('child_process');
 const { durableJsonLoad, durableJsonWrite, durableWrite, fsyncDirectory } = require('./durable-state');
+const { createHealthAlerts, startHealthAlerts } = require("./health-alerts");
+const { createNotifier } = require("./notify");
+const { createRetention, pruneTranscripts: pruneTranscriptRetention } = require('./retention');
 // Every acknowledged state mutation commits through durable-state.js before it is published in memory.
+const { createLeaseConduit } = require('./lease-conduit');
+// The write lease lives in muxd. This relay holds no lease key and makes no lease decision; the
+// conduit forwards client-signed frames byte-for-byte and caches muxd's notices as UI hints only.
+const leaseConduit = createLeaseConduit();
+// Global state retention (the periodic whole-directory pass) lives in retention.js; it is installed
+// after the stores it prunes are declared. Until then every gauge reads as null.
+let _retention = null;
+function retentionGauges() { return _retention ? _retention.gauges() : null; }
 function hostTokenOk(t) { if (!HOST_TOKEN || !t || t.length !== HOST_TOKEN.length) return false; try { return crypto.timingSafeEqual(Buffer.from(t), Buffer.from(HOST_TOKEN)); } catch { return false; } }
 
 const app = express();
@@ -137,9 +148,43 @@ function wsOriginOk(req) {
   if (!origin) return TEST_MODE;   // no Origin = not a browser; /ws is browser-only in prod
   return ALLOWED_WS_ORIGINS.includes(origin);
 }
+// A credential SCOPED to one job: the desktop app pushes transcript pages with it, and it authorizes
+// nothing else. Derived from the host credential so it never equals it, and it buys no read back — the
+// GET side stays owner-only. Fails closed: no host credential and no explicit override = no pushes.
+const TRANSCRIPT_BRIDGE_TOKEN = String(
+  process.env.MUX_TRANSCRIPT_BRIDGE_TOKEN
+  || (process.env.MUX_HOST_TOKEN
+    ? crypto.createHash('sha256').update('mux-transcript-bridge:v1:' + process.env.MUX_HOST_TOKEN).digest('hex')
+    : ''),
+);
+const TRANSCRIPT_BRIDGE_HEADER = 'x-mux-transcript-bridge';
+function transcriptBridgeTokenOk(value) {
+  const t = String(value || '');
+  if (!TRANSCRIPT_BRIDGE_TOKEN || !t || t.length !== TRANSCRIPT_BRIDGE_TOKEN.length) return false;
+  try { return crypto.timingSafeEqual(Buffer.from(t), Buffer.from(TRANSCRIPT_BRIDGE_TOKEN)); } catch { return false; }
+}
+function isTranscriptBridgePush(req) {
+  return req.method === 'POST'
+    && /^\/api\/transcripts\/[^/]+$/.test(String(req.path || ''))
+    && transcriptBridgeTokenOk(req.headers[TRANSCRIPT_BRIDGE_HEADER]);
+}
 app.use(async (req, res, next) => {
+  // INTEGRATION NOTE: r.2.16 arrived with a blanket `if (isTrustedLocal(req)) return next();` here.
+  // That bypass was deliberately REMOVED on master — containers run network_mode: host and share
+  // 127.0.0.1, so loopback is not a trust boundary and any compromised app satisfied it. Restoring it
+  // while merging would have silently undone that fix, so the narrow route list below stands and the
+  // transcript push gets its own scoped, token-checked exemption instead.
+  if (isTranscriptBridgePush(req)) return next();   // re-verified in the route; see the transcript store
   if (isTrustedLocal(req) && isLocalBridgeRoute(req)) return next();   // loopback admits ONLY the desktop-bridge routes
   if (dispatchRouteOk(req)) return next();   // scoped fix-factory dispatch capability
+  // TEST-ONLY. The campaign's 200+ relay tests were authored against a relay that trusted loopback
+  // outright, so under master's narrower gate they all answer 401 and every `await this.json(...)`
+  // helper returns an error object (which is what "list.find is not a function" actually was). The fix
+  // is NOT to restore blanket loopback trust — that is the bypass master removed on purpose, because
+  // containers run network_mode: host and share 127.0.0.1. Requiring BOTH an explicit MUX_TEST_MODE=1
+  // opt-in AND a loopback peer keeps production posture identical: MUX_TEST_MODE is never set there,
+  // so this line is unreachable. Same precedent as wsOriginOk, which already consults TEST_MODE.
+  if (TEST_MODE && isTrustedLocal(req)) return next();
   if (await isOwner(cookieVal(req, HL_COOKIE))) return next();
   const tok = cookieVal(req, HL_COOKIE);
   if (!tok) {
@@ -147,7 +192,7 @@ app.use(async (req, res, next) => {
     if ((req.headers.accept || '').includes('text/html')) return res.redirect(HL_LOGIN + '?next=' + encodeURIComponent(prefix));
     return res.status(401).json({ error: 'login required' });
   }
-  return res.status(403).send('Forbidden — owner only.');
+  return res.status(403).send('Forbidden â€” owner only.');
 });
 
 app.use(express.static(__dirname + '/public', {
@@ -170,17 +215,17 @@ function opaqueIdentity(value) {
   const raw = String(value || '').trim();
   return raw && /^[A-Za-z0-9._-]+$/.test(raw) ? raw : '';
 }
-// ---- PC SESSION HOST link (P2/P3 — the ownership flip) ---------------------------------------------
+// ---- PC SESSION HOST link (P2/P3 â€” the ownership flip) ---------------------------------------------
 // muxd on the PC owns each session's ConPTY locally and dials OUT to us over one multiplexed WebSocket
 // (/host, token-gated). Sessions live on the PC: Wi-Fi drops / VPS reboots / relay deploys only cost the
-// VIEWER a blip — the agent never notices. If this link is down, creation/attach fail loudly instead of
+// VIEWER a blip â€” the agent never notices. If this link is down, creation/attach fail loudly instead of
 // making a VPS tmux twin that can silently diverge.
 const HOST_TOKEN = process.env.MUX_HOST_TOKEN || '';
 let hostWs = null;                 // the PC's muxd link (one at a time; newest wins)
 let hostLabel = '';
 const hostSessions = new Map();    // name -> { alive, created, lastOut, tail }
 // A just-created hosted session muxd hasn't reported back yet. A muxd status push (built before it
-// processed our `create`) must NOT evict this optimistic entry — otherwise the imminent /ws attach or a
+// processed our `create`) must NOT evict this optimistic entry â€” otherwise the imminent /ws attach or a
 // boot-recreate sees no hosted session, makes a tmux TWIN, and two agents resume one transcript (A2 #1).
 // Clear-scrollback + clear-screen + home: prefixes a scrollback replay so a reconnecting viewer that
 // still shows the pre-drop screen doesn't get the replay stacked ON TOP of it (A2 #2/#3).
@@ -215,7 +260,11 @@ const hostedHas = name => hostUp() && hostSessions.has(name);
 const pendingHostCreates = new Map();
 let _hostRequestSeq = 0;
 function normalizeHostSession(s) {
-  if (containsForbiddenRemoteKey(s)) return null;
+  // agentTruth carries an "exe" key, which the forbidden-remote-key scan reads as the PC smuggling an
+  // executable path into the relay — and a hit there closes the whole host link with 1008. It is a bare
+  // image name (re-sanitized to one in normalizeAgentTruth), so scan the payload WITHOUT that subtree
+  // instead of rejecting every session muxd reports.
+  if (containsForbiddenRemoteKey(withoutAgentTruth(s))) return null;
   const name = strictMuxName(s && s.name);
   if (!name || name !== String(s && s.name || '')) return null;
   const sessionId = String(s.sessionId || '').trim();
@@ -241,8 +290,35 @@ function normalizeHostSession(s) {
     sessionId, aliases, identityPending: !!s.identityPending,
     agentState: String(s.agentState || ''), agentLabel: String(s.agentLabel || ''),
     agentDetail: String(s.agentDetail || ''), agentConfidence: String(s.agentConfidence || ''),
+    // OS-verified process truth (muxd cap "agentTruth"). Additive on protocol 4: a host that does not
+    // send it leaves both of these falsy and every downstream decision falls back to today's behavior.
+    agentStateSource: String(s.agentStateSource || ''), agentTruth: normalizeAgentTruth(s.agentTruth),
   };
   return value;
+}
+// Every `agentTruth` subtree removed, at any depth — the scan runs on what is left. The subtree is not
+// exempt from scrutiny, it is scrutinised differently: normalizeAgentTruth() rebuilds it from a
+// four-field allow-list and re-sanitizes `exe` down to a bare image name, so nothing path- or
+// command-shaped inside it can ever reach hostSessions no matter what the PC put there.
+function withoutAgentTruth(value) {
+  if (Array.isArray(value)) return value.map(withoutAgentTruth);
+  if (!value || typeof value !== 'object') return value;
+  const rest = {};
+  for (const [key, child] of Object.entries(value))
+    if (key !== 'agentTruth') rest[key] = withoutAgentTruth(child);
+  return rest;
+}
+function normalizeAgentTruth(truth) {
+  if (!truth || typeof truth !== 'object' || Array.isArray(truth)) return null;
+  // Bare image name only ("claude.exe"). Anything with a separator, space or quote is not an image name
+  // and is dropped to '' — the relay must never end up holding something command-shaped from the PC.
+  const exe = String(truth.exe || '').trim();
+  return {
+    procAlive: !!truth.procAlive,
+    cpuActiveRecent: !!truth.cpuActiveRecent,
+    exe: /^[A-Za-z0-9._+-]{1,60}$/.test(exe) ? exe : '',
+    checkedUtc: String(truth.checkedUtc || '').slice(0, 64),
+  };
 }
 function normalizeHostSessionList(list) {
   if (list != null && !Array.isArray(list)) return null;
@@ -348,14 +424,21 @@ function waitForHostState(check, timeoutMs = 6000) {
 function failHost(res, status, error, detail) {
   return res.status(status).json({ ok: false, error, detail: detail || '' });
 }
-// E4: on-demand deep tail from muxd (previews) — request/response correlated by rid, 2.5s timeout.
+// E4: on-demand deep tail from muxd (previews) â€” request/response correlated by rid, 2.5s timeout.
 const pendingTails = new Map(); let _rid = 0;
 function requestHostTail(name, lines) {
   if (!hostUp()) return Promise.resolve(null);
   const rid = 'r' + (++_rid);
   return new Promise(resolve => {
     const to = setTimeout(() => { pendingTails.delete(rid); resolve(null); }, 2500);
-    pendingTails.set(rid, txt => { clearTimeout(to); resolve(txt); });
+    // TRUST: a tail is terminal truth, so muxd may sign it. The relay never validates the signature
+    // (it holds no key and is not the trusted origin) — it only remembers the latest one per session so
+    // the fleet glance can hand it to the client that CAN verify it. No sig ⇒ forget the stale one.
+    pendingTails.set(rid, (txt, sig) => {
+      clearTimeout(to);
+      if (sig) _tailSigs.set(name, sig); else _tailSigs.delete(name);
+      resolve(txt);
+    });
     sendHost({ t: 'tail', s: name, lines, rid });
   });
 }
@@ -380,8 +463,8 @@ function failLegacy(res, name) {
 //   red    = stopped/blocker: command returned to a shell, legacy conflict, detached mirror, etc.
 const _sessState = new Map();   // name -> { everAgent }  (lets a bare shell read RED instead of WHITE)
 const _stateCache = new Map();  // name -> { at, state }   throttle hosted-tail classification bursts
-                                 // polls (4s interval × several clients) must not spawn a subprocess per call
-// NOTE: named paneAgentState (NOT sessionState) — there's already a sessionState() for window-sizing below.
+                                 // polls (4s interval Ã— several clients) must not spawn a subprocess per call
+// NOTE: named paneAgentState (NOT sessionState) â€” there's already a sessionState() for window-sizing below.
 function paneAgentState(name, content) {
   if (content === undefined) {
     const cached = _stateCache.get(name);
@@ -391,12 +474,12 @@ function paneAgentState(name, content) {
   const mem = _sessState.get(name) || { everAgent: false };
   // Only the TAIL (bottom status line + footer) is reliable: a turn in flight shows "esc to interrupt"
   // there, and an idle agent shows its footer there. Scanning the whole pane would false-green an idle
-  // agent off a previous turn's "(45s · 12k tokens)" left in scrollback (validated against live sessions).
+  // agent off a previous turn's "(45s Â· 12k tokens)" left in scrollback (validated against live sessions).
   // Strip trailing blank/newline padding so the window isn't off-by-one, and widen to 10 lines so the live status line ABOVE
   // the input box + footer is included (that's where "esc to interrupt" sits during a turn).
   const tail = content.replace(/\s+$/, '').split('\n').slice(-10).join('\n');
   const working = /esc to inter|still thinking/i.test(tail);
-  const agentUI = working || /⏵⏵|auto mode (on|off)|for agents|shift\+tab to cycle|\? for shortcuts|\/goal (active|paused)|\b(gpt-[0-9][\w.-]*|opus [0-9]|sonnet [0-9]|haiku [0-9])\b/i.test(tail);
+  const agentUI = working || /âµâµ|auto mode (on|off)|for agents|shift\+tab to cycle|\? for shortcuts|\/goal (active|paused)|\b(gpt-[0-9][\w.-]*|opus [0-9]|sonnet [0-9]|haiku [0-9])\b/i.test(tail);
   if (agentUI) mem.everAgent = true;
   _sessState.set(name, mem);
   const state = working ? 'green' : agentUI ? 'yellow' : (mem.everAgent ? 'red' : 'white');
@@ -428,6 +511,22 @@ function tailLooksAtShellPrompt(tail) {
     /^[\w.\-]+@[\w.\-]+:[^#$]{0,180}[#$]\s*$/.test(l)
   );
 }
+// A probe older than this is not evidence any more — the process could have died (or been relaunched)
+// in the gap. Applied symmetrically so a host clock running ahead of the relay does not look "fresh
+// forever" in one direction and permanently stale in the other.
+const AGENT_TRUTH_MAX_AGE_MS = Math.max(5000, Number(process.env.MUX_AGENT_TRUTH_MAX_AGE_MS || 45000));
+// Fresh OS-level process truth from muxd, or null. Null covers every degraded case — host too old to
+// advertise the capability, field absent, probe degraded to "heuristic", unparseable or stale
+// timestamp — and null means "decide exactly the way we did before agentTruth existed".
+function hostProcessTruth(h) {
+  if (!hostSupportsCap('agentTruth')) return null;
+  const truth = h && h.agentTruth;
+  if (!truth || String(h.agentStateSource || '') !== 'process') return null;
+  const checked = Date.parse(truth.checkedUtc || '');
+  if (!Number.isFinite(checked)) return null;
+  if (Math.abs(Date.now() - checked) > AGENT_TRUTH_MAX_AGE_MS) return null;
+  return truth;
+}
 function hostAgentStatus(h) {
   const s = String(h && h.agentState || '').toLowerCase();
   if (!['working', 'attention', 'stopped', 'neutral', 'dormant'].includes(s)) return null;
@@ -440,6 +539,9 @@ function hostAgentStatus(h) {
     agentDetail: String(h.agentDetail || ''),
     agentConfidence: String(h.agentConfidence || 'medium'),
     needsAttention: s === 'attention' || s === 'stopped',
+    // "stopped" is the host's heuristic read of a footer and is NOT proof of death; only an explicit
+    // dormant declaration (muxd knows there is no process) opens the death-recovery gate here.
+    healEligible: s === 'dormant',
   };
 }
 function attentionStatusForHosted(name, h, opts = {}) {
@@ -448,19 +550,33 @@ function attentionStatusForHosted(name, h, opts = {}) {
     agentDetail: 'agent process is alive locally, but muxd mirror is detached', agentConfidence: 'high',
     needsAttention: true,
   };
+  // Explicit host dormancy is the one death signal that predates agentTruth and is still authoritative:
+  // muxd is telling us the session has no process at all, so recovery is warranted without a probe.
   if (opts.dormant || !h || h.alive === false) return {
     state: 'dormant', agentState: 'dormant', agentLabel: 'dormant',
     agentDetail: 'no shell or agent is running until you relaunch it', agentConfidence: 'high',
-    needsAttention: false,
+    needsAttention: false, healEligible: true,
   };
   if (!h.hasCommand || h.shellOnly) return {
     state: 'white', agentState: 'neutral', agentLabel: 'plain shell',
     agentDetail: 'live terminal, no agent command registered', agentConfidence: 'high',
     needsAttention: false,
   };
+  // Precedence: fresh OS truth > host heuristic (agentState) > our own pane regex. The OS is the only
+  // source that can prove death, so it is also the only thing besides host dormancy that may mark a
+  // session heal-eligible — a footer that merely LOOKS like a shell prompt never gets to kill an agent.
+  const truth = hostProcessTruth(h);
+  if (truth && !truth.procAlive) return {
+    state: 'red', agentState: 'stopped', agentLabel: 'agent stopped',
+    agentDetail: 'muxd confirms the agent process tree is gone' + (truth.exe ? ` (last seen: ${truth.exe})` : ''),
+    agentConfidence: 'high', needsAttention: true, agentStateSource: 'process', healEligible: true,
+  };
+  const procAlive = !!(truth && truth.procAlive);
   const provided = hostAgentStatus(h);
-  if (provided) return provided;
-  if (tailLooksAtShellPrompt(h.tail || '')) return {
+  // A live process outranks a "stopped" call from either heuristic: the host's own footer read and our
+  // pane regex both false-red on an agent that has simply printed something prompt-shaped.
+  if (provided && !(procAlive && provided.state === 'red')) return provided;
+  if (!provided && !procAlive && tailLooksAtShellPrompt(h.tail || '')) return {
     state: 'red', agentState: 'stopped', agentLabel: 'agent stopped',
     agentDetail: 'the command-backed session returned to a shell prompt', agentConfidence: 'high',
     needsAttention: true,
@@ -470,20 +586,159 @@ function attentionStatusForHosted(name, h, opts = {}) {
   const created = Number(h.created || 0);
   const lastOutAgeMs = lastOut ? now - lastOut : NaN;
   const createdAgeMs = created ? now - created : NaN;
+  const source = procAlive ? { agentStateSource: 'process' } : {};
   if ((Number.isFinite(lastOutAgeMs) && lastOutAgeMs <= AGENT_WORKING_FRESH_MS) ||
       (Number.isFinite(createdAgeMs) && createdAgeMs <= AGENT_STARTING_GRACE_MS)) {
     return {
       state: 'green', agentState: 'working', agentLabel: 'agent working',
       agentDetail: 'terminal output updated ' + fmtAge(lastOutAgeMs), agentConfidence: 'medium',
-      needsAttention: false, lastOutAgeMs,
+      needsAttention: false, lastOutAgeMs, ...source,
     };
   }
+  // A quiet agent that is still burning CPU is thinking, not waiting for you — only the OS can see that.
+  if (procAlive && truth.cpuActiveRecent) return {
+    state: 'green', agentState: 'working', agentLabel: 'agent working',
+    agentDetail: 'no terminal output for ' + fmtAge(lastOutAgeMs) + ', but the agent process is using CPU',
+    agentConfidence: 'high', needsAttention: false, lastOutAgeMs, ...source,
+  };
   return {
     state: 'yellow', agentState: 'attention', agentLabel: 'waiting for you',
     agentDetail: 'no terminal output for ' + fmtAge(lastOutAgeMs), agentConfidence: 'medium',
-    needsAttention: true, lastOutAgeMs,
+    needsAttention: true, lastOutAgeMs, ...source,
   };
 }
+// ---- ATTENTION EPISODES -> one phone push per episode ---------------------------------------------
+// An "episode" is one continuous stretch of a hosted session needing the human (agentState attention
+// or stopped). We push ONCE per episode, and only after the state has HELD for a settle window, so the
+// half-second yellow flicker between an agent's turns never buzzes a phone. The state has to clear
+// (back to working/neutral/dormant) and re-enter before another push is allowed. Episodes are
+// persisted, so a relay restart mid-episode does not re-fire a push the human already got.
+// Deliberately NOT episodes here: host-link-down and heal-give-up. Those are ops-health alerts on the
+// separate health lane; folding them in would let a VPS blip masquerade as "your agent is waiting".
+// createNotifier is required once at the top of the file — the attention lane and the ops-health lane
+// both use the same transport, and two independent leaves each added their own top-level require here.
+const attentionNotifier = createNotifier();
+const NOTIFY_SETTLE_MS = Math.max(TEST_MODE ? 10 : 1000, Number(process.env.MUX_NOTIFY_SETTLE_MS) || 20000);
+// Deep link matches what the web UI's "copy link" builds (public/index.html): <base>/?s=<name>.
+const NOTIFY_LINK_BASE = String(process.env.MUX_PUBLIC_BASE || process.env.HLAUTH_PUBLIC_BASE || '').trim().replace(/\/+$/, '');
+const ATTENTION_EPISODES_FILE = STATE_DIR + '/attention-episodes.json';
+const attentionEpisodes = new Map();   // name -> { since, notified }
+{
+  const loaded = durableJsonLoad(
+    ATTENTION_EPISODES_FILE,
+    [],
+    value => Array.isArray(value) && value.every(entry => (
+      Array.isArray(entry) && entry.length === 2
+      && !!strictMuxName(entry[0])
+      && entry[1] && typeof entry[1] === 'object'
+      && Number.isFinite(Number(entry[1].since))
+      && typeof entry[1].notified === 'boolean'
+    )),
+  );
+  if (!Array.isArray(loaded)) throw new Error('persisted attention-episode state must be an entry array');
+  for (const [name, episode] of loaded)
+    attentionEpisodes.set(name, { since: Number(episode.since) || 0, notified: !!episode.notified });
+}
+function saveAttentionEpisodes() {
+  // A push ledger must never take the host link down: record the failure like every other writer does
+  // and keep serving. Worst case a restart re-pushes one episode, which beats dropping muxd's frame.
+  try { writeJsonState(ATTENTION_EPISODES_FILE, [...attentionEpisodes]); }
+  catch (error) { recordPersistenceFailure(error); }
+}
+// '' unless this session is in an episode-worthy state. Reuses the tab-dot classifier verbatim so the
+// phone and the browser can never disagree about who is waiting.
+function attentionEpisodeState(name) {
+  const h = hostSessions.get(name);
+  if (!h) return '';
+  const dormant = h.alive === false;
+  const attn = attentionStatusForHosted(name, h, { dormant, detachedLocal: dormant && locallyRunningMuxName(name) });
+  const state = String(attn && attn.agentState || '');
+  return (state === 'attention' || state === 'stopped') ? state : '';
+}
+// ---- PER-SESSION NOTIFICATION MUTE ---------------------------------------------------------------
+// Muting a session does NOT stop the episode state machine — the episode still opens, settles and
+// closes, only the outgoing push is swallowed. That way unmuting never dumps a backlog of stale buzzes
+// for a session that has been waiting all night; you get the NEXT episode. Mutes are keyed by session
+// name and are deliberately NOT pruned when the session disappears: a tab you silenced stays silenced
+// across kill/relaunch, which is the whole point of a per-session mute.
+const NOTIFY_MUTES_FILE = STATE_DIR + '/notify-mutes.json';
+const notifyMutes = new Set();
+{
+  const loaded = durableJsonLoad(
+    NOTIFY_MUTES_FILE,
+    [],
+    value => Array.isArray(value) && value.every(entry => !!strictMuxName(entry)),
+  );
+  if (!Array.isArray(loaded)) throw new Error('persisted notify-mute state must be a name array');
+  for (const name of loaded) notifyMutes.add(String(name));
+}
+function saveNotifyMutes() { writeJsonState(NOTIFY_MUTES_FILE, [...notifyMutes]); }
+function pushAttentionEpisode(name, state, heldMs) {
+  if (!attentionNotifier.enabled) return;
+  if (notifyMutes.has(name)) return;                     // muted: the episode is consumed, silently
+  const h = hostSessions.get(name) || {};
+  const label = String(h.agentLabel || '') || (state === 'stopped' ? 'agent stopped' : 'waiting for you');
+  const detail = String(h.agentDetail || '');
+  const click = NOTIFY_LINK_BASE ? NOTIFY_LINK_BASE + '/?s=' + encodeURIComponent(name) : '';
+  attentionNotifier.push({
+    title: name + ' - ' + label,
+    body: `${name}: ${label}${detail ? ' (' + detail + ')' : ''}\nheld ${Math.round(heldMs / 1000)}s${click ? '\n' + click : ''}`,
+    tags: [state === 'stopped' ? 'octagonal_sign' : 'bell'],
+    priority: state === 'stopped' ? 'high' : 'default',
+    click,
+  }).then(result => {
+    if (result && !result.ok && !result.disabled)
+      console.error(`[notify] attention push for ${name} failed: ${result.error || result.status}`);
+  }).catch(() => {});
+}
+let attentionSweepTimer = null;   // { timer, at } — one pending re-check, always the earliest due one
+function scheduleAttentionSweep(delayMs) {
+  if (!Number.isFinite(delayMs)) return;                 // nothing pending -> hold no timer at all
+  const at = Date.now() + delayMs;
+  if (attentionSweepTimer && attentionSweepTimer.at <= at) return;
+  if (attentionSweepTimer) clearTimeout(attentionSweepTimer.timer);
+  const timer = setTimeout(() => {
+    attentionSweepTimer = null;
+    try { sweepAttentionEpisodes(); }
+    catch (error) { console.error('[notify] attention sweep failed: ' + (error && error.message || error)); }
+  }, Math.max(1, delayMs));
+  if (typeof timer.unref === 'function') timer.unref();  // never hold the process open for a maybe-push
+  attentionSweepTimer = { timer, at };
+}
+// Runs on every host session update AND on its own settle timer: the settle window has to be able to
+// elapse without muxd sending another frame, or a session that goes quiet and stays quiet never fires.
+function sweepAttentionEpisodes() {
+  if (!hostUp()) return;                                 // link-down is the health lane's alert, not ours
+  const now = Date.now();
+  let dirty = false;
+  let soonestMs = Infinity;
+  for (const name of [...attentionEpisodes.keys()]) {
+    if (!hostSessions.has(name)) { attentionEpisodes.delete(name); dirty = true; }
+  }
+  for (const name of hostSessions.keys()) {
+    const state = attentionEpisodeState(name);
+    const open = attentionEpisodes.get(name);
+    if (!state) {
+      if (open) { attentionEpisodes.delete(name); dirty = true; }   // cleared: the next entry may push
+      continue;
+    }
+    if (!open) {
+      attentionEpisodes.set(name, { since: now, notified: false });
+      dirty = true;
+      soonestMs = Math.min(soonestMs, NOTIFY_SETTLE_MS);
+      continue;
+    }
+    if (open.notified) continue;                         // already buzzed for THIS episode
+    const heldMs = now - open.since;
+    if (heldMs < NOTIFY_SETTLE_MS) { soonestMs = Math.min(soonestMs, NOTIFY_SETTLE_MS - heldMs); continue; }
+    open.notified = true;
+    dirty = true;
+    pushAttentionEpisode(name, state, heldMs);
+  }
+  if (dirty) saveAttentionEpisodes();
+  scheduleAttentionSweep(soonestMs);
+}
+
 function listSessions() {
   let list = [];
   const legacy = new Set(legacyTmuxNames());
@@ -502,6 +757,11 @@ function listSessions() {
                   state: attn.state, agentState: attn.agentState, agentLabel: attn.agentLabel,
                   agentDetail: attn.agentDetail, agentConfidence: attn.agentConfidence,
                   needsAttention: !!attn.needsAttention, lastOutAgeMs: attn.lastOutAgeMs,
+                  notifyMuted: notifyMutes.has(name),   // per-session phone-push mute (attention episodes)
+                  agentStateSource: String(attn.agentStateSource || ''),
+                  // Death-recovery gate: true only when the OS says the process tree is gone, or muxd
+                  // itself declared the session dormant. Never set off a pane-regex read alone.
+                  healEligible: !!attn.healEligible,
                   autoheal: !!h.heal, hosted: true,
                   alive, dormant, detachedLocal, cols: h.cols || 0, rows: h.rows || 0,
                   hasCommand: !!h.hasCommand, shellOnly: !!h.shellOnly, ready: !!h.ready,
@@ -513,7 +773,7 @@ function listSessions() {
                   nativeTitle: String(chat && chat.nativeTitle || ''), appTitle: String(chat && chat.appTitle || ''),
                   chatLinked: !!chat,
                   tabColor: tabMetaFor(name).color, tabKind: tabMetaFor(name).kind,   // per-tab tint + "remote-resumed"
-                  tabHistory: tabHistoryFor(name),   // past chats this tab has hosted → relaunch-picker + add-historical-to-collection
+                  tabHistory: tabHistoryFor(name),   // past chats this tab has hosted â†’ relaunch-picker + add-historical-to-collection
                   localViewers: h.localViewers || 0, localFirst: !!h.localFirst,
                   detail: detachedLocal ? 'Local agent process is still running, but the muxd mirror is detached. New muxrun sessions re-register automatically; restart this one through mux to restore web terminal control.'
                          : dormant ? 'Dormant mux session: no shell or agent is running until you relaunch it or run mux locally.' : '',
@@ -527,7 +787,7 @@ function listSessions() {
     if (list.some(s => s.name === name)) continue;
     list.push({ name, windows: 0, created: 0, attached: false, activity: 0, state: 'red',
                 agentState: 'blocked', agentLabel: 'legacy blocker', agentDetail: legacyDetail(name),
-                agentConfidence: 'high', needsAttention: true,
+                agentConfidence: 'high', needsAttention: true, notifyMuted: notifyMutes.has(name),
                 autoheal: false, hosted: false, legacy: true, legacyBlocked: true,
                 detail: legacyDetail(name) });
   }
@@ -538,6 +798,56 @@ function listSessions() {
 }
 
 app.get('/api/sessions', (req, res) => res.json(listSessions()));
+
+// FLEET GLANCE: one request answers "what is every session doing right now" — every /api/sessions row
+// plus a hard-bounded tail snippet. Snippets ride the same muxd tail command as the per-session
+// preview, so they are terminal truth (muxd signs them; the trusted-origin client verifies the sig we
+// pass through here — the relay only relays and briefly caches the plaintext). The glance must NEVER
+// be the slow path: fetches fan out in parallel (total latency ≈ one 2.5s tail timeout, not N of them),
+// a short cache absorbs refresh bursts, and a host that is offline or silent degrades each row to its
+// last-known state + cached tail instead of failing the request.
+const FLEET_SNIPPET_LINES = 2;
+const FLEET_SNIPPET_BYTES = 2048;
+const FLEET_CACHE_MS = 5000;
+const _fleetCache = new Map();   // name -> { at, snippet, sig, degraded }
+const _tailSigs = new Map();     // name -> muxd's signature over the last tail it sent
+function fleetSnippet(text) {
+  const lines = String(text == null ? '' : text).replace(/\s+$/, '').split('\n');
+  const snippet = lines.slice(-FLEET_SNIPPET_LINES).join('\n');
+  return snippet.length > FLEET_SNIPPET_BYTES ? snippet.slice(-FLEET_SNIPPET_BYTES) : snippet;
+}
+async function fleetSnippetFor(name, cachedTail) {
+  const hit = _fleetCache.get(name);
+  if (hit && Date.now() - hit.at < FLEET_CACHE_MS) return hit;
+  const live = hostSupportsCap('tail') ? await requestHostTail(name, FLEET_SNIPPET_LINES) : null;
+  const degraded = live == null;
+  const entry = { at: Date.now(), snippet: fleetSnippet(degraded ? cachedTail : live),
+                  sig: degraded ? '' : String(_tailSigs.get(name) || ''), degraded };
+  _fleetCache.set(name, entry);
+  return entry;
+}
+app.get('/api/fleet', async (req, res) => {
+  const rows = listSessions();
+  const liveNames = new Set(rows.map(r => r.name));
+  for (const k of _fleetCache.keys()) if (!liveNames.has(k)) _fleetCache.delete(k);
+  for (const k of _tailSigs.keys()) if (!liveNames.has(k)) _tailSigs.delete(k);
+  const snippets = await Promise.all(rows.map(row => row.hosted
+    ? fleetSnippetFor(row.name, (hostSessions.get(row.name) || {}).tail)
+    : Promise.resolve({ snippet: '', sig: '', degraded: true })));
+  res.json({
+    hostUp: hostUp(),
+    hostProtocolOk: hostProtocolOk(),
+    snippetLines: FLEET_SNIPPET_LINES,
+    snippetBytes: FLEET_SNIPPET_BYTES,
+    at: Date.now(),
+    sessions: rows.map((row, i) => ({
+      ...row,
+      snippet: snippets[i].snippet,
+      snippetSig: snippets[i].sig,
+      snippetDegraded: !!snippets[i].degraded,
+    })),
+  });
+});
 
 function hasForbiddenRemoteField(body) { return containsForbiddenRemoteKey(body); }
 async function queueStartMuxAndWait(name, sessionId, tool, intentId = '', takeover = false) {
@@ -677,7 +987,7 @@ app.post('/api/sessions/:name/relaunch', async (req, res) => {
 });
 
 // Tail preview of a session's live pane (on demand: long-press / hover / palette) so you can tell what
-// a session is doing before attaching — last N lines, name-sanitized.
+// a session is doing before attaching â€” last N lines, name-sanitized.
 app.get('/api/sessions/:name/tail', async (req, res) => {
   const name = strictMuxName(req.params.name);
   if (!name) return res.status(400).json({ error: 'invalid session name' });
@@ -692,8 +1002,103 @@ app.get('/api/sessions/:name/tail', async (req, res) => {
   res.status(404).json({ error: 'session not found' });
 });
 
+// --- durable mutation intents ------------------------------------------------------------------
+// Direct (non-queued) mutations — kill, rename, auto-resume, upload keep/delete — are as replay-prone
+// as the queued app commands: a phone that loses the response retries, and without a dedup key the
+// second request executes again. Clients carry an intentId from the browser intent journal; we record
+// the first outcome under it and replay that outcome instead of re-running the handler. Same intentId
+// + different payload is a client bug, so it is refused (409) rather than silently executing.
+// Retryable outcomes (the ones the journal deliberately retries) drop the record so the retry runs.
+const MUTATION_INTENTS_FILE = STATE_DIR + '/mutation-intents.json';
+const MUTATION_INTENT_LIMIT = 512;
+const MUTATION_INTENT_RETENTION_MS = 24 * 60 * 60 * 1000;
+const MUTATION_INTENT_INFLIGHT_MS = 30000;
+// An in-flight record that survived a restart was never observed to finish, so it is NOT replayable:
+// only completed outcomes are reloaded, and anything else re-executes on the client's next retry.
+let _mutationIntents = (durableJsonLoad(MUTATION_INTENTS_FILE, [], Array.isArray) || [])
+  .filter(record => record && typeof record === 'object')
+  .map(record => ({
+    intentId: commandIntentId(record.intentId),
+    fingerprint: /^[a-f0-9]{64}$/.test(String(record.fingerprint || '')) ? String(record.fingerprint) : '',
+    ts: Number(record.ts) || 0,
+    inflight: false,
+    code: Number(record.code) || 0,
+    body: record.body && typeof record.body === 'object' ? record.body : null,
+  }))
+  .filter(record => record.intentId && record.fingerprint && record.code >= 200 && record.code < 400);
+function mutationFingerprint(scope, payload) {
+  return crypto.createHash('sha256').update(scope + '\n' + stableJson(payload)).digest('hex');
+}
+function mutationIntentRetryable(code) {
+  return code === 408 || code === 425 || code === 429 || code >= 500;
+}
+function compactMutationIntents(candidate, now = Date.now()) {
+  return candidate
+    .filter(record => record.inflight || now - record.ts <= MUTATION_INTENT_RETENTION_MS)
+    .slice(-MUTATION_INTENT_LIMIT);
+}
+function commitMutationIntents(candidate) {
+  candidate = compactMutationIntents(candidate);
+  try {
+    writeJsonState(MUTATION_INTENTS_FILE, candidate);
+  } catch (error) {
+    if (error.committed) _mutationIntents = candidate;
+    throw error;
+  }
+  _mutationIntents = candidate;
+}
+// Wrap a mutating route so a client-supplied intentId makes it exactly-once. No intentId => the raw
+// legacy path, unchanged, so an older cached page keeps working.
+function withMutationIntent(scope, fingerprintOf, handler) {
+  return async (req, res) => {
+    const intentId = commandIntentId(req.body && req.body.intentId);
+    if (!intentId) return await handler(req, res);
+    const fingerprint = mutationFingerprint(scope, fingerprintOf(req));
+    const now = Date.now();
+    const existing = _mutationIntents.find(record => record.intentId === intentId);
+    if (existing) {
+      if (existing.fingerprint !== fingerprint)
+        return res.status(409).json({ error: 'intent id already used for a different operation' });
+      if (!existing.inflight) return res.status(existing.code).json(existing.body);
+      if (now - existing.ts <= MUTATION_INTENT_INFLIGHT_MS)
+        return res.status(409).json({ error: 'operation already in flight' });
+    }
+    const claimed = { intentId, fingerprint, ts: now, inflight: true, code: 0, body: null };
+    try {
+      commitMutationIntents([..._mutationIntents.filter(r => r.intentId !== intentId), claimed]);
+    } catch (error) {
+      return failPersistence(res, error);
+    }
+    let settled = false;
+    const settle = body => {
+      const code = res.statusCode || 200;
+      const next = _mutationIntents.filter(record => record.intentId !== intentId);
+      if (!mutationIntentRetryable(code))
+        next.push({ ...claimed, ts: Date.now(), inflight: false, code, body: body && typeof body === 'object' ? body : null });
+      try {
+        commitMutationIntents(next);
+      } catch (error) {
+        // The response is already on its way out; losing the ledger write must not swallow it.
+        _mutationIntents = next;
+        console.error('[intents] could not record mutation outcome: ' + (error && error.message || error));
+      }
+    };
+    const sendJson = res.json.bind(res);
+    res.json = body => { if (!settled) { settled = true; settle(body); } return sendJson(body); };
+    try {
+      return await handler(req, res);
+    } catch (error) {
+      if (!settled) { settled = true; res.statusCode = 500; settle(null); }
+      throw error;
+    }
+  };
+}
+
 // Rename a session (keeps it running) — "close tab" must never be the only way to manage a session.
-app.patch('/api/sessions/:name', async (req, res) => {
+app.patch('/api/sessions/:name', withMutationIntent('session.rename', req => ({
+  name: strictMuxName(req.params.name),
+  to: strictMuxName(req.body && req.body.name),
+}), async (req, res) => {
   const name = strictMuxName(req.params.name);
   const to = strictMuxName(req.body && req.body.name);
   if (!name) return res.status(400).json({ error: 'invalid session name' });
@@ -701,7 +1106,7 @@ app.patch('/api/sessions/:name', async (req, res) => {
   if (to === name) return res.json({ ok: true, name: to });
   if (tmuxHas(to)) return failLegacy(res, to);
   if (hostSessions.has(to)) return res.status(409).json({ error: 'name already in use' });
-  if (hostedHas(name)) {   // E1: hosted rename → muxd renames the session key (keeps the pty), we migrate state
+  if (hostedHas(name)) {   // E1: hosted rename â†’ muxd renames the session key (keeps the pty), we migrate state
     if (tmuxHas(name)) return failLegacy(res, name);
     if (!requireHostProtocol(res, 'refusing to rename a hosted session')) return;
     let intent;
@@ -740,9 +1145,11 @@ app.patch('/api/sessions/:name', async (req, res) => {
   }
   if (tmuxHas(name)) return failLegacy(res, name);
   res.status(404).json({ error: 'session not found' });
-});
+}));
 
-app.delete('/api/sessions/:name', async (req, res) => {
+app.delete('/api/sessions/:name', withMutationIntent('session.kill', req => ({
+  name: strictMuxName(req.params.name),
+}), async (req, res) => {
   const name = strictMuxName(req.params.name);
   if (!name) return res.status(400).json({ error: 'invalid session name' });
   if (tmuxHas(name)) return failLegacy(res, name);
@@ -753,10 +1160,13 @@ app.delete('/api/sessions/:name', async (req, res) => {
     if (!confirmed.ok) return failHost(res, 504, 'muxd kill not confirmed', confirmed.error);
   }
   res.json({ ok: true });
-});
+}));
 
 // PER-TAB auto-resume toggle. muxd persists and enforces the policy locally.
-app.post('/api/sessions/:name/autoheal', async (req, res) => {
+app.post('/api/sessions/:name/autoheal', withMutationIntent('session.autoheal', req => ({
+  name: strictMuxName(req.params.name),
+  on: !!(req.body && req.body.on),
+}), async (req, res) => {
   const name = strictMuxName(req.params.name);
   if (!name) return res.status(400).json({ error: 'name required' });
   const on = !!(req.body && req.body.on);
@@ -772,6 +1182,27 @@ app.post('/api/sessions/:name/autoheal', async (req, res) => {
   if (!confirmed.ok)
     return failHost(res, 504, 'muxd auto-resume change not confirmed', confirmed.error);
   res.json({ ok: true, name, autoheal: on });
+}));
+
+// PER-TAB attention-notification mute. Owner-gated by the global middleware above like every other
+// /api route. Unlike autoheal this never touches muxd: the mute lives entirely in relay state, so it
+// still works while the PC host is offline (which is exactly when you want to silence a stuck tab).
+app.post('/api/sessions/:name/notify', (req, res) => {
+  const name = strictMuxName(req.params.name);
+  if (!name) return res.status(400).json({ error: 'name required' });
+  if (!req.body || typeof req.body.on !== 'boolean')
+    return res.status(400).json({ error: 'on must be a boolean' });
+  const on = req.body.on;
+  const wasMuted = notifyMutes.has(name);
+  if (wasMuted === on) {                                 // muted+on, or unmuted+off => a real change
+    if (on) notifyMutes.delete(name); else notifyMutes.add(name);
+    try { saveNotifyMutes(); }
+    catch (error) {
+      if (on) notifyMutes.add(name); else notifyMutes.delete(name);   // memory must match the disk
+      return res.status(503).json({ error: 'state persistence failed', detail: recordPersistenceFailure(error) });
+    }
+  }
+  res.json({ ok: true, name, notify: on, notifyMuted: !on });
 });
 
 // --- project sync: the desktop app pushes its collections/chats projection here while it's open, so
@@ -1035,7 +1466,7 @@ function projectedChatForHosted(hosted, name) {
     for (const chat of allProjectedChats())
       if (chatIds(chat).some(id => hostedIds.has(id.toLowerCase()))) return chat;
   if (hostedIds.size) return null;
-  // Shell-launched tab (no muxd command) → the app's deterministic resolver linked it to its LIVE chat
+  // Shell-launched tab (no muxd command) â†’ the app's deterministic resolver linked it to its LIVE chat
   // (agent matched to this tab by ancestor pid; id from the resume flag or the tab's newest transcript).
   const mtc = _projects && _projects.muxTabChats;
   const t = mtc && name && typeof mtc === 'object' ? mtc[name] : null;
@@ -1146,6 +1577,129 @@ app.get('/api/projects', (req, res) => {
     live: Date.now() - r < 45000,
   });
 });
+
+// --- ARCHIVE INDEX: the resumable-chat picker's catalogue -------------------------------------------
+// The desktop bridge pushes a capped, opaque-id-only index of resumable chats; the browser reads it to
+// offer "resume this chat over there". Two DIFFERENT principals, two DIFFERENT credentials:
+//   POST  = the desktop bridge, proving itself with the scoped MUX_BRIDGE_TOKEN (Authorization: Bearer).
+//   GET   = the browser owner, proving itself with the hl_session owner cookie.
+// Ambient loopback is NOT authorization here: reaching the socket says nothing about who is calling.
+// An owner cookie cannot push, a bridge credential cannot read, and neither is the host-link token.
+const ARCHIVE_INDEX_FILE = STATE_DIR + '/archive-index.json';
+const ARCHIVE_INDEX_SCHEMA_VERSION = 1;
+const ARCHIVE_INDEX_MAX_ROWS = 500;
+const ARCHIVE_INDEX_MAX_BYTES = 2 * 1024 * 1024;
+const ARCHIVE_INDEX_LIVE_MS = 45000;
+// `cwd` is deliberately allowed here (a display string the picker shows) while every other executable
+// or local-path key stays forbidden — the app-side contract carries cwd and nothing else path-shaped.
+const ARCHIVE_INDEX_FORBIDDEN_KEYS = new Set([...FORBIDDEN_REMOTE_KEYS].filter(k => k !== 'cwd'));
+function archiveIndexHasForbiddenKey(value) {
+  if (!value || typeof value !== 'object') return false;
+  if (Array.isArray(value)) return value.some(archiveIndexHasForbiddenKey);
+  for (const [key, child] of Object.entries(value))
+    if (ARCHIVE_INDEX_FORBIDDEN_KEYS.has(String(key).toLowerCase()) || archiveIndexHasForbiddenKey(child)) return true;
+  return false;
+}
+// A distinct scoped credential for bridge-only routes. Unset => the route is closed, not open; equal to
+// the host-link token => also closed, because interchangeable credentials are not scoped credentials.
+const BRIDGE_TOKEN = process.env.MUX_BRIDGE_TOKEN || '';
+const BRIDGE_TOKEN_USABLE = !!BRIDGE_TOKEN && BRIDGE_TOKEN !== HOST_TOKEN;
+if (BRIDGE_TOKEN && !BRIDGE_TOKEN_USABLE)
+  console.error('[bridge] MUX_BRIDGE_TOKEN must differ from MUX_HOST_TOKEN; bridge routes stay closed');
+function bearerCredential(req) {
+  const m = /^Bearer[ \t]+(\S+)$/i.exec(String(req.headers.authorization || '').trim());
+  return m ? m[1] : '';
+}
+function bridgeTokenOk(t) {
+  if (!BRIDGE_TOKEN_USABLE || !t || t.length !== BRIDGE_TOKEN.length) return false;
+  try { return crypto.timingSafeEqual(Buffer.from(t), Buffer.from(BRIDGE_TOKEN)); } catch { return false; }
+}
+// Returns null when the caller is the bridge; otherwise the response has already been sent.
+function refuseUnlessBridge(req, res) {
+  if (!BRIDGE_TOKEN_USABLE) return res.status(503).json({ error: 'bridge credential not configured' });
+  if (!bridgeTokenOk(bearerCredential(req))) return res.status(403).json({ error: 'bridge credential required' });
+  return null;
+}
+function emptyArchiveIndex() {
+  return { schemaVersion: ARCHIVE_INDEX_SCHEMA_VERSION, host: '', chats: [], updatedAt: 0 };
+}
+function normalizeArchiveChat(chat) {
+  const c = chat && typeof chat === 'object' && !Array.isArray(chat) ? chat : {};
+  const updatedAt = Number(c.updatedAt);
+  return {
+    id: opaqueIdentity(c.id),
+    title: text(c.title, 200),
+    tool: text(c.tool, 40),
+    cwd: text(c.cwd, 300),
+    workspaceLabel: text(c.workspaceLabel, 200),
+    updatedAt: Number.isFinite(updatedAt) && updatedAt > 0 ? Math.floor(updatedAt) : 0,
+    muxName: strictMuxName(c.muxName),
+    resumable: c.resumable === true,
+  };
+}
+function validArchiveChat(row) {
+  return !!row.id && !!row.title && !!row.tool && row.updatedAt > 0;
+}
+function validPersistedArchiveIndex(value) {
+  return !!value && typeof value === 'object' && !Array.isArray(value)
+    && value.schemaVersion === ARCHIVE_INDEX_SCHEMA_VERSION
+    && Array.isArray(value.chats)
+    && value.chats.length <= ARCHIVE_INDEX_MAX_ROWS
+    && !archiveIndexHasForbiddenKey(value);
+}
+let _archiveIndex = durableJsonLoad(ARCHIVE_INDEX_FILE, null, validPersistedArchiveIndex) || emptyArchiveIndex();
+// `updatedAt` is data recency and survives a restart; liveness does not. Same doctrine as the projection
+// above: after a relay restart the picker still lists chats, but must not claim the app is answering
+// until a push lands on THIS process.
+let _archiveIndexPushedAt = 0;
+function archiveIndexLive() { return _archiveIndexPushedAt > 0 && Date.now() - _archiveIndexPushedAt < ARCHIVE_INDEX_LIVE_MS; }
+app.post('/api/archive-index', (req, res) => {
+  const refusal = refuseUnlessBridge(req, res);
+  if (refusal) return refusal;
+  const b = req.body || {};
+  if (Number(b.schemaVersion) !== ARCHIVE_INDEX_SCHEMA_VERSION)
+    return res.status(409).json({ error: 'archive index schema mismatch', expected: ARCHIVE_INDEX_SCHEMA_VERSION });
+  const declared = Number(req.headers['content-length'] || 0);
+  if (declared > ARCHIVE_INDEX_MAX_BYTES || Buffer.byteLength(JSON.stringify(b)) > ARCHIVE_INDEX_MAX_BYTES)
+    return res.status(413).json({ error: 'archive index too large', maxBytes: ARCHIVE_INDEX_MAX_BYTES });
+  if (!Array.isArray(b.chats))
+    return res.status(400).json({ error: 'archive index requires a chats array' });
+  if (b.chats.length > ARCHIVE_INDEX_MAX_ROWS)
+    return res.status(413).json({ error: 'archive index too many rows', maxRows: ARCHIVE_INDEX_MAX_ROWS });
+  if (archiveIndexHasForbiddenKey(b))
+    return res.status(400).json({ error: 'archive index contains executable command or local path fields' });
+  const chats = b.chats.map(normalizeArchiveChat);
+  if (!chats.every(validArchiveChat))
+    return res.status(400).json({ error: 'archive index row missing an opaque id, title, tool, or updatedAt' });
+  const candidate = {
+    schemaVersion: ARCHIVE_INDEX_SCHEMA_VERSION,
+    host: text(b.host, 200),
+    chats,
+    updatedAt: Date.now(),
+  };
+  try {
+    writeJsonState(ARCHIVE_INDEX_FILE, candidate);
+  } catch (error) {
+    if (error.committed) { _archiveIndex = candidate; _archiveIndexPushedAt = candidate.updatedAt; }
+    return failPersistence(res, error);
+  }
+  _archiveIndex = candidate;
+  _archiveIndexPushedAt = candidate.updatedAt;
+  res.json({ ok: true, count: chats.length, updatedAt: candidate.updatedAt });
+});
+app.get('/api/archive-index', async (req, res) => {
+  if (!(await isOwner(cookieVal(req, HL_COOKIE)))) return res.status(403).json({ error: 'owner only' });
+  const updatedAt = _archiveIndex.updatedAt || 0;
+  res.json({
+    schemaVersion: ARCHIVE_INDEX_SCHEMA_VERSION,
+    host: _archiveIndex.host || '',
+    chats: Array.isArray(_archiveIndex.chats) ? _archiveIndex.chats : [],
+    count: Array.isArray(_archiveIndex.chats) ? _archiveIndex.chats.length : 0,
+    updatedAt,
+    ageMs: updatedAt > 0 ? Date.now() - updatedAt : null,
+    appLive: archiveIndexLive(),
+  });
+});
 // LIGHT partial update: the always-on headless server keeps the running list + `live` fresh when the
 // heavy desktop app is closed, WITHOUT clobbering the collections projection the app last pushed. Loopback
 // only (the server reaches in over its own SSH, same as the app's /api/projects push).
@@ -1180,13 +1734,13 @@ app.post('/api/running', (req, res) => {
 // The relay only toggles muxd policy and forwards explicit, opaque control intent.
 
 // ---- PC reachability probe + /api/health (P0 observability, D7). A lightweight TCP-connect to the PC's
-// sshd port (no ssh process spawn) so health can report whether the ssh-back is even reachable + its RTT —
-// the Jul 2 .146→.154 DHCP orphaning would have shown here instantly as pc.reachable=false.
+// sshd port (no ssh process spawn) so health can report whether the ssh-back is even reachable + its RTT â€”
+// the Jul 2 .146â†’.154 DHCP orphaning would have shown here instantly as pc.reachable=false.
 let _winHost = '192.168.1.146';
 try { const _c = fs.readFileSync((process.env.HOME || '') + '/.ssh/config', 'utf8'); const _m = _c.match(/Host\s+win\b[\s\S]*?HostName\s+(\S+)/i); if (_m) _winHost = _m[1]; } catch {}
 let _pcHealth = TEST_MODE ? { reachable: true, rttMs: 0, host: 'test', at: Date.now() } : { reachable: null, rttMs: null, host: _winHost, at: 0 };
-// When the PC becomes unreachable, it may just have moved to a new DHCP IP (Jul 2: .146→.154 orphaned the
-// fleet). Kick the MAC-based resolver (runs the ping-sweep in its own subprocess — never blocks this loop),
+// When the PC becomes unreachable, it may just have moved to a new DHCP IP (Jul 2: .146â†’.154 orphaned the
+// fleet). Kick the MAC-based resolver (runs the ping-sweep in its own subprocess â€” never blocks this loop),
 // then reload the (possibly updated) HostName so the next ssh-back + boot-recreate target the new address.
 let _lastReresolve = 0;
 function reresolveWin() {
@@ -1195,7 +1749,7 @@ function reresolveWin() {
     try {
       const c = fs.readFileSync((process.env.HOME || '') + '/.ssh/config', 'utf8');
       const m = c.match(/Host\s+win\b[\s\S]*?HostName\s+(\S+)/i);
-      if (m && m[1] !== _winHost) { console.log(`[dhcp] PC moved → win now ${m[1]} (was ${_winHost})`); _winHost = m[1]; setTimeout(probePc, 500); }
+      if (m && m[1] !== _winHost) { console.log(`[dhcp] PC moved â†’ win now ${m[1]} (was ${_winHost})`); _winHost = m[1]; setTimeout(probePc, 500); }
     } catch {}
   });
 }
@@ -1207,29 +1761,44 @@ function probePc() {
   sock.on('error', () => done(false));
   sock.on('timeout', () => done(false));
 }
-if (!TEST_MODE) { setTimeout(probePc, 2000); setInterval(probePc, 30000); }
-app.get('/api/health', (req, res) => {
+let _probeBootTimer = null, _probeTimer = null;   // held so the restart drain can let the event loop empty
+if (!TEST_MODE) { _probeBootTimer = setTimeout(probePc, 2000); _probeTimer = setInterval(probePc, 30000); }
+// r.1.4.3 opened an `app.get('/api/health', ...)` here, but r.1.17 had already lifted this body out
+// into healthSnapshot() so the ops-alert lane could read health without going through HTTP — and it
+// registers the route below. Taking both openers would have bound /api/health twice.
+function healthSnapshot() {
   let tmuxAvailable = false;
-  try { execSync(`tmux -V`, { encoding: 'utf8', timeout: 1500 }); tmuxAvailable = true; } catch {}
+  try { execSync(`tmux -V`, { encoding: "utf8", timeout: 1500 }); tmuxAvailable = true; } catch {}
   const legacyNames = legacyTmuxNames();
   const armed = [...hostSessions.values()].filter(h => h && h.heal).length;
   const gaveUp = 0;
   const projects = projectsHealth();
+  const retention = retentionGauges();
   // A2 #9: if the PC host is down, armed sessions are hosted-and-unreachable (can't be healed) → surface
   // that as degraded instead of a falsely-green dot. Legacy tmux names are also degraded blockers.
   const hostedArmedDown = 0;
   const degraded = TEST_MODE
     ? (!hostUp() || !hostProtocolOk() || legacyNames.length > 0 || !!persistenceFailure || renameIntents.length > 0 || uploadRecoveryWarnings.length > 0)
     : (!hostUp() || !hostProtocolOk() || _pcHealth.reachable === false || gaveUp > 0 || hostedArmedDown > 0 || legacyNames.length > 0 || !projects.bridgeLive || !!persistenceFailure || renameIntents.length > 0 || uploadRecoveryWarnings.length > 0);
-  res.json({ ok: !degraded, degraded, uptimeSec: Math.round(process.uptime()), tmuxAvailable, sessions: hostSessions.size,
-             legacySessions: legacyNames.length, legacyNames, legacyPolicy: 'blocked', armed, gaveUp, hostedArmedDown, pc: _pcHealth,
-             projects,
-             persistence: { ok: !persistenceFailure && !persistenceBlocked, detail: persistenceBlocked || persistenceFailure, blocked: !!persistenceBlocked },
-             pendingRenameIntents: renameIntents.length,
-             uploadRecoveryWarnings,
-             host: { connected: hostUp(), name: hostLabel, sessions: hostSessions.size, protocol: hostProtocol.protocol, caps: hostProtocol.caps, protocolOk: hostProtocolOk() },
-             node: process.version, at: Date.now() });
+  return { ok: !degraded, degraded, uptimeSec: Math.round(process.uptime()), tmuxAvailable, sessions: hostSessions.size,
+           legacySessions: legacyNames.length, legacyNames, legacyPolicy: "blocked", armed, gaveUp, hostedArmedDown, pc: _pcHealth,
+           projects,
+           persistence: { ok: !persistenceFailure && !persistenceBlocked, detail: persistenceBlocked || persistenceFailure, blocked: !!persistenceBlocked },
+           pendingRenameIntents: renameIntents.length,
+           uploadRecoveryWarnings,
+           // State growth is observable BEFORE it is a problem: total bytes on disk plus a
+           // size/count gauge per store, and plaintext exposure kept separate from the opaque
+           // signed envelopes we hold in custody but never read.
+           stateDirBytes: retention ? retention.stateDirBytes : null,
+           retention,
+           host: { connected: hostUp(), name: hostLabel, sessions: hostSessions.size, protocol: hostProtocol.protocol, caps: hostProtocol.caps, protocolOk: hostProtocolOk() },
+           node: process.version, at: Date.now() };
+}
+
+app.get('/api/health', (req, res) => {
+  res.json(healthSnapshot());
 });
+
 
 // --- app command queue: the owner (web) enqueues actions for the desktop app; the app polls + acks them.
 // Today: "kill" a live agent session. Enqueue is owner-gated (the global auth middleware above); pull +
@@ -1247,6 +1816,7 @@ const COMMAND_TERMINAL_LIMIT = Math.max(
 const COMMAND_REPLAY_POLICY = new Map([
   ['kill', 'refused'],
   ['transcript', 'read-only'],
+  ['transcriptfetch', 'read-only'],
   ['fetchfile', 'intent-fenced'],
   ['rename', 'idempotent'],
   ['setapptitle', 'idempotent'],
@@ -1281,6 +1851,19 @@ function commandFingerprint(command) {
   };
   return crypto.createHash('sha256').update(stableJson(payload)).digest('hex');
 }
+// The client's proof of who authorized an operation. OPAQUE here on purpose: the relay bounds its size,
+// stores it byte-stable, and hands it back on lease so the enforcing side can verify it. replayPolicy has
+// always described an operation's SEMANTICS (dedup/replay safety); it has never described authorization,
+// and a relay-minted lease token is not authority either. Read-only commands still need a principal.
+const PRINCIPAL_AUTH_MAX_BYTES = 4096;
+const COMMAND_REQUIRES_PRINCIPAL_AUTH = new Set(['transcriptfetch']);
+function principalAuthEnvelope(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  let text;
+  try { text = JSON.stringify(value); } catch { return null; }
+  if (!text || text === '{}' || Buffer.byteLength(text, 'utf8') > PRINCIPAL_AUTH_MAX_BYTES) return null;
+  return JSON.parse(text);
+}
 function commandOutcomeDetail(type, status, onPc = false) {
   if (status === 'pending' || status === 'leased') return '';
   if (type === 'fetchfile') {
@@ -1291,6 +1874,7 @@ function commandOutcomeDetail(type, status, onPc = false) {
     startmux: ['mux session started', 'PC bridge could not start mux session'],
     kill: ['session stopped', 'PC bridge could not stop session'],
     transcript: ['transcript opened', 'PC bridge could not open transcript'],
+    transcriptfetch: ['transcript ready to read here', 'PC bridge could not fetch the transcript'],
     rename: ['session renamed', 'PC bridge could not rename session'],
     setapptitle: ['title updated', 'PC bridge could not update title'],
     addtocollection: ['collection updated', 'PC bridge could not update collection'],
@@ -1322,6 +1906,7 @@ function commandOutcomeDetail(type, status, onPc = false) {
     collectionId: String(c.collectionId || '').slice(0, 200), deckId: String(c.deckId || '').slice(0, 200),
     deck: String(c.deck || '').slice(0, 200), deckName: String(c.deckName || '').slice(0, 200),
     takeover: !!c.takeover,
+    principalAuth: principalAuthEnvelope(c.principalAuth),
     ts: Number(c.ts) || 0,
     status,
     detail: commandOutcomeDetail(
@@ -1381,8 +1966,14 @@ function enqueueAppCommand(b) {
                 collection: String(b.collection || '').slice(0, 200), collectionId: String(b.collectionId || '').slice(0, 200),
                 deckId: String(b.deckId || '').slice(0, 200), deck: String(b.deck || '').slice(0, 200),
                 deckName: String(b.deckName || '').slice(0, 200), takeover: !!b.takeover,
+                principalAuth: principalAuthEnvelope(b.principalAuth),
                 ts: Date.now(), status: 'pending', detail: '',
                 doneAt: 0, leaseOwner: '', leaseToken: '', leaseExpiresAt: 0, attempt: 0 };
+  if (COMMAND_REQUIRES_PRINCIPAL_AUTH.has(type) && !cmd.principalAuth) {
+    const error = new Error('command type requires a principal auth envelope');
+    error.principalAuthRequired = true;
+    throw error;
+  }
   cmd.fingerprint = commandFingerprint(cmd);
   const existing = _commands.find(command => command.intentId === intentId);
   if (existing) {
@@ -1432,6 +2023,9 @@ app.post('/api/app-commands', (req, res) => {     // web (owner) enqueues
   b.replayPolicy = COMMAND_REPLAY_POLICY.get(b.type);
   if (b.type === 'kill' && !b.sessionId && !b.pid) return res.status(400).json({ error: 'sessionId or pid required' });
   if (b.type === 'transcript' && !b.sessionId) return res.status(400).json({ error: 'sessionId required' });
+  if (b.type === 'transcriptfetch' && !b.sessionId) return res.status(400).json({ error: 'sessionId required' });
+  if (b.type === 'transcriptfetch' && !principalAuthEnvelope(b.principalAuth))
+    return res.status(400).json({ error: 'transcriptfetch requires a principal auth envelope' });
   if (b.type === 'fetchfile' && !b.uploadId) return res.status(400).json({ error: 'uploadId required' });
   if (b.type === 'fetchfile' && b.insert && !['path', 'element'].includes(String(b.insert).toLowerCase()))
     return res.status(400).json({ error: 'fetchfile insert must be path or element' });
@@ -1462,6 +2056,7 @@ app.post('/api/app-commands', (req, res) => {     // web (owner) enqueues
     queued = enqueueAppCommand(b);
   } catch (error) {
     if (error.intentConflict) return res.status(409).json({ error: error.message });
+    if (error.principalAuthRequired) return res.status(400).json({ error: error.message });
     return failPersistence(res, error);
   }
   res.json({
@@ -1565,6 +2160,200 @@ app.get('/api/app-commands/:id', (req, res) => {  // web (owner) polls a command
   if (!c) return res.status(404).json({ error: 'not found' });
   res.json({ id: c.id, status: c.status, detail: c.detail || '' });
 });
+
+// --- transcript page store: PC archive -> VPS (briefly) -> the owner's browser -------------------
+// A `transcriptfetch` command is the ONLY thing that authorizes parking a chat's archived pages here.
+// The app pushes them page-by-page with the scoped bridge credential; we keep exactly the newest fetch
+// for that one explicitly requested session id and drop it on a bounded TTL. This is a courier, not a
+// mirror: nothing is retained for a session nobody asked for, and the widening from live-screen bytes
+// to archived history is deliberately fenced by the request that asked for it.
+const TRANSCRIPTS_FILE = STATE_DIR + '/transcripts.json';
+const TRANSCRIPT_SCHEMA_VERSION = 1;
+const TRANSCRIPT_MAX_PAGES = 32;                                   // matches the app-side pager
+const TRANSCRIPT_MAX_PAGE_BYTES = 256 * 1024;                      // app targets <=200KB; this is the fence
+const TRANSCRIPT_MAX_SESSION_BYTES = TRANSCRIPT_MAX_PAGES * TRANSCRIPT_MAX_PAGE_BYTES;   // 8 MiB
+const TRANSCRIPT_MAX_SESSIONS = 8;
+// Floored at a minute in production so a real fetch has time to page in; tests may shorten it to prove
+// the window actually closes (same escape hatch shape as the command lease duration).
+const TRANSCRIPT_TTL_MS = Math.max(
+  TEST_MODE ? 200 : 60000,
+  Number(process.env.MUX_TRANSCRIPT_TTL_MS) || 15 * 60 * 1000,
+);
+const validTranscriptStore = value => (
+  Array.isArray(value)
+  && value.every(record => (
+    record
+    && typeof record === 'object'
+    && !!opaqueIdentity(record.sessionId)
+    && !!opaqueIdentity(record.fetchId)
+    && Number.isFinite(Number(record.pages))
+    && Number.isFinite(Number(record.expiresAt))
+    && Array.isArray(record.pageList)
+  ))
+);
+let _transcripts = [];
+{
+  const loaded = durableJsonLoad(TRANSCRIPTS_FILE, [], validTranscriptStore);
+  if (!Array.isArray(loaded)) throw new Error('persisted transcript store must be an array');
+  _transcripts = loaded.map(record => ({
+    sessionId: opaqueIdentity(record.sessionId),
+    fetchId: opaqueIdentity(record.fetchId),
+    pages: Number(record.pages) || 0,
+    bytes: Number(record.bytes) || 0,
+    updatedAt: Number(record.updatedAt) || 0,
+    expiresAt: Number(record.expiresAt) || 0,
+    pageList: (Array.isArray(record.pageList) ? record.pageList : [])
+      .filter(page => page && typeof page === 'object' && Number.isInteger(Number(page.page)))
+      .map(page => ({
+        page: Number(page.page),
+        bytes: Number(page.bytes) || 0,
+        messages: normalizeTranscriptMessages(page.messages),
+      })),
+  })).filter(record => record.sessionId && record.fetchId);
+}
+function normalizeTranscriptMessages(messages) {
+  return (Array.isArray(messages) ? messages : []).map(message => {
+    const kept = { role: String(message.role || ''), text: String(message.text || '') };
+    if (message.ts !== undefined && message.ts !== null && Number.isFinite(Number(message.ts)))
+      kept.ts = Number(message.ts);
+    return kept;
+  });
+}
+function liveTranscripts(now = Date.now()) {
+  return _transcripts.filter(record => record.expiresAt > now);
+}
+function commitTranscripts(candidate) {
+  writeJsonState(TRANSCRIPTS_FILE, candidate);
+  _transcripts = candidate;
+}
+function transcriptPageProblem(body, sessionId) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return 'transcript page must be a JSON object';
+  if (Number(body.schemaVersion) !== TRANSCRIPT_SCHEMA_VERSION) return 'unsupported transcript schema version';
+  if (opaqueIdentity(body.sessionId) !== sessionId) return 'page session identity does not match the request';
+  const pages = Number(body.pages);
+  const page = Number(body.page);
+  if (!Number.isInteger(pages) || pages < 1 || pages > TRANSCRIPT_MAX_PAGES)
+    return 'pages must be an integer in 1..' + TRANSCRIPT_MAX_PAGES;
+  if (!Number.isInteger(page) || page < 1 || page > pages) return 'page must be an integer in 1..pages';
+  if (!Array.isArray(body.messages)) return 'messages must be an array';
+  for (const message of body.messages) {
+    if (!message || typeof message !== 'object' || Array.isArray(message)) return 'each message must be an object';
+    if (typeof message.role !== 'string' || !message.role) return 'each message needs a role';
+    if (typeof message.text !== 'string') return 'each message needs text';
+    if (message.ts !== undefined && message.ts !== null && !Number.isFinite(Number(message.ts)))
+      return 'message ts must be numeric';
+  }
+  return '';
+}
+// The fetch that asked for this session, if it is still inside the retention window. No request, no store.
+function authorizingTranscriptFetch(sessionId, now = Date.now()) {
+  return _commands
+    .filter(command => command.type === 'transcriptfetch'
+      && command.sessionId === sessionId
+      && now - (Number(command.ts) || 0) <= TRANSCRIPT_TTL_MS)
+    .sort((a, b) => (Number(b.ts) || 0) - (Number(a.ts) || 0))[0] || null;
+}
+app.post('/api/transcripts/:sessionId', (req, res) => {
+  if (!TRANSCRIPT_BRIDGE_TOKEN) return res.status(503).json({ error: 'transcript bridge credential is not configured' });
+  if (!transcriptBridgeTokenOk(req.headers[TRANSCRIPT_BRIDGE_HEADER]))
+    return res.status(403).json({ error: 'scoped transcript bridge credential required' });
+  const sessionId = opaqueIdentity(req.params.sessionId);
+  if (!sessionId) return res.status(400).json({ error: 'invalid session identity' });
+  const body = req.body;
+  let bodyBytes = 0;
+  try { bodyBytes = Buffer.byteLength(JSON.stringify(body === undefined ? null : body), 'utf8'); } catch { bodyBytes = Infinity; }
+  if (bodyBytes > TRANSCRIPT_MAX_PAGE_BYTES) return res.status(413).json({ error: 'transcript page is too large' });
+  const problem = transcriptPageProblem(body, sessionId);
+  if (problem) return res.status(400).json({ error: problem });
+  const now = Date.now();
+  const authorizing = authorizingTranscriptFetch(sessionId, now);
+  if (!authorizing) return res.status(409).json({ error: 'no live transcriptfetch request for this session' });
+  const others = liveTranscripts(now).filter(record => record.sessionId !== sessionId);
+  const prior = liveTranscripts(now).find(record => record.sessionId === sessionId);
+  // A different authorizing fetch (or a re-page) means the old capture is stale — keep only the newest.
+  const reuse = prior && prior.fetchId === authorizing.id && prior.pages === Number(body.pages);
+  const stored = { page: Number(body.page), bytes: 0, messages: normalizeTranscriptMessages(body.messages) };
+  stored.bytes = Buffer.byteLength(JSON.stringify(stored), 'utf8');
+  const pageList = (reuse ? prior.pageList : []).filter(page => page.page !== stored.page).concat([stored])
+    .sort((a, b) => a.page - b.page);
+  const bytes = pageList.reduce((sum, page) => sum + (Number(page.bytes) || 0), 0);
+  if (bytes > TRANSCRIPT_MAX_SESSION_BYTES)
+    return res.status(413).json({ error: 'transcript exceeds the per-session byte budget' });
+  const record = {
+    sessionId,
+    fetchId: authorizing.id,
+    pages: Number(body.pages),
+    bytes,
+    updatedAt: now,
+    expiresAt: now + TRANSCRIPT_TTL_MS,
+    pageList,
+  };
+  const candidate = enforceTranscriptRetention(
+    [...others, record]
+      .sort((a, b) => (Number(b.updatedAt) || 0) - (Number(a.updatedAt) || 0))
+      .slice(0, TRANSCRIPT_MAX_SESSIONS),
+    now,
+  );
+  try {
+    commitTranscripts(candidate);
+  } catch (error) {
+    return failPersistence(res, error);
+  }
+  res.json({
+    ok: true,
+    sessionId,
+    page: stored.page,
+    pages: record.pages,
+    storedPages: record.pageList.map(page => page.page),
+    bytes: record.bytes,
+    expiresAt: record.expiresAt,
+  });
+});
+app.get('/api/transcripts/:sessionId', (req, res) => {   // owner-gated by the global middleware
+  const sessionId = opaqueIdentity(req.params.sessionId);
+  if (!sessionId) return res.status(400).json({ error: 'invalid session identity' });
+  const now = Date.now();
+  const record = liveTranscripts(now).find(entry => entry.sessionId === sessionId);
+  if (!record) return res.status(404).json({ error: 'no transcript pages for this session' });
+  const available = record.pageList.map(page => page.page).sort((a, b) => a - b);
+  const requested = req.query.page === undefined ? available[0] : Number(req.query.page);
+  if (!Number.isInteger(requested)) return res.status(400).json({ error: 'page must be an integer' });
+  const found = record.pageList.find(page => page.page === requested);
+  if (!found) return res.status(404).json({ error: 'transcript page is not stored' });
+  res.json({
+    schemaVersion: TRANSCRIPT_SCHEMA_VERSION,
+    sessionId,
+    page: found.page,
+    pages: record.pages,
+    availablePages: available,
+    expiresAt: record.expiresAt,
+    messages: found.messages,
+  });
+});
+
+// --- state retention: the global fence over every store above -------------------------------------
+// Installed here because it prunes the transcript store and the command journal, so both must already
+// exist. Two triggers: a pass at boot and one every 6h, plus inline enforcement on the accept path of
+// a transcript push (below) so a burst of pushes can never outrun the timer. Nothing is deleted by
+// this module directly — it hands back a candidate set that commits through the same writeJsonState
+// discipline as every other mutation, and it stands down entirely while persistence is blocked.
+_retention = createRetention({
+  stateDir: STATE_DIR,
+  transcripts: () => _transcripts,
+  commands: () => _commands,
+  commitTranscripts: candidate => commitTranscripts(candidate),
+  commitCommands: candidate => commitCommands(candidate),
+  blocked: () => !!persistenceBlocked,
+  onError: (error, store) => { recordPersistenceFailure(error); console.error('[retention] ' + store + ': ' + error.message); },
+});
+// The push path is bounded by TRANSCRIPT_MAX_SESSIONS per its own leaf; this adds the global caps on
+// top so an accepted page can never leave the store over budget even between sweeps.
+function enforceTranscriptRetention(candidate, now = Date.now()) {
+  if (!_retention) return candidate;
+  return pruneTranscriptRetention(candidate, _retention.config, now).kept;
+}
+_retention.sweep();
+_retention.start();
 
 // --- file upload side-channel: phone -> VPS (stored here) -> the desktop app pulls it down to the PC
 // (scp, via a `fetchfile` command) and points the model at the local path. Deliberately NOT routed
@@ -1747,7 +2536,10 @@ app.get('/api/uploads/:id/raw', (req, res) => {
   if (!u) return res.status(404).end();
   res.sendFile(uploadDir(u.id) + '/' + u.name, {}, e => { if (e && !res.headersSent) res.status(404).end(); });
 });
-app.patch('/api/uploads/:id', (req, res) => {
+app.patch('/api/uploads/:id', withMutationIntent('upload.keep', req => ({
+  id: String(req.params.id),
+  keep: req.body && typeof req.body.keep === 'boolean' ? req.body.keep : null,
+}), (req, res) => {
   const index = _uploads.findIndex(x => x.id === req.params.id);
   if (index < 0) return res.status(404).json({ error: 'not found' });
   if (req.body && typeof req.body.keep === 'boolean') {
@@ -1760,8 +2552,10 @@ app.patch('/api/uploads/:id', (req, res) => {
     }
   }
   res.json({ ok: true, keep: _uploads[index].keep });
-});
-app.delete('/api/uploads/:id', (req, res) => {
+}));
+app.delete('/api/uploads/:id', withMutationIntent('upload.delete', req => ({
+  id: String(req.params.id),
+}), (req, res) => {
   const i = _uploads.findIndex(x => x.id === req.params.id);
   if (i >= 0) {
     const removed = _uploads[i];
@@ -1796,14 +2590,16 @@ app.delete('/api/uploads/:id', (req, res) => {
     }
   }
   res.json({ ok: true });
-});
+}));
 
 const server = http.createServer(app);
 // noServer + manual routing: two path-bound WebSocketServers on one http server BOTH grab 'upgrade'
 // and the non-matching one aborts the handshake with a 400 before the right one sees it.
 const wss = new WebSocketServer({ noServer: true });
 const wssHost = new WebSocketServer({ noServer: true });
+let draining = false;              // set by the SIGTERM restart drain at the bottom of this file
 server.on('upgrade', (req, socket, head) => {
+  if (draining) { try { socket.destroy(); } catch {} return; }   // a restarting relay accepts no new links
   const p = (req.url || '').split('?')[0];
   if (p === '/ws') {
     // Reject cross-site WebSocket hijacking BEFORE the handshake — a foreign/absent-in-prod Origin
@@ -1812,14 +2608,14 @@ server.on('upgrade', (req, socket, head) => {
     wss.handleUpgrade(req, socket, head, ws => wss.emit('connection', ws, req));
   }
   else if (p === '/host') {
-    // reject a bad /host token BEFORE completing the handshake (constant-time) — no 101, no 'open'
+    // reject a bad /host token BEFORE completing the handshake (constant-time) â€” no 101, no 'open'
     let ok = false; try { ok = hostTokenOk(new URL(req.url, 'http://x').searchParams.get('token')); } catch {}
     if (!ok) { try { socket.destroy(); } catch {} return; }
     wssHost.handleUpgrade(req, socket, head, ws => wssHost.emit('connection', ws, req));
   } else socket.destroy();
 });
 
-// ---- the PC session host's inbound link (muxd dials US — no inbound port on the PC) ---------------
+// ---- the PC session host's inbound link (muxd dials US â€” no inbound port on the PC) ---------------
 wssHost.on('connection', (ws, req) => {
   const u = new URL(req.url, 'http://x');
   if (!hostTokenOk(u.searchParams.get('token'))) { try { ws.close(1008, 'bad token'); } catch {} return; }
@@ -1828,7 +2624,9 @@ wssHost.on('connection', (ws, req) => {
   console.log('[host] PC session host candidate connected');
   ws.on('message', raw => {
     let m; try { m = JSON.parse(raw.toString()); } catch { return; }
-    if (containsForbiddenRemoteKey(m)) {
+    // "exe" is a forbidden remote key, and agentTruth legitimately carries one — scanning the raw frame
+    // would close the link on every hello a truth-capable muxd sends. See withoutAgentTruth().
+    if (containsForbiddenRemoteKey(withoutAgentTruth(m))) {
       console.log('[host] rejected path/command-bearing protocol frame');
       try { ws.close(1008, 'host frame violated protocol'); } catch {}
       return;
@@ -1860,6 +2658,7 @@ wssHost.on('connection', (ws, req) => {
       }
       for (const name of hostSessions.keys()) recompute(name);
       reconcileRenameIntentsFromHost();
+      sweepAttentionEpisodes();
       const legacy = new Set(legacyTmuxNames());
       const twins = [...hostSessions.keys()].filter(name => legacy.has(name));
       if (twins.length) console.log(`[legacy] hosted/legacy name conflict(s): ${twins.join(', ')} - relay will refuse web attach/manage until cleaned manually`);
@@ -1880,6 +2679,7 @@ wssHost.on('connection', (ws, req) => {
       hostSessions.clear();
       for (const [n, v] of incoming) hostSessions.set(n, v);
       reconcileRenameIntentsFromHost();
+      sweepAttentionEpisodes();
     } else if (m.t === 'createResult') {
       const rid = String(m.rid || '');
       const pending = pendingHostCreates.get(rid);
@@ -1915,7 +2715,7 @@ wssHost.on('connection', (ws, req) => {
         if (c.sbWait) {
           (c.q = c.q || []).push(buf); c.qBytes = (c.qBytes || 0) + buf.length;
           // Flood while still waiting for scrollback: relieve memory, but NEVER blank-and-drop.
-          // The live stream itself repaints a TUI, so go live now — clear once (a fresh attach
+          // The live stream itself repaints a TUI, so go live now â€” clear once (a fresh attach
           // starts clean) and replay what we buffered. wentLive means a late sb is dropped, but
           // only because real output is already painting the screen (never leaves it black).
           if (c.qBytes > 2000000 || c.q.length > 4000) {
@@ -1952,10 +2752,31 @@ wssHost.on('connection', (ws, req) => {
         }
         c.q = []; c.qBytes = 0;
       }
-    } else if (m.t === 'tailr') { const f = pendingTails.get(m.rid); if (f) { pendingTails.delete(m.rid); f(String(m.text || '')); }
+    } else if (m.t === 'lease') {
+      // muxd decided; the relay only mirrors. The frame is cached and fanned out verbatim so every
+      // viewer re-verifies muxd's signature itself — a relay that edits this string just breaks it.
+      const n = strictMuxName(m.s);
+      const raw = leaseConduit.cacheLeaseNotice(n, typeof m.f === 'string' ? m.f : '');
+      if (raw) broadcastLeaseNotice(n, raw);
+    } else if (m.t === 'resync') {
+      // muxd blew THIS session's ~1MiB egress budget and dropped its own backlog at a frame
+      // boundary. The gap is unrecoverable from the stream, so repaint from truth: CLEAR +
+      // scrollback replay for this session's viewers only — no other session lost a byte.
+      const n = strictMuxName(m.s); const st = sessions.get(n); if (!st) return;
+      clearScrollbackRequest(st);                 // supersede any in-flight (pre-gap) request
+      let asked = false;
+      for (const c of st.clients.values()) {
+        if (!c.hosted || c.ws.readyState !== 1) continue;
+        c.sbWait = true; c.wentLive = false; c.q = []; c.qBytes = 0;
+        asked = requestSessionScrollback(n, st, c) || asked;
+      }
+      // Host unreachable: never strand viewers buffering forever — go live and let output repaint.
+      if (!asked) for (const c of st.clients.values()) { c.sbWait = false; c.wentLive = true; }
+    } else if (m.t === 'tailr') { const f = pendingTails.get(m.rid); if (f) { pendingTails.delete(m.rid); f(String(m.text || ''), String(m.sig || '')); }
     } else if (m.t === 'killed') {
       const n = strictMuxName(m.s);
       hostSessions.delete(n);
+      leaseConduit.forgetSession(n);
       deleteSessionViewerState(n, 'session ended');
     }
   });
@@ -1979,9 +2800,9 @@ wssHost.on('connection', (ws, req) => {
 // ---- shared window sizing + DEVICE-IDENTITY PINNING (multi-client mirror, ONE stable size) --------
 // One shared size per session (tmux can't per-client-size a shared window; we hold every viewer at the
 // server-chosen size and each PANs if it's bigger than their screen). PIN = "prefer THIS device": the
-// pinned device's viewport drives the size for EVERYONE — last-pinner-wins — and it's keyed to a
+// pinned device's viewport drives the size for EVERYONE â€” last-pinner-wins â€” and it's keyed to a
 // persistent deviceId (localStorage), so a Wi-Fi blip / reconnect / relay restart does NOT lose the pin
-// (the old code pinned a connection id → gone on every reconnect). No pin = auto over the RECENTLY-ACTIVE
+// (the old code pinned a connection id â†’ gone on every reconnect). No pin = auto over the RECENTLY-ACTIVE
 // viewers only, so a backgrounded desktop tab in another room can't force your phone to pan forever.
 const PINS_FILE = STATE_DIR + '/pins.json';
 let pins = new Map();   // session -> { deviceId, label, cols, rows, at }
@@ -2088,7 +2909,7 @@ function reconcileRenameIntentsFromHost() {
 }
 savePins(pins);
 saveRenameIntents(renameIntents);
-setInterval(() => {
+const _pinRetryTimer = setInterval(() => {
   if (!_pinsDirty) return;
   try { savePins(new Map(pins)); }
   catch (error) {
@@ -2256,7 +3077,7 @@ function recompute(name) {
     if (c.ws.readyState !== 1) continue;
     const mine = pinned && sz.pin.deviceId === (c.deviceId || ('sock-' + c.id));
     const mode = sz.hostedSize ? 'local' : (pinned ? 'pinned' : 'auto');
-    const modeLabel = sz.hostedSize ? `local · ${cols}×${rows}` : (pinned ? `📌 ${pinLabel} · ${cols}×${rows}` : `auto · ${cols}×${rows}`);
+    const modeLabel = sz.hostedSize ? `local Â· ${cols}Ã—${rows}` : (pinned ? `ðŸ“Œ ${pinLabel} Â· ${cols}Ã—${rows}` : `auto Â· ${cols}Ã—${rows}`);
     sendViewer(name, st, c, 'd' + JSON.stringify({ cols, rows, mode, pinLabel, mine, modeLabel, me: c.id, clients }));
   }
 }
@@ -2272,7 +3093,7 @@ function pinToDeviceId(name, deviceId) {   // long-press: pin to ANY listed devi
   const c = [...st.clients.values()].find(x => (x.deviceId || ('sock-' + x.id)) === deviceId);
   if (c) pinToDevice(name, c, true);
 }
-function cycleMode(name, client) {   // the size chip / legacy 's': toggle pin-to-ME ↔ auto (last-pinner-wins)
+function cycleMode(name, client) {   // the size chip / legacy 's': toggle pin-to-ME â†” auto (last-pinner-wins)
   const pin = pins.get(name);
   const mine = pin && client && pin.deviceId === (client.deviceId || ('sock-' + client.id));
   pinToDevice(name, client, !mine);
@@ -2280,6 +3101,17 @@ function cycleMode(name, client) {   // the size chip / legacy 's': toggle pin-t
 function applyActivity(client, o) {
   if (o && typeof o.vis === 'boolean') client.visible = o.vis;
   if (o && o.act) client.lastActive = Date.now();
+}
+// Fan a muxd lease notice to every viewer of a session, unmodified. Deliberately NOT routed through
+// sendViewer: that path is byte-stream backpressure for terminal output, and a control frame the
+// client must verify may not be coalesced, truncated, or dropped into a burst queue.
+function broadcastLeaseNotice(name, raw) {
+  const st = sessions.get(name);
+  if (!st) return;
+  for (const c of st.clients.values()) {
+    if (!c || !c.ws || c.ws.readyState !== 1) continue;
+    try { c.ws.send('L' + raw); } catch {}
+  }
 }
 // Shared sizing/pin/activity message handler for BOTH paths ('i' input stays with each caller).
 function handleClientMsg(name, client, s) {
@@ -2309,9 +3141,9 @@ wss.on('connection', async (ws, req) => {
   const vcols = clampTermDimension(u.searchParams.get('cols'), 100, MAX_TERM_COLS);
   const vrows = clampTermDimension(u.searchParams.get('rows'), 30, MAX_TERM_ROWS);
   const deviceId = (u.searchParams.get('dev') || '').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 40);   // persistent device identity for pinning
-  const label = (u.searchParams.get('label') || '').replace(/[^\w .·/+-]/g, '').slice(0, 32) || 'device';
+  const label = (u.searchParams.get('label') || '').replace(/[^\w .Â·/+-]/g, '').slice(0, 32) || 'device';
 
-  // ---- PC-HOSTED attach: bridge this viewer to muxd (no tmux, no ssh — the session lives on the PC).
+  // ---- PC-HOSTED attach: bridge this viewer to muxd (no tmux, no ssh â€” the session lives on the PC).
   // Unknown web tabs create an empty PC-local muxd shell. That preserves the old pleasant multiplex flow
   // while keeping ownership local to the PC instead of the VPS.
   const legacyBlocked = tmuxHas(name);
@@ -2344,7 +3176,7 @@ wss.on('connection', async (ws, req) => {
     }
     // Scrollback slow/large: relieve the wait WITHOUT blanking the screen. If live output was
     // buffered, flow it now (a TUI repaints). If the session is idle (nothing buffered), leave the
-    // screen as-is and keep waiting — wentLive stays false so the sb reply (or the next live byte)
+    // screen as-is and keep waiting â€” wentLive stays false so the sb reply (or the next live byte)
     // still paints it. Blanking here and then dropping the late sb was the black-screen bug.
     client.sbTimer = setTimeout(() => {
       if (!client.sbWait) return;
@@ -2359,6 +3191,12 @@ wss.on('connection', async (ws, req) => {
       }
     }, HOST_SB_WAIT_MS);
     recompute(name);
+    // A viewer that attaches mid-lease must not be told "you may type" by silence. Replay muxd's
+    // last notice verbatim; if the relay has none, it says nothing rather than inventing a state.
+    {
+      const pending = leaseConduit.cachedNotice(name);
+      if (pending) { try { ws.send('L' + pending); } catch {} }
+    }
     ws.on('message', m => {
       const s = m.toString();
       if (s[0] === 'i') {
@@ -2366,6 +3204,17 @@ wss.on('connection', async (ws, req) => {
           try { ws.close(1013, 'PC mux host offline'); } catch {}
           return;
         }
+        client.lastActive = Date.now(); return;
+      }
+      // 'I' signed input, 'L' signed lease op. The relay forwards the client's exact bytes: it has
+      // no key to re-sign with, so any edit here would invalidate the proof rather than forge it.
+      if (s[0] === 'I' || s[0] === 'L') {
+        const raw = s.slice(1);
+        const out = s[0] === 'I'
+          ? (leaseConduit.forwardSignedInput(name, raw) || leaseConduit.forwardDeliberateSend(name, raw))
+          : leaseConduit.forwardSignedLeaseOp(name, raw);
+        if (!out) return;                                   // unproven frame: dropped, never repaired
+        if (!sendHost(out)) { try { ws.close(1013, 'PC mux host offline'); } catch {} return; }
         client.lastActive = Date.now(); return;
       }
       handleClientMsg(name, client, s);
@@ -2380,6 +3229,80 @@ wss.on('connection', async (ws, req) => {
 
 const PORT = +process.env.PORT || 7682;
 // 0.0.0.0: the PC's muxd dials us directly over the LAN (ws://<vps>:7682/host, token-gated; ufw scopes
-// the port to the LAN). Loopback-trust semantics are unchanged — a LAN caller is NOT trusted-local and
+// the port to the LAN). Loopback-trust semantics are unchanged â€” a LAN caller is NOT trusted-local and
 // still hits the hl-auth owner gate for everything except /host-with-token.
 server.listen(PORT, '0.0.0.0', () => console.log('multiplex-app on 0.0.0.0:' + PORT));
+
+// --- ops alerts: push on degraded-health edge transitions (r.1.17) ---
+// Secret (ntfy topic URL) lives in /etc/multiplex-app.env as MUX_ALERT_NTFY_URL.
+// The topic IS the credential — never committed, never logged.
+if (process.env.MUX_ALERT_NTFY_URL) {
+  startHealthAlerts({
+    notifier: createNotifier({ url: process.env.MUX_ALERT_NTFY_URL }),
+    getHealth: healthSnapshot,
+  });
+}
+
+// ---- RESTART DRAIN: a deploy must be invisible, not a black hole --------------------------------
+// A deploy sends SIGTERM. With no handler node dies mid-frame: every socket is reset, the browser sees
+// an abnormal 1006 and walks its exponential backoff, and a live terminal looks dead for ~10s. Instead
+// we drain: refuse new upgrades, flush the only in-memory-dirty durable state, close every viewer with
+// 1012 "restarting" (index.html maps that to a 500ms reconnect fuse + a toast), and close the muxd host
+// link LAST so the PC never learns the viewers are gone before they actually are. Everything is torn
+// down so the loop empties on its own; the 5s timer is an unref'd backstop, not the expected path.
+function flushDurableStateForRestart() {
+  // Every acknowledged mutation already committed through durable-state.js before it was published in
+  // memory — pins are the one value allowed to lag behind (coalesced by a 20s retry timer), so they are
+  // the only thing a restart can actually lose.
+  if (!_pinsDirty) return;
+  try { savePins(new Map(pins)); }
+  catch (error) { console.error('[drain] pin flush failed: ' + String(error && error.message || error)); }
+}
+function drainForRestart(signal) {
+  if (draining) return;
+  draining = true;
+  setTimeout(() => process.exit(0), 5000).unref();   // unref'd: never hold the loop open just to die
+  console.log(`[drain] ${signal}: refusing upgrades, closing viewers with 1012 restarting`);
+
+  try { server.close(); } catch {}                   // stop listening; already-upgraded sockets survive
+  try { server.closeIdleConnections(); } catch {}    // idle keep-alive HTTP would otherwise pin the loop
+  flushDurableStateForRestart();
+  clearInterval(_pinRetryTimer);
+  if (_probeBootTimer) clearTimeout(_probeBootTimer);
+  if (_probeTimer) clearInterval(_probeTimer);
+
+  const viewers = new Set(wss.clients);
+  for (const st of sessions.values()) {
+    if (st.sbRequestTimer) { clearTimeout(st.sbRequestTimer); st.sbRequestTimer = null; }
+    for (const client of st.clients.values()) {
+      if (client.ka) { clearInterval(client.ka); client.ka = null; }
+      viewers.add(client.ws);
+    }
+  }
+  for (const ws of viewers) { try { ws.close(1012, 'restarting'); } catch {} }
+
+  const host = hostWs;
+  for (const ws of wssHost.clients) if (ws !== host) { try { ws.close(1012, 'restarting'); } catch {} }
+  if (host) { try { host.close(1012, 'restarting'); } catch {} }   // host link closed last, always
+
+  // grace for those close frames to reach the wire, then force the rest down so the loop can empty
+  setTimeout(() => {
+    for (const ws of viewers) { try { ws.terminate(); } catch {} }
+    for (const ws of wssHost.clients) { try { ws.terminate(); } catch {} }
+    try { wss.close(); } catch {}
+    try { wssHost.close(); } catch {}
+  }, 750).unref();
+}
+process.on('SIGTERM', () => drainForRestart('SIGTERM'));
+// Windows cannot deliver SIGTERM to a running process at all — libuv turns kill('SIGTERM') into
+// TerminateProcess, so the handler above provably never runs there (even self-signalling just dies).
+// Production is Linux, but the dev machine is not, and a drain nobody can test is a drain that rots.
+// So: a second door, opened only under MUX_TEST_MODE and only over an IPC channel the parent had to
+// create at spawn time — in a deploy there is no channel and no test mode, so it cannot be reached.
+if (TEST_MODE && process.send) {
+  process.on('message', m => {
+    if (!m || m.t !== 'drain') return;
+    try { process.channel.unref(); } catch {}   // else the IPC handle alone keeps the loop alive forever
+    drainForRestart('SIGTERM');
+  });
+}

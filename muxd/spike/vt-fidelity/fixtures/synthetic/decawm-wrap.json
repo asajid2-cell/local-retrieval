@@ -1,0 +1,9 @@
+{
+  "name": "decawm-wrap",
+  "corpus": "synthetic",
+  "cols": 40,
+  "rows": 12,
+  "bytes": 223,
+  "source": "gen_synthetic.py",
+  "desc": "DECAWM on (wrap) vs off (clamp) over the right margin"
+}

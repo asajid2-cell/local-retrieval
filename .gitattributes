@@ -1,0 +1,6 @@
+# These files are consumed by Linux (bash shebang / systemd unit parsing).
+# They must never be checked out with CRLF: a CR in the shebang makes the
+# kernel look for a program literally named "bash\r" and the unit fails.
+*.sh text eol=lf
+*.service text eol=lf
+*.timer text eol=lf

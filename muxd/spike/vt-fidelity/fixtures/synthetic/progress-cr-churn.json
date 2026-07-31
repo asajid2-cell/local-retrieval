@@ -1,0 +1,9 @@
+{
+  "name": "progress-cr-churn",
+  "corpus": "synthetic",
+  "cols": 60,
+  "rows": 16,
+  "bytes": 1282,
+  "source": "gen_synthetic.py",
+  "desc": "CR/EL2 progress bar plus CUU-based in-place redraw"
+}

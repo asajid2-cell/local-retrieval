@@ -1,0 +1,9 @@
+{
+  "name": "sgr-256-truecolor",
+  "corpus": "synthetic",
+  "cols": 90,
+  "rows": 20,
+  "bytes": 555,
+  "source": "gen_synthetic.py",
+  "desc": "SGR 16/bright/256/truecolor fg+bg and attribute toggles"
+}

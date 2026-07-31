@@ -1,0 +1,7 @@
+primary line A
+primary line B
+primary line C
+[?1049h[2J[HALT ROW 1
+ALT ROW 2
+ALT ROW 3[?1049l
+primary line D

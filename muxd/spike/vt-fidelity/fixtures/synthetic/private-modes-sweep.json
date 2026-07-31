@@ -1,0 +1,9 @@
+{
+  "name": "private-modes-sweep",
+  "corpus": "synthetic",
+  "cols": 80,
+  "rows": 40,
+  "bytes": 456,
+  "source": "gen_synthetic.py",
+  "desc": "set/reset each REPLAY_PRIVATE_MODES mode with text between"
+}

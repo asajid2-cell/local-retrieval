@@ -13,12 +13,14 @@
 # State: sessions.json manifest (resume commands) -> muxd restart / PC reboot lists unarmed sessions
 # as dormant placeholders. Only sessions explicitly armed with heal auto-start.
 import asyncio, base64, collections, ctypes, gc, glob, hashlib, json, os, queue, re, socket, ssl, subprocess, sys, tempfile, threading, time, traceback
+import concurrent.futures
 from ctypes import wintypes
 from datetime import datetime, timedelta, timezone
 import faulthandler
 try: faulthandler.enable(open(os.path.join(os.path.expanduser("~"), "muxd", "muxd.crash"), "a"))
 except Exception: pass
 from winpty import PtyProcess
+import host_input_intent
 
 HOME = os.path.expanduser("~")
 DIR = os.path.join(HOME, "muxd")
@@ -400,6 +402,83 @@ _CONPTY_HOST_EXECUTABLES = (
 _ORPHANED_CONPTY_LOCK = threading.Lock()
 _ORPHANED_CONPTY_HOSTS = {}
 _PENDING_CONPTY_BASELINES = {}
+# Baselines the reaper gave up on. Diagnostic only: nothing reads this to make a decision, so a
+# quarantine that can never resolve degrades into a log line instead of wedging every future spawn.
+_ABANDONED_CONPTY_BASELINES = []
+CONPTY_ABANDONED_BASELINE_LIMIT = 16
+CONPTY_CUSTODY_TTL = float(os.environ.get("MUXD_CONPTY_CUSTODY_TTL", "300"))
+CONPTY_QUARANTINE_TTL = float(os.environ.get("MUXD_CONPTY_QUARANTINE_TTL", "60"))
+CONPTY_QUARANTINE_MAX_ATTEMPTS = 5
+# Last emission of each recurring "still pending" line, so unchanged state stops narrating
+# itself every reap. One slot PER KIND, not one shared slot: both lines can fire inside the
+# same reap pass with different signatures, and a single slot would see them alternate and
+# never suppress anything. Transition lines (abandoning / quarantine expired) never come here.
+_LAST_CUSTODY_EMISSION = {
+    "discovery": {"sig": None, "at": 0.0, "repeats": 0},
+    "cleanup": {"sig": None, "at": 0.0, "repeats": 0},
+}
+CONPTY_EMISSION_INTERVAL = 60.0
+CONPTY_REAPER_INTERVAL = 5.0
+CONPTY_REAPER_MAX_INTERVAL = 30.0
+
+def _custody_record(reason, now=None):
+    stamp = time.monotonic() if now is None else float(now)
+    return {
+        "reason": str(reason or ""),
+        "first_seen": stamp,
+        "last_attempt": stamp,
+        "attempts": 0,
+    }
+
+def _custody_age(record, now=None):
+    stamp = time.monotonic() if now is None else float(now)
+    return max(0.0, stamp - float(record.get("first_seen", stamp)))
+
+def _custody_touch(record, now=None):
+    stamp = time.monotonic() if now is None else float(now)
+    record["attempts"] = int(record.get("attempts", 0)) + 1
+    record["last_attempt"] = stamp
+    return record
+
+def _custody_emission_signature(retained=(), failures=()):
+    """The observable custody state a 'still pending' line is reporting on. Two passes that
+    produce the same signature are saying the same thing, so only the first needs to speak."""
+    with _ORPHANED_CONPTY_LOCK:
+        pending = tuple(sorted(_PENDING_CONPTY_BASELINES))
+    return (tuple(sorted(retained)), tuple(failures), pending)
+
+def _emit_custody_pending(kind, signature, message, now=None):
+    """Log a recurring custody line only when its state changed, or once per
+    CONPTY_EMISSION_INTERVAL while it has not — a permanently stuck record then reports once a
+    minute instead of 720 times an hour. Suppressed repeats are counted onto the next line."""
+    slot = _LAST_CUSTODY_EMISSION[kind]
+    stamp = time.monotonic() if now is None else float(now)
+    if slot["sig"] == signature and stamp - float(slot["at"]) < CONPTY_EMISSION_INTERVAL:
+        slot["repeats"] = int(slot.get("repeats", 0)) + 1
+        return False
+    repeats = int(slot.get("repeats", 0))
+    slot["sig"] = signature
+    slot["at"] = stamp
+    slot["repeats"] = 0
+    log(f"{message} (repeated {repeats}x)" if repeats else message)
+    return True
+
+def _reaper_tick_signature(retained_count):
+    """What the reaper tick compares between passes: a reap that changed nothing at all
+    produces an identical signature, including the count it still holds."""
+    with _ORPHANED_CONPTY_LOCK:
+        hosts = tuple(sorted(_ORPHANED_CONPTY_HOSTS))
+        pending = tuple(sorted(_PENDING_CONPTY_BASELINES))
+    return (int(retained_count), hosts, pending)
+
+def _reaper_backoff(prev_sig, sig, prev_delay):
+    """Sleep before the next reap. Any progress — a changed signature, a newly retained
+    record — snaps back to CONPTY_REAPER_INTERVAL; a reap that moved nothing doubles toward
+    CONPTY_REAPER_MAX_INTERVAL so a hopeless record cannot spin the executor every 5s."""
+    if prev_sig is None or sig != prev_sig:
+        return CONPTY_REAPER_INTERVAL
+    delay = float(prev_delay or CONPTY_REAPER_INTERVAL)
+    return min(CONPTY_REAPER_MAX_INTERVAL, max(CONPTY_REAPER_INTERVAL, delay * 2.0))
 
 def _direct_child_pids(parent_pid, executable_name=""):
     if os.name != "nt":
@@ -585,41 +664,115 @@ def _retain_orphaned_conpty_hosts(owned, reason):
         return
     with _ORPHANED_CONPTY_LOCK:
         for pid, start_token in records:
-            _ORPHANED_CONPTY_HOSTS[(int(pid), str(start_token))] = str(reason or "")
+            key = (int(pid), str(start_token))
+            # An already-custodied host keeps its original first_seen and first reason:
+            # re-retaining must not reset the age clock a later GC pass reads.
+            if key not in _ORPHANED_CONPTY_HOSTS:
+                _ORPHANED_CONPTY_HOSTS[key] = _custody_record(reason)
     log(f"[conpty] retained {len(records)} orphan host record(s) for supervised cleanup: {reason}")
 
 def _retain_pending_conpty_baseline(records, reason):
     baseline = tuple(sorted((int(pid), str(token)) for pid, token in (records or {}).items()))
     with _ORPHANED_CONPTY_LOCK:
-        _PENDING_CONPTY_BASELINES[baseline] = str(reason or "")
+        if baseline not in _PENDING_CONPTY_BASELINES:
+            _PENDING_CONPTY_BASELINES[baseline] = _custody_record(reason)
     log(f"[conpty] quarantined new PTY spawns pending orphan discovery: {reason}")
 
 def _reap_orphaned_conpty_hosts(timeout=5):
     with _CONPTY_SPAWN_LOCK:
         with _ORPHANED_CONPTY_LOCK:
             pending_baselines = list(_PENDING_CONPTY_BASELINES.items())
-        for baseline_key, reason in pending_baselines:
+        for baseline_key, baseline_record in pending_baselines:
+            reason = baseline_record["reason"]
             try:
                 discovered = _new_conpty_host_processes(
                     dict(baseline_key),
                     timeout=min(1.0, max(0.1, timeout)),
                 )
             except OSError as error:
-                log(f"[conpty] orphan discovery still pending: {error}")
+                # Enumeration failed again — the same fault that created this baseline. Age it, and
+                # once it is hopeless drop it so spawns resume; a leaked host beats a dead daemon.
+                _custody_touch(baseline_record)
+                age = _custody_age(baseline_record)
+                attempts = int(baseline_record.get("attempts", 0))
+                if age > CONPTY_QUARANTINE_TTL or attempts >= CONPTY_QUARANTINE_MAX_ATTEMPTS:
+                    with _ORPHANED_CONPTY_LOCK:
+                        _PENDING_CONPTY_BASELINES.pop(baseline_key, None)
+                        _ABANDONED_CONPTY_BASELINES.append({
+                            "baseline": baseline_key,
+                            "reason": reason,
+                            "age": age,
+                            "attempts": attempts,
+                            "error": str(error),
+                        })
+                        del _ABANDONED_CONPTY_BASELINES[:-CONPTY_ABANDONED_BASELINE_LIMIT]
+                    log(
+                        f"[conpty] quarantine expired after {age:.1f}s / {attempts} attempt(s), "
+                        f"resuming spawns (orphan hosts may have leaked): {reason}"
+                    )
+                    continue
+                _emit_custody_pending(
+                    "discovery",
+                    _custody_emission_signature(failures=(str(error),)),
+                    f"[conpty] orphan discovery still pending: {error}",
+                )
                 continue
             with _ORPHANED_CONPTY_LOCK:
                 _PENDING_CONPTY_BASELINES.pop(baseline_key, None)
             _retain_orphaned_conpty_hosts(discovered, reason)
         with _ORPHANED_CONPTY_LOCK:
             records = list(_ORPHANED_CONPTY_HOSTS)
-    retained, failures = _terminate_conhost_records(records, timeout=timeout)
+    # Partition before terminating: a custody record must never outlive its subject.
+    # The _same_process_instance probes call into Win32, so they run OUTSIDE the lock.
+    live = []
+    dormant = []
+    abandoned = []
+    for key in records:
+        pid, start_token = key
+        if not _same_process_instance(int(pid), start_token):
+            # Dead pid, or the pid was recycled onto an unrelated process. Either way
+            # there is nothing of ours left to kill — dropping is not a failure.
+            dormant.append(key)
+            continue
+        with _ORPHANED_CONPTY_LOCK:
+            record = _ORPHANED_CONPTY_HOSTS.get(key)
+        if record is None:
+            continue
+        age = _custody_age(record)
+        if age > CONPTY_CUSTODY_TTL:
+            abandoned.append((key, record, age))
+            continue
+        live.append(key)
+    if dormant or abandoned:
+        with _ORPHANED_CONPTY_LOCK:
+            for key in dormant:
+                _ORPHANED_CONPTY_HOSTS.pop(key, None)
+            for key, _record, _age in abandoned:
+                _ORPHANED_CONPTY_HOSTS.pop(key, None)
+    for key, record, age in abandoned:
+        log(
+            f"[conpty] abandoning orphan host record pid={key[0]} after {age:.1f}s"
+            f" / {int(record.get('attempts', 0))} attempt(s): {record['reason']}"
+        )
+    if live:
+        retained, failures = _terminate_conhost_records(live, timeout=timeout)
+    else:
+        retained, failures = [], []
     retained_set = set(retained)
     with _ORPHANED_CONPTY_LOCK:
-        for record in records:
-            if record not in retained_set:
-                _ORPHANED_CONPTY_HOSTS.pop(record, None)
+        for key in live:
+            if key not in retained_set:
+                _ORPHANED_CONPTY_HOSTS.pop(key, None)
+                continue
+            record = _ORPHANED_CONPTY_HOSTS.get(key)
+            if record is not None:
+                _custody_touch(record)
     if failures:
-        log(f"[conpty] supervised orphan cleanup still pending: {'; '.join(failures)}")
+        _emit_custody_pending(
+            "cleanup",
+            _custody_emission_signature(retained, failures),
+            f"[conpty] supervised orphan cleanup still pending: {'; '.join(failures)}",
+        )
     return len(retained)
 
 def _release_pty_conhosts(pty, session_name="?", timeout=3):
@@ -905,11 +1058,57 @@ CLAIM_ROOT = ENV.get("LAUNCH_CLAIM_ROOT") or os.path.join(
     "launch-claims",
 )
 CLAIM_TTL_SECONDS = max(10, int(ENV.get("LAUNCH_CLAIM_TTL_SECONDS", "120")))
+# Custody TTL: how long a session record muxd is no longer running stays on the books. A dormant tab
+# is a promise to relaunch; a record nobody has touched for a day is landfill that the relay would
+# keep showing forever. os.environ wins over .env so an operator can shorten it for one run.
+CUSTODY_TTL_SECONDS = max(
+    60, int(os.environ.get("MUX_CUSTODY_TTL_S") or ENV.get("MUX_CUSTODY_TTL_S") or "86400")
+)
+# identityPending means a launch is mid-flight with no captured identity yet — reclaiming it would
+# orphan a process nobody can find again, so it survives its deadline by this much.
+CUSTODY_IDENTITY_GRACE_SECONDS = max(
+    30, int(os.environ.get("MUX_CUSTODY_IDENTITY_GRACE_S") or ENV.get("MUX_CUSTODY_IDENTITY_GRACE_S") or "900")
+)
+CUSTODY_GC_INTERVAL_SECONDS = max(
+    30, int(os.environ.get("MUX_CUSTODY_GC_INTERVAL_S") or ENV.get("MUX_CUSTODY_GC_INTERVAL_S") or "600")
+)
+CLAIM_SWEEP_SECONDS = max(15, int(ENV.get("LAUNCH_CLAIM_SWEEP_SECONDS", "60")))
 PROTOCOL = 4
-CAPS = ["ls", "info", "create", "createAck", "bind", "input", "open", "attach", "kill", "rename", "heal", "tail", "scrollback", "resize", "owner", "relaunch"]
+CAPS = ["ls", "info", "create", "createAck", "bind", "input", "open", "attach", "kill", "rename", "heal", "tail", "scrollback", "resize", "owner", "relaunch", "agentTruth", "resync", "inputDurable"]
+# The relay is a conduit, not an authority: a host-link `i` frame only reaches the PTY when it
+# carries a principal-signed input.durable proof this endpoint verifies. Empty until pairing
+# provisions a principal, which means "refuse everything" — the correct posture, not a gap.
+PRINCIPAL_ENDPOINT = host_input_intent.PrincipalEndpoint()
+
+def authorize_relay_input(frame, session, endpoint=None, now_ms=None):
+    """Gate one relay host-link `i` frame. Returns `(principal, body, refusal)`.
+
+    Deliberately does NOT consult MUX_AUTHZ_MODE. An audit mode that still performed the write
+    would be exactly the proofless PTY write this endpoint exists to remove; the knob stays for
+    endpoints where "observe first" is a real option, and this is not one of them.
+    """
+    return host_input_intent.verify_host_input_frame(
+        frame,
+        endpoint=PRINCIPAL_ENDPOINT if endpoint is None else endpoint,
+        session=session,
+        now_ms=int(time.time() * 1000) if now_ms is None else now_ms,
+    )
+
 STARTED = time.time()
 AGENT_WORKING_FRESH = float(ENV.get("AGENT_WORKING_FRESH", "25"))
 AGENT_STARTING_GRACE = float(ENV.get("AGENT_STARTING_GRACE", "45"))
+# --- process-truth probe budget -------------------------------------------------
+# A session payload is built on the event loop, several times a second, for every
+# session. Asking the OS "is the agent really alive" is a syscall storm, so the
+# answer is cached and refreshed OFF the loop by a tiny dedicated executor. Nothing
+# on the request path ever waits for a probe: a missing or stale answer degrades to
+# the heuristic ladder instead of blocking.
+AGENT_TRUTH_TTL = max(10.0, float(ENV.get("AGENT_TRUTH_TTL", "10")))          # refresh no faster than this
+AGENT_TRUTH_MAX_AGE = max(AGENT_TRUTH_TTL * 3, float(ENV.get("AGENT_TRUTH_MAX_AGE", "30")))  # older => heuristic
+AGENT_TRUTH_PROBE_TIMEOUT = min(3.0, max(0.5, float(ENV.get("AGENT_TRUTH_PROBE_TIMEOUT", "3"))))
+AGENT_TRUTH_MAX_INFLIGHT = 2        # hard ceiling on concurrent probes; a wedged probe cannot pile up
+AGENT_TRUTH_MAX_PIDS = 400          # bounded subtree walk
+AGENT_TRUTH_MAX_DEPTH = 12
 ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]")
 STALE_CSI_RE = re.compile(r"\[[0-?]*[ -/]*[@-~]")
 CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
@@ -1041,7 +1240,7 @@ def _without_ignored_live(live, ignored):
     return ok, filtered, detail
 
 
-def _pid_descends_from(pid, ancestor_pid):
+def _pid_descends_from(pid, ancestor_pid, timeout=15):
     try:
         pid = int(pid)
         ancestor_pid = int(ancestor_pid)
@@ -1064,7 +1263,7 @@ def _pid_descends_from(pid, ancestor_pid):
             ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
             capture_output=True,
             text=True,
-            timeout=15,
+            timeout=max(0.5, float(timeout)),
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         if result.returncode != 0:
@@ -1073,6 +1272,249 @@ def _pid_descends_from(pid, ancestor_pid):
         return True if value == "true" else False if value == "false" else None
     except Exception:
         return None
+
+
+_AGENT_TRUTH_LOCK = threading.Lock()      # guards the cache dict ONLY - never held across a probe
+_AGENT_TRUTH_CACHE = {}                   # (pid, start_token) -> entry
+_AGENT_TRUTH_INFLIGHT = 0
+_AGENT_TRUTH_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=AGENT_TRUTH_MAX_INFLIGHT, thread_name_prefix="agent-truth"
+)
+AGENT_TRUTH_UNKNOWN = {"procAlive": False, "cpuActiveRecent": False, "exe": "", "checkedUtc": ""}
+
+
+def _process_rows():
+    """(pid, parentPid, exe) for every process, from one Toolhelp32 snapshot.
+
+    Same machinery `_direct_child_pids` uses, walked once instead of once per parent:
+    a descendant probe that re-snapshots per level costs O(depth) snapshots for nothing.
+    """
+    if os.name != "nt":
+        return []
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_snapshot = kernel32.CreateToolhelp32Snapshot
+    create_snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    create_snapshot.restype = wintypes.HANDLE
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [wintypes.HANDLE]
+    close_handle.restype = wintypes.BOOL
+    snapshot = create_snapshot(0x00000002, 0)  # TH32CS_SNAPPROCESS
+    if snapshot == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    entry = _PROCESSENTRY32W()
+    entry.dwSize = ctypes.sizeof(entry)
+    rows = []
+    try:
+        first = kernel32.Process32FirstW
+        first.argtypes = [wintypes.HANDLE, ctypes.POINTER(_PROCESSENTRY32W)]
+        first.restype = wintypes.BOOL
+        next_entry = kernel32.Process32NextW
+        next_entry.argtypes = [wintypes.HANDLE, ctypes.POINTER(_PROCESSENTRY32W)]
+        next_entry.restype = wintypes.BOOL
+        ctypes.set_last_error(0)
+        if not first(snapshot, ctypes.byref(entry)):
+            error = ctypes.get_last_error()
+            if error == 18:  # ERROR_NO_MORE_FILES
+                return []
+            raise ctypes.WinError(error)
+        while True:
+            rows.append((int(entry.th32ProcessID), int(entry.th32ParentProcessID), str(entry.szExeFile or "")))
+            ctypes.set_last_error(0)
+            if not next_entry(snapshot, ctypes.byref(entry)):
+                error = ctypes.get_last_error()
+                if error not in (0, 18):
+                    raise ctypes.WinError(error)
+                break
+        return rows
+    finally:
+        close_handle(snapshot)
+
+
+def _process_cpu_100ns(pid):
+    """Kernel+user CPU consumed by one pid, in 100ns ticks. 0 when unreadable."""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return 0
+    if pid <= 0 or os.name != "nt":
+        return 0
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        open_process = kernel32.OpenProcess
+        open_process.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        open_process.restype = wintypes.HANDLE
+        get_process_times = kernel32.GetProcessTimes
+        get_process_times.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
+        get_process_times.restype = wintypes.BOOL
+        handle = open_process(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return 0
+        try:
+            created, exited, kernel, user = (wintypes.FILETIME() for _ in range(4))
+            if not get_process_times(handle, ctypes.byref(created), ctypes.byref(exited),
+                                     ctypes.byref(kernel), ctypes.byref(user)):
+                return 0
+            total = 0
+            for part in (kernel, user):
+                total += (int(part.dwHighDateTime) << 32) | int(part.dwLowDateTime)
+            return total
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception:
+        return 0
+
+
+def _agent_truth_subtree(root_pid, rows):
+    """Bounded descendant walk. Returns (pids, exe, agentPid) where exe/agentPid name the
+    deepest non-ConPTY-host descendant - the process a human would call "the agent"."""
+    children = {}
+    names = {}
+    for pid, parent, exe in rows:
+        names[pid] = exe
+        children.setdefault(parent, []).append(pid)
+    if root_pid not in names:
+        return [], "", 0
+    pids = [root_pid]
+    best = (-1, root_pid, names.get(root_pid, ""))
+    seen = {root_pid}
+    frontier = [(root_pid, 0)]
+    while frontier and len(pids) < AGENT_TRUTH_MAX_PIDS:
+        pid, depth = frontier.pop(0)
+        if depth >= AGENT_TRUTH_MAX_DEPTH:
+            continue
+        for child in sorted(children.get(pid, [])):
+            if child in seen or child == pid or len(pids) >= AGENT_TRUTH_MAX_PIDS:
+                continue
+            seen.add(child)
+            pids.append(child)
+            frontier.append((child, depth + 1))
+            exe = names.get(child, "")
+            if exe.lower() in _CONPTY_HOST_EXECUTABLES:
+                continue
+            if depth + 1 > best[0]:
+                best = (depth + 1, child, exe)
+    return pids, best[2], best[1]
+
+
+def _agent_truth_probe(pid, start_token, previous=None):
+    """Off-loop, bounded. Answers whether the session's process tree is REALLY alive."""
+    checked = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    if start_token and not _same_process_instance(pid, start_token):
+        # The pid we recorded is gone (or was recycled onto somebody else's process).
+        return {"procAlive": False, "cpuActiveRecent": False, "exe": "", "checkedUtc": checked}, 0, 0
+    try:
+        rows = _process_rows()
+    except Exception as error:
+        log(f"agent-truth snapshot failed for pid {pid}: {error}")
+        rows = None
+    if rows is None:
+        # Snapshot unavailable: fall back to the per-pid ancestry walk, capped at the
+        # probe budget, to re-confirm the descendant we saw last time.
+        agent_pid = int((previous or {}).get("agentPid", 0) or 0)
+        alive = _pid_alive(pid)
+        if not alive and agent_pid > 0 and _pid_alive(agent_pid):
+            alive = _pid_descends_from(agent_pid, pid, timeout=AGENT_TRUTH_PROBE_TIMEOUT) is True
+        return ({"procAlive": bool(alive), "cpuActiveRecent": False,
+                 "exe": str((previous or {}).get("exe", "") or "") if alive else "",
+                 "checkedUtc": checked}, 0, 0)
+    pids, exe, agent_pid = _agent_truth_subtree(int(pid), rows)
+    alive = bool(pids) or _pid_alive(pid)
+    if not alive:
+        return {"procAlive": False, "cpuActiveRecent": False, "exe": "", "checkedUtc": checked}, 0, 0
+    cpu = sum(_process_cpu_100ns(p) for p in pids)
+    prev_cpu = int((previous or {}).get("cpu", 0) or 0)
+    had_prev = prev_cpu > 0
+    return ({"procAlive": True, "cpuActiveRecent": bool(had_prev and cpu > prev_cpu),
+             "exe": exe, "checkedUtc": checked}, cpu, agent_pid)
+
+
+def _agent_truth_refresh(key, pid, start_token, previous):
+    global _AGENT_TRUTH_INFLIGHT
+    truth, cpu, agent_pid = AGENT_TRUTH_UNKNOWN, 0, 0
+    ok = False
+    try:
+        # Run the probe in a fresh daemon thread so it can be abandoned if
+        # it hangs.  _agent_truth_probe touches kernel32 / psutil syscalls
+        # that can wedge (hung process handle, frozen snapshot) -- the
+        # bounded .join below is the ONLY enforcement of
+        # AGENT_TRUTH_PROBE_TIMEOUT.
+        result = {}
+        def _run_probe():
+            try:
+                t, c, a = _agent_truth_probe(pid, start_token, previous)
+                result["truth"], result["cpu"], result["agent_pid"] = t, c, a
+                result["ok"] = True
+            except Exception as exc:
+                result["error"] = exc
+        probe_thread = threading.Thread(target=_run_probe, daemon=True)
+        probe_thread.start()
+        probe_thread.join(timeout=AGENT_TRUTH_PROBE_TIMEOUT)
+        if probe_thread.is_alive():
+            log(f"agent-truth probe timed out after {AGENT_TRUTH_PROBE_TIMEOUT}s for pid {pid}")
+            # Thread abandoned as daemon; inflight counter recovers in finally.
+        elif result.get("error"):
+            raise result["error"]
+        else:
+            truth, cpu, agent_pid = result["truth"], result["cpu"], result["agent_pid"]
+            ok = True
+    except Exception as error:
+        log(f"agent-truth probe failed for pid {pid}: {error}")
+    finally:
+        with _AGENT_TRUTH_LOCK:
+            _AGENT_TRUTH_INFLIGHT = max(0, _AGENT_TRUTH_INFLIGHT - 1)
+            entry = _AGENT_TRUTH_CACHE.get(key) or {}
+            entry["inflight"] = False
+            if ok:
+                entry["truth"] = truth
+                entry["cpu"] = cpu
+                entry["agentPid"] = agent_pid
+                entry["exe"] = truth.get("exe", "")
+                entry["at"] = time.monotonic()
+            _AGENT_TRUTH_CACHE[key] = entry
+
+
+def _agent_truth_schedule(key, pid, start_token, entry):
+    global _AGENT_TRUTH_INFLIGHT
+    if _AGENT_TRUTH_INFLIGHT >= AGENT_TRUTH_MAX_INFLIGHT:
+        return          # a wedged probe degrades this session to 'heuristic'; it never queues threads
+    _AGENT_TRUTH_INFLIGHT += 1
+    entry["inflight"] = True
+    _AGENT_TRUTH_CACHE[key] = entry
+    previous = dict(entry)
+    try:
+        _AGENT_TRUTH_EXECUTOR.submit(_agent_truth_refresh, key, pid, start_token, previous)
+    except Exception as error:
+        _AGENT_TRUTH_INFLIGHT = max(0, _AGENT_TRUTH_INFLIGHT - 1)
+        entry["inflight"] = False
+        log(f"agent-truth probe could not be scheduled for pid {pid}: {error}")
+
+
+def session_agent_truth(sess, now=None):
+    """(agentTruth, agentStateSource) for a session payload. NEVER blocks and is
+    never called with the state lock held for anything but a dict read: a stale or
+    failed probe reports 'heuristic' and lets `session_agent_status` stand."""
+    if now is None:
+        now = time.monotonic()
+    try:
+        pid = int(getattr(sess, "child_pid", 0) or 0)
+    except (TypeError, ValueError):
+        pid = 0
+    start_token = str(getattr(sess, "child_start_token", "") or "")
+    if pid <= 0:
+        return dict(AGENT_TRUTH_UNKNOWN), "heuristic"
+    key = (pid, start_token)
+    with _AGENT_TRUTH_LOCK:
+        entry = _AGENT_TRUTH_CACHE.get(key)
+        if entry is None:
+            entry = {"truth": None, "at": 0.0, "cpu": 0, "agentPid": 0, "exe": "", "inflight": False}
+        age = now - float(entry.get("at", 0.0) or 0.0) if entry.get("at") else float("inf")
+        if age >= AGENT_TRUTH_TTL and not entry.get("inflight"):
+            _agent_truth_schedule(key, pid, start_token, entry)
+        truth = entry.get("truth")
+    if not truth or age > AGENT_TRUTH_MAX_AGE:
+        # Never probed, or the last answer is too old to be evidence of anything now.
+        return (dict(truth) if truth else dict(AGENT_TRUTH_UNKNOWN)), "heuristic"
+    return dict(truth), "process"
 
 
 def session_owned_live_ids(session, live):
@@ -1195,6 +1637,107 @@ def acquire_launch_claim(cmd="", ids=None, reason="muxd session launch", live=No
     return LaunchClaim(candidate_ids, held), "reserved"
 
 
+def _quarantine_claim_path(path):
+    # <id>-<digest>.claim.json -> <id>-<digest>.claim.bad, so a poisoned file stops being read as a
+    # claim (the sweep and acquire both only look at *.claim.json) without ever being destroyed.
+    base = path[:-len(".json")] if path.lower().endswith(".claim.json") else path
+    return base + ".bad"
+
+
+def sweep_launch_claims(now=None):
+    """Garbage-collect abandoned launch claims out of the SHARED claim directory.
+
+    Claim files are self-describing, so muxd can reap the whole directory without knowing which
+    process wrote each one (the WinUI app writes claims here too). The rules are deliberately
+    conservative — a stale claim only costs a refused launch, a wrongly-deleted one costs a
+    duplicate writer on a live agent session, which is the exact corruption CLAIM_ROOT exists
+    to prevent:
+      * ExpiresUtc <= now                    -> delete (the writer itself promised it'd be gone)
+      * OwnerProcess == 'muxd' + dead pid    -> delete (that was us; nobody is coming back). The pid
+                                                must be readable AND provably dead — a muxd claim with
+                                                a missing/garbage OwnerPid is unverifiable, not dead.
+      * unreadable / not a JSON object       -> quarantine to *.claim.bad, NEVER delete
+      * anything else                        -> keep, even when the owner can't be verified;
+                                                claims without a parseable ExpiresUtc fall back to
+                                                mtime + TTL, so a fresh one is never touched.
+    Returns (removed, quarantined, kept) as lists of paths. Safe to call repeatedly: a second pass
+    over the same directory is a no-op.
+    """
+    now = now or datetime.now(timezone.utc)
+    removed, quarantined, kept = [], [], []
+    try:
+        names = sorted(os.listdir(CLAIM_ROOT))
+    except FileNotFoundError:
+        return removed, quarantined, kept
+    except OSError as e:
+        log(f"launch-claim sweep could not read {CLAIM_ROOT}: {e}")
+        return removed, quarantined, kept
+
+    for name in names:
+        if not name.lower().endswith(".claim.json"):
+            continue                                   # already-quarantined *.claim.bad included
+        path = os.path.join(CLAIM_ROOT, name)
+        if not os.path.isfile(path):
+            continue
+
+        metadata = _read_claim_metadata(path)
+        if metadata is None:
+            target = _quarantine_claim_path(path)
+            try:
+                os.replace(path, target)               # replace, not rename: re-quarantining is idempotent
+                quarantined.append(target)
+                log(f"launch-claim sweep quarantined unreadable claim {name} -> {os.path.basename(target)}")
+            except OSError as e:
+                kept.append(path)
+                log(f"launch-claim sweep could not quarantine {name}: {e}")
+            continue
+
+        expired = _claim_expiry(path, metadata) <= now
+        try:
+            owner_pid = int(metadata.get("OwnerPid"))
+        except (TypeError, ValueError):
+            owner_pid = 0                              # no usable pid == unverifiable, NOT proven dead
+        dead_muxd_owner = (
+            str(metadata.get("OwnerProcess") or "").lower() == "muxd"
+            and owner_pid > 0
+            and not _pid_alive(owner_pid)
+        )
+        if not (expired or dead_muxd_owner):
+            kept.append(path)
+            continue
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass                                       # someone else reaped it; same outcome
+        except OSError as e:
+            kept.append(path)
+            log(f"launch-claim sweep could not remove {name}: {e}")
+            continue
+        removed.append(path)
+        log(f"launch-claim sweep removed {'expired' if expired else 'dead-owner'} claim {name}")
+
+    return removed, quarantined, kept
+
+
+_CLAIM_SWEEP_LAST = 0.0
+
+
+def maybe_sweep_launch_claims(force=False):
+    # The status pump ticks every ~5s but the sweep only needs ~60s granularity, and a relay
+    # reconnect restarts that pump — so the divider is a monotonic clock rather than a tick
+    # counter, and reconnect churn can't turn the sweep into a hot loop over the claim directory.
+    global _CLAIM_SWEEP_LAST
+    now = time.monotonic()
+    if not force and _CLAIM_SWEEP_LAST and (now - _CLAIM_SWEEP_LAST) < CLAIM_SWEEP_SECONDS:
+        return None
+    _CLAIM_SWEEP_LAST = now
+    try:
+        return sweep_launch_claims()
+    except Exception as e:                             # a sweep failure must never kill the pump
+        log(f"launch-claim sweep failed: {e}")
+        return None
+
+
 WATCH = {
     "last_tick": time.monotonic(),
     "last_lag": 0.0,
@@ -1210,38 +1753,235 @@ WATCH_LOCK = threading.Lock()
 WATCHDOG_STARTED = False
 
 
-class RelayOutQueue(asyncio.Queue):
-    """Bound relay backlog so an outage cannot exhaust memory and kill hosted sessions."""
+SESSION_OUT_BUDGET_BYTES = max(65536, int(ENV.get("RELAY_SESSION_OUT_BUDGET", str(1 << 20))))
+# Frame bound per session, a BACKSTOP behind the byte budget. A byte budget alone does not bound
+# the ENTRY count: a million 1-byte chunks fit inside a 1MiB budget and cost a million deque slots.
+# Deliberately loose (not 64): the byte budget is the real policy, and anything tight enough to
+# fire on ordinary backlog would gap quiet sessions — a session sitting on 200 short lines while
+# the link stalls is not flooding. At 4096 frames this can only win the race when the average
+# chunk is under 256B, i.e. exactly the pathology the byte budget cannot see.
+RELAY_SESSION_QUEUE_MAX = max(8, int(ENV.get("RELAY_SESSION_QUEUE_MAX", "4096")))
 
-    def __init__(self, maxsize=64):
-        super().__init__(maxsize=maxsize)
-        self.dropped = 0
+class RelayOutQueue:
+    """Per-session, byte-bounded relay egress drained ROUND-ROBIN into the relay ws.
+
+    The old single shared queue (maxsize 64, silent tail-drop) let ONE flooding session starve
+    every other: `yes` in tab A filled all 64 slots each 12ms tick, so tab B's 100 lines were
+    dropped on the floor with nothing but a counter to show for it. Now each session owns its own
+    ~1MiB budget and its own deque; a flood can only ever exhaust its OWN budget.
+
+    On per-session overflow we drop only THAT session's queued output — whole coalesced frames,
+    which is a frame boundary, so a partial escape sequence can never egress — and enqueue an
+    explicit `{"t":"resync","s":name}` frame. The relay answers it with CLEAR + scrollback replay
+    for that session's viewers, so the gap self-heals into a correct screen instead of silently
+    corrupting one. Bounded memory is kept; the silence is what's gone.
+
+    Keeps the asyncio.Queue surface the call sites already use (put_nowait / get_nowait / await
+    get() / .dropped), so only pump_out grows a branch."""
+
+    _MAX_TRACKED = 256
+
+    def __init__(self, budget=None, maxsize=None):
+        self.budget = int(budget or SESSION_OUT_BUDGET_BYTES)
+        self.maxsize = int(maxsize or RELAY_SESSION_QUEUE_MAX)
+        self._queues = {}            # session name -> deque of (kind, name, data)
+        self._bytes = {}             # session name -> queued output bytes
+        self._order = []             # round-robin ring, insertion-ordered
+        self._cursor = 0
+        self._control = collections.deque()   # every non-"o" kind; drained BEFORE terminal bytes
+        self._dropped = {}           # session name -> chunks this session alone lost
+        self._resync_pending = set()
+        self._wake = asyncio.Event()
+        self.resyncs = 0
+
+    @property
+    def dropped(self):
+        return sum(self._dropped.values())
+
+    @dropped.setter
+    def dropped(self, value):
+        # The reconnect reset does `outq.dropped = 0`; that must zero every shard's tally.
+        self._dropped.clear()
+        if value:
+            self._dropped[""] = int(value)
+
+    def per_session_dropped(self):
+        """{session name: chunks dropped} for shards that actually lost something.
+
+        A single global counter could not answer the only question that matters when output goes
+        missing: WHICH tab is flooding."""
+        return {k: v for k, v in self._dropped.items() if v}
+
+    def forget(self, name):
+        """Drop a gone session's shard. Its queued output can never be delivered anywhere."""
+        key = name or ""
+        self._queues.pop(key, None)
+        self._bytes.pop(key, None)
+        self._dropped.pop(key, None)
+        self._resync_pending.discard(key)
+        if key in self._order:
+            self._order = [k for k in self._order if k != key]
+            self._cursor = 0
+
+    def _track(self, key):
+        q = self._queues.get(key)
+        if q is None:
+            if len(self._order) >= self._MAX_TRACKED:
+                self._prune_idle()
+            q = self._queues[key] = collections.deque()
+            self._bytes[key] = 0
+            self._order.append(key)
+        return q
+
+    def _prune_idle(self):
+        idle = [k for k in self._order if not self._queues.get(k)]
+        for k in idle:
+            self._queues.pop(k, None)
+            self._bytes.pop(k, None)
+            self._resync_pending.discard(k)
+        if idle:
+            self._order = [k for k in self._order if k not in set(idle)]
+            self._cursor = 0
+        for k in [k for k, v in self._dropped.items() if not v]:
+            self._dropped.pop(k, None)
 
     def put_nowait(self, item):
-        if self.full():
-            self.dropped += 1
-            return False
-        super().put_nowait(item)
+        kind, name, data = item
+        key = name or ""
+        if kind != "o":
+            # Control frames ride their own shard. A `("dead", name, "")` is a session-list refresh;
+            # queued behind a flooding tab's terminal bytes it arrives seconds late, so the relay
+            # shows a zombie session the whole time. It is never dropped and never waits on bytes.
+            self._control.append((kind, key, data))
+            self._wake.set()
+            return True
+        q = self._track(key)
+        size = len(data) if isinstance(data, (bytes, bytearray, memoryview)) else 0
+        if self._bytes[key] + size > self.budget or len(q) >= self.maxsize:
+            # This session alone blew its budget (bytes OR frames). Drop ITS backlog at frame
+            # boundaries; control frames were never in here to lose.
+            self._dropped[key] = self._dropped.get(key, 0) + len(q)
+            q.clear()
+            self._bytes[key] = 0
+            if key not in self._resync_pending:
+                self._resync_pending.add(key)
+                self.resyncs += 1
+                self._control.append(("resync", key, b""))
+            self._wake.set()
+            return False           # the overflowing chunk goes too; the resync replay supersedes it
+        q.append((kind, key, data))
+        self._bytes[key] = self._bytes[key] + size
+        self._wake.set()
         return True
+
+    def _pop(self):
+        if self._control:
+            item = self._control.popleft()
+            if item[0] == "resync":
+                self._resync_pending.discard(item[1])
+            return item
+        total = len(self._order)
+        for step in range(total):
+            index = (self._cursor + step) % total
+            key = self._order[index]
+            q = self._queues.get(key)
+            if not q:
+                continue
+            item = q.popleft()
+            if item[0] == "o":
+                self._bytes[key] = max(0, self._bytes[key] - len(item[2]))
+            elif item[0] == "resync":
+                self._resync_pending.discard(key)
+            self._cursor = (index + 1) % total
+            return item
+        return None
+
+    def get_nowait(self):
+        item = self._pop()
+        if item is None:
+            raise asyncio.QueueEmpty
+        return item
+
+    async def get(self):
+        while True:
+            item = self._pop()
+            if item is not None:
+                return item
+            self._wake.clear()
+            item = self._pop()          # re-check: a producer may have raced the clear
+            if item is not None:
+                return item
+            await self._wake.wait()
+
+    def qsize(self):
+        return len(self._control) + sum(len(q) for q in self._queues.values())
+
+    def empty(self):
+        return self.qsize() == 0
+
+
+# The relay-egress fanout role is played by RelayOutQueue itself: it already owns one shard per
+# session plus a control shard and drains them round-robin, so a separate wrapper would only be a
+# second sharding layer over an already-sharded queue.
+RelayFanout = RelayOutQueue
 
 LOCAL_VIEWER_QUEUE_MAX = 64          # ~768ms of link/loop-lag tolerance (was 4 = ~48ms -> spurious detaches)
 LOCAL_VIEWER_SLOW = object()
 
+class LocalViewerQueue(asyncio.Queue):
+    """Per-local-viewer output queue that makes a dropped chunk an OBSERVABLE fact.
+
+    The overflow policy is unchanged and deliberate: a brief lag must NOT detach a local terminal
+    (that was the "[muxctl] detached" bug), so a full queue evicts its OLDEST chunk rather than
+    refusing the newest. What was missing is the accounting. The drop used to happen inline in
+    fanout_local_output and leave no trace anywhere; the only healing was redraw_nudge, which
+    returns immediately unless the session holds the alternate screen — so an ordinary shell
+    viewer rendered a screen with a hole in it and nothing, anywhere, knew.
+
+    Every eviction now lands in dropped_chunks / dropped_bytes, and gap_seq counts GAP EPISODES
+    rather than evictions: one contiguous burst of drops is a single gap (fifty back-to-back
+    evictions while the reader is stalled are one hole in the stream, not fifty), and gap_seq only
+    advances again once an offer has succeeded in between. gap_seq is strictly monotonic across
+    the queue's life and never decreases, so a resync consumer can compare it against the last
+    value it acted on and tell a fresh gap from one it has already healed.
+
+    Subclasses asyncio.Queue so the consumer side (`await lq.get()`, the LOCAL_VIEWER_SLOW
+    sentinel, sizing) is untouched — only producers move to offer()."""
+
+    def __init__(self, maxsize=LOCAL_VIEWER_QUEUE_MAX):
+        super().__init__(maxsize=maxsize)
+        self.dropped_chunks = 0
+        self.dropped_bytes = 0
+        self.gap_seq = 0
+        self._gap_open = False
+
+    def offer(self, data):
+        """Enqueue `data`, evicting the oldest chunk if full. True == lossless, False == a gap."""
+        if not self.full():
+            self.put_nowait(data)
+            self._gap_open = False
+            return True
+        try:
+            evicted = self.get_nowait()
+        except asyncio.QueueEmpty:
+            evicted = None
+        if evicted is not None:
+            try:
+                self.dropped_bytes += len(evicted)
+            except TypeError:
+                pass                       # sentinels (LOCAL_VIEWER_SLOW) have no length
+        self.dropped_chunks += 1
+        if not self._gap_open:
+            self.gap_seq += 1              # one contiguous burst of drops == one gap episode
+            self._gap_open = True
+        self.put_nowait(data)
+        return False
+
 def fanout_local_output(session, data):
     for local_queue in list(session.local):
-        try:
-            local_queue.put_nowait(data)
-        except asyncio.QueueFull:
-            # A brief lag must NOT detach a local terminal (that was the "[muxctl] detached" bug). Drop the
-            # OLDEST chunk to make room, keep the viewer, and nudge a full repaint so the momentary gap heals.
-            try:
-                local_queue.get_nowait()
-            except asyncio.QueueEmpty:
-                pass
-            try:
-                local_queue.put_nowait(data)
-            except asyncio.QueueFull:
-                pass
+        if not local_queue.offer(data):
+            # The viewer lost a chunk. Keep nudging a full repaint so the gap still heals on the
+            # alternate screen exactly as before; the explicit resync frame supersedes this later.
             try:
                 redraw_nudge(session)
             except Exception:
@@ -1429,6 +2169,9 @@ class Session:
         self.owner_key = ""
         self.identity_pending = False
         self.lifecycle = "active" if spawn_now else "dormant"
+        self.last_alive_utc = ""
+        self.custody_expires_utc = ""
+        custody_refresh(self)
         self.child_pid = 0
         self.child_start_token = ""
         self.stop_disposition = ""
@@ -1467,9 +2210,13 @@ class Session:
             direct_cmd = True
         with _CONPTY_SPAWN_LOCK:
             with _ORPHANED_CONPTY_LOCK:
+                # Expired baselines are popped by the reaper, so a non-empty dict means a LIVE
+                # quarantine. Deliberately no expiry check here: this runs under the spawn lock.
                 if _PENDING_CONPTY_BASELINES:
+                    blocking = next(iter(_PENDING_CONPTY_BASELINES.values()))
                     raise RuntimeError(
-                        "ConPTY custody is quarantined pending orphan-host discovery"
+                        "ConPTY custody is quarantined pending orphan-host discovery: "
+                        f"{blocking.get('reason', '')}"
                     )
             conpty_hosts_before = _conpty_host_process_records(os.getpid())
             try:
@@ -1764,6 +2511,9 @@ class OwnerSession:
         self.owner_key = str(owner_key or "")
         self.identity_pending = False
         self.lifecycle = "active"
+        self.last_alive_utc = ""
+        self.custody_expires_utc = ""
+        custody_refresh(self)
         self.child_pid = 0
         self.child_start_token = ""
         self.stop_disposition = ""
@@ -1959,6 +2709,153 @@ def start_watchdog_thread():
 
     threading.Thread(target=run, name="muxd-watchdog", daemon=True).start()
 
+def custody_now(now=None):
+    return time.time() if now is None else float(now)
+
+def custody_stamp(epoch):
+    return datetime.fromtimestamp(float(epoch), timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+def custody_epoch(stamp):
+    # 0.0 means "no custody stamp" — that is NOT the same as expired (see custody_expired).
+    text = str(stamp or "").strip()
+    if not text:
+        return 0.0
+    try:
+        parsed = datetime.fromisoformat(text[:-1] + "+00:00" if text.endswith("Z") else text)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return float(parsed.timestamp())
+    except Exception:
+        return 0.0
+
+def _custody_field(record, key, attr, default=None):
+    if isinstance(record, dict):
+        return record.get(key, default)
+    return getattr(record, attr, default)
+
+def custody_deadline(record):
+    return custody_epoch(_custody_field(record, "custodyExpiresUtc", "custody_expires_utc", ""))
+
+def custody_refresh(session, now=None, ttl=None):
+    at = custody_now(now)
+    session.last_alive_utc = custody_stamp(at)
+    session.custody_expires_utc = custody_stamp(at + float(CUSTODY_TTL_SECONDS if ttl is None else ttl))
+    return session.custody_expires_utc
+
+def custody_seed(session, now=None, ttl=None):
+    # A record persisted before custody existed carries no deadline. Seeding it a full TTL means the
+    # first boot after the upgrade lists every dormant tab exactly as before instead of eating them.
+    if custody_deadline(session) > 0:
+        return False
+    custody_refresh(session, now=now, ttl=ttl)
+    return True
+
+def custody_expired(record, now=None):
+    deadline = custody_deadline(record)
+    return deadline > 0 and custody_now(now) >= deadline
+
+def custody_protected(record, now=None):
+    alive = _custody_field(record, "alive", "alive", None)
+    if callable(alive):
+        try:
+            alive = bool(alive())
+        except Exception:
+            alive = False
+    if bool(alive):
+        return True
+    if _custody_field(record, "_launch_claim", "_launch_claim", None) is not None:
+        return True
+    if list(_custody_field(record, "claimPaths", "claim_paths", []) or []):
+        return True
+    if bool(_custody_field(record, "identityPending", "identity_pending", False)):
+        return custody_now(now) < custody_deadline(record) + CUSTODY_IDENTITY_GRACE_SECONDS
+    return False
+
+def custody_reclaimable(record, now=None):
+    """The one predicate: a reclaimable record is GC'd AND never emitted, so the relay can never
+    see a row muxd is about to delete. Only parked lifecycles are ever reclaimable."""
+    lifecycle = str(_custody_field(record, "lifecycle", "lifecycle", "active") or "active")
+    if lifecycle not in ("dormant", "failed"):
+        return False
+    return custody_expired(record, now) and not custody_protected(record, now)
+
+def refresh_live_custody(source=None, now=None, ttl=None):
+    source = sessions if source is None else source
+    refreshed = []
+    for name, s in list(source.items()):
+        try:
+            alive = bool(s.alive())
+        except Exception:
+            alive = False
+        if alive:
+            custody_refresh(s, now=now, ttl=ttl)
+            refreshed.append(name)
+    return refreshed
+
+def gc_expired_custody(source=None, now=None):
+    source = sessions if source is None else source
+    reclaimed = [name for name, s in list(source.items()) if custody_reclaimable(s, now)]
+    for name in reclaimed:
+        source.pop(name, None)
+    return reclaimed
+
+def restore_manifest_sessions(records, target=None, loop=None, outq=None, now=None):
+# Boot's manifest rehydration, lifted out of main() so tests can drive the REAL restore path:
+    # boot runs inside main() behind a live relay link and has no unit-test seam. Behaviour is
+    # unchanged from the inline loop it replaces.
+    target = sessions if target is None else target
+    restored_names = []
+    for name, m in records.items():
+        if not strict_mux_name(name) or name in target:
+            continue
+        heal = bool(m.get("heal"))
+        mcmd = m.get("cmd", "")
+        ids = m.get("ids") if isinstance(m.get("ids"), list) else []
+        aliases = m.get("aliases") if isinstance(m.get("aliases"), list) else []
+        try:
+            restored = Session(
+                name, mcmd, m.get("cwd", ""), m.get("cols", 140), m.get("rows", 40),
+                loop, outq, heal=heal, spawn_now=False, ids=ids,
+                session_id=m.get("sessionId", ""), aliases=aliases
+            )
+            restored.expected_owner = bool(m.get("owner"))
+            restored.owner_key = str(m.get("ownerKey", "") or "")
+            restored.identity_pending = bool(m.get("identityPending"))
+            restored.lifecycle = str(m.get("lifecycle", "active") or "active")
+            if restored.lifecycle not in ("active", "dormant", "starting", "stopping", "failed"):
+                restored.lifecycle = "failed"
+            restored.child_pid = int(m.get("childPid", 0) or 0)
+            restored.child_start_token = str(m.get("childStartToken", "") or "")
+            restored.stop_disposition = str(m.get("stopDisposition", "") or "")
+            if restored.stop_disposition not in ("", "remove", "replace"):
+                restored.stop_disposition = ""
+            restored.user_killed = bool(m.get("userKilled", False))
+            restored.generation_id = str(m.get("generationId", "") or restored.generation_id)
+            restored.operation_key = str(m.get("operationKey", "") or "")
+            restored.operation_fingerprint = str(m.get("operationFingerprint", "") or "")
+            restored.operation_created = bool(m.get("operationCreated", False))
+            restored.last_alive_utc = str(m.get("lastAliveUtc", "") or "")
+            restored.custody_expires_utc = str(m.get("custodyExpiresUtc", "") or "")
+            custody_seed(restored, now=now)   # pre-custody record: full TTL, not instant reclamation
+            restored.deaths = [
+                float(value)
+                for value in (m.get("deaths") if isinstance(m.get("deaths"), list) else [])
+                if isinstance(value, (int, float))
+            ][-16:]
+        except Exception as error:
+            raise RuntimeError(f"could not restore durable session {name}") from error
+        target[name] = restored
+        restored_names.append(name)
+    return restored_names
+
+def boot_removes_record(restored):
+    # A durable stop intent that boot must complete: the user killed it, or it was mid-`stopping`
+    # with a `remove` disposition. Separate from custody GC, and it runs first.
+    return bool(getattr(restored, "user_killed", False)) or (
+        str(getattr(restored, "lifecycle", "active") or "active") == "stopping"
+        and str(getattr(restored, "stop_disposition", "") or "") == "remove"
+    )
+
 def session_records_payload(source=None):
     source = sessions if source is None else source
     return {
@@ -1978,6 +2875,8 @@ def session_records_payload(source=None):
             "operationKey": str(getattr(s, "operation_key", "") or ""),
             "operationFingerprint": str(getattr(s, "operation_fingerprint", "") or ""),
             "operationCreated": bool(getattr(s, "operation_created", False)),
+            "lastAliveUtc": str(getattr(s, "last_alive_utc", "") or ""),
+            "custodyExpiresUtc": str(getattr(s, "custody_expires_utc", "") or ""),
             "deaths": [float(value) for value in list(getattr(s, "deaths", []) or [])[-16:]]}
         for n, s in source.items()
     }
@@ -2028,6 +2927,8 @@ def valid_session_records(value):
         and isinstance(record.get("operationKey", ""), str)
         and isinstance(record.get("operationFingerprint", ""), str)
         and isinstance(record.get("operationCreated", False), bool)
+        and isinstance(record.get("lastAliveUtc", ""), str)
+        and isinstance(record.get("custodyExpiresUtc", ""), str)
         for name, record in value.items()
     )
 
@@ -2087,6 +2988,8 @@ _PERSISTED_SESSION_FIELDS = (
     "operation_created",
     "deaths",
     "user_killed",
+    "last_alive_utc",
+    "custody_expires_utc",
 )
 
 def persisted_session_snapshot(session):
@@ -2108,9 +3011,11 @@ def restore_persisted_session(session, snapshot):
     session._launch_claim = snapshot["_launch_claim"]
     session.claim_paths = list(snapshot["claim_paths"])
 
-def live_tabs_snapshot():
+def live_tabs_snapshot(now=None):
     out = {}
     for n, s in sessions.items():
+        if custody_reclaimable(s, now):
+            continue    # custody expired: filtered, never labelled — this record is about to be GC'd
         pid = 0
         try:
             p = getattr(s, "pty", None)
@@ -2274,6 +3179,14 @@ def session_payload(name, sess):
     kind = "command" if has_cmd else ("shell" if alive else "dormant")
     tail = sess.tail_text()
     agent = session_agent_status(sess, alive=alive, tail=tail)
+    # Process truth is advisory and additive: it reports what the OS says about the
+    # session's own process tree. It never overrides the heuristic ladder above - when
+    # the probe is stale or failed, agentStateSource says 'heuristic' and agentState
+    # stands on its own.
+    try:
+        agent_truth, agent_source = session_agent_truth(sess)
+    except Exception:
+        agent_truth, agent_source = dict(AGENT_TRUTH_UNKNOWN), "heuristic"
     return {"name": name, "alive": alive, "created": int(sess.created * 1000),
             "lastOut": int(sess.last_out * 1000), "cols": sess.cols, "rows": sess.rows,
             "tail": tail, "heal": sess.heal, "localViewers": len(sess.local),
@@ -2287,7 +3200,8 @@ def session_payload(name, sess):
             "childPid": int(getattr(sess, "child_pid", 0) or 0),
             "agentState": agent["agentState"], "agentLabel": agent["agentLabel"],
             "agentDetail": agent["agentDetail"], "agentConfidence": agent["agentConfidence"],
-            "needsAttention": agent["needsAttention"], "lastOutAgeMs": agent.get("lastOutAgeMs", 0)}
+            "needsAttention": agent["needsAttention"], "lastOutAgeMs": agent.get("lastOutAgeMs", 0),
+            "agentTruth": agent_truth, "agentStateSource": agent_source}
 
 def needs_relaunch_for_command(prev, requested_cmd):
     requested = normalized_cmd(requested_cmd)
@@ -2300,8 +3214,10 @@ def needs_relaunch_for_command(prev, requested_cmd):
         return True
     return command_sig(getattr(prev, "cmd", "")) != command_sig(requested)
 
-def sess_list():
-    return [session_payload(n, s) for n, s in sessions.items()]
+def sess_list(now=None):
+    # Custody-expired records are dropped outright: the relay keeps showing every UNexpired dormant
+    # row for relaunch, and never a row muxd has already written off.
+    return [session_payload(n, s) for n, s in sessions.items() if not custody_reclaimable(s, now)]
 
 async def spawn_session_off_loop(s):
     await asyncio.get_running_loop().run_in_executor(None, s.spawn)
@@ -2646,8 +3562,13 @@ async def main():
                 )
             return result
 
-    async def execute_input_intent(first, session, data, scope="local"):
-        supplied = first.get("intentId")
+    async def execute_input_intent(first, session, data, scope="local", principal=None):
+        # A verified principal replaces the caller-declared scope outright. `scope="relay"` said
+        # "the relay asked for this", which is not an identity; `principal:<id>` names who
+        # authorized it, so two principals can never collide on one intent id.
+        if principal is not None:
+            scope = principal.intent_scope
+        supplied = first.get("intentId") if principal is None else principal.intent_id
         request_id = intent_id(supplied)
         if supplied and not request_id:
             return {"t": "err", "m": "invalid intent id"}
@@ -2668,23 +3589,21 @@ async def main():
             data,
             scope,
             request_id,
+            principal,
         )
 
     @state_mutation
-    async def execute_durable_input_intent(first, session, data, scope, request_id):
+    async def execute_durable_input_intent(first, session, data, scope, request_id, principal=None):
         key = intent_key(scope, "input", request_id)
-        fingerprint = intent_fingerprint(first)
+        # For a signed intent the replay identity is the authorized tuple
+        # (principalId, keyId, sessionUuid, intentId, bodySha256) — not the frame shape. A
+        # reconnect re-signs with a fresh issuedAtMs, and that is the same operation; different
+        # bytes under the same intent id are not, and still fail closed below.
+        fingerprint = principal.intent_fingerprint if principal is not None else intent_fingerprint(first)
         async with operation_lock(key):
-            record = intent_records.get(key)
-            if record is not None:
-                if record.get("fingerprint") != fingerprint:
-                    return {"t": "err", "m": "intent id is already bound to a different payload"}
-                if record.get("status") in ("completed", "failed"):
-                    return dict(record.get("result") or {})
-                return {
-                    "t": "err",
-                    "m": "input outcome is uncertain; the PTY write was not replayed",
-                }
+            _, settled = host_input_intent.replay_decision(intent_records.get(key), fingerprint)
+            if settled is not None:
+                return settled
 
             if session is None or not session.alive():
                 return {"t": "err", "m": "session is not live: " + strict_mux_name(first.get("s", ""))}
@@ -2697,6 +3616,10 @@ async def main():
                 "createdAt": time.time(),
                 "updatedAt": time.time(),
             }
+            # Who authorized the bytes is persisted with the outcome, so an exact replay can be
+            # settled from the record alone without re-consulting a possibly-revoked principal.
+            if principal is not None:
+                record["principal"] = principal.journal_record("dispatching")
             try:
                 await persist_intent(key, record)
             except Exception as error:
@@ -2715,6 +3638,8 @@ async def main():
                 "result": result,
                 "updatedAt": time.time(),
             }
+            if principal is not None:
+                terminal["principal"] = principal.journal_record(terminal["status"])
             try:
                 await persist_intent(key, terminal)
             except Exception as error:
@@ -3291,18 +4216,28 @@ async def main():
     start_supervised_background(background_tasks, "loop-monitor", loop_monitor)
 
     async def conpty_orphan_reaper_tick():
+        delay = CONPTY_REAPER_INTERVAL
+        last_sig = None
         while True:
-            await asyncio.sleep(5)
+            await asyncio.sleep(delay)
             with _ORPHANED_CONPTY_LOCK:
                 pending = bool(
                     _ORPHANED_CONPTY_HOSTS
                     or _PENDING_CONPTY_BASELINES
                 )
-            if pending:
-                await asyncio.get_running_loop().run_in_executor(
-                    None,
-                    _reap_orphaned_conpty_hosts,
-                )
+            if not pending:
+                # Nothing in custody: no executor dispatch at all, and the next record to
+                # arrive gets reaped at the base interval rather than a backed-off one.
+                delay = CONPTY_REAPER_INTERVAL
+                last_sig = None
+                continue
+            retained = await asyncio.get_running_loop().run_in_executor(
+                None,
+                _reap_orphaned_conpty_hosts,
+            )
+            sig = _reaper_tick_signature(retained)
+            delay = _reaper_backoff(last_sig, sig, delay)
+            last_sig = sig
     start_supervised_background(
         background_tasks,
         "conpty-orphan-reaper",
@@ -3338,51 +4273,20 @@ async def main():
                 return False, detail
         return True, "unresolved child processes are stopped"
 
+    # Reap abandoned launch claims BEFORE boot-arming: a PC reboot or a muxd crash leaves claim files
+    # behind whose owner pid is long gone, and an unswept one would refuse the very session it was
+    # protecting. Off-loop — the sweep stats pids and touches disk.
+    swept = await asyncio.get_running_loop().run_in_executor(None, lambda: maybe_sweep_launch_claims(True))
+    if swept and (swept[0] or swept[1]):
+        log(f"[boot] launch-claim sweep: {len(swept[0])} removed, {len(swept[1])} quarantined, {len(swept[2])} kept")
+
     # boot policy (user-specified): agents NEVER auto-start on a fresh boot unless the session was
     # ARMED (auto-resume on). Armed -> recreate + resume now. Unarmed -> a dead placeholder tab that
     # stays dormant until an explicit create/relaunch sends a non-empty resume command.
     # liveness runs a PowerShell CIM query (blocking) — NEVER call it on the event-loop thread or muxd
     # freezes and hosted sessions drop. Always hop to a worker thread.
     boot_manifest = manifest_load()
-    boot_names = []
-    for name, m in boot_manifest.items():
-        if not strict_mux_name(name) or name in sessions:
-            continue
-        heal = bool(m.get("heal"))
-        mcmd = m.get("cmd", "")
-        ids = m.get("ids") if isinstance(m.get("ids"), list) else []
-        aliases = m.get("aliases") if isinstance(m.get("aliases"), list) else []
-        try:
-            restored = Session(
-                name, mcmd, m.get("cwd", ""), m.get("cols", 140), m.get("rows", 40),
-                loop, outq, heal=heal, spawn_now=False, ids=ids,
-                session_id=m.get("sessionId", ""), aliases=aliases
-            )
-            restored.expected_owner = bool(m.get("owner"))
-            restored.owner_key = str(m.get("ownerKey", "") or "")
-            restored.identity_pending = bool(m.get("identityPending"))
-            restored.lifecycle = str(m.get("lifecycle", "active") or "active")
-            if restored.lifecycle not in ("active", "dormant", "starting", "stopping", "failed"):
-                restored.lifecycle = "failed"
-            restored.child_pid = int(m.get("childPid", 0) or 0)
-            restored.child_start_token = str(m.get("childStartToken", "") or "")
-            restored.stop_disposition = str(m.get("stopDisposition", "") or "")
-            if restored.stop_disposition not in ("", "remove", "replace"):
-                restored.stop_disposition = ""
-            restored.user_killed = bool(m.get("userKilled", False))
-            restored.generation_id = str(m.get("generationId", "") or restored.generation_id)
-            restored.operation_key = str(m.get("operationKey", "") or "")
-            restored.operation_fingerprint = str(m.get("operationFingerprint", "") or "")
-            restored.operation_created = bool(m.get("operationCreated", False))
-            restored.deaths = [
-                float(value)
-                for value in (m.get("deaths") if isinstance(m.get("deaths"), list) else [])
-                if isinstance(value, (int, float))
-            ][-16:]
-        except Exception as error:
-            raise RuntimeError(f"could not restore durable session {name}") from error
-        sessions[name] = restored
-        boot_names.append(name)
+    boot_names = restore_manifest_sessions(boot_manifest, sessions, loop, outq)
 
     # Reconcile only after every durable record is represented in memory. Any save below is therefore
     # authoritative for the whole manifest and cannot erase entries that happened to sort later.
@@ -3404,11 +4308,7 @@ async def main():
                     raise RuntimeError(
                         f"could not reconcile unresolved {restored.lifecycle} session {name}: {detail}"
                     )
-                remove_record = restored.user_killed or (
-                    restored.lifecycle == "stopping"
-                    and restored.stop_disposition == "remove"
-                )
-                if remove_record:
+                if boot_removes_record(restored):
                     sessions.pop(name, None)
                     await manifest_save_async(sessions)
                     log(f"[boot] completed durable stop intent for {name}")
@@ -3445,6 +4345,25 @@ async def main():
         except Exception as e:
             log(f"[boot] {name} failed: {e}")
 
+    # Custody GC runs AFTER reconciliation, so a record only faces the TTL once its real lifecycle is
+    # settled: a `starting` tab that boot demoted to dormant is judged as dormant, not as whatever the
+    # crash left behind. Anything reclaimed here was already invisible to the relay (the same
+    # `custody_reclaimable` predicate filters live_tabs_snapshot and sess_list).
+    reclaimed_at_boot = gc_expired_custody(sessions)
+    if reclaimed_at_boot:
+        await manifest_save_async(sessions)
+        log(f"[boot] custody expired; reclaimed {len(reclaimed_at_boot)}: {', '.join(reclaimed_at_boot)}")
+
+    async def custody_gc_tick():
+        # muxd can stay up for weeks — a boot-only sweep would let dormant records accrue the whole
+        # time. Same predicate, same protections, just on a timer.
+        while True:
+            await asyncio.sleep(CUSTODY_GC_INTERVAL_SECONDS)
+            reclaimed = gc_expired_custody(sessions)
+            if reclaimed:
+                await manifest_save_async(sessions)
+                log(f"[custody] reclaimed {len(reclaimed)} expired: {', '.join(reclaimed)}")
+
     async def self_heal_tick():
         # a session whose SHELL died (pty EOF) is useless — recreate + re-run its resume (max 3/10min).
         while True:
@@ -3472,6 +4391,7 @@ async def main():
                     elif created:
                         log(f"[heal] {s.name} shell died -> respawned + resume queued")
     start_supervised_background(background_tasks, "self-heal", self_heal_tick)
+    start_supervised_background(background_tasks, "custody-gc", custody_gc_tick)
 
     async def flush_out():
         # coalesce each session's output into ONE ws frame per ~12ms tick — far fewer frames/less b64+JSON
@@ -3631,7 +4551,7 @@ async def main():
                     s, err, _created = await ensure_local_session(first, False)
                 if err:
                     await ws.send(json.dumps({"t": "err", "m": err})); return
-                lq = asyncio.Queue(maxsize=LOCAL_VIEWER_QUEUE_MAX); s.local.add(lq)
+                lq = LocalViewerQueue(); s.local.add(lq)
                 if first.get("cols"):
                     update_local_session_size(s, lq, first.get("cols"), first.get("rows") or 40)
                 try:
@@ -3740,13 +4660,22 @@ async def main():
                             kind, name, data = await outq.get()
                             if kind == "o":
                                 await ws.send(json.dumps({"t": "o", "s": name, "d": base64.b64encode(data).decode()}))
+                            elif kind == "resync":
+                                # This session alone blew its egress budget; its backlog was dropped at a
+                                # frame boundary. Tell the relay to repaint from scrollback, not from a gap.
+                                await ws.send(json.dumps({"t": "resync", "s": name}))
                             elif kind == "dead":
                                 await ws.send(json.dumps({"t": "sessions", "list": sess_list()}))
 
                     async def pump_status():
                         while True:
                             await asyncio.sleep(5)
+                            refresh_live_custody()   # a session that is alive right now cannot go stale
                             try: await asyncio.get_running_loop().run_in_executor(None, write_live_tabs)   # off-loop file write
+                            except Exception: pass
+                            # divided cadence: the pump ticks every 5s, the claim sweep self-throttles
+                            # to CLAIM_SWEEP_SECONDS (~60s). Off-loop: it stats pids and touches disk.
+                            try: await asyncio.get_running_loop().run_in_executor(None, maybe_sweep_launch_claims)
                             except Exception: pass
                             await ws.send(json.dumps({"t": "sessions", "list": sess_list()}))
 
@@ -3819,7 +4748,23 @@ async def main():
                                         "notice": "auto-resume policy was not persisted",
                                     }))
                             elif t == "i" and name in sessions:
-                                sessions[name].write(base64.b64decode(m.get("d", "")))
+                                # A refusal returns before any write, so a frame without an
+                                # accepted proof performs zero PTY writes.
+                                input_session = sessions[name]
+                                principal, body, refusal = authorize_relay_input(m, input_session)
+                                if refusal is not None:
+                                    log(f"[{name}] input refused: {refusal.code}: {refusal.detail}")
+                                    await ws.send(json.dumps(refusal.frame(name)))
+                                else:
+                                    outcome = await execute_input_intent(
+                                        m, input_session, body, principal=principal
+                                    )
+                                    if outcome.get("t") == "err":
+                                        await ws.send(json.dumps({
+                                            **outcome,
+                                            "s": name,
+                                            "intentId": principal.intent_id,
+                                        }))
                             elif t == "resize" and name in sessions:
                                 apply_remote_session_size(sessions[name], m)
                             elif t == "sb" and name in sessions:

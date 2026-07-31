@@ -256,13 +256,18 @@ public sealed partial class MainPage
     private DispatcherTimer? _cmdTimer;
     private DispatcherTimer? _tabTimer;
     private bool _syncPushing;
+    private bool _indexPushing;
     private bool _cmdPolling;
     private readonly string _commandLeaseOwner = RemoteCommandProtocol.LeaseOwner("gui");
+    // At-most-once fence for intent-fenced polled commands (fetchfile/startmux): a redelivered intent
+    // replays its recorded ack instead of downloading/starting a second time.
+    private readonly RemoteCommandProtocol.IntentLedger _commandIntents = new();
     private bool _tabTracking;
 
     public void StartProjectSync()
     {
         _ = PushProjectsAsync();
+        _ = PushArchiveIndexAsync();
         _syncTimer ??= new DispatcherTimer { Interval = TimeSpan.FromSeconds(30) };
         _syncTimer.Tick -= OnSyncTick;
         _syncTimer.Tick += OnSyncTick;
@@ -281,7 +286,11 @@ public sealed partial class MainPage
         _tabTimer.Tick += OnTabTick;
         _tabTimer.Start();
     }
-    private async void OnSyncTick(object? sender, object e) => await PushProjectsAsync();
+    private async void OnSyncTick(object? sender, object e)
+    {
+        await PushProjectsAsync();
+        await PushArchiveIndexAsync();   // sequential: two SSH pushes on one tick, never contending
+    }
     private async void OnCmdTick(object? sender, object e) => await PollCommandsAsync();
     private async void OnTabTick(object? sender, object e)
     {
@@ -353,6 +362,30 @@ public sealed partial class MainPage
         finally { _syncPushing = false; }
     }
 
+    // The recent-chats archive index (POST /api/archive-index), pushed on the SAME 30s sync tick as the
+    // projection above so the web terminal's "reopen a recent chat" list never lags the app by more than
+    // one cycle. It carries opaque ids + a cwd display string only — never a command — so the relay can
+    // render the list but can only ever hand back an intent for this PC to resolve.
+    private async Task PushArchiveIndexAsync()
+    {
+        if (_indexPushing) return;
+        var settings = _archive.Store.Settings;
+        var target = (settings.MultiplexSshTarget ?? "").Trim();
+        if (string.IsNullOrEmpty(target)) return;
+        string json;
+        try { json = await Task.Run(() => _archive.BuildArchiveIndexJson()); }
+        catch (Exception ex) { Diag.Log("BuildArchiveIndex failed: " + ex.Message); return; }
+        _indexPushing = true;
+        try
+        {
+            var remote = $"curl -s -X POST http://127.0.0.1:{settings.MultiplexApiPort}/api/archive-index -H 'Content-Type: application/json' --data-binary @-";
+            var (code, outText) = await RunSshAsync(target, remote, json);
+            Diag.Log($"Archive index sync rc={code} out={outText.Trim()}");
+        }
+        catch (Exception ex) { Diag.Log("PushArchiveIndex failed: " + ex.Message); }
+        finally { _indexPushing = false; }
+    }
+
     // Pull pending owner commands from the VPS (the web enqueues them) and action them on this PC. Only
     // "kill <session>" today: kill the live agent for that session (scoped to OUR claude/codex processes),
     // ack the result, and immediately re-push the projection so the web reflects the kill within seconds.
@@ -384,9 +417,14 @@ public sealed partial class MainPage
                 if (string.IsNullOrEmpty(c.id)) continue;
                 (bool ok, string detail) res;
                 var onPc = false;
-                if (!RemoteCommandProtocol.IsReplaySafe(c.type, c.replayPolicy))
+                // ONE gate, before any side effect: replay policy AND (for intent-fenced types) a live
+                // lease token + a stable intent id that has not already been delivered.
+                var admission = _commandIntents.Admit(c.type, c.replayPolicy, c.intentId, c.leaseToken, out var gated);
+                if (admission != RemoteCommandAdmission.Execute)
                 {
-                    res = (false, "command replay policy is missing or invalid");
+                    if (admission == RemoteCommandAdmission.Refused)
+                        Diag.Log($"Remote command REFUSED (envelope): type='{c.type}' id={c.id} — {gated.detail}");
+                    res = gated;
                 }
                 else if (string.Equals(c.type, "kill", StringComparison.OrdinalIgnoreCase))
                 {
@@ -414,6 +452,10 @@ public sealed partial class MainPage
                 {
                     var text = await Task.Run(() => ReadTranscriptTail(c.tool ?? "claude", c.sessionId ?? "", 7000));
                     res = (true, text);
+                }
+                else if (string.Equals(c.type, "transcriptfetch", StringComparison.OrdinalIgnoreCase))
+                {
+                    res = await PushTranscriptPagesAsync(target, port, c);
                 }
                 else if (string.Equals(c.type, "rename", StringComparison.OrdinalIgnoreCase))
                 {
@@ -471,6 +513,7 @@ public sealed partial class MainPage
                     added = true;   // re-push so the web re-tints
                 }
                 else res = (false, "unknown command");
+                if (admission == RemoteCommandAdmission.Execute) _commandIntents.Record(c.intentId, res.ok, res.detail);
                 var ackJson = JsonSerializer.Serialize(new { leaseToken = c.leaseToken, ok = res.ok, detail = res.detail, onPc });
                 await AckCommandAsync(target, port, c.id, ackJson);
             }
@@ -478,6 +521,50 @@ public sealed partial class MainPage
         }
         catch (Exception ex) { Diag.Log("PollCommands failed: " + ex.Message); }
         finally { _cmdPolling = false; }
+    }
+
+    // transcriptfetch — an archive.read for ONE explicitly named chat. The relay has already verified
+    // the signed client principal envelope and that principal's current membership of the resource;
+    // what this side enforces is the rest of the fence: the id must be opaque, the leased command must
+    // carry a scoped bridge credential and a bounded fetch TTL, and we ship the clean transcript in
+    // capped pages. Never a bulk mirror of history — one id, one chat, one bounded window.
+    //
+    // The pages go to the relay's own store over our owner-only ssh; the ack carries only a count,
+    // because the relay discards app-supplied ack detail (server.js:1491-1497).
+    private async Task<(bool ok, string detail)> PushTranscriptPagesAsync(string target, int port, AppCommand c)
+    {
+        var sessionId = (c.sessionId ?? "").Trim();
+        var admission = TranscriptFetchProjection.AdmitFetch(sessionId, c.bridgeToken, c.ttlMs);
+        if (!admission.Allowed) return (false, admission.Reason);
+
+        var session = _archive.ResolveSessionByIdOrAlias(sessionId, c.tool);
+        if (session is null) return (false, "chat not in this app's archive");
+
+        var user = await _archive.ExtractReaderMessagesAsync(session, "user");
+        var assistant = await _archive.ExtractReaderMessagesAsync(session, "assistant");
+        var merged = TranscriptFetchProjection.MergeChronological(user, assistant);
+        var redact = TranscriptFetchProjection.RedactReadsEnabled();
+        var pages = TranscriptFetchProjection.BuildPages(sessionId, merged, redact);
+        if (pages.Count == 0) return (true, "no readable messages in that chat");
+
+        string remote;
+        try { remote = TranscriptFetchProjection.PushCommand(port, sessionId, c.bridgeToken!); }
+        catch (ArgumentException ex) { return (false, ex.Message); }
+
+        // The TTL bounds the whole fetch, not each hop: once it lapses we stop pushing rather than
+        // keep writing history the requester is no longer entitled to.
+        var deadline = Stopwatch.StartNew();
+        var pushed = 0;
+        foreach (var page in pages)
+        {
+            if (deadline.ElapsedMilliseconds > c.ttlMs)
+                return (false, $"transcript fetch TTL lapsed after {pushed}/{pages.Count} page(s)");
+            var (code, outText) = await RunSshAsync(target, remote, page.Json);
+            if (code != 0) return (false, $"page {page.Page}/{page.Pages} push failed rc={code} {outText.Trim()}");
+            pushed++;
+        }
+        Diag.Log($"Transcript fetch pushed {pushed} page(s) for session={sessionId} redact={redact}");
+        return (true, $"pushed {pushed} page(s){(redact ? " (redacted)" : "")}");
     }
 
     private static async Task AckCommandAsync(string target, int port, string commandId, string ackJson)
@@ -517,6 +604,12 @@ public sealed partial class MainPage
         public string? deck { get; set; }
         public string? deckName { get; set; }
         public bool takeover { get; set; }
+
+        // transcriptfetch only: the relay mints a scoped, short-lived credential when it queues the
+        // command and bounds the fetch with a TTL. Neither is stored in AppSettings — the app holds
+        // no standing authority to write transcript history, only what a single lease grants it.
+        public string? bridgeToken { get; set; }
+        public int ttlMs { get; set; }
     }
 
     private async Task<(bool ok, string detail)> StartMuxHeadlessFromIntentAsync(
@@ -586,7 +679,8 @@ public sealed partial class MainPage
             launch.SessionId,
             launch.Aliases,
             intentId,
-            relaunch: takeover);
+            relaunch: takeover,
+            allowLocalIntentMint: false);   // polled command: never substitute a locally minted intent
         RecordSessionEvent(
             session,
             created.ok ? "mux.started.remote-command" : "mux.refused.remote-command",
@@ -981,13 +1075,14 @@ public sealed partial class MainPage
         string? sessionId = null,
         IEnumerable<string>? aliases = null,
         string? intentId = null,
-        bool relaunch = false)
+        bool relaunch = false,
+        bool allowLocalIntentMint = true)
     {
         if (!_launchGovernor.TryAcquire(request, out var lease, out var claimDetail))
             return (false, claimDetail);
         using (lease)
         {
-            var created = await CreateLocalMuxdSessionAsync(name, command, sessionId, aliases, intentId, relaunch);
+            var created = await CreateLocalMuxdSessionAsync(name, command, sessionId, aliases, intentId, relaunch, allowLocalIntentMint);
             if (created.ok) lease?.MarkStarted("Started mux-hosted session writer.");
             else lease?.MarkFailed(created.detail);
             return created;
@@ -1063,8 +1158,14 @@ public sealed partial class MainPage
         string? sessionId = null,
         IEnumerable<string>? aliases = null,
         string? intentId = null,
-        bool relaunch = false)
+        bool relaunch = false,
+        bool allowLocalIntentMint = true)
     {
+        // A freshly minted intent is only honest for a start this GUI originated. Minting one for a POLLED
+        // command would hand muxd a brand-new intent on every redelivery, defeating its dedup — so a remote
+        // start with no intent is refused here as well as at the poller's envelope gate.
+        if (!allowLocalIntentMint && !RemoteCommandProtocol.IsWellFormedEnvelopeToken(intentId))
+            return (false, "remote mux start refused: the command carried no usable intent id");
         try
         {
             var cap = await EnsureLocalMuxdCapabilityAsync("create");
@@ -1146,7 +1247,10 @@ public sealed partial class MainPage
             var text = await LocalMuxdRequestAsync(new { t = "kill", s = name });
             using var doc = JsonDocument.Parse(text);
             if (doc.RootElement.TryGetProperty("t", out var t) && t.GetString() == "killed")
+            {
+                RunningSessions.InvalidateScanCache();   // [F#4] the mux session is gone; don't serve the old sweep
                 return (true, "killed");
+            }
             if (doc.RootElement.TryGetProperty("t", out t) && t.GetString() == "err")
                 return (false, doc.RootElement.TryGetProperty("m", out var m) ? m.GetString() ?? "muxd error" : "muxd error");
             return (false, "unexpected muxd kill response: " + Trim(text, 160));

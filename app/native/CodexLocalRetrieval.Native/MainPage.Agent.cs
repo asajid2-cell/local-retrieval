@@ -20,10 +20,12 @@ namespace CodexLocalRetrieval_Native;
 // yourself into project X" from any chat. See Core ArchiveService.ApplyAgentCommandAsync.
 public sealed partial class MainPage
 {
-    private Microsoft.UI.Dispatching.DispatcherQueueTimer? _agentTimer;
-    private int _agentProcessed;
+    // The cursor is a BYTE OFFSET (with a line counter riding along so acks keep quoting absolute line
+    // numbers). That is what makes a poll cost the size of the append instead of the size of the inbox.
+    private AppendCursorState _agentCursor = AppendCursorState.Zero;
     private bool _agentBusy;
-    private sealed record PendingAgentLine(int LineNumber, AgentCommand? Command, string? ParseError);
+    private IFileWatchRegistration? _agentWatch;
+    private sealed record PendingAgentLine(long LineNumber, AgentCommand? Command, string? ParseError);
 
     private static string AgentDir =>
         Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "CodexLocalRetrieval");
@@ -39,14 +41,20 @@ public sealed partial class MainPage
             Directory.CreateDirectory(AgentDir);
             File.WriteAllText(AgentDoc, AgentProtocolDoc());
             if (!File.Exists(AgentInbox)) File.WriteAllText(AgentInbox, "");
-            if (File.Exists(AgentCursor) && int.TryParse(File.ReadAllText(AgentCursor).Trim(), out var c)) _agentProcessed = c;
+            // Migrates a v1 line-count cursor left by an older build exactly once, in place.
+            _agentCursor = AppendCursor.Load(AgentCursor, AgentInbox);
         }
         catch (Exception ex) { Diag.Log("Agent bridge init failed " + ex); return; }
 
-        _agentTimer = DispatcherQueue.CreateTimer();
-        _agentTimer.Interval = TimeSpan.FromMilliseconds(1500);
-        _agentTimer.Tick += async (_, _) => await PollAgentInboxAsync();
-        _agentTimer.Start();
+        // The inbox is now read when an agent WRITES to it, not on a blind 1.5 s beat that re-read the
+        // whole file. FileWatchService keeps a fallback poll behind the event, so a volume that drops
+        // change notifications still drains the inbox on its own.
+        try
+        {
+            _agentWatch = FileWatch.WatchFile(AgentInbox, () =>
+                DispatcherQueue.TryEnqueue(async () => await PollAgentInboxAsync()));
+        }
+        catch (Exception ex) { Diag.Log("Agent inbox watch failed " + ex); }
         Diag.Log("Agent bridge ENABLED, inbox=" + AgentInbox);
 
         // Durable queue: commands an agent appended while the app was CLOSED sit in the inbox past the
@@ -61,26 +69,37 @@ public sealed partial class MainPage
 
     private async Task PollAgentInboxAsync()
     {
-        if (_agentBusy || !_storeLoaded || _syncing) return;
-        string text;
-        try { if (!File.Exists(AgentInbox)) return; text = File.ReadAllText(AgentInbox); }
-        catch { return; }
+        if (_agentBusy || !_storeLoaded || _syncing)
+        {
+            // Declined, not consumed — make the watcher re-deliver instead of treating this as handled.
+            _agentWatch?.Rearm();
+            return;
+        }
+        if (!File.Exists(AgentInbox)) return;
 
-        // Only act on COMPLETE lines (terminated by \n); leave a half-written tail for the next poll.
-        var lines = text.Replace("\r\n", "\n").Split('\n');
-        var complete = lines.Length - 1;
-        if (complete < _agentProcessed) _agentProcessed = 0;        // inbox was truncated/reset
-        if (complete <= _agentProcessed) return;
+        // Read ONLY the bytes appended past the cursor, and do it off the UI thread. ReadNewLines
+        // returns complete lines only, so a half-written tail is left for the next read; if the inbox
+        // is now shorter than the cursor it was reset, and Restarted says the counters restarted at 0.
+        var cursor = _agentCursor;
+        AppendReadResult read;
+        try { read = await Task.Run(() => AppendCursor.ReadNewLines(AgentInbox, cursor)); }
+        catch (Exception ex) { Diag.Log("Agent inbox read error " + ex.Message); return; }
+
+        var next = new AppendCursorState(read.NextOffset, read.NextLine);
+        if (read.Lines.Count == 0)
+        {
+            if (read.Restarted || next != _agentCursor) { _agentCursor = next; AppendCursor.Save(AgentCursor, next); }
+            return;
+        }
 
         _agentBusy = true;
         try
         {
-            var fresh = lines.Skip(_agentProcessed).Take(complete - _agentProcessed).ToList();
             var pending = new List<PendingAgentLine>();
-            for (var i = 0; i < fresh.Count; i++)
+            for (var i = 0; i < read.Lines.Count; i++)
             {
-                var line = fresh[i];
-                var lineNumber = _agentProcessed + i + 1;
+                var line = read.Lines[i];
+                var lineNumber = read.NextLine - read.Lines.Count + i + 1;   // absolute, as the acks quote it
                 if (string.IsNullOrWhiteSpace(line)) continue;
                 try
                 {
@@ -97,8 +116,8 @@ public sealed partial class MainPage
             if (pending.Count == 0)
             {
                 // Blank lines: consume them so they don't re-read every poll.
-                _agentProcessed = complete;
-                try { File.WriteAllText(AgentCursor, _agentProcessed.ToString()); } catch { }
+                _agentCursor = next;
+                AppendCursor.Save(AgentCursor, next);
                 return;
             }
 
@@ -154,8 +173,8 @@ public sealed partial class MainPage
 
             // Advance the cursor ONLY after the batch is applied + acked, so a crash/exception
             // before here reprocesses (ops are idempotent) instead of dropping commands forever.
-            _agentProcessed = complete;
-            try { File.WriteAllText(AgentCursor, _agentProcessed.ToString()); } catch { }
+            _agentCursor = next;
+            AppendCursor.Save(AgentCursor, next);
         }
         catch (Exception ex) { Diag.Log("Agent poll error " + ex); }
         finally { _agentBusy = false; }

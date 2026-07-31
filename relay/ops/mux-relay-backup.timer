@@ -1,0 +1,15 @@
+[Unit]
+Description=Hourly off-box backup of multiplex relay durable state
+Documentation=file:///home/harmonizer/multiplex-app/ops/README.md
+
+[Timer]
+OnCalendar=hourly
+# Spread the scp so a fleet of hosts does not hit the PC route at :00 together.
+RandomizedDelaySec=300
+# If the VPS was down at the scheduled time, run once on the next boot rather than
+# skipping the window entirely — the whole point is surviving a host that goes away.
+Persistent=true
+Unit=mux-relay-backup.service
+
+[Install]
+WantedBy=timers.target

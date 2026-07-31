@@ -133,6 +133,9 @@ public static class MuxIdentityTransfer
         // No candidate ids: this pid IS the target (the handoff already identified it), so the id set is empty
         // rather than null - `null` is ambiguous between the two Kill overloads.
         var result = RunningSessions.Kill(Array.Empty<string>(), pid);
+        // [F#4] Kill already drops the burst cache on success; this makes the takeover path's dependency on a
+        // fresh world explicit, because the very next thing we do is poll for the owner's disappearance.
+        RunningSessions.InvalidateScanCache();
         return (result.ok, result.detail);
     }
 
@@ -153,7 +156,10 @@ public static class MuxIdentityTransfer
             var text = await muxdRequest(new { t = "kill", s = name });
             using var doc = JsonDocument.Parse(text);
             if (doc.RootElement.TryGetProperty("t", out var type) && type.GetString() == "killed")
+            {
+                RunningSessions.InvalidateScanCache();   // [F#4] muxd just removed a tab: the cached world is stale
                 return (true, "removed");
+            }
             var detail = doc.RootElement.TryGetProperty("m", out var message)
                 ? message.GetString() ?? "muxd error"
                 : "unexpected muxd response: " + text;

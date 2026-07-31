@@ -38,6 +38,21 @@ ssh "$VPS" "sudo cp $LIVE/server.js $LIVE/server.js.pre-deploy-$STAMP"
 echo "deploying relay/ code to $LIVE (sudo) ..."
 tar czf - --exclude node_modules --exclude '*.log' --exclude '.deploy-backup*' \
           --exclude 'durable-state.json' --exclude 'app-commands.json' --exclude uploads . | \
-  ssh "$VPS" "sudo tar xzf - -C $LIVE && sudo systemctl restart multiplex-app && echo deployed"
+  ssh "$VPS" "sudo tar xzf - -C $LIVE && echo deployed"
+# SIGTERM-FIRST, then wait. server.js now handles SIGTERM by DRAINING: it refuses new upgrades, flushes
+# pins, and closes every viewer with 1012 'restarting', which index.html maps to a 500ms reconnect plus a
+# toast. `systemctl restart` alone does signal SIGTERM, but it does not wait for the drain to finish
+# before bringing the unit back, so a viewer can still see an abnormal 1006 and walk its exponential
+# backoff — the deploy looks like a ~10s outage. Signal, wait for the process to go (well inside its own
+# 5s backstop), then start clean. r.1.4.3 shipped this logic against the wrong service name and the dead
+# ~/multiplex-app target; it belongs here, on /opt, behind the confirm gate.
+ssh "$VPS" "
+  sudo systemctl kill -s SIGTERM multiplex-app 2>/dev/null || true
+  for i in \$(seq 1 40); do
+    sudo systemctl is-active --quiet multiplex-app || break
+    sleep 0.2
+  done
+  sudo systemctl restart multiplex-app && echo restarted
+"
 echo "health check:"
 ssh "$VPS" "curl -fsS http://127.0.0.1:\$(sudo grep -oE 'PORT[ =:]+[0-9]+' $LIVE/server.js | grep -oE '[0-9]+' | head -1)/api/health || echo 'health check FAILED — check the service'"

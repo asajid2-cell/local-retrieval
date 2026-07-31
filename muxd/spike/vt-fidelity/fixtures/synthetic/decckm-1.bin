@@ -1,0 +1,4 @@
+deccm off
+[?1hdeccm on (SS3 arrows)
+[?1ldeccm off (CSI arrows)
+[?1hleft on for the viewer

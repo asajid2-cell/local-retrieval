@@ -1,0 +1,11 @@
+{
+  "name": "pager-alt",
+  "corpus": "recorded",
+  "cols": 140,
+  "rows": 40,
+  "bytes": 18651,
+  "source": "less -R muxd.py under ConPTY",
+  "desc": "alt-screen pager: 1049 enter/leave, full repaints, reverse-video status line",
+  "captureMethod": "conpty-pager-alt",
+  "containsRecordedSessionContent": false
+}
