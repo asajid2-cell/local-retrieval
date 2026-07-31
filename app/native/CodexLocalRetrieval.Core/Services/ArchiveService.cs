@@ -681,21 +681,32 @@ public sealed partial class ArchiveService
         else RefreshSessions(Store.Sessions.Values);
     }
 
+    // How many rows the bound list ever holds. Everything past this is unreachable in the UI anyway.
+    private const int SessionListCap = 600;
+
+    // The bound list is DIFFED into place, not rebuilt. Clear() + 600 Add() raised 601 CollectionChanged
+    // notifications on every keystroke, and each one makes the ListView rebuild item containers on the
+    // dispatcher — the freeze the app was reported to have while filtering. Re-running an unchanged
+    // filter now raises zero notifications and a one-row delta raises one.
     public void RefreshSessions(IEnumerable<ArchiveSession> sessions, bool preserveOrder = false)
     {
-        Sessions.Clear();
         // preserveOrder: the caller already ordered the set deliberately (e.g. by creation date) —
         // re-sorting by pinned/recency here would silently undo that.
         var ordered = preserveOrder ? sessions.Where(s => !s.Archived) : OrderedVisibleSessions(sessions);
-        foreach (var session in ordered.Take(600))
+
+        var desired = new List<ArchiveSession>(SessionListCap);
+        foreach (var session in ordered)
         {
+            if (desired.Count >= SessionListCap) break;
             if (session.Tags.Count == 0)
             {
                 session.Tags.Add("archive");
                 if (session.CodeBlocks.Count > 0) session.Tags.Add("code");
             }
-            Sessions.Add(session);
+            desired.Add(session);
         }
+
+        PerfCounters.SessionListOps(ObservableDiff.Apply(Sessions, desired, static s => s.Id));
     }
 
     public IReadOnlyList<ArchiveSession> Search(string query)

@@ -18,6 +18,7 @@ public static class PerfCounters
     private static long _inboxBytesRead;
     private static long _fileWatchEvents;
     private static long _fileWatchFallbackPolls;
+    private static long _sessionListOps;
 
     /// One SearchText(session) interpolation — recomposed per session per term today.
     public static void SearchTextComposed(long count = 1) => Interlocked.Add(ref _searchTextCompositions, count);
@@ -47,6 +48,10 @@ public static class PerfCounters
     /// One fallback stat poll — the safety net that runs when no event arrives.
     public static void FileWatchFallbackPoll(long count = 1) => Interlocked.Add(ref _fileWatchFallbackPolls, count);
 
+    /// CollectionChanged notifications raised on the bound session list. This is the number the XAML
+    /// ListView actually pays for: each one can rebuild item containers on the dispatcher.
+    public static void SessionListOps(long count = 1) => Interlocked.Add(ref _sessionListOps, count);
+
     /// Zero every counter. Call immediately before a measured region; counters are process-wide.
     public static void Reset()
     {
@@ -59,6 +64,7 @@ public static class PerfCounters
         Interlocked.Exchange(ref _inboxBytesRead, 0);
         Interlocked.Exchange(ref _fileWatchEvents, 0);
         Interlocked.Exchange(ref _fileWatchFallbackPolls, 0);
+        Interlocked.Exchange(ref _sessionListOps, 0);
     }
 
     /// Current values keyed by their contract names. Ordinal-sorted so artifacts diff cleanly.
@@ -73,5 +79,6 @@ public static class PerfCounters
         ["inboxBytesRead"] = Interlocked.Read(ref _inboxBytesRead),
         ["fileWatchEvents"] = Interlocked.Read(ref _fileWatchEvents),
         ["fileWatchFallbackPolls"] = Interlocked.Read(ref _fileWatchFallbackPolls),
+        ["sessionListOps"] = Interlocked.Read(ref _sessionListOps),
     };
 }
