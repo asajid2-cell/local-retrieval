@@ -7,7 +7,7 @@ const path = require('node:path');
 const vm = require('node:vm');
 const { once } = require('node:events');
 const WebSocket = require('ws');
-const { durableJsonLoad, durableJsonWrite } = require('../durable-state');
+const { durableJsonLoad, durableJsonWrite, recoveryWriteFailureReport } = require('../durable-state');
 const {
   REPO,
   HOST_CAPS,
@@ -82,6 +82,43 @@ test('durable relay state load restores a corrupt primary from its backup', () =
     assert.deepEqual(durableJsonLoad(file, { version: 0 }), { version: 7 });
     assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), { version: 7 });
   } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// A GOOD backup must survive a bad write. The recovered value has already parsed and validated, so
+// republishing it as the primary is housekeeping — if that write fails (disk full, AV lock, read-only
+// mount) the load must still hand back the recovered value. It previously threw, and because every
+// caller in server.js runs at module scope, that turned a transient write error into a relay that
+// would not start while a perfectly good .bak sat on disk.
+test('a recovered backup survives a failed republish: the value is returned and the backup is kept', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-durable-'));
+  const faultFile = path.join(root, 'fault.json');
+  const previousFaultFile = process.env.MUX_TEST_PERSIST_FAULT_FILE;
+  try {
+    const file = path.join(root, 'state.json');
+    fs.writeFileSync(file, '{"broken"');
+    fs.writeFileSync(file + '.bak', JSON.stringify({ version: 7 }));
+
+    // Fail the republish only — the read/parse/validate of the backup all succeed first.
+    process.env.MUX_TEST_PERSIST_FAULT_FILE = faultFile;
+    fs.writeFileSync(faultFile, JSON.stringify({ stage: 'beforeWrite', file: 'state.json', remaining: 1 }));
+
+    const before = recoveryWriteFailureReport().length;
+    assert.deepEqual(
+      durableJsonLoad(file, { version: 0 }),
+      { version: 7 },
+      'a failed republish must not cost us the recovered value',
+    );
+    // The backup is still there, so the next boot recovers again even if nothing wrote in between.
+    assert.deepEqual(JSON.parse(fs.readFileSync(file + '.bak', 'utf8')), { version: 7 });
+    // Recorded, not swallowed: /api/health reports this and goes degraded.
+    const failures = recoveryWriteFailureReport();
+    assert.equal(failures.length, before + 1, 'the failed republish must be recorded');
+    assert.equal(failures[failures.length - 1].file, 'state.json');
+  } finally {
+    if (previousFaultFile === undefined) delete process.env.MUX_TEST_PERSIST_FAULT_FILE;
+    else process.env.MUX_TEST_PERSIST_FAULT_FILE = previousFaultFile;
     fs.rmSync(root, { recursive: true, force: true });
   }
 });

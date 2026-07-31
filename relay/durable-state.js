@@ -168,6 +168,44 @@ function readValidatedJson(file, validate) {
   return value;
 }
 
+// Republishing a recovered backup as the primary is BEST EFFORT, and it must never be able to destroy
+// the recovery it just performed.
+//
+// The value has already parsed AND validated by the time we get here, so it is authoritative in memory
+// whether or not this write lands. Previously commitBytes() sat inside the recovery try-block, so any
+// transient write failure -- disk full, an AV scanner holding the file, a read-only mount -- threw out
+// of durableJsonLoad. Since every caller in server.js runs at module scope, that killed startup while a
+// perfectly good .bak sat on disk. The load must not fail over a write it does not need.
+//
+// The failure is recorded rather than swallowed: it surfaces in /api/health and forces `degraded`, and
+// the next ordinary save of that store rewrites the primary anyway.
+const recoveryWriteFailures = [];
+
+function republishRecoveredBackup(file, backupBytes) {
+  try {
+    commitBytes(file, backupBytes);
+  } catch (error) {
+    const reason = String(error && error.message || error);
+    recoveryWriteFailures.push({ file: path.basename(file), reason, at: Date.now() });
+    console.error(
+      `[persistence] recovered ${path.basename(file)} from its backup but could not republish it: ${reason}; `
+      + 'the recovered value is live in memory and the next save will rewrite the primary',
+    );
+  }
+}
+
+function recoveryWriteFailureReport() {
+  return recoveryWriteFailures.map(record => ({ ...record }));
+}
+
+// NOTE ON THE THROW: an unusable primary with no usable backup still throws, which still prevents the
+// relay from listening. That is deliberate upstream, not an oversight -- server.js:1385 rewrites
+// projects.json through the allowlist on every boot, and "fails startup" is the mechanism that stops
+// that rewrite from clobbering a projection this build does not recognise (e.g. one written by a NEWER
+// relay). relay.test.js pins exactly that contract. Making a bad state file non-fatal is a real and
+// worthwhile change, but it requires a write-refusal design for the quarantined store first, or the
+// boot-time rewrite simply destroys the file the throw was protecting. Tracked separately; do not
+// "fix" this by deleting the throw alone.
 function durableJsonLoad(file, fallback, validate = null) {
   if (fs.existsSync(file)) {
     try {
@@ -180,7 +218,7 @@ function durableJsonLoad(file, fallback, validate = null) {
       if (validate && !validate(restored)) {
         throw new Error(`invalid persisted state shape: ${backup}`, { cause: primaryError });
       }
-      commitBytes(file, backupBytes);
+      republishRecoveredBackup(file, backupBytes);
       return restored;
     }
   }
@@ -192,7 +230,7 @@ function durableJsonLoad(file, fallback, validate = null) {
     if (validate && !validate(restored)) {
       throw new Error(`invalid persisted state shape: ${backup}`);
     }
-    commitBytes(file, backupBytes);
+    republishRecoveredBackup(file, backupBytes);
     return restored;
   }
   return fallback;
@@ -203,4 +241,5 @@ module.exports = {
   durableJsonWrite,
   durableWrite,
   fsyncDirectory,
+  recoveryWriteFailureReport,
 };

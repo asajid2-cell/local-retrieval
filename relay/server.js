@@ -8,7 +8,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { execSync, execFile } = require('child_process');
-const { durableJsonLoad, durableJsonWrite, durableWrite, fsyncDirectory } = require('./durable-state');
+const { durableJsonLoad, durableJsonWrite, durableWrite, fsyncDirectory, recoveryWriteFailureReport } = require('./durable-state');
 const { createHealthAlerts, startHealthAlerts } = require("./health-alerts");
 const { createNotifier } = require("./notify");
 const { createRetention, pruneTranscripts: pruneTranscriptRetention } = require('./retention');
@@ -1788,13 +1788,18 @@ function healthSnapshot() {
   // A2 #9: if the PC host is down, armed sessions are hosted-and-unreachable (can't be healed) → surface
   // that as degraded instead of a falsely-green dot. Legacy tmux names are also degraded blockers.
   const hostedArmedDown = 0;
+  // A store recovered from its .bak but whose primary could not be rewritten. The value in memory is
+  // correct, so this is not an outage — but the primary on disk is still the bad copy until the next
+  // save lands, so it stays visible instead of reading as a clean boot.
+  const stateRecoveryFailures = recoveryWriteFailureReport();
   const degraded = TEST_MODE
-    ? (!hostUp() || !hostProtocolOk() || legacyNames.length > 0 || !!persistenceFailure || renameIntents.length > 0 || uploadRecoveryWarnings.length > 0)
-    : (!hostUp() || !hostProtocolOk() || _pcHealth.reachable === false || gaveUp > 0 || hostedArmedDown > 0 || legacyNames.length > 0 || !projects.bridgeLive || !!persistenceFailure || renameIntents.length > 0 || uploadRecoveryWarnings.length > 0);
+    ? (!hostUp() || !hostProtocolOk() || legacyNames.length > 0 || !!persistenceFailure || renameIntents.length > 0 || uploadRecoveryWarnings.length > 0 || stateRecoveryFailures.length > 0)
+    : (!hostUp() || !hostProtocolOk() || _pcHealth.reachable === false || gaveUp > 0 || hostedArmedDown > 0 || legacyNames.length > 0 || !projects.bridgeLive || !!persistenceFailure || renameIntents.length > 0 || uploadRecoveryWarnings.length > 0 || stateRecoveryFailures.length > 0);
   return { ok: !degraded, degraded, uptimeSec: Math.round(process.uptime()), tmuxAvailable, sessions: hostSessions.size,
            legacySessions: legacyNames.length, legacyNames, legacyPolicy: "blocked", armed, gaveUp, hostedArmedDown, pc: _pcHealth,
            projects,
            persistence: { ok: !persistenceFailure && !persistenceBlocked, detail: persistenceBlocked || persistenceFailure, blocked: !!persistenceBlocked },
+           stateRecoveryFailures,
            pendingRenameIntents: renameIntents.length,
            uploadRecoveryWarnings,
            // State growth is observable BEFORE it is a problem: total bytes on disk plus a
