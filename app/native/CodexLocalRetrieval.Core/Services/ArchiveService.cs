@@ -163,6 +163,17 @@ public sealed partial class ArchiveService
     private readonly string _storePath;
     private readonly string _bundledStorePath;
     private readonly JsonSerializerOptions _jsonOptions = new() { PropertyNameCaseInsensitive = true, WriteIndented = true };
+
+    // The store payload is machine-written and machine-read; nobody reads a 14 MB app-store.json by eye.
+    // Indenting inflated the file and the serialize that produces it, on the caller's thread, on every
+    // save. Reads stay on _jsonOptions, which parses either form, so existing indented stores load
+    // unchanged. Human-facing exports (the collections backup) deliberately keep the indented options.
+    private static readonly JsonSerializerOptions StorePayloadJsonOptions =
+        new() { PropertyNameCaseInsensitive = true, WriteIndented = false };
+
+    // How much of a store file the generation probe is willing to read. The header it needs sits in the
+    // first few dozen bytes; this is slack for a hand-formatted or reordered file.
+    private const int StoreHeaderProbeBytes = 32 * 1024;
     private readonly SemaphoreSlim _saveGate = new(1, 1);
     private readonly ConditionalWeakTable<ArchiveSession, SemaphoreSlim> _contentLoadGates = new();
     private readonly Func<string, string, Task<ArchiveSession?>>? _parseSessionOverride;
@@ -309,6 +320,7 @@ public sealed partial class ArchiveService
     private AppStoreData ReadStore(byte[] bytes, string source)
     {
         ValidateStoreShape(bytes, source);
+        PerfCounters.StoreFullDeserialize();
         var data = JsonSerializer.Deserialize<AppStoreData>(bytes, _jsonOptions)
             ?? throw new InvalidDataException("App store deserialized to null: " + source);
         NormalizeLoadedStore(data);
@@ -317,6 +329,7 @@ public sealed partial class ArchiveService
 
     private static void ValidateStoreShape(byte[] bytes, string source)
     {
+        PerfCounters.StoreJsonParse();
         using var document = JsonDocument.Parse(bytes);
         var root = document.RootElement;
         if (root.ValueKind != JsonValueKind.Object
@@ -586,12 +599,22 @@ public sealed partial class ArchiveService
             var nextGeneration = checked(diskGeneration + 1);
             NormalizeBranchIdentityAliases();
             Store.Generation = nextGeneration;
-            var bytes = JsonSerializer.SerializeToUtf8Bytes(Store, _jsonOptions);
+            // Serialization stays on the CALLER'S thread on purpose. The backlog asked for it to move
+            // into the Task.Run below, but that is unsafe for the reason this method already documented:
+            // the gate does not stop the UI thread from running, so once we yield, a click can mutate
+            // Store.Sessions while a worker is midway through walking it. Compact output makes this step
+            // cheaper without introducing that race; a snapshot cheap enough to hand off does not exist,
+            // because building one costs the same walk as serializing.
+            var bytes = JsonSerializer.SerializeToUtf8Bytes(Store, StorePayloadJsonOptions);
+            PerfCounters.StoreBytesWritten(bytes.LongLength);
             try
             {
-                ReadStore(bytes, "serialized app store");
                 await Task.Run(async () =>
                 {
+                    // `bytes` is immutable from here, so validating it off-thread is safe -- and this
+                    // replaces a full Deserialize<AppStoreData> of every chat whose result was discarded.
+                    // The shape check is what the commit actually depends on.
+                    ValidateStoreShape(bytes, "serialized app store");
                     Directory.CreateDirectory(StoreBackupsDir);
                     var stamp = DateTime.UtcNow.ToString("yyyyMMdd-HHmmss-fff") + "-"
                                 + Guid.NewGuid().ToString("N");
@@ -660,15 +683,94 @@ public sealed partial class ArchiveService
         throw new IOException("Timed out waiting for the cross-process app-store writer lock.", last);
     }
 
+    // SaveAsync needs ONE integer off the front of the store to notice a second writer. Recovering it
+    // used to cost File.ReadAllBytes of the entire store plus two full JsonDocument.Parse passes over it
+    // -- 13.8 MB and ~190 ms of dispatcher time on a 4000-chat archive, on every tag, pin and rename.
+    // AppStoreData writes storeSchemaVersion and generation ahead of the sessions map, so a bounded
+    // prefix answers the question outright.
     private long ReadStoreGeneration(string path)
     {
+        if (TryProbeStoreGeneration(path, out var probed)) return probed;
+
+        // Fallback: anything the probe could not positively confirm is read and validated exactly as
+        // before, so no file that used to load stops loading and no corruption that used to throw stops
+        // throwing.
         var bytes = File.ReadAllBytes(path);
+        PerfCounters.StoreBytesRead(bytes.LongLength);
         ValidateStoreShape(bytes, path);
+        PerfCounters.StoreJsonParse();
         using var document = JsonDocument.Parse(bytes);
         return document.RootElement.TryGetProperty("generation", out var generation)
                && generation.TryGetInt64(out var value)
             ? value
             : 0;
+    }
+
+    // Trusted ONLY when it positively finds the generation AND sees the sessions map open as an object.
+    // Every other outcome -- a reordered or older layout, a header bigger than the probe window, a
+    // truncated value, a bad schema version -- returns false and defers to the full read above rather
+    // than guessing.
+    private static bool TryProbeStoreGeneration(string path, out long generation)
+    {
+        generation = 0;
+        byte[] prefix;
+        int read;
+        try
+        {
+            using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            prefix = new byte[StoreHeaderProbeBytes];
+            read = stream.Read(prefix, 0, prefix.Length);
+        }
+        catch (IOException) { return false; }
+        if (read <= 0) return false;
+
+        PerfCounters.StoreBytesRead(read);
+        PerfCounters.StoreHeaderScan();
+
+        var reader = new Utf8JsonReader(prefix.AsSpan(0, read), isFinalBlock: false, state: default);
+        var haveGeneration = false;
+        try
+        {
+            if (!reader.Read() || reader.TokenType != JsonTokenType.StartObject) return false;
+            while (reader.Read())
+            {
+                if (reader.TokenType != JsonTokenType.PropertyName || reader.CurrentDepth != 1)
+                {
+                    if (reader.TokenType == JsonTokenType.EndObject && reader.CurrentDepth == 0) break;
+                    continue;
+                }
+
+                var name = reader.GetString();
+                if (!reader.Read()) return false;
+
+                if (string.Equals(name, "storeSchemaVersion", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (reader.TokenType != JsonTokenType.Number
+                        || !reader.TryGetInt32(out var schema)
+                        || schema != 1)
+                        return false;
+                }
+                else if (string.Equals(name, "generation", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (reader.TokenType != JsonTokenType.Number || !reader.TryGetInt64(out generation))
+                        return false;
+                    haveGeneration = true;
+                }
+                else if (string.Equals(name, "sessions", StringComparison.OrdinalIgnoreCase))
+                {
+                    // Confirms the shape without reading the map itself, which is the whole file.
+                    return haveGeneration && reader.TokenType == JsonTokenType.StartObject;
+                }
+                else if (!reader.TrySkip())
+                {
+                    return false;   // value runs past the probe window
+                }
+            }
+        }
+        catch (JsonException) { return false; }
+        catch (InvalidOperationException) { return false; }
+
+        return false;   // never reached `sessions` inside the window
     }
 
     // The UI sets this to re-run the ACTIVE chat filter (preserving the selection). Every mutation + sync

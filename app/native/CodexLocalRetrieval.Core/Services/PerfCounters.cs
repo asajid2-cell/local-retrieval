@@ -20,6 +20,10 @@ public static class PerfCounters
     private static long _fileWatchFallbackPolls;
     private static long _sessionListOps;
     private static long _tagAggregateScans;
+    private static long _storeBytesRead;
+    private static long _storeJsonParses;
+    private static long _storeBytesWritten;
+    private static long _storeHeaderScans;
 
     /// One SearchText(session) interpolation — recomposed per session per term today.
     public static void SearchTextComposed(long count = 1) => Interlocked.Add(ref _searchTextCompositions, count);
@@ -57,6 +61,18 @@ public static class PerfCounters
     /// strip asks for both per keystroke, so this should stay flat while nothing is being mutated.
     public static void TagAggregateScan(long count = 1) => Interlocked.Add(ref _tagAggregateScans, count);
 
+    /// Bytes pulled off disk from a store file. Reading the generation used to cost the WHOLE store here.
+    public static void StoreBytesRead(long bytes) => Interlocked.Add(ref _storeBytesRead, bytes);
+
+    /// One JsonDocument.Parse over a whole store payload. Each is a full structural walk of every chat.
+    public static void StoreJsonParse(long count = 1) => Interlocked.Add(ref _storeJsonParses, count);
+
+    /// Bytes serialized for a store commit. Indenting inflated both this and the CPU that produced it.
+    public static void StoreBytesWritten(long bytes) => Interlocked.Add(ref _storeBytesWritten, bytes);
+
+    /// One bounded header probe of a store file -- the cheap alternative to parsing it whole.
+    public static void StoreHeaderScan(long count = 1) => Interlocked.Add(ref _storeHeaderScans, count);
+
     /// Zero every counter. Call immediately before a measured region; counters are process-wide.
     public static void Reset()
     {
@@ -71,6 +87,10 @@ public static class PerfCounters
         Interlocked.Exchange(ref _fileWatchFallbackPolls, 0);
         Interlocked.Exchange(ref _sessionListOps, 0);
         Interlocked.Exchange(ref _tagAggregateScans, 0);
+        Interlocked.Exchange(ref _storeBytesRead, 0);
+        Interlocked.Exchange(ref _storeJsonParses, 0);
+        Interlocked.Exchange(ref _storeBytesWritten, 0);
+        Interlocked.Exchange(ref _storeHeaderScans, 0);
     }
 
     /// Current values keyed by their contract names. Ordinal-sorted so artifacts diff cleanly.
@@ -87,5 +107,9 @@ public static class PerfCounters
         ["fileWatchFallbackPolls"] = Interlocked.Read(ref _fileWatchFallbackPolls),
         ["sessionListOps"] = Interlocked.Read(ref _sessionListOps),
         ["tagAggregateScans"] = Interlocked.Read(ref _tagAggregateScans),
+        ["storeBytesRead"] = Interlocked.Read(ref _storeBytesRead),
+        ["storeJsonParses"] = Interlocked.Read(ref _storeJsonParses),
+        ["storeBytesWritten"] = Interlocked.Read(ref _storeBytesWritten),
+        ["storeHeaderScans"] = Interlocked.Read(ref _storeHeaderScans),
     };
 }
