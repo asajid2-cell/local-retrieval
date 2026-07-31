@@ -1,8 +1,11 @@
 using System;
 using System.Collections.ObjectModel;
+using System.Collections.Specialized;
 using System.ComponentModel;
 using System.Runtime.CompilerServices;
+using System.Text;
 using System.Text.Json.Serialization;
+using CodexLocalRetrieval.Core.Services;
 
 namespace CodexLocalRetrieval.Core.Models;
 
@@ -395,21 +398,90 @@ public sealed class ArchiveSession : INotifyPropertyChanged
     public event PropertyChangedEventHandler? PropertyChanged;
     private void Raise([CallerMemberName] string? name = null) => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
 
+    public ArchiveSession()
+    {
+        // The two ObservableCollections that feed SearchText are wired here as well as in their setters,
+        // because a field initializer bypasses the setter.
+        _tags.CollectionChanged += OnSearchFieldCollectionChanged;
+        _specialPhrases.CollectionChanged += OnSearchFieldCollectionChanged;
+    }
+
+    // ------------------------------------------------------------------ search-text cache
+    //
+    // SearchText composes a ~3 KB string out of eight fields, and the filter pass asks for it once per
+    // session PER TERM — a two-word query over 4000 chats composed 8000 of them and allocated ~20 MB
+    // before a single character was compared. The composition is cached here instead.
+    //
+    // Invalidation is STRUCTURAL, not by convention: every contributing field is either a property whose
+    // setter clears the cache, or an ObservableCollection whose CollectionChanged clears it (rewired when
+    // the collection instance itself is replaced, e.g. by the JSON deserializer). No call site anywhere in
+    // the app has to remember to invalidate, which is the only way a cache like this stays correct.
+    private string? _searchTextCache;
+
+    private void InvalidateSearchText() => _searchTextCache = null;
+
+    private void OnSearchFieldCollectionChanged(object? sender, NotifyCollectionChangedEventArgs e) => InvalidateSearchText();
+
+    private ObservableCollection<string> WatchForSearchText(ObservableCollection<string> old, ObservableCollection<string> next)
+    {
+        if (ReferenceEquals(old, next)) return next;
+        old.CollectionChanged -= OnSearchFieldCollectionChanged;
+        next.CollectionChanged += OnSearchFieldCollectionChanged;
+        InvalidateSearchText();
+        return next;
+    }
+
+    // The haystack one search term is tested against. Composed at most once per mutation.
+    [JsonIgnore]
+    public string SearchText
+    {
+        get
+        {
+            var cached = _searchTextCache;
+            if (cached is not null) return cached;
+            PerfCounters.SearchTextComposed();
+            var sb = new StringBuilder(
+                Id.Length + DisplayTitle.Length + Title.Length + Text.Length
+                + SourcePath.Length + Workspace.Length + 64);
+            sb.Append(Id).Append('\n')
+              .Append(DisplayTitle).Append('\n')
+              .Append(Title).Append('\n')
+              .Append(Text).Append('\n')
+              .Append(SourcePath).Append('\n')
+              .Append(Workspace).Append('\n');
+            AppendJoined(sb, _tags);
+            sb.Append('\n');
+            AppendJoined(sb, _specialPhrases);
+            return _searchTextCache = sb.ToString();
+        }
+    }
+
+    private static void AppendJoined(StringBuilder sb, ObservableCollection<string> values)
+    {
+        for (var i = 0; i < values.Count; i++)
+        {
+            if (i > 0) sb.Append(' ');
+            sb.Append(values[i]);
+        }
+    }
+
+    private string _id = "";
     [JsonPropertyName("id")]
-    public string Id { get; set; } = "";
+    public string Id { get => _id; set { _id = value; InvalidateSearchText(); } }
 
     // Title / CustomTitle / Pinned / UpdatedAt change at runtime (rename, pin, bump-on-resume,
     // re-sync), so they notify their computed display props to keep the live ListView in sync.
     private string _title = "";
     [JsonPropertyName("title")]
-    public string Title { get => _title; set { _title = value; Raise(); Raise(nameof(DisplayTitle)); Raise(nameof(ListTitle)); } }
+    public string Title { get => _title; set { _title = value; InvalidateSearchText(); Raise(); Raise(nameof(DisplayTitle)); Raise(nameof(ListTitle)); } }
 
     private string _customTitle = "";
     [JsonPropertyName("customTitle")]
-    public string CustomTitle { get => _customTitle; set { _customTitle = value; Raise(); Raise(nameof(DisplayTitle)); Raise(nameof(ListTitle)); } }
+    public string CustomTitle { get => _customTitle; set { _customTitle = value; InvalidateSearchText(); Raise(); Raise(nameof(DisplayTitle)); Raise(nameof(ListTitle)); } }
 
+    private string _sourcePath = "";
     [JsonPropertyName("sourcePath")]
-    public string SourcePath { get; set; } = "";
+    public string SourcePath { get => _sourcePath; set { _sourcePath = value; InvalidateSearchText(); } }
 
     // Alternate strong ids found in the transcript header/path. The session Id remains the current
     // resumable chat id; parent/fork ids live here only so exact-id operations can resolve safely.
@@ -423,8 +495,9 @@ public sealed class ArchiveSession : INotifyPropertyChanged
     [JsonPropertyName("updatedAt")]
     public string UpdatedAt { get => _updatedAt; set { _updatedAt = value; Raise(); Raise(nameof(DisplayDate)); } }
 
+    private string _workspace = "";
     [JsonPropertyName("workspace")]
-    public string Workspace { get; set; } = "";
+    public string Workspace { get => _workspace; set { _workspace = value; InvalidateSearchText(); } }
 
     [JsonPropertyName("workspaceName")]
     public string WorkspaceName { get; set; } = "";
@@ -453,17 +526,20 @@ public sealed class ArchiveSession : INotifyPropertyChanged
 
     // Capped, searchable text (user+assistant+tool text, truncated). Serialized so search works without
     // holding full transcripts in memory.
+    private string _text = "";
     [JsonPropertyName("text")]
-    public string Text { get; set; } = "";
+    public string Text { get => _text; set { _text = value; InvalidateSearchText(); } }
 
+    private ObservableCollection<string> _tags = new();
     [JsonPropertyName("tags")]
-    public ObservableCollection<string> Tags { get; set; } = new();
+    public ObservableCollection<string> Tags { get => _tags; set => _tags = WatchForSearchText(_tags, value ?? new()); }
 
     // User-assigned searchable CODENAMES ("special phrases"). A chat can carry several; many chats can
     // share one (e.g. every chat under codename "petunia"). Folded into SearchText, so searching the
     // phrase surfaces every chat stashed under it. App-only metadata — NEVER written into the transcript.
+    private ObservableCollection<string> _specialPhrases = new();
     [JsonPropertyName("specialPhrases")]
-    public ObservableCollection<string> SpecialPhrases { get; set; } = new();
+    public ObservableCollection<string> SpecialPhrases { get => _specialPhrases; set => _specialPhrases = WatchForSearchText(_specialPhrases, value ?? new()); }
 
     [JsonPropertyName("reviewed")]
     public bool Reviewed { get; set; }

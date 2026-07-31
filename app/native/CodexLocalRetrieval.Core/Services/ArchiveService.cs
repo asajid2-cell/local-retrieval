@@ -5291,10 +5291,9 @@ public sealed partial class ArchiveService
         return CleanTitle(value);
     }
 
-    private static string SearchText(ArchiveSession session)
-    {
-        return $"{session.Id}\n{session.DisplayTitle}\n{session.Title}\n{session.Text}\n{session.SourcePath}\n{session.Workspace}\n{string.Join(' ', session.Tags)}\n{string.Join(' ', session.SpecialPhrases)}";
-    }
+    // The composition itself now lives on ArchiveSession, which caches it and invalidates structurally
+    // when any contributing field mutates. Kept as a shim so the search path reads the same either way.
+    private static string SearchText(ArchiveSession session) => session.SearchText;
 
     private static IEnumerable<ArchiveSearchHit> DeepHitsForSession(ArchiveSession session, string[] terms)
     {
