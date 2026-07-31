@@ -148,6 +148,24 @@ function wsOriginOk(req) {
   if (!origin) return TEST_MODE;   // no Origin = not a browser; /ws is browser-only in prod
   return ALLOWED_WS_ORIGINS.includes(origin);
 }
+// TEST-ONLY loopback trust, and the ONLY definition of it — the HTTP gate and the /ws upgrade must
+// consult the same function or they drift, which is exactly what happened: aa74650 correctly removed
+// ambient loopback trust from BOTH, and the campaign's test path was then restored on the HTTP side
+// only, so every viewer-attach test answered 1008 while every HTTP test passed.
+//
+// The campaign's relay tests were authored against a relay that trusted loopback outright. The fix is
+// NOT to restore that bypass — master removed it on purpose, because containers run with
+// network_mode: host and share 127.0.0.1, so any compromised co-tenant satisfied isTrustedLocal().
+// Requiring BOTH an explicit MUX_TEST_MODE=1 opt-in AND a loopback peer keeps production posture
+// bit-identical: MUX_TEST_MODE is never set in a deploy, so this returns false there and both call
+// sites fall through to the real owner check. Same precedent as wsOriginOk above.
+//
+// Both halves are load-bearing and tests/ws-auth-gate.test.js proves each one separately: drop the
+// TEST_MODE half and an unauthenticated loopback caller gets a terminal; drop the isTrustedLocal half
+// and anything arriving through nginx (which stamps X-Forwarded-For) does.
+function testModeLocalTrust(req) {
+  return TEST_MODE && isTrustedLocal(req);
+}
 // A credential SCOPED to one job: the desktop app pushes transcript pages with it, and it authorizes
 // nothing else. Derived from the host credential so it never equals it, and it buys no read back — the
 // GET side stays owner-only. Fails closed: no host credential and no explicit override = no pushes.
@@ -177,14 +195,7 @@ app.use(async (req, res, next) => {
   if (isTranscriptBridgePush(req)) return next();   // re-verified in the route; see the transcript store
   if (isTrustedLocal(req) && isLocalBridgeRoute(req)) return next();   // loopback admits ONLY the desktop-bridge routes
   if (dispatchRouteOk(req)) return next();   // scoped fix-factory dispatch capability
-  // TEST-ONLY. The campaign's 200+ relay tests were authored against a relay that trusted loopback
-  // outright, so under master's narrower gate they all answer 401 and every `await this.json(...)`
-  // helper returns an error object (which is what "list.find is not a function" actually was). The fix
-  // is NOT to restore blanket loopback trust — that is the bypass master removed on purpose, because
-  // containers run network_mode: host and share 127.0.0.1. Requiring BOTH an explicit MUX_TEST_MODE=1
-  // opt-in AND a loopback peer keeps production posture identical: MUX_TEST_MODE is never set there,
-  // so this line is unreachable. Same precedent as wsOriginOk, which already consults TEST_MODE.
-  if (TEST_MODE && isTrustedLocal(req)) return next();
+  if (testModeLocalTrust(req)) return next();
   if (await isOwner(cookieVal(req, HL_COOKIE))) return next();
   const tok = cookieVal(req, HL_COOKIE);
   if (!tok) {
@@ -3133,7 +3144,9 @@ function handleClientMsg(name, client, s) {
 }
 
 wss.on('connection', async (ws, req) => {
-  if (!(await isOwner(cookieVal(req, HL_COOKIE)))) { try { ws.close(1008, 'unauthorized'); } catch {} return; }   // terminal attach is owner-only; loopback is not a credential
+  // Terminal attach is owner-only; loopback is NOT a credential. testModeLocalTrust() is the same
+  // TEST_MODE+loopback exemption the HTTP gate uses and is false in any deploy — see its definition.
+  if (!testModeLocalTrust(req) && !(await isOwner(cookieVal(req, HL_COOKIE)))) { try { ws.close(1008, 'unauthorized'); } catch {} return; }
   try { req.socket.setNoDelay(true); } catch {}                       // low-latency keystrokes: no Nagle on the viewer link
   const u = new URL(req.url, 'http://x');
   const name = strictMuxName(u.searchParams.get('session'));
