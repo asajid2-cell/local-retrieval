@@ -368,12 +368,26 @@ test('dedupe still answers inside the horizon; pruning past it is what re-opens 
 });
 
 // ---- already-bounded stores: assert, never prune ------------------------------------------------------
+// SEED THE SHAPES THE RELAY ACTUALLY WRITES. These previously seeded `{chats:[...]}` with no
+// schemaVersion and `{episodes:[...]}`, neither of which server.js can load: its own validators reject
+// them and durableJsonLoad throws at module scope, so the relay never listened and every assertion here
+// died on "timed out waiting for relay start". retention.js is permissive about shape on purpose
+// (these stores belong to other leaves), which is why the mismatch only showed up at boot.
+//   archive-index.json     -> { schemaVersion, host, chats[], updatedAt }
+//   attention-episodes.json -> Map entry array: [[muxName, { since, notified }], ...]
 test('the sweep asserts the bounded stores instead of pruning them, and reports a real breach', async () => {
   const now = Date.now();
-  const archive = { chats: Array.from({ length: 40 }, (_, i) => ({ id: `a-${i}`, at: now - i })) };
+  const archive = {
+    schemaVersion: 1,
+    host: '',
+    chats: Array.from({ length: 40 }, (_, i) => ({
+      id: `a-${i}`, title: `chat ${i}`, tool: 'codex', updatedAt: now - i,
+    })),
+    updatedAt: now,
+  };
   await withSeededHarness(h => {
     h.seed('archive-index.json', archive);
-    h.seed('attention-episodes.json', { episodes: [{ id: 'e-1' }] });
+    h.seed('attention-episodes.json', [['e-1', { since: now, notified: false }]]);
   }, async h => {
     const health = await h.retention();
     const stores = health.retention.stores;
@@ -397,17 +411,23 @@ test('the sweep asserts the bounded stores instead of pruning them, and reports 
   });
 });
 
+// Retargeted from archiveIndex to attentionEpisodes, because archiveIndex's retention cap is
+// UNREACHABLE from disk: server.js validPersistedArchiveIndex() enforces chats.length <= 500 at load,
+// so a 501-row archive-index.json is refused before retention ever sees it. The old test seeded exactly
+// that and could never have observed the violation it asserted. attentionEpisodes has no length check
+// in its loader, so its 512 cap is a bound retention genuinely owns and can genuinely report on.
 test('a bounded store over its own cap surfaces as an invariant violation, still unpruned', async () => {
-  const overCap = { chats: Array.from({ length: 501 }, (_, i) => ({ id: `a-${i}` })) };
-  await withSeededHarness(h => h.seed('archive-index.json', overCap), async h => {
+  const now = Date.now();
+  const overCap = Array.from({ length: 513 }, (_, i) => [`e-${i}`, { since: now - i, notified: false }]);
+  await withSeededHarness(h => h.seed('attention-episodes.json', overCap), async h => {
     const health = await h.retention();
     assert.equal(health.retention.invariants.ok, false);
-    assert.equal(health.retention.stores.archiveIndex.count, 501);
+    assert.equal(health.retention.stores.attentionEpisodes.count, 513);
     assert.ok(
-      health.retention.invariants.violations.some(v => /archiveIndex.*501.*500/.test(v)),
-      `expected an archiveIndex row-count violation, got ${JSON.stringify(health.retention.invariants.violations)}`,
+      health.retention.invariants.violations.some(v => /attentionEpisodes.*513.*512/.test(v)),
+      `expected an attentionEpisodes row-count violation, got ${JSON.stringify(health.retention.invariants.violations)}`,
     );
-    assert.deepEqual(h.readState('archive-index.json'), overCap, 'observed, not silently rewritten');
+    assert.deepEqual(h.readState('attention-episodes.json'), overCap, 'observed, not silently rewritten');
   });
 });
 

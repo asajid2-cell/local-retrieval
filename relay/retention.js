@@ -126,7 +126,11 @@ function pruneCommands(commands, config, now = Date.now()) {
 // growth. Absent file = that leaf has not landed in this build; that is not a violation.
 const BOUNDED_STORES = [
   { name: 'archiveIndex', file: 'archive-index.json', maxCount: 500, maxBytes: 2 * 1024 * 1024, rowKeys: ['chats'] },
-  { name: 'attentionEpisodes', file: 'attention-episodes.json', maxCount: 512, maxBytes: 1024 * 1024, rowKeys: ['episodes', 'sessions'] },
+  // attention-episodes.json is a Map entry array ([[muxName, {since, notified}], ...]), so extractRows
+  // takes the array branch and rowKeys is never consulted for it. It previously listed
+  // ['episodes','sessions'] — keys server.js has never written. Left empty rather than fictional: a
+  // reader should not have to check server.js to find out that this store has no wrapper object.
+  { name: 'attentionEpisodes', file: 'attention-episodes.json', maxCount: 512, maxBytes: 1024 * 1024, rowKeys: [] },
   { name: 'deferredSends', file: 'deferred-sends.json', maxCount: 256, maxBytes: 4 * 1024 * 1024, rowKeys: ['queue', 'pending', 'sends'] },
 ];
 
