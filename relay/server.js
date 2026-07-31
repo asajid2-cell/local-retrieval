@@ -453,11 +453,39 @@ function requestHostTail(name, lines) {
     sendHost({ t: 'tail', s: name, lines, rid });
   });
 }
+// SYNCHRONOUS SPAWN ON THE STREAMING LOOP. This is execSync, so every call FREEZES the event loop --
+// no keystroke forwarded, no PTY output flushed, no ws frame written -- until the child exits. Measured
+// on the dev box (win32, tmux NOT installed, so the number is only process spawn and contains no tmux
+// IPC at all): 14.9ms p50, 18.2ms p95, 230.7ms max per call. Timer lateness p95 across the loop went
+// 11.0ms -> 105.9ms (max 629.9ms) with these probes running. That is a lower bound, and the 1500ms
+// timeout above is the tail.
+//
+// It is called from: every /ws upgrade (so it blocks attach), listSessions() on GET /api/sessions
+// (polled every 4s BY EVERY OPEN TAB), /api/health (twice -- also `tmux -V`), and every mutating route.
+// Six tabs idling is ~6 spawns per 4s window on the process whose entire job is relaying bytes
+// promptly. This is the most concrete mechanical explanation available for the "stuttery" complaint.
+//
+// The proper fix is to make it async behind a snapshot, which ripples through several sync call sites
+// (tmuxHas is used inline in route guards and in the upgrade handler). This is the contained half of
+// it: a short TTL cache, which collapses the N-tabs-polling case -- the dominant one -- to a single
+// probe per window without changing any call site's sync/async shape. legacyProbes on /api/health
+// makes the remaining spawn rate observable instead of assumed.
+//
+// Staleness is acceptable here BY DESIGN: legacy tmux sessions are a blocking diagnostic that the
+// relay never creates and that an operator is expected to clean up manually, so noticing one up to
+// TTL late costs nothing. Do not reach for this cache for anything with real freshness requirements.
+const LEGACY_TMUX_TTL_MS = Math.max(0, +process.env.MUX_LEGACY_TMUX_TTL_MS || 2000);
+let _legacyTmux = { at: 0, names: [], probes: 0 };
 function legacyTmuxNames() {
+  const now = Date.now();
+  if (_legacyTmux.at && now - _legacyTmux.at < LEGACY_TMUX_TTL_MS) return _legacyTmux.names;
+  let names = [];
   try {
     const out = execSync(`tmux list-sessions -F '#{session_name}' 2>/dev/null`, { encoding: 'utf8', timeout: 1500 });
-    return out.trim().split('\n').map(SAFE).filter(Boolean);
-  } catch { return []; }
+    names = out.trim().split('\n').map(SAFE).filter(Boolean);
+  } catch { names = []; }
+  _legacyTmux = { at: now, names, probes: _legacyTmux.probes + 1 };
+  return names;
 }
 function tmuxHas(name) { const n = SAFE(name); return !!n && legacyTmuxNames().includes(n); }
 function legacyDetail(name) {
@@ -1797,6 +1825,10 @@ function healthSnapshot() {
     : (!hostUp() || !hostProtocolOk() || _pcHealth.reachable === false || gaveUp > 0 || hostedArmedDown > 0 || legacyNames.length > 0 || !projects.bridgeLive || !!persistenceFailure || renameIntents.length > 0 || uploadRecoveryWarnings.length > 0 || stateRecoveryFailures.length > 0);
   return { ok: !degraded, degraded, uptimeSec: Math.round(process.uptime()), tmuxAvailable, sessions: hostSessions.size,
            legacySessions: legacyNames.length, legacyNames, legacyPolicy: "blocked", armed, gaveUp, hostedArmedDown, pc: _pcHealth,
+           // How many times we have actually spawned tmux. Each one is a hard event-loop freeze, so
+           // this is the rate to watch if the terminal feels stuttery — and it is what proves the
+           // TTL cache is doing its job rather than being assumed to.
+           legacyProbes: _legacyTmux.probes,
            projects,
            persistence: { ok: !persistenceFailure && !persistenceBlocked, detail: persistenceBlocked || persistenceFailure, blocked: !!persistenceBlocked },
            stateRecoveryFailures,
