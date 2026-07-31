@@ -172,11 +172,16 @@ test('a draining relay stops serving http as well, so a deploy never half-answer
   const h = new DrainHarness();
   t.after(() => h.stop());
   await h.start();
-  assert.equal(await h.request('GET', '/healthz'), 200);
+  // /api/health, not /healthz: server.js has never served /healthz, so this asserted against a route
+  // that does not exist and 404'd. The claim under test is "a draining relay stops answering HTTP",
+  // which any real route proves. (A cheap liveness endpoint separate from /api/health — which shells
+  // out to tmux twice per call — is worth having, but that is a production change to justify on its
+  // own merits, not something to introduce so a test goes green.)
+  assert.equal(await h.request('GET', '/api/health'), 200);
 
   h.signalDrain();
   await h.exit;
-  await assert.rejects(() => h.request('GET', '/healthz'), /ECONNREFUSED|ECONNRESET|socket hang up/);
+  await assert.rejects(() => h.request('GET', '/api/health'), /ECONNREFUSED|ECONNRESET|socket hang up/);
 });
 
 // Static-source half (client-layout.test.js style): the drain is only invisible if the browser agrees.
