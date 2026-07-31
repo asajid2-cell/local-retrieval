@@ -277,9 +277,16 @@ test('every mouse-originated write goes through the signed seam — no raw send(
   assert.equal(/send\('i'/.test(path), false, 'the mouse path still calls send(\'i\', …) directly');
 });
 
-test('window.__muxBuild is bumped for this deploy', () => {
+// This asserted that the stamp contained "mouse" and differed from one specific older value — i.e. it
+// pinned the deploy that happened to be in flight when it was written. Every later deploy fails it by
+// construction, which is noise, not signal: the next stamp bump breaks it again no matter what changed.
+// What is worth holding is that the stamp EXISTS and is dated, because it is the only handle a loaded
+// tab has for identifying its own build (an open tab never re-fetches the inline script after a deploy).
+test('window.__muxBuild carries a dated build stamp', () => {
   const m = /window\.__muxBuild\s*=\s*'([^']+)'/.exec(source);
-  assert.notEqual(m, null, '__muxBuild missing');
-  assert.notEqual(m[1], '2026-07-12-mobile-ime-viewport-hardening', '__muxBuild not bumped for this deploy');
-  assert.match(m[1], /mouse/, '__muxBuild does not identify this build');
+  assert.notEqual(m, null, '__muxBuild missing: an open tab has no way to identify its build');
+  assert.match(
+    m[1], /^\d{4}-\d{2}-\d{2}-\S/,
+    `__muxBuild must be a dated stamp like 2026-07-27-<what-changed>, got ${JSON.stringify(m[1])}`,
+  );
 });

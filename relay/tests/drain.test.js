@@ -143,12 +143,18 @@ test('SIGTERM drains: viewers get 1012 restarting, new upgrades are refused, the
 
   // (c) a draining relay accepts no new links: the upgrade is refused, not handed a session
   const late = new WebSocket(`ws://127.0.0.1:${h.port}/ws?session=drain-me&cols=80&rows=24`);
-  const lateOutcome = await Promise.race([
-    once(late, 'open').then(() => 'open'),
-    once(late, 'error').then(() => 'refused'),
-    once(late, 'close').then(() => 'refused'),
-    sleep(2000).then(() => 'hung'),
-  ]);
+  // NOT events.once(): it rejects when the emitter emits 'error' while you are awaiting a different
+  // event, so `once(late,'open')` threw the ECONNREFUSED that IS the refusal we are trying to observe.
+  // Promise.race then settled on that rejection and the test died with a transport error instead of
+  // reading 'refused'. Latent since it was written — it only surfaced once the assertions above this
+  // point started passing and execution actually reached here.
+  const lateOutcome = await new Promise(resolve => {
+    const timer = setTimeout(() => resolve('hung'), 2000);
+    const settle = outcome => { clearTimeout(timer); resolve(outcome); };
+    late.on('open', () => settle('open'));
+    late.on('error', () => settle('refused'));    // ECONNREFUSED once the listener is gone
+    late.on('close', () => settle('refused'));
+  });
   try { late.terminate(); } catch {}
   assert.equal(lateOutcome, 'refused', 'a post-SIGTERM upgrade must be refused');
 
@@ -191,8 +197,11 @@ test('index.html turns a 1012 close into an immediate reconnect and a restarting
     onclose.indexOf('reconnectDelay = 500') < onclose.indexOf('scheduleReconnect(name)'),
     'the 500ms fuse must be armed BEFORE scheduleReconnect consumes reconnectDelay',
   );
+  // Anchor on the CALL, not on `flash(` — the handler carries a comment explaining why flash() goes
+  // after scheduleReconnect, and that prose contains "flash()" too. The loose anchor matched the
+  // comment (which precedes the call) and failed an ordering that the shipped code gets right.
   assert.ok(
-    onclose.indexOf('scheduleReconnect(name)') < onclose.indexOf('flash('),
+    onclose.indexOf('scheduleReconnect(name);') < onclose.indexOf("flash('relay restarting"),
     'the toast must be raised AFTER scheduleReconnect, which sets its own status',
   );
 

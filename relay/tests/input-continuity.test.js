@@ -449,9 +449,15 @@ test('compose closes only after the text is sent or queued', () => {
 test('index.html burns the channel on close and opens a fresh one on open', () => {
   assert.match(indexSource, /inputQueue\.disconnect\(/, 'socket close must retire the signing channel');
   assert.match(indexSource, /inputQueue\.reconnect\(\)/, 'socket open must open+verify a fresh channel');
-  const openIdx = indexSource.indexOf('inputQueue.reconnect()');
+  // Assert CONTAINMENT in the handler, not the relative position of two whole-file indexOf hits. The
+  // old form compared the FIRST occurrence of 'inputQueue.reconnect()' against 'sock.onopen', and a
+  // comment above the handler mentions inputQueue.reconnect() by name — so the first hit was the
+  // comment, which sits earlier, and the check failed against correct code. Containment is also the
+  // stronger claim: it fails if the call moves out of onopen, which the index comparison would not.
   const onopenIdx = indexSource.indexOf('sock.onopen');
-  assert.ok(onopenIdx !== -1 && openIdx > onopenIdx, 'the reconnect must hang off sock.onopen');
+  assert.notEqual(onopenIdx, -1, 'missing the viewer socket onopen handler');
+  const onopen = indexSource.slice(onopenIdx, indexSource.indexOf('sock.onmessage', onopenIdx));
+  assert.match(onopen, /inputQueue\.reconnect\(\)/, 'the fresh channel must be opened from sock.onopen');
 });
 
 test('the queue arms only when this origin actually holds a signing key', () => {
