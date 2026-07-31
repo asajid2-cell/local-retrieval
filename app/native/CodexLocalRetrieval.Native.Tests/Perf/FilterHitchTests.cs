@@ -124,6 +124,52 @@ public sealed class FilterHitchTests
             "bound ListView rebuild item containers, which is the visible hitch");
     }
 
+    // The filter strip asks for AllChatTags() and HiddenChatCount() on every keystroke, and each one
+    // walked all 4000 chats. Between mutations the answer cannot change, so the walk must happen once
+    // and then stop happening — otherwise typing a ten-character query pays for twenty full store scans.
+    [TestMethod]
+    [TestCategory(PerfCorpus.Category)]
+    [Timeout(120000)]
+    public void RepeatedKeystrokes_DoNotRescanTheStoreForTagAggregates()
+    {
+        Keystroke("");                       // warm the aggregates
+        _ = _svc.AllChatTags();
+        _ = _svc.HiddenChatCount();
+
+        PerfCounters.Reset();
+        for (var i = 0; i < 10; i++) Keystroke("renderer");
+        var scans = PerfCounters.Snapshot()["tagAggregateScans"];
+
+        PerfRecord.Measure("filter.tagAggregate.scansPerTenKeystrokes", scans, "count");
+        Assert.AreEqual(0L, scans,
+            $"ten keystrokes over an unmutated store triggered {scans} full store walks for the tag " +
+            "strip; between mutations the answer cannot have changed");
+    }
+
+    // The negative control: the caches must not be able to serve a stale tag strip.
+    [TestMethod]
+    [TestCategory(PerfCorpus.Category)]
+    [Timeout(120000)]
+    public void TaggingAChat_RefreshesTheTagStripAndTheHiddenCount()
+    {
+        const string tag = "zzhitchprobe";
+        _ = _svc.AllChatTags();
+        var victim = _svc.Store.Sessions.Values.First(s => !s.Archived);
+
+        try
+        {
+            victim.Tags.Add(tag);
+            var tags = _svc.AllChatTags();
+            Assert.IsTrue(tags.Any(t => string.Equals(t.Tag, tag, StringComparison.OrdinalIgnoreCase)),
+                "a freshly added tag must appear in the strip; the cache served a stale answer");
+        }
+        finally { victim.Tags.Remove(tag); }
+
+        var after = _svc.AllChatTags();
+        Assert.IsFalse(after.Any(t => string.Equals(t.Tag, tag, StringComparison.OrdinalIgnoreCase)),
+            "removing the tag must drop it from the strip");
+    }
+
     // A one-row delta must cost a one-row update, not a full rebuild.
     [TestMethod]
     [TestCategory(PerfCorpus.Category)]

@@ -2653,6 +2653,21 @@ public sealed partial class ArchiveService
             .OrderBy(t => t, StringComparer.OrdinalIgnoreCase)
             .ToList();
 
+    // Does this chat carry at least one DELIBERATE user tag? Exactly UserTags(session).Count != 0, but
+    // without building the list: the caller below only asks the yes/no question, and it asks it once per
+    // session on every filter pass, so materialising a List plus a Distinct set plus a sort per chat cost
+    // thousands of allocations per keystroke to answer a question that short-circuits on the first hit.
+    public static bool HasUserTags(ArchiveSession session)
+    {
+        var tags = session.Tags;
+        for (var i = 0; i < tags.Count; i++)
+        {
+            var tag = tags[i];
+            if (!string.IsNullOrWhiteSpace(tag) && !IsReservedTag(tag)) return true;
+        }
+        return false;
+    }
+
     public async Task<bool> AddChatTagAsync(ArchiveSession session, string tag)
     {
         if (!AddTagTo(session.Tags, tag, reserved: true)) return false;
@@ -2685,15 +2700,41 @@ public sealed partial class ArchiveService
         return true;
     }
 
+    // Both aggregates below walk every chat in the store, and the filter strip asks for both on every
+    // keystroke. They are cached against the session count and ArchiveSession.AggregateEpoch, which is
+    // bumped by any mutation either one depends on (tags, codenames, pinned, archived, message counts).
+    // The session count covers chats being added or removed wholesale, which no per-session setter sees.
+    private (long Epoch, int Sessions) _aggregateKey = (-1, -1);
+    private IReadOnlyList<TagCount>? _cachedAllChatTags;
+    private int _cachedHiddenChatCount = -1;
+
+    private bool AggregatesAreStale()
+    {
+        var key = (ArchiveSession.AggregateEpoch, Store.Sessions.Count);
+        if (_aggregateKey == key && _cachedAllChatTags is not null && _cachedHiddenChatCount >= 0) return false;
+        if (_aggregateKey != key)
+        {
+            _aggregateKey = key;
+            _cachedAllChatTags = null;
+            _cachedHiddenChatCount = -1;
+        }
+        return true;
+    }
+
     // All user chat tags with counts (most-used first, then alpha) - drives the chat filter strip.
-    public IReadOnlyList<TagCount> AllChatTags() =>
-        Store.Sessions.Values
+    public IReadOnlyList<TagCount> AllChatTags()
+    {
+        AggregatesAreStale();
+        if (_cachedAllChatTags is not null) return _cachedAllChatTags;
+        PerfCounters.TagAggregateScan();
+        return _cachedAllChatTags = Store.Sessions.Values
             .Where(s => !s.Archived)
             .SelectMany(UserTags)
             .GroupBy(t => t, StringComparer.OrdinalIgnoreCase)
             .Select(g => new TagCount(g.Key, g.Count()))
             .OrderByDescending(x => x.Count).ThenBy(x => x.Tag, StringComparer.OrdinalIgnoreCase)
             .ToList();
+    }
 
     public IReadOnlyList<TagCount> AllCollectionTags() =>
         Store.Collections.Values
@@ -2720,13 +2761,19 @@ public sealed partial class ArchiveService
     public static bool IsLowSignalChat(ArchiveSession s)
         => !s.Pinned
            && !s.Archived
-           && UserTags(s).Count == 0   // reserved auto-tags ("archive"/"code") are on EVERY chat — only a DELIBERATE user tag counts as "kept"
+           && !HasUserTags(s)   // reserved auto-tags ("archive"/"code") are on EVERY chat — only a DELIBERATE user tag counts as "kept"
            && s.SpecialPhrases.Count == 0   // a codename ("special phrase") is a deliberate keep — never auto-hide a stashed chat
            && s.UserMessageCount <= 1
            && s.MessageCount <= 8;
 
     // How many chats are currently auto-hidden as one-offs (for the "Show hidden (N)" label).
-    public int HiddenChatCount() => Store.Sessions.Values.Count(IsLowSignalChat);
+    public int HiddenChatCount()
+    {
+        AggregatesAreStale();
+        if (_cachedHiddenChatCount >= 0) return _cachedHiddenChatCount;
+        PerfCounters.TagAggregateScan();
+        return _cachedHiddenChatCount = Store.Sessions.Values.Count(IsLowSignalChat);
+    }
 
     public IReadOnlyList<ArchiveSession> FilterChats(ChatFilter f)
     {

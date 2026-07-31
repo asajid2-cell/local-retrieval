@@ -420,7 +420,25 @@ public sealed class ArchiveSession : INotifyPropertyChanged
 
     private void InvalidateSearchText() => _searchTextCache = null;
 
-    private void OnSearchFieldCollectionChanged(object? sender, NotifyCollectionChangedEventArgs e) => InvalidateSearchText();
+    // ------------------------------------------------------------------ store-wide aggregate epoch
+    //
+    // AllChatTags() and HiddenChatCount() are store-wide aggregates that the filter strip recomputes on
+    // every keystroke by walking all 4000 chats. They cache on this counter, which is bumped whenever a
+    // field either aggregate depends on changes on ANY session.
+    //
+    // A single shared counter rather than per-session subscriptions: the service would otherwise have to
+    // hook, and unhook, thousands of objects to notice a tag change. The trade is that mutating one chat
+    // invalidates both aggregates for all of them — correct, and cheap in practice, because mutations are
+    // rare next to keystrokes.
+    internal static long AggregateEpoch;
+
+    private static void BumpAggregateEpoch() => Interlocked.Increment(ref AggregateEpoch);
+
+    private void OnSearchFieldCollectionChanged(object? sender, NotifyCollectionChangedEventArgs e)
+    {
+        InvalidateSearchText();
+        BumpAggregateEpoch();
+    }
 
     private ObservableCollection<string> WatchForSearchText(ObservableCollection<string> old, ObservableCollection<string> next)
     {
@@ -518,8 +536,9 @@ public sealed class ArchiveSession : INotifyPropertyChanged
     [JsonIgnore]
     public ObservableCollection<CodeBlock> CodeBlocks { get; set; } = new();
 
+    private int _messageCount;
     [JsonPropertyName("messageCount")]
-    public int MessageCount { get; set; }
+    public int MessageCount { get => _messageCount; set { _messageCount = value; BumpAggregateEpoch(); } }
 
     [JsonIgnore]
     public bool ContentLoaded { get; set; }
@@ -549,10 +568,11 @@ public sealed class ArchiveSession : INotifyPropertyChanged
 
     private bool _pinned;
     [JsonPropertyName("pinned")]
-    public bool Pinned { get => _pinned; set { _pinned = value; Raise(); Raise(nameof(PinGlyph)); } }
+    public bool Pinned { get => _pinned; set { _pinned = value; BumpAggregateEpoch(); Raise(); Raise(nameof(PinGlyph)); } }
 
+    private bool _archived;
     [JsonPropertyName("archived")]
-    public bool Archived { get; set; }
+    public bool Archived { get => _archived; set { _archived = value; BumpAggregateEpoch(); } }
 
     // Branch linkage. When this chat was created by the app's Branch action, BranchOfId is the PARENT
     // chat's id and BranchedAt is when the clone was taken. Presence of BranchOfId ⇒ this is a branch.
@@ -621,8 +641,9 @@ public sealed class ArchiveSession : INotifyPropertyChanged
 
     // How many REAL user prompts this chat has (your turns, not tool results) — counted from the FULL
     // transcript at parse time. Drives the "min user messages" filter and is shown on the row.
+    private int _userMessageCount;
     [JsonPropertyName("userMessageCount")]
-    public int UserMessageCount { get; set; }
+    public int UserMessageCount { get => _userMessageCount; set { _userMessageCount = value; BumpAggregateEpoch(); } }
 
     // Row-title mode the list sets per-row: "" = name, "last-user" = your last message, "first-user" = your
     // first message. Lets the "last/first user message" sorts show what you said instead of the chat name.

@@ -19,6 +19,7 @@ public static class PerfCounters
     private static long _fileWatchEvents;
     private static long _fileWatchFallbackPolls;
     private static long _sessionListOps;
+    private static long _tagAggregateScans;
 
     /// One SearchText(session) interpolation — recomposed per session per term today.
     public static void SearchTextComposed(long count = 1) => Interlocked.Add(ref _searchTextCompositions, count);
@@ -52,6 +53,10 @@ public static class PerfCounters
     /// ListView actually pays for: each one can rebuild item containers on the dispatcher.
     public static void SessionListOps(long count = 1) => Interlocked.Add(ref _sessionListOps, count);
 
+    /// One full walk of the store to rebuild a tag aggregate (AllChatTags / HiddenChatCount). The filter
+    /// strip asks for both per keystroke, so this should stay flat while nothing is being mutated.
+    public static void TagAggregateScan(long count = 1) => Interlocked.Add(ref _tagAggregateScans, count);
+
     /// Zero every counter. Call immediately before a measured region; counters are process-wide.
     public static void Reset()
     {
@@ -65,6 +70,7 @@ public static class PerfCounters
         Interlocked.Exchange(ref _fileWatchEvents, 0);
         Interlocked.Exchange(ref _fileWatchFallbackPolls, 0);
         Interlocked.Exchange(ref _sessionListOps, 0);
+        Interlocked.Exchange(ref _tagAggregateScans, 0);
     }
 
     /// Current values keyed by their contract names. Ordinal-sorted so artifacts diff cleanly.
@@ -80,5 +86,6 @@ public static class PerfCounters
         ["fileWatchEvents"] = Interlocked.Read(ref _fileWatchEvents),
         ["fileWatchFallbackPolls"] = Interlocked.Read(ref _fileWatchFallbackPolls),
         ["sessionListOps"] = Interlocked.Read(ref _sessionListOps),
+        ["tagAggregateScans"] = Interlocked.Read(ref _tagAggregateScans),
     };
 }
