@@ -187,7 +187,7 @@ public sealed class WindowsProcessJobTests
     {
         const string script = """
             $null = [Console]::In.ReadLine()
-            $child = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList @('-NoProfile', '-Command', 'Start-Sleep -Seconds 120') -PassThru
+            $child = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -WindowStyle Hidden -ArgumentList @('-NoProfile', '-Command', 'Start-Sleep -Seconds 120') -PassThru
             [Console]::Out.WriteLine($child.Id)
             [Console]::Out.Flush()
             Start-Sleep -Seconds 120
@@ -221,7 +221,7 @@ public sealed class WindowsProcessJobTests
     private static ProcessStartInfo ImmediateForkStartInfo()
     {
         const string script = """
-            $child = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList @('-NoProfile', '-Command', 'Start-Sleep -Seconds 120') -PassThru
+            $child = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -WindowStyle Hidden -ArgumentList @('-NoProfile', '-Command', 'Start-Sleep -Seconds 120') -PassThru
             [Console]::Out.WriteLine($child.Id)
             [Console]::Out.Flush()
             Start-Sleep -Seconds 120
