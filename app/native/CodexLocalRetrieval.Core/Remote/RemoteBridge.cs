@@ -60,10 +60,21 @@ public sealed class RemoteBridge
         _processContainment = processContainment;
     }
 
+    // The running heartbeat and the command drain used to share one 3s tick, with the push taken every 3rd
+    // pass. They are now scheduled independently, because they want opposite things: the heartbeat has a
+    // deadline it must keep (the relay ages a projection out at 45s, and calls an agent stale at 25s), while
+    // the command drain is pure polling whose cost is one ssh handshake against a usually-empty queue. Tying
+    // the drain's cadence to the tick counter would have dragged the heartbeat out with it.
+    public static readonly TimeSpan RunningPushInterval = TimeSpan.FromSeconds(9);
+
     public async Task RunLoopAsync(CancellationToken ct)
     {
         _log("remote bridge loop started (acts only while the desktop app is closed)");
-        var tick = 0;
+        var backoff = new RemotePollBackoff();
+        var now = DateTimeOffset.UtcNow;
+        var nextPushAt = now;
+        var nextPollAt = now;
+
         while (!ct.IsCancellationRequested)
         {
             try
@@ -74,16 +85,38 @@ public sealed class RemoteBridge
                     if (s is not null && !string.IsNullOrWhiteSpace(s.Target))
                     {
                         await ReconcilePendingMuxBindingsAsync();
-                        if (tick % 3 == 0) await PushRunningAsync(s);   // running heartbeat ~every 9s (keeps `live` + refreshes the list)
-                        await PollAndProcessAsync(s);                    // drain commands ~every 3s (snappy kills); also re-pushes after a kill
+
+                        now = DateTimeOffset.UtcNow;
+                        if (now >= nextPushAt)
+                        {
+                            await PushRunningAsync(s);   // running heartbeat (keeps `live` + refreshes the list)
+                            nextPushAt = DateTimeOffset.UtcNow + RunningPushInterval;
+                        }
+                        if (now >= nextPollAt)
+                        {
+                            var sawWork = await PollAndProcessAsync(s);   // drain commands; also re-pushes after a kill
+                            nextPollAt = DateTimeOffset.UtcNow
+                                + (sawWork ? backoff.OnCommandsReceived() : backoff.OnEmptyPoll());
+                        }
+                    }
+                    else
+                    {
+                        // No target configured: nothing to poll, so don't spin at the fast cadence either.
+                        nextPollAt = DateTimeOffset.UtcNow + backoff.Current;
                     }
                 }
             }
             catch (Exception ex) { _log("bridge tick failed: " + ex.Message); }
-            tick++;
-            try { await Task.Delay(TimeSpan.FromSeconds(3), ct); } catch { }
+
+            // Sleep until whichever job comes due first, so backing the drain off never delays a heartbeat.
+            var wakeAt = nextPushAt < nextPollAt ? nextPushAt : nextPollAt;
+            var delay = wakeAt - DateTimeOffset.UtcNow;
+            if (delay < MinLoopDelay) delay = MinLoopDelay;   // also the idle cadence while the GUI owns the bridge
+            try { await Task.Delay(delay, ct); } catch { }
         }
     }
+
+    private static readonly TimeSpan MinLoopDelay = TimeSpan.FromSeconds(3);
 
     private async Task ReconcilePendingMuxBindingsAsync()
     {
@@ -161,17 +194,19 @@ public sealed class RemoteBridge
         return null;
     }
 
-    private async Task PollAndProcessAsync(Settings s)
+    /// Returns true when this poll actually carried commands, so the caller can keep the loop fast while
+    /// there is work and let it coast once the queue has gone quiet.
+    private async Task<bool> PollAndProcessAsync(Settings s)
     {
         var leaseJson = JsonSerializer.Serialize(new { owner = _commandLeaseOwner, limit = 1 });
         var outText = (await RunSshAsync(
             s.Target,
             $"curl -s -X POST http://127.0.0.1:{s.Port}/api/app-commands/lease -H 'Content-Type: application/json' --data-binary @-",
             leaseJson)).outText;
-        if (string.IsNullOrWhiteSpace(outText)) return;
+        if (string.IsNullOrWhiteSpace(outText)) return false;
         List<Cmd>? cmds;
-        try { cmds = JsonSerializer.Deserialize<List<Cmd>>(outText); } catch { return; }
-        if (cmds is null || cmds.Count == 0) return;
+        try { cmds = JsonSerializer.Deserialize<List<Cmd>>(outText); } catch { return false; }
+        if (cmds is null || cmds.Count == 0) return false;
 
         var changed = false;
         foreach (var c in cmds)
@@ -245,6 +280,7 @@ public sealed class RemoteBridge
             await AckCommandAsync(s, c.id, ackJson);
         }
         if (changed) { await Task.Delay(300); await PushRunningAsync(s); }   // reflect a kill/rename fast
+        return true;
     }
 
     private (bool ok, string detail) Rename(string tool, string id, string title)

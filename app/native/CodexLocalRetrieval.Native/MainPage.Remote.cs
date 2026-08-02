@@ -258,6 +258,9 @@ public sealed partial class MainPage
     private bool _syncPushing;
     private bool _indexPushing;
     private bool _cmdPolling;
+    // Shapes the command poll's cadence from whether the queue is actually producing work — see
+    // RemotePollBackoff for why neither ssh multiplexing nor a server-side long poll was available here.
+    private readonly RemotePollBackoff _cmdBackoff = new();
     private readonly string _commandLeaseOwner = RemoteCommandProtocol.LeaseOwner("gui");
     // At-most-once fence for intent-fenced polled commands (fetchfile/startmux): a redelivered intent
     // replays its recorded ack instead of downloading/starting a second time.
@@ -274,8 +277,10 @@ public sealed partial class MainPage
         _syncTimer.Start();
         // A faster, lighter loop pulls remote commands (kill / open transcript / fetch an uploaded file)
         // so a tap on the web is actioned within a few seconds, while the heavier full-projection push
-        // stays at 30s. 3s keeps kills snappy without hammering SSH (each call is hardened + timeout-capped).
-        _cmdTimer ??= new DispatcherTimer { Interval = TimeSpan.FromSeconds(3) };
+        // stays at 30s. Each poll is one whole ssh handshake, so the interval is not fixed: it starts fast
+        // and stretches while the queue stays empty, snapping back the moment a command lands.
+        _cmdBackoff.Reset();
+        _cmdTimer ??= new DispatcherTimer { Interval = _cmdBackoff.Current };
         _cmdTimer.Tick -= OnCmdTick;
         _cmdTimer.Tick += OnCmdTick;
         _cmdTimer.Start();
@@ -396,6 +401,7 @@ public sealed partial class MainPage
         var target = (settings.MultiplexSshTarget ?? "").Trim();
         if (string.IsNullOrEmpty(target)) return;
         _cmdPolling = true;
+        var sawWork = false;
         try
         {
             var port = settings.MultiplexApiPort;
@@ -408,6 +414,7 @@ public sealed partial class MainPage
             List<AppCommand>? cmds;
             try { cmds = JsonSerializer.Deserialize<List<AppCommand>>(outText); } catch { return; }
             if (cmds is null || cmds.Count == 0) return;
+            sawWork = true;
 
             var killed = false;
             var renamed = false;
@@ -520,7 +527,24 @@ public sealed partial class MainPage
             if (killed || renamed || added) { await Task.Delay(300); await PushProjectsAsync(); }   // reflect a kill/rename/add fast
         }
         catch (Exception ex) { Diag.Log("PollCommands failed: " + ex.Message); }
-        finally { _cmdPolling = false; }
+        finally
+        {
+            _cmdPolling = false;
+            // Every poll above cost a full ssh handshake, and on an idle PC almost all of them found nothing.
+            // Re-cadence from what this poll actually saw: a command keeps the loop snappy, a quiet stretch
+            // lets it coast. In the finally so the early "nothing to do" returns are counted as the empty
+            // polls they are, rather than leaving the interval wherever it happened to be.
+            ApplyCommandPollInterval(sawWork ? _cmdBackoff.OnCommandsReceived() : _cmdBackoff.OnEmptyPoll());
+        }
+    }
+
+    // DispatcherTimer.Interval only takes effect from the next scheduled tick, so this is safe to call on
+    // every poll; when the cadence is unchanged (the common case) we leave the timer completely alone.
+    private void ApplyCommandPollInterval(TimeSpan interval)
+    {
+        if (_cmdTimer is null || _cmdTimer.Interval == interval) return;
+        _cmdTimer.Interval = interval;
+        Diag.Log($"Command poll cadence -> {interval.TotalSeconds:0.#}s (empty polls: {_cmdBackoff.ConsecutiveEmpty})");
     }
 
     // transcriptfetch — an archive.read for ONE explicitly named chat. The relay has already verified

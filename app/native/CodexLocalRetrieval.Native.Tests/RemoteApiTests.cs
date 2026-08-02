@@ -439,7 +439,8 @@ public sealed class RemoteApiCommandPollerTests
 
     [DataTestMethod]
     [DataRow("native/CodexLocalRetrieval.Native/MainPage.Remote.cs", "private async Task PollCommandsAsync")]
-    [DataRow("native/CodexLocalRetrieval.Core/Remote/RemoteBridge.cs", "private async Task PollAndProcessAsync")]
+    // Task<bool>: the drain reports whether it found work so the loop can back its cadence off when idle.
+    [DataRow("native/CodexLocalRetrieval.Core/Remote/RemoteBridge.cs", "private async Task<bool> PollAndProcessAsync")]
     public void BothPollers_GateOnTheIntentLedgerBeforeAnySideEffect(string relativePath, string pollerSignature)
     {
         var source = File.ReadAllText(Path.Combine(FindRepoRoot(), relativePath.Replace('/', Path.DirectorySeparatorChar)));
