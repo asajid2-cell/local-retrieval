@@ -2,7 +2,8 @@
 
 ## Status
 
-Ready for apex deploy and production E2E. No deploy was run.
+Relay deliverables 1, 2, and 4 are complete. Deliverable 3 is blocked by a deterministic full-suite
+regression in the concurrent discovery lane. No deploy was run.
 
 Canonical required no `relay/server.js` compatibility change. I added the two charter fixtures and
 repaired the deploy script's post-restart health probe so it reads the real service port from
@@ -27,15 +28,29 @@ Focused tests rerun green:
   - legacy `uploads-meta.json` plus kept bytes loads while `pcPath` is dropped
 - `the post-restart health check reads the deployed port from the service environment`
 
-Final full command:
+The full command reached green once before the concurrent picker migration landed:
 
 ```bash
 cd relay
 npm test
 ```
 
-Result: 385 total, 384 passed, 1 skipped, 0 failed. This is the charter's 381 baseline passes plus
+That snapshot was 385 total, 384 passed, 1 skipped, 0 failed: the charter's 381 baseline passes plus
 three new passing tests.
+
+Current-tree result after `relay/public/picker.js` and its fixture changed:
+
+- 385 total
+- 383 passed
+- 1 skipped
+- 1 failed
+- failure: `RENDER: only offered rows are drawn, typing narrows them, and a dead query still says something`
+  at `relay/tests/resume-picker-dom.test.js:228`
+- actual status: `PC archive connected - resume may queue until the desktop app is open`
+- stale assertion: status must include `offline`
+
+The failing file rerun alone reproduces 4 passed, 1 failed. It is outside this lane's write scope.
+My changed tests rerun together remain 7 passed, 0 failed.
 
 Additional checks rerun green:
 
@@ -49,9 +64,9 @@ the VPS.
 
 ## Ambiguities
 
-- One intermediate parallel full-suite run reported one failure, but its console output was truncated
-  before the failing test name. An immediate complete rerun passed all 384 runnable tests. Focused
-  reruns of every changed test were also green.
+- The discovery lane must decide whether the new connected-PC status should intentionally avoid the
+  word `offline`, then update the DOM assertion to the chosen contract. The implementation and fixture
+  already agree on the new PC discovery response shape.
 - The rollback built into the current migration is server-only. The dossier explicitly warns the apex
   not to touch `/var/lib/multiplex` and to inspect static-file differences before any broader rollback.
 - `npm ci` is not needed: live and canonical production dependencies are already exact matches.
@@ -59,6 +74,7 @@ the VPS.
 
 ## Apex Ask
 
-Run the gated deploy from `wp-relay-deploy.md`, capture the printed backup timestamp, and execute the
-production E2E checklist through held lease, PC acknowledgement, and terminal reconnect. Pull this lane
-back only if production evidence contradicts the green fixtures.
+First reconcile `resume-picker-dom.test.js:228` with the discovery lane's new connected-PC status and
+rerun the full relay suite to 384 passed, 0 failed. Then run the gated deploy from
+`wp-relay-deploy.md`, capture the printed backup timestamp, and execute the production E2E checklist
+through held lease, PC acknowledgement, and terminal reconnect.

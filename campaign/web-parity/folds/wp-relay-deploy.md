@@ -1,6 +1,7 @@
 # Relay Deploy Dossier
 
-Status: ready for apex deployment. This branch mind did not run the deploy.
+Status: deploy procedure ready, but deployment is blocked on the current full-suite regression recorded
+in `wp-relay.md`. This branch mind did not run the deploy.
 
 ## Preflight
 
@@ -12,7 +13,10 @@ cd relay && npm test && cd ..
 bash -n scripts/deploy-relay.sh
 ```
 
-Expected suite result: 385 total, 384 passed, 1 skipped, 0 failed.
+Required suite result before deploy: 385 total, 384 passed, 1 skipped, 0 failed.
+
+Current tree does not meet that gate: `resume-picker-dom.test.js` has one deterministic discovery-lane
+assertion failure. Do not deploy until the apex or discovery lane fixes it and reruns `npm test` green.
 
 The live systemd unit resolves to:
 

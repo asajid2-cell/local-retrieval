@@ -74,6 +74,24 @@ test('the deploy never hard-kills the relay', () => {
   );
 });
 
+test('the post-restart health check reads the deployed port from the service environment', () => {
+  assert.match(
+    source,
+    /awk -F= '[^']*PORT[^']*' \/etc\/multiplex-app\.env/,
+    'deploy-relay.sh must read PORT from /etc/multiplex-app.env; canonical server.js has no numeric port literal to grep',
+  );
+  assert.doesNotMatch(
+    commands,
+    /grep[^\n]*PORT[^\n]*server\.js/,
+    'the health check must not scrape a numeric PORT from server.js',
+  );
+  assert.match(
+    source,
+    /curl -fsS \\"http:\/\/127\.0\.0\.1:\\\$PORT\/api\/health\\"/,
+    'the deploy must fail when the restarted relay health endpoint is unreachable',
+  );
+});
+
 test('the sigprobe debug scaffolding stays deleted', () => {
   assert.equal(
     fs.existsSync(path.join(REPO, 'sigprobe.js')),
