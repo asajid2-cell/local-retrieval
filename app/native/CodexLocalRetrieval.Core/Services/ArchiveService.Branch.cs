@@ -105,10 +105,10 @@ public sealed partial class ArchiveService
         };
         snapshot.MessageCount = await CountSnapshotMessagesAsync(snapshot);
 
-        Store.TemplateSnapshots[snapshot.Id] = snapshot;
+        // The snapshot file is already captured; a lost save race must not discard it.
         try
         {
-            await SaveAsync();
+            await CommitBranchWorkAsync(() => Store.TemplateSnapshots[snapshot.Id] = snapshot);
         }
         catch (StoreGenerationConflictException)
         {
@@ -371,6 +371,31 @@ public sealed partial class ArchiveService
         return reader.MessageCount;
     }
 
+    // Branching and checkpointing write a FILE first (a cloned transcript or a snapshot), then record
+    // it in the store. The desktop app and the always-on server share that store, so the recording
+    // save can lose the generation race — and because these paths had no recovery, an unlucky
+    // half-second turned a perfectly good transcript on disk into "branch failed" and deleted it.
+    // The same reload-and-reapply idiom the small ops use: adopt the other writer's store, re-apply
+    // ONLY the bookkeeping onto it, and save again. The file work is never repeated, so this cannot
+    // produce a second branch. Bounded, because three writers interleaving this fast is a real
+    // problem the caller should see.
+    private async Task CommitBranchWorkAsync(Action apply)
+    {
+        for (var attempt = 0; ; attempt++)
+        {
+            try
+            {
+                apply();
+                await SaveAsync();
+                return;
+            }
+            catch (StoreGenerationConflictException) when (attempt < 2)
+            {
+                await LoadAsync();
+            }
+        }
+    }
+
     private async Task<BranchResult> CreateNativeBranchAsync(
         ArchiveSession parent,
         string sourcePath,
@@ -412,10 +437,11 @@ public sealed partial class ArchiveService
             FromSnapshotId = fromSnapshotId,
             BranchedAt = now
         };
-        Store.Sessions[newId] = branch;
+        // The transcript is already written, so a lost save race must not throw the branch away —
+        // see CommitBranchWorkAsync.
         try
         {
-            await SaveAsync();
+            await CommitBranchWorkAsync(() => Store.Sessions[newId] = branch);
         }
         catch
         {
