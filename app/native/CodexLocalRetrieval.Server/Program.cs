@@ -247,6 +247,10 @@ app.MapPost("/api/agent/sessions/{id}/open", async (string id, OpenRequest? req,
         : Results.BadRequest(new { error = result.Message });
 });
 
+// The web archive browser (relay/public/chats.html) reads its rows straight from here through the
+// reverse tunnel — the PC filters, the browser only renders.
+app.MapDiscovery(archiveRuntime);
+
 // ---- fleet: always-on recorder of what's running, so a crash/reboot leaves a restorable record ----
 // The server is the natural writer (it's back ~a minute after boot); if the desktop app ever hosts a
 // recorder too, FleetWriterLock elects exactly one and the loser serves reads. CLR_FLEET=0 disables.

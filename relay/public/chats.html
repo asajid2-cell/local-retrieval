@@ -1,0 +1,241 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0a0a0c">
+<title>Chats - multiplex</title>
+<style>
+  :root {
+    --bg:#0a0a0c; --panel:#101014; --panel-2:#17171c; --raised:#202028;
+    --line:#292932; --text:#ededf0; --muted:#a0a0ab; --faint:#747480;
+    --rose:#fb7185; --rose-dim:rgba(251,113,133,.13); --green:#34d399;
+    --amber:#fbbf24; --red:#f87171; --blue:#60a5fa;
+    --sp1:4px; --sp2:8px; --sp3:12px; --sp4:16px; --sp5:24px;
+    --radius:7px; --radius-lg:10px;
+  }
+  @media (prefers-color-scheme:light) {
+    :root {
+      --bg:#f6f7f9; --panel:#fff; --panel-2:#f1f3f5; --raised:#e7eaee;
+      --line:#d5d9df; --text:#20242a; --muted:#5f6874; --faint:#78828e;
+      --rose:#be123c; --rose-dim:rgba(190,18,60,.09); --green:#047857;
+      --amber:#a16207; --red:#b91c1c; --blue:#1d4ed8;
+    }
+  }
+  * { box-sizing:border-box; }
+  html { background:var(--bg); color:var(--text); }
+  body {
+    margin:0; min-height:100dvh; background:var(--bg);
+    color:var(--text); font:500 14px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+    -webkit-text-size-adjust:100%;
+    padding-bottom:env(safe-area-inset-bottom);
+  }
+  button,input,select { font:inherit; }
+  button,a,summary,select,label:has(input) { -webkit-tap-highlight-color:transparent; }
+  :focus-visible { outline:2px solid var(--rose); outline-offset:2px; }
+  [hidden] { display:none !important; }
+  .topbar {
+    position:sticky; top:0; z-index:4; display:flex; align-items:center; gap:var(--sp2);
+    min-height:54px; padding:calc(var(--sp2) + env(safe-area-inset-top)) var(--sp3) var(--sp2);
+    background:var(--panel); border-bottom:1px solid var(--line);
+  }
+  .brand { display:flex; align-items:center; gap:var(--sp2); min-width:0; text-decoration:none; color:var(--text); }
+  .brand svg { width:20px; height:20px; flex:0 0 auto; }
+  .brand strong { font-size:15px; font-weight:650; }
+  .section { color:var(--muted); font-size:13px; }
+  .spacer { flex:1 1 auto; }
+  .iconlink {
+    display:inline-flex; align-items:center; justify-content:center; width:42px; min-height:42px;
+    border:1px solid var(--line); border-radius:var(--radius); color:var(--muted);
+    background:var(--panel-2); text-decoration:none;
+  }
+  .iconlink:hover { color:var(--text); border-color:var(--rose); }
+  .iconlink svg { width:19px; height:19px; }
+  .searchbar {
+    display:flex; gap:var(--sp2); padding:var(--sp3);
+    background:var(--panel); border-bottom:1px solid var(--line);
+  }
+  .searchbar input {
+    width:100%; min-width:0; min-height:44px; padding:0 var(--sp3);
+    color:var(--text); background:var(--bg); border:1px solid var(--line); border-radius:var(--radius);
+  }
+  .searchbar input:focus { outline:none; border-color:var(--rose); box-shadow:0 0 0 2px var(--rose-dim); }
+  .searchbar button,.pager button,.resume {
+    min-height:44px; border:1px solid var(--line); border-radius:var(--radius);
+    background:var(--panel-2); color:var(--text); cursor:pointer;
+  }
+  .searchbar button { width:46px; flex:0 0 auto; font-size:20px; }
+  .shell { width:min(100%,82rem); margin:0 auto; padding:var(--sp3); display:grid; gap:var(--sp3); }
+  details.filters {
+    align-self:start; background:var(--panel); border:1px solid var(--line); border-radius:var(--radius-lg);
+  }
+  details.filters > summary {
+    min-height:46px; display:flex; align-items:center; gap:var(--sp2); padding:0 var(--sp3);
+    cursor:pointer; color:var(--text); font-weight:650; list-style:none;
+  }
+  details.filters > summary::-webkit-details-marker { display:none; }
+  details.filters > summary::after { content:"+"; margin-left:auto; color:var(--muted); font-size:18px; }
+  details.filters[open] > summary::after { content:"-"; }
+  .filterbody { border-top:1px solid var(--line); padding:var(--sp3); display:grid; gap:var(--sp4); }
+  .filtergrid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:var(--sp2); }
+  .field { display:grid; gap:6px; min-width:0; }
+  .field.wide { grid-column:1/-1; }
+  .field > span,.group-title { color:var(--muted); font-size:12px; font-weight:650; }
+  select {
+    width:100%; min-width:0; min-height:42px; padding:0 30px 0 10px;
+    color:var(--text); background:var(--bg); border:1px solid var(--line); border-radius:var(--radius);
+  }
+  .check {
+    display:flex; align-items:center; gap:var(--sp2); min-height:42px; color:var(--muted);
+  }
+  .check input { width:18px; height:18px; accent-color:var(--rose); }
+  .chips { display:flex; flex-wrap:wrap; gap:6px; }
+  .chip {
+    min-height:34px; max-width:100%; padding:5px 9px; border:1px solid var(--line);
+    border-radius:var(--radius); color:var(--muted); background:var(--bg); cursor:pointer;
+    overflow-wrap:anywhere; text-align:left;
+  }
+  .chip.include { border-color:var(--green); color:var(--green); background:rgba(52,211,153,.09); }
+  .chip.exclude { border-color:var(--red); color:var(--red); background:rgba(248,113,113,.08); text-decoration:line-through; }
+  .chip.phrase { color:var(--blue); }
+  .chip .count { color:var(--faint); margin-left:4px; font-size:11px; }
+  .legend { margin:0; color:var(--faint); font-size:11.5px; }
+  .results { min-width:0; display:flex; flex-direction:column; gap:var(--sp2); }
+  .status {
+    min-height:38px; display:flex; align-items:center; gap:var(--sp2); padding:0 var(--sp1);
+    color:var(--muted); font-size:12.5px;
+  }
+  .status::before { content:""; width:8px; height:8px; border-radius:50%; background:var(--faint); flex:0 0 auto; }
+  .status.online::before { background:var(--green); }
+  .status.loading::before { background:var(--amber); }
+  .status.error::before { background:var(--red); }
+  .state {
+    margin:0; padding:var(--sp5) var(--sp4); border:1px solid var(--line);
+    border-radius:var(--radius-lg); background:var(--panel); color:var(--muted);
+  }
+  .state strong { display:block; color:var(--text); margin-bottom:var(--sp1); }
+  .chatlist { display:flex; flex-direction:column; gap:var(--sp2); }
+  .chat {
+    display:grid; grid-template-columns:minmax(0,1fr) auto; gap:var(--sp2) var(--sp3);
+    padding:var(--sp3); border:1px solid var(--line); border-radius:var(--radius-lg); background:var(--panel);
+  }
+  .chat:hover { border-color:#3a3a45; }
+  .chatmain { min-width:0; }
+  .titleline { display:flex; align-items:center; gap:var(--sp2); min-width:0; }
+  .tool {
+    flex:0 0 auto; padding:4px 6px; border-radius:5px; background:var(--raised);
+    color:var(--muted); font:650 10px/1 ui-monospace,SFMono-Regular,Menlo,monospace; text-transform:uppercase;
+  }
+  .title {
+    min-width:0; overflow-wrap:anywhere; font-size:14px; font-weight:650; color:var(--text);
+  }
+  .pin { color:var(--amber); }
+  .meta { margin-top:5px; color:var(--faint); font-size:12px; overflow-wrap:anywhere; }
+  .rowchips { display:flex; flex-wrap:wrap; gap:5px; margin-top:var(--sp2); }
+  .rowchips .chip { min-height:28px; padding:3px 7px; font-size:11.5px; }
+  .resume {
+    align-self:center; min-width:44px; padding:0 12px; color:var(--rose);
+    border-color:var(--rose); background:var(--rose-dim); font-weight:650;
+  }
+  .resume:hover { background:var(--rose); color:#1b090d; }
+  .resume:disabled { border-color:var(--line); background:transparent; color:var(--faint); cursor:default; }
+  .rowstatus { grid-column:1/-1; margin:0; color:var(--muted); font-size:12px; }
+  .rowstatus.ok { color:var(--green); }
+  .rowstatus.warn { color:var(--amber); }
+  .rowstatus.bad { color:var(--red); }
+  .pager {
+    display:flex; align-items:center; justify-content:center; gap:var(--sp2);
+    padding:var(--sp2) 0 var(--sp4);
+  }
+  .pager button { min-width:44px; padding:0 var(--sp3); }
+  .pager button:disabled { opacity:.45; cursor:default; }
+  .pager span { min-width:9ch; text-align:center; color:var(--muted); font-size:12px; }
+  @media (min-width:54rem) {
+    .shell { grid-template-columns:minmax(15rem,19rem) minmax(0,1fr); align-items:start; }
+    details.filters { position:sticky; top:121px; }
+    details.filters > summary::after { display:none; }
+    details.filters:not([open]) > .filterbody { display:grid; }
+  }
+  @media (max-width:25rem) {
+    .section { display:none; }
+    .filtergrid { grid-template-columns:1fr; }
+    .field.wide { grid-column:auto; }
+    .chat { grid-template-columns:minmax(0,1fr); }
+    .resume { width:100%; }
+  }
+</style>
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="./" aria-label="Multiplex terminal">
+    <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <rect x="2.5" y="4.5" width="19" height="15" rx="3" stroke="#fb7185" stroke-width="1.6"/>
+      <path d="M6.5 9.5l3 2.5-3 2.5M12.5 15h5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+    </svg>
+    <strong>multiplex</strong>
+    <span class="section">Chats</span>
+  </a>
+  <span class="spacer"></span>
+  <a class="iconlink" href="projects.html" title="Projects" aria-label="Projects">
+    <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M3 7a2 2 0 012-2h3.6a2 2 0 011.5.7L12 7.5h7a2 2 0 012 2V17a2 2 0 01-2 2H5a2 2 0 01-2-2V7z" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></svg>
+  </a>
+  <a class="iconlink" href="./" title="Terminal" aria-label="Terminal">
+    <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><rect x="3.5" y="5" width="17" height="14" rx="2" stroke="currentColor" stroke-width="1.7"/><path d="M7 10l3 2-3 2M12.5 15h4" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+  </a>
+</header>
+
+<form class="searchbar" id="searchform" role="search">
+  <input id="query" name="q" type="search" placeholder="Search titles, metadata, or [phrase]" autocomplete="off" spellcheck="false">
+  <button type="submit" title="Search" aria-label="Search">&#8594;</button>
+</form>
+
+<main class="shell">
+  <details class="filters" id="filters" open>
+    <summary>Filters</summary>
+    <div class="filterbody">
+      <div class="filtergrid">
+        <label class="field"><span>Agent</span>
+          <select id="agent"><option value="">Any agent</option><option value="codex">Codex</option><option value="claude">Claude</option></select>
+        </label>
+        <label class="field"><span>Sort</span>
+          <select id="sort"><option value="recent">Recent activity</option><option value="created-newest">Created newest</option><option value="created-oldest">Created oldest</option><option value="last-user">Last user message</option><option value="first-user">First user message</option></select>
+        </label>
+        <label class="field"><span>Created</span>
+          <select id="date"><option value="">Any time</option><option value="today">Today</option><option value="week">Last 7 days</option><option value="month">Last 30 days</option></select>
+        </label>
+        <label class="field"><span>Your messages</span>
+          <select id="minimum"><option value="0">Any</option><option value="2">2+</option><option value="3">3+</option><option value="5">5+</option><option value="10">10+</option><option value="25">25+</option></select>
+        </label>
+        <label class="field wide"><span>Project</span><select id="project"><option value="">All projects</option></select></label>
+        <label class="check field wide"><input id="hidden" type="checkbox"> Show hidden one-off chats</label>
+      </div>
+      <section aria-labelledby="tagheading">
+        <div class="group-title" id="tagheading">Tags</div>
+        <div class="chips" id="tagchips"></div>
+        <p class="legend">Tap: include, exclude, clear.</p>
+      </section>
+      <section aria-labelledby="phraseheading">
+        <div class="group-title" id="phraseheading">Phrases</div>
+        <div class="chips" id="phrasechips"></div>
+      </section>
+    </div>
+  </details>
+
+  <section class="results" aria-labelledby="resultheading">
+    <h1 id="resultheading" hidden>Chat archive</h1>
+    <div class="status loading" id="status" role="status" aria-live="polite">Connecting to your PC archive...</div>
+    <div class="state" id="state"><strong>Loading chats</strong>The archive lives on your PC. This page will say plainly if it cannot reach it.</div>
+    <div class="chatlist" id="chatlist"></div>
+    <nav class="pager" id="pager" aria-label="Chat pages" hidden>
+      <button type="button" id="prev" aria-label="Previous page">&#8592;</button>
+      <span id="pageinfo"></span>
+      <button type="button" id="next" aria-label="Next page">&#8594;</button>
+    </nav>
+  </section>
+</main>
+
+<script src="intent-journal.js"></script>
+<script src="picker.js"></script>
+<script src="chats.js"></script>
+</body>
+</html>

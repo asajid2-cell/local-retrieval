@@ -1,9 +1,9 @@
 (function installMuxResumePicker(global) {
   'use strict';
 
-  // Resume-from-archive picker (phone). Reads the chat catalogue the desktop bridge pushed
-  // (GET /api/archive-index), filters it in the browser, and on a tap asks the PC to bring that chat
-  // back with the EXISTING intent-fenced `startmux` app-command.
+  // Resume-from-archive picker (phone). Reads the first page directly from the PC discovery API,
+  // filters that compact set in the browser, and on a tap asks the PC to bring that chat back with
+  // the EXISTING intent-fenced `startmux` app-command.
   //
   // AUTHORITY: nothing in this file authorizes anything. `startmux` is authorized only by the signed
   // session.create principal proof the desktop bridge mints and muxd verifies; the relay carries that
@@ -68,17 +68,16 @@
     });
   }
 
-  // Freshness follows the projection's doctrine: rows survive a relay restart, the claim that the app
-  // is ANSWERING does not. Every branch produces a visible line — the picker is never silent about why
-  // a resume might not happen now.
+  // Every branch produces a visible line. The discovery endpoint proves the PC archive answered, but
+  // it cannot prove the separate desktop app command poller is currently open.
   function freshness(state) {
     var s = state || {};
     var count = Array.isArray(s.chats) ? s.chats.length : 0;
     if (s.error) return { state: 'error', live: false, label: s.error };
-    if (!s.loaded) return { state: 'loading', live: false, label: 'Loading your chat archive…' };
+    if (!s.loaded) return { state: 'loading', live: false, label: 'Connecting to your PC archive…' };
     if (!count) return {
       state: 'empty', live: false,
-      label: 'No resumable chats yet — open the desktop app so it can push your archive.',
+      label: 'No resumable chats are visible in the PC archive.',
     };
     if (s.appLive === true) return {
       state: 'live', live: true,
@@ -86,7 +85,7 @@
     };
     return {
       state: 'offline', live: false,
-      label: '○ app offline — a resume will queue until the desktop app is next open',
+      label: '○ PC archive connected — resume may queue until the desktop app is open',
     };
   }
 
@@ -100,6 +99,7 @@
     var pollIntervalMs = d.pollIntervalMs || DEFAULTS.pollIntervalMs;
     var pollTimeoutMs = d.pollTimeoutMs || DEFAULTS.pollTimeoutMs;
     var offlineTimeoutMs = d.offlineTimeoutMs || DEFAULTS.offlineTimeoutMs;
+    var discoveryUrl = d.discoveryUrl || '/remote/api/discovery/chats?offset=0&limit=100&sort=recent';
 
     var state = {
       chats: [], query: '', host: '', updatedAt: 0, ageMs: null,
@@ -109,25 +109,25 @@
     async function load() {
       var res;
       try {
-        res = await fetchFn(base + '/api/archive-index');
+        res = await fetchFn(discoveryUrl);
       } catch (error) {
         state.appLive = false;
-        state.error = 'could not reach the relay: ' + ((error && error.message) || error);
+        state.error = 'could not reach the PC archive: ' + ((error && error.message) || error);
         return state;
       }
       if (!res || !res.ok) {
         state.appLive = false;
-        state.error = 'could not load your chat archive (HTTP ' + ((res && res.status) || 0) + ')';
+        state.error = 'could not load the PC archive (HTTP ' + ((res && res.status) || 0) + ')';
         return state;
       }
       var body = (await res.json()) || {};
-      // `resumable:false` is the app saying it could not build a trusted resume for that chat; the
+      // `resumable:false` is the PC saying it could not build a trusted resume for that chat; the
       // picker must not offer it, because tapping it would be a promise the PC cannot keep.
-      state.chats = (Array.isArray(body.chats) ? body.chats : [])
+      state.chats = (Array.isArray(body.rows) ? body.rows : [])
         .filter(function (c) { return c && c.id && c.resumable !== false; });
-      state.host = String(body.host || '');
-      state.updatedAt = Number(body.updatedAt) || 0;
-      state.ageMs = body.ageMs == null ? null : Number(body.ageMs);
+      state.host = '';
+      state.updatedAt = now();
+      state.ageMs = 0;
       state.appLive = body.appLive === true;
       state.loaded = true;
       state.error = '';

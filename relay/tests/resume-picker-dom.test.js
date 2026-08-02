@@ -207,8 +207,8 @@ const INDEX_ROWS = [
 function archiveMount() {
   return mount({
     postIntent: async () => unexpected('postIntent'),
-    fetch: async (url) => (url.includes('/api/archive-index')
-      ? { ok: true, status: 200, json: async () => ({ chats: INDEX_ROWS, host: 'AHMED-PC', updatedAt: 1700000000000, appLive: false }) }
+    fetch: async (url) => (url.includes('/remote/api/discovery/chats')
+      ? { ok: true, status: 200, json: async () => ({ rows: INDEX_ROWS, total: INDEX_ROWS.length, offset: 0, limit: 100, hasMore: false }) }
       : unexpected(url)),
   });
 }
@@ -225,7 +225,7 @@ test('RENDER: only offered rows are drawn, typing narrows them, and a dead query
   assert.deepEqual(list.children.map((c) => c.tagName), ['BUTTON', 'BUTTON']);
   assert.deepEqual(list.children.map((c) => c.dataset.chatId), ['chat-1', 'chat-2']);
   assert.equal(list.children[0].children[0].textContent, 'Cortex planning', 'the row must carry its title');
-  assert.ok($('#resumelive').textContent.includes('offline'), $('#resumelive').textContent);
+  assert.ok($('#resumelive').textContent.includes('connected'), $('#resumelive').textContent);
 
   const box = $('#resumeq');
   box.value = 'relay';

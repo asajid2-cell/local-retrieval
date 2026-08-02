@@ -256,7 +256,6 @@ public sealed partial class MainPage
     private DispatcherTimer? _cmdTimer;
     private DispatcherTimer? _tabTimer;
     private bool _syncPushing;
-    private bool _indexPushing;
     private bool _cmdPolling;
     // Shapes the gaps BETWEEN polls from whether the queue is producing work. The poll itself now
     // long-polls the relay (waitMs — held open, answered the instant a command lands), so on a
@@ -272,7 +271,6 @@ public sealed partial class MainPage
     public void StartProjectSync()
     {
         _ = PushProjectsAsync();
-        _ = PushArchiveIndexAsync();
         _syncTimer ??= new DispatcherTimer { Interval = TimeSpan.FromSeconds(30) };
         _syncTimer.Tick -= OnSyncTick;
         _syncTimer.Tick += OnSyncTick;
@@ -296,7 +294,6 @@ public sealed partial class MainPage
     private async void OnSyncTick(object? sender, object e)
     {
         await PushProjectsAsync();
-        await PushArchiveIndexAsync();   // sequential: two SSH pushes on one tick, never contending
     }
     private async void OnCmdTick(object? sender, object e) => await PollCommandsAsync();
     private async void OnTabTick(object? sender, object e)
@@ -367,30 +364,6 @@ public sealed partial class MainPage
         }
         catch (Exception ex) { Diag.Log("PushProjects failed: " + ex.Message); }
         finally { _syncPushing = false; }
-    }
-
-    // The recent-chats archive index (POST /api/archive-index), pushed on the SAME 30s sync tick as the
-    // projection above so the web terminal's "reopen a recent chat" list never lags the app by more than
-    // one cycle. It carries opaque ids + a cwd display string only — never a command — so the relay can
-    // render the list but can only ever hand back an intent for this PC to resolve.
-    private async Task PushArchiveIndexAsync()
-    {
-        if (_indexPushing) return;
-        var settings = _archive.Store.Settings;
-        var target = (settings.MultiplexSshTarget ?? "").Trim();
-        if (string.IsNullOrEmpty(target)) return;
-        string json;
-        try { json = await Task.Run(() => _archive.BuildArchiveIndexJson()); }
-        catch (Exception ex) { Diag.Log("BuildArchiveIndex failed: " + ex.Message); return; }
-        _indexPushing = true;
-        try
-        {
-            var remote = $"curl -s -X POST http://127.0.0.1:{settings.MultiplexApiPort}/api/archive-index -H 'Content-Type: application/json' --data-binary @-";
-            var (code, outText) = await RunSshAsync(target, remote, json);
-            Diag.Log($"Archive index sync rc={code} out={outText.Trim()}");
-        }
-        catch (Exception ex) { Diag.Log("PushArchiveIndex failed: " + ex.Message); }
-        finally { _indexPushing = false; }
     }
 
     // Pull pending owner commands from the VPS (the web enqueues them) and action them on this PC. Only

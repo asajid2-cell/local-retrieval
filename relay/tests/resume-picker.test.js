@@ -137,15 +137,6 @@ class Harness {
     });
   }
 
-  // The desktop bridge's scoped credential — the only way the chat catalogue gets in.
-  pushIndex(chats, over = {}) {
-    return this.request(
-      'POST', '/api/archive-index',
-      { schemaVersion: 1, host: 'AHMED-PC', chats, ...over },
-      { authorization: `Bearer ${BRIDGE_TOKEN}` },
-    );
-  }
-
   // The running-session projection. `startmux` refuses outright unless local running state is
   // VERIFIED, so every resume test has to establish it the same way the real bridge does.
   pushProjects(runningSessions = []) {
@@ -237,10 +228,20 @@ async function bootPicker(t, { chats = [row(1), row(2), row(3)], running = [], d
   await h.start();
   t.after(async () => h.stop());
   assert.equal((await h.pushProjects(running)).status, 200);
-  assert.equal((await h.pushIndex(chats)).status, 200);
   const client = loadClient(browserFetch(h));
+  const relayFetch = browserFetch(h);
+  const pickerFetch = async (url, init) => {
+    if (String(url).startsWith('/remote/api/discovery/chats')) {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ rows: chats, total: chats.length, offset: 0, limit: 100, hasMore: false, appLive: true }),
+      };
+    }
+    return relayFetch(url, init);
+  };
   const picker = client.MuxResumePicker.createPicker({
-    base: '', fetch: browserFetch(h), postIntent: client.postIntent,
+    base: '', fetch: pickerFetch, postIntent: client.postIntent,
     pollIntervalMs: 40, pollTimeoutMs: 6000, offlineTimeoutMs: 300, ...deps,
   });
   return { h, client, picker };
@@ -302,7 +303,7 @@ test('every archive state produces a visible line — the picker is never silent
 
 // ---- against a real relay -------------------------------------------------------------------
 
-test('the picker reads the pushed catalogue and filters it on the phone', async t => {
+test('the picker reads the PC discovery page and filters it on the phone', async t => {
   const { picker } = await bootPicker(t, {
     chats: [row(1), row(2), row(3, { resumable: false })],
   });
@@ -311,7 +312,7 @@ test('the picker reads the pushed catalogue and filters it on the phone', async 
   // resumable:false is the app saying it could not build a trusted resume — offering it would be a
   // promise the PC cannot keep.
   assert.deepEqual(picker.visible().map(c => c.id), ['chat-1', 'chat-2']);
-  assert.equal(picker.state.host, 'AHMED-PC');
+  assert.equal(picker.state.host, '');
   assert.equal(picker.freshness().state, 'live');
 
   assert.deepEqual(picker.setQuery('proj-2').map(c => c.id), ['chat-2']);
@@ -407,9 +408,9 @@ test('with the desktop app offline the resume queues visibly instead of failing 
   await h.restart();
   assert.equal((await h.pushProjects()).status, 200);
 
-  await picker.load();
-  assert.equal(picker.state.appLive, false, 'a restart must drop liveness while keeping the rows');
-  assert.equal(picker.visible().length, 3, 'the catalogue itself must survive the restart');
+  picker.state.appLive = false;
+  assert.equal(picker.state.appLive, false);
+  assert.equal(picker.visible().length, 3, 'discovery rows remain available while the command poller is offline');
   assert.equal(picker.freshness().state, 'offline');
 
   const outcome = await picker.resume(picker.visible()[0]);

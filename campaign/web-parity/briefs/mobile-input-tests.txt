@@ -1,0 +1,43 @@
+SEALED BRIEF — regression tests for two mobile input defects (write ONLY the test file).
+
+Context: a single-file web terminal client at relay/public/index.html (xterm.js, vanilla JS, no build step). Another engineer is fixing two defects in it RIGHT NOW, against the frozen contract quoted below. You write the tests FROM THAT CONTRACT, not from their code — do not read index.html expecting the fix to be there yet, and never weaken an assertion to match whatever you find. If contract and implementation disagree at integration, the contract wins.
+
+HOW THIS REPO TESTS CLIENT CODE (the idiom you MUST follow — no jsdom, no browser):
+tests read public/index.html as TEXT, slice a named region, and assert on the source. Real example from tests/client-layout.test.js:
+
+  const fs = require('node:fs'); const path = require('node:path'); const vm = require('node:vm');
+  const source = fs.readFileSync(path.join(__dirname, '..', 'public', 'index.html'), 'utf8');
+  function section(start, end) {
+    const from = source.indexOf(start);
+    const to = source.indexOf(end, from + start.length);
+    assert.notEqual(from, -1, `missing section start: ${start}`);
+    assert.notEqual(to, -1, `missing section end: ${end}`);
+    return source.slice(from, to);
+  }
+  test('...', () => {
+    const measure = section('function runViewportMeasure', 'function scheduleViewportFit');
+    assert.match(measure, /!terminalSurfaceVisible\(\)/);
+    assert.ok(measure.indexOf('a') < measure.indexOf('b'), 'ordering matters');
+  });
+
+`node:test` + `node:assert/strict`, CommonJS require, no external deps. You may also use `vm` to evaluate an extracted pure function if that makes an assertion sharper — optional.
+
+=== THE FROZEN CONTRACT UNDER TEST ===
+DEFECT 1 — keyboard-aware viewport:
+ (a) The `window.visualViewport` 'resize' handler must call `applyViewport()` (it currently only calls `scheduleViewportFit(isMobile()?140:40)`; that debounced re-measure must SURVIVE — assert both).
+ (b) There must ALSO be a visualViewport 'scroll' listener that calls `applyViewport()` (iOS shifts rather than resizes the visual viewport).
+ (c) `applyViewport()` must reference `visualViewport.offsetTop` (or a variable read from it) so the app tracks the visible band on iOS, in addition to the existing `vv.height` -> `#app` height assignment which must remain.
+ (d) `applyViewport()` must be memoised: it must not write the same value to the DOM on every event (these fire continuously during keyboard animation). Assert some guard exists comparing against a remembered last value before the style write.
+DEFECT 2 — keybar must not steal focus:
+ (e) `buildKeybar()` must install a focus-preserving guard on the `#keybar` CONTAINER (delegation), not on each button — assert the guard is registered on the container element and that it calls `preventDefault`.
+ (f) The guard must NOT be on 'touchstart' (that suppresses the synthesized click on iOS and would break every button). Assert no `touchstart` listener with preventDefault is added to the keybar container by buildKeybar.
+ (g) The `#sizebtn` long-press listeners must still exist: touchstart/touchend/touchmove and mousedown/mouseup/mouseleave.
+ (h) Every keybar button must still be created with `type='button'` (a submit-type button in a form context would reload the page).
+
+DELIVERABLE: Z:\328\CMPUT328-A2\codexworks\301\mux-local-retrieval\relay\tests\mobile-input.test.js (exactly one new file)
+One test per contract clause (a)-(h), named descriptively (e.g. 'the visual viewport resize handler applies the keyboard-shrunk viewport'). Each failure message must say WHAT BROKE FOR THE USER (e.g. 'the composer will sit under the soft keyboard'), not just 'assertion failed'. Do not modify any other file — especially not public/index.html.
+
+Run it yourself before reporting, from Z:\328\CMPUT328-A2\codexworks\301\mux-local-retrieval\relay:
+VERIFY: node --test tests/mobile-input.test.js
+
+It is EXPECTED that some tests fail while the other engineer is mid-fix. Report the pass/fail table as-is — a red test that correctly encodes the contract is a SUCCESS for you, not a failure. Do not weaken assertions to make them pass. Finish with an AMBIGUITIES section: which clauses you judged hardest to assert on source text alone, and any clause you believe is untestable this way (say so plainly rather than writing a fake test). Turn budget ~20 minutes.

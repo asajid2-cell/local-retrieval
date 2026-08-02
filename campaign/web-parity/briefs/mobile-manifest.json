@@ -1,0 +1,25 @@
+{
+  "swarm": "wp-mobile",
+  "lanes": [
+    {
+      "name": "mobile-input-fix",
+      "taskFile": "Z:\\328\\CMPUT328-A2\\codexworks\\301\\mux-local-retrieval\\campaign\\web-parity\\briefs\\mobile-input-fix.txt",
+      "cwd": "Z:\\328\\CMPUT328-A2\\codexworks\\301\\mux-local-retrieval\\relay",
+      "partner": "codex",
+      "model": "gpt-5.6-luna",
+      "effort": "max",
+      "writes": ["relay/public/index.html"],
+      "verify": "node --test tests/client-layout.test.js tests/wheel-scroll.test.js tests/scroll-parity-web.test.js"
+    },
+    {
+      "name": "mobile-input-tests",
+      "taskFile": "Z:\\328\\CMPUT328-A2\\codexworks\\301\\mux-local-retrieval\\campaign\\web-parity\\briefs\\mobile-input-tests.txt",
+      "cwd": "Z:\\328\\CMPUT328-A2\\codexworks\\301\\mux-local-retrieval\\relay",
+      "partner": "codex",
+      "model": "gpt-5.6-luna",
+      "effort": "max",
+      "writes": ["relay/tests/mobile-input.test.js"],
+      "verify": "node --test tests/mobile-input.test.js"
+    }
+  ]
+}

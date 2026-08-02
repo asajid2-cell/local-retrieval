@@ -1492,6 +1492,8 @@ function scrollAlternate(deltaY){
 let viewportTimer=0, layoutRaf=0, layoutGeneration=0;
 let pendingViewportKey='', pendingViewportCount=0, lastViewportReport='', lastViewportReportSocket=null;
 let _lastViewportResizeAt=0;
+// Keyboard animation can emit viewport events every frame; repeat geometry would otherwise thrash the grid.
+let _lastViewportGeometry='';
 function terminalSurfaceVisible(){
   const host=$('#term');
   if(!host || !host.isConnected || host.offsetParent===null) return false;
@@ -1543,11 +1545,28 @@ function scheduleViewportFit(delay=80){
 function doFit(){ scheduleViewportFit(0); }
 function applyViewport(){
   _lastViewportResizeAt=Date.now();
-  const vv=window.visualViewport;
-  if(vv && vv.height>0) $('#app').style.height = vv.height+'px';
+  const vv=window.visualViewport, app=$('#app');
+  if(vv && vv.height>0){
+    const height=vv.height+'px';
+    const offsetTop=Math.max(0, Number(vv.offsetTop)||0);
+    const geometry=height+'|'+offsetTop;
+    if(geometry!==_lastViewportGeometry){
+      _lastViewportGeometry=geometry;
+      app.style.height=height;
+      // iOS can pan the visual viewport without resizing the layout viewport; shifting the in-flow grid
+      // into that band avoids transform-created containing blocks that would trap fixed overlays.
+      app.style.marginTop=offsetTop ? offsetTop+'px' : '';
+    }
+  }
   scheduleViewportFit(0);
 }
-if (window.visualViewport){ visualViewport.addEventListener('resize', ()=>scheduleViewportFit(isMobile()?140:40)); }
+if (window.visualViewport){
+  visualViewport.addEventListener('resize', ()=>{
+    applyViewport();
+    scheduleViewportFit(isMobile()?140:40);
+  });
+  visualViewport.addEventListener('scroll', ()=>applyViewport());
+}
 new ResizeObserver(()=>scheduleViewportFit(0)).observe($('#term'));
 window.addEventListener('orientationchange', ()=>setTimeout(applyViewport,250));
 
@@ -3014,6 +3033,13 @@ function openHelp(){
   upd();
   openDialog('#helpdlg');
 }
+// Button mousedown steals xterm's hidden textarea before click; cancel only that default so iOS still
+// synthesizes the click that runs the action, including for custom buttons added after this binding.
+const keybar=$('#keybar');
+keybar.addEventListener('mousedown', e=>{
+  const button=e.target && e.target.closest ? e.target.closest('button') : null;
+  if(button && keybar.contains(button)) e.preventDefault();
+}, true);
 function buildKeybar(){
   const kb=$('#keybar'); kb.innerHTML='';
   const mk=(label,cls,on)=>{ const b=document.createElement('button'); b.type='button'; b.className='key'+(cls?' '+cls:''); b.textContent=label; if(on) b.onclick=on; return b; };

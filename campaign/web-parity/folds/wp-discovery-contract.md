@@ -76,9 +76,8 @@ path, source path, or working-directory path. `resumable` is computed with the e
 resume gate. `muxName` is additive to the charter's required row fields and exists only because the
 existing relay `startmux` app-command requires a display-safe session name.
 
-Pagination is deterministic for a fixed archive snapshot. Every supported sort receives a final
-case-insensitive `id` tie-break. Search relevance order is preserved, with `id` used only to settle
-otherwise equal ordering where the underlying sort exposes equal keys.
+Pagination is deterministic for a fixed archive snapshot. Explicit date/recent sorts receive a final
+case-insensitive `id` tie-break. Search relevance order from `ArchiveService.Search` is preserved.
 
 ## GET `/remote/api/discovery/facets`
 
