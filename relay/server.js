@@ -2910,6 +2910,13 @@ wssHost.on('connection', (ws, req) => {
       }
       hostSessions.clear();
       for (const [n, v] of incoming) hostSessions.set(n, v);
+      for (const [n, st] of sessions) {
+        const pending = st.unpinnedLocalSize;
+        const hosted = hostSessions.get(n);
+        if (pending && hosted && (hosted.cols | 0) === pending.cols && (hosted.rows | 0) === pending.rows) {
+          st.unpinnedLocalSize = null;
+        }
+      }
       reconcileRenameIntentsFromHost();
       sweepAttentionEpisodes();
     } else if (m.t === 'createResult') {
@@ -3150,17 +3157,18 @@ const _pinRetryTimer = setInterval(() => {
   }
 }, 20000);
 const ACTIVE_MS = +process.env.MUX_ACTIVE_MS || 180000;   // "recently active" window that auto-size considers (3 min; env-overridable for tests)
+const PIN_HOST_SYNC_GRACE_MS = +process.env.MUX_PIN_HOST_SYNC_GRACE_MS || 5000;
 const VIEWER_HIGH_WATER_BYTES = Math.max(1024, +process.env.MUX_VIEWER_HIGH_WATER_BYTES || 4 * 1024 * 1024);
 const VIEWER_REPLAY_BURST_BYTES = HOST_SB_BYTES + 2000000 + CLEAR_SCREEN.length;
 
-const sessions = new Map(); // name -> { clients: Map<id,Client>, cur, sbInFlight, sbRid, sbWaiters, sbRequestTimer }
+const sessions = new Map(); // name -> { clients: Map<id,Client>, cur, unpinnedLocalSize, sbInFlight, sbRid, sbWaiters, sbRequestTimer }
 let _cid = 0;
 let _scrollbackRequestSeq = 0;
 function sessionState(name) {
   let st = sessions.get(name);
   if (!st) {
     st = {
-      clients: new Map(), cur: null, sbInFlight: false, sbRid: '',
+      clients: new Map(), cur: null, unpinnedLocalSize: null, sbInFlight: false, sbRid: '',
       sbWaiters: new Set(), sbRequestTimer: null,
     };
     sessions.set(name, st);
@@ -3261,17 +3269,17 @@ function requestSessionScrollback(name, st, client) {
 }
 function isActive(c) { return c.visible !== false || (Date.now() - (c.lastActive || c.connAt || 0) < ACTIVE_MS); }
 function widest(list) { let b = list[0]; for (const c of list) if (c.vcols > b.vcols || (c.vcols === b.vcols && c.vrows > b.vrows)) b = c; return b; }
-function targetSize(st, name) {
-  const hosted = hostSessions.get(name);
-  const localOwned = hosted && hosted.alive !== false
-    && ((hosted.localViewers | 0) > 0 || !!hosted.owner);
-  if (localOwned && (hosted.cols | 0) > 1 && (hosted.rows | 0) > 1) {
-    // Local-first rule: an attached PC terminal owns the PTY size. Headless PC-hosted
-    // sessions still resize to the active web viewer so the site behaves like a native terminal.
-    return { cols: hosted.cols | 0, rows: hosted.rows | 0, pin: null, hostedSize: true };
+function commonFit(list) {
+  let cols = list[0].vcols, rows = list[0].vrows;
+  for (const c of list) {
+    cols = Math.min(cols, c.vcols);
+    rows = Math.min(rows, c.vrows);
   }
+  return { vcols: cols, vrows: rows };
+}
+function targetSize(st, name) {
   const all = [...st.clients.values()].filter(c => c.vcols > 1 && c.vrows > 1);
-  const pin = pins.get(name);
+  let pin = pins.get(name);
   if (pin) {
     const onDev = all.filter(c => (c.deviceId || ('sock-' + c.id)) === pin.deviceId);
     if (onDev.length) {
@@ -3287,9 +3295,24 @@ function targetSize(st, name) {
     candidate.delete(name);
     commitBestEffortPinCleanup(candidate, 'stale pin cleanup');
   }
+  const hosted = hostSessions.get(name);
+  const localOwned = hosted && hosted.alive !== false
+    && ((hosted.localViewers | 0) > 0 || !!hosted.owner);
+  if (localOwned && (hosted.cols | 0) > 1 && (hosted.rows | 0) > 1) {
+    const pending = st.unpinnedLocalSize;
+    if (pending && pending.until > Date.now()) {
+      return { cols: pending.cols, rows: pending.rows, pin: null, hostedSize: true };
+    }
+    st.unpinnedLocalSize = null;
+    // Without an explicit pin, an attached PC terminal owns the PTY size. A deliberate pin
+    // outranks it so every connected viewer, including the PC terminal, follows the chosen device.
+    return { cols: hosted.cols | 0, rows: hosted.rows | 0, pin: null, hostedSize: true };
+  }
   if (!all.length) return null;
   const active = all.filter(isActive);
-  const c = widest(active.length ? active : all);
+  // One PTY can paint only one grid. Use the per-axis minimum across active viewers so every
+  // active screen can show the complete frame; larger viewports letterbox on either axis.
+  const c = commonFit(active.length ? active : all);
   return { cols: c.vcols, rows: c.vrows, pin: null };
 }
 function recompute(name) {
@@ -3298,8 +3321,8 @@ function recompute(name) {
   const cols = clampTermDimension(sz.cols, 2, MAX_TERM_COLS);
   const rows = clampTermDimension(sz.rows, 2, MAX_TERM_ROWS);
   for (const c of st.clients.values()) { if (c.term) try { c.term.resize(cols, rows); } catch {} }
-  // Hosted sessions are local-first: if muxd already reports a PTY size, web viewers follow it
-  // and never resize the PC PTY. Only pending brand-new web-created sessions may send an initial size.
+  // Hosted sessions follow the attached PC terminal unless a human explicitly pins a device.
+  // A pin (or a headless hosted session) is forwarded to muxd so the one shared PTY really resizes.
   if ([...st.clients.values()].some(c => c.hosted) && !sz.hostedSize) {
     if (!st.cur || st.cur.cols !== cols || st.cur.rows !== rows) { st.cur = { cols, rows }; sendHost({ t: 'resize', s: name, cols, rows }); }
   }
@@ -3308,17 +3331,35 @@ function recompute(name) {
   for (const c of st.clients.values()) {
     if (c.ws.readyState !== 1) continue;
     const mine = pinned && sz.pin.deviceId === (c.deviceId || ('sock-' + c.id));
-    const mode = sz.hostedSize ? 'local' : (pinned ? 'pinned' : 'auto');
-    const modeLabel = sz.hostedSize ? `local Â· ${cols}Ã—${rows}` : (pinned ? `ðŸ“Œ ${pinLabel} Â· ${cols}Ã—${rows}` : `auto Â· ${cols}Ã—${rows}`);
-    sendViewer(name, st, c, 'd' + JSON.stringify({ cols, rows, mode, pinLabel, mine, modeLabel, me: c.id, clients }));
+    const mode = pinned ? 'pinned' : 'auto';
+    const modeLabel = pinned ? `ðŸ“Œ ${mine ? 'this device' : pinLabel} Â· ${cols}Ã—${rows}` : `auto Â· ${cols}Ã—${rows}`;
+    sendViewer(name, st, c, 'd' + JSON.stringify({ cols, rows, mode, local: !!sz.hostedSize, pinLabel, mine, modeLabel, me: c.id, clients }));
   }
 }
 function pinToDevice(name, client, on) {
   const candidate = new Map(pins);
+  const previous = pins.get(name);
   if (on) candidate.set(name, { deviceId: client.deviceId || ('sock-' + client.id), label: client.label || 'this device', cols: client.vcols, rows: client.vrows, at: Date.now() });
   else candidate.delete(name);
-  savePins(candidate);
+  try {
+    savePins(candidate);
+  } catch (error) {
+    persistenceFailure = String(error && error.message || error);
+    if (!error.committed) persistenceBlocked = persistenceFailure;
+    console.error('[persistence] pin change failed: ' + persistenceFailure);
+    if (!error.committed) {
+      recompute(name);
+      return false;
+    }
+  }
+  const st = sessions.get(name);
+  if (st) {
+    st.unpinnedLocalSize = !on && previous
+      ? { cols: previous.cols | 0, rows: previous.rows | 0, until: Date.now() + PIN_HOST_SYNC_GRACE_MS }
+      : null;
+  }
   recompute(name);
+  return true;
 }
 function pinToDeviceId(name, deviceId) {   // long-press: pin to ANY listed device
   const st = sessions.get(name); if (!st) return;

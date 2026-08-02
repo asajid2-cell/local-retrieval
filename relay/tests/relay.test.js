@@ -16,6 +16,7 @@ const {
   leaseCommands,
   ackLeased,
   waitForWsText,
+  waitForWsFrame,
   RelayHarness,
   FakeHost,
 } = require('./harness');
@@ -1655,6 +1656,159 @@ test('viewer dimensions are clamped before they can resize the shared PTY', asyn
   await sleep(100);
   const resizes = host.messages.filter(m => m.t === 'resize' && m.s === 'bounded-size');
   assert.equal(resizes.every(m => m.cols <= 1000 && m.rows <= 300), true);
+  ws.close();
+});
+
+test('an explicit device pin overrides the attached local terminal for every viewer', async t => {
+  const h = new RelayHarness();
+  await h.start();
+  t.after(async () => h.stop());
+  const hosted = {
+    ...commandSession('shared-pin', 'shared-pin-id'),
+    cols: 160,
+    rows: 44,
+    localViewers: 1,
+  };
+  const host = await h.connectHost([hosted]);
+  t.after(() => host.close());
+
+  const narrow = new WebSocket(
+    `ws://127.0.0.1:${h.port}/ws?session=shared-pin&cols=72&rows=28&dev=phone&label=Phone`,
+  );
+  const wide = new WebSocket(
+    `ws://127.0.0.1:${h.port}/ws?session=shared-pin&cols=132&rows=40&dev=desktop&label=Desktop`,
+  );
+  await Promise.all([once(narrow, 'open'), once(wide, 'open')]);
+
+  const pinnedForNarrow = waitForWsFrame(
+    narrow,
+    text => {
+      if (text[0] !== 'd') return false;
+      const frame = JSON.parse(text.slice(1));
+      return frame.mode === 'pinned' && frame.local === false && frame.mine === true && frame.cols === 72 && frame.rows === 28;
+    },
+    'narrow viewer pinned size frame',
+  );
+  const pinnedForWide = waitForWsFrame(
+    wide,
+    text => {
+      if (text[0] !== 'd') return false;
+      const frame = JSON.parse(text.slice(1));
+      return frame.mode === 'pinned' && frame.mine === false && frame.cols === 72 && frame.rows === 28;
+    },
+    'wide viewer mirrored pinned size frame',
+  );
+  narrow.send('P1');
+
+  const resize = await host.waitFor(
+    m => m.t === 'resize' && m.s === 'shared-pin' && m.cols === 72 && m.rows === 28,
+    'pinned host resize',
+  );
+  assert.deepEqual(resize, { t: 'resize', s: 'shared-pin', cols: 72, rows: 28 });
+  const narrowPinnedFrame = JSON.parse((await pinnedForNarrow).slice(1));
+  const widePinnedFrame = JSON.parse((await pinnedForWide).slice(1));
+  assert.match(narrowPinnedFrame.modeLabel, /this device/i);
+  assert.match(widePinnedFrame.modeLabel, /Phone/);
+
+  const autoForNarrow = waitForWsFrame(
+    narrow,
+    text => {
+      if (text[0] !== 'd') return false;
+      const frame = JSON.parse(text.slice(1));
+      return frame.mode === 'auto' && frame.local === true && frame.cols === 72 && frame.rows === 28;
+    },
+    'narrow viewer auto size frame',
+  );
+  const autoForWide = waitForWsFrame(
+    wide,
+    text => {
+      if (text[0] !== 'd') return false;
+      const frame = JSON.parse(text.slice(1));
+      return frame.mode === 'auto' && frame.local === true && frame.cols === 72 && frame.rows === 28;
+    },
+    'wide viewer auto size frame',
+  );
+  narrow.send('P0');
+  assert.match(JSON.parse((await autoForNarrow).slice(1)).modeLabel, /^auto /);
+  assert.match(JSON.parse((await autoForWide).slice(1)).modeLabel, /^auto /);
+
+  narrow.close();
+  wide.close();
+});
+
+test('headless auto sizing uses the per-axis minimum that fits every active viewer', async t => {
+  const h = new RelayHarness();
+  await h.start();
+  t.after(async () => h.stop());
+  const headless = { ...commandSession('narrow-auto', 'narrow-auto-id'), cols: 0, rows: 0 };
+  const host = await h.connectHost([headless]);
+  t.after(() => host.close());
+
+  const narrow = new WebSocket(
+    `ws://127.0.0.1:${h.port}/ws?session=narrow-auto&cols=74&rows=60&dev=phone&label=Phone`,
+  );
+  const narrowAuto = waitForWsFrame(
+    narrow,
+    text => {
+      if (text[0] !== 'd') return false;
+      const frame = JSON.parse(text.slice(1));
+      return frame.mode === 'auto' && frame.local === false && frame.cols === 74 && frame.rows === 60;
+    },
+    'narrow viewer auto frame',
+  );
+  await once(narrow, 'open');
+
+  const wide = new WebSocket(
+    `ws://127.0.0.1:${h.port}/ws?session=narrow-auto&cols=138&rows=26&dev=desktop&label=Desktop`,
+  );
+  const wideAuto = waitForWsFrame(
+    wide,
+    text => {
+      if (text[0] !== 'd') return false;
+      const frame = JSON.parse(text.slice(1));
+      return frame.mode === 'auto' && frame.local === false && frame.cols === 74 && frame.rows === 26;
+    },
+    'wide viewer narrowest-auto frame',
+  );
+  await once(wide, 'open');
+
+  await Promise.all([narrowAuto, wideAuto]);
+  const resize = await host.waitFor(
+    m => m.t === 'resize' && m.s === 'narrow-auto' && m.cols === 74 && m.rows === 26,
+    'per-axis auto host resize',
+  );
+  assert.deepEqual(resize, { t: 'resize', s: 'narrow-auto', cols: 74, rows: 26 });
+
+  narrow.close();
+  wide.close();
+});
+
+test('a pin persistence failure leaves the relay alive and the accepted size unchanged', async t => {
+  const h = new RelayHarness();
+  await h.start();
+  t.after(async () => h.stop());
+  const host = await h.connectHost([{
+    ...commandSession('pin-fault', 'pin-fault-id'),
+    cols: 120,
+    rows: 36,
+    localViewers: 1,
+  }]);
+  t.after(() => host.close());
+
+  const ws = new WebSocket(
+    `ws://127.0.0.1:${h.port}/ws?session=pin-fault&cols=76&rows=27&dev=phone&label=Phone`,
+  );
+  await once(ws, 'open');
+  h.failPersistence('pins.json', 'beforeWrite');
+  ws.send('P1');
+
+  await sleep(150);
+  const health = await h.json('GET', '/api/health');
+  assert.equal(health.persistence.blocked, true);
+  await host.assertNo(
+    m => m.t === 'resize' && m.s === 'pin-fault' && m.cols === 76 && m.rows === 27,
+    'an uncommitted pin must not resize the shared PTY',
+  );
   ws.close();
 });
 

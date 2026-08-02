@@ -48,6 +48,8 @@ function loadScrollAffordance(fakeTerm, els) {
   const sandbox = {
     term: fakeTerm,
     $: sel => els[sel] || null,
+    winSize: null,
+    flash: () => {},
     scrollPositionLabel: null,
     applyScrollAffordance: null,
   };
@@ -61,6 +63,9 @@ function fakeEl() {
   return {
     hidden: false,
     textContent: '',
+    title: '',
+    addEventListener: () => {},
+    querySelector: () => null,
     classList: {
       add: c => classes.add(c),
       remove: c => classes.delete(c),
@@ -88,16 +93,21 @@ test('the normal buffer gets a real, visible scrollbar on the xterm viewport', (
   const thumb = section('#term .xterm-viewport::-webkit-scrollbar-thumb {', '}');
   assert.match(thumb, /var\(--/, 'the thumb must use theme variables');
 
-  // and the alternate screen must hide it via a distinct, class-scoped rule
-  assert.match(source, /#term\.altbuf \.xterm-viewport \{[^}]*scrollbar-width:\s*none/);
+  // The alternate screen suppresses only the dead vertical direction. Horizontal panning belongs
+  // to the outer #term.pan host and must remain visible.
+  assert.match(source, /#term\.altbuf \.xterm-viewport \{[^}]*overflow-y:\s*hidden/);
   assert.match(source, /#term\.altbuf \.xterm-viewport::-webkit-scrollbar \{[^}]*width:\s*0/);
+  assert.doesNotMatch(source, /#term\.altbuf \.xterm-viewport::-webkit-scrollbar \{[^}]*height:\s*0/);
+  assert.match(source, /#term\.pan \{[^}]*overflow-x:\s*auto[^}]*scrollbar-width:\s*thin/);
+  assert.match(source, /#term\.pan::-webkit-scrollbar \{[^}]*height:\s*(?!0)\d/);
 });
 
-test('alternate buffer swaps the dead scrollbar for an honest "app scroll" chip', () => {
+test('alternate buffer separates app-owned vertical scroll from horizontal pan', () => {
   const host = fakeEl(), chip = fakeEl(), txt = fakeEl();
   const els = { '#term': host, '#scrollstate': chip, '#scrolltext': txt };
   const buffer = { active: { type: 'normal', viewportY: 40, baseY: 100 } };
-  const { applyScrollAffordance } = loadScrollAffordance({ buffer, rows: 30 }, els);
+  const loaded = loadScrollAffordance({ buffer, rows: 30, cols: 120 }, els);
+  const { applyScrollAffordance } = loaded;
 
   buffer.active.type = 'alternate';
   assert.equal(applyScrollAffordance(), 'app scroll');
@@ -106,7 +116,14 @@ test('alternate buffer swaps the dead scrollbar for an honest "app scroll" chip'
   assert.equal(txt.textContent, 'app scroll');
   assert.equal(chip.hidden, false, 'the chip is the whole replacement affordance; it must be visible');
 
+  host.classList.add('pan');
+  loaded.winSize = { cols: 120, rows: 30 };
+  assert.equal(applyScrollAffordance(), 'app scroll · pan 120 cols');
+  assert.equal(txt.textContent, 'app scroll · pan 120 cols');
+  assert.match(chip.title, /horizontal scrollbar/i);
+
   buffer.active.type = 'normal';
+  host.classList.remove('pan');
   applyScrollAffordance();
   assert.equal(host.classList.contains('altbuf'), false, 'leaving the alt screen must restore the scrollbar');
   assert.equal(chip.classList.contains('app'), false);
@@ -122,6 +139,66 @@ test('alternate buffer swaps the dead scrollbar for an honest "app scroll" chip'
   txt.textContent = 'SENTINEL';
   assert.equal(applyScrollAffordance(), 'live · bottom', 'the label is still reported when memoised');
   assert.equal(txt.textContent, 'SENTINEL', 'unchanged scroll state must do zero DOM writes');
+});
+
+test('width mismatch activates a discoverable horizontal pan host', () => {
+  const host = fakeEl();
+  const code = section('function applyPan()', 'let surfaceAlignRaf');
+  const sandbox = {
+    winSize: { cols: 140, rows: 30 },
+    viewportFit: { cols: 80, rows: 30 },
+    $: sel => sel === '#term' ? host : null,
+    scheduleTerminalSurfaceAlign: () => {},
+    applyPan: null,
+  };
+  vm.createContext(sandbox);
+  vm.runInContext(code + '\nthis.applyPan=applyPan;', sandbox);
+
+  sandbox.applyPan();
+  assert.ok(host.classList.contains('pan'));
+  assert.match(host.title, /horizontal scrollbar/i);
+
+  sandbox.viewportFit = { cols: 140, rows: 30 };
+  sandbox.applyPan();
+  assert.equal(host.classList.contains('pan'), false);
+  assert.equal(host.title, '');
+});
+
+test('size chip names auto, own pin, and another device exactly', () => {
+  const host = fakeEl();
+  const code = section('function sizeButtonPresentation()', 'let _altScrollAt');
+  const sandbox = {
+    winSize: { cols: 100, rows: 30 },
+    sizePinned: false,
+    sizeMine: false,
+    sizeLocal: false,
+    sizePinLabel: '',
+    $: sel => sel === '#term' ? host : null,
+    sizeButtonPresentation: null,
+    updateSizeBtn: null,
+  };
+  vm.createContext(sandbox);
+  vm.runInContext(code + '\nthis.sizeButtonPresentation=sizeButtonPresentation;', sandbox);
+
+  assert.equal(sandbox.sizeButtonPresentation().text, 'auto · 100×30');
+  sandbox.sizeLocal = true;
+  assert.match(sandbox.sizeButtonPresentation().title, /following the attached PC terminal/i);
+  sandbox.sizeLocal = false;
+  sandbox.sizePinned = true;
+  sandbox.sizeMine = true;
+  assert.equal(sandbox.sizeButtonPresentation().text, '📌 this device · 100×30');
+  sandbox.sizeMine = false;
+  sandbox.sizePinLabel = 'Phone';
+  assert.equal(sandbox.sizeButtonPresentation().text, '📌 Phone · 100×30');
+
+  host.classList.add('pan');
+  const mirrored = sandbox.sizeButtonPresentation();
+  assert.match(mirrored.title, /mirroring Phone/i);
+  assert.match(mirrored.title, /tap to pin/i);
+  assert.match(mirrored.title, /horizontal scrollbar/i);
+
+  assert.match(source, /<button type="button" class="meta" id="statusmeta"/);
+  assert.match(source, /\$\('#statusmeta'\)\.addEventListener\('click', cycleSize\)/);
 });
 
 test('scroll position label reports top, middle and bottom honestly', () => {
@@ -143,11 +220,10 @@ test('scroll-affordance hygiene preserves touch pan, quiet readout, and cached l
   // would swallow the touch drag that must chain out to the host scroll.
   assert.match(source, /#term:not\(\.rowpan\) \.xterm-viewport \{[^}]*overscroll-behavior:\s*contain/);
 
-  const chip = section('<div id="scrollstate"', '>');
-  assert.match(chip, /aria-hidden="true"/);
+  const chip = section('<button type="button" id="scrollstate"', '>');
+  assert.doesNotMatch(chip, /aria-hidden/);
   assert.doesNotMatch(chip, /aria-live/);
-  // The chip is a decorative readout that would otherwise announce a new string on every tick of a
-  // scroll drag; #jumplive is the actionable control.
+  assert.match(source, /\$\('#scrollstate'\)\.addEventListener\('click', explainScrollAffordance\)/);
 
   const stateZ = section('#scrollstate {', '}').match(/z-index:\s*(\d+)/);
   const emptyZ = section('#empty {', '}').match(/z-index:\s*(\d+)/);

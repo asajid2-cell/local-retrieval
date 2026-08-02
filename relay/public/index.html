@@ -131,8 +131,15 @@
   #term .xterm { isolation:isolate; }
   /* "pan" = the shared window is wider than this screen: let the user drag horizontally.
      Vertical history belongs to xterm's scrollback, never to a browser wrapper scrollbar. */
-  #term.pan { overflow-x:auto; overflow-y:hidden; touch-action:pan-x; }
+  #term.pan {
+    overflow-x:auto; overflow-y:hidden; touch-action:pan-x;
+    scrollbar-width:thin; scrollbar-color:var(--rose) var(--panel-2);
+  }
   #term.pan .xterm { width:max-content !important; min-width:100%; }
+  @media (hover:hover) and (pointer:fine) {
+    #term.pan::-webkit-scrollbar { height:10px; background:var(--panel-2); }
+    #term.pan::-webkit-scrollbar-thumb { background:var(--rose); border-radius:999px; }
+  }
   /* When the shared terminal is taller than the visible phone pane, scroll the host to the live rows.
      Do not transform .xterm itself; stale transforms can clip the renderer into a mostly black viewport. */
   #term.rowpan { overflow-y:auto; overscroll-behavior:contain; touch-action:pan-x pan-y; }
@@ -179,11 +186,11 @@
   }
   /* Alternate screen (vim, less, htop) scrolls itself - xterm's viewport has no scrollback to move, so a
      visible bar there is a dead control that lies about what dragging it will do. Hide it and SAY so. */
-  #term.altbuf .xterm-viewport { scrollbar-width:none; }
-  #term.altbuf .xterm-viewport::-webkit-scrollbar { width:0; height:0; }
+  #term.altbuf .xterm-viewport { overflow-y:hidden !important; }
+  #term.altbuf .xterm-viewport::-webkit-scrollbar { width:0; }
   /* compact scroll readout, stacked above the jump-to-live pill in the same terminal corner */
   #scrollstate {
-    position:absolute; right:14px; bottom:56px; z-index:4; pointer-events:none;
+    position:absolute; right:14px; bottom:56px; z-index:4; cursor:pointer;
     display:inline-flex; align-items:center; gap:6px; height:22px; padding:0 var(--sp2);
     border-radius:999px; border:1px solid var(--line); background:var(--panel-2); color:var(--muted);
     font:600 11.5px/1 ui-monospace,monospace; font-variant-numeric:tabular-nums; white-space:nowrap;
@@ -203,7 +210,12 @@
   #status.err  .sdot { background:var(--warn); }
   #status #statustext { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:1 1 auto; }
   #status .name { color:var(--txt); font-weight:600; }
-  #status .meta { flex:0 0 auto; color:var(--muted); font-variant-numeric:tabular-nums; }
+  #status .meta {
+    flex:0 0 auto; color:var(--muted); font:inherit; font-variant-numeric:tabular-nums;
+    border:0; padding:2px 4px; background:transparent; cursor:pointer;
+  }
+  #status .meta:hover, #status .meta.on { color:var(--rose); }
+  #status .meta:disabled { cursor:default; opacity:.6; }
 
   /* ---- moded touch keybar ---- */
   #keybar {
@@ -657,13 +669,13 @@
         <button data-profile="shell"><span class="rose">›</span> Start shell</button>
       </span>
     </div>
-    <div id="scrollstate" hidden aria-hidden="true"><span id="scrolltext"></span></div>
+    <button type="button" id="scrollstate" hidden><span id="scrolltext"></span></button>
     <button id="jumplive" aria-label="Jump to live"><span id="jlcount">new</span> ↓</button>
   </main>
 
   <div id="fleetList" aria-label="Fleet glance"></div>
 
-  <div id="status"><span class="sdot"></span><span id="statustext">connecting&hellip;</span><span class="meta" id="statusmeta"></span></div>
+  <div id="status"><span class="sdot"></span><span id="statustext">connecting&hellip;</span><button type="button" class="meta" id="statusmeta" aria-label="Shared terminal size"></button></div>
   <div id="keybar"></div>
   <nav id="mobileNav" aria-label="Mobile views">
     <button type="button" data-mobile-view="sessions" aria-label="Sessions" aria-pressed="false">
@@ -1387,13 +1399,13 @@ const send = (t,d) => {
 };
 
 // ---- shared-window sizing (client side) ----
-// The server holds every attached client at ONE size (the widest viewport by default, or a pinned one).
+// The server holds every attached client at ONE size (the narrowest active viewport by default, or a pin).
 // We REPORT our own viewport fit ('v') and RENDER at whatever window size the server sends back ('d').
 // When the window is bigger than our screen (we're a phone following a desktop), we PAN.
 let viewportFit = null;            // {cols,rows} our screen can show at the current font
 let winSize = null;                // {cols,rows} the shared window the server told us to render
 let sizeModeLabel = '';            // e.g. "auto · 100×30" / "📌 Phone · 40×80"
-let sizePinned = false, sizeMine = false, sizePinLabel = '', sizeClients = [];   // from the 'd' control frame
+let sizePinned = false, sizeMine = false, sizeLocal = false, sizePinLabel = '', sizeClients = [];   // from the 'd' control frame
 // Persistent DEVICE identity so a pin follows the DEVICE across reconnects/relay restarts (not the socket).
 const deviceId = (()=>{ let d=LS.get('mux_devid',''); if(!d){ d='d'+Math.random().toString(36).slice(2,10)+Date.now().toString(36).slice(-4); LS.set('mux_devid',d); } return d; })();
 function defaultDeviceLabel(){ const ua=navigator.userAgent||''; const mob=/Mobi|Android|iPhone|iPad/i.test(ua);
@@ -1422,6 +1434,7 @@ function applyPan(){
   }
   const panning = winSize.cols > viewportFit.cols+1;
   host.classList.toggle('pan', panning);
+  host.title = panning ? 'Shared terminal is wider than this viewport. Drag the horizontal scrollbar to pan.' : '';
   scheduleTerminalSurfaceAlign();
 }
 
@@ -1462,7 +1475,7 @@ function onControl(s){
   if(s[0]!=='d') return;
   let m; try{ m=JSON.parse(s.slice(1)); }catch(e){ return; }
   winSize={cols:m.cols, rows:m.rows}; sizeModeLabel=m.modeLabel||'';
-  sizePinned = m.mode==='pinned'; sizeMine = !!m.mine; sizePinLabel = m.pinLabel||''; sizeClients = m.clients||[];
+  sizePinned = m.mode==='pinned'; sizeMine = !!m.mine; sizeLocal = !!m.local; sizePinLabel = m.pinLabel||''; sizeClients = m.clients||[];
   if(term.cols!==m.cols || term.rows!==m.rows){ try{ preserveTermViewport(()=>term.resize(m.cols, m.rows)); hardenHelperTextarea(); installMobileInputDelta(); schedulePaintHeal(20); }catch(e){} }
   applyPan(); updateMeta(); updateSizeBtn();
 }
@@ -1476,14 +1489,25 @@ function pinToOtherDevice(){
   send('P', '#'+(next.dev||('sock-'+next.id)));
   flash('Pinned the window to '+(next.label||'that device'));
 }
-function updateSizeBtn(){ const b=$('#sizebtn'); if(!b) return;
+function sizeButtonPresentation(){
   const dims = winSize ? (' '+winSize.cols+'×'+winSize.rows) : '';
-  b.textContent = sizePinned ? ('📌 '+(sizeMine?'this':(sizePinLabel||'device'))+dims) : ('⇲ auto'+dims);
+  const host=$('#term'), panning=!!(host && host.classList.contains('pan'));
+  const text = sizePinned
+    ? ('📌 '+(sizeMine?'this device':(sizePinLabel||'other device'))+' ·'+dims)
+    : ('auto ·'+dims);
+  let title = sizePinned
+    ? (sizeMine ? 'Pinned to this device; every viewer follows this size. Tap to return everyone to auto.'
+                : 'Mirroring '+(sizePinLabel||'another device')+' at'+dims+'. Tap to pin the shared terminal to this device.')
+    : (sizeLocal ? 'Auto is following the attached PC terminal at'+dims+'. Tap to pin the shared terminal to this device.'
+                 : 'Auto size uses the smallest active screen so every viewer can see the complete terminal. Tap to pin this device.');
+  if(panning) title += ' This terminal is wider than your viewport; drag the horizontal scrollbar to pan.';
+  return { text, title };
+}
+function updateSizeBtn(){ const b=$('#sizebtn'); if(!b) return;
+  const view=sizeButtonPresentation();
+  b.textContent = view.text;
   b.classList.toggle('on', sizePinned && sizeMine);
-  b.title = sizePinned
-    ? (sizeMine ? 'Window size pinned to THIS device — everyone follows you. Tap for auto; long-press to pin another device.'
-                : 'Window size pinned to “'+(sizePinLabel||'another device')+'”. Tap to take over (pin to THIS device); long-press to pin another.')
-    : 'Auto size (widest active device). Tap to pin the window to THIS device for everyone; long-press to pin another.';
+  b.title = view.title;
 }
 let _altScrollAt=0;
 function scrollAlternate(deltaY){
@@ -1520,7 +1544,7 @@ function reportViewport(dim){
     }));
   }
   applyPan();
-  updateMeta();
+  updateMeta(); updateSizeBtn(); applyScrollAffordance();
 }
 function runViewportMeasure(generation){
   if(generation!==layoutGeneration || !terminalSurfaceVisible()) return;
@@ -1647,7 +1671,15 @@ $('#term').addEventListener('wheel', e=>{
 }, {passive:false, capture:true});
 
 function setFont(px){ fontSize=Math.min(20,Math.max(11,px)); term.options.fontSize=fontSize; LS.set('mux_font',fontSize); doFit(); }
-function updateMeta(){ $('#statusmeta').textContent = current ? `${term.cols}×${term.rows}${$('#term').classList.contains('pan')?' · pan':''}` : ''; }
+function updateMeta(){
+  const b=$('#statusmeta'); if(!b) return;
+  const view=sizeButtonPresentation();
+  b.textContent=current ? view.text : '';
+  b.title=current ? view.title : '';
+  b.disabled=!current;
+  b.classList.toggle('on', !!current && sizePinned && sizeMine);
+}
+$('#statusmeta').addEventListener('click', cycleSize);
 
 // Length of the terminal-generated report starting at `at` (0 if there isn't one). This used to be five
 // anchored regexes against s.slice(i); the OSC one — ESC ] [0-9;]+ ; [^BEL/ESC]* (BEL|ESC\) — backtracked
@@ -2018,9 +2050,8 @@ function scrollPositionLabel(viewportY, baseY, rows){
   if(y===0) return 'top · ' + back + ' up';
   return Math.round((y/base)*100) + '% · ' + back + ' up';
 }
-// Keeps the scrollbar and the readout honest about which buffer is on screen. On the alternate screen the
-// viewport has nothing to scroll, so we hide the bar (via #term.altbuf) and show an 'app scroll' chip
-// instead — a dead scrollbar is worse than none. Returns the label it settled on so it can be tested.
+// Keeps the scrollbar and readout honest about which buffer is on screen. The alternate screen has no
+// vertical scrollback, but the outer #term.pan scrollbar must remain available for horizontal panning.
 // onRender fires every frame, so the settled state is memoised: identical state does zero DOM writes.
 // onRender runs per frame, so the three nodes are resolved once and cached; they are static for the life of
 // the document. We only re-query while one is still missing (script can run before the node is parsed).
@@ -2034,17 +2065,34 @@ function applyScrollAffordance(){
   if(!host || !chip || !txt) return null;
   let buf=null, alt=false;
   try{ buf = term.buffer.active; alt = buf.type==='alternate'; }catch(e){}
-  const label = alt ? 'app scroll'
-    : (buf ? scrollPositionLabel(buf.viewportY, buf.baseY, term.rows) : 'no scrollback');
-  const key = (alt?'a:':'n:') + label;
+  const panning = host.classList.contains('pan');
+  const cols = winSize && winSize.cols ? winSize.cols : term.cols;
+  const position = buf ? scrollPositionLabel(buf.viewportY, buf.baseY, term.rows) : 'no scrollback';
+  const label = alt
+    ? ('app scroll'+(panning ? ' · pan '+cols+' cols' : ''))
+    : (panning ? ((position==='live · bottom' || position==='no scrollback' ? '' : position+' · ')+'pan '+cols+' cols') : position);
+  const key = (alt?'a:':'n:') + (panning?'p:':'f:') + label;
   if(key===lastAffordance) return label;
   lastAffordance = key;
   host.classList.toggle('altbuf', alt);
   chip.classList.toggle('app', alt);
   txt.textContent = label;
+  chip.title = alt
+    ? (panning ? 'This app handles vertical scrolling. Drag the horizontal scrollbar to pan the shared terminal.'
+               : 'This full-screen app handles vertical scrolling itself. Tap for details.')
+    : (panning ? 'Drag the horizontal scrollbar to pan the shared terminal.' : label);
   // At the live bottom (or with no history at all) the chip is noise — the pill already covers "go live".
-  chip.hidden = !alt && (label==='live · bottom' || label==='no scrollback');
+  chip.hidden = !panning && !alt && (label==='live · bottom' || label==='no scrollback');
   return label;
+}
+function explainScrollAffordance(){
+  const host=$('#term');
+  let alt=false; try{ alt=term.buffer.active.type==='alternate'; }catch(e){}
+  if(host && host.classList.contains('pan')){
+    flash((alt?'This app owns vertical scrolling. ':'')+'Drag the horizontal scrollbar to see the rest of the shared terminal.');
+  } else if(alt) {
+    flash('This full-screen app owns scrolling; use its scroll controls.');
+  }
 }
 try{ term.buffer.onBufferChange(()=>applyScrollAffordance()); }catch(e){}
 try{ term.onRender(()=>applyScrollAffordance()); }catch(e){}
@@ -2056,6 +2104,7 @@ term.onScroll(()=>{
 $('#term').addEventListener('pointerdown', e=>{
   if(e.target && e.target.closest && e.target.closest('.xterm-viewport')) noteUserScroll();
 }, true);
+$('#scrollstate').addEventListener('click', explainScrollAffordance);
 // FORCE the view to the live bottom, from anywhere, on mobile or desktop. Clears any latched freeze/
 // selection first, flushes buffered output, then pins to the bottom across the next two frames so it lands
 // even while a write is settling. Bound to the ↓ keybar button, the desktop header ⤓ icon, and the pill.

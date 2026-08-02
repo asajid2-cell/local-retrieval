@@ -72,6 +72,23 @@ function waitForWsText(ws, regex, label, timeoutMs = 4000) {
   });
 }
 
+function waitForWsFrame(ws, match, label, timeoutMs = 4000) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      ws.off('message', onMessage);
+      reject(new Error(`timed out waiting for ${label}`));
+    }, timeoutMs);
+    const onMessage = raw => {
+      const text = raw.toString();
+      if (!match(text)) return;
+      clearTimeout(timer);
+      ws.off('message', onMessage);
+      resolve(text);
+    };
+    ws.on('message', onMessage);
+  });
+}
+
 class RelayHarness {
   constructor(env = {}) {
     this.proc = null;
@@ -307,6 +324,7 @@ module.exports = {
   leaseCommands,
   ackLeased,
   waitForWsText,
+  waitForWsFrame,
   RelayHarness,
   FakeHost,
 };
