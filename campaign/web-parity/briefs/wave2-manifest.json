@@ -1,0 +1,25 @@
+{
+  "swarm": "wp-wave2",
+  "lanes": [
+    {
+      "name": "processjob-fix",
+      "taskFile": "Z:\\328\\CMPUT328-A2\\codexworks\\301\\mux-local-retrieval\\campaign\\web-parity\\briefs\\processjob-lane.txt",
+      "cwd": "Z:\\328\\CMPUT328-A2\\codexworks\\301\\mux-local-retrieval\\app\\native",
+      "partner": "codex",
+      "model": "gpt-5.6-luna",
+      "effort": "max",
+      "writes": ["app/native/CodexLocalRetrieval.Native.Tests/WindowsProcessJobTests.cs"],
+      "verify": "dotnet test CodexLocalRetrieval.Native.Tests -c Debug --filter \"FullyQualifiedName~WindowsProcessJobTests\""
+    },
+    {
+      "name": "playwright-harness",
+      "taskFile": "Z:\\328\\CMPUT328-A2\\codexworks\\301\\mux-local-retrieval\\campaign\\web-parity\\briefs\\playwright-lane.txt",
+      "cwd": "Z:\\328\\CMPUT328-A2\\codexworks\\301\\mux-local-retrieval\\relay",
+      "partner": "codex",
+      "model": "gpt-5.6-luna",
+      "effort": "max",
+      "writes": ["relay/tests/ui-browser.test.js", "relay/package.json"],
+      "verify": "node --test tests/ui-browser.test.js"
+    }
+  ]
+}
