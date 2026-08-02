@@ -1,0 +1,15 @@
+{
+  "swarm": "wp-wave0",
+  "lanes": [
+    {
+      "name": "live-only-inventory",
+      "taskFile": "Z:\\328\\CMPUT328-A2\\codexworks\\301\\mux-local-retrieval\\campaign\\web-parity\\briefs\\inventory-lane.txt",
+      "cwd": "Z:\\328\\CMPUT328-A2\\codexworks\\301\\mux-local-retrieval",
+      "partner": "codex",
+      "model": "gpt-5.6-luna",
+      "effort": "max",
+      "writes": ["campaign/web-parity/live-only-inventory.md"],
+      "verify": "powershell -Command \"$c = Get-Content campaign\\web-parity\\live-only-inventory.md -Raw; if ($c -match '## WS t==claude' -and $c -match '## PUBLIC_RETURN' -and $c -match '## __test endpoints' -and $c -match '## Behavioral drift' -and $c -match '## Port checklist' -and $c -match '## Ambiguities') { 'VERIFY-PASS' } else { 'VERIFY-FAIL missing sections' }\""
+    }
+  ]
+}

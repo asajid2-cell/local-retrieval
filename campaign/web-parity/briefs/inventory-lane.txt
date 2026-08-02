@@ -1,0 +1,19 @@
+SEALED BRIEF — live-relay divergence inventory (read-only analysis, one output file).
+
+Context: two versions of one Express relay server. CANONICAL (the development truth, feature superset): Z:\328\CMPUT328-A2\codexworks\301\mux-local-retrieval\relay\server.js (~3418 lines). LIVE FORK (running in production, fetched today): Z:\328\CMPUT328-A2\codexworks\301\mux-local-retrieval\campaign\web-parity\live-vps-server.js (~1477 lines). The live fork will be REPLACED by canonical; before that, every behavior that exists ONLY in the live fork must be found, understood, and specified for porting (or explicitly ruled droppable). Route-surface facts already established (do not re-derive): live-only routes = POST /__test/autoheal, POST /__test/autoheal-tick, POST /__test/boot-recreate; live-only WS message types handled = t==='claude' and t==='codex'; live-only env var = PUBLIC_RETURN. Canonical-only additions are NOT your concern.
+
+FROZEN CONTRACT — you read ONLY those two files (no other repo files, no commands other than VERIFY) and produce EXACTLY one file:
+DELIVERABLE: Z:\328\CMPUT328-A2\codexworks\301\mux-local-retrieval\campaign\web-parity\live-only-inventory.md
+with EXACTLY these level-2 sections, in order:
+## WS t==claude / t==codex — quote the full handler code from the live fork, explain what sends these messages (search the live file for who else references them), what state they mutate, and a PORT SPEC: precise instructions (function names, insertion context relative to canonical's WS message switch which handles 'hello','h','o','r','s','v','sb','tailr','killed','sessions') for adding equivalent behavior to canonical — or a DROP verdict with evidence nothing sends them anymore.
+## PUBLIC_RETURN — quote every live usage, explain the behavior (likely an hl-auth login return path), state whether canonical's HLAUTH_PUBLIC_BASE/PUBLIC path handling covers it (quote the canonical lines you compared against — for this ONE question you may search canonical for HLAUTH_PUBLIC_BASE and PUBLIC_RETURN), and give a PORT SPEC or DROP verdict.
+## __test endpoints — quote the three handlers, state what they manipulate, and verdict: port under MUX_TEST_MODE guard vs drop (canonical has zero __test routes; its test harness may cover the same needs differently — you may search canonical for 'autoheal' to check).
+## Behavioral drift beyond the known list — scan the live fork for sections with no counterpart shape in canonical (auth middleware differences, dispatch-key handling, session-state fields, autoheal timing constants) and list each with line numbers + a one-line risk note. Be exhaustive on the live file; it is only 1477 lines.
+## Port checklist — a numbered, ordered list of every port action from the sections above, each tagged PORT or DROP, each with target location in canonical.
+
+AMBIGUITIES: end the file with an '## Ambiguities' section listing every judgment call you made.
+
+Run the verify yourself before reporting (from cwd Z:\328\CMPUT328-A2\codexworks\301\mux-local-retrieval):
+VERIFY: powershell -Command "$c = Get-Content campaign\web-parity\live-only-inventory.md -Raw; if ($c -match '## WS t==claude' -and $c -match '## PUBLIC_RETURN' -and $c -match '## __test endpoints' -and $c -match '## Behavioral drift' -and $c -match '## Port checklist' -and $c -match '## Ambiguities') { 'VERIFY-PASS' } else { 'VERIFY-FAIL missing sections' }"
+
+Report PASS/FAIL plus a 5-line summary of your most important finding. Turn budget ~20 minutes.
