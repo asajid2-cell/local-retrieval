@@ -1,7 +1,10 @@
 (function installMuxChats(global) {
   'use strict';
 
-  var DEFAULT_API = '/remote/api/discovery';
+  // Same origin as this page: nginx mounts the PC's read-only discovery API under /multiplex/ rather
+  // than publishing the whole PC server at /remote/ (which also carries launch and co-pilot routes).
+  // Unauthenticated calls come back as a JSON 401 from the edge gate, never an HTML login page.
+  var DEFAULT_API = '/multiplex/pc/api/discovery';
   var PAGE_SIZE = 40;
 
   function cleanSet(values) {

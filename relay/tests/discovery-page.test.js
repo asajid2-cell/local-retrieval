@@ -149,8 +149,8 @@ test('DOM smoke renders discovery rows, facets, disabled resume, and delegates r
   const mounted = sandbox.MuxChats.install({ document: doc, fetch, postIntent: sandbox.postIntent });
   await mounted.controller.load(true);
 
-  assert.ok(fetched.some(url => url.startsWith('/remote/api/discovery/chats?')));
-  assert.ok(fetched.some(url => url.startsWith('/remote/api/discovery/facets?')));
+  assert.ok(fetched.some(url => url.startsWith('/multiplex/pc/api/discovery/chats?')));
+  assert.ok(fetched.some(url => url.startsWith('/multiplex/pc/api/discovery/facets?')));
   const list = doc.nodes.get('#chatlist');
   assert.equal(list.children.length, 2);
   assert.equal(list.children[0].dataset.chatId, 'chat-1');

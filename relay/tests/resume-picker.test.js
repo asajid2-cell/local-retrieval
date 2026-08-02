@@ -231,7 +231,7 @@ async function bootPicker(t, { chats = [row(1), row(2), row(3)], running = [], d
   const client = loadClient(browserFetch(h));
   const relayFetch = browserFetch(h);
   const pickerFetch = async (url, init) => {
-    if (String(url).startsWith('/remote/api/discovery/chats')) {
+    if (String(url).startsWith('/multiplex/pc/api/discovery/chats')) {
       return {
         ok: true,
         status: 200,

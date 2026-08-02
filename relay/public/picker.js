@@ -99,7 +99,7 @@
     var pollIntervalMs = d.pollIntervalMs || DEFAULTS.pollIntervalMs;
     var pollTimeoutMs = d.pollTimeoutMs || DEFAULTS.pollTimeoutMs;
     var offlineTimeoutMs = d.offlineTimeoutMs || DEFAULTS.offlineTimeoutMs;
-    var discoveryUrl = d.discoveryUrl || '/remote/api/discovery/chats?offset=0&limit=100&sort=recent';
+    var discoveryUrl = d.discoveryUrl || '/multiplex/pc/api/discovery/chats?offset=0&limit=100&sort=recent';
 
     var state = {
       chats: [], query: '', host: '', updatedAt: 0, ageMs: null,

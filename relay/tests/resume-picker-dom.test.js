@@ -207,7 +207,7 @@ const INDEX_ROWS = [
 function archiveMount() {
   return mount({
     postIntent: async () => unexpected('postIntent'),
-    fetch: async (url) => (url.includes('/remote/api/discovery/chats')
+    fetch: async (url) => (url.includes('/multiplex/pc/api/discovery/chats')
       ? { ok: true, status: 200, json: async () => ({ rows: INDEX_ROWS, total: INDEX_ROWS.length, offset: 0, limit: 100, hasMore: false }) }
       : unexpected(url)),
   });
