@@ -1,4 +1,4 @@
-# Deploy muxd/ from the monorepo to the live runtime (C:\Users\Ahmed\muxd) and restart it.
+﻿# Deploy muxd/ from the monorepo to the live runtime (C:\Users\Ahmed\muxd) and restart it.
 # The scheduled task MuxdSessionHostRestart does the safe swap (preflight refuses if sessions are live).
 $src = Join-Path $PSScriptRoot '..\muxd'
 $dst = 'C:\Users\Ahmed\muxd'
