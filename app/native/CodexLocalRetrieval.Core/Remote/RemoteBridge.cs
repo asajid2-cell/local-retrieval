@@ -39,6 +39,9 @@ public sealed class RemoteBridge
 
     private const string SshHardenOpts = "-o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3";
     private static readonly TimeSpan SshHardTimeout = TimeSpan.FromSeconds(30);
+    // How long the relay may hold an empty lease poll open (its cap is 25s; ServerAlive keepalives
+    // carry the quiet connection through the hold). Also the GUI twin's value — keep in step.
+    public static readonly TimeSpan LeaseHoldWait = TimeSpan.FromSeconds(25);
 
     public RemoteBridge(
         Func<Settings?> settings,
@@ -74,11 +77,26 @@ public sealed class RemoteBridge
         var now = DateTimeOffset.UtcNow;
         var nextPushAt = now;
         var nextPollAt = now;
+        // The command poll long-polls the relay (waitMs): the ssh call itself is held open up to
+        // ~25s and answered the instant work lands. It therefore runs as an IN-FLIGHT TASK the
+        // scheduler observes, never awaits inline — the heartbeat has a 9s cadence against the
+        // relay's 25s staleness clock, and a held poll must not be allowed to starve it.
+        Task<bool>? inflightPoll = null;
 
         while (!ct.IsCancellationRequested)
         {
             try
             {
+                if (inflightPoll is { IsCompleted: true })
+                {
+                    var sawWork = false;
+                    try { sawWork = await inflightPoll; }
+                    catch (Exception ex) { _log("command poll failed: " + ex.Message); }
+                    inflightPoll = null;
+                    nextPollAt = DateTimeOffset.UtcNow
+                        + (sawWork ? backoff.OnCommandsReceived() : backoff.OnEmptyPoll());
+                }
+
                 if (!_guiPrimaryRunning())   // desktop app present => it pushes + drains; we do nothing
                 {
                     var s = _settings();
@@ -92,12 +110,11 @@ public sealed class RemoteBridge
                             await PushRunningAsync(s);   // running heartbeat (keeps `live` + refreshes the list)
                             nextPushAt = DateTimeOffset.UtcNow + RunningPushInterval;
                         }
-                        if (now >= nextPollAt)
-                        {
-                            var sawWork = await PollAndProcessAsync(s);   // drain commands; also re-pushes after a kill
-                            nextPollAt = DateTimeOffset.UtcNow
-                                + (sawWork ? backoff.OnCommandsReceived() : backoff.OnEmptyPoll());
-                        }
+                        // A poll started here may still be in flight when the GUI takes over; its
+                        // lease keeps that overlap at-most-once (the GUI leases under its own
+                        // owner and can never claim the same command), so it is left to finish.
+                        if (inflightPoll is null && DateTimeOffset.UtcNow >= nextPollAt)
+                            inflightPoll = PollAndProcessAsync(s);   // drain commands; also re-pushes after a kill
                     }
                     else
                     {
@@ -108,11 +125,18 @@ public sealed class RemoteBridge
             }
             catch (Exception ex) { _log("bridge tick failed: " + ex.Message); }
 
-            // Sleep until whichever job comes due first, so backing the drain off never delays a heartbeat.
+            // Sleep until whichever job comes due first, so backing the drain off never delays a
+            // heartbeat — and let a completing held poll wake the loop immediately, so a command
+            // delivered mid-hold is executed now, not a tick later.
             var wakeAt = nextPushAt < nextPollAt ? nextPushAt : nextPollAt;
             var delay = wakeAt - DateTimeOffset.UtcNow;
             if (delay < MinLoopDelay) delay = MinLoopDelay;   // also the idle cadence while the GUI owns the bridge
-            try { await Task.Delay(delay, ct); } catch { }
+            try
+            {
+                var sleep = Task.Delay(delay, ct);
+                await (inflightPoll is null ? sleep : Task.WhenAny(sleep, inflightPoll));
+            }
+            catch { }
         }
     }
 
@@ -198,11 +222,17 @@ public sealed class RemoteBridge
     /// there is work and let it coast once the queue has gone quiet.
     private async Task<bool> PollAndProcessAsync(Settings s)
     {
-        var leaseJson = JsonSerializer.Serialize(new { owner = _commandLeaseOwner, limit = 1 });
+        // waitMs long-polls the relay: an empty queue holds the answer open and fulfils it the
+        // moment a command is enqueued, so delivery is instant while the ssh spawn rate stays at
+        // the backoff's idle cadence. A relay predating waitMs ignores the field and answers
+        // immediately — the backoff alone then paces the polling, exactly as before. The ssh
+        // timeout for this one call must sit well above the hold (the relay caps the hold at 25s).
+        var leaseJson = JsonSerializer.Serialize(new { owner = _commandLeaseOwner, limit = 1, waitMs = (int)LeaseHoldWait.TotalMilliseconds });
         var outText = (await RunSshAsync(
             s.Target,
             $"curl -s -X POST http://127.0.0.1:{s.Port}/api/app-commands/lease -H 'Content-Type: application/json' --data-binary @-",
-            leaseJson)).outText;
+            leaseJson,
+            timeout: LeaseHoldWait + SshHardTimeout)).outText;
         if (string.IsNullOrWhiteSpace(outText)) return false;
         List<Cmd>? cmds;
         try { cmds = JsonSerializer.Deserialize<List<Cmd>>(outText); } catch { return false; }
@@ -481,9 +511,12 @@ public sealed class RemoteBridge
         catch (Exception ex) { return "(error reading transcript: " + ex.Message + ")"; }
     }
 
-    // Hardened ssh + hard timeout (see class note). `-n` (stdin from /dev/null) only when not feeding stdin.
-    private async Task<(int code, string outText)> RunSshAsync(string target, string remoteCmd, string? stdin = null)
+    // Hardened ssh + hard timeout (see class note). `-n` (stdin from /dev/null) only when not feeding
+    // stdin. `timeout` widens the wall clock for calls that are held open ON PURPOSE (the long-poll
+    // lease); everything else keeps the tight default.
+    private async Task<(int code, string outText)> RunSshAsync(string target, string remoteCmd, string? stdin = null, TimeSpan? timeout = null)
     {
+        var hardTimeout = timeout ?? SshHardTimeout;
         try
         {
             var stdinFlag = stdin is null ? "-n " : "";
@@ -497,14 +530,14 @@ public sealed class RemoteBridge
             };
             var result = await ContainedProcessRunner.RunAsync(
                 psi,
-                SshHardTimeout,
+                hardTimeout,
                 stdin,
                 maxStdoutChars: 4 * 1024 * 1024,
                 maxStderrChars: 64 * 1024,
                 containment: _processContainment);
             if (result.TimedOut)
             {
-                _log($"ssh timed out ({SshHardTimeout.TotalSeconds:0}s), tree-killed: {remoteCmd}");
+                _log($"ssh timed out ({hardTimeout.TotalSeconds:0}s), tree-killed: {remoteCmd}");
                 return (-2, "");
             }
             if (result.StdoutTruncated)

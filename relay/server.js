@@ -2034,6 +2034,12 @@ function enqueueAppCommand(b) {
   }
   const candidate = [..._commands, cmd];
   commitCommands(candidate);
+  // Wake long-poll lease waiters now that a fresh pending command exists. Deduplicated returns
+  // above don't notify: their command was already visible before this call, so any waiter still
+  // parked was parked because someone else holds its lease, and this call changed nothing.
+  // setImmediate keeps waiter responses out of the enqueue caller's stack (its own response and
+  // error handling come first).
+  if (_leaseWaiters.length) setImmediate(notifyLeaseWaiters);
   return { command: cmd, deduplicated: false };
 }
 function waitForCommandResult(id, timeoutMs) {
@@ -2115,14 +2121,10 @@ app.post('/api/app-commands', (req, res) => {     // web (owner) enqueues
     deduplicated: queued.deduplicated,
   });
 });
-app.post('/api/app-commands/lease', (req, res) => {
-  if (!isTrustedLocal(req)) return res.status(403).json({ error: 'forbidden' });
-  const owner = commandIntentId(req.body && req.body.owner);
-  if (!owner) return res.status(400).json({ error: 'valid lease owner required' });
-  const limit = Math.max(1, Math.min(16, Number(req.body && req.body.limit) || 8));
-  const leaseMs = TEST_MODE && Number(req.body && req.body.leaseMs)
-    ? Math.max(50, Math.min(COMMAND_LEASE_MS, Number(req.body.leaseMs)))
-    : COMMAND_LEASE_MS;
+// One lease pass over the queue: recover expired leases, then claim up to `limit` pending
+// commands for `owner`. Throws whatever commitCommands throws (persistence), so each caller
+// decides how to answer its own response.
+function leaseAppCommands(owner, limit, leaseMs) {
   const now = Date.now();
   let changed = false;
   const candidate = _commands.map(command => {
@@ -2146,12 +2148,70 @@ app.post('/api/app-commands/lease', (req, res) => {
     leased.push(updated);
     changed = true;
   }
+  if (changed) commitCommands(candidate);
+  return leased;
+}
+
+// Long-poll waiters: lease requests that found an empty queue and asked (waitMs) to be held open
+// until a command arrives. Each poll from the PC costs a full ssh handshake, so holding the answer
+// here is what turns "poll every few seconds" into "answer the moment there is work". Waiters are
+// woken only by a fresh enqueue; a lease that expires mid-wait is recovered lazily on the next
+// lease pass, at worst one waitMs later — with waits capped at 25s against a 120s lease, that
+// corner costs seconds on an already-failed consumer, so it stays lazy.
+const LEASE_WAIT_MAX_MS = 25000;
+const _leaseWaiters = [];
+
+function notifyLeaseWaiters() {
+  // FIFO fairness; stop as soon as a pass comes back empty — later waiters would see the same.
+  while (_leaseWaiters.length) {
+    const waiter = _leaseWaiters[0];
+    let leased;
+    try {
+      leased = leaseAppCommands(waiter.owner, waiter.limit, waiter.leaseMs);
+    } catch (error) {
+      _leaseWaiters.shift();
+      clearTimeout(waiter.timer);
+      failPersistence(waiter.res, error);
+      continue;
+    }
+    if (!leased.length) return;
+    _leaseWaiters.shift();
+    clearTimeout(waiter.timer);
+    waiter.res.json(leased);
+  }
+}
+
+function dropLeaseWaiter(waiter) {
+  const index = _leaseWaiters.indexOf(waiter);
+  if (index >= 0) _leaseWaiters.splice(index, 1);
+  clearTimeout(waiter.timer);
+}
+
+app.post('/api/app-commands/lease', (req, res) => {
+  if (!isTrustedLocal(req)) return res.status(403).json({ error: 'forbidden' });
+  const owner = commandIntentId(req.body && req.body.owner);
+  if (!owner) return res.status(400).json({ error: 'valid lease owner required' });
+  const limit = Math.max(1, Math.min(16, Number(req.body && req.body.limit) || 8));
+  const leaseMs = TEST_MODE && Number(req.body && req.body.leaseMs)
+    ? Math.max(50, Math.min(COMMAND_LEASE_MS, Number(req.body.leaseMs)))
+    : COMMAND_LEASE_MS;
+  // waitMs opts into the long poll; absent/0 keeps the classic answer-now contract for old clients.
+  const waitMs = Math.max(0, Math.min(LEASE_WAIT_MAX_MS, Number(req.body && req.body.waitMs) || 0));
+  let leased;
   try {
-    if (changed) commitCommands(candidate);
+    leased = leaseAppCommands(owner, limit, leaseMs);
   } catch (error) {
     return failPersistence(res, error);
   }
-  res.json(leased);
+  if (leased.length || waitMs === 0) return res.json(leased);
+
+  const waiter = { owner, limit, leaseMs, res, timer: null };
+  waiter.timer = setTimeout(() => {
+    dropLeaseWaiter(waiter);
+    if (!res.writableEnded) res.json([]);
+  }, waitMs);
+  res.on('close', () => dropLeaseWaiter(waiter));   // client gone: never answer a dead socket
+  _leaseWaiters.push(waiter);
 });
 app.get('/api/app-commands', (req, res) => {
   if (!isTrustedLocal(req)) return res.status(403).json({ error: 'forbidden' });

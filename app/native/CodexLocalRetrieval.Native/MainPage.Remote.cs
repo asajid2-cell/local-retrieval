@@ -258,8 +258,10 @@ public sealed partial class MainPage
     private bool _syncPushing;
     private bool _indexPushing;
     private bool _cmdPolling;
-    // Shapes the command poll's cadence from whether the queue is actually producing work — see
-    // RemotePollBackoff for why neither ssh multiplexing nor a server-side long poll was available here.
+    // Shapes the gaps BETWEEN polls from whether the queue is producing work. The poll itself now
+    // long-polls the relay (waitMs — held open, answered the instant a command lands), so on a
+    // current relay the backoff paces reconnects while delivery stays instant; against an older
+    // relay that ignores waitMs it degrades to exactly the pre-long-poll cadence.
     private readonly RemotePollBackoff _cmdBackoff = new();
     private readonly string _commandLeaseOwner = RemoteCommandProtocol.LeaseOwner("gui");
     // At-most-once fence for intent-fenced polled commands (fetchfile/startmux): a redelivered intent
@@ -405,11 +407,15 @@ public sealed partial class MainPage
         try
         {
             var port = settings.MultiplexApiPort;
-            var leaseJson = JsonSerializer.Serialize(new { owner = _commandLeaseOwner, limit = 1 });
+            // waitMs long-polls the relay (held open, fulfilled the moment work lands); the ssh
+            // timeout for this one call sits above the relay's 25s hold cap. _cmdPolling makes the
+            // overlapping timer ticks no-ops while the hold is out.
+            var leaseJson = JsonSerializer.Serialize(new { owner = _commandLeaseOwner, limit = 1, waitMs = (int)RemoteBridge.LeaseHoldWait.TotalMilliseconds });
             var outText = (await RunSshAsync(
                 target,
                 $"curl -s -X POST http://127.0.0.1:{port}/api/app-commands/lease -H 'Content-Type: application/json' --data-binary @-",
-                leaseJson)).outText;
+                leaseJson,
+                timeout: RemoteBridge.LeaseHoldWait + SshHardTimeout)).outText;
             if (string.IsNullOrWhiteSpace(outText)) return;
             List<AppCommand>? cmds;
             try { cmds = JsonSerializer.Deserialize<List<AppCommand>>(outText); } catch { return; }
@@ -941,9 +947,12 @@ public sealed partial class MainPage
     private const string SshHardenOpts = "-o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3";
     private static readonly TimeSpan SshHardTimeout = TimeSpan.FromSeconds(30);
 
-    // Run ssh with the hardened options + a hard timeout. Returns (exitCode, stdout); -2 = timed out (tree-killed).
-    private static async Task<(int code, string outText)> RunSshAsync(string target, string remoteCmd, string? stdin = null)
+    // Run ssh with the hardened options + a hard timeout. Returns (exitCode, stdout); -2 = timed out
+    // (tree-killed). `timeout` widens the wall clock only for calls held open on purpose (the
+    // long-poll lease); everything else keeps the tight default.
+    private static async Task<(int code, string outText)> RunSshAsync(string target, string remoteCmd, string? stdin = null, TimeSpan? timeout = null)
     {
+        var hardTimeout = timeout ?? SshHardTimeout;
         try
         {
             var stdinFlag = stdin is null ? "-n " : "";   // -n only when we're NOT feeding stdin
@@ -957,13 +966,13 @@ public sealed partial class MainPage
             };
             var result = await ContainedProcessRunner.RunAsync(
                 psi,
-                SshHardTimeout,
+                hardTimeout,
                 stdin,
                 maxStdoutChars: 4 * 1024 * 1024,
                 maxStderrChars: 64 * 1024);
             if (result.TimedOut)
             {
-                Diag.Log($"ssh timed out ({SshHardTimeout.TotalSeconds:0}s), tree-killed: {remoteCmd}");
+                Diag.Log($"ssh timed out ({hardTimeout.TotalSeconds:0}s), tree-killed: {remoteCmd}");
                 return (-2, "");
             }
             if (result.StdoutTruncated)

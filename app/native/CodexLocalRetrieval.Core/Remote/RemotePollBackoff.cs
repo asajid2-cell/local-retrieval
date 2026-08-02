@@ -10,12 +10,16 @@ namespace CodexLocalRetrieval.Core.Remote;
 //   * SSH connection multiplexing (ControlMaster/ControlPath/ControlPersist) is NOT supported by Windows
 //     OpenSSH — 9.5p2 on this host fails the moment a ControlPath is handed to it ("getsockname failed: Not
 //     a socket"), while the identical command without ControlMaster connects fine. So it is not an option.
-//   * A server-side long poll (block until a command arrives) is the real architectural fix, but the relay's
-//     lease handler answers synchronously and takes no wait parameter, so it needs a relay change first.
+//   * A server-side long poll (block until a command arrives) is the real architectural fix — and it now
+//     exists: the relay's lease handler takes `waitMs` and holds an empty answer open (capped 25s), fulfilled
+//     the instant a command is enqueued. Both callers send it.
 //
-// That leaves shaping the poll itself. An empty queue is the overwhelmingly common case, so we hold the fast
-// cadence while anything is happening and stretch toward an idle cadence once the queue has proved quiet,
-// snapping back the instant a command actually lands. Latency is only ever spent on an idle system.
+// This class remains the pacing BETWEEN polls, and the whole behavior against a relay that predates
+// `waitMs` (which answers immediately, exactly the old contract). An empty queue is the overwhelmingly
+// common case, so we hold the fast cadence while anything is happening and stretch toward an idle cadence
+// once the queue has proved quiet, snapping back the instant a command actually lands. With the long poll
+// in front, "empty" means "held 25s and nothing came", so the idle spawn rate lands near 1.5/min while
+// delivery stays instant.
 //
 // Deliberately a pure state machine — no clock, no timer, no I/O — so the policy is testable on its own and
 // both callers (the GUI DispatcherTimer and the headless RemoteBridge loop delay) share one behaviour.
