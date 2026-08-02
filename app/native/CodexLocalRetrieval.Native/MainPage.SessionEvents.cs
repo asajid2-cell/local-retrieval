@@ -40,6 +40,26 @@ public sealed partial class MainPage
         SessionEventLedger.AppendBestEffortQueued(ev, m => Diag.Log(m));
     }
 
+    private static void RecordAppEvent(
+        string kind,
+        string summary,
+        string severity = "info",
+        string source = "native",
+        string? tool = null,
+        string? workspace = null,
+        IReadOnlyDictionary<string, string>? details = null)
+    {
+        var ev = SessionEventLedger.Create(
+            kind,
+            summary,
+            tool: tool,
+            workspace: WorkspaceLabel(workspace),
+            source: source,
+            severity: severity,
+            details: details);
+        SessionEventLedger.AppendBestEffortQueued(ev, m => Diag.Log(m));
+    }
+
     private static string WorkspaceLabel(string? workspace)
     {
         workspace = (workspace ?? "").Trim();

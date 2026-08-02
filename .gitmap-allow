@@ -26,3 +26,9 @@ private-key-block:relay/tests/retention.test.js:b846fdb2d23a
 # SECRETS list drives a test that secret-bearing files are NOT captured into backups. A real credential
 # here would defeat the test's own purpose.
 credential-file-path:relay/tests/fixtures/backup-state/local-control.cred
+
+# Telemetry redaction fixtures. The literal is self-labelled FAKEexampleKEYnotreal0000000 and exists
+# ONLY as the input to tests asserting that a secret inside an exception message is redacted BEFORE
+# it reaches the durable event ledger — the exact accident that once burned a live key. Read all
+# three call sites (lines 54, 93, 112) before trusting this entry.
+openai-key:app/native/CodexLocalRetrieval.Native.Tests/SessionEventLedgerTests.cs:1aac09f88b8f

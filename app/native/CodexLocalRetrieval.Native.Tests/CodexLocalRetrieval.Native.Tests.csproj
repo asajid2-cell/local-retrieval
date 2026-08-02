@@ -17,6 +17,10 @@
   </ItemGroup>
 
   <ItemGroup>
+    <Compile Include="..\CodexLocalRetrieval.Native\Diag.cs" Link="Native\Diag.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\CodexLocalRetrieval.Core\CodexLocalRetrieval.Core.csproj" />
     <ProjectReference Include="..\CodexLocalRetrieval.ProcessJobProbe\CodexLocalRetrieval.ProcessJobProbe.csproj"
                       ReferenceOutputAssembly="false" />

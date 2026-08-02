@@ -125,7 +125,8 @@ class DurableInputIntentPersistence(unittest.TestCase):
         principal = make_principal(principal_id=WIDE, intent_id=WIDE)
         manifest = {
             "version": 2,
-            "sessions": {"work": {"cmd": "bash", "cwd": "/tmp", "cols": 80, "rows": 24, "heal": True}},
+            "sessions": {"work": {"cmd": "bash", "cwd": "/tmp", "cols": 80, "rows": 24, "heal": True,
+                                  "sessionUuid": SESSION_UUID}},
             "intents": {keyed(principal): terminal_record(principal)},
         }
         self.assertTrue(muxd.valid_manifest(manifest))

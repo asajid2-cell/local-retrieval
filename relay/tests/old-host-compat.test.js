@@ -102,11 +102,10 @@ test('canonical fully bridges the production protocol-4 16-cap muxd', async t =>
     message => message.t === 'i' && message.s === 'production-compat',
     'unsigned viewer input',
   );
-  assert.deepEqual(input, {
-    t: 'i',
-    s: 'production-compat',
-    d: Buffer.from('typed through canonical', 'utf8').toString('base64'),
-  });
+  assert.equal(input.t, 'i');
+  assert.equal(input.s, 'production-compat');
+  assert.ok(input.channelId);
+  assert.equal(input.d, Buffer.from('typed through canonical', 'utf8').toString('base64'));
 
   const killResponse = h.request('DELETE', '/api/sessions/production-compat');
   await host.waitFor(

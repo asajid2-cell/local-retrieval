@@ -50,6 +50,15 @@ public sealed partial class MainPage
             var indexed = await _archive.MergeScanAsync(scan, refreshList: true);
             var added = _archive.Store.Sessions.Count - before;
             Diag.Log($"Sync: indexed {indexed}, store now {_archive.Store.Sessions.Count} (was {before}, +{added})");
+            RecordAppEvent(
+                "sync.succeeded",
+                $"Session sync indexed {indexed} chats; the store now has {_archive.Store.Sessions.Count} chats.",
+                details: new Dictionary<string, string>
+                {
+                    ["operation"] = initial ? "startup.resurface" : "sync",
+                    ["indexed"] = indexed.ToString(),
+                    ["added"] = added.ToString()
+                });
 
             // MergeScanAsync's refresh now routes through OnReapplyFilter (ReapplyActiveFilter), which keeps
             // the active filter/sort AND the current selection — so a background sync no longer drops filters.
@@ -63,7 +72,12 @@ public sealed partial class MainPage
         catch (Exception ex)
         {
             Diag.Log("Sync error " + ex);
-            SyncStatus.Text = "Sync failed - see log.";
+            RecordAppEvent(
+                "sync.failed",
+                ex.Message,
+                "error",
+                details: new Dictionary<string, string> { ["operation"] = initial ? "startup.resurface" : "sync" });
+            SyncStatus.Text = "Sync failed: " + ex.Message;
         }
         finally
         {
@@ -89,6 +103,18 @@ public sealed partial class MainPage
             // Guard against resuming a chat that's already running (locally or in a multiplex) - two
             // runs corrupt the transcript. Offers to kill the running copy first.
             var guard = await ConfirmRunOrKillAsync(session);
+            if (guard.KilledPids.Count > 0)
+            {
+                RecordSessionEvent(
+                    session,
+                    "kill.succeeded",
+                    $"Stopped {guard.KilledPids.Count} running process{(guard.KilledPids.Count == 1 ? "" : "es")} before resume.",
+                    details: new Dictionary<string, string>
+                    {
+                        ["operation"] = "resume.takeover",
+                        ["processCount"] = guard.KilledPids.Count.ToString()
+                    });
+            }
             if (guard.Outcome == RunGuardOutcome.Unverifiable)
             {
                 // NOT "already running" - the scan never got an answer. Recording this as a live owner
@@ -105,6 +131,13 @@ public sealed partial class MainPage
             if (guard.Outcome == RunGuardOutcome.Cancelled || guard.Outcome == RunGuardOutcome.Live)
             {
                 var takeoverFailed = guard.Outcome == RunGuardOutcome.Live;
+                if (takeoverFailed)
+                    RecordSessionEvent(
+                        session,
+                        "kill.failed",
+                        guard.Detail,
+                        "error",
+                        details: new Dictionary<string, string> { ["operation"] = "resume.takeover" });
                 RecordSessionEvent(
                     session,
                     "resume.refused.running",
@@ -275,6 +308,18 @@ public sealed partial class MainPage
         try
         {
             var (native, recovered) = await _archive.BumpSessionAsync(session);
+            RecordSessionEvent(
+                session,
+                "recency.bump.succeeded",
+                native
+                    ? "Updated the chat's native and app recency."
+                    : "Updated app recency, but the native picker record was not found.",
+                native ? "info" : "warn",
+                details: new Dictionary<string, string>
+                {
+                    ["nativeUpdated"] = native.ToString(),
+                    ["recovered"] = recovered.ToString()
+                });
             SelectSessionRow(session);
             RenderCurrent();
             var where = string.Equals(session.Tool, "codex", StringComparison.OrdinalIgnoreCase) ? "codex resume" : "Claude's recent chats";
@@ -287,7 +332,8 @@ public sealed partial class MainPage
         catch (Exception ex)
         {
             Diag.Log("Bump FAILED " + ex);
-            SyncStatus.Text = "Could not bump chat - see log.";
+            RecordSessionEvent(session, "recency.bump.failed", ex.Message, "error");
+            SyncStatus.Text = "Could not bump chat: " + ex.Message;
         }
     }
 

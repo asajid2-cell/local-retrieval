@@ -2,6 +2,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json.Nodes;
 using CodexLocalRetrieval.Core.Models;
+using CodexLocalRetrieval.Core.Remote;
 using Microsoft.Data.Sqlite;
 
 namespace CodexLocalRetrieval.Core.Services;
@@ -18,7 +19,24 @@ public sealed partial class ArchiveService
     public readonly record struct TemplateSnapshotResult(bool Ok, string Message, TemplateSnapshot? Snapshot);
     public readonly record struct SnapshotReaderResult(bool Ok, string Message, ArchiveSession? Reader);
 
-    public async Task<BranchResult> BranchSessionAsync(ArchiveSession parent)
+    public async Task<BranchResult> BranchSessionAsync(
+        ArchiveSession parent,
+        SessionEventLedger.Options? eventOptions = null)
+    {
+        try
+        {
+            var result = await BranchSessionCoreAsync(parent);
+            RecordBranchOperation("branch", parent, result.Ok, result.Message, result.Branch, eventOptions);
+            return result;
+        }
+        catch (Exception ex)
+        {
+            RecordBranchOperation("branch", parent, false, "Branch failed: " + ex.Message, null, eventOptions);
+            throw;
+        }
+    }
+
+    private async Task<BranchResult> BranchSessionCoreAsync(ArchiveSession parent)
     {
         if (parent is null) return new BranchResult(false, "No chat to branch.", null);
         var sourcePath = ResolveSessionSourcePath(parent);
@@ -36,7 +54,26 @@ public sealed partial class ArchiveService
     public async Task<TemplateSnapshotResult> CreateTemplateSnapshotAsync(
         ArchiveSession source,
         string? name = null,
-        string? idempotencyKey = null)
+        string? idempotencyKey = null,
+        SessionEventLedger.Options? eventOptions = null)
+    {
+        try
+        {
+            var result = await CreateTemplateSnapshotCoreAsync(source, name, idempotencyKey);
+            RecordCheckpointOperation("checkpoint.create", source, result.Ok, result.Message, result.Snapshot, eventOptions);
+            return result;
+        }
+        catch (Exception ex)
+        {
+            RecordCheckpointOperation("checkpoint.create", source, false, "Checkpoint failed: " + ex.Message, null, eventOptions);
+            throw;
+        }
+    }
+
+    private async Task<TemplateSnapshotResult> CreateTemplateSnapshotCoreAsync(
+        ArchiveSession source,
+        string? name,
+        string? idempotencyKey)
     {
         if (source is null) return new TemplateSnapshotResult(false, "No chat to checkpoint.", null);
         var sourcePath = ResolveSessionSourcePath(source);
@@ -120,7 +157,27 @@ public sealed partial class ArchiveService
         return new TemplateSnapshotResult(true, $"Created checkpoint \"{snapshot.DisplayName}\".", snapshot);
     }
 
-    public async Task<BranchResult> SpawnTemplateAsync(TemplateSnapshot snapshot)
+    public async Task<BranchResult> SpawnTemplateAsync(
+        TemplateSnapshot snapshot,
+        SessionEventLedger.Options? eventOptions = null)
+    {
+        ArchiveSession? source = null;
+        if (snapshot is not null && Store.TemplateSnapshots.TryGetValue(snapshot.Id, out var current))
+            source = SnapshotSource(current);
+        try
+        {
+            var result = await SpawnTemplateCoreAsync(snapshot);
+            RecordBranchOperation("checkpoint.spawn", source, result.Ok, result.Message, result.Branch, eventOptions, snapshot?.Id);
+            return result;
+        }
+        catch (Exception ex)
+        {
+            RecordBranchOperation("checkpoint.spawn", source, false, "Checkpoint spawn failed: " + ex.Message, null, eventOptions, snapshot?.Id);
+            throw;
+        }
+    }
+
+    private async Task<BranchResult> SpawnTemplateCoreAsync(TemplateSnapshot? snapshot)
     {
         if (snapshot is null) return new BranchResult(false, "No checkpoint selected.", null);
         if (!Store.TemplateSnapshots.TryGetValue(snapshot.Id, out var current))
@@ -128,16 +185,7 @@ public sealed partial class ArchiveService
         if (string.IsNullOrWhiteSpace(current.SnapshotPath) || !File.Exists(current.SnapshotPath))
             return new BranchResult(false, "The checkpoint transcript is missing from disk.", null);
 
-        var parent = new ArchiveSession
-        {
-            Id = current.SourceSessionId,
-            Tool = current.Tool,
-            Title = current.SourceTitle,
-            Workspace = current.Workspace,
-            WorkspaceName = current.WorkspaceName,
-            Model = current.Model,
-            SourcePath = current.SourcePath
-        };
+        var parent = SnapshotSource(current);
         return await CreateNativeBranchAsync(
             parent,
             current.SnapshotPath,
@@ -686,6 +734,82 @@ public sealed partial class ArchiveService
             for (var index = 0; index < read; index++)
                 if (buffer[index] == (byte)'\n') count++;
         return count;
+    }
+
+    private static ArchiveSession SnapshotSource(TemplateSnapshot snapshot) => new()
+    {
+        Id = snapshot.SourceSessionId,
+        Tool = snapshot.Tool,
+        Title = snapshot.SourceTitle,
+        Workspace = snapshot.Workspace,
+        WorkspaceName = snapshot.WorkspaceName,
+        Model = snapshot.Model,
+        SourcePath = snapshot.SourcePath
+    };
+
+    private static void RecordBranchOperation(
+        string operation,
+        ArchiveSession? source,
+        bool ok,
+        string summary,
+        ArchiveSession? branch,
+        SessionEventLedger.Options? options,
+        string? checkpointId = null)
+    {
+        var ids = new[] { source?.Id, branch?.Id }
+            .Concat(source?.Aliases ?? [])
+            .Concat(branch?.Aliases ?? [])
+            .Where(id => !string.IsNullOrWhiteSpace(id))
+            .Select(id => id!)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        var details = new Dictionary<string, string>
+        {
+            ["operation"] = operation,
+            ["outcome"] = ok ? "succeeded" : "failed"
+        };
+        if (!string.IsNullOrWhiteSpace(checkpointId)) details["checkpointId"] = checkpointId!;
+        if (branch is not null) details["createdSessionId"] = branch.Id;
+        var ev = SessionEventLedger.Create(
+            operation + (ok ? ".succeeded" : ".failed"),
+            summary,
+            source?.Id,
+            source?.Tool,
+            source?.DisplayTitle,
+            source?.WorkspaceName,
+            source: "archive",
+            severity: ok ? "info" : "error",
+            details: details,
+            sessionIds: ids);
+        SessionEventLedger.AppendBestEffort(ev, options: options);
+    }
+
+    private static void RecordCheckpointOperation(
+        string operation,
+        ArchiveSession? source,
+        bool ok,
+        string summary,
+        TemplateSnapshot? snapshot,
+        SessionEventLedger.Options? options)
+    {
+        var details = new Dictionary<string, string>
+        {
+            ["operation"] = operation,
+            ["outcome"] = ok ? "succeeded" : "failed"
+        };
+        if (snapshot is not null) details["checkpointId"] = snapshot.Id;
+        var ev = SessionEventLedger.Create(
+            operation + (ok ? ".succeeded" : ".failed"),
+            summary,
+            source?.Id,
+            source?.Tool,
+            source?.DisplayTitle,
+            source?.WorkspaceName,
+            source: "archive",
+            severity: ok ? "info" : "error",
+            details: details,
+            sessionIds: source is null ? [] : new[] { source.Id }.Concat(source.Aliases));
+        SessionEventLedger.AppendBestEffort(ev, options: options);
     }
 
     private static string DeterministicSnapshotId(string sourceId, string idempotencyKey)

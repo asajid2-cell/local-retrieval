@@ -9,6 +9,8 @@ namespace CodexLocalRetrieval.Native.Tests;
 [TestClass]
 public sealed class BranchSessionTests
 {
+    public TestContext TestContext { get; set; } = null!;
+
     [TestMethod]
     public async Task BranchSessionAsync_Claude_ClonesTranscriptAndLinksParent()
     {
@@ -505,6 +507,47 @@ public sealed class BranchSessionTests
         var result = await service.BranchSessionAsync(parent);
         Assert.IsFalse(result.Ok);
         Assert.IsNull(result.Branch);
+    }
+
+    [TestMethod]
+    public async Task BranchFailure_IsFindableBySessionWithTheExactVisibleError()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "clr-branch-telemetry-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            Directory.CreateDirectory(root);
+            var sourcePath = Path.Combine(root, "source.jsonl");
+            await File.WriteAllTextAsync(sourcePath, ClaudeLine("telemetry-source", "u1", "hello"));
+            var eventsRoot = Path.Combine(root, "events");
+            var service = new ArchiveService(
+                storePath: Path.Combine(root, "store.json"),
+                templatesRoot: Path.Combine(root, "templates"));
+            var parent = new ArchiveSession
+            {
+                Id = "telemetry-source",
+                Tool = "broken-tool",
+                Title = "Telemetry source",
+                SourcePath = sourcePath,
+                Workspace = root
+            };
+            var eventOptions = new SessionEventLedger.Options(eventsRoot, DateTimeOffset.Parse("2026-08-02T12:00:00Z"));
+
+            var result = await service.BranchSessionAsync(parent, eventOptions);
+
+            Assert.IsFalse(result.Ok);
+            Assert.AreEqual("Branch failed: branching isn't supported for tool 'broken-tool'.", result.Message);
+            var ev = SessionEventLedger.ReadForSession(parent.Id, max: 10, options: eventOptions).Single();
+            Assert.AreEqual("branch.failed", ev.Kind);
+            Assert.AreEqual("error", ev.Severity);
+            Assert.AreEqual(result.Message, ev.Summary);
+            Assert.AreEqual("failed", ev.Details["outcome"]);
+            Assert.AreEqual("branch", ev.Details["operation"]);
+            TestContext.WriteLine(JsonSerializer.Serialize(ev));
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch { }
+        }
     }
 
     private static string ClaudeLine(string sessionId, string uuid, string text) =>

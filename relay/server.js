@@ -265,6 +265,14 @@ function clampTermDimension(value, fallback, maximum) {
 const REQUIRED_HOST_PROTOCOL = 4;
 const REQUIRED_HOST_CAPS = new Set(['create', 'createAck', 'kill', 'rename', 'heal', 'tail', 'scrollback']);
 let hostProtocol = { protocol: 0, caps: [] };
+const hostInputOrigins = new Map();
+function rememberHostInputOrigin(key, clientId) {
+  const prior = hostInputOrigins.get(key);
+  if (prior) clearTimeout(prior.timer);
+  const timer = setTimeout(() => hostInputOrigins.delete(key), 20000);
+  if (timer.unref) timer.unref();
+  hostInputOrigins.set(key, { clientId, timer });
+}
 const hostUp = () => !!(hostWs && hostWs.readyState === 1);
 function sendHost(obj) { if (hostUp()) { try { hostWs.send(JSON.stringify(obj)); return true; } catch {} } return false; }
 const hostedHas = name => hostUp() && hostSessions.has(name);
@@ -304,6 +312,7 @@ function normalizeHostSession(s) {
     // OS-verified process truth (muxd cap "agentTruth"). Additive on protocol 4: a host that does not
     // send it leaves both of these falsy and every downstream decision falls back to today's behavior.
     agentStateSource: String(s.agentStateSource || ''), agentTruth: normalizeAgentTruth(s.agentTruth),
+    sessionUuid: String(s.sessionUuid || '').slice(0, 128),
   };
   return value;
 }
@@ -347,6 +356,7 @@ function announcedHostProtocol(message) {
   const announced = {
     protocol: Number(message && message.protocol || 0),
     caps: Array.isArray(message && message.caps) ? message.caps.map(String) : [],
+    instanceId: String(message && message.instanceId || '').slice(0, 128),
   };
   if (!Number.isInteger(announced.protocol) || announced.protocol !== REQUIRED_HOST_PROTOCOL) return null;
   const caps = new Set(announced.caps);
@@ -2997,6 +3007,18 @@ wssHost.on('connection', (ws, req) => {
       const n = strictMuxName(m.s);
       const raw = leaseConduit.cacheLeaseNotice(n, typeof m.f === 'string' ? m.f : '');
       if (raw) broadcastLeaseNotice(n, raw);
+    } else if (m.t === 'err' && String(m.code || '').startsWith('principal-')) {
+      const n = strictMuxName(m.s); const st = sessions.get(n); if (!st) return;
+      const originKey = n + ':' + String(m.intentId || '');
+      const origin = hostInputOrigins.get(originKey);
+      const source = (origin && origin.clientId) || String(m.channelId || '');
+      if (origin) clearTimeout(origin.timer);
+      hostInputOrigins.delete(originKey);
+      for (const c of st.clients.values()) {
+        if (!c.hosted || c.ws.readyState !== 1) continue;
+        if (source && c.id !== source) continue;
+        try { c.ws.close(1008, String(m.code) + ': ' + String(m.m || 'input refused').slice(0, 90)); } catch {}
+      }
     } else if (m.t === 'resync') {
       // muxd blew THIS session's ~1MiB egress budget and dropped its own backlog at a frame
       // boundary. The gap is unrecoverable from the stream, so repaint from truth: CLEAR +
@@ -3475,7 +3497,9 @@ wss.on('connection', async (ws, req) => {
     ws.on('message', m => {
       const s = m.toString();
       if (s[0] === 'i') {
-        if (!sendHost({ t: 'i', s: name, d: Buffer.from(s.slice(1), 'utf8').toString('base64') })) {
+        rememberHostInputOrigin(name + ':', client.id);
+        if (!sendHost({ t: 'i', s: name, channelId: client.id,
+                        d: Buffer.from(s.slice(1), 'utf8').toString('base64') })) {
           try { ws.close(1013, 'PC mux host offline'); } catch {}
           return;
         }
@@ -3489,6 +3513,16 @@ wss.on('connection', async (ws, req) => {
           ? (leaseConduit.forwardSignedInput(name, raw) || leaseConduit.forwardDeliberateSend(name, raw))
           : leaseConduit.forwardSignedLeaseOp(name, raw);
         if (!out) return;                                   // unproven frame: dropped, never repaired
+        if (out.t === 'i') {
+          const intentId = String(out.auth && out.auth.intentId || '');
+          rememberHostInputOrigin(name + ':' + intentId, client.id);
+        }
+        if (out.t === 'i' && !hostSupportsCap('inputDurable')) {
+          const bodyB64 = out.auth && out.auth.bodyB64;
+          if (!bodyB64) return;
+          delete out.auth;
+          out.d = bodyB64;
+        }
         if (!sendHost(out)) { try { ws.close(1013, 'PC mux host offline'); } catch {} return; }
         client.lastActive = Date.now(); return;
       }

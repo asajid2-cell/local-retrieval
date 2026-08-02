@@ -1,8 +1,39 @@
 ﻿# Deploy muxd/ from the monorepo to the live runtime (C:\Users\Ahmed\muxd) and restart it.
 # The scheduled task MuxdSessionHostRestart does the safe swap (preflight refuses if sessions are live).
+param(
+  [ValidateSet('audit','enforce')]
+  [string]$AuthzMode = $(if ($env:MUX_AUTHZ_MODE) { $env:MUX_AUTHZ_MODE } else { 'audit' })
+)
 $src = Join-Path $PSScriptRoot '..\muxd'
+$relay = Join-Path $PSScriptRoot '..\relay'
 $dst = 'C:\Users\Ahmed\muxd'
 $files = @('muxd.py','muxctl.py','host_input_intent.py')   # runtime code only — never state (live-tabs.json, logs, env)
+
+node -e "const c=require(process.argv[1]).createLeaseConduit();const f={t:'i',auth:{principalId:'p',keyId:'k',sig:'x',bodyB64:'eA=='}};const o=c.forwardSignedInput('s',JSON.stringify(f));if(!o||o.t!=='i'||!o.auth||o.auth.sig!=='x')process.exit(1)" (Join-Path $relay 'lease-conduit.js')
+if ($LASTEXITCODE -ne 0) { Write-Error 'local relay cannot forward the inputDurable t:i contract - NOT deploying'; exit 1 }
+
+if ($AuthzMode -eq 'enforce') {
+  $principalStatus = @'
+import sys
+sys.path.insert(0, sys.argv[1])
+import host_input_intent
+try:
+    endpoint = host_input_intent.load_principal_endpoint()
+except Exception as error:
+    print(error)
+    raise SystemExit(1)
+print(endpoint.summary())
+raise SystemExit(0 if endpoint.provisioned() else 1)
+'@
+  $principalStatus | python - $src
+  if ($LASTEXITCODE -ne 0) { Write-Error 'enforce deployment requires a DPAPI-protected provisioned principal - NOT deploying'; exit 1 }
+}
+$rollback = Join-Path $dst 'rollback\pre-input-durable'
+New-Item -ItemType Directory -Path $rollback -Force | Out-Null
+foreach ($f in $files) {
+  $live = Join-Path $dst $f
+  if (Test-Path -LiteralPath $live) { Copy-Item -LiteralPath $live -Destination (Join-Path $rollback $f) -Force }
+}
 foreach ($f in $files) { Copy-Item (Join-Path $src $f) (Join-Path $dst $f) -Force; Write-Host "deployed $f" }
 foreach ($f in $files) {
   python -m py_compile (Join-Path $dst $f)

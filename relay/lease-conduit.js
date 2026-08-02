@@ -35,7 +35,9 @@ function hasClientProof(frame) {
     && frame.auth && typeof frame.auth === 'object'
     && typeof frame.auth.principalId === 'string' && frame.auth.principalId
     && typeof frame.auth.keyId === 'string' && frame.auth.keyId
-    && typeof frame.auth.signature === 'string' && frame.auth.signature);
+    && ((typeof frame.auth.sig === 'string' && frame.auth.sig
+         && typeof frame.auth.bodyB64 === 'string' && frame.auth.bodyB64)
+        || (typeof frame.auth.signature === 'string' && frame.auth.signature)));
 }
 
 function createLeaseConduit() {
@@ -46,9 +48,9 @@ function createLeaseConduit() {
   // Client -> muxd. `raw` is the exact string the client signed; it leaves untouched.
   function forwardSignedInput(session, raw) {
     const frame = parseFrame(raw, MAX_INPUT_FRAME_BYTES);
-    if (!frame || frame.kind !== 'input.raw' || !hasClientProof(frame)) { stats.refused++; return null; }
+    if (!frame || (frame.t !== 'i' && frame.kind !== 'input.raw') || !hasClientProof(frame)) { stats.refused++; return null; }
     stats.forwardedInput++;
-    return { t: 'iw', s: session, e: raw };          // `e` is the original text, not a re-encode
+    return { ...frame, t: 'i', s: session };
   }
 
   // Client -> muxd. Only `lease.steal` and `lease.release`; both must already be signed.
@@ -66,11 +68,11 @@ function createLeaseConduit() {
   function forwardDeliberateSend(session, raw) {
     const frame = parseFrame(raw, MAX_INPUT_FRAME_BYTES);
     if (!frame) { stats.refused++; return null; }
-    if (frame.kind !== 'input.durable' && frame.kind !== 'input.deferred') { stats.refused++; return null; }
+    if (frame.t !== 'i' && frame.kind !== 'input.durable' && frame.kind !== 'input.deferred') { stats.refused++; return null; }
     if (!hasClientProof(frame)) { stats.refused++; return null; }
     if (typeof frame.leaseBehavior !== 'string' || !frame.leaseBehavior) { stats.refused++; return null; }
     stats.forwardedInput++;
-    return { t: 'iw', s: session, e: raw };
+    return { ...frame, t: 'i', s: session };
   }
 
   // muxd -> relay. Cache the frame verbatim so a late-attaching viewer can verify it itself.

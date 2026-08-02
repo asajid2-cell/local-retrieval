@@ -5,6 +5,7 @@
 #   muxctl open [name]      create/revive if needed, then attach (Ctrl-] to detach)
 #   muxctl kill <name>      kill and remove a local muxd session
 import asyncio, base64, json, sys, os, re, ctypes, threading, subprocess, time, shutil, contextlib, atexit, queue
+import host_input_intent
 try:
     import websockets
 except ImportError:
@@ -796,6 +797,14 @@ def main():
             raise SystemExit(asyncio.run(do_status()))
         elif a[0] in ("doctor", "diag"):
             raise SystemExit(asyncio.run(do_doctor()))
+        elif a[0] == "principal" and len(a) >= 2 and a[1] == "status":
+            endpoint = host_input_intent.load_principal_endpoint()
+            print(json.dumps(endpoint.summary(), indent=2))
+        elif a[0] == "principal" and len(a) == 6 and a[1] == "provision":
+            endpoint = host_input_intent.provision_principal(
+                open(a[5], "rb").read(), a[2], a[3], a[4]
+            )
+            print(json.dumps(endpoint.summary(), indent=2))
         elif a[0] in ("next-name", "next"):
             raise SystemExit(asyncio.run(do_next_name()))
         elif a[0] in ("attach", "a") and len(a) >= 2:
@@ -808,7 +817,7 @@ def main():
             try: asyncio.run(do_attach(name, create=True))
             except KeyboardInterrupt: pass
         else:
-            print("usage: muxctl ls | muxctl status | muxctl doctor | muxctl next-name | muxctl create <session> | muxctl kill <session> | muxctl attach <session> | muxctl open [session]")
+            print("usage: muxctl ls | muxctl status | muxctl doctor | muxctl principal status | muxctl principal provision <principal> <key> <sessionUuid> <public-key.pem> | muxctl next-name | muxctl create <session> | muxctl kill <session> | muxctl attach <session> | muxctl open [session]")
     except OSError as e:
         sys.stderr.write("[muxctl] cannot reach muxd at %s: %s\n" % (URL, e))
         raise SystemExit(2)

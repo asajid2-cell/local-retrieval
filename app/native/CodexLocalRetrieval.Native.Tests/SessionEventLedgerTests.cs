@@ -104,6 +104,28 @@ public sealed class SessionEventLedgerTests
     }
 
     [TestMethod]
+    public void TryAppend_RedactsExceptionTextInTheDurableBytes()
+    {
+        using var dir = NewTempDir();
+        var options = Options(dir.Path);
+        var error = new InvalidOperationException(
+            @"'0x00' is an invalid start of a value at C:\Users\Ahmed\private\chat.jsonl; api_key=sk-FAKEexampleKEYnotreal0000000");
+
+        Assert.IsTrue(SessionEventLedger.TryAppend(
+            SessionEventLedger.Create("branch.failed", error.Message, "branch-source", severity: "error"),
+            out var detail,
+            options), detail);
+
+        var raw = string.Join("\n", Directory.EnumerateFiles(dir.Path, "events-*.jsonl").Select(File.ReadAllText));
+        StringAssert.Contains(raw, "0x00");
+        StringAssert.Contains(raw, "is an invalid start of a value");
+        Assert.DoesNotContain(@"C:\Users\Ahmed", raw);
+        Assert.DoesNotContain("sk-FAKE", raw);
+        StringAssert.Contains(raw, "[path]");
+        StringAssert.Contains(raw, "[redacted]");
+    }
+
+    [TestMethod]
     public void ReadRecent_CanReadWhileFileIsOpenForAppend()
     {
         using var dir = NewTempDir();
@@ -159,7 +181,7 @@ public sealed class SessionEventLedgerTests
         using var release = new ManualResetEventSlim(false);
         var holder = Task.Run(() =>
         {
-            using var mutex = new Mutex(false, MutexName(EventFile(dir.Path, now)));
+            using var mutex = new Mutex(false, MutexName(dir.Path));
             Assert.IsTrue(mutex.WaitOne(TimeSpan.FromSeconds(1)));
             ready.Set();
             release.Wait(TimeSpan.FromSeconds(5));
@@ -193,6 +215,55 @@ public sealed class SessionEventLedgerTests
         Assert.AreEqual(64, lines.Length);
         foreach (var line in lines)
             Assert.IsFalse(string.IsNullOrWhiteSpace(JsonDocument.Parse(line).RootElement.GetProperty("kind").GetString()));
+    }
+
+    [TestMethod]
+    public void TryAppend_RotatesMonthlyLedgerAndKeepsTotalBytesBounded()
+    {
+        using var dir = NewTempDir();
+        var options = Options(dir.Path) with
+        {
+            MaxFileBytes = 1024,
+            MaxTotalBytes = 3072,
+            Retention = TimeSpan.FromDays(365)
+        };
+
+        for (var i = 0; i < 40; i++)
+            Assert.IsTrue(SessionEventLedger.TryAppend(
+                SessionEventLedger.Create("event." + i, new string('x', 420), "bounded"),
+                out var detail,
+                options), detail);
+
+        var files = Directory.EnumerateFiles(dir.Path, "events-*.jsonl").Select(path => new FileInfo(path)).ToList();
+        Assert.IsGreaterThan(1, files.Count);
+        Assert.IsTrue(files.All(file => file.Length <= options.EffectiveMaxFileBytes));
+        Assert.IsLessThanOrEqualTo(options.EffectiveMaxTotalBytes, files.Sum(file => file.Length));
+        Assert.AreEqual("event.39", SessionEventLedger.ReadRecent(1, options).Single().Kind);
+        CollectionAssert.AreEqual(
+            new[] { "event.39", "event.38", "event.37" },
+            SessionEventLedger.ReadForSession("bounded", max: 3, options: options).Select(ev => ev.Kind).ToArray());
+    }
+
+    [TestMethod]
+    public void TryAppend_PrunesLedgerFilesOlderThanRetention()
+    {
+        using var dir = NewTempDir();
+        var old = Options(dir.Path, DateTimeOffset.Parse("2025-01-08T00:00:00Z")) with
+        {
+            Retention = TimeSpan.FromDays(30)
+        };
+        Assert.IsTrue(SessionEventLedger.TryAppend(SessionEventLedger.Create("old", "old", "s1"), out var oldDetail, old), oldDetail);
+        var oldPath = EventFile(dir.Path, old.EffectiveNow);
+        File.SetLastWriteTimeUtc(oldPath, DateTime.Parse("2025-01-08T00:00:00Z").ToUniversalTime());
+
+        var current = Options(dir.Path, DateTimeOffset.Parse("2026-08-02T00:00:00Z")) with
+        {
+            Retention = TimeSpan.FromDays(30)
+        };
+        Assert.IsTrue(SessionEventLedger.TryAppend(SessionEventLedger.Create("current", "current", "s1"), out var detail, current), detail);
+
+        Assert.IsFalse(File.Exists(oldPath));
+        Assert.AreEqual("current", SessionEventLedger.ReadRecent(10, current).Single().Kind);
     }
 
     [TestMethod]

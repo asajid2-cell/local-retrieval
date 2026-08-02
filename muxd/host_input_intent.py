@@ -26,9 +26,13 @@ import hashlib
 import json
 import os
 import re
+import ctypes
+from ctypes import wintypes
+from pathlib import Path
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec, utils as asym_utils
 
 TRANSCRIPT_VERSION = "mux-authz-v1"
@@ -53,6 +57,8 @@ MAX_BODY_BYTES = 64 * 1024
 
 _ID_RE = re.compile(r"\A[A-Za-z0-9._-]{1,128}\Z")
 _HEX32_RE = re.compile(r"\A[0-9a-f]{64}\Z")
+REGISTRY_VERSION = 1
+DEFAULT_REGISTRY = Path.home() / "muxd" / "principal-registry.dpapi"
 
 # Staged rollout knob owned by the trust migration leaf. This module's endpoint always refuses a
 # proofless frame; the mode only decides whether muxd's call site is still allowed to fall back
@@ -139,17 +145,18 @@ class PrincipalEndpoint:
 
     def register(self, principal_id, key_id, public_key, *, session_uuid, roles=("drive",),
                  acl_revision=1, lease_epoch=1, lease_holder="", status="active"):
-        self._principals[(principal_id, key_id)] = {
+        record = self._principals.setdefault((principal_id, key_id), {
             "publicKey": public_key,
             "status": status,
-            "sessions": {
-                session_uuid: {
-                    "roles": set(roles),
-                    "aclRevision": int(acl_revision),
-                    "leaseEpoch": int(lease_epoch),
-                    "leaseHolder": str(lease_holder or ""),
-                }
-            },
+            "sessions": {},
+        })
+        record["publicKey"] = public_key
+        record["status"] = status
+        record["sessions"][session_uuid] = {
+            "roles": set(roles),
+            "aclRevision": int(acl_revision),
+            "leaseEpoch": int(lease_epoch),
+            "leaseHolder": str(lease_holder or ""),
         }
 
     def lookup(self, principal_id, key_id, session_uuid):
@@ -162,6 +169,138 @@ class PrincipalEndpoint:
             "status": record.get("status", "active"),
             "grant": dict(grant) if grant else None,
         }
+
+    def provisioned(self):
+        return bool(self.instance_id and self._principals)
+
+    def summary(self):
+        return {
+            "instanceId": self.instance_id,
+            "principals": len(self._principals),
+            "provisioned": self.provisioned(),
+        }
+
+
+class _DATA_BLOB(ctypes.Structure):
+    _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_byte))]
+
+
+def _blob(data):
+    raw = bytes(data)
+    buf = ctypes.create_string_buffer(raw)
+    return _DATA_BLOB(len(raw), ctypes.cast(buf, ctypes.POINTER(ctypes.c_byte))), buf
+
+
+def _dpapi(data, protect):
+    if os.name != "nt":
+        raise RuntimeError("the principal registry requires Windows DPAPI")
+    source, source_buf = _blob(data)
+    target = _DATA_BLOB()
+    crypt32 = ctypes.windll.crypt32
+    kernel32 = ctypes.windll.kernel32
+    fn = crypt32.CryptProtectData if protect else crypt32.CryptUnprotectData
+    ok = fn(
+        ctypes.byref(source), "muxd principal registry" if protect else None,
+        None, None, None, 0, ctypes.byref(target),
+    )
+    if not ok:
+        raise ctypes.WinError()
+    try:
+        return ctypes.string_at(target.pbData, target.cbData)
+    finally:
+        kernel32.LocalFree(target.pbData)
+        del source_buf
+
+
+def _public_key_pem(public_key):
+    return public_key.public_bytes(
+        serialization.Encoding.PEM,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    ).decode("ascii")
+
+
+def save_principal_endpoint(endpoint, path=DEFAULT_REGISTRY):
+    path = Path(path)
+    records = []
+    for (principal_id, key_id), record in endpoint._principals.items():
+        sessions = {}
+        for session_uuid, grant in (record.get("sessions") or {}).items():
+            sessions[session_uuid] = {
+                "roles": sorted(set(grant.get("roles") or ())),
+                "aclRevision": int(grant.get("aclRevision", 1)),
+                "leaseEpoch": int(grant.get("leaseEpoch", 1)),
+                "leaseHolder": str(grant.get("leaseHolder") or ""),
+            }
+        records.append({
+            "principalId": principal_id,
+            "keyId": key_id,
+            "status": str(record.get("status", "active")),
+            "publicKeyPem": _public_key_pem(record.get("publicKey")),
+            "sessions": sessions,
+        })
+    payload = json.dumps({
+        "version": REGISTRY_VERSION,
+        "instanceId": endpoint.instance_id,
+        "principals": records,
+    }, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    protected = _dpapi(payload, True)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_suffix(path.suffix + ".tmp")
+    temp.write_bytes(protected)
+    os.replace(str(temp), str(path))
+
+
+def load_principal_endpoint(path=DEFAULT_REGISTRY):
+    path = Path(path)
+    if not path.exists():
+        return PrincipalEndpoint(instance_id="mux-" + os.urandom(16).hex())
+    payload = json.loads(_dpapi(path.read_bytes(), False).decode("utf-8"))
+    if payload.get("version") != REGISTRY_VERSION:
+        raise ValueError("unsupported principal registry version")
+    endpoint = PrincipalEndpoint(instance_id=_bounded_id(payload.get("instanceId")))
+    if not endpoint.instance_id:
+        raise ValueError("principal registry has no valid instance id")
+    for record in payload.get("principals") or []:
+        public_key = serialization.load_pem_public_key(
+            str(record.get("publicKeyPem") or "").encode("ascii")
+        )
+        if not isinstance(public_key, ec.EllipticCurvePublicKey) or not isinstance(
+            public_key.curve, ec.SECP256R1
+        ):
+            raise ValueError("principal key is not P-256")
+        for session_uuid, grant in (record.get("sessions") or {}).items():
+            endpoint.register(
+                _bounded_id(record.get("principalId")),
+                _bounded_id(record.get("keyId")),
+                public_key,
+                session_uuid=_bounded_id(session_uuid),
+                roles=grant.get("roles") or ("drive",),
+                acl_revision=grant.get("aclRevision", 1),
+                lease_epoch=grant.get("leaseEpoch", 1),
+                lease_holder=grant.get("leaseHolder", ""),
+                status=record.get("status", "active"),
+            )
+    return endpoint
+
+
+def provision_principal(public_key_pem, principal_id, key_id, session_uuid,
+                        path=DEFAULT_REGISTRY, roles=("drive",)):
+    endpoint = load_principal_endpoint(path)
+    public_key = serialization.load_pem_public_key(bytes(public_key_pem))
+    if not isinstance(public_key, ec.EllipticCurvePublicKey) or not isinstance(
+        public_key.curve, ec.SECP256R1
+    ):
+        raise ValueError("principal public key must be P-256")
+    for value, label in (
+        (principal_id, "principal id"), (key_id, "key id"), (session_uuid, "session uuid")
+    ):
+        if not _bounded_id(value):
+            raise ValueError(label + " is malformed")
+    endpoint.register(
+        principal_id, key_id, public_key, session_uuid=session_uuid, roles=roles
+    )
+    save_principal_endpoint(endpoint, path)
+    return endpoint
 
 
 def canonical_transcript_bytes(op, instance_id, principal_id, key_id, session_uuid, channel_id,

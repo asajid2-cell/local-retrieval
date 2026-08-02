@@ -14,6 +14,7 @@ public sealed partial class MainPage
         SyncStatus.Text = $"Branching \"{Trim(session.DisplayTitle, 40)}\"...";
         var result = await _archive.BranchSessionAsync(session);
         SyncStatus.Text = result.Message;
+        RenderIntegrity(force: true);
         if (result.Ok && result.Branch is not null)
         {
             RenderCurrent();
@@ -27,6 +28,7 @@ public sealed partial class MainPage
         var result = await _archive.CreateTemplateSnapshotAsync(session);
         SyncStatus.Text = result.Message;
         RenderCurrent();
+        RenderIntegrity(force: true);
     }
 
     private async Task StartFromTemplateAsync(
@@ -44,21 +46,50 @@ public sealed partial class MainPage
         }
         var branch = result.Branch;
 
-        var name = (chatName ?? "").Trim();
-        if (name.Length > 0)
-            await _archive.RenameSessionAsync(branch, name);
-        else
-            await _archive.RenameSessionAsync(branch, template.SourceTitle);
-
-        var ph = (phrase ?? "").Trim();
-        if (ph.Length > 0)
+        try
         {
-            var list = branch.SpecialPhrases.ToList();
-            list.Add(ph);
-            await _archive.SetSpecialPhrasesAsync(branch, list);
+            var name = (chatName ?? "").Trim();
+            var finalName = name.Length > 0 ? name : template.SourceTitle;
+            await _archive.RenameSessionAsync(branch, finalName);
+            RecordSessionEvent(
+                branch,
+                "rename.succeeded",
+                $"Renamed spawned chat to \"{finalName}\".",
+                details: new Dictionary<string, string> { ["operation"] = "checkpoint.spawn.rename" });
+
+            var ph = (phrase ?? "").Trim();
+            if (ph.Length > 0)
+            {
+                var list = branch.SpecialPhrases.ToList();
+                list.Add(ph);
+                await _archive.SetSpecialPhrasesAsync(branch, list);
+            }
+            if (!string.IsNullOrWhiteSpace(collectionName))
+            {
+                await _archive.AddToCollectionAsync(branch, collectionName, deckId);
+                RecordSessionEvent(
+                    branch,
+                    "collection.file.succeeded",
+                    $"Filed spawned chat in \"{collectionName}\".",
+                    details: new Dictionary<string, string> { ["operation"] = "checkpoint.spawn.file" });
+            }
         }
-        if (!string.IsNullOrWhiteSpace(collectionName))
-            await _archive.AddToCollectionAsync(branch, collectionName, deckId);
+        catch (Exception ex)
+        {
+            RecordSessionEvent(
+                branch,
+                "checkpoint.spawn.configure.failed",
+                ex.Message,
+                "error",
+                details: new Dictionary<string, string>
+                {
+                    ["operation"] = "checkpoint.spawn.configure",
+                    ["checkpointId"] = template.Id
+                });
+            SyncStatus.Text = "The chat was spawned, but its name or filing failed: " + ex.Message;
+            RenderIntegrity(force: true);
+            return;
+        }
 
         RenderCurrent();
         ResumeInTerminal(branch);
@@ -298,10 +329,36 @@ public sealed partial class MainPage
                 };
                 if (await renameDialog.ShowAsync() == ContentDialogResult.Primary)
                 {
-                    if (selectedSnapshot is not null)
-                        await _archive.RenameTemplateSnapshotAsync(selectedSnapshot.Id, input.Text);
-                    else if (selectedBranch is not null)
-                        await _archive.RenameSessionAsync(selectedBranch, input.Text);
+                    try
+                    {
+                        if (selectedSnapshot is not null)
+                        {
+                            var renamed = await _archive.RenameTemplateSnapshotAsync(selectedSnapshot.Id, input.Text);
+                            RecordSessionEvent(
+                                session,
+                                renamed ? "checkpoint.rename.succeeded" : "checkpoint.rename.refused",
+                                renamed ? $"Renamed checkpoint to \"{input.Text.Trim()}\"." : "Checkpoint rename made no change.",
+                                renamed ? "info" : "warn",
+                                details: new Dictionary<string, string> { ["checkpointId"] = selectedSnapshot.Id });
+                        }
+                        else if (selectedBranch is not null)
+                        {
+                            await _archive.RenameSessionAsync(selectedBranch, input.Text);
+                            RecordSessionEvent(selectedBranch, "rename.succeeded", $"Renamed branch to \"{input.Text.Trim()}\".");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        RecordSessionEvent(
+                            selectedBranch ?? session,
+                            selectedSnapshot is not null ? "checkpoint.rename.failed" : "rename.failed",
+                            ex.Message,
+                            "error",
+                            details: selectedSnapshot is null
+                                ? null
+                                : new Dictionary<string, string> { ["checkpointId"] = selectedSnapshot.Id });
+                        SyncStatus.Text = "Rename failed: " + ex.Message;
+                    }
                 }
                 continue;
             }
@@ -319,11 +376,38 @@ public sealed partial class MainPage
             };
             if (await confirm.ShowAsync() == ContentDialogResult.Primary)
             {
-                if (selectedSnapshot is not null)
-                    await _archive.DeleteTemplateSnapshotAsync(selectedSnapshot.Id);
-                else if (selectedBranch is not null)
-                    await _archive.ArchiveSessionAsync(selectedBranch);
+                try
+                {
+                    if (selectedSnapshot is not null)
+                    {
+                        var deleted = await _archive.DeleteTemplateSnapshotAsync(selectedSnapshot.Id);
+                        RecordSessionEvent(
+                            session,
+                            deleted ? "checkpoint.delete.succeeded" : "checkpoint.delete.refused",
+                            deleted ? $"Deleted checkpoint \"{selectedSnapshot.DisplayName}\"." : "Checkpoint delete made no change.",
+                            deleted ? "info" : "warn",
+                            details: new Dictionary<string, string> { ["checkpointId"] = selectedSnapshot.Id });
+                    }
+                    else if (selectedBranch is not null)
+                    {
+                        await _archive.ArchiveSessionAsync(selectedBranch);
+                        RecordSessionEvent(selectedBranch, "archive.succeeded", "Archived branch.");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    RecordSessionEvent(
+                        selectedBranch ?? session,
+                        selectedSnapshot is not null ? "checkpoint.delete.failed" : "archive.failed",
+                        ex.Message,
+                        "error",
+                        details: selectedSnapshot is null
+                            ? null
+                            : new Dictionary<string, string> { ["checkpointId"] = selectedSnapshot.Id });
+                    SyncStatus.Text = "Delete failed: " + ex.Message;
+                }
                 RenderCurrent();
+                RenderIntegrity(force: true);
             }
         }
     }

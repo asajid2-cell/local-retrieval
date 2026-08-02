@@ -172,6 +172,12 @@ public sealed partial class MainPage
             {
                 if (sub.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0)
                 {
+                    RecordAppEvent(
+                        "start.refused.folder-name",
+                        "Start chat refused because the requested subfolder name contains invalid characters.",
+                        "warn",
+                        tool: toolKey,
+                        workspace: baseDir);
                     SyncStatus.Text = "That folder name has invalid characters.";
                     return;
                 }
@@ -182,7 +188,14 @@ public sealed partial class MainPage
         catch (Exception ex)
         {
             Diag.Log("Start chat: folder setup failed " + ex);
-            SyncStatus.Text = "Couldn't create that folder. Check the path.";
+            RecordAppEvent(
+                "start.failed.folder-setup",
+                ex.Message,
+                "error",
+                tool: toolKey,
+                workspace: baseDir,
+                details: new Dictionary<string, string> { ["operation"] = "start-chat.folder-setup" });
+            SyncStatus.Text = "Couldn't create that folder: " + ex.Message;
             return;
         }
 
@@ -207,9 +220,26 @@ public sealed partial class MainPage
                 if (pendingIntentId.Length == 0)
                     throw new InvalidOperationException("The new-chat filing intent could not be persisted.");
                 Diag.Log($"Start chat intent queued id={pendingIntentId} collection={targetCollection?.Id ?? ""}");
+                RecordAppEvent(
+                    "start.intent.queued",
+                    "Queued the new-chat filing intent.",
+                    tool: toolKey,
+                    workspace: cwd,
+                    details: new Dictionary<string, string>
+                    {
+                        ["intentId"] = pendingIntentId,
+                        ["collectionId"] = targetCollection?.Id ?? ""
+                    });
             }
             catch (Exception ex)
             {
+                RecordAppEvent(
+                    "start.intent.failed",
+                    ex.Message,
+                    "error",
+                    tool: toolKey,
+                    workspace: cwd,
+                    details: new Dictionary<string, string> { ["operation"] = "start-chat.intent" });
                 SyncStatus.Text = ex.Message;
                 return;
             }
@@ -219,6 +249,13 @@ public sealed partial class MainPage
         if (toolKey != "shell" && string.IsNullOrEmpty(launch.Exe))
         {
             if (pendingIntentId.Length > 0) await _archive.CancelPendingNewChatAsync(pendingIntentId);
+            RecordAppEvent(
+                "start.refused.invalid-launch",
+                launch.DisplayCommand,
+                "warn",
+                tool: toolKey,
+                workspace: cwd,
+                details: new Dictionary<string, string> { ["intentId"] = pendingIntentId });
             SyncStatus.Text = launch.DisplayCommand;
             return;
         }
@@ -242,13 +279,26 @@ public sealed partial class MainPage
             });
             Diag.Log($"Start chat process spawned tool={toolKey} cwd={launch.WorkingDirectory} intent={pendingIntentId}");
             lease?.MarkStarted("Started deliberate chat terminal.");
+            if (toolKey == "shell")
+                RecordAppEvent(
+                    "start.started.shell",
+                    "Started an ephemeral shell.",
+                    tool: toolKey,
+                    workspace: launch.WorkingDirectory);
         }
         catch (Exception ex)
         {
             lease?.MarkFailed(ex.Message);
             if (pendingIntentId.Length > 0) await _archive.CancelPendingNewChatAsync(pendingIntentId);
             Diag.Log("Start chat launch failed " + ex);
-            SyncStatus.Text = "Could not open a terminal. No filing intent was left behind.";
+            if (toolKey == "shell")
+                RecordAppEvent(
+                    "start.failed.shell",
+                    ex.Message,
+                    "error",
+                    tool: toolKey,
+                    workspace: cwd);
+            SyncStatus.Text = "Could not open a terminal: " + ex.Message + " No filing intent was left behind.";
             return;
         }
         finally
@@ -324,6 +374,13 @@ public sealed partial class MainPage
                     string.Equals(p.IntentId, intentId, StringComparison.Ordinal));
                 if (!pending)
                 {
+                    RecordAppEvent(
+                        "start.intent.filed",
+                        collectionName.Length > 0
+                            ? $"The new chat was indexed and filed in \"{collectionName}\"."
+                            : "The new chat was indexed and its pending filing intent completed.",
+                        tool: toolKey,
+                        details: new Dictionary<string, string> { ["intentId"] = intentId });
                     RenderCurrent();
                     SyncStatus.Text = collectionName.Length > 0
                         ? $"The new chat is named and filed in \"{collectionName}\"."
@@ -331,6 +388,13 @@ public sealed partial class MainPage
                     return;
                 }
             }
+            RecordAppEvent(
+                "start.intent.timed-out",
+                "The new chat did not appear in the archive before the two-minute filing deadline.",
+                "warn",
+                tool: toolKey,
+                details: new Dictionary<string, string> { ["intentId"] = intentId });
+            SyncStatus.Text = "The terminal started, but the new chat was not indexed within two minutes. Its filing intent is still pending.";
         }
         finally
         {

@@ -6,10 +6,15 @@ The answer has to be no even when the relay is the one asking.
 """
 
 import base64
+import asyncio
 import hashlib
 import importlib
 import json
+import os
+import tempfile
+import time
 import unittest
+from unittest import mock
 
 from cryptography.hazmat.primitives.asymmetric import ec
 
@@ -334,18 +339,39 @@ class MuxdWiringTests(unittest.TestCase):
     def test_relay_host_link_refuses_a_proofless_frame_with_zero_writes(self):
         session = RecordingSession()
 
-        principal, body, refusal = muxd.authorize_relay_input(
-            {"t": "i", "s": "work", "d": base64.b64encode(b"whoami\r").decode()},
-            session,
-            endpoint=host_input_intent.PrincipalEndpoint(instance_id=INSTANCE),
-            now_ms=NOW_MS,
-        )
+        with mock.patch.dict(os.environ, {"MUX_AUTHZ_MODE": "enforce"}):
+            principal, body, refusal = muxd.authorize_relay_input(
+                {"t": "i", "s": "work", "d": base64.b64encode(b"whoami\r").decode()},
+                session,
+                endpoint=host_input_intent.PrincipalEndpoint(instance_id=INSTANCE),
+                now_ms=NOW_MS,
+            )
 
         self.assertIsNone(principal)
         self.assertIsNone(body)
         self.assertEqual(refusal.code, "principal-proof-required")
         self.assertEqual(refusal.frame("work")["code"], "principal-proof-required")
         self.assertEqual(session.writes, [])
+
+    def test_audit_mode_admits_only_a_proofless_legacy_body(self):
+        endpoint, private = make_endpoint()
+        legacy = {"t": "i", "s": "work", "d": base64.b64encode(b"legacy\r").decode()}
+        with mock.patch.dict(os.environ, {"MUX_AUTHZ_MODE": "audit"}):
+            principal, body, refusal = muxd.authorize_relay_input(
+                legacy, RecordingSession(), endpoint=endpoint, now_ms=NOW_MS
+            )
+            self.assertIsNone(principal)
+            self.assertEqual(body, b"legacy\r")
+            self.assertIsNone(refusal)
+
+            forged = signed_frame(private)
+            forged["auth"]["sig"] = base64.b64encode(b"x" * 64).decode()
+            principal, body, refusal = muxd.authorize_relay_input(
+                forged, RecordingSession(), endpoint=endpoint, now_ms=NOW_MS
+            )
+            self.assertIsNone(principal)
+            self.assertIsNone(body)
+            self.assertEqual(refusal.code, "principal-proof-invalid")
 
     def test_relay_host_link_admits_a_verified_frame(self):
         endpoint, private = make_endpoint()
@@ -371,6 +397,61 @@ class MuxdWiringTests(unittest.TestCase):
         self.assertEqual(muxd.PROTOCOL, 4)
         self.assertIn("inputDurable", muxd.CAPS)
         self.assertIn("input", muxd.CAPS)
+
+
+@unittest.skipIf(os.name != "nt", "DPAPI registry requires Windows")
+class PrincipalRegistryTests(unittest.TestCase):
+    def test_dpapi_registry_round_trip_preserves_instance_and_grant(self):
+        endpoint, _ = make_endpoint()
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "principals.dpapi")
+            host_input_intent.save_principal_endpoint(endpoint, path)
+            with open(path, "rb") as stream:
+                raw = stream.read()
+            self.assertNotIn(PRINCIPAL.encode(), raw)
+            loaded = host_input_intent.load_principal_endpoint(path)
+            self.assertEqual(loaded.instance_id, INSTANCE)
+            self.assertTrue(loaded.provisioned())
+            self.assertIsNotNone(loaded.lookup(PRINCIPAL, KEY_ID, SESSION_UUID))
+
+
+@unittest.skipIf(os.name != "nt", "real PTY test requires Windows ConPTY")
+class SignedInputRuntimeTests(unittest.TestCase):
+    def test_verified_input_reaches_a_real_conpty(self):
+        marker = "SIGNED_INPUT_PTY_%d" % int(time.time() * 1000)
+        loop = asyncio.new_event_loop()
+        session = muxd.Session(
+            "signed-input-runtime", "", tempfile.gettempdir(), 100, 30,
+            loop, asyncio.Queue(), session_uuid=SESSION_UUID,
+        )
+        endpoint, private = make_endpoint()
+        try:
+            principal, body, refusal = muxd.authorize_relay_input(
+                signed_frame(private, ("Write-Output '%s'\r" % marker).encode("utf-8")),
+                session, endpoint=endpoint, now_ms=NOW_MS,
+            )
+            self.assertIsNone(refusal)
+            self.assertIsNotNone(principal)
+            ok, detail = session.write_confirmed(body)
+            self.assertTrue(ok, detail)
+            deadline = time.time() + 10
+            while time.time() < deadline and marker not in session.tail_text():
+                time.sleep(0.1)
+            self.assertIn(marker, session.tail_text())
+        finally:
+            session.kill()
+            loop.close()
+
+    def test_session_uuid_survives_manifest_restore(self):
+        original = muxd.Session(
+            "uuid-runtime", "", tempfile.gettempdir(), 80, 24,
+            None, None, spawn_now=False,
+        )
+        payload = muxd.session_records_payload({"uuid-runtime": original})
+        restored = {}
+        muxd.restore_manifest_sessions(payload, restored, None, None)
+        self.assertEqual(restored["uuid-runtime"].session_uuid, original.session_uuid)
+        self.assertNotEqual(restored["uuid-runtime"].session_uuid, original.session_id)
 
 
 if __name__ == "__main__":

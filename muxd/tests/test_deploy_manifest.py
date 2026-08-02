@@ -30,7 +30,7 @@ def extract_preflight_source(script_path=DEPLOY_SCRIPT):
     """Return the Python source embedded in deploy-muxd.ps1's here-string."""
     lines = read(script_path).splitlines()
     opener = next(
-        (index for index, line in enumerate(lines) if line.rstrip().endswith("@'")),
+        (index for index, line in enumerate(lines) if re.match(r"\s*\$preflight\s*=\s*@'\s*$", line)),
         None,
     )
     assert opener is not None, "deploy-muxd.ps1 is missing the preflight here-string opener"
@@ -89,6 +89,32 @@ def missing_from_manifest(muxd_dir=MUXD_DIR, script_path=DEPLOY_SCRIPT):
 
 
 class TestDeployManifest(unittest.TestCase):
+    @unittest.skipIf(os.name != "nt", "PowerShell deploy preflight requires Windows")
+    def test_enforce_deploy_refuses_an_empty_principal_registry_before_copy(self):
+        with tempfile.TemporaryDirectory() as profile:
+            env = os.environ.copy()
+            env["HOME"] = profile
+            env["USERPROFILE"] = profile
+            result = subprocess.run(
+                [
+                    "powershell.exe",
+                    "-NoProfile",
+                    "-ExecutionPolicy", "Bypass",
+                    "-File", DEPLOY_SCRIPT,
+                    "-AuthzMode", "enforce",
+                ],
+                cwd=REPO_ROOT,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertRegex(
+            result.stdout + result.stderr,
+            r"enforce deployment requires a\s+DPAPI-protected provisioned principal",
+        )
+
     def test_preflight_refuses_when_a_local_module_is_missing_from_dst(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             src = os.path.join(temp_dir, "src")

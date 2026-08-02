@@ -71,8 +71,10 @@ function createFakeMuxd(host) {
 
   function verifyClient(raw) {
     let frame;
-    try { frame = JSON.parse(raw); } catch { return null; }
+    try { frame = typeof raw === 'string' ? JSON.parse(raw) : { ...raw }; } catch { return null; }
     if (!frame || !frame.auth) return null;
+    delete frame.t;
+    delete frame.s;
     const pub = principals.get(frame.auth.principalId);
     if (!pub) return null;                            // unauthorized principal: not a lease question
     const { auth, ...body } = frame;
@@ -129,8 +131,8 @@ function createFakeMuxd(host) {
         return;
       }
 
-      if (msg.t === 'iw') {
-        const v = verifyClient(msg.e);
+      if (msg.t === 'i') {
+        const v = verifyClient(msg);
         if (!v) { rejects.push({ why: 'bad-signature', t: msg.t }); return; }
         // The epoch the client signed is the epoch it *observed*. On acquisition that is the
         // free-lease epoch, which the grant then supersedes — so the comparison happens first.

@@ -1078,21 +1078,35 @@ CAPS = ["ls", "info", "create", "createAck", "bind", "input", "open", "attach", 
 # The relay is a conduit, not an authority: a host-link `i` frame only reaches the PTY when it
 # carries a principal-signed input.durable proof this endpoint verifies. Empty until pairing
 # provisions a principal, which means "refuse everything" — the correct posture, not a gap.
-PRINCIPAL_ENDPOINT = host_input_intent.PrincipalEndpoint()
+try:
+    PRINCIPAL_ENDPOINT = host_input_intent.load_principal_endpoint()
+except Exception as error:
+    PRINCIPAL_ENDPOINT = host_input_intent.PrincipalEndpoint()
+    log("[principal] registry unavailable: " + str(error))
 
 def authorize_relay_input(frame, session, endpoint=None, now_ms=None):
     """Gate one relay host-link `i` frame. Returns `(principal, body, refusal)`.
 
-    Deliberately does NOT consult MUX_AUTHZ_MODE. An audit mode that still performed the write
-    would be exactly the proofless PTY write this endpoint exists to remove; the knob stays for
-    endpoints where "observe first" is a real option, and this is not one of them.
+    A presented proof is always verified strictly. During the staged audit rollout only a frame
+    with no proof at all may use the legacy `d` body; enforce mode refuses it.
     """
-    return host_input_intent.verify_host_input_frame(
+    principal, body, refusal = host_input_intent.verify_host_input_frame(
         frame,
         endpoint=PRINCIPAL_ENDPOINT if endpoint is None else endpoint,
         session=session,
         now_ms=int(time.time() * 1000) if now_ms is None else now_ms,
     )
+    if principal is not None or isinstance(frame.get("auth"), dict):
+        return principal, body, refusal
+    if host_input_intent.authz_mode() == "enforce":
+        return principal, body, refusal
+    try:
+        legacy = base64.b64decode(str(frame.get("d", "") or ""), validate=True)
+    except Exception:
+        return principal, body, refusal
+    if not legacy or len(legacy) > host_input_intent.MAX_BODY_BYTES:
+        return principal, body, refusal
+    return None, legacy, None
 
 STARTED = time.time()
 AGENT_WORKING_FRESH = float(ENV.get("AGENT_WORKING_FRESH", "25"))
@@ -2158,11 +2172,12 @@ class TerminalReplayState:
 
 class Session:
     def __init__(self, name, cmd, cwd, cols, rows, loop, outq, heal=False, spawn_now=True,
-                 ids=None, session_id="", aliases=None):
+                 ids=None, session_id="", aliases=None, session_uuid=""):
         self.name, self.cmd, self.cwd = name, cmd or "", cwd or DEFAULT_CWD
         self.session_id, self.aliases, self.ids = resolve_session_identity(
             self.cmd, session_id, aliases, ids
         )
+        self.session_uuid = str(session_uuid or ("s-" + os.urandom(16).hex()))
         self.claim_paths = []
         self._launch_claim = None
         self.expected_owner = False
@@ -2485,11 +2500,12 @@ class OwnerSession:
     # A visible local terminal owns the agent. muxd only relays that terminal's screen
     # snapshots to the VPS and forwards remote keystrokes back into the owner sidecar.
     def __init__(self, name, cmd, cwd, cols, rows, loop, outq, owner_ws, heal=False,
-                 ids=None, session_id="", aliases=None, owner_key=""):
+                 ids=None, session_id="", aliases=None, owner_key="", session_uuid=""):
         self.name, self.cmd, self.cwd = name, cmd or "", cwd or DEFAULT_CWD
         self.session_id, self.aliases, self.ids = resolve_session_identity(
             self.cmd, session_id, aliases, ids
         )
+        self.session_uuid = str(session_uuid or ("s-" + os.urandom(16).hex()))
         self.claim_paths = []
         self._launch_claim = None
         self.heal = bool(heal)
@@ -2816,7 +2832,8 @@ def restore_manifest_sessions(records, target=None, loop=None, outq=None, now=No
             restored = Session(
                 name, mcmd, m.get("cwd", ""), m.get("cols", 140), m.get("rows", 40),
                 loop, outq, heal=heal, spawn_now=False, ids=ids,
-                session_id=m.get("sessionId", ""), aliases=aliases
+                session_id=m.get("sessionId", ""), aliases=aliases,
+                session_uuid=m.get("sessionUuid", "")
             )
             restored.expected_owner = bool(m.get("owner"))
             restored.owner_key = str(m.get("ownerKey", "") or "")
@@ -2861,6 +2878,7 @@ def session_records_payload(source=None):
     return {
         n: {"cmd": s.cmd, "cwd": s.cwd, "cols": s.cols, "rows": s.rows, "heal": s.heal,
             "sessionId": getattr(s, "session_id", "") or "",
+            "sessionUuid": getattr(s, "session_uuid", "") or "",
             "aliases": list(getattr(s, "aliases", []) or []),
             "ids": list(getattr(s, "ids", []) or []),
             "owner": bool(getattr(s, "owner", False) or getattr(s, "expected_owner", False)),
@@ -2924,6 +2942,7 @@ def valid_session_records(value):
         and str(record.get("stopDisposition", "") or "") in stop_dispositions
         and isinstance(record.get("userKilled", False), bool)
         and isinstance(record.get("generationId", ""), str)
+        and isinstance(record.get("sessionUuid", ""), str)
         and isinstance(record.get("operationKey", ""), str)
         and isinstance(record.get("operationFingerprint", ""), str)
         and isinstance(record.get("operationCreated", False), bool)
@@ -2972,6 +2991,7 @@ _PERSISTED_SESSION_FIELDS = (
     "rows",
     "heal",
     "session_id",
+    "session_uuid",
     "aliases",
     "ids",
     "owner",
@@ -3192,6 +3212,7 @@ def session_payload(name, sess):
             "tail": tail, "heal": sess.heal, "localViewers": len(sess.local),
             "localFirst": owner or len(sess.local) > 0, "owner": owner,
             "hasCommand": has_cmd, "shellOnly": alive and not has_cmd,
+            "sessionUuid": str(getattr(sess, "session_uuid", "") or ""),
             "ready": alive, "kind": kind,
             "sessionId": getattr(sess, "session_id", "") or "",
             "aliases": list(getattr(sess, "aliases", []) or []),
@@ -4453,6 +4474,7 @@ async def main():
                     snap = watch_snapshot()
                     await ws.send(json.dumps({"t": "info", "protocol": PROTOCOL, "caps": CAPS,
                                               "host": os.environ.get("COMPUTERNAME", "pc"),
+                                              "instanceId": PRINCIPAL_ENDPOINT.instance_id,
                                               "sessions": len(sessions), "pid": os.getpid(),
                                               "uptimeSec": int(time.time() - STARTED),
                                               "loopLagMs": round(float(snap.get("last_lag", 0.0)) * 1000, 1),
@@ -4653,7 +4675,9 @@ async def main():
                         )
                         outq.dropped = 0
                     await ws.send(json.dumps({"t": "hello", "host": os.environ.get("COMPUTERNAME", "pc"),
-                                              "protocol": PROTOCOL, "caps": CAPS, "sessions": sess_list()}))
+                                              "protocol": PROTOCOL, "caps": CAPS,
+                                              "instanceId": PRINCIPAL_ENDPOINT.instance_id,
+                                              "sessions": sess_list()}))
 
                     async def pump_out():
                         while True:
@@ -4754,7 +4778,13 @@ async def main():
                                 principal, body, refusal = authorize_relay_input(m, input_session)
                                 if refusal is not None:
                                     log(f"[{name}] input refused: {refusal.code}: {refusal.detail}")
-                                    await ws.send(json.dumps(refusal.frame(name)))
+                                    refused = refusal.frame(name)
+                                    refused["channelId"] = str(
+                                        m.get("channelId")
+                                        or ((m.get("auth") or {}).get("channelId") if isinstance(m.get("auth"), dict) else "")
+                                        or ""
+                                    )
+                                    await ws.send(json.dumps(refused))
                                 else:
                                     outcome = await execute_input_intent(
                                         m, input_session, body, principal=principal

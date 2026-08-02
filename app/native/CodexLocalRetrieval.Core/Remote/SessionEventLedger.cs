@@ -27,6 +27,9 @@ public static class SessionEventLedger
 {
     private const int ReverseReadBufferBytes = 64 * 1024;
     private const int MaxLedgerLineBytes = 256 * 1024;
+    private const long DefaultMaxFileBytes = 8L * 1024 * 1024;
+    private const long DefaultMaxTotalBytes = 64L * 1024 * 1024;
+    private static readonly TimeSpan DefaultRetention = TimeSpan.FromDays(180);
 
     // Per-session sidecar index. events-index/<session-id>.jsonl holds one {"f","o"} line per ledger event
     // that mentions that id, so ReadForSession costs O(events-of-that-session) instead of an all-time scan.
@@ -35,7 +38,13 @@ public static class SessionEventLedger
     private const int MaxIndexKeyLength = 120;
     private const int BackfillFlushChars = 8_000_000;
 
-    public sealed record Options(string? RootDirectory = null, DateTimeOffset? Now = null, TimeSpan? LockTimeout = null)
+    public sealed record Options(
+        string? RootDirectory = null,
+        DateTimeOffset? Now = null,
+        TimeSpan? LockTimeout = null,
+        long? MaxFileBytes = null,
+        long? MaxTotalBytes = null,
+        TimeSpan? Retention = null)
     {
         public string EffectiveRootDirectory
         {
@@ -50,6 +59,9 @@ public static class SessionEventLedger
 
         public DateTimeOffset EffectiveNow => Now ?? DateTimeOffset.UtcNow;
         public TimeSpan EffectiveLockTimeout => LockTimeout ?? TimeSpan.FromSeconds(1);
+        public long EffectiveMaxFileBytes => Math.Max(1024, MaxFileBytes ?? DefaultMaxFileBytes);
+        public long EffectiveMaxTotalBytes => Math.Max(EffectiveMaxFileBytes, MaxTotalBytes ?? DefaultMaxTotalBytes);
+        public TimeSpan EffectiveRetention => Retention ?? DefaultRetention;
     }
 
     private static readonly JsonSerializerOptions JsonOptions = new()
@@ -124,7 +136,6 @@ public static class SessionEventLedger
         }
 
         var root = options.EffectiveRootDirectory;
-        var path = EventFile(root, options.EffectiveNow);
         try { Directory.CreateDirectory(root); }
         catch (Exception ex)
         {
@@ -134,7 +145,7 @@ public static class SessionEventLedger
 
         var line = JsonSerializer.Serialize(ev, JsonOptions) + "\n";
         var bytes = Encoding.UTF8.GetBytes(line);
-        var mutexName = MutexName(path);
+        var mutexName = MutexName(root);
         var acquired = false;
         Mutex? mutex = null;
         try
@@ -148,6 +159,7 @@ public static class SessionEventLedger
                 return false;
             }
 
+            var path = WritableEventFile(root, options.EffectiveNow, bytes.Length, options.EffectiveMaxFileBytes);
             using var fs = new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete, 4096, FileOptions.WriteThrough);
 
             // Index FIRST, at the offset the event is about to occupy. A crash between the two writes then
@@ -160,6 +172,7 @@ public static class SessionEventLedger
 
             fs.Write(bytes, 0, bytes.Length);
             fs.Flush(flushToDisk: true);
+            EnforceRetention(root, path, options);
             return true;
         }
         catch (Exception ex)
@@ -247,11 +260,94 @@ public static class SessionEventLedger
     internal static string EventFile(string root, DateTimeOffset now)
         => Path.Combine(root, "events-" + now.UtcDateTime.ToString("yyyy-MM") + ".jsonl");
 
+    private static string WritableEventFile(string root, DateTimeOffset now, int appendBytes, long maxFileBytes)
+    {
+        var basePath = EventFile(root, now);
+        var stem = Path.GetFileNameWithoutExtension(basePath);
+        var highestSegment = Directory.EnumerateFiles(root, stem + "*.jsonl")
+            .Select(path => EventFileOrder(path).Segment)
+            .DefaultIfEmpty(0)
+            .Max();
+        var current = highestSegment == 0
+            ? basePath
+            : Path.Combine(root, $"{stem}-{highestSegment:0000}.jsonl");
+        if (Fits(current, appendBytes, maxFileBytes)) return current;
+        return Path.Combine(root, $"{stem}-{highestSegment + 1:0000}.jsonl");
+    }
+
+    private static bool Fits(string path, int appendBytes, long maxFileBytes)
+    {
+        try
+        {
+            if (!File.Exists(path)) return true;
+            return new FileInfo(path).Length + appendBytes <= maxFileBytes;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static void EnforceRetention(string root, string currentPath, Options options)
+    {
+        try
+        {
+            var files = EventFilesNewestFirst(root)
+                .Select(path => new FileInfo(path))
+                .Where(info => info.Exists)
+                .OrderByDescending(info => EventFileOrder(info.FullName).Month, StringComparer.Ordinal)
+                .ThenByDescending(info => EventFileOrder(info.FullName).Segment)
+                .ToList();
+            var cutoff = options.EffectiveNow - options.EffectiveRetention;
+            var total = files.Sum(info => info.Length);
+            var removed = false;
+
+            foreach (var info in files
+                         .OrderBy(info => EventFileOrder(info.FullName).Month, StringComparer.Ordinal)
+                         .ThenBy(info => EventFileOrder(info.FullName).Segment))
+            {
+                if (string.Equals(info.FullName, currentPath, StringComparison.OrdinalIgnoreCase)) continue;
+                var tooOld = info.LastWriteTimeUtc < cutoff.UtcDateTime;
+                var tooLarge = total > options.EffectiveMaxTotalBytes;
+                if (!tooOld && !tooLarge) continue;
+                var length = info.Length;
+                try
+                {
+                    info.Delete();
+                    total -= length;
+                    removed = true;
+                }
+                catch { }
+            }
+
+            if (removed) ResetIndex(root, options.EffectiveLockTimeout);
+        }
+        catch { }
+    }
+
     private static IEnumerable<string> EventFilesNewestFirst(string root)
     {
         if (!Directory.Exists(root)) yield break;
-        foreach (var path in Directory.EnumerateFiles(root, "events-*.jsonl").OrderByDescending(p => p, StringComparer.OrdinalIgnoreCase))
+        foreach (var path in Directory.EnumerateFiles(root, "events-*.jsonl")
+                     .OrderByDescending(path => EventFileOrder(path).Month, StringComparer.Ordinal)
+                     .ThenByDescending(path => EventFileOrder(path).Segment))
             yield return path;
+    }
+
+    private static (string Month, int Segment) EventFileOrder(string path)
+    {
+        var name = Path.GetFileName(path);
+        if (!name.StartsWith("events-", StringComparison.OrdinalIgnoreCase)
+            || !name.EndsWith(".jsonl", StringComparison.OrdinalIgnoreCase)
+            || name.Length < 20)
+            return ("", -1);
+        var month = name.Substring(7, 7);
+        var segmentText = name.Substring(14, name.Length - 14 - ".jsonl".Length);
+        if (segmentText.Length == 0) return (month, 0);
+        return segmentText[0] == '-'
+               && int.TryParse(segmentText.AsSpan(1), out var segment)
+            ? (month, segment)
+            : (month, -1);
     }
 
     private static IEnumerable<SessionEvent> ReadFileNewestFirst(string path, byte[][]? screen = null)
@@ -496,6 +592,34 @@ public static class SessionEventLedger
         try { File.Delete(Path.Combine(IndexDirectory(root), IndexCompleteMarker)); } catch { }
     }
 
+    private static void ResetIndex(string root, TimeSpan timeout)
+    {
+        var dir = IndexDirectory(root);
+        if (!Directory.Exists(dir)) return;
+        Mutex? mutex = null;
+        var acquired = false;
+        try
+        {
+            mutex = new Mutex(false, MutexName(dir));
+            try { acquired = mutex.WaitOne(timeout); }
+            catch (AbandonedMutexException) { acquired = true; }
+            if (!acquired)
+            {
+                InvalidateIndex(root);
+                return;
+            }
+            foreach (var path in Directory.EnumerateFiles(dir))
+                try { File.Delete(path); } catch { }
+        }
+        catch { InvalidateIndex(root); }
+        finally
+        {
+            if (acquired)
+                try { mutex?.ReleaseMutex(); } catch { }
+            mutex?.Dispose();
+        }
+    }
+
     private static bool TryWriteIndexEntries(string root, HashSet<string> keys, string fileName, long offset, TimeSpan timeout)
     {
         if (keys.Count == 0) return true;
@@ -677,7 +801,8 @@ public static class SessionEventLedger
         // (file name descending, offset descending) is exactly the order EventFilesNewestFirst plus the
         // reverse in-file reader produces, so limit and ordering semantics are unchanged.
         var ordered = entries
-            .OrderByDescending(e => e.File, StringComparer.OrdinalIgnoreCase)
+            .OrderByDescending(e => EventFileOrder(e.File).Month, StringComparer.Ordinal)
+            .ThenByDescending(e => EventFileOrder(e.File).Segment)
             .ThenByDescending(e => e.Offset);
 
         var outEvents = new List<SessionEvent>();
