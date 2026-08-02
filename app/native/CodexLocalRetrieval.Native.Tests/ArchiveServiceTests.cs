@@ -845,6 +845,48 @@ public sealed class ArchiveServiceTests
     }
 
     [TestMethod]
+    public async Task MergeScanAsync_ReloadsAndRemergesAfterGenerationConflict()
+    {
+        // The "Sync failed — see log" bug: the desktop's session sync merged onto a store the
+        // always-on server had already advanced, and the save's generation conflict failed the
+        // whole sync instead of re-merging. The scan is still valid against the fresher store.
+        var dir = Path.Combine(Path.GetTempPath(), "clr-merge-generation-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            var store = Path.Combine(dir, "store.json");
+            var seed = new ArchiveService(storePath: store);
+            seed.Store.Sessions["original"] = new ArchiveSession
+                { Id = "original", Tool = "codex", Title = "original" };
+            await seed.SaveAsync();
+
+            var desktop = new ArchiveService(storePath: store);
+            var server = new ArchiveService(storePath: store);
+            await desktop.LoadAsync();
+            await server.LoadAsync();
+
+            // The server commits first: the desktop's loaded generation is now stale.
+            server.Store.Sessions["server-change"] = new ArchiveSession
+                { Id = "server-change", Tool = "claude", Title = "server-change" };
+            await server.SaveAsync();
+
+            var incoming = new ArchiveSession
+                { Id = "scanned-session", Tool = "claude", Title = "scanned-session", SourcePath = Path.Combine(dir, "scanned.jsonl") };
+            var merged = await desktop.MergeScanAsync(
+                new DiskScan(new List<ArchiveSession> { incoming }, new List<ArchiveSession>()),
+                refreshList: false);
+
+            Assert.AreEqual(1, merged);
+            var reader = new ArchiveService(storePath: store);
+            await reader.LoadAsync();
+            Assert.IsTrue(reader.Store.Sessions.ContainsKey("scanned-session"), "the sync's own result must land");
+            Assert.IsTrue(reader.Store.Sessions.ContainsKey("server-change"), "the other writer's commit must survive the re-merge");
+            Assert.IsTrue(reader.Store.Sessions.ContainsKey("original"));
+        }
+        finally { Directory.Delete(dir, true); }
+    }
+
+    [TestMethod]
     public async Task AgentCommand_StashReloadsAndReplaysAfterGenerationConflict()
     {
         var dir = Path.Combine(Path.GetTempPath(), "clr-agent-generation-" + Guid.NewGuid().ToString("N"));

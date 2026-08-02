@@ -3496,7 +3496,26 @@ public sealed partial class ArchiveService
     // UI-THREAD: merge scanned sessions into the store. Disk content always refreshes a session,
     // but app-owned organization (custom title, pin, archive, review, star, user tags) is preserved
     // so a re-sync never wipes how you've filed your chats. Bundled history only fills genuine gaps.
+    // The always-on server and the desktop app share one store, so the save at the end of a merge
+    // can lose the generation race to another process's write (the exact failure the sync button
+    // surfaced as "Sync failed — see log"). The scan itself stays valid regardless of who wrote:
+    // adopt the other writer's store (LoadAsync) and re-merge the same scan onto it — the merge
+    // reads app-owned fields from the CURRENT store, so re-running it against the fresh one is the
+    // designed operation, same recovery idiom as the small ops above. Bounded: three writers
+    // interleaving that fast means something is genuinely wrong, and the conflict should surface.
     public async Task<int> MergeScanAsync(DiskScan scan, bool refreshList = true)
+    {
+        for (var attempt = 0; ; attempt++)
+        {
+            try { return await MergeScanOnceAsync(scan, refreshList); }
+            catch (StoreGenerationConflictException) when (attempt < 2)
+            {
+                await LoadAsync();
+            }
+        }
+    }
+
+    private async Task<int> MergeScanOnceAsync(DiskScan scan, bool refreshList)
     {
         var imported = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var sourceRekeys = FindSourcePathRekeys(scan.Disk);
