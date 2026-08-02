@@ -1554,15 +1554,15 @@ function applyViewport(){
   _lastViewportResizeAt=Date.now();
   const vv=window.visualViewport, app=$('#app');
   if(vv && vv.height>0){
+    // Height ONLY. A margin/offset compensation for the iOS visual-viewport shift was tried and
+    // reverted: it makes the document taller than the layout viewport, which lets the page scroll,
+    // which fires visualViewport 'scroll', which re-enters here — and every pass re-measures and
+    // re-reports the grid, so the PTY got a resize storm and the terminal froze mid-keystroke.
+    // Any future iOS offset handling must not change document height and must not re-fit on scroll.
     const height=vv.height+'px';
-    const offsetTop=Math.max(0, Number(vv.offsetTop)||0);
-    const geometry=height+'|'+offsetTop;
-    if(geometry!==_lastViewportGeometry){
-      _lastViewportGeometry=geometry;
+    if(height!==_lastViewportGeometry){
+      _lastViewportGeometry=height;
       app.style.height=height;
-      // iOS can pan the visual viewport without resizing the layout viewport; shifting the in-flow grid
-      // into that band avoids transform-created containing blocks that would trap fixed overlays.
-      app.style.marginTop=offsetTop ? offsetTop+'px' : '';
     }
   }
   scheduleViewportFit(0);
@@ -1572,7 +1572,9 @@ if (window.visualViewport){
     applyViewport();
     scheduleViewportFit(isMobile()?140:40);
   });
-  visualViewport.addEventListener('scroll', ()=>applyViewport());
+  // Deliberately NO 'scroll' listener: it fires on ordinary page scrolling, and applyViewport
+  // re-measures the grid, so every scroll became a PTY resize. The keyboard changes the viewport
+  // HEIGHT, and 'resize' is what reports that.
 }
 new ResizeObserver(()=>scheduleViewportFit(0)).observe($('#term'));
 window.addEventListener('orientationchange', ()=>setTimeout(applyViewport,250));

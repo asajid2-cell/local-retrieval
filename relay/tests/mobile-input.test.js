@@ -213,21 +213,26 @@ test('the visual viewport resize handler applies the keyboard-shrunk viewport an
   );
 });
 
-test('the visual viewport scroll handler applies keyboard-aware positioning on iOS', () => {
-  const impact = 'iOS visual-viewport shifts will move the composer under the keyboard';
-  const scrollHandlers = visualViewportListeners('scroll', impact);
-  assert.ok(
-    scrollHandlers.some(handler => /applyViewport\s*\(\s*\)/.test(handler)),
-    `${impact}: visual viewport scroll events do not update the app position`
-  );
+// This clause originally REQUIRED a visualViewport 'scroll' listener calling applyViewport, for the
+// iOS shift. Shipping it froze the terminal: applyViewport re-measures the grid, ordinary page
+// scrolling fires 'scroll', and every scroll became a PTY resize. The contract was wrong, so it is
+// inverted here rather than deleted — the regression must stay pinned.
+test('viewport re-measurement is never wired to visual viewport scrolling', () => {
+  const impact = 'every page scroll would re-measure the grid and storm the PTY with resizes, freezing the terminal';
+  // Asserted against the source directly: visualViewportListeners() requires at least one match, so
+  // it cannot express absence.
+  const registered = /(?:window\s*\.\s*)?visualViewport\s*(?:\.|\?\.)\s*addEventListener\s*\(\s*['"]scroll['"]/.test(source);
+  assert.equal(registered, false, `${impact}: a visualViewport 'scroll' listener is registered`);
 });
 
-test('applyViewport tracks visualViewport offsetTop while retaining the app height assignment', () => {
-  const impact = 'the app will not follow the visible iOS viewport band or will lose its keyboard-shrunk height';
+// Also inverted from the original contract, same reason as the scroll clause: compensating for the
+// iOS offset by growing the app made the document scrollable, which is what let the scroll storm
+// start. The height assignment is the part that actually fixes the keyboard, and it is pinned here.
+test('applyViewport sets the keyboard-shrunk height without offsetting the document', () => {
+  const impact = 'the composer will sit under the keyboard, or the app will grow the document and re-enter on scroll';
   const apply = functionSection('applyViewport', impact);
-  const readsOffsetTop =
-    /(?:\bvisualViewport\b|\bvv\b)\s*\.\s*offsetTop\b/.test(apply) ||
-    /\{\s*[^}]*\boffsetTop\b[^}]*\}\s*=\s*(?:window\s*\.\s*)?visualViewport\b/.test(apply);
+  const shiftsDocument =
+    /\.\s*style\s*\.\s*(?:marginTop|top|transform)\s*=/.test(apply);
   const readsHeight =
     /(?:\bvisualViewport\b|\bvv\b)\s*\.\s*height\b/.test(apply) ||
     /\{\s*[^}]*\bheight\b[^}]*\}\s*=\s*(?:window\s*\.\s*)?visualViewport\b/.test(apply);
@@ -238,7 +243,7 @@ test('applyViewport tracks visualViewport offsetTop while retaining the app heig
     ).test(apply)) ||
     /(?:\$\(\s*['"]#app['"]\s*\)|document\s*\.\s*getElementById\s*\(\s*['"]app['"]\s*\)|document\s*\.\s*querySelector\s*\(\s*['"]#app['"]\s*\))\s*\.\s*style\s*\.\s*height\s*=/.test(apply);
 
-  assert.ok(readsOffsetTop, `${impact}: applyViewport never reads visualViewport.offsetTop`);
+  assert.equal(shiftsDocument, false, `${impact}: applyViewport moves the app with marginTop/top/transform`);
   assert.ok(readsHeight, `${impact}: applyViewport no longer reads the visual viewport height`);
   assert.ok(writesAppHeight, `${impact}: applyViewport no longer assigns the visible height to #app`);
 });
