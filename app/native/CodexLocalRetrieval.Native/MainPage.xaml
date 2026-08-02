@@ -197,6 +197,12 @@
                             <TextBlock Text="Running" />
                         </StackPanel>
                     </Button>
+                    <Button Click="Nav_Click" Style="{StaticResource PillButtonStyle}" Tag="Fleet">
+                        <StackPanel Orientation="Horizontal" Spacing="10">
+                            <FontIcon FontFamily="Segoe Fluent Icons" FontSize="15" Glyph="&#xE7F4;" />
+                            <TextBlock Text="Fleet" />
+                        </StackPanel>
+                    </Button>
                     <Button Click="Nav_Click" Style="{StaticResource PillButtonStyle}" Tag="Phrases">
                         <StackPanel Orientation="Horizontal" Spacing="10">
                             <FontIcon FontFamily="Segoe Fluent Icons" FontSize="15" Glyph="&#xE8EC;" />

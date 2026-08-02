@@ -247,6 +247,24 @@ app.MapPost("/api/agent/sessions/{id}/open", async (string id, OpenRequest? req,
         : Results.BadRequest(new { error = result.Message });
 });
 
+// ---- fleet: always-on recorder of what's running, so a crash/reboot leaves a restorable record ----
+// The server is the natural writer (it's back ~a minute after boot); if the desktop app ever hosts a
+// recorder too, FleetWriterLock elects exactly one and the loser serves reads. CLR_FLEET=0 disables.
+var fleetInterval = int.TryParse(Environment.GetEnvironmentVariable("CLR_FLEET_INTERVAL_SEC"), out var fleetSec) && fleetSec > 0
+    ? TimeSpan.FromSeconds(fleetSec) : (TimeSpan?)null;
+var fleetService = new FleetSnapshotService("server", new FleetSnapshotService.Options(
+    Interval: fleetInterval,
+    OnTransition: t => SessionEventLedger.AppendBestEffortQueued(SessionEventLedger.Create(
+        kind: "fleet-session-" + t.Kind,
+        summary: $"{t.Tool} session {t.SessionId} {t.Kind} (fleet recorder)",
+        sessionId: t.SessionId,
+        tool: t.Tool,
+        source: "fleet")),
+    Log: m => Console.WriteLine("[fleet] " + m)));
+if (Environment.GetEnvironmentVariable("CLR_FLEET") != "0")
+    _ = Task.Run(() => fleetService.RunAsync(app.Lifetime.ApplicationStopping));
+app.MapFleet(fleetService, sessionOpenService);
+
 // "Open the full desktop app on the PC" — light headless server by default, heavy app on demand.
 // Owner-gated by the global auth middleware; honours the same CLR_REMOTE_ALLOW_LAUNCH switch.
 app.MapGet("/api/desktop-app", () => Results.Json(new { available = launcher.Enabled, running = System.Diagnostics.Process.GetProcessesByName("CodexLocalRetrieval.Native").Length > 0 }));

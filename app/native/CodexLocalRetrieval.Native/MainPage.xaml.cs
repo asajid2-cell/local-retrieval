@@ -323,6 +323,9 @@ public sealed partial class MainPage : Page
             case "Running":
                 RenderRunningPage();
                 break;
+            case "Fleet":
+                RenderFleetPage();
+                break;
             case "Custody":
                 RenderCustodyPage();
                 break;
