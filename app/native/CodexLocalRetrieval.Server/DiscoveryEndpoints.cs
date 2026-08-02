@@ -30,6 +30,21 @@ public static class DiscoveryEndpoints
                 (archive, _) => Task.FromResult(new DiscoveryApi(archive).Facets(query)), ct);
             return Results.Json(facets);
         });
+
+        // Pickers for the web's Start-chat dialog. Read-only like the rest of discovery: they hand
+        // out ids and labels, never a path or a command line, because the choice travels back
+        // through the relay's command queue where the browser can read it.
+        app.MapGet("/api/discovery/start/decks", async (CancellationToken ct) =>
+            Results.Json(await runtime.UseAsync((a, _) => Task.FromResult(new DiscoveryApi(a).StartDecks()), ct)));
+
+        app.MapGet("/api/discovery/start/collections", async (string? deckId, CancellationToken ct) =>
+            Results.Json(await runtime.UseAsync((a, _) => Task.FromResult(new DiscoveryApi(a).StartCollections(deckId ?? "")), ct)));
+
+        app.MapGet("/api/discovery/start/checkpoints", async (CancellationToken ct) =>
+            Results.Json(await runtime.UseAsync((a, _) => Task.FromResult(new DiscoveryApi(a).StartCheckpoints()), ct)));
+
+        app.MapGet("/api/discovery/start/workspaces", async (CancellationToken ct) =>
+            Results.Json(await runtime.UseAsync((a, _) => Task.FromResult(new DiscoveryApi(a).StartWorkspaces()), ct)));
     }
 
     private static DiscoveryQuery ReadQuery(HttpRequest req)

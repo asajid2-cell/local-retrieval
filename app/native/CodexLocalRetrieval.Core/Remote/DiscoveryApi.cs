@@ -1,6 +1,8 @@
 using CodexLocalRetrieval.Core.Chat;
 using CodexLocalRetrieval.Core.Models;
 using CodexLocalRetrieval.Core.Services;
+using System.Security.Cryptography;
+using System.Text;
 
 namespace CodexLocalRetrieval.Core.Remote;
 
@@ -47,6 +49,22 @@ public sealed record DiscoveryFacets(
     IReadOnlyList<DiscoveryFacet> Tags,
     IReadOnlyList<DiscoveryFacet> Phrases,
     IReadOnlyList<DiscoveryProjectFacet> Projects);
+
+public sealed record StartDeckRow(string Id, string Label);
+public sealed record StartDeckProjection(string ActiveDeckId, IReadOnlyList<StartDeckRow> Rows);
+public sealed record StartCollectionRow(string Id, string Label);
+public sealed record StartCollectionProjection(string DeckId, IReadOnlyList<StartCollectionRow> Rows);
+public sealed record StartCheckpointRow(
+    string Id,
+    string Label,
+    string SourceTitle,
+    string Tool,
+    string WorkspaceLabel,
+    string CreatedAt,
+    int MessageCount);
+public sealed record StartCheckpointProjection(IReadOnlyList<StartCheckpointRow> Rows);
+public sealed record StartWorkspaceRow(string Id, string Label, IReadOnlyList<string> Tools);
+public sealed record StartWorkspaceProjection(IReadOnlyList<StartWorkspaceRow> Rows);
 
 // HTTP-agnostic discovery surface. The server adapter binds query parameters onto DiscoveryQuery;
 // all archive semantics and response shaping stay here so they can be tested without a web host.
@@ -117,6 +135,78 @@ public sealed class DiscoveryApi
             tags,
             phrases,
             projects);
+    }
+
+    public StartDeckProjection StartDecks()
+    {
+        _archive.EnsureDecks();
+        var rows = _archive.Decks
+            .Where(deck => !string.IsNullOrWhiteSpace(deck.Id))
+            .Select(deck => new StartDeckRow(deck.Id.Trim(), deck.Name.Trim()))
+            .OrderBy(row => row.Label, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(row => row.Id, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        var active = rows.FirstOrDefault(row =>
+            string.Equals(row.Id, _archive.ActiveDeckId, StringComparison.OrdinalIgnoreCase));
+        var main = rows.FirstOrDefault(row =>
+            string.Equals(row.Id, ArchiveService.MainDeckId, StringComparison.OrdinalIgnoreCase));
+        return new StartDeckProjection(active?.Id ?? main?.Id ?? ArchiveService.MainDeckId, rows);
+    }
+
+    public StartCollectionProjection StartCollections(string deckId)
+    {
+        _archive.EnsureDecks();
+        var requestedId = (deckId ?? "").Trim();
+        var deck = _archive.Decks.FirstOrDefault(candidate =>
+            string.Equals(candidate.Id, requestedId, StringComparison.OrdinalIgnoreCase));
+        if (deck is null)
+            return new StartCollectionProjection(
+                requestedId,
+                Array.Empty<StartCollectionRow>());
+
+        var rows = _archive.CollectionsInDeck(deck.Id)
+            .Where(collection => !string.IsNullOrWhiteSpace(collection.Id))
+            .Select(collection => new StartCollectionRow(collection.Id.Trim(), collection.Name.Trim()))
+            .OrderBy(row => row.Label, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(row => row.Id, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        return new StartCollectionProjection(requestedId, rows);
+    }
+
+    public StartCheckpointProjection StartCheckpoints()
+    {
+        var rows = _archive.Templates()
+            .Select(snapshot => new StartCheckpointRow(
+                snapshot.Id,
+                SecretRedactor.Scrub(ArchiveService.TemplateSnapshotDisplayLabel(snapshot)),
+                SecretRedactor.Scrub((snapshot.SourceTitle ?? "").Trim()),
+                NormalizeTool(snapshot.Tool),
+                SecretRedactor.Scrub(WorkspaceLabel(snapshot.WorkspaceName, snapshot.Workspace)),
+                snapshot.CreatedAt,
+                snapshot.MessageCount))
+            .ToList();
+        return new StartCheckpointProjection(rows);
+    }
+
+    public StartWorkspaceProjection StartWorkspaces()
+    {
+        var rows = BuildWorkspaceRegistry()
+            .Select(workspace => new StartWorkspaceRow(workspace.Id, workspace.Label, workspace.Tools))
+            .ToList();
+        return new StartWorkspaceProjection(rows);
+    }
+
+    public bool TryResolveWorkspace(string workspaceId, out string path)
+    {
+        path = "";
+        var requestedId = (workspaceId ?? "").Trim();
+        if (requestedId.Length == 0) return false;
+
+        var workspace = BuildWorkspaceRegistry().FirstOrDefault(candidate =>
+            string.Equals(candidate.Id, requestedId, StringComparison.OrdinalIgnoreCase));
+        if (workspace is null || !Directory.Exists(workspace.Path)) return false;
+        path = workspace.Path;
+        return true;
     }
 
     private IReadOnlyList<ArchiveSession> Filter(NormalizedQuery query)
@@ -266,18 +356,112 @@ public sealed class DiscoveryApi
     }
 
     private static string WorkspaceLabel(ArchiveSession session)
+        => WorkspaceLabel(session.WorkspaceName, session.Workspace);
+
+    private static string WorkspaceLabel(string? workspaceName, string? workspace)
     {
-        if (!string.IsNullOrWhiteSpace(session.WorkspaceName)) return session.WorkspaceName.Trim();
+        if (!string.IsNullOrWhiteSpace(workspaceName)) return workspaceName.Trim();
         try
         {
-            var workspace = (session.Workspace ?? "").TrimEnd('\\', '/');
-            return Path.GetFileName(workspace);
+            var normalized = (workspace ?? "").TrimEnd('\\', '/');
+            return Path.GetFileName(normalized);
         }
         catch
         {
             return "";
         }
     }
+
+    private IReadOnlyList<WorkspaceRegistryEntry> BuildWorkspaceRegistry()
+    {
+        var entries = new Dictionary<string, WorkspaceAccumulator>(StringComparer.OrdinalIgnoreCase);
+
+        AddWorkspace(entries, Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), null);
+        foreach (var session in _archive.Store.Sessions.Values)
+            AddWorkspace(entries, session.Workspace, session.Tool);
+
+        return entries.Values
+            .Select(entry => new WorkspaceRegistryEntry(
+                WorkspaceId(entry.Path),
+                entry.Path,
+                WorkspaceDisplayLabel(entry.Path),
+                entry.Tools
+                    .OrderBy(tool => tool, StringComparer.OrdinalIgnoreCase)
+                    .ToList()))
+            .OrderBy(entry => entry.Label, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(entry => entry.Id, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    private static void AddWorkspace(
+        Dictionary<string, WorkspaceAccumulator> entries,
+        string? path,
+        string? tool)
+    {
+        if (string.IsNullOrWhiteSpace(path)) return;
+
+        string normalized;
+        try { normalized = NormalizeWorkspacePath(path); }
+        catch { return; }
+        if (normalized.Length == 0 || !Directory.Exists(normalized)) return;
+
+        if (!entries.TryGetValue(normalized, out var entry))
+        {
+            entry = new WorkspaceAccumulator(normalized);
+            entries[normalized] = entry;
+        }
+
+        var normalizedTool = NormalizeTool(tool);
+        if (normalizedTool.Length > 0) entry.Tools.Add(normalizedTool);
+    }
+
+    private static string NormalizeWorkspacePath(string path)
+    {
+        var full = Path.GetFullPath(path.Trim());
+        var root = Path.GetPathRoot(full);
+        if (!string.IsNullOrEmpty(root)
+            && string.Equals(full, root, StringComparison.OrdinalIgnoreCase))
+            return root;
+        return full.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+    }
+
+    private static string WorkspaceId(string normalizedPath)
+    {
+        var identity = normalizedPath
+            .Replace(Path.AltDirectorySeparatorChar, Path.DirectorySeparatorChar)
+            .ToUpperInvariant();
+        var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(identity))).ToLowerInvariant();
+        return "ws-" + hash;
+    }
+
+    private static string WorkspaceDisplayLabel(string normalizedPath)
+    {
+        try
+        {
+            var withoutTrailingSeparator = normalizedPath.TrimEnd(
+                Path.DirectorySeparatorChar,
+                Path.AltDirectorySeparatorChar);
+            var name = Path.GetFileName(withoutTrailingSeparator);
+            if (string.IsNullOrWhiteSpace(name)) name = "workspace";
+            return SecretRedactor.Scrub(name);
+        }
+        catch
+        {
+            return "workspace";
+        }
+    }
+
+    private sealed class WorkspaceAccumulator(string path)
+    {
+        public string Path { get; } = path;
+        public HashSet<string> Tools { get; } = new(StringComparer.OrdinalIgnoreCase);
+    }
+
+    private sealed record WorkspaceRegistryEntry(
+        string Id,
+        string Path,
+        string Label,
+        IReadOnlyList<string> Tools);
 
     private sealed record NormalizedQuery(
         string Q,

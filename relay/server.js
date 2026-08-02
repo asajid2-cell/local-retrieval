@@ -1870,6 +1870,7 @@ const COMMAND_REPLAY_POLICY = new Map([
   ['setapptitle', 'idempotent'],
   ['addtocollection', 'idempotent'],
   ['startmux', 'intent-fenced'],
+  ['startchat', 'intent-fenced'],
   ['cleartabhistory', 'idempotent'],
   ['settabcolor', 'idempotent'],
 ]);
@@ -1877,6 +1878,87 @@ let _commands = [];
 function commandIntentId(value) {
   const raw = String(value || '').trim();
   return /^[A-Za-z0-9._-]{1,128}$/.test(raw) ? raw : '';
+}
+const STARTCHAT_ALLOWED_FIELDS = new Set([
+  'type', 'intentId', 'muxName', 'title', 'tool', 'checkpointId', 'workspaceId', 'subfolder',
+  'deckId', 'collectionId', 'collection', 'phrase',
+]);
+const STARTCHAT_MAX_TEXT = 200;
+function startChatString(source, key) {
+  if (!Object.prototype.hasOwnProperty.call(source, key)) return '';
+  if (typeof source[key] !== 'string') return null;
+  return source[key].trim().slice(0, STARTCHAT_MAX_TEXT);
+}
+function startChatIdentity(source, key) {
+  if (!Object.prototype.hasOwnProperty.call(source, key)) return '';
+  if (typeof source[key] !== 'string') return null;
+  const value = source[key].trim();
+  if (!value) return '';
+  if (!opaqueIdentity(value) || value === '.' || value === '..' || /[\\/:]/.test(value)) return null;
+  return value;
+}
+function startChatSubfolder(source) {
+  if (!Object.prototype.hasOwnProperty.call(source, 'subfolder')) return '';
+  if (typeof source.subfolder !== 'string') return null;
+  const value = source.subfolder.trim();
+  if (!value) return '';
+  if (
+    value === '.'
+    || value === '..'
+    || /[\\\/]/.test(value)
+    || /[<>:"|?*\u0000-\u001f]/.test(value)
+    || /[. ]$/.test(value)
+    || /^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?$/i.test(value)
+  ) return null;
+  return value.slice(0, STARTCHAT_MAX_TEXT);
+}
+function normalizeStartChatFields(source) {
+  if (!source || typeof source !== 'object' || Array.isArray(source)) return null;
+  const muxName = Object.prototype.hasOwnProperty.call(source, 'muxName')
+    ? (typeof source.muxName === 'string' ? strictMuxName(source.muxName) : null)
+    : '';
+  const tool = Object.prototype.hasOwnProperty.call(source, 'tool')
+    ? (typeof source.tool === 'string' ? source.tool.trim().toLowerCase() : null)
+    : '';
+  const fields = {
+    intentId: Object.prototype.hasOwnProperty.call(source, 'intentId')
+      ? (typeof source.intentId === 'string' ? commandIntentId(source.intentId) : null)
+      : '',
+    muxName,
+    title: startChatString(source, 'title'),
+    tool,
+    checkpointId: startChatIdentity(source, 'checkpointId'),
+    workspaceId: startChatIdentity(source, 'workspaceId'),
+    subfolder: startChatSubfolder(source),
+    deckId: startChatIdentity(source, 'deckId'),
+    collectionId: startChatIdentity(source, 'collectionId'),
+    collection: startChatString(source, 'collection'),
+    phrase: startChatString(source, 'phrase'),
+  };
+  return Object.values(fields).some(value => value === null) ? null : fields;
+}
+function startChatValidationError(fields) {
+  if (!fields || !fields.intentId) return 'startchat requires a valid intent id';
+  if (!fields.muxName) return 'startchat requires a valid mux session name';
+  if (!fields.deckId) return 'startchat requires a valid deck identity';
+  if (fields.collectionId && fields.collection)
+    return 'startchat collectionId and collection are mutually exclusive';
+  if (fields.checkpointId) {
+    if (fields.tool || fields.workspaceId || fields.subfolder)
+      return 'checkpoint startchat cannot include tool, workspaceId, or subfolder';
+    return '';
+  }
+  if (!['claude', 'codex'].includes(fields.tool))
+    return 'blank startchat requires tool claude or codex';
+  if (!fields.workspaceId) return 'blank startchat requires workspaceId';
+  return '';
+}
+function normalizeStartChatPayload(body) {
+  const unknown = Object.keys(body).find(key => !STARTCHAT_ALLOWED_FIELDS.has(key));
+  if (unknown) return { error: `startchat field is not allowed: ${unknown}` };
+  const fields = normalizeStartChatFields(body);
+  const error = startChatValidationError(fields);
+  return error ? { error } : { fields };
 }
 function stableJson(value) {
   if (Array.isArray(value)) return '[' + value.map(stableJson).join(',') + ']';
@@ -1895,6 +1977,8 @@ function commandFingerprint(command) {
     insert: String(command.insert || ''), collection: String(command.collection || ''),
     collectionId: String(command.collectionId || ''), deckId: String(command.deckId || ''),
     deck: String(command.deck || ''), deckName: String(command.deckName || ''),
+    checkpointId: String(command.checkpointId || ''), workspaceId: String(command.workspaceId || ''),
+    subfolder: String(command.subfolder || ''), phrase: String(command.phrase || ''),
     takeover: !!command.takeover,
   };
   return crypto.createHash('sha256').update(stableJson(payload)).digest('hex');
@@ -1920,6 +2004,7 @@ function commandOutcomeDetail(type, status, onPc = false) {
   }
   const labels = {
     startmux: ['mux session started', 'PC bridge could not start mux session'],
+    startchat: ['chat started', 'PC bridge could not start chat'],
     kill: ['session stopped', 'PC bridge could not stop session'],
     transcript: ['transcript opened', 'PC bridge could not open transcript'],
     transcriptfetch: ['transcript ready to read here', 'PC bridge could not fetch the transcript'],
@@ -1939,10 +2024,17 @@ function commandOutcomeDetail(type, status, onPc = false) {
     const status = ['pending', 'leased', 'done', 'failed'].includes(String(c.status))
       ? String(c.status)
       : 'failed';
+    const type = String(c.type || '');
+    const startChatFields = type === 'startchat'
+      ? normalizeStartChatFields({ ...c, intentId: commandIntentId(c.intentId) || commandIntentId(c.id) })
+      : null;
+    if (type === 'startchat' && startChatValidationError(startChatFields)) return null;
     const command = {
     id: opaqueIdentity(c.id), intentId: commandIntentId(c.intentId) || commandIntentId(c.id),
-    type: String(c.type || ''),
-    replayPolicy: String(c.replayPolicy || COMMAND_REPLAY_POLICY.get(String(c.type || '')) || ''),
+    type,
+    replayPolicy: type === 'startchat'
+      ? COMMAND_REPLAY_POLICY.get(type)
+      : String(c.replayPolicy || COMMAND_REPLAY_POLICY.get(type) || ''),
     sessionId: opaqueIdentity(c.sessionId),
     tool: ['claude', 'codex'].includes(String(c.tool || '').toLowerCase()) ? String(c.tool).toLowerCase() : '',
     pid: Number(c.pid) || 0,
@@ -1953,12 +2045,24 @@ function commandOutcomeDetail(type, status, onPc = false) {
     insert: String(c.insert || ''), collection: String(c.collection || '').slice(0, 200),
     collectionId: String(c.collectionId || '').slice(0, 200), deckId: String(c.deckId || '').slice(0, 200),
     deck: String(c.deck || '').slice(0, 200), deckName: String(c.deckName || '').slice(0, 200),
+    ...(type === 'startchat' ? {
+      checkpointId: startChatFields.checkpointId,
+      workspaceId: startChatFields.workspaceId,
+      subfolder: startChatFields.subfolder,
+      phrase: startChatFields.phrase,
+      title: startChatFields.title,
+      tool: startChatFields.tool,
+      muxName: startChatFields.muxName,
+      collection: startChatFields.collection,
+      collectionId: startChatFields.collectionId,
+      deckId: startChatFields.deckId,
+    } : {}),
     takeover: !!c.takeover,
     principalAuth: principalAuthEnvelope(c.principalAuth),
     ts: Number(c.ts) || 0,
     status,
     detail: commandOutcomeDetail(
-      String(c.type || ''),
+      type,
       status,
       !!c.onPc,
     ),
@@ -1970,11 +2074,13 @@ function commandOutcomeDetail(type, status, onPc = false) {
     leaseExpiresAt: status === 'leased' ? Number(c.leaseExpiresAt) || 0 : 0,
     attempt: Math.max(0, Number(c.attempt) || 0),
   };
-    command.fingerprint = /^[a-f0-9]{64}$/.test(String(c.fingerprint || ''))
+    command.fingerprint = type === 'startchat'
+      ? commandFingerprint(command)
+      : (/^[a-f0-9]{64}$/.test(String(c.fingerprint || ''))
       ? String(c.fingerprint)
-      : commandFingerprint(command);
+      : commandFingerprint(command));
     return command;
-  }).filter(c => c.id && c.intentId);
+  }).filter(c => c && c.id && c.intentId);
 }
 function saveCommands(candidate = _commands) { writeJsonState(COMMANDS_FILE, candidate); }
 function compactCommands(candidate, now = Date.now()) {
@@ -2006,6 +2112,7 @@ function enqueueAppCommand(b) {
   const type = String(b.type || '');
   const replayPolicy = COMMAND_REPLAY_POLICY.get(type) || '';
   if (!replayPolicy) throw new Error('command type has no declared replay policy');
+  const startChatFields = type === 'startchat' ? normalizeStartChatFields(b) : null;
   const cmd = { id, intentId, type, replayPolicy,
                 sessionId: String(b.sessionId || ''), tool: String(b.tool || ''),
                 pid: Number(b.pid) || 0, uploadId: String(b.uploadId || ''), filename: String(b.filename || ''),
@@ -2014,6 +2121,18 @@ function enqueueAppCommand(b) {
                 collection: String(b.collection || '').slice(0, 200), collectionId: String(b.collectionId || '').slice(0, 200),
                 deckId: String(b.deckId || '').slice(0, 200), deck: String(b.deck || '').slice(0, 200),
                 deckName: String(b.deckName || '').slice(0, 200), takeover: !!b.takeover,
+                ...(type === 'startchat' ? {
+                  checkpointId: startChatFields.checkpointId,
+                  workspaceId: startChatFields.workspaceId,
+                  subfolder: startChatFields.subfolder,
+                  phrase: startChatFields.phrase,
+                  title: startChatFields.title,
+                  tool: startChatFields.tool,
+                  muxName: startChatFields.muxName,
+                  collection: startChatFields.collection,
+                  collectionId: startChatFields.collectionId,
+                  deckId: startChatFields.deckId,
+                } : {}),
                 principalAuth: principalAuthEnvelope(b.principalAuth),
                 ts: Date.now(), status: 'pending', detail: '',
                 doneAt: 0, leaseOwner: '', leaseToken: '', leaseExpiresAt: 0, attempt: 0 };
@@ -2060,6 +2179,11 @@ app.post('/api/app-commands', (req, res) => {     // web (owner) enqueues
   const b = req.body || {};
   if (hasForbiddenRemoteField(b)) return res.status(400).json({ error: 'executable commands and local paths are forbidden' });
   if (!COMMAND_REPLAY_POLICY.has(b.type)) return res.status(400).json({ error: 'unsupported command' });
+  if (b.type === 'startchat') {
+    const normalized = normalizeStartChatPayload(b);
+    if (normalized.error) return res.status(400).json({ error: normalized.error });
+    Object.assign(b, normalized.fields);
+  }
   const sessionId = b.sessionId ? opaqueIdentity(b.sessionId) : '';
   const muxName = b.muxName ? strictMuxName(b.muxName) : '';
   const sessionName = b.sessionName ? strictMuxName(b.sessionName) : '';

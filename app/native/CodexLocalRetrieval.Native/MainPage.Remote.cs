@@ -405,7 +405,13 @@ public sealed partial class MainPage
                 var onPc = false;
                 // ONE gate, before any side effect: replay policy AND (for intent-fenced types) a live
                 // lease token + a stable intent id that has not already been delivered.
+                // startchat has the same at-most-once envelope semantics as startmux. Translate only
+                // while the shared protocol gate runs, then restore the real dispatch type.
+                var commandType = c.type;
+                if (string.Equals(c.type, "startchat", StringComparison.OrdinalIgnoreCase))
+                    c.type = "startmux";
                 var admission = _commandIntents.Admit(c.type, c.replayPolicy, c.intentId, c.leaseToken, out var gated);
+                c.type = commandType;
                 if (admission != RemoteCommandAdmission.Execute)
                 {
                     if (admission == RemoteCommandAdmission.Refused)
@@ -485,6 +491,11 @@ public sealed partial class MainPage
                         c.tool ?? "",
                         c.intentId,
                         c.takeover);
+                }
+                else if (string.Equals(c.type, "startchat", StringComparison.OrdinalIgnoreCase))
+                {
+                    res = await StartChatHeadlessFromIntentAsync(c);
+                    added |= res.ok;
                 }
                 else if (string.Equals(c.type, "cleartabhistory", StringComparison.OrdinalIgnoreCase))
                 {
@@ -606,6 +617,10 @@ public sealed partial class MainPage
         public string? deckId { get; set; }
         public string? deck { get; set; }
         public string? deckName { get; set; }
+        public string? checkpointId { get; set; }
+        public string? workspaceId { get; set; }
+        public string? subfolder { get; set; }
+        public string? phrase { get; set; }
         public bool takeover { get; set; }
 
         // transcriptfetch only: the relay mints a scoped, short-lived credential when it queues the
@@ -613,6 +628,165 @@ public sealed partial class MainPage
         // no standing authority to write transcript history, only what a single lease grants it.
         public string? bridgeToken { get; set; }
         public int ttlMs { get; set; }
+    }
+
+    private async Task<(bool ok, string detail)> StartChatHeadlessFromIntentAsync(AppCommand command)
+    {
+        var name = (command.muxName ?? command.sessionName ?? "").Trim();
+        var title = (command.title ?? "").Trim();
+        var tool = (command.tool ?? "").Trim().ToLowerInvariant();
+        var checkpointId = (command.checkpointId ?? "").Trim();
+        var workspaceId = (command.workspaceId ?? "").Trim();
+        var subfolder = (command.subfolder ?? "").Trim();
+        var deckId = (command.deckId ?? "").Trim();
+        var collectionId = (command.collectionId ?? "").Trim();
+        var collectionName = (command.collection ?? "").Trim();
+        var phrase = (command.phrase ?? "").Trim();
+
+        if (name.Length == 0) return (false, "missing mux session name");
+        if (collectionId.Length > 0 && collectionName.Length > 0)
+            return (false, "choose an existing collection or enter a new one, not both");
+        if (deckId.Length == 0 || !_archive.Decks.Any(deck =>
+                string.Equals(deck.Id, deckId, StringComparison.OrdinalIgnoreCase)))
+            return (false, "the selected deck is no longer available");
+
+        ArchiveCollection? targetCollection = null;
+        if (collectionId.Length > 0)
+        {
+            if (!_archive.Store.Collections.TryGetValue(collectionId, out targetCollection)
+                || !string.Equals(
+                    ArchiveService.CollectionDeck(targetCollection),
+                    deckId,
+                    StringComparison.OrdinalIgnoreCase))
+                return (false, "the selected collection is no longer available in that deck");
+        }
+
+        if (checkpointId.Length > 0)
+        {
+            if (tool.Length > 0 || workspaceId.Length > 0 || subfolder.Length > 0)
+                return (false, "checkpoint starts take their tool and workspace from the checkpoint");
+            if (!_archive.Store.TemplateSnapshots.TryGetValue(checkpointId, out var checkpoint))
+                return (false, "the selected checkpoint is no longer available");
+
+            var spawned = await _archive.SpawnTemplateAsync(checkpoint);
+            if (!spawned.Ok || spawned.Branch is null) return (false, spawned.Message);
+            var branch = spawned.Branch;
+
+            await _archive.RenameSessionAsync(
+                branch,
+                title.Length > 0 ? title : checkpoint.SourceTitle);
+            if (phrase.Length > 0)
+                await _archive.SetSpecialPhrasesAsync(branch, new[] { phrase });
+            if (targetCollection is not null)
+                await _archive.AddToCollectionByIdAsync(branch, targetCollection.Id);
+            else if (collectionName.Length > 0)
+                await _archive.AddToCollectionAsync(branch, collectionName, deckId);
+
+            var started = await StartMuxHeadlessFromIntentAsync(
+                name,
+                branch.Id,
+                branch.Tool,
+                command.intentId);
+            return started;
+        }
+
+        if (tool is not ("claude" or "codex"))
+            return (false, "tool must be claude or codex");
+        if (workspaceId.Length == 0)
+            return (false, "select a workspace");
+        if (!new DiscoveryApi(_archive).TryResolveWorkspace(workspaceId, out var cwd))
+            return (false, "the selected workspace is no longer available");
+        if (!TryResolveStartSubfolder(cwd, subfolder, out cwd, out var folderError))
+            return (false, folderError);
+        if (collectionName.Length > 0)
+            targetCollection = await _archive.CreateCollectionAsync(collectionName, deckId);
+
+        var pendingIntentId = "";
+        try
+        {
+            pendingIntentId = await _archive.QueuePendingNewChatAsync(
+                tool,
+                cwd,
+                targetCollection?.Id ?? "",
+                title,
+                phrase);
+            if (pendingIntentId.Length == 0)
+                return (false, "the new-chat filing intent could not be persisted");
+
+            var launchCommand = _archive.BuildMultiplexStartCommand(tool, cwd);
+            if (launchCommand.Length == 0)
+            {
+                await _archive.CancelPendingNewChatAsync(pendingIntentId);
+                return (false, $"the {tool} CLI was not found at a trusted path");
+            }
+
+            var started = await StartMuxHeadlessCommandFromIntentAsync(
+                new SessionLaunchRequest(
+                    null,
+                    null,
+                    tool,
+                    "native",
+                    $"headless fresh mux start ({name})",
+                    "start.refused.remote-command",
+                    "start.started.remote-command",
+                    "start.failed.remote-command",
+                    name,
+                    cwd,
+                    new Dictionary<string, string> { ["muxName"] = name }),
+                name,
+                launchCommand,
+                null,
+                null,
+                command.intentId);
+            if (!started.ok)
+            {
+                await _archive.CancelPendingNewChatAsync(pendingIntentId);
+                return started;
+            }
+
+            PollFileNewChatAsync(pendingIntentId, targetCollection?.Name ?? "", tool);
+            return (true, "started PC-local mux session: " + name);
+        }
+        catch (Exception ex)
+        {
+            if (pendingIntentId.Length > 0)
+            {
+                try { await _archive.CancelPendingNewChatAsync(pendingIntentId); } catch { }
+            }
+            Diag.Log("Remote start chat failed " + ex);
+            return (false, "start chat failed: " + ex.Message);
+        }
+    }
+
+    private static bool TryResolveStartSubfolder(
+        string baseDirectory,
+        string subfolder,
+        out string workingDirectory,
+        out string detail)
+    {
+        workingDirectory = baseDirectory;
+        detail = "";
+        if (subfolder.Length == 0) return true;
+        if (subfolder is "." or ".."
+            || subfolder.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0
+            || subfolder.Contains(Path.DirectorySeparatorChar)
+            || subfolder.Contains(Path.AltDirectorySeparatorChar)
+            || Path.IsPathRooted(subfolder))
+        {
+            detail = "the new subfolder must be one valid folder name";
+            return false;
+        }
+        try
+        {
+            workingDirectory = Path.Combine(baseDirectory, subfolder);
+            Directory.CreateDirectory(workingDirectory);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            detail = "could not create the selected subfolder: " + ex.Message;
+            return false;
+        }
     }
 
     private async Task<(bool ok, string detail)> StartMuxHeadlessFromIntentAsync(
@@ -664,7 +838,7 @@ public sealed partial class MainPage
             if (transferred.ExitedPids.Count > 0)
                 ClearClaimsAfterVerifiedKill(session, launch.SessionId, launch.Aliases, transferred.ExitedPids, name);
         }
-        var created = await GovernedCreateLocalMuxdSessionAsync(
+        var created = await StartMuxHeadlessCommandFromIntentAsync(
             new SessionLaunchRequest(
                 launch.SessionId,
                 launch.Aliases,
@@ -682,8 +856,7 @@ public sealed partial class MainPage
             launch.SessionId,
             launch.Aliases,
             intentId,
-            relaunch: takeover,
-            allowLocalIntentMint: false);   // polled command: never substitute a locally minted intent
+            relaunch: takeover);
         RecordSessionEvent(
             session,
             created.ok ? "mux.started.remote-command" : "mux.refused.remote-command",
@@ -694,6 +867,27 @@ public sealed partial class MainPage
                 ["muxName"] = name,
                 ["sessionId"] = launch.SessionId
             });
+        return created.ok ? (true, "started PC-local mux session: " + name) : created;
+    }
+
+    private async Task<(bool ok, string detail)> StartMuxHeadlessCommandFromIntentAsync(
+        SessionLaunchRequest request,
+        string name,
+        string command,
+        string? sessionId,
+        IEnumerable<string>? aliases,
+        string intentId,
+        bool relaunch = false)
+    {
+        var created = await GovernedCreateLocalMuxdSessionAsync(
+            request,
+            name,
+            command,
+            sessionId,
+            aliases,
+            intentId: intentId,
+            relaunch: relaunch,
+            allowLocalIntentMint: false);
         return created.ok ? (true, "started PC-local mux session: " + name) : created;
     }
 
