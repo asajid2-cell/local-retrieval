@@ -36,6 +36,15 @@
     var s = state || {};
     if (s.error) return { tone: 'error', text: 'PC archive unavailable: ' + s.error };
     if (s.loading) return { tone: 'loading', text: 'Loading chats from your PC...' };
+    if (s.coverage && s.coverage.complete === false) {
+      return {
+        tone: 'loading',
+        text: s.coverage.message || (
+          'Search is partial: ' + (Number(s.coverage.indexedFiles) || 0)
+          + ' of ' + (Number(s.coverage.totalFiles) || 0) + ' transcript files indexed.'
+        ),
+      };
+    }
     if (!s.total) return { tone: 'online', text: 'PC archive connected. No chats match these filters.' };
     return { tone: 'online', text: 'PC archive connected. ' + s.total + ' matching chat' + (s.total === 1 ? '' : 's') + '.' };
   }
@@ -58,7 +67,7 @@
       },
       rows: [], facets: { tags: [], phrases: [], projects: [], hidden: 0 },
       offset: 0, limit: d.limit || PAGE_SIZE, total: 0, hasMore: false,
-      loading: false, error: '', generation: 0,
+      loading: false, error: '', coverage: null, generation: 0,
     };
 
     async function getJson(path, params) {
@@ -91,6 +100,7 @@
         state.limit = Number(page.limit) || state.limit;
         state.total = Number(page.total) || 0;
         state.hasMore = page.hasMore === true;
+        state.coverage = page.coverage || facets.coverage || null;
         state.facets = {
           tags: Array.isArray(facets.tags) ? facets.tags : [],
           phrases: Array.isArray(facets.phrases) ? facets.phrases : [],
@@ -102,6 +112,7 @@
         state.rows = [];
         state.total = 0;
         state.hasMore = false;
+        state.coverage = null;
         state.error = (error && error.message) || String(error);
       } finally {
         if (generation === state.generation) {
@@ -607,8 +618,15 @@
         titleLine.className = 'titleline';
         var tool = text(doc.createElement('span'), chat.tool || 'chat');
         tool.className = 'tool';
-        var title = text(doc.createElement('span'), chat.title || chat.id);
+        var title = text(
+          doc.createElement(chat.navigable === false ? 'span' : 'a'),
+          chat.title || chat.id,
+        );
         title.className = 'title';
+        if (chat.navigable !== false) {
+          title.href = './reader.html?session=' + encodeURIComponent(chat.id)
+            + '&title=' + encodeURIComponent(chat.title || chat.id);
+        }
         titleLine.appendChild(tool);
         titleLine.appendChild(title);
         if (chat.pinned) {
@@ -622,6 +640,11 @@
         meta.className = 'meta';
         text(meta, [chat.workspaceLabel, formatDate(chat.updatedAt), (Number(chat.userMsgCount) || 0) + ' your messages'].filter(Boolean).join(' - '));
         main.appendChild(meta);
+        if (chat.snippet) {
+          var snippet = text(doc.createElement('p'), chat.snippet);
+          snippet.className = 'snippet';
+          main.appendChild(snippet);
+        }
 
         var rowChips = doc.createElement('div');
         rowChips.className = 'rowchips';

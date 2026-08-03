@@ -22,7 +22,6 @@ internal sealed class StoreGenerationConflictException(long expected, long actua
 public sealed partial class ArchiveService
 {
     private const int CurrentIndexVersion = 17; // bump on any parser change to force a full re-parse
-    private const int MaxIndexedFiles = 4000;
     // The reader keeps the MOST RECENT messages (not the oldest), so a long chat opens on its latest
     // turns. The first prompt is still captured for the title before this window is applied.
     private const int RecentMessageWindow = 600;
@@ -178,6 +177,20 @@ public sealed partial class ArchiveService
     private readonly ConditionalWeakTable<ArchiveSession, SemaphoreSlim> _contentLoadGates = new();
     private readonly Func<string, string, Task<ArchiveSession?>>? _parseSessionOverride;
     private long _loadedGeneration;
+    private readonly TranscriptSearchIndex? _transcriptSearchIndex;
+    private readonly bool _transcriptSearchEnabled;
+    private readonly object _transcriptSearchTaskGate = new();
+    private Task<TranscriptSearchSyncResult>? _transcriptSearchBuildTask;
+    private SearchCoverage _lastSearchCoverage = new(
+        false,
+        0,
+        0,
+        0,
+        0,
+        false,
+        "Transcript search index has not started.");
+    private IReadOnlyDictionary<string, ArchiveSearchHit> _lastSearchHits =
+        new Dictionary<string, ArchiveSearchHit>(StringComparer.OrdinalIgnoreCase);
 
     public AppStoreData Store { get; private set; } = new();
     public ObservableCollection<ArchiveSession> Sessions { get; } = new();
@@ -189,7 +202,9 @@ public sealed partial class ArchiveService
         string? claudeSessionsRoot = null,
         string? codexStateDbPath = null,
         string? templatesRoot = null,
-        Func<ArchiveSession, string, string, bool>? codexThreadRegistrar = null)
+        Func<ArchiveSession, string, string, bool>? codexThreadRegistrar = null,
+        string? transcriptSearchIndexPath = null,
+        bool? enableTranscriptSearchIndex = null)
     {
         _rootPath = FindProjectRoot();
         _bundledStorePath = Path.Combine(_rootPath, "data", "app-store.json");
@@ -207,6 +222,14 @@ public sealed partial class ArchiveService
             "state_5.sqlite");
         _templatesRoot = templatesRoot ?? Path.Combine(Path.GetDirectoryName(_storePath)!, "templates");
         _codexThreadRegistrar = codexThreadRegistrar ?? RegisterCodexThread;
+        _transcriptSearchEnabled = enableTranscriptSearchIndex
+            ?? (!useBundledStore && storePath is null);
+        if (_transcriptSearchEnabled)
+        {
+            _transcriptSearchIndex = new TranscriptSearchIndex(
+                transcriptSearchIndexPath
+                ?? Path.Combine(Path.GetDirectoryName(_storePath)!, "search-index.sqlite"));
+        }
     }
 
     internal ArchiveService(
@@ -225,6 +248,87 @@ public sealed partial class ArchiveService
         await BackfillTemplateSnapshotMetadataAsync();
         RefreshTemplateSnapshotCounts();
         RefreshSessions(OrderedVisibleSessions(Store.Sessions.Values));
+        StartTranscriptSearchIndexBuild();
+    }
+
+    public TranscriptSearchIndexStatus TranscriptSearchStatus =>
+        _transcriptSearchIndex?.Status
+        ?? new TranscriptSearchIndexStatus(
+            false,
+            false,
+            0,
+            0,
+            0,
+            0,
+            "",
+            "Transcript search index is disabled.",
+            DateTimeOffset.UtcNow);
+
+    public SearchCoverage LastSearchCoverage => _lastSearchCoverage;
+
+    public ArchiveSearchHit? LastSearchHit(string sessionId) =>
+        _lastSearchHits.TryGetValue(sessionId, out var hit) ? hit : null;
+
+    public string TranscriptSearchDatabasePath =>
+        _transcriptSearchIndex?.DatabasePath ?? "";
+
+    public Task<TranscriptSearchSyncResult> WaitForTranscriptSearchIndexAsync(
+        CancellationToken cancellationToken = default)
+    {
+        if (_transcriptSearchIndex is null)
+            return Task.FromResult(new TranscriptSearchSyncResult(
+                0,
+                0,
+                0,
+                0,
+                0,
+                TimeSpan.Zero));
+        StartTranscriptSearchIndexBuild(cancellationToken);
+        lock (_transcriptSearchTaskGate)
+            return _transcriptSearchBuildTask!;
+    }
+
+    public async Task<TranscriptSearchSyncResult> SyncTranscriptSearchIndexAsync(
+        IProgress<TranscriptSearchIndexStatus>? progress = null,
+        CancellationToken cancellationToken = default)
+    {
+        if (_transcriptSearchIndex is null)
+            return new TranscriptSearchSyncResult(0, 0, 0, 0, 0, TimeSpan.Zero);
+        var sessions = Store.Sessions.Values.ToList();
+        var sources = EffectiveSources().Select(source => new SessionSource
+        {
+            Tool = source.Tool,
+            Root = source.Root,
+            Enabled = source.Enabled,
+        }).ToList();
+        return await _transcriptSearchIndex.SyncAsync(
+            sessions,
+            sources,
+            progress,
+            cancellationToken).ConfigureAwait(false);
+    }
+
+    private void StartTranscriptSearchIndexBuild(
+        CancellationToken cancellationToken = default)
+    {
+        if (_transcriptSearchIndex is null) return;
+        lock (_transcriptSearchTaskGate)
+        {
+            if (_transcriptSearchBuildTask is { IsCompleted: false }) return;
+            _transcriptSearchBuildTask = Task.Run(
+                () => SyncTranscriptSearchIndexAsync(
+                    progress: null,
+                    cancellationToken),
+                cancellationToken);
+            _ = _transcriptSearchBuildTask.ContinueWith(
+                task =>
+                {
+                    _ = task.Exception;
+                },
+                CancellationToken.None,
+                TaskContinuationOptions.OnlyOnFaulted,
+                TaskScheduler.Default);
+        }
     }
 
     internal async Task LoadStoreStateAsync()
@@ -813,6 +917,17 @@ public sealed partial class ArchiveService
 
     public IReadOnlyList<ArchiveSession> Search(string query)
     {
+        if (!_transcriptSearchEnabled
+            || string.IsNullOrWhiteSpace(query)
+            || IsBracketPhraseQuery(query))
+            return SearchLegacy(query);
+
+        var result = UnifiedSearchAsync(query, 1000).GetAwaiter().GetResult();
+        return result.Hits.Select(hit => hit.Session).ToList();
+    }
+
+    private IReadOnlyList<ArchiveSession> SearchLegacy(string query)
+    {
         if (string.IsNullOrWhiteSpace(query))
         {
             return OrderedVisibleSessions(Store.Sessions.Values).ToList();
@@ -841,6 +956,100 @@ public sealed partial class ArchiveService
             .ThenByDescending(session => session.Pinned)
             .ThenByDescending(session => session.UpdatedAt)
             .ToList();
+    }
+
+    private static bool IsBracketPhraseQuery(string query)
+    {
+        var value = (query ?? "").Trim();
+        return value.Length >= 3 && value[0] == '[' && value[^1] == ']';
+    }
+
+    public async Task<UnifiedSearchResult> UnifiedSearchAsync(
+        string query,
+        int limit = 80,
+        CancellationToken cancellationToken = default)
+    {
+        limit = Math.Clamp(limit, 1, 1000);
+        if (string.IsNullOrWhiteSpace(query))
+        {
+            var recent = OrderedVisibleSessions(Store.Sessions.Values)
+                .Take(limit)
+                .Select(session => new ArchiveSearchHit
+                {
+                    Session = session,
+                    Message = session.Messages.LastOrDefault(),
+                    SourceLabel = "recent chat",
+                    Snippet = MakeSnippet(
+                        session.Messages.LastOrDefault()?.Text ?? session.Text,
+                        []),
+                    Score = session.Pinned ? 5 : 0,
+                    Navigable = !string.IsNullOrWhiteSpace(session.SourcePath)
+                        && File.Exists(session.SourcePath),
+                })
+                .ToList();
+            var complete = new SearchCoverage(
+                true,
+                Store.Sessions.Count,
+                Store.Sessions.Count,
+                0,
+                0,
+                true,
+                $"Listed {Store.Sessions.Count:N0} known chats.");
+            _lastSearchCoverage = complete;
+            _lastSearchHits = recent.ToDictionary(
+                hit => hit.Session.Id,
+                StringComparer.OrdinalIgnoreCase);
+            return new UnifiedSearchResult(recent, complete);
+        }
+
+        if (IsBracketPhraseQuery(query) || _transcriptSearchIndex is null)
+        {
+            var legacy = DeepSearchLegacy(query, limit);
+            var coverage = new SearchCoverage(
+                false,
+                0,
+                Store.Sessions.Count,
+                0,
+                0,
+                false,
+                "Transcript search index is unavailable; results use cached metadata and text only.");
+            _lastSearchCoverage = coverage;
+            _lastSearchHits = legacy.ToDictionary(
+                hit => hit.Session.Id,
+                StringComparer.OrdinalIgnoreCase);
+            return new UnifiedSearchResult(legacy, coverage);
+        }
+
+        var indexed = await _transcriptSearchIndex.SearchAsync(
+            query,
+            Math.Max(limit, 100),
+            id => Store.Sessions.TryGetValue(id, out var session) ? session : null,
+            cancellationToken).ConfigureAwait(false);
+        var bySession = indexed.Hits.ToDictionary(
+            hit => hit.Session.Id,
+            StringComparer.OrdinalIgnoreCase);
+        foreach (var metadataHit in DeepSearchLegacy(query, Math.Max(limit, 100)))
+        {
+            if (bySession.TryGetValue(metadataHit.Session.Id, out var contentHit))
+            {
+                contentHit.Score += Math.Max(0, metadataHit.Score);
+                if (contentHit.SourceLabel.Length == 0)
+                    contentHit.SourceLabel = metadataHit.SourceLabel;
+                continue;
+            }
+            bySession[metadataHit.Session.Id] = metadataHit;
+        }
+        var hits = bySession.Values
+            .OrderByDescending(hit => hit.Score)
+            .ThenByDescending(hit => hit.Session.Pinned)
+            .ThenByDescending(hit => hit.Session.UpdatedAt, StringComparer.Ordinal)
+            .Take(limit)
+            .ToList();
+        _lastSearchCoverage = indexed.Coverage;
+        _lastSearchHits = hits.ToDictionary(
+            hit => hit.Session.Id,
+            StringComparer.OrdinalIgnoreCase);
+        return new UnifiedSearchResult(hits, indexed.Coverage);
     }
 
     // FUZZY full-content search: scan the actual transcript FILES for how many of a pasted turn's distinctive
@@ -935,6 +1144,9 @@ public sealed partial class ArchiveService
     // substring is primary; long tokens also match close (typo'd) words on smaller files. Parallel + bounded.
     public async Task<IReadOnlyList<ArchiveSearchHit>> DeepSearchContentAsync(string query, int limit = 300)
     {
+        if (_transcriptSearchEnabled)
+            return (await UnifiedSearchAsync(query, limit).ConfigureAwait(false)).Hits;
+
         var tokens = ContentQueryTokens(query);
         if (tokens.Count == 0) return Array.Empty<ArchiveSearchHit>();
         var phrase = Regex.Replace((query ?? "").Trim().ToLowerInvariant(), "\\s+", " ");
@@ -1195,6 +1407,13 @@ public sealed partial class ArchiveService
             .Select(m => m.Value).Distinct().Take(16).ToList();
 
     public IReadOnlyList<ArchiveSearchHit> DeepSearch(string query, int limit = 80)
+    {
+        if (_transcriptSearchEnabled)
+            return UnifiedSearchAsync(query, limit).GetAwaiter().GetResult().Hits;
+        return DeepSearchLegacy(query, limit);
+    }
+
+    private IReadOnlyList<ArchiveSearchHit> DeepSearchLegacy(string query, int limit = 80)
     {
         var visible = Store.Sessions.Values.Where(session => !session.Archived);
         if (string.IsNullOrWhiteSpace(query))
@@ -1820,7 +2039,9 @@ public sealed partial class ArchiveService
     // Narrow by-id operations for the co-pilot tools. App metadata only — these never write the
     // canonical agent store and never touch source .jsonl files.
     public ArchiveSession? GetSession(string sessionId) =>
-        Store.Sessions.TryGetValue(sessionId, out var session) ? session : null;
+        Store.Sessions.TryGetValue(sessionId, out var session)
+            ? session
+            : _transcriptSearchIndex?.TryGetSession(sessionId);
 
     public async Task<bool> SetFavoriteAsync(string sessionId, bool favorite)
     {
@@ -3275,7 +3496,6 @@ public sealed partial class ArchiveService
         }
         var newestFiles = files
             .OrderByDescending(entry => entry.LastWriteUtc)
-            .Take(MaxIndexedFiles)
             .ToList();
         var parsed = new List<ArchiveSession>();
         var stamps = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -3576,6 +3796,7 @@ public sealed partial class ArchiveService
         RefreshTemplateSnapshotCounts();
         await SaveAsync();
         if (refreshList) ReapplyList();
+        StartTranscriptSearchIndexBuild();
         return scan.Disk.Count + recovered;
     }
 

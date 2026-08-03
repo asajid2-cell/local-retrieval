@@ -59,9 +59,19 @@ public sealed class ArchiveToolService
                 workspace = SecretRedactor.Scrub(h.Session.WorkspaceName),
                 tool = h.Session.Tool,
                 updatedAt = h.Session.UpdatedAt,
-                snippet = SecretRedactor.Scrub(Cap(h.Snippet, 240))
+                snippet = SecretRedactor.Scrub(Cap(h.Snippet, 240)),
+                matchOffset = h.ByteOffset,
+                matchLength = h.ByteLength,
+                provenance = h.Provenance,
+                navigable = h.Navigable
             }).ToList();
-            return new { query, count = results.Count, results };
+            return new
+            {
+                query,
+                count = results.Count,
+                results,
+                coverage = _archive.LastSearchCoverage
+            };
         });
 
     private ChatTool ReadChat() => ReadAsync("read_chat",

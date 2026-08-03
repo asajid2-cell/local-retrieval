@@ -31,7 +31,12 @@ public sealed record DiscoveryChatRow(
     int UserMsgCount,
     bool Pinned,
     bool Resumable,
-    string MuxName);
+    string MuxName,
+    string Snippet = "",
+    long MatchOffset = 0,
+    long MatchLength = 0,
+    string MatchProvenance = "",
+    bool Navigable = true);
 
 public sealed record DiscoveryPage(
     string Query,
@@ -39,7 +44,8 @@ public sealed record DiscoveryPage(
     int Limit,
     int Total,
     bool HasMore,
-    IReadOnlyList<DiscoveryChatRow> Rows);
+    IReadOnlyList<DiscoveryChatRow> Rows,
+    SearchCoverage? Coverage = null);
 
 public sealed record DiscoveryFacet(string Value, int Count);
 public sealed record DiscoveryProjectFacet(string Id, string Label, int Count);
@@ -48,7 +54,8 @@ public sealed record DiscoveryFacets(
     int Hidden,
     IReadOnlyList<DiscoveryFacet> Tags,
     IReadOnlyList<DiscoveryFacet> Phrases,
-    IReadOnlyList<DiscoveryProjectFacet> Projects);
+    IReadOnlyList<DiscoveryProjectFacet> Projects,
+    SearchCoverage? Coverage = null);
 
 public sealed record StartDeckRow(string Id, string Label);
 public sealed record StartDeckProjection(string ActiveDeckId, IReadOnlyList<StartDeckRow> Rows);
@@ -107,7 +114,8 @@ public sealed class DiscoveryApi
             normalized.Limit,
             total,
             normalized.Offset + rows.Count < total,
-            rows);
+            rows,
+            _archive.LastSearchCoverage);
     }
 
     public DiscoveryFacets Facets(DiscoveryQuery? query = null)
@@ -134,7 +142,8 @@ public sealed class DiscoveryApi
             _archive.HiddenChatCount(),
             tags,
             phrases,
-            projects);
+            projects,
+            _archive.LastSearchCoverage);
     }
 
     public StartDeckProjection StartDecks()
@@ -232,24 +241,33 @@ public sealed class DiscoveryApi
         return StableOrder(filtered, query);
     }
 
-    private DiscoveryChatRow ToRow(ArchiveSession session, string sort) => new(
-        session.Id,
-        SecretRedactor.Scrub(RowTitle(session, sort)),
-        NormalizeTool(session.Tool),
-        SecretRedactor.Scrub(WorkspaceLabel(session)),
-        session.UpdatedAt,
-        ArchiveService.UserTags(session)
-            .OrderBy(tag => tag, StringComparer.OrdinalIgnoreCase)
-            .ToList(),
-        session.SpecialPhrases
-            .Where(phrase => !string.IsNullOrWhiteSpace(phrase))
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .OrderBy(phrase => phrase, StringComparer.OrdinalIgnoreCase)
-            .ToList(),
-        session.UserMessageCount,
-        session.Pinned,
-        _isResumable(session),
-        ArchiveService.MultiplexSessionName(session));
+    private DiscoveryChatRow ToRow(ArchiveSession session, string sort)
+    {
+        var hit = _archive.LastSearchHit(session.Id);
+        return new DiscoveryChatRow(
+            session.Id,
+            SecretRedactor.Scrub(RowTitle(session, sort)),
+            NormalizeTool(session.Tool),
+            SecretRedactor.Scrub(WorkspaceLabel(session)),
+            session.UpdatedAt,
+            ArchiveService.UserTags(session)
+                .OrderBy(tag => tag, StringComparer.OrdinalIgnoreCase)
+                .ToList(),
+            session.SpecialPhrases
+                .Where(phrase => !string.IsNullOrWhiteSpace(phrase))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .OrderBy(phrase => phrase, StringComparer.OrdinalIgnoreCase)
+                .ToList(),
+            session.UserMessageCount,
+            session.Pinned,
+            _isResumable(session),
+            ArchiveService.MultiplexSessionName(session),
+            SecretRedactor.Scrub(hit?.Snippet ?? ""),
+            hit?.ByteOffset ?? 0,
+            hit?.ByteLength ?? 0,
+            hit?.Provenance ?? "",
+            hit?.Navigable ?? File.Exists(session.SourcePath));
+    }
 
     private static string RowTitle(ArchiveSession session, string sort) => sort switch
     {

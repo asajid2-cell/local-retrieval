@@ -68,9 +68,19 @@ public sealed class RemoteApi
             tool = h.Session.Tool,
             pinned = h.Session.Pinned,
             updatedAt = h.Session.UpdatedAt,
-            snippet = SecretRedactor.Scrub(Cap(h.Snippet, 240))
+            snippet = SecretRedactor.Scrub(Cap(h.Snippet, 240)),
+            matchOffset = h.ByteOffset,
+            matchLength = h.ByteLength,
+            provenance = h.Provenance,
+            navigable = h.Navigable
         }).ToList();
-        return new { query = q ?? "", count = results.Count, results };
+        return new
+        {
+            query = q ?? "",
+            count = results.Count,
+            results,
+            coverage = _archive.LastSearchCoverage
+        };
     }
 
     public object? Read(string id, int page, int pageSize)

@@ -775,4 +775,12 @@ public sealed class ArchiveSearchHit
     public string MatchedTerms { get; set; } = "";
 
     public int Score { get; set; }
+
+    public long ByteOffset { get; set; }
+
+    public long ByteLength { get; set; }
+
+    public string Provenance { get; set; } = "";
+
+    public bool Navigable { get; set; }
 }
