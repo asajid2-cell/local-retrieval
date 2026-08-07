@@ -1,4 +1,6 @@
+using System.Security.AccessControl;
 using System.Security.Cryptography;
+using System.Security.Principal;
 using System.Text;
 using CodexLocalRetrieval.Core.Remote;
 
@@ -117,5 +119,47 @@ public sealed class CommandSignerTests
         var (c2, n2, t2, sig2) = Sign(Key, "edge-out", nonce: "n-out");
         Assert.IsFalse(s.Verify(c2, n2, t2, sig2, t2 + 121_000, out var why)); // 121s later: outside
         StringAssert.Contains(why, "stale");
+    }
+
+    [TestMethod]
+    public void LoadOrCreate_DoesNotLogKey_AndProtectsPersistedFile()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "command-signer-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            var path = Path.Combine(dir, "signing.key");
+            var logs = new List<string>();
+            var signer = CommandSigner.LoadOrCreate(null, path, logs.Add);
+
+            Assert.IsTrue(signer.Enabled);
+            var key = File.ReadAllText(path).Trim();
+            Assert.AreEqual(48, key.Length);
+            Assert.IsFalse(logs.Any(line => line.Contains(key, StringComparison.Ordinal)));
+
+            if (OperatingSystem.IsWindows())
+            {
+                var acl = new FileInfo(path).GetAccessControl();
+                Assert.IsTrue(acl.AreAccessRulesProtected);
+                var allowed = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                {
+                    WindowsIdentity.GetCurrent().User!.Value,
+                    new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null).Value,
+                    new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null).Value,
+                };
+                var rules = acl.GetAccessRules(includeExplicit: true, includeInherited: true, typeof(SecurityIdentifier))
+                    .Cast<FileSystemAccessRule>()
+                    .ToArray();
+                Assert.IsGreaterThanOrEqualTo(3, rules.Length);
+                Assert.IsTrue(rules.All(rule =>
+                    !rule.IsInherited
+                    && rule.AccessControlType == AccessControlType.Allow
+                    && allowed.Contains(((SecurityIdentifier)rule.IdentityReference).Value)));
+            }
+        }
+        finally
+        {
+            Directory.Delete(dir, recursive: true);
+        }
     }
 }

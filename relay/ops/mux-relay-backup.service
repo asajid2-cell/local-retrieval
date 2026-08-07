@@ -1,18 +1,24 @@
 [Unit]
 Description=Back up multiplex relay durable state off-box to the PC
-Documentation=file:///home/harmonizer/multiplex-app/ops/README.md
+Documentation=file:///opt/multiplex-app/ops/README.md
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=oneshot
-User=harmonizer
-Group=harmonizer
+User=svc-multiplex
+Group=svc-multiplex
+Environment=HOME=/var/lib/multiplex
+
+# A temporary PC outage or unconfigured service-user SSH route skips this run
+# without turning the oneshot into a failed unit. The deploy wrapper enables the
+# timer only after the same strict probe has succeeded at least once.
+ExecCondition=/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=yes win true
 
 # --verify proves a restore roundtrip against the freshly built archive BEFORE it is
 # sent, so a corrupt or empty backup fails the unit instead of silently replacing a
 # good one on the far side.
-ExecStart=/usr/local/bin/mux-backup-state.sh --state-dir /home/harmonizer/multiplex-app --verify
+ExecStart=/usr/local/bin/mux-backup-state.sh --state-dir /var/lib/multiplex --verify
 
 # The script builds its archive under TMPDIR and refuses to include anything outside
 # its allowlist, so it needs no write access to the relay's state dir.
@@ -24,7 +30,13 @@ PrivateTmp=yes
 NoNewPrivileges=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes
-ReadOnlyPaths=/home/harmonizer/multiplex-app
+ReadOnlyPaths=/var/lib/multiplex
+ProtectHome=yes
+PrivateDevices=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+TasksMax=128
 
 # A failed backup is not an emergency, but it must be visible.
 StandardOutput=journal

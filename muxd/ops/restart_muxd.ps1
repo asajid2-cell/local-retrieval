@@ -1,6 +1,8 @@
 [CmdletBinding()]
 param(
     [switch]$CheckOnly,
+    [switch]$Recovery,
+    [string]$RecoveryToken,
     [int]$TimeoutSeconds = 30
 )
 
@@ -9,6 +11,7 @@ $root = Split-Path -Parent $PSScriptRoot
 $python = "C:\Python311\python.exe"
 $taskName = "MuxdSessionHost"
 $logPath = Join-Path $root "muxd-restart.log"
+$deployFence = Join-Path $root "deploying.flag"
 
 function Write-RestartLog([string]$Message) {
     $line = "{0:yyyy-MM-dd HH:mm:ss} {1}" -f (Get-Date), $Message
@@ -58,14 +61,34 @@ function Wait-ForCondition([scriptblock]$Condition, [string]$Failure) {
     throw $Failure
 }
 
-$sessions = @(Get-HostedSessions)
-$active = @($sessions | Where-Object { @($_.alive) -contains $true })
-if ($active.Count -gt 0) {
-    $names = ($active | ForEach-Object { $_.name }) -join ", "
-    throw "refusing muxd restart while active sessions exist: $names"
+$existingProcesses = @(Get-MuxdProcesses)
+$skipPreflight = $false
+if ($Recovery) {
+    if (-not $RecoveryToken -or -not (Test-Path -LiteralPath $deployFence)) {
+        throw "recovery restart requires the active deployment token"
+    }
+    $fence = (Get-Content -LiteralPath $deployFence -Raw).Trim()
+    if ($fence -ne "recovery:$RecoveryToken") {
+        throw "recovery restart token does not match the active deployment"
+    }
+    $fenceAge = (Get-Date) - (Get-Item -LiteralPath $deployFence).LastWriteTime
+    if ($fenceAge.TotalMinutes -gt 5) {
+        throw "recovery restart token expired"
+    }
+    $skipPreflight = $true
+}
+if (-not $skipPreflight) {
+    $sessions = @(Get-HostedSessions)
+    $active = @($sessions | Where-Object { @($_.alive) -contains $true })
+    if ($active.Count -gt 0) {
+        $names = ($active | ForEach-Object { $_.name }) -join ", "
+        throw "refusing muxd restart while active sessions exist: $names"
+    }
+} else {
+    Write-RestartLog "recovery restart allowed under the active deployment fence"
 }
 
-Write-RestartLog "preflight passed; activeSessions=0 checkOnly=$CheckOnly"
+Write-RestartLog "preflight passed; activeSessions=0 checkOnly=$CheckOnly recovery=$Recovery"
 if ($CheckOnly) {
     return
 }

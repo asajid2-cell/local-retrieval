@@ -39,6 +39,48 @@ class FakeSession:
 
 
 class MuxdStateTests(unittest.TestCase):
+    def test_deployment_fence_is_file_backed_and_dynamic(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fence = os.path.join(temp_dir, "deploying.flag")
+            with mock.patch.object(muxd, "DEPLOY_FENCE", fence):
+                self.assertFalse(muxd.deployment_fenced())
+                with open(fence, "w", encoding="utf-8") as stream:
+                    stream.write("verify")
+                self.assertTrue(muxd.deployment_fenced())
+                os.remove(fence)
+                self.assertFalse(muxd.deployment_fenced())
+
+    def test_adopted_tree_termination_uses_pinned_fenced_muxrun_stop(self):
+        muxrun = importlib.import_module("muxrun")
+        events = []
+        token = f"{1234:016x}"
+
+        class FakeChild:
+            def __init__(self, pid):
+                self.pid = pid
+                events.append(("open", pid))
+
+            def creation_time(self):
+                return 1234
+
+            def close(self):
+                events.append(("close", self.pid))
+
+        with mock.patch.object(muxd, "_same_process_instance", return_value=True), \
+             mock.patch.object(muxrun, "AttachedChild", FakeChild), \
+             mock.patch.object(
+                 muxrun,
+                 "terminate_child_tree",
+                 side_effect=lambda child: events.append(("tree", child.pid)) or True,
+             ):
+            stopped, detail = muxd._terminate_adopted_process_tree(4242, token)
+
+        self.assertTrue(stopped, detail)
+        self.assertEqual(
+            [("open", 4242), ("tree", 4242), ("close", 4242)],
+            events,
+        )
+
     def test_remote_size_ownership_blocks_local_resize_and_release_restores_it(self):
         class SizedSession:
             def __init__(self):
@@ -122,21 +164,25 @@ class MuxdStateTests(unittest.TestCase):
         self.assertEqual([], errors)
 
     def test_scrollback_reconstructs_active_terminal_modes_before_raw_suffix(self):
-        session = muxd.Session(
-            "replay-mode-session",
-            "",
-            r"Z:\tmp",
-            100,
-            30,
-            asyncio.new_event_loop(),
-            asyncio.Queue(),
-            spawn_now=False,
-        )
-        session.replay_state.ingest(b"\x1b[?1049h\x1b[?2004h")
-        session._append_ring(b"CURRENT_TUI_FRAME")
-        replay = session.scrollback()
-        self.assertTrue(replay.startswith(b"\x1b[?1049h\x1b[?2004h"))
-        self.assertTrue(replay.endswith(b"CURRENT_TUI_FRAME"))
+        loop = asyncio.new_event_loop()
+        try:
+            session = muxd.Session(
+                "replay-mode-session",
+                "",
+                r"Z:\tmp",
+                100,
+                30,
+                loop,
+                asyncio.Queue(),
+                spawn_now=False,
+            )
+            session.replay_state.ingest(b"\x1b[?1049h\x1b[?2004h")
+            session._append_ring(b"CURRENT_TUI_FRAME")
+            replay = session.scrollback()
+            self.assertTrue(replay.startswith(b"\x1b[?1049h\x1b[?2004h"))
+            self.assertTrue(replay.endswith(b"CURRENT_TUI_FRAME"))
+        finally:
+            loop.close()
 
     def test_all_pywinpty_spawns_are_inside_the_custody_critical_section(self):
         with open(muxd.__file__, encoding="utf-8") as stream:
@@ -678,8 +724,9 @@ class MuxdStateTests(unittest.TestCase):
         self.assertTrue(q.put_nowait(("o", "a", b"two")))
         self.assertFalse(q.put_nowait(("o", "a", b"three")))
 
-        self.assertEqual(2, q.qsize())
-        self.assertEqual(1, q.dropped)
+        self.assertEqual(1, q.qsize())
+        self.assertEqual(2, q.dropped)
+        self.assertEqual(("resync", "a", b""), q.get_nowait())
 
     def test_manifest_preserves_canonical_and_alias_ids(self):
         class ManifestSession(FakeSession):
@@ -1875,6 +1922,119 @@ class MuxdAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(owner.dead)
         self.assertIsNone(owner._launch_claim)
 
+    def test_visible_owner_stop_surfaces_sidecar_tree_failure(self):
+        class Owner:
+            owner = True
+            owner_exit_confirmed = False
+            owner_stop_error = ""
+            dead = False
+
+            def kill(self, by_user=True):
+                self.user_killed = by_user
+                self.owner_stop_error = "descendant 4343 remained alive"
+
+            @staticmethod
+            def alive():
+                return True
+
+        ok, detail = asyncio.run(
+            muxd.terminate_session_off_loop(Owner(), timeout=1)
+        )
+
+        self.assertFalse(ok)
+        self.assertIn("descendant 4343 remained alive", detail)
+
+    async def test_detached_adopted_stop_removes_only_the_mirror_record(self):
+        class Claim:
+            def __init__(self):
+                self.released = False
+
+            def release(self):
+                self.released = True
+
+        class Adopted:
+            name = "detached-adopted"
+            adopted = True
+            owner = True
+            dead = True
+            child_pid = 4242
+            child_start_token = "same-instance"
+
+            def __init__(self):
+                self._launch_claim = Claim()
+                self.claim_paths = ["adopted.claim.json"]
+
+            @staticmethod
+            def alive():
+                return False
+
+            def kill(self, by_user=True):
+                raise AssertionError("detached adopted stop must not send a kill to a dead owner socket")
+
+        adopted = Adopted()
+        with mock.patch.object(muxd, "_same_process_instance", return_value=True):
+            ok, detail = await muxd.terminate_session_off_loop(adopted, timeout=0.1)
+
+        self.assertTrue(ok, detail)
+        self.assertIn("still running", detail)
+        self.assertTrue(adopted.dead)
+        self.assertTrue(adopted._launch_claim is None)
+
+    async def test_detached_adopted_stop_reports_an_exited_target(self):
+        class Adopted:
+            adopted = True
+            owner = True
+            dead = True
+            child_pid = 4242
+            child_start_token = "stale-instance"
+            _launch_claim = None
+            claim_paths = []
+
+            @staticmethod
+            def alive():
+                return False
+
+        with mock.patch.object(muxd, "_same_process_instance", return_value=False):
+            ok, detail = await muxd.terminate_session_off_loop(Adopted(), timeout=0.1)
+
+        self.assertTrue(ok, detail)
+        self.assertIn("already exited", detail)
+
+    def test_user_stop_is_crash_durable_before_process_termination(self):
+        class Pty:
+            pid = 4242
+
+        class Session:
+            lifecycle = "active"
+            stop_disposition = ""
+            user_killed = False
+            child_pid = 0
+            child_start_token = ""
+            pty = Pty()
+
+        session = Session()
+        with mock.patch.object(muxd, "_process_start_token", return_value="same-instance"):
+            snapshot = muxd.prepare_session_stop(session, by_user=True)
+
+        self.assertFalse(snapshot["user_killed"])
+        self.assertEqual("stopping", session.lifecycle)
+        self.assertEqual("remove", session.stop_disposition)
+        self.assertTrue(session.user_killed)
+        self.assertEqual(4242, session.child_pid)
+        self.assertEqual("same-instance", session.child_start_token)
+        self.assertTrue(muxd.boot_removes_record(session))
+
+    def test_audit_mode_input_error_frame_does_not_require_a_principal(self):
+        frame = muxd.relay_input_error_frame(
+            {"t": "err", "m": "write failed"},
+            "audit-session",
+            {"intentId": "legacy-intent"},
+            principal=None,
+        )
+
+        self.assertEqual("legacy-intent", frame["intentId"])
+        self.assertEqual("audit-session", frame["s"])
+
     async def test_new_session_spawn_runs_off_event_loop(self):
         class SlowSession:
             def __init__(
@@ -2027,6 +2187,218 @@ class CustodyTtlTests(unittest.TestCase):
         legacy = {name: {k: v for k, v in rec.items() if not k.startswith(("lastAlive", "custody"))}
                   for name, rec in payload.items()}
         self.assertTrue(muxd.valid_session_records(legacy))
+
+class AdoptedOwnerTests(unittest.TestCase):
+    def test_adopted_owner_exempts_only_the_exact_live_target_pid(self):
+        ok, ignored, detail = muxd.adopted_owner_ignored_live(
+            ["session-1"],
+            4242,
+            (True, {"session-1": 4242}, ""),
+        )
+        self.assertTrue(ok, detail)
+        self.assertEqual(ignored, {"session-1": 4242})
+
+        ok, _, detail = muxd.adopted_owner_ignored_live(
+            ["session-1"],
+            4242,
+            (True, {"session-1": 4343}, ""),
+        )
+        self.assertFalse(ok)
+        self.assertIn("not adopted target pid", detail)
+
+        ok, _, detail = muxd.adopted_owner_ignored_live(
+            ["session-1"],
+            4242,
+            (True, {}, ""),
+        )
+        self.assertFalse(ok)
+        self.assertIn("could not verify", detail)
+
+    def test_adopted_owner_is_external_non_healable_and_published(self):
+        owner = muxd.OwnerSession(
+            "adopted",
+            "codex resume session-1",
+            tempfile.gettempdir(),
+            100,
+            30,
+            None,
+            None,
+            None,
+            heal=True,
+            session_id="session-1",
+            adopted=True,
+        )
+        owner.child_pid = os.getpid()
+        owner.child_start_token = muxd._process_start_token(os.getpid())
+
+        payload = muxd.session_payload("adopted", owner)
+        records = muxd.session_records_payload({"adopted": owner})
+
+        self.assertTrue(payload["adopted"])
+        self.assertTrue(payload["externalOwner"])
+        self.assertEqual(payload["kind"], "adopted-local")
+        self.assertFalse(payload["heal"])
+        self.assertTrue(records["adopted"]["adopted"])
+        self.assertTrue(records["adopted"]["externalOwner"])
+        self.assertTrue(muxd.valid_session_records(records))
+
+    def test_adopted_owner_reconnect_requires_same_process_instance(self):
+        class Previous:
+            adopted = True
+            owner = True
+            expected_owner = True
+            child_pid = 4242
+            child_start_token = "same-instance"
+
+            @staticmethod
+            def alive():
+                return False
+
+        old_same = muxd._same_process_instance
+        try:
+            muxd._same_process_instance = lambda pid, token: pid == 4242 and token == "same-instance"
+            self.assertTrue(muxd.adopted_owner_reconnect_matches(Previous(), True, 4242))
+            self.assertFalse(muxd.adopted_owner_reconnect_matches(Previous(), True, 4343))
+
+            muxd._same_process_instance = lambda _pid, _token: False
+            self.assertFalse(muxd.adopted_owner_reconnect_matches(Previous(), True, 4242))
+        finally:
+            muxd._same_process_instance = old_same
+
+    def test_adopted_manifest_record_restores_external_non_healable_custody(self):
+        target = {}
+        record = {
+            "adopted": {
+                "cmd": "codex resume session-1",
+                "cwd": tempfile.gettempdir(),
+                "cols": 100,
+                "rows": 30,
+                "heal": True,
+                "sessionId": "session-1",
+                "aliases": [],
+                "ids": ["session-1"],
+                "owner": True,
+                "ownerKey": "k" * 32,
+                "adopted": True,
+                "externalOwner": True,
+                "lifecycle": "dormant",
+                "childPid": 4242,
+                "childStartToken": "process-instance",
+            },
+        }
+
+        restored = muxd.restore_manifest_sessions(record, target=target, loop=None, outq=None)
+
+        self.assertEqual(["adopted"], restored)
+        session = target["adopted"]
+        self.assertTrue(session.adopted)
+        self.assertTrue(session.external_owner)
+        self.assertTrue(session.expected_owner)
+        self.assertFalse(session.heal)
+        self.assertEqual(4242, session.child_pid)
+        self.assertEqual("process-instance", session.child_start_token)
+
+    def test_confirmed_owner_exit_clears_reconnect_custody_before_persistence(self):
+        class Claim:
+            def __init__(self):
+                self.released = False
+
+            def release(self):
+                self.released = True
+
+        owner = muxd.OwnerSession(
+            "finished-owner",
+            "codex resume session-1",
+            tempfile.gettempdir(),
+            100,
+            30,
+            None,
+            None,
+            None,
+            session_id="session-1",
+        )
+        claim = Claim()
+        owner._launch_claim = claim
+        owner.claim_paths = ["owner.claim.json"]
+        owner.child_pid = 4242
+        owner.child_start_token = "process-instance"
+
+        muxd.finalize_confirmed_owner_exit(owner)
+        record = muxd.session_records_payload({"finished-owner": owner})["finished-owner"]
+
+        self.assertTrue(owner.owner_exit_confirmed)
+        self.assertFalse(owner.owner)
+        self.assertFalse(owner.expected_owner)
+        self.assertEqual("", owner.owner_key)
+        self.assertEqual(0, owner.child_pid)
+        self.assertFalse(record["owner"])
+        self.assertEqual("dormant", record["lifecycle"])
+        self.assertTrue(claim.released)
+
+    def test_owner_reconnect_wait_requires_the_recorded_process_instance(self):
+        class Restored:
+            child_pid = 4242
+            child_start_token = "same-instance"
+
+        with mock.patch.object(muxd, "_same_process_instance", return_value=True):
+            self.assertTrue(muxd.owner_reconnect_target_alive(Restored()))
+        with mock.patch.object(muxd, "_same_process_instance", return_value=False):
+            self.assertFalse(muxd.owner_reconnect_target_alive(Restored()))
+
+    def test_disconnected_exited_adopted_owner_is_removed_durably(self):
+        owner = muxd.OwnerSession(
+            "finished-adopted",
+            "codex resume session-1",
+            tempfile.gettempdir(),
+            100,
+            30,
+            None,
+            None,
+            None,
+            session_id="session-1",
+            adopted=True,
+        )
+        owner.child_pid = 4242
+        owner.child_start_token = "gone-instance"
+        sessions = {owner.name: owner}
+
+        async def run():
+            save = mock.AsyncMock()
+            with mock.patch.object(muxd, "_same_process_instance", return_value=False):
+                await muxd.reconcile_owner_disconnect(sessions, owner.name, owner, save)
+                save.assert_awaited_once_with(sessions)
+
+        asyncio.run(run())
+        self.assertNotIn(owner.name, sessions)
+        self.assertTrue(owner.owner_exit_confirmed)
+
+    def test_disconnected_owner_with_failed_tree_stop_keeps_custody(self):
+        owner = muxd.OwnerSession(
+            "failed-stop",
+            "codex resume session-1",
+            tempfile.gettempdir(),
+            100,
+            30,
+            None,
+            None,
+            None,
+            session_id="session-1",
+            adopted=True,
+        )
+        owner.owner_stop_error = "descendant remained alive"
+        sessions = {owner.name: owner}
+
+        async def run():
+            save = mock.AsyncMock()
+            with mock.patch.object(muxd, "_same_process_instance") as same_process:
+                await muxd.reconcile_owner_disconnect(sessions, owner.name, owner, save)
+                same_process.assert_not_called()
+                save.assert_not_awaited()
+
+        asyncio.run(run())
+        self.assertIs(sessions[owner.name], owner)
+        self.assertFalse(owner.owner_exit_confirmed)
+        self.assertEqual("dormant", owner.lifecycle)
 
 
 if __name__ == "__main__":

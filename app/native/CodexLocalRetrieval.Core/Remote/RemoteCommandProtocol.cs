@@ -37,6 +37,7 @@ public static class RemoteCommandProtocol
             "setapptitle" => "idempotent",
             "addtocollection" => "idempotent",
             "startmux" => "intent-fenced",
+            "mirrorlocal" => "intent-fenced",
             "cleartabhistory" => "idempotent",
             "settabcolor" => "idempotent",
             _ => "",
@@ -50,7 +51,7 @@ public static class RemoteCommandProtocol
     // delivery still owns the command) and a stable intent id (redeliveries are recognisable). Neither proves
     // WHO authorised the operation — that is the principal-proof layer, not this one.
     public static bool RequiresIntentEnvelope(string? type)
-        => (type ?? "").Trim().ToLowerInvariant() is "fetchfile" or "startmux";
+        => (type ?? "").Trim().ToLowerInvariant() is "fetchfile" or "startmux" or "mirrorlocal";
 
     // The relay's own canonical form for both ids (relay/server.js commandIntentId): it rejects anything
     // outside this charset before queueing, so a value that fails here never came from an honest lease.

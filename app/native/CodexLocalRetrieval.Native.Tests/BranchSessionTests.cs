@@ -27,6 +27,36 @@ public sealed class BranchSessionTests
         StringAssert.Contains(text, "snapshot-tip");
     }
 
+    // A branch must report the CHECKPOINT it came from, not the source chat's current name.
+    //
+    // Measured on the owner's store: three branches spawned from checkpoint "cleanmusic" carried
+    // cleanmusic's transcript exactly (1310 user messages, tip uuid 1167d9f7) while the app described
+    // them as "branch of iosnmusic-pixel" - the name the SOURCE chat had been renamed to an hour after
+    // the checkpoint was taken. The spawn was correct and the label said it was not, which reads as
+    // having branched from the wrong checkpoint. BranchOfId points at a moving target; FromSnapshotId
+    // does not, and it was already recorded correctly.
+    [TestMethod]
+    public async Task DescribeSession_NamesTheCheckpoint_NotTheRenamedSource()
+    {
+        using var fixture = new TemplateFixture("claude");
+        var snapshot = await fixture.Service.CreateTemplateSnapshotAsync(fixture.Source, "cleanmusic");
+        Assert.IsTrue(snapshot.Ok, snapshot.Message);
+        Assert.IsNotNull(snapshot.Snapshot);
+
+        var spawned = await fixture.Service.SpawnTemplateAsync(snapshot.Snapshot);
+        Assert.IsTrue(spawned.Ok, spawned.Message);
+        Assert.IsNotNull(spawned.Branch);
+
+        // The source chat keeps living and gets renamed - this is what made the old label lie.
+        fixture.Source.CustomTitle = "iosnmusic-pixel";
+
+        var described = fixture.Service.DescribeSession(spawned.Branch);
+        StringAssert.Contains(described, "cleanmusic", "the branch must name the checkpoint it came from");
+        Assert.IsFalse(
+            described.Contains("branch of: \"iosnmusic-pixel\""),
+            "the branch must not be attributed to the source chat's post-checkpoint name: " + described);
+    }
+
     [TestMethod]
     public void RewriteCodexSessionMeta_RewritesIdAndStampsFork()
     {

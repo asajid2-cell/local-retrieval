@@ -303,10 +303,12 @@ function normalizeHostSession(s) {
     cols: clampTermDimension(s.cols, 0, MAX_TERM_COLS),
     rows: clampTermDimension(s.rows, 0, MAX_TERM_ROWS),
     heal: !!s.heal, owner: !!s.owner,
+    adopted: !!s.adopted, externalOwner: !!s.externalOwner,
     localFirst: !!s.localFirst, localViewers: s.localViewers || 0,
     hasCommand, shellOnly, ready: Object.prototype.hasOwnProperty.call(s, 'ready') ? !!s.ready : alive,
     kind: String(s.kind || (alive ? (shellOnly ? 'shell' : 'command') : 'dormant')),
     sessionId, aliases, identityPending: !!s.identityPending,
+    childPid: Number.isSafeInteger(Number(s.childPid)) && Number(s.childPid) > 0 ? Number(s.childPid) : 0,
     agentState: String(s.agentState || ''), agentLabel: String(s.agentLabel || ''),
     agentDetail: String(s.agentDetail || ''), agentConfidence: String(s.agentConfidence || ''),
     // OS-verified process truth (muxd cap "agentTruth"). Additive on protocol 4: a host that does not
@@ -813,6 +815,7 @@ function listSessions() {
                   healEligible: !!attn.healEligible,
                   autoheal: !!h.heal, hosted: true,
                   alive, dormant, detachedLocal, cols: h.cols || 0, rows: h.rows || 0,
+                  adopted: !!h.adopted, externalOwner: !!h.externalOwner,
                   hasCommand: !!h.hasCommand, shellOnly: !!h.shellOnly, ready: !!h.ready,
                   kind: h.kind || (dormant ? 'dormant' : (h.shellOnly ? 'shell' : 'command')),
                   sessionId: String(chat && chat.id || h.sessionId || ''), aliases: Array.isArray(h.aliases) ? h.aliases : [],
@@ -824,7 +827,8 @@ function listSessions() {
                   tabColor: tabMetaFor(name).color, tabKind: tabMetaFor(name).kind,   // per-tab tint + "remote-resumed"
                   tabHistory: tabHistoryFor(name),   // past chats this tab has hosted â†’ relaunch-picker + add-historical-to-collection
                   localViewers: h.localViewers || 0, localFirst: !!h.localFirst,
-                  detail: detachedLocal ? 'Local agent process is still running, but the muxd mirror is detached. New muxrun sessions re-register automatically; restart this one through mux to restore web terminal control.'
+                  detail: detachedLocal && h.adopted ? 'The local agent is still running, but its mirror sidecar is detached. Mirror the local session again to restore web terminal control.'
+                         : detachedLocal ? 'Local agent process is still running, but the muxd mirror is detached. New muxrun sessions re-register automatically; restart this one through mux to restore web terminal control.'
                          : dormant ? 'Dormant mux session: no shell or agent is running until you relaunch it or run mux locally.' : '',
                   hostProtocol: hostProtocol.protocol || 0, hostProtocolOk: protocolOk,
                   hostProtocolDetail: protocolOk ? '' : hostProtocolDetail(),
@@ -1202,13 +1206,21 @@ app.delete('/api/sessions/:name', withMutationIntent('session.kill', req => ({
   const name = strictMuxName(req.params.name);
   if (!name) return res.status(400).json({ error: 'invalid session name' });
   if (tmuxHas(name)) return failLegacy(res, name);
+  const hosted = hostSessions.get(name);
+  const detachedAdopted = !!(hosted && hosted.adopted && hosted.alive === false
+    && locallyRunningMuxName(name));
   if (hostedHas(name)) {
     if (!requireHostProtocol(res, 'refusing to kill a hosted session')) return;
     if (!sendHost({ t: 'kill', s: name })) return failHost(res, 503, 'PC mux host offline', 'host socket closed before kill could be sent');
     const confirmed = await waitForHostState(() => !hostSessions.has(name), 6000);
     if (!confirmed.ok) return failHost(res, 504, 'muxd kill not confirmed', confirmed.error);
   }
-  res.json({ ok: true });
+  res.json({
+    ok: true,
+    detail: detachedAdopted
+      ? 'Adopted mirror removed; the local terminal and its agent are still running.'
+      : 'Session ended.',
+  });
 }));
 
 // PER-TAB auto-resume toggle. muxd persists and enforces the policy locally.
@@ -1559,6 +1571,29 @@ function ensureNoLocalOwnerForMuxName(name, sessionId = '') {
   if (!found) return { ok: true, stopped: false };
   return localOwnerRefusal(name, found.chat, found.run);
 }
+function verifyMirrorTarget(name, sessionId, pid, tool) {
+  if (!runningVerified())
+    return { ok: false, detail: 'could not verify local running sessions'
+        + (_projects.runningVerificationDetail ? ` (${_projects.runningVerificationDetail})` : '') };
+  const running = Array.isArray(_projects.runningSessions) ? _projects.runningSessions : [];
+  const row = running.find(item => Number(item && item.pid || 0) === Number(pid));
+  if (!row) return { ok: false, detail: `pid ${pid} is no longer a live local agent` };
+  if (String(row.sessionId || '').toLowerCase() !== String(sessionId || '').toLowerCase())
+    return { ok: false, detail: `pid ${pid} does not own session ${sessionId}` };
+  if (String(row.tool || '').toLowerCase() !== String(tool || '').toLowerCase())
+    return { ok: false, detail: `pid ${pid} is ${row.tool || 'an unknown tool'}, not ${tool}` };
+  const hosted = hostSessions.get(strictMuxName(name));
+  if (hosted && hosted.alive !== false) {
+    const ids = [hosted.sessionId, ...(Array.isArray(hosted.aliases) ? hosted.aliases : [])]
+      .filter(Boolean).map(value => String(value).toLowerCase());
+    if (hosted.adopted && hosted.externalOwner
+        && Number(hosted.childPid || 0) === Number(pid)
+        && ids.includes(String(sessionId).toLowerCase()))
+      return { ok: true, alreadyMirrored: true };
+    return { ok: false, detail: `mux session ${name} is already owned by a different live terminal` };
+  }
+  return { ok: true, alreadyMirrored: false };
+}
 function localOwnerRefusal(name, chat, run) {
   chat = chat || {};
   run = run || {};
@@ -1880,6 +1915,7 @@ const COMMAND_REPLAY_POLICY = new Map([
   ['setapptitle', 'idempotent'],
   ['addtocollection', 'idempotent'],
   ['startmux', 'intent-fenced'],
+  ['mirrorlocal', 'intent-fenced'],
   ['startchat', 'intent-fenced'],
   ['cleartabhistory', 'idempotent'],
   ['settabcolor', 'idempotent'],
@@ -2014,6 +2050,7 @@ function commandOutcomeDetail(type, status, onPc = false) {
   }
   const labels = {
     startmux: ['mux session started', 'PC bridge could not start mux session'],
+    mirrorlocal: ['local terminal mirrored', 'PC bridge could not mirror local terminal'],
     startchat: ['chat started', 'PC bridge could not start chat'],
     kill: ['session stopped', 'PC bridge could not stop session'],
     transcript: ['transcript opened', 'PC bridge could not open transcript'],
@@ -2198,6 +2235,7 @@ app.post('/api/app-commands', (req, res) => {     // web (owner) enqueues
   const muxName = b.muxName ? strictMuxName(b.muxName) : '';
   const sessionName = b.sessionName ? strictMuxName(b.sessionName) : '';
   const tool = String(b.tool || '').trim().toLowerCase();
+  const pid = Number(b.pid) || 0;
   if (b.intentId && !commandIntentId(b.intentId))
     return res.status(400).json({ error: 'invalid intent id' });
   if (b.sessionId && !sessionId) return res.status(400).json({ error: 'invalid session identity' });
@@ -2208,6 +2246,7 @@ app.post('/api/app-commands', (req, res) => {     // web (owner) enqueues
   b.muxName = muxName;
   b.sessionName = sessionName;
   b.tool = tool;
+  b.pid = pid;
   b.replayPolicy = COMMAND_REPLAY_POLICY.get(b.type);
   if (b.type === 'kill' && !b.sessionId && !b.pid) return res.status(400).json({ error: 'sessionId or pid required' });
   if (b.type === 'transcript' && !b.sessionId) return res.status(400).json({ error: 'sessionId required' });
@@ -2238,6 +2277,14 @@ app.post('/api/app-commands', (req, res) => {     // web (owner) enqueues
   if (b.type === 'startmux') {
     const localOwner = ensureNoLocalOwnerForMuxName(b.muxName || b.sessionName, b.sessionId || '');
     if (!localOwner.ok) return res.status(409).json({ error: 'local copy is already running', detail: localOwner.detail });
+  }
+  if (b.type === 'mirrorlocal' && !(b.muxName || b.sessionName))
+    return res.status(400).json({ error: 'mirrorlocal requires muxName/sessionName' });
+  if (b.type === 'mirrorlocal' && (!b.sessionId || !['claude', 'codex'].includes(b.tool) || !Number.isSafeInteger(pid) || pid <= 0))
+    return res.status(400).json({ error: 'mirrorlocal requires sessionId, tool, and a positive integer pid' });
+  if (b.type === 'mirrorlocal') {
+    const target = verifyMirrorTarget(b.muxName || b.sessionName, b.sessionId, pid, b.tool);
+    if (!target.ok) return res.status(409).json({ error: 'local mirror target could not be verified', detail: target.detail });
   }
   let queued;
   try {

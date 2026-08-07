@@ -323,11 +323,27 @@ public sealed partial class ArchiveService
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToList();
         var phrases = session.SpecialPhrases.Where(phrase => !string.IsNullOrWhiteSpace(phrase)).ToList();
-        var parent = session.IsBranch
-            ? (Store.Sessions.TryGetValue(session.BranchOfId, out var source)
+        // NAME THE CHECKPOINT, not just the live chat. BranchOfId points at the SOURCE SESSION, whose
+        // title keeps moving: a chat renamed after a checkpoint was taken makes every branch from every
+        // one of its checkpoints report the chat's LATEST name. Measured: branches spawned from
+        // checkpoint "cleanmusic" carried cleanmusic's transcript exactly (1310 user messages, tip uuid
+        // 1167d9f7) while this line called them "branch of iosnmusic-pixel" — the name the source chat
+        // had acquired an hour later. The branch was right and the label said otherwise, which reads as
+        // the spawn having used the wrong checkpoint.
+        //
+        // FromSnapshotId already records which checkpoint it actually came from, so use it. The
+        // checkpoint name is immutable; the source title is not.
+        var parent = "no";
+        if (session.IsBranch)
+        {
+            var sourceLabel = Store.Sessions.TryGetValue(session.BranchOfId, out var source)
                 ? $"\"{source.DisplayTitle}\""
-                : session.BranchOfId)
-            : "no";
+                : session.BranchOfId;
+            parent = !string.IsNullOrWhiteSpace(session.FromSnapshotId)
+                     && Store.TemplateSnapshots.TryGetValue(session.FromSnapshotId, out var viaSnapshot)
+                ? $"checkpoint \"{viaSnapshot.DisplayName}\" of {sourceLabel}"
+                : sourceLabel;
+        }
         var branchCount = Store.Sessions.Values.Count(candidate =>
             !candidate.Archived
             && string.Equals(candidate.BranchOfId, session.Id, StringComparison.OrdinalIgnoreCase));

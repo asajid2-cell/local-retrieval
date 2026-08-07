@@ -137,6 +137,11 @@ public sealed partial class MainPage
                 results.Add((item, await HandleToMuxAsync(item.Command!)));
             commandLines = commandLines.Where(p => !IsToMux(p.Command!)).ToList();
 
+            bool IsMirrorLocal(AgentCommand c) => ArchiveService.NormalizeAgentOp(c.op) == "mirrorlocal";
+            foreach (var item in commandLines.Where(p => IsMirrorLocal(p.Command!)))
+                results.Add((item, await HandleMirrorLocalAsync(item.Command!)));
+            commandLines = commandLines.Where(p => !IsMirrorLocal(p.Command!)).ToList();
+
             foreach (var item in commandLines.Where(p => IsSourceOp(p.Command!)))
                 results.Add((item, await _archive.ApplyAgentCommandAsync(item.Command!)));
 

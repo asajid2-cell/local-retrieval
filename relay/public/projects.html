@@ -48,6 +48,9 @@
   .pill { flex:0 0 auto; height:30px; padding:0 var(--sp3); border-radius:99px; font:600 12px/1 inherit; cursor:pointer;
     display:inline-flex; align-items:center; gap:6px; }
   .pill[hidden] { display:none; }
+  #wscolbtn { border:1px solid var(--line); background:var(--panel-2); color:var(--txt); }
+  #wscolbtn:hover { border-color:var(--rose); color:var(--rose); }
+  #wscolbtn:disabled { opacity:.45; cursor:default; border-color:var(--line); color:var(--muted); }
   #refreshpill { border:1px solid var(--rose); background:var(--rose-dim); color:var(--rose); }
   #refreshpill:hover { background:var(--rose); color:#1a0a0e; }
   #runpill { border:1px solid var(--warn); background:rgba(251,191,36,.12); color:var(--warn); }
@@ -127,7 +130,7 @@
   .runrow .rmeta .sub { display:block; font-size:11.5px; color:var(--faint); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .runrow.killing { opacity:.6; }
   .ractions { flex:0 0 auto; display:flex; gap:var(--sp2); }
-  .openbtn, .killbtn, .renbtn { flex:0 0 auto; height:36px; padding:0 var(--sp3); border-radius:var(--r-s); font:600 12.5px/1 inherit; cursor:pointer; }
+  .openbtn, .mirrorbtn, .killbtn, .renbtn { flex:0 0 auto; height:36px; padding:0 var(--sp3); border-radius:var(--r-s); font:600 12.5px/1 inherit; cursor:pointer; }
   .openbtn { border:1px solid var(--line); background:var(--panel-2); color:var(--txt); }
   .openbtn:hover { border-color:var(--rose); }
   .renbtn { border:1px solid var(--line); background:var(--panel-2); color:var(--muted); min-width:36px; padding:0 10px; }
@@ -136,6 +139,9 @@
   .openbtn:disabled:hover, .renbtn:disabled:hover { border-color:var(--line); color:var(--muted); }
   .killbtn { border:1px solid var(--rose); background:transparent; color:var(--rose); }
   .killbtn:hover { background:var(--rose); color:#1a0a0e; }
+  .mirrorbtn { border:1px solid var(--live); background:rgba(52,211,153,.08); color:var(--live); }
+  .mirrorbtn:hover { background:var(--live); color:#0a1a12; }
+  .mirrorbtn:disabled { opacity:.55; cursor:default; background:transparent; }
   .killbtn:disabled { opacity:.55; cursor:default; background:transparent; }
   .killbtn.done { border-color:var(--faint); color:var(--faint); }
   /* inline native-name editor inside a running row */
@@ -166,10 +172,10 @@
   #mobileNav svg { width:18px; height:18px; flex:0 0 auto; }
   #mobileNav .active { background:var(--raised); color:var(--txt); }
   #mobileNav button:disabled { opacity:.42; cursor:default; }
-  @media (pointer:coarse) { .resume { height:42px; } .crow { min-height:60px; } .chat { min-height:58px; } .runrow { min-height:62px; } .openbtn, .killbtn, .renbtn { height:42px; } .renedit .reninput, .renedit .rensave, .renedit .rencancel { height:42px; } }
+  @media (pointer:coarse) { .resume { height:42px; } .crow { min-height:60px; } .chat { min-height:58px; } .runrow { min-height:62px; } .openbtn, .mirrorbtn, .killbtn, .renbtn { height:42px; } .renedit .reninput, .renedit .rensave, .renedit .rencancel { height:42px; } }
   @media (max-width:59.99rem) {
     #mobileNav {
-      display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:var(--sp1);
+      display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:var(--sp1);
       flex:0 0 auto; padding:var(--sp1) var(--sp2); padding-bottom:max(var(--sp1),env(safe-area-inset-bottom));
       background:var(--panel); border-top:1px solid var(--line);
     }
@@ -189,7 +195,7 @@
     .runrow .tool { grid-area:tool; }
     .runrow .rmeta { grid-area:meta; }
     .ractions { grid-area:actions; width:100%; display:flex; gap:var(--sp2); }
-    .openbtn, .killbtn, .renbtn { flex:1 1 0; min-width:0; }
+    .openbtn, .mirrorbtn, .killbtn, .renbtn { flex:1 1 0; min-width:0; }
     .dhead { align-items:flex-start; flex-wrap:wrap; }
     .dhead .dname { flex:1 1 auto; }
     .modal { align-items:stretch; padding:var(--sp2); padding-top:max(var(--sp2),env(safe-area-inset-top)); padding-bottom:max(var(--sp2),env(safe-area-inset-bottom)); }
@@ -212,9 +218,9 @@
     <div class="spacer"></div>
     <a class="topbtn" href="./">&lsaquo; Terminal</a>
   </div>
-  <div id="syncbar"><span class="sdot"></span><span id="synctext">checking sync&hellip;</span><button id="wscolbtn" class="pill" type="button" title="Add all your open remote tabs to a collection (new or existing) — save your current workspace">&#43; Tabs &rarr; collection</button><button id="runpill" class="pill" type="button" hidden><span class="rdot"></span><span id="runcount">0</span> running on PC</button><button id="refreshpill" class="pill" type="button" hidden>&#8635; New chats — refresh</button></div>
+  <div id="syncbar"><span class="sdot"></span><span id="synctext">checking sync&hellip;</span><button id="wscolbtn" class="pill" type="button" title="Open the desktop app to save tabs to a collection" disabled>&#43; Tabs &rarr; collection</button><button id="runpill" class="pill" type="button" hidden><span class="rdot"></span><span id="runcount">0</span> running on PC</button><button id="refreshpill" class="pill" type="button" hidden>&#8635; New chats — refresh</button></div>
   <div id="projsearch"><input id="projfilter" placeholder="Search projects &amp; chats…" autocapitalize="off" autocomplete="off" spellcheck="false"></div>
-  <div id="viewList" class="view"></div>
+  <div id="viewList" class="view"><div class="projempty">Loading projects&hellip;</div></div>
   <div id="viewDetail" class="view" hidden></div>
   <nav id="mobileNav" aria-label="Mobile views">
     <a href="./" aria-label="Terminal">
@@ -237,7 +243,7 @@
 </div>
 <dialog id="wscoldlg">
   <h3>Save open tabs to a collection</h3>
-  <p class="dlghint">Files <b id="wscolcount">0 tabs</b> — <b>every open tab</b> in multiplex — into a deck. Chat-linked tabs keep their chat; shell-launched tabs are saved as named markers. Works only while the desktop app is open (it owns your collections). Reopen chat-linked ones later with <b>↻ Relaunch</b>.</p>
+  <p class="dlghint" id="wscolcount">0 open tabs will be added.</p>
   <div id="wscollist" class="wscollist"></div>
   <div class="dlgrow"><label class="wslabel" for="wsdecksel">Deck</label><select id="wsdecksel"></select></div>
   <div class="dlgrow" id="wsdecknewrow" hidden><label class="wslabel" for="wsdecknew">New deck</label><input id="wsdecknew" placeholder="deck name" autocapitalize="off" autocomplete="off" spellcheck="false"></div>
@@ -256,6 +262,7 @@ const $ = s => document.querySelector(s);
 const LS = { get:(k,d)=>{ try{ return JSON.parse(localStorage.getItem(k)) ?? d; }catch(e){ return d; } }, set:(k,v)=>{ try{ localStorage.setItem(k, JSON.stringify(v)); }catch(e){} } };
 const esc = s => String(s).replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 let data={collections:[]}, sessions=[], built=false, sig=null, curDetail=null, detailOrigin=null;
+let initialLoadFailed=false;
 const rows=[];           // master rows: [{id,name,crow,crun,total,coll}]
 const visibleChats=[];   // currently-rendered detail/search chat rows: [{key,ch,btn}]
 let _markRowsPending=false;
@@ -283,6 +290,10 @@ function bridgeLive(d=data){ return !!(d && (d.bridgeLive ?? d.live)); }
 function renderSync(d){
   const sb=$('#syncbar'); sb.classList.remove('live','stale');
   const live = appLive(d), bridge = bridgeLive(d), stamp = d.appSyncedAt ?? d.syncedAt;
+  $('#wscolbtn').disabled=!live;
+  $('#wscolbtn').title=live
+    ? 'Add all your open remote tabs to a collection (new or existing)'
+    : 'Open the desktop app to save tabs to a collection';
   if(live){ sb.classList.add('live'); $('#synctext').innerHTML = `<span class="b">Synced</span> &middot; desktop app live${d.host?` &middot; ${esc(d.host)}`:''}`; }
   else if(stamp){ sb.classList.add('stale'); $('#synctext').innerHTML = `<span class="b">Last app sync ${ago(stamp)}</span> &middot; desktop app closed${bridge?' &middot; PC bridge live':''}`; }
   else $('#synctext').textContent = 'Not synced yet - open the desktop app to push your projects here';
@@ -306,13 +317,18 @@ const goSvg = '<svg class="cgo" viewBox="0 0 24 24" fill="none" aria-hidden="tru
 // the collections snapshot: after a PC restart the bridge refreshes runningSessions but NOT that
 // snapshot, so the baked flag goes stale and falsely marks dead sessions as live ("Take over" / amber dot).
 function liveRunIds(){ return new Set((data && Array.isArray(data.runningSessions) ? data.runningSessions : []).map(r=>String(r.sessionId||'')).filter(Boolean)); }
-function chatLive(ch, runIds){ return !!ch && !!ch.id && runIds.has(String(ch.id)); }
+function localChatIds(ch){
+  const out=[]; const add=v=>{ const s=String(v||''); if(s&&!out.includes(s)) out.push(s); };
+  add(ch&&ch.id); (Array.isArray(ch&&ch.aliases)?ch.aliases:[]).forEach(add); return out;
+}
+function chatLive(ch, runIds){ return localChatIds(ch).some(id=>runIds.has(id)); }
 // Resolve the mux session name hosting a running agent, so we can end it through muxd and keep
 // the relay/manifest/session list in sync. Matches the agent's sessionId to a chat's muxName.
 function muxNameForSession(s){
   if(s && s.muxName) return s.muxName;
   const sid=String((s&&s.sessionId)||''); if(!sid) return '';
-  for(const c of ((data&&data.collections)||[])) for(const ch of (c.chats||[])){ if(String(ch.id||'')===sid && ch.muxName) return ch.muxName; }
+  for(const ch of archiveChats()){ if(localChatIds(ch).includes(sid) && ch.muxName) return ch.muxName; }
+  for(const c of ((data&&data.collections)||[])) for(const ch of (c.chats||[])){ if(localChatIds(ch).includes(sid) && ch.muxName) return ch.muxName; }
   return '';
 }
 function sessionBlocker(name){
@@ -329,7 +345,7 @@ function canRelaunchMuxName(name){
 function blockerDetail(s){ return (s && (s.detail || s.legacyDetail || s.hostProtocolDetail)) || 'mux session is blocked by stale protocol or legacy tmux state'; }
 
 // Resume button state. inMux=already a running multiplex (Attach); localRun=running locally,
-// not in mux (Take over); missing name/command and not in mux => nothing to resume (Unavailable).
+// not in mux (Mirror); missing name/command and not in mux => nothing to resume (Unavailable).
 function setBtnState(btn, ch, muxNames, runIds){
   runIds = runIds || liveRunIds();
   const blocked=ch.muxName ? sessionBlocker(ch.muxName) : null;
@@ -338,7 +354,7 @@ function setBtnState(btn, ch, muxNames, runIds){
   if(inMux){ btn.textContent='Attach'; btn.classList.add('running'); }
   else if(blocked){ btn.textContent=blocked.hostProtocolOk===false?'Stale':'Blocked'; btn.disabled=true; btn.title=blockerDetail(blocked); }
   else if(!ch.muxName || (!ch.id && !canRelaunchMuxName(ch.muxName))){ btn.textContent='Unavailable'; btn.disabled=true; btn.title='No trusted session identity is available for this chat.'; }
-  else if(localRun){ btn.textContent='Take over'; btn.classList.add('warn'); }
+  else if(localRun){ btn.textContent='Mirror'; btn.classList.add('warn'); }
   else btn.textContent='Resume remote';
   btn.onclick=()=>{ if(!btn.disabled) resume(ch, inMux, localRun); };
   return { inMux, localRun };
@@ -357,8 +373,12 @@ function chatNode(ch, withColl){
 }
 
 // ---- master list (built once) ----
-function buildList(){
+function buildList(loadError){
   const el=$('#viewList'); el.innerHTML=''; rows.length=0;
+  if(loadError){
+    el.innerHTML='<div class="projempty">Projects could not be loaded.<br>Retrying automatically.</div>';
+    built=true; queueMarkRows(); return;
+  }
   const cols=(data&&data.collections)||[];
   const allArchive=archiveChats();
   const withChats=cols.filter(c=>(c.chats||[]).length);
@@ -491,6 +511,9 @@ function updateRunPill(){
 function runRow(s){
   const row=document.createElement('div'); row.className='runrow';
   row.innerHTML=`<span class="tool"></span><span class="rmeta"><span class="t"></span><span class="realname" title="the chat's own Claude/Codex name — tap ✎ to rename"></span><span class="sub"></span></span><div class="ractions"><button class="renbtn" type="button" aria-label="Rename native name" title="Rename the chat's own Claude/Codex name">&#9998;</button><button class="openbtn" type="button">Open</button><button class="killbtn" type="button">Kill</button></div>`;
+  const mirrorBtn=document.createElement('button');
+  mirrorBtn.type='button'; mirrorBtn.className='mirrorbtn'; mirrorBtn.textContent='Mirror';
+  row.querySelector('.ractions').insertBefore(mirrorBtn, row.querySelector('.killbtn'));
   row.querySelector('.tool').textContent=(s.tool==='codex')?'CX':'CL';
   // primary = our collection name if we have one, else the tool's OWN name, else a generic label
   const primary = s.title || s.realTitle || ('Unsaved '+(s.tool==='codex'?'Codex':'Claude')+' session');
@@ -513,6 +536,23 @@ function runRow(s){
     // No transcript id yet (a fresh agent that hasn't been identified) — Open/Rename would 400.
     openBtn.disabled = true; openBtn.title = 'No transcript id yet — type in the session, then hit refresh.';
     renBtn.disabled = true;  renBtn.title  = 'No transcript id yet — type in the session, then hit refresh.';
+  }
+  const muxName=muxNameForSession(s);
+  const alreadyMirrored=!!muxName && actionableMuxNames().has(muxName);
+  if(alreadyMirrored){
+    mirrorBtn.textContent='Attach';
+    mirrorBtn.onclick=()=>{ location.href='./?s='+encodeURIComponent(muxName); };
+  }else if(!s.sessionId || !muxName || !s.pid){
+    mirrorBtn.disabled=true;
+    mirrorBtn.title='This process needs a verified chat identity and mux name before it can be mirrored.';
+  }else{
+    mirrorBtn.onclick=()=>mirrorAndOpen({
+      muxName,
+      sessionId:s.sessionId,
+      tool:s.tool,
+      pid:s.pid,
+      title:primary,
+    }, mirrorBtn, row);
   }
   row.querySelector('.killbtn').onclick = (ev)=> killSession(s, row, ev.currentTarget);
   return row;
@@ -593,7 +633,7 @@ function openRunning(){
   head.querySelector('.dcount').textContent=`${list.length} agent${list.length!==1?'s':''}`;
   el.appendChild(head);
   const note=document.createElement('div'); note.className='reslabel';
-  note.textContent='Live claude/codex agents on your PC — including forgotten background VS Code sessions. “Kill” ends that session here.';
+  note.textContent='Live claude/codex agents on your PC — including forgotten background VS Code sessions. A detached mirror can be cleared without ending its local agent.';
   el.appendChild(note);
   if(!list.length){ const e2=document.createElement('div'); e2.className='projempty'; e2.textContent='No agents running right now.'; el.appendChild(e2); }
   else list.forEach(s=> el.appendChild(runRow(s)));
@@ -613,7 +653,7 @@ async function apiError(r){
 }
 async function killSession(s, row, btn){
   const label = s.title || ('session '+String(s.sessionId||'').slice(0,8));
-  if(!confirm(`Kill the ${s.tool==='codex'?'Codex':'Claude'} agent for “${label}”?\n\n${s.parent||'Unknown'} · pid ${s.pid||'?'}\nThis ends that running session on your PC.`)) return;
+  if(!confirm(`Stop the ${s.tool==='codex'?'Codex':'Claude'} session for “${label}”?\n\n${s.parent||'Unknown'} · pid ${s.pid||'?'}\nA connected session is ended. A detached mirror is only cleared, leaving its local agent running.`)) return;
   btn.disabled=true; btn.textContent='Killing…'; row.classList.add('killing');
   // Mux-hosted sessions must be killed through the mux API so muxd, the relay, and the manifest agree.
   // If that path fails, stop and show the error instead of falling through to a local-agent kill.
@@ -631,6 +671,7 @@ async function killSession(s, row, btn){
       return;
     }
     if(live.some(x=> x && x.name===mux)){
+      const hosted=live.find(x=>x && x.name===mux);
       const blocked=live.find(x=>x && x.name===mux && (x.legacyBlocked || x.legacyTwin || x.hostProtocolOk===false));
       if(blocked){
         btn.disabled=false; row.classList.remove('killing'); btn.textContent='Kill';
@@ -640,7 +681,10 @@ async function killSession(s, row, btn){
       try{
         const drop=await sendIntent('DELETE', 'api/sessions/'+encodeURIComponent(mux), null, 'projects-kill');
         if(!drop.ok) throw new Error(await apiError(drop));
-        btn.textContent='Killed'; btn.classList.add('done'); btn.disabled=true; row.classList.remove('killing');
+        const detachedAdopted=!!(hosted && hosted.adopted && hosted.detachedLocal);
+        btn.textContent=detachedAdopted?'Mirror cleared':'Killed';
+        btn.classList.add('done'); btn.disabled=true; row.classList.remove('killing');
+        if(detachedAdopted) alert('The detached mirror record was cleared. The local agent is still running on your PC.');
         setTimeout(()=>{ row.remove(); afterKill(); }, 700); return;
       }catch(e){
         btn.disabled=false; row.classList.remove('killing'); btn.textContent='Kill';
@@ -687,8 +731,30 @@ async function awaitCmdResult(id, ms){
   }
   return { ok:false, detail:'timed out waiting for the desktop app' };
 }
-async function awaitCmd(id, ms){
-  return (await awaitCmdResult(id, ms)).ok;
+async function mirrorAndOpen(target, btn, row){
+  if(!bridgeLive()){
+    if(row) flash(row, 'PC bridge is not live - open the app or bridge and try again.');
+    else alert('The PC bridge is not live right now.');
+    return false;
+  }
+  const old=btn ? btn.textContent : '';
+  if(btn){ btn.disabled=true; btn.textContent='Mirroring...'; }
+  try{
+    const r=await postIntent('api/app-commands',
+      {type:'mirrorlocal', muxName:target.muxName, sessionId:target.sessionId, tool:target.tool, pid:target.pid},
+      'mirror-local');
+    if(!r.ok) throw new Error(await apiError(r));
+    const queued=await r.json();
+    const done=await awaitCmdResult(queued.id, 20000);
+    if(!done.ok) throw new Error(done.detail);
+    location.href='./?s='+encodeURIComponent(target.muxName);
+    return true;
+  }catch(e){
+    if(btn){ btn.disabled=false; btn.textContent=old||'Mirror'; }
+    const detail='Could not mirror the local terminal ('+(e.message||e)+').';
+    if(row) flash(row, detail); else alert(detail);
+    return false;
+  }
 }
 // ---- Save open tabs → collection: file EVERY open multiplex tab into a (new/existing) collection so you can
 // snapshot your current workspace, then reopen it all later via the collection's ↻ Relaunch button. -------
@@ -735,8 +801,9 @@ function addWorkspaceToCollection(){
   const newOpt=document.createElement('option'); newOpt.value='__new__'; newOpt.textContent='New deck...'; sel.appendChild(newOpt);
   sel.onchange=setDeckNewVisible; setDeckNewVisible();
   const dormant=open.length-_wsTabs.length;
-  $('#wscolcount').textContent=_wsTabs.length+' open tab'+(_wsTabs.length!==1?'s':'')+(dormant?(' ('+dormant+' dormant skipped)'):'');
-  $('#wscolnew').value=''; $('#wsdecknew').value=''; $('#wscoldlg').showModal(); setTimeout(()=>$('#wscolnew').focus(),60);
+  $('#wscolcount').textContent=_wsTabs.length+' open tab'+(_wsTabs.length!==1?'s':'')+' will be added.'+(dormant?(' '+dormant+' dormant tab'+(dormant!==1?'s':'')+' skipped.'):'');
+  $('#wscolnew').value=''; $('#wsdecknew').value='';
+  $('#app').inert=true; $('#wscoldlg').showModal(); setTimeout(()=>$('#wscolnew').focus(),60);
 }
 async function submitWsCol(target){
   if(typeof target==='string') target={collection:target};
@@ -771,29 +838,18 @@ async function submitWsCol(target){
 }
 
 function runningSessionForChat(ch){
-  return (Array.isArray(data.runningSessions)?data.runningSessions:[]).find(r=>String(r.sessionId||'')===String(ch.id||'')) || null;
-}
-async function stopLocalCopyForRelaunch(ch){
-  const rs=runningSessionForChat(ch);
-  if(!rs) return {ok:false, detail:'running process not identified'};
-  const r=await postIntent('api/app-commands',
-    {type:'kill', sessionId:ch.id||'', pid:rs.pid||0, label:ch.title||ch.muxName},
-    'kill-local');
-  if(!r.ok) return {ok:false, detail:await apiError(r)};
-  const queued=await r.json();
-  return await awaitCmdResult(queued.id, 20000);
+  const ids=new Set(localChatIds(ch));
+  return (Array.isArray(data.runningSessions)?data.runningSessions:[]).find(r=>ids.has(String(r.sessionId||''))) || null;
 }
 
 // ---- Relaunch collection: KILL any of a collection's chats currently running in multiplex, then restart
 // them all fresh (re-run each chat's resume command). Right-click a collection row, or the ↻ in the header.
 async function relaunchCollection(c){
   const chats=(c.chats||[]).filter(ch=>ch.muxName && (ch.id || canRelaunchMuxName(ch.muxName)));
-  if(!chats.length){ alert('No resumable chats in “'+(c.name||'this collection')+'” — open them once from the desktop app to link them.'); return; }
+  if(!chats.length){ alert('No resumable chats in "'+(c.name||'this collection')+'" - open them once from the desktop app to link them.'); return; }
   const blocked=chats.map(ch=>sessionBlocker(ch.muxName)).filter(Boolean);
   if(blocked.length){ alert('Cannot relaunch yet: '+blocked.length+' mux session'+(blocked.length!==1?'s are':' is')+' blocked/stale. Fix the blocker first; not falling back to a legacy path.'); return; }
-  const muxNames=actionableMuxNames(); const runIds=liveRunIds();
-  const localOnly=chats.filter(ch=>chatLive(ch,runIds) && !muxNames.has(ch.muxName));
-  if(!confirm('Relaunch “'+(c.name||'collection')+'”?\n\nKills any matching multiplex sessions'+(localOnly.length?(' and '+localOnly.length+' local PC cop'+(localOnly.length===1?'y':'ies')):'')+', then restarts '+chats.length+' chat'+(chats.length!==1?'s':'')+' fresh.')) return;
+  if(!confirm('Relaunch "'+(c.name||'collection')+'"?\n\nRestarts '+chats.length+' multiplex chat'+(chats.length!==1?'s':'')+'. Chats that are only running locally are left untouched and reported as failures.')) return;
   let ok=0, fail=0;
   for(const ch of chats){
     try{
@@ -828,7 +884,18 @@ async function resume(ch, inMux, localRun){
   const name=ch.muxName; if(!name){ alert('No remote-resume info for this chat'); return; }
   if(inMux){ location.href = './?s='+encodeURIComponent(name); return; }
   if(!ch.id && !canRelaunchMuxName(name)){ alert('No trusted session identity is available for this chat.'); return; }
-  if(localRun && !confirm('"'+(ch.title||name)+'" is already running on your PC.\n\nI will stop that copy first, then restart it in mux so there is only one transcript writer.\n\nProceed?')) return;
+  if(localRun){
+    const running=runningSessionForChat(ch);
+    if(!running){ alert('The local process could not be identified. Refresh and try again.'); return; }
+    await mirrorAndOpen({
+      muxName:name,
+      sessionId:running.sessionId,
+      tool:ch.tool,
+      pid:running.pid,
+      title:ch.title||name,
+    });
+    return;
+  }
   try{
     const body={sessionId:ch.id||'', tool:ch.tool||''};
     const res=await postIntent('api/sessions/'+encodeURIComponent(name)+'/relaunch',body,'relaunch');
@@ -853,6 +920,7 @@ $('#refreshpill').onclick = ()=> location.reload();
 $('#wscolbtn').onclick = addWorkspaceToCollection;
 $('#wscolcreate').onclick = ()=> submitWsCol($('#wscolnew').value);
 $('#wscolcancel').onclick = ()=> $('#wscoldlg').close();
+$('#wscoldlg').addEventListener('close', ()=>{ $('#app').inert=false; });
 $('#wscolnew').addEventListener('keydown', e=>{ if(e.key==='Enter'){ e.preventDefault(); submitWsCol($('#wscolnew').value); } });
 $('#runpill').onclick = openRunning;
 $('#mobileRunNav').onclick = ()=>{ if(!$('#mobileRunNav').disabled) openRunning(); };
@@ -865,11 +933,23 @@ document.addEventListener('keydown', e=>{
 });
 
 async function load(){
-  let nd=null, nsess=null;
-  try{ nd = await (await fetch('api/projects',{headers:{'Content-Type':'application/json'}})).json(); }catch(e){}
+  let nd=null, nsess=null, projectsFailed=false;
+  try{ nd = await (await fetch('api/projects',{headers:{'Content-Type':'application/json'}})).json(); }catch(e){ projectsFailed=true; }
   try{ nsess = await (await fetch('api/sessions',{headers:{'Content-Type':'application/json'}})).json(); }catch(e){}
-  if(!built){ data = nd||{collections:[]}; sessions = nsess||[]; sig=structSig(data); renderSync(data); buildList(); updateRunPill(); return; }
+  if(!built){
+    data = nd||{collections:[]}; sessions = nsess||[]; sig=structSig(data); renderSync(data);
+    if(projectsFailed){
+      initialLoadFailed=true;
+      $('#syncbar').classList.add('stale');
+      $('#synctext').innerHTML='<span class="b">Could not load projects</span> &middot; retrying';
+    }
+    buildList(projectsFailed); updateRunPill(); return;
+  }
   if(nd===null && nsess===null) return;                    // both fetches failed — keep showing what we have
+  if(nd && initialLoadFailed){
+    data=nd; sessions=nsess||[]; sig=structSig(data); initialLoadFailed=false;
+    renderSync(data); buildList(); updateRunPill(); return;
+  }
   const newSig = structSig(nd||data);
   if(nd && newSig!==sig){                                  // content/structure drift -> freeze the list (don't mutate it),
     data.runningSessions=nd.runningSessions; data.live=nd.live; data.appLive=nd.appLive; data.bridgeLive=nd.bridgeLive;

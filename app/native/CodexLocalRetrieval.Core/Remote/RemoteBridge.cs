@@ -302,6 +302,13 @@ public sealed class RemoteBridge
                         c.intentId,
                         c.takeover);
                     break;
+                case "mirrorlocal":
+                    res = await MirrorLocalAsync(
+                        c.muxName ?? c.sessionName ?? "",
+                        c.sessionId ?? "",
+                        c.tool ?? "",
+                        c.pid);
+                    break;
                 default:
                     res = (false, "unknown command"); break;
             }
@@ -426,6 +433,63 @@ public sealed class RemoteBridge
                 ex.Message,
                 "warn",
                 details: new Dictionary<string, string> { ["muxName"] = name });
+            return (false, ex.Message);
+        }
+    }
+
+    private async Task<(bool ok, string detail)> MirrorLocalAsync(
+        string name,
+        string requestedSessionId,
+        string tool,
+        int pid)
+    {
+        name = (name ?? "").Trim();
+        var eventSessionId = (requestedSessionId ?? "").Trim();
+        if (string.IsNullOrWhiteSpace(name)) return (false, "missing mux session name");
+        if (_resolveMuxLaunch is null)
+            return (false, "headless local mirror refused: no local archive resolver is configured");
+        try
+        {
+            var resolved = await _resolveMuxLaunch(requestedSessionId, tool);
+            if (!resolved.ok || resolved.launch is null) return (false, resolved.detail);
+            var launch = resolved.launch;
+            var result = await AdoptedMuxLauncher.MirrorAsync(
+                new AdoptedMuxLauncher.Request(
+                    name,
+                    pid,
+                    launch.SessionId,
+                    launch.Aliases,
+                    launch.Tool.ToLowerInvariant(),
+                    launch.Command,
+                    launch.Workspace),
+                LocalMuxdRequestAsync,
+                _log);
+            RecordSessionEvent(
+                launch.SessionId,
+                launch.Aliases,
+                result.Ok ? "mux.mirror.started" : "mux.mirror.refused",
+                result.Detail,
+                result.Ok ? "info" : "warn",
+                new Dictionary<string, string>
+                {
+                    ["muxName"] = name,
+                    ["pid"] = pid.ToString(),
+                });
+            return (result.Ok, result.Detail);
+        }
+        catch (Exception ex)
+        {
+            RecordSessionEvent(
+                eventSessionId,
+                null,
+                "mux.mirror.refused",
+                ex.Message,
+                "warn",
+                new Dictionary<string, string>
+                {
+                    ["muxName"] = name,
+                    ["pid"] = pid.ToString(),
+                });
             return (false, ex.Message);
         }
     }

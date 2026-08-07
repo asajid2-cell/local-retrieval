@@ -1047,6 +1047,80 @@ test('startmux command queue accepts only opaque intent', async t => {
     assert.equal(Object.prototype.hasOwnProperty.call(cmd, forbidden), false);
 });
 
+test('mirrorlocal queues only an exact verified running pid/session/tool tuple', async t => {
+  const h = new RelayHarness();
+  await h.start();
+  t.after(async () => h.stop());
+  await h.json('POST', '/api/projects', {
+    schemaVersion: 3,
+    decks: [],
+    collections: [],
+    allChats: [{ id: 'mirror-session', tool: 'codex', title: 'Mirror me', muxName: 'mirror-tab' }],
+    runningSessions: [{ sessionId: 'mirror-session', pid: 4242, tool: 'codex' }],
+    runningVerified: true,
+  });
+
+  const wrong = await h.request('POST', '/api/app-commands', {
+    type: 'mirrorlocal',
+    muxName: 'mirror-tab',
+    sessionId: 'different-session',
+    pid: 4242,
+    tool: 'codex',
+  });
+  assert.equal(wrong.status, 409);
+  assert.match(wrong.body.detail, /does not own session/);
+
+  const queued = await h.request('POST', '/api/app-commands', {
+    type: 'mirrorlocal',
+    muxName: 'mirror-tab',
+    sessionId: 'mirror-session',
+    pid: 4242,
+    tool: 'codex',
+  });
+  assert.equal(queued.status, 200);
+  const command = (await leaseCommands(h)).find(item => item.id === queued.body.id);
+  assert.deepEqual(
+    {
+      type: command.type,
+      replayPolicy: command.replayPolicy,
+      muxName: command.muxName,
+      sessionId: command.sessionId,
+      pid: command.pid,
+      tool: command.tool,
+    },
+    {
+      type: 'mirrorlocal',
+      replayPolicy: 'intent-fenced',
+      muxName: 'mirror-tab',
+      sessionId: 'mirror-session',
+      pid: 4242,
+      tool: 'codex',
+    },
+  );
+});
+
+test('adopted host metadata reaches the session list without executable data', async t => {
+  const h = new RelayHarness();
+  await h.start();
+  t.after(async () => h.stop());
+  const host = await h.connectHost([{
+    ...commandSession('adopted-tab', 'adopted-session'),
+    kind: 'adopted-local',
+    adopted: true,
+    externalOwner: true,
+    childPid: 5151,
+    heal: false,
+  }]);
+  t.after(() => host.close());
+
+  const row = (await h.json('GET', '/api/sessions')).find(item => item.name === 'adopted-tab');
+  assert.equal(row.adopted, true);
+  assert.equal(row.externalOwner, true);
+  assert.equal(row.kind, 'adopted-local');
+  assert.equal(row.autoheal, false);
+  assert.equal(Object.prototype.hasOwnProperty.call(row, 'cmd'), false);
+});
+
 test('app command acknowledgements never return or persist a local PC path', async t => {
   const h = new RelayHarness();
   await h.start();

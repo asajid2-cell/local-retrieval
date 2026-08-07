@@ -11,6 +11,7 @@ public sealed class RemoteCommandProtocolTests
     [DataRow("addtocollection", "idempotent")]
     [DataRow("fetchfile", "intent-fenced")]
     [DataRow("startmux", "intent-fenced")]
+    [DataRow("mirrorlocal", "intent-fenced")]
     [DataRow("transcript", "read-only")]
     [DataRow("transcriptfetch", "read-only")]
     [DataRow("kill", "refused")]
@@ -44,6 +45,7 @@ public sealed class RemoteCommandProtocolTests
         Assert.IsTrue(RemoteCommandProtocol.RequiresIntentEnvelope("fetchfile"));
         Assert.IsTrue(RemoteCommandProtocol.RequiresIntentEnvelope("StartMux"));   // case/space tolerant
         Assert.IsTrue(RemoteCommandProtocol.RequiresIntentEnvelope("  startmux "));
+        Assert.IsTrue(RemoteCommandProtocol.RequiresIntentEnvelope("MirrorLocal"));
         foreach (var idempotent in new[] { "rename", "setapptitle", "addtocollection", "cleartabhistory", "settabcolor", "transcript", "kill", "", null })
             Assert.IsFalse(RemoteCommandProtocol.RequiresIntentEnvelope(idempotent), $"'{idempotent}' is not intent-fenced");
     }
@@ -89,6 +91,7 @@ public sealed class RemoteCommandProtocolTests
     [DataTestMethod]
     [DataRow("fetchfile")]
     [DataRow("startmux")]
+    [DataRow("mirrorlocal")]
     public void TryAdmit_RefusesIntentFencedCommandsWithADefaultedEnvelope(string type)
     {
         Assert.IsFalse(RemoteCommandProtocol.TryAdmit(type, "intent-fenced", "", "", out var blank));

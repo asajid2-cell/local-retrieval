@@ -1,80 +1,99 @@
-# relay/ops — off-box state backup
+# Multiplex production operations
 
-The relay keeps everything it cannot rebuild in a handful of JSON files under
-`MUX_STATE_DIR` (`relay/server.js`), each with a `.bak` sibling maintained by
-`durable-state.js`. Lose the VPS and you lose all of it. `scripts/backup-state.sh`
-copies exactly those files to the PC over the `win` ssh route the VPS already has.
+Production code lives in immutable directories under `/opt/multiplex-releases`. The
+`/opt/multiplex-app` symlink selects one release. Durable state stays outside the
+release under `/var/lib/multiplex`, owned by `svc-multiplex`.
 
-Installing this on the VPS is an **ops step for the deploy owner** — nothing here
-runs automatically, and `scripts/deploy-relay.sh` does not ship it (it deploys
-`relay/` only, and the script lives at the repo root under `scripts/`).
+`multiplex-app.service` runs as `svc-multiplex`, explicitly resets supplementary
+groups, and has no Docker socket access. Nginx and `hl-auth` remain separate existing
+security layers; a Multiplex deploy does not rewrite their keys or routes.
 
-## Install
+## One-time provisioning
 
-```sh
-# 1. Put the script somewhere the unit can reach it.
-scp scripts/backup-state.sh harmonizer@192.168.1.142:/tmp/mux-backup-state.sh
-ssh harmonizer@192.168.1.142 'sudo install -m 0755 /tmp/mux-backup-state.sh /usr/local/bin/mux-backup-state.sh'
-
-# 2. Confirm the PC route works for the *service* user before trusting the timer.
-ssh harmonizer@192.168.1.142 'ssh -o BatchMode=yes win true && echo win-route-ok'
-
-# 3. Prove one run by hand. This touches the network and writes to the PC.
-ssh harmonizer@192.168.1.142 '/usr/local/bin/mux-backup-state.sh --state-dir ~/multiplex-app --verify'
-
-# 4. Install the units.
-scp relay/ops/mux-relay-backup.service relay/ops/mux-relay-backup.timer harmonizer@192.168.1.142:/tmp/
-ssh harmonizer@192.168.1.142 '
-  sudo install -m 0644 /tmp/mux-relay-backup.service /tmp/mux-relay-backup.timer /etc/systemd/system/ &&
-  sudo systemctl daemon-reload &&
-  sudo systemctl enable --now mux-relay-backup.timer &&
-  systemctl list-timers mux-relay-backup.timer'
-```
-
-If the relay lives somewhere other than `/home/harmonizer/multiplex-app`, or runs as
-another user, edit `--state-dir`, `User=`, `Group=` and `ReadOnlyPaths=` in the
-service before installing.
-
-## Check on it
+Changing root-owned policy requires an authorized admin/root session (the existing
+`harmonizer` admin path), not the routine `harmonizer-sub` release account. Stage
+this directory on the VPS, inspect it, then run:
 
 ```sh
-systemctl list-timers mux-relay-backup.timer     # when it last ran, when it runs next
-journalctl -u mux-relay-backup.service -n 50     # why the last run failed
-sudo systemctl start mux-relay-backup.service    # force a run now
-ssh win 'ls -lt mux-relay-backups | head'        # what actually landed on the PC
+sudo bash relay/ops/provision-multiplex-deploy.sh
 ```
 
-`--verify` runs before the scp: the archive is extracted to a temp dir, every member
-is checked against its recorded sha256 and byte-compared with the live state file, and
-the refusal sweep runs again on the extracted tree. A bad archive fails the unit
-instead of overwriting a good backup on the far side.
+The provisioner:
 
-## Trust boundary
+- installs the fixed `/usr/local/bin/deploy-multiplex` wrapper;
+- installs the consolidated non-root service and backup units;
+- removes the stale Docker supplementary-group drop-in;
+- locks `/etc/multiplex-app.env` to `root:root` mode `0600`;
+- adds one sudo rule for `sub`: `deploy-multiplex` only;
+- reloads systemd, restarts the existing relay once so its live process drops Docker
+  access immediately, and verifies the effective unit, runtime UID/GID/groups, nginx,
+  and loopback `hl-auth` boundary.
 
-The archive carries relay-tier state only — project registry, queued app commands,
-pins, upload metadata, rename intents, and the `.bak` siblings. It never carries muxd
-identity keys, client private keys, local-control credentials, principal registries or
-session ACL state; the script's allowlist excludes them and a name-based refusal sweep
-aborts the run if one ever shows up anyway.
+Verify before the first release:
 
-What it does carry inherits the relay's exposure profile: plaintext transcript
-references, archive indexes, signed intent envelopes, metadata and timing. **The
-backup destination on the PC is as sensitive as the relay host.** Full write-up:
-`relay/tests/fixtures/backup-state/EXPOSURE.md`.
+```sh
+sudo -l -U sub
+systemctl show multiplex-app.service -p User -p Group -p SupplementaryGroups
+systemctl cat multiplex-app.service
+pid=$(systemctl show multiplex-app.service -p MainPID --value)
+grep -E '^(Uid|Gid|Groups):' "/proc/$pid/status"
+```
+
+## Routine release
+
+The worktree must be clean because the archive is built from `HEAD`, stamped with the
+full commit hash, and hashed before upload:
+
+```sh
+bash scripts/deploy-relay.sh
+```
+
+The client first runs the wrapper's read-only preflight, so missing provisioning or
+security drift is reported before an archive is built or uploaded.
+
+The client uploads only to `harmonizer-sub`. The root-owned wrapper accepts exactly a
+40-hex commit and 64-hex SHA-256, quarantines and validates the archive, refuses links
+or path traversal, installs dependencies as `svc-multiplex`, makes code root-owned,
+drains with SIGTERM, atomically switches the release symlink, checks `/api/health`,
+and restores the previous release on failure.
+
+## Backup
+
+The deploy wrapper installs `mux-backup-state.sh`. It enables
+`mux-relay-backup.timer` only after a strict, non-interactive `win` SSH probe succeeds
+as `svc-multiplex`; otherwise it leaves the timer disabled instead of generating
+hourly failures. Once enabled, the backup unit repeats that probe as an
+`ExecCondition`, so a temporary PC outage skips a run cleanly without disabling the
+schedule. The timer reads only `/var/lib/multiplex`, verifies a restore roundtrip,
+and sends the archive over that route. A timer activation problem is logged as a
+backup warning after a healthy application release; it does not roll the app back.
+
+```sh
+systemctl list-timers mux-relay-backup.timer
+journalctl -u mux-relay-backup.service -n 50
+sudo -u svc-multiplex /usr/local/bin/mux-backup-state.sh \
+  --state-dir /var/lib/multiplex --verify
+ssh win 'ls -lt mux-relay-backups | head'
+```
+
+The archive includes only relay-tier durable state: projects, queued app commands,
+pins, upload metadata, rename intents, and `.bak` siblings. It refuses identity keys,
+private keys, credentials, principal registries, and ACL state. The backup destination
+still inherits the relay's exposure profile and must be protected accordingly.
 
 ## Restore
 
-1. Stop the relay (`pm2 stop multiplex` / `sudo systemctl stop multiplex`).
-2. `tar -xzf mux-relay-state-<stamp>.tgz` — files land under `relay-state/`.
-3. Read `relay-state/EXPOSURE.txt`, then copy the JSON files (and their `.bak`
-   siblings) into `MUX_STATE_DIR`.
-4. Start the relay. Identity, credentials, principals and ACLs are re-established on
-   the host that owns them — they are never restored from this archive.
+1. Stop `multiplex-app.service`.
+2. Extract `mux-relay-state-<stamp>.tgz`.
+3. Copy the JSON files and `.bak` siblings from `relay-state/` into
+   `/var/lib/multiplex`.
+4. Set ownership to `svc-multiplex:svc-multiplex`, mode `0600`, and restart the unit.
 
-## Local check, no VPS needed
+## Local verification
 
 ```sh
-cd relay && bash ../scripts/backup-state.sh --dry-run-to /tmp/mux-backup-test \
+cd relay
+bash ../scripts/backup-state.sh --dry-run-to /tmp/mux-backup-test \
   --state-dir tests/fixtures/backup-state --verify
-node --test tests/backup-state.test.js
+npm test
 ```

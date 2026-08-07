@@ -343,6 +343,7 @@ public sealed class RemoteApiCommandPollerTests
     [DataTestMethod]
     [DataRow("fetchfile")]
     [DataRow("startmux")]
+    [DataRow("mirrorlocal")]
     public void Poller_RefusesAnIntentFencedCommandWithNoLeaseToken_NoSideEffect(string type)
     {
         var poller = new PollerHarness();
@@ -358,6 +359,7 @@ public sealed class RemoteApiCommandPollerTests
     [DataTestMethod]
     [DataRow("fetchfile")]
     [DataRow("startmux")]
+    [DataRow("mirrorlocal")]
     public void Poller_RefusesAnIntentFencedCommandWithNoIntentId_NoSideEffect(string type)
     {
         var poller = new PollerHarness();
@@ -375,6 +377,7 @@ public sealed class RemoteApiCommandPollerTests
     [DataTestMethod]
     [DataRow("fetchfile")]
     [DataRow("startmux")]
+    [DataRow("mirrorlocal")]
     public void Poller_ExecutesOnceForAValidEnvelope_AndDedupsARedelivery(string type)
     {
         var poller = new PollerHarness();
@@ -451,7 +454,7 @@ public sealed class RemoteApiCommandPollerTests
         var admit = poller.IndexOf("_commandIntents.Admit(c.type, c.replayPolicy, c.intentId, c.leaseToken", StringComparison.Ordinal);
         Assert.IsGreaterThanOrEqualTo(0, admit, "the poller must run the full envelope gate, not just a policy check");
 
-        foreach (var sideEffect in new[] { "RemoteUploadTransfer.", "StartMuxHeadless" })
+        foreach (var sideEffect in new[] { "RemoteUploadTransfer.", "StartMuxHeadless", "MirrorLocal" })
         {
             var handler = poller.IndexOf(sideEffect, StringComparison.Ordinal);
             Assert.IsGreaterThanOrEqualTo(0, handler, $"{sideEffect} handler is missing from the poller");

@@ -21,6 +21,12 @@ const FIXTURE = posix(path.join(__dirname, 'fixtures', 'backup-state'));
 const DURABLE = ['projects.json', 'app-commands.json', 'pins.json', 'uploads-meta.json', 'rename-intents.json'];
 // Present in the fixture, must never reach the archive.
 const SECRETS = ['muxd-identity.json', 'client-private.key', 'local-control.cred', 'principals.json', 'session-acl.json'];
+const BASH = process.platform === 'win32'
+  ? [
+      path.join(process.env.ProgramFiles || 'C:\\Program Files', 'Git', 'bin', 'bash.exe'),
+      path.join(process.env.LOCALAPPDATA || '', 'Programs', 'Git', 'bin', 'bash.exe'),
+    ].find((candidate) => candidate && fs.existsSync(candidate)) || 'bash'
+  : 'bash';
 
 const tempDirs = [];
 function tmp(prefix) {
@@ -33,7 +39,7 @@ test.after(() => {
 });
 
 function runBackup(args, opts = {}) {
-  return spawnSync('bash', [opts.script || SCRIPT, ...args], {
+  return spawnSync(BASH, [opts.script || SCRIPT, ...args], {
     cwd: opts.cwd || RELAY_DIR,
     encoding: 'utf8',
   });
@@ -43,7 +49,7 @@ function runBackup(args, opts = {}) {
 // cd into the archive's directory and name it relatively.
 function tarIn(tgz, flags, extra = '') {
   const res = spawnSync(
-    'bash',
+    BASH,
     ['-c', `cd "${posix(path.dirname(tgz))}" && tar ${flags} "${path.basename(tgz)}" ${extra}`],
     { encoding: 'utf8' },
   );

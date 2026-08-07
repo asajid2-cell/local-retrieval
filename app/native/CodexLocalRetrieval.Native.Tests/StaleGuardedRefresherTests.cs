@@ -29,14 +29,16 @@ public sealed class StaleGuardedRefresherTests
     }
 
     [TestMethod]
-    public async Task Build_RunsOffTheCallersThread()
+    public void Build_RunsOffTheCallersThread()
     {
         var refresher = new StaleGuardedRefresher<Box>();
         var callerThread = Environment.CurrentManagedThreadId;
 
-        var outcome = await refresher.RefreshAsync(
+        var task = refresher.RefreshAsync(
             "k",
             () => new Box("built") { ThreadId = Environment.CurrentManagedThreadId });
+        Wait(task, "the default-dispatched build");
+        var outcome = task.Result;
 
         Assert.IsTrue(outcome.IsCurrent);
         Assert.IsNotNull(outcome.Value);

@@ -23,6 +23,8 @@ REPO = Path(__file__).resolve().parents[1]
 MUXD = REPO / "muxd.py"
 MUXRUN = REPO / "muxrun.py"
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+CREATE_NEW_CONSOLE = getattr(subprocess, "CREATE_NEW_CONSOLE", 0x00000010)
+DETACHED_PROCESS = getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
 
 
 def free_port():
@@ -109,6 +111,29 @@ async def create_while_hammering_info(port, name, cmd, timeout=14):
         except Exception as exc:
             samples.append((time.perf_counter() - started, exc))
         await asyncio.sleep(0.05)
+    created = await asyncio.wait_for(create_task, timeout=timeout)
+    return created, samples
+
+
+async def info_during_slow_create_persistence(port, fault_path, name, cmd, timeout=18):
+    create_task = asyncio.create_task(
+        request_json(port, {"t": "create", "s": name, "cmd": cmd}, timeout=timeout)
+    )
+    deadline = time.perf_counter() + timeout
+    while fault_path.exists() and time.perf_counter() < deadline:
+        await asyncio.sleep(0.01)
+    if fault_path.exists():
+        raise TimeoutError("slow persistence fault was not consumed")
+
+    async def timed_info():
+        started = time.perf_counter()
+        try:
+            result = await request_json(port, {"t": "info"}, timeout=2)
+        except Exception as exc:
+            result = exc
+        return time.perf_counter() - started, result
+
+    samples = await asyncio.gather(*(timed_info() for _ in range(4)))
     created = await asyncio.wait_for(create_task, timeout=timeout)
     return created, samples
 
@@ -572,7 +597,8 @@ class MuxdLocalIntegrationTests(unittest.TestCase):
             cwd=str(REPO),
             env=self.muxd.env,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
             creationflags=CREATE_NO_WINDOW,
         )
         try:
@@ -599,7 +625,11 @@ class MuxdLocalIntegrationTests(unittest.TestCase):
                 if after and after.get("owner"):
                     break
                 time.sleep(0.25)
-            self.assertIsNone(owner.poll(), "muxrun child owner exited during muxd restart")
+            if owner.poll() is not None:
+                stderr = owner.stderr.read() if owner.stderr is not None else ""
+                self.fail(self.muxd.diagnostics(
+                    f"muxrun child owner exited during muxd restart with {owner.returncode}: {stderr}"
+                ))
             self.assertIsNotNone(after)
             self.assertTrue(after.get("owner"), after)
         finally:
@@ -615,6 +645,8 @@ class MuxdLocalIntegrationTests(unittest.TestCase):
                     creationflags=CREATE_NO_WINDOW,
                 )
                 owner.wait(timeout=5)
+            if owner.stderr is not None:
+                owner.stderr.close()
 
     def test_visible_owner_sidecar_death_cannot_orphan_its_child(self):
         name = "it-owner-contained"
@@ -699,6 +731,126 @@ class MuxdLocalIntegrationTests(unittest.TestCase):
                     timeout=10,
                     creationflags=CREATE_NO_WINDOW,
                 )
+
+    def test_adopted_local_console_mirrors_input_reconnects_and_survives_sidecar_exit(self):
+        name = "it-adopted-local"
+        session_id = f"adopted-{int(time.time() * 1000)}"
+        marker = "MUX_ADOPTED_SCREEN_READY"
+        input_marker = "MUX_ADOPTED_REMOTE_INPUT"
+        fake_codex = self.muxd.root / "codex.exe"
+        shutil.copy2(os.environ.get("ComSpec", r"C:\Windows\System32\cmd.exe"), fake_codex)
+        startup = subprocess.STARTUPINFO()
+        startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startup.wShowWindow = 0
+        target = subprocess.Popen(
+            [
+                str(fake_codex),
+                "/d",
+                "/q",
+                "/k",
+                f"echo {marker}",
+                "resume",
+                session_id,
+            ],
+            cwd=str(self.muxd.root),
+            startupinfo=startup,
+            creationflags=CREATE_NEW_CONSOLE,
+        )
+        sidecars = []
+        command = base64.b64encode(f"codex resume {session_id}".encode("utf-8")).decode("ascii")
+
+        def start_sidecar():
+            env = dict(self.muxd.env)
+            env["MUXCTL_PORT"] = str(self.muxd.port)
+            env["MUXD_TASK"] = f"MuxdNonexistentTest-{self.muxd.port}"
+            pythonw = Path(sys.executable).with_name("pythonw.exe")
+            executable = pythonw if pythonw.exists() else Path(sys.executable)
+            proc = subprocess.Popen(
+                [
+                    str(executable),
+                    str(MUXRUN),
+                    name,
+                    "--attach-pid",
+                    str(target.pid),
+                    "--cwd",
+                    str(self.muxd.root),
+                    "--cmd-b64",
+                    command,
+                    "--session-id",
+                    session_id,
+                ],
+                cwd=str(REPO),
+                env=env,
+                creationflags=DETACHED_PROCESS,
+                close_fds=True,
+            )
+            sidecars.append(proc)
+            return proc
+
+        def wait_adopted(sidecar, timeout=15):
+            deadline = time.time() + timeout
+            last = None
+            while time.time() < deadline:
+                if sidecar.poll() is not None:
+                    self.fail(self.muxd.diagnostics(
+                        f"adopted sidecar exited with {sidecar.returncode}; last session={last}"
+                    ))
+                last = self.session(name)
+                if (
+                    last
+                    and last.get("alive")
+                    and last.get("adopted")
+                    and last.get("externalOwner")
+                    and int(last.get("childPid") or 0) == target.pid
+                ):
+                    return last
+                time.sleep(0.2)
+            self.fail(self.muxd.diagnostics(f"adopted session did not become live; last={last}"))
+
+        self.kill(name)
+        try:
+            first_sidecar = start_sidecar()
+            first = wait_adopted(first_sidecar)
+            self.assertEqual("adopted-local", first.get("kind"))
+            self.assertFalse(first.get("heal"))
+            self.wait_for_tail(name, marker)
+
+            sent = run_request(
+                self.muxd.port,
+                {
+                    "t": "input",
+                    "s": name,
+                    "d": base64.b64encode(f"echo {input_marker}\r".encode("utf-8")).decode("ascii"),
+                },
+                timeout=8,
+            )
+            self.assertEqual("input-ok", sent.get("t"), sent)
+            self.wait_for_tail(name, input_marker)
+
+            first_sidecar.kill()
+            first_sidecar.wait(timeout=5)
+            time.sleep(0.5)
+            self.assertTrue(process_alive(target.pid), "adopted target died with its mirror sidecar")
+
+            second_sidecar = start_sidecar()
+            wait_adopted(second_sidecar)
+            self.assertTrue(process_alive(target.pid))
+
+            killed = run_request(self.muxd.port, {"t": "kill", "s": name}, timeout=18)
+            self.assertEqual("killed", killed.get("t"), killed)
+            deadline = time.time() + 8
+            while process_alive(target.pid) and time.time() < deadline:
+                time.sleep(0.1)
+            self.assertFalse(process_alive(target.pid), "explicit mux Stop left the adopted target alive")
+        finally:
+            self.kill(name)
+            for sidecar in sidecars:
+                if sidecar.poll() is None:
+                    sidecar.kill()
+                    sidecar.wait(timeout=5)
+            if target.poll() is None:
+                target.kill()
+                target.wait(timeout=5)
 
     def test_boot_never_resurrects_user_killed_armed_session(self):
         name = "it-user-killed-boot"
@@ -1356,8 +1508,9 @@ class MuxdLocalIntegrationTests(unittest.TestCase):
         try:
             self.muxd.delay_persistence("before_write", 1500)
             created, samples = asyncio.run(
-                create_while_hammering_info(
+                info_during_slow_create_persistence(
                     self.muxd.port,
+                    self.muxd.root / "persist-fault.json",
                     name,
                     "while($true){Start-Sleep -Milliseconds 200}",
                     timeout=18,

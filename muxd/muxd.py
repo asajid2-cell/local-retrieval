@@ -27,12 +27,17 @@ DIR = os.path.join(HOME, "muxd")
 MANIFEST = os.path.join(DIR, "sessions.json")
 LOG = os.path.join(DIR, "muxd.log")
 ENVF = os.path.join(DIR, "muxd.env")
+DEPLOY_FENCE = os.path.join(DIR, "deploying.flag")
 # {name: {pid, cwd, alive}} — the desktop app reads this to link a live claude/codex process to its mux
 # TAB by walking the process's ancestor pids to a shell pid here (deterministic; no folder guessing). Lets
 # a shell-launched agent be added to a collection / relaunched by its real chat id.
 LIVE_TABS = os.path.join(DIR, "live-tabs.json")
 
 _DURABLE_TEMP_SEQUENCE = 0
+
+
+def deployment_fenced():
+    return os.path.exists(DEPLOY_FENCE)
 
 def _durable_checkpoint(fault, stage, path):
     if fault is not None:
@@ -378,6 +383,39 @@ def _terminate_process_instance(pid, expected_start_token, timeout=3):
         return False, f"could not wait for process {pid} termination (result={wait_result})"
     finally:
         close_handle(handle)
+
+def _terminate_adopted_process_tree(pid, expected_start_token):
+    """Terminate an adopted process and pinned verified descendants."""
+    if os.name != "nt":
+        return False, "adopted process-tree termination is Windows-specific"
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return True, "no process recorded"
+    expected = str(expected_start_token or "")
+    if pid <= 0 or not expected:
+        return True, "no process instance recorded"
+    if not _same_process_instance(pid, expected):
+        return True, "PID no longer refers to the adopted process instance"
+
+    from muxrun import AttachedChild, terminate_child_tree
+
+    child = None
+    try:
+        child = AttachedChild(pid)
+        if f"{child.creation_time():016x}" != expected:
+            return True, "PID now refers to a different process instance"
+        if not terminate_child_tree(child):
+            return False, f"adopted process tree rooted at {pid} is still alive after termination"
+        return True, "adopted process tree exited"
+    except Exception as error:
+        return False, f"could not terminate adopted process tree {pid}: {error}"
+    finally:
+        if child is not None:
+            try:
+                child.close()
+            except Exception:
+                pass
 
 class _PROCESSENTRY32W(ctypes.Structure):
     _fields_ = [
@@ -1031,10 +1069,11 @@ def acquire_single_instance():
 def loadenv():
     env = {}
     try:
-        for ln in open(ENVF, encoding="utf-8"):
-            ln = ln.strip()
-            if ln and not ln.startswith("#") and "=" in ln:
-                k, v = ln.split("=", 1); env[k.strip()] = v.strip()
+        with open(ENVF, encoding="utf-8") as stream:
+            for ln in stream:
+                ln = ln.strip()
+                if ln and not ln.startswith("#") and "=" in ln:
+                    k, v = ln.split("=", 1); env[k.strip()] = v.strip()
     except Exception: pass
     return env
 
@@ -1098,7 +1137,9 @@ def authorize_relay_input(frame, session, endpoint=None, now_ms=None):
     )
     if principal is not None or isinstance(frame.get("auth"), dict):
         return principal, body, refusal
-    if host_input_intent.authz_mode() == "enforce":
+    runtime_authz_env = dict(ENV)
+    runtime_authz_env.update(os.environ)
+    if host_input_intent.authz_mode(runtime_authz_env) == "enforce":
         return principal, body, refusal
     try:
         legacy = base64.b64decode(str(frame.get("d", "") or ""), validate=True)
@@ -1575,6 +1616,53 @@ def owner_reconnect_ignored_live(candidate_ids, child_pid, live):
             return False, {}, f"session {session_id} is live outside the reconnecting visible owner"
         ignored[str(session_id).lower()] = pid
     return True, ignored, ""
+
+def adopted_owner_ignored_live(candidate_ids, child_pid, live):
+    if not isinstance(live, tuple):
+        live = (True, live, "")
+    ok, values, detail = live
+    if not ok:
+        return False, {}, detail
+    try:
+        child_pid = int(child_pid)
+    except (TypeError, ValueError):
+        child_pid = 0
+    if child_pid <= 0:
+        return False, {}, "adopted owner did not report its target pid"
+    ignored = {}
+    matched = False
+    for session_id in candidate_ids:
+        pid = (values or {}).get(str(session_id).lower())
+        if not pid:
+            continue
+        matched = True
+        if int(pid) != child_pid:
+            return False, {}, (
+                f"session {session_id} belongs to pid {pid}, not adopted target pid {child_pid}"
+            )
+        ignored[str(session_id).lower()] = int(pid)
+    if candidate_ids and not matched:
+        return False, {}, "could not verify the adopted target against a live session identity"
+    return True, ignored, ""
+
+
+def adopted_owner_reconnect_matches(prev, adopted, child_pid):
+    if not prev or not adopted or not getattr(prev, "adopted", False):
+        return False
+    if not (getattr(prev, "owner", False) or getattr(prev, "expected_owner", False)):
+        return False
+    if prev.alive():
+        return False
+    try:
+        child_pid = int(child_pid)
+        previous_pid = int(getattr(prev, "child_pid", 0) or 0)
+    except (TypeError, ValueError):
+        return False
+    return (
+        child_pid > 0
+        and previous_pid == child_pid
+        and _same_process_instance(child_pid, getattr(prev, "child_start_token", ""))
+    )
 
 
 def acquire_launch_claim(cmd="", ids=None, reason="muxd session launch", live=None, ignored_live=None):
@@ -2182,6 +2270,8 @@ class Session:
         self._launch_claim = None
         self.expected_owner = False
         self.owner_key = ""
+        self.adopted = False
+        self.external_owner = False
         self.identity_pending = False
         self.lifecycle = "active" if spawn_now else "dormant"
         self.last_alive_utc = ""
@@ -2500,7 +2590,8 @@ class OwnerSession:
     # A visible local terminal owns the agent. muxd only relays that terminal's screen
     # snapshots to the VPS and forwards remote keystrokes back into the owner sidecar.
     def __init__(self, name, cmd, cwd, cols, rows, loop, outq, owner_ws, heal=False,
-                 ids=None, session_id="", aliases=None, owner_key="", session_uuid=""):
+                 ids=None, session_id="", aliases=None, owner_key="", session_uuid="",
+                 adopted=False):
         self.name, self.cmd, self.cwd = name, cmd or "", cwd or DEFAULT_CWD
         self.session_id, self.aliases, self.ids = resolve_session_identity(
             self.cmd, session_id, aliases, ids
@@ -2508,7 +2599,9 @@ class OwnerSession:
         self.session_uuid = str(session_uuid or ("s-" + os.urandom(16).hex()))
         self.claim_paths = []
         self._launch_claim = None
-        self.heal = bool(heal)
+        self.adopted = bool(adopted)
+        self.external_owner = self.adopted
+        self.heal = False if self.adopted else bool(heal)
         self.cols, self.rows = max(20, int(cols or 140)), max(8, int(rows or 40))
         self.created = time.time(); self.last_out = time.time()
         self.ring = collections.deque(); self.ring_len = 0
@@ -2538,6 +2631,7 @@ class OwnerSession:
         self.operation_fingerprint = ""
         self.operation_created = False
         self.owner_exit_confirmed = False
+        self.owner_stop_error = ""
         self.input_waiters = {}
         self.input_seq = 0
 
@@ -2630,6 +2724,7 @@ class OwnerSession:
 
     def kill(self, by_user=True):
         self.user_killed = by_user
+        self.owner_stop_error = ""
         self._send_owner({"t": "kill"})
 
 sessions = {}          # name -> Session
@@ -2837,6 +2932,10 @@ def restore_manifest_sessions(records, target=None, loop=None, outq=None, now=No
             )
             restored.expected_owner = bool(m.get("owner"))
             restored.owner_key = str(m.get("ownerKey", "") or "")
+            restored.adopted = bool(m.get("adopted", False))
+            restored.external_owner = bool(m.get("externalOwner", restored.adopted))
+            if restored.adopted:
+                restored.heal = False
             restored.identity_pending = bool(m.get("identityPending"))
             restored.lifecycle = str(m.get("lifecycle", "active") or "active")
             if restored.lifecycle not in ("active", "dormant", "starting", "stopping", "failed"):
@@ -2883,6 +2982,8 @@ def session_records_payload(source=None):
             "ids": list(getattr(s, "ids", []) or []),
             "owner": bool(getattr(s, "owner", False) or getattr(s, "expected_owner", False)),
             "ownerKey": str(getattr(s, "owner_key", "") or ""),
+            "adopted": bool(getattr(s, "adopted", False)),
+            "externalOwner": bool(getattr(s, "external_owner", False)),
             "identityPending": bool(getattr(s, "identity_pending", False)),
             "lifecycle": str(getattr(s, "lifecycle", "active") or "active"),
             "childPid": int(getattr(s, "child_pid", 0) or 0),
@@ -2946,6 +3047,8 @@ def valid_session_records(value):
         and isinstance(record.get("operationKey", ""), str)
         and isinstance(record.get("operationFingerprint", ""), str)
         and isinstance(record.get("operationCreated", False), bool)
+        and isinstance(record.get("adopted", False), bool)
+        and isinstance(record.get("externalOwner", False), bool)
         and isinstance(record.get("lastAliveUtc", ""), str)
         and isinstance(record.get("custodyExpiresUtc", ""), str)
         for name, record in value.items()
@@ -2997,6 +3100,8 @@ _PERSISTED_SESSION_FIELDS = (
     "owner",
     "expected_owner",
     "owner_key",
+    "adopted",
+    "external_owner",
     "identity_pending",
     "lifecycle",
     "child_pid",
@@ -3030,6 +3135,28 @@ def restore_persisted_session(session, snapshot):
         setattr(session, field, snapshot[field])
     session._launch_claim = snapshot["_launch_claim"]
     session.claim_paths = list(snapshot["claim_paths"])
+
+def prepare_session_stop(session, by_user):
+    snapshot = persisted_session_snapshot(session)
+    session.lifecycle = "stopping"
+    session.stop_disposition = "remove" if by_user else "replace"
+    # Persist the user's stop intent before process termination. If muxd dies after
+    # that commit, boot completes the stop instead of accepting an owner reconnect.
+    session.user_killed = bool(by_user)
+    pty = getattr(session, "pty", None)
+    session.child_pid = int(getattr(pty, "pid", 0) or getattr(session, "child_pid", 0) or 0)
+    session.child_start_token = (
+        _process_start_token(session.child_pid)
+        or getattr(session, "child_start_token", "")
+    )
+    return snapshot
+
+def relay_input_error_frame(outcome, session_name, frame, principal=None):
+    response = {**outcome, "s": session_name}
+    supplied = principal.intent_id if principal is not None else str(frame.get("intentId", "") or "")
+    if supplied:
+        response["intentId"] = supplied
+    return response
 
 def live_tabs_snapshot(now=None):
     out = {}
@@ -3196,7 +3323,9 @@ def session_payload(name, sess):
     except Exception: alive = False
     has_cmd = session_has_command(sess)
     owner = bool(getattr(sess, "owner", False))
-    kind = "command" if has_cmd else ("shell" if alive else "dormant")
+    adopted = bool(getattr(sess, "adopted", False))
+    external_owner = bool(getattr(sess, "external_owner", False))
+    kind = "adopted-local" if adopted and alive else ("command" if has_cmd else ("shell" if alive else "dormant"))
     tail = sess.tail_text()
     agent = session_agent_status(sess, alive=alive, tail=tail)
     # Process truth is advisory and additive: it reports what the OS says about the
@@ -3211,6 +3340,7 @@ def session_payload(name, sess):
             "lastOut": int(sess.last_out * 1000), "cols": sess.cols, "rows": sess.rows,
             "tail": tail, "heal": sess.heal, "localViewers": len(sess.local),
             "localFirst": owner or len(sess.local) > 0, "owner": owner,
+            "adopted": adopted, "externalOwner": external_owner,
             "hasCommand": has_cmd, "shellOnly": alive and not has_cmd,
             "sessionUuid": str(getattr(sess, "session_uuid", "") or ""),
             "ready": alive, "kind": kind,
@@ -3262,11 +3392,69 @@ def release_session_claim(s):
     s.claim_paths = []
 
 
+def owner_reconnect_target_alive(session):
+    pid = int(getattr(session, "child_pid", 0) or 0)
+    token = str(getattr(session, "child_start_token", "") or "")
+    return pid > 0 and bool(token) and _same_process_instance(pid, token)
+
+
+def finalize_confirmed_owner_exit(session):
+    session.owner_exit_confirmed = True
+    session.dead = True
+    session.lifecycle = "dormant"
+    session.expected_owner = False
+    session.owner = False
+    session.owner_key = ""
+    session.child_pid = 0
+    session.child_start_token = ""
+    session.stop_disposition = ""
+    release_session_claim(session)
+
+
+async def reconcile_owner_disconnect(sessions, name, owner, save_manifest):
+    if sessions.get(name) is not owner:
+        return
+    target_alive = True
+    if not str(getattr(owner, "owner_stop_error", "") or ""):
+        target_alive = await asyncio.get_running_loop().run_in_executor(
+            None,
+            lambda: owner_reconnect_target_alive(owner),
+        )
+    if not target_alive:
+        finalize_confirmed_owner_exit(owner)
+        if owner.adopted:
+            sessions.pop(name, None)
+        await save_manifest(sessions)
+    else:
+        owner.dead = True
+        owner.lifecycle = "dormant"
+
+
 async def terminate_session_off_loop(s, by_user=True, timeout=12, release_claim_on_success=True):
     """Stop a session and do not return success until its PTY process is confirmed gone."""
     if s is None:
         return True, "already stopped"
     s.user_killed = by_user
+    try:
+        alive = bool(s.alive())
+    except Exception:
+        alive = False
+    if bool(getattr(s, "adopted", False)) and not alive:
+        stop_error = str(getattr(s, "owner_stop_error", "") or "")
+        if stop_error:
+            return False, "visible local owner could not stop its process tree: " + stop_error
+        pid = int(getattr(s, "child_pid", 0) or 0)
+        token = str(getattr(s, "child_start_token", "") or "")
+        target_alive = await asyncio.get_running_loop().run_in_executor(
+            None,
+            lambda: _same_process_instance(pid, token),
+        )
+        s.dead = True
+        if release_claim_on_success:
+            release_session_claim(s)
+        if target_alive:
+            return True, "adopted mirror removed; the local terminal and its agent are still running"
+        return True, "adopted terminal already exited; mirror record removed"
     if bool(getattr(s, "owner", False)):
         try:
             s.kill(by_user=by_user)
@@ -3274,6 +3462,9 @@ async def terminate_session_off_loop(s, by_user=True, timeout=12, release_claim_
             return False, f"owner stop request failed: {e}"
         deadline = time.monotonic() + max(0.1, timeout)
         while not bool(getattr(s, "owner_exit_confirmed", False)):
+            stop_error = str(getattr(s, "owner_stop_error", "") or "")
+            if stop_error:
+                return False, "visible local owner could not stop its process tree: " + stop_error
             if time.monotonic() >= deadline:
                 return False, "visible local owner did not confirm child-process exit"
             await asyncio.sleep(0.05)
@@ -3676,15 +3867,7 @@ async def main():
             current = sessions.get(name)
             if current is None:
                 return False, "no such session: " + name
-            snapshot = persisted_session_snapshot(current)
-            current.lifecycle = "stopping"
-            current.stop_disposition = "remove" if by_user else "replace"
-            pty = getattr(current, "pty", None)
-            current.child_pid = int(getattr(pty, "pid", 0) or getattr(current, "child_pid", 0) or 0)
-            current.child_start_token = (
-                _process_start_token(current.child_pid)
-                or getattr(current, "child_start_token", "")
-            )
+            snapshot = prepare_session_stop(current, by_user)
             try:
                 await manifest_save_async(sessions)
             except Exception as e:
@@ -3740,12 +3923,20 @@ async def main():
 
     @state_mutation
     async def coordinate_owner_registration(first, ws):
+        if deployment_fenced():
+            return None, "muxd deployment verification is in progress"
         name = strict_mux_name(first.get("s", ""))
         if not name:
             return None, "session name required"
         owner_key = str(first.get("ownerKey", "") or "")
         if len(owner_key) < 24:
             return None, "visible owner registration requires a reconnect key"
+        adopted = bool(first.get("adopted") or first.get("externalOwner"))
+        child_pid = int(first.get("childPid", 0) or 0)
+        if adopted and child_pid <= 0:
+            return None, "adopted owner registration requires a target pid"
+        if adopted and not _process_start_token(child_pid):
+            return None, "adopted target process is not alive"
 
         async with launch_lock(name):
             prev = sessions.get(name)
@@ -3759,6 +3950,8 @@ async def main():
                 requested_aliases or (getattr(prev, "aliases", ()) if prev else ()),
                 ids or (prev.ids if prev else None),
             )
+            if adopted and not candidate_ids:
+                return None, "adopted owner registration requires a verified session identity"
             live_owner_reconnect = bool(
                 prev
                 and getattr(prev, "owner", False)
@@ -3772,7 +3965,8 @@ async def main():
                 and not prev.alive()
                 and getattr(prev, "owner_key", "") == owner_key
             )
-            reconnect = live_owner_reconnect or restored_owner_reconnect
+            adopted_owner_reconnect = adopted_owner_reconnect_matches(prev, adopted, child_pid)
+            reconnect = live_owner_reconnect or restored_owner_reconnect or adopted_owner_reconnect
             if prev and prev.alive():
                 return None, "session already has a visible local owner: " + name
             if prev and (getattr(prev, "owner", False) or getattr(prev, "expected_owner", False)) and not reconnect:
@@ -3780,15 +3974,26 @@ async def main():
             if reconnect and (
                 normalized_cmd(getattr(prev, "cmd", "")) != normalized_cmd(cmd)
                 or set(getattr(prev, "ids", []) or []) != set(candidate_ids)
+                or bool(getattr(prev, "adopted", False)) != adopted
             ):
                 return None, "visible owner reconnect identity changed: " + name
 
             ignored_live_override = None
-            if restored_owner_reconnect and candidate_ids:
+            if adopted and candidate_ids and (
+                not reconnect or getattr(prev, "_launch_claim", None) is None
+            ):
                 live = await asyncio.get_running_loop().run_in_executor(None, try_live_session_ids)
                 owned_ok, ignored_live_override, owned_detail = await asyncio.get_running_loop().run_in_executor(
                     None,
-                    lambda: owner_reconnect_ignored_live(candidate_ids, first.get("childPid", 0), live),
+                    lambda: adopted_owner_ignored_live(candidate_ids, child_pid, live),
+                )
+                if not owned_ok:
+                    return None, owned_detail or "could not verify adopted visible owner"
+            elif restored_owner_reconnect and candidate_ids:
+                live = await asyncio.get_running_loop().run_in_executor(None, try_live_session_ids)
+                owned_ok, ignored_live_override, owned_detail = await asyncio.get_running_loop().run_in_executor(
+                    None,
+                    lambda: owner_reconnect_ignored_live(candidate_ids, child_pid, live),
                 )
                 if not owned_ok:
                     return None, owned_detail or "could not verify reconnecting visible owner"
@@ -3853,10 +4058,11 @@ async def main():
                 session_id=canonical_id,
                 aliases=identity_aliases,
                 owner_key=owner_key,
+                adopted=adopted,
             )
             owner._launch_claim = claim
             owner.claim_paths = list(claim.paths) if claim is not None else []
-            owner.child_pid = int(first.get("childPid", 0) or 0)
+            owner.child_pid = child_pid
             owner.child_start_token = _process_start_token(owner.child_pid)
             candidate = dict(sessions)
             candidate[name] = owner
@@ -3885,6 +4091,8 @@ async def main():
         operation_key="",
         operation_fingerprint="",
     ):
+        if deployment_fenced():
+            return None, "muxd deployment verification is in progress", False
         name = SAFE(first.get("s", ""))
         if not name:
             return None, "session name required", False
@@ -4287,9 +4495,16 @@ async def main():
                         "that process belongs to this interrupted lifecycle"
                     )
         for pid in pids:
-            ok, detail = await asyncio.get_running_loop().run_in_executor(
-                None, lambda target=pid: _terminate_pid_tree(target)
-            )
+            if bool(getattr(restored, "adopted", False)):
+                ok, detail = await asyncio.get_running_loop().run_in_executor(
+                    None,
+                    lambda target=pid, token=restored.child_start_token:
+                        _terminate_adopted_process_tree(target, token),
+                )
+            else:
+                ok, detail = await asyncio.get_running_loop().run_in_executor(
+                    None, lambda target=pid: _terminate_pid_tree(target)
+                )
             if not ok:
                 return False, detail
         return True, "unresolved child processes are stopped"
@@ -4347,6 +4562,20 @@ async def main():
                 log(f"[boot] failed lifecycle for {name}; left dormant")
                 continue
             if restored.expected_owner:
+                target_alive = await asyncio.get_running_loop().run_in_executor(
+                    None,
+                    lambda current=restored: owner_reconnect_target_alive(current),
+                )
+                if not target_alive:
+                    finalize_confirmed_owner_exit(restored)
+                    if restored.adopted:
+                        sessions.pop(name, None)
+                        await manifest_save_async(sessions)
+                        log(f"[boot] removed exited adopted owner: {name}")
+                    else:
+                        await manifest_save_async(sessions)
+                        log(f"[boot] visible owner target exited; left dormant: {name}")
+                    continue
                 log(f"[boot] waiting for visible owner reconnect: {name}")
                 continue
             if restored.identity_pending:
@@ -4527,16 +4756,27 @@ async def main():
                                         bool(m.get("ok")),
                                         "" if m.get("ok") else "visible terminal rejected input",
                                     ))
+                            elif mt == "killResult" and not bool(m.get("ok")):
+                                owner.owner_stop_error = str(
+                                    m.get("m") or "process-tree termination was not confirmed"
+                                )[:500]
                             elif mt == "dead":
-                                owner.owner_exit_confirmed = True
-                                owner.dead = True
+                                finalize_confirmed_owner_exit(owner)
+                                if owner.adopted:
+                                    sessions.pop(name, None)
+                                await manifest_save_async(sessions)
                                 break
                     finally:
                         for waiter in list(owner.input_waiters.values()):
                             if not waiter.done():
                                 waiter.set_result((False, "visible owner disconnected during input"))
                         if sessions.get(name) is owner:
-                            owner.dead = True
+                            await reconcile_owner_disconnect(
+                                sessions,
+                                name,
+                                owner,
+                                manifest_save_async,
+                            )
                             outq.put_nowait(("dead", name, ""))
                     return
                 if first.get("t") == "bind":
@@ -4790,11 +5030,9 @@ async def main():
                                         m, input_session, body, principal=principal
                                     )
                                     if outcome.get("t") == "err":
-                                        await ws.send(json.dumps({
-                                            **outcome,
-                                            "s": name,
-                                            "intentId": principal.intent_id,
-                                        }))
+                                        await ws.send(json.dumps(relay_input_error_frame(
+                                            outcome, name, m, principal
+                                        )))
                             elif t == "resize" and name in sessions:
                                 apply_remote_session_size(sessions[name], m)
                             elif t == "sb" and name in sessions:

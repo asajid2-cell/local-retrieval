@@ -492,6 +492,15 @@ public sealed partial class MainPage
                         c.intentId,
                         c.takeover);
                 }
+                else if (string.Equals(c.type, "mirrorlocal", StringComparison.OrdinalIgnoreCase))
+                {
+                    res = await MirrorLocalFromIntentAsync(
+                        c.muxName ?? c.sessionName ?? "",
+                        c.sessionId ?? "",
+                        c.tool ?? "",
+                        c.pid);
+                    added |= res.ok;
+                }
                 else if (string.Equals(c.type, "startchat", StringComparison.OrdinalIgnoreCase))
                 {
                     res = await StartChatHeadlessFromIntentAsync(c);
@@ -870,6 +879,54 @@ public sealed partial class MainPage
         return created.ok ? (true, "started PC-local mux session: " + name) : created;
     }
 
+    private async Task<(bool ok, string detail)> MirrorLocalFromIntentAsync(
+        string name,
+        string sessionId,
+        string tool,
+        int pid)
+    {
+        name = (name ?? "").Trim();
+        if (string.IsNullOrWhiteSpace(name)) return (false, "missing mux session name");
+        if (!_archive.TryBuildRemoteMuxLaunch(sessionId, tool, out var launch, out var detail) || launch is null)
+            return (false, detail);
+
+        var result = await AdoptedMuxLauncher.MirrorAsync(
+            new AdoptedMuxLauncher.Request(
+                name,
+                pid,
+                launch.SessionId,
+                launch.Aliases,
+                launch.Tool.ToLowerInvariant(),
+                launch.Command,
+                launch.Workspace),
+            message => LocalMuxdRequestAsync(message),
+            Diag.Log);
+        var session = _archive.ResolveSessionByIdOrAlias(launch.SessionId, launch.Tool);
+        RecordSessionEvent(
+            session,
+            result.Ok ? "mux.mirror.started" : "mux.mirror.refused",
+            result.Detail,
+            result.Ok ? "info" : "warn",
+            details: new Dictionary<string, string>
+            {
+                ["muxName"] = name,
+                ["pid"] = pid.ToString(),
+            });
+        if (!result.Ok) return (false, result.Detail);
+
+        _archive.SetTabKind(name, "adopted-local", "#38bdf8");
+        try
+        {
+            await _archive.SaveAsync();
+            await PushProjectsAsync();
+        }
+        catch (Exception ex)
+        {
+            Diag.Log("Adopted mux metadata persistence failed: " + ex.Message);
+        }
+        return (true, result.Detail);
+    }
+
     private async Task<(bool ok, string detail)> StartMuxHeadlessCommandFromIntentAsync(
         SessionLaunchRequest request,
         string name,
@@ -889,6 +946,29 @@ public sealed partial class MainPage
             relaunch: relaunch,
             allowLocalIntentMint: false);
         return created.ok ? (true, "started PC-local mux session: " + name) : created;
+    }
+
+    private async Task<CodexLocalRetrieval.Core.Models.AgentCommandResult> HandleMirrorLocalAsync(
+        CodexLocalRetrieval.Core.Models.AgentCommand command)
+    {
+        if (command.pid <= 0)
+            return new CodexLocalRetrieval.Core.Models.AgentCommandResult(
+                false,
+                "mirrorlocal needs the live Claude/Codex process pid.");
+        CodexLocalRetrieval.Core.Models.ArchiveSession? session = null;
+        try { session = await _archive.ResolveOrIndexTargetAsync(command); } catch { }
+        if (session is null)
+            return new CodexLocalRetrieval.Core.Models.AgentCommandResult(
+                false,
+                "couldn't resolve this session; pass id + tool.");
+        var name = !string.IsNullOrWhiteSpace(command.name)
+            ? command.name!.Trim()
+            : ArchiveService.MultiplexSessionName(session);
+        var result = await MirrorLocalFromIntentAsync(name, session.Id, session.Tool, command.pid);
+        return new CodexLocalRetrieval.Core.Models.AgentCommandResult(
+            result.ok,
+            result.detail,
+            ResolvedSessionId: session.Id);
     }
 
     // /tomux handoff: resolve the caller's own session, stop the local owner, verify the

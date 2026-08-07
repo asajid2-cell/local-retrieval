@@ -1,0 +1,257 @@
+#!/usr/bin/env bash
+# Root-owned fixed-policy installer. The caller supplies content identity, never paths or commands.
+set -euo pipefail
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+die() { printf 'deploy-multiplex: %s\n' "$*" >&2; exit 1; }
+log() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" | tee -a /var/log/multiplex-deploy.log; }
+
+[ "$(id -u)" -eq 0 ] || die "must run as root"
+RELEASES=/opt/multiplex-releases
+CURRENT=/opt/multiplex-app
+STATE=/var/lib/multiplex
+UNIT=multiplex-app.service
+ENV_FILE=/etc/multiplex-app.env
+
+require_unit_value() {
+    local property="$1" expected="$2" actual
+    actual="$(systemctl show "$UNIT" -p "$property" --value)"
+    [ "$actual" = "$expected" ] || die "$UNIT must have $property=$expected (found ${actual:-<empty>})"
+}
+
+runtime_identity_ok() {
+    local pid status svc_uid svc_gid docker_gid
+    pid="$(systemctl show "$UNIT" -p MainPID --value)"
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+    status="/proc/$pid/status"
+    [ -r "$status" ] || return 1
+    svc_uid="$(id -u svc-multiplex)"
+    svc_gid="$(id -g svc-multiplex)"
+    awk -v expected="$svc_uid" '
+        /^Uid:/ {
+            found = 1
+            for (i = 2; i <= 5; i++) if ($i != expected) exit 1
+        }
+        END { if (!found) exit 1 }
+    ' "$status" || return 1
+    awk -v expected="$svc_gid" '
+        /^Gid:/ {
+            found = 1
+            for (i = 2; i <= 5; i++) if ($i != expected) exit 1
+        }
+        END { if (!found) exit 1 }
+    ' "$status" || return 1
+    docker_gid="$(getent group docker | awk -F: '{print $3; exit}')"
+    if [ -n "$docker_gid" ] && awk -v denied="$docker_gid" '
+        /^Groups:/ {
+            for (i = 2; i <= NF; i++) if ($i == denied) found = 1
+        }
+        END { exit(found ? 0 : 1) }
+    ' "$status"; then
+        return 1
+    fi
+}
+
+env_has_value() {
+    local key="$1"
+    awk -F= -v key="$key" '
+        $1 == key {
+            value = substr($0, index($0, "=") + 1)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+            if (value != "" && value != "\"\"" && value != "\047\047") found = 1
+        }
+        END { exit(found ? 0 : 1) }
+    ' "$ENV_FILE"
+}
+
+preflight() {
+    local env_mode env_owner env_group listeners
+    [ -f "$ENV_FILE" ] && [ ! -L "$ENV_FILE" ] || die "$ENV_FILE is missing or unsafe"
+    env_owner="$(stat -c %U "$ENV_FILE")"
+    env_group="$(stat -c %G "$ENV_FILE")"
+    env_mode="$(stat -c %a "$ENV_FILE")"
+    [ "$env_owner:$env_group" = "root:root" ] || die "$ENV_FILE must be owned by root:root"
+    [ "$env_mode" = 600 ] || die "$ENV_FILE must have mode 0600"
+    for key in PORT MUX_HOST_TOKEN HL_INTERNAL_KEY MUX_BRIDGE_TOKEN; do
+        env_has_value "$key" || die "$ENV_FILE is missing a non-empty $key"
+    done
+
+    require_unit_value User svc-multiplex
+    require_unit_value Group svc-multiplex
+    require_unit_value NoNewPrivileges yes
+    require_unit_value ProtectSystem strict
+    require_unit_value ReadWritePaths /var/lib/multiplex
+    require_unit_value SupplementaryGroups ""
+    if systemctl is-active --quiet "$UNIT"; then
+        runtime_identity_ok || die "$UNIT running process has the wrong UID/GID or retains docker access"
+    fi
+
+    nginx -t >/dev/null 2>&1 || die "nginx configuration check failed"
+    listeners="$(ss -H -ltn 'sport = :4200' | awk '{print $4}')"
+    [ -n "$listeners" ] || die "hl-auth is not listening on port 4200"
+    if printf '%s\n' "$listeners" | grep -Ev '^(127\.0\.0\.1|\[::1\]):4200$' >/dev/null; then
+        die "hl-auth port 4200 must be loopback-only"
+    fi
+}
+
+if [ "$#" -eq 1 ] && [ "$1" = --preflight ]; then
+    preflight
+    printf 'deploy-multiplex preflight ok\n'
+    exit 0
+fi
+
+[ "$#" -eq 2 ] || die "usage: deploy-multiplex --preflight | <40-hex-commit> <64-hex-sha256>"
+COMMIT="$1"
+EXPECTED_SHA="$2"
+[[ "$COMMIT" =~ ^[0-9a-f]{40}$ ]] || die "invalid commit"
+[[ "$EXPECTED_SHA" =~ ^[0-9a-f]{64}$ ]] || die "invalid sha256"
+preflight
+
+ARCHIVE="/home/sub/multiplex-incoming/multiplex-$COMMIT.tgz"
+[ -f "$ARCHIVE" ] && [ ! -L "$ARCHIVE" ] || die "release archive missing or unsafe"
+[ "$(stat -c %U "$ARCHIVE")" = sub ] || die "release archive must be owned by sub"
+QUARANTINE="$STATE/deploy-incoming"
+install -d -o root -g root -m 0700 "$QUARANTINE"
+mv -- "$ARCHIVE" "$QUARANTINE/multiplex-$COMMIT.tgz"
+ARCHIVE="$QUARANTINE/multiplex-$COMMIT.tgz"
+[ -f "$ARCHIVE" ] && [ ! -L "$ARCHIVE" ] || die "quarantined release archive is unsafe"
+ACTUAL_SHA="$(sha256sum "$ARCHIVE" | awk '{print $1}')"
+[ "$ACTUAL_SHA" = "$EXPECTED_SHA" ] || die "release archive checksum mismatch"
+
+STAGE="$(mktemp -d /opt/multiplex-stage.XXXXXX)"
+NEXT_LINK=/opt/.multiplex-app.next
+cleanup() { rm -rf -- "$STAGE" "$NEXT_LINK"; }
+trap cleanup EXIT
+
+python3 - "$ARCHIVE" "$STAGE" <<'PY'
+import pathlib, sys, tarfile
+archive, stage = sys.argv[1:]
+root = pathlib.Path(stage).resolve()
+with tarfile.open(archive, "r:gz") as tf:
+    for member in tf.getmembers():
+        path = pathlib.PurePosixPath(member.name)
+        if path.is_absolute() or ".." in path.parts:
+            raise SystemExit("unsafe archive path: " + member.name)
+        if not (member.isdir() or member.isfile()):
+            raise SystemExit("archive links/devices are refused: " + member.name)
+        target = (root / pathlib.Path(*path.parts)).resolve()
+        if root not in target.parents and target != root:
+            raise SystemExit("archive path escapes staging: " + member.name)
+    tf.extractall(root)
+PY
+
+[ "$(cat "$STAGE/RELEASE_COMMIT")" = "$COMMIT" ] || die "archive commit marker mismatch"
+APP="$STAGE/relay"
+[ -f "$APP/server.js" ] || die "release is missing relay/server.js"
+[ -f "$APP/package.json" ] && [ -f "$APP/package-lock.json" ] || die "release is missing npm manifests"
+[ -f "$STAGE/scripts/backup-state.sh" ] || die "release is missing backup-state.sh"
+
+install -d -o svc-multiplex -g svc-multiplex -m 0700 "$STATE"
+chown -R svc-multiplex:svc-multiplex "$STAGE"
+runuser -u svc-multiplex -- env HOME="$STATE" npm --prefix "$APP" ci --omit=dev --ignore-scripts
+runuser -u svc-multiplex -- node --check "$APP/server.js"
+chown -R root:root "$STAGE"
+chmod -R go-w "$STAGE"
+
+RELEASE="$RELEASES/$COMMIT"
+install -d -o root -g root -m 0755 "$RELEASES"
+if [ -e "$RELEASE" ]; then
+    [ -f "$RELEASE/RELEASE_COMMIT" ] && [ "$(cat "$RELEASE/RELEASE_COMMIT")" = "$COMMIT" ] \
+        || die "existing release directory does not match commit"
+    rm -rf -- "$STAGE"
+else
+    mv -- "$STAGE" "$RELEASE"
+fi
+
+install -o root -g root -m 0755 "$RELEASE/scripts/backup-state.sh" /usr/local/bin/mux-backup-state.sh
+
+PREVIOUS=""
+LEGACY=""
+if [ -L "$CURRENT" ]; then
+    PREVIOUS="$(readlink -f "$CURRENT")"
+elif [ -d "$CURRENT" ]; then
+    LEGACY="$RELEASES/legacy-$(date -u +%Y%m%dT%H%M%SZ)"
+fi
+
+PORT="$(awk -F= '$1 == "PORT" { gsub(/[[:space:]]/, "", $2); print $2; exit }' "$ENV_FILE")"
+[[ "$PORT" =~ ^[0-9]{2,5}$ ]] || die "invalid PORT in $ENV_FILE"
+
+release_health_ok() {
+    runtime_identity_ok || return 1
+    curl -fsS --max-time 3 "http://127.0.0.1:$PORT/api/health" |
+        python3 -c '
+import json, sys
+health = json.load(sys.stdin)
+persistence = health.get("persistence") or {}
+ok = (
+    isinstance(health.get("uptimeSec"), (int, float))
+    and isinstance(health.get("node"), str)
+    and bool(health.get("node"))
+    and persistence.get("ok") is True
+)
+raise SystemExit(0 if ok else 1)
+'
+}
+
+distributed_health_ok() {
+    curl -fsS --max-time 3 "http://127.0.0.1:$PORT/api/health" |
+        python3 -c 'import json,sys; raise SystemExit(0 if json.load(sys.stdin).get("ok") is True else 1)'
+}
+
+backup_route_ready() {
+    runuser -u svc-multiplex -- env HOME="$STATE" \
+        ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=yes win true \
+        >/dev/null 2>&1
+}
+
+log "deploy start commit=$COMMIT sha256=$EXPECTED_SHA"
+systemctl stop "$UNIT"
+if [ -n "$LEGACY" ]; then
+    mv -- "$CURRENT" "$LEGACY"
+    PREVIOUS="$LEGACY"
+fi
+ln -s "$RELEASE/relay" "$NEXT_LINK"
+mv -Tf -- "$NEXT_LINK" "$CURRENT"
+
+if systemctl start "$UNIT"; then
+    for _ in $(seq 1 40); do
+        release_health_ok && break
+        sleep 0.5
+    done
+fi
+
+if ! systemctl is-active --quiet "$UNIT" || ! release_health_ok; then
+    log "deploy health failed commit=$COMMIT; rolling back"
+    systemctl stop "$UNIT" || true
+    if [ -n "$PREVIOUS" ] && [ -d "$PREVIOUS" ]; then
+        ln -s "$PREVIOUS" "$NEXT_LINK"
+        mv -Tf -- "$NEXT_LINK" "$CURRENT"
+        systemctl start "$UNIT"
+        for _ in $(seq 1 40); do
+            release_health_ok && break
+            sleep 0.5
+        done
+    fi
+    release_health_ok || die "deployment and rollback health checks failed"
+    die "deployment failed; previous release restored"
+fi
+
+if distributed_health_ok; then
+    log "distributed health green commit=$COMMIT"
+else
+    log "deploy locally healthy commit=$COMMIT; distributed health remains degraded"
+fi
+
+if backup_route_ready; then
+    if systemctl enable --now mux-relay-backup.timer; then
+        log "backup timer enabled; svc-multiplex win route verified"
+    else
+        log "backup route verified, but timer activation failed; application release remains healthy"
+    fi
+elif systemctl is-enabled --quiet mux-relay-backup.timer; then
+    log "backup route unavailable; existing timer remains enabled and will skip cleanly"
+else
+    log "backup timer left disabled; svc-multiplex win route is not ready"
+fi
+rm -f -- "$ARCHIVE"
+log "deploy healthy commit=$COMMIT"

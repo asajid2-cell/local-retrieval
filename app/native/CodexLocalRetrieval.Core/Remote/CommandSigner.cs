@@ -1,5 +1,7 @@
 using System.Collections.Concurrent;
+using System.Security.AccessControl;
 using System.Security.Cryptography;
+using System.Security.Principal;
 using System.Text;
 
 namespace CodexLocalRetrieval.Core.Remote;
@@ -55,8 +57,8 @@ public sealed class CommandSigner
     }
 
     // Key source: explicit env value, else a persisted per-machine key, else freshly generated + saved.
-    // The key is printed once via `log` so the owner can read it OFF THE PC (out-of-band) and enter it in
-    // the browser — it is never delivered over the network.
+    // The persisted file is owner/SYSTEM/Administrators-only. Its value is never logged or delivered
+    // over the network.
     public static CommandSigner LoadOrCreate(string? envKey, string keyFilePath, Action<string> log)
     {
         if (!string.IsNullOrWhiteSpace(envKey) && envKey.Trim().Length >= 24)
@@ -65,14 +67,31 @@ public sealed class CommandSigner
         {
             if (File.Exists(keyFilePath))
             {
+                HardenKeyFileAcl(keyFilePath);
                 var existing = File.ReadAllText(keyFilePath).Trim();
                 if (existing.Length >= 24) return new CommandSigner(existing);
             }
             var key = Convert.ToHexString(RandomNumberGenerator.GetBytes(24)).ToLowerInvariant(); // 48 hex chars
             Directory.CreateDirectory(Path.GetDirectoryName(keyFilePath)!);
-            File.WriteAllText(keyFilePath, key);
-            log($"owner signing key (enter this in the browser to enable auto mode): {key}");
-            log($"  (saved to {keyFilePath}; set CLR_REMOTE_SIGNING_KEY to override)");
+            var tempPath = keyFilePath + "." + Guid.NewGuid().ToString("N") + ".tmp";
+            try
+            {
+                using (var stream = new FileStream(tempPath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+                {
+                    HardenKeyFileAcl(tempPath);
+                    using var writer = new StreamWriter(stream, new UTF8Encoding(false), leaveOpen: true);
+                    writer.Write(key);
+                    writer.Flush();
+                    stream.Flush(flushToDisk: true);
+                }
+                File.Move(tempPath, keyFilePath, overwrite: true);
+                HardenKeyFileAcl(keyFilePath);
+            }
+            finally
+            {
+                if (File.Exists(tempPath)) File.Delete(tempPath);
+            }
+            log($"owner signing key saved to {keyFilePath}; read that protected local file to configure auto mode");
             return new CommandSigner(key);
         }
         catch (Exception ex)
@@ -80,5 +99,26 @@ public sealed class CommandSigner
             log("could not establish a signing key, auto mode disabled: " + ex.Message);
             return new CommandSigner(null);
         }
+    }
+
+    internal static void HardenKeyFileAcl(string path)
+    {
+        if (!OperatingSystem.IsWindows()) return;
+
+        var owner = WindowsIdentity.GetCurrent().User
+            ?? throw new InvalidOperationException("could not resolve the current Windows user SID");
+        var security = new FileSecurity();
+        security.SetOwner(owner);
+        security.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
+        security.AddAccessRule(new FileSystemAccessRule(owner, FileSystemRights.FullControl, AccessControlType.Allow));
+        security.AddAccessRule(new FileSystemAccessRule(
+            new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null),
+            FileSystemRights.FullControl,
+            AccessControlType.Allow));
+        security.AddAccessRule(new FileSystemAccessRule(
+            new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null),
+            FileSystemRights.FullControl,
+            AccessControlType.Allow));
+        new FileInfo(path).SetAccessControl(security);
     }
 }

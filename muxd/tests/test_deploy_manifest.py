@@ -91,7 +91,11 @@ def missing_from_manifest(muxd_dir=MUXD_DIR, script_path=DEPLOY_SCRIPT):
 class TestDeployManifest(unittest.TestCase):
     @unittest.skipIf(os.name != "nt", "PowerShell deploy preflight requires Windows")
     def test_enforce_deploy_refuses_an_empty_principal_registry_before_copy(self):
-        with tempfile.TemporaryDirectory() as profile:
+        with tempfile.TemporaryDirectory() as profile, tempfile.TemporaryDirectory() as runtime:
+            ops = os.path.join(runtime, "ops")
+            os.mkdir(ops)
+            with open(os.path.join(ops, "restart_muxd.ps1"), "w", encoding="utf-8") as fh:
+                fh.write("param([switch]$CheckOnly)\nexit 0\n")
             env = os.environ.copy()
             env["HOME"] = profile
             env["USERPROFILE"] = profile
@@ -102,6 +106,7 @@ class TestDeployManifest(unittest.TestCase):
                     "-ExecutionPolicy", "Bypass",
                     "-File", DEPLOY_SCRIPT,
                     "-AuthzMode", "enforce",
+                    "-RuntimeDir", runtime,
                 ],
                 cwd=REPO_ROOT,
                 env=env,
@@ -195,18 +200,18 @@ class TestDeployManifest(unittest.TestCase):
     def test_deploy_script_propagates_preflight_failure(self):
         text = read(DEPLOY_SCRIPT)
         refusal = re.search(
-            r"\$preflight\s*\|\s*python\s+-\s+\$src\s+\$dst\s*\r?\n"
-            r"\s*if\s*\(\$LASTEXITCODE\s*-ne\s*0\)[\s\S]*?\bexit\s+1\b",
+            r"\$preflight\s*\|\s*python\s+-\s+\$src\s+\$stage\s*\r?\n"
+            r"\s*if\s*\(\$LASTEXITCODE\s*-ne\s*0\)[\s\S]*?\bthrow\b",
             text,
         )
         self.assertIsNotNone(
             refusal,
-            "the preflight invocation must be followed by a LASTEXITCODE check that exits 1",
+            "the staged preflight invocation must be followed by a LASTEXITCODE check that throws",
         )
         self.assertLess(
             refusal.end(),
-            text.index("Start-ScheduledTask"),
-            "preflight refusal must appear before Start-ScheduledTask",
+            text.index("$liveChanged = $true"),
+            "preflight refusal must appear before any live runtime mutation",
         )
 
     def test_every_local_sibling_module_is_deployed(self):
@@ -283,17 +288,92 @@ class TestDeployManifest(unittest.TestCase):
             re.search(r"(?m)^\s*(import muxd|from muxd import)\b", text),
             "the preflight must not import muxd — muxd.py runs module-level side effects",
         )
-        restart = text.index("Start-ScheduledTask")
+        restart = text.index("Invoke-RestartAndVerify", text.index("$restartRequested = $true"))
         preflight = text.index("PREFLIGHT-LOCAL-MODULE-MANIFEST")
         self.assertLess(
             preflight, restart,
-            "the local-module preflight must run before Start-ScheduledTask",
+            "the local-module preflight must run before the restart",
         )
         refusal = re.search(
-            r"missing local modules[\s\S]*?exit 1[\s\S]*?Start-ScheduledTask", text)
+            r"missing local modules[\s\S]*?throw[\s\S]*?\$liveChanged = \$true", text)
         self.assertIsNotNone(
             refusal,
-            "deploy-muxd.ps1 must exit 1 on missing local modules before Start-ScheduledTask",
+            "deploy-muxd.ps1 must reject missing local modules before changing the live runtime",
+        )
+
+    def test_deploy_stages_before_live_copy_and_restores_on_failure(self):
+        text = read(DEPLOY_SCRIPT)
+        self.assertRegex(text, r"(?m)^\$ErrorActionPreference\s*=\s*['\"]Stop['\"]")
+        stage_compile = text.index("& python -m py_compile $stagedFile")
+        live_copy = text.index(
+            "Copy-Item -LiteralPath (Join-Path $stage $f) -Destination $liveFile -Force"
+        )
+        self.assertLess(stage_compile, live_copy)
+        self.assertIn("function Restore-Runtime", text)
+        self.assertRegex(
+            text,
+            r"catch\s*\{[\s\S]*?Restore-Runtime[\s\S]*?throw \$deploymentError",
+        )
+
+    def test_deploy_persists_authz_mode_and_verifies_restart_health(self):
+        text = read(DEPLOY_SCRIPT)
+        self.assertNotIn(
+            "[string]$AuthzMode = $(if ($env:MUX_AUTHZ_MODE)",
+            text,
+            "an omitted mode must preserve the current runtime setting instead of defaulting to audit",
+        )
+        self.assertIn(
+            "Get-MuxdEnvValue -Path $runtimeEnv -Name 'MUX_AUTHZ_MODE'",
+            text,
+        )
+        self.assertIn(
+            "Set-MuxdEnvValue -Path $runtimeEnv -Name 'MUX_AUTHZ_MODE' -Value $AuthzMode",
+            text,
+        )
+        self.assertIn("Get-ScheduledTaskInfo -TaskName $restartTask", text)
+        self.assertIn("& python (Join-Path $dst 'muxctl.py') status", text)
+
+    def test_enforce_requires_the_trusted_browser_signer_before_copy(self):
+        text = read(DEPLOY_SCRIPT)
+        signer_guard = text.index(
+            "enforce deployment requires the trusted browser principal-auth.js signer"
+        )
+        live_copy = text.index(
+            "Copy-Item -LiteralPath (Join-Path $stage $f) -Destination $liveFile -Force"
+        )
+        self.assertLess(signer_guard, live_copy)
+        self.assertIn("Join-Path $relay 'public\\principal-auth.js'", text)
+        self.assertIn("principal-auth\\.js", text)
+        self.assertIn("<script\\b", text)
+
+    def test_rollback_uses_recovery_restart_that_can_start_an_absent_muxd(self):
+        deploy = read(DEPLOY_SCRIPT)
+        restart = read(os.path.join(MUXD_DIR, "ops", "restart_muxd.ps1"))
+        self.assertRegex(
+            deploy,
+            r"Restore-Runtime[\s\S]*?Invoke-RestartAndVerify -Recovery",
+        )
+        self.assertIn("'ops\\restart_muxd.ps1'", deploy)
+        self.assertRegex(
+            deploy,
+            r"foreach \(\$f in \$files\)[\s\S]*?Copy-Item -LiteralPath "
+            r"\(Join-Path \$stage \$f\) -Destination \$liveFile -Force",
+        )
+        self.assertIn("[switch]$Recovery", restart)
+        self.assertIn("[string]$RecoveryToken", restart)
+        self.assertIn('$fence -ne "recovery:$RecoveryToken"', restart)
+        self.assertIn("recovery restart token expired", restart)
+        self.assertRegex(
+            restart,
+            r"if \(-not \$skipPreflight\)\s*\{\s*\$sessions = @\(Get-HostedSessions\)",
+        )
+        fence_create = deploy.index('"recovery:$recoveryToken`n"')
+        restart_request = deploy.index("$restartRequested = $true")
+        self.assertLess(fence_create, restart_request)
+        self.assertRegex(
+            deploy,
+            r"Invoke-RestartAndVerify -Recovery[\s\S]*?"
+            r"Remove-Item -LiteralPath \$deployFence -Force",
         )
 
 

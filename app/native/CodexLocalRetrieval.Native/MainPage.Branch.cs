@@ -431,12 +431,23 @@ public sealed partial class MainPage
             SyncStatus.Text = "The original chat isn't in the index.";
     }
 
+    // The checkpoint a branch came from, or "" when it was branched off a live chat directly. Named
+    // separately because the source chat's title keeps moving and the checkpoint's does not: renaming a
+    // chat after taking a checkpoint made every branch report the chat's newest name, which reads as the
+    // spawn having used the wrong checkpoint even when the transcript was correct.
+    private string CheckpointNameOf(ArchiveSession session)
+        => !string.IsNullOrWhiteSpace(session?.FromSnapshotId)
+           && _archive.Store.TemplateSnapshots.TryGetValue(session.FromSnapshotId, out var snapshot)
+            ? snapshot.DisplayName
+            : "";
+
     private UIElement? BranchBadge(ArchiveSession session)
     {
         if (session is null || !session.IsBranch) return null;
         var parentTitle = _archive.Store.Sessions.TryGetValue(session.BranchOfId, out var parent)
             ? parent.DisplayTitle
             : session.BranchOfId;
+        var checkpointName = CheckpointNameOf(session);
         var button = new Button
         {
             Style = (Style)Resources["PillButtonStyle"],
@@ -449,7 +460,11 @@ public sealed partial class MainPage
                 FontWeight = FontWeights.SemiBold
             }
         };
-        ToolTipService.SetToolTip(button, $"Branch of \"{parentTitle}\" - click to view the original");
+        ToolTipService.SetToolTip(
+            button,
+            checkpointName.Length > 0
+                ? $"Branch of checkpoint \"{checkpointName}\" (from \"{parentTitle}\") - click to view the original"
+                : $"Branch of \"{parentTitle}\" - click to view the original");
         button.Click += (_, _) => OpenParentOf(session);
         return button;
     }

@@ -60,6 +60,18 @@ function Stop-AppAndDeps {
     } catch {}
     try { Stop-ScheduledTask -TaskName 'CodexArchiveRemote' -ErrorAction SilentlyContinue } catch {}   # the bridge task can relaunch the app mid-install
 }
+
+function Protect-OwnerSecret([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    $owner = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+    $rules = @(
+        ('*' + $owner.Value + ':(F)'),
+        '*S-1-5-18:(F)',
+        '*S-1-5-32-544:(F)'
+    )
+    & "$env:SystemRoot\System32\icacls.exe" $Path /inheritance:r /grant:r $rules | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "Could not protect owner secret: $Path" }
+}
 Stop-AppAndDeps
 
 & dotnet build $proj -c Release -r $rid --nologo -v m
@@ -144,6 +156,13 @@ if (Test-Path $remoteDir) {
         Get-ChildItem -LiteralPath $remoteDir -Filter $pattern -File -ErrorAction SilentlyContinue |
             Copy-Item -Destination $remoteStaging -Force -ErrorAction SilentlyContinue
     }
+    $runRemote = Join-Path $remoteStaging 'run-remote.ps1'
+    if (Test-Path $runRemote) {
+        $runRemoteText = Get-Content -Raw $runRemote
+        $runRemoteText = $runRemoteText -replace '(?m)^\$env:CLR_REMOTE_BIND\s*=.*$', '$env:CLR_REMOTE_BIND         = "127.0.0.1"      # reverse tunnel publishes loopback to the VPS'
+        Set-Content -LiteralPath $runRemote -Value $runRemoteText -Encoding UTF8
+    }
+    Protect-OwnerSecret (Join-Path $remoteStaging 'signing.key')
     $remoteTunnelTemplate = Join-Path $repo 'scripts\remote-tunnel.ps1'
     if (Test-Path $remoteTunnelTemplate) { Copy-Item $remoteTunnelTemplate (Join-Path $remoteStaging 'remote-tunnel.ps1') -Force }
     Get-ChildItem -LiteralPath $serverBuildDir -Exclude '*.pdb' | Copy-Item -Destination $remoteStaging -Recurse -Force
@@ -155,6 +174,7 @@ if (Test-Path $remoteDir) {
 
     Rename-Item -LiteralPath $remoteDir -NewName (Split-Path $remoteBackup -Leaf) -ErrorAction Stop
     Rename-Item -LiteralPath $remoteStaging -NewName (Split-Path $remoteDir -Leaf) -ErrorAction Stop
+    Protect-OwnerSecret (Join-Path $remoteDir 'signing.key')
     if (Test-Path $remoteBackup) { Remove-Item $remoteBackup -Recurse -Force -ErrorAction SilentlyContinue }
 } else {
     Write-Host "Remote bridge folder not found; skipped CodexArchiveRemote update." -ForegroundColor DarkYellow

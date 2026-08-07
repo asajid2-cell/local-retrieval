@@ -1,6 +1,6 @@
 [Unit]
 Description=Hourly off-box backup of multiplex relay durable state
-Documentation=file:///home/harmonizer/multiplex-app/ops/README.md
+Documentation=file:///opt/multiplex-app/ops/README.md
 
 [Timer]
 OnCalendar=hourly

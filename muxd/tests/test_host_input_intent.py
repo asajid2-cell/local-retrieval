@@ -353,6 +353,40 @@ class MuxdWiringTests(unittest.TestCase):
         self.assertEqual(refusal.frame("work")["code"], "principal-proof-required")
         self.assertEqual(session.writes, [])
 
+    def test_runtime_config_enforces_when_process_environment_is_unset(self):
+        session = RecordingSession()
+
+        with mock.patch.object(muxd, "ENV", {"MUX_AUTHZ_MODE": "enforce"}):
+            with mock.patch.dict(os.environ, {}):
+                os.environ.pop("MUX_AUTHZ_MODE", None)
+                principal, body, refusal = muxd.authorize_relay_input(
+                    {"t": "i", "s": "work", "d": base64.b64encode(b"whoami\r").decode()},
+                    session,
+                    endpoint=host_input_intent.PrincipalEndpoint(instance_id=INSTANCE),
+                    now_ms=NOW_MS,
+                )
+
+        self.assertIsNone(principal)
+        self.assertIsNone(body)
+        self.assertEqual(refusal.code, "principal-proof-required")
+        self.assertEqual(session.writes, [])
+
+    def test_process_environment_overrides_runtime_authz_config(self):
+        legacy = {"t": "i", "s": "work", "d": base64.b64encode(b"legacy\r").decode()}
+
+        with mock.patch.object(muxd, "ENV", {"MUX_AUTHZ_MODE": "enforce"}):
+            with mock.patch.dict(os.environ, {"MUX_AUTHZ_MODE": "audit"}):
+                principal, body, refusal = muxd.authorize_relay_input(
+                    legacy,
+                    RecordingSession(),
+                    endpoint=host_input_intent.PrincipalEndpoint(instance_id=INSTANCE),
+                    now_ms=NOW_MS,
+                )
+
+        self.assertIsNone(principal)
+        self.assertEqual(body, b"legacy\r")
+        self.assertIsNone(refusal)
+
     def test_audit_mode_admits_only_a_proofless_legacy_body(self):
         endpoint, private = make_endpoint()
         legacy = {"t": "i", "s": "work", "d": base64.b64encode(b"legacy\r").decode()}

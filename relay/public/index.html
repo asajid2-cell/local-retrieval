@@ -2442,7 +2442,13 @@ function menuAction(a, s){
   else if(a==='rename'){ openRenameDialog(s); }
   else if(a==='color'){ pickTabColor(s); }
   else if(a==='copy'){ const url=location.origin+location.pathname+'?s='+encodeURIComponent(s.name); navigator.clipboard?.writeText(url).then(()=>flash('Link copied')).catch(()=>{}); }
-  else if(a==='kill'){ if(confirm('Kill session "'+s.name+'"? This ends the PC-hosted mux session (any running agent stops).')){ killSession(s.name); } }
+  else if(a==='kill'){
+    const detachedAdopted=!!(s.adopted && s.detachedLocal);
+    const prompt=detachedAdopted
+      ? 'Remove detached mirror "'+s.name+'"? The local terminal and its agent keep running on your PC.'
+      : 'Kill session "'+s.name+'"? This ends the PC-hosted mux session (any running agent stops).';
+    if(confirm(prompt)){ killSession(s.name); }
+  }
 }
 // ---- app-sync state + Add-to-collection --------------------------------------------------------------
 // Collections are OWNED by the desktop app; the web must NOT create them independently or state drifts. So
@@ -2566,7 +2572,9 @@ async function killSession(name){
   try{
     const r=await sendIntent('DELETE', base+'/api/sessions/'+encodeURIComponent(name), null, 'kill');
     if(!r.ok) throw new Error(await apiError(r));
-    if(current===name){ intentional=true; current=null; if(ws){try{ws.close();}catch(e){}} term.reset(); $('#empty').style.display='flex'; setStatus('','Session ended'); }
+    const result=await r.json();
+    if(current===name){ intentional=true; current=null; if(ws){try{ws.close();}catch(e){}} term.reset(); $('#empty').style.display='flex'; setStatus('',result.detail||'Session ended'); }
+    else if(result.detail) flash(result.detail);
     loadSessions();
   }catch(e){ flash('Kill failed: '+(e.message||e)); loadSessions(); }
 }

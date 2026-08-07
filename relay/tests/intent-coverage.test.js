@@ -133,7 +133,7 @@ test('r.1.6.3 integration: session.kill intent replays exactly-once and rejects 
   host.sendKilled('kill-intent');
   const firstRes = await first;
   assert.equal(firstRes.status, 200);
-  assert.deepEqual(firstRes.body, { ok: true });
+  assert.deepEqual(firstRes.body, { ok: true, detail: 'Session ended.' });
 
   // Byte-identical replay: intentId 't-kill-1' is now COMPLETED, so the stored
   // {code, body} is replayed and the handler is skipped entirely.

@@ -4,103 +4,131 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const REPO = path.resolve(__dirname, '..');
-const SCRIPT = path.resolve(__dirname, '..', '..', 'scripts', 'deploy-relay.sh');
-// deploy-relay.sh is stored with CRLF terminators. Normalize once, here: a trailing '\r' is not
-// matched by '.' , so every line-anchored regex below (comment stripping, `^\s*drain_wait\s*$`)
-// would silently no-op against the raw text.
-const source = fs.readFileSync(SCRIPT, 'utf8').replace(/\r\n/g, '\n');
+const ROOT = path.resolve(REPO, '..');
+const deployClient = fs.readFileSync(path.join(ROOT, 'scripts', 'deploy-relay.sh'), 'utf8');
+const installer = fs.readFileSync(path.join(REPO, 'ops', 'deploy-multiplex'), 'utf8');
+const provisioner = fs.readFileSync(path.join(REPO, 'ops', 'provision-multiplex-deploy.sh'), 'utf8');
+const service = fs.readFileSync(path.join(REPO, 'ops', 'multiplex-app.service'), 'utf8');
+const backupService = fs.readFileSync(path.join(REPO, 'ops', 'mux-relay-backup.service'), 'utf8');
 
-// Comments explain WHY the restart is SIGTERM-first and name SIGKILL to rule it out, so the
-// hard-kill assertion looks at commands only.
-const commands = source
-  .split('\n')
-  .map((line) => line.replace(/(^|\s)#.*$/, ''))
-  .join('\n');
-
-function branch(start, end) {
-  const from = source.indexOf(start);
-  assert.notEqual(from, -1, `deploy-relay.sh no longer contains the branch starting at: ${start}`);
-  const to = source.indexOf(end, from + start.length);
-  assert.notEqual(to, -1, `deploy-relay.sh no longer contains the branch end marker: ${end}`);
-  return source.slice(from, to);
-}
-
-// REMOVED: a test for a pm2 branch that does not exist. It required `pm2 sendSignal SIGTERM multiplex`
-// and `pm2 restart multiplex` in deploy-relay.sh; a repo-wide search finds those strings ONLY inside
-// this file. The shipped script deploys over ssh to a systemd unit and there is no pm2 anywhere in the
-// tree. Adding a pm2 branch to satisfy the assertion would have been inventing infrastructure to make a
-// test pass. The behaviour worth protecting — signal, wait for exit, then restart, and never hard-kill
-// — is covered by the tests below against the script that actually ships.
-
-test('the systemd branch sends SIGTERM before it restarts', () => {
-  const signal = source.indexOf('systemctl kill -s SIGTERM multiplex');
-  const restart = source.indexOf('systemctl restart multiplex');
-  assert.notEqual(signal, -1, 'deploy-relay.sh must run `systemctl kill -s SIGTERM multiplex`; `systemctl restart` alone does not give server.js its drain window');
-  assert.notEqual(restart, -1, 'deploy-relay.sh must still bring the relay back with `systemctl restart multiplex`');
-  assert.ok(signal < restart, 'the SIGTERM must be sent BEFORE `systemctl restart multiplex`, or the drain is skipped');
-});
-
-// This required a `drain_wait()` shell function. There isn't one, and the requirement was about the
-// wrong thing: what matters is that the deploy WAITS between the signal and the restart, not how that
-// wait is spelled. The shipped script waits with an inline poll loop, which satisfies the contract.
-// Asserted here on the observable behaviour so a refactor that keeps the wait keeps passing, and a
-// refactor that drops it fails.
-test('the deploy waits for the drained relay to exit before restarting it', () => {
-  const signal = source.indexOf('systemctl kill -s SIGTERM multiplex');
-  const restart = source.indexOf('systemctl restart multiplex');
-  assert.notEqual(signal, -1, 'deploy-relay.sh must signal SIGTERM so server.js gets its drain window');
-  assert.notEqual(restart, -1, 'deploy-relay.sh must bring the relay back with `systemctl restart multiplex`');
-
-  // The wait: poll `is-active` and stop as soon as the unit is gone. Anything that blocks on the
-  // process actually exiting would do; this is the construct in the script today.
-  const wait = source.indexOf('is-active --quiet multiplex-app || break');
-  assert.notEqual(
-    wait, -1,
-    'deploy-relay.sh must wait for the signalled relay to exit before restarting; `systemctl restart` '
-    + 'alone does not wait for the drain, so a viewer still sees an abnormal 1006 and walks its backoff',
-  );
-  assert.ok(signal < wait, 'the wait must come AFTER the SIGTERM, or it is waiting on nothing');
+test('release client packages only a clean immutable commit for harmonizer-sub', () => {
+  assert.match(deployClient, /^VPS=harmonizer-sub$/m);
+  assert.match(deployClient, /^REMOTE_DEPLOY=\/usr\/local\/bin\/deploy-multiplex$/m);
+  assert.match(deployClient, /git status --porcelain/);
+  assert.match(deployClient, /git rev-parse HEAD/);
+  assert.match(deployClient, /sudo -n '\$REMOTE_DEPLOY' --preflight/);
   assert.ok(
-    wait < restart,
-    'the wait must come BEFORE the restart, or the unit comes back on top of a still-draining relay',
+    deployClient.indexOf("sudo -n '$REMOTE_DEPLOY' --preflight")
+      < deployClient.indexOf('scp -q -- "$ARCHIVE"'),
+    'remote preflight must run before release upload',
   );
+  assert.match(deployClient, /RELEASE_COMMIT/);
+  assert.match(deployClient, /sha256sum/);
+  assert.match(deployClient, /sudo '\$REMOTE_DEPLOY' '\$COMMIT' '\$SHA256'/);
+  assert.doesNotMatch(deployClient, /harmonizer-admin|deploy-stack|MUX_DEPLOY_CONFIRM/);
 });
 
-test('the deploy never hard-kills the relay', () => {
-  assert.doesNotMatch(
-    commands,
-    /SIGKILL|kill -9/,
-    'deploy-relay.sh must never SIGKILL / `kill -9` the relay: a hard kill skips the drain entirely and turns a deploy into a ~10s outage for every browser'
-  );
+test('root installer accepts identities, never caller-controlled paths or commands', () => {
+  assert.match(installer, /--preflight/);
+  assert.match(installer, /\[ "\$#" -eq 2 \]/);
+  assert.match(installer, /\^\[0-9a-f\]\{40\}\$/);
+  assert.match(installer, /\^\[0-9a-f\]\{64\}\$/);
+  assert.match(installer, /ARCHIVE="\/home\/sub\/multiplex-incoming\/multiplex-\$COMMIT\.tgz"/);
+  assert.match(installer, /QUARANTINE="\$STATE\/deploy-incoming"/);
+  assert.match(installer, /mv -- "\$ARCHIVE" "\$QUARANTINE\/multiplex-\$COMMIT\.tgz"/);
+  assert.match(installer, /archive links\/devices are refused/);
+  assert.match(installer, /archive commit marker mismatch/);
+  assert.match(installer, /release archive checksum mismatch/);
 });
 
-test('the post-restart health check reads the deployed port from the service environment', () => {
-  assert.match(
-    source,
-    /awk -F= '[^']*PORT[^']*' \/etc\/multiplex-app\.env/,
-    'deploy-relay.sh must read PORT from /etc/multiplex-app.env; canonical server.js has no numeric port literal to grep',
-  );
-  assert.doesNotMatch(
-    commands,
-    /grep[^\n]*PORT[^\n]*server\.js/,
-    'the health check must not scrape a numeric PORT from server.js',
-  );
-  assert.match(
-    source,
-    /curl -fsS \\"http:\/\/127\.0\.0\.1:\\\$PORT\/api\/health\\"/,
-    'the deploy must fail when the restarted relay health endpoint is unreachable',
-  );
+test('deployment installs dependencies unprivileged and code root-owned', () => {
+  assert.match(installer, /runuser -u svc-multiplex -- env HOME="\$STATE" npm/);
+  assert.match(installer, /--omit=dev --ignore-scripts/);
+  assert.match(installer, /chown -R root:root "\$STAGE"/);
+  assert.match(installer, /chmod -R go-w "\$STAGE"/);
+});
+
+test('service is non-root and explicitly has no docker supplementary group', () => {
+  assert.match(service, /^User=svc-multiplex$/m);
+  assert.match(service, /^Group=svc-multiplex$/m);
+  assert.match(service, /^SupplementaryGroups=$/m);
+  assert.match(service, /^WorkingDirectory=\/opt\/multiplex-app$/m);
+  assert.match(service, /^ReadWritePaths=\/var\/lib\/multiplex$/m);
+  assert.match(service, /^NoNewPrivileges=yes$/m);
+  assert.match(service, /^CapabilityBoundingSet=$/m);
+  assert.match(service, /^AmbientCapabilities=$/m);
+  assert.match(service, /^ProtectClock=yes$/m);
+  assert.match(service, /^SystemCallFilter=@system-service$/m);
+  assert.match(service, /^SystemCallErrorNumber=EPERM$/m);
+  assert.match(service, /^MemoryDenyWriteExecute=no$/m);
+  assert.doesNotMatch(service, /docker/);
+  assert.match(installer, /require_unit_value SupplementaryGroups ""/);
+});
+
+test('deploy preflight validates the existing auth and host security boundary', () => {
+  assert.match(installer, /ENV_FILE=\/etc\/multiplex-app\.env/);
+  assert.match(installer, /must be owned by root:root/);
+  assert.match(installer, /must have mode 0600/);
+  for (const key of ['PORT', 'MUX_HOST_TOKEN', 'HL_INTERNAL_KEY', 'MUX_BRIDGE_TOKEN']) {
+    assert.match(installer, new RegExp(`for key in[\\s\\S]*${key}`));
+  }
+  assert.match(installer, /require_unit_value User svc-multiplex/);
+  assert.match(installer, /require_unit_value Group svc-multiplex/);
+  assert.match(installer, /require_unit_value NoNewPrivileges yes/);
+  assert.match(installer, /require_unit_value ProtectSystem strict/);
+  assert.match(installer, /require_unit_value ReadWritePaths \/var\/lib\/multiplex/);
+  assert.match(installer, /runtime_identity_ok/);
+  assert.match(installer, /\/proc\/\$pid\/status/);
+  assert.match(installer, /id -u svc-multiplex/);
+  assert.match(installer, /id -g svc-multiplex/);
+  assert.match(installer, /getent group docker/);
+  assert.match(installer, /running process has the wrong UID\/GID or retains docker access/);
+  assert.match(installer, /nginx -t/);
+  assert.match(installer, /hl-auth is not listening on port 4200/);
+  assert.match(installer, /hl-auth port 4200 must be loopback-only/);
+});
+
+test('deploy drains, verifies health, and atomically rolls back', () => {
+  assert.match(installer, /systemctl stop "\$UNIT"/);
+  assert.match(installer, /KillSignal=SIGTERM|systemctl stop/);
+  assert.match(installer, /mv -Tf -- "\$NEXT_LINK" "\$CURRENT"/);
+  assert.match(installer, /\/api\/health/);
+  assert.match(installer, /release_health_ok/);
+  assert.match(installer, /persistence\.get\("ok"\) is True/);
+  assert.match(installer, /distributed health remains degraded/);
+  assert.match(installer, /rolling back/);
+  assert.match(installer, /previous release restored/);
+});
+
+test('one-time provisioner removes stale docker drop-ins and installs only the narrow sudo command', () => {
+  assert.match(provisioner, /10-docker-group\.conf/);
+  assert.match(provisioner, /gpasswd -d svc-multiplex docker/);
+  assert.match(provisioner, /sub ALL=\(root\) NOPASSWD: \/usr\/local\/bin\/deploy-multiplex \*/);
+  assert.match(provisioner, /visudo -cf/);
+  assert.match(provisioner, /chown root:root \/etc\/multiplex-app\.env/);
+  assert.match(provisioner, /chmod 0600 \/etc\/multiplex-app\.env/);
+  assert.match(provisioner, /systemctl restart multiplex-app\.service/);
+  assert.match(provisioner, /deploy-multiplex --preflight/);
+  assert.match(provisioner, /live service identity refreshed/);
+});
+
+test('backup timer runs as svc-multiplex with a bounded writable surface', () => {
+  assert.match(backupService, /^User=svc-multiplex$/m);
+  assert.match(backupService, /^Group=svc-multiplex$/m);
+  assert.match(backupService, /^Environment=HOME=\/var\/lib\/multiplex$/m);
+  assert.match(backupService, /^ExecCondition=\/usr\/bin\/ssh .* win true$/m);
+  assert.match(backupService, /^ReadOnlyPaths=\/var\/lib\/multiplex$/m);
+  assert.match(backupService, /^NoNewPrivileges=yes$/m);
+  assert.match(installer, /runuser -u svc-multiplex[\s\S]*ssh[\s\S]*win true/);
+  assert.match(installer, /systemctl enable --now mux-relay-backup\.timer/);
+  assert.match(installer, /timer activation failed; application release remains healthy/);
+  assert.match(installer, /systemctl is-enabled --quiet mux-relay-backup\.timer/);
+  assert.doesNotMatch(installer, /systemctl disable --now mux-relay-backup\.timer/);
+  assert.match(installer, /existing timer remains enabled and will skip cleanly/);
+  assert.match(installer, /backup timer left disabled/);
 });
 
 test('the sigprobe debug scaffolding stays deleted', () => {
-  assert.equal(
-    fs.existsSync(path.join(REPO, 'sigprobe.js')),
-    false,
-    'relay/sigprobe.js is a throwaway debug probe; anything under relay/ is tarred onto the production VPS by scripts/deploy-relay.sh'
-  );
-  assert.equal(
-    fs.existsSync(path.join(REPO, 'sigprobe-child.js')),
-    false,
-    'relay/sigprobe-child.js is a throwaway debug probe; anything under relay/ is tarred onto the production VPS by scripts/deploy-relay.sh'
-  );
+  assert.equal(fs.existsSync(path.join(REPO, 'sigprobe.js')), false);
+  assert.equal(fs.existsSync(path.join(REPO, 'sigprobe-child.js')), false);
 });

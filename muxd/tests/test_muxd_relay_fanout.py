@@ -68,7 +68,11 @@ class RelayFanoutTests(unittest.TestCase):
         async def drain(n):
             return [await self.q.get() for _ in range(n)]
 
-        names = [item[1] for item in asyncio.new_event_loop().run_until_complete(drain(6))]
+        loop = asyncio.new_event_loop()
+        try:
+            names = [item[1] for item in loop.run_until_complete(drain(6))]
+        finally:
+            loop.close()
         # Round-robin, not drain-one-then-the-other.
         self.assertEqual(["a", "b", "a", "b", "a", "b"], names)
 
