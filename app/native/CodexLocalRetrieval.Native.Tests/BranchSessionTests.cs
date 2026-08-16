@@ -25,6 +25,87 @@ public sealed class BranchSessionTests
         StringAssert.Contains(text, result.Branch.Id);
         StringAssert.Contains(text, fixture.Source.Id);
         StringAssert.Contains(text, "snapshot-tip");
+        Assert.AreEqual(ArchiveService.NativeLaunchMode, result.Branch.LaunchMode);
+    }
+
+    [TestMethod]
+    [DataRow("claude")]
+    [DataRow("codex")]
+    public async Task ForkSessionAsync_Gateway_ClonesNativeTranscriptAndPersistsLaunchMode(string tool)
+    {
+        using var fixture = new TemplateFixture(tool);
+        var initialThreadCount = tool == "codex" ? fixture.ThreadCount() : 0;
+
+        var result = await fixture.Service.ForkSessionAsync(
+            fixture.Source,
+            ArchiveService.GatewayLaunchMode);
+
+        Assert.IsTrue(result.Ok, result.Message);
+        Assert.IsNotNull(result.Branch);
+        Assert.AreEqual(tool, result.Branch.Tool);
+        Assert.AreEqual(ArchiveService.GatewayLaunchMode, result.Branch.LaunchMode);
+        Assert.IsTrue(result.Branch.IsGatewayBranch);
+        Assert.AreEqual("GW", result.Branch.GatewayGlyph);
+        StringAssert.Contains(result.Branch.ListMarks, "GW");
+        StringAssert.Contains(result.Branch.DisplayTitle, "(branch)");
+        Assert.IsFalse(result.Branch.DisplayTitle.Contains("Gateway", StringComparison.OrdinalIgnoreCase));
+        Assert.IsTrue(File.Exists(result.Branch.SourcePath));
+        StringAssert.Contains(await File.ReadAllTextAsync(result.Branch.SourcePath), fixture.Source.Id);
+
+        var reloaded = fixture.NewService();
+        await reloaded.LoadStoreStateAsync();
+        Assert.AreEqual(
+            ArchiveService.GatewayLaunchMode,
+            reloaded.Store.Sessions[result.Branch.Id].LaunchMode);
+
+        if (tool == "codex")
+        {
+            Assert.AreEqual(initialThreadCount + 1, fixture.ThreadCount());
+            Assert.AreEqual(result.Branch.SourcePath, fixture.RolloutPath(result.Branch.Id));
+        }
+    }
+
+    [TestMethod]
+    [DataRow(ArchiveService.DeepSeekLaunchMode, "claude")]
+    [DataRow(ArchiveService.LunaLaunchMode, "claude")]
+    [DataRow(ArchiveService.DeepSeekLaunchMode, "codex")]
+    [DataRow(ArchiveService.LunaLaunchMode, "codex")]
+    public async Task ForkSessionAsync_LegacyDeepSeekOrLuna_ClonesAsGatewayBranchAndUsesValidContinuation(string legacyMode, string tool)
+    {
+        using var fixture = new TemplateFixture(tool);
+
+        var result = await fixture.Service.ForkSessionAsync(fixture.Source, legacyMode);
+
+        Assert.IsTrue(result.Ok, result.Message);
+        Assert.IsNotNull(result.Branch);
+        Assert.AreEqual(ArchiveService.GatewayLaunchMode, result.Branch.LaunchMode);
+        Assert.IsTrue(result.Branch.IsGatewayBranch);
+        StringAssert.Contains(result.Branch.ListMarks, "GW");
+        StringAssert.Contains(await File.ReadAllTextAsync(result.Branch.SourcePath), fixture.Source.Id);
+
+        var launch = fixture.Service.BuildResumeLaunch(result.Branch, exeOverride: "C:\\cmd.exe");
+        if (tool == "claude")
+        {
+            Assert.AreEqual("C:\\cmd.exe", launch.Exe);
+            StringAssert.Contains(launch.Arguments, "cc.cmd");
+            StringAssert.Contains(launch.Arguments, $"--resume {result.Branch.Id}");
+        }
+        else
+        {
+            Assert.AreEqual("", launch.Exe);
+            StringAssert.Contains(launch.DisplayCommand, "Claude transcripts only");
+
+            var handoff = fixture.Service.BuildGatewayHandoffLaunch(
+                result.Branch,
+                exeOverride: "C:\\cmd.exe");
+            Assert.AreEqual("C:\\cmd.exe", handoff.Exe);
+            StringAssert.Contains(handoff.Arguments, "cc.cmd");
+            Assert.IsFalse(handoff.Arguments.Contains("--resume", StringComparison.OrdinalIgnoreCase));
+        }
+
+        var reloaded = fixture.NewService();
+        await reloaded.LoadStoreStateAsync();
+        Assert.IsTrue(reloaded.Store.Sessions[result.Branch.Id].IsGatewayBranch);
     }
 
     // A branch must report the CHECKPOINT it came from, not the source chat's current name.

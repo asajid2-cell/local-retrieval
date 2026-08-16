@@ -78,4 +78,33 @@ public sealed class ArchiveToolServiceTests
         StringAssert.Contains(json, SecretRedactor.Mask);
         StringAssert.DoesNotMatch(json, new System.Text.RegularExpressions.Regex(System.Text.RegularExpressions.Regex.Escape(fakeKey)));
     }
+
+    [TestMethod]
+    public async Task ResumeChat_GatewaySession_DescribesAndReturnsGatewayLaunchMode()
+    {
+        var session = new ArchiveSession
+        {
+            Id = "gateway-chat",
+            Tool = "claude",
+            Title = "Gateway chat",
+            LaunchMode = ArchiveService.GatewayLaunchMode
+        };
+        var svc = StoreWith(session);
+        string? resumed = null;
+        var tool = new ArchiveToolService(
+            svc,
+            resumeChat: id => resumed = id)
+            .Tools()
+            .First(t => t.Name == "resume_chat");
+
+        StringAssert.Contains(tool.Spec.Description, "Gateway");
+        StringAssert.Contains(tool.Spec.Description, "cc");
+
+        var args = JsonSerializer.Deserialize<JsonElement>("{\"id\":\"gateway-chat\"}");
+        var json = JsonSerializer.Serialize(await tool.Execute(args, default));
+
+        Assert.AreEqual("gateway-chat", resumed);
+        StringAssert.Contains(json, "\"launchMode\":\"gateway\"");
+        StringAssert.Contains(json, "Gateway");
+    }
 }

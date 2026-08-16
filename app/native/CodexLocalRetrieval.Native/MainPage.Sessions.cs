@@ -6,6 +6,7 @@ using System.Linq;
 using System.Threading.Tasks;
 using CodexLocalRetrieval.Core.Models;
 using CodexLocalRetrieval.Core.Remote;
+using CodexLocalRetrieval.Core.Services;
 using Microsoft.UI.Text;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
@@ -88,13 +89,148 @@ public sealed partial class MainPage
 
     private void ResumeInTerminal_Click(object sender, RoutedEventArgs e)
     {
-        if (_selected is not null) ResumeInTerminal(_selected);
+        if (_selected is not null)
+            ResumeInTerminal(
+                _selected,
+                trigger: "user-native",
+                launchModeOverride: ArchiveService.NativeLaunchMode);
+    }
+
+    private static string NativeResumeLabel(ArchiveSession session) =>
+        string.Equals(session.Tool, "codex", StringComparison.OrdinalIgnoreCase)
+            ? "Resume as Codex"
+            : "Resume as Claude";
+
+    private static string GatewayResumeLabel(ArchiveSession session) =>
+        string.Equals(session.Tool, "codex", StringComparison.OrdinalIgnoreCase)
+            ? "Continue in Gateway"
+            : "Resume as Gateway";
+
+    private static string GatewayResumeTooltip(ArchiveSession session) =>
+        string.Equals(session.Tool, "codex", StringComparison.OrdinalIgnoreCase)
+            ? "Start a new Gateway chat and copy a handoff prompt for this Codex chat."
+            : "Resume this Claude transcript through the custom cc Gateway.";
+
+    private void ResumeAsGateway(ArchiveSession session)
+    {
+        if (ArchiveService.CanResumeThroughGateway(session.Tool))
+        {
+            ResumeInTerminal(session, trigger: "user-gateway", launchModeOverride: ArchiveService.GatewayLaunchMode);
+            return;
+        }
+
+        if (string.Equals(session.Tool, "codex", StringComparison.OrdinalIgnoreCase))
+        {
+            _ = StartCodexGatewayHandoffAsync(session);
+            return;
+        }
+
+        SyncStatus.Text = "Gateway continuation is unavailable for this chat.";
+    }
+
+    private void ResumeAsGateway_Click(object sender, RoutedEventArgs e)
+    {
+        if (_selected is not null) ResumeAsGateway(_selected);
+    }
+
+    private async Task StartCodexGatewayHandoffAsync(ArchiveSession source)
+    {
+        var prompt = "";
+        try
+        {
+            prompt = await _archive.CopyPayloadAsync(source, "resume");
+            if (string.IsNullOrWhiteSpace(prompt))
+                throw new InvalidOperationException("The handoff prompt was empty.");
+        }
+        catch (Exception ex)
+        {
+            Diag.Log("Codex Gateway handoff prompt failed " + ex);
+            SyncStatus.Text = "Couldn't build the Gateway handoff prompt: " + ex.Message;
+            return;
+        }
+
+        var launch = _archive.BuildGatewayHandoffLaunch(source);
+        if (string.IsNullOrWhiteSpace(launch.Exe))
+        {
+            SyncStatus.Text = launch.DisplayCommand;
+            return;
+        }
+
+        var pendingIntentId = "";
+        try
+        {
+            pendingIntentId = await _archive.QueuePendingNewChatAsync(
+                "claude",
+                launch.WorkingDirectory,
+                customTitle: $"Gateway handoff: {source.DisplayTitle}",
+                launchMode: ArchiveService.GatewayLaunchMode,
+                handoffFromId: source.Id);
+            if (pendingIntentId.Length == 0)
+                throw new InvalidOperationException("The Gateway handoff filing intent could not be persisted.");
+
+            SetClipboardText(prompt);
+            var lease = _launchGovernor.BeginFresh(new SessionLaunchRequest(
+                null,
+                null,
+                "claude",
+                ArchiveService.GatewayLaunchMode,
+                "gateway Codex handoff",
+                "resume.refused.claim",
+                "resume.started.terminal",
+                "resume.failed.terminal",
+                $"Gateway handoff: {source.DisplayTitle}",
+                launch.WorkingDirectory,
+                new Dictionary<string, string>
+                {
+                    ["sourceSessionId"] = source.Id,
+                    ["pendingIntentId"] = pendingIntentId
+                }));
+            try
+            {
+                Process.Start(BuildGatewayTerminalStartInfo(launch));
+                lease.MarkStarted("Started a fresh Gateway handoff terminal.");
+            }
+            catch
+            {
+                lease.MarkFailed("Could not open the Gateway handoff terminal.");
+                throw;
+            }
+            finally
+            {
+                lease.Dispose();
+            }
+
+            RecordSessionEvent(
+                source,
+                "handoff.started.gateway",
+                "Started a fresh Gateway chat; the handoff prompt was copied to the clipboard.",
+                details: new Dictionary<string, string>
+                {
+                    ["pendingIntentId"] = pendingIntentId,
+                    ["sourceSessionId"] = source.Id,
+                    ["launchMode"] = ArchiveService.GatewayLaunchMode
+                });
+            SyncStatus.Text = "Started a new Gateway chat. The handoff prompt is on the clipboard; paste it into the terminal.";
+            PollFileNewChatAsync(pendingIntentId, "", "claude");
+        }
+        catch (Exception ex)
+        {
+            if (pendingIntentId.Length > 0)
+            {
+                try { await _archive.CancelPendingNewChatAsync(pendingIntentId); } catch { }
+            }
+            Diag.Log("Codex Gateway handoff launch failed " + ex);
+            SyncStatus.Text = "Could not open the Gateway handoff terminal: " + ex.Message;
+        }
     }
 
     // Open a real terminal and run `codex resume <id>` in the chat's original workspace, so the
     // agent session continues with the right cwd. This is the difference between an archive you
     // read and one you can pick back up.
-    private async void ResumeInTerminal(ArchiveSession session, string trigger = "user")
+    private async void ResumeInTerminal(
+        ArchiveSession session,
+        string trigger = "user",
+        string? launchModeOverride = null)
     {
         var failureRecordedByGovernor = false;
         var launchStarted = false;
@@ -151,7 +287,7 @@ public sealed partial class MainPage
                 return;
             }
 
-            var launch = _archive.BuildResumeLaunch(session);
+            var launch = _archive.BuildResumeLaunch(session, launchModeOverride: launchModeOverride);
             if (string.IsNullOrEmpty(launch.Exe))
             {
                 Diag.Log("Resume refused: " + launch.DisplayCommand);
@@ -174,8 +310,8 @@ public sealed partial class MainPage
                 session.Id,
                 session.Aliases,
                 session.Tool,
-                "native",
-                $"native terminal resume ({trigger})",
+                ArchiveService.NormalizeLaunchMode(launchModeOverride ?? session.LaunchMode),
+                $"{ArchiveService.NormalizeLaunchMode(launchModeOverride ?? session.LaunchMode)} terminal resume ({trigger})",
                 "resume.refused.claim",
                 "resume.started.terminal",
                 "resume.failed.terminal",
@@ -193,7 +329,7 @@ public sealed partial class MainPage
                 try
                 {
                     Diag.Log($"Resume launch [trigger={trigger}]: {launch.DisplayCommand} (cwd={cwd})");
-                    var started = LaunchResumeWrapper(session);
+                    var started = LaunchResumeWrapper(session, launchModeOverride);
                     if (!started.Ok) throw new InvalidOperationException(started.Detail);
                     launchStarted = true;
                     lease?.MarkStarted("Started terminal resume.");
@@ -249,23 +385,44 @@ public sealed partial class MainPage
     // launch — same wrapper shape, same owner record, same job-object assignment — instead of a second copy
     // that would drift. The CALLER owns the reservation; this only starts the process. Safe off the UI thread:
     // .NET runs a UseShellExecute start on its own STA thread when the caller isn't one.
-    private (bool Ok, string Detail) LaunchResumeWrapper(ArchiveSession session)
+    private (bool Ok, string Detail) LaunchResumeWrapper(
+        ArchiveSession session,
+        string? launchModeOverride = null)
     {
-        var launch = _archive.BuildResumeLaunch(session);
+        var launch = _archive.BuildResumeLaunch(session, launchModeOverride: launchModeOverride);
         if (string.IsNullOrEmpty(launch.Exe)) return (false, launch.DisplayCommand);
         var cwd = Directory.Exists(launch.WorkingDirectory)
             ? launch.WorkingDirectory
             : Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        var psi = new ProcessStartInfo
-        {
-            FileName = "cmd.exe",
-            Arguments = $"/k \"{launch.DisplayCommand}\"",
-            WorkingDirectory = cwd,
-            UseShellExecute = true
-        };
+        var gateway = ArchiveService.IsGatewayLaunchMode(launchModeOverride ?? session.LaunchMode);
+        var psi = gateway
+            ? BuildGatewayTerminalStartInfo(launch)
+            : new ProcessStartInfo
+            {
+                FileName = ArchiveService.ResolveCmdExe(),
+                Arguments = $"/k \"{launch.DisplayCommand}\"",
+                WorkingDirectory = cwd,
+                UseShellExecute = true
+            };
         var wrapper = Process.Start(psi);
         RecordSessionOwner(session.Id, session.Aliases, wrapper, "terminal");
         return (true, launch.DisplayCommand);
+    }
+
+    private static ProcessStartInfo BuildGatewayTerminalStartInfo(ResumeLaunch launch)
+    {
+        var arguments = ArchiveService.BuildGatewayTerminalArgumentList(launch);
+        if (arguments.Count == 0)
+            throw new InvalidOperationException("Gateway launch did not provide a structured command-shell argument vector.");
+
+        var psi = new ProcessStartInfo
+        {
+            FileName = launch.Exe,
+            WorkingDirectory = launch.WorkingDirectory,
+            UseShellExecute = true
+        };
+        foreach (var argument in arguments) psi.ArgumentList.Add(argument);
+        return psi;
     }
 
     // Best-effort note of the wrapper process this app started for a session, and the point where that wrapper

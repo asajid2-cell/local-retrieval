@@ -206,8 +206,9 @@ public sealed class ArchiveToolService
     // ---- terminal action (confirmed: it launches an external agent CLI) ----
 
     private ChatTool ResumeChat() => Write("resume_chat",
-        "Resume a chat in a NEW terminal so the user can continue it: runs `codex resume` or " +
-        "`claude --resume` in the chat's original workspace. Use the id from search_chats.",
+        "Select a chat for manual resume in a NEW terminal. Native chats use `codex resume` or " +
+        "`claude --resume`; Gateway chats use the cc launcher. The app preserves the chat's stored " +
+        "launch mode and original workspace. Use the id from search_chats.",
         Obj(("id", Str("session id"))), new[] { "id" },
         args =>
         {
@@ -216,7 +217,15 @@ public sealed class ArchiveToolService
             // The Native handler builds the resume command (with the trusted-exe safety check) and
             // launches the terminal; refusals surface there.
             _resumeChat?.Invoke(session.Id);
-            return Task.FromResult<object>(new { ok = true, tool = session.Tool, message = $"Opening a terminal to resume \"{session.DisplayTitle}\"." });
+            var launchMode = ArchiveService.NormalizeLaunchMode(session.LaunchMode);
+            var launcher = launchMode == ArchiveService.GatewayLaunchMode ? "Gateway (cc)" : session.Tool;
+            return Task.FromResult<object>(new
+            {
+                ok = true,
+                tool = session.Tool,
+                launchMode,
+                message = $"Selected \"{session.DisplayTitle}\" for manual resume with {launcher}."
+            });
         });
 
     // ---- UI side-effect ----

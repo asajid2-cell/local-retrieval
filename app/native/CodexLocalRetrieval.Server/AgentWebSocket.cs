@@ -38,6 +38,7 @@ public static class AgentWebSocket
         string? openedId = null;           // the id the client opened (stable; used to bind signatures)
         string? claudeSid = null;          // current Claude session id (updated each turn)
         var claudeCwd = defaultWorkspace;
+        var claudeLaunchMode = CodexLocalRetrieval.Core.Services.ArchiveService.NativeLaunchMode;
         IReadOnlyList<string> openAliases = Array.Empty<string>();
         System.Diagnostics.Process? claudeProc = null;
         Task? codexTurnStart = null;
@@ -53,6 +54,7 @@ public static class AgentWebSocket
             openedId = null;
             claudeSid = null;
             claudeCwd = defaultWorkspace;
+            claudeLaunchMode = CodexLocalRetrieval.Core.Services.ArchiveService.NativeLaunchMode;
             openAliases = Array.Empty<string>();
             openSource = "codex";
             codexTurnStart = null;
@@ -169,13 +171,14 @@ public static class AgentWebSocket
                             openAliases = trusted.Aliases;
                             claudeSid = nextSource == "claude" ? id : null;
                             claudeCwd = nextSource == "claude" ? trusted.WorkingDirectory : defaultWorkspace;
+                            claudeLaunchMode = trusted.LaunchMode;
                             await SendJson(ws, send, new
                             {
                                 kind = "Opened",
                                 threadId = id,
                                 source = openSource,
                                 cwd = trusted.WorkingDirectory,
-                                live = nextSource == "claude" ? claudeDriver.Available : true
+                                live = nextSource == "claude" ? claudeDriver.AvailableFor(claudeLaunchMode) : true
                             }, ct);
                             foreach (var ev in history) await SendJson(ws, send, ev, ct);
                         }
@@ -268,7 +271,11 @@ public static class AgentWebSocket
                                         return;
                                     }
                                     await SendJson(ws, send, ev, ct);
-                                }, socketLifetime.Token, auto ? "bypassPermissions" : "acceptEdits", openAliases);
+                                },
+                                socketLifetime.Token,
+                                auto ? "bypassPermissions" : "acceptEdits",
+                                openAliases,
+                                launchMode: claudeLaunchMode);
                             }
                             catch (InvalidOperationException ex)
                             {

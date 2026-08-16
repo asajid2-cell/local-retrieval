@@ -131,11 +131,19 @@ else
     });
 }
 
-async Task<(bool ok, ArchiveService.RemoteMuxLaunch? launch, string detail)> ResolveRemoteMuxLaunchAsync(string? sessionId, string? tool)
+async Task<(bool ok, ArchiveService.RemoteMuxLaunch? launch, string detail)> ResolveRemoteMuxLaunchAsync(
+    string? sessionId,
+    string? tool,
+    string? launchMode)
 {
     return await archiveRuntime.UseAsync((loadedArchive, _) =>
     {
-        var result = loadedArchive.TryBuildRemoteMuxLaunch(sessionId, tool, out var launch, out var detail)
+        var result = loadedArchive.TryBuildRemoteMuxLaunch(
+                sessionId,
+                tool,
+                out var launch,
+                out var detail,
+                launchMode: launchMode)
             ? (true, launch, detail)
             : (false, null, detail);
         return Task.FromResult(result);
@@ -231,6 +239,7 @@ var canonicalSessionResolver = new CanonicalSessionResolver(async ct =>
                 {
                     Id = s.Id,
                     Tool = s.Tool,
+                    LaunchMode = s.LaunchMode,
                     Workspace = s.Workspace,
                     Aliases = new(s.Aliases.ToArray()),
                 })

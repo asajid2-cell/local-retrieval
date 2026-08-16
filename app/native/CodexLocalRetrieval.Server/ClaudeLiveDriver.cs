@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using CodexLocalRetrieval.Core.Agents;
 using CodexLocalRetrieval.Core.Remote;
+using CodexLocalRetrieval.Core.Services;
 
 namespace CodexLocalRetrieval.Server;
 
@@ -13,6 +14,8 @@ public sealed class ClaudeLiveDriver
     private static readonly TimeSpan EventDeliveryTimeout = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan TerminationTimeout = TimeSpan.FromSeconds(5);
     private readonly string _exe;
+    private readonly string _gatewayCliScript;
+    private readonly string _cmdExe;
     private readonly SessionLaunchGovernor _launchGovernor;
     private readonly IProcessContainment? _processContainment;
     private readonly Func<ProcessStartInfo, Process?>? _processStarter;
@@ -23,15 +26,25 @@ public sealed class ClaudeLiveDriver
         SessionLaunchClaims.Options? claimOptions = null,
         SessionLaunchGovernor? launchGovernor = null,
         IProcessContainment? processContainment = null,
-        Func<ProcessStartInfo, Process?>? processStarter = null)
+        Func<ProcessStartInfo, Process?>? processStarter = null,
+        string? gatewayCliScript = null,
+        string? cmdExe = null)
     {
         _exe = exe ?? Resolve();
+        _gatewayCliScript = gatewayCliScript ?? ArchiveService.ResolveGatewayCliScript();
+        _cmdExe = cmdExe ?? ArchiveService.ResolveCmdExe();
         _launchGovernor = launchGovernor ?? new SessionLaunchGovernor(new SessionLaunchGovernorOptions(claimOptions, IsSessionLive: isSessionLive));
         _processContainment = processContainment;
         _processStarter = processStarter;
     }
 
-    public bool Available => File.Exists(_exe) || _exe == "claude";
+    public bool Available => AvailableFor(ArchiveService.NativeLaunchMode);
+
+    public bool AvailableFor(string? launchMode) =>
+        ArchiveService.IsGatewayLaunchMode(launchMode)
+            ? (File.Exists(_cmdExe) || string.Equals(_cmdExe, "cmd.exe", StringComparison.OrdinalIgnoreCase))
+              && File.Exists(_gatewayCliScript)
+            : File.Exists(_exe) || _exe == "claude";
 
     public Process StartTurn(
         string? sessionId,
@@ -40,12 +53,13 @@ public sealed class ClaudeLiveDriver
         Func<AgentEvent, Task> onEvent,
         CancellationToken ownerStopping,
         string permissionMode = "acceptEdits",
-        IEnumerable<string>? aliases = null)
+        IEnumerable<string>? aliases = null,
+        string? launchMode = null)
     {
         SessionLaunchLease? lease = null;
         if (!string.IsNullOrWhiteSpace(sessionId))
         {
-            var request = LaunchRequest(sessionId, aliases, permissionMode);
+            var request = LaunchRequest(sessionId, aliases, permissionMode, launchMode);
             if (!_launchGovernor.TryAcquire(request, out lease, out var leaseDetail))
                 throw new InvalidOperationException(leaseDetail);
         }
@@ -53,9 +67,10 @@ public sealed class ClaudeLiveDriver
         // only the known-safe set; default acceptEdits. "bypassPermissions" is reachable only for an
         // owner-signed auto command (the WS gates it on CommandSigner.Verify), never for an unsigned one.
         if (permissionMode is not ("acceptEdits" or "bypassPermissions" or "default" or "plan")) permissionMode = "acceptEdits";
+        var gateway = ArchiveService.IsGatewayLaunchMode(launchMode);
         var psi = new ProcessStartInfo
         {
-            FileName = _exe,
+            FileName = gateway ? _cmdExe : _exe,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
             RedirectStandardInput = true,
@@ -63,6 +78,11 @@ public sealed class ClaudeLiveDriver
             CreateNoWindow = true,
             WorkingDirectory = Directory.Exists(cwd) ? cwd : Environment.CurrentDirectory,
         };
+        if (gateway)
+        {
+            psi.ArgumentList.Add("/c");
+            psi.ArgumentList.Add(_gatewayCliScript);
+        }
         psi.ArgumentList.Add("-p");
         psi.ArgumentList.Add(prompt);
         psi.ArgumentList.Add("--output-format");
@@ -252,12 +272,16 @@ public sealed class ClaudeLiveDriver
         return "claude"; // last resort: rely on PATH
     }
 
-    private static SessionLaunchRequest LaunchRequest(string? sessionId, IEnumerable<string>? aliases, string permissionMode)
+    private static SessionLaunchRequest LaunchRequest(
+        string? sessionId,
+        IEnumerable<string>? aliases,
+        string permissionMode,
+        string? launchMode)
         => new(
             sessionId,
             aliases,
             "claude",
-            "server",
+            ArchiveService.NormalizeLaunchMode(launchMode),
             "server Claude live turn",
             "claude.turn.refused.claim",
             "claude.turn.started",

@@ -21,6 +21,14 @@ internal sealed class StoreGenerationConflictException(long expected, long actua
 
 public sealed partial class ArchiveService
 {
+    public const string NativeLaunchMode = "native";
+    public const string GatewayLaunchMode = "gateway";
+    // Legacy launch modes: an old fork persisted with a deepseek/luna marker. These no longer select a
+    // distinct launcher; they resume through the Gateway (cc) build now; the constants and predicates
+    // remain so stored data is recognized.
+    public const string DeepSeekLaunchMode = "deepseek";
+    public const string LunaLaunchMode = "luna";
+
     private const int CurrentIndexVersion = 17; // bump on any parser change to force a full re-parse
     // The reader keeps the MOST RECENT messages (not the oldest), so a long chat opens on its latest
     // turns. The first prompt is still captured for the title before this window is applied.
@@ -455,8 +463,11 @@ public sealed partial class ArchiveService
         foreach (var session in data.Sessions.Values)
             if (session.Text.Length > SearchTextCap) session.Text = session.Text[..SearchTextCap];
         foreach (var pending in data.PendingNewChats)
+        {
             if (string.IsNullOrWhiteSpace(pending.IntentId))
                 pending.IntentId = Guid.NewGuid().ToString("N");
+            pending.LaunchMode = NormalizeLaunchMode(pending.LaunchMode);
+        }
     }
 
     private string StoreBackupPrefix
@@ -1511,7 +1522,9 @@ public sealed partial class ArchiveService
         string cwd,
         string collectionId = "",
         string customTitle = "",
-        string specialPhrase = "")
+        string specialPhrase = "",
+        string launchMode = NativeLaunchMode,
+        string handoffFromId = "")
     {
         tool = (tool ?? "").Trim().ToLowerInvariant();
         cwd = (cwd ?? "").Trim();
@@ -1531,11 +1544,13 @@ public sealed partial class ArchiveService
             IntentId = intentId,
             Cwd = cwd,   // keep the ORIGINAL cwd so we can find the Claude project folder (case-encoded)
             Tool = tool,
+            LaunchMode = NormalizeLaunchMode(launchMode),
             CollectionId = collectionId,
             CustomTitle = CleanTitle(customTitle ?? ""),
             SpecialPhrase = (specialPhrase ?? "").Trim(),
             CreatedAt = DateTime.UtcNow.ToString("O"),
-            KnownIds = ClaudeFolderTranscripts(cwd).Select(t => t.id).ToList()   // snapshot ids already there
+            KnownIds = ClaudeFolderTranscripts(cwd).Select(t => t.id).ToList(),   // snapshot ids already there
+            HandoffFromId = (handoffFromId ?? "").Trim()
         });
         await SaveAsync();
         return intentId;
@@ -1649,7 +1664,9 @@ public sealed partial class ArchiveService
                         collection.SessionIds.Add(newId);
                         changed = true;
                     }
-                    if (!string.IsNullOrWhiteSpace(p.CustomTitle) || !string.IsNullOrWhiteSpace(p.SpecialPhrase))
+                    if (!string.IsNullOrWhiteSpace(p.CustomTitle)
+                        || !string.IsNullOrWhiteSpace(p.SpecialPhrase)
+                        || !string.IsNullOrWhiteSpace(p.HandoffFromId))
                         keep.Add(p);
                     else
                         changed = true;
@@ -1661,6 +1678,9 @@ public sealed partial class ArchiveService
                 if (!string.IsNullOrWhiteSpace(p.CustomTitle))
                     session.CustomTitle = CleanTitle(p.CustomTitle);
                 AddSpecialPhrase(session, p.SpecialPhrase);
+                session.LaunchMode = NormalizeLaunchMode(p.LaunchMode);
+                if (!string.IsNullOrWhiteSpace(p.HandoffFromId))
+                    session.HandoffFromId = p.HandoffFromId.Trim();
                 changed = true;   // filed -> drop the pending entry
             }
             else keep.Add(p);     // no new chat yet -> keep waiting (up to 24h)
@@ -3828,6 +3848,14 @@ public sealed partial class ArchiveService
             incoming.FromSnapshotId = existing.FromSnapshotId;
         if (string.IsNullOrWhiteSpace(incoming.BranchedAt) && !string.IsNullOrWhiteSpace(existing.BranchedAt))
             incoming.BranchedAt = existing.BranchedAt;
+        if (string.IsNullOrWhiteSpace(incoming.HandoffFromId) && !string.IsNullOrWhiteSpace(existing.HandoffFromId))
+            incoming.HandoffFromId = existing.HandoffFromId;
+        if (IsDeepSeekLaunchMode(existing.LaunchMode))
+            incoming.LaunchMode = DeepSeekLaunchMode;
+        else if (IsLunaLaunchMode(existing.LaunchMode))
+            incoming.LaunchMode = LunaLaunchMode;
+        else if (IsGatewayLaunchMode(existing.LaunchMode))
+            incoming.LaunchMode = GatewayLaunchMode;
         NormalizeBranchIdentityAliases(incoming);
         if (existing.IsTemplate) incoming.IsTemplate = true;
     }
@@ -3887,6 +3915,12 @@ public sealed partial class ArchiveService
         foreach (var snapshot in Store.TemplateSnapshots.Values)
             if (string.Equals(snapshot.SourceSessionId, oldId, StringComparison.OrdinalIgnoreCase))
                 snapshot.SourceSessionId = newId;
+        foreach (var session in Store.Sessions.Values)
+            if (string.Equals(session.HandoffFromId, oldId, StringComparison.OrdinalIgnoreCase))
+                session.HandoffFromId = newId;
+        foreach (var pending in Store.PendingNewChats)
+            if (string.Equals(pending.HandoffFromId, oldId, StringComparison.OrdinalIgnoreCase))
+                pending.HandoffFromId = newId;
     }
 
     private List<ArchiveSession> LoadBundledHistory(IProgress<string>? progress)
@@ -3930,10 +3964,16 @@ public sealed partial class ArchiveService
         && char.IsAsciiLetterOrDigit(id[0])
         && Regex.IsMatch(id, "^[A-Za-z0-9._-]+$");
 
-    public ResumeLaunch BuildResumeLaunch(ArchiveSession session, string? exeOverride = null, string? extraArgsOverride = null)
+    public ResumeLaunch BuildResumeLaunch(
+        ArchiveSession session,
+        string? exeOverride = null,
+        string? extraArgsOverride = null,
+        string? launchModeOverride = null,
+        string? gatewayCliScriptOverride = null)
     {
         var id = ResumeSessionId(session);
         var isClaude = string.Equals(session.Tool, "claude", StringComparison.OrdinalIgnoreCase);
+        var launchMode = NormalizeLaunchMode(launchModeOverride ?? session.LaunchMode);
         // Claude resume is directory-scoped (it only finds the session under the launch dir's encoded
         // project folder), so it needs the recovered launch dir — not the recorded workspace subdir.
         var cwd = isClaude ? ResolveClaudeResumeDirectory(session) : ResolveWorkingDirectory(session);
@@ -3942,14 +3982,43 @@ public sealed partial class ArchiveService
         if (!IsResumableId(id))
             return new ResumeLaunch("", "", cwd, "Refused: session id is not a safe token.");
 
-        var exe = !string.IsNullOrWhiteSpace(exeOverride) ? exeOverride!
-            : isClaude ? ResolveClaudeExe() : ResolveCodexExe();
+        var isGateway = launchMode == GatewayLaunchMode;
+        if (isGateway && !CanResumeThroughGateway(session.Tool))
+            return new ResumeLaunch(
+                "",
+                "",
+                cwd,
+                "Refused: Gateway (cc) can resume Claude transcripts only; use Resume for this Codex chat.");
+        var exe = !string.IsNullOrWhiteSpace(exeOverride)
+            ? exeOverride!
+            : isGateway
+                ? ResolveCmdExe()
+                : isClaude ? ResolveClaudeExe() : ResolveCodexExe();
 
         // The terminal opens in the chat's workspace, and cmd resolves a bare command against the
         // current directory before PATH — so a workspace that contains a planted codex.exe/claude.bat
         // could be run. Require a trusted ABSOLUTE existing exe (overrides are caller-trusted, e.g. tests).
         if (string.IsNullOrWhiteSpace(exeOverride) && (!Path.IsPathRooted(exe) || !File.Exists(exe)))
-            return new ResumeLaunch("", "", cwd, $"Refused: the {(isClaude ? "claude" : "codex")} CLI was not found at a trusted path.");
+        {
+            var missingLabel = isGateway
+                ? "the Gateway cmd launcher"
+                : $"the {(isClaude ? "claude" : "codex")} CLI";
+            return new ResumeLaunch("", "", cwd, $"Refused: {missingLabel} was not found at a trusted path.");
+        }
+
+        if (isGateway)
+        {
+            var cc = string.IsNullOrWhiteSpace(gatewayCliScriptOverride)
+                ? ResolveGatewayCliScript()
+                : gatewayCliScriptOverride!;
+            if (string.IsNullOrWhiteSpace(exeOverride) && !File.Exists(cc))
+                return new ResumeLaunch("", "", cwd, $"Refused: the Gateway launcher was not found at a trusted path: {cc}");
+            var gatewayArgs = $"/c {QuoteWindowsArgument(cc)} --resume {id}";
+            return new ResumeLaunch(exe, gatewayArgs, cwd, $"\"{exe}\" {gatewayArgs}")
+            {
+                ArgumentList = new[] { "/c", cc, "--resume", id }
+            };
+        }
 
         var baseArgs = isClaude ? $"--resume {id}" : $"resume --include-non-interactive {id}";
         // Optional user-configured launch args (e.g. "--profile http_sse" for Codex) go in the PREFIX
@@ -3970,8 +4039,12 @@ public sealed partial class ArchiveService
         if (!IsResumableId(id)) return false;
 
         var isClaude = string.Equals(session.Tool, "claude", StringComparison.OrdinalIgnoreCase);
-        var exe = isClaude ? ResolveClaudeExe() : ResolveCodexExe();
+        var launchMode = NormalizeLaunchMode(session.LaunchMode);
+        var isGateway = launchMode == GatewayLaunchMode;
+        if (isGateway && !CanResumeThroughGateway(session.Tool)) return false;
+        var exe = isGateway ? ResolveCmdExe() : isClaude ? ResolveClaudeExe() : ResolveCodexExe();
         if (!Path.IsPathRooted(exe) || !File.Exists(exe)) return false;
+        if (isGateway) return File.Exists(ResolveGatewayCliScript());
 
         var extra = NormalizeLaunchArgs(isClaude ? Store.Settings.ClaudeLaunchArgs : Store.Settings.CodexLaunchArgs);
         return string.IsNullOrEmpty(ParseResumedSessionId(extra));
@@ -3980,39 +4053,95 @@ public sealed partial class ArchiveService
     // Build a launch for a NEW (un-resumed) chat of `tool` in `cwd`. Resolves a trusted CLI exe exactly
     // like the resume path (so a planted codex.exe in the cwd can't run); "shell" opens a plain terminal.
     // Returns Exe="" with a human reason if the CLI isn't found. DisplayCommand is "" for a shell.
-    public ResumeLaunch BuildStartLaunch(string tool, string cwd)
+    public ResumeLaunch BuildStartLaunch(
+        string tool,
+        string cwd,
+        string? exeOverride = null,
+        string? extraArgsOverride = null,
+        string? launchModeOverride = null,
+        string? gatewayCliScriptOverride = null)
     {
         cwd = Directory.Exists(cwd) ? cwd : Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
         if (string.Equals(tool, "shell", StringComparison.OrdinalIgnoreCase))
             return new ResumeLaunch("cmd.exe", "", cwd, "");
         var isClaude = string.Equals(tool, "claude", StringComparison.OrdinalIgnoreCase);
-        var extra = NormalizeLaunchArgs(isClaude ? Store.Settings.ClaudeLaunchArgs : Store.Settings.CodexLaunchArgs);
+        var launchMode = NormalizeLaunchMode(launchModeOverride);
+        var isGateway = launchMode == GatewayLaunchMode;
+        if (isGateway && !CanResumeThroughGateway(tool))
+            return new ResumeLaunch(
+                "",
+                "",
+                cwd,
+                "Gateway (cc) starts Claude sessions only; choose Claude for the native launcher.");
+        var extra = NormalizeLaunchArgs(extraArgsOverride ?? (isClaude ? Store.Settings.ClaudeLaunchArgs : Store.Settings.CodexLaunchArgs));
         if (!string.IsNullOrEmpty(ParseResumedSessionId(extra)))
             return new ResumeLaunch("", "", cwd, "Fresh chat launch args must not contain a resume/session id; use Resume for an existing chat.");
-        var exe = isClaude ? ResolveClaudeExe() : ResolveCodexExe();
-        if (!Path.IsPathRooted(exe) || !File.Exists(exe))
-            return new ResumeLaunch("", "", cwd, $"The {(isClaude ? "claude" : "codex")} CLI was not found at a trusted path.");
+        var exe = !string.IsNullOrWhiteSpace(exeOverride)
+            ? exeOverride!
+            : isGateway ? ResolveCmdExe() : isClaude ? ResolveClaudeExe() : ResolveCodexExe();
+        if (string.IsNullOrWhiteSpace(exeOverride) && (!Path.IsPathRooted(exe) || !File.Exists(exe)))
+            return new ResumeLaunch("", "", cwd, $"The {(isGateway ? "Gateway cmd launcher" : isClaude ? "claude" : "codex")} CLI was not found at a trusted path.");
+        if (isGateway)
+        {
+            var cc = string.IsNullOrWhiteSpace(gatewayCliScriptOverride)
+                ? ResolveGatewayCliScript()
+                : gatewayCliScriptOverride!;
+            if (string.IsNullOrWhiteSpace(exeOverride) && !File.Exists(cc))
+                return new ResumeLaunch("", "", cwd, $"The Gateway launcher was not found at a trusted path: {cc}");
+            var args = $"/c {QuoteWindowsArgument(cc)}";
+            return new ResumeLaunch(exe, args, cwd, $"\"{exe}\" {args}")
+            {
+                ArgumentList = new[] { "/c", cc }
+            };
+        }
         return new ResumeLaunch(exe, extra, cwd, string.IsNullOrEmpty(extra) ? $"\"{exe}\"" : $"\"{exe}\" {extra}");
+    }
+
+    public ResumeLaunch BuildGatewayHandoffLaunch(
+        ArchiveSession source,
+        string? exeOverride = null,
+        string? gatewayCliScriptOverride = null)
+    {
+        if (!string.Equals(source.Tool, "codex", StringComparison.OrdinalIgnoreCase))
+            return new ResumeLaunch("", "", ResolveWorkingDirectory(source), "Gateway handoff is only needed for Codex chats.");
+        return BuildStartLaunch(
+            "claude",
+            ResolveWorkingDirectory(source),
+            exeOverride: exeOverride,
+            launchModeOverride: GatewayLaunchMode,
+            gatewayCliScriptOverride: gatewayCliScriptOverride);
     }
 
     // The command muxd types into the PC-local terminal session to resume THIS chat: cd into the
     // recovered launch dir, then invoke the trusted resolved CLI path. Forward slashes in the cd/exe
     // paths sidestep JSON/backslash escaping when this travels through the relay API. Returns "" if the
     // session id isn't a safe token or the CLI cannot be resolved to a trusted path.
-    public string BuildMultiplexCommand(ArchiveSession session, string? exeOverride = null, string? extraArgsOverride = null)
+    public string BuildMultiplexCommand(
+        ArchiveSession session,
+        string? exeOverride = null,
+        string? extraArgsOverride = null,
+        string? launchModeOverride = null)
     {
-        var launch = BuildResumeLaunch(session, exeOverride, extraArgsOverride);
+        var launch = BuildResumeLaunch(session, exeOverride, extraArgsOverride, launchModeOverride);
         if (string.IsNullOrWhiteSpace(launch.Exe) || string.IsNullOrWhiteSpace(launch.Arguments)) return "";
         return BuildMultiplexCommand(launch);
     }
 
-    public string BuildMultiplexStartCommand(string tool, string? cwd = null)
+    public string BuildMultiplexStartCommand(
+        string tool,
+        string? cwd = null,
+        string? exeOverride = null,
+        string? extraArgsOverride = null,
+        string? launchModeOverride = null)
     {
         var launch = BuildStartLaunch(
             tool,
             string.IsNullOrWhiteSpace(cwd)
                 ? Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)
-                : cwd);
+                : cwd,
+            exeOverride,
+            extraArgsOverride,
+            launchModeOverride);
         if (string.IsNullOrWhiteSpace(launch.Exe)) return "";
         return BuildMultiplexCommand(launch);
     }
@@ -4031,6 +4160,33 @@ public sealed partial class ArchiveService
 
     private static string NormalizeLaunchArgs(string? args)
         => (args ?? "").Replace("\r", " ").Replace("\n", " ").Trim();
+
+    public static string NormalizeLaunchMode(string? launchMode)
+        => IsGatewayLaunchMode(launchMode) ? GatewayLaunchMode : NativeLaunchMode;
+
+    public static bool IsGatewayLaunchMode(string? launchMode)
+        => string.Equals(launchMode, GatewayLaunchMode, StringComparison.OrdinalIgnoreCase)
+           || string.Equals(launchMode, DeepSeekLaunchMode, StringComparison.OrdinalIgnoreCase)
+           || string.Equals(launchMode, LunaLaunchMode, StringComparison.OrdinalIgnoreCase);
+
+    public static bool CanResumeThroughGateway(string? tool)
+        => string.Equals(tool, "claude", StringComparison.OrdinalIgnoreCase);
+
+    public static bool CanContinueInGateway(string? tool)
+        => CanResumeThroughGateway(tool)
+           || string.Equals(tool, "codex", StringComparison.OrdinalIgnoreCase);
+
+    public static bool IsDeepSeekLaunchMode(string? launchMode)
+        => string.Equals(launchMode, DeepSeekLaunchMode, StringComparison.OrdinalIgnoreCase);
+
+    public static bool IsLunaLaunchMode(string? launchMode)
+        => string.Equals(launchMode, LunaLaunchMode, StringComparison.OrdinalIgnoreCase);
+
+    public static string LaunchModeLabel(string? launchMode)
+        => IsGatewayLaunchMode(launchMode) ? "Gateway" : "native";
+
+    private static string QuoteWindowsArgument(string value)
+        => "\"" + (value ?? "").Replace("\"", "\\\"") + "\"";
 
     // A readable, collision-resistant mux session name for a chat: a slug of its title plus a short
     // id tail so two chats that happen to share a title still get distinct sessions/tabs. The server
@@ -4124,13 +4280,27 @@ public sealed partial class ArchiveService
     private static string QuotePowerShellSingle(string value)
         => "'" + (value ?? "").Replace("'", "''") + "'";
 
+    // Interactive GUI terminals use /k, while server/live/mux launches use the raw /c vector. Keeping this
+    // conversion structured avoids wrapping a complete quoted cmd.exe command inside another shell string.
+    public static IReadOnlyList<string> BuildGatewayTerminalArgumentList(ResumeLaunch launch)
+    {
+        if (launch.ArgumentList.Count == 0
+            || !string.Equals(launch.ArgumentList[0], "/c", StringComparison.OrdinalIgnoreCase))
+            return Array.Empty<string>();
+
+        var args = launch.ArgumentList.ToArray();
+        args[0] = "/k";
+        return args;
+    }
+
     public sealed record RemoteMuxLaunch(
         string SessionId,
         string Tool,
         string Command,
         IReadOnlyList<string> Aliases,
         string Title,
-        string Workspace);
+        string Workspace,
+        string LaunchMode);
 
     public sealed record PendingMuxBinding(string MuxName, RemoteMuxLaunch Launch);
 
@@ -4139,11 +4309,14 @@ public sealed partial class ArchiveService
         string? tool,
         out RemoteMuxLaunch? launch,
         out string detail,
-        Func<ArchiveSession, string>? multiplexCommandFactory = null)
+        Func<ArchiveSession, string>? multiplexCommandFactory = null,
+        string? launchMode = null,
+        Func<string, string, string>? multiplexStartCommandFactory = null)
     {
         launch = null;
         var requestedId = (sessionId ?? "").Trim();
         var requestedTool = (tool ?? "").Trim().ToLowerInvariant();
+        var requestedLaunchMode = NormalizeLaunchMode(launchMode);
         if (string.IsNullOrWhiteSpace(requestedId))
         {
             if (requestedTool is not ("claude" or "codex"))
@@ -4151,7 +4324,9 @@ public sealed partial class ArchiveService
                 detail = "remote mux start refused: tool must be claude or codex";
                 return false;
             }
-            var startCommand = BuildMultiplexStartCommand(requestedTool);
+            var startCommand = multiplexStartCommandFactory is null
+                ? BuildMultiplexStartCommand(requestedTool, launchModeOverride: requestedLaunchMode)
+                : multiplexStartCommandFactory(requestedTool, requestedLaunchMode);
             if (string.IsNullOrWhiteSpace(startCommand))
             {
                 detail = $"remote mux start refused: no trusted {requestedTool} launch is available";
@@ -4163,7 +4338,8 @@ public sealed partial class ArchiveService
                 startCommand,
                 Array.Empty<string>(),
                 requestedTool,
-                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile));
+                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                requestedLaunchMode);
             detail = "ok";
             return true;
         }
@@ -4175,7 +4351,11 @@ public sealed partial class ArchiveService
             return false;
         }
 
-        var buildCommand = multiplexCommandFactory ?? (s => BuildMultiplexCommand(s));
+        var effectiveLaunchMode = string.IsNullOrWhiteSpace(launchMode)
+            ? NormalizeLaunchMode(session.LaunchMode)
+            : requestedLaunchMode;
+        var buildCommand = multiplexCommandFactory
+            ?? (s => BuildMultiplexCommand(s, launchModeOverride: effectiveLaunchMode));
         var command = buildCommand(session);
         if (string.IsNullOrWhiteSpace(command))
         {
@@ -4189,7 +4369,8 @@ public sealed partial class ArchiveService
             command,
             session.Aliases.Where(a => !string.IsNullOrWhiteSpace(a)).Distinct(StringComparer.OrdinalIgnoreCase).ToArray(),
             session.DisplayTitle,
-            session.Workspace);
+            session.Workspace,
+            effectiveLaunchMode);
         detail = "ok";
         return true;
     }
@@ -4566,7 +4747,8 @@ public sealed partial class ArchiveService
                     command,
                     session.Aliases.ToArray(),
                     session.DisplayTitle,
-                    session.Workspace)));
+                    session.Workspace,
+                    NormalizeLaunchMode(session.LaunchMode))));
         }
         return bindings;
     }
@@ -4705,6 +4887,19 @@ public sealed partial class ArchiveService
     {
         var local = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".local", "bin", "claude.exe");
         return File.Exists(local) ? local : "claude";
+    }
+
+    public static string ResolveGatewayCliScript() =>
+        Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+            ".local",
+            "bin",
+            "cc.cmd");
+
+    public static string ResolveCmdExe()
+    {
+        var cmd = Path.Combine(Environment.SystemDirectory, "cmd.exe");
+        return File.Exists(cmd) ? cmd : "cmd.exe";
     }
 
     private static string ResolveWorkingDirectory(ArchiveSession session)

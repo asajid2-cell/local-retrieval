@@ -3,11 +3,64 @@ using CodexLocalRetrieval.Core.Services;
 using Microsoft.UI.Text;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
+using Microsoft.UI.Xaml.Media;
 
 namespace CodexLocalRetrieval_Native;
 
 public sealed partial class MainPage
 {
+    private async Task ForkChatAsync(ArchiveSession session, string launchMode)
+    {
+        if (session is null) return;
+        var modeLabel = ArchiveService.NormalizeLaunchMode(launchMode) == ArchiveService.NativeLaunchMode
+            ? ""
+            : $" with {ArchiveService.LaunchModeLabel(launchMode)} marker";
+        SyncStatus.Text = $"Forking \"{Trim(session.DisplayTitle, 40)}\"{modeLabel}...";
+        var result = await _archive.ForkSessionAsync(session, launchMode);
+        SyncStatus.Text = result.Message;
+        RenderIntegrity(force: true);
+        if (result.Ok && result.Branch is not null)
+        {
+            RenderCurrent();
+            OpenSession(result.Branch);
+        }
+    }
+
+    private MenuFlyoutSubItem ForkAsMenu(ArchiveSession session)
+    {
+        var menu = new MenuFlyoutSubItem { Text = "Fork as..." };
+
+        var native = new MenuFlyoutItem { Text = "Native branch" };
+        native.Click += async (_, _) => await ForkChatAsync(session, ArchiveService.NativeLaunchMode);
+        menu.Items.Add(native);
+        return menu;
+    }
+
+    private UIElement? GatewayBadge(ArchiveSession session)
+    {
+        if (!session.IsGatewayBranch) return null;
+        var badge = new Border
+        {
+            Background = new SolidColorBrush(Windows.UI.Color.FromArgb(45, 45, 190, 160)),
+            BorderBrush = LineBrush(),
+            BorderThickness = new Thickness(1),
+            CornerRadius = new CornerRadius(5),
+            Padding = new Thickness(6, 1, 6, 1),
+            VerticalAlignment = VerticalAlignment.Center,
+            Child = new TextBlock
+            {
+                Text = session.GatewayGlyph,
+                Foreground = StrongBrush(),
+                FontSize = 10,
+                FontWeight = FontWeights.SemiBold
+            }
+        };
+        ToolTipService.SetToolTip(
+            badge,
+            "Gateway branch. Use Resume as Gateway to launch it through the cc build.");
+        return badge;
+    }
+
     private async Task BranchChatAsync(ArchiveSession session)
     {
         if (session is null) return;

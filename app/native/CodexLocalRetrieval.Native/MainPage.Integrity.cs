@@ -91,6 +91,15 @@ public sealed partial class MainPage
             var branches = BranchesOf(_selected);
             if (branches.Count > 0) IntegrityItems.Children.Add(BranchesOfBlock(branches));
         }
+        if (!string.IsNullOrWhiteSpace(_selected.HandoffFromId))
+        {
+            var sourceTitle = _archive.Store.Sessions.TryGetValue(_selected.HandoffFromId, out var source)
+                ? source.DisplayTitle
+                : _selected.HandoffFromId;
+            IntegrityItems.Children.Add(IntegrityEvidenceBlock(
+                "Gateway handoff",
+                new[] { $"Fresh chat from \"{sourceTitle}\" ({_selected.HandoffFromId})" }));
+        }
 
         foreach (var check in summary.Checks)
             IntegrityItems.Children.Add(IntegrityCheckRow(check));

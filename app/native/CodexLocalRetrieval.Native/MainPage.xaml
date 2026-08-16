@@ -65,7 +65,7 @@
                     VerticalAlignment="Center"
                     FontSize="12"
                     Foreground="{StaticResource AccentBrush}"
-                    ToolTipService.ToolTip="★ checkpoint count · ! legacy checkpoint pending · ⑂ branch"
+                    ToolTipService.ToolTip="Checkpoint count; ! legacy checkpoint pending; branch; GW Gateway branch"
                     Text="{Binding ListMarks}" />
                 <TextBlock
                     Grid.Column="3"
@@ -321,14 +321,28 @@
                             ToolTipService.ToolTip="More actions">
                             <FontIcon FontFamily="Segoe Fluent Icons" FontSize="16" Glyph="&#xE712;" />
                         </Button>
-                        <Button Click="ResumeInTerminal_Click" Style="{StaticResource PrimaryPillButtonStyle}">
+                        <Button Style="{StaticResource PrimaryPillButtonStyle}" ToolTipService.ToolTip="Resume with this chat's native CLI, or expand for Gateway (cc) continuation">
+                            <Button.Flyout>
+                                <MenuFlyout>
+                                    <MenuFlyoutItem
+                                        x:Name="HeaderResumeNativeItem"
+                                        Text="Resume as Claude"
+                                        Click="ResumeInTerminal_Click"
+                                        ToolTipService.ToolTip="Resume with this chat's native Codex or Claude CLI." />
+                                    <MenuFlyoutItem
+                                        x:Name="HeaderResumeGatewayItem"
+                                        Text="Resume as Gateway"
+                                        Click="ResumeAsGateway_Click"
+                                        ToolTipService.ToolTip="Continue through the custom cc Gateway." />
+                                </MenuFlyout>
+                            </Button.Flyout>
                             <StackPanel Orientation="Horizontal" Spacing="8">
                                 <FontIcon
                                     FontFamily="Segoe Fluent Icons"
                                     FontSize="15"
                                     Foreground="Black"
                                     Glyph="&#xE756;" />
-                                <TextBlock Text="Resume in terminal" />
+                                <TextBlock Text="Resume" />
                             </StackPanel>
                         </Button>
                     </StackPanel>
@@ -383,24 +397,57 @@
                     Text="Quick actions" />
                 <Button
                     x:Name="ResumeTerminalButton"
-                    Click="ResumeInTerminal_Click"
-                    Content="Resume in terminal"
+                    Content="Resume"
                     HorizontalAlignment="Stretch"
-                    Style="{StaticResource PrimaryPillButtonStyle}" />
+                    Style="{StaticResource PrimaryPillButtonStyle}"
+                    ToolTipService.ToolTip="Resume with this chat's native CLI, or expand for Gateway (cc) continuation">
+                    <Button.Flyout>
+                        <MenuFlyout>
+                            <MenuFlyoutItem
+                                x:Name="QuickResumeNativeItem"
+                                Text="Resume as Claude"
+                                Click="ResumeInTerminal_Click"
+                                ToolTipService.ToolTip="Resume with this chat's native Codex or Claude CLI." />
+                            <MenuFlyoutItem
+                                x:Name="QuickResumeGatewayItem"
+                                Text="Resume as Gateway"
+                                Click="ResumeAsGateway_Click"
+                                ToolTipService.ToolTip="Continue through the custom cc Gateway." />
+                        </MenuFlyout>
+                    </Button.Flyout>
+                </Button>
                 <Button
                     x:Name="ResumeMultiplexButton"
-                    Click="ResumeInMultiplex_Click"
                     Content="Start multiplex"
-                    ToolTipService.ToolTip="Start this chat in multiplex and open a local terminal attached to it."
+                    ToolTipService.ToolTip="Start this chat in multiplex with its stored launcher or explicitly through Gateway."
                     HorizontalAlignment="Stretch"
-                    Style="{StaticResource PillButtonStyle}" />
+                    Style="{StaticResource PillButtonStyle}">
+                    <Button.Flyout>
+                        <MenuFlyout>
+                            <MenuFlyoutItem Text="Start multiplex" Click="ResumeInMultiplex_Click" />
+                            <MenuFlyoutItem
+                                x:Name="QuickGatewayMultiplexItem"
+                                Text="Start Gateway multiplex"
+                                Click="ResumeInGatewayMultiplex_Click" />
+                        </MenuFlyout>
+                    </Button.Flyout>
+                </Button>
                 <Button
                     x:Name="ResumeHeadlessMultiplexButton"
-                    Click="ResumeInHeadlessMultiplex_Click"
                     Content="Start headless multiplex"
-                    ToolTipService.ToolTip="Start this chat in multiplex without opening a local terminal; attach later with mux &lt;name&gt;."
+                    ToolTipService.ToolTip="Start this chat headlessly with its stored launcher or explicitly through Gateway."
                     HorizontalAlignment="Stretch"
-                    Style="{StaticResource PillButtonStyle}" />
+                    Style="{StaticResource PillButtonStyle}">
+                    <Button.Flyout>
+                        <MenuFlyout>
+                            <MenuFlyoutItem Text="Start headless multiplex" Click="ResumeInHeadlessMultiplex_Click" />
+                            <MenuFlyoutItem
+                                x:Name="QuickGatewayHeadlessItem"
+                                Text="Start Gateway headless multiplex"
+                                Click="ResumeInGatewayHeadlessMultiplex_Click" />
+                        </MenuFlyout>
+                    </Button.Flyout>
+                </Button>
                 <Button
                     x:Name="AddToProjectButton"
                     Click="AddToProject_Click"
@@ -408,7 +455,7 @@
                     HorizontalAlignment="Stretch"
                     Style="{StaticResource PillButtonStyle}" />
                 <Button Click="CopyContext_Click" Content="Copy resume prompt" HorizontalAlignment="Stretch" Style="{StaticResource PillButtonStyle}" />
-                <Button x:Name="CopyCommandButton" Click="CopyCommand_Click" Content="Copy resume command" ToolTipService.ToolTip="Copy the CLI command that resumes this chat (codex resume &lt;id&gt; / claude --resume &lt;id&gt;)" HorizontalAlignment="Stretch" Style="{StaticResource PillButtonStyle}" />
+                <Button x:Name="CopyCommandButton" Click="CopyCommand_Click" Content="Copy resume command" ToolTipService.ToolTip="Copy the trusted command for this chat's stored launcher, including Gateway (cc)." HorizontalAlignment="Stretch" Style="{StaticResource PillButtonStyle}" />
                 <Button Click="CopyPath_Click" Content="Copy chat path" HorizontalAlignment="Stretch" Style="{StaticResource PillButtonStyle}" />
                 <Button Click="CopyCode_Click" Content="Copy all code" HorizontalAlignment="Stretch" Style="{StaticResource PillButtonStyle}" />
                 <Button Click="Restore_Click" Content="Build restore packet" HorizontalAlignment="Stretch" Style="{StaticResource PillButtonStyle}" />

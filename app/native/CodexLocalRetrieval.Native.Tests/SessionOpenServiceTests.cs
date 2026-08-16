@@ -5,6 +5,7 @@ using System.Text.Json;
 using CodexLocalRetrieval.Core.Agents;
 using CodexLocalRetrieval.Core.Models;
 using CodexLocalRetrieval.Core.Remote;
+using CodexLocalRetrieval.Core.Services;
 using CodexLocalRetrieval.Server;
 
 namespace CodexLocalRetrieval.Native.Tests;
@@ -149,6 +150,75 @@ public sealed class SessionOpenServiceTests
     }
 
     [TestMethod]
+    public void SessionLauncher_GatewayMode_UsesCcResume()
+    {
+        using var workspace = new TempDirectory("gateway workspace");
+        var starts = new List<ProcessStartInfo>();
+        var launcher = new SessionLauncher(
+            @"C:\trusted\claude.exe",
+            @"C:\trusted\codex.exe",
+            allowLaunch: true,
+            isSessionLive: _ => false,
+            claimOptions: new(
+                RootDirectory: Path.Combine(Path.GetTempPath(), "clr-session-open-tests", Guid.NewGuid().ToString("N"))),
+            startProcess: psi => { starts.Add(psi); return null; },
+            windowsTerminal: null,
+            discoverWindowsTerminal: false,
+            ownerRecordOptions: new(
+                RootDirectory: Path.Combine(Path.GetTempPath(), "clr-session-open-tests", Guid.NewGuid().ToString("N"))),
+            gatewayCliScript: @"C:\trusted\cc.cmd",
+            cmdExe: @"C:\Windows\System32\cmd.exe");
+        var session = new TrustedSessionLaunch(
+            "gateway-session-id",
+            SessionTool.Claude,
+            workspace.Path,
+            new[] { "gateway-session-id" },
+            ArchiveService.GatewayLaunchMode);
+
+        var result = launcher.Open(session, SessionOpenTarget.Terminal);
+
+        Assert.IsTrue(result.ok, result.message);
+        Assert.HasCount(1, starts);
+        Assert.AreEqual(@"C:\Windows\System32\cmd.exe", starts[0].FileName);
+        CollectionAssert.AreEqual(
+            new[] { "/c", @"C:\trusted\cc.cmd", "--resume", "gateway-session-id" },
+            starts[0].ArgumentList.ToArray());
+    }
+
+    [TestMethod]
+    public void SessionLauncher_GatewayMode_RefusesCodexTranscript()
+    {
+        using var workspace = new TempDirectory("gateway codex workspace");
+        var starts = new List<ProcessStartInfo>();
+        var launcher = new SessionLauncher(
+            @"C:\trusted\claude.exe",
+            @"C:\trusted\codex.exe",
+            allowLaunch: true,
+            isSessionLive: _ => false,
+            claimOptions: new(
+                RootDirectory: Path.Combine(Path.GetTempPath(), "clr-session-open-tests", Guid.NewGuid().ToString("N"))),
+            startProcess: psi => { starts.Add(psi); return null; },
+            windowsTerminal: null,
+            discoverWindowsTerminal: false,
+            ownerRecordOptions: new(
+                RootDirectory: Path.Combine(Path.GetTempPath(), "clr-session-open-tests", Guid.NewGuid().ToString("N"))),
+            gatewayCliScript: @"C:\trusted\cc.cmd",
+            cmdExe: @"C:\Windows\System32\cmd.exe");
+        var session = new TrustedSessionLaunch(
+            "codex-session-id",
+            SessionTool.Codex,
+            workspace.Path,
+            new[] { "codex-session-id" },
+            ArchiveService.GatewayLaunchMode);
+
+        var result = launcher.Open(session, SessionOpenTarget.Terminal);
+
+        Assert.IsFalse(result.ok);
+        StringAssert.Contains(result.message, "Claude transcripts only");
+        Assert.IsEmpty(starts);
+    }
+
+    [TestMethod]
     public void BrowserAndRequestContract_DoNotAcceptToolOrWorkspaceOverrides()
     {
         CollectionAssert.AreEqual(
@@ -169,6 +239,8 @@ public sealed class SessionOpenServiceTests
         var webSocket = File.ReadAllText(Path.Combine(root, "native", "CodexLocalRetrieval.Server", "AgentWebSocket.cs"));
         Assert.IsTrue(webSocket.Contains("resolveSession(id, ct)", StringComparison.Ordinal));
         Assert.IsTrue(webSocket.Contains("ClearOpenSession()", StringComparison.Ordinal));
+        Assert.IsTrue(webSocket.Contains("claudeLaunchMode = trusted.LaunchMode", StringComparison.Ordinal));
+        Assert.IsTrue(webSocket.Contains("launchMode: claudeLaunchMode", StringComparison.Ordinal));
         var openCase = webSocket[webSocket.IndexOf("case \"open\":", StringComparison.Ordinal)..];
         Assert.IsTrue(openCase.IndexOf("resolveSession(id, ct)", StringComparison.Ordinal)
             < openCase.IndexOf("ClearOpenSession();", StringComparison.Ordinal));

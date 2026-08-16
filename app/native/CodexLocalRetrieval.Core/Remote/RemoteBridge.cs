@@ -30,7 +30,7 @@ public sealed class RemoteBridge
     private readonly ClaudeSessionStore _claude;
     private readonly string _codexDbPath;
     private readonly Action<string> _log;
-    private readonly Func<string?, string?, Task<(bool ok, ArchiveService.RemoteMuxLaunch? launch, string detail)>>? _resolveMuxLaunch;
+    private readonly Func<string?, string?, string?, Task<(bool ok, ArchiveService.RemoteMuxLaunch? launch, string detail)>>? _resolveMuxLaunch;
     private readonly Func<Task<IReadOnlyList<ArchiveService.PendingMuxBinding>>>? _resolvePendingMuxBindings;
     private readonly IProcessContainment? _processContainment;
     private readonly string _commandLeaseOwner = RemoteCommandProtocol.LeaseOwner("headless");
@@ -49,7 +49,7 @@ public sealed class RemoteBridge
         ClaudeSessionStore claude,
         string codexDbPath,
         Action<string>? log = null,
-        Func<string?, string?, Task<(bool ok, ArchiveService.RemoteMuxLaunch? launch, string detail)>>? resolveMuxLaunch = null,
+        Func<string?, string?, string?, Task<(bool ok, ArchiveService.RemoteMuxLaunch? launch, string detail)>>? resolveMuxLaunch = null,
         Func<Task<IReadOnlyList<ArchiveService.PendingMuxBinding>>>? resolvePendingMuxBindings = null,
         IProcessContainment? processContainment = null)
     {
@@ -300,7 +300,8 @@ public sealed class RemoteBridge
                         c.sessionId ?? "",
                         c.tool ?? "",
                         c.intentId,
-                        c.takeover);
+                        c.takeover,
+                        c.launchMode);
                     break;
                 case "mirrorlocal":
                     res = await MirrorLocalAsync(
@@ -333,7 +334,8 @@ public sealed class RemoteBridge
         string requestedSessionId,
         string tool,
         string intentId,
-        bool takeover = false)
+        bool takeover = false,
+        string? launchMode = null)
     {
         name = (name ?? "").Trim();
         var eventSessionId = (requestedSessionId ?? "").Trim();
@@ -356,7 +358,7 @@ public sealed class RemoteBridge
                 return (false, resolverMissing);
             }
 
-            var resolved = await _resolveMuxLaunch(requestedSessionId, tool);
+            var resolved = await _resolveMuxLaunch(requestedSessionId, tool, launchMode);
             if (!resolved.ok || resolved.launch is null)
             {
                 RecordSessionEvent(
@@ -450,7 +452,7 @@ public sealed class RemoteBridge
             return (false, "headless local mirror refused: no local archive resolver is configured");
         try
         {
-            var resolved = await _resolveMuxLaunch(requestedSessionId, tool);
+            var resolved = await _resolveMuxLaunch(requestedSessionId, tool, null);
             if (!resolved.ok || resolved.launch is null) return (false, resolved.detail);
             var launch = resolved.launch;
             var result = await AdoptedMuxLauncher.MirrorAsync(
@@ -637,6 +639,7 @@ public sealed class RemoteBridge
         public string replayPolicy { get; set; } = "";
         public string? sessionId { get; set; }
         public string? tool { get; set; }
+        public string? launchMode { get; set; }
         public int pid { get; set; }
         public string? uploadId { get; set; }
         public string? filename { get; set; }

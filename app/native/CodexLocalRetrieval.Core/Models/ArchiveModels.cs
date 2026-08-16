@@ -111,6 +111,9 @@ public sealed class PendingNewChat
     [JsonPropertyName("tool")]
     public string Tool { get; set; } = "";         // "claude" | "codex"
 
+    [JsonPropertyName("launchMode")]
+    public string LaunchMode { get; set; } = "native";
+
     [JsonPropertyName("collectionId")]
     public string CollectionId { get; set; } = "";
 
@@ -128,6 +131,11 @@ public sealed class PendingNewChat
     // match that doesn't depend on parsing the workspace or on a shared cwd like the 301 root.
     [JsonPropertyName("knownIds")]
     public List<string> KnownIds { get; set; } = new();
+
+    // When a fresh chat was opened as a handoff from an existing chat, keep the source id so the
+    // resulting transcript remains a distinct chat without losing where it came from.
+    [JsonPropertyName("handoffFromId")]
+    public string HandoffFromId { get; set; } = "";
 }
 
 // A place agent sessions are stored on disk. Defaults cover Codex + Claude; an agent or the user
@@ -527,6 +535,12 @@ public sealed class ArchiveSession : INotifyPropertyChanged
     [JsonPropertyName("tool")]
     public string Tool { get; set; } = "codex";
 
+    // How the app should launch this chat when resumed. This deliberately stays separate from Tool: a
+    // gateway (or legacy deepseek/luna) branch still uses the native Claude/Codex transcript and parser,
+    // only the resume command differs (cc build instead of the stock CLI).
+    [JsonPropertyName("launchMode")]
+    public string LaunchMode { get; set; } = "native";
+
     // Heavy content is NOT persisted or kept in memory at rest — it's lazy-loaded from SourcePath on open
     // (ArchiveService.EnsureContentAsync) and paginated in the reader. The store keeps only metadata +
     // a capped Text for fast in-memory search. This is what keeps the app light (was ~1GB resident).
@@ -589,6 +603,12 @@ public sealed class ArchiveSession : INotifyPropertyChanged
     [JsonPropertyName("branchedAt")]
     public string BranchedAt { get; set; } = "";
 
+    // A handoff is a fresh transcript created in another agent/runtime (for example Codex -> Gateway).
+    // It is intentionally separate from BranchOfId: branches are app-created transcript clones, while
+    // handoffs are new chats that start from a copied prompt.
+    [JsonPropertyName("handoffFromId")]
+    public string HandoffFromId { get; set; } = "";
+
     [JsonIgnore]
     public bool IsReadOnlySnapshot { get; set; }
 
@@ -618,6 +638,31 @@ public sealed class ArchiveSession : INotifyPropertyChanged
     [JsonIgnore]
     public bool IsBranch => !string.IsNullOrWhiteSpace(BranchOfId);
 
+    // The current branch marker: a fork persisted as gateway, OR an older fork persisted with the legacy
+    // deepseek/luna marker. They all resume through the Gateway (cc) build now, so they show one GW mark.
+    [JsonIgnore]
+    public bool IsGatewayBranch =>
+        IsBranch && ArchiveService.IsGatewayLaunchMode(LaunchMode);
+
+    // Legacy reads: an old fork whose persisted marker is literally deepseek/luna. Kept so stored data is
+    // recognized and (e.g.) carried across re-parses; they no longer select a distinct launcher.
+    [JsonIgnore]
+    public bool IsDeepSeekBranch =>
+        IsBranch && ArchiveService.IsDeepSeekLaunchMode(LaunchMode);
+
+    [JsonIgnore]
+    public bool IsLunaBranch =>
+        IsBranch && ArchiveService.IsLunaLaunchMode(LaunchMode);
+
+    [JsonIgnore]
+    public string GatewayGlyph => IsGatewayBranch ? "GW" : "";
+
+    [JsonIgnore]
+    public string DeepSeekGlyph => IsDeepSeekBranch ? "DS" : "";
+
+    [JsonIgnore]
+    public string LunaGlyph => IsLunaBranch ? "LU" : "";
+
     // Sidebar marker for a branch (bound in the SessionList template). Empty for non-branches.
     [JsonIgnore]
     public string BranchGlyph => IsBranch ? "⑂" : "";
@@ -626,7 +671,8 @@ public sealed class ArchiveSession : INotifyPropertyChanged
     [JsonIgnore]
     public string ListMarks =>
         (TemplateSnapshotCount > 0 ? $"★{TemplateSnapshotCount}" : IsTemplate ? "!" : "")
-        + (IsBranch ? "⑂" : "");
+        + (IsBranch ? "⑂" : "")
+        + (IsGatewayBranch ? " GW" : "");
 
     [JsonIgnore]
     public string DisplayTitle => string.IsNullOrWhiteSpace(CustomTitle) ? Title : CustomTitle;
@@ -746,7 +792,11 @@ public sealed record AgentCommandResult(
     string? Project = null,
     bool? Persisted = null);
 
-public sealed record ResumeLaunch(string Exe, string Arguments, string WorkingDirectory, string DisplayCommand);
+public sealed record ResumeLaunch(string Exe, string Arguments, string WorkingDirectory, string DisplayCommand)
+{
+    // Gateway callers use this exact argv instead of reparsing DisplayCommand through another shell.
+    public IReadOnlyList<string> ArgumentList { get; init; } = Array.Empty<string>();
+}
 
 public sealed record RawEvent(string Kind, string Timestamp, string Preview);
 

@@ -942,6 +942,339 @@ public sealed class ArchiveServiceTests
         Assert.AreEqual(cwd, launch.WorkingDirectory);
     }
 
+    // Gateway resume: `cmd.exe /c "C:\Users\<user>\.local\bin\cc.cmd" --resume <id>`.
+    [TestMethod]
+    public void BuildResumeLaunch_GatewayClaude_InvokesCcWrapperAndIgnoresNativeArgs()
+    {
+        var service = new ArchiveService(useBundledStore: true);
+        service.Store.Settings.ClaudeLaunchArgs = "--mcp-debug";
+        var cwd = Path.GetTempPath().TrimEnd('\\', '/');
+        var session = new ArchiveSession
+        {
+            Id = "cl-gw-9",
+            Tool = "claude",
+            LaunchMode = ArchiveService.GatewayLaunchMode,
+            Workspace = cwd,
+            SourcePath = Path.Combine(cwd, "cl-gw-9.jsonl")
+        };
+
+        var launch = service.BuildResumeLaunch(session, exeOverride: "C:\\cmd.exe");
+
+        Assert.AreEqual("C:\\cmd.exe", launch.Exe);
+        StringAssert.Contains(launch.Arguments, "/c ");
+        StringAssert.Contains(launch.Arguments, "cc.cmd");
+        StringAssert.Contains(launch.Arguments, "--resume cl-gw-9");
+        Assert.IsFalse(launch.Arguments.Contains("--mcp-debug", StringComparison.Ordinal));
+    }
+
+    [TestMethod]
+    public void BuildGatewayResume_ExposesStructuredInteractiveArgumentsWithOneResume()
+    {
+        var service = new ArchiveService(useBundledStore: true);
+        var cwd = Path.Combine(Path.GetTempPath(), "gateway resume workspace " + Guid.NewGuid().ToString("N"));
+        var cc = Path.Combine(cwd, "Program Files", "Trusted Gateway", "cc.cmd");
+        Directory.CreateDirectory(cwd);
+        try
+        {
+            var session = new ArchiveSession
+            {
+                Id = "gateway-spaced-id",
+                Tool = "claude",
+                LaunchMode = ArchiveService.GatewayLaunchMode,
+                Workspace = cwd,
+                SourcePath = Path.Combine(cwd, "gateway-spaced-id.jsonl")
+            };
+
+            var launch = service.BuildResumeLaunch(
+                session,
+                exeOverride: @"C:\Windows\System32\cmd.exe",
+                gatewayCliScriptOverride: cc);
+
+            Assert.AreEqual(@"C:\Windows\System32\cmd.exe", launch.Exe);
+            CollectionAssert.AreEqual(
+                new[] { "/c", cc, "--resume", session.Id },
+                launch.ArgumentList.ToArray());
+            CollectionAssert.AreEqual(
+                new[] { "/k", cc, "--resume", session.Id },
+                ArchiveService.BuildGatewayTerminalArgumentList(launch).ToArray());
+            Assert.AreEqual(
+                1,
+                launch.ArgumentList.Count(a => string.Equals(a, "--resume", StringComparison.OrdinalIgnoreCase)));
+        }
+        finally
+        {
+            try { Directory.Delete(cwd, recursive: true); } catch { }
+        }
+    }
+
+    [TestMethod]
+    public void BuildResumeLaunch_GatewayCodex_RefusesNativeCodexTranscript()
+    {
+        var service = new ArchiveService(useBundledStore: true);
+        service.Store.Settings.CodexLaunchArgs = "--profile http_sse";
+        var cwd = Path.GetTempPath().TrimEnd('\\', '/');
+        var session = new ArchiveSession
+        {
+            Id = "cx-gw-9",
+            Tool = "codex",
+            LaunchMode = ArchiveService.GatewayLaunchMode,
+            Workspace = cwd,
+            SourcePath = Path.Combine(cwd, "cx-gw-9.jsonl")
+        };
+
+        var launch = service.BuildResumeLaunch(session, exeOverride: "C:\\cmd.exe");
+
+        Assert.AreEqual("", launch.Exe);
+        Assert.AreEqual("", launch.Arguments);
+        StringAssert.Contains(launch.DisplayCommand, "Claude transcripts only");
+    }
+
+    [TestMethod]
+    public void BuildResumeLaunch_GatewayOverride_LeavesNativeBranchMetadataUntouched()
+    {
+        var service = new ArchiveService(useBundledStore: true);
+        var cwd = Path.GetTempPath().TrimEnd('\\', '/');
+        var session = new ArchiveSession
+        {
+            Id = "cl-native-branch",
+            Tool = "claude",
+            LaunchMode = ArchiveService.NativeLaunchMode,
+            BranchOfId = "parent-id",
+            Workspace = cwd,
+            SourcePath = Path.Combine(cwd, "cl-native-branch.jsonl")
+        };
+
+        var launch = service.BuildResumeLaunch(
+            session,
+            exeOverride: "C:\\cmd.exe",
+            launchModeOverride: ArchiveService.GatewayLaunchMode);
+
+        Assert.AreEqual(ArchiveService.NativeLaunchMode, session.LaunchMode);
+        StringAssert.Contains(launch.Arguments, "cc.cmd");
+        StringAssert.Contains(launch.Arguments, "--resume cl-native-branch");
+        Assert.IsFalse(launch.Arguments.Contains("claude.exe", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [TestMethod]
+    public void BuildResumeLaunch_LegacyDeepSeek_RoutesThroughGateway()
+    {
+        var service = new ArchiveService(useBundledStore: true);
+        var cwd = Path.GetTempPath().TrimEnd('\\', '/');
+        var session = new ArchiveSession
+        {
+            Id = "cl-legacy-ds",
+            Tool = "claude",
+            LaunchMode = ArchiveService.DeepSeekLaunchMode,
+            Workspace = cwd,
+            SourcePath = Path.Combine(cwd, "cl-legacy-ds.jsonl")
+        };
+
+        var launch = service.BuildResumeLaunch(session, exeOverride: "C:\\cmd.exe");
+
+        Assert.AreEqual("C:\\cmd.exe", launch.Exe);
+        StringAssert.Contains(launch.Arguments, "cc.cmd");
+        StringAssert.Contains(launch.Arguments, "--resume cl-legacy-ds");
+        Assert.IsTrue(ArchiveService.IsGatewayLaunchMode(session.LaunchMode));
+        Assert.AreEqual("Gateway", ArchiveService.LaunchModeLabel(session.LaunchMode));
+    }
+
+    [TestMethod]
+    public void BuildResumeLaunch_LegacyLuna_RoutesThroughGateway()
+    {
+        var service = new ArchiveService(useBundledStore: true);
+        var cwd = Path.GetTempPath().TrimEnd('\\', '/');
+        var session = new ArchiveSession
+        {
+            Id = "cl-legacy-luna",
+            Tool = "claude",
+            LaunchMode = ArchiveService.LunaLaunchMode,
+            Workspace = cwd,
+            SourcePath = Path.Combine(cwd, "cl-legacy-luna.jsonl")
+        };
+
+        var launch = service.BuildResumeLaunch(session, exeOverride: "C:\\cmd.exe");
+
+        Assert.AreEqual("C:\\cmd.exe", launch.Exe);
+        StringAssert.Contains(launch.Arguments, "cc.cmd");
+        StringAssert.Contains(launch.Arguments, "--resume cl-legacy-luna");
+        Assert.IsTrue(ArchiveService.IsGatewayLaunchMode(session.LaunchMode));
+        Assert.AreEqual("Gateway", ArchiveService.LaunchModeLabel(session.LaunchMode));
+    }
+
+    [TestMethod]
+    public void BuildResumeLaunch_GatewayOverride_LeavesLegacyDeepSeekMetadataUntouched()
+    {
+        var service = new ArchiveService(useBundledStore: true);
+        var cwd = Path.GetTempPath().TrimEnd('\\', '/');
+        var session = new ArchiveSession
+        {
+            Id = "cl-ds-gw",
+            Tool = "claude",
+            LaunchMode = ArchiveService.DeepSeekLaunchMode,
+            Workspace = cwd,
+            SourcePath = Path.Combine(cwd, "cl-ds-gw.jsonl")
+        };
+
+        var launch = service.BuildResumeLaunch(
+            session,
+            exeOverride: "C:\\cmd.exe",
+            launchModeOverride: ArchiveService.GatewayLaunchMode);
+
+        Assert.AreEqual(ArchiveService.DeepSeekLaunchMode, session.LaunchMode);
+        StringAssert.Contains(launch.Arguments, "cc.cmd");
+        StringAssert.Contains(launch.Arguments, "--resume cl-ds-gw");
+    }
+
+    [TestMethod]
+    public void BuildMultiplexCommand_Gateway_UsesCcWrapper()
+    {
+        var service = new ArchiveService(useBundledStore: true);
+        var cwd = Path.Combine(Path.GetTempPath(), "gw-mux-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(cwd);
+        try
+        {
+            var session = new ArchiveSession
+            {
+                Id = "cx-gw-mux",
+                Tool = "claude",
+                LaunchMode = ArchiveService.GatewayLaunchMode,
+                Workspace = cwd,
+                SourcePath = Path.Combine(cwd, "cx-gw-mux.jsonl")
+            };
+
+            var command = service.BuildMultiplexCommand(
+                session,
+                exeOverride: "C:\\cmd.exe");
+
+            StringAssert.Contains(command, "cc.cmd");
+            StringAssert.Contains(command, "--resume cx-gw-mux");
+        }
+        finally
+        {
+            try { Directory.Delete(cwd, recursive: true); } catch { }
+        }
+    }
+
+    [TestMethod]
+    public void BuildMultiplexCommand_LegacyLunaOverride_RoutesThroughGateway()
+    {
+        var service = new ArchiveService(useBundledStore: true);
+        var cwd = Path.Combine(Path.GetTempPath(), "luna-mux-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(cwd);
+        try
+        {
+            var session = new ArchiveSession
+            {
+                Id = "cl-luna-mux",
+                Tool = "claude",
+                LaunchMode = ArchiveService.NativeLaunchMode,
+                Workspace = cwd,
+                SourcePath = Path.Combine(cwd, "cl-luna-mux.jsonl")
+            };
+
+            var command = service.BuildMultiplexCommand(
+                session,
+                exeOverride: "C:\\cmd.exe",
+                launchModeOverride: ArchiveService.LunaLaunchMode);
+
+            StringAssert.Contains(command, "cc.cmd");
+            StringAssert.Contains(command, "--resume cl-luna-mux");
+            Assert.AreEqual(ArchiveService.NativeLaunchMode, session.LaunchMode);
+        }
+        finally
+        {
+            try { Directory.Delete(cwd, recursive: true); } catch { }
+        }
+    }
+
+    [TestMethod]
+    public void BuildStartLaunch_GatewayClaude_UsesCcWrapper()
+    {
+        var service = new ArchiveService(useBundledStore: true);
+        service.Store.Settings.ClaudeLaunchArgs = "--mcp-debug";
+        var cwd = Path.GetTempPath().TrimEnd('\\', '/');
+
+        var launch = service.BuildStartLaunch(
+            "claude",
+            cwd,
+            exeOverride: "C:\\cmd.exe",
+            launchModeOverride: ArchiveService.GatewayLaunchMode);
+
+        Assert.AreEqual("C:\\cmd.exe", launch.Exe);
+        StringAssert.Contains(launch.Arguments, "cc.cmd");
+        Assert.IsFalse(launch.Arguments.Contains("--resume", StringComparison.Ordinal));
+        Assert.IsFalse(launch.Arguments.Contains("--mcp-debug", StringComparison.Ordinal));
+    }
+
+    [TestMethod]
+    public void BuildStartLaunch_GatewayCodex_RefusesUnsupportedTool()
+    {
+        var service = new ArchiveService(useBundledStore: true);
+        var cwd = Path.GetTempPath().TrimEnd('\\', '/');
+
+        var launch = service.BuildStartLaunch(
+            "codex",
+            cwd,
+            exeOverride: "C:\\cmd.exe",
+            launchModeOverride: ArchiveService.GatewayLaunchMode);
+
+        Assert.AreEqual("", launch.Exe);
+        Assert.AreEqual("", launch.Arguments);
+        StringAssert.Contains(launch.DisplayCommand, "Claude sessions only");
+    }
+
+    [TestMethod]
+    public void BuildGatewayHandoffLaunch_CodexStartsFreshClaudeGatewayWithoutResume()
+    {
+        var service = new ArchiveService(useBundledStore: true);
+        var cwd = Path.Combine(Path.GetTempPath(), "codex-gateway-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(cwd);
+        try
+        {
+            var source = new ArchiveSession
+            {
+                Id = "codex-source",
+                Tool = "codex",
+                Workspace = cwd,
+                SourcePath = Path.Combine(cwd, "rollout.jsonl")
+            };
+
+            var launch = service.BuildGatewayHandoffLaunch(source, exeOverride: "C:\\cmd.exe");
+
+            Assert.AreEqual("C:\\cmd.exe", launch.Exe);
+            Assert.AreEqual(cwd, launch.WorkingDirectory);
+            StringAssert.Contains(launch.Arguments, "cc.cmd");
+            Assert.IsFalse(launch.Arguments.Contains("--resume", StringComparison.OrdinalIgnoreCase));
+            Assert.IsFalse(launch.Arguments.Contains("codex", StringComparison.OrdinalIgnoreCase));
+        }
+        finally { try { Directory.Delete(cwd, true); } catch { } }
+    }
+
+    [TestMethod]
+    public void GatewayContinuation_AllowsCodexButDirectGatewayResumeDoesNot()
+    {
+        Assert.IsTrue(ArchiveService.CanContinueInGateway("codex"));
+        Assert.IsTrue(ArchiveService.CanContinueInGateway("claude"));
+        Assert.IsFalse(ArchiveService.CanResumeThroughGateway("codex"));
+        Assert.IsTrue(ArchiveService.CanResumeThroughGateway("claude"));
+    }
+
+    [TestMethod]
+    public void BuildMultiplexStartCommand_GatewayClaude_UsesCcWrapper()
+    {
+        var service = new ArchiveService(useBundledStore: true);
+        var cwd = Path.GetTempPath().TrimEnd('\\', '/');
+
+        var command = service.BuildMultiplexStartCommand(
+            "claude",
+            cwd,
+            exeOverride: "C:\\cmd.exe",
+            launchModeOverride: ArchiveService.GatewayLaunchMode);
+
+        StringAssert.Contains(command, "cc.cmd");
+        Assert.IsFalse(command.Contains("--resume", StringComparison.Ordinal));
+    }
+
     // Optional per-tool launch args are inserted in the PREFIX position (after the exe, before the
     // subcommand) so global flags like Codex's --profile apply (codex --profile X resume ...). This is
     // how the app lets you force the stable HTTP/SSE transport without rebuilding the default command.
@@ -1243,6 +1576,14 @@ public sealed class ArchiveServiceTests
     public void ParseResumedSessionId_ExtractsClaudeAndCodexIds()
     {
         Assert.AreEqual("3b7b7fbc", ArchiveService.ParseResumedSessionId(@"C:\x\claude.exe --resume 3b7b7fbc"));
+        Assert.IsTrue(
+            RunningSessions.IsLiveAgentProcess(
+                "claude.exe",
+                @"C:\Users\Ahmed\.local\bin\claude.exe --resume cc-child-session"));
+        Assert.AreEqual(
+            "cc-child-session",
+            ArchiveService.ParseResumedSessionId(
+                @"C:\Users\Ahmed\.local\bin\claude.exe --resume cc-child-session"));
         Assert.AreEqual("quoted-claude", ArchiveService.ParseResumedSessionId(@"C:\x\claude.exe --resume ""quoted-claude"""));
         Assert.AreEqual("9f2a", ArchiveService.ParseResumedSessionId(@"codex.exe --profile http_sse resume --include-non-interactive 9f2a"));
         Assert.AreEqual("quoted-codex", ArchiveService.ParseResumedSessionId(@"codex.exe --profile http_sse resume --include-non-interactive ""quoted-codex"""));
@@ -1273,6 +1614,7 @@ public sealed class ArchiveServiceTests
         {
             Id = "canonical-id",
             Tool = "codex",
+            LaunchMode = ArchiveService.GatewayLaunchMode,
             Title = "Canonical",
             Workspace = Path.GetTempPath(),
             SourcePath = Path.Combine(Path.GetTempPath(), "canonical-id.jsonl")
@@ -1290,8 +1632,33 @@ public sealed class ArchiveServiceTests
         Assert.IsTrue(ok, detail);
         Assert.IsNotNull(launch);
         Assert.AreEqual("canonical-id", launch!.SessionId);
+        Assert.AreEqual(ArchiveService.GatewayLaunchMode, launch.LaunchMode);
         StringAssert.Contains(launch.Command, "canonical-id");
         CollectionAssert.Contains(launch.Aliases.ToList(), "alias-id");
+    }
+
+    [TestMethod]
+    public void TryBuildRemoteMuxLaunch_FreshGatewayClaude_UsesCcAndCarriesMode()
+    {
+        var service = new ArchiveService(useBundledStore: true);
+
+        var ok = service.TryBuildRemoteMuxLaunch(
+            "",
+            "claude",
+            out var launch,
+            out var detail,
+            launchMode: ArchiveService.GatewayLaunchMode,
+            multiplexStartCommandFactory: (tool, mode) =>
+                service.BuildMultiplexStartCommand(
+                    tool,
+                    exeOverride: @"C:\Windows\System32\cmd.exe",
+                    launchModeOverride: mode));
+
+        Assert.IsTrue(ok, detail);
+        Assert.IsNotNull(launch);
+        Assert.AreEqual(ArchiveService.GatewayLaunchMode, launch!.LaunchMode);
+        StringAssert.Contains(launch.Command, "cc.cmd");
+        Assert.IsFalse(launch.Command.Contains("--resume", StringComparison.Ordinal));
     }
 
     [TestMethod]
@@ -2077,6 +2444,85 @@ public sealed class ArchiveServiceTests
     }
 
     [TestMethod]
+    public async Task PendingNewChat_GatewayMode_PersistsAndAppliesToDiscoveredSession()
+    {
+        var cwd = Path.Combine(Path.GetTempPath(), "clr-gateway-pending-" + Guid.NewGuid().ToString("N"));
+        var svc = TempService(out var store);
+        try
+        {
+            await svc.QueuePendingNewChatAsync(
+                "codex",
+                cwd,
+                launchMode: ArchiveService.GatewayLaunchMode);
+
+            var reader = new ArchiveService(storePath: store);
+            await reader.LoadAsync();
+            Assert.AreEqual(ArchiveService.GatewayLaunchMode, reader.Store.PendingNewChats[0].LaunchMode);
+
+            var fresh = new ArchiveSession
+            {
+                Id = "gateway-fresh",
+                Tool = "codex",
+                Workspace = cwd,
+                CreatedAt = DateTime.UtcNow.ToString("O")
+            };
+            await reader.MergeScanAsync(
+                new DiskScan(new List<ArchiveSession> { fresh }, new List<ArchiveSession>()),
+                refreshList: false);
+
+            Assert.AreEqual(
+                ArchiveService.GatewayLaunchMode,
+                reader.Store.Sessions["gateway-fresh"].LaunchMode);
+        }
+        finally { if (File.Exists(store)) File.Delete(store); }
+    }
+
+    [TestMethod]
+    public async Task PendingNewChat_GatewayHandoff_LinksFreshClaudeSessionToCodexSource()
+    {
+        var cwd = Path.Combine(Path.GetTempPath(), "clr-handoff-" + Guid.NewGuid().ToString("N").Substring(0, 12));
+        var encoded = System.Text.RegularExpressions.Regex.Replace(cwd.TrimEnd('\\', '/'), @"[\\/:.\s]", "-");
+        var folder = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".claude", "projects", encoded);
+        var svc = TempService(out var store);
+        try
+        {
+            Directory.CreateDirectory(folder);
+            const string sourceId = "codex-source";
+            await svc.QueuePendingNewChatAsync(
+                "claude",
+                cwd,
+                customTitle: "Gateway handoff: Original Codex",
+                launchMode: ArchiveService.GatewayLaunchMode,
+                handoffFromId: sourceId);
+
+            var newId = Guid.NewGuid().ToString();
+            File.WriteAllText(Path.Combine(folder, newId + ".jsonl"), "{}\n");
+            var fresh = new ArchiveSession
+            {
+                Id = newId,
+                Tool = "claude",
+                Workspace = cwd,
+                CreatedAt = DateTime.UtcNow.ToString("O")
+            };
+
+            await svc.MergeScanAsync(
+                new DiskScan(new List<ArchiveSession> { fresh }, new List<ArchiveSession>()),
+                refreshList: false);
+
+            var linked = svc.Store.Sessions[newId];
+            Assert.AreEqual("Gateway handoff: Original Codex", linked.CustomTitle);
+            Assert.AreEqual(sourceId, linked.HandoffFromId);
+            Assert.AreEqual(ArchiveService.GatewayLaunchMode, linked.LaunchMode);
+            Assert.AreEqual(0, svc.Store.PendingNewChats.Count);
+        }
+        finally
+        {
+            try { if (Directory.Exists(folder)) Directory.Delete(folder, true); } catch { }
+            if (File.Exists(store)) File.Delete(store);
+        }
+    }
+
+    [TestMethod]
     public void BuildStartLaunch_Shell_OpensPlainTerminalInCwd()
     {
         var svc = TempService(out var store);
@@ -2696,6 +3142,29 @@ public sealed class ArchiveServiceTests
             Assert.IsTrue(prompt.Contains("do the actual thing"), "includes a recent message preview");
         }
         finally { if (File.Exists(store)) File.Delete(store); }
+    }
+
+    [TestMethod]
+    public void CopyPayload_ResumePromptIncludesAuthoritativeCodexSource()
+    {
+        var svc = new ArchiveService(useBundledStore: true);
+        var source = new ArchiveSession
+        {
+            Id = "codex-source",
+            Tool = "codex",
+            Title = "Original Codex chat",
+            SourcePath = @"C:\Users\Ahmed\.codex\sessions\2026\08\14\rollout.jsonl",
+            Workspace = @"C:\Users\Ahmed",
+            ContentLoaded = true
+        };
+        source.Messages.Add(new ArchiveMessage { Role = "user", Text = "Continue the implementation from here." });
+
+        var prompt = svc.CopyPayload(source, "resume");
+
+        StringAssert.Contains(prompt, source.SourcePath);
+        StringAssert.Contains(prompt, source.Workspace);
+        StringAssert.Contains(prompt, "read it first");
+        StringAssert.Contains(prompt, "Continue the implementation from here.");
     }
 
     // N4: an agent favorites "self" — resolved as the newest session in its workspace.

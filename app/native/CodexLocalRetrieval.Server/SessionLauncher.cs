@@ -10,6 +10,8 @@ public sealed class SessionLauncher
 {
     private readonly string _claudeExe;
     private readonly string _codexExe;
+    private readonly string _gatewayCliScript;
+    private readonly string _cmdExe;
     private readonly bool _allow;
     private readonly string? _wt;
     private readonly SessionLaunchGovernor _launchGovernor;
@@ -26,11 +28,15 @@ public sealed class SessionLauncher
         Func<ProcessStartInfo, Process?>? startProcess = null,
         string? windowsTerminal = null,
         bool discoverWindowsTerminal = true,
-        SessionOwnerRecords.Options? ownerRecordOptions = null)
+        SessionOwnerRecords.Options? ownerRecordOptions = null,
+        string? gatewayCliScript = null,
+        string? cmdExe = null)
     {
         _ownerRecordOptions = ownerRecordOptions;
         _claudeExe = claudeExe;
         _codexExe = codexExe;
+        _gatewayCliScript = gatewayCliScript ?? ArchiveService.ResolveGatewayCliScript();
+        _cmdExe = cmdExe ?? ArchiveService.ResolveCmdExe();
         _allow = allowLaunch;
         _wt = windowsTerminal ?? (discoverWindowsTerminal ? Which("wt.exe") : null);
         _launchGovernor = launchGovernor
@@ -82,6 +88,15 @@ public sealed class SessionLauncher
             return (false, "invalid launch target");
         }
 
+        var gateway = ArchiveService.IsGatewayLaunchMode(session.LaunchMode);
+        if (gateway && session.Tool != SessionTool.Claude)
+        {
+            _launchGovernor.RecordRefused(
+                LaunchRequest(source, id, aliases, targetName),
+                "Server reopen refused because Gateway (cc) can resume Claude transcripts only.");
+            return (false, "Gateway (cc) can resume Claude transcripts only; use native Codex resume.");
+        }
+
         var dir = (session.WorkingDirectory ?? "").Trim();
         if (!Path.IsPathRooted(dir) || !Directory.Exists(dir))
         {
@@ -107,10 +122,14 @@ public sealed class SessionLauncher
             if (!_launchGovernor.TryAcquire(request, out var lease, out var leaseDetail))
                 return (false, leaseDetail);
 
-            var exe = session.Tool == SessionTool.Claude ? _claudeExe : _codexExe;
-            var arguments = session.Tool == SessionTool.Claude
-                ? new[] { "--resume", id }
-                : new[] { "resume", id };
+            var exe = gateway
+                ? _cmdExe
+                : session.Tool == SessionTool.Claude ? _claudeExe : _codexExe;
+            var arguments = gateway
+                ? new[] { "/c", _gatewayCliScript, "--resume", id }
+                : session.Tool == SessionTool.Claude
+                    ? new[] { "--resume", id }
+                    : new[] { "resume", id };
             using (lease)
             {
                 try
@@ -376,4 +395,5 @@ public sealed record TrustedSessionLaunch(
     string SessionId,
     SessionTool Tool,
     string WorkingDirectory,
-    IReadOnlyList<string> Aliases);
+    IReadOnlyList<string> Aliases,
+    string LaunchMode = ArchiveService.NativeLaunchMode);

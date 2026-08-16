@@ -15,7 +15,7 @@ public sealed partial class MainPage
     private async Task StartChatAsync()
     {
         var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        var tool = new ComboBox { MinWidth = 220, SelectedIndex = 0, Items = { "Claude", "Codex", "Shell only" } };
+        var tool = new ComboBox { MinWidth = 220, SelectedIndex = 0, Items = { "Claude", "Gateway (cc)", "Codex", "Shell only" } };
         var chatName = Field("Name this chat", "Optional app name");
         var phrase = Field("Special phrase", "Optional phrase, searchable as [phrase]");
         var location = Field("Working folder", home);
@@ -160,7 +160,11 @@ public sealed partial class MainPage
             return;
         }
 
-        var toolKey = (tool.SelectedItem as string) switch { "Codex" => "codex", "Shell only" => "shell", _ => "claude" };
+        var selectedTool = tool.SelectedItem as string;
+        var toolKey = selectedTool switch { "Codex" => "codex", "Shell only" => "shell", _ => "claude" };
+        var launchMode = selectedTool == "Gateway (cc)"
+            ? ArchiveService.GatewayLaunchMode
+            : ArchiveService.NativeLaunchMode;
         var baseDir = string.IsNullOrWhiteSpace(location.Text) ? home : location.Text.Trim();
         var sub = (newFolder.Text ?? "").Trim();
         string cwd;
@@ -216,7 +220,8 @@ public sealed partial class MainPage
                     cwd,
                     targetCollection?.Id ?? "",
                     chatName.Text,
-                    phrase.Text);
+                    phrase.Text,
+                    launchMode);
                 if (pendingIntentId.Length == 0)
                     throw new InvalidOperationException("The new-chat filing intent could not be persisted.");
                 Diag.Log($"Start chat intent queued id={pendingIntentId} collection={targetCollection?.Id ?? ""}");
@@ -245,7 +250,7 @@ public sealed partial class MainPage
             }
         }
 
-        var launch = _archive.BuildStartLaunch(toolKey, cwd);
+        var launch = _archive.BuildStartLaunch(toolKey, cwd, launchModeOverride: launchMode);
         if (toolKey != "shell" && string.IsNullOrEmpty(launch.Exe))
         {
             if (pendingIntentId.Length > 0) await _archive.CancelPendingNewChatAsync(pendingIntentId);
@@ -264,19 +269,21 @@ public sealed partial class MainPage
         if (toolKey != "shell")
         {
             lease = _launchGovernor.BeginFresh(new SessionLaunchRequest(
-                null, null, toolKey, "native", "native deliberate chat start",
+                null, null, toolKey, launchMode, $"{launchMode} deliberate chat start",
                 "start.refused.native", "start.started.native", "start.failed.native", Workspace: cwd));
         }
         try
         {
-            var args = string.IsNullOrEmpty(launch.DisplayCommand) ? "/k" : $"/k \"{launch.DisplayCommand}\"";
-            Process.Start(new ProcessStartInfo
-            {
-                FileName = "cmd.exe",
-                Arguments = args,
-                WorkingDirectory = launch.WorkingDirectory,
-                UseShellExecute = true
-            });
+            var process = launchMode == ArchiveService.GatewayLaunchMode
+                ? BuildGatewayTerminalStartInfo(launch)
+                : new ProcessStartInfo
+                {
+                    FileName = ArchiveService.ResolveCmdExe(),
+                    Arguments = string.IsNullOrEmpty(launch.DisplayCommand) ? "/k" : $"/k \"{launch.DisplayCommand}\"",
+                    WorkingDirectory = launch.WorkingDirectory,
+                    UseShellExecute = true
+                };
+            Process.Start(process);
             Diag.Log($"Start chat process spawned tool={toolKey} cwd={launch.WorkingDirectory} intent={pendingIntentId}");
             lease?.MarkStarted("Started deliberate chat terminal.");
             if (toolKey == "shell")

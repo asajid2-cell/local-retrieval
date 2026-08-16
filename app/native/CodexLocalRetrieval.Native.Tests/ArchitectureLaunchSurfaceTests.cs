@@ -375,6 +375,92 @@ public sealed class ArchitectureLaunchSurfaceTests
             "Co-pilot resume confirmation must not expose raw launch commands before integrity-gated user action.");
     }
 
+    [TestMethod]
+    public void HeadlessRemoteMux_ForwardsGatewayLaunchModeToLocalResolver()
+    {
+        var root = FindRepoRoot();
+        var bridge = File.ReadAllText(Path.Combine(
+            root,
+            "native",
+            "CodexLocalRetrieval.Core",
+            "Remote",
+            "RemoteBridge.cs"));
+        var server = File.ReadAllText(Path.Combine(
+            root,
+            "native",
+            "CodexLocalRetrieval.Server",
+            "Program.cs"));
+
+        Assert.Contains("c.launchMode", bridge);
+        Assert.Contains("_resolveMuxLaunch(requestedSessionId, tool, launchMode)", bridge);
+        Assert.Contains("launchMode: launchMode", server);
+    }
+
+    [TestMethod]
+    public void GatewayMultiplexAffordances_ForwardGatewayLaunchMode()
+    {
+        var root = FindRepoRoot();
+        var remote = File.ReadAllText(Path.Combine(
+            root,
+            "native",
+            "CodexLocalRetrieval.Native",
+            "MainPage.Remote.cs"));
+        var page = File.ReadAllText(Path.Combine(
+            root,
+            "native",
+            "CodexLocalRetrieval.Native",
+            "MainPage.xaml.cs"));
+
+        StringAssert.Contains(remote, "StartRemoteSessionAsGateway");
+        StringAssert.Contains(remote, "launchModeOverride: ArchiveService.GatewayLaunchMode");
+        StringAssert.Contains(page, "Start Gateway multiplex");
+        StringAssert.Contains(page, "Start Gateway headless multiplex");
+    }
+
+    [TestMethod]
+    public void GuiTerminalLaunches_UseResolvedSystemCommandShell()
+    {
+        var root = FindRepoRoot();
+        var files = new[]
+        {
+            Path.Combine(root, "native", "CodexLocalRetrieval.Native", "MainPage.StartChat.cs"),
+            Path.Combine(root, "native", "CodexLocalRetrieval.Native", "MainPage.Sessions.cs"),
+        };
+
+        foreach (var file in files)
+        {
+            var text = File.ReadAllText(file);
+            Assert.DoesNotContain(
+                "FileName = \"cmd.exe\"",
+                text,
+                Path.GetFileName(file) + " must not rely on PATH lookup for the GUI terminal shell.");
+            Assert.Contains(
+                "ArchiveService.ResolveCmdExe()",
+                text,
+                Path.GetFileName(file) + " must use the trusted System32 cmd.exe resolution.");
+        }
+    }
+
+    [TestMethod]
+    public void GuiGatewayLaunches_DoNotNestDisplayCommandInsideAnotherShell()
+    {
+        var root = FindRepoRoot();
+        var files = new[]
+        {
+            Path.Combine(root, "native", "CodexLocalRetrieval.Native", "MainPage.StartChat.cs"),
+            Path.Combine(root, "native", "CodexLocalRetrieval.Native", "MainPage.Sessions.cs"),
+        };
+
+        foreach (var file in files)
+        {
+            var text = File.ReadAllText(file);
+            Assert.Contains(
+                "BuildGatewayTerminalStartInfo(launch)",
+                text,
+                Path.GetFileName(file) + " must launch Gateway with the structured command-shell argument vector.");
+        }
+    }
+
     // The guard's refusal reaches the ledger through these two call sites. An unverifiable scan must land
     // on `*.refused.unverified`; if it ever falls back into the `*.refused.running` branch again, the app is
     // writing "the session already had a live owner" about a scan that confirmed nothing.

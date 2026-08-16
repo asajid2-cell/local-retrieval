@@ -41,7 +41,7 @@ public sealed class RemoteStartChatContractTests
         foreach (var field in new[]
         {
             "checkpointId", "workspaceId", "subfolder", "phrase",
-            "deckId", "collectionId", "collection", "title", "tool", "muxName",
+            "deckId", "collectionId", "collection", "title", "tool", "muxName", "launchMode",
         })
             StringAssert.Contains(dto, $"string? {field}");
 

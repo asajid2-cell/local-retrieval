@@ -29,22 +29,52 @@ public sealed partial class MainPage
         if (_selected is not null) StartRemoteSession(_selected, openLocalAttach: false);
     }
 
-    private async void StartRemoteSession(ArchiveSession session, bool openLocalAttach = false)
+    private void ResumeInGatewayMultiplex_Click(object sender, RoutedEventArgs e)
     {
-        var command = _archive.BuildMultiplexCommand(session);
+        if (_selected is not null) StartRemoteSessionAsGateway(_selected, openLocalAttach: true);
+    }
+
+    private void ResumeInGatewayHeadlessMultiplex_Click(object sender, RoutedEventArgs e)
+    {
+        if (_selected is not null) StartRemoteSessionAsGateway(_selected, openLocalAttach: false);
+    }
+
+    private void StartRemoteSessionAsGateway(ArchiveSession session, bool openLocalAttach)
+    {
+        if (!ArchiveService.CanResumeThroughGateway(session.Tool))
+        {
+            SyncStatus.Text = "Gateway (cc) can resume Claude transcripts only; use native Codex resume.";
+            return;
+        }
+        StartRemoteSession(
+            session,
+            openLocalAttach,
+            launchModeOverride: ArchiveService.GatewayLaunchMode);
+    }
+
+    private async void StartRemoteSession(
+        ArchiveSession session,
+        bool openLocalAttach = false,
+        string? launchModeOverride = null)
+    {
+        var command = _archive.BuildMultiplexCommand(session, launchModeOverride: launchModeOverride);
         if (string.IsNullOrEmpty(command))
         {
-            RecordSessionEvent(session, "mux.refused.invalid", "Mux session refused because this chat has no safe resume command.", "warn");
-            SyncStatus.Text = "Mux session refused: this chat's id is not a safe resume token.";
+            var refusal = _archive.BuildResumeLaunch(session, launchModeOverride: launchModeOverride).DisplayCommand;
+            RecordSessionEvent(session, "mux.refused.invalid", refusal, "warn");
+            SyncStatus.Text = "Mux session refused: " + refusal;
             if (ReferenceEquals(_selected, session)) RenderIntegrity(force: true);
             return;
         }
 
         var name = ArchiveService.MultiplexSessionName(session);
         var title = Trim(session.DisplayTitle, 40);
+        var launchLabel = ArchiveService.LaunchModeLabel(launchModeOverride ?? session.LaunchMode);
         var muxStarted = false;
-        SyncStatus.Text = $"Starting mux session \"{title}\"...";
-        Diag.Log($"Mux start requested name={name} openLocalAttach={openLocalAttach}");
+        SyncStatus.Text = launchLabel == "native"
+            ? $"Starting mux session \"{title}\"..."
+            : $"Starting {launchLabel} mux session \"{title}\"...";
+        Diag.Log($"Mux start requested name={name} mode={launchLabel} openLocalAttach={openLocalAttach}");
 
         try
         {
@@ -116,8 +146,8 @@ public sealed partial class MainPage
                     session.Id,
                     session.Aliases,
                     session.Tool,
-                    "native",
-                    $"native mux start ({name})",
+                    ArchiveService.NormalizeLaunchMode(launchModeOverride ?? session.LaunchMode),
+                    $"{ArchiveService.NormalizeLaunchMode(launchModeOverride ?? session.LaunchMode)} mux start ({name})",
                     "mux.refused.claim",
                     "mux.started.local",
                     "mux.failed",
@@ -490,7 +520,8 @@ public sealed partial class MainPage
                         c.sessionId ?? "",
                         c.tool ?? "",
                         c.intentId,
-                        c.takeover);
+                        c.takeover,
+                        c.launchMode);
                 }
                 else if (string.Equals(c.type, "mirrorlocal", StringComparison.OrdinalIgnoreCase))
                 {
@@ -630,6 +661,7 @@ public sealed partial class MainPage
         public string? workspaceId { get; set; }
         public string? subfolder { get; set; }
         public string? phrase { get; set; }
+        public string? launchMode { get; set; }
         public bool takeover { get; set; }
 
         // transcriptfetch only: the relay mints a scoped, short-lived credential when it queues the
@@ -651,6 +683,7 @@ public sealed partial class MainPage
         var collectionId = (command.collectionId ?? "").Trim();
         var collectionName = (command.collection ?? "").Trim();
         var phrase = (command.phrase ?? "").Trim();
+        var launchMode = ArchiveService.NormalizeLaunchMode(command.launchMode);
 
         if (name.Length == 0) return (false, "missing mux session name");
         if (collectionId.Length > 0 && collectionName.Length > 0)
@@ -718,11 +751,15 @@ public sealed partial class MainPage
                 cwd,
                 targetCollection?.Id ?? "",
                 title,
-                phrase);
+                phrase,
+                launchMode);
             if (pendingIntentId.Length == 0)
                 return (false, "the new-chat filing intent could not be persisted");
 
-            var launchCommand = _archive.BuildMultiplexStartCommand(tool, cwd);
+            var launchCommand = _archive.BuildMultiplexStartCommand(
+                tool,
+                cwd,
+                launchModeOverride: launchMode);
             if (launchCommand.Length == 0)
             {
                 await _archive.CancelPendingNewChatAsync(pendingIntentId);
@@ -734,8 +771,8 @@ public sealed partial class MainPage
                     null,
                     null,
                     tool,
-                    "native",
-                    $"headless fresh mux start ({name})",
+                    launchMode,
+                    $"{launchMode} headless fresh mux start ({name})",
                     "start.refused.remote-command",
                     "start.started.remote-command",
                     "start.failed.remote-command",
@@ -803,11 +840,18 @@ public sealed partial class MainPage
         string sessionId,
         string tool,
         string intentId,
-        bool takeover = false)
+        bool takeover = false,
+        string? launchMode = null)
     {
         name = (name ?? "").Trim();
         if (string.IsNullOrEmpty(name)) return (false, "missing mux session name");
-        if (!_archive.TryBuildRemoteMuxLaunch(sessionId, tool, out var launch, out var detail) || launch is null)
+        if (!_archive.TryBuildRemoteMuxLaunch(
+                sessionId,
+                tool,
+                out var launch,
+                out var detail,
+                launchMode: launchMode)
+            || launch is null)
         {
             RecordSessionEvent(
                 string.IsNullOrWhiteSpace(sessionId) ? null : _archive.ResolveSessionByIdOrAlias(sessionId, tool),
@@ -852,8 +896,8 @@ public sealed partial class MainPage
                 launch.SessionId,
                 launch.Aliases,
                 launch.Tool,
-                "native",
-                $"headless mux start ({name})",
+                launch.LaunchMode,
+                $"{launch.LaunchMode} headless mux start ({name})",
                 "mux.refused.claim",
                 "mux.started.remote-command",
                 "mux.failed",
@@ -1072,7 +1116,7 @@ public sealed partial class MainPage
                     session.Id,
                     session.Aliases,
                     session.Tool,
-                    "native",
+                    ArchiveService.NormalizeLaunchMode(session.LaunchMode),
                     $"tomux handoff ({name})",
                     "tomux.refused.claim",
                     "tomux.completed",

@@ -50,7 +50,12 @@ public sealed class CanonicalSessionResolver
             .ToArray();
         return new SessionResolutionResult(
             true,
-            new TrustedSessionLaunch(canonicalId, tool, workspace, aliases),
+            new TrustedSessionLaunch(
+                canonicalId,
+                tool,
+                workspace,
+                aliases,
+                CodexLocalRetrieval.Core.Services.ArchiveService.NormalizeLaunchMode(session.LaunchMode)),
             "ok");
     }
 

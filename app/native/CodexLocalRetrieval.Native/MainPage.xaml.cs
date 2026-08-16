@@ -346,9 +346,36 @@ public sealed partial class MainPage : Page
         bool sessionContext = _screen is "Archive" or "Source" or "Restore";
         bool readOnlySnapshot = _selected?.IsReadOnlySnapshot == true;
         bool showRight = sessionContext && !readOnlySnapshot && !_narrowLayout;   // fold the right rail when too narrow to fit
+        bool showResume = sessionContext && !readOnlySnapshot;
+        bool gatewayContinuation = showResume
+            && _selected is not null
+            && ArchiveService.CanContinueInGateway(_selected.Tool);
+        bool gatewayMultiplex = showResume
+            && _selected is not null
+            && ArchiveService.CanResumeThroughGateway(_selected.Tool);
         RightColumnBorder.Visibility = showRight ? Visibility.Visible : Visibility.Collapsed;
         RightColumn.Width = showRight ? new GridLength(292) : new GridLength(0);
         HeaderActions.Visibility = sessionContext && !readOnlySnapshot ? Visibility.Visible : Visibility.Collapsed;
+        ResumeTerminalButton.Visibility = showResume ? Visibility.Visible : Visibility.Collapsed;
+        HeaderResumeNativeItem.Text = _selected is null ? "Resume" : NativeResumeLabel(_selected);
+        QuickResumeNativeItem.Text = _selected is null ? "Resume" : NativeResumeLabel(_selected);
+        HeaderResumeGatewayItem.Text = _selected is null ? "Continue in Gateway" : GatewayResumeLabel(_selected);
+        QuickResumeGatewayItem.Text = _selected is null ? "Continue in Gateway" : GatewayResumeLabel(_selected);
+        if (_selected is not null)
+        {
+            ToolTipService.SetToolTip(
+                HeaderResumeNativeItem,
+                NativeResumeLabel(_selected) + " using the chat's native CLI.");
+            ToolTipService.SetToolTip(
+                QuickResumeNativeItem,
+                NativeResumeLabel(_selected) + " using the chat's native CLI.");
+            ToolTipService.SetToolTip(HeaderResumeGatewayItem, GatewayResumeTooltip(_selected));
+            ToolTipService.SetToolTip(QuickResumeGatewayItem, GatewayResumeTooltip(_selected));
+        }
+        HeaderResumeGatewayItem.Visibility = gatewayContinuation ? Visibility.Visible : Visibility.Collapsed;
+        QuickResumeGatewayItem.Visibility = gatewayContinuation ? Visibility.Visible : Visibility.Collapsed;
+        QuickGatewayMultiplexItem.Visibility = gatewayMultiplex ? Visibility.Visible : Visibility.Collapsed;
+        QuickGatewayHeadlessItem.Visibility = gatewayMultiplex ? Visibility.Visible : Visibility.Collapsed;
     }
 
     // Header overflow menu: the same secondary actions as the right "Quick actions" rail, reachable
@@ -360,6 +387,9 @@ public sealed partial class MainPage : Page
         void Add(string text, Action act) { var item = new MenuFlyoutItem { Text = text }; item.Click += (_, _) => act(); flyout.Items.Add(item); }
         Add("Add to project", () => ShowAddToProjectFlyout(HeaderMoreButton, _selected!));
         Add("Bump to top of resume list", () => _ = BumpSession(_selected!));
+        if (ArchiveService.CanContinueInGateway(_selected.Tool))
+            Add(GatewayResumeLabel(_selected), () => ResumeAsGateway(_selected!));
+        flyout.Items.Add(ForkAsMenu(_selected));
         flyout.Items.Add(new MenuFlyoutSeparator());
         Add("Copy resume prompt", () => Copy("resume"));
         Add("Copy resume command", CopyResumeCommandIfClear);
@@ -1568,9 +1598,12 @@ public sealed partial class MainPage : Page
             Style = (Style)Resources["PillButtonStyle"],
             Padding = new Thickness(12, 0, 12, 0),
             MinHeight = 34,
-            Content = "Resume"
+            Content = NativeResumeLabel(session)
         };
-        resumeButton.Click += (_, _) => ResumeInTerminal(session);
+        resumeButton.Click += (_, _) => ResumeInTerminal(
+            session,
+            trigger: "user-native",
+            launchModeOverride: ArchiveService.NativeLaunchMode);
 
         var openButton = new Button
         {
@@ -1610,6 +1643,8 @@ public sealed partial class MainPage : Page
                     VerticalAlignment = VerticalAlignment.Center
                 });
         }
+        var gatewayBadge = GatewayBadge(session);
+        if (gatewayBadge is not null) meta.Children.Add(gatewayBadge);
 
         var titleStack = new StackPanel
         {
@@ -1669,9 +1704,20 @@ public sealed partial class MainPage : Page
         open.Click += (_, _) => OpenSession(session);
         flyout.Items.Add(open);
 
-        var resume = new MenuFlyoutItem { Text = "Resume in terminal" };
-        resume.Click += (_, _) => ResumeInTerminal(session);
+        var resume = new MenuFlyoutItem { Text = NativeResumeLabel(session) };
+        resume.Click += (_, _) => ResumeInTerminal(
+            session,
+            trigger: "user-native",
+            launchModeOverride: ArchiveService.NativeLaunchMode);
         flyout.Items.Add(resume);
+
+        if (ArchiveService.CanContinueInGateway(session.Tool))
+        {
+            var resumeGateway = new MenuFlyoutItem { Text = GatewayResumeLabel(session) };
+            ToolTipService.SetToolTip(resumeGateway, GatewayResumeTooltip(session));
+            resumeGateway.Click += (_, _) => ResumeAsGateway(session);
+            flyout.Items.Add(resumeGateway);
+        }
 
         var remote = new MenuFlyoutItem { Text = "Start multiplex" };
         ToolTipService.SetToolTip(remote, "Start in multiplex and open a local terminal attached to it.");
@@ -1683,6 +1729,18 @@ public sealed partial class MainPage : Page
         headlessRemote.Click += (_, _) => StartRemoteSession(session, openLocalAttach: false);
         flyout.Items.Add(headlessRemote);
 
+        if (ArchiveService.CanResumeThroughGateway(session.Tool))
+        {
+            var gatewayRemote = new MenuFlyoutItem { Text = "Start Gateway multiplex" };
+            ToolTipService.SetToolTip(gatewayRemote, "Resume through cc in multiplex and open a local attach terminal.");
+            gatewayRemote.Click += (_, _) => StartRemoteSessionAsGateway(session, openLocalAttach: true);
+            flyout.Items.Add(gatewayRemote);
+
+            var gatewayHeadless = new MenuFlyoutItem { Text = "Start Gateway headless multiplex" };
+            ToolTipService.SetToolTip(gatewayHeadless, "Resume through cc in headless multiplex; attach later with mux <name>.");
+            gatewayHeadless.Click += (_, _) => StartRemoteSessionAsGateway(session, openLocalAttach: false);
+            flyout.Items.Add(gatewayHeadless);
+        }
         var bump = new MenuFlyoutItem
         {
             Text = "Bump to top of resume list",
@@ -1746,6 +1804,7 @@ public sealed partial class MainPage : Page
         ToolTipService.SetToolTip(branch, "Clone this chat's exact history into a new, resumable branch linked to this original.");
         branch.Click += async (_, _) => await BranchChatAsync(session);
         flyout.Items.Add(branch);
+        flyout.Items.Add(ForkAsMenu(session));
 
         var checkpoint = new MenuFlyoutItem { Text = "Create checkpoint" };
         ToolTipService.SetToolTip(checkpoint, "Save this chat's current state as an immutable starting point.");
@@ -2455,6 +2514,29 @@ public sealed partial class MainPage : Page
         ToolTipService.SetToolTip(branchItem, "Clone this chat's exact history into a new, resumable branch linked to this original.");
         branchItem.Click += async (_, _) => await BranchChatAsync(session);
         flyout.Items.Add(branchItem);
+        flyout.Items.Add(ForkAsMenu(session));
+        var resumeNativeItem = new MenuFlyoutItem { Text = "Resume" };
+        resumeNativeItem.Click += (_, _) => ResumeInTerminal(
+            session,
+            trigger: "user-native",
+            launchModeOverride: ArchiveService.NativeLaunchMode);
+        flyout.Items.Add(resumeNativeItem);
+        if (ArchiveService.CanContinueInGateway(session.Tool))
+        {
+            var resumeGatewayItem = new MenuFlyoutItem { Text = GatewayResumeLabel(session) };
+            ToolTipService.SetToolTip(resumeGatewayItem, GatewayResumeTooltip(session));
+            resumeGatewayItem.Click += (_, _) => ResumeAsGateway(session);
+            flyout.Items.Add(resumeGatewayItem);
+        }
+        if (ArchiveService.CanResumeThroughGateway(session.Tool))
+        {
+            var gatewayMuxItem = new MenuFlyoutItem { Text = "Start Gateway multiplex" };
+            gatewayMuxItem.Click += (_, _) => StartRemoteSessionAsGateway(session, openLocalAttach: true);
+            flyout.Items.Add(gatewayMuxItem);
+            var gatewayHeadlessMuxItem = new MenuFlyoutItem { Text = "Start Gateway headless multiplex" };
+            gatewayHeadlessMuxItem.Click += (_, _) => StartRemoteSessionAsGateway(session, openLocalAttach: false);
+            flyout.Items.Add(gatewayHeadlessMuxItem);
+        }
 
         var checkpointItem = new MenuFlyoutItem { Text = "Create checkpoint" };
         ToolTipService.SetToolTip(checkpointItem, "Save this chat's current state as an immutable starting point.");

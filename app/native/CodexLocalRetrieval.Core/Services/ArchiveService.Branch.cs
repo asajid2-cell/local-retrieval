@@ -22,10 +22,16 @@ public sealed partial class ArchiveService
     public async Task<BranchResult> BranchSessionAsync(
         ArchiveSession parent,
         SessionEventLedger.Options? eventOptions = null)
+        => await ForkSessionAsync(parent, NativeLaunchMode, eventOptions);
+
+    public async Task<BranchResult> ForkSessionAsync(
+        ArchiveSession parent,
+        string launchMode,
+        SessionEventLedger.Options? eventOptions = null)
     {
         try
         {
-            var result = await BranchSessionCoreAsync(parent);
+            var result = await BranchSessionCoreAsync(parent, launchMode);
             RecordBranchOperation("branch", parent, result.Ok, result.Message, result.Branch, eventOptions);
             return result;
         }
@@ -36,9 +42,14 @@ public sealed partial class ArchiveService
         }
     }
 
-    private async Task<BranchResult> BranchSessionCoreAsync(ArchiveSession parent)
+    private async Task<BranchResult> BranchSessionCoreAsync(ArchiveSession parent, string launchMode)
     {
         if (parent is null) return new BranchResult(false, "No chat to branch.", null);
+        if (!string.Equals(launchMode, NativeLaunchMode, StringComparison.OrdinalIgnoreCase)
+            && !string.Equals(launchMode, GatewayLaunchMode, StringComparison.OrdinalIgnoreCase)
+            && !string.Equals(launchMode, DeepSeekLaunchMode, StringComparison.OrdinalIgnoreCase)
+            && !string.Equals(launchMode, LunaLaunchMode, StringComparison.OrdinalIgnoreCase))
+            return new BranchResult(false, $"Unsupported branch launch mode '{launchMode}'.", null);
         var sourcePath = ResolveSessionSourcePath(parent);
         if (string.IsNullOrWhiteSpace(sourcePath) || !File.Exists(sourcePath))
             return new BranchResult(false, "This chat's transcript file isn't on disk, so it can't be branched.", null);
@@ -48,7 +59,8 @@ public sealed partial class ArchiveService
             sourcePath,
             string.IsNullOrWhiteSpace(parent.DisplayTitle) ? parent.Id : parent.DisplayTitle,
             parent.Id,
-            fromSnapshotId: "");
+            fromSnapshotId: "",
+            launchMode: NormalizeLaunchMode(launchMode));
     }
 
     public async Task<TemplateSnapshotResult> CreateTemplateSnapshotAsync(
@@ -465,7 +477,8 @@ public sealed partial class ArchiveService
         string sourcePath,
         string displayTitle,
         string parentId,
-        string fromSnapshotId = "")
+        string fromSnapshotId = "",
+        string launchMode = NativeLaunchMode)
     {
         var tool = (parent.Tool ?? "").Trim().ToLowerInvariant();
         var newId = Guid.NewGuid().ToString();
@@ -499,7 +512,8 @@ public sealed partial class ArchiveService
             UpdatedAt = now,
             BranchOfId = parentId,
             FromSnapshotId = fromSnapshotId,
-            BranchedAt = now
+            BranchedAt = now,
+            LaunchMode = NormalizeLaunchMode(launchMode)
         };
         // The transcript is already written, so a lost save race must not throw the branch away —
         // see CommitBranchWorkAsync.

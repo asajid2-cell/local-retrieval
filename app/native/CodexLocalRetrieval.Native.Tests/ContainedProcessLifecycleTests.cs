@@ -5,6 +5,7 @@ using System.Text;
 using CodexLocalRetrieval.Core.Agents;
 using CodexLocalRetrieval.Core.Memory;
 using CodexLocalRetrieval.Core.Remote;
+using CodexLocalRetrieval.Core.Services;
 using CodexLocalRetrieval.Server;
 
 namespace CodexLocalRetrieval.Native.Tests;
@@ -573,6 +574,73 @@ public sealed class ContainedProcessLifecycleTests
         finally
         {
             try { Directory.Delete(claimRoot, recursive: true); } catch { }
+        }
+    }
+
+    [TestMethod]
+    public void ClaudeLiveDriver_GatewayMode_UsesCcWrapperWithLiveTurnArguments()
+    {
+        ProcessStartInfo? captured = null;
+        var driver = new ClaudeLiveDriver(
+            "ignored-claude.exe",
+            isSessionLive: _ => false,
+            processStarter: psi =>
+            {
+                captured = psi;
+                throw new InvalidOperationException("captured");
+            },
+            gatewayCliScript: @"C:\trusted\cc.cmd",
+            cmdExe: @"C:\Windows\System32\cmd.exe");
+
+        var error = Assert.ThrowsExactly<InvalidOperationException>(() => driver.StartTurn(
+            "gateway-live-session",
+            Path.GetTempPath(),
+            "hello",
+            _ => Task.CompletedTask,
+            CancellationToken.None,
+            launchMode: ArchiveService.GatewayLaunchMode));
+
+        Assert.AreEqual("captured", error.Message);
+        Assert.IsNotNull(captured);
+        Assert.AreEqual(@"C:\Windows\System32\cmd.exe", captured!.FileName);
+        CollectionAssert.AreEqual(
+            new[]
+            {
+                "/c",
+                @"C:\trusted\cc.cmd",
+                "-p",
+                "hello",
+                "--output-format",
+                "stream-json",
+                "--verbose",
+                "--permission-mode",
+                "acceptEdits",
+                "--resume",
+                "gateway-live-session",
+            },
+            captured.ArgumentList.ToArray());
+    }
+
+    [TestMethod]
+    public void ClaudeLiveDriver_GatewayAvailability_UsesCcInsteadOfNativeClaude()
+    {
+        var gateway = Path.Combine(Path.GetTempPath(), "clr-gateway-availability", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(gateway);
+        try
+        {
+            var cc = Path.Combine(gateway, "cc.cmd");
+            File.WriteAllText(cc, "@echo off");
+            var driver = new ClaudeLiveDriver(
+                Path.Combine(gateway, "missing-claude.exe"),
+                gatewayCliScript: cc,
+                cmdExe: "cmd.exe");
+
+            Assert.IsFalse(driver.Available);
+            Assert.IsTrue(driver.AvailableFor(ArchiveService.GatewayLaunchMode));
+        }
+        finally
+        {
+            try { Directory.Delete(gateway, recursive: true); } catch { }
         }
     }
 
