@@ -12,7 +12,7 @@
 #
 # State: sessions.json manifest (resume commands) -> muxd restart / PC reboot lists unarmed sessions
 # as dormant placeholders. Only sessions explicitly armed with heal auto-start.
-import asyncio, base64, collections, ctypes, gc, glob, hashlib, json, os, queue, re, socket, ssl, subprocess, sys, tempfile, threading, time, traceback
+import asyncio, base64, collections, ctypes, gc, glob, hashlib, json, os, queue, re, socket, ssl, subprocess, sys, tempfile, threading, time, traceback, urllib.parse
 import concurrent.futures
 from ctypes import wintypes
 from datetime import datetime, timedelta, timezone
@@ -4888,7 +4888,7 @@ async def main():
     while True:
         url = None
         for cand in RELAYS:
-            url = cand + ("&" if "?" in cand else "?") + "token=" + TOKEN
+            url = cand + ("&" if "?" in cand else "?") + "token=" + urllib.parse.quote(TOKEN, safe="")
             try:
                 tls_context = await relay_tls_context(url)
                 async with websockets.connect(
