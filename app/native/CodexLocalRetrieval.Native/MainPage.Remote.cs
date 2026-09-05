@@ -63,7 +63,7 @@ public sealed partial class MainPage
             var refusal = _archive.BuildResumeLaunch(session, launchModeOverride: launchModeOverride).DisplayCommand;
             RecordSessionEvent(session, "mux.refused.invalid", refusal, "warn");
             SyncStatus.Text = "Mux session refused: " + refusal;
-            if (ReferenceEquals(_selected, session)) RenderIntegrity(force: true);
+            if (IsSelectedSession(session)) RenderIntegrity(force: true);
             return;
         }
 
@@ -80,7 +80,19 @@ public sealed partial class MainPage
         {
             // Already in muxd? Do not inject a SECOND resume into the same transcript.
             // Attach locally if this was the foreground/local action.
-            if (await LocalMuxdSessionAliveAsync(name))
+            var localMuxState = await LocalMuxdSessionStateAsync(name);
+            if (localMuxState == LocalMuxState.Unavailable)
+            {
+                RecordSessionEvent(
+                    session,
+                    "mux.refused.local-scan",
+                    "Mux start refused because local muxd ownership could not be verified.",
+                    "warn",
+                    details: new Dictionary<string, string> { ["muxName"] = name });
+                SyncStatus.Text = "Mux start refused: could not verify local muxd ownership.";
+                return;
+            }
+            if (localMuxState == LocalMuxState.Live)
             {
                 RecordSessionEvent(
                     session,
@@ -141,19 +153,9 @@ public sealed partial class MainPage
             if (guard.KilledPids.Count > 0)
                 ClearClaimsAfterVerifiedKill(session, session.Id, session.Aliases, guard.KilledPids, name);
 
-            var created = await GovernedCreateLocalMuxdSessionAsync(
-                new SessionLaunchRequest(
-                    session.Id,
-                    session.Aliases,
-                    session.Tool,
-                    ArchiveService.NormalizeLaunchMode(launchModeOverride ?? session.LaunchMode),
-                    $"{ArchiveService.NormalizeLaunchMode(launchModeOverride ?? session.LaunchMode)} mux start ({name})",
-                    "mux.refused.claim",
-                    "mux.started.local",
-                    "mux.failed",
-                    session.DisplayTitle,
-                    session.Workspace,
-                    new Dictionary<string, string> { ["muxName"] = name }),
+            // muxd owns reservation for every mux-hosted writer. Do not acquire the native app claim
+            // before this request: muxd's create_intent lock and claim are the single reservation authority.
+            var created = await CreateLocalMuxdSessionAsync(
                 name,
                 command,
                 session.Id,
@@ -249,7 +251,7 @@ public sealed partial class MainPage
         }
         finally
         {
-            if (ReferenceEquals(_selected, session)) RenderIntegrity(force: true);
+            if (IsSelectedSession(session)) RenderIntegrity(force: true);
         }
     }
 
@@ -258,15 +260,19 @@ public sealed partial class MainPage
         try
         {
             var mux = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".local", "bin", "mux.cmd");
-            if (!File.Exists(mux)) mux = "mux";
+            if (!File.Exists(mux))
+                return (false, "trusted local mux launcher was not found at " + mux);
+
             var command = $"{QuoteCmd(mux)} {QuoteCmd(name)}";
             var psi = new ProcessStartInfo
             {
-                FileName = "cmd.exe",
-                Arguments = $"/k \"{command}\"",
+                FileName = ArchiveService.ResolveCmdExe(),
                 WorkingDirectory = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
                 UseShellExecute = true
             };
+            psi.ArgumentList.Add("/k");
+            psi.ArgumentList.Add(mux);
+            psi.ArgumentList.Add(name);
             Process.Start(psi);
             return (true, command);
         }
@@ -371,12 +377,12 @@ public sealed partial class MainPage
         {
             var scan = await Task.Run(() =>
             {
-                var verified = RunningSessions.TryScan(out var list, out var detail);
-                return (verified, detail, sessions: EnrichRunningSessionTitles(ResolveMissingSessionIds(list)));
+                var verified = RunningSessions.TryScanEnriched(out var list, out var detail);
+                return (verified, detail, sessions: EnrichRunningSessionTitles(list));
             });
             var sessions = scan.sessions;
             var running = new HashSet<string>(
-                sessions.Where(s => !string.IsNullOrEmpty(s.SessionId)).Select(s => s.SessionId),
+                sessions.SelectMany(s => s.AllSessionIds),
                 StringComparer.OrdinalIgnoreCase);
             json = _archive.BuildProjectsProjectionJson(running, sessions, scan.verified, scan.detail);
             await _archive.SaveMuxHistoryIfDirtyAsync();   // persist any tab-session-history rotation the projection detected
@@ -887,7 +893,7 @@ public sealed partial class MainPage
                     });
                 return (false, transferred.Detail);
             }
-            // [F#5] verified kill -> clear the tied (retained) claim before the lease is requested.
+            // [F#5] verified kill -> clear any tied retained native claim before asking muxd to create.
             if (transferred.ExitedPids.Count > 0)
                 ClearClaimsAfterVerifiedKill(session, launch.SessionId, launch.Aliases, transferred.ExitedPids, name);
         }
@@ -980,8 +986,9 @@ public sealed partial class MainPage
         string intentId,
         bool relaunch = false)
     {
-        var created = await GovernedCreateLocalMuxdSessionAsync(
-            request,
+        // muxd owns reservation for mux-hosted writers. Its create_intent lock and claim system
+        // serialize this request; the native governor must not pre-claim the shared claim root.
+        var created = await CreateLocalMuxdSessionAsync(
             name,
             command,
             sessionId,
@@ -1111,23 +1118,11 @@ public sealed partial class MainPage
 
         var created = transferred.AlreadyOwned
             ? (ok: true, detail: "mux session already owns this identity")
-            : await GovernedCreateLocalMuxdSessionAsync(
-                new SessionLaunchRequest(
-                    session.Id,
-                    session.Aliases,
-                    session.Tool,
-                    ArchiveService.NormalizeLaunchMode(session.LaunchMode),
-                    $"tomux handoff ({name})",
-                    "tomux.refused.claim",
-                    "tomux.completed",
-                    "tomux.failed",
-                    session.DisplayTitle,
-                    session.Workspace,
-                    new Dictionary<string, string> { ["muxName"] = name }),
+            : await CreateLocalMuxdSessionAsync(
                 name,
                 command,
                 session.Id,
-                session.Aliases);
+                session.Aliases); // muxd is the sole reservation authority for this mux-hosted writer.
         if (!created.ok)
         {
             RecordSessionEvent(
@@ -1374,44 +1369,31 @@ public sealed partial class MainPage
         catch (Exception ex) { return (-1, "", ex.Message); }
     }
 
-    private static async Task<bool> LocalMuxdSessionAliveAsync(string name)
+    private enum LocalMuxState { Unavailable, Absent, Live }
+
+    private static async Task<LocalMuxState> LocalMuxdSessionStateAsync(string name)
     {
         try
         {
             var text = await LocalMuxdRequestAsync(new { t = "ls" });
             using var doc = JsonDocument.Parse(text);
-            foreach (var s in doc.RootElement.GetProperty("list").EnumerateArray())
-                if (string.Equals(s.GetProperty("name").GetString(), name, StringComparison.OrdinalIgnoreCase))
-                    return s.TryGetProperty("alive", out var alive) && alive.ValueKind == JsonValueKind.True;
+            if (!doc.RootElement.TryGetProperty("list", out var list) || list.ValueKind != JsonValueKind.Array)
+                return LocalMuxState.Unavailable;
+            foreach (var s in list.EnumerateArray())
+            {
+                if (!s.TryGetProperty("name", out var sessionName)
+                    || !string.Equals(sessionName.GetString(), name, StringComparison.OrdinalIgnoreCase)) continue;
+                return s.TryGetProperty("alive", out var alive) && alive.ValueKind == JsonValueKind.True
+                    ? LocalMuxState.Live
+                    : LocalMuxState.Absent;
+            }
+            return LocalMuxState.Absent;
         }
-        catch { }
-        return false;
+        catch { return LocalMuxState.Unavailable; }
     }
 
-    // H1: every writer-creation path goes through the governor, not just the terminal resume. The claim's own
-    // comment ("closes the check-then-spawn race across the GUI, headless server, and remote bridge") was
-    // aspirational while the GUI's own mux path never touched it — ConfirmRunOrKillAsync is a check, not a
-    // reservation, so two mux creates could still race each other into the same transcript.
-    private async Task<(bool ok, string detail)> GovernedCreateLocalMuxdSessionAsync(
-        SessionLaunchRequest request,
-        string name,
-        string command,
-        string? sessionId = null,
-        IEnumerable<string>? aliases = null,
-        string? intentId = null,
-        bool relaunch = false,
-        bool allowLocalIntentMint = true)
-    {
-        if (!_launchGovernor.TryAcquire(request, out var lease, out var claimDetail))
-            return (false, claimDetail);
-        using (lease)
-        {
-            var created = await CreateLocalMuxdSessionAsync(name, command, sessionId, aliases, intentId, relaunch, allowLocalIntentMint);
-            if (created.ok) lease?.MarkStarted("Started mux-hosted session writer.");
-            else lease?.MarkFailed(created.detail);
-            return created;
-        }
-    }
+    private static async Task<bool> LocalMuxdSessionAliveAsync(string name)
+        => await LocalMuxdSessionStateAsync(name) == LocalMuxState.Live;
 
     // [F#5]. An app-launched session retains its claim for ~2 minutes, so once the handoff paths above are
     // governed, a /tomux or a kill-and-takeover inside that window would be refused by the PREVIOUS launch's own
@@ -1446,6 +1428,59 @@ public sealed partial class MainPage
             }
         }
         catch (Exception ex) { Diag.Log("Tied-claim clear after verified kill failed: " + ex.Message); }
+    }
+
+    private async Task<ReclaimMuxResult> KillCanonicalMuxForReclaimAsync(ArchiveSession session, int seq)
+    {
+        var name = ArchiveService.MultiplexSessionName(session);
+        Report(seq, $"Checking mux custody for {name}...");
+        try
+        {
+            var listing = await LocalMuxdRequestAsync(new { t = "ls" });
+            using var doc = JsonDocument.Parse(listing);
+            if (!doc.RootElement.TryGetProperty("list", out var list) || list.ValueKind != JsonValueKind.Array)
+                return new ReclaimMuxResult(false, false, false, "muxd listing did not contain a session list");
+
+            JsonElement? owner = null;
+            foreach (var row in list.EnumerateArray())
+            {
+                if (row.TryGetProperty("name", out var rowName)
+                    && string.Equals(rowName.GetString(), name, StringComparison.OrdinalIgnoreCase))
+                {
+                    owner = row;
+                    break;
+                }
+            }
+
+            if (owner is null)
+                return new ReclaimMuxResult(true, false, true, "canonical mux owner absent");
+
+            var alive = owner.Value.TryGetProperty("alive", out var aliveValue)
+                        && aliveValue.ValueKind == JsonValueKind.True;
+            if (!alive)
+                return new ReclaimMuxResult(true, false, true, "canonical mux owner is not live");
+
+            var deleted = await DeleteLocalMuxdSessionAsync(name);
+            if (!deleted.ok)
+                return new ReclaimMuxResult(true, true, false, "could not kill canonical mux session " + name + ": " + deleted.detail);
+
+            var after = await LocalMuxdRequestAsync(new { t = "ls" });
+            using var afterDoc = JsonDocument.Parse(after);
+            if (!afterDoc.RootElement.TryGetProperty("list", out var afterList) || afterList.ValueKind != JsonValueKind.Array)
+                return new ReclaimMuxResult(false, true, false, "muxd teardown response was not verifiable");
+            var remainsLive = afterList.EnumerateArray().Any(row =>
+                row.TryGetProperty("name", out var rowName)
+                && string.Equals(rowName.GetString(), name, StringComparison.OrdinalIgnoreCase)
+                && row.TryGetProperty("alive", out var rowAlive)
+                && rowAlive.ValueKind == JsonValueKind.True);
+            return remainsLive
+                ? new ReclaimMuxResult(true, true, false, "canonical mux session remained live after kill: " + name)
+                : new ReclaimMuxResult(true, true, true, "killed and verified canonical mux session " + name);
+        }
+        catch (Exception ex)
+        {
+            return new ReclaimMuxResult(false, true, false, "could not verify canonical mux teardown for " + name + ": " + ex.Message);
+        }
     }
 
     // Reclaim's stale-mux-custody step. A Current pointer is pruned ONLY when muxd itself confirms the tab is

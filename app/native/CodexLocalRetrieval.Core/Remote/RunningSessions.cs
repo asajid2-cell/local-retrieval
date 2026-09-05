@@ -44,11 +44,12 @@ public static class RunningSessions
     // so its result is discarded rather than stored â€” otherwise a kill could be undone by an in-flight read.
     private static long _scanCacheEpoch;
 
-    // TEST SEAM (mirrors KillSignals): WMI and Claude's registry are machine-global and cannot be arranged
-    // in-test without touching real user state, so the two sweep sources are injectable. Null = the real thing.
+    // TEST SEAM (mirrors KillSignals): machine-global process, registry, and open-handle sources cannot be
+    // arranged safely in unit tests. Null delegates use the real source.
     internal sealed record ScanSources(
         Func<(bool Ok, List<ArchiveService.RunningSessionInfo> Sessions, string Detail)>? Scan = null,
-        Func<HashSet<int>?, (bool Ok, Dictionary<string, int> Map, HashSet<int> Unverifiable, string Detail)>? ClaudeRegistry = null);
+        Func<HashSet<int>?, (bool Ok, Dictionary<string, int> Map, HashSet<int> Unverifiable, string Detail)>? ClaudeRegistry = null,
+        Func<HashSet<int>, (bool Ok, Dictionary<string, int> Map, HashSet<int> Unverifiable, string Detail)>? OpenTranscripts = null);
 
     internal static ScanSources? ScanSourceOverride;
 
@@ -153,6 +154,84 @@ public static class RunningSessions
     {
         TryScan(out var list, out _);
         return list;
+    }
+
+    // Add identities that are not present on a process command line to the rows used by the UI and remote
+    // projection. The returned rows keep unresolved agents visible; identity is never guessed from mtime.
+    public static bool TryScanEnriched(
+        out List<ArchiveService.RunningSessionInfo> list,
+        out string detail)
+    {
+        var scanSource = ScanSourceOverride?.Scan;
+        var (verified, scanned, scanDetail) = scanSource is not null
+            ? scanSource()
+            : (TryScan(out var raw, out var rawDetail), raw, rawDetail);
+        list = scanned ?? new List<ArchiveService.RunningSessionInfo>();
+        detail = scanDetail;
+        if (!verified) return false;
+
+        detail = "";
+
+        var pids = new HashSet<int>(list.Where(s => s.Pid > 0).Select(s => s.Pid));
+        var registrySource = ScanSourceOverride?.ClaudeRegistry;
+        var (registryOk, registry, registryUnverifiable, registryDetail) = registrySource is not null
+            ? registrySource(pids)
+            : (TryClaudeLiveSessionIds(pids, out var rm, out var ru, out var rd), rm, ru, rd);
+        var registryByPid = registry
+            .GroupBy(kv => kv.Value)
+            .ToDictionary(g => g.Key, g => g.Select(kv => kv.Key).ToArray());
+        var handleSource = ScanSourceOverride?.OpenTranscripts;
+        var (handleOk, handles, handleUnverifiable, handleDetail) = handleSource is not null
+            ? handleSource(pids)
+            : (TryOpenTranscriptSessionIds(pids, out var hm, out var hu, out var hd), hm, hu, hd);
+        var handleByPid = handles
+            .GroupBy(kv => kv.Value)
+            .ToDictionary(g => g.Key, g => g.Select(kv => kv.Key).ToArray());
+
+        list = new List<ArchiveService.RunningSessionInfo>(list); // retain the scan rows even when enrichment cannot verify every identity
+        var enriched = new List<ArchiveService.RunningSessionInfo>(list.Count);
+        foreach (var row in list)
+        {
+            var ids = new List<string>();
+            var source = new List<string>();
+            if (!string.IsNullOrWhiteSpace(row.SessionId))
+            {
+                ids.Add(row.SessionId);
+                source.Add("command line");
+            }
+            AddIdentityIds(ids, source, registryByPid.GetValueOrDefault(row.Pid), "Claude registry");
+            AddIdentityIds(ids, source, handleByPid.GetValueOrDefault(row.Pid), "open transcript");
+            var unresolved = registryUnverifiable.Contains(row.Pid) || handleUnverifiable.Contains(row.Pid);
+            var status = unresolved ? "unverifiable" : ids.Count == 0 ? "unresolved" : "resolved";
+            enriched.Add(row with
+            {
+                SessionId = ids.FirstOrDefault() ?? "",
+                SessionAliases = ids.Skip(1).ToArray(),
+                IdentitySource = string.Join(", ", source.Distinct(StringComparer.OrdinalIgnoreCase)),
+                IdentityStatus = status
+            });
+        }
+        list = enriched;
+        if (!registryOk || !handleOk)
+        {
+            detail = string.Join("; ", new[] { registryDetail, handleDetail }.Where(s => !string.IsNullOrWhiteSpace(s)));
+            return false;
+        }
+        return true;
+    }
+
+    private static void AddIdentityIds(
+        List<string> ids,
+        List<string> sources,
+        IEnumerable<string>? additions,
+        string source)
+    {
+        foreach (var id in additions ?? Array.Empty<string>())
+        {
+            if (string.IsNullOrWhiteSpace(id) || ids.Contains(id, StringComparer.OrdinalIgnoreCase)) continue;
+            ids.Add(id);
+            sources.Add(source);
+        }
     }
 
     public static bool TryScan(out List<ArchiveService.RunningSessionInfo> list, out string detail)
@@ -578,6 +657,7 @@ public static class RunningSessions
                     owned.Add(candidate);
                     break;
                 }
+                current = parents.TryGetValue(current, out var parent) ? parent : 0;
             }
         }
         return true;

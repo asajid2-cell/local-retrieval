@@ -1,6 +1,6 @@
-# mux-local-retrieval
+# MUX
 
-The whole product in one repo: the local-retrieval desktop app and its remote/multiplex capability.
+The whole product in one repo: the MUX desktop app and its remote/multiplex capability.
 
 - `app/`   — Windows desktop app (WinUI): chat archive, retrieval, session lifecycle, integrity/custody
 - `relay/` — VPS web relay + browser terminal (multiplex): remote viewing/driving of PC sessions

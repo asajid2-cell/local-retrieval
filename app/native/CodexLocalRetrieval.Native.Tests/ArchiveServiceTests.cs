@@ -186,6 +186,42 @@ public sealed class ArchiveServiceTests
         }
     }
 
+    [TestMethod]
+    public async Task LoadCachedAsync_ReadsDurableSnapshotWhileWriterLockIsHeld()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "clr-cache-lock-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        var storePath = Path.Combine(root, "store.json");
+        var seed = new ArchiveService(storePath: storePath);
+        seed.Store.Sessions["cached-1"] = new ArchiveSession
+        {
+            Id = "cached-1",
+            Tool = "codex",
+            CustomTitle = "Cached chat",
+            UpdatedAt = DateTime.UtcNow.ToString("O"),
+        };
+        await seed.SaveAsync();
+        var before = File.ReadAllBytes(storePath);
+        var lockPath = storePath + ".lock";
+        try
+        {
+            using var heldLock = new FileStream(lockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+            var service = new ArchiveService(storePath: storePath);
+            var load = service.LoadCachedAsync();
+            var completed = await Task.WhenAny(load, Task.Delay(TimeSpan.FromSeconds(2)));
+
+            Assert.AreSame(load, completed, "cache load must not wait for the writer lock");
+            await load;
+            Assert.IsTrue(service.Store.Sessions.ContainsKey("cached-1"));
+            CollectionAssert.AreEqual(before, File.ReadAllBytes(storePath), "cache load must not rewrite the primary snapshot");
+        }
+        finally
+        {
+            try { File.Delete(lockPath); } catch { }
+            try { Directory.Delete(root, recursive: true); } catch { }
+        }
+    }
+
     // L1: indexing the rollout store resurfaces every session on disk, old and new alike.
     [TestMethod]
     public async Task IndexRoot_ResurfacesOldAndNewRollouts()
@@ -1153,6 +1189,44 @@ public sealed class ArchiveServiceTests
         {
             try { Directory.Delete(cwd, recursive: true); } catch { }
         }
+    }
+
+    [TestMethod]
+    public void ResumeCommandText_GatewayOverride_UsesCcWithoutChangingStoredMode()
+    {
+        var service = new ArchiveService(useBundledStore: true);
+        var cwd = Path.Combine(Path.GetTempPath(), "gw-copy-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(cwd);
+        try
+        {
+            var session = new ArchiveSession
+            {
+                Id = "cl-copy-gateway",
+                Tool = "claude",
+                LaunchMode = ArchiveService.NativeLaunchMode,
+                Workspace = cwd,
+                SourcePath = Path.Combine(cwd, "cl-copy-gateway.jsonl")
+            };
+
+            var command = service.ResumeCommandText(
+                session,
+                ArchiveService.GatewayLaunchMode);
+
+            StringAssert.Contains(command, "cc.cmd");
+            StringAssert.Contains(command, "--resume cl-copy-gateway");
+            Assert.AreEqual(ArchiveService.NativeLaunchMode, session.LaunchMode);
+        }
+        finally
+        {
+            try { Directory.Delete(cwd, recursive: true); } catch { }
+        }
+    }
+
+    [TestMethod]
+    public void GatewayResumePolicy_IsClaudeOnly()
+    {
+        Assert.IsTrue(ArchiveService.CanResumeThroughGateway("claude"));
+        Assert.IsFalse(ArchiveService.CanResumeThroughGateway("codex"));
     }
 
     [TestMethod]

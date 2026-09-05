@@ -1,9 +1,9 @@
 {
   "profiles": {
-    "CodexLocalRetrieval.Native (Package)": {
+    "MUX (Package)": {
       "commandName": "MsixPackage"
     },
-    "CodexLocalRetrieval.Native (Unpackaged)": {
+    "MUX (Unpackaged)": {
       "commandName": "Project"
     }
   }

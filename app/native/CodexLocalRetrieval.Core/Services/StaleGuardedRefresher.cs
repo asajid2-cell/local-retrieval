@@ -105,7 +105,7 @@ public sealed class StaleGuardedRefresher<T> where T : class
         }
     }
 
-    /// <summary>Forget everything published. An in-flight build still publishes when it lands.</summary>
+    /// <summary>Forget everything published and let the next refresh start a new build.</summary>
     public void Invalidate()
     {
         lock (_gate)

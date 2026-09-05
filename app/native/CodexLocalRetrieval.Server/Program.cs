@@ -366,19 +366,20 @@ if (Environment.GetEnvironmentVariable("CLR_REMOTE_BRIDGE") != "0")
             ResolvePendingMuxBindingsAsync,
             childProcessJob);
         _ = bridge.RunLoopAsync(app.Lifetime.ApplicationStopping);
-        Console.WriteLine($"remote command bridge armed (target {bridgeSettings.Target}:{bridgeSettings.Port}; active only while the desktop app is closed)");
+        Console.WriteLine($"MUX remote bridge armed (target {bridgeSettings.Target}:{bridgeSettings.Port}; active only while the desktop app is closed)");
     }
-    else Console.WriteLine("remote command bridge OFF — no multiplex SSH target in settings.");
+    else Console.WriteLine("MUX remote bridge OFF — no multiplex SSH target in settings.");
 }
 
 var authMode = hlAuthOn ? $"hl-auth ({hlBase}, page:{hlPage ?? "any"})" : "bearer token";
-Console.WriteLine($"codex-local-retrieval remote server on http://{bind}:{port}  (archive: lazy (loads on first browse), auth: {authMode}, launch: {(allowLaunch ? "on" : "off")}, redact-reads: {(redactReads ? "on" : "off")})");
+Console.WriteLine($"MUX remote server on http://{bind}:{port}  (archive: lazy (loads on first browse), auth: {authMode}, launch: {(allowLaunch ? "on" : "off")}, redact-reads: {(redactReads ? "on" : "off")})");
 try
 {
     app.Run();
 }
 finally
 {
+    archiveRuntime.Dispose();
     try
     {
         await agentHub.DisposeAsync();

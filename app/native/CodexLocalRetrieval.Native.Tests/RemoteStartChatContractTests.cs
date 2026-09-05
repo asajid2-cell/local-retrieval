@@ -65,7 +65,7 @@ public sealed class RemoteStartChatContractTests
     }
 
     [TestMethod]
-    public void BlankStart_QueuesFilingThenUsesGovernedMuxWithoutMintingAnIntent()
+    public void BlankStart_QueuesFilingThenDelegatesMuxReservationWithoutMintingAnIntent()
     {
         var handler = HandlerSource();
         var queue = handler.IndexOf("_archive.QueuePendingNewChatAsync(", StringComparison.Ordinal);
@@ -81,8 +81,11 @@ public sealed class RemoteStartChatContractTests
             RemoteSource(),
             "private async Task<(bool ok, string detail)> StartMuxHeadlessCommandFromIntentAsync",
             "// /tomux handoff:");
-        StringAssert.Contains(helper, "GovernedCreateLocalMuxdSessionAsync(");
+        StringAssert.Contains(helper, "CreateLocalMuxdSessionAsync(");
         StringAssert.Contains(helper, "allowLocalIntentMint: false");
+        Assert.IsFalse(helper.Contains("GovernedCreateLocalMuxdSessionAsync(", StringComparison.Ordinal));
+        Assert.IsFalse(helper.Contains("SessionLaunchGovernor", StringComparison.Ordinal));
+        Assert.IsFalse(helper.Contains("SessionLaunchClaims", StringComparison.Ordinal));
         Assert.IsFalse(helper.Contains("Process.Start", StringComparison.Ordinal));
     }
 

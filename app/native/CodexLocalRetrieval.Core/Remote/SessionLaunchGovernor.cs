@@ -224,6 +224,13 @@ public sealed class SessionLaunchLease : IDisposable
                 _claim?.RetainUntilExpiry();
                 _retained = true;
             }
+            else if (!retainUntilExpiry && !_retained)
+            {
+                // A definitive launch failure means no writer owns this reservation. Release it now rather
+                // than relying on the caller's eventual Dispose, so an immediate retry is not poisoned by the
+                // failed transport/create attempt. Uncertain failures explicitly opt into retention above.
+                _claim?.Dispose();
+            }
             _governor.RecordFailed(_request, summary, details);
         }
     }

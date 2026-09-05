@@ -28,7 +28,7 @@ public partial class App : Application
     // Held for the whole process lifetime so a second launch can detect us. Static so the GC
     // never collects it (which would silently release the lock).
     private static System.Threading.Mutex? _instanceMutex;
-    private const string SingleInstanceName = @"Local\CodexLocalRetrieval.SingleInstance";
+    private const string SingleInstanceName = @"Local\MUX.SingleInstance";
 
     [DllImport("user32.dll")] private static extern bool SetForegroundWindow(IntPtr hWnd);
     [DllImport("user32.dll")] private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);

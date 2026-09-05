@@ -234,19 +234,58 @@ public static class ProcessSnapshot
         return map;
     }
 
+    // The registry shape is sessionId -> pid. A gateway process is trusted only when its exact pid maps to
+    // one distinct session id; ambiguous registry state remains unresolved instead of selecting an arbitrary id.
+    internal static bool IsGatewayProcessName(string processName)
+    {
+        var lower = (processName ?? "").Trim().ToLowerInvariant();
+        return lower is "bun.exe" or "node.exe" or "bun" or "node";
+    }
+
+    internal static string? RegisteredGatewaySessionId(
+        int pid,
+        IReadOnlyDictionary<string, int> sessionIdsByPid)
+    {
+        if (pid <= 0) return null;
+
+        var matches = sessionIdsByPid
+            .Where(kv => kv.Value == pid && !string.IsNullOrWhiteSpace(kv.Key))
+            .Select(kv => kv.Key)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        return matches.Length == 1 ? matches[0] : null;
+    }
+
+    // Gateway registry identity is continuously updated for the exact process, while --resume is launch-time.
+    // Native agents have no registry authority and therefore continue to use their command-line identity.
+    internal static string ResolveAgentSessionId(
+        bool isGatewayAgent,
+        string? commandLineSessionId,
+        string? registeredGatewaySessionId)
+        => isGatewayAgent
+            ? registeredGatewaySessionId ?? ""
+            : commandLineSessionId ?? "";
+
     public static List<(int Pid, int Ppid, string Tool, string SessionId, DateTime StartedUtc)> AgentsWithPpid()
     {
         var list = new List<(int, int, string, string, DateTime)>();
         var all = SnapshotAllProcesses();
+        var registry = RunningSessions.ClaudeLiveSessionIds(new HashSet<int>(all.Keys));
         foreach (var kv in all)
         {
             var (name, ppid) = kv.Value;
             var pid = kv.Key;
             var lower = name.ToLowerInvariant();
-            if (lower != "claude.exe" && lower != "codex.exe") continue;
+            var isNativeAgent = lower is "claude.exe" or "codex.exe";
+            var isGatewayProcess = IsGatewayProcessName(lower);
+            var gatewaySessionId = isGatewayProcess
+                ? RegisteredGatewaySessionId(pid, registry)
+                : null;
+            var isGatewayAgent = isGatewayProcess && gatewaySessionId is not null;
+            if (!isNativeAgent && !isGatewayAgent) continue;
 
             var cl = TryGetCommandLine(pid);
-            if (!RunningSessions.IsLiveAgentProcess(name, cl)) continue;
+            if (isNativeAgent && !RunningSessions.IsLiveAgentProcess(name, cl)) continue;
 
             DateTime started = default;
             try
@@ -257,7 +296,8 @@ public static class ProcessSnapshot
             catch { }
 
             var tool = lower.Contains("codex") ? "codex" : "claude";
-            var sid = ArchiveService.ParseResumedSessionId(cl) ?? "";
+            var commandLineSessionId = ArchiveService.ParseResumedSessionId(cl);
+            var sid = ResolveAgentSessionId(isGatewayAgent, commandLineSessionId, gatewaySessionId);
             if (pid > 0) list.Add((pid, ppid, tool, sid, started));
         }
         return list;

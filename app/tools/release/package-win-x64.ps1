@@ -4,18 +4,18 @@ $ErrorActionPreference = "Stop"
 $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repoRoot = Resolve-Path (Join-Path $scriptRoot "..\..")
 $artifactsRoot = Join-Path $repoRoot "artifacts"
-$packageRoot = Join-Path $artifactsRoot "codex-local-retrieval-package"
+$packageRoot = Join-Path $artifactsRoot "mux-package"
 $appRoot = Join-Path $packageRoot "app"
-$zipPath = Join-Path $artifactsRoot "codex-local-retrieval-win-x64.zip"
+$zipPath = Join-Path $artifactsRoot "mux-win-x64.zip"
 $projectPath = Join-Path $repoRoot "native\CodexLocalRetrieval.Native\CodexLocalRetrieval.Native.csproj"
 $buildOutput = Join-Path $repoRoot "native\CodexLocalRetrieval.Native\bin\x64\Release\net8.0-windows10.0.26100.0\win-x64"
-$launcherSource = Join-Path $scriptRoot "StartCodexLocalRetrieval.c"
-$launcherPath = Join-Path $packageRoot "Codex Local Retrieval.exe"
+$launcherSource = Join-Path $scriptRoot "StartCodexLocalRetrieval.c" # Internal source filename retained for build compatibility.
+$launcherPath = Join-Path $packageRoot "MUX.exe"
 $iconPath = Join-Path $repoRoot "native\CodexLocalRetrieval.Native\Assets\AppIcon.ico"
 $dataSource = Join-Path $repoRoot "data"
 $dataTarget = Join-Path $appRoot "data"
-$objPath = Join-Path $artifactsRoot "StartCodexLocalRetrieval.obj"
-$rcPath = Join-Path $artifactsRoot "launcher-icon.rc"
+$objPath = Join-Path $artifactsRoot "MUX.obj"
+$rcPath = Join-Path $artifactsRoot "MUX-icon.rc"
 $resPath = Join-Path $artifactsRoot "launcher-icon.res"
 
 function Find-VsDevCmd {
@@ -62,9 +62,9 @@ Copy-Item -Path (Join-Path $dataSource "app-store.json") -Destination $dataTarge
 Copy-Item -Path (Join-Path $dataSource "fixtures") -Destination $dataTarget -Recurse -Force
 
 $readmeFirst = @"
-Codex Local Retrieval
+MUX
 
-Run "Codex Local Retrieval.exe".
+Run "MUX.exe".
 
 The app files are in app\. Keep the app folder next to the launcher.
 This build is unsigned, so Windows SmartScreen may warn on first launch.

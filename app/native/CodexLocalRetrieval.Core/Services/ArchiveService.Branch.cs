@@ -113,6 +113,7 @@ public sealed partial class ArchiveService
 
         Directory.CreateDirectory(_templatesRoot);
         var snapshotPath = Path.Combine(_templatesRoot, snapshotId + ".jsonl");
+        var createdSnapshotFile = false;
         JsonlCloneResult capture;
         if (File.Exists(snapshotPath))
         {
@@ -122,6 +123,7 @@ public sealed partial class ArchiveService
         else
         {
             capture = await JsonlTranscriptCloner.CloneAsync(sourcePath, snapshotPath);
+            createdSnapshotFile = true;
         }
 
         if (capture.LineCount == 0)
@@ -159,9 +161,10 @@ public sealed partial class ArchiveService
         {
             await CommitBranchWorkAsync(() => Store.TemplateSnapshots[snapshot.Id] = snapshot);
         }
-        catch (StoreGenerationConflictException)
+        catch
         {
             Store.TemplateSnapshots.Remove(snapshot.Id);
+            if (createdSnapshotFile) TryDeleteFile(snapshotPath);
             throw;
         }
         RefreshTemplateSnapshotCounts();
@@ -524,6 +527,9 @@ public sealed partial class ArchiveService
         catch
         {
             Store.Sessions.Remove(newId);
+            TryDeleteFile(destinationPath);
+            if (string.Equals(tool, "codex", StringComparison.OrdinalIgnoreCase))
+                TryDeleteCodexThread(newId);
             throw;
         }
         ReapplyList();
@@ -635,6 +641,21 @@ public sealed partial class ArchiveService
         }
         if (obj.ContainsKey("id")) obj["id"] = newId;
         return obj.ToJsonString();
+    }
+
+    private void TryDeleteCodexThread(string id)
+    {
+        if (string.IsNullOrWhiteSpace(id) || !File.Exists(_codexStateDbPath)) return;
+        try
+        {
+            using var connection = new SqliteConnection(new SqliteConnectionStringBuilder { DataSource = _codexStateDbPath }.ToString());
+            connection.Open();
+            using var command = connection.CreateCommand();
+            command.CommandText = "delete from threads where id = $id";
+            command.Parameters.AddWithValue("$id", id);
+            command.ExecuteNonQuery();
+        }
+        catch { }
     }
 
     internal bool RegisterCodexThread(ArchiveSession parent, string newId, string rolloutPath)

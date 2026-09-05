@@ -23,6 +23,10 @@ public class ScanCacheTests
     private long _registryReads;
     private volatile bool _scanFails;
     private volatile bool _registryFails;
+    private List<ArchiveService.RunningSessionInfo> _scanRows = new();
+    private Dictionary<string, int> _registryRows = new(StringComparer.OrdinalIgnoreCase);
+    private Dictionary<string, int> _handleRows = new(StringComparer.OrdinalIgnoreCase);
+    private HashSet<int> _handleUnverifiable = new();
 
     [TestInitialize]
     public void Init()
@@ -31,7 +35,14 @@ public class ScanCacheTests
         _registryReads = 0;
         _scanFails = false;
         _registryFails = false;
-        RunningSessions.ScanSourceOverride = new RunningSessions.ScanSources(Scan: FakeScan, ClaudeRegistry: FakeRegistry);
+        _scanRows = new();
+        _registryRows = new(StringComparer.OrdinalIgnoreCase);
+        _handleRows = new(StringComparer.OrdinalIgnoreCase);
+        _handleUnverifiable = new();
+        RunningSessions.ScanSourceOverride = new RunningSessions.ScanSources(
+            Scan: FakeScan,
+            ClaudeRegistry: FakeRegistry,
+            OpenTranscripts: FakeOpenTranscripts);
         RunningSessions.InvalidateScanCache();
     }
 
@@ -50,7 +61,7 @@ public class ScanCacheTests
         PerfCounters.WmiSweep();
         return _scanFails
             ? (false, new List<ArchiveService.RunningSessionInfo>(), "injected scan failure")
-            : (true, new List<ArchiveService.RunningSessionInfo>(), "");
+            : (true, new List<ArchiveService.RunningSessionInfo>(_scanRows), "");
     }
 
     // Stands in for TryClaudeLiveSessionIds. Not a WMI pass, so it does NOT tick wmiSweeps — it gets its own
@@ -60,10 +71,67 @@ public class ScanCacheTests
         Interlocked.Increment(ref _registryReads);
         return _registryFails
             ? (false, new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase), new HashSet<int> { 4242 }, "injected registry failure")
-            : (true, new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase), new HashSet<int>(), "");
+            : (true, new Dictionary<string, int>(_registryRows, StringComparer.OrdinalIgnoreCase), new HashSet<int>(), "");
     }
 
+    private (bool Ok, Dictionary<string, int> Map, HashSet<int> Unverifiable, string Detail) FakeOpenTranscripts(HashSet<int> livePids)
+        => (_handleUnverifiable.Count == 0,
+            new Dictionary<string, int>(_handleRows, StringComparer.OrdinalIgnoreCase),
+            new HashSet<int>(_handleUnverifiable),
+            _handleUnverifiable.Count == 0 ? "" : "injected handle failure");
+
     private static long Sweeps() => PerfCounters.Snapshot()["wmiSweeps"];
+
+    [TestMethod]
+    public void EnrichedScan_UsesCommandLineRegistryAndOpenTranscriptIdentityWithoutGuessing()
+    {
+        _scanRows = new()
+        {
+            new(100, "claude", "command-id", "Terminal", "", ""),
+            new(200, "claude", "", "VS Code", "", ""),
+            new(300, "codex", "", "Terminal", "", ""),
+            new(400, "claude", "", "Terminal", "", ""),
+        };
+        _registryRows["registry-id"] = 200;
+        _handleRows["codex-id"] = 300;
+
+        Assert.IsTrue(RunningSessions.TryScanEnriched(out var rows, out var detail), detail);
+        Assert.AreEqual("command-id", rows.Single(r => r.Pid == 100).SessionId);
+        Assert.AreEqual("command line", rows.Single(r => r.Pid == 100).IdentitySource);
+        Assert.AreEqual("registry-id", rows.Single(r => r.Pid == 200).SessionId);
+        Assert.AreEqual("Claude registry", rows.Single(r => r.Pid == 200).IdentitySource);
+        Assert.AreEqual("codex-id", rows.Single(r => r.Pid == 300).SessionId);
+        Assert.AreEqual("open transcript", rows.Single(r => r.Pid == 300).IdentitySource);
+        Assert.AreEqual("", rows.Single(r => r.Pid == 400).SessionId);
+        Assert.AreEqual("unresolved", rows.Single(r => r.Pid == 400).IdentityStatus);
+    }
+
+    [TestMethod]
+    public void EnrichedScan_PreservesConflictingEvidenceAsAliases()
+    {
+        _scanRows = new() { new(100, "claude", "command-id", "Terminal", "", "") };
+        _registryRows["registry-id"] = 100;
+        _handleRows["handle-id"] = 100;
+
+        Assert.IsTrue(RunningSessions.TryScanEnriched(out var rows, out var detail), detail);
+        var row = rows.Single();
+        Assert.AreEqual("command-id", row.SessionId);
+        CollectionAssert.AreEquivalent(new[] { "registry-id", "handle-id" }, row.SessionAliases!.ToArray());
+        CollectionAssert.AreEquivalent(new[] { "command-id", "registry-id", "handle-id" }, row.AllSessionIds.ToArray());
+    }
+
+    [TestMethod]
+    public void EnrichedScan_ReportsUnverifiableIdentityButKeepsTheProcessVisible()
+    {
+        _scanRows = new() { new(500, "codex", "", "Terminal", "", "") };
+        _handleUnverifiable.Add(500);
+
+        Assert.IsFalse(RunningSessions.TryScanEnriched(out var rows, out var detail));
+        Assert.AreEqual(1, rows.Count);
+        Assert.AreEqual(500, rows[0].Pid);
+        Assert.AreEqual("unverifiable", rows[0].IdentityStatus);
+        StringAssert.Contains(detail, "handle failure");
+    }
 
     // ---- 1. a burst shares one sweep ----------------------------------------------------------------
 

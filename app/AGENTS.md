@@ -1,8 +1,7 @@
-# Codex Local Retrieval - Agent Protocol
+# MUX - Agent Protocol
 
 You are an AI coding agent (Claude or Codex) running in a terminal. The human uses
-Codex Local Retrieval to index local Claude/Codex chats so they can be organized,
-searched, and resumed.
+MUX to index local Claude/Codex chats so they can be organized, searched, and resumed.
 
 The app watches an inbox file and applies one JSON command per complete line.
 

@@ -238,11 +238,10 @@ public class SessionReclaimTests
         }
     }
 
-    // ---- relaunch: only the liveness gate is forced --------------------------------------------------
+    // ---- explicit launch lease helper -----------------------------------------------------------------
 
-    // The relaunch acquires through the NORMAL FileMode.CreateNew path. Only `isSessionLive` is forced (the
-    // kills were identity-verified); the file race is never bypassed, so a concurrent launcher that got there
-    // first still wins and reclaim reports it instead of starting a second writer.
+    // Explicit Resume/Continue owns new-session creation. Only `isSessionLive` is forced; the file race is
+    // never bypassed, so a concurrent launcher that got there first still wins.
     [TestMethod]
     public void ReclaimRelaunch_LosingTheCreateNewRace_ReportsInsteadOfDoubleLaunching()
     {
@@ -284,7 +283,155 @@ public class SessionReclaimTests
         freshLease!.Dispose();
     }
 
+    // ---- wait/re-read behavior ------------------------------------------------------------------------
+
+    [TestMethod]
+    public async Task Reclaim_WaitUsesInjectedClock_RereadsClaim_AndClearsOriginalOnly()
+    {
+        var root = TempDir();
+        var now = DateTimeOffset.UtcNow;
+        var current = now;
+        var claim = WriteClaim(root, "session-wait", ownerPid: 4242, now, now.AddSeconds(2));
+        var replacement = false;
+        var delays = 0;
+        var report = await SessionReclaim.ExecuteAsync(new ReclaimOptions
+        {
+            CandidateIds = new[] { "session-wait" },
+            ClaimOptions = new SessionLaunchClaims.Options(RootDirectory: root, Now: now),
+            Now = now,
+            Clock = () => current,
+            Delay = (span, _) =>
+            {
+                current += span;
+                if (!replacement && current >= now.AddSeconds(1))
+                {
+                    replacement = true;
+                    File.WriteAllText(claim.Path, JsonSerializer.Serialize(new
+                    {
+                        SessionId = "session-wait",
+                        CandidateIds = new[] { "session-wait" },
+                        OwnerPid = 5151,
+                        OwnerProcess = "replacement",
+                        CreatedUtc = now.AddSeconds(1),
+                        ExpiresUtc = now.AddSeconds(3),
+                        Reason = "replacement"
+                    }));
+                }
+                delays++;
+                return Task.CompletedTask;
+            },
+            OnRefusal = _ => Task.FromResult(ReclaimRefusalChoice.WaitForExpiry),
+            Kill = _ => new RunningSessions.KillResult(true, "no owners", Array.Empty<ReclaimKilledPid>()),
+        });
+
+        Assert.IsGreaterThan(0, delays);
+        Assert.AreEqual(ReclaimClearOutcome.Failed, report.Claims.Single().Outcome);
+        StringAssert.Contains(report.Claims.Single().Detail, "replaced");
+        Assert.IsTrue(File.Exists(claim.Path), "a replacement reservation must not be cleared by stale grace evidence");
+    }
+
+    [TestMethod]
+    public async Task Reclaim_CancellationDuringWaitCompletesAndPreservesClaim()
+    {
+        var root = TempDir();
+        var now = DateTimeOffset.UtcNow;
+        var claim = WriteClaim(root, "session-cancel-wait", ownerPid: 4242, now, now.AddMinutes(2));
+        using var cancellation = new CancellationTokenSource();
+        var waiting = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var reportTask = SessionReclaim.ExecuteAsync(new ReclaimOptions
+        {
+            CandidateIds = new[] { "session-cancel-wait" },
+            ClaimOptions = new SessionLaunchClaims.Options(RootDirectory: root, Now: now),
+            Now = now,
+            OnRefusal = _ => Task.FromResult(ReclaimRefusalChoice.WaitForExpiry),
+            Cancellation = cancellation.Token,
+            Delay = async (_, token) =>
+            {
+                waiting.TrySetResult(true);
+                await Task.Delay(Timeout.InfiniteTimeSpan, token);
+            },
+            Kill = _ => new RunningSessions.KillResult(true, "no owners", Array.Empty<ReclaimKilledPid>()),
+        });
+
+        await waiting.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        cancellation.Cancel();
+        try
+        {
+            await reportTask;
+            Assert.Fail("reclaim should propagate cancellation from the wait");
+        }
+        catch (OperationCanceledException)
+        {
+            // expected
+        }
+        Assert.IsTrue(File.Exists(claim.Path));
+    }
+
     // ---- mux custody --------------------------------------------------------------------------------
+
+    [TestMethod]
+    public async Task Reclaim_KillsLiveMuxBeforeProcessCleanup_AndDoesNotLaunch()
+    {
+        var order = new List<string>();
+        var claimRoot = TempDir();
+        var report = await SessionReclaim.ExecuteAsync(new ReclaimOptions
+        {
+            CandidateIds = new[] { "session-mux-reclaim" },
+            ClaimOptions = new SessionLaunchClaims.Options(RootDirectory: claimRoot),
+            KillMux = () =>
+            {
+                order.Add("mux-kill");
+                return Task.FromResult(new ReclaimMuxResult(true, true, true, "killed canonical mux"));
+            },
+            Kill = _ =>
+            {
+                order.Add("process-kill");
+                return new RunningSessions.KillResult(true, "no process owner", Array.Empty<ReclaimKilledPid>());
+            },
+        });
+
+        Assert.IsTrue(report.MuxOk, report.MuxDetail);
+        Assert.IsFalse(report.Relaunched);
+        CollectionAssert.AreEqual(new[] { "mux-kill", "process-kill" }, order);
+        StringAssert.Contains(report.Headline, "ready to continue");
+    }
+
+    [TestMethod]
+    public async Task Reclaim_WhenNothingExists_ReportsNoOpInsteadOfClaimingOwnersStopped()
+    {
+        var report = await SessionReclaim.ExecuteAsync(new ReclaimOptions
+        {
+            CandidateIds = new[] { "session-already-clear" },
+            Kill = _ => new RunningSessions.KillResult(true, "already gone", Array.Empty<ReclaimKilledPid>()),
+        });
+
+        Assert.IsFalse(report.Changed);
+        StringAssert.Contains(report.Headline, "Nothing to reclaim");
+        StringAssert.Contains(report.Headline, "no owner");
+        Assert.DoesNotContain("owners stopped", report.Headline);
+    }
+
+    [TestMethod]
+    public async Task Reclaim_RefusesCleanupWhenLiveMuxKillFails_AndPreservesOwnership()
+    {
+        var processCleanup = 0;
+        var report = await SessionReclaim.ExecuteAsync(new ReclaimOptions
+        {
+            CandidateIds = new[] { "session-mux-kill-fails" },
+            KillMux = () => Task.FromResult(new ReclaimMuxResult(true, true, false, "muxd kill was not verified")),
+            Kill = _ =>
+            {
+                Interlocked.Increment(ref processCleanup);
+                return new RunningSessions.KillResult(true, "must not run", Array.Empty<ReclaimKilledPid>());
+            },
+        });
+
+        Assert.IsFalse(report.MuxOk);
+        StringAssert.Contains(report.MuxDetail, "not verified");
+        Assert.IsFalse(report.Relaunched);
+        Assert.AreEqual(0, processCleanup, "failed mux takeover must preserve process/claim custody");
+        StringAssert.Contains(report.Headline, "mux");
+    }
 
     [TestMethod]
     public void PruneStaleMuxCurrent_DropsConfirmedAbsentTabs_KeepsLiveOnes_AndDoesNothingWhenMuxdCannotAnswer()
@@ -310,19 +457,22 @@ public class SessionReclaimTests
         Assert.IsNotNull(unaskable["gone-tab"].Current);
     }
 
-    // ---- integration: a real process tree, killed, cleared, pruned, relaunched -----------------------
+
+    // ---- integration: a real process tree, killed, cleared, and pruned -------------------------------
+
+    // Reclaim stops at cleanup. A later explicit Resume owns any new terminal/session creation.
+
 
     // The throwaway-session bar: a real cmd.exe tree holding a real transcript open, a real owner record and a
     // real unexpired claim tied to it, run through the REAL reclaim core (no user chats anywhere). The claim's
     // owner is this live test process, so nothing but the tier-2 kill evidence can clear it — which is exactly
     // the [F#1] shape the retired own-pid override used to short-circuit.
     [TestMethod]
-    public async Task ReclaimCore_KillsTheTree_ClearsViaTierTwoEvidence_PrunesMux_AndRelaunches()
+    public async Task ReclaimCore_KillsTheTree_ClearsViaTierTwoEvidence_PrunesMux_AndDoesNotLaunch()
     {
         RequireWindows();
         var claimRoot = TempDir();
         var recordRoot = TempDir();
-        var eventRoot = TempDir();
         var now = DateTimeOffset.UtcNow;
 
         var (sid, child) = StartChildHoldingTranscript();
@@ -335,7 +485,6 @@ public class SessionReclaimTests
             ["stale-tab"] = new MuxTabRecord { Current = new MuxTabChat { Id = sid } },
         };
 
-        var launched = 0;
         var report = await SessionReclaim.ExecuteAsync(new ReclaimOptions
         {
             CandidateIds = new[] { sid },
@@ -343,15 +492,6 @@ public class SessionReclaimTests
             RecordOptions = RecordOptions(recordRoot),
             // muxd confirms the tab is absent (empty live list).
             PruneMuxCurrent = ids => SessionReclaim.PruneStaleMuxCurrent(history, ids, Array.Empty<string>()),
-            LaunchRequest = Request(sid),
-            GovernorOptions = new SessionLaunchGovernorOptions(
-                ClaimOptions: new SessionLaunchClaims.Options(RootDirectory: claimRoot),
-                EventOptions: new SessionEventLedger.Options(RootDirectory: eventRoot)),
-            Launch = () =>
-            {
-                Interlocked.Increment(ref launched);
-                return Task.FromResult((true, "relaunched (seam)"));
-            },
         });
 
         // 1. the tree actually died, checked by identity rather than by bare pid.
@@ -373,16 +513,14 @@ public class SessionReclaimTests
         CollectionAssert.AreEquivalent(new[] { "stale-tab" }, report.PrunedMuxTabs.ToArray());
         Assert.IsNull(history["stale-tab"].Current);
 
-        // 4. relaunched through a FRESH CreateNew reservation — a different claim file from the one cleared.
-        Assert.IsTrue(report.Relaunched, report.RelaunchDetail);
+        // 4. reclaim is cleanup-only: it leaves no new reservation or terminal behind.
+        Assert.IsFalse(report.Relaunched);
         Assert.IsFalse(report.LostLaunchRace);
-        Assert.AreEqual(1, launched);
-        Assert.IsTrue(File.Exists(claim.Path), "the relaunch must hold its own reservation");
-        var relaunchClaim = SessionLaunchClaims
-            .ReadClaimsForSession(sid, options: new SessionLaunchClaims.Options(RootDirectory: claimRoot))
-            .Single();
-        Assert.AreEqual(Environment.ProcessId, relaunchClaim.OwnerPid);
-        Assert.IsGreaterThan(claim.CreatedUtc, relaunchClaim.CreatedUtc, "the reservation must be a new one, not the cleared one");
+        Assert.IsFalse(File.Exists(claim.Path), "cleanup must remove the old reservation without creating a replacement");
+        Assert.IsEmpty(SessionLaunchClaims.ReadClaimsForSession(
+            sid,
+            options: new SessionLaunchClaims.Options(RootDirectory: claimRoot)));
+        StringAssert.Contains(report.Headline, "ready to continue");
     }
 
     // ---- the reclaim-strand repro: a clear that FAILS must be reported, not swallowed ----------------
@@ -406,7 +544,6 @@ public class SessionReclaimTests
         var claim = WriteClaim(claimRoot, sid, ownerPid: 4242, now.AddMinutes(-5), now.AddMinutes(-3));
         File.SetAttributes(claim.Path, File.GetAttributes(claim.Path) | FileAttributes.ReadOnly);
 
-        var launched = 0;
         var report = await SessionReclaim.ExecuteAsync(new ReclaimOptions
         {
             CandidateIds = new[] { sid },
@@ -414,9 +551,10 @@ public class SessionReclaimTests
             Now = now,
             // Hermetic: no real owner to hunt; the clear failure is the whole point.
             Kill = _ => new RunningSessions.KillResult(true, "no owners", Array.Empty<ReclaimKilledPid>()),
-            LaunchRequest = Request(sid),
-            Launch = () => { Interlocked.Increment(ref launched); return Task.FromResult((true, "must not run")); },
         });
+
+        // Reclaim is cleanup-only even when the reservation cleanup itself fails.
+        Assert.IsFalse(report.Relaunched);
 
         // The clear failed and reported the actual reason...
         var failed = report.Claims.Single();
@@ -430,8 +568,7 @@ public class SessionReclaimTests
             report.Headline,
             "the failing reason must be surfaced, not collapsed to the generic line");
 
-        // Nothing was relaunched over an unresolved reservation.
-        Assert.AreEqual(0, launched, "a blocking claim must not relaunch");
+        // Nothing was launched over an unresolved reservation.
         Assert.IsFalse(report.Relaunched);
         Assert.IsTrue(report.AnyClaimBlocking);
 
@@ -535,62 +672,51 @@ public class SessionReclaimTests
 
     // ---- source-level wiring (ArchitectureLaunchSurfaceTests style) ----------------------------------
 
-    // H1: the lease has to be taken BEFORE the muxd create on all three writer-creation paths, and [F#1]: the
-    // own-pid clearing override must be gone and stay gone.
+    // Muxd is the sole reservation authority for mux-hosted writers. The GUI must not acquire the native
+    // claim first because muxd uses the same claim root and correctly sees that foreign claim as pending.
     [TestMethod]
-    public void MuxWriterCreationPaths_AreGoverned_AndNoOwnPidOverrideSurvives()
+    public void MuxHostedCreation_DelegatesReservationToMuxd_AndNeverUsesNativeGovernor()
     {
         var root = FindRepoRoot();
         var remote = File.ReadAllText(Path.Combine(root, "native", "CodexLocalRetrieval.Native", "MainPage.Remote.cs"));
         var integrity = File.ReadAllText(Path.Combine(root, "native", "CodexLocalRetrieval.Native", "MainPage.Integrity.cs"));
 
-        // The governed wrapper acquires the lease first and marks the outcome on the muxd answer.
-        var wrapperStart = remote.IndexOf("private async Task<(bool ok, string detail)> GovernedCreateLocalMuxdSessionAsync", StringComparison.Ordinal);
-        Assert.IsGreaterThanOrEqualTo(0, wrapperStart, "the governed mux-create wrapper is missing");
-        var wrapperEnd = remote.IndexOf("private static void ClearClaimsAfterVerifiedKill", wrapperStart, StringComparison.Ordinal);
-        var wrapper = remote[wrapperStart..wrapperEnd];
-        var acquire = wrapper.IndexOf("_launchGovernor.TryAcquire", StringComparison.Ordinal);
-        var create = wrapper.IndexOf("await CreateLocalMuxdSessionAsync", StringComparison.Ordinal);
-        Assert.IsGreaterThanOrEqualTo(0, acquire);
-        Assert.IsTrue(create > acquire, "the governor lease must be acquired BEFORE the muxd create, not after");
-        StringAssert.Contains(wrapper, "MarkStarted");
-        StringAssert.Contains(wrapper, "MarkFailed");
+        var muxStart = remote.IndexOf("private async Task<(bool ok, string detail)> StartMuxHeadlessCommandFromIntentAsync", StringComparison.Ordinal);
+        var muxEnd = remote.IndexOf("private async Task<CodexLocalRetrieval.Core.Models.AgentCommandResult> HandleMirrorLocalAsync", muxStart, StringComparison.Ordinal);
+        var muxHelper = remote[muxStart..muxEnd];
+        StringAssert.Contains(muxHelper, "CreateLocalMuxdSessionAsync(");
+        Assert.DoesNotContain("GovernedCreateLocalMuxdSessionAsync(", muxHelper);
+        Assert.DoesNotContain("SessionLaunchGovernor", muxHelper);
+        Assert.DoesNotContain("SessionLaunchClaims", muxHelper);
 
-        // All three writer-creation paths go through it; nothing calls the raw create except the wrapper.
-        Assert.AreEqual(
-            3,
-            CountOccurrences(remote, "await GovernedCreateLocalMuxdSessionAsync("),
-            "StartRemoteSession, StartMuxHeadlessFromIntentAsync and HandleToMuxAsync must all be governed");
-        Assert.AreEqual(
-            1,
-            CountOccurrences(remote, "await CreateLocalMuxdSessionAsync("),
-            "the ungoverned muxd create must only be reachable through the governed wrapper");
+        // The local GUI resume and /tomux handoff also delegate the create reservation to muxd.
+        Assert.AreEqual(0, CountOccurrences(remote, "await GovernedCreateLocalMuxdSessionAsync("),
+            "mux-hosted GUI creation must not pre-claim through the native governor");
+        Assert.AreEqual(3, CountOccurrences(remote, "await CreateLocalMuxdSessionAsync("),
+            "local resume, intent-fenced remote start, and /tomux must call muxd directly");
+        StringAssert.Contains(remote, "muxd owns reservation");
+        StringAssert.Contains(remote, "create_intent lock and claim");
 
-        // [F#5] the handoff paths clear the tied claim on verified-kill evidence before taking the lease.
-        StringAssert.Contains(remote, "ClearClaimsTiedToVerifiedKills");
-        Assert.IsGreaterThanOrEqualTo(
-            3,
-            CountOccurrences(remote, "ClearClaimsAfterVerifiedKill("),
-            "the guard kill and both MuxIdentityTransfer handoffs must release the claim they verified out");
+        // The native governor remains the authority for non-mux app-owned launches.
+        var sessions = File.ReadAllText(Path.Combine(root, "native", "CodexLocalRetrieval.Native", "MainPage.Sessions.cs"));
+        var startChat = File.ReadAllText(Path.Combine(root, "native", "CodexLocalRetrieval.Native", "MainPage.StartChat.cs"));
+        StringAssert.Contains(sessions, "_launchGovernor.TryAcquire");
+        StringAssert.Contains(startChat, "_launchGovernor.BeginFresh");
+        StringAssert.Contains(startChat, "Process.Start(process)");
+        StringAssert.Contains(sessions, "LaunchResumeWrapper(session, launchModeOverride)");
+        Assert.IsFalse(sessions.Contains("CreateLocalMuxdSessionAsync(", StringComparison.Ordinal));
+        Assert.IsFalse(startChat.Contains("CreateLocalMuxdSessionAsync(", StringComparison.Ordinal));
 
-        // [F#1] NON-NEGOTIABLE: no own-pid special case anywhere in the reclaim surface.
+        // Native terminal launches remain governor-owned; changing muxd creation must not weaken that path.
+        StringAssert.Contains(integrity, "private static bool CanReclaim(");
         Assert.DoesNotContain("Environment.ProcessId", integrity,
             "Reclaim must not special-case claims owned by this app's own pid.");
         Assert.DoesNotContain("isProcessAlive: ownerAlive", integrity);
         Assert.DoesNotContain("_ => false", integrity,
             "no forced-dead owner probe may be reintroduced on the reclaim path.");
 
-        // M7 + the oracle rule: Reclaim shows on ANY danger blocker and never gates itself on the scan.
-        StringAssert.Contains(integrity, "private static bool CanReclaim(");
-        Assert.DoesNotContain("RunningSessions.TryScan", integrity);
-        Assert.DoesNotContain("RunningSessions.TryAllLiveSessionIds", integrity);
-        Assert.DoesNotContain("TryLiveSessionPids", integrity);
-
-        // M3: the flow runs off the UI thread behind a sequence guard.
         StringAssert.Contains(integrity, "await Task.Run(() => SessionReclaim.ExecuteAsync(options))");
         StringAssert.Contains(integrity, "DispatcherQueue.TryEnqueue");
-
-        // Start-class buttons may be disabled on uncertainty; Reclaim/Kill never are.
         var riskyStart = integrity.IndexOf("private void SetRiskySessionActionsEnabled", StringComparison.Ordinal);
         var riskyEnd = integrity.IndexOf("private string IntegrityKey", riskyStart, StringComparison.Ordinal);
         var risky = integrity[riskyStart..riskyEnd];

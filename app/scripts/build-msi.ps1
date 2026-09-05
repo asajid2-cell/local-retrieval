@@ -1,10 +1,10 @@
 #requires -version 5
 <#
-  Build CodexLocalRetrieval.msi - a proper per-user installer (no admin, no code signing).
+  Build MUX.msi - a proper per-user installer (no admin, no code signing).
 
   Builds the Release output, stages a clean copy (no publish subfolder, no .pdb), and runs the
-  WiX toolset to produce dist\CodexLocalRetrieval.msi. Double-clicking that .msi installs the app
-  to %LOCALAPPDATA%\Programs\CodexLocalRetrieval, adds Start Menu + Desktop shortcuts, and an
+  WiX toolset to produce dist\MUX.msi. Double-clicking that .msi installs the app
+  to %LOCALAPPDATA%\Programs\MUX, adds Start Menu + Desktop shortcuts, and an
   Add/Remove Programs entry.
 
   Requires the WiX v5 tool:  dotnet tool install --global wix --version 5.0.2
@@ -22,7 +22,7 @@ $buildDir = Join-Path $repo "native\CodexLocalRetrieval.Native\bin\Release\$tfm\
 $stageDir = Join-Path $env:TEMP 'clr-msi-stage'
 $wxs      = Join-Path $repo 'installer\CodexLocalRetrieval.wxs'
 $outDir   = Join-Path $repo 'dist'
-$msi      = Join-Path $outDir 'CodexLocalRetrieval.msi'
+$msi      = Join-Path $outDir 'MUX.msi'
 
 $wix = if (Get-Command wix -ErrorAction SilentlyContinue) { 'wix' } else { Join-Path $env:USERPROFILE '.dotnet\tools\wix.exe' }
 if (-not (Test-Path $wix) -and $wix -ne 'wix') { throw "WiX not found. Install it: dotnet tool install --global wix" }
@@ -47,4 +47,4 @@ if ($code -ne 0) { throw "wix build failed (exit $code)" }
 Write-Host ""
 Write-Host "Built: $msi" -ForegroundColor Green
 Write-Host "Install: double-click the .msi (per-user, no admin)."
-Write-Host "Uninstall: Settings > Apps, or Add/Remove Programs ('Codex Local Retrieval')."
+Write-Host "Uninstall: Settings > Apps, or Add/Remove Programs ('MUX')."

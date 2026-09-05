@@ -1,6 +1,6 @@
 # Project Overview
 
-Codex Local Retrieval exists because local session archives can outlive the app sidebar that originally displayed them. The app gives those files a read-only browser: search the index, inspect messages, copy useful code, and build a handoff prompt for continuing work elsewhere.
+MUX exists because local session archives can outlive the app sidebar that originally displayed them. MUX gives those files a read-only browser: search the index, inspect messages, copy useful code, and build a handoff prompt for continuing work elsewhere.
 
 The main design choice is separation between source data and app metadata. Source JSONL files and local Codex state are treated as inputs. Pins, collections, renamed titles, tags, and UI settings belong to the app store under `%LocalAppData%`.
 

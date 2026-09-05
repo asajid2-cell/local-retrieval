@@ -456,6 +456,7 @@
                     Style="{StaticResource PillButtonStyle}" />
                 <Button Click="CopyContext_Click" Content="Copy resume prompt" HorizontalAlignment="Stretch" Style="{StaticResource PillButtonStyle}" />
                 <Button x:Name="CopyCommandButton" Click="CopyCommand_Click" Content="Copy resume command" ToolTipService.ToolTip="Copy the trusted command for this chat's stored launcher, including Gateway (cc)." HorizontalAlignment="Stretch" Style="{StaticResource PillButtonStyle}" />
+                <Button x:Name="CopyGatewayCommandButton" Click="CopyGatewayCommand_Click" Content="Copy Gateway command" ToolTipService.ToolTip="Copy the trusted cc.cmd Gateway resume command for this Claude chat." HorizontalAlignment="Stretch" Style="{StaticResource PillButtonStyle}" />
                 <Button Click="CopyPath_Click" Content="Copy chat path" HorizontalAlignment="Stretch" Style="{StaticResource PillButtonStyle}" />
                 <Button Click="CopyCode_Click" Content="Copy all code" HorizontalAlignment="Stretch" Style="{StaticResource PillButtonStyle}" />
                 <Button Click="Restore_Click" Content="Build restore packet" HorizontalAlignment="Stretch" Style="{StaticResource PillButtonStyle}" />

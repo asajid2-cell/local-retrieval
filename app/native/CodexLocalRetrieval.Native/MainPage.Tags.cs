@@ -131,8 +131,11 @@ public sealed partial class MainPage
         foreach (var s in results) s.RowTitleMode = titleMode;
         // A sort OR a search picks the order; preserve it (don't let RefreshSessions re-sort by recent).
         var preserve = _dateMode.Length > 0 || !string.IsNullOrWhiteSpace(SearchBox.Text);
-        _archive.RefreshSessions(results, preserveOrder: preserve);
-        SelectFirstSession();
+        RunSessionListRefresh(() =>
+        {
+            _archive.RefreshSessions(results, preserveOrder: preserve);
+            SelectFirstSession();
+        });
         RenderTagFilterBar();
         // NARROW RENDER: filtering touches the session list and the tag strip, nothing else. A full-screen
         // rebuild here re-ran whatever page you were on for every keystroke — on Running that meant a fresh
@@ -167,12 +170,15 @@ public sealed partial class MainPage
         var titleMode = (_dateMode == "last-user" || _dateMode == "first-user") ? _dateMode : "";
         foreach (var s in results) s.RowTitleMode = titleMode;
         var preserve = _dateMode.Length > 0 || !string.IsNullOrWhiteSpace(SearchBox.Text);
-        _archive.RefreshSessions(results, preserveOrder: preserve);
-        if (!string.IsNullOrEmpty(keep))
+        RunSessionListRefresh(() =>
         {
-            var m = _archive.Sessions.FirstOrDefault(x => string.Equals(x.Id, keep, StringComparison.OrdinalIgnoreCase));
-            if (m is not null) { _selected = m; SelectSessionRow(m); }
-        }
+            _archive.RefreshSessions(results, preserveOrder: preserve);
+            var restored = !string.IsNullOrEmpty(keep)
+                ? _archive.Sessions.FirstOrDefault(x => string.Equals(x.Id, keep, StringComparison.OrdinalIgnoreCase))
+                : null;
+            _selected = restored;
+            SelectSessionRow(restored);
+        });
         RenderTagFilterBar();
     }
 

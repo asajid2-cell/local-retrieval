@@ -19,7 +19,16 @@ namespace CodexLocalRetrieval_Native;
 // collection, kill — without hunting through the web UI or Task Manager.
 public sealed partial class MainPage
 {
-    private sealed record MuxRow(string Name, string State, string AgentLabel, string AgentDetail, bool Hosted, bool Alive, bool Armed, long Activity, bool Attached);
+    private sealed record MuxRow(
+        string Name, string State, string AgentLabel, string AgentDetail, bool Hosted, bool Alive, bool Armed,
+        long Activity, bool Attached, string SessionId, IReadOnlyList<string> Aliases,
+        bool IdentityPending, string Lifecycle, int ChildPid, bool AgentProcessAlive, bool Legacy = false);
+
+    private sealed record MuxScanResult(bool Verified, IReadOnlyList<MuxRow> Rows, string Detail)
+    {
+        public static MuxScanResult Unconfigured { get; } = new(true, Array.Empty<MuxRow>(), "");
+    }
+
     private int _runningSeq;
 
     private void RenderRunningPage()
@@ -51,51 +60,108 @@ public sealed partial class MainPage
         // both scans in parallel: relay session list (over our ssh) + local process sweep
         var muxTask = Task.Run(async () =>
         {
-            var rows = new List<MuxRow>();
-            if (string.IsNullOrEmpty(target)) return rows;
+            if (string.IsNullOrEmpty(target)) return MuxScanResult.Unconfigured;
             try
             {
-                var (_, outText) = await RunSshAsync(target, $"curl -s http://127.0.0.1:{settings.MultiplexApiPort}/api/sessions");
-                using var doc = JsonDocument.Parse(outText);
+                var response = await RunSshAsync(target, $"curl -sS -f http://127.0.0.1:{settings.MultiplexApiPort}/api/sessions");
+                if (response.code != 0)
+                    return new MuxScanResult(false, Array.Empty<MuxRow>(), $"relay session scan failed (exit {response.code})");
+
+                using var doc = JsonDocument.Parse(response.outText);
+                if (doc.RootElement.ValueKind != JsonValueKind.Array)
+                    return new MuxScanResult(false, Array.Empty<MuxRow>(), "relay session scan returned a non-array response");
+
+                var rows = new List<MuxRow>();
                 foreach (var s in doc.RootElement.EnumerateArray())
                 {
+                    var aliases = s.TryGetProperty("aliases", out var aa) && aa.ValueKind == JsonValueKind.Array
+                        ? aa.EnumerateArray().Select(a => a.GetString() ?? "").Where(a => a.Length > 0).ToArray()
+                        : Array.Empty<string>();
+                    var alive = JsonBool(s, "alive");
+                    var agentTruth = s.TryGetProperty("agentTruth", out var truth) && truth.ValueKind == JsonValueKind.Object
+                        ? truth : default;
                     rows.Add(new MuxRow(
-                        s.TryGetProperty("name", out var n) ? n.GetString() ?? "" : "",
-                        s.TryGetProperty("state", out var st) ? st.GetString() ?? "white" : "white",
-                        s.TryGetProperty("agentLabel", out var al) ? al.GetString() ?? "" : "",
-                        s.TryGetProperty("agentDetail", out var ad) ? ad.GetString() ?? "" : "",
-                        s.TryGetProperty("hosted", out var h) && h.GetBoolean(),
-                        s.TryGetProperty("alive", out var alive) && alive.GetBoolean(),
-                        s.TryGetProperty("autoheal", out var a) && a.GetBoolean(),
-                        s.TryGetProperty("activity", out var ac) ? ac.GetInt64() : 0,
-                        s.TryGetProperty("attached", out var at) && at.GetBoolean()));
+                        JsonString(s, "name"), JsonString(s, "state", "white"), JsonString(s, "agentLabel"), JsonString(s, "agentDetail"),
+                        JsonBool(s, "hosted"), alive, JsonBool(s, "autoheal"), JsonLong(s, "activity"), JsonBool(s, "attached"),
+                        JsonString(s, "sessionId"), aliases, JsonBool(s, "identityPending"), JsonString(s, "lifecycle"),
+                        JsonInt(s, "childPid"), agentTruth.ValueKind == JsonValueKind.Object && JsonBool(agentTruth, "procAlive"),
+                        JsonBool(s, "legacy")));
                 }
+                return new MuxScanResult(true, rows, "");
             }
-            catch { }
-            return rows;
+            catch (Exception ex)
+            {
+                Diag.Log("Running mux scan unavailable: " + ex.Message);
+                return new MuxScanResult(false, Array.Empty<MuxRow>(), "relay session scan could not be verified");
+            }
         });
-        var localTask = Task.Run(() => EnrichRunningSessionTitles(ResolveMissingSessionIds(GetRunningSessions())));
+        var localTask = Task.Run(() =>
+        {
+            var verified = CodexLocalRetrieval.Core.Remote.RunningSessions.TryScanEnriched(out var sessions, out var detail);
+            return (verified, detail, sessions: EnrichRunningSessionTitles(sessions));
+        });
         await Task.WhenAll(muxTask, localTask);
         if (seq != _runningSeq || _screen != "Running") return;   // navigated away / re-rendered meanwhile
 
-        var mux = muxTask.Result.Where(m => m.Name.Length > 0).OrderByDescending(m => m.Activity).ToList();
-        var muxIds = new HashSet<string>(mux.Where(m => m.Alive).Select(m => m.Name), StringComparer.OrdinalIgnoreCase);
-        // a local process whose session is a multiplex one is the SAME agent seen from the OS side — don't list it twice
-        var local = localTask.Result
-            .Where(r => string.IsNullOrEmpty(r.SessionId)
-                        || FindArchiveSessionForRunning(r) is not { } s0
-                        || !muxIds.Contains(ArchiveService.MultiplexSessionName(s0)))
+        var muxScan = muxTask.Result;
+        var mux = muxScan.Rows.Where(m => m.Name.Length > 0).OrderByDescending(m => m.Activity).ToList();
+        var activeMux = mux.Where(IsActiveMuxRow).ToList();
+        var muxIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var row in activeMux)
+        {
+            AddMuxIdentity(muxIds, row.SessionId);
+            foreach (var alias in row.Aliases) AddMuxIdentity(muxIds, alias);
+        }
+        // A local process whose canonical id/alias belongs to a live multiplex tab is the SAME agent seen
+        // from the OS side. Identity-pending and dormant tabs deliberately do not suppress local rows.
+        var local = localTask.Result.sessions
+            .Where(r => r.AllSessionIds.Count == 0 || !r.AllSessionIds.Any(muxIds.Contains))
             .ToList();
 
         MainContent.Children.Remove(loading);
         MainContent.Children.Add(SectionLabel($"Multiplex sessions ({mux.Count})"));
-        if (mux.Count == 0) MainContent.Children.Add(new TextBlock { Text = string.IsNullOrEmpty(target) ? "No multiplex target configured (Settings)." : "None running.", Foreground = MutedBrush(), FontSize = 12, Margin = new Thickness(0, 0, 0, 10) });
+        if (mux.Count == 0)
+        {
+            var message = !muxScan.Verified
+                ? "Could not verify multiplex sessions: " + muxScan.Detail
+                : string.IsNullOrEmpty(target)
+                    ? "No multiplex target configured (Settings)."
+                    : "No multiplex sessions reported by the relay.";
+            MainContent.Children.Add(new TextBlock { Text = message, Foreground = MutedBrush(), FontSize = 12, Margin = new Thickness(0, 0, 0, 10) });
+        }
         foreach (var m in mux) MainContent.Children.Add(MuxRowCard(m, target, settings.MultiplexApiPort));
 
         MainContent.Children.Add(SectionLabel($"Local agent processes ({local.Count})"));
-        if (local.Count == 0) MainContent.Children.Add(new TextBlock { Text = "No loose local claude/codex processes.", Foreground = MutedBrush(), FontSize = 12 });
+        if (!localTask.Result.verified)
+            MainContent.Children.Add(new TextBlock { Text = "Could not verify local claude/codex processes: " + localTask.Result.detail, Foreground = MutedBrush(), FontSize = 12 });
+        else if (local.Count == 0)
+            MainContent.Children.Add(new TextBlock { Text = "No loose local claude/codex processes.", Foreground = MutedBrush(), FontSize = 12 });
         foreach (var r in local) MainContent.Children.Add(LocalRowCard(r));
     }
+
+    private static bool IsActiveMuxRow(MuxRow row) =>
+        row.Alive
+        && !row.IdentityPending
+        && !string.Equals(row.Lifecycle, "dormant", StringComparison.OrdinalIgnoreCase)
+        && !row.Legacy;
+
+    private static void AddMuxIdentity(HashSet<string> ids, string id)
+    {
+        if (!string.IsNullOrWhiteSpace(id)) ids.Add(id.Trim());
+    }
+
+    private static string JsonString(JsonElement row, string property, string fallback = "") =>
+        row.TryGetProperty(property, out var value) && value.ValueKind == JsonValueKind.String
+            ? value.GetString() ?? fallback : fallback;
+
+    private static bool JsonBool(JsonElement row, string property) =>
+        row.TryGetProperty(property, out var value) && value.ValueKind == JsonValueKind.True;
+
+    private static long JsonLong(JsonElement row, string property) =>
+        row.TryGetProperty(property, out var value) && value.TryGetInt64(out var result) ? result : 0;
+
+    private static int JsonInt(JsonElement row, string property) =>
+        row.TryGetProperty(property, out var value) && value.TryGetInt32(out var result) ? result : 0;
 
     private TextBlock SectionLabel(string text) => new()
     { Text = text, Foreground = StrongBrush(), FontSize = 14, FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 10, 0, 6) };
@@ -135,7 +201,7 @@ public sealed partial class MainPage
 
     private Border MuxRowCard(MuxRow m, string target, int port)
     {
-        var session = FindArchiveSessionByMuxName(m.Name);
+        var session = FindArchiveSessionForMux(m);
         var grid = new Grid { ColumnDefinitions = { new ColumnDefinition(), new ColumnDefinition { Width = GridLength.Auto } } };
         var left = new StackPanel { Spacing = 3, VerticalAlignment = VerticalAlignment.Center };
         var nameRow = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8 };
@@ -151,13 +217,17 @@ public sealed partial class MainPage
         nameRow.Children.Add(new TextBlock { Text = m.Name, Foreground = StrongBrush(), FontSize = 14, FontWeight = FontWeights.SemiBold, VerticalAlignment = VerticalAlignment.Center });
         if (m.Hosted) nameRow.Children.Add(SmallChip("PC", "Runs on this PC (muxd) — survives network/VPS failures"));
         if (m.Armed) nameRow.Children.Add(SmallChip("auto", "Auto-resume is ON for this session"));
+        if (!IsActiveMuxRow(m)) nameRow.Children.Add(SmallChip("dormant", "This multiplex row is not an active agent owner"));
+        if (m.ChildPid > 0) ToolTipService.SetToolTip(nameRow, $"mux child pid {m.ChildPid}");
         left.Children.Add(nameRow);
         if (session is not null)
         {
             left.Children.Add(new TextBlock { Text = Trim(session.DisplayTitle, 110), Foreground = MutedBrush(), FontSize = 12, TextWrapping = TextWrapping.Wrap });
         }
         var age = m.Activity > 0 ? $" · active {Ago(m.Activity)}" : "";
-        left.Children.Add(new TextBlock { Text = stateLabel + age + (m.Attached ? " · viewer attached" : ""), Foreground = MutedBrush(), FontSize = 11 });
+        var lifecycle = string.IsNullOrWhiteSpace(m.Lifecycle) ? "" : " · " + m.Lifecycle;
+        var identity = m.IdentityPending ? " · identity pending" : "";
+        left.Children.Add(new TextBlock { Text = stateLabel + age + lifecycle + identity + (m.Attached ? " · viewer attached" : ""), Foreground = MutedBrush(), FontSize = 11 });
         grid.Children.Add(left);
 
         var actions = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 6, VerticalAlignment = VerticalAlignment.Center };
@@ -171,9 +241,11 @@ public sealed partial class MainPage
             actions.Children.Add(SmallAction("Transcript", "Open this chat's transcript in the archive reader", () => { OpenSession(s); return Task.CompletedTask; }));
         }
         actions.Children.Add(SmallAction("Add to collection", "File this session's chat into a collection", () => { ShowMuxAddToCollectionFlyout(m.Name); return Task.CompletedTask; }));
-        actions.Children.Add(SmallAction("Kill", "End this session (the agent stops)", async () =>
+        if (!m.Hosted)
         {
-            var dlg = new ContentDialog { Title = $"Kill \"{Trim(m.Name, 40)}\"?", Content = "Ends the session and stops its agent.", PrimaryButtonText = "Kill", CloseButtonText = "Cancel", DefaultButton = ContentDialogButton.Close, XamlRoot = XamlRoot };
+            actions.Children.Add(SmallAction("Kill", "End this session (the agent stops)", async () =>
+            {
+                var dlg = new ContentDialog { Title = $"Kill \"{Trim(m.Name, 40)}\"?", Content = "Ends the session and stops its agent.", PrimaryButtonText = "Kill", CloseButtonText = "Cancel", DefaultButton = ContentDialogButton.Close, XamlRoot = XamlRoot };
             if (await dlg.ShowAsync() != ContentDialogResult.Primary) return;
             var response = await RunSshAsync(
                 target,
@@ -197,9 +269,26 @@ public sealed partial class MainPage
                 SyncStatus.Text = $"Could not verify that \"{m.Name}\" stopped: {ex.Message}";
                 return;
             }
-            SyncStatus.Text = $"Stopped \"{m.Name}\"; process exit verified by muxd.";
-            RenderRunningPage();
-        }));
+                SyncStatus.Text = $"Stopped \"{m.Name}\"; process exit verified by muxd.";
+                RenderRunningPage();
+            }));
+        }
+        else
+        {
+            var reason = IsActiveMuxRow(m)
+                ? "Hosted mux kill is disabled until the relay provides an identity-fenced delete."
+                : "This mux row is not an active owner.";
+            var disabled = new Button
+            {
+                Style = (Style)Resources["PillButtonStyle"],
+                Padding = new Thickness(10, 4, 10, 4),
+                MinHeight = 0,
+                IsEnabled = false,
+                Content = new TextBlock { Text = "Kill disabled", FontSize = 11 }
+            };
+            ToolTipService.SetToolTip(disabled, reason);
+            actions.Children.Add(disabled);
+        }
         Grid.SetColumn(actions, 1);
         grid.Children.Add(actions);
         return RowCard(grid);
@@ -222,7 +311,14 @@ public sealed partial class MainPage
         {
             left.Children.Add(new TextBlock { Text = Trim(r.Preview, 150), Foreground = MutedBrush(), FontSize = 11, TextWrapping = TextWrapping.Wrap });
         }
-        left.Children.Add(new TextBlock { Text = $"{r.Parent} · pid {r.Pid}" + (string.IsNullOrEmpty(r.SessionId) ? "" : $" · {r.SessionId[..Math.Min(8, r.SessionId.Length)]}"), Foreground = MutedBrush(), FontSize = 11 });
+        var identity = r.IdentityStatus switch
+        {
+            "unverifiable" => " · identity unverifiable",
+            "unresolved" => " · session identity pending",
+            _ when !string.IsNullOrWhiteSpace(r.IdentitySource) => " · " + r.IdentitySource,
+            _ => ""
+        };
+        left.Children.Add(new TextBlock { Text = $"{r.Parent} · pid {r.Pid}" + (string.IsNullOrEmpty(r.SessionId) ? "" : $" · {r.SessionId[..Math.Min(8, r.SessionId.Length)]}") + identity, Foreground = MutedBrush(), FontSize = 11 });
         grid.Children.Add(left);
 
         var actions = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 6, VerticalAlignment = VerticalAlignment.Center };
@@ -261,6 +357,18 @@ public sealed partial class MainPage
     {
         if (string.IsNullOrWhiteSpace(id)) return null;
         return _archive.ResolveTargetSession(new AgentCommand { id = id.Trim(), tool = tool });
+    }
+
+    private ArchiveSession? FindArchiveSessionForMux(MuxRow mux)
+    {
+        var ids = new[] { mux.SessionId }.Concat(mux.Aliases);
+        foreach (var id in ids)
+        {
+            if (string.IsNullOrWhiteSpace(id)) continue;
+            var session = _archive.ResolveTargetSession(new AgentCommand { id = id, tool = null });
+            if (session is not null) return session;
+        }
+        return FindArchiveSessionByMuxName(mux.Name);
     }
 
     private ArchiveSession? FindArchiveSessionByMuxName(string muxName)

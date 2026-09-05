@@ -256,7 +256,8 @@ public static class SessionLaunchClaims
             var (tied, wrapperDetail) = TiedWrappersConfirmedDead(claim, evidence);
             if (tied)
                 return Quarantine(claim, "abandoned claim cleared (" + wrapperDetail + ")", out detail);
-            // Fall through to tier 2: the writer may still be spawning behind a dead app.
+            // Fall through to tier 2: the writer may still be spawning behind a dead app, or the handoff
+            // could not prove that the recorded wrapper belongs to this reservation.
         }
 
         // ---- tier 2 -----------------------------------------------------------------------------------
