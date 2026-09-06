@@ -7,6 +7,30 @@ namespace CodexLocalRetrieval.Native.Tests;
 public sealed class SessionIntegrityTests
 {
     [TestMethod]
+    public void BuildPostStateNotice_UsesAuthoritativeBlockedOutcome()
+    {
+        var (store, session) = Seed(filed: true);
+        var blocked = Build(store, session, liveIds: new[] { session.Id });
+        var report = new ReclaimReport(true, "ok", true, "ok", Array.Empty<ReclaimKilledPid>(), Array.Empty<ReclaimClaimResult>(), Array.Empty<string>(), false, false, "", "ready to continue");
+
+        var notice = SessionReclaim.BuildPostStateNotice(report, blocked);
+
+        StringAssert.StartsWith(notice, "Reclaim incomplete:");
+        StringAssert.Contains(notice, "live owner");
+        Assert.DoesNotContain("Reclaim completed", notice);
+    }
+
+    [TestMethod]
+    public void BuildPostStateNotice_ReportsCompletedOnlyWhenPostStateIsClear()
+    {
+        var (store, session) = Seed(filed: true);
+        var clear = Build(store, session);
+        var report = new ReclaimReport(true, "ok", true, "ok", Array.Empty<ReclaimKilledPid>(), Array.Empty<ReclaimClaimResult>(), Array.Empty<string>(), false, false, "", "ready to continue");
+
+        StringAssert.StartsWith(SessionReclaim.BuildPostStateNotice(report, clear), "Reclaim completed");
+    }
+
+    [TestMethod]
     public void Build_DangerWhenLiveOwnerScanIsUnverified()
     {
         var (store, session) = Seed(filed: true);

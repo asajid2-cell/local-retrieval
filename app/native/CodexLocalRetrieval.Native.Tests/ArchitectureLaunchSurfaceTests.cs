@@ -147,6 +147,32 @@ public sealed class ArchitectureLaunchSurfaceTests
     }
 
     [TestMethod]
+    public void GatewayCopy_IsAwaitedAndDoesNotLaunchOrBlockOnRiskGuard()
+    {
+        var root = FindRepoRoot();
+        var text = File.ReadAllText(Path.Combine(root, "native", "CodexLocalRetrieval.Native", "MainPage.xaml.cs"));
+        var start = text.IndexOf("private async void CopyGatewayCommandIfClear()", StringComparison.Ordinal);
+        var end = text.IndexOf("private async Task Copy(", start, StringComparison.Ordinal);
+        Assert.IsTrue(start >= 0 && end > start, "Could not locate Gateway copy handler.");
+        var handler = text[start..end];
+
+        Assert.Contains("await Copy(\"command\", ArchiveService.GatewayLaunchMode", handler);
+        Assert.DoesNotContain("RiskySessionActionBlocked", handler);
+        Assert.DoesNotContain("OpenSession", handler);
+        Assert.DoesNotContain("Open", handler);
+        Assert.DoesNotContain("BuildResumeLaunch", handler);
+        Assert.DoesNotContain("BuildMultiplexCommand", handler);
+        Assert.DoesNotContain("RiskySessionActionBlocked", handler);
+
+        var copyStart = text.IndexOf("private async Task Copy(", StringComparison.Ordinal);
+        var copyEnd = text.IndexOf("private void CopyPath(", copyStart, StringComparison.Ordinal);
+        var copy = text[copyStart..copyEnd];
+        Assert.Contains("var text = await _archive.CopyPayloadAsync", copy);
+        Assert.Contains("Clipboard.SetContent(package);", copy);
+        Assert.Contains("SyncStatus.Text = $\"Copy failed:", copy);
+    }
+
+    [TestMethod]
     public void ArchiveTranscriptReadsAndSearchesAreStreamingAndBounded()
     {
         var root = FindRepoRoot();
@@ -465,7 +491,7 @@ public sealed class ArchitectureLaunchSurfaceTests
 
         StringAssert.Contains(xaml, "CopyGatewayCommandButton");
         StringAssert.Contains(page, "ArchiveService.CanResumeThroughGateway(_selected.Tool)");
-        StringAssert.Contains(page, "Copy(\"command\", ArchiveService.GatewayLaunchMode)");
+        StringAssert.Contains(page, "await Copy(\"command\", ArchiveService.GatewayLaunchMode, \"Gateway command copied.\")");
         StringAssert.Contains(core, "ResumeCommandText(session, launchModeOverride)");
     }
 

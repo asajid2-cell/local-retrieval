@@ -1113,7 +1113,10 @@ CUSTODY_GC_INTERVAL_SECONDS = max(
 )
 CLAIM_SWEEP_SECONDS = max(15, int(ENV.get("LAUNCH_CLAIM_SWEEP_SECONDS", "60")))
 PROTOCOL = 4
-CAPS = ["ls", "info", "create", "createAck", "bind", "input", "open", "attach", "kill", "rename", "heal", "tail", "scrollback", "resize", "owner", "relaunch", "agentTruth", "resync", "inputDurable"]
+CAPS = ["ls", "info", "create", "createAck", "bind", "input", "open", "attach", "kill", "killFence", "rename", "heal", "tail", "scrollback", "resize", "owner", "relaunch", "agentTruth", "resync", "inputDurable"]
+
+# killFence is deliberately separate from legacy name-only kill. Reclaim must prove both
+# the advertised logical owner and this concrete mux generation before remove_session mutates state.
 # The relay is a conduit, not an authority: a host-link `i` frame only reaches the PTY when it
 # carries a principal-signed input.durable proof this endpoint verifies. Empty until pairing
 # provisions a principal, which means "refuse everything" — the correct posture, not a gap.
@@ -3345,6 +3348,7 @@ def session_payload(name, sess):
             "sessionUuid": str(getattr(sess, "session_uuid", "") or ""),
             "ready": alive, "kind": kind,
             "sessionId": getattr(sess, "session_id", "") or "",
+            "generationId": str(getattr(sess, "generation_id", "") or ""),
             "aliases": list(getattr(sess, "aliases", []) or []),
             "identityPending": bool(getattr(sess, "identity_pending", False)),
             "lifecycle": str(getattr(sess, "lifecycle", "active") or "active"),
@@ -3862,11 +3866,20 @@ async def main():
             return result
 
     @state_mutation
-    async def remove_session(name, by_user):
+    async def remove_session(name, by_user, expected_session_id=None, expected_generation_id=None):
         async with launch_lock(name):
             current = sessions.get(name)
             if current is None:
                 return False, "no such session: " + name
+            if expected_session_id is not None or expected_generation_id is not None:
+                actual_session_id = str(getattr(current, "session_id", "") or "")
+                actual_generation_id = str(getattr(current, "generation_id", "") or "")
+                if not expected_session_id or not expected_generation_id:
+                    return False, "fenced kill requires sessionId and generationId"
+                if actual_session_id != expected_session_id:
+                    return False, "fenced kill session identity mismatch"
+                if actual_generation_id != expected_generation_id:
+                    return False, "fenced kill generation mismatch"
             snapshot = prepare_session_stop(current, by_user)
             try:
                 await manifest_save_async(sessions)
@@ -4719,7 +4732,16 @@ async def main():
                     name = SAFE(first.get("s", ""))
                     if not name or name not in sessions:
                         await ws.send(json.dumps({"t": "err", "m": "no such session: " + name})); return
-                    ok, detail = await remove_session(name, by_user=True)
+                    fenced = "sessionId" in first or "generationId" in first
+                    if fenced and ("sessionId" not in first or "generationId" not in first):
+                        await ws.send(json.dumps({"t": "err", "m": "fenced kill requires sessionId and generationId"})); return
+                    ok, detail = await remove_session(
+                        name, by_user=True,
+                        expected_session_id=_safe_identity(first.get("sessionId", "")) if fenced else None,
+                        expected_generation_id=_safe_identity(first.get("generationId", "")) if fenced else None,
+                    )
+                    if fenced and not ok:
+                        await ws.send(json.dumps({"t": "err", "m": detail})); return
                     if not ok:
                         await ws.send(json.dumps({"t": "err", "m": detail})); return
                     await ws.send(json.dumps({"t": "killed", "s": name})); return

@@ -31,14 +31,22 @@ else if (!RemoteAuth.IsValidConfiguredToken(token))
 
 var port = int.TryParse(Environment.GetEnvironmentVariable("CLR_REMOTE_PORT"), out var p) ? p : 8765;
 var bind = Environment.GetEnvironmentVariable("CLR_REMOTE_BIND") ?? "127.0.0.1"; // localhost only; nginx is the edge
+var storePath = Environment.GetEnvironmentVariable("CLR_REMOTE_STORE");
+var useBundled = Environment.GetEnvironmentVariable("CLR_REMOTE_BUNDLED") == "1";
+var instance = ServerSingleInstanceGuard.Identify(bind, port, storePath, useBundled);
+var instanceResult = ServerSingleInstanceGuard.TryAcquire(bind, port, storePath, useBundled);
+if (!instanceResult.Acquired)
+{
+    Console.Error.WriteLine(instanceResult.Message);
+    return instanceResult.ExistingHealthy ? 0 : 2;
+}
+using var instanceLease = instanceResult.Lease;
 var redactReads = Environment.GetEnvironmentVariable("CLR_REMOTE_REDACT_READS") == "1";
 var allowLaunch = Environment.GetEnvironmentVariable("CLR_REMOTE_ALLOW_LAUNCH") == "1";
 
 // ---- archive: load the store and index the live session folders so remote browsing is current ----
 // CLR_REMOTE_STORE: point at a specific app-store.json (e.g. a synced copy). CLR_REMOTE_BUNDLED=1
 // uses the repo's sanitized demo store (handy for a smoke test without touching real chats).
-var storePath = Environment.GetEnvironmentVariable("CLR_REMOTE_STORE");
-var useBundled = Environment.GetEnvironmentVariable("CLR_REMOTE_BUNDLED") == "1";
 var archive = new ArchiveService(storePath: string.IsNullOrWhiteSpace(storePath) ? null : storePath, useBundledStore: useBundled);
 // LAZY: the archive (store + disk index) is the heavy part (~150-200MB), but only the Chats tab and the
 // co-pilot use it — the Agent tab lists live sessions straight from the app-server / Claude store. So we
@@ -160,7 +168,7 @@ app.UseDefaultFiles();
 app.UseStaticFiles();
 
 // healthz stays light — it must NOT trigger the archive load (it's a liveness probe).
-app.MapGet("/healthz", () => Results.Ok(new { ok = true, service = "codex-local-retrieval", archiveLoaded = archiveRuntime.IsLoaded, chats = archiveRuntime.SessionCount }));
+app.MapGet("/healthz", () => Results.Ok(new { ok = true, service = "codex-local-retrieval", instance = instance.Value, archiveLoaded = archiveRuntime.IsLoaded, chats = archiveRuntime.SessionCount }));
 app.MapGet("/api/stats", async (CancellationToken ct) =>
     Results.Json(await archiveRuntime.UseAsync((_, _) => Task.FromResult(api.Stats()), ct)));
 app.MapGet("/api/custody", async (CancellationToken ct) =>

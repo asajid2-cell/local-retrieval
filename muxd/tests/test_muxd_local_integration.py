@@ -1262,6 +1262,28 @@ class MuxdLocalIntegrationTests(unittest.TestCase):
         self.assertIn("no such session", result.get("m", ""))
         self.assertIsNone(self.session(name))
 
+    def test_fenced_kill_requires_matching_identity_and_generation(self):
+        name = "it-fenced-kill"
+        self.kill(name)
+        created = run_request(self.muxd.port, {
+            "t": "create", "s": name, "cmd": "while($true){Start-Sleep -Milliseconds 200}",
+            "sessionId": "fenced-session",
+        }, timeout=18)
+        self.assertEqual("created", created.get("t"), created)
+        row = next(item for item in run_request(self.muxd.port, {"t": "ls"})["list"] if item["name"] == name)
+        self.assertTrue(row.get("generationId"), row)
+        wrong_id = run_request(self.muxd.port, {"t": "kill", "s": name,
+                                                "sessionId": "wrong", "generationId": row["generationId"]})
+        self.assertEqual("err", wrong_id.get("t"), wrong_id)
+        self.assertIsNotNone(self.session(name))
+        wrong_generation = run_request(self.muxd.port, {"t": "kill", "s": name,
+                                                        "sessionId": "fenced-session", "generationId": "wrong"})
+        self.assertEqual("err", wrong_generation.get("t"), wrong_generation)
+        self.assertIsNotNone(self.session(name))
+        killed = run_request(self.muxd.port, {"t": "kill", "s": name,
+                                              "sessionId": "fenced-session", "generationId": row["generationId"]}, timeout=18)
+        self.assertEqual("killed", killed.get("t"), killed)
+
     def test_kill_removes_session_from_manifest_and_listing(self):
         name = "it-kill"
         self.kill(name)

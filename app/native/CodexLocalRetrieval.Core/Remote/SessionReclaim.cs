@@ -1,3 +1,4 @@
+using System.Text.Json;
 using CodexLocalRetrieval.Core.Models;
 
 namespace CodexLocalRetrieval.Core.Remote;
@@ -101,6 +102,33 @@ public sealed record ReclaimMuxResult(
     bool OwnerFound,
     bool TeardownVerified,
     string Detail);
+
+// Identity-bearing rows returned by muxd `ls`. A tab name is presentation only; it is never an owner key.
+public sealed record ReclaimMuxRow(
+    string Name,
+    bool Alive,
+    string SessionId,
+    IReadOnlyList<string> Aliases)
+{
+    public string GenerationId { get; init; } = "";
+}
+
+public enum ReclaimMuxOwnerStatus
+{
+    Absent,
+    Matched,
+    NameConflict,
+    Ambiguous,
+    Unverifiable,
+}
+
+public sealed record ReclaimMuxOwnerResolution(
+    ReclaimMuxOwnerStatus Status,
+    ReclaimMuxRow? Owner,
+    string Detail)
+{
+    public bool IsSafeToKill => Status == ReclaimMuxOwnerStatus.Matched && Owner is not null;
+}
 
 public sealed record ReclaimReport(
     bool KillOk,
@@ -328,6 +356,27 @@ public static class SessionReclaim
     // Stale mux custody: a Current pointer at one of our candidate ids whose muxd session is CONFIRMED absent.
     // `liveMuxNames` null means the probe could not answer - nothing is pruned, because "we couldn't ask muxd"
     // is not "the tab is gone". Live tabs are left strictly alone.
+    public static string BuildPostStateNotice(ReclaimReport report, SessionIntegritySummary? postState)
+    {
+        if (!report.MuxOk)
+            return "Reclaim blocked: state is uncertain; cleanup may be partial. " + report.MuxDetail;
+        if (!report.KillOk)
+            return "Reclaim incomplete: cleanup may be partial. " + report.KillDetail;
+        if (postState is null)
+            return "Reclaim incomplete: post-state integrity could not be verified. Refresh before retrying.";
+        if (string.Equals(postState.Severity, "danger", StringComparison.OrdinalIgnoreCase))
+        {
+            var reason = postState.Checks.FirstOrDefault(c => string.Equals(c.Severity, "danger", StringComparison.OrdinalIgnoreCase))?.Summary
+                         ?? postState.Headline;
+            return "Reclaim incomplete: " + reason;
+        }
+        if (report.AnyClaimBlocking)
+            return "Reclaim incomplete: " + report.Headline;
+        return report.Changed
+            ? "Reclaim completed: " + postState.Headline
+            : "Reclaim completed: no changes were made. " + postState.Headline;
+    }
+
     public static IReadOnlyList<string> PruneStaleMuxCurrent(
         IDictionary<string, MuxTabRecord> muxTabHistory,
         IReadOnlyCollection<string> candidateIds,
@@ -348,6 +397,70 @@ public static class SessionReclaim
             pruned.Add(kv.Key);
         }
         return pruned;
+    }
+
+    // Parse the muxd listing conservatively: only an explicit boolean alive=true authorizes a name to protect
+    // Current custody. A malformed row or listing is unverifiable, not evidence that the tab is gone.
+    public static IReadOnlyCollection<string>? ParseLiveMuxNames(string? listingJson)
+    {
+        if (string.IsNullOrWhiteSpace(listingJson)) return null;
+        try
+        {
+            using var doc = JsonDocument.Parse(listingJson);
+            if (!doc.RootElement.TryGetProperty("list", out var list) || list.ValueKind != JsonValueKind.Array)
+                return null;
+            var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var row in list.EnumerateArray())
+            {
+                if (row.ValueKind != JsonValueKind.Object
+                    || !row.TryGetProperty("name", out var name)
+                    || name.ValueKind != JsonValueKind.String
+                    || string.IsNullOrWhiteSpace(name.GetString()))
+                    return null;
+                if (!row.TryGetProperty("alive", out var alive) || alive.ValueKind != JsonValueKind.True && alive.ValueKind != JsonValueKind.False)
+                    return null;
+                if (alive.GetBoolean()) names.Add(name.GetString()!);
+            }
+            return names;
+        }
+        catch (JsonException) { return null; }
+    }
+
+    public static IReadOnlyList<string> PruneStaleMuxCurrentFromListing(
+        IDictionary<string, MuxTabRecord> muxTabHistory,
+        IReadOnlyCollection<string> candidateIds,
+        string? listingJson)
+        => PruneStaleMuxCurrent(muxTabHistory, candidateIds, ParseLiveMuxNames(listingJson));
+
+
+    // Resolve only from live muxd identity. History/name is a hint for diagnostics, never authorization.
+    public static ReclaimMuxOwnerResolution ResolveMuxOwner(
+        IEnumerable<ReclaimMuxRow> liveRows,
+        IEnumerable<string>? candidateIds,
+        string? hintedName = null)
+    {
+        if (liveRows is null)
+            return new(ReclaimMuxOwnerStatus.Unverifiable, null, "muxd listing was unavailable");
+        var ids = new HashSet<string>(Normalize(candidateIds), StringComparer.OrdinalIgnoreCase);
+        if (ids.Count == 0) return new(ReclaimMuxOwnerStatus.Absent, null, "no session identity was supplied");
+
+        var matches = liveRows
+            .Where(row => ids.Contains((row.SessionId ?? "").Trim())
+                       || (row.Aliases ?? Array.Empty<string>()).Any(alias => ids.Contains((alias ?? "").Trim())))
+            .ToList();
+        if (matches.Count == 0)
+        {
+            var conflictingName = !string.IsNullOrWhiteSpace(hintedName)
+                && liveRows.Any(row =>
+                    string.Equals(row.Name, hintedName, StringComparison.OrdinalIgnoreCase));
+            return conflictingName
+                ? new(ReclaimMuxOwnerStatus.NameConflict, null, "canonical mux name belongs to a different live identity")
+                : new(ReclaimMuxOwnerStatus.Absent, null, "no live mux owner matched the session identity");
+        }
+        if (matches.Count != 1)
+            return new(ReclaimMuxOwnerStatus.Ambiguous, null, $"{matches.Count} live mux owners matched the session identity");
+        return new(ReclaimMuxOwnerStatus.Matched, matches[0], "live mux owner matched by session identity");
+
     }
 
     // ---- internals ---------------------------------------------------------------------------------
@@ -435,7 +548,9 @@ public static class SessionReclaim
     private static string Headline(ReclaimReport report)
     {
         if (!report.MuxOk)
-            return "Reclaim stopped: " + report.MuxDetail;
+            return "Reclaim stopped: state is uncertain; cleanup may be partial. " + report.MuxDetail;
+        if (!report.KillOk)
+            return "Reclaim incomplete: could not stop every owner; cleanup may be partial. " + report.KillDetail;
         if (report.LaunchInFlight) return "A launch is already in flight for this chat; nothing was forced.";
         var refused = report.Claims.Count(c => c.Outcome == ReclaimClearOutcome.RefusedAliveOwner);
         if (refused > 0)

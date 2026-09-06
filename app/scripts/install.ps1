@@ -39,7 +39,7 @@ $rid        = 'win-x64'
 $exeName    = 'CodexLocalRetrieval.Native.exe' # Internal build output name; product name is MUX.
 $installDir = Join-Path $env:LOCALAPPDATA 'Programs\MUX'
 $legacyInstallDir = Join-Path $env:LOCALAPPDATA 'Programs\CodexLocalRetrieval'
-$buildDir   = Join-Path $repo "native\CodexLocalRetrieval.Native\bin\Release\$tfm\$rid"
+$buildDir   = Join-Path $repo "native\CodexLocalRetrieval.Native\bin\x64\Release\$tfm\$rid"
 $serverBuildDir = Join-Path $repo 'native\CodexLocalRetrieval.Server\bin\Release\net8.0'
 $remoteDir  = Join-Path $env:LOCALAPPDATA 'CodexArchiveRemote'
 $dataDir    = Join-Path $env:LOCALAPPDATA 'CodexLocalRetrieval' # Existing data location is preserved.
@@ -85,7 +85,7 @@ function Protect-OwnerSecret([string]$Path) {
 }
 Stop-AppAndDeps
 
-& dotnet build $proj -c Release -r $rid --nologo -v m
+& dotnet build $proj -c Release -p:Platform=x64 -r $rid --nologo -v m
 if ($LASTEXITCODE -ne 0) { throw "dotnet build failed (exit $LASTEXITCODE)" }
 & dotnet build $serverProj -c Release --nologo -v m
 if ($LASTEXITCODE -ne 0) { throw "server dotnet build failed (exit $LASTEXITCODE)" }

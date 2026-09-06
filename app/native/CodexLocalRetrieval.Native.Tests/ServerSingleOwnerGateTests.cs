@@ -9,6 +9,44 @@ namespace CodexLocalRetrieval.Native.Tests;
 public class ServerSingleOwnerGateTests
 {
     [TestMethod]
+    public void ServerSingleInstanceGuard_ConcurrentStartReportsHealthyExistingOwner()
+    {
+        var store = Path.Combine(Path.GetTempPath(), "mux-guard-" + Guid.NewGuid().ToString("N"), "app-store.json");
+        var first = ServerSingleInstanceGuard.TryAcquire(
+            "127.0.0.1", 40000, store, bundled: false,
+            isHealthy: (_, identity) => identity == ServerSingleInstanceGuard.Identify("127.0.0.1", 40000, store, false).Value);
+        try
+        {
+            Assert.IsTrue(first.Acquired);
+            var second = ServerSingleInstanceGuard.TryAcquire(
+                "127.0.0.1", 40000, store, bundled: false,
+                isHealthy: (_, identity) => identity == ServerSingleInstanceGuard.Identify("127.0.0.1", 40000, store, false).Value);
+            Assert.IsFalse(second.Acquired);
+            Assert.IsTrue(second.AlreadyRunning);
+            Assert.IsTrue(second.ExistingHealthy);
+            Assert.IsNull(second.Lease);
+        }
+        finally { first.Lease?.Dispose(); }
+    }
+
+    [TestMethod]
+    public void ServerSingleInstanceGuard_IsolatesProfilesAndRejectsForeignHealthIdentity()
+    {
+        var left = ServerSingleInstanceGuard.Identify("127.0.0.1", 40001, "C:/one/app-store.json", false);
+        var right = ServerSingleInstanceGuard.Identify("127.0.0.1", 40001, "C:/two/app-store.json", false);
+        var foreign = ServerSingleInstanceGuard.TryAcquire(
+            "127.0.0.1", 40001, "C:/one/app-store.json", false,
+            isHealthy: (_, identity) => identity == right.Value);
+        try
+        {
+            Assert.IsTrue(foreign.Acquired);
+            Assert.AreNotEqual(left.Value, right.Value);
+            Assert.AreEqual(left.Scope, "127.0.0.1:40001|C:\\ONE\\APP-STORE.JSON");
+        }
+        finally { foreign.Lease?.Dispose(); }
+    }
+
+    [TestMethod]
     public void ThreadRouteRegistry_StaleSocketCannotRemoveNewerOwner()
     {
         var routes = new ThreadRouteRegistry();

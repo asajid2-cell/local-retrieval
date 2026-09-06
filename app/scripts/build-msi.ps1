@@ -18,7 +18,7 @@ $repo     = Split-Path -Parent $PSScriptRoot
 $proj     = Join-Path $repo 'native\CodexLocalRetrieval.Native\CodexLocalRetrieval.Native.csproj'
 $tfm      = 'net8.0-windows10.0.26100.0'
 $rid      = 'win-x64'
-$buildDir = Join-Path $repo "native\CodexLocalRetrieval.Native\bin\Release\$tfm\$rid"
+$buildDir = Join-Path $repo "native\CodexLocalRetrieval.Native\bin\x64\Release\$tfm\$rid"
 $stageDir = Join-Path $env:TEMP 'clr-msi-stage'
 $wxs      = Join-Path $repo 'installer\CodexLocalRetrieval.wxs'
 $outDir   = Join-Path $repo 'dist'
@@ -28,7 +28,7 @@ $wix = if (Get-Command wix -ErrorAction SilentlyContinue) { 'wix' } else { Join-
 if (-not (Test-Path $wix) -and $wix -ne 'wix') { throw "WiX not found. Install it: dotnet tool install --global wix" }
 
 Write-Host "Building Release..." -ForegroundColor Cyan
-& dotnet build $proj -c Release -r $rid --nologo -v m
+& dotnet build $proj -c Release -p:Platform=x64 -r $rid --nologo -v m
 if ($LASTEXITCODE -ne 0) { throw 'dotnet build failed' }
 if (-not (Test-Path (Join-Path $buildDir 'CodexLocalRetrieval.Native.pri'))) { throw 'App .pri missing from build output.' }
 

@@ -128,6 +128,32 @@ public sealed partial class MainPage
         var stopwatch = System.Diagnostics.Stopwatch.StartNew();
         var before = _archive.Store.Sessions.Count;
         var keepId = _selected?.Id;
+        var selectionRevision = SelectionRevision;
+        ArchiveSession? RestoreSelectionIfUnchanged()
+        {
+            var id = SelectionRaceGuard.Resolve(
+                keepId,
+                selectionRevision,
+                SelectionRevision,
+                _selected?.Id,
+                _archive.Sessions.Select(s => s.Id));
+            return id is not null
+                ? _archive.Sessions.FirstOrDefault(s => string.Equals(s.Id, id, StringComparison.OrdinalIgnoreCase))
+                : null;
+        }
+        bool CanRestoreSelection() => SelectionRevision == selectionRevision;
+
+        void RestoreSelectionIfStillAuthoritative()
+        {
+            if (!CanRestoreSelection()) return;
+            var restored = RestoreSelectionIfUnchanged();
+            RunSessionListRefresh(() =>
+            {
+                _selected = restored;
+                SelectSessionRow(restored);
+            });
+            RenderCurrent();
+        }
         try
         {
             SyncButton.IsEnabled = false;
@@ -137,15 +163,16 @@ public sealed partial class MainPage
                 Diag.Log("Sync: retrying archive load before disk merge");
                 await _archive.LoadAsync(cancellationToken);
                 _archiveLoadFailed = false;
-                var retryRestored = keepId is not null
-                    ? _archive.Sessions.FirstOrDefault(s => string.Equals(s.Id, keepId, StringComparison.OrdinalIgnoreCase))
-                    : null;
-                RunSessionListRefresh(() =>
+                if (CanRestoreSelection())
                 {
-                    _selected = retryRestored;
-                    SelectSessionRow(retryRestored);
-                });
-                RenderCurrent();
+                    var retryRestored = RestoreSelectionIfUnchanged();
+                    RunSessionListRefresh(() =>
+                    {
+                        _selected = retryRestored;
+                        SelectSessionRow(retryRestored);
+                    });
+                    RenderCurrent();
+                }
                 Diag.Log("Sync: archive load retry succeeded (" + _archive.Sessions.Count + " sessions)");
             }
             var progress = new Progress<string>(s => SyncStatus.Text = s);
@@ -168,17 +195,10 @@ public sealed partial class MainPage
                 });
 
             // MergeScanAsync's refresh now routes through OnReapplyFilter (ReapplyActiveFilter), which keeps
-            // the active filter/sort AND the current selection — so a background sync no longer drops filters.
+            // the active filter/sort AND the current selection. Only restore the pre-scan selection when no
+            // newer user click happened while the scan/merge was awaiting; otherwise that click is authoritative.
+            RestoreSelectionIfStillAuthoritative();
             // If the selected chat disappeared, leave selection empty rather than navigating to an unrelated row.
-            var restored = keepId is not null
-                ? _archive.Sessions.FirstOrDefault(s => string.Equals(s.Id, keepId, StringComparison.OrdinalIgnoreCase))
-                : null;
-            RunSessionListRefresh(() =>
-            {
-                _selected = restored;
-                SelectSessionRow(restored);
-            });
-            RenderCurrent();
             SyncStatus.Text = $"{_archive.Sessions.Count} chats - synced {DateTime.Now:h:mm tt}"
                               + (added > 0 ? $" - +{added} new" : "");
         }

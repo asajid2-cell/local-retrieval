@@ -20,6 +20,10 @@ public sealed partial class MainPage : Page
     private readonly SessionLaunchGovernor _launchGovernor = new();
     private readonly Stack<string> _backStack = new();
     private ArchiveSession? _selectedField;
+    // User selection intent is separate from programmatic list maintenance. Async refreshes capture this
+    // revision and may restore their snapshot only when no newer click has happened.
+    private long _selectionRevision;
+    private long SelectionRevision => Volatile.Read(ref _selectionRevision);
     // Selection is the live reader's target, so every assignment re-points the watch through this one
     // hook — no beat is needed to notice a different chat got opened. Assign first, THEN arm, so
     // ArmLiveWatch always reads the new selection and can never re-enter this setter.
@@ -291,9 +295,11 @@ public sealed partial class MainPage : Page
         var sel = SessionList.SelectedItems;
         if (sel.Count == 1)
         {
+            Interlocked.Increment(ref _selectionRevision);
             _selected = sel[0] as ArchiveSession;
             Navigate("Archive");
         }
+
         else if (sel.Count > 1)
         {
             SyncStatus.Text = $"{sel.Count} chats selected — right-click to add them to a collection.";
@@ -311,7 +317,7 @@ public sealed partial class MainPage : Page
 
     // Live in-memory filter as you type (title + capped content + all active filters). The deeper
     // full-transcript phrase search is heavy, so it runs on ENTER only (see SearchBox_KeyDown), not per key.
-    private void SearchBox_TextChanged(object sender, TextChangedEventArgs e) => SearchDebouncer.Post(SearchBox.Text);
+    private void SearchBox_TextChanged(object sender, TextChangedEventArgs e) => SearchDebouncer.Post((SearchBox.Text, SelectionRevision));
 
     // Kept for callers that pre-set SearchBox.Text (e.g. capture replay); routes through the unified
     // text + tag filter so an active tag filter is always respected.
@@ -2456,43 +2462,47 @@ public sealed partial class MainPage : Page
         };
     }
 
-    private void CopyContext_Click(object sender, RoutedEventArgs e) => Copy("resume");
-    private void CopyCode_Click(object sender, RoutedEventArgs e) => Copy("code");
-    private void CopyPath_Click(object sender, RoutedEventArgs e) => Copy("path");
+    private void CopyContext_Click(object sender, RoutedEventArgs e) => _ = Copy("resume");
+    private void CopyCode_Click(object sender, RoutedEventArgs e) => _ = Copy("code");
+    private void CopyPath_Click(object sender, RoutedEventArgs e) => _ = Copy("path");
     private void CopyCommand_Click(object sender, RoutedEventArgs e) => CopyResumeCommandIfClear();
     private void CopyGatewayCommand_Click(object sender, RoutedEventArgs e) => CopyGatewayCommandIfClear();
 
-    private void CopyResumeCommandIfClear()
+    private async void CopyResumeCommandIfClear()
     {
         if (RiskySessionActionBlocked())
         {
             SyncStatus.Text = "Resume command blocked: this chat is live, pending, unverifiable, or otherwise unsafe to duplicate.";
             return;
         }
-        Copy("command");
-        SyncStatus.Text = "Resume command copied.";
+        await Copy("command", successMessage: "Resume command copied.");
     }
 
-    private void CopyGatewayCommandIfClear()
+    private async void CopyGatewayCommandIfClear()
     {
-        if (_selected is null || !ArchiveService.CanResumeThroughGateway(_selected.Tool)) return;
-        if (RiskySessionActionBlocked())
-        {
-            SyncStatus.Text = "Gateway command blocked: this chat is live, pending, unverifiable, or otherwise unsafe to duplicate.";
-            return;
-        }
-        Copy("command", ArchiveService.GatewayLaunchMode);
-        SyncStatus.Text = "Gateway command copied.";
-    }
-
-    private async void Copy(string mode, string? launchModeOverride = null)
-    {
-        if (_selected is null) return;
         var session = _selected;
-        var package = new DataPackage();
-        package.SetText(await _archive.CopyPayloadAsync(session, mode, launchModeOverride: launchModeOverride));
-        Clipboard.SetContent(package);
+        if (session is null || !ArchiveService.CanResumeThroughGateway(session.Tool)) return;
+        await Copy("command", ArchiveService.GatewayLaunchMode, "Gateway command copied.");
     }
+
+    private async Task Copy(string mode, string? launchModeOverride = null, string? successMessage = null)
+    {
+        var session = _selected;
+        if (session is null) return;
+        try
+        {
+            var text = await _archive.CopyPayloadAsync(session, mode, launchModeOverride: launchModeOverride);
+            var package = new DataPackage();
+            package.SetText(text);
+            Clipboard.SetContent(package);
+            if (!string.IsNullOrWhiteSpace(successMessage)) SyncStatus.Text = successMessage;
+        }
+        catch (Exception ex)
+        {
+            SyncStatus.Text = $"Copy failed: {ex.Message}";
+        }
+    }
+
 
     private void CopyPath(ArchiveSession session)
     {

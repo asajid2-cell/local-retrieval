@@ -3780,6 +3780,33 @@ public sealed class ArchiveServiceTests
     }
 
     [TestMethod]
+    public void GatewayCopyPayload_ContainsCwdResolvedLauncherAndResumeId()
+    {
+        var service = new ArchiveService(useBundledStore: true);
+        var cwd = Path.Combine(Path.GetTempPath(), "gateway-copy-payload-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(cwd);
+        try
+        {
+            var session = new ArchiveSession
+            {
+                Id = "gateway-copy-payload-id",
+                Tool = "claude",
+                Workspace = cwd,
+                SourcePath = Path.Combine(cwd, "gateway-copy-payload-id.jsonl")
+            };
+
+            var payload = service.CopyPayload(session, "command", ArchiveService.GatewayLaunchMode);
+
+            StringAssert.Contains(payload, "cd ");
+            StringAssert.Contains(payload, cwd.Replace('\\', '/'));
+            StringAssert.Contains(payload, ArchiveService.ResolveGatewayCliScript());
+            StringAssert.Contains(payload, "--resume gateway-copy-payload-id");
+            StringAssert.Contains(payload, ArchiveService.ResolveCmdExe().Replace('\\', '/'));
+        }
+        finally { try { Directory.Delete(cwd, recursive: true); } catch { } }
+    }
+
+    [TestMethod]
     public async Task DeepSearch_ReturnsContentSnippetsAndPathPayload()
     {
         var service = new ArchiveService(useBundledStore: true);

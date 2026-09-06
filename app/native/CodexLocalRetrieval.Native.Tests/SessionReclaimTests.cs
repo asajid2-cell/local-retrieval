@@ -370,6 +370,69 @@ public class SessionReclaimTests
     // ---- mux custody --------------------------------------------------------------------------------
 
     [TestMethod]
+    public void ResolveMuxOwner_UsesRenamedLiveIdentity_NotHistoricalName()
+    {
+        var result = SessionReclaim.ResolveMuxOwner(
+            new[] { new ReclaimMuxRow("renamed-tab", true, "canonical", new[] { "old-alias" }) },
+            new[] { "canonical", "old-alias" },
+            "canonical-generated-name");
+
+        Assert.AreEqual(ReclaimMuxOwnerStatus.Matched, result.Status);
+        Assert.AreEqual("renamed-tab", result.Owner!.Name);
+        Assert.IsTrue(result.IsSafeToKill);
+    }
+
+    [TestMethod]
+    public void ResolveMuxOwner_RefusesCanonicalNameWithWrongIdentity()
+    {
+        var result = SessionReclaim.ResolveMuxOwner(
+            new[] { new ReclaimMuxRow("canonical-generated-name", true, "other-session", Array.Empty<string>()) },
+            new[] { "target-session" },
+            "canonical-generated-name");
+
+        Assert.AreEqual(ReclaimMuxOwnerStatus.NameConflict, result.Status);
+        Assert.IsFalse(result.IsSafeToKill);
+    }
+
+    [TestMethod]
+    public void ResolveMuxOwner_MatchesAlias()
+    {
+        var result = SessionReclaim.ResolveMuxOwner(
+            new[] { new ReclaimMuxRow("historical-tab", true, "unrelated", new[] { "old-id" }) },
+            new[] { "current-id", "old-id" });
+
+        Assert.AreEqual(ReclaimMuxOwnerStatus.Matched, result.Status);
+        Assert.AreEqual("historical-tab", result.Owner!.Name);
+    }
+
+    [TestMethod]
+    public void ResolveMuxOwner_RefusesAmbiguousDuplicates()
+    {
+        var result = SessionReclaim.ResolveMuxOwner(
+            new[]
+            {
+                new ReclaimMuxRow("one", true, "target", Array.Empty<string>()),
+                new ReclaimMuxRow("two", true, "target", Array.Empty<string>()),
+            },
+            new[] { "target" });
+
+        Assert.AreEqual(ReclaimMuxOwnerStatus.Ambiguous, result.Status);
+        Assert.IsFalse(result.IsSafeToKill);
+    }
+
+    [TestMethod]
+    public void ResolveMuxOwner_AbsentIsNotAuthorized()
+    {
+        var result = SessionReclaim.ResolveMuxOwner(Array.Empty<ReclaimMuxRow>(), new[] { "target" });
+        Assert.AreEqual(ReclaimMuxOwnerStatus.Absent, result.Status);
+        Assert.IsFalse(result.IsSafeToKill);
+
+        var unverifiable = SessionReclaim.ResolveMuxOwner(null!, new[] { "target" });
+        Assert.AreEqual(ReclaimMuxOwnerStatus.Unverifiable, unverifiable.Status);
+        Assert.IsFalse(unverifiable.IsSafeToKill);
+    }
+
+    [TestMethod]
     public async Task Reclaim_KillsLiveMuxBeforeProcessCleanup_AndDoesNotLaunch()
     {
         var order = new List<string>();
@@ -397,6 +460,25 @@ public class SessionReclaimTests
     }
 
     [TestMethod]
+    public async Task Reclaim_WhenKillFails_IsNotReportedAsCompletedEvenIfCleanupChangedState()
+    {
+        var report = await SessionReclaim.ExecuteAsync(new ReclaimOptions
+        {
+            CandidateIds = new[] { "session-kill-failed" },
+            Kill = _ => new RunningSessions.KillResult(false, "owner exit was not verified", new[]
+            {
+                new ReclaimKilledPid(4242, null, new[] { "session-kill-failed" })
+            }),
+        });
+
+        Assert.IsFalse(report.KillOk);
+        Assert.IsTrue(report.Changed, "the report contains confirmed partial mutation");
+        StringAssert.Contains(report.Headline, "incomplete");
+        StringAssert.Contains(report.Headline, "partial");
+        Assert.DoesNotContain("ready to continue", report.Headline);
+    }
+
+    [TestMethod]
     public async Task Reclaim_WhenNothingExists_ReportsNoOpInsteadOfClaimingOwnersStopped()
     {
         var report = await SessionReclaim.ExecuteAsync(new ReclaimOptions
@@ -415,10 +497,14 @@ public class SessionReclaimTests
     public async Task Reclaim_RefusesCleanupWhenLiveMuxKillFails_AndPreservesOwnership()
     {
         var processCleanup = 0;
+        var claimRoot = TempDir();
+        var now = DateTimeOffset.UtcNow;
+        var claim = WriteClaim(claimRoot, "session-mux-kill-fails", ownerPid: 4242, now, now.AddMinutes(2));
         var report = await SessionReclaim.ExecuteAsync(new ReclaimOptions
         {
             CandidateIds = new[] { "session-mux-kill-fails" },
-            KillMux = () => Task.FromResult(new ReclaimMuxResult(true, true, false, "muxd kill was not verified")),
+            ClaimOptions = new SessionLaunchClaims.Options(RootDirectory: claimRoot),
+            KillMux = () => Task.FromResult(new ReclaimMuxResult(false, true, false, "ws://127.0.0.1:7699: connection refused")),
             Kill = _ =>
             {
                 Interlocked.Increment(ref processCleanup);
@@ -427,10 +513,11 @@ public class SessionReclaimTests
         });
 
         Assert.IsFalse(report.MuxOk);
-        StringAssert.Contains(report.MuxDetail, "not verified");
+        StringAssert.Contains(report.MuxDetail, "connection refused");
         Assert.IsFalse(report.Relaunched);
         Assert.AreEqual(0, processCleanup, "failed mux takeover must preserve process/claim custody");
-        StringAssert.Contains(report.Headline, "mux");
+        Assert.IsTrue(File.Exists(claim.Path), "blocked reclaim must preserve the launch claim");
+        StringAssert.Contains(report.Headline, "127.0.0.1:7699");
     }
 
     [TestMethod]
@@ -455,6 +542,34 @@ public class SessionReclaimTests
         var unaskable = Build();
         Assert.IsEmpty(SessionReclaim.PruneStaleMuxCurrent(unaskable, new[] { "sid-a", "sid-b" }, null));
         Assert.IsNotNull(unaskable["gone-tab"].Current);
+    }
+
+    [TestMethod]
+    public void PruneStaleMuxCurrentFromListing_RequiresExplicitAliveAndPreservesHistory()
+    {
+        Dictionary<string, MuxTabRecord> Build() => new()
+        {
+            ["dormant-tab"] = new MuxTabRecord
+            {
+                Current = new MuxTabChat { Id = "target" },
+                History = { new MuxTabChat { Id = "target", Title = "old" } }
+            },
+            ["live-tab"] = new MuxTabRecord { Current = new MuxTabChat { Id = "target" } },
+        };
+
+        var history = Build();
+        var pruned = SessionReclaim.PruneStaleMuxCurrentFromListing(
+            history, new[] { "target" },
+            "{\"list\":[{\"name\":\"live-tab\",\"alive\":true},{\"name\":\"dormant-tab\",\"alive\":false}]} ");
+        CollectionAssert.AreEquivalent(new[] { "dormant-tab" }, pruned.ToArray());
+        Assert.IsNull(history["dormant-tab"].Current);
+        Assert.AreEqual(1, history["dormant-tab"].History.Count);
+        Assert.IsNotNull(history["live-tab"].Current);
+
+        var malformed = Build();
+        Assert.IsEmpty(SessionReclaim.PruneStaleMuxCurrentFromListing(
+            malformed, new[] { "target" }, "{\"list\":[{\"name\":\"live-tab\"}]}"));
+        Assert.IsNotNull(malformed["dormant-tab"].Current);
     }
 
 

@@ -15,6 +15,8 @@ public sealed partial class MainPage
     private int _reclaimSeq;
     private bool _reclaimRunning;
     private CancellationTokenSource? _reclaimCancellation;
+    private string? _reclaimNoticeSessionId;
+    private string? _reclaimNotice;
     private const int ReclaimWaitSeconds = 150;
 
     private void RefreshIntegrity_Click(object sender, RoutedEventArgs e) => RenderIntegrity(force: true);
@@ -80,6 +82,12 @@ public sealed partial class MainPage
         }
 
         IntegrityItems.Children.Add(IntegrityHeadline(summary.Severity, summary.Headline));
+        if (_reclaimNoticeSessionId is not null
+            && string.Equals(_reclaimNoticeSessionId, _selected.Id, StringComparison.OrdinalIgnoreCase)
+            && !string.IsNullOrWhiteSpace(_reclaimNotice))
+            IntegrityItems.Children.Add(IntegrityHeadline(
+                _reclaimNotice.StartsWith("Reclaim completed", StringComparison.Ordinal) ? "ok" : "danger",
+                _reclaimNotice));
         if (checking) IntegrityItems.Children.Add(IntegrityChip("Checking integrity..."));
         if (CanReclaim(summary))
             IntegrityItems.Children.Add(IntegrityReclaimButton());
@@ -200,12 +208,24 @@ public sealed partial class MainPage
         }
         catch (OperationCanceledException)
         {
-            if (seq == _reclaimSeq) SyncStatus.Text = "Reclaim cancelled; try again when the chat is ready.";
+            if (seq == _reclaimSeq)
+            {
+                _reclaimNoticeSessionId = session.Id;
+                _reclaimNotice = "Reclaim cancelled: state is uncertain; cleanup may be partial. Refresh before retrying.";
+                SyncStatus.Text = _reclaimNotice;
+                RenderIntegrity();
+            }
         }
         catch (Exception ex)
         {
             Diag.Log("Reclaim FAILED " + ex);
-            if (seq == _reclaimSeq) SyncStatus.Text = "Reclaim failed - see log.";
+            if (seq == _reclaimSeq)
+            {
+                _reclaimNoticeSessionId = session.Id;
+                _reclaimNotice = "Reclaim failed: state is uncertain; cleanup may be partial. Refresh before retrying. " + ex.Message;
+                SyncStatus.Text = _reclaimNotice;
+                RenderIntegrity();
+            }
         }
         finally
         {
@@ -220,7 +240,34 @@ public sealed partial class MainPage
         await SyncNowAsync(initial: false, waitForActive: true);
         _integrity.Invalidate();
         await RefreshIntegrityAsync(session, IntegrityKey(session), _archive.Store, force: true);
-        SyncStatus.Text = report.Headline;
+
+        // The report describes the attempted mutation; only the authoritative post-state decides whether the
+        // user may be told this completed. Keep blocked/unknown outcomes truthful and include the remaining check.
+        var postState = _integrity.CurrentFor(IntegrityKey(session));
+        _reclaimNoticeSessionId = session.Id;
+        _reclaimNotice = SessionReclaim.BuildPostStateNotice(report, postState);
+        SyncStatus.Text = _reclaimNotice;
+    }
+
+    private static string BuildReclaimNotice(ReclaimReport report, SessionIntegritySummary? postState)
+    {
+        if (!report.MuxOk)
+            return "Reclaim blocked: state is uncertain; cleanup may be partial. " + report.MuxDetail;
+        if (!report.KillOk)
+            return "Reclaim incomplete: cleanup may be partial. " + report.KillDetail;
+        if (postState is null)
+            return "Reclaim incomplete: post-state integrity could not be verified. Refresh before retrying.";
+        if (string.Equals(postState.Severity, "danger", StringComparison.OrdinalIgnoreCase))
+        {
+            var reason = postState.Checks.FirstOrDefault(c => string.Equals(c.Severity, "danger", StringComparison.OrdinalIgnoreCase))?.Summary
+                         ?? postState.Headline;
+            return "Reclaim incomplete: " + reason;
+        }
+        if (report.AnyClaimBlocking)
+            return "Reclaim incomplete: " + report.Headline;
+        return report.Changed
+            ? "Reclaim completed: " + postState.Headline
+            : "Reclaim completed: no changes were made. " + postState.Headline;
     }
 
     private void Report(int seq, string message)

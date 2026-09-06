@@ -1441,41 +1441,49 @@ public sealed partial class MainPage
             if (!doc.RootElement.TryGetProperty("list", out var list) || list.ValueKind != JsonValueKind.Array)
                 return new ReclaimMuxResult(false, false, false, "muxd listing did not contain a session list");
 
-            JsonElement? owner = null;
-            foreach (var row in list.EnumerateArray())
-            {
-                if (row.TryGetProperty("name", out var rowName)
-                    && string.Equals(rowName.GetString(), name, StringComparison.OrdinalIgnoreCase))
-                {
-                    owner = row;
-                    break;
-                }
-            }
-
-            if (owner is null)
+            var rows = list.EnumerateArray().Select(row => new ReclaimMuxRow(
+                row.TryGetProperty("name", out var rowName) ? rowName.GetString() ?? "" : "",
+                row.TryGetProperty("alive", out var alive) && alive.ValueKind == JsonValueKind.True,
+                row.TryGetProperty("sessionId", out var sid) ? sid.GetString() ?? "" : "",
+                row.TryGetProperty("aliases", out var aliases) && aliases.ValueKind == JsonValueKind.Array
+                    ? aliases.EnumerateArray().Select(alias => alias.GetString() ?? "").Where(alias => alias.Length > 0).ToArray()
+                    : Array.Empty<string>())
+                { GenerationId = row.TryGetProperty("generationId", out var generation) ? generation.GetString() ?? "" : "" }).ToList();
+            var resolution = SessionReclaim.ResolveMuxOwner(rows, new[] { session.Id }.Concat(session.Aliases), name);
+            if (resolution.Status == ReclaimMuxOwnerStatus.Absent)
                 return new ReclaimMuxResult(true, false, true, "canonical mux owner absent");
+            if (!resolution.IsSafeToKill)
+                return new ReclaimMuxResult(true, true, false, "refusing mux teardown: " + resolution.Detail);
 
-            var alive = owner.Value.TryGetProperty("alive", out var aliveValue)
-                        && aliveValue.ValueKind == JsonValueKind.True;
-            if (!alive)
-                return new ReclaimMuxResult(true, false, true, "canonical mux owner is not live");
+            var owner = resolution.Owner!;
+            if (!owner.Alive)
+                return new ReclaimMuxResult(true, false, true, "matched mux owner is not live");
 
-            var deleted = await DeleteLocalMuxdSessionAsync(name);
+            if (string.IsNullOrWhiteSpace(owner.SessionId) || string.IsNullOrWhiteSpace(owner.GenerationId))
+                return new ReclaimMuxResult(true, true, false, "refusing mux teardown: owner fence was not advertised");
+
+            var deleted = await DeleteLocalMuxdSessionAsync(owner.Name, owner.SessionId, owner.GenerationId);
             if (!deleted.ok)
-                return new ReclaimMuxResult(true, true, false, "could not kill canonical mux session " + name + ": " + deleted.detail);
+                return new ReclaimMuxResult(true, true, false, "could not kill mux session " + owner.Name + ": " + deleted.detail);
 
             var after = await LocalMuxdRequestAsync(new { t = "ls" });
             using var afterDoc = JsonDocument.Parse(after);
             if (!afterDoc.RootElement.TryGetProperty("list", out var afterList) || afterList.ValueKind != JsonValueKind.Array)
                 return new ReclaimMuxResult(false, true, false, "muxd teardown response was not verifiable");
-            var remainsLive = afterList.EnumerateArray().Any(row =>
-                row.TryGetProperty("name", out var rowName)
-                && string.Equals(rowName.GetString(), name, StringComparison.OrdinalIgnoreCase)
-                && row.TryGetProperty("alive", out var rowAlive)
-                && rowAlive.ValueKind == JsonValueKind.True);
-            return remainsLive
-                ? new ReclaimMuxResult(true, true, false, "canonical mux session remained live after kill: " + name)
-                : new ReclaimMuxResult(true, true, true, "killed and verified canonical mux session " + name);
+            var afterRows = afterList.EnumerateArray().Select(row => new ReclaimMuxRow(
+                row.TryGetProperty("name", out var rowName) ? rowName.GetString() ?? "" : "",
+                row.TryGetProperty("alive", out var alive) && alive.ValueKind == JsonValueKind.True,
+                row.TryGetProperty("sessionId", out var sid) ? sid.GetString() ?? "" : "",
+                row.TryGetProperty("aliases", out var aliases) && aliases.ValueKind == JsonValueKind.Array
+                    ? aliases.EnumerateArray().Select(alias => alias.GetString() ?? "").Where(alias => alias.Length > 0).ToArray()
+                    : Array.Empty<string>())
+                { GenerationId = row.TryGetProperty("generationId", out var generation) ? generation.GetString() ?? "" : "" }).ToList();
+            var nameRemains = afterRows.Any(row => string.Equals(row.Name, owner.Name, StringComparison.OrdinalIgnoreCase));
+            var identityRemains = SessionReclaim.ResolveMuxOwner(afterRows, new[] { session.Id }.Concat(session.Aliases)).Status
+                                  != ReclaimMuxOwnerStatus.Absent;
+            return nameRemains || identityRemains
+                ? new ReclaimMuxResult(true, true, false, "mux session remained after kill: " + owner.Name)
+                : new ReclaimMuxResult(true, true, true, "killed and verified mux session " + owner.Name);
         }
         catch (Exception ex)
         {
@@ -1484,25 +1492,16 @@ public sealed partial class MainPage
     }
 
     // Reclaim's stale-mux-custody step. A Current pointer is pruned ONLY when muxd itself confirms the tab is
-    // gone; if muxd can't be asked, nothing is pruned — "we couldn't reach muxd" is not "the tab is absent".
+    // gone; if muxd can't be asked, or its liveness listing is malformed, nothing is pruned.
     private IReadOnlyList<string> PruneMuxCustodyForReclaim(IReadOnlyList<string> candidateIds)
     {
-        IReadOnlyCollection<string>? live = null;
-        try
-        {
-            var text = LocalMuxdRequestAsync(new { t = "ls" }).GetAwaiter().GetResult();
-            using var doc = JsonDocument.Parse(text);
-            var names = new List<string>();
-            foreach (var row in doc.RootElement.GetProperty("list").EnumerateArray())
-            {
-                var rowName = row.TryGetProperty("name", out var n) ? n.GetString() : null;
-                if (!string.IsNullOrWhiteSpace(rowName)) names.Add(rowName!);
-            }
-            live = names;
-        }
-        catch { live = null; }
+        string? listing = null;
+        try { listing = LocalMuxdRequestAsync(new { t = "ls" }).GetAwaiter().GetResult(); }
+        catch { }
 
-        var pruned = SessionReclaim.PruneStaleMuxCurrent(_archive.Store.MuxTabHistory, candidateIds, live);
+        var pruned = SessionReclaim.PruneStaleMuxCurrentFromListing(
+            _archive.Store.MuxTabHistory, candidateIds, listing);
+
         if (pruned.Count > 0)
         {
             try { _archive.SaveAsync().GetAwaiter().GetResult(); }
@@ -1597,6 +1596,7 @@ public sealed partial class MainPage
         catch (Exception ex) { return (false, ex.Message); }
     }
 
+    // General UI kill retains the legacy name-only protocol. Reclaim uses the fenced overload below.
     private static async Task<(bool ok, string detail)> DeleteLocalMuxdSessionAsync(string name)
     {
         try
@@ -1604,6 +1604,32 @@ public sealed partial class MainPage
             var cap = await EnsureLocalMuxdCapabilityAsync("kill");
             if (!cap.ok) return cap;
             var text = await LocalMuxdRequestAsync(new { t = "kill", s = name });
+            using var doc = JsonDocument.Parse(text);
+            if (doc.RootElement.TryGetProperty("t", out var t) && t.GetString() == "killed")
+            {
+                RunningSessions.InvalidateScanCache();
+                return (true, "killed");
+            }
+            if (doc.RootElement.TryGetProperty("t", out t) && t.GetString() == "err")
+                return (false, doc.RootElement.TryGetProperty("m", out var m) ? m.GetString() ?? "muxd error" : "muxd error");
+            return (false, "unexpected muxd kill response: " + Trim(text, 160));
+        }
+        catch (Exception ex) { return (false, ex.Message); }
+    }
+
+    private static async Task<(bool ok, string detail)> DeleteLocalMuxdSessionAsync(
+        string name, string expectedSessionId, string expectedGenerationId)
+    {
+        try
+        {
+            var cap = await EnsureLocalMuxdCapabilityAsync("killFence");
+            if (!cap.ok) return cap;
+            var text = await LocalMuxdRequestAsync(new
+            {
+                t = "kill", s = name,
+                sessionId = expectedSessionId,
+                generationId = expectedGenerationId,
+            });
             using var doc = JsonDocument.Parse(text);
             if (doc.RootElement.TryGetProperty("t", out var t) && t.GetString() == "killed")
             {
