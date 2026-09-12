@@ -760,6 +760,61 @@ public sealed class ContainedProcessLifecycleTests
     }
 
     [TestMethod]
+    public async Task CodexTurnStart_ConfirmedTerminationWithoutResponseStillRetainsWriterClaim()
+    {
+        // A confirmed process exit proves the transport is gone; it does not prove that
+        // turn/start was rejected before Codex accepted it. The writer claim must stay
+        // fenced until expiry so a retry can never double-start an accepted turn.
+        var claimRoot = Path.Combine(Path.GetTempPath(), "clr-codex-dead-no-response", Guid.NewGuid().ToString("N"));
+        var hub = new CodexAgentHub(
+            "ignored.exe",
+            isSessionLive: _ => false,
+            claimOptions: new SessionLaunchClaims.Options(
+                RootDirectory: claimRoot,
+                StaleAfter: TimeSpan.FromMinutes(5)),
+            processStarter: _ => StartProtocolProcess(
+                """
+                $initialize = [Console]::In.ReadLine()
+                [Console]::Out.WriteLine('{"jsonrpc":"2.0","id":1,"result":{"ok":true}}')
+                [Console]::Out.Flush()
+                $null = [Console]::In.ReadLine()
+                exit 0
+                """));
+
+        try
+        {
+            var startTask = hub.StartTurnAsync(
+                "codex-died-before-response",
+                "hello",
+                CancellationToken.None);
+            Exception ex = await Assert.ThrowsExactlyAsync<InvalidOperationException>(() => startTask);
+            Assert.IsNotInstanceOfType(ex, typeof(CodexAppServerResponseException),
+                "the fake server never sent a response, so this must not look like an RPC rejection");
+
+            var acquired = SessionLaunchClaims.TryAcquire(
+                "codex-died-before-response",
+                null,
+                "fence verification",
+                out var fencedClaim,
+                out var detail,
+                _ => false,
+                new SessionLaunchClaims.Options(
+                    RootDirectory: claimRoot,
+                    StaleAfter: TimeSpan.FromMinutes(5)));
+
+            Assert.IsFalse(acquired, detail == null
+                ? "claim should still be held"
+                : detail + " — a confirmed transport death must not unfence a turn whose acceptance is unknown.");
+            fencedClaim?.Dispose();
+        }
+        finally
+        {
+            try { await hub.DisposeAsync(); } catch { }
+            try { Directory.Delete(claimRoot, recursive: true); } catch { }
+        }
+    }
+
+    [TestMethod]
     public async Task CodexTurnStart_DefiniteRpcRejectionReleasesWriterClaim()
     {
         var claimRoot = Path.Combine(Path.GetTempPath(), "clr-codex-rejected-turn", Guid.NewGuid().ToString("N"));
