@@ -225,4 +225,93 @@ public sealed class ReclaimOperationsTests
         }
         finally { Directory.Delete(f.Dir, true); }
     }
+
+    // The relay treats an acknowledgement as "this command is done with", so an outcome whose effect is
+    // UNKNOWN must never be acknowledged - the command has to stay leased and come back. This is the one
+    // decision both dispatch lanes share, and it is shared exactly so a lane cannot quietly start acking
+    // uncertainty. An unrecognised status is a failure, never a success.
+    [TestMethod]
+    public void ReclaimReply_AcknowledgesOnlyApplied_AndNeverAcknowledgesUncertainty()
+    {
+        var applied = ReclaimCommandOutcome.Reply(ReclaimOperationStatus.Applied);
+        Assert.IsTrue(applied.Acknowledge);
+        Assert.IsTrue(applied.Ok);
+
+        var refused = ReclaimCommandOutcome.Reply(ReclaimOperationStatus.Refused);
+        Assert.IsTrue(refused.Acknowledge, "a refusal is a real answer and must clear the command");
+        Assert.IsFalse(refused.Ok);
+
+        var uncertain = ReclaimCommandOutcome.Reply(ReclaimOperationStatus.Uncertain);
+        Assert.IsFalse(uncertain.Acknowledge, "an uncertain outcome must stay leased for redelivery");
+        Assert.IsFalse(uncertain.Ok, "an uncertain outcome is never success");
+
+        var unknown = ReclaimCommandOutcome.Reply((ReclaimOperationStatus)97);
+        Assert.IsTrue(unknown.Acknowledge);
+        Assert.IsFalse(unknown.Ok, "an unknown status must fail closed, not read as success");
+    }
+
+    // Source-level parity, in the same style as SessionReclaimTests' GUI source-wiring checks: WinUI's MainPage
+    // needs an app dispatcher and cannot be instantiated here, so the runtime GUI lane is pinned structurally.
+    // Both lanes must (1) require an explicit cleanup confirmation, (2) answer through the shared reply so
+    // neither can decide acknowledgement on its own, and (3) reach a mux teardown that is fenced on the exact
+    // generation - the GUI lane inline, the closed-GUI lane through its Server wiring.
+    [TestMethod]
+    public void GuiActiveAndClosedGuiReclaimLanes_ShareConfirmationFenceAndReplyDecision()
+    {
+        var root = FindRepoRoot();
+        var gui = Slice(
+            File.ReadAllText(Path.Combine(root, "native", "CodexLocalRetrieval.Native", "MainPage.Remote.cs")),
+            "string.Equals(c.type, \"reclaim\", StringComparison.OrdinalIgnoreCase)",
+            "string.Equals(c.type, \"cleartabhistory\", StringComparison.OrdinalIgnoreCase)");
+        var bridge = Slice(
+            File.ReadAllText(Path.Combine(root, "native", "CodexLocalRetrieval.Core", "Remote", "RemoteBridge.cs")),
+            "case \"reclaim\":",
+            "case \"startchat\":");
+        var bridgeWiring = Slice(
+            File.ReadAllText(Path.Combine(root, "native", "CodexLocalRetrieval.Server", "Program.cs")),
+            "executeReclaim: (command, muxRequest)",
+            "fetchTranscript:");
+
+        foreach (var (lane, name) in new[] { (gui, "GUI-active"), (bridge, "closed-GUI") })
+        {
+            Assert.IsTrue(lane.Length > 0, name + " reclaim lane not found");
+            StringAssert.Contains(lane, "confirmed", name + " must require an explicit cleanup confirmation");
+            StringAssert.Contains(lane, "ReclaimCommandOutcome.Reply(", name + " must answer through the shared reply");
+            StringAssert.Contains(lane, "!reply.Acknowledge", name + " must release rather than acknowledge uncertainty");
+            StringAssert.Contains(lane, "_commandIntents.Release(c.intentId)", name + " must release the intent it does not answer");
+            Assert.DoesNotContain(
+                "ReclaimOperationStatus.",
+                lane,
+                name + " must not decide the outcome locally; that is what the shared reply is for");
+        }
+
+        // Both lanes still delegate the policy itself to one ArchiveService entry point...
+        StringAssert.Contains(gui, "_archive.ExecuteReclaimOperationAsync(");
+        StringAssert.Contains(bridge, "_executeReclaim(");
+        // ...and both end up at a generation-fenced mux teardown.
+        StringAssert.Contains(gui, "generationId", "GUI-active must fence the mux teardown on the generation");
+        Assert.IsTrue(bridgeWiring.Length > 0, "closed-GUI reclaim wiring not found");
+        StringAssert.Contains(bridgeWiring, "generationId", "closed-GUI must fence the mux teardown on the generation");
+        StringAssert.Contains(bridgeWiring, "ExecuteReclaimOperationAsync(");
+    }
+
+    private static string Slice(string text, string start, string end)
+    {
+        var from = text.IndexOf(start, StringComparison.Ordinal);
+        if (from < 0) return "";
+        var to = text.IndexOf(end, from, StringComparison.Ordinal);
+        return to < 0 ? text[from..] : text[from..to];
+    }
+
+    private static string FindRepoRoot()
+    {
+        var dir = new DirectoryInfo(AppContext.BaseDirectory);
+        while (dir is not null)
+        {
+            if (File.Exists(Path.Combine(dir.FullName, "CodexLocalRetrieval.sln")))
+                return dir.FullName;
+            dir = dir.Parent;
+        }
+        throw new DirectoryNotFoundException("Could not find CodexLocalRetrieval.sln from " + AppContext.BaseDirectory);
+    }
 }

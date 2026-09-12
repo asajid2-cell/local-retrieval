@@ -485,12 +485,13 @@ public sealed class RemoteBridge
                         _commandIntents.Release(c.intentId);
                         continue;
                     }
-                    if (outcome.Status == ReclaimOperationStatus.Uncertain)
+                    var reply = ReclaimCommandOutcome.Reply(outcome.Status);
+                    if (!reply.Acknowledge)
                     {
                         _commandIntents.Release(c.intentId);
                         continue;
                     }
-                    res = (outcome.Status == ReclaimOperationStatus.Applied, outcome.Detail);
+                    res = (reply.Ok, outcome.Detail);
                     break;
                 }
                 case "startchat":

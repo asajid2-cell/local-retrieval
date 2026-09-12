@@ -766,6 +766,54 @@ public class SessionReclaimTests
         StringAssert.Contains(report.Headline, "ready to continue");
     }
 
+    // The live-unrelated-process clause, against the kill the PRODUCTION lanes actually use: no injected Kill
+    // delegate and no fixture stub, so this is the real global RunningSessions.KillWithEvidence path that both
+    // the GUI-active loop and the closed-GUI bridge reach in a real install. A second, real, live process with
+    // its own transcript open and its own unexpired reservation must be invisible to a reclaim that was never
+    // asked about it - "scoped to this chat" is the whole difference between reclaim and a process sweep.
+    [TestMethod]
+    public async Task Reclaim_WithTheDefaultGlobalKill_StopsTheTiedWrapper_AndLeavesAnUnrelatedLiveProcessUntouched()
+    {
+        RequireWindows();
+        var claimRoot = TempDir();
+        var recordRoot = TempDir();
+        var now = DateTimeOffset.UtcNow;
+
+        var (targetSid, target) = StartChildHoldingTranscript();
+        var targetStart = target.StartTime.ToUniversalTime();
+        WriteOwnerRecord(recordRoot, targetSid, target.Id, new DateTimeOffset(targetStart, TimeSpan.Zero));
+        var targetClaim = WriteClaim(claimRoot, targetSid, ownerPid: Environment.ProcessId, now, now.AddMinutes(2));
+
+        // An unrelated chat: alive, holding its own transcript open, with its own unexpired reservation.
+        var (otherSid, other) = StartChildHoldingTranscript();
+        var otherStart = other.StartTime.ToUniversalTime();
+        var otherClaim = WriteClaim(claimRoot, otherSid, ownerPid: 4242, now, now.AddMinutes(2));
+
+        var report = await SessionReclaim.ExecuteAsync(new ReclaimOptions
+        {
+            CandidateIds = new[] { targetSid },
+            ClaimOptions = new SessionLaunchClaims.Options(RootDirectory: claimRoot),
+            RecordOptions = RecordOptions(recordRoot),
+            // Deliberately NO Kill delegate: this is the unmocked global path.
+        });
+
+        // The tied owner died, verified by identity rather than by bare pid.
+        Assert.IsTrue(report.KillOk, "the recorded wrapper should have been killed: " + report.KillDetail);
+        Assert.IsTrue(target.WaitForExit(20_000), "the tied tree did not exit");
+        Assert.IsTrue(RunningSessions.HasExitedByIdentity(target.Id, targetStart));
+        Assert.IsTrue(report.ConfirmedExited.Any(p => p.Pid == target.Id));
+        Assert.IsFalse(File.Exists(targetClaim.Path), "the reclaimed chat's own reservation is the one that clears");
+
+        // ...and nothing else moved.
+        Assert.IsFalse(other.HasExited, "an unrelated live process was killed by a scoped reclaim");
+        Assert.IsFalse(
+            RunningSessions.HasExitedByIdentity(other.Id, otherStart),
+            "the unrelated process must still be alive BY IDENTITY after reclaim");
+        Assert.IsTrue(File.Exists(otherClaim.Path), "a different chat's launch reservation must remain untouched");
+        Assert.AreEqual(1, report.Claims.Count, "reclaim must only read the candidate chat's reservations");
+        Assert.AreEqual(targetSid, report.Claims.Single().SessionId);
+    }
+
     // ---- the reclaim-strand repro: a clear that FAILS must be reported, not swallowed ----------------
 
     // A real user hit this: reclaim cleared the danger (killed the owner) but its claim-file cleanup FAILED with
