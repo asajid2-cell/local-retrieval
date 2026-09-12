@@ -77,6 +77,11 @@
   <button id="refresh" type="button">Refresh</button>
 </header>
 <div id="status" role="status" aria-live="polite">Loading…</div>
+<nav aria-label="Transcript navigation">
+  <label>Show <select id="role"><option value="all">All</option><option value="assistant">Agent</option><option value="user">You</option></select></label>
+  <button id="start" type="button" disabled>Start</button>
+  <button id="previoususer" type="button" disabled>Previous user</button>
+</nav>
 <main id="transcript"></main>
 <p class="exposure">Transcript text is stored on the relay in plaintext for a few minutes so you can read it here.</p>
 
@@ -92,7 +97,35 @@
   const refreshBtn = document.getElementById('refresh');
   if (label) document.getElementById('title').textContent = label;
 
-  function say(text, kind){ statusEl.textContent = text; statusEl.className = kind || ''; }
+  const role = document.getElementById('role');
+  const start = document.getElementById('start');
+  const previous = document.getElementById('previoususer');
+  function filterRoles(){
+    const messages = Array.from(mount.querySelectorAll('.msg'));
+    messages.forEach(node => { node.hidden = role.value !== 'all' && !node.classList.contains('role-' + role.value); });
+    start.disabled = !messages.some(node => !node.hidden);
+    previous.disabled = !messages.some(node => node.classList.contains('role-user'));
+  }
+  function jump(node){
+    if (!node) return;
+    node.tabIndex = -1;
+    node.focus({ preventScroll: true });
+    node.style.scrollMarginTop = (document.querySelector('header').getBoundingClientRect().height + 12) + 'px';
+    node.scrollIntoView({ block: 'start' });
+  }
+  role.addEventListener('change', filterRoles);
+  start.addEventListener('click', () => jump(Array.from(mount.querySelectorAll('.msg')).find(node => !node.hidden)));
+  previous.addEventListener('click', () => {
+    const visible = Array.from(mount.querySelectorAll('.msg')).filter(node => !node.hidden);
+    const anchor = visible.find(node => node.getBoundingClientRect().bottom > document.querySelector('header').getBoundingClientRect().bottom);
+    const messages = Array.from(mount.querySelectorAll('.msg'));
+    const index = anchor ? messages.indexOf(anchor) : messages.length;
+    const target = messages.slice(0, index).filter(node => node.classList.contains('role-user')).pop()
+      || messages.find(node => node.classList.contains('role-user'));
+    if (role.value === 'assistant') { role.value = 'all'; filterRoles(); }
+    jump(target);
+  });
+  function say(text, kind){ statusEl.textContent = text; statusEl.className = kind || ''; filterRoles(); }
 
   async function show(){
     try{

@@ -59,6 +59,8 @@ class DrainHarness {
         PORT: String(this.port),
         MUX_HOST_TOKEN: 'test-token',
         MUX_TEST_MODE: '1',
+        MUX_TEST_FIXTURE: '1',
+        MUX_BIND_HOST: '127.0.0.1',
         MUX_AUTOHEAL: '0',
         MUX_STATE_DIR: this.tmp,
         MUX_HOST_SB_WAIT_MS: '40',
@@ -70,7 +72,7 @@ class DrainHarness {
     this.proc.stdout.on('data', d => { this.stdout += d.toString(); });
     this.proc.stderr.on('data', d => { this.stdout += d.toString(); });
     this.proc.on('exit', (code, signal) => this._resolveExit({ code, signal, at: Date.now() }));
-    await waitFor(() => this.stdout.includes(`multiplex-app on 0.0.0.0:${this.port}`), 'relay start');
+    await waitFor(() => this.stdout.includes(`multiplex-app on 127.0.0.1:${this.port}`), 'relay start');
   }
 
   signalDrain() {

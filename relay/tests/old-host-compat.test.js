@@ -45,7 +45,7 @@ function shellSession(name) {
   };
 }
 
-test('canonical fully bridges the production protocol-4 16-cap muxd', async t => {
+test('canonical bridges old protocol-4 viewing but refuses unfenced hosted deletion', async t => {
   const h = new RelayHarness();
   await h.start();
   t.after(async () => h.stop());
@@ -107,17 +107,14 @@ test('canonical fully bridges the production protocol-4 16-cap muxd', async t =>
   assert.ok(input.channelId);
   assert.equal(input.d, Buffer.from('typed through canonical', 'utf8').toString('base64'));
 
-  const killResponse = h.request('DELETE', '/api/sessions/production-compat');
-  await host.waitFor(
-    message => message.t === 'kill' && message.s === 'production-compat',
-    'kill request',
-  );
-  host.sendKilled('production-compat');
-  const killed = await killResponse;
-  assert.equal(killed.status, 200);
-  assert.equal(killed.body.ok, true);
-
-  const [closeCode] = await viewerClosed;
-  assert.equal(closeCode, 1013);
-  assert.deepEqual(await h.json('GET', '/api/sessions'), []);
+  const killed = await h.request('DELETE', '/api/sessions/production-compat', {
+    sessionId: '', generationId: 'old-host-generation',
+  });
+  assert.equal(killed.status, 503);
+  assert.match(killed.body.detail, /relayKillFence/);
+  assert.equal(host.messages.some(message => message.t === 'kill'), false);
+  assert.equal((await h.json('GET', '/api/sessions')).length, 1);
+  assert.equal(viewer.readyState, WebSocket.OPEN);
+  viewer.close();
+  await viewerClosed;
 });

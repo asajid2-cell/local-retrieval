@@ -20,6 +20,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { once } = require('node:events');
 const WebSocket = require('ws');
+const http = require('node:http');
 
 const { RelayHarness, sleep } = require('./harness');
 
@@ -59,6 +60,151 @@ async function attachOutcome(port, session, headers = {}) {
 // with `=== '1'`. The harness sets it, so this deletes it from the spawned child's environment.
 const NO_TEST_MODE = { MUX_TEST_MODE: undefined, ALLOWED_WS_ORIGINS: ORIGIN };
 const TEST_MODE_ON = { ALLOWED_WS_ORIGINS: ORIGIN };
+
+test('production middleware distinguishes anonymous, non-owner, and owner over HTTP and WebSocket', async t => {
+  const verified = [];
+  const identity = http.createServer((req, res) => {
+    if (req.url !== '/internal/verify') { res.writeHead(404); res.end(); return; }
+    const token = req.headers['x-session-token'];
+    verified.push(token);
+    res.setHeader('content-type', 'application/json');
+    res.end(JSON.stringify({ authenticated: token === 'fixture-owner' || token === 'fixture-member', user: { isOwner: token === 'fixture-owner' } }));
+  });
+  await new Promise(resolve => identity.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise(resolve => { identity.closeAllConnections(); identity.close(resolve); }));
+  const h = new RelayHarness({ ...NO_TEST_MODE, HLAUTH_BASE: `http://127.0.0.1:${identity.address().port}` });
+  t.after(() => h.stop());
+  await h.start();
+  const host = await h.connectHost([shellSession('identitycase')]);
+  t.after(() => host.close());
+  for (const [token, expected] of [[null, 401], ['fixture-member', 403], ['fixture-owner', 200]]) {
+    const headers = { 'x-forwarded-for': '203.0.113.7', ...(token ? { cookie: `hl_session=${token}` } : {}) };
+    const response = await h.request('GET', '/api/sessions', undefined, headers);
+    assert.equal(response.status, expected, `HTTP authorization for ${token || 'anonymous'}`);
+    const outcome = await attachOutcome(h.port, 'identitycase', headers);
+    assert.deepEqual(outcome, { code: token === 'fixture-owner' ? 'open' : 1008 });
+    if (token !== 'fixture-owner') {
+      await host.assertNo(m => m.t === 'sb' && m.s === 'identitycase', 'unauthorized identity must not reach host');
+      for (const route of ['/api/app-commands', '/api/app-commands/lease', '/api/app-commands/forged/ack']) {
+        const rejected = await h.request('POST', route, { type: 'setfavorite', sessionId: 'fixture', favorite: true }, headers);
+        assert.equal(rejected.status, route === '/api/app-commands' ? expected : 403, `unauthorized identity must not access ${route}`);
+      }
+    }
+  }
+  const { chromium } = require('playwright');
+  const browser = await chromium.launch({ headless: true });
+  t.after(() => browser.close());
+  for (const [token, expected] of [[null, 401], ['fixture-member', 403], ['fixture-owner', 200]]) {
+    const context = await browser.newContext();
+    try {
+      if (token) await context.addCookies([{ name: 'hl_session', value: token, url: `http://127.0.0.1:${h.port}` }]);
+      const page = await context.newPage();
+      await page.goto(`http://127.0.0.1:${h.port}/`);
+      const result = await page.evaluate(async () => {
+        const response = await fetch('/api/sessions');
+        return { status: response.status, body: await response.text() };
+      });
+      assert.equal(result.status, expected, 'real browser cookie authorization');
+      if (token === 'fixture-owner') assert.ok(JSON.stringify(result.body).includes('identitycase'));
+      const mutation = await page.evaluate(async () => {
+        const response = await fetch('/api/app-commands', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ type: 'setfavorite', sessionId: 'fixture-auth-chat', favorite: true, expectedRevision: 'fixture-revision', intentId: 'browser-owner-mutation' }) });
+        return { status: response.status, text: await response.text() };
+      });
+      assert.equal(mutation.status, expected, 'browser mutation requires owner cookie');
+      const upload = await page.evaluate(async () => {
+        const response = await fetch('/api/upload?name=authorization-fixture.txt', { method: 'POST',
+          headers: { 'Content-Type': 'application/octet-stream' }, body: 'isolated browser authorization fixture' });
+        return { status: response.status, text: await response.text() };
+      });
+      assert.equal(upload.status, expected, 'browser upload requires owner cookie');
+      if (token === 'fixture-owner') {
+        const queued = JSON.parse(mutation.text);
+        assert.ok(queued.id, 'owner mutation receives a durable queue receipt');
+        const lease = await h.request('POST', '/api/app-commands/lease', { owner: 'fixture-pc-authority', limit: 1 },
+          { 'x-mux-command-bridge': h.commandBridgeToken });
+        assert.equal(lease.status, 200);
+        assert.equal(lease.body[0].id, queued.id);
+        assert.equal(lease.body[0].sessionId, 'fixture-auth-chat');
+        assert.equal(lease.body[0].intentId, 'browser-owner-mutation');
+      }
+    } finally { await context.close(); }
+  }
+  assert.ok(verified.includes('fixture-member'), 'member identity reached actual middleware verification');
+  assert.ok(verified.includes('fixture-owner'), 'owner positive control reached actual middleware verification');
+  await host.waitFor(m => m.t === 'sb' && m.s === 'identitycase', 'authorized owner screen request');
+});
+
+test('owner browser mutation reaches real headless archive and survives reload', async t => {
+  const fs = require('node:fs'), path = require('node:path'), cp = require('node:child_process'), crypto = require('node:crypto');
+  const { freePort, waitFor } = require('./harness');
+  const identity = http.createServer((req, res) => {
+    res.setHeader('content-type', 'application/json');
+    const token = req.headers['x-session-token'];
+    res.end(JSON.stringify({ authenticated: ['fixture-owner', 'fixture-member'].includes(token), user: { isOwner: token === 'fixture-owner' } }));
+  });
+  await new Promise(resolve => identity.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise(resolve => { identity.closeAllConnections(); identity.close(resolve); }));
+  const h = new RelayHarness({ ...NO_TEST_MODE, HLAUTH_BASE: `http://127.0.0.1:${identity.address().port}` });
+  let server;
+  const stopServer = async () => {
+    if (server && server.exitCode === null && server.signalCode === null) { const exited = once(server, 'exit'); server.kill(); await exited; }
+  };
+  t.after(async () => { await stopServer(); await h.stop(); });
+  await h.start();
+  const port = await freePort(), token = crypto.randomBytes(32).toString('hex');
+  const storePath = path.join(h.tmp, 'archive.json'), sources = path.join(h.tmp, 'claude-sources');
+  fs.mkdirSync(sources);
+  const session = id => ({ id, title: id, tool: 'claude', sourcePath: '', workspace: h.tmp, userMessageCount: 2, messageCount: 4, tags: [], aliases: [], pinned: false });
+  fs.writeFileSync(storePath, JSON.stringify({ sessions: { target: session('target'), unrelated: session('unrelated') }, settings: { sources: [], multiplexSshTarget: 'loopback', multiplexApiPort: h.port }, collections: {} }));
+  const dll = path.resolve(__dirname, '../../app/native/CodexLocalRetrieval.Server/bin/Debug/net8.0/CodexLocalRetrieval.Server.dll');
+  assert.ok(fs.existsSync(dll), 'build headless Server before connected acceptance');
+  const startServer = () => {
+    server = cp.spawn('dotnet', [dll], { windowsHide: true, stdio: ['ignore', 'ignore', 'pipe'], env: { ...process.env,
+      CLR_REMOTE_TOKEN: token, CLR_REMOTE_PORT: String(port), CLR_REMOTE_BIND: '127.0.0.1', CLR_REMOTE_STORE: storePath,
+      CLR_CLAUDE_PROJECTS: sources, CLR_REMOTE_SYNC: '0', CLR_REMOTE_BRIDGE: '1', CLR_REMOTE_TEST_PROFILE: '1',
+      CLR_REMOTE_TEST_RELAY_PORT: String(h.port), CLR_REMOTE_TEST_COMMAND_BRIDGE_TOKEN: h.commandBridgeToken,
+      MUX_TEST_FIXTURE: '1', MUX_BIND_HOST: '127.0.0.1', CLR_REMOTE_ALLOW_LAUNCH: '0', CLR_FLEET: '0', CLR_REMOTE_IDLE_UNLOAD_SEC: '0' } });
+    server.stderr.resume();
+  };
+  const archiveGet = async route => {
+    const response = await fetch(`http://127.0.0.1:${port}${route}`, { headers: { authorization: `Bearer ${token}` } });
+    assert.equal(response.status, 200); return response.json();
+  };
+  startServer();
+  await waitFor(async () => { try { return await archiveGet('/healthz'); } catch { return false; } }, 'headless authority', 30000);
+  const row = (await archiveGet('/api/discovery/chats?showHidden=true&archived=all')).rows.find(row => row.id === 'target');
+  const beforeUnrelated = (await archiveGet('/api/discovery/chats?showHidden=true&archived=all')).rows.find(row => row.id === 'unrelated');
+  const browser = await require('playwright').chromium.launch({ headless: true });
+  t.after(() => browser.close());
+  let commandId;
+  for (const [cookie, expected] of [[null, 401], ['fixture-member', 403], ['fixture-owner', 200]]) {
+    const context = await browser.newContext();
+    try {
+      if (cookie) await context.addCookies([{ name: 'hl_session', value: cookie, url: `http://127.0.0.1:${h.port}` }]);
+      const page = await context.newPage(); await page.goto(`http://127.0.0.1:${h.port}/`);
+      const response = await page.evaluate(async revision => {
+        const r = await fetch('/api/app-commands', { method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ type: 'setfavorite', sessionId: 'target', favorite: true, expectedRevision: revision, intentId: 'owner-to-archive' }) });
+        return { status: r.status, text: await r.text() };
+      }, row.revision);
+      assert.equal(response.status, expected);
+      if (cookie !== 'fixture-owner') assert.equal(JSON.parse(fs.readFileSync(storePath)).sessions.target.pinned, false);
+      else {
+        commandId = JSON.parse(response.text).id;
+        await waitFor(async () => page.evaluate(async id => (await (await fetch('/api/app-commands/' + id)).json()).status === 'done', commandId), 'PC-applied owner mutation', 45000);
+        await page.reload();
+        assert.equal(await page.evaluate(async id => (await (await fetch('/api/app-commands/' + id)).json()).status, commandId), 'done');
+      }
+    } finally { await context.close(); }
+  }
+  await stopServer(); startServer();
+  await waitFor(async () => { try { return (await archiveGet('/api/discovery/chats?showHidden=true&archived=all')).rows.find(row => row.id === 'target')?.pinned; } catch { return false; } }, 'durable favorite after Server restart', 30000);
+  const after = JSON.parse(fs.readFileSync(storePath));
+  const afterUnrelated = (await archiveGet('/api/discovery/chats?showHidden=true&archived=all')).rows.find(row => row.id === 'unrelated');
+  assert.deepEqual(afterUnrelated, beforeUnrelated);
+  assert.equal(after.sessions.target.pinned, true);
+});
 
 // ---------------------------------------------------------------------------------------------
 // (a) THE NEGATIVE. No test mode => loopback buys nothing, even for a session that really exists.

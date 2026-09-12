@@ -218,7 +218,7 @@
     <div class="spacer"></div>
     <a class="topbtn" href="./">&lsaquo; Terminal</a>
   </div>
-  <div id="syncbar"><span class="sdot"></span><span id="synctext">checking sync&hellip;</span><button id="wscolbtn" class="pill" type="button" title="Open the desktop app to save tabs to a collection" disabled>&#43; Tabs &rarr; collection</button><button id="runpill" class="pill" type="button" hidden><span class="rdot"></span><span id="runcount">0</span> running on PC</button><button id="refreshpill" class="pill" type="button" hidden>&#8635; New chats — refresh</button></div>
+  <div id="syncbar"><span class="sdot"></span><span id="synctext">checking sync&hellip;</span><button id="wscolbtn" class="pill" type="button" title="Open the desktop app to save tabs to a collection" disabled>&#43; Tabs &rarr; collection</button><button id="containerbtn" class="pill" type="button" title="Manage decks and collections" disabled>Manage containers</button><button id="runpill" class="pill" type="button" hidden><span class="rdot"></span><span id="runcount">0</span> running on PC</button><button id="refreshpill" class="pill" type="button" hidden>&#8635; New chats — refresh</button></div>
   <div id="projsearch"><input id="projfilter" placeholder="Search projects &amp; chats…" autocapitalize="off" autocomplete="off" spellcheck="false"></div>
   <div id="viewList" class="view"><div class="projempty">Loading projects&hellip;</div></div>
   <div id="viewDetail" class="view" hidden></div>
@@ -249,6 +249,12 @@
   <div class="dlgrow" id="wsdecknewrow" hidden><label class="wslabel" for="wsdecknew">New deck</label><input id="wsdecknew" placeholder="deck name" autocapitalize="off" autocomplete="off" spellcheck="false"></div>
   <div class="dlgrow"><input id="wscolnew" placeholder="new collection name…" autocapitalize="off" autocomplete="off" spellcheck="false"><button id="wscolcreate" type="button" class="prim">Create &amp; add</button></div>
   <div class="dlgrow" style="justify-content:flex-end"><button id="wscolcancel" type="button">Cancel</button></div>
+</dialog>
+<dialog id="containerdlg">
+  <h3>Manage decks and collections</h3>
+  <p class="dlghint" id="containerstatus">Loading authoritative containers...</p>
+  <div id="containerbody"></div>
+  <div class="dlgrow" style="justify-content:flex-end"><button id="containerclose" type="button">Close</button></div>
 </dialog>
 <div id="tmodal" class="modal" hidden role="dialog" aria-modal="true" aria-label="Transcript">
   <div class="msheet">
@@ -291,6 +297,7 @@ function renderSync(d){
   const sb=$('#syncbar'); sb.classList.remove('live','stale');
   const live = appLive(d), bridge = bridgeLive(d), stamp = d.appSyncedAt ?? d.syncedAt;
   $('#wscolbtn').disabled=!live;
+  $('#containerbtn').disabled=!bridge;
   $('#wscolbtn').title=live
     ? 'Add all your open remote tabs to a collection (new or existing)'
     : 'Open the desktop app to save tabs to a collection';
@@ -316,7 +323,7 @@ const goSvg = '<svg class="cgo" viewBox="0 0 24 24" fill="none" aria-hidden="tru
 // source as the "N running on PC" pill). We deliberately ignore the per-chat `running` flag baked into
 // the collections snapshot: after a PC restart the bridge refreshes runningSessions but NOT that
 // snapshot, so the baked flag goes stale and falsely marks dead sessions as live ("Take over" / amber dot).
-function liveRunIds(){ return new Set((data && Array.isArray(data.runningSessions) ? data.runningSessions : []).map(r=>String(r.sessionId||'')).filter(Boolean)); }
+function liveRunIds(){ return new Set((data && Array.isArray(data.runningSessions) ? data.runningSessions : []).flatMap(r=>[r.sessionId,...(r.sessionAliases||[])]).map(id=>String(id||'')).filter(Boolean)); }
 function localChatIds(ch){
   const out=[]; const add=v=>{ const s=String(v||''); if(s&&!out.includes(s)) out.push(s); };
   add(ch&&ch.id); (Array.isArray(ch&&ch.aliases)?ch.aliases:[]).forEach(add); return out;
@@ -500,12 +507,14 @@ function applyFilter(){
 // ---- Running on PC: list every live claude/codex agent (incl. background VS Code) + kill any of them ----
 function updateRunPill(){
   const n=(data && bridgeLive() && Array.isArray(data.runningSessions)) ? data.runningSessions.length : 0;
-  $('#runcount').textContent=n;
-  $('#runpill').hidden = (n===0);
+  const unverified=!!(data && (!bridgeLive() || data.runningVerified===false));
+  if(curDetail==='__running__') updateRunningCertainty();
+  $('#runcount').textContent=unverified?'?':n;
+  $('#runpill').hidden = (n===0 && !unverified);
   const mb=$('#mobileRunNav');
   if(mb){
-    mb.disabled = (n===0);
-    mb.querySelector('span').textContent = n ? `${n} running` : 'Running';
+    mb.disabled = (n===0 && !unverified);
+    mb.querySelector('span').textContent = unverified ? 'Running unknown' : n ? `${n} running` : 'Running';
   }
 }
 function runRow(s){
@@ -527,6 +536,7 @@ function runRow(s){
   if(s.collection) bits.push(s.collection);
   if(s.pid) bits.push('pid '+s.pid);
   if(s.sessionId) bits.push(String(s.sessionId).slice(0,8));
+  if(s.identityStatus && s.identityStatus!=='resolved') bits.push('identity '+s.identityStatus);
   row.querySelector('.sub').textContent = bits.join(' · ');
   const openBtn=row.querySelector('.openbtn'), renBtn=row.querySelector('.renbtn');
   if(s.sessionId){
@@ -558,8 +568,7 @@ function runRow(s){
   return row;
 }
 
-// Edit the chat's OWN Claude/Codex name from the phone: inline editor -> enqueue a `rename` command the
-// desktop app actions (writes Codex's thread title / a Claude custom-title), poll the result.
+// Native rename retains its original revision and intent until the PC confirms completion.
 function renameNative(s, row){
   if(row.querySelector('.renedit')) return;                 // already editing
   if(!bridgeLive()){ flash(row, 'PC bridge is not live - open the app or bridge and try again.'); return; }
@@ -567,31 +576,66 @@ function renameNative(s, row){
   const editor=document.createElement('div'); editor.className='renedit';
   editor.innerHTML=`<input class="reninput" type="text" maxlength="200" autocapitalize="off" spellcheck="false"><button class="rensave" type="button">Save</button><button class="rencancel" type="button">Cancel</button><span class="renstat"></span>`;
   const input=editor.querySelector('.reninput'), stat=editor.querySelector('.renstat');
+  const base=new URL('.', location.href).pathname.replace(/\/$/, '');
+  const pendingKey='mux.native-rename.v1:'+JSON.stringify([base,s.sessionId,s.tool]);
   input.value = s.realTitle || s.title || '';
+  try{
+    const pending=JSON.parse(localStorage.getItem(pendingKey)||'null');
+    if(pending){ input.value=pending.title; stat.textContent='Outcome unknown; Save reconciles the original request.'; }
+  }catch{ stat.textContent='Cannot read pending rename; restore browser storage before retrying.'; }
   rmeta.appendChild(editor); input.focus(); input.select();
   const close=()=>editor.remove();
   editor.querySelector('.rencancel').onclick=close;
-  editor.querySelector('.reninput').addEventListener('keydown', e=>{ if(e.key==='Escape') close(); if(e.key==='Enter') editor.querySelector('.rensave').click(); });
-  editor.querySelector('.rensave').onclick=async()=>{
+  input.addEventListener('keydown', e=>{ if(e.key==='Escape') close(); if(e.key==='Enter') editor.querySelector('.rensave').click(); });
+  const save=editor.querySelector('.rensave');
+  save.onclick=async()=>{
+    if(save.disabled) return;
     const title=input.value.trim(); if(!title){ close(); return; }
-    stat.textContent='saving…';
-    let id=null;
+    save.disabled=true;
+    stat.textContent='Waiting for PC confirmation…';
     try{
-      const r=await postIntent('api/app-commands',
-        {type:'rename', sessionId:s.sessionId, tool:s.tool, title},
-        'rename-native');
+      let pending=JSON.parse(localStorage.getItem(pendingKey)||'null');
+      if(pending && pending.title!==title) throw new Error('An earlier native rename is unconfirmed. Retry its original title before choosing another.');
+      if(!pending){
+        const discoveryBase=window.MUX_DISCOVERY_BASE||base+'/pc/api/discovery';
+        let chat=null;
+        for(let offset=0;!chat;){
+          const response=await fetch(discoveryBase+'/chats?showHidden=true&archived=all&limit=100&offset='+offset);
+          if(!response.ok) throw new Error('PC discovery unavailable');
+          const page=await response.json();
+          if(!Array.isArray(page.rows)) throw new Error('invalid PC discovery response');
+          chat=page.rows.find(r=>r.id===s.sessionId&&r.tool===s.tool);
+          if(chat||page.rows.length===0) break;
+          offset+=page.rows.length;
+          if(Number.isFinite(page.total)&&offset>=page.total) break;
+        }
+        if(!chat?.revision) throw new Error('exact chat revision unavailable');
+        pending={type:'rename',sessionId:s.sessionId,tool:s.tool,title,expectedRevision:chat.revision,intentId:'rename-native-'+crypto.randomUUID().replaceAll('-','')};
+        localStorage.setItem(pendingKey,JSON.stringify(pending));
+      }
+      const r=await postIntent('api/app-commands',pending,'rename-native');
       if(!r.ok) throw new Error(await apiError(r));
-      id=(await r.json()).id;
-    }catch(e){ stat.textContent='couldn’t send ('+(e.message||e)+')'; return; }
-    const t0=Date.now();
-    const poll=async()=>{
-      if(Date.now()-t0>30000){ stat.textContent='no response from the PC'; return; }
-      let c=null; try{ c=await (await fetch('api/app-commands/'+encodeURIComponent(id))).json(); }catch(e){}
-      if(c && c.status==='done'){ s.realTitle=title; const rn=row.querySelector('.realname'); rn.hidden=false; rn.textContent=title; close(); return; }
-      if(c && c.status==='failed'){ stat.textContent=c.detail||'rename failed'; return; }
-      setTimeout(poll, 1000);
-    };
-    setTimeout(poll, 1000);
+      const id=(await r.json()).id;
+      if(!id) throw new Error('missing command receipt');
+      const deadline=Date.now()+30000;
+      while(editor.isConnected && Date.now()<deadline){
+        let c=null;
+        try{
+          const response=await fetch('api/app-commands/'+encodeURIComponent(id));
+          if(response.ok) c=await response.json();
+        }catch{}
+        if(c && (c.status==='done'||c.status==='failed')){
+          localStorage.removeItem(pendingKey);
+          if(c.status==='failed') throw new Error(c.detail||'rename failed');
+          s.realTitle=pending.title;
+          const rn=row.querySelector('.realname'); rn.hidden=false; rn.textContent=pending.title;
+          close(); return;
+        }
+        await new Promise(resolve=>setTimeout(resolve,1000));
+      }
+      stat.textContent='Outcome unknown; Save reconciles the original request.';
+    }catch(e){ stat.textContent='Rename not confirmed: '+(e.message||e); }
+    finally{ save.disabled=false; }
   };
 }
 function flash(row, msg){ const sub=row.querySelector('.sub'); if(!sub) return; const old=sub.textContent; sub.textContent=msg; setTimeout(()=>{ sub.textContent=old; }, 2600); }
@@ -623,6 +667,17 @@ async function openTranscript(s){
   };
   setTimeout(poll, 1200);
 }
+function updateRunningCertainty(){
+  const el=$('#viewDetail'), list=Array.isArray(data.runningSessions)?data.runningSessions:[];
+  const shown=el.querySelectorAll('.runrow').length;
+  const unverified=!bridgeLive() || data.runningVerified===false;
+  el.querySelector('.dcount').textContent=unverified ? 'Count unknown' : `${list.length} agent${list.length!==1?'s':''}`;
+  el.querySelector('.reslabel').textContent=unverified
+    ? 'Running state is unverified. '+(data.runningVerificationDetail||'PC bridge is unavailable; last-known rows are not proof of current liveness.')
+    : 'Latest scan: '+list.length+' agents. Rows below are the snapshot selected when this view opened; reopen Running to refresh them.';
+  const empty=el.querySelector('.projempty');
+  if(empty && !shown) empty.textContent=unverified ? 'Cannot determine whether agents are running.' : list.length ? 'New agents detected. Reopen Running to view them.' : 'No agents running right now.';
+}
 function openRunning(){
   const list=(data && Array.isArray(data.runningSessions)) ? data.runningSessions : [];
   curDetail='__running__'; detailOrigin=$('#runpill');
@@ -630,13 +685,12 @@ function openRunning(){
   const head=document.createElement('div'); head.className='dhead';
   head.innerHTML=`<span class="dname"></span><span class="dcount"></span>`;
   head.querySelector('.dname').textContent='Running on '+(data.host||'this PC');
-  head.querySelector('.dcount').textContent=`${list.length} agent${list.length!==1?'s':''}`;
   el.appendChild(head);
   const note=document.createElement('div'); note.className='reslabel';
-  note.textContent='Live claude/codex agents on your PC — including forgotten background VS Code sessions. A detached mirror can be cleared without ending its local agent.';
   el.appendChild(note);
-  if(!list.length){ const e2=document.createElement('div'); e2.className='projempty'; e2.textContent='No agents running right now.'; el.appendChild(e2); }
+  if(!list.length){ const e2=document.createElement('div'); e2.className='projempty'; el.appendChild(e2); }
   else list.forEach(s=> el.appendChild(runRow(s)));
+  updateRunningCertainty();
   $('#viewList').hidden=true; $('#projsearch').hidden=true;
   el.hidden=false; el.scrollTop=0;
   $('#backproj').hidden=false; $('#brandword').textContent='running';
@@ -652,12 +706,14 @@ async function apiError(r){
   return msg;
 }
 async function killSession(s, row, btn){
+  const mux=muxNameForSession(s);
+  const selected=muxSession(mux);
+  const expected=selected ? {sessionId:selected.authoritativeSessionId,generationId:selected.generationId} : null;
   const label = s.title || ('session '+String(s.sessionId||'').slice(0,8));
   if(!confirm(`Stop the ${s.tool==='codex'?'Codex':'Claude'} session for “${label}”?\n\n${s.parent||'Unknown'} · pid ${s.pid||'?'}\nA connected session is ended. A detached mirror is only cleared, leaving its local agent running.`)) return;
   btn.disabled=true; btn.textContent='Killing…'; row.classList.add('killing');
   // Mux-hosted sessions must be killed through the mux API so muxd, the relay, and the manifest agree.
   // If that path fails, stop and show the error instead of falling through to a local-agent kill.
-  const mux=muxNameForSession(s);
   if(mux){
     let live=null;
     try{
@@ -679,7 +735,7 @@ async function killSession(s, row, btn){
         return;
       }
       try{
-        const drop=await sendIntent('DELETE', 'api/sessions/'+encodeURIComponent(mux), null, 'projects-kill');
+        const drop=await sendIntent('DELETE', 'api/sessions/'+encodeURIComponent(mux), expected, 'projects-kill');
         if(!drop.ok) throw new Error(await apiError(drop));
         const detachedAdopted=!!(hosted && hosted.adopted && hosted.detachedLocal);
         btn.textContent=detachedAdopted?'Mirror cleared':'Killed';
@@ -726,6 +782,7 @@ async function awaitCmdResult(id, ms){
   while(Date.now()-t0<(ms||12000)){
     await new Promise(s=>setTimeout(s,900));
     let c=null; try{ c=await (await fetch('api/app-commands/'+encodeURIComponent(id))).json(); }catch(e){}
+    // Enqueue acknowledgement is not completion. Only the durable terminal states are usable.
     if(c && c.status==='done') return { ok:true, detail:c.detail||'' };
     if(c && c.status==='failed') return { ok:false, detail:c.detail||'command failed' };
   }
@@ -782,20 +839,180 @@ function setDeckNewVisible(){
   $('#wsdecknewrow').hidden=!isNew;
   if(isNew) setTimeout(()=>$('#wsdecknew').focus(),30);
 }
-function addWorkspaceToCollection(){
-  if(!appLive()){ alert('Open the desktop app first - it owns your collections, so this cannot drift out of sync.'); return; }
+let _containerAdmin = null;
+function containerApi(){ return '/multiplex/pc/api/discovery/admin/containers'; }
+async function loadContainerAdmin(){
+  const r=await fetch(containerApi(), {headers:{Accept:'application/json'}});
+  if(!r.ok) throw new Error(await apiError(r));
+  _containerAdmin=await r.json(); return _containerAdmin;
+}
+function containerRow(parent, textValue, action, dangerous){
+  const row=document.createElement('div'); row.className='dlgrow';
+  const label=document.createElement('span'); label.textContent=textValue; label.style.flex='1'; row.appendChild(label);
+  if(action){ const b=document.createElement('button'); b.type='button'; b.textContent=action.label; if(dangerous) b.className='danger'; b.onclick=action.run; row.appendChild(b); }
+  parent.appendChild(row); return row;
+}
+async function containerCommand(payload, prefix){
+  const r=await postIntent('api/app-commands', payload, prefix);
+  if(!r.ok) throw new Error(await apiError(r));
+  const queued=await r.json(); const done=await awaitCmdResult(queued.id, 30000);
+  if(!done.ok) throw new Error(done.detail || 'desktop app rejected the operation');
+  return done;
+}
+let _containerMutation = Promise.resolve();
+function setContainerMutationBusy(busy){
+  const dialog=$('#containerdlg');
+  if(!dialog) return;
+  dialog.dataset.mutationBusy=busy?'true':'false';
+  const status=$('#containerstatus');
+  if(status) status.textContent=busy ? 'Waiting for the desktop app to finish and reload...' : 'Changes are revision-checked on the PC.';
+  dialog.querySelectorAll('button,input,select').forEach(control=>{
+    control.disabled=!!busy || control.title==='Main cannot be deleted' || control.dataset.orderBoundary==='true';
+  });
+}
+function queueContainerMutation(work){
+  const run=_containerMutation.then(work, work);
+  _containerMutation=run.catch(()=>{});
+  return run;
+}
+async function mutateContainer(type, item){
+  return queueContainerMutation(async()=>{
+    setContainerMutationBusy(true);
+    const fields={type};
+    try {
+    if(type==='deckcreate' || type==='collectioncreate') fields.name=item.name;
+    if(type==='collectioncreate') fields.targetDeckId=item.deckId || 'main';
+    if(type==='deckrename' || type==='deckdelete'){
+      const current=(_containerAdmin?.decks||[]).find(d=>d.id===item.id);
+      if(!current) throw new Error('This deck is no longer displayed. Reload the container list.');
+      if(item.revision && current.revision!==item.revision) throw new Error('This deck changed. Reload the container list before retrying.');
+      fields.deckId=current.id; fields.expectedRevision=item.revision || current.revision;
+    }
+    if(type==='collectionrename' || type==='collectiondelete' || type==='collectionmove' || type==='collectionsettag' || type==='collectionreorder') {
+      const current=(_containerAdmin?.collections||[]).find(c=>c.id===item.id);
+      if(!current) throw new Error('This collection is no longer displayed. Reload the container list.');
+      if(item.revision && current.revision!==item.revision) throw new Error('This collection changed. Reload the container list before retrying.');
+      fields.collectionId=current.id; fields.expectedRevision=item.revision || current.revision;
+    }
+    if(type==='collectionrecover' || type==='collectionpurge') {
+      const current=(_containerAdmin?.recentlyDeleted||[]).find(c=>c.id===item.id);
+      if(!current) throw new Error('This deleted collection is no longer displayed. Reload the container list.');
+      if(item.revision && current.revision!==item.revision) throw new Error('This collection changed. Reload the container list before retrying.');
+      fields.collectionId=current.id; fields.expectedRevision=item.revision || current.revision;
+    }
+    if(type==='collectionpurge') fields.expectedDeletedRevision=fields.expectedRevision;
+    if(type==='collectionempty') {
+      if(!item.revision || item.revision!==_containerAdmin?.recentlyDeletedManagementRevision) throw new Error('Recently Deleted changed. Reload before emptying it.');
+      fields.expectedRecentlyDeletedRevision=item.revision;
+    }
+    if(type==='collectionpurge' || type==='collectionempty')
+      if(!confirm(type==='collectionempty' ? 'Permanently remove all '+item.count+' deleted collections?\n\nChats and transcripts remain. These collections will no longer be recoverable from Recently Deleted.' : 'Permanently remove “'+item.name+'” from Recently Deleted?\n\nChats and transcripts remain.')) return;
+    if(type==='deckrename') fields.name=item.name;
+    if(type==='collectionrename') fields.name=item.name;
+    if(type==='collectionmove') fields.targetDeckId=item.targetDeckId;
+    if(type==='collectionsettag'){ fields.tag=item.tag; fields.enabled=item.enabled; }
+    if(type==='collectionreorder') fields.sessionIds=item.sessionIds;
+    if(type==='deckreorder') {
+      if(!item.revision || item.revision!==_containerAdmin?.deckOrderRevision) throw new Error('Deck order changed. Reload before retrying.');
+      fields.expectedRevision=item.revision; fields.deckIds=item.deckIds;
+    }
+    if(type==='deckdelete' || type==='collectiondelete' || type==='collectionrecover')
+      if(!confirm((type==='collectionrecover'?'Recover':'Delete')+' “'+(item.name||item.id)+'”?\n\nThis changes organization only; transcript content is never deleted.')) return;
+      await containerCommand(fields, 'container-'+type);
+      // The command is terminal only after the PC has durably committed it. One authoritative
+      // reload is sufficient; do not poll or silently upgrade a stale reviewed revision.
+      await loadContainerAdmin();
+      renderContainerAdmin();
+    } finally {
+      setContainerMutationBusy(false);
+    }
+  });
+}
+function renderContainerAdmin(){
+  const body=$('#containerbody'); body.innerHTML=''; const a=_containerAdmin||{};
+  const decks=Array.isArray(a.decks)?a.decks:[], cols=Array.isArray(a.collections)?a.collections:[], deleted=Array.isArray(a.recentlyDeleted)?a.recentlyDeleted:[];
+  const add=document.createElement('div'); add.className='dlgrow';
+  const input=document.createElement('input'); input.placeholder='new deck name'; input.maxLength=200; add.appendChild(input);
+  const btn=document.createElement('button'); btn.type='button'; btn.textContent='Create deck'; btn.onclick=async()=>{ if(!input.value.trim()) return; btn.disabled=true; try{ await mutateContainer('deckcreate',{name:input.value.trim()}); input.value=''; }catch(e){ alert(e.message||e); }finally{btn.disabled=false;} }; add.appendChild(btn); body.appendChild(add);
+  decks.forEach((d,index)=>{
+    const row=containerRow(body, 'Deck: '+d.label+' · '+d.id, null);
+    for(const [label,delta] of [['Move earlier',-1],['Move later',1]]) {
+      const move=document.createElement('button'); move.type='button'; move.textContent=label;
+      move.disabled=index+delta<0||index+delta>=decks.length;
+      move.dataset.orderBoundary=String(move.disabled);
+      move.onclick=async()=>{const order=decks.map(deck=>deck.id);const next=index+delta;if(next<0||next>=order.length)return;[order[index],order[next]]=[order[next],order[index]];try{await mutateContainer('deckreorder',{revision:a.deckOrderRevision,deckIds:order});}catch(e){alert(e.message||e);}};
+      row.appendChild(move);
+    }
+    const rename=document.createElement('button'); rename.textContent='Rename'; rename.onclick=async()=>{ const name=prompt('New deck name',d.label); if(!name||!name.trim()) return; try{await mutateContainer('deckrename',{id:d.id,name:name.trim(),revision:d.revision});}catch(e){alert(e.message||e);} }; row.appendChild(rename);
+    const del=document.createElement('button'); del.textContent='Delete'; del.disabled=String(d.id).toLowerCase()==='main'; del.title=del.disabled?'Main cannot be deleted':'Delete deck'; del.onclick=async()=>{try{await mutateContainer('deckdelete',{id:d.id,name:d.label,revision:d.revision});}catch(e){alert(e.message||e);}}; row.appendChild(del);
+  });
+  const collectionAdd=document.createElement('div'); collectionAdd.className='dlgrow';
+  const collectionInput=document.createElement('input'); collectionInput.placeholder='new collection name'; collectionInput.maxLength=200; collectionAdd.appendChild(collectionInput);
+  const collectionDeck=document.createElement('select'); decks.forEach(d=>{const o=document.createElement('option');o.value=d.id;o.textContent=d.label;collectionDeck.appendChild(o);}); collectionAdd.appendChild(collectionDeck);
+  const collectionCreate=document.createElement('button'); collectionCreate.type='button'; collectionCreate.textContent='Create collection'; collectionCreate.onclick=async()=>{if(!collectionInput.value.trim())return;try{await mutateContainer('collectioncreate',{name:collectionInput.value.trim(),deckId:collectionDeck.value});collectionInput.value='';}catch(e){alert(e.message||e);}}; collectionAdd.appendChild(collectionCreate); body.appendChild(collectionAdd);
+  cols.forEach(c=>{
+    const row=containerRow(body, 'Collection: '+c.label+' · '+(c.deckLabel||c.deckId), null);
+    const tagButton=document.createElement('button'); tagButton.type='button'; tagButton.textContent='Add tag';
+    tagButton.onclick=async()=>{const tag=prompt('Collection tag');if(!tag||!tag.trim())return;try{await mutateContainer('collectionsettag',{id:c.id,revision:c.revision,tag:tag.trim(),enabled:true});}catch(e){alert(e.message||e);}};row.appendChild(tagButton);
+    (c.tags||[]).forEach(tag=>{const remove=document.createElement('button');remove.type='button';remove.textContent='Remove tag: '+tag;remove.onclick=async()=>{try{await mutateContainer('collectionsettag',{id:c.id,revision:c.revision,tag,enabled:false});}catch(e){alert(e.message||e);}};row.appendChild(remove);});
+    if((c.sessionIds||[]).length){
+      const members=document.createElement('details');const summary=document.createElement('summary');summary.textContent='Manual chat order · '+c.sessionIds.length;members.appendChild(summary);
+      c.sessionIds.forEach((sessionId,index)=>{
+        const member=containerRow(members,sessionId,null);
+        for(const [label,delta] of [['Move up',-1],['Move down',1]]){
+          const button=document.createElement('button');button.type='button';button.textContent=label;
+          button.disabled=index+delta<0||index+delta>=c.sessionIds.length;button.dataset.orderBoundary=button.disabled?'true':'false';
+          button.onclick=async()=>{const order=c.sessionIds.slice();const next=index+delta;if(next<0||next>=order.length)return;[order[index],order[next]]=[order[next],order[index]];try{await mutateContainer('collectionreorder',{id:c.id,revision:c.revision,sessionIds:order});}catch(e){alert(e.message||e);}};
+          member.appendChild(button);
+        }
+      });body.appendChild(members);
+    }
+    const rename=document.createElement('button'); rename.textContent='Rename'; rename.onclick=async()=>{const name=prompt('New collection name',c.label);if(!name||!name.trim())return;try{await mutateContainer('collectionrename',{id:c.id,name:name.trim(),revision:c.revision});}catch(e){alert(e.message||e);}}; row.appendChild(rename);
+    const move=document.createElement('button'); move.textContent='Move'; move.onclick=async()=>{const target=prompt('Destination deck id',decks.find(d=>d.id!==c.deckId)?.id||c.deckId);if(!target||target===c.deckId)return;try{await mutateContainer('collectionmove',{id:c.id,targetDeckId:target,revision:c.revision});}catch(e){alert(e.message||e);}}; row.appendChild(move);
+    const del=document.createElement('button'); del.textContent='Delete'; del.onclick=async()=>{try{await mutateContainer('collectiondelete',{id:c.id,name:c.label,revision:c.revision});}catch(e){alert(e.message||e);}}; row.appendChild(del);
+  });
+  if(deleted.length){
+    const h=document.createElement('h4'); h.textContent='Recently Deleted'; body.appendChild(h);
+    const reviewedDeletedRevision=a.recentlyDeletedManagementRevision;
+    containerRow(body, deleted.length+' deleted collections', {label:'Empty Recently Deleted',run:async()=>{try{await mutateContainer('collectionempty',{revision:reviewedDeletedRevision,count:deleted.length});}catch(e){alert(e.message||e);}}}, true);
+    deleted.forEach(c=>{
+      const row=containerRow(body, c.label+' · deleted '+c.deletedAt, {label:'Recover',run:async()=>{try{await mutateContainer('collectionrecover',{id:c.id,name:c.label,revision:c.revision});}catch(e){alert(e.message||e);}}});
+      const purge=document.createElement('button'); purge.type='button'; purge.className='danger'; purge.textContent='Delete forever';
+      purge.onclick=async()=>{try{await mutateContainer('collectionpurge',{id:c.id,name:c.label,revision:c.revision});}catch(e){alert(e.message||e);}};
+      row.appendChild(purge);
+    });
+  }
+}
+async function openContainerAdmin(){
+  if(!bridgeLive()){ alert('The PC bridge is not live.'); return; }
+  $('#containerstatus').textContent='Loading authoritative containers...'; $('#containerdlg').showModal();
+  try{ await loadContainerAdmin(); $('#containerstatus').textContent='Changes are revision-checked on the PC.'; renderContainerAdmin(); }
+  catch(e){ $('#containerstatus').textContent='Could not load containers: '+(e.message||e); }
+}
+async function addWorkspaceToCollection(){
+  if(!bridgeLive()){ alert('The PC bridge is not live.'); return; }
+  let collections=[];
+  try {
+    await loadContainerAdmin();
+    for(const deck of _containerAdmin.decks){
+      const response=await fetch('/multiplex/pc/api/discovery/start/collections?deckId='+encodeURIComponent(deck.id));
+      if(!response.ok) throw new Error(await apiError(response));
+      const projection=await response.json();
+      collections.push(...(projection.rows||[]).map(c=>({...c,deckId:deck.id,deckName:deck.label})));
+    }
+  } catch(e){alert('Could not load current collections: '+(e.message||e));return;}
   const open=(sessions||[]).filter(s=>s && s.name);
   // EVERY open tab, not just chat-linked ones. Shell-launched tabs (a bare `mux` you ran claude/codex in)
   // have no indexed chat; the desktop app files them as a named "mux-tab" placeholder so the whole open
   // working set is captured. (dormant placeholders that never ran are still skipped — nothing to save.)
   _wsTabs=open
     .filter(s=>s.alive!==false)
-    .map(s=>({ name:s.name, muxName:s.projectMuxName||s.name, sessionId:s.sessionId||'', title:s.chatTitle||s.name, tool:s.tool||'', linked:!!(s.sessionId||s.projectMuxName) }));
+    .map(s=>({name:s.name,generationId:s.generationId||'',sessionId:s.authoritativeSessionId??s.sessionId??'',tool:s.authoritativeTool??s.tool??'',alive:s.alive===true,identityPending:s.identityPending===true,shellOnly:s.shellOnly===true}));
   if(!_wsTabs.length){ alert('No open remote tabs to add — open some sessions in the terminal first.'); return; }
   const list=$('#wscollist'); list.innerHTML='';
-  const cols=(data.collections||[]);
+  const cols=collections;
   if(!cols.length){ const p=document.createElement('div'); p.className='projempty'; p.textContent='No collections yet — type a name below to make one.'; list.appendChild(p); }
-  cols.forEach(c=>{ const b=document.createElement('button'); b.type='button'; b.className='wscolitem'; b.textContent=(c.deckName||deckLabel(c.deckId))+' / '+(c.name||'Untitled')+' · '+((c.chats||[]).length)+' chats'; b.onclick=()=>submitWsCol({collection:c.name||'Untitled', collectionId:c.id||'', deckId:c.deckId||'main', deckName:c.deckName||deckLabel(c.deckId)}); list.appendChild(b); });
+  cols.forEach(c=>{ const b=document.createElement('button'); b.type='button'; b.className='wscolitem'; b.textContent=c.deckName+' / '+c.label; b.onclick=()=>submitWsCol({collection:c.label,collectionId:c.id,revision:c.revision,deckId:c.deckId,deckName:c.deckName}); list.appendChild(b); });
   const sel=$('#wsdecksel'); sel.innerHTML='';
   allDecks().forEach(d=>{ const o=document.createElement('option'); o.value=d.id; o.textContent=d.name; sel.appendChild(o); });
   const newOpt=document.createElement('option'); newOpt.value='__new__'; newOpt.textContent='New deck...'; sel.appendChild(newOpt);
@@ -812,29 +1029,31 @@ async function submitWsCol(target){
   const name=(target.collection||$('#wscolnew').value||'').trim();
   if(!name){ alert('Pick a collection or type a new name'); return; }
   if(!target.collectionId && !choice.deckId && !choice.deckName){ alert('Pick a deck or type a new deck name'); return; }
-  if(!appLive()){ alert('App went offline - cannot add now'); return; }
+  if(!bridgeLive()){ alert('PC bridge went offline - cannot add now'); return; }
   const btns=$('#wscoldlg').querySelectorAll('button'); btns.forEach(b=>b.disabled=true);
-  let ok=0, fail=0; const details=[];
-  for(const t of _wsTabs){
-    const tab = typeof t==='string' ? { name:t, muxName:t, sessionId:'' } : t;
-    try{
-      const r=await postIntent('api/app-commands',
-        {type:'addtocollection', muxName:tab.muxName||tab.name, sessionName:tab.name, sessionId:tab.sessionId||'', tool:tab.tool||'', collection:name, collectionId:target.collectionId||'', deckId:choice.deckId||'', deckName:choice.deckName||''},
-        'add-collection');
-      if(!r.ok) throw new Error(await apiError(r));
-      const queued=await r.json();
-      const done=await awaitCmdResult(queued.id, 20000);
-      if(done.ok) ok++;
-      else { fail++; details.push(tab.name+': '+done.detail); }
+  try {
+    if(_wsTabs.some(tab=>!tab.generationId||!tab.alive||tab.identityPending)) throw new Error('A tab has no verified live generation. Refresh the workspace before filing.');
+    if(!target.collectionId){
+      if(!choice.deckId){
+        await containerCommand({type:'deckcreate',name:choice.deckName},'workspace-deck');
+        await loadContainerAdmin();
+        const matches=_containerAdmin.decks.filter(d=>d.label===choice.deckName);
+        if(matches.length!==1) throw new Error('Deck created but destination is ambiguous. Select it explicitly.');
+        choice.deckId=matches[0].id;
+      }
+      await containerCommand({type:'collectioncreate',name,targetDeckId:choice.deckId},'workspace-collection');
+      const response=await fetch('/multiplex/pc/api/discovery/start/collections?deckId='+encodeURIComponent(choice.deckId));
+      if(!response.ok) throw new Error(await apiError(response));
+      const projection=await response.json();const matches=(projection.rows||[]).filter(c=>c.label===name);
+      if(matches.length!==1) throw new Error('Collection created but destination is ambiguous. Select it explicitly.');
+      target.collectionId=matches[0].id;target.revision=matches[0].revision;
     }
-    catch(e){ fail++; details.push(tab.name+': '+(e.message||e)); }
-  }
-  btns.forEach(b=>b.disabled=false); $('#wscoldlg').close();
-  let msg='Added '+ok+' of your '+_wsTabs.length+' open tab'+(_wsTabs.length!==1?'s':'')+' to "'+name+'" on '+(choice.deckName||deckLabel(choice.deckId))+'.';
-  if(fail) msg+='\n\nFailed/skipped '+fail+':\n'+details.slice(0,6).join('\n')+(details.length>6?'\n...':'');
-  else msg+='\n\nThe desktop app confirmed the collection update.';
-  alert(msg);
-  setTimeout(()=>location.reload(), fail ? 800 : 1800);
+    await containerCommand({type:'captureworkspace',collectionId:target.collectionId,expectedCollectionRevision:target.revision,tabs:_wsTabs},'capture-workspace');
+    $('#wscoldlg').close();
+    alert('Filed all '+_wsTabs.length+' selected tabs in “'+name+'”. The PC confirmed the atomic membership update.');
+    await load();
+  } catch(e){alert('Workspace was not confirmed: '+(e.message||e)+'. Any newly created deck or collection remains available for retry.');}
+  finally {btns.forEach(b=>b.disabled=false);}
 }
 
 function runningSessionForChat(ch){
@@ -918,6 +1137,9 @@ $('#backproj').onclick = goBack;
 $('#projfilter').addEventListener('input', applyFilter);
 $('#refreshpill').onclick = ()=> location.reload();
 $('#wscolbtn').onclick = addWorkspaceToCollection;
+$('#containerbtn').onclick = openContainerAdmin;
+$('#containerclose').onclick = ()=> $('#containerdlg').close();
+$('#containerdlg').addEventListener('close', ()=>{ $('#app').inert=false; });
 $('#wscolcreate').onclick = ()=> submitWsCol($('#wscolnew').value);
 $('#wscolcancel').onclick = ()=> $('#wscoldlg').close();
 $('#wscoldlg').addEventListener('close', ()=>{ $('#app').inert=false; });
@@ -952,7 +1174,7 @@ async function load(){
   }
   const newSig = structSig(nd||data);
   if(nd && newSig!==sig){                                  // content/structure drift -> freeze the list (don't mutate it),
-    data.runningSessions=nd.runningSessions; data.live=nd.live; data.appLive=nd.appLive; data.bridgeLive=nd.bridgeLive;
+    data.runningSessions=nd.runningSessions; data.runningVerified=nd.runningVerified; data.runningVerificationDetail=nd.runningVerificationDetail; data.live=nd.live; data.appLive=nd.appLive; data.bridgeLive=nd.bridgeLive;
     data.syncedAt=nd.syncedAt; data.appSyncedAt=nd.appSyncedAt; data.runningSyncedAt=nd.runningSyncedAt; data.host=nd.host;  // but keep the running info fresh
     renderSync(nd); updateRunPill(); $('#refreshpill').hidden=false; return;
   }

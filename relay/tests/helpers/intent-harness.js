@@ -16,7 +16,7 @@ const path = require('node:path');
 const { once } = require('node:events');
 
 const REPO = path.resolve(__dirname, '..', '..');
-const HOST_CAPS = ['create', 'createAck', 'kill', 'rename', 'heal', 'tail', 'scrollback', 'relaunch'];
+const HOST_CAPS = ['create', 'createAck', 'kill', 'relayKillFence', 'rename', 'heal', 'tail', 'scrollback', 'relaunch'];
 
 // This harness can run from a git worktree that has no node_modules of its own:
 // the relay deps (`ws`, `express`, …) live only in the main checkout's
@@ -103,6 +103,8 @@ class RelayHarness {
         PORT: String(this.port),
         MUX_HOST_TOKEN: 'test-token',
         MUX_TEST_MODE: '1',
+        MUX_TEST_FIXTURE: '1',
+        MUX_BIND_HOST: '127.0.0.1',
         MUX_AUTOHEAL: '0',
         MUX_STATE_DIR: this.tmp,
         MUX_TEST_PERSIST_FAULT_FILE: path.join(this.tmp, '.persist-fault.json'),
@@ -115,7 +117,7 @@ class RelayHarness {
     });
     this.proc.stdout.on('data', d => { this.stdout += d.toString(); });
     this.proc.stderr.on('data', d => { this.stderr += d.toString(); });
-    await waitFor(() => this.stdout.includes(`multiplex-app on 0.0.0.0:${this.port}`), 'relay start', 5000);
+    await waitFor(() => this.stdout.includes(`multiplex-app on 127.0.0.1:${this.port}`), 'relay start', 5000);
   }
 
   async stopProcess() {
@@ -267,7 +269,9 @@ class FakeHost {
   }
 
   sendKilled(name) {
-    this.ws.send(JSON.stringify({ t: 'killed', s: name }));
+    const request = [...this.messages].reverse().find(m => m.t === 'kill' && m.s === name);
+    if (!request?.rid) throw new Error('no correlated kill request for ' + name);
+    this.ws.send(JSON.stringify({ ...request, t: 'killed' }));
   }
 
   sendCreateResult(request, { ok = true, created = true, session = null, detail = '', retryable = false } = {}) {

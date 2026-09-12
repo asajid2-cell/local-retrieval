@@ -2,6 +2,27 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { RelayHarness, ackLeased, leaseCommands } = require('./harness');
 
+test('reclaim requires explicit confirmation and preserves its fence across restart', async t => {
+  const h = new RelayHarness();
+  await h.start();
+  t.after(async () => h.stop());
+  const payload = { type: 'reclaim', intentId: 'reclaim-test-1', sessionId: 'exact-chat',
+    tool: 'codex', expectedRevision: 'revision-1', confirmed: true };
+  for (const patch of [{ confirmed: false }, { confirmed: 'true' }, { expectedRevision: '' }, { intentId: '' }, { cmd: 'forbidden' }]) {
+    assert.equal((await h.request('POST', '/api/app-commands', { ...payload, ...patch })).status, 400);
+  }
+  const first = await h.json('POST', '/api/app-commands', payload);
+  await h.restart();
+  const replay = await h.json('POST', '/api/app-commands', payload);
+  assert.equal(replay.id, first.id);
+  assert.equal(replay.deduplicated, true);
+  const command = (await leaseCommands(h)).find(c => c.id === first.id);
+  assert.equal(command.confirmed, true);
+  assert.equal(command.expectedRevision, 'revision-1');
+  assert.equal(command.replayPolicy, 'intent-fenced');
+  assert.equal((await h.request('POST', '/api/app-commands', { ...payload, expectedRevision: 'revision-2' })).status, 409);
+});
+
 function blankStartChat(overrides = {}) {
   return {
     type: 'startchat',
@@ -19,6 +40,21 @@ function blankStartChat(overrides = {}) {
     ...overrides,
   };
 }
+
+test('handoff source and Gateway mode survive normalization restart and replay', async t => {
+  const h = new RelayHarness();
+  await h.start();
+  t.after(async () => h.stop());
+  const payload = blankStartChat({ tool: 'claude', launchMode: 'gateway', handoffFromId: 'codex-source' });
+  const first = await h.json('POST', '/api/app-commands', payload);
+  await h.restart();
+  const command = (await leaseCommands(h)).find(c => c.id === first.id);
+  assert.equal(command.handoffFromId, 'codex-source');
+  assert.equal(command.launchMode, 'gateway');
+  assert.equal((await h.json('POST', '/api/app-commands', payload)).id, first.id);
+  assert.equal((await h.request('POST', '/api/app-commands', { ...payload, handoffFromId: 'different-source' })).status, 409);
+  assert.equal((await h.request('POST', '/api/app-commands', { ...payload, tool: 'codex' })).status, 400);
+});
 
 test('startchat is identity-only, intent-fenced, normalized, and durably replayed', async t => {
   const h = new RelayHarness();
@@ -138,11 +174,21 @@ test('startchat validates launch-source exclusivity, picker identities, and loca
     title: 'Checkpoint chat',
     tool: '',
     checkpointId: 'checkpoint-1',
+    checkpointRevision: 'checkpoint-revision-1',
+    collectionRevision: 'collection-revision-1',
     workspaceId: '',
     subfolder: '',
     collection: '',
     collectionId: 'collection-1',
   }));
+  await h.restart();
+  const changedRevision = await h.request('POST', '/api/app-commands', blankStartChat({
+    intentId: 'startchat-checkpoint-1', title: 'Checkpoint chat', tool: '',
+    checkpointId: 'checkpoint-1', checkpointRevision: 'checkpoint-revision-2',
+    collectionRevision: 'collection-revision-1', workspaceId: '', subfolder: '',
+    collection: '', collectionId: 'collection-1',
+  }));
+  assert.equal(changedRevision.status, 409, 'revision change must collide after restart');
   const command = (await leaseCommands(h)).find(item => item.id === checkpoint.id);
   assert.ok(command);
   assert.deepEqual(
@@ -161,6 +207,8 @@ test('startchat validates launch-source exclusivity, picker identities, and loca
       collectionId: 'collection-1',
     },
   );
+  assert.equal(command.checkpointRevision, 'checkpoint-revision-1');
+  assert.equal(command.collectionRevision, 'collection-revision-1');
   await ackLeased(h, command, { ok: false, detail: 'local path and command must not surface' });
   const outcome = await h.json('GET', `/api/app-commands/${checkpoint.id}`);
   assert.deepEqual(

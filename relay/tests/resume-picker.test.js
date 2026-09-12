@@ -9,6 +9,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const childProcess = require('node:child_process');
 const fs = require('node:fs');
+const crypto = require('node:crypto');
 const http = require('node:http');
 const net = require('node:net');
 const os = require('node:os');
@@ -63,6 +64,7 @@ async function startAuth(t) {
 class Harness {
   constructor(env = {}) {
     this.proc = null;
+    this.commandBridgeToken = crypto.randomBytes(32).toString('hex');
     this.env = env;
     this.tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-resume-'));
     this.stdout = '';
@@ -78,7 +80,10 @@ class Harness {
         PORT: String(this.port),
         MUX_HOST_TOKEN: HOST_TOKEN,
         MUX_BRIDGE_TOKEN: BRIDGE_TOKEN,
+        MUX_COMMAND_BRIDGE_TOKEN: this.commandBridgeToken,
         MUX_TEST_MODE: '1',
+        MUX_TEST_FIXTURE: '1',
+        MUX_BIND_HOST: '127.0.0.1',
         MUX_AUTOHEAL: '0',
         MUX_STATE_DIR: this.tmp,
         HLAUTH_BASE: 'http://127.0.0.1:1',
@@ -88,7 +93,7 @@ class Harness {
     });
     this.proc.stdout.on('data', d => { this.stdout += d.toString(); });
     this.proc.stderr.on('data', d => { this.stderr += d.toString(); });
-    await waitFor(() => this.stdout.includes(`multiplex-app on 0.0.0.0:${this.port}`), 'relay start', 8000);
+    await waitFor(() => this.stdout.includes(`multiplex-app on 127.0.0.1:${this.port}`), 'relay start', 8000);
   }
 
   async stopProcess() {
@@ -147,11 +152,21 @@ class Harness {
   }
 
   lease(owner = 'fake-host') {
-    return this.request('POST', '/api/app-commands/lease', { owner, limit: 8, leaseMs: 20000 });
+    return this.request(
+      'POST',
+      '/api/app-commands/lease',
+      { owner, limit: 8, leaseMs: 20000 },
+      { 'X-Mux-Command-Bridge': this.commandBridgeToken },
+    );
   }
 
   ack(id, leaseToken, ok) {
-    return this.request('POST', `/api/app-commands/${id}/ack`, { leaseToken, ok, onPc: true });
+    return this.request(
+      'POST',
+      `/api/app-commands/${id}/ack`,
+      { leaseToken, ok, onPc: true },
+      { 'X-Mux-Command-Bridge': this.commandBridgeToken },
+    );
   }
 }
 
@@ -246,6 +261,44 @@ async function bootPicker(t, { chats = [row(1), row(2), row(3)], running = [], d
   });
   return { h, client, picker };
 }
+
+test('resume uses unique live alias owner and refuses ambiguous or unreadable authority', async () => {
+  for (const mode of ['alias', 'ambiguous', 'unreadable']) {
+    const sent = [];
+    const owner = { name: 'actual-owner', sessionId: 'canonical', aliases: ['chat-1'], alive: true, generationId: 'gen-one' };
+    const client = loadClient(async () => ({ ok: true, json: async () => [] }));
+    const picker = client.MuxResumePicker.createPicker({
+      base: '',
+      fetch: async url => url === '/api/sessions'
+        ? { ok: mode !== 'unreadable', json: async () => mode === 'ambiguous' ? [owner, { ...owner, name: 'second-owner' }] : [owner] }
+        : { ok: true, json: async () => ({ status: 'done' }) },
+      postIntent: async (url, body) => { sent.push(body); return { ok: true, json: async () => ({ id: 'command' }) }; },
+      pollIntervalMs: 1, offlineTimeoutMs: 100,
+    });
+    const result = await picker.resume(row(1));
+    assert.equal(sent.length, mode === 'alias' ? 1 : 0);
+    if (mode === 'alias') {
+      assert.equal(sent[0].muxName, 'actual-owner');
+      assert.equal(result.muxName, 'actual-owner');
+    } else assert.equal(result.state, 'failed');
+  }
+});
+
+test('Gateway resume carries explicit mode and refuses Codex same-chat conversion', async () => {
+  const sent = [];
+  const client = loadClient(async () => ({ ok: true, json: async () => [] }));
+  const picker = client.MuxResumePicker.createPicker({
+    base: '',
+    fetch: async url => ({ ok: true, json: async () => url === '/api/sessions' ? [] : { status: 'done' } }),
+    postIntent: async (url, body) => { sent.push(body); return { ok: true, json: async () => ({ id: 'gateway-command' }) }; },
+    pollIntervalMs: 1, offlineTimeoutMs: 100,
+  });
+  assert.equal((await picker.resume(row(2), 'gateway')).state, 'done');
+  assert.equal(sent[0].launchMode, 'gateway');
+  assert.equal(sent[0].tool, 'claude');
+  assert.equal((await picker.resume(row(1), 'gateway')).state, 'failed');
+  assert.equal(sent.length, 1);
+});
 
 // ---- pure logic, no relay -------------------------------------------------------------------
 

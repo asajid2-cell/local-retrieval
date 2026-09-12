@@ -66,6 +66,7 @@ async function waitFor(fn, label, timeoutMs = 5000) {
 class RelayHarness {
   constructor(env = {}) {
     this.proc = null;
+    this.commandBridgeToken = crypto.randomBytes(32).toString('hex');
     this.env = env;
     this.tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-transcript-'));
     this.stdout = '';
@@ -82,6 +83,9 @@ class RelayHarness {
         PORT: String(this.port),
         MUX_HOST_TOKEN: HOST_TOKEN,
         MUX_TEST_MODE: '1',
+        MUX_TEST_FIXTURE: '1',
+        MUX_BIND_HOST: '127.0.0.1',
+        MUX_COMMAND_BRIDGE_TOKEN: this.commandBridgeToken,
         MUX_AUTOHEAL: '0',
         MUX_STATE_DIR: this.tmp,
         MUX_HOST_SB_WAIT_MS: '40',
@@ -94,7 +98,7 @@ class RelayHarness {
     this.proc.stdout.on('data', d => { this.stdout += d.toString(); });
     this.proc.stderr.on('data', d => { this.stderr += d.toString(); });
     try {
-      await waitFor(() => this.stdout.includes(`multiplex-app on 0.0.0.0:${this.port}`), 'relay start', 8000);
+      await waitFor(() => this.stdout.includes(`multiplex-app on 127.0.0.1:${this.port}`), 'relay start', 8000);
     } catch (err) {
       // Never let a boot failure hide behind a bare timeout — the child's stderr is the actual cause.
       throw new Error(`${err.message}\n--- relay stderr ---\n${this.stderr}\n--- relay stdout ---\n${this.stdout}`);
@@ -156,8 +160,8 @@ class RelayHarness {
 
 async function withHarness(fn, env) {
   const h = new RelayHarness(env);
-  await h.start();
   try {
+    await h.start();
     await fn(h);
   } finally {
     await h.stop();
@@ -165,18 +169,36 @@ async function withHarness(fn, env) {
 }
 
 const leaseCommands = (h, owner = 'test-consumer') =>
-  h.json('POST', '/api/app-commands/lease', { owner, limit: 16 });
+  h.json(
+    'POST',
+    '/api/app-commands/lease',
+    { owner, limit: 16 },
+    { 'X-Mux-Command-Bridge': h.commandBridgeToken },
+  );
 
 const ackLeased = (h, command, result) =>
-  h.json('POST', `/api/app-commands/${encodeURIComponent(command.id)}/ack`, { leaseToken: command.leaseToken, ...result });
+  h.json(
+    'POST',
+    `/api/app-commands/${encodeURIComponent(command.id)}/ack`,
+    { leaseToken: command.leaseToken, ...result },
+    { 'X-Mux-Command-Bridge': h.commandBridgeToken },
+  );
 
-const enqueueFetch = (h, sessionId, extra = {}) =>
-  h.request('POST', '/api/app-commands', { type: 'transcriptfetch', sessionId, principalAuth: PRINCIPAL, ...extra });
+const enqueueFetch = async (h, sessionId, extra = {}) => {
+  const principalAuth = await h.json('POST', '/api/principal-auth', { intent: 'archive.read', sessionId });
+  return h.request('POST', '/api/app-commands', { type: 'transcriptfetch', sessionId, principalAuth, ...extra });
+};
 
 const pageBody = (sessionId, page, pages, messages) => ({ schemaVersion: 1, sessionId, page, pages, messages });
 
-const pushPage = (h, sessionId, body, headers = { [BRIDGE_HEADER]: BRIDGE_TOKEN }) =>
-  h.request('POST', `/api/transcripts/${encodeURIComponent(sessionId)}`, body, headers);
+const pushPage = async (h, sessionId, body, headers) => {
+  if (headers === undefined) {
+    h.pushTokens ||= {};
+    for (const command of await leaseCommands(h)) h.pushTokens[command.sessionId] = command.bridgeToken;
+    headers = { [BRIDGE_HEADER]: h.pushTokens[sessionId] || BRIDGE_TOKEN };
+  }
+  return h.request('POST', `/api/transcripts/${encodeURIComponent(sessionId)}`, body, headers);
+};
 
 test('transcriptfetch enqueues read-only, needs sessionId + a principal envelope, and round-trips a lease/ack', async () => {
   await withHarness(async h => {
@@ -185,8 +207,8 @@ test('transcriptfetch enqueues read-only, needs sessionId + a principal envelope
     assert.match(noSession.body.error, /sessionId required/);
 
     const noPrincipal = await h.request('POST', '/api/app-commands', { type: 'transcriptfetch', sessionId: 's-alpha' });
-    assert.equal(noPrincipal.status, 400);
-    assert.match(noPrincipal.body.error, /principal auth envelope/);
+    assert.equal(noPrincipal.status, 403);
+    assert.match(noPrincipal.body.error, /owner transcript grant/);
 
     const ok = await enqueueFetch(h, 's-alpha');
     assert.equal(ok.status, 200);
@@ -201,8 +223,10 @@ test('transcriptfetch enqueues read-only, needs sessionId + a principal envelope
     assert.equal(alpha.type, 'transcriptfetch');
     assert.equal(alpha.replayPolicy, 'read-only');
     assert.equal(alpha.sessionId, 's-alpha');
-    // The principal envelope rides the lease back unchanged — the relay is custodian, not verifier.
-    assert.deepEqual(alpha.principalAuth, PRINCIPAL);
+    assert.equal(alpha.principalAuth.sessionId, 's-alpha');
+    assert.match(alpha.bridgeToken, /^[a-f0-9]{64}$/);
+    assert.ok(alpha.ttlMs > 0 && alpha.ttlMs <= 300000);
+    assert.equal((await h.json('GET', `/api/app-commands/${alpha.id}`)).bridgeToken, undefined);
 
     await ackLeased(h, alpha, { ok: true });
     await ackLeased(h, beta, { ok: false });
@@ -212,6 +236,30 @@ test('transcriptfetch enqueues read-only, needs sessionId + a principal envelope
     const failed = await h.json('GET', `/api/app-commands/${beta.id}`);
     assert.equal(failed.status, 'failed');
     assert.equal(failed.detail, 'PC bridge could not fetch the transcript');
+  });
+});
+
+test('owner grants reject forgery, cross-session use and expired authorization', async () => {
+  await withHarness(async h => {
+    assert.equal((await h.request('POST', '/api/principal-auth',
+      { intent: 'archive.read', sessionId: 's-owner' }, PUBLIC)).status, 401);
+    const grant = await h.json('POST', '/api/principal-auth', { intent: 'archive.read', sessionId: 's-owner' });
+    for (const principalAuth of [PRINCIPAL, { ...grant, proof: '0'.repeat(64) },
+      { ...grant, expiresAt: Date.now() - 1 }, { ...grant, subject: 'another-owner' }]) {
+      assert.equal((await h.request('POST', '/api/app-commands',
+        { type: 'transcriptfetch', sessionId: 's-owner', principalAuth })).status, 403);
+    }
+    assert.equal((await h.request('POST', '/api/app-commands',
+      { type: 'transcriptfetch', sessionId: 's-other', principalAuth: grant })).status, 403);
+    const queued = await h.json('POST', '/api/app-commands',
+      { type: 'transcriptfetch', sessionId: 's-owner', principalAuth: grant });
+    const [leased] = await leaseCommands(h);
+    assert.equal((await pushPage(h, 's-other', pageBody('s-other', 1, 1, []),
+      { [BRIDGE_HEADER]: leased.bridgeToken })).status, 403);
+    await ackLeased(h, leased, { ok: false });
+    assert.equal((await pushPage(h, 's-owner', pageBody('s-owner', 1, 1, []),
+      { [BRIDGE_HEADER]: leased.bridgeToken })).status, 403);
+    assert.equal((await h.json('GET', `/api/app-commands/${queued.id}`)).bridgeToken, undefined);
   });
 });
 
@@ -278,7 +326,8 @@ test('page pushes without the scoped credential, or with the wrong one, are reje
     assert.equal((await pushPage(h, sessionId, body, PUBLIC)).status, 401);
     assert.equal((await pushPage(h, sessionId, body, { ...PUBLIC, [BRIDGE_HEADER]: 'nope' })).status, 401);
     // ...but a correctly credentialed push from off-box is exactly what the bypass is for.
-    assert.equal((await pushPage(h, sessionId, body, { ...PUBLIC, [BRIDGE_HEADER]: BRIDGE_TOKEN })).status, 200);
+    const [leased] = await leaseCommands(h);
+    assert.equal((await pushPage(h, sessionId, body, { ...PUBLIC, [BRIDGE_HEADER]: leased.bridgeToken })).status, 200);
 
     assert.equal((await h.json('GET', `/api/transcripts/${sessionId}`)).messages.length, 1);
   });
@@ -287,8 +336,8 @@ test('page pushes without the scoped credential, or with the wrong one, are reje
 test('a page for a session nobody requested is refused, and bad shapes are rejected', async () => {
   await withHarness(async h => {
     const unasked = await pushPage(h, 's-unasked', pageBody('s-unasked', 1, 1, [{ role: 'user', text: 'x' }]));
-    assert.equal(unasked.status, 409);
-    assert.match(unasked.body.error, /no live transcriptfetch/);
+    assert.equal(unasked.status, 403);
+    assert.match(unasked.body.error, /scoped transcript bridge credential/);
 
     const sessionId = 's-shapes';
     assert.equal((await enqueueFetch(h, sessionId)).status, 200);
@@ -378,6 +427,6 @@ test('a capture is dropped once its retention window closes', async () => {
       'transcript capture to expire', 8000);
     // With the authorizing fetch aged out too, nothing may re-park pages for that session.
     const late = await pushPage(h, sessionId, pageBody(sessionId, 1, 1, [{ role: 'user', text: 'too late' }]));
-    assert.equal(late.status, 409);
+    assert.equal(late.status, 403);
   }, { MUX_TRANSCRIPT_TTL_MS: '1500' });
 });

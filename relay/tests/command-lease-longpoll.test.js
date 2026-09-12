@@ -29,7 +29,12 @@ const { test } = require('node:test');
 const { RelayHarness, sleep, ackLeased } = require('./harness');
 
 function lease(h, body) {
-  return h.json('POST', '/api/app-commands/lease', { owner: 'longpoll-consumer', limit: 16, ...body });
+  return h.json(
+    'POST',
+    '/api/app-commands/lease',
+    { owner: 'longpoll-consumer', limit: 16, ...body },
+    { 'X-Mux-Command-Bridge': h.commandBridgeToken },
+  );
 }
 
 function enqueue(h, sessionId) {

@@ -52,7 +52,7 @@
   READER.isToolMessage = isToolMessage;
 
   // --- ordering: newest LAST, the way a chat reads -----------------------------------------------------
-  // Page number dominates (the app pages oldest-first); inside a page, ts breaks ties when present and
+  // Page number descends (page 1 is newest); inside a page, ts breaks ties when present and
   // array order holds otherwise, so a page missing timestamps is never shuffled.
   function orderedMessages(pages) {
     const list = Array.isArray(pages) ? pages : [];
@@ -66,7 +66,7 @@
       });
     });
     flat.sort((a, b) => {
-      if (a.page !== b.page) return a.page - b.page;
+      if (a.page !== b.page) return b.page - a.page;
       if (a.ts !== null && b.ts !== null && a.ts !== b.ts) return a.ts - b.ts;
       return a.index - b.index;
     });
@@ -202,16 +202,15 @@
     const rest = (Array.isArray(head.availablePages) ? head.availablePages : []).filter(p => p !== head.page);
     for (const page of rest) {
       const response = await theFetch()(url + '?page=' + encodeURIComponent(page), { headers: JSON_HEADERS });
-      if (response && response.ok) pages.push(await response.json());
+      if (!response || !response.ok) throw new Error('transcript page ' + page + ' HTTP ' + (response && response.status));
+      pages.push(await response.json());
     }
     return { pages, sessionId: head.sessionId, totalPages: head.pages, expiresAt: head.expiresAt };
   }
   READER.loadPages = loadPages;
 
-  // The relay refuses a `transcriptfetch` without a principal-auth envelope and never interprets it. The
-  // trusted origin mints it; if that endpoint is not deployed yet we send a well-formed envelope that
-  // carries NO proof and says so, so the verifying side can reject it rather than be fooled by silence.
-  // Envelope keys are checked against the relay's forbidden-key set (path/command shapes) by the verifier.
+  // Never enqueue an archive read without authorization from the trusted origin.
+  // An absent mint endpoint is a refusal, not permission to fabricate an envelope.
   let mintUnavailable = false;
   async function mintPrincipalAuth(sessionId) {
     if (!mintUnavailable) {
@@ -228,17 +227,7 @@
         if (response && response.status === 404) mintUnavailable = true;
       } catch (error) { mintUnavailable = true; }
     }
-    return {
-      scheme: 'mux-principal-v1',
-      intent: 'archive.read',
-      sessionId: String(sessionId),
-      origin: global.location ? String(global.location.origin || '') : '',
-      issuedAt: now(),
-      nonce: (global.crypto && global.crypto.randomUUID)
-        ? global.crypto.randomUUID()
-        : 'n-' + now().toString(36) + '-' + Math.random().toString(36).slice(2, 10),
-      proof: 'none',
-    };
+    return null;
   }
   READER.mintPrincipalAuth = mintPrincipalAuth;
 
@@ -267,6 +256,7 @@
     if (!health.bridgeLive) return { ok: false, offline: true, health };   // no enqueue while the bridge is dark
 
     const principalAuth = await mintPrincipalAuth(sessionId);
+    if (!principalAuth) return { ok: false, error: 'Transcript authorization unavailable; no fetch was requested.' };
     let response;
     try {
       response = await thePost()(apiBase() + '/api/app-commands',

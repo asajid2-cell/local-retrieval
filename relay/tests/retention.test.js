@@ -80,7 +80,10 @@ class RelayHarness {
         ...process.env,
         PORT: String(this.port),
         MUX_HOST_TOKEN: HOST_TOKEN,
+        MUX_COMMAND_BRIDGE_TOKEN: 'retention-command-bridge',
         MUX_TEST_MODE: '1',
+        MUX_TEST_FIXTURE: '1',
+        MUX_BIND_HOST: '127.0.0.1',
         MUX_AUTOHEAL: '0',
         MUX_STATE_DIR: this.tmp,
         MUX_HOST_SB_WAIT_MS: '40',
@@ -92,7 +95,7 @@ class RelayHarness {
     });
     this.proc.stdout.on('data', d => { this.stdout += d.toString(); });
     this.proc.stderr.on('data', d => { this.stderr += d.toString(); });
-    await waitFor(() => this.stdout.includes(`multiplex-app on 0.0.0.0:${this.port}`), 'relay start', 8000);
+    await waitFor(() => this.stdout.includes(`multiplex-app on 127.0.0.1:${this.port}`), 'relay start', 8000);
   }
 
   async stopProcess() {
@@ -294,11 +297,13 @@ test('a transcript push is fenced inline at accept time, not left to the next ti
       // Authorize and push a third session. The push path's own cap is 8 sessions, so only the global
       // byte fence can bite here — and it must bite on this request, before the response returns.
       const fetchCmd = await h.request('POST', '/api/app-commands',
-        { type: 'transcriptfetch', sessionId: 's-new', principalAuth: PRINCIPAL });
+        { type: 'transcriptfetch', sessionId: 's-new', principalAuth: await h.json('POST', '/api/principal-auth', { intent: 'archive.read', sessionId: 's-new' }) });
       assert.equal(fetchCmd.status, 200);
+      const leased = await h.json('POST', '/api/app-commands/lease', { owner: 'retention-fixture', limit: 10, waitMs: 0 }, { 'x-mux-command-bridge': 'retention-command-bridge' });
+      const pushToken = leased.find(command => command.id === fetchCmd.body.id).bridgeToken;
       const push = await h.request('POST', '/api/transcripts/s-new',
         { schemaVersion: 1, sessionId: 's-new', page: 1, pages: 1, messages: [{ role: 'assistant', text: 'x'.repeat(3000), ts: 1 }] },
-        { [BRIDGE_HEADER]: BRIDGE_TOKEN });
+        { [BRIDGE_HEADER]: pushToken });
       assert.equal(push.status, 200, push.text);
 
       // Read the file straight off disk: the commit that answered the push is already at-bounds.
@@ -439,7 +444,7 @@ test('health exposes stateDirBytes plus accurate per-store gauges, plaintext spl
   await withSeededHarness(h => h.seed('transcripts.json', seeded), async h => {
     // One command carrying a signed envelope, so the custody gauge has something real to count.
     const enqueued = await h.request('POST', '/api/app-commands',
-      { type: 'transcriptfetch', sessionId: 's-000', principalAuth: PRINCIPAL });
+      { type: 'transcriptfetch', sessionId: 's-000', principalAuth: await h.json('POST', '/api/principal-auth', { intent: 'archive.read', sessionId: 's-000' }) });
     assert.equal(enqueued.status, 200);
 
     const lower = walkBytes(h.tmp);

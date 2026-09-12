@@ -145,6 +145,8 @@
   }
   .resume:hover { background:var(--rose); color:#1b090d; }
   .resume:disabled { border-color:var(--line); background:transparent; color:var(--faint); cursor:default; }
+  .metadata { align-self:center; min-height:44px; padding:0 12px; border:1px solid var(--line); border-radius:var(--radius); color:var(--muted); background:var(--panel-2); cursor:pointer; }
+  .metadata:hover { color:var(--text); border-color:var(--rose); }
   .rowstatus { grid-column:1/-1; margin:0; color:var(--muted); font-size:12px; }
   .rowstatus.ok { color:var(--green); }
   .rowstatus.warn { color:var(--amber); }
@@ -261,12 +263,16 @@
           <select id="minimum"><option value="0">Any</option><option value="2">2+</option><option value="3">3+</option><option value="5">5+</option><option value="10">10+</option><option value="25">25+</option></select>
         </label>
         <label class="field wide"><span>Project</span><select id="project"><option value="">All projects</option></select></label>
+        <label class="field wide"><span>Archive</span>
+          <select id="archived"><option value="active">Active chats</option><option value="archived">Archived chats</option><option value="all">All chats</option></select>
+        </label>
         <label class="check field wide"><input id="hidden" type="checkbox"> Show hidden one-off chats</label>
       </div>
       <section aria-labelledby="tagheading">
         <div class="group-title" id="tagheading">Tags</div>
         <div class="chips" id="tagchips"></div>
         <p class="legend">Tap: include, exclude, clear.</p>
+        <label class="check"><input id="matchall" type="checkbox"> Match all included tags</label>
       </section>
       <section aria-labelledby="phraseheading">
         <div class="group-title" id="phraseheading">Phrases</div>
