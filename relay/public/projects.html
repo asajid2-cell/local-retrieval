@@ -329,6 +329,23 @@ function localChatIds(ch){
   add(ch&&ch.id); (Array.isArray(ch&&ch.aliases)?ch.aliases:[]).forEach(add); return out;
 }
 function chatLive(ch, runIds){ return localChatIds(ch).some(id=>runIds.has(id)); }
+// Resolve the authoritative archive row for a running agent by exact sessionId+tool. Revision-fenced
+// operations (rename, reclaim) must act on that row, never on a display guess.
+async function exactChatFor(s){
+  if(!s || (s.tool!=='claude' && s.tool!=='codex') || !s.sessionId) return null;
+  const discoveryBase=window.MUX_DISCOVERY_BASE || (new URL('.', location.href).pathname.replace(/\/$/,'')+'/pc/api/discovery');
+  for(let offset=0;;){
+    const response=await fetch(discoveryBase+'/chats?showHidden=true&archived=all&limit=100&offset='+offset);
+    if(!response.ok) throw new Error('PC discovery unavailable');
+    const page=await response.json();
+    if(!Array.isArray(page.rows)) throw new Error('invalid PC discovery response');
+    const chat=page.rows.find(r=>r.id===s.sessionId&&r.tool===s.tool);
+    if(chat) return chat;
+    if(page.rows.length===0) return null;
+    offset+=page.rows.length;
+    if(Number.isFinite(page.total)&&offset>=page.total) return null;
+  }
+}
 // Resolve the mux session name hosting a running agent, so we can end it through muxd and keep
 // the relay/manifest/session list in sync. Matches the agent's sessionId to a chat's muxName.
 function muxNameForSession(s){
@@ -564,7 +581,10 @@ function runRow(s){
       title:primary,
     }, mirrorBtn, row);
   }
-  row.querySelector('.killbtn').onclick = (ev)=> killSession(s, row, ev.currentTarget);
+  const reclaimBtn=row.querySelector('.killbtn');
+  reclaimBtn.textContent='Reclaim';
+  reclaimBtn.title='Stop this chat’s processes and release its custody without deleting its transcript';
+  reclaimBtn.onclick = (ev)=> reclaimSession(s, row, ev.currentTarget);
   return row;
 }
 
@@ -597,18 +617,7 @@ function renameNative(s, row){
       let pending=JSON.parse(localStorage.getItem(pendingKey)||'null');
       if(pending && pending.title!==title) throw new Error('An earlier native rename is unconfirmed. Retry its original title before choosing another.');
       if(!pending){
-        const discoveryBase=window.MUX_DISCOVERY_BASE||base+'/pc/api/discovery';
-        let chat=null;
-        for(let offset=0;!chat;){
-          const response=await fetch(discoveryBase+'/chats?showHidden=true&archived=all&limit=100&offset='+offset);
-          if(!response.ok) throw new Error('PC discovery unavailable');
-          const page=await response.json();
-          if(!Array.isArray(page.rows)) throw new Error('invalid PC discovery response');
-          chat=page.rows.find(r=>r.id===s.sessionId&&r.tool===s.tool);
-          if(chat||page.rows.length===0) break;
-          offset+=page.rows.length;
-          if(Number.isFinite(page.total)&&offset>=page.total) break;
-        }
+        const chat=await exactChatFor(s);
         if(!chat?.revision) throw new Error('exact chat revision unavailable');
         pending={type:'rename',sessionId:s.sessionId,tool:s.tool,title,expectedRevision:chat.revision,intentId:'rename-native-'+crypto.randomUUID().replaceAll('-','')};
         localStorage.setItem(pendingKey,JSON.stringify(pending));
@@ -705,74 +714,67 @@ async function apiError(r){
   }catch(e){}
   return msg;
 }
-async function killSession(s, row, btn){
-  const mux=muxNameForSession(s);
-  const selected=muxSession(mux);
-  const expected=selected ? {sessionId:selected.authoritativeSessionId,generationId:selected.generationId} : null;
-  const label = s.title || ('session '+String(s.sessionId||'').slice(0,8));
-  if(!confirm(`Stop the ${s.tool==='codex'?'Codex':'Claude'} session for “${label}”?\n\n${s.parent||'Unknown'} · pid ${s.pid||'?'}\nA connected session is ended. A detached mirror is only cleared, leaving its local agent running.`)) return;
-  btn.disabled=true; btn.textContent='Killing…'; row.classList.add('killing');
-  // Mux-hosted sessions must be killed through the mux API so muxd, the relay, and the manifest agree.
-  // If that path fails, stop and show the error instead of falling through to a local-agent kill.
-  if(mux){
-    let live=null;
-    try{
-      const lr=await fetch('api/sessions');
-      if(!lr.ok) throw new Error(await apiError(lr));
-      live=await lr.json();
-      if(!Array.isArray(live)) throw new Error('sessions response was not an array');
-    }catch(e){
-      btn.disabled=false; row.classList.remove('killing'); btn.textContent='Kill';
-      alert('Could not verify whether this is a mux session ('+(e.message||e)+'). Not falling back to local kill.');
+// ONE reclaim flow per chat. Reclaim stops this chat's processes, releases its custody and keeps the
+// transcript, so the chat can be resumed straight afterwards. It is the same flow whether the agent
+// runs as a mux tab or in a plain local terminal: the PC decides whether a hosted owner must be torn
+// down first (under the frozen generation fence), then clears the process, its owner records and its
+// launch claims. There is no separate "kill" - stopping a chat is reclaiming it.
+async function reclaimSession(s, row, btn){
+  if(!bridgeLive()){ flash(row, 'PC bridge is not live - open the app or bridge and try again.'); return; }
+  const label=s.title || s.realTitle || ('session '+String(s.sessionId||'').slice(0,8));
+  const tool=s.tool==='codex' ? 'Codex' : 'Claude';
+  if(!confirm(`Reclaim this chat?\n\n“${label}” · ${tool} · pid ${s.pid||'?'}\n\nThis stops the chat's processes and releases its custody. The transcript is kept, so the chat can be resumed afterwards.`)) return;
+  btn.disabled=true; btn.textContent='Reclaiming…'; row.classList.add('killing');
+  const restore=(msg)=>{ btn.disabled=false; btn.textContent='Reclaim'; row.classList.remove('killing'); if(msg) alert(msg); };
+  // A reclaim intent is retained until the PC confirms a terminal outcome, so a reload or a late reply
+  // reconciles the SAME intentId instead of starting a second cleanup.
+  const pendingKey='mux.reclaim.v1:'+JSON.stringify([location.pathname,s.sessionId,s.tool]);
+  let pending=null;
+  try{ pending=JSON.parse(localStorage.getItem(pendingKey)||'null'); }catch{}
+  if(pending && (pending.type!=='reclaim' || pending.sessionId!==s.sessionId || pending.tool!==s.tool)) pending=null;
+  if(!pending){
+    let chat=null;
+    try{ chat=await exactChatFor(s); }
+    catch(e){ restore('Reclaim not started: '+(e.message||e)); return; }
+    if(!chat?.revision){
+      restore('This running agent has no authoritative archived chat yet, so it cannot be reclaimed from the web. Reclaim it once the PC has indexed the chat.');
       return;
     }
-    if(live.some(x=> x && x.name===mux)){
-      const hosted=live.find(x=>x && x.name===mux);
-      const blocked=live.find(x=>x && x.name===mux && (x.legacyBlocked || x.legacyTwin || x.hostProtocolOk===false));
-      if(blocked){
-        btn.disabled=false; row.classList.remove('killing'); btn.textContent='Kill';
-        alert('Mux session is blocked/stale ('+blockerDetail(blocked)+'). Not falling back to local kill.');
-        return;
-      }
-      try{
-        const drop=await sendIntent('DELETE', 'api/sessions/'+encodeURIComponent(mux), expected, 'projects-kill');
-        if(!drop.ok) throw new Error(await apiError(drop));
-        const detachedAdopted=!!(hosted && hosted.adopted && hosted.detachedLocal);
-        btn.textContent=detachedAdopted?'Mirror cleared':'Killed';
-        btn.classList.add('done'); btn.disabled=true; row.classList.remove('killing');
-        if(detachedAdopted) alert('The detached mirror record was cleared. The local agent is still running on your PC.');
-        setTimeout(()=>{ row.remove(); afterKill(); }, 700); return;
-      }catch(e){
-        btn.disabled=false; row.classList.remove('killing'); btn.textContent='Kill';
-        alert('Could not kill the mux session ('+(e.message||e)+'). Not falling back to local kill.');
-        return;
-      }
-    }
+    pending={type:'reclaim',confirmed:true,sessionId:s.sessionId,tool:s.tool,expectedRevision:chat.revision,
+      intentId:'reclaim-'+crypto.randomUUID().replaceAll('-','')};
+    try{ localStorage.setItem(pendingKey,JSON.stringify(pending)); }catch{}
   }
-  // Local non-mux agents are controlled by the desktop app bridge.
   let id=null;
   try{
-    const r=await postIntent('api/app-commands',
-      {type:'kill', sessionId:s.sessionId||'', pid:s.pid||0, label},
-      'kill-local');
+    const r=await postIntent('api/app-commands',pending,'reclaim');
     if(!r.ok) throw new Error(await apiError(r));
     id=(await r.json()).id;
-  }catch(e){ btn.disabled=false; row.classList.remove('killing'); btn.textContent='Kill'; alert('Could not queue the kill ('+(e.message||e)+').'); return; }
-  const t0=Date.now();
-  const poll=async()=>{
-    if(Date.now()-t0>30000){ row.classList.remove('killing'); btn.disabled=false; btn.textContent='Kill'; alert('No response from the desktop app — is it open and synced?'); return; }
-    let c=null; try{ c=await (await fetch('api/app-commands/'+encodeURIComponent(id))).json(); }catch(e){}
-    if(c && c.status==='done'){ const gone=/already gone|raced/i.test(c.detail||''); btn.textContent=gone?'Gone':'Killed'; btn.classList.add('done'); btn.disabled=true; row.classList.remove('killing');
-      setTimeout(()=>{ row.remove(); afterKill(); }, 700); return; }
-    if(c && c.status==='failed'){ row.classList.remove('killing'); btn.disabled=false; btn.textContent='Kill'; alert('Kill failed: '+(c.detail||'unknown')); return; }
-    setTimeout(poll, 800);
-  };
-  setTimeout(poll, 800);
+    if(!id) throw new Error('missing command receipt');
+  }catch(e){ restore('Reclaim not queued: '+(e.message||e)); return; }
+  const deadline=Date.now()+30000;
+  while(Date.now()<deadline){
+    let c=null;
+    try{ const response=await fetch('api/app-commands/'+encodeURIComponent(id)); if(response.ok) c=await response.json(); }catch{}
+    if(c && c.status==='done'){
+      try{ localStorage.removeItem(pendingKey); }catch{}
+      btn.textContent='Reclaimed'; btn.classList.add('done');
+      setTimeout(()=>{ row.remove(); afterReclaim(); }, 700);
+      return;
+    }
+    if(c && c.status==='failed'){
+      try{ localStorage.removeItem(pendingKey); }catch{}
+      restore('Reclaim failed: '+(c.detail||'unknown'));
+      return;
+    }
+    await new Promise(resolve=>setTimeout(resolve,1000));
+  }
+  // Unknown is not success: keep the retained intent so the next press reconciles it.
+  restore('Reclaim outcome is unconfirmed. The request is retained — press Reclaim again to reconcile it.');
 }
-function afterKill(){
+function afterReclaim(){
   const left=$('#viewDetail').querySelectorAll('.runrow').length;
-  const dc=$('#viewDetail .dcount'); if(dc) dc.textContent=`${left} agent${left!==1?'s':''}`;
   if(!left){ const e2=document.createElement('div'); e2.className='projempty'; e2.textContent='No agents running now.'; $('#viewDetail').appendChild(e2); }
+  if(curDetail==='__running__') updateRunningCertainty();
   queueMarkRows();
 }
 

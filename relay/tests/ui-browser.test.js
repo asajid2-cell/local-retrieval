@@ -178,31 +178,71 @@ test('bulk hosted deletion retains history and sends each snapshot generation', 
   });
 });
 
-test('Projects hosted kill keeps the selected generation through confirmation', async t => {
+test('Projects reclaim cleans up a local agent through one revision-fenced intent', async t => {
   if (skipWithoutChromium(t)) return;
-  const session = { name: 'projects-kill', alive: true, hasCommand: true, sessionId: 'projects-chat', generationId: 'projects-original' };
-  await withBrowserRelay(session, async ({ harness, host, page }) => {
+  // A plain local agent: no mux session hosts it. The old running-list control only offered a "kill"
+  // that the PC bridge always refuses, so a local agent could never be stopped from the web.
+  await withBrowserRelay({ name: 'projects-reclaim-host', alive: true, shellOnly: true }, async ({ harness, page }) => {
+    const requests = [];
+    let done = false;
     await page.route('**/api/projects', route => route.fulfill({ json: {
-      appLive: true, bridgeLive: true, live: true, runningVerified: true,
-      collections: [], decks: [], allChats: [{ id: 'projects-chat', title: 'Project kill', tool: 'claude', muxName: session.name }],
-      runningSessions: [{ pid: 123, tool: 'claude', sessionId: 'projects-chat', title: 'Project kill', parent: 'fixture' }],
+      appLive: true, bridgeLive: true, live: true, runningVerified: true, collections: [], decks: [],
+      runningSessions: [{ pid: 321, tool: 'claude', sessionId: 'local-exact', title: 'Local exact', parent: 'fixture' }],
     } }));
+    await page.route('**/pc/api/discovery/chats?*', route => route.fulfill({ json: {
+      rows: [{ id: 'local-exact', tool: 'claude', revision: 'local-revision' }],
+    } }));
+    await page.route('**/api/app-commands', route => {
+      requests.push(route.request().postDataJSON());
+      return route.fulfill({ json: { id: 'projects-reclaim-command' } });
+    });
+    await page.route('**/api/app-commands/projects-reclaim-command', route => done
+      ? route.fulfill({ json: { status: 'done', detail: 'cleanup verified' } })
+      : route.abort('failed'));
+    page.on('dialog', dialog => dialog.accept());
     await page.goto(`http://127.0.0.1:${harness.port}/projects.html`);
     await page.locator('#runpill').click();
-    const dialogPromise = page.waitForEvent('dialog');
-    const click = page.locator('.runrow').getByRole('button', { name: 'Kill', exact: true }).click();
-    click.catch(() => {});
-    const dialog = await dialogPromise;
-    host.sendSessions([{ ...session, generationId: 'projects-replacement' }]);
-    await waitFor(async () => (await harness.json('GET', '/api/sessions'))[0]?.generationId === 'projects-replacement', 'Projects replacement');
-    const responsePromise = page.waitForResponse(r => r.request().method() === 'DELETE');
-    page.once('dialog', d => d.dismiss());
-    await dialog.accept();
-    await click;
-    const response = await responsePromise;
-    assert.equal(response.request().postDataJSON().generationId, session.generationId);
-    assert.equal(response.status(), 409);
-    assert.equal(host.messages.some(m => m.t === 'kill'), false);
+    const firstClick = page.locator('.runrow').getByRole('button', { name: 'Reclaim', exact: true }).click();
+    firstClick.catch(() => {});
+    await waitFor(() => requests.length === 1, 'Projects reclaim request');
+    assert.equal(requests[0].type, 'reclaim');
+    assert.equal(requests[0].confirmed, true);
+    assert.equal(requests[0].sessionId, 'local-exact');
+    assert.equal(requests[0].tool, 'claude');
+    assert.equal(requests[0].expectedRevision, 'local-revision');
+    const first = requests[0];
+    // An unconfirmed outcome is not success: the row survives and the intent is retained, not replaced.
+    await waitFor(() => page.evaluate(() => localStorage.length > 0), 'Projects retained reclaim intent');
+    await page.reload();
+    await page.locator('#runpill').click();
+    done = true;
+    await page.locator('.runrow').getByRole('button', { name: 'Reclaim', exact: true }).click();
+    await waitFor(() => requests.length === 2, 'Projects reclaim reconciliation');
+    assert.deepEqual(requests[1], first, 'the retained intent is replayed verbatim');
+    await page.locator('.runrow').waitFor({ state: 'detached' });
+  });
+});
+
+test('Projects reclaim refuses a running agent with no authoritative archived chat', async t => {
+  if (skipWithoutChromium(t)) return;
+  await withBrowserRelay({ name: 'projects-unarchived-host', alive: true, shellOnly: true }, async ({ harness, page }) => {
+    const requests = [];
+    const dialogs = [];
+    await page.route('**/api/projects', route => route.fulfill({ json: {
+      appLive: true, bridgeLive: true, live: true, runningVerified: true, collections: [], decks: [],
+      runningSessions: [{ pid: 654, tool: 'codex', sessionId: 'unarchived-exact', title: 'Unarchived', parent: 'fixture' }],
+    } }));
+    await page.route('**/pc/api/discovery/chats?*', route => route.fulfill({ json: { rows: [] } }));
+    await page.route('**/api/app-commands', route => {
+      requests.push(route.request().postDataJSON());
+      return route.fulfill({ json: { id: 'should-not-happen' } });
+    });
+    page.on('dialog', dialog => { dialogs.push(dialog.message()); dialog.accept(); });
+    await page.goto(`http://127.0.0.1:${harness.port}/projects.html`);
+    await page.locator('#runpill').click();
+    await page.locator('.runrow').getByRole('button', { name: 'Reclaim', exact: true }).click();
+    await waitFor(() => dialogs.some(m => m.includes('no authoritative archived chat')), 'Projects reclaim refusal');
+    assert.equal(requests.length, 0, 'an unarchived agent must not enqueue a cleanup command');
   });
 });
 
