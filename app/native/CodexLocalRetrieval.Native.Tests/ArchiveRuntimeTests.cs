@@ -93,6 +93,33 @@ public sealed class ArchiveRuntimeTests
     }
 
     [TestMethod]
+    public async Task WarmRuntime_ObservesExternalStoreCommitWithoutTranscriptRescan()
+    {
+        using var store = new TempStore();
+        ArchiveService Create() => new(storePath: store.Path,
+            sourceOverride: Array.Empty<CodexLocalRetrieval.Core.Models.SessionSource>(), enableTranscriptSearchIndex: false);
+        var writer = Create();
+        await writer.LoadAsync();
+        writer.Store.Sessions["shared"] = new() { Id = "shared", Tool = "claude", Title = "Original" };
+        await writer.SaveAsync();
+        var runtime = new ArchiveRuntime(Create(), syncOnLoad: false);
+        try
+        {
+            Assert.IsFalse(await runtime.UseAsync((archive, _) => Task.FromResult(archive.Store.Sessions["shared"].Pinned)));
+            writer.Store.Sessions["shared"].Pinned = true;
+            writer.Store.Sessions["shared"].CustomTitle = "GUI committed title";
+            await writer.SaveAsync();
+            await runtime.UseAsync((archive, _) =>
+            {
+                Assert.IsTrue(archive.Store.Sessions["shared"].Pinned, "completed external favorite must be visible on the next read");
+                Assert.AreEqual("GUI committed title", archive.Store.Sessions["shared"].CustomTitle);
+                return Task.FromResult(true);
+            });
+        }
+        finally { runtime.Dispose(); }
+    }
+
+    [TestMethod]
     public async Task TryUnloadIfIdleAsync_WaitsForActiveArchiveOperation()
     {
         using var store = new TempStore();

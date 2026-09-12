@@ -14,6 +14,26 @@ namespace CodexLocalRetrieval.Native.Tests;
 public sealed class ContainedProcessLifecycleTests
 {
     [TestMethod]
+    public async Task CreationTimeContainment_RetainsExitCodeAfterFastChildExits()
+    {
+        using var job = WindowsProcessJob.CreateKillOnClose();
+        using var process = job.StartContained(new ProcessStartInfo("cmd.exe")
+        {
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            Arguments = "/d /c exit 37",
+        });
+        // Pipe EOF observes child termination without opening Process's cached OS handle.
+        Assert.AreEqual("", await process.StandardOutput.ReadToEndAsync().WaitAsync(TimeSpan.FromSeconds(10)));
+        Assert.AreEqual("", await process.StandardError.ReadToEndAsync().WaitAsync(TimeSpan.FromSeconds(10)));
+        await process.WaitForExitAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.AreEqual(37, process.ExitCode);
+    }
+
+    [TestMethod]
     public async Task ClaudeContainmentFailure_KillsProcessAndReleasesWriterLease()
     {
         if (!OperatingSystem.IsWindows())

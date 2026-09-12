@@ -28,6 +28,7 @@ public sealed partial class MainPage
     private sealed record PendingAgentLine(long LineNumber, AgentCommand? Command, string? ParseError);
 
     private static string AgentDir =>
+        GuiVerificationFixture.Enabled ? Path.Combine(GuiVerificationFixture.Root, "agent") :
         Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "CodexLocalRetrieval");
     private static string AgentInbox => Path.Combine(AgentDir, "agent-inbox.jsonl");
     private static string AgentOutbox => Path.Combine(AgentDir, "agent-outbox.jsonl");

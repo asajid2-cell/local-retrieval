@@ -1,3 +1,4 @@
+using CodexLocalRetrieval.Core.Chat;
 using CodexLocalRetrieval.Core.Remote;
 using CodexLocalRetrieval.Core.Services;
 
@@ -11,7 +12,7 @@ namespace CodexLocalRetrieval.Server;
 // breaks the page, so they are read explicitly here instead of by model binding.
 public static class DiscoveryEndpoints
 {
-    public static void MapDiscovery(this WebApplication app, ArchiveRuntime runtime)
+    public static void MapDiscovery(this WebApplication app, ArchiveRuntime runtime, bool redactReads = false)
     {
         // The archive loads lazily and is evicted when idle, so the api is built per request around
         // whichever ArchiveService instance the runtime hands over.
@@ -40,12 +41,47 @@ public static class DiscoveryEndpoints
         app.MapGet("/api/discovery/start/collections", async (string? deckId, CancellationToken ct) =>
             Results.Json(await runtime.UseAsync((a, _) => Task.FromResult(new DiscoveryApi(a).StartCollections(deckId ?? "")), ct)));
 
+        app.MapGet("/api/discovery/admin/containers", async (CancellationToken ct) =>
+            Results.Json(await runtime.UseAsync((a, _) => Task.FromResult(new DiscoveryApi(a).ContainerAdmin()), ct)));
+
         app.MapGet("/api/discovery/start/checkpoints", async (CancellationToken ct) =>
             Results.Json(await runtime.UseAsync((a, _) => Task.FromResult(new DiscoveryApi(a).StartCheckpoints()), ct)));
+
+        app.MapPost("/api/discovery/copy", async (HttpContext context, CancellationToken ct) =>
+        {
+            context.Response.Headers.CacheControl = "no-store";
+            var request = await context.Request.ReadFromJsonAsync<CopyRequest>(ct);
+            if (request is null || string.IsNullOrWhiteSpace(request.SessionId)
+                || request.Tool is not ("claude" or "codex")
+                || request.Mode is not ("resume" or "command" or "path" or "paths" or "code")
+                || request.LaunchMode is not (null or "native" or "gateway"))
+                return Results.BadRequest(new { error = "exact chat, tool and supported copy mode required" });
+            return await runtime.UseAsync<IResult>(async (archive, cancellation) =>
+            {
+                var session = archive.ResolveSessionByIdOrAlias(request.SessionId, request.Tool);
+                if (session is null || session.Id != request.SessionId)
+                    return Results.NotFound(new { error = "exact chat not found" });
+                if (request.LaunchMode == "gateway" && (request.Mode != "command" || !ArchiveService.CanResumeThroughGateway(session.Tool)))
+                    return Results.BadRequest(new { error = "Gateway resume command unavailable for this chat" });
+                if (request.Mode == "command")
+                {
+                    var launch = archive.BuildResumeLaunch(session, launchModeOverride: request.LaunchMode);
+                    if (string.IsNullOrWhiteSpace(launch.Exe) || string.IsNullOrWhiteSpace(launch.Arguments))
+                        return Results.BadRequest(new { error = "resume command unavailable for this chat" });
+                }
+                var payload = await archive.CopyPayloadAsync(session, request.Mode, cancellation, request.LaunchMode);
+                if (redactReads) payload = SecretRedactor.Scrub(payload);
+                if (System.Text.Encoding.UTF8.GetByteCount(payload) > 1024 * 1024)
+                    return Results.BadRequest(new { error = "copy payload exceeds 1 MiB; use the desktop export" });
+                return Results.Json(new { sessionId = session.Id, tool = session.Tool, mode = request.Mode, payload });
+            }, ct);
+        });
 
         app.MapGet("/api/discovery/start/workspaces", async (CancellationToken ct) =>
             Results.Json(await runtime.UseAsync((a, _) => Task.FromResult(new DiscoveryApi(a).StartWorkspaces()), ct)));
     }
+
+    private sealed record CopyRequest(string SessionId, string Tool, string Mode, string? LaunchMode);
 
     private static DiscoveryQuery ReadQuery(HttpRequest req)
     {
@@ -70,6 +106,7 @@ public static class DiscoveryEndpoints
             Date: S("date"),
             MinUserMessages: I("minUserMessages"),
             ShowHidden: B("showHidden"),
+            Archived: S("archived"),
             Project: S("project"),
             Sort: S("sort"),
             Offset: I("offset"),

@@ -558,7 +558,11 @@ public static class RunningSessions
         }
         foreach (var kv in claudeLiveIds)
             AddLivePid(live, kv.Key, kv.Value);
-        if (!TryOpenTranscriptSessionIdsBounded(pids, out var openTranscriptIds, out var handleUnverifiable, out var handleDetail))
+        var handleSource = ScanSourceOverride?.OpenTranscripts;
+        var (handleOk, openTranscriptIds, handleUnverifiable, handleDetail) = handleSource is not null
+            ? handleSource(pids)
+            : (TryOpenTranscriptSessionIdsBounded(pids, out var hm, out var hu, out var hd), hm, hu, hd);
+        if (!handleOk)
         {
             unverifiablePids.UnionWith(handleUnverifiable);
             detail = string.IsNullOrEmpty(detail) ? handleDetail : detail + "; " + handleDetail;

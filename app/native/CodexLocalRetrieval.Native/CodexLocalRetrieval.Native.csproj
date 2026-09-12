@@ -67,6 +67,7 @@
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\CodexLocalRetrieval.Core\CodexLocalRetrieval.Core.csproj" />
+    <Compile Include="..\CodexLocalRetrieval.Server\ArchiveRemoteCommands.cs" Link="Remote\ArchiveRemoteCommands.cs" />
   </ItemGroup>
 
   <!--

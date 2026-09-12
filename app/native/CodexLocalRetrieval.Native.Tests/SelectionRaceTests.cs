@@ -34,4 +34,10 @@ public sealed class SelectionRaceTests
     {
         Assert.AreEqual("A", SelectionRaceGuard.Resolve("A", 7, 7, "A", new[] { "A" }));
     }
+
+    [TestMethod]
+    public void ActualClickRejectsCapturedSelectionEvenWhenIdIsUnchanged()
+    {
+        Assert.AreEqual("A", SelectionRaceGuard.Resolve("A", 7, 8, "A", new[] { "A", "B" }));
+    }
 }

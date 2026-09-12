@@ -96,7 +96,12 @@ public sealed class SaveLiteTests
             await svc.SaveAsync();          // establish the file and warm the JIT
             await svc.SaveAsync();
 
+            var phases = new List<(string Name, double Ms)>();
+            svc.SavePhaseMeasured = (name, ms) => phases.Add((name, ms));
             var (busyMs, counters) = TagClick(svc);
+            svc.SavePhaseMeasured = null;
+            foreach (var phase in phases)
+                PerfRecord.Measure("store.save.phase." + phase.Name, phase.Ms, "ms");
 
             var bytesRead = counters["storeBytesRead"];
             var parses = counters["storeJsonParses"];

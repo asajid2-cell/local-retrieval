@@ -9,6 +9,35 @@ namespace CodexLocalRetrieval.Native.Tests;
 [TestClass]
 public sealed class DiscoveryApiTests
 {
+    [TestMethod]
+    public async Task SourceOverride_SurvivesForeignStoreConfigurationAndReload()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "discovery-source-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var storePath = Path.Combine(root, "app-store.json");
+            var isolated = Path.Combine(root, "isolated");
+            var foreign = Path.Combine(root, "foreign");
+            var data = new AppStoreData();
+            data.Settings.Sources.Add(new SessionSource { Tool = "claude", Root = foreign });
+            await File.WriteAllTextAsync(storePath, JsonSerializer.Serialize(data));
+            var source = new SessionSource { Tool = "claude", Root = isolated };
+            var archive = new ArchiveService(storePath: storePath, enableTranscriptSearchIndex: false,
+                sourceOverride: new[] { source });
+            source.Root = foreign;
+            await archive.LoadCachedAsync();
+            Assert.AreEqual(isolated, archive.EffectiveSources().Single().Root);
+            archive.Store.Settings.Sources.Clear();
+            await archive.LoadCachedAsync();
+            Assert.AreEqual(isolated, archive.EffectiveSources().Single().Root);
+            var ordinary = new ArchiveService(storePath: storePath, enableTranscriptSearchIndex: false);
+            await ordinary.LoadCachedAsync();
+            Assert.AreEqual(foreign, ordinary.EffectiveSources().Single().Root);
+        }
+        finally { Directory.Delete(root, recursive: true); }
+    }
+
     private static ArchiveSession Chat(
         string id,
         string title,
@@ -41,8 +70,10 @@ public sealed class DiscoveryApiTests
         var hidden = Chat("c", "One Shot", "codex", "2026-07-31T10:00:00Z", 1);
         hidden.MessageCount = 2;
         var unsafeChat = Chat("bad id", "Unsafe Resume", "codex", "2026-07-30T10:00:00Z", 5, "web");
+        var archived = Chat("old", "Archived Work", "codex", "2026-07-29T10:00:00Z", 4, "archive");
+        archived.Archived = true;
 
-        foreach (var chat in new[] { alpha, beta, hidden, unsafeChat })
+        foreach (var chat in new[] { alpha, beta, hidden, unsafeChat, archived })
             archive.Store.Sessions[chat.Id] = chat;
         archive.Store.Collections["project-web"] = new ArchiveCollection
         {
@@ -63,7 +94,7 @@ public sealed class DiscoveryApiTests
     [TestMethod]
     public void Chats_ReusesCompoundFiltersAndDefaultsToHidingOneOffs()
     {
-        var (_, api) = Fixture();
+        var (archive, api) = Fixture();
 
         var page = api.Chats(new DiscoveryQuery(
             Include: "active, ACTIVE",
@@ -78,8 +109,19 @@ public sealed class DiscoveryApiTests
 
         var hidden = api.Chats(new DiscoveryQuery());
         CollectionAssert.DoesNotContain(hidden.Rows.Select(row => row.Id).ToList(), "c");
+        CollectionAssert.DoesNotContain(hidden.Rows.Select(row => row.Id).ToList(), "old");
         var revealed = api.Chats(new DiscoveryQuery(ShowHidden: true));
         CollectionAssert.Contains(revealed.Rows.Select(row => row.Id).ToList(), "c");
+
+        var archived = api.Chats(new DiscoveryQuery(Archived: "archived", ShowHidden: true));
+        Assert.AreEqual(1, archived.Total);
+        Assert.IsTrue(archived.Rows.Single().Archived);
+        var all = api.Chats(new DiscoveryQuery(Archived: "all", ShowHidden: true));
+        Assert.AreEqual(5, all.Total);
+        archive.Store.Sessions["old"].Archived = false;
+        var afterUnarchive = api.Chats(new DiscoveryQuery());
+        CollectionAssert.Contains(afterUnarchive.Rows.Select(row => row.Id).ToList(), "old");
+        Assert.IsFalse(afterUnarchive.Rows.Single(row => row.Id == "old").Archived);
     }
 
     [TestMethod]
@@ -111,6 +153,7 @@ public sealed class DiscoveryApiTests
         Assert.AreEqual("web-parity", good.Phrases.Single());
         Assert.AreEqual(10, good.UserMsgCount);
         Assert.IsTrue(good.Pinned);
+        Assert.IsFalse(good.Archived);
         Assert.IsTrue(good.Resumable);
         Assert.IsFalse(bad.Resumable);
         Assert.IsTrue(good.MuxName.Length > 0);

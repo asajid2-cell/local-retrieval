@@ -124,7 +124,12 @@ public sealed class LedgerReadTests
     {
         using var dir = NewTempDir();
         // One month => one monthly file => one mutex, so all 64 appends genuinely contend.
-        var options = new SessionEventLedger.Options(dir.Path, DateTimeOffset.Parse("2026-07-08T00:00:00Z"));
+        // This gates consistency under contention, not the default best-effort admission latency.
+        var options = new SessionEventLedger.Options(dir.Path, DateTimeOffset.Parse("2026-07-08T00:00:00Z"),
+            LockTimeout: TimeSpan.FromSeconds(30));
+        Assert.HasCount(0, SessionEventLedger.ReadForSession("shared-alias", max: 200, options: options));
+        Assert.IsTrue(File.Exists(Path.Combine(SessionEventLedger.IndexDirectory(dir.Path), ".complete")),
+            "Reads must use the append-maintained index, not repair offsets through a first-read backfill.");
 
         Parallel.For(0, 64, i =>
         {

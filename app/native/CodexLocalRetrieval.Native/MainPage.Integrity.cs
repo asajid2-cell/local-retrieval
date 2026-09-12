@@ -17,6 +17,7 @@ public sealed partial class MainPage
     private CancellationTokenSource? _reclaimCancellation;
     private string? _reclaimNoticeSessionId;
     private string? _reclaimNotice;
+    private ReclaimReport? _pendingReclaimReport;
     private const int ReclaimWaitSeconds = 150;
 
     private void RefreshIntegrity_Click(object sender, RoutedEventArgs e) => RenderIntegrity(force: true);
@@ -27,6 +28,14 @@ public sealed partial class MainPage
     // is still the newest answer to the newest question. Same shape as RenderCustodyPage/LoadCustodyAsync.
     private void RenderIntegrity(bool force = false)
     {
+        if (GuiVerificationFixture.Enabled)
+        {
+            _integrity.Invalidate();
+            SetRiskySessionActionsEnabled(false);
+            IntegrityItems.Children.Clear();
+            IntegrityItems.Children.Add(IntegrityChip("Isolated metadata fixture; runtime actions disabled"));
+            return;
+        }
         if (_selected is null)
         {
             _integrity.Invalidate();
@@ -48,11 +57,16 @@ public sealed partial class MainPage
     {
         var outcome = await _integrity.RefreshAsync(key, () => SessionIntegrity.Build(store, session), force);
 
-        // Superseded by a newer refresh, or the selection moved on while we were building: either way this
-        // answer is no longer about what is on screen, and painting it would be a lie with a fresh timestamp.
-        if (!outcome.IsCurrent || !IsSelectedSession(session)) return;
+        // Superseded by a newer refresh, or the selection/store object moved on while we were building: either
+        // way this answer is no longer about what is on screen, and painting it would be a lie with a fresh timestamp.
+        // The reference checks matter when a sync replaces a session with a same-ID object; an ID-only lookup
+        // would incorrectly accept the old build for the new object.
+        if (!outcome.IsCurrent
+            || !ReferenceEquals(_selected, session)
+            || !ReferenceEquals(_archive.Store, store)) return;
         if (outcome.Error is not null) Diag.Log("RenderIntegrity failed: " + outcome.Error);
         PaintIntegrity(outcome.Value, checking: false);
+        ReconcilePendingReclaim(session, outcome, key);
     }
 
     private void PaintIntegrity(SessionIntegritySummary? summary, bool checking)
@@ -185,8 +199,12 @@ public sealed partial class MainPage
 
         var seq = ++_reclaimSeq;
         _reclaimRunning = true;
-        _reclaimCancellation?.Dispose();
-        _reclaimCancellation = new CancellationTokenSource();
+        _pendingReclaimReport = null;
+        _reclaimNoticeSessionId = null;
+        _reclaimNotice = null;
+        // The prior operation owns and disposes its CTS in its own finally; never dispose a shared field here.
+        var cancellation = new CancellationTokenSource();
+        _reclaimCancellation = cancellation;
         SyncStatus.Text = "Reclaiming...";
 
         ReclaimReport? report = null;
@@ -199,7 +217,7 @@ public sealed partial class MainPage
                 KillMux = () => KillCanonicalMuxForReclaimAsync(session, seq),
                 PruneMuxCurrent = ids => PruneMuxCustodyForReclaim(ids),
                 OnRefusal = refusal => AskReclaimRefusalAsync(session, refusal),
-                Cancellation = _reclaimCancellation.Token,
+                Cancellation = cancellation.Token,
             };
 
             Diag.Log($"Reclaim start session={session.Id} candidates={string.Join(",", candidateIds)} mux={ArchiveService.MultiplexSessionName(session)}");
@@ -229,45 +247,54 @@ public sealed partial class MainPage
         }
         finally
         {
-            _reclaimCancellation?.Dispose();
-            _reclaimCancellation = null;
-            _reclaimRunning = false;
+            // A newer reclaim owns the shared lifecycle now. Dispose this operation's local token, but never
+            // clear/reset the newer operation's cancellation source or running flag.
+            if (seq == _reclaimSeq)
+            {
+                if (ReferenceEquals(_reclaimCancellation, cancellation))
+                    _reclaimCancellation = null;
+                _reclaimRunning = false;
+            }
+            cancellation.Dispose();
         }
 
         if (report is null || seq != _reclaimSeq || !IsSelectedSession(session)) return;
 
         RecordReclaimEvents(session, report);
+        var selectionRevisionBeforeSync = SelectionRevision;
+        var selectedSessionId = session.Id;
         await SyncNowAsync(initial: false, waitForActive: true);
-        _integrity.Invalidate();
-        await RefreshIntegrityAsync(session, IntegrityKey(session), _archive.Store, force: true);
-
-        // The report describes the attempted mutation; only the authoritative post-state decides whether the
-        // user may be told this completed. Keep blocked/unknown outcomes truthful and include the remaining check.
-        var postState = _integrity.CurrentFor(IntegrityKey(session));
+        // Sync may refresh the selected model object without changing the user's selection. Fence only
+        // actual clicks/reselection, a changed selected ID, or a newer reclaim; same-ID replacement is normal.
+        if (seq != _reclaimSeq
+            || SelectionRevision != selectionRevisionBeforeSync
+            || !IsSelectedSession(session)
+            || !string.Equals(_selected?.Id, selectedSessionId, StringComparison.OrdinalIgnoreCase)) return;
+        _pendingReclaimReport = report;
         _reclaimNoticeSessionId = session.Id;
-        _reclaimNotice = SessionReclaim.BuildPostStateNotice(report, postState);
+        _reclaimNotice = SessionReclaim.BuildPostStateNotice(report, null);
         SyncStatus.Text = _reclaimNotice;
+        _integrity.Invalidate();
+        RenderIntegrity(force: true);
     }
 
-    private static string BuildReclaimNotice(ReclaimReport report, SessionIntegritySummary? postState)
+    private void ReconcilePendingReclaim(
+        ArchiveSession session,
+        RefreshOutcome<SessionIntegritySummary> outcome,
+        string key)
     {
-        if (!report.MuxOk)
-            return "Reclaim blocked: state is uncertain; cleanup may be partial. " + report.MuxDetail;
-        if (!report.KillOk)
-            return "Reclaim incomplete: cleanup may be partial. " + report.KillDetail;
-        if (postState is null)
-            return "Reclaim incomplete: post-state integrity could not be verified. Refresh before retrying.";
-        if (string.Equals(postState.Severity, "danger", StringComparison.OrdinalIgnoreCase))
-        {
-            var reason = postState.Checks.FirstOrDefault(c => string.Equals(c.Severity, "danger", StringComparison.OrdinalIgnoreCase))?.Summary
-                         ?? postState.Headline;
-            return "Reclaim incomplete: " + reason;
-        }
-        if (report.AnyClaimBlocking)
-            return "Reclaim incomplete: " + report.Headline;
-        return report.Changed
-            ? "Reclaim completed: " + postState.Headline
-            : "Reclaim completed: no changes were made. " + postState.Headline;
+        if (_pendingReclaimReport is null
+            || !string.Equals(_reclaimNoticeSessionId, session.Id, StringComparison.OrdinalIgnoreCase)
+            || !string.Equals(outcome.Key, key, StringComparison.Ordinal)
+            || outcome.Error is not null
+            || outcome.Value is null)
+            return;
+
+        var report = _pendingReclaimReport;
+        _pendingReclaimReport = null;
+        _reclaimNotice = SessionReclaim.BuildPostStateNotice(report, outcome.Value);
+        SyncStatus.Text = _reclaimNotice;
+        PaintIntegrity(outcome.Value, checking: false);
     }
 
     private void Report(int seq, string message)

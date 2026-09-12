@@ -1,5 +1,6 @@
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json;
 using System.Text.Json.Nodes;
 using CodexLocalRetrieval.Core.Models;
 using CodexLocalRetrieval.Core.Remote;
@@ -85,7 +86,8 @@ public sealed partial class ArchiveService
     private async Task<TemplateSnapshotResult> CreateTemplateSnapshotCoreAsync(
         ArchiveSession source,
         string? name,
-        string? idempotencyKey)
+        string? idempotencyKey,
+        Action<string>? appliedReceipt = null)
     {
         if (source is null) return new TemplateSnapshotResult(false, "No chat to checkpoint.", null);
         var sourcePath = ResolveSessionSourcePath(source);
@@ -159,10 +161,23 @@ public sealed partial class ArchiveService
         // The snapshot file is already captured; a lost save race must not discard it.
         try
         {
-            await CommitBranchWorkAsync(() => Store.TemplateSnapshots[snapshot.Id] = snapshot);
+            await CommitBranchWorkAsync(() =>
+            {
+                Store.TemplateSnapshots[snapshot.Id] = snapshot;
+                appliedReceipt?.Invoke(snapshot.Id);
+            }, failClosedOnConflict: appliedReceipt is not null);
+        }
+        catch (Exception error) when (IsDurabilityUncertain(error))
+        {
+            // A committed/unknown durable save may already contain the metadata. Reload before
+            // deciding whether this operation failed; never destroy bytes based on an unverified save.
+            if (await ReloadAndFindSnapshotAsync(snapshot.Id, snapshotPath))
+                return new TemplateSnapshotResult(true, $"Created checkpoint \"{snapshot.DisplayName}\".", Store.TemplateSnapshots[snapshot.Id]);
+            throw;
         }
         catch
         {
+            // Only a known pre-commit failure (or a non-durable failure) permits cleanup of our file.
             Store.TemplateSnapshots.Remove(snapshot.Id);
             if (createdSnapshotFile) TryDeleteFile(snapshotPath);
             throw;
@@ -192,7 +207,7 @@ public sealed partial class ArchiveService
         }
     }
 
-    private async Task<BranchResult> SpawnTemplateCoreAsync(TemplateSnapshot? snapshot)
+    private async Task<BranchResult> SpawnTemplateCoreAsync(TemplateSnapshot? snapshot, Action<string>? appliedReceipt = null)
     {
         if (snapshot is null) return new BranchResult(false, "No checkpoint selected.", null);
         if (!Store.TemplateSnapshots.TryGetValue(snapshot.Id, out var current))
@@ -206,7 +221,8 @@ public sealed partial class ArchiveService
             current.SnapshotPath,
             current.DisplayName,
             current.SourceSessionId,
-            current.Id);
+            current.Id,
+            appliedReceipt: appliedReceipt);
     }
 
     public IReadOnlyList<TemplateSnapshot> Templates() =>
@@ -269,22 +285,47 @@ public sealed partial class ArchiveService
         return new SnapshotReaderResult(true, "Opened checkpoint read-only.", reader);
     }
 
-    public async Task<bool> RenameTemplateSnapshotAsync(string snapshotId, string name)
+    private async Task<bool> RenameTemplateSnapshotCoreAsync(string snapshotId, string name, Action<string>? appliedReceipt = null)
     {
         if (!Store.TemplateSnapshots.TryGetValue(snapshotId, out var snapshot)) return false;
         var clean = (name ?? "").Trim();
         if (clean.Length == 0 || string.Equals(snapshot.Name, clean, StringComparison.Ordinal)) return false;
+        var oldName = snapshot.Name;
         snapshot.Name = clean;
-        await SaveAsync();
-        return true;
-    }
-
-    public async Task<bool> DeleteTemplateSnapshotAsync(string snapshotId)
-    {
-        if (!Store.TemplateSnapshots.Remove(snapshotId, out var snapshot)) return false;
         try
         {
-            await SaveAsync();
+            await CommitBranchWorkAsync(() => appliedReceipt?.Invoke(snapshotId), failClosedOnConflict: appliedReceipt is not null);
+            return true;
+        }
+        catch (Exception error) when (IsDurabilityUncertain(error))
+        {
+            await ReloadStoreForUncertainDurabilityAsync();
+            return Store.TemplateSnapshots.TryGetValue(snapshotId, out var current)
+                && string.Equals(current.Name, clean, StringComparison.Ordinal);
+        }
+        catch
+        {
+            snapshot.Name = oldName;
+            throw;
+        }
+    }
+
+    public async Task<bool> RenameTemplateSnapshotAsync(string snapshotId, string name)
+        => await RenameTemplateSnapshotCoreAsync(snapshotId, name);
+
+    public async Task<bool> DeleteTemplateSnapshotAsync(string snapshotId, Action<string>? appliedReceipt = null)
+    {
+        if (!Store.TemplateSnapshots.TryGetValue(snapshotId, out var snapshot)) return false;
+        Store.TemplateSnapshots.Remove(snapshotId);
+        try
+        {
+            await CommitBranchWorkAsync(() => appliedReceipt?.Invoke(snapshotId), failClosedOnConflict: appliedReceipt is not null);
+        }
+        catch (Exception error) when (IsDurabilityUncertain(error))
+        {
+            await ReloadStoreForUncertainDurabilityAsync();
+            if (Store.TemplateSnapshots.ContainsKey(snapshotId)) return false;
+            throw;
         }
         catch
         {
@@ -295,6 +336,50 @@ public sealed partial class ArchiveService
         RefreshTemplateSnapshotCounts();
         ReapplyList();
         return true;
+    }
+
+    private async Task<bool> DeleteTemplateSnapshotCoreAsync(string snapshotId, Action<string>? appliedReceipt = null)
+        => await DeleteTemplateSnapshotAsync(snapshotId, appliedReceipt);
+
+    private static bool IsDurabilityUncertain(Exception error) =>
+        error is DurableWriteException durable && (durable.Committed || durable.VerificationUnknown);
+
+    private async Task ReloadStoreForUncertainDurabilityAsync() => await LoadStoreStateAsync();
+
+    private async Task<bool> ReloadAndFindSnapshotAsync(string snapshotId, string snapshotPath)
+    {
+        try
+        {
+            await ReloadStoreForUncertainDurabilityAsync();
+            return Store.TemplateSnapshots.TryGetValue(snapshotId, out var current)
+                && string.Equals(current.SnapshotPath, snapshotPath, StringComparison.OrdinalIgnoreCase);
+        }
+        catch
+        {
+            // Reload failure is not evidence that the durable write did not commit.
+            return false;
+        }
+    }
+
+    public string TemplateSnapshotManagementRevision(string snapshotId)
+    {
+        if (!Store.TemplateSnapshots.TryGetValue(snapshotId, out var snapshot)) return "";
+        return Revision(JsonSerializer.Serialize(new { snapshot.Id, snapshot.Name, snapshot.SourceSessionId, snapshot.SourceTitle, snapshot.SnapshotPath, snapshot.Tool, snapshot.Workspace, snapshot.WorkspaceName, snapshot.Model, snapshot.CreatedAt, snapshot.CapturedSourceLength, snapshot.MessageCount, snapshot.LineCount, snapshot.IdempotencyKey }));
+    }
+
+    private async Task<bool> ReloadAndFindBranchAsync(string branchId, string destinationPath)
+    {
+        try
+        {
+            await ReloadStoreForUncertainDurabilityAsync();
+            return Store.Sessions.TryGetValue(branchId, out var current)
+                && string.Equals(current.SourcePath, destinationPath, StringComparison.OrdinalIgnoreCase);
+        }
+        catch
+        {
+            // Reload failure is not evidence that the durable write did not commit.
+            return false;
+        }
     }
 
     public async Task<int> RemoveTemplateSnapshotsForSourceAsync(string sourceSessionId)
@@ -458,7 +543,7 @@ public sealed partial class ArchiveService
     // ONLY the bookkeeping onto it, and save again. The file work is never repeated, so this cannot
     // produce a second branch. Bounded, because three writers interleaving this fast is a real
     // problem the caller should see.
-    private async Task CommitBranchWorkAsync(Action apply)
+    private async Task CommitBranchWorkAsync(Action apply, bool failClosedOnConflict = false)
     {
         for (var attempt = 0; ; attempt++)
         {
@@ -468,7 +553,7 @@ public sealed partial class ArchiveService
                 await SaveAsync();
                 return;
             }
-            catch (StoreGenerationConflictException) when (attempt < 2)
+            catch (StoreGenerationConflictException) when (!failClosedOnConflict && attempt < 2)
             {
                 await LoadAsync();
             }
@@ -481,7 +566,8 @@ public sealed partial class ArchiveService
         string displayTitle,
         string parentId,
         string fromSnapshotId = "",
-        string launchMode = NativeLaunchMode)
+        string launchMode = NativeLaunchMode,
+        Action<string>? appliedReceipt = null)
     {
         var tool = (parent.Tool ?? "").Trim().ToLowerInvariant();
         var newId = Guid.NewGuid().ToString();
@@ -522,7 +608,22 @@ public sealed partial class ArchiveService
         // see CommitBranchWorkAsync.
         try
         {
-            await CommitBranchWorkAsync(() => Store.Sessions[newId] = branch);
+            await CommitBranchWorkAsync(() =>
+            {
+                Store.Sessions[newId] = branch;
+                appliedReceipt?.Invoke(newId);
+            }, failClosedOnConflict: appliedReceipt is not null);
+        }
+        catch (Exception error) when (IsDurabilityUncertain(error))
+        {
+            // A durable commit may have succeeded even though its acknowledgement failed. Reload
+            // before reporting failure, and never delete the transcript or Codex row on uncertainty.
+            if (await ReloadAndFindBranchAsync(newId, destinationPath))
+            {
+                ReapplyList();
+                return new BranchResult(true, $"Branched \"{displayTitle}\".", Store.Sessions[newId]);
+            }
+            throw;
         }
         catch
         {

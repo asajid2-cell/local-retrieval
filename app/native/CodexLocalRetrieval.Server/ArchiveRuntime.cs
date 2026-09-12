@@ -128,6 +128,7 @@ public sealed class ArchiveRuntime
         {
             var wasLoaded = IsLoaded;
             await EnsureLoadedAsync(cancellationToken, strictRefresh: refreshBeforeUse);
+            if (wasLoaded) await _archive.ReloadExternalStoreCommitAsync(cancellationToken);
             EnsureSourceWatches();
             if ((refreshBeforeUse || Interlocked.Exchange(ref _refreshPending, 0) == 1) && _syncOnLoad && wasLoaded)
                 await RefreshAsync(cancellationToken);

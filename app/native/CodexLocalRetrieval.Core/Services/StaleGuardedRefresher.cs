@@ -16,8 +16,12 @@ public readonly record struct RefreshOutcome<T>(bool IsCurrent, string Key, T? V
 ///   1. the build func runs on the dispatcher's thread, never the caller's (default dispatcher is
 ///      <see cref="Task.Run(Func{T})"/>);
 ///   2. of two overlapping refreshes only the newer one publishes, whatever order they finish in;
-///   3. a refresh — force included — that arrives while a build for the SAME key is already in flight
-///      coalesces onto that build instead of starting a second one.
+///   3. a refresh — force included — that arrives while a VALID/CURRENT build for the SAME key is already in
+///      flight coalesces onto that build instead of starting a second one. An invalidated build is not current
+///      and must never absorb a replacement refresh.
+///
+/// Coalescing is limited to an in-flight task whose sequence still equals the current sequence. This preserves
+/// normal force-refresh coalescing while ensuring invalidation starts a replacement build for the same key.
 ///
 /// The build func is supplied per refresh rather than per instance on purpose: it has to close over the
 /// exact subject that was current when the refresh was requested. A ctor-injected build would have to read
@@ -135,7 +139,7 @@ public sealed class StaleGuardedRefresher<T> where T : class
         {
             // A force refresh wants a build newer than the published value. An in-flight build for the same
             // key already IS that, so piling a second one on top buys nothing but contention.
-            if (_inFlight is not null && string.Equals(_inFlightKey, key, StringComparison.Ordinal))
+            if (_inFlight is not null && _inFlightSeq == _seq && string.Equals(_inFlightKey, key, StringComparison.Ordinal))
             {
                 _coalesced++;
                 return _inFlight;

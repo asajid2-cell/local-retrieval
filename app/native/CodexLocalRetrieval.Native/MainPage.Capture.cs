@@ -80,6 +80,14 @@ public sealed partial class MainPage
 
     private async Task RunStepAsync(CapStep step, List<string> artifacts)
     {
+        if (GuiVerificationFixture.Enabled)
+        {
+            if (step.nav is not (null or "Archive") || step.click is not null || step.clipboard is true)
+                throw new InvalidOperationException("GUI metadata fixture permits read-only capture steps only");
+            foreach (var name in new[] { step.shot, step.dump, step.snapshot })
+                if (name is not null && !System.Text.RegularExpressions.Regex.IsMatch(name, @"\A[A-Za-z0-9_-]{1,80}\z"))
+                    throw new InvalidOperationException("GUI fixture artifact name refused");
+        }
         if (step.nav is not null) Navigate(step.nav);
         if (step.resize is { Length: 2 }) MainWindow.Instance?.AppWindow.Resize(new Windows.Graphics.SizeInt32(step.resize[0], step.resize[1]));
         if (step.type is not null) { SearchBox.Text = step.type; ApplySearch(step.type); }
@@ -118,8 +126,7 @@ public sealed partial class MainPage
 
             var container = SessionList.ContainerFromIndex(index) as ListViewItem;
             if (container is null) throw new InvalidOperationException($"Session '{id}' is not displayed.");
-            var peer = FrameworkElementAutomationPeer.CreatePeerForElement(container)
-                       ?? new ListViewItemAutomationPeer(container);
+            var peer = new ListViewItemDataAutomationPeer(session, new ListViewAutomationPeer(SessionList));
             if (peer.GetPattern(PatternInterface.SelectionItem) is not ISelectionItemProvider selection)
                 throw new InvalidOperationException("Displayed session item has no selection automation pattern.");
 
@@ -141,6 +148,7 @@ public sealed partial class MainPage
         {
             selectedId = _selected?.Id,
             selectedItemId,
+            renderedTitle = TitleText.Text,
             screen = _screen,
             syncInProgress = _syncing,
             count = _archive.Sessions.Count

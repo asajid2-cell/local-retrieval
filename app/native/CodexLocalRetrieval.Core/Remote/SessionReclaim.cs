@@ -103,6 +103,8 @@ public sealed record ReclaimMuxResult(
     bool TeardownVerified,
     string Detail);
 
+public sealed record ReclaimMuxFence(string Name, string SessionId, string GenerationId);
+
 // Identity-bearing rows returned by muxd `ls`. A tab name is presentation only; it is never an owner key.
 public sealed record ReclaimMuxRow(
     string Name,
@@ -432,6 +434,126 @@ public static class SessionReclaim
         string? listingJson)
         => PruneStaleMuxCurrent(muxTabHistory, candidateIds, ParseLiveMuxNames(listingJson));
 
+
+    // Probe muxd, remove only the exact identity+generation it advertised, then prove that neither the
+    // presentation name nor any candidate identity remains. The transport callbacks own protocol I/O;
+    // this shared helper owns the reclaim policy so GUI and headless callers cannot drift.
+    public static async Task<ReclaimMuxResult> ProbeAndFencedRemoveMuxOwnerAsync(
+        IReadOnlyCollection<string> candidateIds,
+        string? hintedName,
+        Func<Task<string>> list,
+        Func<string, string, string, Task<(bool ok, string detail)>> fencedRemove,
+        Func<ReclaimMuxOwnerResolution, Task<(bool ok, string detail)>>? prepare = null,
+        ReclaimMuxFence? requiredFence = null)
+    {
+        ArgumentNullException.ThrowIfNull(candidateIds);
+        ArgumentNullException.ThrowIfNull(list);
+        ArgumentNullException.ThrowIfNull(fencedRemove);
+
+        try
+        {
+            var before = ParseMuxRowsStrict(await list().ConfigureAwait(false), out var beforeError);
+            if (before is null)
+                return new ReclaimMuxResult(false, false, false, beforeError);
+
+            var resolution = ResolveMuxOwner(before, candidateIds, hintedName);
+            if (resolution.Status == ReclaimMuxOwnerStatus.Absent)
+            {
+                if (requiredFence is not null)
+                    return new ReclaimMuxResult(true, true, false, "refusing mux teardown: frozen owner is absent; prior destructive outcome is uncertain");
+                if (prepare is not null)
+                {
+                    var preparedAbsent = await prepare(resolution).ConfigureAwait(false);
+                    if (!preparedAbsent.ok)
+                        return new ReclaimMuxResult(true, false, false, "refusing mux teardown: " + preparedAbsent.detail);
+                }
+                return new ReclaimMuxResult(true, false, true, "canonical mux owner absent");
+            }
+            if (!resolution.IsSafeToKill)
+                return new ReclaimMuxResult(true, true, false, "refusing mux teardown: " + resolution.Detail);
+
+            var owner = resolution.Owner!;
+            if (requiredFence is not null
+                && (!string.Equals(owner.Name, requiredFence.Name, StringComparison.OrdinalIgnoreCase)
+                    || !string.Equals(owner.SessionId, requiredFence.SessionId, StringComparison.Ordinal)
+                    || !string.Equals(owner.GenerationId, requiredFence.GenerationId, StringComparison.Ordinal)))
+                return new ReclaimMuxResult(true, true, false, "refusing mux teardown: observed owner does not match the frozen fence");
+            if (string.IsNullOrWhiteSpace(owner.SessionId) || string.IsNullOrWhiteSpace(owner.GenerationId))
+                return new ReclaimMuxResult(true, true, false, "refusing mux teardown: owner fence was not advertised");
+
+            if (prepare is not null)
+            {
+                var prepared = await prepare(resolution).ConfigureAwait(false);
+                if (!prepared.ok)
+                    return new ReclaimMuxResult(true, true, false, "refusing mux teardown: " + prepared.detail);
+            }
+
+            var deleted = await fencedRemove(owner.Name, owner.SessionId, owner.GenerationId).ConfigureAwait(false);
+            if (!deleted.ok)
+                return new ReclaimMuxResult(true, true, false, "could not kill mux session " + owner.Name + ": " + deleted.detail);
+
+            var after = ParseMuxRowsStrict(await list().ConfigureAwait(false), out var afterError);
+            if (after is null)
+                return new ReclaimMuxResult(false, true, false, "muxd teardown response was not verifiable: " + afterError);
+
+            var nameRemains = after.Any(row => string.Equals(row.Name, owner.Name, StringComparison.OrdinalIgnoreCase));
+            var identityRemains = ResolveMuxOwner(after, candidateIds).Status != ReclaimMuxOwnerStatus.Absent;
+            return nameRemains || identityRemains
+                ? new ReclaimMuxResult(true, true, false, "mux session remained after kill: " + owner.Name)
+                : new ReclaimMuxResult(true, true, true, "killed and verified mux session " + owner.Name);
+        }
+        catch (Exception ex)
+        {
+            return new ReclaimMuxResult(false, true, false, "could not verify canonical mux teardown for " + hintedName + ": " + ex.Message);
+        }
+    }
+
+    internal static IReadOnlyList<ReclaimMuxRow>? ParseMuxRowsStrict(string listing, out string error)
+    {
+        error = "";
+        try
+        {
+            using var doc = JsonDocument.Parse(listing);
+            if (doc.RootElement.ValueKind != JsonValueKind.Object
+                || !doc.RootElement.TryGetProperty("list", out var rows)
+                || rows.ValueKind != JsonValueKind.Array)
+            {
+                error = "muxd listing did not contain a session list";
+                return null;
+            }
+
+            var parsed = new List<ReclaimMuxRow>();
+            foreach (var row in rows.EnumerateArray())
+            {
+                if (row.ValueKind != JsonValueKind.Object
+                    || !row.TryGetProperty("name", out var name) || name.ValueKind != JsonValueKind.String
+                    || !row.TryGetProperty("alive", out var alive) || alive.ValueKind is not (JsonValueKind.True or JsonValueKind.False)
+                    || !row.TryGetProperty("sessionId", out var sessionId) || sessionId.ValueKind != JsonValueKind.String
+                    || !row.TryGetProperty("aliases", out var aliases) || aliases.ValueKind != JsonValueKind.Array
+                    || aliases.EnumerateArray().Any(alias => alias.ValueKind != JsonValueKind.String)
+                    || !row.TryGetProperty("generationId", out var generationId) || generationId.ValueKind != JsonValueKind.String)
+                {
+                    error = "muxd listing contained a malformed session row";
+                    return null;
+                }
+
+                parsed.Add(new ReclaimMuxRow(
+                    name.GetString() ?? "",
+                    alive.GetBoolean(),
+                    sessionId.GetString() ?? "",
+                    aliases.EnumerateArray().Select(alias => alias.GetString() ?? "").Where(alias => alias.Length > 0).ToArray())
+                {
+                    GenerationId = generationId.GetString() ?? ""
+                });
+            }
+            return parsed;
+        }
+        catch (JsonException ex)
+        {
+            error = "muxd listing was not valid JSON: " + ex.Message;
+            return null;
+        }
+    }
 
     // Resolve only from live muxd identity. History/name is a hint for diagnostics, never authorization.
     public static ReclaimMuxOwnerResolution ResolveMuxOwner(

@@ -10,7 +10,10 @@ public enum RemoteCommandAdmission
     Execute,    // gate passed; run it, then Record the outcome
     Refused,    // policy/envelope violation — ack as failed, NO side effect
     Duplicate,  // this intent was already delivered — replay the recorded ack, NO side effect
+    Busy,       // still executing — no terminal acknowledgement
 }
+
+public sealed class RemoteCommandUnconfirmedException(string detail) : Exception(detail);
 
 public static class RemoteCommandProtocol
 {
@@ -35,8 +38,10 @@ public static class RemoteCommandProtocol
             "fetchfile" => "intent-fenced",
             "rename" => "idempotent",
             "setapptitle" => "idempotent",
-            "addtocollection" => "idempotent",
-            "startmux" => "intent-fenced",
+            "setfavorite" or "setapptitle" or "archive" or "setphrases" or "settag" => "idempotent",
+            "addtocollection" or "removefromcollection" => "idempotent",
+            "deckcreate" or "collectioncreate" or "deckrename" or "collectionrename" or "collectionmove" or "deckdelete" or "collectiondelete" or "collectionrecover" or "collectionpurge" or "collectionempty" or "collectionsettag" or "collectionreorder" or "deckreorder" or "captureworkspace" or "checkpointcreate" or "checkpointrename" or "checkpointdelete" or "checkpointspawn" or "branchcreate" => "intent-fenced",
+            "startmux" or "startchat" or "reclaim" => "intent-fenced",
             "mirrorlocal" => "intent-fenced",
             "cleartabhistory" => "idempotent",
             "settabcolor" => "idempotent",
@@ -51,7 +56,9 @@ public static class RemoteCommandProtocol
     // delivery still owns the command) and a stable intent id (redeliveries are recognisable). Neither proves
     // WHO authorised the operation — that is the principal-proof layer, not this one.
     public static bool RequiresIntentEnvelope(string? type)
-        => (type ?? "").Trim().ToLowerInvariant() is "fetchfile" or "startmux" or "mirrorlocal";
+        => (type ?? "").Trim().ToLowerInvariant() is "fetchfile" or "startmux" or "startchat" or "reclaim" or "mirrorlocal"
+            or "deckcreate" or "collectioncreate" or "deckrename" or "collectionrename"
+            or "collectionmove" or "deckdelete" or "collectiondelete" or "collectionrecover" or "collectionpurge" or "collectionempty" or "collectionsettag" or "collectionreorder" or "deckreorder" or "captureworkspace" or "checkpointcreate" or "checkpointrename" or "checkpointdelete" or "checkpointspawn" or "branchcreate";
 
     // The relay's own canonical form for both ids (relay/server.js commandIntentId): it rejects anything
     // outside this charset before queueing, so a value that fails here never came from an honest lease.
@@ -136,14 +143,39 @@ public static class RemoteCommandProtocol
                 if (_outcomes.TryGetValue(key, out var prior))
                 {
                     outcome = prior ?? (false, InFlight);
-                    return RemoteCommandAdmission.Duplicate;
+                    return prior.HasValue ? RemoteCommandAdmission.Duplicate : RemoteCommandAdmission.Busy;
+                }
+                if (_outcomes.Count >= _capacity)
+                {
+                    var completed = _order.FirstOrDefault(candidate => _outcomes[candidate].HasValue);
+                    if (completed is null)
+                    {
+                        outcome = (false, "intent capacity is busy; retry delivery");
+                        return RemoteCommandAdmission.Busy;
+                    }
+                    _outcomes.Remove(completed);
+                    var retained = _order.Where(candidate => candidate != completed).ToArray();
+                    _order.Clear();
+                    foreach (var candidate in retained) _order.Enqueue(candidate);
                 }
                 _outcomes[key] = null;   // claimed, not yet completed
                 _order.Enqueue(key);
-                while (_order.Count > _capacity) _outcomes.Remove(_order.Dequeue());
             }
             outcome = (false, "");
             return RemoteCommandAdmission.Execute;
+        }
+
+        public void Release(string? intentId)
+        {
+            var key = (intentId ?? "").Trim();
+            lock (_sync)
+            {
+                if (!_outcomes.TryGetValue(key, out var outcome) || outcome.HasValue) return;
+                _outcomes.Remove(key);
+                var retained = _order.Where(candidate => candidate != key).ToArray();
+                _order.Clear();
+                foreach (var candidate in retained) _order.Enqueue(candidate);
+            }
         }
 
         // Record the terminal outcome so a redelivery replays the same ack instead of re-executing.

@@ -124,7 +124,20 @@ public sealed class RolloutAndLiveMappingTests
             // 3) rename (custom-title) wins over the ai-title, persists, and is shared via the .jsonl
             var store = new ClaudeSessionStore(root);
             store.List(); // cache the path
-            Assert.IsTrue(store.RenameSession(id, "claude-remote maker"));
+            var previousSources = CodexLocalRetrieval.Core.Remote.RunningSessions.ScanSourceOverride;
+            try
+            {
+                CodexLocalRetrieval.Core.Remote.RunningSessions.ScanSourceOverride = new(
+                    Scan: () => (true, new List<CodexLocalRetrieval.Core.Services.ArchiveService.RunningSessionInfo>(), ""),
+                    ClaudeRegistry: _ => (true, new Dictionary<string, int>(), new HashSet<int>(), ""),
+                    OpenTranscripts: _ => (true, new Dictionary<string, int>(), new HashSet<int>(), ""));
+                Assert.IsTrue(store.RenameSession(id, "claude-remote maker"));
+            }
+            finally
+            {
+                CodexLocalRetrieval.Core.Remote.RunningSessions.ScanSourceOverride = previousSources;
+                CodexLocalRetrieval.Core.Remote.RunningSessions.InvalidateScanCache();
+            }
             Assert.AreEqual("claude-remote maker", new ClaudeSessionStore(root).List()[0].Title);
             var disk = File.ReadAllText(path);
             StringAssert.Contains(disk, "\"type\":\"custom-title\"");

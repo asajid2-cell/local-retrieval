@@ -433,6 +433,134 @@ public class SessionReclaimTests
     }
 
     [TestMethod]
+    public async Task ProbeAndFencedRemoveMuxOwner_RejectsMalformedListingsWithoutRemoving()
+    {
+        var removals = 0;
+        foreach (var listing in new[]
+        {
+            "not-json",
+            "{}",
+            "{\"list\":{}}",
+            "{\"list\":[{\"name\":\"target\",\"alive\":\"true\",\"sessionId\":\"sid\",\"aliases\":[],\"generationId\":\"gen\"}]}",
+            "{\"list\":[{\"name\":\"target\",\"alive\":true,\"sessionId\":\"sid\",\"aliases\":[1],\"generationId\":\"gen\"}]}"
+        })
+        {
+            var result = await SessionReclaim.ProbeAndFencedRemoveMuxOwnerAsync(
+                new[] { "sid" }, "target", () => Task.FromResult(listing),
+                (_, _, _) => { removals++; return Task.FromResult((true, "killed")); });
+
+            Assert.IsFalse(result.ProbeOk, listing);
+            Assert.IsFalse(result.TeardownVerified, listing);
+        }
+        Assert.AreEqual(0, removals);
+    }
+
+    [TestMethod]
+    public async Task ProbeAndFencedRemoveMuxOwner_RefusesNameConflictWithoutRemoving()
+    {
+        var removals = 0;
+        var result = await SessionReclaim.ProbeAndFencedRemoveMuxOwnerAsync(
+            new[] { "target-id" }, "target-name",
+            () => Task.FromResult("{\"list\":[{\"name\":\"target-name\",\"alive\":true,\"sessionId\":\"other-id\",\"aliases\":[],\"generationId\":\"other-gen\"}]}"),
+            (_, _, _) => { removals++; return Task.FromResult((true, "killed")); });
+
+        Assert.IsTrue(result.ProbeOk);
+        Assert.IsFalse(result.TeardownVerified);
+        StringAssert.Contains(result.Detail, "different live identity");
+        Assert.AreEqual(0, removals);
+    }
+
+    [TestMethod]
+    public async Task ProbeAndFencedRemoveMuxOwner_RequiresBothFenceValues()
+    {
+        var removals = 0;
+        var result = await SessionReclaim.ProbeAndFencedRemoveMuxOwnerAsync(
+            new[] { "target-id" }, "target-name",
+            () => Task.FromResult("{\"list\":[{\"name\":\"target-name\",\"alive\":true,\"sessionId\":\"target-id\",\"aliases\":[],\"generationId\":\"\"}]}"),
+            (_, _, _) => { removals++; return Task.FromResult((true, "killed")); });
+
+        Assert.IsFalse(result.TeardownVerified);
+        StringAssert.Contains(result.Detail, "fence was not advertised");
+        Assert.AreEqual(0, removals);
+    }
+
+    [DataTestMethod]
+    [DataRow(true)]
+    [DataRow(false)]
+    public async Task ProbeAndFencedRemoveMuxOwner_DeadRowStillRequiresConfirmedRemoval(bool confirmed)
+    {
+        var calls = 0;
+        var listings = new Queue<string>(new[]
+        {
+            "{\"list\":[{\"name\":\"target-name\",\"alive\":false,\"sessionId\":\"target-id\",\"aliases\":[],\"generationId\":\"generation-1\"}]}",
+            "{\"list\":[]}"
+        });
+        var result = await SessionReclaim.ProbeAndFencedRemoveMuxOwnerAsync(
+            new[] { "target-id" }, "target-name", () => Task.FromResult(listings.Dequeue()),
+            (name, id, generation) =>
+            {
+                calls++;
+                Assert.AreEqual(("target-name", "target-id", "generation-1"), (name, id, generation));
+                return Task.FromResult((confirmed, "cleanup result"));
+            });
+        Assert.AreEqual(1, calls, "dead PTY does not prove host and tombstone cleanup");
+        Assert.AreEqual(confirmed, result.TeardownVerified);
+        Assert.IsTrue(result.OwnerFound);
+    }
+
+    [TestMethod]
+    public async Task ProbeAndFencedRemoveMuxOwner_RejectsReplacementGenerationAfterExactKill()
+    {
+        var listings = new Queue<string>(new[]
+        {
+            "{\"list\":[{\"name\":\"target-name\",\"alive\":true,\"sessionId\":\"target-id\",\"aliases\":[],\"generationId\":\"generation-1\"}]}",
+            "{\"list\":[{\"name\":\"target-name\",\"alive\":true,\"sessionId\":\"target-id\",\"aliases\":[],\"generationId\":\"generation-2\"}]}"
+        });
+        (string name, string sessionId, string generationId)? removed = null;
+
+        var result = await SessionReclaim.ProbeAndFencedRemoveMuxOwnerAsync(
+            new[] { "target-id" }, "target-name", () => Task.FromResult(listings.Dequeue()),
+            (name, sessionId, generationId) =>
+            {
+                removed = (name, sessionId, generationId);
+                return Task.FromResult((true, "killed"));
+            });
+
+        Assert.AreEqual(("target-name", "target-id", "generation-1"), removed);
+        Assert.IsFalse(result.TeardownVerified);
+        StringAssert.Contains(result.Detail, "remained after kill");
+    }
+
+    [TestMethod]
+    public async Task ProbeAndFencedRemoveMuxOwner_MatchesAlias_PreservesUnrelatedRow_AndNeverCreates()
+    {
+        var listings = new Queue<string>(new[]
+        {
+            "{\"list\":[{\"name\":\"renamed\",\"alive\":true,\"sessionId\":\"canonical\",\"aliases\":[\"old-id\"],\"generationId\":\"target-gen\"},{\"name\":\"unrelated\",\"alive\":true,\"sessionId\":\"other\",\"aliases\":[],\"generationId\":\"other-gen\"}]}",
+            "{\"list\":[{\"name\":\"unrelated\",\"alive\":true,\"sessionId\":\"other\",\"aliases\":[],\"generationId\":\"other-gen\"}]}"
+        });
+        var listCalls = 0;
+        var removeCalls = 0;
+
+        var result = await SessionReclaim.ProbeAndFencedRemoveMuxOwnerAsync(
+            new[] { "current-id", "old-id" }, "generated-name",
+            () => { listCalls++; return Task.FromResult(listings.Dequeue()); },
+            (name, sessionId, generationId) =>
+            {
+                removeCalls++;
+                Assert.AreEqual("renamed", name);
+                Assert.AreEqual("canonical", sessionId);
+                Assert.AreEqual("target-gen", generationId);
+                return Task.FromResult((true, "killed"));
+            });
+
+        Assert.IsTrue(result.TeardownVerified, result.Detail);
+        Assert.AreEqual(2, listCalls, "the helper performs only pre/post probes");
+        Assert.AreEqual(1, removeCalls, "the helper performs one fenced remove and has no create path");
+        Assert.AreEqual(0, listings.Count, "the unrelated row remained visible in the verified post-list");
+    }
+
+    [TestMethod]
     public async Task Reclaim_KillsLiveMuxBeforeProcessCleanup_AndDoesNotLaunch()
     {
         var order = new List<string>();
@@ -836,6 +964,39 @@ public class SessionReclaimTests
         var riskyEnd = integrity.IndexOf("private string IntegrityKey", riskyStart, StringComparison.Ordinal);
         var risky = integrity[riskyStart..riskyEnd];
         Assert.DoesNotContain("Reclaim", risky, "the Reclaim affordance must never be disabled by uncertainty");
+    }
+
+    // These are source-wiring tests, not runtime GUI tests: WinUI MainPage requires an app dispatcher and XamlRoot.
+    // They pin the narrow async fence and ownership rules that runtime UI verification must still exercise.
+    [TestMethod]
+    public void ReclaimCompletion_FencesPostSyncPublication_AndPreservesNewerOwnership()
+    {
+        var root = FindRepoRoot();
+        var integrity = File.ReadAllText(Path.Combine(root, "native", "CodexLocalRetrieval.Native", "MainPage.Integrity.cs"));
+        var sync = integrity.IndexOf("await SyncNowAsync(initial: false, waitForActive: true)", StringComparison.Ordinal);
+        var postGuard = integrity.IndexOf("SelectionRevision != selectionRevisionBeforeSync", sync, StringComparison.Ordinal);
+        var pending = integrity.IndexOf("_pendingReclaimReport = report;", postGuard, StringComparison.Ordinal);
+
+        Assert.IsTrue(sync >= 0, "reclaim must synchronize before publishing its post-state");
+        Assert.IsTrue(postGuard > sync, "post-sync publication needs a revision/selection fence");
+        Assert.IsTrue(pending > postGuard, "pending report must be assigned only after the fence");
+        StringAssert.Contains(integrity, "!IsSelectedSession(session)");
+        StringAssert.Contains(integrity, "_selected?.Id, selectedSessionId");
+        Assert.DoesNotContain("SelectionRevision != selectionRevisionBeforeSync || !ReferenceEquals(_selected, session)", integrity);
+        StringAssert.Contains(integrity, "if (seq == _reclaimSeq)");
+        StringAssert.Contains(integrity, "ReferenceEquals(_reclaimCancellation, cancellation)");
+    }
+
+    [TestMethod]
+    public void IntegrityRefresh_RejectsSameIdReplacementByReference()
+    {
+        var root = FindRepoRoot();
+        var integrity = File.ReadAllText(Path.Combine(root, "native", "CodexLocalRetrieval.Native", "MainPage.Integrity.cs"));
+        var refresh = integrity.IndexOf("private async Task RefreshIntegrityAsync", StringComparison.Ordinal);
+        var guard = integrity.IndexOf("ReferenceEquals(_selected, session)", refresh, StringComparison.Ordinal);
+
+        Assert.IsTrue(guard > refresh, "refresh completion must reject a replaced same-ID selected object");
+        StringAssert.Contains(integrity, "ReferenceEquals(_archive.Store, store)");
     }
 
     // ---- harness -------------------------------------------------------------------------------------

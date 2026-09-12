@@ -322,6 +322,7 @@ public sealed partial class MainPage
         _cmdTimer.Start();
         // Track which chat each mux tab is hosting on a fast loop (off the UI thread) so a brief
         // `claude` → `codex` → exit is caught into the tab's session history even between 30s pushes.
+        if (GuiVerificationFixture.Enabled) return;
         _tabTimer ??= new DispatcherTimer { Interval = TimeSpan.FromSeconds(5) };
         _tabTimer.Tick -= OnTabTick;
         _tabTimer.Tick += OnTabTick;
@@ -338,9 +339,16 @@ public sealed partial class MainPage
         _tabTracking = true;
         try
         {
-            var bindings = await Task.Run(() => _archive.ResolvePendingMuxBindings());
+            IReadOnlyList<ArchiveService.PendingMuxBinding> bindings;
+            await _syncGate.WaitAsync();
+            try { bindings = await Task.Run(() => _archive.ResolvePendingMuxBindings()); }
+            finally { _syncGate.Release(); }
             foreach (var binding in bindings)
                 await BindPendingMuxIdentityAsync(binding);
+            var listing = await LocalMuxdRequestAsync(new { t = "ls" });
+            await _syncGate.WaitAsync();
+            try { await _archive.ReconcileStartChatBindingsAsync(listing); }
+            finally { _syncGate.Release(); }
         }
         catch { }
         finally { _tabTracking = false; }
@@ -355,6 +363,7 @@ public sealed partial class MainPage
             {
                 t = "bind",
                 s = binding.MuxName,
+                generationId = binding.Generation,
                 cmd = launch.Command,
                 sessionId = launch.SessionId,
                 aliases = launch.Aliases
@@ -372,30 +381,35 @@ public sealed partial class MainPage
         var settings = _archive.Store.Settings;
         var target = (settings.MultiplexSshTarget ?? "").Trim();
         if (string.IsNullOrEmpty(target)) return;
-        string json;
-        try
-        {
-            var scan = await Task.Run(() =>
-            {
-                var verified = RunningSessions.TryScanEnriched(out var list, out var detail);
-                return (verified, detail, sessions: EnrichRunningSessionTitles(list));
-            });
-            var sessions = scan.sessions;
-            var running = new HashSet<string>(
-                sessions.SelectMany(s => s.AllSessionIds),
-                StringComparer.OrdinalIgnoreCase);
-            json = _archive.BuildProjectsProjectionJson(running, sessions, scan.verified, scan.detail);
-            await _archive.SaveMuxHistoryIfDirtyAsync();   // persist any tab-session-history rotation the projection detected
-        }
-        catch (Exception ex) { Diag.Log("BuildProjects failed: " + ex.Message); return; }
         _syncPushing = true;
         try
         {
+            string json;
+            await _syncGate.WaitAsync();
+            try
+            {
+                var scan = await Task.Run(() =>
+                {
+                    if (GuiVerificationFixture.Enabled)
+                        return (verified: true, detail: "isolated GUI fixture", sessions: new List<ArchiveService.RunningSessionInfo>());
+                    var verified = RunningSessions.TryScanEnriched(out var list, out var detail);
+                    return (verified, detail, sessions: EnrichRunningSessionTitles(list));
+                });
+                var sessions = scan.sessions;
+                var running = new HashSet<string>(
+                    sessions.SelectMany(s => s.AllSessionIds),
+                    StringComparer.OrdinalIgnoreCase);
+                json = _archive.BuildProjectsProjectionJson(running, sessions, scan.verified, scan.detail);
+                await _archive.SaveMuxHistoryIfDirtyAsync();
+            }
+            finally { _syncGate.Release(); }
             // POST over our own owner-only SSH to the VPS loopback (the API trusts loopback); the JSON
             // rides ssh stdin into curl so its quotes/backslashes never touch a shell command line.
             // Hardened + hard-timeout via RunSshAsync so a stalled push can't wedge _syncPushing either.
             var remote = $"curl -s -X POST http://127.0.0.1:{settings.MultiplexApiPort}/api/projects -H 'Content-Type: application/json' --data-binary @-";
-            var (code, outText) = await RunSshAsync(target, remote, json);
+            var (code, outText) = GuiVerificationFixture.Enabled
+                ? await GuiVerificationFixture.SendAsync("/api/projects", json)
+                : await RunSshAsync(target, remote, json);
             Diag.Log($"Projects sync rc={code} out={outText.Trim()}");
         }
         catch (Exception ex) { Diag.Log("PushProjects failed: " + ex.Message); }
@@ -420,11 +434,15 @@ public sealed partial class MainPage
             // timeout for this one call sits above the relay's 25s hold cap. _cmdPolling makes the
             // overlapping timer ticks no-ops while the hold is out.
             var leaseJson = JsonSerializer.Serialize(new { owner = _commandLeaseOwner, limit = 1, waitMs = (int)RemoteBridge.LeaseHoldWait.TotalMilliseconds });
-            var outText = (await RunSshAsync(
+            var lease = GuiVerificationFixture.Enabled
+                ? await GuiVerificationFixture.SendAsync("/api/app-commands/lease", leaseJson, RemoteBridge.LeaseHoldWait + SshHardTimeout)
+                : await RunSshAsync(
                 target,
-                $"curl -s -X POST http://127.0.0.1:{port}/api/app-commands/lease -H 'Content-Type: application/json' --data-binary @-",
+                $"h=\"$HOME/.config/mux/command-bridge.header\"; [ -f \"$h\" ] && [ ! -L \"$h\" ] && [ -s \"$h\" ] && [ -r \"$h\" ] && [ $(stat -c %u -- \"$h\") -eq $(id -u) ] || exit 77; p=$(stat -c %A -- \"$h\") || exit 77; case $p in ?r??------) ;; *) exit 77;; esac; curl --fail --silent --show-error -X POST http://127.0.0.1:{port}/api/app-commands/lease -H 'Content-Type: application/json' --header \"@$h\" --data-binary @-",
                 leaseJson,
-                timeout: RemoteBridge.LeaseHoldWait + SshHardTimeout)).outText;
+                timeout: RemoteBridge.LeaseHoldWait + SshHardTimeout);
+            if (lease.code != 0) return;
+            var outText = lease.outText;
             if (string.IsNullOrWhiteSpace(outText)) return;
             List<AppCommand>? cmds;
             try { cmds = JsonSerializer.Deserialize<List<AppCommand>>(outText); } catch { return; }
@@ -441,18 +459,17 @@ public sealed partial class MainPage
                 var onPc = false;
                 // ONE gate, before any side effect: replay policy AND (for intent-fenced types) a live
                 // lease token + a stable intent id that has not already been delivered.
-                // startchat has the same at-most-once envelope semantics as startmux. Translate only
-                // while the shared protocol gate runs, then restore the real dispatch type.
-                var commandType = c.type;
-                if (string.Equals(c.type, "startchat", StringComparison.OrdinalIgnoreCase))
-                    c.type = "startmux";
                 var admission = _commandIntents.Admit(c.type, c.replayPolicy, c.intentId, c.leaseToken, out var gated);
-                c.type = commandType;
+                if (admission == RemoteCommandAdmission.Busy) continue;
                 if (admission != RemoteCommandAdmission.Execute)
                 {
                     if (admission == RemoteCommandAdmission.Refused)
                         Diag.Log($"Remote command REFUSED (envelope): type='{c.type}' id={c.id} — {gated.detail}");
                     res = gated;
+                }
+                else if (GuiVerificationFixture.Enabled && c.type is not ("setfavorite" or "setapptitle" or "archive" or "setphrases" or "settag" or "rename"))
+                {
+                    res = (false, "operation not enabled in isolated GUI metadata fixture");
                 }
                 else if (string.Equals(c.type, "kill", StringComparison.OrdinalIgnoreCase))
                 {
@@ -487,18 +504,42 @@ public sealed partial class MainPage
                 }
                 else if (string.Equals(c.type, "rename", StringComparison.OrdinalIgnoreCase))
                 {
-                    var status = await _archive.RenameNativeByIdAsync(c.tool ?? "claude", c.sessionId ?? "", c.title ?? "");
-                    var ok = status is not null && !status.Contains("failed", StringComparison.OrdinalIgnoreCase)
-                                                && !status.Contains("needs", StringComparison.OrdinalIgnoreCase)
-                                                && !status.Contains("not found", StringComparison.OrdinalIgnoreCase);
-                    res = (ok, status ?? "renamed");
-                    renamed |= ok;
+                    if (GuiVerificationFixture.Enabled) GuiVerificationFixture.Validate();
+                    using var command = JsonDocument.Parse(JsonSerializer.Serialize(c));
+                    await _syncGate.WaitAsync();
+                    try { res = await CodexLocalRetrieval.Server.ArchiveRemoteCommands.ExecuteAsync(_archive, command.RootElement); }
+                    catch (RemoteCommandUnconfirmedException)
+                    {
+                        _commandIntents.Release(c.intentId);
+                        continue;
+                    }
+                    finally { _syncGate.Release(); }
+                    renamed |= res.ok;
                 }
-                else if (string.Equals(c.type, "setapptitle", StringComparison.OrdinalIgnoreCase))
+                else if (c.type is "setfavorite" or "setapptitle" or "archive" or "setphrases" or "settag"
+                    or "addtocollection" or "removefromcollection" or "deckcreate" or "collectioncreate"
+                    or "deckrename" or "collectionrename" or "collectionmove" or "deckdelete"
+                    or "collectiondelete" or "collectionrecover" or "collectionpurge" or "collectionempty"
+                    or "collectionsettag" or "collectionreorder" or "deckreorder" or "checkpointcreate" or "checkpointrename" or "checkpointdelete" or "checkpointspawn" or "branchcreate")
                 {
-                    var ok = await _archive.RenameAppTitleByIdAsync(c.sessionId ?? "", c.title ?? "");
-                    res = (ok, ok ? "app name set" : "chat not in this app's archive");
-                    renamed |= ok;
+                    using var command = JsonDocument.Parse(JsonSerializer.Serialize(c));
+                    await _syncGate.WaitAsync();
+                    try { res = await CodexLocalRetrieval.Server.ArchiveRemoteCommands.ExecuteAsync(_archive, command.RootElement); }
+                    finally { _syncGate.Release(); }
+                    renamed |= res.ok;
+                    added |= res.ok;
+                }
+                else if (c.type == "captureworkspace")
+                {
+                    using var command = JsonDocument.Parse(JsonSerializer.Serialize(c));
+                    await _syncGate.WaitAsync();
+                    try
+                    {
+                        var listing = await LocalMuxdRequestAsync(new { t = "ls" });
+                        res = await CodexLocalRetrieval.Server.ArchiveRemoteCommands.CaptureWorkspaceAsync(_archive, command.RootElement, listing);
+                    }
+                    finally { _syncGate.Release(); }
+                    added |= res.ok;
                 }
                 else if (string.Equals(c.type, "fetchfile", StringComparison.OrdinalIgnoreCase))
                 {
@@ -510,14 +551,14 @@ public sealed partial class MainPage
                         c.muxName ?? c.sessionName,
                         c.insert,
                         c.intentId,
-                        message => LocalMuxdRequestAsync(message));
+                        message => LocalMuxdRequestAsync(message, retryStart: false), c.sessionId, c.generationId);
+                    if (transfer.Uncertain)
+                    {
+                        _commandIntents.Release(c.intentId);
+                        continue;
+                    }
                     res = (transfer.Ok, transfer.Detail);
                     onPc = transfer.OnPc;
-                }
-                else if (string.Equals(c.type, "addtocollection", StringComparison.OrdinalIgnoreCase))
-                {
-                    res = await AddSessionToCollectionAsync(c.muxName ?? c.sessionName ?? "", c.collection ?? "", c.collectionId ?? "", c.deckId ?? "", c.deckName ?? c.deck ?? "", c.tool ?? "", c.sessionId ?? "");
-                    added |= res.ok;
                 }
                 else if (string.Equals(c.type, "startmux", StringComparison.OrdinalIgnoreCase))
                 {
@@ -540,27 +581,101 @@ public sealed partial class MainPage
                 }
                 else if (string.Equals(c.type, "startchat", StringComparison.OrdinalIgnoreCase))
                 {
-                    res = await StartChatHeadlessFromIntentAsync(c);
+                    StartChatPreparationResult outcome;
+                    try { outcome = await StartChatHeadlessFromIntentAsync(c); }
+                    catch
+                    {
+                        _commandIntents.Release(c.intentId);
+                        continue;
+                    }
+                    if (outcome.Uncertain)
+                    {
+                        _commandIntents.Release(c.intentId);
+                        continue;
+                    }
+                    res = (outcome.Ok, outcome.Detail);
                     added |= res.ok;
+                }
+                else if (string.Equals(c.type, "reclaim", StringComparison.OrdinalIgnoreCase))
+                {
+                    using var command = JsonDocument.Parse(JsonSerializer.Serialize(c));
+                    var root = command.RootElement;
+                    if (!root.TryGetProperty("confirmed", out var confirmed) || confirmed.ValueKind != JsonValueKind.True)
+                    {
+                        res = (false, "explicit cleanup confirmation required");
+                    }
+                    else
+                    {
+                        ReclaimOperationResult outcome;
+                        try
+                        {
+                            await _syncGate.WaitAsync();
+                            try
+                            {
+                                outcome = await _archive.ExecuteReclaimOperationAsync(c.intentId,
+                                    c.sessionId ?? "", c.tool ?? "",
+                                    root.TryGetProperty("expectedRevision", out var revision) && revision.ValueKind == JsonValueKind.String
+                                        ? revision.GetString() ?? "" : "",
+                                    () => LocalMuxdRequestAsync(new { t = "ls" }, retryStart: false),
+                                    async (name, id, generation) =>
+                                    {
+                                        using var reply = JsonDocument.Parse(await LocalMuxdRequestAsync(new
+                                        {
+                                            t = "kill", s = name, sessionId = id, generationId = generation
+                                        }, retryStart: false));
+                                        var result = reply.RootElement;
+                                        var removed = result.TryGetProperty("t", out var type) && type.GetString() == "killed"
+                                            && result.TryGetProperty("s", out var returnedName) && returnedName.GetString() == name;
+                                        return (removed, removed ? "fenced mux owner removed" : "mux teardown was not confirmed");
+                                    });
+                            }
+                            finally { _syncGate.Release(); }
+                        }
+                        catch
+                        {
+                            _commandIntents.Release(c.intentId);
+                            continue;
+                        }
+                        if (outcome.Status == ReclaimOperationStatus.Uncertain)
+                        {
+                            _commandIntents.Release(c.intentId);
+                            continue;
+                        }
+                        res = (outcome.Status == ReclaimOperationStatus.Applied, outcome.Detail);
+                        added |= res.ok;
+                    }
                 }
                 else if (string.Equals(c.type, "cleartabhistory", StringComparison.OrdinalIgnoreCase))
                 {
-                    var n = await _archive.ClearMuxTabHistoryAsync(c.muxName);   // one tab, or ALL when muxName is empty
+                    int n;
+                    await _syncGate.WaitAsync();
+                    try { n = await _archive.ClearMuxTabHistoryAsync(c.muxName); }
+                    finally { _syncGate.Release(); }
                     res = (true, n > 0 ? $"cleared session history for {n} tab(s)" : "no tab history to clear");
                     added |= n > 0;   // trigger a fast re-push so the web reflects the cleared history
                 }
                 else if (string.Equals(c.type, "settabcolor", StringComparison.OrdinalIgnoreCase))
                 {
-                    await _archive.SetTabColorAsync(c.muxName ?? c.sessionName ?? "", c.title);   // title carries the hex color ("" clears)
+                    await _syncGate.WaitAsync();
+                    try { await _archive.SetTabColorAsync(c.muxName ?? c.sessionName ?? "", c.title); }
+                    finally { _syncGate.Release(); }
                     res = (true, "tab color set");
                     added = true;   // re-push so the web re-tints
                 }
                 else res = (false, "unknown command");
                 if (admission == RemoteCommandAdmission.Execute) _commandIntents.Record(c.intentId, res.ok, res.detail);
-                var ackJson = JsonSerializer.Serialize(new { leaseToken = c.leaseToken, ok = res.ok, detail = res.detail, onPc });
+                var resultId = res.ok && (c.type is "deckcreate" or "collectioncreate") ? res.detail : null;
+                var ackJson = JsonSerializer.Serialize(new { leaseToken = c.leaseToken, ok = res.ok, detail = res.detail, resultId, onPc });
                 await AckCommandAsync(target, port, c.id, ackJson);
             }
-            if (killed || renamed || added) { await Task.Delay(300); await PushProjectsAsync(); }   // reflect a kill/rename/add fast
+            if (killed || renamed || added)
+            {
+                await _syncGate.WaitAsync();
+                try { RenderSelectedSessionPane(); }
+                finally { _syncGate.Release(); }
+                await Task.Delay(300);
+                await PushProjectsAsync();
+            }
         }
         catch (Exception ex) { Diag.Log("PollCommands failed: " + ex.Message); }
         finally
@@ -597,15 +712,25 @@ public sealed partial class MainPage
         var admission = TranscriptFetchProjection.AdmitFetch(sessionId, c.bridgeToken, c.ttlMs);
         if (!admission.Allowed) return (false, admission.Reason);
 
-        var session = _archive.ResolveSessionByIdOrAlias(sessionId, c.tool);
-        if (session is null) return (false, "chat not in this app's archive");
-
-        var user = await _archive.ExtractReaderMessagesAsync(session, "user");
-        var assistant = await _archive.ExtractReaderMessagesAsync(session, "assistant");
-        var merged = TranscriptFetchProjection.MergeChronological(user, assistant);
+        var deadline = Stopwatch.StartNew();
+        using var captureDeadline = new CancellationTokenSource(c.ttlMs);
         var redact = TranscriptFetchProjection.RedactReadsEnabled();
-        var pages = TranscriptFetchProjection.BuildPages(sessionId, merged, redact);
-        if (pages.Count == 0) return (true, "no readable messages in that chat");
+        IReadOnlyList<TranscriptFetchProjection.TranscriptPage> pages;
+        try
+        {
+            await _syncGate.WaitAsync(captureDeadline.Token);
+            try
+            {
+                var session = _archive.ResolveSessionByIdOrAlias(sessionId, c.tool);
+                if (session is null) return (false, "chat not in this app's archive");
+                var messages = await _archive.ExtractReaderMessagesAsync(session, "all", captureDeadline.Token);
+                pages = TranscriptFetchProjection.BuildPages(sessionId, messages, redact);
+            }
+            finally { _syncGate.Release(); }
+        }
+        catch (OperationCanceledException) { return (false, "transcript fetch authorization expired"); }
+        catch { return (false, "transcript fetch failed"); }
+        if (pages.Count == 0) return (false, "no readable messages in that chat");
 
         string remote;
         try { remote = TranscriptFetchProjection.PushCommand(port, sessionId, c.bridgeToken!); }
@@ -613,7 +738,6 @@ public sealed partial class MainPage
 
         // The TTL bounds the whole fetch, not each hop: once it lapses we stop pushing rather than
         // keep writing history the requester is no longer entitled to.
-        var deadline = Stopwatch.StartNew();
         var pushed = 0;
         foreach (var page in pages)
         {
@@ -629,11 +753,14 @@ public sealed partial class MainPage
 
     private static async Task AckCommandAsync(string target, int port, string commandId, string ackJson)
     {
+        if (!RemoteCommandProtocol.IsWellFormedEnvelopeToken(commandId)) return;
         for (var attempt = 1; attempt <= 3; attempt++)
         {
-            var result = await RunSshAsync(
+            var result = GuiVerificationFixture.Enabled
+                ? await GuiVerificationFixture.SendAsync($"/api/app-commands/{commandId}/ack", ackJson)
+                : await RunSshAsync(
                 target,
-                $"curl -sS -X POST http://127.0.0.1:{port}/api/app-commands/{commandId}/ack -H 'Content-Type: application/json' --data-binary @-",
+                $"h=\"$HOME/.config/mux/command-bridge.header\"; [ -f \"$h\" ] && [ ! -L \"$h\" ] && [ -s \"$h\" ] && [ -r \"$h\" ] && [ $(stat -c %u -- \"$h\") -eq $(id -u) ] || exit 77; p=$(stat -c %A -- \"$h\") || exit 77; case $p in ?r??------) ;; *) exit 77;; esac; curl --fail --silent --show-error -X POST http://127.0.0.1:{port}/api/app-commands/{commandId}/ack -H 'Content-Type: application/json' --header \"@$h\" --data-binary @-",
                 ackJson);
             if (result.code == 0 && RemoteCommandProtocol.AckSucceeded(result.outText)) return;
             if (attempt < 3) await Task.Delay(attempt * 500);
@@ -651,6 +778,7 @@ public sealed partial class MainPage
         public string? sessionId { get; set; }
         public string? tool { get; set; }
         public int pid { get; set; }
+        public string? generationId { get; set; }
         public string? uploadId { get; set; }
         public string? filename { get; set; }
         public string? title { get; set; }
@@ -664,11 +792,16 @@ public sealed partial class MainPage
         public string? deck { get; set; }
         public string? deckName { get; set; }
         public string? checkpointId { get; set; }
+        public string? checkpointRevision { get; set; }
+        public string? collectionRevision { get; set; }
         public string? workspaceId { get; set; }
         public string? subfolder { get; set; }
         public string? phrase { get; set; }
         public string? launchMode { get; set; }
+        public string? handoffFromId { get; set; }
         public bool takeover { get; set; }
+        [System.Text.Json.Serialization.JsonExtensionData]
+        public Dictionary<string, JsonElement>? archiveFields { get; set; }
 
         // transcriptfetch only: the relay mints a scoped, short-lived credential when it queues the
         // command and bounds the fetch with a TTL. Neither is stored in AppSettings — the app holds
@@ -677,137 +810,35 @@ public sealed partial class MainPage
         public int ttlMs { get; set; }
     }
 
-    private async Task<(bool ok, string detail)> StartChatHeadlessFromIntentAsync(AppCommand command)
+    private async Task<StartChatPreparationResult> StartChatHeadlessFromIntentAsync(AppCommand command)
     {
-        var name = (command.muxName ?? command.sessionName ?? "").Trim();
-        var title = (command.title ?? "").Trim();
-        var tool = (command.tool ?? "").Trim().ToLowerInvariant();
-        var checkpointId = (command.checkpointId ?? "").Trim();
-        var workspaceId = (command.workspaceId ?? "").Trim();
-        var subfolder = (command.subfolder ?? "").Trim();
-        var deckId = (command.deckId ?? "").Trim();
-        var collectionId = (command.collectionId ?? "").Trim();
-        var collectionName = (command.collection ?? "").Trim();
-        var phrase = (command.phrase ?? "").Trim();
-        var launchMode = ArchiveService.NormalizeLaunchMode(command.launchMode);
-
-        if (name.Length == 0) return (false, "missing mux session name");
-        if (collectionId.Length > 0 && collectionName.Length > 0)
-            return (false, "choose an existing collection or enter a new one, not both");
-        if (deckId.Length == 0 || !_archive.Decks.Any(deck =>
-                string.Equals(deck.Id, deckId, StringComparison.OrdinalIgnoreCase)))
-            return (false, "the selected deck is no longer available");
-
-        ArchiveCollection? targetCollection = null;
-        if (collectionId.Length > 0)
+        var request = new StartChatPreparationRequest(command.intentId,
+            command.muxName ?? command.sessionName ?? "", command.deckId ?? "",
+            command.tool ?? "", command.workspaceId ?? "", command.subfolder ?? "",
+            command.checkpointId ?? "", command.checkpointRevision ?? "",
+            command.collectionId ?? "", command.collectionRevision ?? "",
+            command.collection ?? "", command.title ?? "", command.phrase ?? "",
+            command.launchMode ?? ArchiveService.NativeLaunchMode, command.handoffFromId ?? "");
+        async Task<StartChatPreparationResult> Prepare()
         {
-            if (!_archive.Store.Collections.TryGetValue(collectionId, out targetCollection)
-                || !string.Equals(
-                    ArchiveService.CollectionDeck(targetCollection),
-                    deckId,
-                    StringComparison.OrdinalIgnoreCase))
-                return (false, "the selected collection is no longer available in that deck");
+            await _syncGate.WaitAsync();
+            try { return await _archive.PrepareStartChatAsync(request); }
+            finally { _syncGate.Release(); }
         }
-
-        if (checkpointId.Length > 0)
+        async Task<StartChatPreparationResult> Finalize(bool ok, string detail, string generation)
         {
-            if (tool.Length > 0 || workspaceId.Length > 0 || subfolder.Length > 0)
-                return (false, "checkpoint starts take their tool and workspace from the checkpoint");
-            if (!_archive.Store.TemplateSnapshots.TryGetValue(checkpointId, out var checkpoint))
-                return (false, "the selected checkpoint is no longer available");
-
-            var spawned = await _archive.SpawnTemplateAsync(checkpoint);
-            if (!spawned.Ok || spawned.Branch is null) return (false, spawned.Message);
-            var branch = spawned.Branch;
-
-            await _archive.RenameSessionAsync(
-                branch,
-                title.Length > 0 ? title : checkpoint.SourceTitle);
-            if (phrase.Length > 0)
-                await _archive.SetSpecialPhrasesAsync(branch, new[] { phrase });
-            if (targetCollection is not null)
-                await _archive.AddToCollectionByIdAsync(branch, targetCollection.Id);
-            else if (collectionName.Length > 0)
-                await _archive.AddToCollectionAsync(branch, collectionName, deckId);
-
-            var started = await StartMuxHeadlessFromIntentAsync(
-                name,
-                branch.Id,
-                branch.Tool,
-                command.intentId);
-            return started;
-        }
-
-        if (tool is not ("claude" or "codex"))
-            return (false, "tool must be claude or codex");
-        if (workspaceId.Length == 0)
-            return (false, "select a workspace");
-        if (!new DiscoveryApi(_archive).TryResolveWorkspace(workspaceId, out var cwd))
-            return (false, "the selected workspace is no longer available");
-        if (!TryResolveStartSubfolder(cwd, subfolder, out cwd, out var folderError))
-            return (false, folderError);
-        if (collectionName.Length > 0)
-            targetCollection = await _archive.CreateCollectionAsync(collectionName, deckId);
-
-        var pendingIntentId = "";
-        try
-        {
-            pendingIntentId = await _archive.QueuePendingNewChatAsync(
-                tool,
-                cwd,
-                targetCollection?.Id ?? "",
-                title,
-                phrase,
-                launchMode);
-            if (pendingIntentId.Length == 0)
-                return (false, "the new-chat filing intent could not be persisted");
-
-            var launchCommand = _archive.BuildMultiplexStartCommand(
-                tool,
-                cwd,
-                launchModeOverride: launchMode);
-            if (launchCommand.Length == 0)
+            await _syncGate.WaitAsync();
+            try
             {
-                await _archive.CancelPendingNewChatAsync(pendingIntentId);
-                return (false, $"the {tool} CLI was not found at a trusted path");
+                return ok ? await _archive.MarkStartChatAppliedAsync(request, detail, generation)
+                    : await _archive.MarkStartChatFailedAsync(request, detail);
             }
-
-            var started = await StartMuxHeadlessCommandFromIntentAsync(
-                new SessionLaunchRequest(
-                    null,
-                    null,
-                    tool,
-                    launchMode,
-                    $"{launchMode} headless fresh mux start ({name})",
-                    "start.refused.remote-command",
-                    "start.started.remote-command",
-                    "start.failed.remote-command",
-                    name,
-                    cwd,
-                    new Dictionary<string, string> { ["muxName"] = name }),
-                name,
-                launchCommand,
-                null,
-                null,
-                command.intentId);
-            if (!started.ok)
-            {
-                await _archive.CancelPendingNewChatAsync(pendingIntentId);
-                return started;
-            }
-
-            PollFileNewChatAsync(pendingIntentId, targetCollection?.Name ?? "", tool);
-            return (true, "started PC-local mux session: " + name);
+            finally { _syncGate.Release(); }
         }
-        catch (Exception ex)
-        {
-            if (pendingIntentId.Length > 0)
-            {
-                try { await _archive.CancelPendingNewChatAsync(pendingIntentId); } catch { }
-            }
-            Diag.Log("Remote start chat failed " + ex);
-            return (false, "start chat failed: " + ex.Message);
-        }
+        var result = await StartChatCoordinator.ExecuteAsync(request, Prepare, Finalize, frame => LocalMuxdRequestAsync(frame));
+        if (result.Ok && !result.Replay && result.Launch is { PendingIntentId.Length: > 0 } launch)
+            PollFileNewChatAsync(launch.PendingIntentId, command.collection ?? "", launch.Tool);
+        return result;
     }
 
     private static bool TryResolveStartSubfolder(
@@ -1238,6 +1269,7 @@ public sealed partial class MainPage
     // long-poll lease); everything else keeps the tight default.
     private static async Task<(int code, string outText)> RunSshAsync(string target, string remoteCmd, string? stdin = null, TimeSpan? timeout = null)
     {
+        if (GuiVerificationFixture.Enabled) return (-1, "SSH disabled in GUI fixture");
         var hardTimeout = timeout ?? SshHardTimeout;
         try
         {
@@ -1258,17 +1290,17 @@ public sealed partial class MainPage
                 maxStderrChars: 64 * 1024);
             if (result.TimedOut)
             {
-                Diag.Log($"ssh timed out ({hardTimeout.TotalSeconds:0}s), tree-killed: {remoteCmd}");
+                Diag.Log($"ssh timed out ({hardTimeout.TotalSeconds:0}s), tree-killed");
                 return (-2, "");
             }
             if (result.StdoutTruncated)
             {
-                Diag.Log($"ssh output exceeded the 4 MiB capture limit: {remoteCmd}");
+                Diag.Log("ssh output exceeded the 4 MiB capture limit");
                 return (-3, "");
             }
             return (result.ExitCode, result.Stdout);
         }
-        catch (Exception ex) { Diag.Log("RunSsh failed: " + ex.Message); return (-1, ""); }
+        catch (Exception ex) { Diag.Log("RunSsh failed: " + ex.GetType().Name); return (-1, ""); }
     }
 
     // Run a remote command over our owner-only SSH and capture stdout.
@@ -1283,6 +1315,7 @@ public sealed partial class MainPage
 
     private static async Task<string> LocalMuxdRequestAsync(object message, bool retryStart = true)
     {
+        if (GuiVerificationFixture.Enabled) throw new InvalidOperationException("production muxd disabled in GUI fixture");
         try { return await LocalMuxdRequestOnceAsync(message); }
         catch (Exception ex) when (retryStart)
         {
@@ -1434,61 +1467,11 @@ public sealed partial class MainPage
     {
         var name = ArchiveService.MultiplexSessionName(session);
         Report(seq, $"Checking mux custody for {name}...");
-        try
-        {
-            var listing = await LocalMuxdRequestAsync(new { t = "ls" });
-            using var doc = JsonDocument.Parse(listing);
-            if (!doc.RootElement.TryGetProperty("list", out var list) || list.ValueKind != JsonValueKind.Array)
-                return new ReclaimMuxResult(false, false, false, "muxd listing did not contain a session list");
-
-            var rows = list.EnumerateArray().Select(row => new ReclaimMuxRow(
-                row.TryGetProperty("name", out var rowName) ? rowName.GetString() ?? "" : "",
-                row.TryGetProperty("alive", out var alive) && alive.ValueKind == JsonValueKind.True,
-                row.TryGetProperty("sessionId", out var sid) ? sid.GetString() ?? "" : "",
-                row.TryGetProperty("aliases", out var aliases) && aliases.ValueKind == JsonValueKind.Array
-                    ? aliases.EnumerateArray().Select(alias => alias.GetString() ?? "").Where(alias => alias.Length > 0).ToArray()
-                    : Array.Empty<string>())
-                { GenerationId = row.TryGetProperty("generationId", out var generation) ? generation.GetString() ?? "" : "" }).ToList();
-            var resolution = SessionReclaim.ResolveMuxOwner(rows, new[] { session.Id }.Concat(session.Aliases), name);
-            if (resolution.Status == ReclaimMuxOwnerStatus.Absent)
-                return new ReclaimMuxResult(true, false, true, "canonical mux owner absent");
-            if (!resolution.IsSafeToKill)
-                return new ReclaimMuxResult(true, true, false, "refusing mux teardown: " + resolution.Detail);
-
-            var owner = resolution.Owner!;
-            if (!owner.Alive)
-                return new ReclaimMuxResult(true, false, true, "matched mux owner is not live");
-
-            if (string.IsNullOrWhiteSpace(owner.SessionId) || string.IsNullOrWhiteSpace(owner.GenerationId))
-                return new ReclaimMuxResult(true, true, false, "refusing mux teardown: owner fence was not advertised");
-
-            var deleted = await DeleteLocalMuxdSessionAsync(owner.Name, owner.SessionId, owner.GenerationId);
-            if (!deleted.ok)
-                return new ReclaimMuxResult(true, true, false, "could not kill mux session " + owner.Name + ": " + deleted.detail);
-
-            var after = await LocalMuxdRequestAsync(new { t = "ls" });
-            using var afterDoc = JsonDocument.Parse(after);
-            if (!afterDoc.RootElement.TryGetProperty("list", out var afterList) || afterList.ValueKind != JsonValueKind.Array)
-                return new ReclaimMuxResult(false, true, false, "muxd teardown response was not verifiable");
-            var afterRows = afterList.EnumerateArray().Select(row => new ReclaimMuxRow(
-                row.TryGetProperty("name", out var rowName) ? rowName.GetString() ?? "" : "",
-                row.TryGetProperty("alive", out var alive) && alive.ValueKind == JsonValueKind.True,
-                row.TryGetProperty("sessionId", out var sid) ? sid.GetString() ?? "" : "",
-                row.TryGetProperty("aliases", out var aliases) && aliases.ValueKind == JsonValueKind.Array
-                    ? aliases.EnumerateArray().Select(alias => alias.GetString() ?? "").Where(alias => alias.Length > 0).ToArray()
-                    : Array.Empty<string>())
-                { GenerationId = row.TryGetProperty("generationId", out var generation) ? generation.GetString() ?? "" : "" }).ToList();
-            var nameRemains = afterRows.Any(row => string.Equals(row.Name, owner.Name, StringComparison.OrdinalIgnoreCase));
-            var identityRemains = SessionReclaim.ResolveMuxOwner(afterRows, new[] { session.Id }.Concat(session.Aliases)).Status
-                                  != ReclaimMuxOwnerStatus.Absent;
-            return nameRemains || identityRemains
-                ? new ReclaimMuxResult(true, true, false, "mux session remained after kill: " + owner.Name)
-                : new ReclaimMuxResult(true, true, true, "killed and verified mux session " + owner.Name);
-        }
-        catch (Exception ex)
-        {
-            return new ReclaimMuxResult(false, true, false, "could not verify canonical mux teardown for " + name + ": " + ex.Message);
-        }
+        return await SessionReclaim.ProbeAndFencedRemoveMuxOwnerAsync(
+            new[] { session.Id }.Concat(session.Aliases).ToArray(),
+            name,
+            () => LocalMuxdRequestAsync(new { t = "ls" }, retryStart: false),
+            DeleteLocalMuxdSessionAsync);
     }
 
     // Reclaim's stale-mux-custody step. A Current pointer is pruned ONLY when muxd itself confirms the tab is
@@ -1496,7 +1479,7 @@ public sealed partial class MainPage
     private IReadOnlyList<string> PruneMuxCustodyForReclaim(IReadOnlyList<string> candidateIds)
     {
         string? listing = null;
-        try { listing = LocalMuxdRequestAsync(new { t = "ls" }).GetAwaiter().GetResult(); }
+        try { listing = LocalMuxdRequestAsync(new { t = "ls" }, retryStart: false).GetAwaiter().GetResult(); }
         catch { }
 
         var pruned = SessionReclaim.PruneStaleMuxCurrentFromListing(
@@ -1526,7 +1509,7 @@ public sealed partial class MainPage
             return (false, "remote mux start refused: the command carried no usable intent id");
         try
         {
-            var cap = await EnsureLocalMuxdCapabilityAsync("create");
+            var cap = await EnsureLocalMuxdCapabilityAsync(allowLocalIntentMint ? "create" : "resumeOnly");
             if (!cap.ok) return cap;
             var canonicalId = (sessionId ?? "").Trim();
             if (string.IsNullOrWhiteSpace(canonicalId))
@@ -1547,6 +1530,7 @@ public sealed partial class MainPage
                 aliases = identityAliases,
                 identityPending = string.IsNullOrWhiteSpace(canonicalId),
                 relaunch,
+                resumeOnly = !allowLocalIntentMint,
                 intentId = string.IsNullOrWhiteSpace(intentId)
                     ? RemoteCommandProtocol.NewIntent("local-create")
                     : intentId
@@ -1559,6 +1543,17 @@ public sealed partial class MainPage
             }
             if (doc.RootElement.TryGetProperty("t", out t) && t.GetString() == "created")
             {
+                var reply = doc.RootElement;
+                if (!reply.TryGetProperty("s", out var returnedName) || returnedName.GetString() != name
+                    || !reply.TryGetProperty("generationId", out var generation) || string.IsNullOrWhiteSpace(generation.GetString()))
+                    return (false, "mux create response did not identify the requested generation");
+                using var listing = JsonDocument.Parse(await LocalMuxdRequestAsync(new { t = "ls" }, retryStart: false));
+                if (!listing.RootElement.TryGetProperty("list", out var rows) || rows.ValueKind != JsonValueKind.Array
+                    || !rows.EnumerateArray().Any(row => row.TryGetProperty("name", out var rowName) && rowName.GetString() == name
+                        && row.TryGetProperty("generationId", out var rowGeneration) && rowGeneration.GetString() == generation.GetString()
+                        && row.TryGetProperty("sessionId", out var rowId) && rowId.GetString() == canonicalId
+                        && row.TryGetProperty("alive", out var alive) && alive.ValueKind == JsonValueKind.True))
+                    return (false, "mux create could not verify the exact live chat generation");
                 RecordMuxSessionOwner(canonicalId, identityAliases, name);
                 return (true, text);
             }
@@ -1567,11 +1562,11 @@ public sealed partial class MainPage
         catch (Exception ex) { return (false, ex.Message); }
     }
 
-    private static async Task<(bool ok, string detail)> EnsureLocalMuxdCapabilityAsync(string cap)
+    private static async Task<(bool ok, string detail)> EnsureLocalMuxdCapabilityAsync(string cap, bool retryStart = true)
     {
         try
         {
-            var text = await LocalMuxdRequestAsync(new { t = "info" });
+            var text = await LocalMuxdRequestAsync(new { t = "info" }, retryStart);
             using var doc = JsonDocument.Parse(text);
             var root = doc.RootElement;
             if (root.TryGetProperty("t", out var t) && t.GetString() == "err")
@@ -1622,14 +1617,14 @@ public sealed partial class MainPage
     {
         try
         {
-            var cap = await EnsureLocalMuxdCapabilityAsync("killFence");
+            var cap = await EnsureLocalMuxdCapabilityAsync("killFence", retryStart: false);
             if (!cap.ok) return cap;
             var text = await LocalMuxdRequestAsync(new
             {
                 t = "kill", s = name,
                 sessionId = expectedSessionId,
                 generationId = expectedGenerationId,
-            });
+            }, retryStart: false);
             using var doc = JsonDocument.Parse(text);
             if (doc.RootElement.TryGetProperty("t", out var t) && t.GetString() == "killed")
             {

@@ -2351,7 +2351,21 @@ public sealed class ArchiveServiceTests
             var session = new ArchiveSession { Id = "claude-rn-1", Tool = "claude", SourcePath = transcript, Title = "old native", CustomTitle = "app name" };
             svc.Store.Sessions[session.Id] = session;
 
-            var status = await svc.RenameNativeAsync(session, "Renamed In Claude");
+            var previousSources = CodexLocalRetrieval.Core.Remote.RunningSessions.ScanSourceOverride;
+            string? status;
+            try
+            {
+                CodexLocalRetrieval.Core.Remote.RunningSessions.ScanSourceOverride = new(
+                    Scan: () => (true, new List<ArchiveService.RunningSessionInfo>(), ""),
+                    ClaudeRegistry: _ => (true, new Dictionary<string, int>(), new HashSet<int>(), ""),
+                    OpenTranscripts: _ => (true, new Dictionary<string, int>(), new HashSet<int>(), ""));
+                status = await svc.RenameNativeAsync(session, "Renamed In Claude");
+            }
+            finally
+            {
+                CodexLocalRetrieval.Core.Remote.RunningSessions.ScanSourceOverride = previousSources;
+                CodexLocalRetrieval.Core.Remote.RunningSessions.InvalidateScanCache();
+            }
 
             var text = File.ReadAllText(transcript);
             Assert.IsTrue(text.Contains("\"type\":\"custom-title\""), "a custom-title record was appended");
@@ -2378,7 +2392,21 @@ public sealed class ArchiveServiceTests
             var session = new ArchiveSession { Id = "rnid-1", Tool = "claude", SourcePath = transcript, Title = "before" };
             svc.Store.Sessions[session.Id] = session;
 
-            var status = await svc.RenameNativeByIdAsync("claude", "rnid-1", "After Remote");
+            var previousSources = CodexLocalRetrieval.Core.Remote.RunningSessions.ScanSourceOverride;
+            string? status;
+            try
+            {
+                CodexLocalRetrieval.Core.Remote.RunningSessions.ScanSourceOverride = new(
+                    Scan: () => (true, new List<ArchiveService.RunningSessionInfo>(), ""),
+                    ClaudeRegistry: _ => (true, new Dictionary<string, int>(), new HashSet<int>(), ""),
+                    OpenTranscripts: _ => (true, new Dictionary<string, int>(), new HashSet<int>(), ""));
+                status = await svc.RenameNativeByIdAsync("claude", "rnid-1", "After Remote");
+            }
+            finally
+            {
+                CodexLocalRetrieval.Core.Remote.RunningSessions.ScanSourceOverride = previousSources;
+                CodexLocalRetrieval.Core.Remote.RunningSessions.InvalidateScanCache();
+            }
 
             Assert.AreEqual("After Remote", session.Title);
             Assert.IsTrue(File.ReadAllText(transcript).Contains("\"customTitle\":\"After Remote\""));

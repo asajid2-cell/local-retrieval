@@ -163,7 +163,7 @@ public sealed class RemoteCommandProtocolTests
             ledger.Admit("startmux", "intent-fenced", "intent-1", "lease-1", out _));
 
         var concurrent = ledger.Admit("startmux", "intent-fenced", "intent-1", "lease-2", out var busy);
-        Assert.AreEqual(RemoteCommandAdmission.Duplicate, concurrent);
+        Assert.AreEqual(RemoteCommandAdmission.Busy, concurrent);
         Assert.IsFalse(busy.ok, "an unfinished intent must never ack success");
 
         ledger.Record("intent-1", true, "started");
@@ -202,6 +202,31 @@ public sealed class RemoteCommandProtocolTests
             RemoteCommandAdmission.Duplicate,
             ledger.Admit("fetchfile", "intent-fenced", "intent-5", "lease-1", out _),
             "recent intents must survive eviction");
+    }
+
+    [TestMethod]
+    public void Ledger_ReleaseAllowsRetryWithoutEvictingReclaimedIntent()
+    {
+        var ledger = new RemoteCommandProtocol.IntentLedger(capacity: 2);
+        Assert.AreEqual(RemoteCommandAdmission.Execute, ledger.Admit("startmux", "intent-fenced", "a", "lease", out _));
+        ledger.Release("a");
+        Assert.AreEqual(RemoteCommandAdmission.Execute, ledger.Admit("startmux", "intent-fenced", "a", "lease2", out _));
+        ledger.Record("a", true, "created");
+        ledger.Release("a");
+        Assert.AreEqual(RemoteCommandAdmission.Execute, ledger.Admit("startmux", "intent-fenced", "b", "lease", out _));
+        Assert.AreEqual(RemoteCommandAdmission.Duplicate, ledger.Admit("startmux", "intent-fenced", "a", "lease3", out var result));
+        Assert.IsTrue(result.ok);
+    }
+
+    [TestMethod]
+    public void Ledger_CapacityNeverEvictsAnExecutingIntent()
+    {
+        var ledger = new RemoteCommandProtocol.IntentLedger(capacity: 1);
+        Assert.AreEqual(RemoteCommandAdmission.Execute, ledger.Admit("startmux", "intent-fenced", "a", "lease", out _));
+        Assert.AreEqual(RemoteCommandAdmission.Busy, ledger.Admit("startmux", "intent-fenced", "b", "lease", out _));
+        Assert.AreEqual(RemoteCommandAdmission.Busy, ledger.Admit("startmux", "intent-fenced", "a", "lease2", out _));
+        ledger.Release("a");
+        Assert.AreEqual(RemoteCommandAdmission.Execute, ledger.Admit("startmux", "intent-fenced", "b", "lease2", out _));
     }
 
     [TestMethod]

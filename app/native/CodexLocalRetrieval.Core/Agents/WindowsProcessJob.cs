@@ -342,6 +342,9 @@ public sealed class WindowsProcessJob : IProcessContainment, IDisposable
                 throw new Win32Exception(
                     Marshal.GetLastWin32Error(),
                     $"Could not attach suspended child process {processInfo.ProcessId} to the owner job.");
+            // Retain exit-query access before the child can finish; a PID-only Process cannot
+            // recover an exited process's handle after the creation handle is closed below.
+            _ = process.SafeHandle;
             if (ResumeThread(processInfo.Thread) == uint.MaxValue)
                 throw new Win32Exception(
                     Marshal.GetLastWin32Error(),

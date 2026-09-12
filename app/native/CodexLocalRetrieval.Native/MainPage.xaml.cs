@@ -15,7 +15,7 @@ namespace CodexLocalRetrieval_Native;
 
 public sealed partial class MainPage : Page
 {
-    private readonly ArchiveService _archive = new();
+    private readonly ArchiveService _archive = GuiVerificationFixture.CreateArchive();
     private readonly AiChatService _ai = new();
     private readonly SessionLaunchGovernor _launchGovernor = new();
     private readonly Stack<string> _backStack = new();
@@ -104,9 +104,16 @@ public sealed partial class MainPage : Page
             RenderCurrent();
             Diag.Log("MP.Loaded: render done");
             StartCaptureHarness();
-            StartAgentBridge();
+            if (!GuiVerificationFixture.Enabled) StartAgentBridge();
             StartLiveReader();
             _pageInitialized = true;
+            if (GuiVerificationFixture.Enabled)
+            {
+                _archive.Store.Settings.MultiplexSshTarget = "loopback";
+                _archive.Store.Settings.MultiplexApiPort = GuiVerificationFixture.Port;
+                StartProjectSync();
+                return;
+            }
             StartArchiveSourceWatches();
             Unloaded += (_, _) => StopArchiveSourceWatches();
             Diag.Log("DeepSeek key source: " + ApiKeySource("deepseek"));
