@@ -818,9 +818,36 @@ def _release_pty_conhosts(pty, session_name="?", timeout=3):
     if lock is None:
         return True
     with lock:
-        owned = list(getattr(pty, "_muxd_conhost_processes", ()) or ())
-        retained, failures = _terminate_conhost_records(owned, timeout=timeout)
-        pty._muxd_conhost_processes = retained
+        deadline = time.monotonic() + max(0.1, timeout)
+        retained = list(getattr(pty, "_muxd_conhost_processes", ()) or ())
+        failures = []
+        while retained:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                failures = ["ConPTY host cleanup deadline expired"]
+                break
+            retained, failures = _terminate_conhost_records(
+                retained,
+                timeout=remaining,
+            )
+            pty._muxd_conhost_processes = retained
+            if not retained:
+                return True
+            # A ConPTY host can outlive its PTY briefly after the exact child has
+            # exited. Retry the same PID/start-token custody within the caller's
+            # deadline only for the known transient termination outcomes. Other
+            # custody failures remain fail-closed.
+            retryable = failures and all(
+                "winerror=5" in detail
+                or "is still alive after termination" in detail
+                for detail in failures
+            )
+            if not retryable:
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.1:
+                break
+            time.sleep(min(0.1, remaining))
     if failures:
         log(f"[{session_name}] ConPTY host cleanup failed: {'; '.join(failures)}")
         return False
@@ -3213,6 +3240,26 @@ async def relay_tls_context(url):
         return None
     return await asyncio.get_running_loop().run_in_executor(None, _load_relay_tls_context)
 
+def relay_link_failure_detail(endpoint, error):
+    """Turn opaque websocket failures into an actionable host-link diagnosis."""
+    kind = type(error).__name__
+    status = getattr(error, "status_code", None)
+    if status is None:
+        response = getattr(error, "response", None)
+        status = getattr(response, "status_code", None)
+    if kind == "InvalidMessage":
+        return (
+            f"{endpoint}: websocket handshake returned an invalid HTTP response; "
+            "verify the relay URL terminates at the /host WebSocket route and that the "
+            "reverse proxy is forwarding Upgrade/Connection headers"
+        )
+    if status is not None:
+        return (
+            f"{endpoint}: relay rejected the websocket handshake with HTTP {status}; "
+            "verify the relay service, proxy route, and /host token"
+        )
+    return f"{endpoint}: {kind}: {error}"
+
 def remote_create_violation(frame):
     if not isinstance(frame, dict):
         return "create frame must be an object"
@@ -5160,7 +5207,7 @@ async def main():
                         for tk in tasks: tk.cancel()
                         clear_remote_size_ownership()
             except Exception as e:
-                log(f"relay link ({cand}) dropped/failed: {type(e).__name__}: {e}")
+                log("relay link dropped/failed: " + relay_link_failure_detail(cand, e))
             # try next candidate immediately; back off only after all fail
         await asyncio.sleep(backoff)
         backoff = min(15, backoff * 2)

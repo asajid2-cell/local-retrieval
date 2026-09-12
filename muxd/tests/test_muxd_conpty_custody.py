@@ -1,4 +1,5 @@
 import importlib
+import threading
 import unittest
 from unittest import mock
 
@@ -115,6 +116,28 @@ class ConptyCustodyReapTests(unittest.TestCase):
         self.assertEqual(1, retained)
         self.assertEqual({}, muxd._PENDING_CONPTY_BASELINES)
         self.assertEqual("quarantined", muxd._ORPHANED_CONPTY_HOSTS[(9, "spawned")]["reason"])
+
+
+class ConptyReleaseRetryTests(unittest.TestCase):
+    def test_release_retries_transient_host_cleanup_within_deadline(self):
+        pty = type("FakePty", (), {})()
+        pty._muxd_conhost_lock = threading.Lock()
+        pty._muxd_conhost_processes = [(1234, "tok")]
+        calls = []
+
+        def terminate(owned, timeout=3):
+            calls.append((list(owned), timeout))
+            if len(calls) == 1:
+                return list(owned), [
+                    "could not open process 1234 for fenced termination (winerror=5)"
+                ]
+            return [], []
+
+        with mock.patch.object(muxd, "_terminate_conhost_records", side_effect=terminate):
+            self.assertTrue(muxd._release_pty_conhosts(pty, "retry", timeout=1))
+
+        self.assertGreaterEqual(len(calls), 2)
+        self.assertEqual([], pty._muxd_conhost_processes)
 
 
 class ConptyCustodyGarbageCollectionTests(unittest.TestCase):
