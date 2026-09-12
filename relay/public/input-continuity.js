@@ -31,6 +31,14 @@
     return n;
   }
 
+  // A buffered item belongs to the session it was typed into. The relay forwards a signed frame to whichever
+  // session the socket is attached to, so without this the bytes you typed into session A would flush into
+  // session B the moment you switched — a wrong-session insertion. Scope is a plain session name (not a
+  // secret); the empty string means "unscoped", which is what the single-session tests use.
+  function normalizeScope(scope) {
+    return scope === undefined || scope === null ? '' : String(scope);
+  }
+
   function rejectionKind(err) {
     const raw = err && (err.reason || err.code || err.message) || '';
     const text = String(raw).toLowerCase();
@@ -116,7 +124,7 @@
       return frame;
     }
 
-    function enqueue(bytes, at) {
+    function enqueue(bytes, at, scope) {
       const size = utf8Len(bytes);
       if (size > capBytes) {
         stats.droppedCap += 1;
@@ -124,7 +132,7 @@
         return 'dropped';
       }
       evictForRoom(size, at);
-      buffer.push({ bytes, capturedAt: at, expiresAt: at + ttlMs, size });
+      buffer.push({ bytes, capturedAt: at, expiresAt: at + ttlMs, size, scope: normalizeScope(scope) });
       bufferedBytes += size;
       stats.queued += 1;
       return 'queued';
@@ -138,6 +146,7 @@
        */
       async capture(bytes, meta) {
         const kind = (meta && meta.kind) || 'input';
+        const scope = normalizeScope(meta && meta.scope);
         if (typeof bytes !== 'string' || bytes === '') return 'dropped';
         const at = now();
 
@@ -168,10 +177,10 @@
               channel.live = false;
               say('halt', 'Input stopped — ' + kindOfRejection + ' rejected by the host', { reason: kindOfRejection });
             }
-            return enqueue(bytes, at);
+            return enqueue(bytes, at, scope);
           }
         }
-        return enqueue(bytes, at);
+        return enqueue(bytes, at, scope);
       },
 
       /** The socket went away: the channel is dead and its id is burned. Buffered plaintext survives. */
@@ -189,7 +198,7 @@
        * Fresh channel, verified accept, verified attach replay, then flush. Any failure short-circuits
        * BEFORE the flush: unverified means unattached, and we do not write into a session we cannot vouch for.
        */
-      async reconnect() {
+      async reconnect(scope) {
         if (channel) this.disconnect('reconnect');
         if (!transport || typeof transport.openChannel !== 'function') throw new Error('no transport');
         if (!verifyAccept || !verifyAttachReplay) throw new Error('no verifier');
@@ -220,13 +229,19 @@
         channel = { id: channelId, seq: 0, live: true };
         retired.add(channelId);
         halted = false;
-        const flushed = await this.flush();
+        const flushed = await this.flush(scope);
         return { channelId, replay, ...flushed };
       },
 
-      /** In capture order, still-fresh only, stopping dead on a sequence/lease rejection. */
-      async flush() {
-        const result = { flushed: 0, expired: 0, halted: false, remaining: 0 };
+      /**
+       * In capture order, still-fresh only, stopping dead on a sequence/lease rejection.
+       * `scope` is the session now attached: input captured for a DIFFERENT session is held, never delivered
+       * into this one. Order is preserved, so a head item for another session stops the drain rather than
+       * letting later items overtake it.
+       */
+      async flush(scope) {
+        const want = normalizeScope(scope);
+        const result = { flushed: 0, expired: 0, halted: false, remaining: 0, held: 0 };
         if (!channel || !channel.live) { result.remaining = buffer.length; return result; }
         if (!canSign()) {
           stats.droppedUnsignable += buffer.length;
@@ -241,6 +256,14 @@
 
         while (buffer.length) {
           const item = buffer[0];
+          if (item.scope !== want) {
+            // These bytes belong to a session this socket is not attached to. Delivering them here would be
+            // a wrong-session insertion, so they stay put (and expire on their own clock if you never return).
+            result.held = buffer.reduce((n, i) => n + (i.scope !== want ? 1 : 0), 0);
+            result.remaining = buffer.length;
+            say('info', 'Buffered input held — it was typed into another session', { held: result.held, scope: want });
+            return result;
+          }
           if (item.expiresAt <= now()) {   // a slow flush can age out later items mid-drain
             buffer.shift();
             bufferedBytes -= item.size;
@@ -276,10 +299,22 @@
         return result;
       },
 
+      /**
+       * The chat was renamed: same session, new name. Retarget held bytes so an unrelated rename does not
+       * strand the user's input until it expires. Returns how many items moved.
+       */
+      rescope(from, to) {
+        const a = normalizeScope(from), b = normalizeScope(to);
+        if (a === b) return 0;
+        let moved = 0;
+        for (const item of buffer) if (item.scope === a) { item.scope = b; moved += 1; }
+        return moved;
+      },
+
       pendingBytes() { return bufferedBytes; },
       pendingCount() { return buffer.length; },
       /** Plaintext copy for the UI only (an "unsent input" affordance). Never leaves this origin. */
-      peek() { return buffer.map(i => ({ bytes: i.bytes, capturedAt: i.capturedAt, expiresAt: i.expiresAt })); },
+      peek() { return buffer.map(i => ({ bytes: i.bytes, capturedAt: i.capturedAt, expiresAt: i.expiresAt, scope: i.scope })); },
       channelId() { return channel ? channel.id : null; },
       sequence() { return channel ? channel.seq : 0; },
       isLive() { return !!(channel && channel.live && !halted); },

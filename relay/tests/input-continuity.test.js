@@ -308,7 +308,77 @@ test('index.html only ever buffers the input frame type', () => {
   const send = indexSource.slice(indexSource.indexOf('const send = (t,d) =>'));
   const body = send.slice(0, send.indexOf('};') + 2);
   assert.match(body, /t==='i'\s*&&\s*inputQueue/, 'the queue must be gated on the input frame type');
-  assert.match(body, /return 'dropped'/, 'every other frame type falls through to a drop');
+  assert.match(body, /r='dropped'/, 'every other frame type falls through to a drop');
+  assert.equal((body.match(/inputQueue\.capture/g) || []).length, 1, 'exactly one buffered frame type');
+});
+
+// ---- 6b. the buffer is scoped to the session it was typed into -----------------------------------
+// The relay forwards a signed frame to whichever session the socket is attached to, so an unscoped
+// buffer would deliver the bytes you typed into chat A into chat B the moment you switched.
+
+test('input typed into one session is held, not flushed, when another session attaches', async () => {
+  const { queue, transport, notices } = build({ channelIds: ['ch-B', 'ch-A'] });
+  assert.equal(await queue.capture('run the migration', { scope: 'chat-a' }), 'queued');
+  assert.equal(queue.pendingCount(), 1);
+
+  const r = await queue.reconnect('chat-b');
+  assert.equal(r.flushed, 0, 'chat-a input must not be delivered into chat-b');
+  assert.equal(r.held, 1, 'the held bytes must be reported');
+  assert.equal(transport.sent.length, 0, 'no frame may leave for the wrong session');
+  assert.equal(queue.pendingCount(), 1, 'the bytes are still held, not discarded');
+  assert.ok(notices.some(n => /another session/i.test(n.message)), 'the hold must be visible in the log');
+});
+
+test('returning to the original session delivers exactly what was typed there', async () => {
+  const { queue, transport } = build({ channelIds: ['ch-B', 'ch-A'] });
+  await queue.capture('alpha', { scope: 'chat-a' });
+  await queue.reconnect('chat-b');
+  assert.equal(transport.sent.length, 0);
+  queue.disconnect('switched back');
+  const r = await queue.reconnect('chat-a');
+  assert.equal(r.flushed, 1);
+  assert.deepEqual(transport.sent.map(f => f.bytes), ['alpha']);
+  assert.equal(queue.pendingCount(), 0);
+});
+
+test('a head item for another session stops the drain instead of being overtaken', async () => {
+  const { queue, transport } = build({ channelIds: ['ch-A'] });
+  await queue.capture('for-a', { scope: 'a' });
+  await queue.capture('for-b', { scope: 'b' });
+  const r = await queue.reconnect('b');
+  assert.equal(r.flushed, 0, 'later input must never overtake an earlier item for another session');
+  assert.equal(r.held, 1);
+  assert.equal(transport.sent.length, 0);
+});
+
+test('unscoped input still flushes to an unscoped attach (the single-session case)', async () => {
+  const { queue, transport } = build();
+  await queue.capture('plain');
+  await queue.reconnect();
+  assert.deepEqual(transport.sent.map(f => f.bytes), ['plain']);
+});
+
+test('a rename retargets held input instead of stranding it', async () => {
+  const { queue, transport } = build({ channelIds: ['ch-B'] });
+  await queue.capture('half-typed', { scope: 'old-name' });
+  assert.equal(queue.rescope('old-name', 'new-name'), 1, 'the held item must follow the rename');
+  assert.equal(queue.rescope('old-name', 'new-name'), 0, 'nothing left under the old name');
+  const r = await queue.reconnect('new-name');
+  assert.equal(r.flushed, 1, 'the text must reach the renamed chat');
+  assert.deepEqual(transport.sent.map(f => f.bytes), ['half-typed']);
+});
+
+test('a held item expires on its own clock like any other', async () => {
+  const { queue, clock, notices } = build({ ttlMs: 10_000, channelIds: ['ch-B', 'ch-A'] });
+  await queue.capture('stale', { scope: 'chat-a' });
+  await queue.reconnect('chat-b');                    // held, not delivered
+  clock.advance(10_001);
+  queue.disconnect('later');
+  const r = await queue.reconnect('chat-a');
+  assert.equal(r.flushed, 0);
+  assert.equal(r.expired, 1, 'held bytes must not become deliverable just because they waited');
+  assert.equal(queue.pendingCount(), 0);
+  assert.ok(drops(notices).some(n => /expired/i.test(n.message)));
 });
 
 // ---- 7. no unsigned fallback ---------------------------------------------------------------------
@@ -405,8 +475,11 @@ test('relay-side code holds no reconnect buffer', () => {
 
 // ---- compose closes only after sent/queued -------------------------------------------------------
 
-test('compose closes only after the text is sent or queued', () => {
-  const start = indexSource.indexOf('function submitCompose(');
+// The compose body is driven for real. term.paste routes the text back through send exactly as xterm's
+// onData does, and send reports the REAL disposition — including a promise from the buffer, which decides
+// asynchronously whether it can hold the bytes.
+function composeHarness() {
+  const start = indexSource.indexOf('async function submitCompose(');
   assert.notEqual(start, -1, 'missing submitCompose');
   let depth = 0, end = -1;
   for (let i = indexSource.indexOf('{', start); i < indexSource.length; i++) {
@@ -415,35 +488,91 @@ test('compose closes only after the text is sent or queued', () => {
   }
   const body = indexSource.slice(start, end);
 
-  const dropIdx = body.indexOf("status==='dropped'");
-  const closeIdx = body.lastIndexOf("$('#composedlg').close()");
-  assert.ok(dropIdx !== -1 && closeIdx > dropIdx, 'the dropped-case return must come before the close');
-  assert.match(body, /return 'dropped'/, 'a dropped compose must bail out with the dialog still open');
-
-  // Drive the real function: sockets down + no queue => stays open; queued => closes.
-  const ctx = {
-    ws: null, inputQueue: null, pasted: [], closed: 0, flashed: [], focused: 0,
-    $: () => ({ value: 'run the migration', close(){ ctx.closed++; } }),
-    term: { paste: t => ctx.pasted.push(t), focus(){ ctx.focused++; } },
-    flash: m => ctx.flashed.push(m),
-    send: () => 'sent',
+  return function make(over = {}) {
+    const ctx = {
+      ws: over.ws === undefined ? null : over.ws,
+      inputQueue: over.inputQueue === undefined ? null : over.inputQueue,
+      pasted: [], closed: 0, flashed: [], focused: 0, raw: [],
+      inputSendProbe: { sink: null },
+    };
+    ctx.$ = sel => sel === '#composetext' ? { value: over.text || 'run the migration' } : { close(){ ctx.closed++; } };
+    ctx.term = { paste(t){ ctx.pasted.push(t); ctx.send('i', t); }, focus(){ ctx.focused++; } };
+    ctx.flash = m => ctx.flashed.push(m);
+    ctx.send = (t, d) => {
+      let r;
+      if (ctx.ws && ctx.ws.readyState === 1) r = 'sent';
+      else if (t === 'i' && ctx.inputQueue) r = ctx.inputQueue.capture(d);
+      else r = 'dropped';
+      if (t === 'i') ctx.raw.push(d);
+      if (ctx.inputSendProbe.sink) ctx.inputSendProbe.sink.push(r);
+      return r;
+    };
+    vm.createContext(ctx);
+    vm.runInContext(body + '\nthis.submitCompose = submitCompose;', ctx);
+    return ctx;
   };
-  vm.createContext(ctx);
-  vm.runInContext(body + '\nthis.submitCompose = submitCompose;', ctx);
+}
 
-  assert.equal(ctx.submitCompose(false), 'dropped');
-  assert.equal(ctx.closed, 0, 'compose closed on a dead socket and ate the message');
-  assert.equal(ctx.pasted.length, 0, 'nothing may be pasted when it cannot be delivered');
-  assert.equal(ctx.flashed.length, 1, 'the failure must be visible');
+test('compose closes only after the text is sent or queued', async () => {
+  const make = composeHarness();
 
-  ctx.inputQueue = {};                                   // signer present => the text can be queued
-  assert.equal(ctx.submitCompose(false), 'queued');
-  assert.equal(ctx.closed, 1, 'compose must close once the text is queued');
-  assert.deepEqual(ctx.pasted, ['run the migration']);
+  // Sockets down and no signer: nothing can carry the text, so it must not leave the dialog.
+  const a = make();
+  assert.equal(await a.submitCompose(false), 'dropped');
+  assert.equal(a.closed, 0, 'compose closed on a dead socket and ate the message');
+  assert.equal(a.pasted.length, 0, 'nothing may be pasted when it cannot be delivered');
+  assert.equal(a.flashed.length, 1, 'the failure must be visible');
 
-  ctx.ws = { readyState: 1 };
-  assert.equal(ctx.submitCompose(true), 'sent');
-  assert.equal(ctx.closed, 2);
+  // Signer present but the buffer REFUSES the bytes (over the 4 KB cap, or authority vanished). The old
+  // code predicted 'queued' from socket state and closed the dialog on a message that never arrived.
+  const b = make({ inputQueue: { capture: () => 'dropped' } });
+  assert.equal(await b.submitCompose(false), 'dropped', 'a refused buffer is a drop, not a queue');
+  assert.equal(b.closed, 0, 'a refused buffer must leave the dialog open with the text');
+  assert.equal(b.flashed.length, 1, 'the refusal must be visible');
+
+  // The buffer accepts: the text is held and the dialog closes.
+  const c = make({ inputQueue: { capture: () => 'queued' } });
+  assert.equal(await c.submitCompose(false), 'queued');
+  assert.equal(c.closed, 1, 'compose must close once the text is queued');
+  assert.deepEqual(c.pasted, ['run the migration']);
+
+  // The buffer's verdict arrives as a promise; compose must await it rather than assume.
+  const d = make({ inputQueue: { capture: () => Promise.resolve('queued') } });
+  assert.equal(await d.submitCompose(false), 'queued');
+  assert.equal(d.closed, 1);
+
+  const e = make({ ws: { readyState: 1 } });
+  assert.equal(await e.submitCompose(false), 'sent');
+  assert.equal(e.closed, 1);
+});
+
+test('Send + Enter fires the Enter only when the text actually went out', async () => {
+  const make = composeHarness();
+
+  const live = make({ ws: { readyState: 1 } });
+  assert.equal(await live.submitCompose(true), 'sent');
+  assert.deepEqual(live.raw.slice(-1), ['\r'], 'the Enter must follow a delivered text');
+  assert.deepEqual(live.pasted, ['run the migration']);
+
+  // The text is refused. Sending the trailing CR anyway would submit whatever was already on the prompt
+  // line — a stray Enter is a real side effect, not a harmless no-op.
+  const refused = make({ inputQueue: { capture: () => 'dropped' } });
+  assert.equal(await refused.submitCompose(true), 'dropped');
+  assert.equal(refused.raw.includes('\r'), false, 'a dropped text must not fire the Enter');
+  assert.equal(refused.closed, 0);
+});
+
+test('compose observes the send disposition instead of predicting it', () => {
+  const body = indexSource.slice(indexSource.indexOf('async function submitCompose('));
+  assert.match(body, /inputSendProbe\.sink=seen/, 'compose must collect the real dispositions');
+  assert.doesNotMatch(body, /readyState===1\) ?\? ?'sent'/, 'compose must not predict from socket state');
+});
+
+test('index.html scopes buffered input to the session it was typed into', () => {
+  assert.match(indexSource, /inputQueue\.capture\(d, \{ kind:'input', scope:current \}\)/,
+    'buffered input must carry the session it was typed into');
+  assert.match(indexSource, /inputQueue\.reconnect\(name\)/,
+    'the flush must know which session just attached');
 });
 
 test('index.html burns the channel on close and opens a fresh one on open', () => {
@@ -457,7 +586,8 @@ test('index.html burns the channel on close and opens a fresh one on open', () =
   const onopenIdx = indexSource.indexOf('sock.onopen');
   assert.notEqual(onopenIdx, -1, 'missing the viewer socket onopen handler');
   const onopen = indexSource.slice(onopenIdx, indexSource.indexOf('sock.onmessage', onopenIdx));
-  assert.match(onopen, /inputQueue\.reconnect\(\)/, 'the fresh channel must be opened from sock.onopen');
+  assert.match(onopen, /inputQueue\.reconnect\(name\)/,
+    'the fresh channel must be opened from sock.onopen, scoped to the session that just attached');
 });
 
 test('the queue arms only when this origin actually holds a signing key', () => {

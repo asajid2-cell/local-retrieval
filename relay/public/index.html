@@ -1390,15 +1390,25 @@ const inputQueue = (function(){
     transport: auth.transport,
     verifyAccept: auth.verifyAccept && auth.verifyAccept.bind(auth),
     verifyAttachReplay: auth.verifyAttachReplay && auth.verifyAttachReplay.bind(auth),
-    notice: n => { if(n && (n.kind==='drop' || n.kind==='halt' || n.kind==='error')) flash(n.message); },
+    // Held input is not a failure, so it is not a drop — but the user must not be left thinking their typing
+    // went out. Anything carrying a `held` count is surfaced alongside the real failures.
+    notice: n => { if(n && (n.kind==='drop' || n.kind==='halt' || n.kind==='error' || (n.detail && n.detail.held))) flash(n.message); },
   });
 })();
 // 'sent' | 'queued' | 'dropped'. Only input ('i') is ever buffered; a resize/heartbeat replayed minutes
-// late is noise, and the sender emits a current one on reattach anyway.
+// late is noise, and the sender emits a current one on reattach anyway. Input carries the session it was
+// typed into so the buffer can never flush it into a different chat after a switch.
+// `sink` is the compose probe: while it is collecting, each disposition lands in it. The queued path yields
+// a PROMISE (the buffer decides asynchronously whether it can hold the bytes), so a caller that needs the
+// truth awaits it instead of guessing from socket state.
+const inputSendProbe = { sink:null };
 const send = (t,d) => {
-  if (ws && ws.readyState===1) { ws.send(t+d); return 'sent'; }
-  if (t==='i' && inputQueue) { inputQueue.capture(d); return 'queued'; }
-  return 'dropped';
+  let r;
+  if (ws && ws.readyState===1) { ws.send(t+d); r='sent'; }
+  else if (t==='i' && inputQueue) r=inputQueue.capture(d, { kind:'input', scope:current });
+  else r='dropped';
+  if (inputSendProbe.sink) inputSendProbe.sink.push(r);
+  return r;
 };
 
 // ---- shared-window sizing (client side) ----
@@ -2214,7 +2224,7 @@ function connect(name, isRetry){
     sock.onopen = () => { if(!fresh()) return; reconnectDelay=1000; setStatusHtml('live', `<span class="name">${esc(name)}</span> &middot; live`); scheduleViewportFit(0); term.focus();
       // Fresh socket => fresh signing channel. The queue opens+verifies its own channel.accept and attach
       // replay before it flushes anything; the old channel id and its sequence are burned, never reused.
-      if(inputQueue) inputQueue.reconnect().catch(err => flash('Buffered input not flushed: '+(err&&err.message||err)));
+      if(inputQueue) inputQueue.reconnect(name).catch(err => flash('Buffered input not flushed: '+(err&&err.message||err)));
     };
     sock.onmessage = e => { if(!fresh()) return;
       if(typeof e.data==='string'){ onControl(e.data); return; }     // control frame: shared window size
@@ -2890,6 +2900,8 @@ $('#dorename').onclick = async ()=>{
     else{
       if(read[from]!=null){ read[to]=read[from]; delete read[from]; LS.set('mux_read',read); }   // migrate read-state
       if(LS.get('mux_last',null)===from) LS.set('mux_last', to);
+      // Same chat, new name: retarget any input still held for the old name so a rename does not strand it.
+      if(inputQueue) inputQueue.rescope(from, to);
       if(current===from){ connect(to); } else loadSessions();   // re-attach under the new name (only on confirmed rename)
     }
   } else { loadSessions(); }
@@ -2907,24 +2919,37 @@ function openCompose(){ openDialog('#composedlg'); setTimeout(()=>$('#composetex
 // Send composed/pasted text through xterm's OWN paste path (term.paste) — it wraps the block in bracketed
 // paste (when the agent supports it) so codex/claude ingest it as ONE paste. The old raw send('i',t) dumped
 // the whole burst at once; the agent mis-parsed a big/multiline burst and dropped its HEAD ("first half cut").
-// Compose closes only once the text is SENT or QUEUED. Closing on a dead socket used to eat the whole
-// message — you watched the dialog vanish and nothing arrived. If it can't go anywhere, the dialog stays
-// open with your text still in it.
-function submitCompose(withEnter){
+// Compose closes only once every piece of the text is SENT or QUEUED. Closing on a dead socket used to eat
+// the whole message — you watched the dialog vanish and nothing arrived. If it can't go anywhere, the dialog
+// stays open with your text still in it.
+// The disposition is OBSERVED, not predicted. term.paste routes through onData -> send, so we collect what
+// each send actually did. Predicting from ws.readyState called the text 'queued' when the reconnect buffer
+// then refused it (over the 4 KB cap, or no signing key in this origin), and the dialog closed on a message
+// that was never going to arrive. A dropped text also suppresses the trailing Enter: a bare CR arriving
+// alone would submit whatever was already sitting on the prompt line.
+async function submitCompose(withEnter){
   const t=$('#composetext').value;
   if(!t){ $('#composedlg').close(); term.focus(); return 'sent'; }
-  // A live socket goes now; a dead one can still be HELD, but only if this origin holds a signing key —
-  // without one there is no honest way to deliver the text later, so we say so instead of pretending.
-  const status = (ws && ws.readyState===1) ? 'sent' : (inputQueue ? 'queued' : 'dropped');
-  if(status==='dropped'){ flash('Not sent - no connection. Your text is still here.'); return 'dropped'; }
-  term.paste(t);
+  // The one case we can settle without touching the terminal: no socket and no signer means no path at all.
+  // Anything else has to actually attempt the send, because only the buffer knows whether it can hold the
+  // bytes — and a refused buffer is a drop, not a queue.
+  if(!(ws && ws.readyState===1) && !inputQueue){ flash('Not sent - no connection. Your text is still here.'); return 'dropped'; }
+  const seen=[];
+  inputSendProbe.sink=seen;
+  try{ term.paste(t); } finally { inputSendProbe.sink=null; }
+  const settled=await Promise.all(seen.map(r=>Promise.resolve(r)));
+  const status = settled.includes('dropped') || !settled.length ? 'dropped'
+               : (settled.includes('sent') ? 'sent' : 'queued');
+  if(status==='dropped'){ flash('Not sent - nothing reached the session. Your text is still here.'); return 'dropped'; }
   if(withEnter) send('i','\r');
   $('#composedlg').close();
   term.focus();
   return status;
 }
-$('#sendcompose').onclick = ()=>submitCompose(false);
-$('#sendcomposeenter').onclick = ()=>submitCompose(true);
+const composeClick = withEnter => { Promise.resolve(submitCompose(withEnter))
+  .catch(err => flash('Compose failed: '+(err&&err.message||err))); };   // a throw must be visible, not a silent unhandled rejection
+$('#sendcompose').onclick = ()=>composeClick(false);
+$('#sendcomposeenter').onclick = ()=>composeClick(true);
 
 // ---- file workspace: a mini file explorer for per-session uploads. Browse a thumbnail GRID,
 // tap a file to OPEN it (big preview + all its actions), and switch scope between THIS session and
