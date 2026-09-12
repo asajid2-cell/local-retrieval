@@ -96,6 +96,7 @@ function mount({ fetch: fetchImpl, postIntent } = {}) {
 
   const trackedFetch = async (url, init) => {
     calls.fetched.push(String(url));
+    if (String(url).endsWith('/api/sessions')) return { ok: true, json: async () => [] };
     return fetchImpl(String(url), init);
   };
   const trackedPost = async (url, payload, kind) => {

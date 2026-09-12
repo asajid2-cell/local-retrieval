@@ -1,3 +1,4 @@
+using System.Text.Json;
 using CodexLocalRetrieval.Core.Models;
 
 namespace CodexLocalRetrieval.Core.Remote;
@@ -69,7 +70,7 @@ public sealed record ReclaimEvidence
 }
 
 // A tier-2 refusal, carried out to whoever has to explain it to the operator. `EvidenceLine` is deliberately
-// the ONLY sanctioned wording for the override dialog: it must never name a pid the app did not verify.
+// the ONLY sanctioned wording for the refusal dialog: it must never name a pid the app did not verify.
 public sealed record ReclaimRefusal(
     SessionLaunchClaims.LaunchClaimInfo Claim,
     string Detail,
@@ -87,8 +88,6 @@ public enum ReclaimRefusalChoice
     Abort,
     // Wait the reservation out (<= 2 min), then re-run the tier check with graceWaitedOut: true.
     WaitForExpiry,
-    // The operator's informed last resort: force-clear and accept the double-writer risk. Ledgered as error.
-    LaunchAnyway,
 }
 
 public sealed record ReclaimClaimResult(
@@ -98,9 +97,46 @@ public sealed record ReclaimClaimResult(
     string Detail,
     bool Overridden = false);
 
+public sealed record ReclaimMuxResult(
+    bool ProbeOk,
+    bool OwnerFound,
+    bool TeardownVerified,
+    string Detail);
+
+public sealed record ReclaimMuxFence(string Name, string SessionId, string GenerationId);
+
+// Identity-bearing rows returned by muxd `ls`. A tab name is presentation only; it is never an owner key.
+public sealed record ReclaimMuxRow(
+    string Name,
+    bool Alive,
+    string SessionId,
+    IReadOnlyList<string> Aliases)
+{
+    public string GenerationId { get; init; } = "";
+}
+
+public enum ReclaimMuxOwnerStatus
+{
+    Absent,
+    Matched,
+    NameConflict,
+    Ambiguous,
+    Unverifiable,
+}
+
+public sealed record ReclaimMuxOwnerResolution(
+    ReclaimMuxOwnerStatus Status,
+    ReclaimMuxRow? Owner,
+    string Detail)
+{
+    public bool IsSafeToKill => Status == ReclaimMuxOwnerStatus.Matched && Owner is not null;
+}
+
 public sealed record ReclaimReport(
     bool KillOk,
     string KillDetail,
+    bool MuxOk,
+    string MuxDetail,
     IReadOnlyList<ReclaimKilledPid> ConfirmedExited,
     IReadOnlyList<ReclaimClaimResult> Claims,
     IReadOnlyList<string> PrunedMuxTabs,
@@ -111,11 +147,20 @@ public sealed record ReclaimReport(
 {
     public bool AnyClaimBlocking => Claims.Any(c => c.Outcome != ReclaimClearOutcome.Cleared);
     public bool LaunchInFlight => Claims.Any(c => c.Outcome == ReclaimClearOutcome.LaunchInFlight);
+    public bool Changed => ConfirmedExited.Count > 0
+                           || Claims.Any(c => c.Outcome == ReclaimClearOutcome.Cleared)
+                           || PrunedMuxTabs.Count > 0
+                           || MuxDetail.StartsWith("killed ", StringComparison.OrdinalIgnoreCase);
 }
 
 public sealed record ReclaimOptions
 {
     public IReadOnlyList<string> CandidateIds { get; init; } = Array.Empty<string>();
+
+    // The canonical local mux owner, when present. The callback must first establish ownership from the muxd
+    // listing and then return a verified teardown result. A failed or unverifiable mux teardown aborts reclaim
+    // before process/claim cleanup, because starting a terminal over that tab would create a second writer.
+    public Func<Task<ReclaimMuxResult>>? KillMux { get; init; }
 
     // Best-effort. A kill failure NEVER aborts the flow - it only shapes what tier-2 evidence exists and what
     // the report says. Default: the alias-aware Core kill with its identity-checked exit verification.
@@ -125,20 +170,20 @@ public sealed record ReclaimOptions
     // nothing is pruned (an unverifiable probe must never be read as "the mux session is gone").
     public Func<IReadOnlyList<string>, IReadOnlyList<string>>? PruneMuxCurrent { get; init; }
 
-    // The transport-specific start, run INSIDE the reclaim lease. Reclaim owns the reservation; the caller owns
-    // the process.
+    // Launching is intentionally not part of reclaim. Explicit Resume/Continue owns new-session creation.
     public Func<Task<(bool Ok, string Detail)>>? Launch { get; init; }
     public SessionLaunchRequest? LaunchRequest { get; init; }
     public SessionLaunchGovernorOptions? GovernorOptions { get; init; }
 
     public Func<ReclaimRefusal, Task<ReclaimRefusalChoice>>? OnRefusal { get; init; }
-    public Func<ReclaimRefusal, Task>? OnOverride { get; init; }
     public Action<string>? Progress { get; init; }
 
     public SessionLaunchClaims.Options? ClaimOptions { get; init; }
     public SessionOwnerRecords.Options? RecordOptions { get; init; }
 
     public Func<TimeSpan, CancellationToken, Task>? Delay { get; init; }
+    // Tests and callers that need a progressing clock can provide one; production uses UTC now.
+    public Func<DateTimeOffset>? Clock { get; init; }
     public CancellationToken Cancellation { get; init; }
     public DateTimeOffset? Now { get; init; }
 }
@@ -149,9 +194,9 @@ public sealed record ReclaimOptions
 // relaunched. This is the replacement, and none of it touches TryScan / TryLiveSessionPids /
 // TryAllLiveSessionIds as a gate.
 //
-// The flow, in order: kill (best effort, identity-verified) -> tiered clear of EVERY claim across the full
-// candidate set -> prune stale mux custody -> relaunch through the NORMAL CreateNew acquire with only the
-// liveness gate forced.
+// The flow, in order: canonical mux teardown (when live, verified) -> process kill (best effort,
+// identity-verified) -> tiered clear of EVERY claim across the full candidate set -> prune stale mux
+// custody -> stop here; continuation is an explicit separate user action.
 public static class SessionReclaim
 {
     public const string LostRaceDetail = "another launcher got there first";
@@ -163,20 +208,42 @@ public static class SessionReclaim
         var claimResults = new List<ReclaimClaimResult>();
         var pruned = Array.Empty<string>() as IReadOnlyList<string>;
 
-        // ---- 1. kill -------------------------------------------------------------------------------
+        // ---- 1. canonical mux teardown ---------------------------------------------------------------
+        // The mux listing is the authoritative owner check. If it says the canonical session is live, the
+        // callback must kill that exact name and verify the killed response before anything else changes.
+        var mux = await RunMuxKillAsync(options);
+        if (!mux.ProbeOk || (mux.OwnerFound && !mux.TeardownVerified))
+        {
+            var refused = new ReclaimReport(
+                KillOk: false,
+                KillDetail: "not attempted: mux owner teardown did not complete safely",
+                MuxOk: false,
+                MuxDetail: mux.Detail,
+                ConfirmedExited: Array.Empty<ReclaimKilledPid>(),
+                Claims: Array.Empty<ReclaimClaimResult>(),
+                PrunedMuxTabs: Array.Empty<string>(),
+                Relaunched: false,
+                LostLaunchRace: false,
+                RelaunchDetail: "not relaunched: mux owner teardown failed or could not be verified",
+                Headline: "");
+            return refused with { Headline = Headline(refused) };
+        }
+
+        // ---- 2. process kill -------------------------------------------------------------------------
         progress("Stopping any owner of this chat...");
         var kill = RunKill(options, ids);
 
-        // ---- 2/3. tiered clear over the FULL candidate set ------------------------------------------
+        // ---- 3/4. tiered clear over the FULL candidate set ------------------------------------------
         progress("Clearing launch reservations...");
         var claims = SessionLaunchClaims.ReadClaimsForSession(
             ids.Count > 0 ? ids[0] : null,
             ids.Skip(1),
             options.ClaimOptions);
 
-        foreach (var claim in claims)
+        foreach (var originalClaim in claims)
         {
-            var evidence = BuildEvidence(options, ids, kill, graceWaitedOut: false);
+            var claim = originalClaim;
+            var evidence = BuildEvidence(options, kill, graceWaitedOut: false);
             var outcome = SessionLaunchClaims.TryReclaimClear(claim, evidence, out var detail);
 
             if (outcome == ReclaimClearOutcome.RefusedAliveOwner && options.OnRefusal is not null)
@@ -187,18 +254,29 @@ public static class SessionReclaim
                 if (choice == ReclaimRefusalChoice.WaitForExpiry)
                 {
                     await WaitOutGraceAsync(options, claim, progress).ConfigureAwait(false);
-                    var waited = BuildEvidence(options, ids, kill, graceWaitedOut: true);
-                    outcome = SessionLaunchClaims.TryReclaimClear(claim, waited, out detail);
-                }
-                else if (choice == ReclaimRefusalChoice.LaunchAnyway)
-                {
-                    // The ledger event lands BEFORE anything is forced, so the record survives even if the
-                    // force-clear or the relaunch then throws.
-                    if (options.OnOverride is not null) await options.OnOverride(refusal).ConfigureAwait(false);
-                    var forced = BuildEvidence(options, ids, kill, graceWaitedOut: true);
-                    outcome = SessionLaunchClaims.TryReclaimClear(claim, forced, out detail);
-                    claimResults.Add(new ReclaimClaimResult(claim.Path, claim.SessionId, outcome, detail, Overridden: true));
-                    continue;
+                    // The reservation may have expired, been replaced, or entered an in-flight acquire while
+                    // the operator was waiting. Never apply grace evidence to the stale object we first read.
+                    var current = SessionLaunchClaims.ReadClaimsForSession(
+                        ids.Count > 0 ? ids[0] : null,
+                        ids.Skip(1),
+                        options.ClaimOptions)
+                        .FirstOrDefault(c => string.Equals(c.Path, claim.Path, StringComparison.OrdinalIgnoreCase));
+                    if (current is null)
+                    {
+                        outcome = ReclaimClearOutcome.Cleared;
+                        detail = "launch claim was cleared while waiting";
+                    }
+                    else if (!SameClaimIdentity(claim, current))
+                    {
+                        outcome = ReclaimClearOutcome.Failed;
+                        detail = "launch claim was replaced while waiting; refusing to clear the replacement reservation";
+                    }
+                    else
+                    {
+                        claim = current;
+                        var waited = BuildEvidence(options, kill, graceWaitedOut: true);
+                        outcome = SessionLaunchClaims.TryReclaimClear(claim, waited, out detail);
+                    }
                 }
             }
 
@@ -206,7 +284,7 @@ public static class SessionReclaim
             if (outcome == ReclaimClearOutcome.LaunchInFlight) break;   // never force past a live acquire
         }
 
-        // ---- 4. stale mux custody -------------------------------------------------------------------
+        // ---- 5. stale mux custody -------------------------------------------------------------------
         if (options.PruneMuxCurrent is not null)
         {
             progress("Checking mux custody...");
@@ -214,37 +292,22 @@ public static class SessionReclaim
             catch { pruned = Array.Empty<string>(); }
         }
 
-        // ---- 5. relaunch through the NORMAL acquire --------------------------------------------------
-        var relaunched = false;
-        var lostRace = false;
-        var relaunchDetail = "";
-        var blocking = claimResults.Any(c => c.Outcome != ReclaimClearOutcome.Cleared);
-        if (options.Launch is null || options.LaunchRequest is null)
-            relaunchDetail = "no relaunch requested";
-        else if (blocking)
-            relaunchDetail = "not relaunched: a launch reservation still blocks this chat";
-        else
-        {
-            progress("Relaunching...");
-            (relaunched, lostRace, relaunchDetail) = await RelaunchAsync(options).ConfigureAwait(false);
-        }
-
         var report = new ReclaimReport(
-            kill.Ok,
-            kill.Detail,
-            kill.ConfirmedExited,
-            claimResults,
-            pruned,
-            relaunched,
-            lostRace,
-            relaunchDetail,
-            "");
+            KillOk: kill.Ok,
+            KillDetail: kill.Detail,
+            MuxOk: !mux.OwnerFound || mux.TeardownVerified,
+            MuxDetail: mux.Detail,
+            ConfirmedExited: kill.ConfirmedExited,
+            Claims: claimResults,
+            PrunedMuxTabs: pruned,
+            Relaunched: false,
+            LostLaunchRace: false,
+            RelaunchDetail: "reclaim is cleanup-only; continuation was not requested",
+            Headline: "");
         return report with { Headline = Headline(report) };
     }
 
-    // The relaunch reservation. ONLY the liveness gate is forced - justified by the identity-verified kills
-    // above - and the FileMode.CreateNew race closure is left completely alone, so a concurrent legitimate
-    // launcher that wins the file race still wins and we report it instead of double-launching.
+    // Explicit launch leasing remains available to Resume/Continue. Reclaim does not call this helper.
     public static bool TryAcquireReclaimLease(
         SessionLaunchRequest request,
         SessionLaunchGovernorOptions? baseOptions,
@@ -295,6 +358,27 @@ public static class SessionReclaim
     // Stale mux custody: a Current pointer at one of our candidate ids whose muxd session is CONFIRMED absent.
     // `liveMuxNames` null means the probe could not answer - nothing is pruned, because "we couldn't ask muxd"
     // is not "the tab is gone". Live tabs are left strictly alone.
+    public static string BuildPostStateNotice(ReclaimReport report, SessionIntegritySummary? postState)
+    {
+        if (!report.MuxOk)
+            return "Reclaim blocked: state is uncertain; cleanup may be partial. " + report.MuxDetail;
+        if (!report.KillOk)
+            return "Reclaim incomplete: cleanup may be partial. " + report.KillDetail;
+        if (postState is null)
+            return "Reclaim incomplete: post-state integrity could not be verified. Refresh before retrying.";
+        if (string.Equals(postState.Severity, "danger", StringComparison.OrdinalIgnoreCase))
+        {
+            var reason = postState.Checks.FirstOrDefault(c => string.Equals(c.Severity, "danger", StringComparison.OrdinalIgnoreCase))?.Summary
+                         ?? postState.Headline;
+            return "Reclaim incomplete: " + reason;
+        }
+        if (report.AnyClaimBlocking)
+            return "Reclaim incomplete: " + report.Headline;
+        return report.Changed
+            ? "Reclaim completed: " + postState.Headline
+            : "Reclaim completed: no changes were made. " + postState.Headline;
+    }
+
     public static IReadOnlyList<string> PruneStaleMuxCurrent(
         IDictionary<string, MuxTabRecord> muxTabHistory,
         IReadOnlyCollection<string> candidateIds,
@@ -317,7 +401,204 @@ public static class SessionReclaim
         return pruned;
     }
 
+    // Parse the muxd listing conservatively: only an explicit boolean alive=true authorizes a name to protect
+    // Current custody. A malformed row or listing is unverifiable, not evidence that the tab is gone.
+    public static IReadOnlyCollection<string>? ParseLiveMuxNames(string? listingJson)
+    {
+        if (string.IsNullOrWhiteSpace(listingJson)) return null;
+        try
+        {
+            using var doc = JsonDocument.Parse(listingJson);
+            if (!doc.RootElement.TryGetProperty("list", out var list) || list.ValueKind != JsonValueKind.Array)
+                return null;
+            var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var row in list.EnumerateArray())
+            {
+                if (row.ValueKind != JsonValueKind.Object
+                    || !row.TryGetProperty("name", out var name)
+                    || name.ValueKind != JsonValueKind.String
+                    || string.IsNullOrWhiteSpace(name.GetString()))
+                    return null;
+                if (!row.TryGetProperty("alive", out var alive) || alive.ValueKind != JsonValueKind.True && alive.ValueKind != JsonValueKind.False)
+                    return null;
+                if (alive.GetBoolean()) names.Add(name.GetString()!);
+            }
+            return names;
+        }
+        catch (JsonException) { return null; }
+    }
+
+    public static IReadOnlyList<string> PruneStaleMuxCurrentFromListing(
+        IDictionary<string, MuxTabRecord> muxTabHistory,
+        IReadOnlyCollection<string> candidateIds,
+        string? listingJson)
+        => PruneStaleMuxCurrent(muxTabHistory, candidateIds, ParseLiveMuxNames(listingJson));
+
+
+    // Probe muxd, remove only the exact identity+generation it advertised, then prove that neither the
+    // presentation name nor any candidate identity remains. The transport callbacks own protocol I/O;
+    // this shared helper owns the reclaim policy so GUI and headless callers cannot drift.
+    public static async Task<ReclaimMuxResult> ProbeAndFencedRemoveMuxOwnerAsync(
+        IReadOnlyCollection<string> candidateIds,
+        string? hintedName,
+        Func<Task<string>> list,
+        Func<string, string, string, Task<(bool ok, string detail)>> fencedRemove,
+        Func<ReclaimMuxOwnerResolution, Task<(bool ok, string detail)>>? prepare = null,
+        ReclaimMuxFence? requiredFence = null)
+    {
+        ArgumentNullException.ThrowIfNull(candidateIds);
+        ArgumentNullException.ThrowIfNull(list);
+        ArgumentNullException.ThrowIfNull(fencedRemove);
+
+        try
+        {
+            var before = ParseMuxRowsStrict(await list().ConfigureAwait(false), out var beforeError);
+            if (before is null)
+                return new ReclaimMuxResult(false, false, false, beforeError);
+
+            var resolution = ResolveMuxOwner(before, candidateIds, hintedName);
+            if (resolution.Status == ReclaimMuxOwnerStatus.Absent)
+            {
+                if (requiredFence is not null)
+                    return new ReclaimMuxResult(true, true, false, "refusing mux teardown: frozen owner is absent; prior destructive outcome is uncertain");
+                if (prepare is not null)
+                {
+                    var preparedAbsent = await prepare(resolution).ConfigureAwait(false);
+                    if (!preparedAbsent.ok)
+                        return new ReclaimMuxResult(true, false, false, "refusing mux teardown: " + preparedAbsent.detail);
+                }
+                return new ReclaimMuxResult(true, false, true, "canonical mux owner absent");
+            }
+            if (!resolution.IsSafeToKill)
+                return new ReclaimMuxResult(true, true, false, "refusing mux teardown: " + resolution.Detail);
+
+            var owner = resolution.Owner!;
+            if (requiredFence is not null
+                && (!string.Equals(owner.Name, requiredFence.Name, StringComparison.OrdinalIgnoreCase)
+                    || !string.Equals(owner.SessionId, requiredFence.SessionId, StringComparison.Ordinal)
+                    || !string.Equals(owner.GenerationId, requiredFence.GenerationId, StringComparison.Ordinal)))
+                return new ReclaimMuxResult(true, true, false, "refusing mux teardown: observed owner does not match the frozen fence");
+            if (string.IsNullOrWhiteSpace(owner.SessionId) || string.IsNullOrWhiteSpace(owner.GenerationId))
+                return new ReclaimMuxResult(true, true, false, "refusing mux teardown: owner fence was not advertised");
+
+            if (prepare is not null)
+            {
+                var prepared = await prepare(resolution).ConfigureAwait(false);
+                if (!prepared.ok)
+                    return new ReclaimMuxResult(true, true, false, "refusing mux teardown: " + prepared.detail);
+            }
+
+            var deleted = await fencedRemove(owner.Name, owner.SessionId, owner.GenerationId).ConfigureAwait(false);
+            if (!deleted.ok)
+                return new ReclaimMuxResult(true, true, false, "could not kill mux session " + owner.Name + ": " + deleted.detail);
+
+            var after = ParseMuxRowsStrict(await list().ConfigureAwait(false), out var afterError);
+            if (after is null)
+                return new ReclaimMuxResult(false, true, false, "muxd teardown response was not verifiable: " + afterError);
+
+            var nameRemains = after.Any(row => string.Equals(row.Name, owner.Name, StringComparison.OrdinalIgnoreCase));
+            var identityRemains = ResolveMuxOwner(after, candidateIds).Status != ReclaimMuxOwnerStatus.Absent;
+            return nameRemains || identityRemains
+                ? new ReclaimMuxResult(true, true, false, "mux session remained after kill: " + owner.Name)
+                : new ReclaimMuxResult(true, true, true, "killed and verified mux session " + owner.Name);
+        }
+        catch (Exception ex)
+        {
+            return new ReclaimMuxResult(false, true, false, "could not verify canonical mux teardown for " + hintedName + ": " + ex.Message);
+        }
+    }
+
+    internal static IReadOnlyList<ReclaimMuxRow>? ParseMuxRowsStrict(string listing, out string error)
+    {
+        error = "";
+        try
+        {
+            using var doc = JsonDocument.Parse(listing);
+            if (doc.RootElement.ValueKind != JsonValueKind.Object
+                || !doc.RootElement.TryGetProperty("list", out var rows)
+                || rows.ValueKind != JsonValueKind.Array)
+            {
+                error = "muxd listing did not contain a session list";
+                return null;
+            }
+
+            var parsed = new List<ReclaimMuxRow>();
+            foreach (var row in rows.EnumerateArray())
+            {
+                if (row.ValueKind != JsonValueKind.Object
+                    || !row.TryGetProperty("name", out var name) || name.ValueKind != JsonValueKind.String
+                    || !row.TryGetProperty("alive", out var alive) || alive.ValueKind is not (JsonValueKind.True or JsonValueKind.False)
+                    || !row.TryGetProperty("sessionId", out var sessionId) || sessionId.ValueKind != JsonValueKind.String
+                    || !row.TryGetProperty("aliases", out var aliases) || aliases.ValueKind != JsonValueKind.Array
+                    || aliases.EnumerateArray().Any(alias => alias.ValueKind != JsonValueKind.String)
+                    || !row.TryGetProperty("generationId", out var generationId) || generationId.ValueKind != JsonValueKind.String)
+                {
+                    error = "muxd listing contained a malformed session row";
+                    return null;
+                }
+
+                parsed.Add(new ReclaimMuxRow(
+                    name.GetString() ?? "",
+                    alive.GetBoolean(),
+                    sessionId.GetString() ?? "",
+                    aliases.EnumerateArray().Select(alias => alias.GetString() ?? "").Where(alias => alias.Length > 0).ToArray())
+                {
+                    GenerationId = generationId.GetString() ?? ""
+                });
+            }
+            return parsed;
+        }
+        catch (JsonException ex)
+        {
+            error = "muxd listing was not valid JSON: " + ex.Message;
+            return null;
+        }
+    }
+
+    // Resolve only from live muxd identity. History/name is a hint for diagnostics, never authorization.
+    public static ReclaimMuxOwnerResolution ResolveMuxOwner(
+        IEnumerable<ReclaimMuxRow> liveRows,
+        IEnumerable<string>? candidateIds,
+        string? hintedName = null)
+    {
+        if (liveRows is null)
+            return new(ReclaimMuxOwnerStatus.Unverifiable, null, "muxd listing was unavailable");
+        var ids = new HashSet<string>(Normalize(candidateIds), StringComparer.OrdinalIgnoreCase);
+        if (ids.Count == 0) return new(ReclaimMuxOwnerStatus.Absent, null, "no session identity was supplied");
+
+        var matches = liveRows
+            .Where(row => ids.Contains((row.SessionId ?? "").Trim())
+                       || (row.Aliases ?? Array.Empty<string>()).Any(alias => ids.Contains((alias ?? "").Trim())))
+            .ToList();
+        if (matches.Count == 0)
+        {
+            var conflictingName = !string.IsNullOrWhiteSpace(hintedName)
+                && liveRows.Any(row =>
+                    string.Equals(row.Name, hintedName, StringComparison.OrdinalIgnoreCase));
+            return conflictingName
+                ? new(ReclaimMuxOwnerStatus.NameConflict, null, "canonical mux name belongs to a different live identity")
+                : new(ReclaimMuxOwnerStatus.Absent, null, "no live mux owner matched the session identity");
+        }
+        if (matches.Count != 1)
+            return new(ReclaimMuxOwnerStatus.Ambiguous, null, $"{matches.Count} live mux owners matched the session identity");
+        return new(ReclaimMuxOwnerStatus.Matched, matches[0], "live mux owner matched by session identity");
+
+    }
+
     // ---- internals ---------------------------------------------------------------------------------
+
+    private static async Task<ReclaimMuxResult> RunMuxKillAsync(ReclaimOptions options)
+    {
+        if (options.KillMux is null) return new ReclaimMuxResult(true, false, true, "no local mux owner found");
+        try
+        {
+            return await options.KillMux().ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            return new ReclaimMuxResult(false, true, false, "mux teardown threw: " + ex.Message);
+        }
+    }
 
     private static RunningSessions.KillResult RunKill(ReclaimOptions options, IReadOnlyList<string> ids)
     {
@@ -335,7 +616,6 @@ public static class SessionReclaim
 
     private static ReclaimEvidence BuildEvidence(
         ReclaimOptions options,
-        IReadOnlyList<string> ids,
         RunningSessions.KillResult kill,
         bool graceWaitedOut)
         => new()
@@ -353,22 +633,33 @@ public static class SessionReclaim
         catch { return false; }
     }
 
+    private static bool SameClaimIdentity(
+        SessionLaunchClaims.LaunchClaimInfo expected,
+        SessionLaunchClaims.LaunchClaimInfo actual)
+        => string.Equals(expected.SessionId, actual.SessionId, StringComparison.Ordinal)
+           && expected.OwnerPid == actual.OwnerPid
+           && expected.CreatedUtc == actual.CreatedUtc
+           && expected.ExpiresUtc == actual.ExpiresUtc
+           && expected.CandidateIds.SequenceEqual(actual.CandidateIds, StringComparer.Ordinal);
+
     private static async Task WaitOutGraceAsync(
         ReclaimOptions options,
         SessionLaunchClaims.LaunchClaimInfo claim,
         Action<string> progress)
     {
         var delay = options.Delay ?? ((span, token) => Task.Delay(span, token));
+        var clock = options.Clock ?? (() => DateTimeOffset.UtcNow);
         // Bounded by the claim's own TTL: the reservation is 2 minutes by construction, and a claim whose
         // ExpiresUtc is garbage must not turn this into an unbounded wait.
+        var start = options.Now ?? clock();
         var deadline = claim.ExpiresUtc.AddSeconds(1);
-        var cap = (options.Now ?? DateTimeOffset.UtcNow).Add(SessionLaunchClaims.DefaultStartupGrace).AddSeconds(5);
+        var cap = start.Add(SessionLaunchClaims.DefaultStartupGrace).AddSeconds(5);
         if (deadline > cap) deadline = cap;
 
         while (true)
         {
             options.Cancellation.ThrowIfCancellationRequested();
-            var remaining = deadline - DateTimeOffset.UtcNow;
+            var remaining = deadline - clock();
             if (remaining <= TimeSpan.Zero) return;
             progress($"Waiting for the reservation to expire ({(int)Math.Ceiling(remaining.TotalSeconds)}s)...");
             var step = remaining > TimeSpan.FromSeconds(1) ? TimeSpan.FromSeconds(1) : remaining;
@@ -376,58 +667,32 @@ public static class SessionReclaim
         }
     }
 
-    private static async Task<(bool Relaunched, bool LostRace, string Detail)> RelaunchAsync(ReclaimOptions options)
-    {
-        if (!TryAcquireReclaimLease(
-                options.LaunchRequest!,
-                options.GovernorOptions,
-                out var lease,
-                out var detail,
-                out var lostRace))
-            return (false, lostRace, detail);
-
-        using (lease)
-        {
-            try
-            {
-                var launched = await options.Launch!().ConfigureAwait(false);
-                if (launched.Ok)
-                {
-                    lease?.MarkStarted("Relaunched by reclaim.");
-                    return (true, false, launched.Detail);
-                }
-                lease?.MarkFailed(launched.Detail);
-                return (false, false, launched.Detail);
-            }
-            catch (Exception ex)
-            {
-                lease?.MarkFailed(ex.Message);
-                return (false, false, ex.Message);
-            }
-        }
-    }
-
     private static string Headline(ReclaimReport report)
     {
+        if (!report.MuxOk)
+            return "Reclaim stopped: state is uncertain; cleanup may be partial. " + report.MuxDetail;
+        if (!report.KillOk)
+            return "Reclaim incomplete: could not stop every owner; cleanup may be partial. " + report.KillDetail;
         if (report.LaunchInFlight) return "A launch is already in flight for this chat; nothing was forced.";
         var refused = report.Claims.Count(c => c.Outcome == ReclaimClearOutcome.RefusedAliveOwner);
         if (refused > 0)
-            return "A live launch reservation still holds this chat; nothing was relaunched.";
+            return "A live launch reservation still holds this chat; continuation remains blocked.";
         var failedClaims = report.Claims.Where(c => c.Outcome == ReclaimClearOutcome.Failed).ToList();
         if (failedClaims.Count > 0)
         {
-            // Surface the actual reason instead of a generic line: the claim's Detail carries the cleanup error
-            // (e.g. "claim cleanup failed: The process cannot access the file because it is being used by another
-            // process"), which is what the operator needs to see in the status bar to know WHY nothing relaunched.
             var reason = failedClaims[0].Detail;
             if (failedClaims.Count > 1) reason += $" (+{failedClaims.Count - 1} more)";
-            return "A launch reservation could not be cleared (" + reason + "); nothing was relaunched.";
+            return "Reclaim completed with reservation cleanup failure (" + reason + ").";
         }
-        if (report.LostLaunchRace) return LostRaceDetail + "; this chat was not launched twice.";
-        if (report.Relaunched) return "Reclaimed and relaunched.";
-        return report.KillOk
-            ? "Reclaimed: owners stopped and reservations cleared."
-            : "Reclaimed what it could - " + report.KillDetail;
+        if (!report.Changed)
+            return report.KillOk
+                ? "Nothing to reclaim: no owner, reservation, or mux custody was changed."
+                : "Reclaim could not change ownership - " + report.KillDetail;
+        if (report.ConfirmedExited.Count > 0)
+            return "Reclaimed: stopped " + report.ConfirmedExited.Count + " owner process"
+                   + (report.ConfirmedExited.Count == 1 ? "" : "es")
+                   + "; cleanup completed and ready to continue.";
+        return "Reclaimed: cleanup completed and ready to continue.";
     }
 
     private static List<string> Candidates(string? sessionId, IEnumerable<string>? aliases)

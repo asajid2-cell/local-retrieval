@@ -14,6 +14,11 @@ public sealed partial class MainPage
     private readonly StaleGuardedRefresher<SessionIntegritySummary> _integrity = new(TimeSpan.FromSeconds(5));
     private int _reclaimSeq;
     private bool _reclaimRunning;
+    private CancellationTokenSource? _reclaimCancellation;
+    private string? _reclaimNoticeSessionId;
+    private string? _reclaimNotice;
+    private ReclaimReport? _pendingReclaimReport;
+    private const int ReclaimWaitSeconds = 150;
 
     private void RefreshIntegrity_Click(object sender, RoutedEventArgs e) => RenderIntegrity(force: true);
 
@@ -23,6 +28,14 @@ public sealed partial class MainPage
     // is still the newest answer to the newest question. Same shape as RenderCustodyPage/LoadCustodyAsync.
     private void RenderIntegrity(bool force = false)
     {
+        if (GuiVerificationFixture.Enabled)
+        {
+            _integrity.Invalidate();
+            SetRiskySessionActionsEnabled(false);
+            IntegrityItems.Children.Clear();
+            IntegrityItems.Children.Add(IntegrityChip("Isolated metadata fixture; runtime actions disabled"));
+            return;
+        }
         if (_selected is null)
         {
             _integrity.Invalidate();
@@ -44,11 +57,16 @@ public sealed partial class MainPage
     {
         var outcome = await _integrity.RefreshAsync(key, () => SessionIntegrity.Build(store, session), force);
 
-        // Superseded by a newer refresh, or the selection moved on while we were building: either way this
-        // answer is no longer about what is on screen, and painting it would be a lie with a fresh timestamp.
-        if (!outcome.IsCurrent || !ReferenceEquals(_selected, session)) return;
+        // Superseded by a newer refresh, or the selection/store object moved on while we were building: either
+        // way this answer is no longer about what is on screen, and painting it would be a lie with a fresh timestamp.
+        // The reference checks matter when a sync replaces a session with a same-ID object; an ID-only lookup
+        // would incorrectly accept the old build for the new object.
+        if (!outcome.IsCurrent
+            || !ReferenceEquals(_selected, session)
+            || !ReferenceEquals(_archive.Store, store)) return;
         if (outcome.Error is not null) Diag.Log("RenderIntegrity failed: " + outcome.Error);
         PaintIntegrity(outcome.Value, checking: false);
+        ReconcilePendingReclaim(session, outcome, key);
     }
 
     private void PaintIntegrity(SessionIntegritySummary? summary, bool checking)
@@ -78,6 +96,12 @@ public sealed partial class MainPage
         }
 
         IntegrityItems.Children.Add(IntegrityHeadline(summary.Severity, summary.Headline));
+        if (_reclaimNoticeSessionId is not null
+            && string.Equals(_reclaimNoticeSessionId, _selected.Id, StringComparison.OrdinalIgnoreCase)
+            && !string.IsNullOrWhiteSpace(_reclaimNotice))
+            IntegrityItems.Children.Add(IntegrityHeadline(
+                _reclaimNotice.StartsWith("Reclaim completed", StringComparison.Ordinal) ? "ok" : "danger",
+                _reclaimNotice));
         if (checking) IntegrityItems.Children.Add(IntegrityChip("Checking integrity..."));
         if (CanReclaim(summary))
             IntegrityItems.Children.Add(IntegrityReclaimButton());
@@ -140,7 +164,7 @@ public sealed partial class MainPage
             HorizontalAlignment = HorizontalAlignment.Stretch,
             Style = (Style)Resources["PrimaryPillButtonStyle"]
         };
-        ToolTipService.SetToolTip(button, "Take control: stop every owner of this chat, clear the reservations that are safe to clear, then relaunch it");
+        ToolTipService.SetToolTip(button, "Take control: stop every owner of this chat, clear safe reservations, and leave it ready for explicit continuation.");
         button.Click += async (_, _) => await ReclaimSelectedSessionAsync();
         return button;
     }
@@ -160,7 +184,8 @@ public sealed partial class MainPage
             Title = "Reclaim this chat?",
             Content = new TextBlock
             {
-                Text = "The app will stop every process it can tie to this chat, clear the launch reservations it is allowed to clear, prune stale mux custody, and relaunch it in a terminal. "
+                Text = "The app will stop every process it can tie to this chat, clear the launch reservations it is allowed to clear, and prune stale mux custody. "
+                       + "It will not start a new terminal; use Resume when you are ready to continue. "
                        + "A reservation held by a live owner is NOT force-cleared — you'll be asked what to do.",
                 TextWrapping = TextWrapping.Wrap,
                 MaxWidth = 460
@@ -174,65 +199,102 @@ public sealed partial class MainPage
 
         var seq = ++_reclaimSeq;
         _reclaimRunning = true;
+        _pendingReclaimReport = null;
+        _reclaimNoticeSessionId = null;
+        _reclaimNotice = null;
+        // The prior operation owns and disposes its CTS in its own finally; never dispose a shared field here.
+        var cancellation = new CancellationTokenSource();
+        _reclaimCancellation = cancellation;
         SyncStatus.Text = "Reclaiming...";
 
-        ReclaimReport report;
+        ReclaimReport? report = null;
         try
         {
             var options = new ReclaimOptions
             {
                 CandidateIds = candidateIds,
                 Progress = message => Report(seq, message),
+                KillMux = () => KillCanonicalMuxForReclaimAsync(session, seq),
                 PruneMuxCurrent = ids => PruneMuxCustodyForReclaim(ids),
-                LaunchRequest = new SessionLaunchRequest(
-                    session.Id,
-                    session.Aliases,
-                    session.Tool,
-                    "native",
-                    "native terminal resume (reclaim)",
-                    "resume.refused.claim",
-                    "resume.started.terminal",
-                    "resume.failed.terminal",
-                    session.DisplayTitle,
-                    session.Workspace,
-                    new Dictionary<string, string> { ["trigger"] = "reclaim" }),
-                Launch = () => Task.FromResult(LaunchResumeWrapper(session)),
                 OnRefusal = refusal => AskReclaimRefusalAsync(session, refusal),
-                OnOverride = refusal =>
-                {
-                    // Ledgered BEFORE anything is forced: the operator owns this double-writer risk and the
-                    // record has to survive whatever happens next.
-                    RecordSessionEvent(
-                        session,
-                        "reclaim.override.double-writer-risk",
-                        "Operator forced a launch past a live launch reservation: " + refusal.EvidenceLine,
-                        "error",
-                        details: new Dictionary<string, string>
-                        {
-                            ["claim"] = refusal.Claim.Path,
-                            ["ownerPid"] = refusal.Claim.OwnerPid.ToString()
-                        });
-                    return Task.CompletedTask;
-                }
+                Cancellation = cancellation.Token,
             };
 
+            Diag.Log($"Reclaim start session={session.Id} candidates={string.Join(",", candidateIds)} mux={ArchiveService.MultiplexSessionName(session)}");
             report = await Task.Run(() => SessionReclaim.ExecuteAsync(options));
+            Diag.Log($"Reclaim result session={session.Id} changed={report.Changed} killOk={report.KillOk} exited={report.ConfirmedExited.Count} claims={report.Claims.Count} blocking={report.AnyClaimBlocking} pruned={report.PrunedMuxTabs.Count} muxOk={report.MuxOk} killDetail={report.KillDetail} muxDetail={report.MuxDetail}");
+        }
+        catch (OperationCanceledException)
+        {
+            if (seq == _reclaimSeq)
+            {
+                _reclaimNoticeSessionId = session.Id;
+                _reclaimNotice = "Reclaim cancelled: state is uncertain; cleanup may be partial. Refresh before retrying.";
+                SyncStatus.Text = _reclaimNotice;
+                RenderIntegrity();
+            }
         }
         catch (Exception ex)
         {
             Diag.Log("Reclaim FAILED " + ex);
-            _reclaimRunning = false;
-            if (seq == _reclaimSeq) SyncStatus.Text = "Reclaim failed - see log.";
-            return;
+            if (seq == _reclaimSeq)
+            {
+                _reclaimNoticeSessionId = session.Id;
+                _reclaimNotice = "Reclaim failed: state is uncertain; cleanup may be partial. Refresh before retrying. " + ex.Message;
+                SyncStatus.Text = _reclaimNotice;
+                RenderIntegrity();
+            }
+        }
+        finally
+        {
+            // A newer reclaim owns the shared lifecycle now. Dispose this operation's local token, but never
+            // clear/reset the newer operation's cancellation source or running flag.
+            if (seq == _reclaimSeq)
+            {
+                if (ReferenceEquals(_reclaimCancellation, cancellation))
+                    _reclaimCancellation = null;
+                _reclaimRunning = false;
+            }
+            cancellation.Dispose();
         }
 
-        _reclaimRunning = false;
-        if (seq != _reclaimSeq || !ReferenceEquals(_selected, session)) return;
+        if (report is null || seq != _reclaimSeq || !IsSelectedSession(session)) return;
 
         RecordReclaimEvents(session, report);
-        await SyncNowAsync(initial: false);
+        var selectionRevisionBeforeSync = SelectionRevision;
+        var selectedSessionId = session.Id;
+        await SyncNowAsync(initial: false, waitForActive: true);
+        // Sync may refresh the selected model object without changing the user's selection. Fence only
+        // actual clicks/reselection, a changed selected ID, or a newer reclaim; same-ID replacement is normal.
+        if (seq != _reclaimSeq
+            || SelectionRevision != selectionRevisionBeforeSync
+            || !IsSelectedSession(session)
+            || !string.Equals(_selected?.Id, selectedSessionId, StringComparison.OrdinalIgnoreCase)) return;
+        _pendingReclaimReport = report;
+        _reclaimNoticeSessionId = session.Id;
+        _reclaimNotice = SessionReclaim.BuildPostStateNotice(report, null);
+        SyncStatus.Text = _reclaimNotice;
+        _integrity.Invalidate();
         RenderIntegrity(force: true);
-        SyncStatus.Text = report.Headline;
+    }
+
+    private void ReconcilePendingReclaim(
+        ArchiveSession session,
+        RefreshOutcome<SessionIntegritySummary> outcome,
+        string key)
+    {
+        if (_pendingReclaimReport is null
+            || !string.Equals(_reclaimNoticeSessionId, session.Id, StringComparison.OrdinalIgnoreCase)
+            || !string.Equals(outcome.Key, key, StringComparison.Ordinal)
+            || outcome.Error is not null
+            || outcome.Value is null)
+            return;
+
+        var report = _pendingReclaimReport;
+        _pendingReclaimReport = null;
+        _reclaimNotice = SessionReclaim.BuildPostStateNotice(report, outcome.Value);
+        SyncStatus.Text = _reclaimNotice;
+        PaintIntegrity(outcome.Value, checking: false);
     }
 
     private void Report(int seq, string message)
@@ -273,12 +335,11 @@ public sealed partial class MainPage
                     {
                         Text = refusal.EvidenceLine + ".\n\n"
                                + "Waiting the reservation out is safe: it expires within two minutes and the app then takes control. "
-                               + "Launching anyway risks two writers on the same transcript and silent message loss — it is recorded as an error in this chat's event log.",
+                               + "Reclaim will not force-clear a live reservation or start another terminal.",
                         TextWrapping = TextWrapping.Wrap,
                         MaxWidth = 460
                     },
                     PrimaryButtonText = "Wait for it to expire",
-                    SecondaryButtonText = "Launch anyway",
                     CloseButtonText = "Stop",
                     DefaultButton = ContentDialogButton.Primary,
                     XamlRoot = XamlRoot
@@ -287,7 +348,6 @@ public sealed partial class MainPage
                 tcs.TrySetResult(result switch
                 {
                     ContentDialogResult.Primary => ReclaimRefusalChoice.WaitForExpiry,
-                    ContentDialogResult.Secondary => ReclaimRefusalChoice.LaunchAnyway,
                     _ => ReclaimRefusalChoice.Abort
                 });
             }
@@ -305,11 +365,31 @@ public sealed partial class MainPage
             "Reclaim refused to force a live launch reservation: " + refusal.Detail,
             "warn",
             details: new Dictionary<string, string> { ["claim"] = refusal.Claim.Path });
-        return await tcs.Task;
+
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(ReclaimWaitSeconds));
+        var completed = await Task.WhenAny(
+            tcs.Task,
+            Task.Delay(Timeout.InfiniteTimeSpan, timeout.Token));
+        if (completed == tcs.Task) return await tcs.Task;
+
+        tcs.TrySetResult(ReclaimRefusalChoice.Abort);
+        _reclaimCancellation?.Cancel();
+        return ReclaimRefusalChoice.Abort;
     }
 
     private void RecordReclaimEvents(ArchiveSession session, ReclaimReport report)
     {
+        if (!report.MuxOk)
+            RecordSessionEvent(
+                session,
+                "reclaim.mux.failed",
+                "Reclaim stopped before cleanup because canonical mux teardown was not verified: " + report.MuxDetail,
+                "warn",
+                details: new Dictionary<string, string>
+                {
+                    ["muxName"] = ArchiveService.MultiplexSessionName(session)
+                });
+
         RecordSessionEvent(
             session,
             "reclaim.kill",
@@ -318,6 +398,7 @@ public sealed partial class MainPage
 
         foreach (var claim in report.Claims)
         {
+            Diag.Log($"Reclaim claim path={claim.Path} outcome={claim.Outcome} detail={claim.Detail}");
             switch (claim.Outcome)
             {
                 case ReclaimClearOutcome.Cleared:
@@ -341,10 +422,6 @@ public sealed partial class MainPage
                 "reclaim.mux.pruned",
                 "Pruned stale mux custody for: " + string.Join(", ", report.PrunedMuxTabs));
 
-        if (report.Relaunched)
-            RecordSessionEvent(session, "reclaim.relaunched", "Reclaim relaunched this chat: " + report.RelaunchDetail);
-        else if (report.LostLaunchRace)
-            RecordSessionEvent(session, "reclaim.relaunch.lost-race", report.RelaunchDetail, "warn");
     }
 
     // B4. Async-aware: the click never waits on the oracle. It answers from the last COMPLETED build and kicks

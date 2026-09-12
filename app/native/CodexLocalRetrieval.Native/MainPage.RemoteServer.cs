@@ -47,8 +47,8 @@ public sealed partial class MainPage
             Content = running ? "Stop server" : "Start server"
         };
         ToolTipService.SetToolTip(btn, running
-            ? "Stop the headless remote server and free its RAM. It will start again at next login."
-            : "Start the headless remote server so you can reach your workspace at harmonizerlabs.cc/remote.");
+            ? "Stop the MUX remote server and free its RAM. It will start again at next login."
+            : "Start the MUX remote server so you can reach your workspace at harmonizerlabs.cc/remote.");
         btn.Click += async (_, _) =>
         {
             btn.IsEnabled = false;
@@ -65,20 +65,20 @@ public sealed partial class MainPage
         row.Children.Add(btn);
 
         var body = installed
-            ? "harmonizerlabs.cc/remote — browse and drive your Claude/Codex chats from any browser. It " +
+            ? "harmonizerlabs.cc/remote — browse and drive your Claude/Codex chats from any browser through the MUX remote server. It " +
               "auto-starts at login and stays light (loads your archive only when you open Chats; idle ≈ 40 MB). " +
               "Stop it here to reclaim memory when you don't need remote access — it'll come back at next login."
-            : "The remote server isn't installed on this PC (run-remote.ps1 not found in %LocalAppData%\\CodexArchiveRemote).";
+            : "The MUX remote server isn't installed on this PC (run-remote.ps1 not found in %LocalAppData%\\CodexArchiveRemote).";
 
-        return SettingsPanel("Remote server", body, row);
+        return SettingsPanel("MUX remote server", body, row);
     }
 
     private void StartRemoteServer()
     {
         try
         {
-            if (RemoteServerProcess() is not null) { SyncStatus.Text = "Remote server is already running."; return; }
-            if (!File.Exists(RemoteServerLauncher)) { SyncStatus.Text = "Remote server isn't installed (run-remote.ps1 missing)."; return; }
+            if (RemoteServerProcess() is not null) { SyncStatus.Text = "MUX remote server is already running."; return; }
+            if (!File.Exists(RemoteServerLauncher)) { SyncStatus.Text = "MUX remote server isn't installed (run-remote.ps1 missing)."; return; }
             Process.Start(new ProcessStartInfo
             {
                 FileName = "powershell.exe",
@@ -87,9 +87,9 @@ public sealed partial class MainPage
                 WindowStyle = ProcessWindowStyle.Hidden,
                 CreateNoWindow = true
             });
-            SyncStatus.Text = "Starting the remote server…";
+            SyncStatus.Text = "Starting the MUX remote server…";
         }
-        catch (Exception ex) { Diag.Log("StartRemoteServer FAILED " + ex); SyncStatus.Text = "Couldn't start the remote server — see log."; }
+        catch (Exception ex) { Diag.Log("StartRemoteServer FAILED " + ex); SyncStatus.Text = "Couldn't start the MUX remote server — see log."; }
     }
 
     private void StopRemoteServer()
@@ -101,7 +101,7 @@ public sealed partial class MainPage
             {
                 try { p.Kill(entireProcessTree: true); any = true; } catch { }
             }
-            SyncStatus.Text = any ? "Stopped the remote server (RAM reclaimed)." : "Remote server wasn't running.";
+            SyncStatus.Text = any ? "Stopped the MUX remote server (RAM reclaimed)." : "MUX remote server wasn't running.";
         }
         catch (Exception ex) { Diag.Log("StopRemoteServer FAILED " + ex); }
     }

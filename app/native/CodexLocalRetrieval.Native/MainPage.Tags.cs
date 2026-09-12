@@ -114,25 +114,42 @@ public sealed partial class MainPage
     // Every keystroke used to run ApplyFilters synchronously; this collapses a burst of typing into one
     // filter pass 150 ms after you stop. The dispatcher hop is injected (the debouncer's timer fires on
     // the thread pool, but every UI touch below must happen on the UI thread).
-    private TrailingDebouncer<string>? _searchDebouncer;
-    internal TrailingDebouncer<string> SearchDebouncer => _searchDebouncer ??= new TrailingDebouncer<string>(
-        // The posted text is the debounce key; ApplyFilters re-reads the live box, which by definition
-        // holds that same last-typed value by the time the trailing edge fires.
-        _ => ApplyFilters(),
-        TrailingDebouncer<string>.DefaultDelay,
+    private TrailingDebouncer<(string Query, long SelectionRevision)>? _searchDebouncer;
+    internal TrailingDebouncer<(string Query, long SelectionRevision)> SearchDebouncer => _searchDebouncer ??= new TrailingDebouncer<(string Query, long SelectionRevision)>(
+        // Capture the selection revision when the keystroke is posted. If a click happens before the
+        // trailing callback runs, the callback must not select the first filtered row over that click.
+        posted => ApplyFilters(posted.SelectionRevision),
+        TrailingDebouncer<(string Query, long SelectionRevision)>.DefaultDelay,
         run => DispatcherQueue.TryEnqueue(() => run()));
 
-    private void ApplyFilters()
+    private void ApplyFilters(long? postedSelectionRevision = null)
     {
         var previousId = _selected?.Id;
+        var preserveSelection = postedSelectionRevision is not null && SelectionRevision != postedSelectionRevision.Value;
         var results = _archive.FilterChats(CurrentChatFilter());
+        var currentId = _selected?.Id;
+        var selection = preserveSelection && currentId is not null
+            ? results.FirstOrDefault(s => string.Equals(s.Id, currentId, StringComparison.OrdinalIgnoreCase))
+            : null;
+        // A newer click owns selection even when filtering removed that row; never replace it with an unrelated first result.
         // last-user / first-user sorts flip each visible row's title to what YOU said.
         var titleMode = (_dateMode == "last-user" || _dateMode == "first-user") ? _dateMode : "";
         foreach (var s in results) s.RowTitleMode = titleMode;
         // A sort OR a search picks the order; preserve it (don't let RefreshSessions re-sort by recent).
         var preserve = _dateMode.Length > 0 || !string.IsNullOrWhiteSpace(SearchBox.Text);
-        _archive.RefreshSessions(results, preserveOrder: preserve);
-        SelectFirstSession();
+        RunSessionListRefresh(() =>
+        {
+            _archive.RefreshSessions(results, preserveOrder: preserve);
+            if (selection is not null)
+            {
+                _selected = selection;
+                SelectSessionRow(selection);
+            }
+            else
+            {
+                SelectFirstSession();
+            }
+        });
         RenderTagFilterBar();
         // NARROW RENDER: filtering touches the session list and the tag strip, nothing else. A full-screen
         // rebuild here re-ran whatever page you were on for every keystroke — on Running that meant a fresh
@@ -167,12 +184,15 @@ public sealed partial class MainPage
         var titleMode = (_dateMode == "last-user" || _dateMode == "first-user") ? _dateMode : "";
         foreach (var s in results) s.RowTitleMode = titleMode;
         var preserve = _dateMode.Length > 0 || !string.IsNullOrWhiteSpace(SearchBox.Text);
-        _archive.RefreshSessions(results, preserveOrder: preserve);
-        if (!string.IsNullOrEmpty(keep))
+        RunSessionListRefresh(() =>
         {
-            var m = _archive.Sessions.FirstOrDefault(x => string.Equals(x.Id, keep, StringComparison.OrdinalIgnoreCase));
-            if (m is not null) { _selected = m; SelectSessionRow(m); }
-        }
+            _archive.RefreshSessions(results, preserveOrder: preserve);
+            var restored = !string.IsNullOrEmpty(keep)
+                ? _archive.Sessions.FirstOrDefault(x => string.Equals(x.Id, keep, StringComparison.OrdinalIgnoreCase))
+                : null;
+            _selected = restored;
+            SelectSessionRow(restored);
+        });
         RenderTagFilterBar();
     }
 

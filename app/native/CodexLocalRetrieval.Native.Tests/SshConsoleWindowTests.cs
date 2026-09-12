@@ -1,4 +1,5 @@
 using System.Text.RegularExpressions;
+using CodexLocalRetrieval.Core.Remote;
 
 namespace CodexLocalRetrieval.Native.Tests;
 
@@ -104,6 +105,67 @@ public sealed class SshConsoleWindowTests
             0,
             violations.Count,
             "CreateNoWindow is ignored unless UseShellExecute = false: " + string.Join(", ", violations));
+    }
+
+    [TestMethod]
+    public void CommandConsumerSshCallsUseOwnerOnlyHeaderFileAndFailingCurl()
+    {
+        var root = FindRepoRoot();
+        var sources = new[]
+        {
+            Path.Combine(root, "native", "CodexLocalRetrieval.Core", "Remote", "RemoteBridge.cs"),
+            Path.Combine(root, "native", "CodexLocalRetrieval.Native", "MainPage.Remote.cs"),
+        };
+
+        foreach (var source in sources)
+        {
+            var text = File.ReadAllText(source);
+            StringAssert.Contains(text, "$HOME/.config/mux/command-bridge.header", source);
+            StringAssert.Contains(text, "[ -f \\\"$h\\\" ]", source);
+            StringAssert.Contains(text, "[ ! -L \\\"$h\\\" ]", source);
+            StringAssert.Contains(text, "[ -r \\\"$h\\\" ]", source);
+            StringAssert.Contains(text, "stat -c %u -- \\\"$h\\\"", source);
+            StringAssert.Contains(text, "?r??------", source);
+            StringAssert.Contains(text, "curl --fail --silent --show-error", source);
+            StringAssert.Contains(text, "--header \\\"@$h\\\"", source);
+            if (source.EndsWith("MainPage.Remote.cs", StringComparison.Ordinal))
+                StringAssert.Contains(text, "if (lease.code != 0) return;", source);
+            else
+            {
+                StringAssert.Contains(text, "if (lease.code != 0) return false;", source);
+                StringAssert.Contains(text, "RunSshAsync(settings.Target, settings.Port", source);
+                Assert.DoesNotContain("_settings()?.Port", text, source + " must use the settings snapshot captured by RunTransportAsync");
+            }
+            StringAssert.Contains(text, "IsWellFormedEnvelopeToken(commandId)", source);
+            Assert.DoesNotContain("MUX_COMMAND_BRIDGE_TOKEN", text, source + " must never put the token in a command string");
+        }
+    }
+
+    [TestMethod]
+    public void RelayCommandIdValidationMatchesRelayAlphabetAndLength()
+    {
+        Assert.IsTrue(RemoteCommandProtocol.IsWellFormedEnvelopeToken("cabc123-1"));
+        Assert.IsTrue(RemoteCommandProtocol.IsWellFormedEnvelopeToken(new string('A', 128)));
+        Assert.IsFalse(RemoteCommandProtocol.IsWellFormedEnvelopeToken(new string('A', 129)));
+        Assert.IsFalse(RemoteCommandProtocol.IsWellFormedEnvelopeToken("cabc/ack"));
+        Assert.IsFalse(RemoteCommandProtocol.IsWellFormedEnvelopeToken("cabc;touch-pwned"));
+        Assert.IsFalse(RemoteCommandProtocol.IsWellFormedEnvelopeToken("cabc $(id)"));
+        Assert.IsFalse(RemoteCommandProtocol.IsWellFormedEnvelopeToken("cabc\"quoted"));
+    }
+
+    [TestMethod]
+    public void FixtureCommandConsumerTransportUsesDedicatedHeaderToken()
+    {
+        var root = FindRepoRoot();
+        var source = Path.Combine(root, "native", "CodexLocalRetrieval.Server", "LoopbackRelayTransport.cs");
+        var text = File.ReadAllText(source);
+
+        StringAssert.Contains(text, "CLR_REMOTE_TEST_COMMAND_BRIDGE_TOKEN", source);
+        StringAssert.Contains(text, "X-Mux-Command-Bridge", source);
+        StringAssert.Contains(text, "string.IsNullOrWhiteSpace(token)", source);
+        StringAssert.Contains(text, "IsWellFormedEnvelopeToken(commandId)", source);
+        StringAssert.Contains(text, "AllowAutoRedirect = false", source);
+        Assert.DoesNotContain("ex.Message", text, source + " must not return exception text that could include request headers");
     }
 
     private static string FindRepoRoot()

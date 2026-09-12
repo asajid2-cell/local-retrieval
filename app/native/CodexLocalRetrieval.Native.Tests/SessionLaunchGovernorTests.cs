@@ -49,6 +49,38 @@ public sealed class SessionLaunchGovernorTests
     }
 
     [TestMethod]
+    public void MarkFailed_ReleasesDefinitiveFailureClaimForImmediateRetry()
+    {
+        using var claims = NewTempDir("claims");
+        using var events = NewTempDir("events");
+        var governor = Governor(claims.Path, events.Path, _ => false);
+        var request = Request("failed-create");
+
+        Assert.IsTrue(governor.TryAcquire(request, out var failed, out var detail), detail);
+        using (failed)
+            failed!.MarkFailed("muxd create failed");
+
+        Assert.IsTrue(governor.TryAcquire(request, out var retry, out var retryDetail), retryDetail);
+        retry!.Dispose();
+    }
+
+    [TestMethod]
+    public void MarkFailed_RetainsUncertainFailureClaimAndStillBlocksRetry()
+    {
+        using var claims = NewTempDir("claims");
+        using var events = NewTempDir("events");
+        var governor = Governor(claims.Path, events.Path, _ => false);
+        var request = Request("uncertain-create");
+
+        Assert.IsTrue(governor.TryAcquire(request, out var failed, out var detail), detail);
+        using (failed)
+            failed!.MarkFailed("could not confirm process exit", retainUntilExpiry: true);
+
+        Assert.IsFalse(governor.TryAcquire(request, out _, out var blocked));
+        StringAssert.Contains(blocked, "launch already pending");
+    }
+
+    [TestMethod]
     public void BeginFresh_RecordsStartedEventWithoutSessionClaim()
     {
         using var claims = NewTempDir("claims");

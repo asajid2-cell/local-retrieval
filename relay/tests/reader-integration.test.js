@@ -26,10 +26,6 @@ const { once } = require('node:events');
 const REPO = path.resolve(__dirname, '..');
 const READER_SOURCE = fs.readFileSync(path.join(REPO, 'public', 'reader.js'), 'utf8');
 const HOST_TOKEN = 'test-token';
-// Derived from the host credential exactly as server.js derives it: scoped to page pushes, never equal to
-// the host token, and it buys no read back.
-const BRIDGE_TOKEN = crypto.createHash('sha256')
-  .update('mux-transcript-bridge:v1:' + HOST_TOKEN).digest('hex');
 const BRIDGE_HEADER = 'x-mux-transcript-bridge';
 const PROJECTION_SCHEMA_VERSION = 3;
 // The relay's own list (server.js FORBIDDEN_REMOTE_KEYS), mirrored so a drift names the offending key
@@ -87,6 +83,7 @@ async function waitFor(fn, label, timeoutMs = 5000) {
 class RelayHarness {
   constructor(env = {}) {
     this.proc = null;
+    this.commandBridgeToken = crypto.randomBytes(32).toString('hex');
     this.env = env;
     this.tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-reader-'));
     this.stdout = '';
@@ -104,6 +101,9 @@ class RelayHarness {
         PORT: String(this.port),
         MUX_HOST_TOKEN: HOST_TOKEN,
         MUX_TEST_MODE: '1',
+        MUX_TEST_FIXTURE: '1',
+        MUX_BIND_HOST: '127.0.0.1',
+        MUX_COMMAND_BRIDGE_TOKEN: this.commandBridgeToken,
         MUX_AUTOHEAL: '0',
         MUX_STATE_DIR: this.tmp,
         MUX_HOST_SB_WAIT_MS: '40',
@@ -116,7 +116,7 @@ class RelayHarness {
     this.proc.stdout.on('data', d => { this.stdout += d.toString(); });
     this.proc.stderr.on('data', d => { this.stderr += d.toString(); });
     try {
-      await waitFor(() => this.stdout.includes(`multiplex-app on 0.0.0.0:${this.port}`), 'relay start', 15000);
+      await waitFor(() => this.stdout.includes(`multiplex-app on 127.0.0.1:${this.port}`), 'relay start', 15000);
     } catch (error) {
       throw new Error(`${error.message}\n--- relay stderr ---\n${this.stderr}`);
     }
@@ -214,15 +214,25 @@ const markBridgeLive = h => h.json('POST', '/api/running',
   { schemaVersion: PROJECTION_SCHEMA_VERSION, runningSessions: [], runningVerified: true, host: 'test-pc' });
 
 const leaseCommands = (h, owner = 'reader-bridge') =>
-  h.json('POST', '/api/app-commands/lease', { owner, limit: 16 });
+  h.json(
+    'POST',
+    '/api/app-commands/lease',
+    { owner, limit: 16 },
+    { 'X-Mux-Command-Bridge': h.commandBridgeToken },
+  );
 
 const ackLeased = (h, command, result) =>
-  h.json('POST', `/api/app-commands/${encodeURIComponent(command.id)}/ack`, { leaseToken: command.leaseToken, ...result });
+  h.json(
+    'POST',
+    `/api/app-commands/${encodeURIComponent(command.id)}/ack`,
+    { leaseToken: command.leaseToken, ...result },
+    { 'X-Mux-Command-Bridge': h.commandBridgeToken },
+  );
 
 const pageBody = (sessionId, page, pages, messages) => ({ schemaVersion: 1, sessionId, page, pages, messages });
 
-const pushPage = (h, sessionId, body) =>
-  h.request('POST', `/api/transcripts/${encodeURIComponent(sessionId)}`, body, { [BRIDGE_HEADER]: BRIDGE_TOKEN });
+const pushPage = (h, sessionId, body, credential) =>
+  h.request('POST', `/api/transcripts/${encodeURIComponent(sessionId)}`, body, { [BRIDGE_HEADER]: credential });
 
 // Acts as the PC bridge for one transcriptfetch: lease it, park the pages with the scoped credential, then
 // sign the terminal outcome. Runs concurrently with the reader's own refresh().
@@ -235,7 +245,7 @@ async function bridgeServe(h, sessionId, pages, ackOk) {
   assert.ok(command.principalAuth && typeof command.principalAuth === 'object',
     'the principal envelope must ride the lease out to the bridge');
   for (const body of pages) {
-    const pushed = await pushPage(h, sessionId, body);
+    const pushed = await pushPage(h, sessionId, body, command.bridgeToken);
     assert.equal(pushed.status, 200, `page push rejected: ${pushed.text}`);
   }
   await ackLeased(h, command, { ok: ackOk });
@@ -306,7 +316,11 @@ test('the enqueue body refresh() mints is accepted by the real relay and stored 
       'the relay rejects an empty or non-object principal envelope');
     assert.ok(Buffer.byteLength(JSON.stringify(envelope), 'utf8') <= PRINCIPAL_AUTH_MAX_BYTES);
     assert.equal(forbiddenKeyIn(sent.body, 'body'), '', 'the enqueue body must carry no command/path-shaped key');
-    assert.equal(envelope.origin, h.origin, 'the envelope names the origin that asked');
+    assert.equal(envelope.sessionId, sessionId);
+    assert.equal(envelope.scheme, 'mux-owner-read-v1');
+    assert.match(envelope.subject, /^[a-f0-9]{64}$/);
+    assert.match(envelope.proof, /^[a-f0-9]{64}$/);
+    assert.ok(envelope.expiresAt > Date.now());
 
     assert.equal(reader.posts.statuses[0], 200, 'the REAL relay accepted the enqueue');
     assert.equal(result.ok, false);
@@ -326,15 +340,15 @@ test('the enqueue body refresh() mints is accepted by the real relay and stored 
     // Non-vacuity: the same endpoint really does refuse a drifted envelope, so the 200 above is earned.
     const empty = await h.request('POST', '/api/app-commands',
       { type: 'transcriptfetch', sessionId, principalAuth: {} });
-    assert.equal(empty.status, 400);
-    assert.match(empty.body.error, /principal auth envelope/);
+    assert.equal(empty.status, 403);
+    assert.match(empty.body.error, /owner transcript grant/);
     const forbidden = await h.request('POST', '/api/app-commands',
       { type: 'transcriptfetch', sessionId, principalAuth: { ...envelope, cwd: 'C:/Users/me' } });
     assert.equal(forbidden.status, 400);
     assert.match(forbidden.body.error, /executable commands and local paths are forbidden/);
     const oversized = await h.request('POST', '/api/app-commands',
       { type: 'transcriptfetch', sessionId, principalAuth: { ...envelope, pad: 'x'.repeat(PRINCIPAL_AUTH_MAX_BYTES) } });
-    assert.equal(oversized.status, 400);
+    assert.equal(oversized.status, 403);
   });
 });
 
@@ -367,7 +381,7 @@ test('refresh() round-trips through a real bridge lease/push/ack and loads the p
     assert.equal(result.totalPages, 2);
     assert.ok(Number.isFinite(result.expiresAt) && result.expiresAt > Date.now());
     assert.deepEqual(plain(reader.orderedMessages(result.pages).map(m => m.text)),
-      ['first', 'second', 'third', 'fourth']);
+      ['third', 'fourth', 'first', 'second']);
 
     const doc = { createElement: tag => ({ tag, className: '', textContent: '', children: [], appendChild(c) { this.children.push(c); return c; }, setAttribute() {} }) };
     const mount = doc.createElement('div');

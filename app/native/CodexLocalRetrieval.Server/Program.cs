@@ -31,15 +31,46 @@ else if (!RemoteAuth.IsValidConfiguredToken(token))
 
 var port = int.TryParse(Environment.GetEnvironmentVariable("CLR_REMOTE_PORT"), out var p) ? p : 8765;
 var bind = Environment.GetEnvironmentVariable("CLR_REMOTE_BIND") ?? "127.0.0.1"; // localhost only; nginx is the edge
+var storePath = Environment.GetEnvironmentVariable("CLR_REMOTE_STORE");
+var useBundled = Environment.GetEnvironmentVariable("CLR_REMOTE_BUNDLED") == "1";
+var isolatedProfile = Environment.GetEnvironmentVariable("CLR_REMOTE_TEST_PROFILE") == "1";
+if (isolatedProfile)
+{
+    var fixtureError = LoopbackRelayTransport.ValidateFixtureProfile(storePath, Environment.GetEnvironmentVariable("CLR_CLAUDE_PROJECTS"), bind, useBundled);
+    if (fixtureError.Length != 0)
+    {
+        Console.Error.WriteLine("refusing isolated remote test profile: " + fixtureError);
+        return 2;
+    }
+}
+var instance = ServerSingleInstanceGuard.Identify(bind, port, storePath, useBundled);
+var instanceResult = ServerSingleInstanceGuard.TryAcquire(bind, port, storePath, useBundled);
+if (!instanceResult.Acquired)
+{
+    Console.Error.WriteLine(instanceResult.Message);
+    return instanceResult.ExistingHealthy ? 0 : 2;
+}
+using var instanceLease = instanceResult.Lease;
 var redactReads = Environment.GetEnvironmentVariable("CLR_REMOTE_REDACT_READS") == "1";
 var allowLaunch = Environment.GetEnvironmentVariable("CLR_REMOTE_ALLOW_LAUNCH") == "1";
 
 // ---- archive: load the store and index the live session folders so remote browsing is current ----
 // CLR_REMOTE_STORE: point at a specific app-store.json (e.g. a synced copy). CLR_REMOTE_BUNDLED=1
 // uses the repo's sanitized demo store (handy for a smoke test without touching real chats).
-var storePath = Environment.GetEnvironmentVariable("CLR_REMOTE_STORE");
-var useBundled = Environment.GetEnvironmentVariable("CLR_REMOTE_BUNDLED") == "1";
-var archive = new ArchiveService(storePath: string.IsNullOrWhiteSpace(storePath) ? null : storePath, useBundledStore: useBundled);
+var isolatedArchiveRoot = isolatedProfile ? Path.GetDirectoryName(storePath!)! : null;
+var archive = new ArchiveService(
+    storePath: string.IsNullOrWhiteSpace(storePath) ? null : storePath,
+    useBundledStore: useBundled,
+    codexSessionsRoot: isolatedProfile ? Path.Combine(isolatedArchiveRoot!, "codex-sources") : null,
+    claudeSessionsRoot: isolatedProfile ? Environment.GetEnvironmentVariable("CLR_CLAUDE_PROJECTS") : null,
+    codexStateDbPath: isolatedProfile ? Path.Combine(isolatedArchiveRoot!, "codex-state.sqlite") : null,
+    transcriptSearchIndexPath: isolatedProfile ? Path.Combine(isolatedArchiveRoot!, "transcript-search.sqlite") : null,
+    enableTranscriptSearchIndex: isolatedProfile ? true : null,
+    sourceOverride: isolatedProfile ? new[]
+    {
+        new SessionSource { Tool = "codex", Root = Path.Combine(isolatedArchiveRoot!, "codex-sources") },
+        new SessionSource { Tool = "claude", Root = Environment.GetEnvironmentVariable("CLR_CLAUDE_PROJECTS")! }
+    } : null);
 // LAZY: the archive (store + disk index) is the heavy part (~150-200MB), but only the Chats tab and the
 // co-pilot use it — the Agent tab lists live sessions straight from the app-server / Claude store. So we
 // DON'T load it at startup; the first archive-backed request triggers a one-time load (+ disk sync). An
@@ -143,6 +174,11 @@ async Task<(bool ok, ArchiveService.RemoteMuxLaunch? launch, string detail)> Res
                 tool,
                 out var launch,
                 out var detail,
+                multiplexCommandFactory: isolatedProfile ? session =>
+                    System.Text.RegularExpressions.Regex.IsMatch(session.Id, "\\A[A-Za-z0-9_-]{1,200}\\z")
+                        ? (session.Tool == "claude"
+                            ? (launchMode == ArchiveService.GatewayLaunchMode ? "# cc --resume " : "# claude --resume ")
+                            : "# codex resume ") + session.Id : "" : null,
                 launchMode: launchMode)
             ? (true, launch, detail)
             : (false, null, detail);
@@ -160,7 +196,7 @@ app.UseDefaultFiles();
 app.UseStaticFiles();
 
 // healthz stays light — it must NOT trigger the archive load (it's a liveness probe).
-app.MapGet("/healthz", () => Results.Ok(new { ok = true, service = "codex-local-retrieval", archiveLoaded = archiveRuntime.IsLoaded, chats = archiveRuntime.SessionCount }));
+app.MapGet("/healthz", () => Results.Ok(new { ok = true, service = "codex-local-retrieval", instance = instance.Value, archiveLoaded = archiveRuntime.IsLoaded, chats = archiveRuntime.SessionCount }));
 app.MapGet("/api/stats", async (CancellationToken ct) =>
     Results.Json(await archiveRuntime.UseAsync((_, _) => Task.FromResult(api.Stats()), ct)));
 app.MapGet("/api/custody", async (CancellationToken ct) =>
@@ -258,7 +294,7 @@ app.MapPost("/api/agent/sessions/{id}/open", async (string id, OpenRequest? req,
 
 // The web archive browser (relay/public/chats.html) reads its rows straight from here through the
 // reverse tunnel — the PC filters, the browser only renders.
-app.MapDiscovery(archiveRuntime);
+app.MapDiscovery(archiveRuntime, redactReads);
 
 // ---- fleet: always-on recorder of what's running, so a crash/reboot leaves a restorable record ----
 // The server is the natural writer (it's back ~a minute after boot); if the desktop app ever hosts a
@@ -344,15 +380,34 @@ if (Environment.GetEnvironmentVariable("CLR_REMOTE_BRIDGE") != "0")
     {
         var st = archive.ReadSettingsOnly();
         if (!string.IsNullOrWhiteSpace(st.MultiplexSshTarget))
+        {
+            if (isolatedProfile)
+            {
+                var portError = LoopbackRelayTransport.ValidateFixturePort(st.MultiplexApiPort);
+                if (portError.Length != 0)
+                {
+                    Console.Error.WriteLine("refusing isolated remote test profile: " + portError);
+                    return 2;
+                }
+            }
             bridgeSettings = new RemoteBridge.Settings(st.MultiplexSshTarget.Trim(), st.MultiplexApiPort);
+        }
     }
     catch (Exception ex) { Console.Error.WriteLine("bridge settings read failed: " + ex.Message); }
 
     if (bridgeSettings is not null)
     {
-        var codexDbPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".codex", "state_5.sqlite");
+        var codexDbPath = isolatedProfile
+            ? Path.Combine(Path.GetDirectoryName(storePath!)!, "fixture-codex-state.sqlite")
+            : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".codex", "state_5.sqlite");
+        var emptyRunningSnapshot = isolatedProfile
+            ? new Func<(bool verified, List<ArchiveService.RunningSessionInfo> sessions, string detail)>(() => (true, new List<ArchiveService.RunningSessionInfo>(), "fixture snapshot; production process absence not asserted"))
+            : null;
         bool DesktopAppRunning()
         {
+            // An explicitly isolated fixture profile owns its temporary store and loopback relay;
+            // it must not be suppressed by the production desktop process on the same machine.
+            if (isolatedProfile) return LoopbackRelayTransport.IsGuiFixtureRunning(storePath!);
             try { return System.Diagnostics.Process.GetProcessesByName("CodexLocalRetrieval.Native").Length > 0; }
             catch { return false; }
         }
@@ -364,21 +419,124 @@ if (Environment.GetEnvironmentVariable("CLR_REMOTE_BRIDGE") != "0")
             m => Console.WriteLine("[bridge] " + m),
             ResolveRemoteMuxLaunchAsync,
             ResolvePendingMuxBindingsAsync,
-            childProcessJob);
+            executeArchiveCommand: command => archiveRuntime.UseAsync(
+                (loadedArchive, _) => ArchiveRemoteCommands.ExecuteAsync(loadedArchive, command)),
+            processContainment: childProcessJob,
+            transport: isolatedProfile
+                ? LoopbackRelayTransport.Create()
+                : null,
+            isolationFixture: isolatedProfile,
+            runningSnapshot: emptyRunningSnapshot,
+            captureWorkspace: (command, listing) => archiveRuntime.UseAsync(
+                (loadedArchive, _) => ArchiveRemoteCommands.CaptureWorkspaceAsync(loadedArchive, command, listing)),
+            fixtureWorkspaceListing: isolatedProfile ? async () =>
+            {
+                var fixtureListing = Path.Combine(Path.GetDirectoryName(storePath!)!, "workspace-listing.json");
+                return File.Exists(fixtureListing) ? await File.ReadAllTextAsync(fixtureListing) : "{\"list\":[]}";
+            } : null,
+            executeStartChat: (request, muxRequest) => StartChatCoordinator.ExecuteAsync(request,
+                () => archiveRuntime.UseAsync((loadedArchive, _) => loadedArchive.PrepareStartChatAsync(request,
+                    isolatedProfile && request.HandoffFromId.Length > 0
+                        ? (tool, cwd, mode) => tool == "claude" && mode == ArchiveService.GatewayLaunchMode ? "# isolated Gateway handoff" : ""
+                        : null)),
+                (ok, detail, generation) => archiveRuntime.UseAsync((loadedArchive, _) => ok
+                    ? loadedArchive.MarkStartChatAppliedAsync(request, detail, generation)
+                    : loadedArchive.MarkStartChatFailedAsync(request, detail)),
+                muxRequest),
+            fixtureMuxRequest: isolatedProfile ? LoopbackRelayTransport.CreateMuxFixture() : null,
+            fixtureUploadRoot: isolatedProfile ? Path.Combine(Path.GetDirectoryName(storePath!)!, "downloaded-uploads") : null,
+            fixtureSshConfigPath: isolatedProfile ? Environment.GetEnvironmentVariable("CLR_REMOTE_TEST_SSH_CONFIG") : null,
+            fixtureDownload: isolatedProfile && string.IsNullOrEmpty(Environment.GetEnvironmentVariable("CLR_REMOTE_TEST_SSH_CONFIG")) ? (id, filename, destination) => LoopbackRelayTransport.DownloadUploadAsync(
+                bridgeSettings, Path.GetDirectoryName(storePath!)!, id, destination) : null,
+            reconcileStartChatBindings: listing => archiveRuntime.UseAsync((loadedArchive, _) =>
+                loadedArchive.ReconcileStartChatBindingsAsync(listing)),
+            executeReclaim: (command, muxRequest) => archiveRuntime.UseAsync(async (loadedArchive, _) =>
+            {
+                var intent = command.GetProperty("intentId").GetString() ?? "";
+                var sessionId = command.GetProperty("sessionId").GetString() ?? "";
+                var tool = command.GetProperty("tool").GetString() ?? "";
+                var revision = command.GetProperty("expectedRevision").GetString() ?? "";
+                if (!command.TryGetProperty("confirmed", out var confirmed) || confirmed.ValueKind != System.Text.Json.JsonValueKind.True)
+                    return new CodexLocalRetrieval.Core.Models.ReclaimOperationResult(
+                        CodexLocalRetrieval.Core.Models.ReclaimOperationStatus.Refused, "explicit cleanup confirmation required");
+                var fixtureRoot = isolatedProfile ? Path.GetDirectoryName(storePath!)! : null;
+                return await loadedArchive.ExecuteReclaimOperationAsync(intent, sessionId, tool, revision,
+                    () =>
+                    {
+                        if (isolatedProfile && Environment.GetEnvironmentVariable("CLR_REMOTE_TEST_RECLAIM_PAUSE_BEFORE_PRUNE") == "1"
+                            && loadedArchive.Store.ManagementOperations.TryGetValue(intent, out var receipt)
+                            && receipt.State == "started")
+                        {
+                            var payload = System.Text.Json.JsonSerializer.Deserialize<CodexLocalRetrieval.Core.Models.ReclaimOperationReceiptPayload>(receipt.ResultId);
+                            if (payload?.Report is not null) return Task.FromResult("fixture paused before prune");
+                        }
+                        return muxRequest(new { t = "ls" });
+                    },
+                    async (name, id, generation) =>
+                    {
+                        using var reply = System.Text.Json.JsonDocument.Parse(await muxRequest(new
+                        {
+                            t = "kill", s = name, sessionId = id, generationId = generation
+                        }));
+                        var root = reply.RootElement;
+                        var killed = root.TryGetProperty("t", out var type) && type.GetString() == "killed"
+                            && root.TryGetProperty("s", out var returnedName) && returnedName.GetString() == name;
+                        return (killed, killed ? "fenced mux owner removed" : "mux teardown was not confirmed");
+                    },
+                    processKill: isolatedProfile ? _ => new RunningSessions.KillResult(true,
+                        "fixture cleanup is restricted to generation-fenced mux teardown", Array.Empty<ReclaimKilledPid>()) : null,
+                    claimOptions: isolatedProfile ? new SessionLaunchClaims.Options(RootDirectory: Path.Combine(fixtureRoot!, "claims")) : null,
+                    recordOptions: isolatedProfile ? new SessionOwnerRecords.Options(RootDirectory: Path.Combine(fixtureRoot!, "owners")) : null,
+                    cancellationToken: app.Lifetime.ApplicationStopping);
+            }),
+            fetchTranscript: async command =>
+            {
+                var id = command.GetProperty("sessionId").GetString() ?? "";
+                var credential = command.GetProperty("bridgeToken").GetString();
+                var ttl = command.GetProperty("ttlMs").GetInt32();
+                var admission = TranscriptFetchProjection.AdmitFetch(id, credential, ttl);
+                if (!admission.Allowed) return (false, admission.Reason);
+                var clock = System.Diagnostics.Stopwatch.StartNew();
+                try
+                {
+                    var pages = await archiveRuntime.UseAsync(async (loaded, _) =>
+                    {
+                        var session = loaded.ResolveSessionByIdOrAlias(id);
+                        if (session is null) return null;
+                        var remaining = ttl - clock.ElapsedMilliseconds;
+                        if (remaining <= 0) return null;
+                        using var captureDeadline = new CancellationTokenSource(TimeSpan.FromMilliseconds(remaining));
+                        var messages = await loaded.ExtractReaderMessagesAsync(session, "all", captureDeadline.Token);
+                        return TranscriptFetchProjection.BuildPages(id, messages, redactReads);
+                    });
+                    if (pages is null || pages.Count == 0) return (false, "no readable transcript for this chat");
+                    foreach (var page in pages)
+                    {
+                        var remaining = ttl - clock.ElapsedMilliseconds;
+                        if (remaining <= 0) return (false, "transcript fetch authorization expired");
+                        if (!await LoopbackRelayTransport.PushTranscriptAsync(bridgeSettings, id, credential!, page.Json,
+                            TimeSpan.FromMilliseconds(Math.Min(30000, remaining)), isolatedProfile))
+                            return (false, "transcript page delivery was not confirmed");
+                    }
+                    return (true, $"{pages.Count} transcript pages delivered");
+                }
+                catch { return (false, "transcript fetch failed"); }
+            });
         _ = bridge.RunLoopAsync(app.Lifetime.ApplicationStopping);
-        Console.WriteLine($"remote command bridge armed (target {bridgeSettings.Target}:{bridgeSettings.Port}; active only while the desktop app is closed)");
+        Console.WriteLine($"MUX remote bridge armed (target {bridgeSettings.Target}:{bridgeSettings.Port}; active only while the desktop app is closed)");
     }
-    else Console.WriteLine("remote command bridge OFF — no multiplex SSH target in settings.");
+    else Console.WriteLine("MUX remote bridge OFF — no multiplex SSH target in settings.");
 }
 
 var authMode = hlAuthOn ? $"hl-auth ({hlBase}, page:{hlPage ?? "any"})" : "bearer token";
-Console.WriteLine($"codex-local-retrieval remote server on http://{bind}:{port}  (archive: lazy (loads on first browse), auth: {authMode}, launch: {(allowLaunch ? "on" : "off")}, redact-reads: {(redactReads ? "on" : "off")})");
+Console.WriteLine($"MUX remote server on http://{bind}:{port}  (archive: lazy (loads on first browse), auth: {authMode}, launch: {(allowLaunch ? "on" : "off")}, redact-reads: {(redactReads ? "on" : "off")})");
 try
 {
     app.Run();
 }
 finally
 {
+    archiveRuntime.Dispose();
     try
     {
         await agentHub.DisposeAsync();

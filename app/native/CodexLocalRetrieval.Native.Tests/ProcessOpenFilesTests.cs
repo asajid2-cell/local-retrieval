@@ -58,7 +58,7 @@ public class ProcessOpenFilesTests
 
         var result = ProcessOpenFiles.Scan(new[] { survivor.Id, doomed.Id });
 
-        Assert.IsTrue(result.DeadPids.Contains(doomed.Id), "an exited candidate must classify dead");
+        Assert.IsTrue(result.DeadPids.Contains(doomed.Id), "an exited candidate must classify dead: " + result.UnverifiableDetail());
         Assert.IsFalse(result.UnverifiablePids.Contains(doomed.Id), "an exited candidate is not uncertainty");
         Assert.IsTrue(result.AllVerifiable, "one dead pid must not make the set unverifiable");
         Assert.IsTrue(result.Found.TryGetValue(survivorSid, out var owner), "the surviving owner was lost with the dead one");
@@ -91,7 +91,7 @@ public class ProcessOpenFilesTests
 
         var inspection = ProcessOpenFiles.Inspect(zombie.Id);
         Assert.AreEqual(ProcessOpenFiles.PidOutcome.Dead, inspection.Outcome,
-            "a successful open on an exited process must classify DEAD, not alive");
+            "a successful open on an exited process must classify DEAD, not alive: " + inspection.Detail);
     }
 
     // C2 policy: alive + uninspectable (the elevated-agent case) is UNVERIFIABLE — reported honestly — and the

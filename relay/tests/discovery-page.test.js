@@ -44,7 +44,7 @@ function fakeDocument() {
   const ids = [
     'chatlist', 'status', 'state', 'tagchips', 'phrasechips', 'project', 'pager',
     'pageinfo', 'prev', 'next', 'searchform', 'query', 'agent', 'sort', 'date',
-    'minimum', 'hidden',
+    'minimum', 'hidden', 'matchall',
   ];
   const nodes = new Map(ids.map(id => [`#${id}`, element(id === 'searchform' ? 'form' : 'div')]));
   nodes.get('#query').value = '';
@@ -100,7 +100,7 @@ test('query parameters encode the frozen discovery contract', () => {
   const params = MuxChats.queryParams({
     q: '[web-parity]', include: new Set(['active', 'ACTIVE']), exclude: new Set(['done']),
     matchAll: true, agent: 'codex', date: 'week', minUserMessages: 5,
-    showHidden: true, project: 'project-web', sort: 'created-newest',
+    showHidden: true, archived: 'archived', project: 'project-web', sort: 'created-newest',
   }, 40, 40);
 
   assert.equal(params.get('q'), '[web-parity]');
@@ -111,6 +111,7 @@ test('query parameters encode the frozen discovery contract', () => {
   assert.equal(params.get('date'), 'week');
   assert.equal(params.get('minUserMessages'), '5');
   assert.equal(params.get('showHidden'), 'true');
+  assert.equal(params.get('archived'), 'archived');
   assert.equal(params.get('project'), 'project-web');
   assert.equal(params.get('sort'), 'created-newest');
   assert.equal(params.get('offset'), '40');
@@ -169,11 +170,56 @@ test('DOM smoke renders discovery rows, facets, disabled resume, and delegates r
   assert.equal(mounted.controller.state.filters.include.has('active'), true);
 });
 
+test('ALL tag control preserves selected tags and resets pagination', async () => {
+  const doc = fakeDocument(), fetched = [];
+  const { MuxChats } = loadClient();
+  const mounted = MuxChats.install({ document: doc, fetch: async url => {
+    fetched.push(String(url));
+    return { ok: true, json: async () => String(url).includes('/facets') ? FACETS : PAGE };
+  } });
+  await mounted.controller.load(true);
+  mounted.controller.state.filters.include = new Set(['active', 'web']);
+  mounted.controller.state.filters.exclude = new Set(['done']);
+  mounted.controller.state.offset = 40;
+  const control = doc.nodes.get('#matchall');
+  control.checked = true;
+  assert.equal(typeof control.onchange, 'function');
+  control.onchange();
+  const query = new URL(fetched.at(-2), 'http://fixture').searchParams;
+  assert.equal(query.get('match'), 'all');
+  assert.equal(query.get('include'), 'active,web');
+  assert.equal(query.get('exclude'), 'done');
+  assert.equal(query.get('offset'), '0');
+  control.checked = false;
+  control.onchange();
+  assert.equal(new URL(fetched.at(-2), 'http://fixture').searchParams.get('match'), 'any');
+});
+
+test('ordinary copy preserves stored launch mode while explicit Gateway copy overrides it', async () => {
+  const doc = fakeDocument(), requests = [], clipboard = [];
+  const sandbox = loadClient({
+    navigator: { clipboard: { writeText: async value => clipboard.push(value) } },
+    fetch: async (url, options) => {
+      const body = JSON.parse(options.body); requests.push(body);
+      return { ok: true, json: async () => ({ ...body, payload: 'exact command' }) };
+    },
+  });
+  const mounted = sandbox.MuxChats.install({ document: doc, fetch: async url => ({ ok: true, json: async () => String(url).includes('/facets') ? FACETS : PAGE }) });
+  await mounted.controller.load(true);
+  const menu = doc.nodes.get('#chatlist').children[1].querySelector('details');
+  await menu.children.find(node => node.textContent === 'Copy resume command').onclick();
+  await menu.children.find(node => node.textContent === 'Copy Gateway command').onclick();
+  assert.equal(Object.hasOwn(requests[0], 'launchMode'), false);
+  assert.equal(requests[1].launchMode, 'gateway');
+  assert.equal(requests[0].sessionId, 'chat-2');
+  assert.equal(clipboard.length, 2);
+});
+
 test('page markup exposes every primary control and loads scripts in dependency order', () => {
   const html = fs.readFileSync(path.join(PUBLIC, 'chats.html'), 'utf8');
   for (const id of [
     'searchform', 'query', 'filters', 'agent', 'sort', 'date', 'minimum', 'project',
-    'hidden', 'tagchips', 'phrasechips', 'status', 'state', 'chatlist', 'pager', 'prev', 'next',
+    'hidden', 'matchall', 'archived', 'tagchips', 'phrasechips', 'status', 'state', 'chatlist', 'pager', 'prev', 'next',
   ]) assert.ok(html.includes(`id="${id}"`), `missing #${id}`);
   assert.ok(html.indexOf('intent-journal.js') < html.indexOf('picker.js'));
   assert.ok(html.indexOf('picker.js') < html.indexOf('chats.js'));

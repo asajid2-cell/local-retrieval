@@ -104,6 +104,8 @@ class RelayHarness {
         PORT: String(this.port),
         MUX_HOST_TOKEN: 'test-token',
         MUX_TEST_MODE: '1',
+        MUX_TEST_FIXTURE: '1',
+        MUX_BIND_HOST: '127.0.0.1',
         MUX_AUTOHEAL: '0',
         MUX_STATE_DIR: this.tmp,
         MUX_HOST_SB_WAIT_MS: '40',
@@ -115,7 +117,7 @@ class RelayHarness {
     });
     this.proc.stdout.on('data', d => { this.stdout += d.toString(); });
     this.proc.stderr.on('data', d => { this.stderr += d.toString(); });
-    await waitFor(() => this.stdout.includes(`multiplex-app on 0.0.0.0:${this.port}`), 'relay start', 10000);
+    await waitFor(() => this.stdout.includes(`multiplex-app on 127.0.0.1:${this.port}`), 'relay start', 10000);
   }
 
   async stop() {
@@ -301,7 +303,14 @@ test('flood past the viewer high-water mark terminates the stalled viewer and ke
   }
   const expectedBuf = Buffer.concat(expected);
 
-  await waitFor(() => fast.bytes >= expectedBuf.length, 'healthy viewer drained the whole flood', 30000);
+  await waitFor(() => fast.bytes >= expectedBuf.length, 'healthy viewer drained the whole flood', 30000)
+    .catch(error => {
+      throw new Error(error.message + '; ' + JSON.stringify({
+        expectedBytes: expectedBuf.length, fastBytes: fast.bytes, fastClosed: fast.closed,
+        fastCloseCode: fast.closeCode, slowBytes: slow.bytes, slowClosed: slow.closed,
+        hostState: host.ws.readyState, relayExit: h.proc.exitCode,
+      }));
+    });
 
   // The stalled socket stopped accepting bytes long before the flood ended -- that stall is what
   // drives the relay's bufferedAmount past the high-water mark.

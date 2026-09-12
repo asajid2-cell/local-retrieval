@@ -28,6 +28,7 @@ public sealed partial class MainPage
     private sealed record PendingAgentLine(long LineNumber, AgentCommand? Command, string? ParseError);
 
     private static string AgentDir =>
+        GuiVerificationFixture.Enabled ? Path.Combine(GuiVerificationFixture.Root, "agent") :
         Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "CodexLocalRetrieval");
     private static string AgentInbox => Path.Combine(AgentDir, "agent-inbox.jsonl");
     private static string AgentOutbox => Path.Combine(AgentDir, "agent-outbox.jsonl");
@@ -173,7 +174,8 @@ public sealed partial class MainPage
                 catch { }
             }
             if (results.Count > 0) SyncStatus.Text = "Agent: " + results[^1].res.Message;
-            SelectFirstSession();
+            // Agent commands mutate metadata in the background; they must not navigate away from the
+            // chat the user is reading. ReapplyActiveFilter/SyncNowAsync preserve the selected id.
             RenderCurrent();
 
             // Advance the cursor ONLY after the batch is applied + acked, so a crash/exception
@@ -250,7 +252,7 @@ public sealed partial class MainPage
         var inbox = AgentInbox;
         var outbox = AgentOutbox;
         return
-$@"# Codex Local Retrieval — Agent Protocol
+$@"# MUX - Agent Protocol
 
 You are an AI agent (Claude or Codex) in a terminal. The human uses this app to index every
 Claude/Codex chat on this machine. You can drive it by appending JSON commands (one per line) to:

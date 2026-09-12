@@ -755,11 +755,13 @@
   <label class="rnlabel" id="renameapplabel" for="renameapp">App name (this app’s display)</label>
   <input id="renameapp" autocapitalize="off" autocomplete="off" spellcheck="false">
   <p class="hint" id="renamenote" style="display:none">This tab isn’t linked to a chat, so only the multiplex tab name can change.</p>
+  <p id="renamestatus" role="status"></p>
   <div class="row"><button class="act" id="cancelrename">Cancel</button><button class="act primary" id="dorename">Save</button></div>
 </dialog>
 <dialog id="addcoldlg">
   <h3>Add to collection</h3>
-  <p class="hint">Adds this session’s chat to a deck. Works only while the desktop app is open — it owns your collections, so this can’t drift out of sync.</p>
+  <p class="hint">Files this exact chat through the PC authority, including when the desktop app is closed.</p>
+  <p id="addcolstatus" role="status"></p>
   <div id="addcollist" class="addcollist"></div>
   <div class="row adddeckrow"><label for="adddecksel">Deck</label><select id="adddecksel"></select></div>
   <div class="row adddeckrow" id="adddecknewrow" hidden><label for="adddecknew">New deck</label><input id="adddecknew" placeholder="deck name" autocapitalize="off" autocomplete="off" spellcheck="false"></div>
@@ -795,6 +797,7 @@
     </div>
   </div>
   <p class="hint">Upload a picture, PDF, zip — anything; it lands here. Tap a file to open it, then <b>Add to prompt</b> (the agent reads the real file from its PC path) or copy it as a path/element to Paste. <b>Keep</b> persists a file; otherwise it's cleared when the PC restarts.</p>
+  <p id="wsuploaderror" role="alert" hidden></p>
   <div id="wsbody"></div>
   <div class="row">
     <button class="act" id="wsupload" type="button">＋ Upload</button>
@@ -2382,11 +2385,10 @@ function openMenu(s, anchor){
     `<button data-a="kill" class="danger">🗑 Kill session</button>`;
   m.querySelector('.mtitle').textContent = s.name;
   const sync=m.querySelector('.msync');                                   // app-synced indicator (avoid drifting state)
-  sync.textContent = _appLive ? '● desktop app synced' : '○ app offline — Add to collection disabled';
+  sync.textContent = _appLive ? 'Desktop projection synced' : 'Desktop projection unavailable; collections use PC authority';
   sync.className = 'msync '+(_appLive?'ok':'off');
   const addB=m.querySelector('[data-a="addcol"]');
-  if(!_appLive){ addB.disabled=true; addB.title='Open the desktop app to add to a collection (it owns your collections, so this can’t drift out of sync)'; }
-  else if(!chatBackedSession(s)){ addB.disabled=true; addB.title='This tab is not linked to a chat, so it cannot be filed into a collection'; }
+  if(!s.sessionId){ addB.disabled=true; addB.title='This tab is not linked to an exact chat, so it cannot be filed into a collection'; }
   const rdB=m.querySelector('[data-a="reader"]');
   if(!s.sessionId){ rdB.disabled=true; rdB.title='This tab is not linked to a chat yet, so there is no transcript to read'; }
   const ahB=m.querySelector('[data-a="autoheal"]');
@@ -2447,7 +2449,7 @@ function menuAction(a, s){
     const prompt=detachedAdopted
       ? 'Remove detached mirror "'+s.name+'"? The local terminal and its agent keep running on your PC.'
       : 'Kill session "'+s.name+'"? This ends the PC-hosted mux session (any running agent stops).';
-    if(confirm(prompt)){ killSession(s.name); }
+    if(confirm(prompt)){ killSession(s); }
   }
 }
 // ---- app-sync state + Add-to-collection --------------------------------------------------------------
@@ -2485,9 +2487,15 @@ function setAddDeckNewVisible(){
   if(isNew) setTimeout(()=>$('#adddecknew').focus(),30);
 }
 function chatBackedSession(s){ return !!(s && (s.sessionId || s.projectMuxName)); }
-function addToCollection(s){
-  if(!_appLive){ flash('Desktop app is closed — open it to add to a collection (so states don’t drift)'); return; }
-  if(!chatBackedSession(s)){ flash('This tab is not linked to a chat yet, so it cannot be filed into a collection'); return; }
+async function addToCollection(s){
+  if(!s?.sessionId){ flash('This tab is not linked to an exact chat yet, so it cannot be filed into a collection'); return; }
+  try{
+    const response=await fetch((window.MUX_DISCOVERY_BASE||base+'/pc/api/discovery')+'/admin/containers');
+    if(!response.ok) throw new Error('PC container authority unavailable');
+    const containers=await response.json();
+    _appDecks=containers.decks.map(d=>({id:d.id,name:d.label}));
+    _appCollections=containers.collections.map(c=>({id:c.id,name:c.label,deckId:c.deckId,deckName:c.deckLabel,chats:c.sessionIds}));
+  }catch(e){ flash('Cannot load collections: '+(e.message||e)); return; }
   addColTarget=s;
   const list=$('#addcollist'); list.innerHTML='';
   if(!_appCollections.length){ const p=document.createElement('div'); p.className='hint'; p.textContent='No collections yet — type a name below to make one.'; list.appendChild(p); }
@@ -2517,25 +2525,69 @@ async function submitAddCol(target){
   if(typeof target==='string') target={ collection:target };
   target=target||{};
   const s=addColTarget; if(!s) return;
+  if(!s.sessionId){ flash('Exact chat identity required before creating or changing collections'); return; }
   const choice=target.collectionId ? { deckId:target.deckId||'main', deckName:target.deckName||appDeckLabel(target.deckId) } : addColDeckChoice();
   const name=(target.collection||$('#addcolnew').value||'').trim();
   if(!name){ flash('Pick a collection or type a new name'); return; }
   if(!target.collectionId && !choice.deckId && !choice.deckName){ flash('Pick a deck or type a new deck name'); return; }
-  if(!_appLive){ flash('App went offline — can’t add now'); $('#addcoldlg').close(); return; }
   const btns=$('#addcoldlg').querySelectorAll('button'); btns.forEach(b=>b.disabled=true);
+  $('#addcolstatus').textContent='Waiting for PC confirmation…';
+  const creationKey='mux.collection-filing.v1:'+JSON.stringify([s.sessionId,name,choice.deckId,choice.deckName]);
   try{
+    const discoveryBase=window.MUX_DISCOVERY_BASE||base+'/pc/api/discovery';
+    const readContainers=async()=>{
+      const response=await fetch(discoveryBase+'/admin/containers');
+      if(!response.ok) throw new Error('PC container authority unavailable');
+      return response.json();
+    };
+    const createContainer=async body=>{
+      const intents=JSON.parse(localStorage.getItem(creationKey)||'{}');
+      if(!intents[body.type]){
+        intents[body.type]='container-'+crypto.randomUUID().replaceAll('-','');
+        localStorage.setItem(creationKey,JSON.stringify(intents));
+      }
+      const response=await postIntent(base+'/api/app-commands',{...body,intentId:intents[body.type]},'create-container');
+      if(!response.ok) throw new Error(await apiError(response));
+      const receipt=await response.json();
+      if(!receipt.id) throw new Error('creation receipt missing; refresh before retrying');
+      if(await pollUploadCmd(receipt.id,20000)===null) throw new Error('creation outcome unknown; refresh before retrying');
+      const outcomeResponse=await fetch(base+'/api/app-commands/'+encodeURIComponent(receipt.id));
+      if(!outcomeResponse.ok) throw new Error('creation result unavailable; refresh before retrying');
+      const outcome=await outcomeResponse.json();
+      if(outcome.status!=='done'||!outcome.resultId) throw new Error('exact created container identity unavailable');
+      return outcome.resultId;
+    };
+    let containers=await readContainers();
+    let deckId=choice.deckId;
+    if(!target.collectionId&&!deckId){
+      deckId=await createContainer({type:'deckcreate',name:choice.deckName});
+      containers=await readContainers();
+      if(!containers.decks.some(deck=>deck.id===deckId)) throw new Error('created deck no longer exists');
+    }
+    let collection=target.collectionId?containers.collections.find(item=>item.id===target.collectionId):null;
+    if(!target.collectionId){
+      const collectionId=await createContainer({type:'collectioncreate',name,deckId});
+      containers=await readContainers();
+      collection=containers.collections.find(item=>item.id===collectionId&&item.deckId===deckId);
+    }
+    if(!collection||!s.sessionId) throw new Error('exact chat and collection required');
+    const membershipResponse=await fetch(discoveryBase+'/start/collections?deckId='+encodeURIComponent(collection.deckId));
+    if(!membershipResponse.ok) throw new Error('PC membership authority unavailable');
+    const membership=(await membershipResponse.json()).rows.find(item=>item.id===collection.id);
+    if(!membership?.revision) throw new Error('exact collection membership revision required');
     const r=await postIntent(base+'/api/app-commands',
-      { type:'addtocollection', muxName:s.projectMuxName||s.muxName||s.name, sessionName:s.name, sessionId:s.sessionId||'', collection:name, collectionId:target.collectionId||'', deckId:choice.deckId||'', deckName:choice.deckName||'' },
+      { type:'addtocollection', muxName:s.projectMuxName||s.muxName||s.name, sessionName:s.name, sessionId:s.sessionId||'', collection:name, collectionId:collection.id, expectedCollectionRevision:membership.revision, deckId:choice.deckId||'', deckName:choice.deckName||'' },
       'add-collection');
     if(!r.ok) throw new Error(await apiError(r));
     const queued=await r.json();
     const detail=await pollUploadCmd(queued.id, 20000);
     if(detail===null) throw new Error('timed out waiting for the desktop app');
+    localStorage.removeItem(creationKey);
     $('#addcoldlg').close();
     flash('Added "'+s.name+'" to "'+name+'" on '+(choice.deckName||appDeckLabel(choice.deckId)));
     pollAppSync();
   }catch(e){
-    flash('Couldn’t add: '+(e.message||e));
+    $('#addcolstatus').textContent='Filing not confirmed: '+(e.message||e)+'. Retry the same names to reconcile the original creation.';
   }finally{
     btns.forEach(b=>b.disabled=false);
   }
@@ -2568,13 +2620,14 @@ async function apiError(r){
   }catch(e){}
   return msg;
 }
-async function killSession(name){
+async function killSession(s){
+  const name=s.name;
   try{
-    const r=await sendIntent('DELETE', base+'/api/sessions/'+encodeURIComponent(name), null, 'kill');
+    const r=await sendIntent('DELETE', base+'/api/sessions/'+encodeURIComponent(name),
+      {sessionId:s.authoritativeSessionId,generationId:s.generationId}, 'kill');
     if(!r.ok) throw new Error(await apiError(r));
     const result=await r.json();
-    if(current===name){ intentional=true; current=null; if(ws){try{ws.close();}catch(e){}} term.reset(); $('#empty').style.display='flex'; setStatus('',result.detail||'Session ended'); }
-    else if(result.detail) flash(result.detail);
+    flash(result.detail||'Session ended');
     loadSessions();
   }catch(e){ flash('Kill failed: '+(e.message||e)); loadSessions(); }
 }
@@ -2647,16 +2700,14 @@ function exportTabs(){
 async function killAllTabs(){
   const list=(window._sessions||[]).slice();
   if(!list.length){ flash('No tabs to delete'); return; }
-  if(!confirm('Delete ALL '+list.length+' tabs and start fresh?\n\nThis removes every PC-hosted mux tab (any running agents stop) AND clears their tracked session history. Cannot be undone.\n\n(Tip: Export first if you want to keep the resume commands.)')) return;
+  if(!confirm('Delete all '+list.length+' listed tabs?\n\nThis stops the listed PC-hosted mux generations. Changed or newly created tabs are preserved. Tracked session history is kept.\n\n(Tip: Export first if you want to keep the resume commands.)')) return;
   $('#managedlg').close();
   flash('Deleting '+list.length+' tabs…');
   let ok=0, fail=0;
   for(const s of list){
-    try{ const r=await sendIntent('DELETE', base+'/api/sessions/'+encodeURIComponent(s.name), null, 'kill-all'); if(r.ok) ok++; else fail++; }catch(e){ fail++; }
+    try{ const r=await sendIntent('DELETE', base+'/api/sessions/'+encodeURIComponent(s.name),
+      {sessionId:s.authoritativeSessionId,generationId:s.generationId}, 'kill-all'); if(r.ok) ok++; else fail++; }catch(e){ fail++; }
   }
-  // Start fresh: also clear the app's per-tab session history so no stale/mislabeled entries linger.
-  if(_appLive){ try{ await postIntent(base+'/api/app-commands',{type:'cleartabhistory'},'clear-history'); }catch(e){} }
-  if(current){ intentional=true; try{ if(ws) ws.close(); }catch(e){} intentional=false; current=null; try{ term.reset(); }catch(e){} $('#empty').style.display='flex'; setStatus('','All tabs deleted'); }
   flash('Deleted '+ok+' tab'+(ok!==1?'s':'')+(fail?(' · '+fail+' failed'):''));
   loadSessions();
 }
@@ -2731,7 +2782,7 @@ document.querySelectorAll('#empty .quick button').forEach(b=> b.onclick=()=>open
 // rename — three independent names: multiplex tab (mux session), native (Claude/Codex own title,
 // via the app's `rename` command), and app display override (CustomTitle, via `setapptitle`). The
 // native + app fields only apply when the tab is linked to a chat (has a sessionId) and are actioned
-// by the desktop app when it's live (they queue otherwise and land on its next sync).
+// by the PC bridge, including its headless fallback. Queue admission is not completion.
 let renameTarget=null, renameSessionId='', renameTool='';
 function openRenameDialog(s){
   renameTarget=s.name; renameSessionId=s.sessionId||''; renameTool=s.tool||'';
@@ -2745,6 +2796,12 @@ function openRenameDialog(s){
   $('#renameapplabel').classList.toggle('rndim', !linked);
   app.placeholder=linked?'blank = show the native name':'';
   $('#renamenote').style.display=linked?'none':'block';
+  $('#renamestatus').textContent='';
+  nat.dataset.pending='';
+  try{
+    const pending=JSON.parse(localStorage.getItem('mux.native-rename.v1:'+JSON.stringify([base,renameSessionId,renameTool]))||'null');
+    if(pending){ nat.value=pending.title; nat.dataset.pending='1'; $('#renamestatus').textContent='Native rename outcome unknown; Save reconciles the original request.'; }
+  }catch{ $('#renamestatus').textContent='Cannot read pending native rename; restore browser storage before retrying.'; }
   openDialog('#renamedlg'); setTimeout(()=>mux.select(),50);
 }
 $('#cancelrename').onclick = ()=>$('#renamedlg').close();
@@ -2758,19 +2815,72 @@ $('#dorename').onclick = async ()=>{
   const to=($('#renameinput').value||'').replace(/[^A-Za-z0-9_.-]/g,'').slice(0,40);
   const nat=($('#renamenative').value||'').slice(0,200), origNat=$('#renamenative').dataset.orig||'';
   const app=($('#renameapp').value||'').slice(0,200), origApp=$('#renameapp').dataset.orig||'';
-  $('#renamedlg').close();
+  if($('#dorename').disabled) return;
+  $('#dorename').disabled=true;
+  $('#cancelrename').disabled=true;
+  $('#renamestatus').textContent='Waiting for PC confirmation…';
   const errs=[]; let did=false;
-  // Native + app names: queue app-commands (the desktop app applies them; they land on its next sync if closed).
+  // Native + app names require the PC's terminal command result, not just queue admission.
   if(sid){
-    if(nat.trim() && nat!==origNat){
+    if(nat.trim() && (nat!==origNat || $('#renamenative').dataset.pending==='1')){
       did=true;
-      try{ const r=await postIntent(base+'/api/app-commands',{type:'rename', sessionId:sid, tool, title:nat},'rename-native'); if(!r.ok) errs.push('native: '+await apiError(r)); }catch(e){ errs.push('native: '+(e.message||e)); }
+      const pendingKey='mux.native-rename.v1:'+JSON.stringify([base,sid,tool]);
+      try{
+        let pending=JSON.parse(localStorage.getItem(pendingKey)||'null');
+        if(pending && pending.title!==nat) throw new Error('An earlier native rename is unconfirmed. Retry its original title before choosing another.');
+        if(!pending){
+          const discoveryBase=window.MUX_DISCOVERY_BASE||base+'/pc/api/discovery';
+          let chat=null;
+          for(let offset=0;!chat;){
+            const response=await fetch(discoveryBase+'/chats?showHidden=true&archived=all&limit=100&offset='+offset);
+            if(!response.ok) throw new Error('PC discovery unavailable');
+            const page=await response.json();
+            if(!Array.isArray(page.rows)) throw new Error('invalid PC discovery response');
+            chat=page.rows.find(row=>row.id===sid&&row.tool===tool);
+            if(chat||page.rows.length===0) break;
+            offset+=page.rows.length;
+            if(Number.isFinite(page.total)&&offset>=page.total) break;
+          }
+          if(!chat?.revision) throw new Error('exact chat revision unavailable');
+          pending={type:'rename',sessionId:sid,tool,title:nat,expectedRevision:chat.revision,intentId:'rename-native-'+crypto.randomUUID().replaceAll('-','')};
+          localStorage.setItem(pendingKey,JSON.stringify(pending));
+        }
+        const r=await postIntent(base+'/api/app-commands',pending,'rename-native');
+        if(!r.ok) throw new Error(await apiError(r));
+        const command=await r.json();
+        if(!command.id) throw new Error('missing command receipt');
+        if(await pollUploadCmd(command.id,60000)===null) throw new Error('outcome unknown; retry reconciles the original request');
+        localStorage.removeItem(pendingKey);
+        $('#renamenative').dataset.orig=nat;
+        $('#renamenative').dataset.pending='';
+      }catch(e){
+        if(e.terminal){ localStorage.removeItem(pendingKey); $('#renamenative').dataset.pending=''; }
+        errs.push('native: '+(e.message||e));
+      }
     }
     if(app!==origApp){
       did=true;
-      try{ const r=await postIntent(base+'/api/app-commands',{type:'setapptitle', sessionId:sid, title:app},'rename-app'); if(!r.ok) errs.push('app: '+await apiError(r)); }catch(e){ errs.push('app: '+(e.message||e)); }
+      try{
+        const discoveryBase=window.MUX_DISCOVERY_BASE||base+'/pc/api/discovery';
+        let chat=null;
+        for(let offset=0;!chat;){
+          const response=await fetch(discoveryBase+'/chats?showHidden=true&archived=all&limit=100&offset='+offset);
+          if(!response.ok) throw new Error('PC discovery unavailable');
+          const page=await response.json();
+          if(!Array.isArray(page.rows)) throw new Error('invalid PC discovery response');
+          chat=page.rows.find(row=>row.id===sid&&row.tool===tool);
+          if(chat||page.rows.length===0) break;
+          offset+=page.rows.length;
+          if(Number.isFinite(page.total)&&offset>=page.total) break;
+        }
+        if(!chat?.revision) throw new Error('exact chat revision unavailable');
+        const r=await postIntent(base+'/api/app-commands',{type:'setapptitle', sessionId:sid, title:app, expectedRevision:chat.revision},'rename-app');
+        if(!r.ok) throw new Error(await apiError(r));
+        const command=await r.json();
+        if(!command.id) throw new Error('missing command receipt');
+        if(await pollUploadCmd(command.id,60000)===null) throw new Error('outcome unknown; refresh before retrying');
+      }catch(e){ errs.push('app: '+(e.message||e)); }
     }
-    if(did && !_appLive) errs.push('desktop app is offline — the native/app name will apply when it’s next open');
   }
   // Multiplex tab name last (it may re-attach the terminal under the new name).
   if(to && from && to!==from){
@@ -2783,8 +2893,12 @@ $('#dorename').onclick = async ()=>{
       if(current===from){ connect(to); } else loadSessions();   // re-attach under the new name (only on confirmed rename)
     }
   } else { loadSessions(); }
-  if(!did){ return; }
-  flash(errs.length ? ('Some names didn’t change — '+errs.join('; ')) : 'Renamed');
+  $('#dorename').disabled=false;
+  $('#cancelrename').disabled=false;
+  $('#renamestatus').textContent=errs.length ? ('Some names were not confirmed — '+errs.join('; ')) : '';
+  if(errs.length) return;
+  $('#renamedlg').close();
+  if(did) flash('Renamed');
 };
 
 // compose
@@ -2891,18 +3005,22 @@ function renderWsDetail(body){
   const kc=document.createElement('input'); kc.type='checkbox'; kc.checked=!!f.keep; kc.onchange=ev=>{ wsKeep(f, ev.target.checked); setMeta(); };
   keepL.appendChild(kc); keepL.appendChild(document.createTextNode(' keep')); acts.appendChild(keepL);
   acts.appendChild(mk('Delete','del', ()=>wsDelete(f)));
-  d.appendChild(back); d.appendChild(preview); d.appendChild(name); d.appendChild(meta); d.appendChild(acts);
+  const status=document.createElement('p'); status.id='wsinsertstatus'; status.setAttribute('role','status');
+  d.appendChild(back); d.appendChild(preview); d.appendChild(name); d.appendChild(meta); d.appendChild(acts); d.appendChild(status);
   body.appendChild(d);
 }
 async function wsUploadFiles(files){
+  const uploadError=$('#wsuploaderror'); uploadError.textContent=''; uploadError.hidden=true;
   const keep = $('#wskeepnew').checked ? '1':'0';
   if(!$('#uploaddlg').open){ wsSel=null; openDialog('#uploaddlg'); }
   for(const f of files){
     // raw-fetch-allowlist: same as the paste path — the request body IS the file, so the intent journal
     // (which sends a JSON envelope) cannot wrap it. Duplicates are visible files, not silent damage.
-    try{ await fetch(base+'/api/upload?session='+encodeURIComponent(current||'')+'&keep='+keep+'&name='+encodeURIComponent(f.name),
-      { method:'POST', headers:{'Content-Type':'application/octet-stream'}, body:f }); }
-    catch(e){ flash('Upload failed: '+(e.message||e)); }
+    try{ const response = await fetch(base+'/api/upload?session='+encodeURIComponent(current||'')+'&keep='+keep+'&name='+encodeURIComponent(f.name),
+      { method:'POST', headers:{'Content-Type':'application/octet-stream'}, body:f });
+      if(!response.ok) throw new Error('HTTP '+response.status);
+    }
+    catch(e){ uploadError.textContent='Upload failed: '+(e.message||e); uploadError.hidden=false; }
   }
   wsSel=null; loadWorkspace();   // back to the grid so the new file is visible
 }
@@ -2912,7 +3030,7 @@ async function pollUploadCmd(id, timeoutMs){
     await new Promise(r=>setTimeout(r,1200));
     let c=null; try{ c=await (await fetch(base+'/api/app-commands/'+encodeURIComponent(id))).json(); }catch(e){}
     if(c && c.status==='done') return c.detail||'';
-    if(c && c.status==='failed') throw new Error(c.detail||'failed on the PC');
+    if(c && c.status==='failed') throw Object.assign(new Error(c.detail||'failed on the PC'),{terminal:true});
   }
   return null;
 }
@@ -2920,22 +3038,43 @@ async function pollUploadCmd(id, timeoutMs){
 // The local path never returns to or persists on the relay/browser.
 async function insertUploadIntoPrompt(f, insert){
   if(!current) throw new Error('open a mux session first');
+  const selected = findSession(current);
+  if(!selected?.sessionId || !selected?.generationId) throw new Error('Refresh the session list: exact chat identity is required for insertion');
+  const destination = { muxName: current, sessionId: selected.sessionId, generationId: selected.generationId };
   flash('Transferring “'+f.name+'” to the PC…');
-  const cmd=await postIntent(base+'/api/app-commands',
-    { type:'fetchfile', uploadId:f.id, filename:f.name, keep:!!f.keep, muxName:current, insert:insert||'path' },
-    'fetch-file');
+  const payload={ type:'fetchfile', uploadId:f.id, filename:f.name, keep:!!f.keep, ...destination, insert:insert||'path' };
+  const pendingKey='mux.upload-insertion.v1:'+JSON.stringify([base,f.id,destination.sessionId,destination.generationId,destination.muxName,payload.insert]);
+  let pending=JSON.parse(localStorage.getItem(pendingKey)||'null');
+  if(!pending){
+    pending={...payload,intentId:'fetch-file-'+crypto.randomUUID().replaceAll('-','')};
+    localStorage.setItem(pendingKey,JSON.stringify(pending));
+  }
+  const cmd=await postIntent(base+'/api/app-commands',pending,'fetch-file');
   if(!cmd.ok) throw new Error('queue HTTP '+cmd.status);
   const id=(await cmd.json()).id;
   const detail=await pollUploadCmd(id, 60000);
-  if(!detail) throw new Error('no response from the PC app — is it open?');
+  if(!detail) throw new Error('insertion outcome unknown; retry reconciles the original request');
+  localStorage.removeItem(pendingKey);
   f.onPc=true;
 }
 async function wsAdd(f, insert){
+  const status=$('#wsinsertstatus');
+  if(status) status.textContent='Waiting for PC insertion confirmation…';
   try{ await insertUploadIntoPrompt(f, insert||'path'); $('#uploaddlg').close(); term.focus(); flash(insert==='element'?'Added the image to your prompt':'Added the file path to your prompt'); }
-  catch(e){ flash('Couldn’t add: '+(e.message||e)); }
+  catch(e){
+    const message='Insertion not confirmed: '+(e.message||e);
+    if(status) status.textContent=message;
+    flash(message);
+  }
 }
 async function wsKeep(f, keep){ f.keep=keep; try{ await sendIntent('PATCH', base+'/api/uploads/'+encodeURIComponent(f.id), {keep}, 'upload-keep'); }catch(e){} }
-async function wsDelete(f){ try{ await sendIntent('DELETE', base+'/api/uploads/'+encodeURIComponent(f.id), null, 'upload-delete'); }catch(e){} wsFiles=wsFiles.filter(x=>x.id!==f.id); wsSel=null; renderWorkspace(); }
+async function wsDelete(f){
+  try{
+    const response = await sendIntent('DELETE', base+'/api/uploads/'+encodeURIComponent(f.id), null, 'upload-delete');
+    if(!response.ok) throw new Error('HTTP '+response.status);
+    wsFiles=wsFiles.filter(x=>x.id!==f.id); wsSel=null; renderWorkspace();
+  }catch(e){ flash('Couldn’t delete: '+(e.message||e)); }
+}
 
 // ---- expanded touch keybar -------------------------------------------------------------------------
 // Phones can't do key combos or navigation from the soft keyboard, so the bar provides: sticky

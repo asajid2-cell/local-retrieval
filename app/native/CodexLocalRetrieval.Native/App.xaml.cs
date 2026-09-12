@@ -28,7 +28,7 @@ public partial class App : Application
     // Held for the whole process lifetime so a second launch can detect us. Static so the GC
     // never collects it (which would silently release the lock).
     private static System.Threading.Mutex? _instanceMutex;
-    private const string SingleInstanceName = @"Local\CodexLocalRetrieval.SingleInstance";
+    private const string SingleInstanceName = @"Local\MUX.SingleInstance";
 
     [DllImport("user32.dll")] private static extern bool SetForegroundWindow(IntPtr hWnd);
     [DllImport("user32.dll")] private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
@@ -40,6 +40,7 @@ public partial class App : Application
     /// </summary>
     public App()
     {
+        GuiVerificationFixture.Validate();
         Diag.Log("App.ctor: before InitializeComponent");
         InitializeComponent();
         Diag.Log("App.ctor: after InitializeComponent");
@@ -60,11 +61,11 @@ public partial class App : Application
         // shortcut click spawns ANOTHER ~450MB process; the copies then thrash the CPU and fight
         // over app-store.json (IOException on save), which is what made everything feel slow.
         // A second launch just brings the live window forward and exits the duplicate.
-        _instanceMutex = new System.Threading.Mutex(initiallyOwned: true, SingleInstanceName, out var createdNew);
+        _instanceMutex = new System.Threading.Mutex(initiallyOwned: true, GuiVerificationFixture.Enabled ? GuiVerificationFixture.MutexName : SingleInstanceName, out var createdNew);
         if (!createdNew)
         {
             Diag.Log("OnLaunched: another instance is live -> focusing it, exiting this duplicate");
-            ActivateExistingInstance();
+            if (!GuiVerificationFixture.Enabled) ActivateExistingInstance();
             Environment.Exit(0);
             return;
         }

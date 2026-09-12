@@ -16,7 +16,17 @@ public sealed partial class MainPage
             ? ""
             : $" with {ArchiveService.LaunchModeLabel(launchMode)} marker";
         SyncStatus.Text = $"Forking \"{Trim(session.DisplayTitle, 40)}\"{modeLabel}...";
-        var result = await _archive.ForkSessionAsync(session, launchMode);
+        ArchiveService.BranchResult result;
+        try
+        {
+            result = await _archive.ForkSessionAsync(session, launchMode);
+        }
+        catch (Exception ex)
+        {
+            SyncStatus.Text = "Fork failed: " + ex.Message;
+            RenderIntegrity(force: true);
+            return;
+        }
         SyncStatus.Text = result.Message;
         RenderIntegrity(force: true);
         if (result.Ok && result.Branch is not null)
@@ -65,7 +75,17 @@ public sealed partial class MainPage
     {
         if (session is null) return;
         SyncStatus.Text = $"Branching \"{Trim(session.DisplayTitle, 40)}\"...";
-        var result = await _archive.BranchSessionAsync(session);
+        ArchiveService.BranchResult result;
+        try
+        {
+            result = await _archive.BranchSessionAsync(session);
+        }
+        catch (Exception ex)
+        {
+            SyncStatus.Text = "Branch failed: " + ex.Message;
+            RenderIntegrity(force: true);
+            return;
+        }
         SyncStatus.Text = result.Message;
         RenderIntegrity(force: true);
         if (result.Ok && result.Branch is not null)
@@ -78,7 +98,17 @@ public sealed partial class MainPage
     private async Task CreateCheckpointAsync(ArchiveSession session)
     {
         SyncStatus.Text = $"Creating checkpoint from \"{Trim(session.DisplayTitle, 40)}\"...";
-        var result = await _archive.CreateTemplateSnapshotAsync(session);
+        ArchiveService.TemplateSnapshotResult result;
+        try
+        {
+            result = await _archive.CreateTemplateSnapshotAsync(session);
+        }
+        catch (Exception ex)
+        {
+            SyncStatus.Text = "Checkpoint failed: " + ex.Message;
+            RenderIntegrity(force: true);
+            return;
+        }
         SyncStatus.Text = result.Message;
         RenderCurrent();
         RenderIntegrity(force: true);
@@ -91,7 +121,17 @@ public sealed partial class MainPage
         string collectionName,
         string? deckId)
     {
-        var result = await _archive.SpawnTemplateAsync(template);
+        ArchiveService.BranchResult result;
+        try
+        {
+            result = await _archive.SpawnTemplateAsync(template);
+        }
+        catch (Exception ex)
+        {
+            SyncStatus.Text = "Checkpoint spawn failed: " + ex.Message;
+            RenderIntegrity(force: true);
+            return;
+        }
         if (!result.Ok || result.Branch is null)
         {
             SyncStatus.Text = result.Message;

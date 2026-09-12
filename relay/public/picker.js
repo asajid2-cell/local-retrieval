@@ -170,8 +170,24 @@
     // One tap. Deliberately NOT guarded by an in-flight lock: a double-tap must reach the relay twice
     // and be collapsed THERE, because the intent journal — not the button's disabled state — is what
     // makes this idempotent across a reload, a flaky retry, or a second phone.
-    async function resume(chat) {
+    async function resume(chat, launchMode) {
+      if (launchMode && launchMode !== 'native' && launchMode !== 'gateway') return { state: 'failed', muxName: '', detail: 'Unsupported resume mode.' };
+      if (launchMode === 'gateway' && toolFor(chat) !== 'claude') return { state: 'failed', muxName: '', detail: 'Codex requires a new Gateway handoff chat, not same-chat resume.' };
       var muxName = muxNameFor(chat);
+      try {
+        var liveResponse = await fetchFn(base + '/api/sessions');
+        if (!liveResponse.ok) throw new Error('session authority unavailable');
+        var liveRows = await liveResponse.json();
+        if (!Array.isArray(liveRows)) throw new Error('invalid session listing');
+        var owners = liveRows.filter(function (row) {
+          return row.alive && !row.identityPending && row.generationId
+            && (row.sessionId === chat.id || (Array.isArray(row.aliases) && row.aliases.includes(chat.id)));
+        });
+        if (owners.length > 1) return { state: 'failed', muxName: '', detail: 'Multiple live owners; refresh and resolve ownership before resuming.' };
+        if (owners.length === 1) muxName = muxNameFor({ muxName: owners[0].name });
+      } catch (error) {
+        return { state: 'failed', muxName: '', detail: 'Could not verify the live resume destination.' };
+      }
       if (!muxName) return { state: 'failed', muxName: '', detail: 'this chat has no resumable session name' };
       var payload = {
         type: 'startmux',
@@ -179,6 +195,7 @@
         tool: toolFor(chat),
         muxName: muxName,
       };
+      if (launchMode) payload.launchMode = launchMode;
       var res;
       try {
         res = await postIntent(base + '/api/app-commands', payload, 'resume');

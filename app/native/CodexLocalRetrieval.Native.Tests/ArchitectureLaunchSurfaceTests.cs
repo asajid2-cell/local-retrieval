@@ -147,6 +147,32 @@ public sealed class ArchitectureLaunchSurfaceTests
     }
 
     [TestMethod]
+    public void GatewayCopy_IsAwaitedAndDoesNotLaunchOrBlockOnRiskGuard()
+    {
+        var root = FindRepoRoot();
+        var text = File.ReadAllText(Path.Combine(root, "native", "CodexLocalRetrieval.Native", "MainPage.xaml.cs"));
+        var start = text.IndexOf("private async void CopyGatewayCommandIfClear()", StringComparison.Ordinal);
+        var end = text.IndexOf("private async Task Copy(", start, StringComparison.Ordinal);
+        Assert.IsTrue(start >= 0 && end > start, "Could not locate Gateway copy handler.");
+        var handler = text[start..end];
+
+        Assert.Contains("await Copy(\"command\", ArchiveService.GatewayLaunchMode", handler);
+        Assert.DoesNotContain("RiskySessionActionBlocked", handler);
+        Assert.DoesNotContain("OpenSession", handler);
+        Assert.DoesNotContain("Open", handler);
+        Assert.DoesNotContain("BuildResumeLaunch", handler);
+        Assert.DoesNotContain("BuildMultiplexCommand", handler);
+        Assert.DoesNotContain("RiskySessionActionBlocked", handler);
+
+        var copyStart = text.IndexOf("private async Task Copy(", StringComparison.Ordinal);
+        var copyEnd = text.IndexOf("private void CopyPath(", copyStart, StringComparison.Ordinal);
+        var copy = text[copyStart..copyEnd];
+        Assert.Contains("var text = await _archive.CopyPayloadAsync", copy);
+        Assert.Contains("Clipboard.SetContent(package);", copy);
+        Assert.Contains("SyncStatus.Text = $\"Copy failed:", copy);
+    }
+
+    [TestMethod]
     public void ArchiveTranscriptReadsAndSearchesAreStreamingAndBounded()
     {
         var root = FindRepoRoot();
@@ -317,7 +343,7 @@ public sealed class ArchitectureLaunchSurfaceTests
             "native",
             "CodexLocalRetrieval.Native",
             "MainPage.RunningChats.cs"));
-        Assert.Contains("RunningSessions.TryOpenTranscriptSessionIds", runningChats);
+        Assert.Contains("RunningSessions.TryScanEnriched", runningChats);
         Assert.DoesNotContain("OpenHandles.OpenTranscriptSessionIds", runningChats);
     }
 
@@ -412,9 +438,61 @@ public sealed class ArchitectureLaunchSurfaceTests
             "MainPage.xaml.cs"));
 
         StringAssert.Contains(remote, "StartRemoteSessionAsGateway");
+        StringAssert.Contains(remote, "ClearClaimsAfterVerifiedKill");
         StringAssert.Contains(remote, "launchModeOverride: ArchiveService.GatewayLaunchMode");
         StringAssert.Contains(page, "Start Gateway multiplex");
         StringAssert.Contains(page, "Start Gateway headless multiplex");
+    }
+
+    [TestMethod]
+    public void MuxBinding_RejectsWeakIdentityFallbacksAndRequiresProcessOwnedIdentity()
+    {
+        var root = FindRepoRoot();
+        var archive = File.ReadAllText(Path.Combine(
+            root,
+            "native",
+            "CodexLocalRetrieval.Core",
+            "Services",
+            "ArchiveService.cs"));
+        var start = archive.IndexOf("private Dictionary<string, object> ResolveMuxTabChats()", StringComparison.Ordinal);
+        var end = archive.IndexOf("public IReadOnlyList<PendingMuxBinding> ResolvePendingMuxBindings()", start, StringComparison.Ordinal);
+        Assert.IsTrue(start >= 0 && end > start, "Could not locate the mux binding resolver.");
+        var resolver = archive[start..end];
+
+        Assert.Contains("ScanAgentsWithPpid", resolver);
+        Assert.Contains("AncestorTab", resolver);
+        Assert.DoesNotContain("FreshAgentSessionIdByStart", resolver);
+        Assert.DoesNotContain("OrderByDescending(s => s.UpdatedAt", resolver);
+        Assert.DoesNotContain("cwdShareCount", resolver);
+        Assert.DoesNotContain("tabCwd.Values", resolver);
+        Assert.Contains("if (!string.IsNullOrEmpty(ag.SessionId))", resolver);
+    }
+
+    [TestMethod]
+    public void GatewayCopyAffordance_UsesExplicitClaudeOnlyOverride()
+    {
+        var root = FindRepoRoot();
+        var page = File.ReadAllText(Path.Combine(
+            root,
+            "native",
+            "CodexLocalRetrieval.Native",
+            "MainPage.xaml.cs"));
+        var xaml = File.ReadAllText(Path.Combine(
+            root,
+            "native",
+            "CodexLocalRetrieval.Native",
+            "MainPage.xaml"));
+        var core = File.ReadAllText(Path.Combine(
+            root,
+            "native",
+            "CodexLocalRetrieval.Core",
+            "Services",
+            "ArchiveService.cs"));
+
+        StringAssert.Contains(xaml, "CopyGatewayCommandButton");
+        StringAssert.Contains(page, "ArchiveService.CanResumeThroughGateway(_selected.Tool)");
+        StringAssert.Contains(page, "await Copy(\"command\", ArchiveService.GatewayLaunchMode, \"Gateway command copied.\")");
+        StringAssert.Contains(core, "ResumeCommandText(session, launchModeOverride)");
     }
 
     [TestMethod]
@@ -425,6 +503,7 @@ public sealed class ArchitectureLaunchSurfaceTests
         {
             Path.Combine(root, "native", "CodexLocalRetrieval.Native", "MainPage.StartChat.cs"),
             Path.Combine(root, "native", "CodexLocalRetrieval.Native", "MainPage.Sessions.cs"),
+            Path.Combine(root, "native", "CodexLocalRetrieval.Native", "MainPage.Remote.cs"),
         };
 
         foreach (var file in files)

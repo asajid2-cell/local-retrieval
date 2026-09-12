@@ -9,6 +9,7 @@ using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Media;
 using Microsoft.UI.Xaml.Media.Imaging;
 using Windows.Graphics.Imaging;
+using CodexLocalRetrieval.Core.Models;
 
 namespace CodexLocalRetrieval_Native;
 
@@ -60,7 +61,12 @@ public sealed partial class MainPage
             foreach (var step in req.steps ?? new List<CapStep>())
             {
                 try { await RunStepAsync(step, artifacts); }
-                catch (Exception ex) { errors.Add(step + ": " + ex.Message); Diag.Log("step error " + ex); }
+                catch (Exception ex)
+                {
+                    errors.Add(step + ": " + ex.Message);
+                    Diag.Log("step error " + ex);
+                    break;
+                }
             }
         }
         finally
@@ -74,13 +80,95 @@ public sealed partial class MainPage
 
     private async Task RunStepAsync(CapStep step, List<string> artifacts)
     {
+        if (GuiVerificationFixture.Enabled)
+        {
+            if (step.nav is not (null or "Archive") || step.click is not null || step.clipboard is true)
+                throw new InvalidOperationException("GUI metadata fixture permits read-only capture steps only");
+            foreach (var name in new[] { step.shot, step.dump, step.snapshot })
+                if (name is not null && !System.Text.RegularExpressions.Regex.IsMatch(name, @"\A[A-Za-z0-9_-]{1,80}\z"))
+                    throw new InvalidOperationException("GUI fixture artifact name refused");
+        }
         if (step.nav is not null) Navigate(step.nav);
         if (step.resize is { Length: 2 }) MainWindow.Instance?.AppWindow.Resize(new Windows.Graphics.SizeInt32(step.resize[0], step.resize[1]));
         if (step.type is not null) { SearchBox.Text = step.type; ApplySearch(step.type); }
-        if (step.click is not null) InvokeByText(step.click);
+        if (step.click is not null)
+        {
+            InvokeByText(step.click, step.expectedSessionId);
+        }
+        else if (step.expectedSessionId is not null)
+        {
+            RequireExpectedSelection(step.expectedSessionId, null);
+        }
+        if (step.clipboard is true
+            && step.click is not ("CopyGatewayCommandButton" or "Copy Gateway command"))
+            throw new InvalidOperationException("Clipboard snapshot requires a CopyGatewayCommandButton click in the same step.");
+        if (step.selectSessionId is not null) SelectDisplayedSession(step.selectSessionId);
+        if (step.waitMs is not null)
+        {
+            if (step.waitMs is < 0 or > 10000) throw new ArgumentOutOfRangeException(nameof(step.waitMs), "waitMs must be between 0 and 10000 milliseconds.");
+            await Task.Delay(step.waitMs.Value);
+        }
         await SettleAsync(step.wait ?? 3);
         if (step.shot is not null) artifacts.Add(await CaptureAsync(step.shot));
         if (step.dump is not null) artifacts.Add(DumpTree(step.dump));
+        if (step.snapshot is not null) artifacts.Add(WriteStateSnapshot(step.snapshot));
+        if (step.clipboard is true) artifacts.Add(await WriteClipboardSnapshotAsync());
+    }
+
+    private void SelectDisplayedSession(string id)
+    {
+        if (string.IsNullOrWhiteSpace(id)) throw new ArgumentException("selectSessionId must not be empty.", nameof(id));
+
+        for (var index = 0; index < SessionList.Items.Count; index++)
+        {
+            if (SessionList.Items[index] is not ArchiveSession session
+                || !string.Equals(session.Id, id, StringComparison.OrdinalIgnoreCase)) continue;
+
+            var container = SessionList.ContainerFromIndex(index) as ListViewItem;
+            if (container is null) throw new InvalidOperationException($"Session '{id}' is not displayed.");
+            var peer = new ListViewItemDataAutomationPeer(session, new ListViewAutomationPeer(SessionList));
+            if (peer.GetPattern(PatternInterface.SelectionItem) is not ISelectionItemProvider selection)
+                throw new InvalidOperationException("Displayed session item has no selection automation pattern.");
+
+            selection.Select();
+            if (SessionList.SelectedItem is not ArchiveSession selected
+                || !string.Equals(selected.Id, id, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException($"Session selection did not settle on '{id}'.");
+            return;
+        }
+
+        throw new InvalidOperationException($"Displayed session '{id}' was not found.");
+    }
+
+    private string WriteStateSnapshot(string name)
+    {
+        var selectedItemId = (SessionList.SelectedItem as ArchiveSession)?.Id;
+        var path = Path.Combine(CapDir, "out", name + ".json");
+        File.WriteAllText(path, JsonSerializer.Serialize(new
+        {
+            selectedId = _selected?.Id,
+            selectedItemId,
+            renderedTitle = TitleText.Text,
+            screen = _screen,
+            syncInProgress = _syncing,
+            count = _archive.Sessions.Count
+        }));
+        return path;
+    }
+
+    private async Task<string> WriteClipboardSnapshotAsync()
+    {
+        var content = Windows.ApplicationModel.DataTransfer.Clipboard.GetContent();
+        if (content is null || !content.Contains(Windows.ApplicationModel.DataTransfer.StandardDataFormats.Text))
+            throw new InvalidOperationException("Clipboard does not contain text after the copy action.");
+
+        var text = await content.GetTextAsync();
+        if (string.IsNullOrEmpty(text))
+            throw new InvalidOperationException("Clipboard text is absent after the copy action.");
+
+        var path = Path.Combine(CapDir, "out", "clipboard-command.txt");
+        File.WriteAllText(path, text);
+        return path;
     }
 
     // Yield enough UI-thread frames for layout/render to settle before capturing.
@@ -145,19 +233,68 @@ public sealed partial class MainPage
         return path;
     }
 
-    private void InvokeByText(string text)
+    private void RequireExpectedSelection(string? expectedSessionId, string? action)
     {
+        var isReclaim = action?.Contains("reclaim", StringComparison.OrdinalIgnoreCase) == true;
+        if (isReclaim && string.IsNullOrWhiteSpace(expectedSessionId))
+            throw new InvalidOperationException("Reclaim requires expectedSessionId.");
+        if (expectedSessionId is null) return;
+        if (string.IsNullOrWhiteSpace(expectedSessionId))
+            throw new InvalidOperationException("expectedSessionId must not be empty.");
+        var selectedId = _selected?.Id;
+        var selectedItemId = (SessionList.SelectedItem as ArchiveSession)?.Id;
+        if (!string.Equals(selectedId, expectedSessionId, StringComparison.Ordinal)
+            || !string.Equals(selectedItemId, expectedSessionId, StringComparison.Ordinal))
+            throw new InvalidOperationException($"Expected selected session '{expectedSessionId}', actual _selected='{selectedId}', SelectedItem='{selectedItemId}'.");
+    }
+
+    private void InvokeByText(string text, string? expectedSessionId)
+    {
+        RequireExpectedSelection(expectedSessionId, text);
+        if (text.Contains("launch", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("resume", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("delete", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("terminate", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("kill", StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException($"Destructive capture action '{text}' is not allowlisted.");
+
+        Button? unavailable = null;
         Button? Find(DependencyObject d)
         {
-            if (d is Button b && (b.Name == text || (b.Content as string) == text || ButtonText(b) == text)) return b;
+            if (d is Button b)
+            {
+                var caption = b.Content as string ?? ButtonText(b);
+                var matches = b.Name == text || caption == text
+                    || (text.Contains("reclaim", StringComparison.OrdinalIgnoreCase)
+                        && (b.Name.Contains("reclaim", StringComparison.OrdinalIgnoreCase)
+                            || caption?.Contains("reclaim", StringComparison.OrdinalIgnoreCase) == true));
+                if (matches)
+                {
+                    if (b.IsEnabled && b.Visibility == Visibility.Visible && b.ActualWidth > 0 && b.ActualHeight > 0)
+                        return b;
+                    unavailable ??= b;
+                }
+            }
             int n = VisualTreeHelper.GetChildrenCount(d);
-            for (int i = 0; i < n; i++) { var r = Find(VisualTreeHelper.GetChild(d, i)); if (r is not null) return r; }
+            for (int i = 0; i < n; i++)
+            {
+                var result = Find(VisualTreeHelper.GetChild(d, i));
+                if (result is not null) return result;
+            }
             return null;
         }
+
         var btn = Find(this);
-        if (btn is not null && new ButtonAutomationPeer(btn).GetPattern(PatternInterface.Invoke) is IInvokeProvider inv)
-            inv.Invoke();
+        if (btn is null)
+        {
+            if (unavailable is not null) throw new InvalidOperationException($"Button '{text}' is unavailable.");
+            throw new InvalidOperationException($"Button '{text}' was not found.");
+        }
+        if (new ButtonAutomationPeer(btn).GetPattern(PatternInterface.Invoke) is not IInvokeProvider inv)
+            throw new InvalidOperationException($"Button '{text}' has no invoke automation pattern.");
+        inv.Invoke();
     }
+
 
     private static string? ButtonText(Button b)
     {
@@ -186,8 +323,13 @@ internal sealed class CapStep
     public int[]? resize { get; set; }
     public string? type { get; set; }
     public string? click { get; set; }
+    public string? expectedSessionId { get; set; }
+    public string? selectSessionId { get; set; }
     public string? shot { get; set; }
     public string? dump { get; set; }
+    public string? snapshot { get; set; }
+    public bool? clipboard { get; set; }
     public int? wait { get; set; }
+    public int? waitMs { get; set; }
     public override string ToString() => JsonSerializer.Serialize(this);
 }

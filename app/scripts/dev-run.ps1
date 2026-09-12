@@ -1,7 +1,7 @@
 #requires -version 5
 <#
-  DEV ONLY: rebuild the Debug build and launch it from bin\Debug for fast iteration.
-  This is NOT the installed app - for a real, pinnable install run scripts\install.ps1.
+  DEV ONLY: rebuild the MUX Debug build and launch it from bin\Debug for fast iteration.
+  This is NOT the installed MUX app - for a real, pinnable install run scripts\install.ps1.
 #>
 [CmdletBinding()]
 param()
@@ -15,4 +15,4 @@ Get-Process -Name CodexLocalRetrieval.Native -ErrorAction SilentlyContinue | Sto
 & dotnet build $proj -c Debug --nologo -v m
 if ($LASTEXITCODE -ne 0) { throw 'build failed' }
 Start-Process $exe
-Write-Host "Launched the DEV build from bin\Debug. (Use scripts\install.ps1 for the real install.)" -ForegroundColor Yellow
+Write-Host "Launched the MUX DEV build from bin\Debug. (Use scripts\install.ps1 for the real install.)" -ForegroundColor Yellow

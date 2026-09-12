@@ -21,60 +21,6 @@ public sealed partial class MainPage
         return s.Length <= n ? s : s.Substring(0, n).TrimEnd() + "…";
     }
 
-    // A fresh `claude` (no `--resume <id>` on its command line) has no parsed session id, so the web's
-    // "Open" would 400 ("sessionId required"). An actively-running session is writing its transcript right
-    // now, so its .jsonl mtime is ~now. Match each id-less Claude session to the most-recently-modified
-    // Claude transcript that isn't already claimed by another running session — best-effort, newest-first,
-    // one-to-one, only very recent files. Leaves the id empty if there's no fresh candidate (Open stays
-    // disabled rather than guessing wrong). Codex ids almost always come from `codex resume <id>`, so we
-    // don't guess those (rollout↔thread-id mapping is ambiguous).
-    private List<ArchiveService.RunningSessionInfo> ResolveMissingSessionIds(List<ArchiveService.RunningSessionInfo> list)
-    {
-        if (!list.Any(s => string.IsNullOrEmpty(s.SessionId)
-                           && !string.Equals(s.Tool, "codex", StringComparison.OrdinalIgnoreCase)))
-            return list;
-        var claimed = new HashSet<string>(
-            list.Where(s => !string.IsNullOrEmpty(s.SessionId)).Select(s => s.SessionId),
-            StringComparer.OrdinalIgnoreCase);
-        var candidates = RecentClaudeTranscriptIds(claimed);
-        var ci = 0;
-        var outList = new List<ArchiveService.RunningSessionInfo>(list.Count);
-        foreach (var s in list)
-        {
-            if (!string.IsNullOrEmpty(s.SessionId) || string.Equals(s.Tool, "codex", StringComparison.OrdinalIgnoreCase))
-            { outList.Add(s); continue; }
-            if (ci < candidates.Count) outList.Add(s with { SessionId = candidates[ci++] });
-            else outList.Add(s);
-        }
-        return outList;
-    }
-
-    // Session ids of Claude transcripts modified within the last 15 minutes (newest first), excluding any
-    // already claimed by a running session. The filename (sans .jsonl) IS the session id.
-    private static List<string> RecentClaudeTranscriptIds(HashSet<string> claimed)
-    {
-        var result = new List<string>();
-        try
-        {
-            var root = Path.Combine(HomeDir, ".claude", "projects");
-            if (!Directory.Exists(root)) return result;
-            var cutoff = DateTime.UtcNow.AddMinutes(-15);
-            var hits = new List<(string id, DateTime mtime)>();
-            foreach (var dir in Directory.EnumerateDirectories(root))
-                foreach (var f in Directory.EnumerateFiles(dir, "*.jsonl"))
-                {
-                    var id = Path.GetFileNameWithoutExtension(f);
-                    if (claimed.Contains(id)) continue;
-                    DateTime mt;
-                    try { mt = File.GetLastWriteTimeUtc(f); } catch { continue; }
-                    if (mt >= cutoff) hits.Add((id, mt));
-                }
-            result.AddRange(hits.OrderByDescending(h => h.mtime).Select(h => h.id));
-        }
-        catch { }
-        return result;
-    }
-
     // Fill RealTitle + Preview on each running session (codex from its state DB, claude from its transcript).
     private List<ArchiveService.RunningSessionInfo> EnrichRunningSessionTitles(List<ArchiveService.RunningSessionInfo> list)
     {

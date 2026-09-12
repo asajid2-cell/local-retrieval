@@ -41,8 +41,11 @@ function fakeDocument() {
   const dialog = nodes.get('#startdlg');
   dialog.showModal = () => { dialog.open = true; };
   dialog.close = () => { dialog.open = false; };
+  const listeners = new Map();
   return {
     nodes,
+    addEventListener(type, listener) { listeners.set(type, listener); },
+    dispatchEvent(event) { return listeners.get(event.type)?.(event); },
     querySelector(selector) { return nodes.get(selector) || null; },
     createElement(tagName) { return element(tagName); },
   };
@@ -79,7 +82,7 @@ function optionsFetch(calls) {
         ok: true, status: 200,
         json: async () => ({
           rows: [{
-            id: 'checkpoint-1', label: 'Checkpoint one', sourceTitle: 'Source chat',
+            id: 'checkpoint-1', label: 'Checkpoint one', sourceTitle: 'Source chat', revision: 'checkpoint-r1',
             tool: 'codex', workspaceLabel: 'retrieval', createdAt: '2026-08-02T12:00:00Z',
             messageCount: 4,
           }],
@@ -95,7 +98,7 @@ function optionsFetch(calls) {
     if (address.includes('/start/collections?deckId=deck-main')) {
       return {
         ok: true, status: 200,
-        json: async () => ({ deckId: 'deck-main', rows: [{ id: 'collection-1', label: 'Web parity' }] }),
+        json: async () => ({ deckId: 'deck-main', rows: [{ id: 'collection-1', label: 'Web parity', revision: 'membership-r1', managementRevision: 'management-r1' }] }),
       };
     }
     if (address.includes('/api/app-commands/cmd-1')) {
@@ -141,6 +144,8 @@ test('start controller loads four pickers, sends opaque identity payload, polls,
   controller.setField('workspaceId', 'workspace-1');
   controller.setField('subfolder', 'fresh-folder');
   controller.setField('phrase', 'web parity');
+  controller.setField('collectionId', 'collection-1');
+  assert.equal(controller.payloadFor().collectionRevision, 'management-r1');
   controller.setField('collection', 'New collection');
 
   const outcome = await controller.submit();
@@ -154,6 +159,8 @@ test('start controller loads four pickers, sends opaque identity payload, polls,
       title: 'phone-start',
       tool: 'codex',
       checkpointId: '',
+      checkpointRevision: '',
+      collectionRevision: '',
       workspaceId: 'workspace-1',
       subfolder: 'fresh-folder',
       deckId: 'deck-main',
@@ -164,6 +171,21 @@ test('start controller loads four pickers, sends opaque identity payload, polls,
   });
   assert.deepEqual(navigated, ['phone-start']);
   assert.doesNotMatch(JSON.stringify(posted[0].payload), /command|cwd|path|exe|snapshot|transcript/i);
+});
+
+test('handoff opens a new Claude Gateway start with frozen source identity', async () => {
+  const sandbox = loadClient();
+  const doc = fakeDocument();
+  const ui = sandbox.MuxChats.installStartChat({ document: doc, $: selector => doc.querySelector(selector), fetch: optionsFetch([]), postIntent: async () => {}, navigate: async () => {} });
+  doc.dispatchEvent({ type: 'mux-gateway-handoff', detail: { sessionId: 'codex-source' } });
+  for (let i = 0; i < 12 && ui.controller.state.loading; i++) await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(ui.controller.state.form.handoffFromId, 'codex-source');
+  assert.equal(ui.controller.state.form.tool, 'claude');
+  assert.equal(ui.controller.state.form.launchMode, 'gateway');
+  assert.equal(doc.nodes.get('#starttool').disabled, true);
+  assert.match(doc.nodes.get('#startstatus').textContent, /Codex source stays unchanged/);
+  ui.open();
+  assert.equal(ui.controller.state.form.handoffFromId, '');
 });
 
 test('checkpoint mode clears and disables blank-chat controls, then restores them', async () => {
@@ -209,6 +231,8 @@ test('checkpoint mode clears and disables blank-chat controls, then restores the
     title: '',
     tool: '',
     checkpointId: 'checkpoint-1',
+    checkpointRevision: 'checkpoint-r1',
+    collectionRevision: '',
     workspaceId: '',
     subfolder: '',
     deckId: 'deck-main',

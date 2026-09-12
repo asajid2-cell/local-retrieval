@@ -80,8 +80,11 @@
   // replay-prone as POST once a phone drops the response, and the relay dedupes them all on intentId.
   async function sendIntent(method, url, payload, prefix) {
     const verb = String(method || 'POST').toUpperCase();
-    const acquired = acquire(verb, url, payload, prefix);
-    const body = { ...(payload || {}), intentId: acquired.intentId };
+    const explicitIntent = payload && payload.intentId;
+    if (explicitIntent !== undefined && !/^[A-Za-z0-9._-]{1,128}$/.test(explicitIntent))
+      throw new Error('invalid explicit operation intent');
+    const acquired = explicitIntent ? null : acquire(verb, url, payload, prefix);
+    const body = { ...(payload || {}), intentId: explicitIntent || acquired.intentId };
     let lastError = null;
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
@@ -90,7 +93,7 @@
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(body),
         });
-        if (!retryableStatus(response.status)) clear(acquired);
+        if (acquired && !retryableStatus(response.status)) clear(acquired);
         if (!retryableStatus(response.status) || attempt === 2) return response;
       } catch (error) {
         lastError = error;

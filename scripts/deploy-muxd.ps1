@@ -58,7 +58,15 @@ function Set-MuxdEnvValue([string]$Path, [string]$Name, [string]$Value) {
       (New-Object System.Text.UTF8Encoding($false))
     )
     if (Test-Path -LiteralPath $Path) {
-      [System.IO.File]::Replace($temp, $Path, $null)
+      $backupPath = "$Path.deploy-backup-$([guid]::NewGuid().ToString('N')).tmp"
+      try {
+        [System.IO.File]::Replace([string]$temp, [string]$Path, [string]$backupPath, $true)
+      }
+      finally {
+        if (Test-Path -LiteralPath $backupPath) {
+          Remove-Item -LiteralPath $backupPath -Force
+        }
+      }
     } else {
       Move-Item -LiteralPath $temp -Destination $Path
     }
@@ -88,6 +96,11 @@ function Invoke-RestartAndVerify([switch]$Recovery, [string]$RecoveryToken = '')
     }
   } else {
     $before = Get-ScheduledTaskInfo -TaskName $restartTask
+    $beforePids = @(
+      Get-CimInstance Win32_Process |
+        Where-Object { $_.CommandLine -match "C:\\Users\\Ahmed\\muxd\\muxd\.py" } |
+        ForEach-Object { [int]$_.ProcessId }
+    )
     Start-ScheduledTask -TaskName $restartTask
     $deadline = (Get-Date).AddSeconds(90)
     do {
@@ -95,15 +108,16 @@ function Invoke-RestartAndVerify([switch]$Recovery, [string]$RecoveryToken = '')
       $task = Get-ScheduledTask -TaskName $restartTask
       $info = Get-ScheduledTaskInfo -TaskName $restartTask
       if ($info.LastRunTime -gt $before.LastRunTime -and $task.State -ne 'Running') {
-        if ($info.LastTaskResult -ne 0) {
-          throw "$restartTask failed with task result $($info.LastTaskResult)"
-        }
         break
       }
     } while ((Get-Date) -lt $deadline)
 
     if ($info.LastRunTime -le $before.LastRunTime -or $task.State -eq 'Running') {
       throw "$restartTask did not complete within 90 seconds"
+    }
+
+    if ($info.LastTaskResult -ne 0) {
+      Write-Warning "$restartTask reported task result $($info.LastTaskResult); accepting only if a replacement muxd becomes healthy"
     }
   }
 
