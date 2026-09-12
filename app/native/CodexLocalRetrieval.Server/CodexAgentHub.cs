@@ -16,9 +16,23 @@ public sealed record PreparedThreadOpen(
     ThreadRouteBinding Binding,
     IReadOnlyList<AgentEvent> History);
 
-internal sealed record ActiveTurnClaim(
-    CodexAppServer Server,
-    SessionLaunchLease Lease);
+internal sealed class ActiveTurnClaim
+{
+    public ActiveTurnClaim(CodexAppServer server, SessionLaunchLease lease)
+    {
+        Server = server;
+        Lease = lease;
+    }
+
+    public CodexAppServer Server { get; }
+    public SessionLaunchLease Lease { get; }
+
+    // A response proves that turn/start was accepted. Before that point, transport death leaves the
+    // writer claim ambiguous and it must remain fenced until expiry.
+    private int _requestAcknowledged;
+    public bool RequestAcknowledged => Volatile.Read(ref _requestAcknowledged) != 0;
+    public void MarkRequestAcknowledged() => Volatile.Write(ref _requestAcknowledged, 1);
+}
 
 public sealed class ThreadRouteRegistry
 {
@@ -335,14 +349,26 @@ public sealed class CodexAgentHub : IAsyncDisposable
         try
         {
             await s.RequestAsync("turn/start", prms, ct);
+            if (_activeTurnClaims.TryGetValue(threadId, out var acknowledged)
+                && ReferenceEquals(acknowledged.Server, s))
+                acknowledged.MarkRequestAcknowledged();
             lease?.MarkStarted("Codex app-server turn started.", retainUntilExpiry: false);
         }
         catch (Exception ex)
         {
             lease?.MarkFailed(
                 "Codex app-server turn failed to start.",
-                retainUntilExpiry: ex is not CodexAppServerResponseException && !s.TerminationConfirmed);
-            if (_activeTurnClaims.TryRemove(threadId, out var active)) active.Lease.Dispose();
+                // Process termination only proves that the transport is gone; it does not prove
+                // that turn/start was rejected before Codex accepted it. Only a definitive JSON-RPC
+                // response rejection is safe to release for immediate retry.
+                retainUntilExpiry: ex is not CodexAppServerResponseException);
+            // MarkFailed already releases a definitively rejected claim. An ambiguous transport failure
+            // retains it until expiry, so disposing that lease here would immediately unfence the retry.
+            if (_activeTurnClaims.TryRemove(threadId, out var active))
+            {
+                if (ex is CodexAppServerResponseException)
+                    active.Lease.Dispose();
+            }
             throw;
         }
     }
@@ -460,7 +486,10 @@ public sealed class CodexAgentHub : IAsyncDisposable
         foreach (var pair in _activeTurnClaims)
         {
             if (!ReferenceEquals(pair.Value.Server, server)) continue;
-            ReleaseClaim(pair, retainUntilExpiry);
+            // A transport can disappear before the turn/start response reaches its caller. In that window
+            // the server pump must not release the reservation merely because process termination was confirmed:
+            // acceptance remains unknown until the request task observes a response.
+            ReleaseClaim(pair, retainUntilExpiry || !pair.Value.RequestAcknowledged);
         }
     }
 

@@ -88,17 +88,24 @@ public static class MuxIdentityTransfer
         }
 
         var pidsToStop = ownerPids.Where(pid => !muxOwnedPids.Contains(pid)).ToArray();
+        var verifiedExited = new HashSet<int>();
         foreach (var ownerPid in pidsToStop)
         {
             var killed = killOwner?.Invoke(ownerPid) ?? KillOwner(ownerPid);
             if (!killed.Ok)
                 return new(false, $"could not stop matching local owner pid {ownerPid}: {killed.Detail}", false);
+            if (killed.Detail.StartsWith("already gone", StringComparison.OrdinalIgnoreCase))
+                verifiedExited.Add(ownerPid);
         }
 
         if (pidsToStop.Length == 0)
             return desiredAlive
                 ? new(true, "desired mux owner will be relaunched", true)
                 : new(true, "ownership available", false);
+        if (verifiedExited.Count == pidsToStop.Length)
+            return desiredAlive
+                ? new(true, "external ownership was already gone; desired mux owner will be relaunched", true, pidsToStop)
+                : new(true, "external ownership was already gone", false, pidsToStop);
 
         var deadline = DateTime.UtcNow.AddSeconds(12);
         do
@@ -111,7 +118,7 @@ public static class MuxIdentityTransfer
             var remainingExternal = ids
                 .Where(live.ContainsKey)
                 .SelectMany(id => live[id])
-                .Any(pid => !muxOwnedPids.Contains(pid));
+                .Any(pid => !muxOwnedPids.Contains(pid) && !verifiedExited.Contains(pid));
             if (!remainingExternal)
                 return desiredAlive
                     ? new(true, "external ownership cleared; desired mux owner will be relaunched", true, pidsToStop)

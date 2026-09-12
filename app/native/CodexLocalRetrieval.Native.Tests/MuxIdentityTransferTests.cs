@@ -97,6 +97,38 @@ public sealed class MuxIdentityTransferTests
     }
 
     [TestMethod]
+    public async Task ExecuteAsync_DoesNotRejectAStalePidThatKillVerifierConfirmsIsGone()
+    {
+        var scans = 0;
+        var result = await MuxIdentityTransfer.ExecuteAsync(
+            "requested",
+            "canonical",
+            Array.Empty<string>(),
+            _ => Task.FromResult("""
+                {"list":[{"name":"requested","alive":false,"sessionId":"canonical","aliases":[]}]}
+                """),
+            () =>
+            {
+                scans++;
+                return (true, new(StringComparer.OrdinalIgnoreCase)
+                {
+                    ["canonical"] = new() { 30160 }
+                }, "stale projection");
+            },
+            pid =>
+            {
+                Assert.AreEqual(30160, pid);
+                return (true, "already gone");
+            },
+            (_, _) => (true, new(), ""));
+
+        Assert.IsTrue(result.Ok, result.Detail);
+        Assert.IsFalse(result.AlreadyOwned);
+        Assert.AreEqual(1, scans);
+        CollectionAssert.AreEquivalent(new[] { 30160 }, result.ExitedPids.ToArray());
+    }
+
+    [TestMethod]
     public async Task ExecuteAsync_FailsClosedWhenMuxCustodyCannotBeVerified()
     {
         var result = await MuxIdentityTransfer.ExecuteAsync(
