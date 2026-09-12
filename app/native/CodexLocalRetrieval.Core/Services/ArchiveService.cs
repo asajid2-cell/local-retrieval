@@ -5125,6 +5125,15 @@ public sealed partial class ArchiveService
                     pid = r.Pid,
                     tool = r.Tool,
                     sessionId = r.SessionId,
+                    // The identity evidence must ride every lane that publishes a running row. The web
+                    // recomputes liveness from these rows (aliases included) and prints "identity
+                    // unresolved/unverifiable" for any row that is not resolved, so a full projection that
+                    // omitted them would silently upgrade an unidentified process into an identified one
+                    // whenever the desktop app was the freshest pusher. Same shape as the light /api/running
+                    // push in RemoteBridge.PushRunningAsync.
+                    sessionAliases = r.SessionAliases ?? Array.Empty<string>(),
+                    identityStatus = r.IdentityStatus,
+                    identitySource = r.IdentitySource,
                     parent = r.Parent,
                     startedAt = r.StartedAt,
                     title = hit.Title,             // null when the running session isn't in any collection

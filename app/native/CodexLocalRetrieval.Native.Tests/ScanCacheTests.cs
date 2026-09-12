@@ -618,6 +618,82 @@ public class ScanCacheTests
         Assert.AreEqual("unverifiable", row.GetProperty("identityStatus").GetString());
     }
 
+    // SESSION-001: the two publish lanes must carry the SAME identity evidence for a running row.
+    // The GUI-active lane pushes the full /api/projects projection (ArchiveService.BuildProjectsProjectionJson);
+    // the closed-GUI lane pushes the light /api/running partial (RemoteBridge.PushRunningAsync). The web
+    // derives liveness from the row's aliases AND prints "identity unresolved/unverifiable" from
+    // identityStatus, so a lane that dropped either would make the same process read as running-or-not and
+    // identified-or-not depending only on which lane happened to push last. The two lanes deliberately
+    // differ in the collection fields (the light push must not clobber the projection the app last pushed);
+    // the identity fields are the part that must be identical.
+    [TestMethod]
+    public async Task RunningProjection_BothLanesCarryTheSameIdentityEvidence()
+    {
+        _scanRows = new()
+        {
+            new(600, "claude", "", "Terminal", "2026-06-29T01:00:00Z", ""),
+            new(700, "codex", "", "Terminal", "2026-06-29T02:00:00Z", ""),
+        };
+        _handleRows["alias-600"] = 600;            // identified only by the open transcript handle
+        _registryRows["registry-700"] = 700;       // and this one only by the Claude live-session registry
+        _handleUnverifiable.Add(700);              // whose handle probe cannot be trusted this pass
+
+        // Lane 1: the closed-GUI bridge's light running push.
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        System.Text.Json.JsonElement light = default;
+        var bridge = new RemoteBridge(() => new RemoteBridge.Settings("loopback", 1), () => false,
+            new CodexLocalRetrieval.Core.Agents.ClaudeSessionStore(Path.GetTempPath()), "",
+            isolationFixture: true,
+            transport: (_, operation, body, _, _) =>
+            {
+                if (operation == RemoteBridge.BridgeOperation.Running)
+                {
+                    light = System.Text.Json.JsonSerializer.Deserialize<System.Text.Json.JsonElement>(body!);
+                    cancellation.Cancel();
+                }
+                return Task.FromResult((0, operation == RemoteBridge.BridgeOperation.Lease ? "[]" : "{}"));
+            });
+        await bridge.RunLoopAsync(cancellation.Token).WaitAsync(TimeSpan.FromSeconds(15));
+
+        // Lane 2: the GUI-active full projection, built from the same enriched scan.
+        Assert.IsFalse(RunningSessions.TryScanEnriched(out var rows, out var scanDetail), scanDetail);
+        var svc = new ArchiveService(useBundledStore: true);
+        using var doc = System.Text.Json.JsonDocument.Parse(
+            svc.BuildProjectsProjectionJson(null, rows, runningVerified: false, runningVerificationDetail: scanDetail));
+
+        static System.Text.Json.JsonElement RowByPid(System.Text.Json.JsonElement body, int pid)
+        {
+            foreach (var row in body.GetProperty("runningSessions").EnumerateArray())
+                if (row.GetProperty("pid").GetInt32() == pid) return row;
+            Assert.Fail("pid " + pid + " missing from the running projection");
+            return default;
+        }
+
+        foreach (var pid in new[] { 600, 700 })
+        {
+            var lightRow = RowByPid(light, pid);
+            var fullRow = RowByPid(doc.RootElement, pid);
+            Assert.AreEqual(lightRow.GetProperty("sessionId").GetString(), fullRow.GetProperty("sessionId").GetString(),
+                "lane disagreement on the resolved identity of pid " + pid);
+            CollectionAssert.AreEqual(
+                lightRow.GetProperty("sessionAliases").EnumerateArray().Select(a => a.GetString()).ToArray(),
+                fullRow.GetProperty("sessionAliases").EnumerateArray().Select(a => a.GetString()).ToArray(),
+                "lane disagreement on the alias set of pid " + pid);
+            Assert.AreEqual(lightRow.GetProperty("identityStatus").GetString(), fullRow.GetProperty("identityStatus").GetString(),
+                "lane disagreement on the identity status of pid " + pid);
+            Assert.AreEqual(lightRow.GetProperty("identitySource").GetString(), fullRow.GetProperty("identitySource").GetString(),
+                "lane disagreement on the identity source of pid " + pid);
+        }
+        // The honesty signals themselves, so a lane cannot "agree" by both dropping them.
+        Assert.AreEqual("alias-600", RowByPid(doc.RootElement, 600).GetProperty("sessionId").GetString());
+        Assert.AreEqual("resolved", RowByPid(doc.RootElement, 600).GetProperty("identityStatus").GetString());
+        Assert.AreEqual("registry-700", RowByPid(doc.RootElement, 700).GetProperty("sessionId").GetString());
+        Assert.AreEqual("unverifiable", RowByPid(doc.RootElement, 700).GetProperty("identityStatus").GetString());
+        Assert.AreEqual("open transcript", RowByPid(doc.RootElement, 600).GetProperty("identitySource").GetString());
+        Assert.IsFalse(light.GetProperty("runningVerified").GetBoolean());
+        Assert.IsFalse(doc.RootElement.GetProperty("runningVerified").GetBoolean());
+    }
+
     [TestMethod]
     public void EnrichedScan_UsesCommandLineRegistryAndOpenTranscriptIdentityWithoutGuessing()
     {

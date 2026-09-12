@@ -2183,7 +2183,9 @@ test('projects save-tabs dialog keeps new-deck row hidden until selected', () =>
   assert.match(html, /id="wsdecknewrow" hidden/);
   assert.match(html, /#wscoldlg\s+\.dlgrow\s*\{[^}]*display:flex/);
   assert.match(html, /#wscoldlg\s+\.dlgrow\[hidden\]\s*\{[^}]*display:none/);
-  assert.match(html, /sessionId:s\.sessionId\|\|''/);
+  // Filing a tab must use the AUTHORITATIVE session id. The older `sessionId:s.sessionId||''` form filed
+  // the tab against a merely-reported identity, so pin its absence instead of the obsolete literal.
+  assert.equal(html.includes("sessionId:s.sessionId||''"), false);
   assert.ok(html.includes("generationId:s.generationId||''"));
   assert.ok(html.includes("sessionId:s.authoritativeSessionId??s.sessionId??''"));
 });
@@ -2398,6 +2400,38 @@ test('running projection preserves unresolved identity evidence without claiming
   assert.equal(projects.runningSessions.length, 1);
   assert.deepEqual(projects.runningSessions[0].sessionAliases, ['other-id']);
   assert.equal(projects.runningSessions[0].identityStatus, 'unverifiable');
+});
+
+// The GUI-active lane pushes the FULL /api/projects projection (collections + running rows together),
+// the closed-GUI lane pushes the light /api/running partial. Both must land the same identity evidence
+// in the stored projection, or the web's "identity unresolved/unverifiable" label and its alias-based
+// liveness would depend on which lane happened to push last. This is the full-projection counterpart of
+// the test above, and it also pins that a running push never clobbers the collections projection.
+test('full projection preserves unresolved running identity evidence alongside collections', async t => {
+  const h = new RelayHarness();
+  t.after(() => h.stop());
+  await h.start();
+  const posted = await h.json('POST', '/api/projects', {
+    schemaVersion: 3, host: 'PC',
+    decks: [{ id: 'deck-1', name: 'Main' }],
+    collections: [{
+      id: 'collection-1', name: 'Cortex', deckId: 'deck-1', deckName: 'Main',
+      chats: [{ id: 'known-id', title: 'Known chat', tool: 'codex', muxName: 'known-tab' }],
+    }],
+    allChats: [{ id: 'known-id', title: 'Known chat', tool: 'codex', muxName: 'known-tab' }],
+    runningVerified: false, runningVerificationDetail: 'handle lookup unavailable',
+    runningSessions: [{ pid: 456, tool: 'codex', sessionId: 'known-id', sessionAliases: ['other-id'],
+      identityStatus: 'unverifiable', identitySource: 'open transcript' }],
+  });
+  assert.equal(posted.ok, true);
+  const projects = await h.json('GET', '/api/projects');
+  assert.equal(projects.collections.length, 1);
+  assert.equal(projects.collections[0].chats[0].id, 'known-id');
+  assert.equal(projects.runningVerified, false);
+  assert.equal(projects.runningSessions.length, 1);
+  assert.equal(projects.runningSessions[0].identityStatus, 'unverifiable');
+  assert.equal(projects.runningSessions[0].identitySource, 'open transcript');
+  assert.deepEqual(projects.runningSessions[0].sessionAliases, ['other-id']);
 });
 
 test('hosted kill rejects a stale generation before sending any stop', async t => {
