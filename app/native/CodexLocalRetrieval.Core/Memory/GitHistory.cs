@@ -57,6 +57,7 @@ public sealed class GitHistory
     {
         if (!IsAvailable()) return "";
         if (!InitIfNeeded(vaultDir)) return "";
+        ClearStaleLock(vaultDir);
         Run(vaultDir, "add -A");
         // -c on the commit guards the rare case init-time config didn't take.
         var commit = Run(vaultDir,
@@ -102,15 +103,22 @@ public sealed class GitHistory
             var psi = new ProcessStartInfo
             {
                 FileName = "git",
-                Arguments = args,
+                // -c core.pager=cat: never invoke a pager (a pager waits for a TTY -> hangs reading output).
+                Arguments = "-c core.pager=cat " + args,
                 WorkingDirectory = workingDir,
                 UseShellExecute = false,
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
+                RedirectStandardInput = true,   // closed immediately so git never blocks waiting for input
                 CreateNoWindow = true,
                 StandardOutputEncoding = Encoding.UTF8,
                 StandardErrorEncoding = Encoding.UTF8,
             };
+            // Disable any interactive prompts (credentials/editors) so a subprocess can never block.
+            psi.EnvironmentVariables["GIT_TERMINAL_PROMPT"] = "0";
+            psi.EnvironmentVariables["GIT_PAGER"] = "cat";
+            psi.EnvironmentVariables["GIT_OPTIONAL_LOCKS"] = "0";
+
             var result = Task.Run(() => ContainedProcessRunner.RunAsync(
                         psi,
                         CommandTimeout,
@@ -136,6 +144,18 @@ public sealed class GitHistory
         {
             return new GitResult(false, -1, "", ex.Message);
         }
+    }
+
+    // A crashed/killed git can leave .git/index.lock behind, which blocks every later add/commit.
+    // Best-effort remove it before staging (we only ever run git serially per vault).
+    private static void ClearStaleLock(string vaultDir)
+    {
+        try
+        {
+            var lockPath = Path.Combine(vaultDir, ".git", "index.lock");
+            if (File.Exists(lockPath)) File.Delete(lockPath);
+        }
+        catch { }
     }
 
     private static string Quote(string s) => "\"" + s.Replace("\\", "\\\\").Replace("\"", "\\\"") + "\"";

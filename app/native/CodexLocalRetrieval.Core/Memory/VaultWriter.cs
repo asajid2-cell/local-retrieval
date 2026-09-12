@@ -148,7 +148,7 @@ public sealed class VaultWriter
             var nl = body.IndexOf('\n');
             body = nl >= 0 ? body[(nl + 1)..].TrimStart('\n') : "";
         }
-        // strip any prior auto Sources section so re-writes don't stack them
+        // strip any prior auto sections (Sources comes first, Links after) so re-writes don't stack them
         var marker = "\n## Sources\n";
         var mi = body.IndexOf(marker, StringComparison.Ordinal);
         if (mi >= 0) body = body[..mi].TrimEnd();
@@ -166,6 +166,27 @@ public sealed class VaultWriter
             // it knows it. We store the anchor coordinates verbatim so the link is always reconstructable.
             foreach (var s in card.Sources)
                 sb.Append("- ").Append(SourceLink("{collection}", s)).Append("  `").Append(Short(s.QuoteHash)).Append("`\n");
+        }
+
+        // Graph links for Obsidian: card<->card (related + causal chain + supersede) and card<->topic,
+        // so the vault is a connected mind map you can run through visually, not a flat list.
+        var linkLines = new List<string>();
+        void LinkLine(string label, IEnumerable<string> ids)
+        {
+            var refs = ids.Where(x => !string.IsNullOrWhiteSpace(x)).Distinct().Select(x => "[[" + Slug(x) + "]]").ToList();
+            if (refs.Count > 0) linkLines.Add("- " + label + ": " + string.Join(" ", refs));
+        }
+        LinkLine("Related", card.Related);
+        LinkLine("Led to", card.LedTo);
+        LinkLine("Caused by", card.CausedBy);
+        LinkLine("Supersedes", card.Supersedes);
+        if (!string.IsNullOrWhiteSpace(card.SupersededBy)) LinkLine("Superseded by", new[] { card.SupersededBy });
+        var topicRefs = card.Topics.Where(t => !string.IsNullOrWhiteSpace(t)).Distinct().Select(t => "[[" + Slug(t) + "]]").ToList();
+        if (topicRefs.Count > 0) linkLines.Add("- Topics: " + string.Join(" ", topicRefs));
+        if (linkLines.Count > 0)
+        {
+            sb.Append("\n## Links\n");
+            foreach (var l in linkLines) sb.Append(l).Append('\n');
         }
         return sb.ToString().TrimEnd('\n');
     }

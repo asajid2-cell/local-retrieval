@@ -14,6 +14,8 @@ public sealed class BrainBuildOptions
 {
     public BuildScope Scope { get; set; } = BuildScope.ProjectOnly;
     public int MaxCardsPerAnalyst { get; set; } = 40;
+    // Deep Search: how many extra whole-archive chats (beyond the collection's members) to pull in.
+    public int DeepSearchMaxExtra { get; set; } = 25;
 }
 
 // One analyst's proposed card BEFORE it becomes a real MemoryCard (anchors resolved, lane enforced).
@@ -100,25 +102,68 @@ public sealed class BackendAnalyst : IBrainAnalyst
 {
     private readonly IChatBackend _backend;
     private readonly string _createdBy;
+    private readonly int _maxBatchChars;
 
-    public BackendAnalyst(IChatBackend backend)
+    // maxBatchChars caps the excerpt text per request. CLI backends that pass the prompt as a command
+    // -line ARG (codex exec) need a smaller cap than a stdin/API backend; the caller picks the size.
+    public BackendAnalyst(IChatBackend backend, int maxBatchChars = MaxExcerptCharsPerBatch)
     {
         _backend = backend;
         _createdBy = MapCreatedBy(backend.Name);
+        _maxBatchChars = maxBatchChars;
     }
 
     public string Id => _createdBy;
 
+    // Cap the excerpt text sent in one request so a long project doesn't overflow the model's context.
+    public const int MaxExcerptCharsPerBatch = 40_000;
+
     public async Task<List<CandidateCard>> ExtractAsync(IReadOnlyList<SourceBlock> blocks, BrainBuildOptions opts, CancellationToken ct)
     {
         if (blocks.Count == 0) return new List<CandidateCard>();
-        var messages = new[]
+        var all = new List<CandidateCard>();
+        // Map over batches of blocks (a real multi-session project has far more than one request can hold);
+        // accumulate cards across batches. A single slow/failed batch must NOT discard the cards already
+        // gathered from earlier batches — keep partial results and move on.
+        foreach (var batch in Batch(blocks, _maxBatchChars))
         {
-            ChatMessage.System(MemoryPrompts.ExtractionSystem),
-            ChatMessage.User(MemoryPrompts.BlocksUserMessage(blocks)),
-        };
-        var reply = await _backend.CompleteAsync(messages, Array.Empty<ChatToolSpec>(), ct);
-        return ParseCards(reply.Message.Content ?? "", _createdBy, opts.MaxCardsPerAnalyst);
+            ct.ThrowIfCancellationRequested();
+            var messages = new[]
+            {
+                ChatMessage.System(MemoryPrompts.ExtractionSystem),
+                ChatMessage.User(MemoryPrompts.BlocksUserMessage(batch)),
+            };
+            try
+            {
+                var reply = await _backend.CompleteAsync(messages, Array.Empty<ChatToolSpec>(), ct);
+                all.AddRange(ParseCards(reply.Message.Content ?? "", _createdBy, opts.MaxCardsPerAnalyst));
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+            catch { /* this batch failed (timeout/parse) — keep earlier cards, continue */ }
+            if (all.Count >= opts.MaxCardsPerAnalyst) break;
+        }
+        return all;
+    }
+
+    // Group blocks so the total excerpt length per batch stays under maxChars (each block is its own
+    // minimum unit). Deterministic given the block order.
+    public static IEnumerable<IReadOnlyList<SourceBlock>> Batch(IReadOnlyList<SourceBlock> blocks, int maxChars)
+    {
+        var cur = new List<SourceBlock>();
+        var chars = 0;
+        foreach (var b in blocks)
+        {
+            var len = (b.Excerpt?.Length ?? 0) + 120; // + header overhead per block
+            if (cur.Count > 0 && chars + len > maxChars)
+            {
+                yield return cur;
+                cur = new List<SourceBlock>();
+                chars = 0;
+            }
+            cur.Add(b);
+            chars += len;
+        }
+        if (cur.Count > 0) yield return cur;
     }
 
     public static List<CandidateCard> ParseCards(string content, string createdBy, int max)
@@ -205,15 +250,22 @@ public sealed class BrainBuilder
         IReadOnlyList<IBrainAnalyst> analysts, BrainBuildOptions opts, string nowIso, CancellationToken ct)
     {
         var byId = blocks.ToDictionary(b => b.Id, b => b, StringComparer.Ordinal);
-        var result = new List<MemoryCard>();
-        foreach (var analyst in analysts)
+
+        // Run the analysts CONCURRENTLY (Claude + Codex are independent subprocesses) so the wall-clock
+        // is the slowest analyst, not their sum. One analyst failing wholesale yields its empty list and
+        // never sinks the others.
+        var tasks = analysts.Select(async analyst =>
         {
-            List<CandidateCard> candidates;
-            try { candidates = await analyst.ExtractAsync(blocks, opts, ct); }
-            catch { candidates = new List<CandidateCard>(); }
+            try { return await analyst.ExtractAsync(blocks, opts, ct); }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+            catch { return new List<CandidateCard>(); }
+        }).ToList();
+        var perAnalyst = await Task.WhenAll(tasks);
+
+        var result = new List<MemoryCard>();
+        foreach (var candidates in perAnalyst)
             foreach (var cand in candidates)
                 result.Add(ToCard(cand, byId, nowIso));
-        }
         return result;
     }
 
@@ -228,7 +280,7 @@ public sealed class BrainBuilder
         var card = new MemoryCard
         {
             Id = Slugify(cand.Title),
-            Title = cand.Title.Trim(),
+            Title = SecretRedactor.StripLoneSurrogates(cand.Title.Trim()),
             Lane = cand.Lane,
             Type = cand.Type,
             Status = CardStatuses.Active,
@@ -243,7 +295,7 @@ public sealed class BrainBuilder
             Topics = cand.Topics.Where(t => !string.IsNullOrWhiteSpace(t)).Distinct().ToList(),
             Sources = anchors,
             SourceCoverage = anchors.Count > 0 ? SourceCoverage.ExactSpan : SourceCoverage.ManualUnverified,
-            Body = SecretRedactor.Redact(cand.Body),
+            Body = SecretRedactor.Clean(cand.Body),
         };
         return card;
     }
