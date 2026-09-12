@@ -32,6 +32,19 @@ public static class DiscoveryEndpoints
             return Results.Json(facets);
         });
 
+        // The full-transcript scan the desktop app runs on Enter. Kept on its own route because it is the
+        // expensive one: the browser only asks when the user actually submits a phrase, so typing can never
+        // start a file scan. Read-only, like everything else under /api/discovery.
+        app.MapGet("/api/discovery/search", async (HttpRequest req, CancellationToken ct) =>
+        {
+            var q = req.Query.TryGetValue("q", out var rawQuery) ? rawQuery.ToString() : null;
+            var limit = int.TryParse(req.Query["limit"], out var parsed) ? parsed : (int?)null;
+            var showHidden = ReadQuery(req).ShowHidden == true;
+            var page = await runtime.UseAsync(
+                (archive, _) => new DiscoveryApi(archive).DeepSearchAsync(q, limit, showHidden), ct);
+            return Results.Json(page);
+        });
+
         // Pickers for the web's Start-chat dialog. Read-only like the rest of discovery: they hand
         // out ids and labels, never a path or a command line, because the choice travels back
         // through the relay's command queue where the browser can read it.

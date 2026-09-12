@@ -166,6 +166,60 @@ public sealed class DiscoveryApiTests
     }
 
     [TestMethod]
+    public async Task DeepSearch_ScansTranscriptFilesAndSeparatesNoMatchFromNothingScanned()
+    {
+        var (archive, api) = Fixture();
+        // The scan reads real files, so point the two transcripts at a private directory instead of the
+        // shared temp names the fixture hands out.
+        var root = Path.Combine(Path.GetTempPath(), "discovery-deep-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        var keptPath = Path.Combine(root, "kept.jsonl");
+        var oneShotPath = Path.Combine(root, "one-shot.jsonl");
+        archive.Store.Sessions["b"].SourcePath = keptPath;
+        archive.Store.Sessions["c"].SourcePath = oneShotPath;
+        try
+        {
+            await File.WriteAllTextAsync(keptPath,
+                "{\"type\":\"user\",\"text\":\"promicro venpod magenta parity work\"}\n");
+            await File.WriteAllTextAsync(oneShotPath,
+                "{\"type\":\"user\",\"text\":\"promicro venpod in a one off chat\"}\n");
+
+            var page = await api.DeepSearchAsync("promicro venpod");
+            Assert.IsTrue(page.Ran);
+            Assert.AreEqual("promicro venpod", page.Query);
+            Assert.AreEqual(DiscoveryApi.DefaultDeepLimit, page.Limit);
+            var row = page.Rows.Single();
+            Assert.AreEqual("b", row.Id);
+            Assert.AreEqual("chat content", row.Provenance);
+            Assert.IsTrue(row.Snippet.Length > 0, "a file-scan hit must carry its own snippet");
+            Assert.IsTrue(row.Score > 0);
+
+            // The desktop Enter path keeps one-off chats hidden unless they were revealed; the browser
+            // deep section has to agree or the same query returns two different answers.
+            var revealed = await api.DeepSearchAsync("promicro venpod", null, showHidden: true);
+            CollectionAssert.AreEquivalent(new[] { "b", "c" }, revealed.Rows.Select(r => r.Id).ToList());
+
+            // An empty query is not an empty result: Ran=false means no scan happened at all.
+            var blank = await api.DeepSearchAsync("   ");
+            Assert.IsFalse(blank.Ran);
+            Assert.AreEqual(0, blank.Count);
+
+            // A query with no searchable words also never ran, so the web cannot print "0 matches".
+            var noTokens = await api.DeepSearchAsync("a of");
+            Assert.IsFalse(noTokens.Ran);
+            Assert.AreEqual(0, noTokens.Count);
+
+            var miss = await api.DeepSearchAsync("zeppelin airship");
+            Assert.IsTrue(miss.Ran, "a real query that matched nothing still ran");
+            Assert.AreEqual(0, miss.Count);
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [TestMethod]
     public void Facets_CountFilteredTagsPhrasesAndProjects()
     {
         var (_, api) = Fixture();

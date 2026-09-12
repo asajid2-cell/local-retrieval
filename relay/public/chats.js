@@ -7,6 +7,14 @@
   var DEFAULT_API = '/multiplex/pc/api/discovery';
   var PAGE_SIZE = 40;
 
+  // The desktop app filters the list as you type on a 150 ms trailing debounce
+  // (TrailingDebouncer.DefaultDelay), and reserves the whole-transcript scan for Enter because it reads
+  // every transcript file. The browser used to filter only on submit, so pressing keys did nothing here
+  // and the two surfaces felt like different products. These numbers keep them the same shape.
+  var LIVE_FILTER_MS = 150;
+  var DEEP_SEARCH_MIN = 8;
+  var DEEP_SEARCH_LIMIT = 40;
+
   function cleanSet(values) {
     return Array.from(new Set(Array.from(values || []).map(function (v) {
       return String(v == null ? '' : v).trim();
@@ -69,6 +77,11 @@
       rows: [], facets: { tags: [], phrases: [], projects: [], hidden: 0 },
       offset: 0, limit: d.limit || PAGE_SIZE, total: 0, hasMore: false,
       loading: false, error: '', coverage: null, generation: 0,
+      // The full-transcript scan is a SEPARATE, explicitly requested result set. It is never folded into
+      // `rows` because the two answer different questions ("what matches the filters" vs "what else
+      // contains this phrase"), and merging them would make `total` and the pager lie.
+      deep: { query: '', count: 0, rows: [], ran: true, loading: false, error: '', tooShort: false, unsupported: false },
+      deepGeneration: 0,
     };
 
     async function getJson(path, params) {
@@ -76,7 +89,13 @@
       var qs = params && params.toString();
       if (qs) url += '?' + qs;
       var response = await fetchFn(url, { headers: { Accept: 'application/json' } });
-      if (!response || !response.ok) throw new Error('HTTP ' + ((response && response.status) || 0));
+      if (!response || !response.ok) {
+        var failure = new Error('HTTP ' + ((response && response.status) || 0));
+        // Keep the status: a PC build that predates a route answers 404, and that has to be told apart
+        // from "the search ran and found nothing".
+        failure.status = (response && response.status) || 0;
+        throw failure;
+      }
       return (await response.json()) || {};
     }
 
@@ -139,7 +158,56 @@
 
     function phrase(value) {
       state.filters.q = '[' + String(value || '').trim() + ']';
+      clearDeep();
       return load(true);
+    }
+
+    // Enter on the search box: the phone-side equivalent of the desktop app's whole-transcript scan.
+    // Every failure mode is named, because "no matches" and "the scan never ran" are different answers.
+    async function deepSearch(query) {
+      var q = String(query == null ? '' : query).trim();
+      var generation = ++state.deepGeneration;
+      state.deep = { query: q, count: 0, rows: [], ran: true, loading: false, error: '', tooShort: false, unsupported: false };
+      if (q.length < DEEP_SEARCH_MIN) {
+        state.deep.tooShort = q.length > 0;
+        if (d.onChange) d.onChange(state);
+        return state;
+      }
+      state.deep.loading = true;
+      if (d.onChange) d.onChange(state);
+      try {
+        var params = new URLSearchParams();
+        params.set('q', q);
+        params.set('limit', String(DEEP_SEARCH_LIMIT));
+        if (state.filters.showHidden) params.set('showHidden', 'true');
+        var body = await getJson('/search', params);
+        if (generation !== state.deepGeneration) return state;
+        state.deep.rows = Array.isArray(body.rows) ? body.rows : [];
+        state.deep.count = Number(body.count) || 0;
+        state.deep.ran = body.ran === true;
+      } catch (error) {
+        if (generation !== state.deepGeneration) return state;
+        var status = Number(error && error.status) || 0;
+        state.deep.unsupported = status === 404 || status === 405 || status === 501;
+        state.deep.error = (error && error.message) || String(error);
+      } finally {
+        if (generation === state.deepGeneration) {
+          state.deep.loading = false;
+          if (d.onChange) d.onChange(state);
+        }
+      }
+      return state;
+    }
+
+    // Typing again means the phrase those results belong to is gone. Dropping them here (rather than
+    // leaving a stale section under a different query) is why the deep pass bumps a generation of its own.
+    function clearDeep() {
+      var deep = state.deep;
+      if (!deep.query && !deep.loading && !deep.rows.length && !deep.error && !deep.tooShort) return state;
+      state.deepGeneration += 1;
+      state.deep = { query: '', count: 0, rows: [], ran: true, loading: false, error: '', tooShort: false, unsupported: false };
+      if (d.onChange) d.onChange(state);
+      return state;
     }
 
     function page(delta) {
@@ -147,7 +215,7 @@
       return load(false);
     }
 
-    return { state: state, load: load, cycleTag: cycleTag, phrase: phrase, page: page };
+    return { state: state, load: load, cycleTag: cycleTag, phrase: phrase, page: page, deepSearch: deepSearch, clearDeep: clearDeep };
   }
 
   var START_SAFE_MUX = /^[A-Za-z0-9_.-]{1,48}$/;
@@ -1168,12 +1236,106 @@
       $('#next').disabled = !controller.state.hasMore;
     }
 
+    function deepRow(chat) {
+      var article = doc.createElement('article');
+      article.className = 'chat deep';
+      article.dataset.chatId = chat.id;
+      var main = doc.createElement('div');
+      main.className = 'chatmain';
+      var titleLine = doc.createElement('div');
+      titleLine.className = 'titleline';
+      var tool = text(doc.createElement('span'), chat.tool || 'chat');
+      tool.className = 'tool';
+      var title = text(doc.createElement(chat.navigable === false ? 'span' : 'a'), chat.title || chat.id);
+      title.className = 'title';
+      if (chat.navigable !== false) {
+        title.href = './reader.html?session=' + encodeURIComponent(chat.id)
+          + '&title=' + encodeURIComponent(chat.title || chat.id);
+      }
+      titleLine.appendChild(tool);
+      titleLine.appendChild(title);
+      main.appendChild(titleLine);
+      if (chat.snippet) {
+        var snippet = text(doc.createElement('p'), chat.snippet);
+        snippet.className = 'snippet';
+        main.appendChild(snippet);
+      }
+      var meta = doc.createElement('div');
+      meta.className = 'meta';
+      text(meta, [
+        chat.provenance ? 'matched in ' + chat.provenance : '',
+        chat.matchedTerms ? 'words: ' + chat.matchedTerms : '',
+        formatDate(chat.updatedAt),
+      ].filter(Boolean).join(' - '));
+      main.appendChild(meta);
+      article.appendChild(main);
+      return article;
+    }
+
+    // Returns how many transcript-only rows it put on screen, so the empty state above cannot claim
+    // "no matching chats" in the same breath as a list of matched chats.
+    function renderDeepResults() {
+      var section = $('#deepresults');
+      var heading = $('#deepheading');
+      var deepList = $('#deeplist');
+      if (!section || !heading || !deepList) return 0;
+      var deep = controller.state.deep;
+      var visible = !!(deep.query || deep.loading || deep.error || deep.tooShort || deep.unsupported);
+      section.hidden = !visible;
+      if (!visible) { clear(deepList); text(heading, ''); return 0; }
+
+      if (deep.tooShort) {
+        text(heading, 'Full-transcript search needs at least ' + DEEP_SEARCH_MIN + ' characters.');
+        clear(deepList);
+        return 0;
+      }
+      if (deep.unsupported) {
+        // An older PC build simply does not have the route. Saying "no matches" here would be a lie.
+        text(heading, 'This PC build cannot search inside transcripts. Update the archive app on your PC.');
+        clear(deepList);
+        return 0;
+      }
+      if (deep.loading) {
+        text(heading, 'Scanning full transcripts for "' + deep.query + '"...');
+        clear(deepList);
+        return 0;
+      }
+      if (deep.error) {
+        text(heading, 'Full-transcript search failed: ' + deep.error);
+        clear(deepList);
+        return 0;
+      }
+      if (!deep.ran) {
+        text(heading, 'No full-transcript scan ran - "' + deep.query + '" has no words to search for.');
+        clear(deepList);
+        return 0;
+      }
+
+      // Only chats the filtered list did NOT already show: the appends below are the point of the scan,
+      // and repeating a row the user can already see above would just look like a duplicate.
+      var listed = {};
+      controller.state.rows.forEach(function (row) { listed[rowId(row)] = true; });
+      var extras = deep.rows.filter(function (row) { return !listed[rowId(row)]; });
+      if (extras.length) {
+        text(heading, extras.length + ' more chat' + (extras.length === 1 ? '' : 's')
+          + ' matched "' + deep.query + '" inside the transcript, beyond titles and metadata.');
+      } else if (deep.count) {
+        text(heading, 'Every full-transcript match for "' + deep.query + '" is already listed above.');
+      } else {
+        text(heading, 'No chat contains "' + deep.query + '" in its transcript.');
+      }
+      clear(deepList);
+      extras.forEach(function (chat) { deepList.appendChild(deepRow(chat)); });
+      return extras.length;
+    }
+
     function render() {
       var view = statusFor(controller.state);
       status.className = 'status ' + view.tone;
       text(status, view.text);
       renderFacets();
       renderRows();
+      var deepExtras = renderDeepResults();
       renderPager();
 
       stateBox.hidden = !controller.state.loading && !controller.state.error && controller.state.total > 0;
@@ -1181,6 +1343,8 @@
         stateBox.innerHTML = '<strong>Loading chats</strong>Reading the archive directly from your PC.';
       } else if (controller.state.error) {
         stateBox.innerHTML = '<strong>PC archive unavailable</strong>Your PC did not answer. Check that the archive server is running there and that the reverse tunnel is up.';
+      } else if (!controller.state.total && deepExtras) {
+        stateBox.innerHTML = '<strong>No chats match these filters</strong>The full-transcript scan below found chats containing your phrase.';
       } else if (!controller.state.total) {
         stateBox.innerHTML = '<strong>No matching chats</strong>Clear a filter or show hidden one-off chats.';
       }
@@ -1195,11 +1359,42 @@
       };
     }
 
+    var liveTimer = 0;
+    function queryValue() { return ($('#query') && $('#query').value) || ''; }
+    // The filter runs 150 ms after you stop typing, exactly like the app's trailing debounce: a five-key
+    // burst costs ONE discovery pass. A newer keystroke supersedes the response through the controller's
+    // own generation guard, so a slow answer can never overwrite a fresher one.
+    function runLiveFilter() {
+      liveTimer = 0;
+      var value = queryValue();
+      if (value === controller.state.filters.q) return;   // `input` and `search` can both fire for one clear
+      controller.state.filters.q = value;
+      if (value !== controller.state.deep.query) controller.clearDeep();
+      controller.load(true);
+    }
+    function cancelLiveFilter() {
+      if (liveTimer) { clearTimeout(liveTimer); liveTimer = 0; }
+    }
+    var queryBox = $('#query');
+    if (queryBox) {
+      queryBox.oninput = function () {
+        cancelLiveFilter();
+        liveTimer = setTimeout(runLiveFilter, LIVE_FILTER_MS);
+      };
+      // Clearing a type=search box fires `search`, not `input`, in most browsers; reset the list at once.
+      queryBox.onsearch = function () { cancelLiveFilter(); runLiveFilter(); };
+    }
     var form = $('#searchform');
     if (form) form.onsubmit = function (event) {
       event.preventDefault();
-      controller.state.filters.q = ($('#query') && $('#query').value) || '';
-      controller.load(true);
+      cancelLiveFilter();
+      var value = queryValue();
+      var changed = value !== controller.state.filters.q;
+      controller.state.filters.q = value;
+      var reload = changed ? controller.load(true) : Promise.resolve(controller.state);
+      // Enter = filter AND scan whole transcripts, the same pairing the desktop search box has. They run
+      // together because the scan reads files and does not depend on the filtered list.
+      return Promise.all([reload, controller.deepSearch(value)]);
     };
     bindSelect('#agent', 'agent');
     bindSelect('#sort', 'sort');

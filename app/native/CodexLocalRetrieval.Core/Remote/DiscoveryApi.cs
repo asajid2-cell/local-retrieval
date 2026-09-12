@@ -86,12 +86,45 @@ public sealed record StartCheckpointProjection(IReadOnlyList<StartCheckpointRow>
 public sealed record StartWorkspaceRow(string Id, string Label, IReadOnlyList<string> Tools);
 public sealed record StartWorkspaceProjection(IReadOnlyList<StartWorkspaceRow> Rows);
 
+// The "deep search" projection: the desktop Search page's content-first transcript scan, reduced to what a
+// browser row needs. It is deliberately NOT a DiscoveryChatRow — these hits come from reading transcript
+// FILES, so each row carries its own snippet and provenance instead of looking one up in the in-memory hit
+// table the filtered list populates. `Ran` distinguishes "the scan found nothing" from "nothing was
+// scanned", so a caller can never report an empty query as an empty result.
+public sealed record DiscoveryDeepRow(
+    string Id,
+    string Title,
+    string Tool,
+    string WorkspaceLabel,
+    string UpdatedAt,
+    int UserMsgCount,
+    bool Pinned,
+    bool Resumable,
+    string MuxName,
+    string Snippet,
+    string Provenance,
+    string MatchedTerms,
+    int Score,
+    string Revision,
+    bool Archived);
+
+public sealed record DiscoveryDeepPage(
+    string Query,
+    int Limit,
+    int Count,
+    bool Ran,
+    IReadOnlyList<DiscoveryDeepRow> Rows);
+
 // HTTP-agnostic discovery surface. The server adapter binds query parameters onto DiscoveryQuery;
 // all archive semantics and response shaping stay here so they can be tested without a web host.
 public sealed class DiscoveryApi
 {
     public const int DefaultLimit = 50;
     public const int MaxLimit = 100;
+
+    // The desktop app's Enter-on-search-box cap is 40 chats; the browser deep search keeps that number so
+    // the two surfaces report the same breadth for the same query.
+    public const int DefaultDeepLimit = 40;
 
     private static readonly HashSet<int> AllowedMinimums = new() { 0, 2, 3, 5, 10, 25 };
     private static readonly HashSet<string> AllowedAgents = new(StringComparer.OrdinalIgnoreCase) { "codex", "claude" };
@@ -129,6 +162,47 @@ public sealed class DiscoveryApi
             normalized.Offset + rows.Count < total,
             rows,
             _archive.LastSearchCoverage);
+    }
+
+    // The desktop app's Enter-on-search-box engine (ArchiveService.DeepSearchContentAsync): scan the real
+    // transcript files for the query's words and rank by frequency plus a title boost. Read-only and
+    // bounded by `limit`; it is a separate call so a heavy file scan is only ever paid for on purpose,
+    // never per keystroke. Archived chats are re-checked here because the indexed engine behind
+    // DeepSearchContentAsync can return them, and the desktop path skips them too.
+    public async Task<DiscoveryDeepPage> DeepSearchAsync(string? query, int? limit = null, bool showHidden = false)
+    {
+        var q = (query ?? "").Trim();
+        var take = Math.Clamp(limit ?? DefaultDeepLimit, 1, MaxLimit);
+        if (q.Length == 0) return new DiscoveryDeepPage(q, take, 0, false, Array.Empty<DiscoveryDeepRow>());
+
+        var hits = await _archive.DeepSearchContentAsync(q, take);
+        // A query of pure stopwords has no words to scan, so an empty result is "nothing was searched",
+        // not "nothing matched". The indexed engine can still return hits for such a query, and a hit
+        // obviously proves the search ran.
+        var ran = hits.Count > 0 || ArchiveService.HasSearchableContentQuery(q);
+        var rows = hits
+            .Where(hit => !hit.Session.Archived)
+            .Where(hit => showHidden || !ArchiveService.IsLowSignalChat(hit.Session))
+            .Take(take)
+            .Select(hit => new DiscoveryDeepRow(
+                hit.Session.Id,
+                SecretRedactor.Scrub(hit.Session.DisplayTitle),
+                NormalizeTool(hit.Session.Tool),
+                SecretRedactor.Scrub(WorkspaceLabel(hit.Session)),
+                hit.Session.UpdatedAt,
+                hit.Session.UserMessageCount,
+                hit.Session.Pinned,
+                _isResumable(hit.Session),
+                ArchiveService.MultiplexSessionName(hit.Session),
+                SecretRedactor.Scrub(hit.Snippet ?? ""),
+                hit.SourceLabel ?? "",
+                SecretRedactor.Scrub(hit.MatchedTerms ?? ""),
+                hit.Score,
+                _archive.RemoteManagementRevision(hit.Session),
+                hit.Session.Archived))
+            .ToList();
+
+        return new DiscoveryDeepPage(q, take, rows.Count, ran, rows);
     }
 
     public DiscoveryFacets Facets(DiscoveryQuery? query = null)

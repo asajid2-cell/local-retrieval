@@ -115,6 +115,11 @@
   }
   .state strong { display:block; color:var(--text); margin-bottom:var(--sp1); }
   .chatlist { display:flex; flex-direction:column; gap:var(--sp2); }
+  .deepresults {
+    display:flex; flex-direction:column; gap:var(--sp2);
+    padding-top:var(--sp3); border-top:1px solid var(--line);
+  }
+  .chat.deep { background:var(--panel-2); }
   .chat {
     display:grid; grid-template-columns:minmax(0,1fr) auto; gap:var(--sp2) var(--sp3);
     padding:var(--sp3); border:1px solid var(--line); border-radius:var(--radius-lg); background:var(--panel);
@@ -241,7 +246,7 @@
 </header>
 
 <form class="searchbar" id="searchform" role="search">
-  <input id="query" name="q" type="search" placeholder="Search titles, metadata, or [phrase]" autocomplete="off" spellcheck="false">
+  <input id="query" name="q" type="search" placeholder="Search titles, metadata, or [phrase]" autocomplete="off" spellcheck="false" title="Type to filter as you go. Press Enter to also scan whole transcripts for the phrase (8+ characters).">
   <button type="submit" title="Search" aria-label="Search">&#8594;</button>
 </form>
 
@@ -286,6 +291,10 @@
     <div class="status loading" id="status" role="status" aria-live="polite">Connecting to your PC archive...</div>
     <div class="state" id="state"><strong>Loading chats</strong>The archive lives on your PC. This page will say plainly if it cannot reach it.</div>
     <div class="chatlist" id="chatlist"></div>
+    <section class="deepresults" id="deepresults" aria-labelledby="deepheading" hidden>
+      <div class="group-title" id="deepheading" role="status" aria-live="polite"></div>
+      <div class="chatlist" id="deeplist"></div>
+    </section>
     <nav class="pager" id="pager" aria-label="Chat pages" hidden>
       <button type="button" id="prev" aria-label="Previous page">&#8592;</button>
       <span id="pageinfo"></span>

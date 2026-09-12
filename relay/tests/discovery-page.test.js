@@ -44,7 +44,7 @@ function fakeDocument() {
   const ids = [
     'chatlist', 'status', 'state', 'tagchips', 'phrasechips', 'project', 'pager',
     'pageinfo', 'prev', 'next', 'searchform', 'query', 'agent', 'sort', 'date',
-    'minimum', 'hidden', 'matchall',
+    'minimum', 'hidden', 'matchall', 'deepresults', 'deepheading', 'deeplist',
   ];
   const nodes = new Map(ids.map(id => [`#${id}`, element(id === 'searchform' ? 'form' : 'div')]));
   nodes.get('#query').value = '';
@@ -54,6 +54,23 @@ function fakeDocument() {
     querySelector: selector => nodes.get(selector) || null,
     createElement: tag => element(tag),
     nodes,
+  };
+}
+
+// The live filter fires on a real timer, so the harness owns the clock instead of waiting 150 ms.
+function fakeClock() {
+  let next = 0;
+  const timers = new Map();
+  return {
+    setTimeout(fn, ms) { const id = ++next; timers.set(id, { fn, ms }); return id; },
+    clearTimeout(id) { timers.delete(id); },
+    pending() { return timers.size; },
+    pendingDelay() { return Array.from(timers.values()).map(t => t.ms); },
+    runAll() {
+      const due = Array.from(timers.values());
+      timers.clear();
+      due.forEach(t => t.fn());
+    },
   };
 }
 
@@ -94,6 +111,48 @@ const FACETS = {
   phrases: [{ value: 'web-parity', count: 1 }],
   projects: [{ id: 'project-web', label: 'Web Project', count: 2 }],
 };
+
+// One chat the filtered page does NOT contain, so the deep section has something of its own to show.
+const DEEP = {
+  query: 'promicro venpod', limit: 40, count: 1, ran: true,
+  rows: [{
+    id: 'chat-9', title: 'Deep transcript match', tool: 'codex', workspaceLabel: 'deep-workspace',
+    updatedAt: '2026-08-02T10:00:00Z', userMsgCount: 4, pinned: false, resumable: true,
+    muxName: 'chat-9', snippet: 'promicro venpod magenta', provenance: 'chat content',
+    matchedTerms: 'promicro, venpod', score: 62, revision: 'rev-9', archived: false,
+  }],
+};
+
+const SEARCH_PREFIX = '/multiplex/pc/api/discovery/search';
+
+function discoveryFetch(over = {}) {
+  return async url => {
+    const text = String(url);
+    if (over.onCall) over.onCall(text);
+    if (text.startsWith(SEARCH_PREFIX)) {
+      if (over.search) return over.search(text);
+      return { ok: true, status: 200, json: async () => over.deep || DEEP };
+    }
+    return { ok: true, status: 200, json: async () => text.includes('/facets') ? FACETS : PAGE };
+  };
+}
+
+async function mount(extra = {}, over = {}) {
+  const doc = fakeDocument();
+  const clock = fakeClock();
+  const calls = [];
+  const sandbox = loadClient({
+    setTimeout: clock.setTimeout, clearTimeout: clock.clearTimeout, ...extra,
+  });
+  const mounted = sandbox.MuxChats.install({
+    document: doc,
+    fetch: over.fetch || discoveryFetch({ ...over, onCall: text => calls.push(text) }),
+  });
+  await mounted.controller.load(true);
+  return { doc, clock, calls, mounted, sandbox };
+}
+
+function submit(doc) { return doc.nodes.get('#searchform').onsubmit({ preventDefault() {} }); }
 
 test('query parameters encode the frozen discovery contract', () => {
   const { MuxChats } = loadClient();
@@ -195,6 +254,152 @@ test('ALL tag control preserves selected tags and resets pagination', async () =
   assert.equal(new URL(fetched.at(-2), 'http://fixture').searchParams.get('match'), 'any');
 });
 
+test('typing filters live on the app\'s 150 ms trailing debounce', async () => {
+  const { doc, clock, calls, mounted } = await mount();
+  const box = doc.nodes.get('#query');
+  assert.equal(typeof box.oninput, 'function', 'the query box must filter as you type');
+
+  const before = calls.length;
+  for (const value of ['w', 'we', 'web', 'web-', 'web-p']) { box.value = value; box.oninput(); }
+  assert.equal(clock.pending(), 1, 'a five-key burst must collapse into one pending pass');
+  assert.deepEqual(clock.pendingDelay(), [150]);
+  assert.equal(calls.length, before, 'typing must not fire a request before the burst settles');
+
+  clock.runAll();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(mounted.controller.state.filters.q, 'web-p');
+  assert.equal(calls.length - before, 2, 'one settled burst is exactly one discovery pass');
+
+  // Settling on the text that is already filtered must not cost another pass.
+  box.value = 'web-p';
+  box.oninput();
+  clock.runAll();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(calls.length - before, 2);
+});
+
+test('Enter filters and scans whole transcripts in one deliberate pass', async () => {
+  const { doc, calls, mounted } = await mount();
+  doc.nodes.get('#query').value = 'promicro venpod';
+  await submit(doc);
+
+  const deepCalls = calls.filter(url => url.startsWith(SEARCH_PREFIX));
+  assert.equal(deepCalls.length, 1, 'only Enter pays for the transcript scan');
+  const params = new URL(deepCalls[0], 'http://fixture').searchParams;
+  assert.equal(params.get('q'), 'promicro venpod');
+  assert.equal(params.get('limit'), '40');
+  assert.equal(params.get('showHidden'), null);
+
+  assert.equal(mounted.controller.state.deep.query, 'promicro venpod');
+  assert.equal(mounted.controller.state.deep.count, 1);
+  assert.equal(mounted.controller.state.deep.ran, true);
+
+  assert.equal(doc.nodes.get('#deepresults').hidden, false);
+  const extras = doc.nodes.get('#deeplist');
+  assert.equal(extras.children.length, 1);
+  assert.equal(extras.children[0].dataset.chatId, 'chat-9');
+  assert.equal(extras.children[0].querySelector('.snippet').textContent, 'promicro venpod magenta');
+  assert.match(extras.children[0].querySelector('.meta').textContent, /matched in chat content/);
+  assert.match(extras.children[0].querySelector('.meta').textContent, /words: promicro, venpod/);
+  assert.match(doc.nodes.get('#deepheading').textContent, /1 more chat matched "promicro venpod" inside the transcript/);
+});
+
+test('deep search never dresses a non-answer up as "no matches"', async () => {
+  // Too short to be a phrase: nothing is sent at all.
+  {
+    const { doc, calls } = await mount();
+    doc.nodes.get('#query').value = 'short';
+    await submit(doc);
+    assert.equal(calls.filter(url => url.startsWith(SEARCH_PREFIX)).length, 0);
+    assert.match(doc.nodes.get('#deepheading').textContent, /at least 8 characters/);
+  }
+  // An older PC build does not have the route.
+  {
+    const { doc } = await mount({}, {
+      fetch: discoveryFetch({ search: () => ({ ok: false, status: 404, json: async () => ({}) }) }),
+    });
+    doc.nodes.get('#query').value = 'promicro venpod';
+    await submit(doc);
+    assert.match(doc.nodes.get('#deepheading').textContent, /cannot search inside transcripts/);
+    assert.doesNotMatch(doc.nodes.get('#deepheading').textContent, /No chat contains/);
+  }
+  // The query had no words worth scanning, so the scan never ran.
+  {
+    const { doc } = await mount({}, {
+      fetch: discoveryFetch({ deep: { query: 'the and you are', limit: 40, count: 0, ran: false, rows: [] } }),
+    });
+    doc.nodes.get('#query').value = 'the and you are';
+    await submit(doc);
+    assert.match(doc.nodes.get('#deepheading').textContent, /No full-transcript scan ran/);
+    assert.doesNotMatch(doc.nodes.get('#deepheading').textContent, /No chat contains/);
+  }
+  // The scan ran and matched nothing — only THIS case may say so.
+  {
+    const { doc } = await mount({}, {
+      fetch: discoveryFetch({ deep: { query: 'zeppelin airship', limit: 40, count: 0, ran: true, rows: [] } }),
+    });
+    doc.nodes.get('#query').value = 'zeppelin airship';
+    await submit(doc);
+    assert.match(doc.nodes.get('#deepheading').textContent, /No chat contains "zeppelin airship"/);
+  }
+});
+
+test('a new keystroke drops results that belonged to the previous phrase', async () => {
+  const { doc, clock, mounted } = await mount();
+  doc.nodes.get('#query').value = 'promicro venpod';
+  await submit(doc);
+  assert.equal(mounted.controller.state.deep.rows.length, 1);
+
+  const box = doc.nodes.get('#query');
+  box.value = 'promicro venpod x';
+  box.oninput();
+  clock.runAll();
+  assert.equal(mounted.controller.state.deep.query, '');
+  assert.equal(mounted.controller.state.deep.rows.length, 0);
+  assert.equal(doc.nodes.get('#deepresults').hidden, true);
+  assert.equal(doc.nodes.get('#deeplist').children.length, 0);
+});
+
+test('deep rows already in the filtered list are not shown twice', async () => {
+  const { doc } = await mount({}, {
+    fetch: discoveryFetch({ deep: { ...DEEP, rows: [{ ...DEEP.rows[0], id: 'chat-1' }] } }),
+  });
+  doc.nodes.get('#query').value = 'promicro venpod';
+  await submit(doc);
+  assert.equal(doc.nodes.get('#deeplist').children.length, 0);
+  assert.match(doc.nodes.get('#deepheading').textContent, /already listed above/);
+});
+
+test('an empty filtered list does not deny a full-transcript match on the same screen', async () => {
+  const empty = { query: '', offset: 0, limit: 40, total: 0, hasMore: false, rows: [] };
+  const { doc } = await mount({}, {
+    fetch: async url => {
+      const text = String(url);
+      if (text.startsWith(SEARCH_PREFIX)) return { ok: true, status: 200, json: async () => DEEP };
+      return {
+        ok: true, status: 200,
+        json: async () => text.includes('/facets')
+          ? { ...FACETS, total: 0, hidden: 0, tags: [], phrases: [], projects: [] }
+          : empty,
+      };
+    },
+  });
+  doc.nodes.get('#query').value = 'promicro venpod';
+  await submit(doc);
+  assert.equal(doc.nodes.get('#deeplist').children.length, 1);
+  assert.match(doc.nodes.get('#state').innerHTML, /No chats match these filters/);
+  assert.doesNotMatch(doc.nodes.get('#state').innerHTML, /No matching chats/);
+});
+
+test('deep search follows the show-hidden choice the list is using', async () => {
+  const { doc, calls, mounted } = await mount();
+  mounted.controller.state.filters.showHidden = true;
+  doc.nodes.get('#query').value = 'promicro venpod';
+  await submit(doc);
+  const call = calls.find(url => url.startsWith(SEARCH_PREFIX));
+  assert.equal(new URL(call, 'http://fixture').searchParams.get('showHidden'), 'true');
+});
+
 test('ordinary copy preserves stored launch mode while explicit Gateway copy overrides it', async () => {
   const doc = fakeDocument(), requests = [], clipboard = [];
   const sandbox = loadClient({
@@ -219,7 +424,8 @@ test('page markup exposes every primary control and loads scripts in dependency 
   const html = fs.readFileSync(path.join(PUBLIC, 'chats.html'), 'utf8');
   for (const id of [
     'searchform', 'query', 'filters', 'agent', 'sort', 'date', 'minimum', 'project',
-    'hidden', 'matchall', 'archived', 'tagchips', 'phrasechips', 'status', 'state', 'chatlist', 'pager', 'prev', 'next',
+    'hidden', 'matchall', 'archived', 'tagchips', 'phrasechips', 'status', 'state', 'chatlist',
+    'deepresults', 'deepheading', 'deeplist', 'pager', 'prev', 'next',
   ]) assert.ok(html.includes(`id="${id}"`), `missing #${id}`);
   assert.ok(html.indexOf('intent-journal.js') < html.indexOf('picker.js'));
   assert.ok(html.indexOf('picker.js') < html.indexOf('chats.js'));

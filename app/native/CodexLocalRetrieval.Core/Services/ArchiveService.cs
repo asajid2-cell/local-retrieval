@@ -1212,6 +1212,11 @@ public sealed partial class ArchiveService
             .Take(12)
             .ToList();
 
+    // True when a query contains words worth scanning transcripts for. Callers that report a result to a
+    // human need this to tell "the search ran and matched nothing" apart from "there was nothing to
+    // search" — printing "0 matches" for a query of stopwords is a wrong answer, not an empty one.
+    public static bool HasSearchableContentQuery(string? query) => ContentQueryTokens(query ?? "").Count > 0;
+
     // Count (capped) case-insensitive, non-overlapping occurrences of a needle in a haystack.
     private static int CountOccurrencesCI(string haystack, string needle, int cap = 50)
     {
