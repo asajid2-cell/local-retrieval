@@ -10,3 +10,13 @@ __pycache__/
 *.bak
 *.pre-schema*
 *.pre-*hardening
+
+# verification scratch: ledgers, run artifacts, disposable fixtures
+.agent/
+_gui-experiment-*/
+.pytest_cache/
+TestResults/
+*.trx
+
+# ad-hoc evidence dumps at repo root (durable copies live under .agent/runs/)
+/*.json
