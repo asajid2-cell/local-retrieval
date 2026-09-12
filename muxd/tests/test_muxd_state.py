@@ -39,6 +39,25 @@ class FakeSession:
 
 
 class MuxdStateTests(unittest.TestCase):
+    def test_relay_link_failure_detail_explains_invalid_handshake_response(self):
+        detail = muxd.relay_link_failure_detail(
+            "ws://lan.example/host",
+            type("InvalidMessage", (Exception,), {})(),
+        )
+
+        self.assertIn("invalid HTTP response", detail)
+        self.assertIn("/host WebSocket route", detail)
+        self.assertIn("Upgrade/Connection", detail)
+
+    def test_relay_link_failure_detail_explains_http_status(self):
+        error = type("InvalidStatus", (Exception,), {"status_code": 502})()
+
+        detail = muxd.relay_link_failure_detail("wss://public.example/host", error)
+
+        self.assertIn("HTTP 502", detail)
+        self.assertIn("relay service", detail)
+        self.assertIn("/host token", detail)
+
     def test_deployment_fence_is_file_backed_and_dynamic(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             fence = os.path.join(temp_dir, "deploying.flag")
