@@ -1113,7 +1113,10 @@ CUSTODY_GC_INTERVAL_SECONDS = max(
 )
 CLAIM_SWEEP_SECONDS = max(15, int(ENV.get("LAUNCH_CLAIM_SWEEP_SECONDS", "60")))
 PROTOCOL = 4
-CAPS = ["ls", "info", "create", "createAck", "bind", "input", "open", "attach", "kill", "rename", "heal", "tail", "scrollback", "resize", "owner", "relaunch", "agentTruth", "resync", "inputDurable"]
+CAPS = ["ls", "info", "create", "createAck", "bind", "input", "open", "attach", "kill", "killFence", "relayKillFence", "rename", "heal", "tail", "scrollback", "resize", "owner", "relaunch", "agentTruth", "resync", "inputDurable", "inputFence", "resumeOnly"]
+
+# killFence is deliberately separate from legacy name-only kill. Reclaim must prove both
+# the advertised logical owner and this concrete mux generation before remove_session mutates state.
 # The relay is a conduit, not an authority: a host-link `i` frame only reaches the PTY when it
 # carries a principal-signed input.durable proof this endpoint verifies. Empty until pairing
 # provisions a principal, which means "refuse everything" — the correct posture, not a gap.
@@ -3173,6 +3176,7 @@ def live_tabs_snapshot(now=None):
         except Exception: alive = False
         out[n] = {
             "pid": pid,
+            "generationId": str(getattr(s, "generation_id", "") or ""),
             "cwd": getattr(s, "cwd", "") or "",
             "alive": alive,
             "hasCommand": session_has_command(s),
@@ -3181,9 +3185,9 @@ def live_tabs_snapshot(now=None):
         }
     return out
 
-def write_live_tabs():
+def write_live_tabs(snapshot):
     try:
-        durable_json_write(LIVE_TABS, live_tabs_snapshot())
+        durable_json_write(LIVE_TABS, snapshot)
     except Exception as e:
         log(f"live-tabs write failed: {e}")
 
@@ -3345,6 +3349,7 @@ def session_payload(name, sess):
             "sessionUuid": str(getattr(sess, "session_uuid", "") or ""),
             "ready": alive, "kind": kind,
             "sessionId": getattr(sess, "session_id", "") or "",
+            "generationId": str(getattr(sess, "generation_id", "") or ""),
             "aliases": list(getattr(sess, "aliases", []) or []),
             "identityPending": bool(getattr(sess, "identity_pending", False)),
             "lifecycle": str(getattr(sess, "lifecycle", "active") or "active"),
@@ -3787,6 +3792,12 @@ async def main():
         if not request_id:
             if session is None or not session.alive():
                 return {"t": "err", "m": "session is not live: " + strict_mux_name(first.get("s", ""))}
+            if "sessionId" in first or "generationId" in first:
+                if (sessions.get(session.name) is not session
+                        or not first.get("sessionId") or not first.get("generationId")
+                        or first.get("sessionId") != getattr(session, "session_id", "")
+                        or first.get("generationId") != getattr(session, "generation_id", "")):
+                    return {"t": "err", "m": "input destination identity changed"}
             if isinstance(session, OwnerSession):
                 ok, detail = await session.write_confirmed(data)
             else:
@@ -3819,6 +3830,12 @@ async def main():
 
             if session is None or not session.alive():
                 return {"t": "err", "m": "session is not live: " + strict_mux_name(first.get("s", ""))}
+            if "sessionId" in first or "generationId" in first:
+                if (sessions.get(session.name) is not session
+                        or not first.get("sessionId") or not first.get("generationId")
+                        or first.get("sessionId") != getattr(session, "session_id", "")
+                        or first.get("generationId") != getattr(session, "generation_id", "")):
+                    return {"t": "err", "m": "input destination identity changed"}
             record = {
                 "kind": "input",
                 "session": session.name,
@@ -3862,11 +3879,20 @@ async def main():
             return result
 
     @state_mutation
-    async def remove_session(name, by_user):
+    async def remove_session(name, by_user, expected_session_id=None, expected_generation_id=None):
         async with launch_lock(name):
             current = sessions.get(name)
             if current is None:
                 return False, "no such session: " + name
+            if expected_session_id is not None or expected_generation_id is not None:
+                actual_session_id = str(getattr(current, "session_id", "") or "")
+                actual_generation_id = str(getattr(current, "generation_id", "") or "")
+                if expected_session_id is None or not expected_generation_id:
+                    return False, "fenced kill requires sessionId and generationId"
+                if actual_session_id != expected_session_id:
+                    return False, "fenced kill session identity mismatch"
+                if actual_generation_id != expected_generation_id:
+                    return False, "fenced kill generation mismatch"
             snapshot = prepare_session_stop(current, by_user)
             try:
                 await manifest_save_async(sessions)
@@ -4125,6 +4151,12 @@ async def main():
             if requested_identity_pending and requested_heal:
                 return None, "cannot arm auto-resume until the fresh session identity is captured", False
 
+            if first.get("resumeOnly") and prev and not requested_relaunch:
+                if (not requested_session_id
+                        or requested_session_id != getattr(prev, "session_id", "")
+                        or (prev.alive() and needs_relaunch_for_command(prev, requested_cmd))):
+                    return None, "resume destination is occupied by a different identity or command", False
+
             if prev and prev.alive() and not requested_relaunch and not needs_relaunch_for_command(prev, requested_cmd):
                 claim, _, claim_detail = await reserve_launch_claim(name, cmd, candidate_ids, prev)
                 if candidate_ids and claim is None:
@@ -4340,6 +4372,9 @@ async def main():
             current = sessions.get(name)
             if current is None or not current.alive():
                 return None, "session is not live: " + name
+            expected_generation = first.get("generationId", "")
+            if not isinstance(expected_generation, str) or not expected_generation or expected_generation != str(getattr(current, "generation_id", "") or ""):
+                return None, "identity binding generation mismatch"
             if not getattr(current, "identity_pending", False):
                 current_ids = {str(value).lower() for value in ([getattr(current, "session_id", "")] + list(getattr(current, "aliases", []) or [])) if value}
                 if canonical_id.lower() in current_ids:
@@ -4355,6 +4390,8 @@ async def main():
             )
             if not owned_ok:
                 return None, owned_detail or "could not verify pending session ownership"
+            if not ignored_live:
+                return None, "pending identity requires a verified live descendant"
             claim, _, claim_detail = await reserve_launch_claim(
                 name,
                 cmd,
@@ -4443,6 +4480,13 @@ async def main():
                 last_warn = now
                 log(f"[watchdog] event loop lag {lag:.3f}s")
     start_supervised_background(background_tasks, "loop-monitor", loop_monitor)
+
+    async def live_identity_projection():
+        while True:
+            snapshot = live_tabs_snapshot()
+            await asyncio.get_running_loop().run_in_executor(None, write_live_tabs, snapshot)
+            await asyncio.sleep(5)
+    start_supervised_background(background_tasks, "live-identity-projection", live_identity_projection)
 
     async def conpty_orphan_reaper_tick():
         delay = CONPTY_REAPER_INTERVAL
@@ -4719,7 +4763,19 @@ async def main():
                     name = SAFE(first.get("s", ""))
                     if not name or name not in sessions:
                         await ws.send(json.dumps({"t": "err", "m": "no such session: " + name})); return
-                    ok, detail = await remove_session(name, by_user=True)
+                    fenced = "sessionId" in first or "generationId" in first
+                    if fenced and (not isinstance(first.get("sessionId"), str)
+                                   or _safe_identity(first["sessionId"]) != first["sessionId"]
+                                   or not isinstance(first.get("generationId"), str) or not first["generationId"]
+                                   or _safe_identity(first["generationId"]) != first["generationId"]):
+                        await ws.send(json.dumps({"t": "err", "m": "fenced kill requires exact sessionId and generationId"})); return
+                    ok, detail = await remove_session(
+                        name, by_user=True,
+                        expected_session_id=_safe_identity(first.get("sessionId", "")) if fenced else None,
+                        expected_generation_id=_safe_identity(first.get("generationId", "")) if fenced else None,
+                    )
+                    if fenced and not ok:
+                        await ws.send(json.dumps({"t": "err", "m": detail})); return
                     if not ok:
                         await ws.send(json.dumps({"t": "err", "m": detail})); return
                     await ws.send(json.dumps({"t": "killed", "s": name})); return
@@ -4788,13 +4844,17 @@ async def main():
                 if first.get("t") == "create":
                     result = await coordinate_create_intent(first, "local", True)
                     if not result.get("ok"):
-                        await ws.send(json.dumps({"t": "err", "m": result.get("detail", "create failed")})); return
+                        await ws.send(json.dumps({
+                            "t": "err", "m": result.get("detail", "create failed"),
+                            "retryable": bool(result.get("retryable", True)),
+                        })); return
                     session = result.get("session") or {}
                     await ws.send(json.dumps({
                         "t": "created",
                         "s": session.get("name", strict_mux_name(first.get("s", ""))),
                         "created": bool(result.get("created")),
                         "alive": bool(session.get("alive")),
+                        "generationId": session.get("generationId", ""),
                     })); return
                 if first.get("t") == "input":
                     name = SAFE(first.get("s", ""))
@@ -4935,8 +4995,6 @@ async def main():
                         while True:
                             await asyncio.sleep(5)
                             refresh_live_custody()   # a session that is alive right now cannot go stale
-                            try: await asyncio.get_running_loop().run_in_executor(None, write_live_tabs)   # off-loop file write
-                            except Exception: pass
                             # divided cadence: the pump ticks every 5s, the claim sweep self-throttles
                             # to CLAIM_SWEEP_SECONDS (~60s). Off-loop: it stats pids and touches disk.
                             try: await asyncio.get_running_loop().run_in_executor(None, maybe_sweep_launch_claims)
@@ -5078,13 +5136,25 @@ async def main():
                                     ),
                                 )
                                 await ws.send(json.dumps({"t": "tailr", "rid": m.get("rid", ""), "text": tail}))
-                            elif t == "kill" and name in sessions:
-                                ok, detail = await remove_session(name, by_user=True)
+                            elif t == "kill":
+                                session_id = m.get("sessionId")
+                                generation_id = m.get("generationId")
+                                reply = {"s": name, "rid": m.get("rid", ""),
+                                         "sessionId": session_id, "generationId": generation_id}
+                                if (not isinstance(session_id, str) or _safe_identity(session_id) != session_id
+                                        or not isinstance(generation_id, str) or not generation_id
+                                        or _safe_identity(generation_id) != generation_id or not m.get("rid")):
+                                    await ws.send(json.dumps({**reply, "t": "killResult", "ok": False,
+                                                             "detail": "exact sessionId, generationId and rid required"}))
+                                    continue
+                                ok, detail = await remove_session(name, by_user=True,
+                                    expected_session_id=session_id, expected_generation_id=generation_id)
                                 if not ok:
                                     log(f"[{name}] remote stop failed: {detail}")
-                                    await ws.send(json.dumps({"t": "sessions", "list": sess_list(), "notice": "session stop failed"}))
-                                    continue
-                                await ws.send(json.dumps({"t": "killed", "s": name}))
+                                    await ws.send(json.dumps({**reply, "t": "killResult", "ok": False,
+                                                             "uncertain": True, "detail": detail}))
+                                else:
+                                    await ws.send(json.dumps({**reply, "t": "killed"}))
                                 await ws.send(json.dumps({"t": "sessions", "list": sess_list()}))
                     finally:
                         for tk in tasks: tk.cancel()

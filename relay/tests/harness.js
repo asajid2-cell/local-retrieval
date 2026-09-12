@@ -1,5 +1,6 @@
 const assert = require('node:assert/strict');
 const childProcess = require('node:child_process');
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const http = require('node:http');
 const net = require('node:net');
@@ -9,7 +10,7 @@ const { once } = require('node:events');
 const WebSocket = require('ws');
 
 const REPO = path.resolve(__dirname, '..');
-const HOST_CAPS = ['create', 'createAck', 'kill', 'rename', 'heal', 'tail', 'scrollback', 'relaunch'];
+const HOST_CAPS = ['create', 'createAck', 'kill', 'relayKillFence', 'rename', 'heal', 'tail', 'scrollback', 'relaunch'];
 
 function freePort() {
   return new Promise((resolve, reject) => {
@@ -42,15 +43,27 @@ async function waitFor(fn, label, timeoutMs = 4000) {
 }
 
 async function leaseCommands(h, owner = 'test-consumer') {
-  return await h.json('POST', '/api/app-commands/lease', { owner, limit: 16 });
+  const pathName = '/api/app-commands/lease';
+  const res = await h.request(
+    'POST',
+    pathName,
+    { owner, limit: 16 },
+    { 'X-Mux-Command-Bridge': h.commandBridgeToken },
+  );
+  assert.ok(res.status >= 200 && res.status < 300, `POST ${pathName} failed: ${res.status} ${res.text}`);
+  return res.body;
 }
 
 async function ackLeased(h, command, result) {
-  return await h.json(
+  const pathName = `/api/app-commands/${encodeURIComponent(command.id)}/ack`;
+  const res = await h.request(
     'POST',
-    `/api/app-commands/${encodeURIComponent(command.id)}/ack`,
+    pathName,
     { leaseToken: command.leaseToken, ...result },
+    { 'X-Mux-Command-Bridge': h.commandBridgeToken },
   );
+  assert.ok(res.status >= 200 && res.status < 300, `POST ${pathName} failed: ${res.status} ${res.text}`);
+  return res.body;
 }
 
 function waitForWsText(ws, regex, label, timeoutMs = 4000) {
@@ -92,6 +105,7 @@ function waitForWsFrame(ws, match, label, timeoutMs = 4000) {
 class RelayHarness {
   constructor(env = {}) {
     this.proc = null;
+    this.commandBridgeToken = crypto.randomBytes(32).toString('hex');
     this.env = env;
     this.tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-test-'));
     this.stdout = '';
@@ -99,7 +113,7 @@ class RelayHarness {
   }
 
   async start() {
-    this.port = await freePort();
+    this.port = this.fixedPort || await freePort();
     this.proc = childProcess.spawn(process.execPath, ['server.js'], {
       cwd: REPO,
       env: {
@@ -107,11 +121,14 @@ class RelayHarness {
         PORT: String(this.port),
         MUX_HOST_TOKEN: 'test-token',
         MUX_TEST_MODE: '1',
+        MUX_TEST_FIXTURE: '1',
+        MUX_BIND_HOST: '127.0.0.1',
         MUX_AUTOHEAL: '0',
         MUX_STATE_DIR: this.tmp,
         MUX_TEST_PERSIST_FAULT_FILE: path.join(this.tmp, '.persist-fault.json'),
         MUX_HOST_SB_WAIT_MS: '40',
         MUX_COMMAND_LEASE_MS: '1000',
+        MUX_COMMAND_BRIDGE_TOKEN: this.commandBridgeToken,
         HLAUTH_BASE: 'http://127.0.0.1:1',
         ...this.env,
       },
@@ -119,7 +136,12 @@ class RelayHarness {
     });
     this.proc.stdout.on('data', d => { this.stdout += d.toString(); });
     this.proc.stderr.on('data', d => { this.stderr += d.toString(); });
-    await waitFor(() => this.stdout.includes(`multiplex-app on 0.0.0.0:${this.port}`), 'relay start', 5000);
+    try {
+      await waitFor(() => this.stdout.includes(`multiplex-app on 127.0.0.1:${this.port}`), 'relay start', 5000);
+    } catch (error) {
+      error.message += `; pid=${this.proc.pid}; exit=${this.proc.exitCode}; signal=${this.proc.signalCode}; stdoutBytes=${Buffer.byteLength(this.stdout)}; stderrBytes=${Buffer.byteLength(this.stderr)}`;
+      throw error;
+    }
   }
 
   async stopProcess() {
@@ -174,8 +196,8 @@ class RelayHarness {
     });
   }
 
-  async json(method, pathName, body) {
-    const res = await this.request(method, pathName, body);
+  async json(method, pathName, body, headers = {}) {
+    const res = await this.request(method, pathName, body, headers);
     assert.ok(res.status >= 200 && res.status < 300, `${method} ${pathName} failed: ${res.status} ${res.text}`);
     return res.body;
   }
@@ -279,7 +301,9 @@ class FakeHost {
   }
 
   sendKilled(name) {
-    this.ws.send(JSON.stringify({ t: 'killed', s: name }));
+    const request = [...this.messages].reverse().find(m => m.t === 'kill' && m.s === name);
+    if (!request?.rid) throw new Error('no correlated kill request for ' + name);
+    this.ws.send(JSON.stringify({ ...request, t: 'killed' }));
   }
 
   sendCreateResult(request, { ok = true, created = true, session = null, detail = '', retryable = false } = {}) {

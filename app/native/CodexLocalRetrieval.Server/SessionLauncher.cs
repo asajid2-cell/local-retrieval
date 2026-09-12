@@ -235,7 +235,7 @@ public sealed class SessionLauncher
             exe = Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
                 "Programs",
-                "CodexLocalRetrieval",
+                "MUX",
                 "CodexLocalRetrieval.Native.exe");
         if (!File.Exists(exe))
             return (false, "Desktop app not found (install it, or set CLR_DESKTOP_APP_EXE).");

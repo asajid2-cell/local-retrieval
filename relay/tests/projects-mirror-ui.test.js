@@ -38,12 +38,16 @@ test('running-on-PC rows expose Mirror or Attach only with a verified identity',
   assert.ok(source.includes('!s.sessionId || !muxName || !s.pid'));
 });
 
-test('detached adopted stop is honest about leaving the local agent alive', () => {
-  assert.match(source, /hosted && hosted\.adopted && hosted\.detachedLocal/);
-  assert.match(source, /btn\.textContent=detachedAdopted\?'Mirror cleared':'Killed'/);
-  assert.match(source, /The local agent is still running on your PC/);
-  assert.match(source, /A detached mirror is only cleared, leaving its local agent running/);
-  assert.doesNotMatch(source, /This ends that running session on your PC/);
+test('projects running rows reclaim the chat instead of killing it', () => {
+  // One flow per chat: reclaim stops the chat's processes, releases custody and keeps the transcript,
+  // whether the agent runs as a mux tab or in a plain local terminal. The old bare "kill" is gone.
+  assert.match(source, /reclaimBtn\.textContent='Reclaim'/);
+  assert.match(source, /async function reclaimSession\(s, row, btn\)/);
+  assert.match(source, /type:'reclaim',confirmed:true/);
+  assert.match(source, /This stops the chat's processes and releases its custody\. The transcript is kept/);
+  assert.doesNotMatch(source, /type:'kill'/);
+  assert.doesNotMatch(source, /'kill-local'/);
+  assert.doesNotMatch(source, /detachedAdopted/);
 });
 
 test('obsolete kill-before-relaunch helper is gone', () => {

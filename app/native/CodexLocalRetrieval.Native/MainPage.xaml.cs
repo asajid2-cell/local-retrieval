@@ -15,11 +15,15 @@ namespace CodexLocalRetrieval_Native;
 
 public sealed partial class MainPage : Page
 {
-    private readonly ArchiveService _archive = new();
+    private readonly ArchiveService _archive = GuiVerificationFixture.CreateArchive();
     private readonly AiChatService _ai = new();
     private readonly SessionLaunchGovernor _launchGovernor = new();
     private readonly Stack<string> _backStack = new();
     private ArchiveSession? _selectedField;
+    // User selection intent is separate from programmatic list maintenance. Async refreshes capture this
+    // revision and may restore their snapshot only when no newer click has happened.
+    private long _selectionRevision;
+    private long SelectionRevision => Volatile.Read(ref _selectionRevision);
     // Selection is the live reader's target, so every assignment re-points the watch through this one
     // hook — no beat is needed to notice a different chat got opened. Assign first, THEN arm, so
     // ArmLiveWatch always reads the new selection and can never re-enter this setter.
@@ -38,6 +42,11 @@ public sealed partial class MainPage : Page
     private int _panelRadius = 12;
     private int _controlRadius = 12;
     private bool _storeLoaded;
+    private bool _archiveLoadFailed;
+    private bool _pageInitialized;
+    private int _archiveSyncWorkerActive;
+    private int _archiveSyncPending;
+    private readonly List<IFileWatchRegistration> _archiveSourceWatches = new();
     private string _deepSearchQuery = "";
     private string _askQuestion = "";
     private string _askAnswer = "";
@@ -68,9 +77,24 @@ public sealed partial class MainPage : Page
         Diag.Log("MP.Loaded: start");
         try
         {
-            await _archive.LoadAsync();
+            await _archive.LoadCachedAsync();
             Diag.Log("MP.Loaded: archive loaded (" + _archive.Sessions.Count + " sessions)");
+        }
+        catch (Exception ex)
+        {
+            _archiveLoadFailed = true;
+            Diag.Log("MP.Loaded: archive load failed: " + ex);
+            SyncStatus.Text = "Archive store is busy; showing an empty view. Click Sync sessions to retry.";
+        }
+
+        try
+        {
+            if (_archiveLoadFailed)
+                Diag.Log("MP.Loaded: continuing with empty in-memory store after archive load failure");
+
             ApplyThemeAndShape();
+            if (_archive.Sessions.Count > 0)
+                SyncStatus.Text = _archive.Sessions.Count + " chats - cached";
             _storeLoaded = true;
             _archive.OnReapplyFilter = ReapplyActiveFilter;   // mutations/sync re-run the active filter instead of dropping it
             SessionList.ItemsSource = _archive.Sessions;
@@ -80,14 +104,24 @@ public sealed partial class MainPage : Page
             RenderCurrent();
             Diag.Log("MP.Loaded: render done");
             StartCaptureHarness();
-            StartAgentBridge();
+            if (!GuiVerificationFixture.Enabled) StartAgentBridge();
             StartLiveReader();
+            _pageInitialized = true;
+            if (GuiVerificationFixture.Enabled)
+            {
+                _archive.Store.Settings.MultiplexSshTarget = "loopback";
+                _archive.Store.Settings.MultiplexApiPort = GuiVerificationFixture.Port;
+                StartProjectSync();
+                return;
+            }
+            StartArchiveSourceWatches();
+            Unloaded += (_, _) => StopArchiveSourceWatches();
             Diag.Log("DeepSeek key source: " + ApiKeySource("deepseek"));
             _ = StartupResurfaceAsync();
         }
         catch (Exception ex)
         {
-            Diag.Log("MP.Loaded: EXCEPTION " + ex);
+            Diag.Log("MP.Loaded: page initialization failed: " + ex);
         }
     }
 
@@ -117,7 +151,7 @@ public sealed partial class MainPage : Page
             var beforeCount = s.MessageCount;
             var beforeLast = s.LastUserMessage ?? "";
             await _archive.ReloadContentAsync(s);
-            if (_screen != "Archive" || !ReferenceEquals(_selected, s)) return;
+            if (_screen != "Archive" || !IsSelectedSession(s)) return;
             // Re-baseline the live watcher so it doesn't immediately reload again.
             _liveSession = s;
             _liveMtime = _archive.SourceWriteTimeUtc(s);
@@ -172,7 +206,7 @@ public sealed partial class MainPage : Page
         }
 
         // First sight of this chat -> set the baseline, don't repaint.
-        if (!ReferenceEquals(_selected, _liveSession))
+        if (_liveSession is null || !IsSelectedSession(_liveSession))
         {
             _liveSession = _selected;
             _liveMtime = _archive.SourceWriteTimeUtc(_selected);
@@ -194,7 +228,7 @@ public sealed partial class MainPage : Page
         {
             _liveMtime = mtime;
             await _archive.ReloadContentAsync(_selected);
-            if (_screen == "Archive" && ReferenceEquals(_selected, _liveSession))
+            if (_screen == "Archive" && _liveSession is not null && IsSelectedSession(_liveSession))
             {
                 _scrollArchiveToBottom = true;
                 RenderArchive();
@@ -206,11 +240,19 @@ public sealed partial class MainPage : Page
 
     private async Task RefreshTitlesAfterFirstPaint()
     {
+        var keepId = _selected?.Id;
         try
         {
             if (await _archive.EnrichTitlesFromLocalStateAsync())
             {
-                SelectFirstSession();
+                var restored = keepId is not null
+                    ? _archive.Sessions.FirstOrDefault(s => string.Equals(s.Id, keepId, StringComparison.OrdinalIgnoreCase))
+                    : null;
+                RunSessionListRefresh(() =>
+                {
+                    _selected = restored;
+                    SelectSessionRow(restored);
+                });
                 RenderCurrent();
             }
         }
@@ -219,6 +261,11 @@ public sealed partial class MainPage : Page
             // Local title indexes are optional; startup should not depend on them.
         }
     }
+
+    private bool IsSelectedSession(ArchiveSession? session) =>
+        session is not null
+        && _selected is { } selected
+        && string.Equals(selected.Id, session.Id, StringComparison.OrdinalIgnoreCase);
 
     private void SelectFirstSession()
     {
@@ -230,6 +277,7 @@ public sealed partial class MainPage : Page
     // path that highlights a row goes through here so SelectionChanged can distinguish user clicks
     // from our own bookkeeping.
     private bool _suppressSelChanged;
+    private bool _refreshingSessionList;
     private void SelectSessionRow(ArchiveSession? s)
     {
         _suppressSelChanged = true;
@@ -237,17 +285,28 @@ public sealed partial class MainPage : Page
         finally { _suppressSelChanged = false; }
     }
 
+    private void RunSessionListRefresh(Action refresh)
+    {
+        _refreshingSessionList = true;
+        try { refresh(); }
+        finally { _refreshingSessionList = false; }
+    }
+
+    private bool SessionListSelectionSuppressed => _suppressSelChanged || _refreshingSessionList;
+
     // Plain click selects one row -> open it. Ctrl/Shift-click grows a multi-selection (count > 1);
     // in that case we leave the open chat alone — the right-click menu acts on the whole selection.
     private void SessionList_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
-        if (_suppressSelChanged) return;
+        if (SessionListSelectionSuppressed) return;
         var sel = SessionList.SelectedItems;
         if (sel.Count == 1)
         {
+            Interlocked.Increment(ref _selectionRevision);
             _selected = sel[0] as ArchiveSession;
             Navigate("Archive");
         }
+
         else if (sel.Count > 1)
         {
             SyncStatus.Text = $"{sel.Count} chats selected — right-click to add them to a collection.";
@@ -265,7 +324,7 @@ public sealed partial class MainPage : Page
 
     // Live in-memory filter as you type (title + capped content + all active filters). The deeper
     // full-transcript phrase search is heavy, so it runs on ENTER only (see SearchBox_KeyDown), not per key.
-    private void SearchBox_TextChanged(object sender, TextChangedEventArgs e) => SearchDebouncer.Post(SearchBox.Text);
+    private void SearchBox_TextChanged(object sender, TextChangedEventArgs e) => SearchDebouncer.Post((SearchBox.Text, SelectionRevision));
 
     // Kept for callers that pre-set SearchBox.Text (e.g. capture replay); routes through the unified
     // text + tag filter so an active tag filter is always respected.
@@ -376,6 +435,10 @@ public sealed partial class MainPage : Page
         QuickResumeGatewayItem.Visibility = gatewayContinuation ? Visibility.Visible : Visibility.Collapsed;
         QuickGatewayMultiplexItem.Visibility = gatewayMultiplex ? Visibility.Visible : Visibility.Collapsed;
         QuickGatewayHeadlessItem.Visibility = gatewayMultiplex ? Visibility.Visible : Visibility.Collapsed;
+        CopyGatewayCommandButton.Visibility = showRight && _selected is not null
+            && ArchiveService.CanResumeThroughGateway(_selected.Tool)
+            ? Visibility.Visible
+            : Visibility.Collapsed;
     }
 
     // Header overflow menu: the same secondary actions as the right "Quick actions" rail, reachable
@@ -393,6 +456,8 @@ public sealed partial class MainPage : Page
         flyout.Items.Add(new MenuFlyoutSeparator());
         Add("Copy resume prompt", () => Copy("resume"));
         Add("Copy resume command", CopyResumeCommandIfClear);
+        if (ArchiveService.CanResumeThroughGateway(_selected.Tool))
+            Add("Copy Gateway command", CopyGatewayCommandIfClear);
         Add("Copy chat path", () => Copy("path"));
         Add("Copy all code", () => Copy("code"));
         flyout.Items.Add(new MenuFlyoutSeparator());
@@ -453,11 +518,11 @@ public sealed partial class MainPage : Page
         try
         {
             var full = await _archive.ExtractReaderMessagesAsync(sess, filter);
-            if (ReferenceEquals(_selected, sess) && _msgFilter == filter) { _fullMsgs = full; _fullMsgsFor = sess.Id + "|" + filter; }
+            if (IsSelectedSession(sess) && _msgFilter == filter) { _fullMsgs = full; _fullMsgsFor = sess.Id + "|" + filter; }
         }
         catch (Exception ex) { Diag.Log("ExtractReaderMessages: " + ex.Message); }
         finally { _fullMsgsLoading = false; }
-        if (ReferenceEquals(_selected, sess) && _msgFilter == filter && _screen == "Archive") RenderArchive();
+        if (IsSelectedSession(sess) && _msgFilter == filter && _screen == "Archive") RenderArchive();
     }
 
     private void UpdateMsgViewToggle() =>
@@ -575,36 +640,38 @@ public sealed partial class MainPage : Page
         }
 
         // New chat selected -> start fresh and jump to the newest messages once it renders.
-        if (!ReferenceEquals(_selected, _lastArchiveSession)) { _archiveShown = 0; _lastArchiveSession = _selected; _scrollArchiveToBottom = true; _msgFilter = "all"; _jumpUserAnchor = null; _fullMsgs = null; _fullMsgsFor = ""; _openFreshenDone = false; UpdateMsgViewToggle(); }
+        if (!string.Equals(_selected?.Id, _lastArchiveSession?.Id, StringComparison.OrdinalIgnoreCase)) { _archiveShown = 0; _lastArchiveSession = _selected; _scrollArchiveToBottom = true; _msgFilter = "all"; _jumpUserAnchor = null; _fullMsgs = null; _fullMsgsFor = ""; _openFreshenDone = false; UpdateMsgViewToggle(); }
 
         // Content lazy-loads from the source file the first time you open a chat (the store holds only
         // metadata). The reader shows the MOST RECENT messages at the bottom; scrolling up auto-loads
         // older ones, so a long chat opens where the conversation actually is.
-        if (!_selected.ContentLoaded)
+        var selected = _selected;
+        if (selected is { ContentLoaded: false })
         {
-            MainContent.Children.Add(EmptyBlock("Loading conversation...", _selected.WorkspaceName));
-            if (!ReferenceEquals(_contentLoadingSession, _selected))
+            MainContent.Children.Add(EmptyBlock("Loading conversation...", selected.WorkspaceName));
+            if (!ReferenceEquals(_contentLoadingSession, selected))
             {
-                _contentLoadingSession = _selected;
-                _ = EnsureContentThenRenderAsync(_selected);
+                _contentLoadingSession = selected;
+                _ = EnsureContentThenRenderAsync(selected);
             }
             return;
         }
 
         // Content is cached (from index time or a prior open) — render it now, but force ONE fresh re-parse
         // per open so a chat NEVER shows a stale transcript from a previous session (the "3 days old" bug).
-        if (!_openFreshenDone && !_selected.IsReadOnlySnapshot)
+        if (selected is not null && !_openFreshenDone && !selected.IsReadOnlySnapshot)
         {
             _openFreshenDone = true;
-            _ = FreshenOpenChatAsync(_selected);
+            _ = FreshenOpenChatAsync(selected);
         }
 
         var messages = CurrentReaderMessages();
+        if (selected is null) return;
         if (messages.Count == 0)
         {
             MainContent.Children.Add(EmptyBlock(
                 _msgFilter == "all" ? "No conversation messages parsed" : "No messages of this kind in this chat",
-                _msgFilter == "all" ? _selected.SourcePath : "Switch the View toggle back to all."));
+                _msgFilter == "all" ? selected.SourcePath : "Switch the View toggle back to all."));
             return;
         }
         var shown = Math.Min(_archiveShown <= 0 ? ArchivePageSize : _archiveShown, messages.Count);
@@ -666,7 +733,7 @@ public sealed partial class MainPage : Page
         {
             if (ReferenceEquals(_contentLoadingSession, session)) _contentLoadingSession = null;
         }
-        if (ReferenceEquals(_selected, session) && _screen == "Archive")
+        if (IsSelectedSession(session) && _screen == "Archive")
         {
             _archiveShown = ArchivePageSize;
             RenderArchive();
@@ -941,7 +1008,7 @@ public sealed partial class MainPage : Page
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             "CodexLocalRetrieval", "agent-inbox.jsonl");
         return
-            $"Add THIS chat to my \"Codex Local Retrieval\" app under the project \"{projectName}\" on deck \"{deckName}\".\n" +
+            $"Add THIS chat to my \"MUX\" app under the project \"{projectName}\" on deck \"{deckName}\".\n" +
             "If I gave this chat a name (e.g. \"add yourself as codex-claude-local\"), set that as its " +
             "in-app name too. The name is app-only - it does NOT change your global/native title.\n\n" +
             "1. Get YOUR exact session id from your environment (you already have it):\n" +
@@ -1029,7 +1096,7 @@ public sealed partial class MainPage : Page
         IReadOnlyList<RawEvent> events;
         try { events = await _archive.ReadEventsAsync(session); }
         catch (Exception ex) { Diag.Log("ReadEvents: " + ex.Message); events = Array.Empty<RawEvent>(); }
-        if (!ReferenceEquals(_selected, session) || _screen != "Source") return;
+        if (!IsSelectedSession(session) || _screen != "Source") return;
         MainContent.Children.Clear();
         MainContent.Children.Add(InfoPanel("Source file", session.SourcePath));
         MainContent.Children.Add(SourceEventsPanel(session, events));
@@ -1058,7 +1125,7 @@ public sealed partial class MainPage : Page
             Diag.Log("Restore packet: " + ex.Message);
             packet = "Could not build the restore packet.\n\n" + ex.Message;
         }
-        if (!ReferenceEquals(_selected, session) || _screen != "Restore") return;
+        if (!IsSelectedSession(session) || _screen != "Restore") return;
         MainContent.Children.Clear();
         MainContent.Children.Add(TextPanel(packet));
     }
@@ -2402,30 +2469,47 @@ public sealed partial class MainPage : Page
         };
     }
 
-    private void CopyContext_Click(object sender, RoutedEventArgs e) => Copy("resume");
-    private void CopyCode_Click(object sender, RoutedEventArgs e) => Copy("code");
-    private void CopyPath_Click(object sender, RoutedEventArgs e) => Copy("path");
+    private void CopyContext_Click(object sender, RoutedEventArgs e) => _ = Copy("resume");
+    private void CopyCode_Click(object sender, RoutedEventArgs e) => _ = Copy("code");
+    private void CopyPath_Click(object sender, RoutedEventArgs e) => _ = Copy("path");
     private void CopyCommand_Click(object sender, RoutedEventArgs e) => CopyResumeCommandIfClear();
+    private void CopyGatewayCommand_Click(object sender, RoutedEventArgs e) => CopyGatewayCommandIfClear();
 
-    private void CopyResumeCommandIfClear()
+    private async void CopyResumeCommandIfClear()
     {
         if (RiskySessionActionBlocked())
         {
             SyncStatus.Text = "Resume command blocked: this chat is live, pending, unverifiable, or otherwise unsafe to duplicate.";
             return;
         }
-        Copy("command");
-        SyncStatus.Text = "Resume command copied.";
+        await Copy("command", successMessage: "Resume command copied.");
     }
 
-    private async void Copy(string mode)
+    private async void CopyGatewayCommandIfClear()
     {
-        if (_selected is null) return;
         var session = _selected;
-        var package = new DataPackage();
-        package.SetText(await _archive.CopyPayloadAsync(session, mode));
-        Clipboard.SetContent(package);
+        if (session is null || !ArchiveService.CanResumeThroughGateway(session.Tool)) return;
+        await Copy("command", ArchiveService.GatewayLaunchMode, "Gateway command copied.");
     }
+
+    private async Task Copy(string mode, string? launchModeOverride = null, string? successMessage = null)
+    {
+        var session = _selected;
+        if (session is null) return;
+        try
+        {
+            var text = await _archive.CopyPayloadAsync(session, mode, launchModeOverride: launchModeOverride);
+            var package = new DataPackage();
+            package.SetText(text);
+            Clipboard.SetContent(package);
+            if (!string.IsNullOrWhiteSpace(successMessage)) SyncStatus.Text = successMessage;
+        }
+        catch (Exception ex)
+        {
+            SyncStatus.Text = $"Copy failed: {ex.Message}";
+        }
+    }
+
 
     private void CopyPath(ArchiveSession session)
     {

@@ -59,7 +59,7 @@ public sealed class TranscriptFetchTests
         CollectionAssert.AreEqual(
             new[] { "first ask", "first answer", "second ask" },
             wire.Select(m => m.GetProperty("text").GetString()).ToArray());
-        Assert.AreEqual("2026-07-01T00:00:00Z", wire[0].GetProperty("ts").GetString());
+        Assert.AreEqual(DateTimeOffset.Parse("2026-07-01T00:00:00Z").ToUnixTimeMilliseconds(), wire[0].GetProperty("ts").GetInt64());
     }
 
     [TestMethod]
@@ -203,7 +203,8 @@ public sealed class TranscriptFetchTests
 
         StringAssert.Contains(cmd, $"http://127.0.0.1:7411/api/transcripts/{Sid}");
         StringAssert.Contains(cmd, "--data-binary @-");                 // the page rides stdin, never argv
-        StringAssert.Contains(cmd, "Authorization: Bearer bridge-token-abcdefgh12345678");
+        StringAssert.Contains(cmd, "X-Mux-Transcript-Bridge: bridge-token-abcdefgh12345678");
+        StringAssert.Contains(cmd, "--fail");
         StringAssert.Contains(cmd, "Content-Type: application/json");
     }
 
@@ -227,6 +228,107 @@ public sealed class TranscriptFetchTests
         CollectionAssert.AreEqual(new[] { "u1", "a1", "u2", "a2" }, merged.Select(m => m.Text).ToArray());
     }
 
+    [TestMethod]
+    public async Task ReaderAllRoles_PreservesFileOrderWithMissingOrEqualTimestamps()
+    {
+        var path = WriteJsonl(
+            "{\"type\":\"user\",\"message\":{\"content\":\"first prompt\"}}",
+            "{\"type\":\"assistant\",\"message\":{\"content\":\"first answer\"}}",
+            "{\"type\":\"user\",\"message\":{\"content\":\"second prompt\"}}",
+            "{\"type\":\"assistant\",\"message\":{\"content\":\"second answer\"}}");
+        try
+        {
+            var session = new ArchiveSession { Id = Sid, Tool = "claude", SourcePath = path };
+            var messages = await NewArchive().ExtractReaderMessagesAsync(session, "all");
+            var wire = Parse(TranscriptFetchProjection.BuildPages(Sid, messages, false)[0].Json)
+                .GetProperty("messages").EnumerateArray().ToArray();
+            CollectionAssert.AreEqual(new[] { "first prompt", "first answer", "second prompt", "second answer" },
+                wire.Select(m => m.GetProperty("text").GetString()).ToArray());
+        }
+        finally { File.Delete(path); }
+    }
+
+    [TestMethod]
+    public void ReaderCapture_StopsAtOpeningLengthWithoutBlockingAppend()
+    {
+        var first = "{\"type\":\"user\",\"message\":{\"content\":\"first prompt\"}}";
+        var path = WriteJsonl(first, first);
+        try
+        {
+            using var capture = ArchiveService.SafeReadLines(path, captureOpeningLength: true).GetEnumerator();
+            Assert.IsTrue(capture.MoveNext());
+            using (var writer = new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete))
+            using (var text = new StreamWriter(writer))
+                text.WriteLine("{\"type\":\"assistant\",\"message\":{\"content\":\"later answer\"}}");
+            var lines = new List<string> { capture.Current };
+            while (capture.MoveNext()) lines.Add(capture.Current);
+            Assert.HasCount(2, lines, "capture must not chase writes appended after it opened");
+            Assert.HasCount(3, ArchiveService.SafeReadLines(path).ToList(), "next refresh sees the append");
+        }
+        finally { File.Delete(path); }
+    }
+
+    [TestMethod]
+    public void ReaderCapture_PathReplacementKeepsOneOpenedSource()
+    {
+        var path = WriteJsonl("original first", "original second");
+        var replacement = WriteJsonl("replacement first", "replacement second");
+        try
+        {
+            using var capture = ArchiveService.SafeReadLines(path, captureOpeningLength: true).GetEnumerator();
+            Assert.IsTrue(capture.MoveNext());
+            File.Replace(replacement, path, null);
+            var lines = new List<string> { capture.Current };
+            while (capture.MoveNext()) lines.Add(capture.Current);
+            CollectionAssert.AreEqual(new[] { "original first", "original second" }, lines);
+            CollectionAssert.AreEqual(new[] { "replacement first", "replacement second" }, ArchiveService.SafeReadLines(path).ToList());
+        }
+        finally { File.Delete(path); File.Delete(replacement); }
+    }
+
+    [TestMethod]
+    public void ReaderCapture_TruncationRefusesPartialSuccess()
+    {
+        var path = WriteJsonl("first", new string('x', 64 * 1024));
+        try
+        {
+            using var capture = ArchiveService.SafeReadLines(path, captureOpeningLength: true).GetEnumerator();
+            Assert.IsTrue(capture.MoveNext());
+            using (var writer = new FileStream(path, FileMode.Open, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete))
+                writer.SetLength(0);
+            Assert.ThrowsAsync<IOException>(() => Task.Run(() => { while (capture.MoveNext()) { } })).GetAwaiter().GetResult();
+        }
+        finally { File.Delete(path); }
+    }
+
+    [TestMethod]
+    public async Task ReaderAllRoles_UnreadableSourceFailsRatherThanReturningSuccess()
+    {
+        var path = WriteJsonl("{\"type\":\"user\",\"message\":{\"content\":\"preserve this prompt\"}}");
+        try
+        {
+            using var owner = new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.None);
+            var session = new ArchiveSession { Id = Sid, Tool = "claude", SourcePath = path };
+            await Assert.ThrowsAsync<IOException>(() => NewArchive().ExtractReaderMessagesAsync(session, "all"));
+        }
+        finally { File.Delete(path); }
+    }
+
+    [TestMethod]
+    public async Task ReaderAllRoles_CancellationDoesNotPublishPartialCapture()
+    {
+        var path = WriteJsonl("{\"type\":\"user\",\"message\":{\"content\":\"preserve this prompt\"}}");
+        try
+        {
+            using var deadline = new CancellationTokenSource();
+            deadline.Cancel();
+            var session = new ArchiveSession { Id = Sid, Tool = "claude", SourcePath = path };
+            await Assert.ThrowsAsync<OperationCanceledException>(() =>
+                NewArchive().ExtractReaderMessagesAsync(session, "all", deadline.Token));
+        }
+        finally { File.Delete(path); }
+    }
+
     // Half-written live tail: a chat still being appended to ends in a partial JSON line. The reader
     // must skip it and still return everything before it, and both roles must survive the fetch.
     [TestMethod]
@@ -242,9 +344,7 @@ public sealed class TranscriptFetchTests
             var archive = NewArchive();
             var session = new ArchiveSession { Id = Sid, Tool = "claude", SourcePath = path };
 
-            var merged = TranscriptFetchProjection.MergeChronological(
-                await archive.ExtractReaderMessagesAsync(session, "user"),
-                await archive.ExtractReaderMessagesAsync(session, "assistant"));
+            var merged = await archive.ExtractReaderMessagesAsync(session, "all");
             var pages = TranscriptFetchProjection.BuildPages(Sid, merged, redact: false);
 
             Assert.AreEqual(1, pages.Count);
@@ -272,9 +372,7 @@ public sealed class TranscriptFetchTests
             var archive = NewArchive();
             var session = new ArchiveSession { Id = Sid, Tool = "codex", SourcePath = path };
 
-            var merged = TranscriptFetchProjection.MergeChronological(
-                await archive.ExtractReaderMessagesAsync(session, "user"),
-                await archive.ExtractReaderMessagesAsync(session, "assistant"));
+            var merged = await archive.ExtractReaderMessagesAsync(session, "all");
             var pages = TranscriptFetchProjection.BuildPages(Sid, merged, redact: false);
 
             Assert.AreEqual(1, pages.Count);
@@ -299,9 +397,7 @@ public sealed class TranscriptFetchTests
             var archive = NewArchive();
             var session = new ArchiveSession { Id = Sid, Tool = "claude", SourcePath = path };
 
-            var merged = TranscriptFetchProjection.MergeChronological(
-                await archive.ExtractReaderMessagesAsync(session, "user"),
-                await archive.ExtractReaderMessagesAsync(session, "assistant"));
+            var merged = await archive.ExtractReaderMessagesAsync(session, "all");
             var pages = TranscriptFetchProjection.BuildPages(Sid, merged, redact: true);
 
             Assert.AreEqual(1, pages.Count);

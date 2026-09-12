@@ -1,8 +1,8 @@
 #requires -version 5
 <#
-  Proper per-user install for Codex Local Retrieval.
+  Proper per-user install for MUX.
 
-  Builds a Release build and copies it to %LOCALAPPDATA%\Programs\CodexLocalRetrieval, then
+  Builds a Release build and copies it to %LOCALAPPDATA%\Programs\MUX, then
   creates Start Menu + Desktop shortcuts that point THERE. The app is launched from a stable
   install location - never from the throwaway bin/dist build output.
 
@@ -36,14 +36,25 @@ $proj       = Join-Path $repo 'native\CodexLocalRetrieval.Native\CodexLocalRetri
 $serverProj = Join-Path $repo 'native\CodexLocalRetrieval.Server\CodexLocalRetrieval.Server.csproj'
 $tfm        = 'net8.0-windows10.0.26100.0'
 $rid        = 'win-x64'
-$exeName    = 'CodexLocalRetrieval.Native.exe'
-$installDir = Join-Path $env:LOCALAPPDATA 'Programs\CodexLocalRetrieval'
-$buildDir   = Join-Path $repo "native\CodexLocalRetrieval.Native\bin\Release\$tfm\$rid"
+$exeName    = 'CodexLocalRetrieval.Native.exe' # Internal build output name; product name is MUX.
+$installDir = Join-Path $env:LOCALAPPDATA 'Programs\MUX'
+$legacyInstallDir = Join-Path $env:LOCALAPPDATA 'Programs\CodexLocalRetrieval'
+$buildDir   = Join-Path $repo "native\CodexLocalRetrieval.Native\bin\x64\Release\$tfm\$rid"
 $serverBuildDir = Join-Path $repo 'native\CodexLocalRetrieval.Server\bin\Release\net8.0'
 $remoteDir  = Join-Path $env:LOCALAPPDATA 'CodexArchiveRemote'
-$dataDir    = Join-Path $env:LOCALAPPDATA 'CodexLocalRetrieval'
+$dataDir    = Join-Path $env:LOCALAPPDATA 'CodexLocalRetrieval' # Existing data location is preserved.
+$startMenuDir = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs'
+$desktopDir = [Environment]::GetFolderPath('Desktop')
+$shortcutPaths = @(
+    (Join-Path $startMenuDir 'MUX.lnk'),
+    (Join-Path $startMenuDir 'Codex Local Retrieval.lnk'),
+    (Join-Path $startMenuDir 'mux Local Retrieval.lnk'),
+    (Join-Path $desktopDir 'MUX.lnk'),
+    (Join-Path $desktopDir 'Codex Local Retrieval.lnk'),
+    (Join-Path $desktopDir 'mux Local Retrieval.lnk')
+)
 
-Write-Host "Building Codex Local Retrieval (Release)..." -ForegroundColor Cyan
+Write-Host "Building MUX (Release)..." -ForegroundColor Cyan
 
 # Stop EVERYTHING that could hold a lock on the install dir. A running app/bridge locking a DLL during
 # the copy is exactly how a PARTIAL install happened - which then crash-loops at startup with
@@ -74,7 +85,7 @@ function Protect-OwnerSecret([string]$Path) {
 }
 Stop-AppAndDeps
 
-& dotnet build $proj -c Release -r $rid --nologo -v m
+& dotnet build $proj -c Release -p:Platform=x64 -r $rid --nologo -v m
 if ($LASTEXITCODE -ne 0) { throw "dotnet build failed (exit $LASTEXITCODE)" }
 & dotnet build $serverProj -c Release --nologo -v m
 if ($LASTEXITCODE -ne 0) { throw "server dotnet build failed (exit $LASTEXITCODE)" }
@@ -85,7 +96,7 @@ if (-not (Test-Path (Join-Path $buildDir 'CodexLocalRetrieval.Native.pri'))) { t
 if (-not (Test-Path (Join-Path $serverBuildDir 'CodexLocalRetrieval.Server.exe'))) { throw "Built remote bridge exe not found: $serverBuildDir" }
 if (-not (Test-Path (Join-Path $serverBuildDir 'CodexLocalRetrieval.Core.dll'))) { throw "Built remote bridge is missing CodexLocalRetrieval.Core.dll" }
 
-Write-Host "Staging a COMPLETE, verified install (atomic swap) ..." -ForegroundColor Cyan
+Write-Host "Staging a COMPLETE, verified MUX install (atomic swap) ..." -ForegroundColor Cyan
 Stop-AppAndDeps            # once more, in case a copy relaunched during the build
 Start-Sleep -Milliseconds 400
 
@@ -115,8 +126,15 @@ $critical = @($exeName,'CodexLocalRetrieval.Native.pri','Microsoft.WindowsAppRun
 $missing = $critical | Where-Object { -not (Test-Path (Join-Path $staging $_)) }
 if ($missing) { Remove-Item $staging -Recurse -Force -ErrorAction SilentlyContinue; throw "Refusing to install: staged build is missing [$($missing -join ', ')]. The working install was left untouched." }
 
-# 4) ATOMIC SWAP: move the old install aside, move staging into place. If the old dir is still locked
-# after our kills, RETRY then ABORT - we NEVER overwrite-in-place (that is what produced partial installs).
+# 4) Remove legacy product artifacts before the replacement. Data is deliberately not under either
+# install directory, so this cleanup does not remove chats, collections, or backups.
+if (Test-Path $legacyInstallDir) {
+    Remove-Item $legacyInstallDir -Recurse -Force
+    if (Test-Path $legacyInstallDir) { throw "Could not remove legacy install: $legacyInstallDir" }
+}
+
+# 5) ATOMIC SWAP: move the current canonical install aside, move staging into place. If the old dir is
+# still locked after our kills, RETRY then ABORT - we NEVER overwrite-in-place (including downgrades).
 $backup = "$installDir.old"
 if (Test-Path $backup) { Remove-Item $backup -Recurse -Force -ErrorAction SilentlyContinue }
 if (Test-Path $installDir) {
@@ -129,7 +147,16 @@ if (Test-Path $installDir) {
 }
 Rename-Item -LiteralPath $staging -NewName (Split-Path $installDir -Leaf) -ErrorAction Stop
 
-# 5) POST-SWAP verify; if somehow incomplete, roll back to the backup.
+# Remove both old and canonical shortcut names only after the verified replacement is live. This keeps
+# a failed build or locked canonical install from destroying the user's working shortcuts.
+foreach ($lnk in $shortcutPaths) {
+    if (Test-Path $lnk) {
+        Remove-Item $lnk -Force
+        if (Test-Path $lnk) { throw "Could not remove old shortcut: $lnk" }
+    }
+}
+
+# 6) POST-SWAP verify; if somehow incomplete, roll back to the backup.
 $stillMissing = $critical | Where-Object { -not (Test-Path (Join-Path $installDir $_)) }
 if ($stillMissing) {
     Remove-Item $installDir -Recurse -Force -ErrorAction SilentlyContinue
@@ -138,7 +165,7 @@ if ($stillMissing) {
 }
 if (Test-Path $backup) { Remove-Item $backup -Recurse -Force -ErrorAction SilentlyContinue }
 
-# 6) Keep the always-on remote bridge in lockstep with the GUI/Core build. It runs from
+# 7) Keep the always-on remote bridge in lockstep with the GUI/Core build. It runs from
 # %LOCALAPPDATA%\CodexArchiveRemote, not from the GUI install dir, so failing to update it leaves the
 # VPS Projects/Running feed on stale code even though the desktop app was updated.
 if (Test-Path $remoteDir) {
@@ -177,12 +204,12 @@ if (Test-Path $remoteDir) {
     Protect-OwnerSecret (Join-Path $remoteDir 'signing.key')
     if (Test-Path $remoteBackup) { Remove-Item $remoteBackup -Recurse -Force -ErrorAction SilentlyContinue }
 } else {
-    Write-Host "Remote bridge folder not found; skipped CodexArchiveRemote update." -ForegroundColor DarkYellow
+    Write-Host "MUX remote bridge folder not found; skipped update." -ForegroundColor DarkYellow
 }
 try { Start-ScheduledTask -TaskName 'CodexArchiveRemote' -ErrorAction SilentlyContinue } catch {}   # restart the bridge we paused
 
 # A small marker so you can tell what's installed.
-@{ installedAt = (Get-Date).ToString('o') } | ConvertTo-Json | Set-Content (Join-Path $installDir 'install.json') -Encoding utf8
+@{ product = 'MUX'; installedAt = (Get-Date).ToString('o') } | ConvertTo-Json | Set-Content (Join-Path $installDir 'install.json') -Encoding utf8
 
 $target = Join-Path $installDir $exeName
 $ws = New-Object -ComObject WScript.Shell
@@ -191,17 +218,17 @@ function New-AppShortcut([string]$lnkPath) {
     $sc.TargetPath       = $target
     $sc.WorkingDirectory = $installDir
     $sc.IconLocation     = "$target,0"
-    $sc.Description       = 'Codex Local Retrieval - your local Claude/Codex chat hub'
+    $sc.Description       = 'MUX - your local Claude/Codex chat hub'
     $sc.Save()
 }
-$startMenu = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Codex Local Retrieval.lnk'
+$startMenu = Join-Path $startMenuDir 'MUX.lnk'
 New-AppShortcut $startMenu
 if (-not $NoDesktopShortcut) {
-    New-AppShortcut (Join-Path ([Environment]::GetFolderPath('Desktop')) 'Codex Local Retrieval.lnk')
+    New-AppShortcut (Join-Path $desktopDir 'MUX.lnk')
 }
 
 Write-Host ""
 Write-Host "Installed: $target" -ForegroundColor Green
 Write-Host "Shortcuts: Start Menu$(if (-not $NoDesktopShortcut) { ' + Desktop' })."
-Write-Host "Pin it: press Start, type 'Codex Local Retrieval', right-click -> Pin to Start / Pin to taskbar."
+Write-Host "Pin it: press Start, type 'MUX', right-click -> Pin to Start / Pin to taskbar."
 Write-Host "Your data stays in: $dataDir"

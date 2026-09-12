@@ -186,6 +186,42 @@ public sealed class ArchiveServiceTests
         }
     }
 
+    [TestMethod]
+    public async Task LoadCachedAsync_ReadsDurableSnapshotWhileWriterLockIsHeld()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "clr-cache-lock-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        var storePath = Path.Combine(root, "store.json");
+        var seed = new ArchiveService(storePath: storePath);
+        seed.Store.Sessions["cached-1"] = new ArchiveSession
+        {
+            Id = "cached-1",
+            Tool = "codex",
+            CustomTitle = "Cached chat",
+            UpdatedAt = DateTime.UtcNow.ToString("O"),
+        };
+        await seed.SaveAsync();
+        var before = File.ReadAllBytes(storePath);
+        var lockPath = storePath + ".lock";
+        try
+        {
+            using var heldLock = new FileStream(lockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+            var service = new ArchiveService(storePath: storePath);
+            var load = service.LoadCachedAsync();
+            var completed = await Task.WhenAny(load, Task.Delay(TimeSpan.FromSeconds(2)));
+
+            Assert.AreSame(load, completed, "cache load must not wait for the writer lock");
+            await load;
+            Assert.IsTrue(service.Store.Sessions.ContainsKey("cached-1"));
+            CollectionAssert.AreEqual(before, File.ReadAllBytes(storePath), "cache load must not rewrite the primary snapshot");
+        }
+        finally
+        {
+            try { File.Delete(lockPath); } catch { }
+            try { Directory.Delete(root, recursive: true); } catch { }
+        }
+    }
+
     // L1: indexing the rollout store resurfaces every session on disk, old and new alike.
     [TestMethod]
     public async Task IndexRoot_ResurfacesOldAndNewRollouts()
@@ -1153,6 +1189,44 @@ public sealed class ArchiveServiceTests
         {
             try { Directory.Delete(cwd, recursive: true); } catch { }
         }
+    }
+
+    [TestMethod]
+    public void ResumeCommandText_GatewayOverride_UsesCcWithoutChangingStoredMode()
+    {
+        var service = new ArchiveService(useBundledStore: true);
+        var cwd = Path.Combine(Path.GetTempPath(), "gw-copy-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(cwd);
+        try
+        {
+            var session = new ArchiveSession
+            {
+                Id = "cl-copy-gateway",
+                Tool = "claude",
+                LaunchMode = ArchiveService.NativeLaunchMode,
+                Workspace = cwd,
+                SourcePath = Path.Combine(cwd, "cl-copy-gateway.jsonl")
+            };
+
+            var command = service.ResumeCommandText(
+                session,
+                ArchiveService.GatewayLaunchMode);
+
+            StringAssert.Contains(command, "cc.cmd");
+            StringAssert.Contains(command, "--resume cl-copy-gateway");
+            Assert.AreEqual(ArchiveService.NativeLaunchMode, session.LaunchMode);
+        }
+        finally
+        {
+            try { Directory.Delete(cwd, recursive: true); } catch { }
+        }
+    }
+
+    [TestMethod]
+    public void GatewayResumePolicy_IsClaudeOnly()
+    {
+        Assert.IsTrue(ArchiveService.CanResumeThroughGateway("claude"));
+        Assert.IsFalse(ArchiveService.CanResumeThroughGateway("codex"));
     }
 
     [TestMethod]
@@ -2277,7 +2351,21 @@ public sealed class ArchiveServiceTests
             var session = new ArchiveSession { Id = "claude-rn-1", Tool = "claude", SourcePath = transcript, Title = "old native", CustomTitle = "app name" };
             svc.Store.Sessions[session.Id] = session;
 
-            var status = await svc.RenameNativeAsync(session, "Renamed In Claude");
+            var previousSources = CodexLocalRetrieval.Core.Remote.RunningSessions.ScanSourceOverride;
+            string? status;
+            try
+            {
+                CodexLocalRetrieval.Core.Remote.RunningSessions.ScanSourceOverride = new(
+                    Scan: () => (true, new List<ArchiveService.RunningSessionInfo>(), ""),
+                    ClaudeRegistry: _ => (true, new Dictionary<string, int>(), new HashSet<int>(), ""),
+                    OpenTranscripts: _ => (true, new Dictionary<string, int>(), new HashSet<int>(), ""));
+                status = await svc.RenameNativeAsync(session, "Renamed In Claude");
+            }
+            finally
+            {
+                CodexLocalRetrieval.Core.Remote.RunningSessions.ScanSourceOverride = previousSources;
+                CodexLocalRetrieval.Core.Remote.RunningSessions.InvalidateScanCache();
+            }
 
             var text = File.ReadAllText(transcript);
             Assert.IsTrue(text.Contains("\"type\":\"custom-title\""), "a custom-title record was appended");
@@ -2304,7 +2392,21 @@ public sealed class ArchiveServiceTests
             var session = new ArchiveSession { Id = "rnid-1", Tool = "claude", SourcePath = transcript, Title = "before" };
             svc.Store.Sessions[session.Id] = session;
 
-            var status = await svc.RenameNativeByIdAsync("claude", "rnid-1", "After Remote");
+            var previousSources = CodexLocalRetrieval.Core.Remote.RunningSessions.ScanSourceOverride;
+            string? status;
+            try
+            {
+                CodexLocalRetrieval.Core.Remote.RunningSessions.ScanSourceOverride = new(
+                    Scan: () => (true, new List<ArchiveService.RunningSessionInfo>(), ""),
+                    ClaudeRegistry: _ => (true, new Dictionary<string, int>(), new HashSet<int>(), ""),
+                    OpenTranscripts: _ => (true, new Dictionary<string, int>(), new HashSet<int>(), ""));
+                status = await svc.RenameNativeByIdAsync("claude", "rnid-1", "After Remote");
+            }
+            finally
+            {
+                CodexLocalRetrieval.Core.Remote.RunningSessions.ScanSourceOverride = previousSources;
+                CodexLocalRetrieval.Core.Remote.RunningSessions.InvalidateScanCache();
+            }
 
             Assert.AreEqual("After Remote", session.Title);
             Assert.IsTrue(File.ReadAllText(transcript).Contains("\"customTitle\":\"After Remote\""));
@@ -3703,6 +3805,33 @@ public sealed class ArchiveServiceTests
 
         StringAssert.Contains(restore, "Restore Packet");
         StringAssert.Contains(code, "export function score");
+    }
+
+    [TestMethod]
+    public void GatewayCopyPayload_ContainsCwdResolvedLauncherAndResumeId()
+    {
+        var service = new ArchiveService(useBundledStore: true);
+        var cwd = Path.Combine(Path.GetTempPath(), "gateway-copy-payload-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(cwd);
+        try
+        {
+            var session = new ArchiveSession
+            {
+                Id = "gateway-copy-payload-id",
+                Tool = "claude",
+                Workspace = cwd,
+                SourcePath = Path.Combine(cwd, "gateway-copy-payload-id.jsonl")
+            };
+
+            var payload = service.CopyPayload(session, "command", ArchiveService.GatewayLaunchMode);
+
+            StringAssert.Contains(payload, "cd ");
+            StringAssert.Contains(payload, cwd.Replace('\\', '/'));
+            StringAssert.Contains(payload, ArchiveService.ResolveGatewayCliScript());
+            StringAssert.Contains(payload, "--resume gateway-copy-payload-id");
+            StringAssert.Contains(payload, ArchiveService.ResolveCmdExe().Replace('\\', '/'));
+        }
+        finally { try { Directory.Delete(cwd, recursive: true); } catch { } }
     }
 
     [TestMethod]

@@ -68,6 +68,8 @@ function makeElement(id, listeners){
     className: '',
     innerHTML: '',
     disabled: false,
+    value: 'all',
+    querySelectorAll: () => [],
     dataset: Object.create(null),
     children: [],
     attrs: Object.create(null),
@@ -90,7 +92,7 @@ function makeElement(id, listeners){
 }
 
 // ids the reader page is entitled to look up; anything else returns null (and blows up on first use).
-const READER_IDS = ['transcript', 'status', 'refresh', 'title'];
+const READER_IDS = ['transcript', 'status', 'refresh', 'title', 'role', 'start', 'previoususer'];
 
 function makeDom(){
   const listeners = new Map();

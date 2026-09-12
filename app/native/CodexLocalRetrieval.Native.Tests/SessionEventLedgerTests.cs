@@ -179,17 +179,20 @@ public sealed class SessionEventLedgerTests
         Directory.CreateDirectory(dir.Path);
         using var ready = new ManualResetEventSlim(false);
         using var release = new ManualResetEventSlim(false);
-        var holder = Task.Run(() =>
+        var holder = Task.Factory.StartNew(() =>
         {
             using var mutex = new Mutex(false, MutexName(dir.Path));
             Assert.IsTrue(mutex.WaitOne(TimeSpan.FromSeconds(1)));
-            ready.Set();
-            release.Wait(TimeSpan.FromSeconds(5));
-            mutex.ReleaseMutex();
-        });
-        Assert.IsTrue(ready.Wait(TimeSpan.FromSeconds(1)));
+            try
+            {
+                ready.Set();
+                release.Wait(TimeSpan.FromSeconds(10));
+            }
+            finally { mutex.ReleaseMutex(); }
+        }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
         try
         {
+            Assert.IsTrue(ready.Wait(TimeSpan.FromSeconds(5)), "dedicated mutex holder did not start");
             Assert.IsFalse(SessionEventLedger.TryAppend(SessionEventLedger.Create("blocked", "blocked"), out var detail, options));
             StringAssert.Contains(detail, "lock timed out");
         }
@@ -204,7 +207,8 @@ public sealed class SessionEventLedgerTests
     public void TryAppend_ConcurrentCallersProduceUncorruptedLines()
     {
         using var dir = NewTempDir();
-        var options = Options(dir.Path);
+        // Admission latency is covered by TryAppend_RespectsNamedMutexTimeout.
+        var options = Options(dir.Path) with { LockTimeout = TimeSpan.FromSeconds(30) };
 
         Parallel.For(0, 64, i =>
         {

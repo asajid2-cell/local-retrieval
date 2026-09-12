@@ -177,7 +177,53 @@ public class ProcessSnapshotTests
             $"our pid {ourPid} must be in the parent map");
     }
 
-    // ------------------------------------------------------------------ Test 6: agents scan ---------------
+    // ------------------------------------------------------------------ Test 6: gateway identity ---------
+
+    [TestMethod]
+    public void GatewayProcessIdentity_RequiresExactPidAndOneRegistrySession()
+    {
+        var registry = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["gateway-session"] = 4242,
+            ["other-session"] = 4343,
+        };
+
+        Assert.IsTrue(ProcessSnapshot.IsGatewayProcessName("bun.exe"));
+        Assert.IsTrue(ProcessSnapshot.IsGatewayProcessName("node"));
+        Assert.IsFalse(ProcessSnapshot.IsGatewayProcessName("powershell.exe"));
+        Assert.AreEqual("gateway-session", ProcessSnapshot.RegisteredGatewaySessionId(4242, registry));
+        Assert.IsNull(ProcessSnapshot.RegisteredGatewaySessionId(9999, registry),
+            "a registry entry for another pid must not identify this process");
+
+        registry["ambiguous-session"] = 4242;
+        Assert.IsNull(ProcessSnapshot.RegisteredGatewaySessionId(4242, registry),
+            "multiple session ids for one pid must remain unresolved rather than selecting one");
+    }
+
+    [TestMethod]
+    public void AgentSessionIdentity_GatewayRegistryWinsWhileNativeUsesCommandLine()
+    {
+        Assert.AreEqual(
+            "registry-session",
+            ProcessSnapshot.ResolveAgentSessionId(
+                isGatewayAgent: true,
+                commandLineSessionId: "launch-session",
+                registeredGatewaySessionId: "registry-session"));
+        Assert.AreEqual(
+            "launch-session",
+            ProcessSnapshot.ResolveAgentSessionId(
+                isGatewayAgent: false,
+                commandLineSessionId: "launch-session",
+                registeredGatewaySessionId: "registry-session"));
+        Assert.AreEqual(
+            "",
+            ProcessSnapshot.ResolveAgentSessionId(
+                isGatewayAgent: true,
+                commandLineSessionId: "launch-session",
+                registeredGatewaySessionId: null));
+    }
+
+    // ------------------------------------------------------------------ Test 7: agents scan ---------------
 
     [TestMethod]
     public void AgentsWithPpid_DoesNotThrow()
@@ -188,7 +234,7 @@ public class ProcessSnapshotTests
         Assert.IsNotNull(agents);
     }
 
-    // ------------------------------------------------------------------ Test 7: tree ----------------------
+    // ------------------------------------------------------------------ Test 8: tree ----------------------
 
     [TestMethod]
     public void Tree_IncludesRoot()

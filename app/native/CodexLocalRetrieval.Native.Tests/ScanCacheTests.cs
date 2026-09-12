@@ -23,6 +23,10 @@ public class ScanCacheTests
     private long _registryReads;
     private volatile bool _scanFails;
     private volatile bool _registryFails;
+    private List<ArchiveService.RunningSessionInfo> _scanRows = new();
+    private Dictionary<string, int> _registryRows = new(StringComparer.OrdinalIgnoreCase);
+    private Dictionary<string, int> _handleRows = new(StringComparer.OrdinalIgnoreCase);
+    private HashSet<int> _handleUnverifiable = new();
 
     [TestInitialize]
     public void Init()
@@ -31,7 +35,14 @@ public class ScanCacheTests
         _registryReads = 0;
         _scanFails = false;
         _registryFails = false;
-        RunningSessions.ScanSourceOverride = new RunningSessions.ScanSources(Scan: FakeScan, ClaudeRegistry: FakeRegistry);
+        _scanRows = new();
+        _registryRows = new(StringComparer.OrdinalIgnoreCase);
+        _handleRows = new(StringComparer.OrdinalIgnoreCase);
+        _handleUnverifiable = new();
+        RunningSessions.ScanSourceOverride = new RunningSessions.ScanSources(
+            Scan: FakeScan,
+            ClaudeRegistry: FakeRegistry,
+            OpenTranscripts: FakeOpenTranscripts);
         RunningSessions.InvalidateScanCache();
     }
 
@@ -42,6 +53,513 @@ public class ScanCacheTests
         RunningSessions.InvalidateScanCache();
     }
 
+    [TestMethod]
+    public void NativeRename_RefusesUnknownAndRegistryOrHandleOwnersWithoutChangingTranscript()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "rename-ownership-" + Guid.NewGuid().ToString("N"));
+        var project = Path.Combine(root, "project");
+        Directory.CreateDirectory(project);
+        var id = Guid.NewGuid().ToString();
+        var path = Path.Combine(project, id + ".jsonl");
+        const string original = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"Original transcript\"}}\n";
+        File.WriteAllText(path, original);
+        var store = new CodexLocalRetrieval.Core.Agents.ClaudeSessionStore(root);
+        try
+        {
+            _scanFails = true;
+            Assert.IsFalse(store.RenameSession(id, "refused scan"));
+            Assert.AreEqual(original, File.ReadAllText(path));
+            _scanFails = false;
+            _registryFails = true;
+            Assert.IsFalse(store.RenameSession(id, "refused registry"));
+            Assert.AreEqual(original, File.ReadAllText(path));
+            _registryFails = false;
+            _registryRows[id] = 12345;
+            Assert.IsFalse(store.RenameSession(id, "registry owner"));
+            Assert.AreEqual(original, File.ReadAllText(path));
+            _registryRows.Clear();
+            _scanRows.Add(new ArchiveService.RunningSessionInfo(12345, "claude", "", "Terminal", "", ""));
+            _handleRows[id] = 12345;
+            Assert.IsFalse(store.RenameSession(id, "handle owner"));
+            Assert.AreEqual(original, File.ReadAllText(path));
+            _handleRows.Clear();
+            Assert.IsTrue(store.RenameSession(id, "Verified idle title"));
+            StringAssert.StartsWith(File.ReadAllText(path), original);
+            StringAssert.Contains(File.ReadAllText(path), "Verified idle title");
+            var once = File.ReadAllText(path);
+            Assert.IsTrue(new CodexLocalRetrieval.Core.Agents.ClaudeSessionStore(root).RenameSession(id, "Verified idle title"));
+            Assert.AreEqual(once, File.ReadAllText(path), "same-title replay after a new store instance must not append again");
+        }
+        finally { Directory.Delete(root, true); }
+    }
+
+    [TestMethod]
+    public async Task NativeRename_StaleBridgeCommandCannotOverwriteNewerTitle()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "rename-stale-" + Guid.NewGuid().ToString("N"));
+        var project = Path.Combine(root, "project");
+        Directory.CreateDirectory(project);
+        var id = Guid.NewGuid().ToString();
+        var path = Path.Combine(project, id + ".jsonl");
+        var original = "{\"type\":\"custom-title\",\"sessionId\":\"" + id + "\",\"customTitle\":\"Newer title\"}\n";
+        File.WriteAllText(path, original);
+        try
+        {
+            var archive = new ArchiveService(storePath: Path.Combine(root, "store.json"), sourceOverride: Array.Empty<CodexLocalRetrieval.Core.Models.SessionSource>());
+            archive.Store.Sessions[id] = new CodexLocalRetrieval.Core.Models.ArchiveSession
+                { Id = id, Tool = "claude", SourcePath = path, Title = "Newer title" };
+            await archive.SaveAsync();
+            using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+            var acknowledged = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var command = System.Text.Json.JsonSerializer.Serialize(new[] { new {
+                id = "stale-command", type = "rename", tool = "claude", sessionId = id, title = "Older title",
+                intentId = "stale-intent", leaseToken = "stale-lease", replayPolicy = "idempotent", expectedRevision = "stale-revision"
+            }});
+            var bridge = new RemoteBridge(() => new RemoteBridge.Settings("loopback", 1), () => false,
+                new CodexLocalRetrieval.Core.Agents.ClaudeSessionStore(root), "",
+                executeArchiveCommand: value => CodexLocalRetrieval.Server.ArchiveRemoteCommands.ExecuteAsync(archive, value),
+                isolationFixture: true, runningSnapshot: () => (true, new List<ArchiveService.RunningSessionInfo>(), ""),
+                transport: (_, operation, body, _, _) =>
+                {
+                    if (operation == RemoteBridge.BridgeOperation.Lease) return Task.FromResult((0, command));
+                    if (operation == RemoteBridge.BridgeOperation.Ack)
+                    {
+                        acknowledged.TrySetResult(System.Text.Json.JsonSerializer.Deserialize<System.Text.Json.JsonElement>(body!).GetProperty("ok").GetBoolean());
+                        cancellation.Cancel();
+                    }
+                    return Task.FromResult((0, "{}"));
+                });
+            await bridge.RunLoopAsync(cancellation.Token).WaitAsync(TimeSpan.FromSeconds(20));
+            Assert.IsFalse(await acknowledged.Task.WaitAsync(TimeSpan.FromSeconds(1)), "stale rename must be refused");
+            Assert.AreEqual(original, File.ReadAllText(path), "old delivery must preserve the newer native title");
+        }
+        finally { Directory.Delete(root, true); }
+    }
+
+    [TestMethod]
+    public async Task NativeRename_UnconfirmedReceiptIsRedeliveredWithoutTerminalAck()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "rename-redelivery-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        var path = Path.Combine(root, "source.jsonl");
+        File.WriteAllText(path, "{\"type\":\"user\",\"message\":{\"content\":\"Original\"}}\n");
+        try
+        {
+            var archive = new ArchiveService(storePath: Path.Combine(root, "store.json"),
+                sourceOverride: Array.Empty<CodexLocalRetrieval.Core.Models.SessionSource>());
+            var id = Guid.NewGuid().ToString();
+            archive.Store.Sessions[id] = new CodexLocalRetrieval.Core.Models.ArchiveSession
+                { Id = id, Tool = "claude", SourcePath = path, Title = "Original" };
+            await archive.SaveAsync();
+            var revision = archive.RemoteManagementRevision(archive.Store.Sessions[id]);
+            archive.StoreWriteFault = _ =>
+            {
+                using var source = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                using var reader = new StreamReader(source);
+                if (reader.ReadToEnd().Contains("muxRenameIntent", StringComparison.Ordinal))
+                    throw new IOException("injected applied receipt failure");
+            };
+            var command = System.Text.Json.JsonSerializer.Serialize(new[] { new {
+                id = "rename-command", type = "rename", tool = "claude", sessionId = id, title = "Confirmed title",
+                intentId = "rename-intent", leaseToken = "rename-lease", replayPolicy = "idempotent", expectedRevision = revision
+            }});
+            using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+            var executions = 0;
+            var acknowledgements = 0;
+            var ackAfterExecutions = 0;
+            var ackOk = false;
+            string? writtenSource = null;
+            var bridge = new RemoteBridge(() => new RemoteBridge.Settings("loopback", 1), () => false,
+                new CodexLocalRetrieval.Core.Agents.ClaudeSessionStore(root), "",
+                executeArchiveCommand: async value =>
+                {
+                    executions++;
+                    if (executions == 2)
+                    {
+                        writtenSource = File.ReadAllText(path);
+                        archive.StoreWriteFault = null;
+                    }
+                    return await CodexLocalRetrieval.Server.ArchiveRemoteCommands.ExecuteAsync(archive, value);
+                },
+                isolationFixture: true, runningSnapshot: () => (true, new List<ArchiveService.RunningSessionInfo>(), ""),
+                transport: (_, operation, body, _, _) =>
+                {
+                    if (operation == RemoteBridge.BridgeOperation.Lease) return Task.FromResult((0, command));
+                    if (operation == RemoteBridge.BridgeOperation.Ack)
+                    {
+                        acknowledgements++;
+                        ackAfterExecutions = executions;
+                        ackOk = System.Text.Json.JsonSerializer.Deserialize<System.Text.Json.JsonElement>(body!).GetProperty("ok").GetBoolean();
+                        cancellation.Cancel();
+                    }
+                    return Task.FromResult((0, "{}"));
+                });
+            await bridge.RunLoopAsync(cancellation.Token).WaitAsync(TimeSpan.FromSeconds(20));
+            Assert.AreEqual(2, ackAfterExecutions, "unknown transcript/store outcome must not receive a terminal ACK before reconciliation");
+            Assert.AreEqual(1, acknowledgements);
+            Assert.IsTrue(ackOk);
+            Assert.AreEqual("applied", archive.Store.ManagementOperations["rename-intent"].State);
+            Assert.AreEqual(writtenSource, File.ReadAllText(path), "redelivery must reconcile without reappending");
+        }
+        finally { Directory.Delete(root, true); }
+    }
+
+    [TestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task NativeRename_HoldsLaunchCustodyThroughAppliedReceiptCommit(bool recovery)
+    {
+        var root = Path.Combine(Path.GetTempPath(), "rename-commit-custody-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        var path = Path.Combine(root, "source.jsonl");
+        File.WriteAllText(path, "{\"type\":\"user\",\"message\":{\"content\":\"Original\"}}\n");
+        try
+        {
+            var archive = new ArchiveService(storePath: Path.Combine(root, "store.json"),
+                sourceOverride: Array.Empty<CodexLocalRetrieval.Core.Models.SessionSource>());
+            var id = Guid.NewGuid().ToString();
+            archive.Store.Sessions[id] = new CodexLocalRetrieval.Core.Models.ArchiveSession
+                { Id = id, Tool = "claude", SourcePath = path, Title = "Original" };
+            await archive.SaveAsync();
+            var revision = archive.RemoteManagementRevision(archive.Store.Sessions[id]);
+            if (recovery)
+            {
+                archive.StoreWriteFault = stage =>
+                {
+                    using var source = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                    using var reader = new StreamReader(source);
+                    if (reader.ReadToEnd().Contains("muxRenameIntent", StringComparison.Ordinal))
+                        throw new IOException("injected receipt failure before recovery probe");
+                };
+                Assert.IsTrue((await archive.RenameNativeRemoteAsync("claude", id, "Desired", "custody", revision)).Uncertain);
+            }
+            var observedCommit = false;
+            var competingLaunchAllowed = false;
+            archive.StoreWriteFault = stage =>
+            {
+                using var source = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                using var reader = new StreamReader(source);
+                if (!reader.ReadToEnd().Contains("muxRenameIntent", StringComparison.Ordinal)) return;
+                observedCommit = true;
+                if (new SessionLaunchGovernor().TryAcquire(
+                    new(id, Array.Empty<string>(), "claude", "test", "competing fixture launch", "", "", ""),
+                    out var competing, out _))
+                {
+                    competingLaunchAllowed = true;
+                    competing?.Dispose();
+                }
+            };
+            var result = await archive.RenameNativeRemoteAsync("claude", id, "Desired", "custody", revision);
+            Assert.IsTrue(result.Ok, result.Detail);
+            Assert.IsTrue(observedCommit, "fixture must probe the applied receipt durability boundary");
+            Assert.IsFalse(competingLaunchAllowed, "launch custody must not end between transcript append and applied receipt commit");
+            Assert.IsTrue(new SessionLaunchGovernor().TryAcquire(
+                new(id, Array.Empty<string>(), "claude", "test", "post-commit fixture launch", "", "", ""),
+                out var afterCommit, out var detail), detail);
+            afterCommit?.Dispose();
+        }
+        finally { Directory.Delete(root, true); }
+    }
+
+    [TestMethod]
+    public async Task NativeRename_MissingPreparedMarkerRemainsUnconfirmedWithoutWriting()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "rename-missing-marker-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        var path = Path.Combine(root, "source.jsonl");
+        const string original = "{\"type\":\"user\",\"message\":{\"content\":\"Original\"}}\n";
+        File.WriteAllText(path, original);
+        try
+        {
+            var storePath = Path.Combine(root, "store.json");
+            var archive = new ArchiveService(storePath: storePath,
+                sourceOverride: Array.Empty<CodexLocalRetrieval.Core.Models.SessionSource>());
+            var id = Guid.NewGuid().ToString();
+            archive.Store.Sessions[id] = new CodexLocalRetrieval.Core.Models.ArchiveSession
+                { Id = id, Tool = "claude", SourcePath = path, Title = "Original" };
+            await archive.SaveAsync();
+            var revision = archive.RemoteManagementRevision(archive.Store.Sessions[id]);
+            archive.StoreWriteFault = _ =>
+            {
+                using var source = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                using var reader = new StreamReader(source);
+                if (reader.ReadToEnd().Contains("muxRenameIntent", StringComparison.Ordinal))
+                    throw new IOException("injected applied receipt failure");
+            };
+            var unknown = await archive.RenameNativeRemoteAsync("claude", id, "Desired", "pending", revision);
+            Assert.IsTrue(unknown.Uncertain);
+            var committed = File.ReadAllText(path);
+            File.WriteAllText(path, original);
+            var restarted = new ArchiveService(storePath: storePath,
+                sourceOverride: Array.Empty<CodexLocalRetrieval.Core.Models.SessionSource>());
+            var missing = await restarted.RenameNativeRemoteAsync("claude", id, "Desired", "pending", revision);
+            Assert.IsFalse(missing.Ok);
+            Assert.IsTrue(missing.Uncertain);
+            Assert.AreEqual("prepared", restarted.Store.ManagementOperations["pending"].State);
+            Assert.AreEqual(original, File.ReadAllText(path));
+            File.WriteAllText(path, committed);
+            var recovered = await restarted.RenameNativeRemoteAsync("claude", id, "Desired", "pending", revision);
+            Assert.IsTrue(recovered.Ok, recovered.Detail);
+            Assert.IsFalse(recovered.Uncertain);
+            Assert.AreEqual(committed, File.ReadAllText(path));
+        }
+        finally { Directory.Delete(root, true); }
+    }
+
+    [TestMethod]
+    public async Task NativeRename_DurableReplayDoesNotRestoreOlderTitle()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "rename-replay-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        var path = Path.Combine(root, "source.jsonl");
+        File.WriteAllText(path, "{\"type\":\"user\",\"message\":{\"content\":\"Original\"}}\n");
+        try
+        {
+            var storePath = Path.Combine(root, "store.json");
+            ArchiveService Fresh() => new(storePath: storePath, sourceOverride: Array.Empty<CodexLocalRetrieval.Core.Models.SessionSource>());
+            var archive = Fresh();
+            var id = Guid.NewGuid().ToString();
+            archive.Store.Sessions[id] = new CodexLocalRetrieval.Core.Models.ArchiveSession
+                { Id = id, Tool = "claude", SourcePath = path, Title = "Original" };
+            await archive.SaveAsync();
+            var firstRevision = archive.RemoteManagementRevision(archive.Store.Sessions[id]);
+            var first = await archive.RenameNativeRemoteAsync("claude", id, "First", "rename-first", firstRevision);
+            Assert.IsTrue(first.Ok, first.Detail);
+            var secondRevision = archive.RemoteManagementRevision(archive.Store.Sessions[id]);
+            var second = await archive.RenameNativeRemoteAsync("claude", id, "Second", "rename-second", secondRevision);
+            Assert.IsTrue(second.Ok, second.Detail);
+            var latest = File.ReadAllText(path);
+            var restarted = Fresh();
+            var replay = await restarted.RenameNativeRemoteAsync("claude", id, "First", "rename-first", firstRevision);
+            Assert.IsTrue(replay.Ok, replay.Detail);
+            Assert.AreEqual(latest, File.ReadAllText(path));
+            Assert.AreEqual("Second", restarted.Store.Sessions[id].Title);
+            var stale = await restarted.RenameNativeRemoteAsync("claude", id, "Stale", "rename-stale", firstRevision);
+            Assert.IsFalse(stale.Ok);
+            var collision = await restarted.RenameNativeRemoteAsync("claude", id, "Different", "rename-first", firstRevision);
+            Assert.IsFalse(collision.Ok);
+            Assert.AreEqual(latest, File.ReadAllText(path));
+        }
+        finally { Directory.Delete(root, true); }
+    }
+
+    [TestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task NativeRename_RefusesCodexAndPendingWriteAfterRestart(bool malformedTail)
+    {
+        var root = Path.Combine(Path.GetTempPath(), "rename-pending-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        var path = Path.Combine(root, "source.jsonl");
+        const string original = "{\"type\":\"user\",\"message\":{\"content\":\"Original\"}}\n";
+        File.WriteAllText(path, original);
+        try
+        {
+            var storePath = Path.Combine(root, "store.json");
+            var archive = new ArchiveService(storePath: storePath, sourceOverride: Array.Empty<CodexLocalRetrieval.Core.Models.SessionSource>());
+            var id = Guid.NewGuid().ToString();
+            archive.Store.Sessions[id] = new CodexLocalRetrieval.Core.Models.ArchiveSession
+                { Id = id, Tool = "claude", SourcePath = path, Title = "Original" };
+            await archive.SaveAsync();
+            var revision = archive.RemoteManagementRevision(archive.Store.Sessions[id]);
+            var refused = await archive.RenameNativeRemoteAsync("codex", id, "Forbidden", "wrong-tool", revision);
+            Assert.IsFalse(refused.Ok);
+            Assert.AreEqual(original, File.ReadAllText(path));
+            archive.StoreWriteFault = _ =>
+            {
+                using var source = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                using var reader = new StreamReader(source);
+                if (reader.ReadToEnd().Contains("First", StringComparison.Ordinal))
+                    throw new IOException("injected receipt persistence failure");
+            };
+            var unknown = await archive.RenameNativeRemoteAsync("claude", id, "First", "first", revision);
+            Assert.IsFalse(unknown.Ok, "a native write without its applied receipt is not confirmed success");
+            var once = File.ReadAllText(path);
+            StringAssert.Contains(once, "First");
+            var restarted = new ArchiveService(storePath: storePath, sourceOverride: Array.Empty<CodexLocalRetrieval.Core.Models.SessionSource>());
+            var later = await restarted.RenameNativeRemoteAsync("claude", id, "Later", "later", revision);
+            Assert.IsFalse(later.Ok);
+            File.AppendAllText(path, "{\"type\":\"custom-title\",\"customTitle\":\"Newer external title\"}\n");
+            var validSource = File.ReadAllText(path);
+            if (malformedTail)
+            {
+                File.AppendAllText(path, "{\"type\":\"custom-title\",\"customTitle\":\"Incomplete");
+                var incompleteSource = File.ReadAllText(path);
+                var incomplete = await restarted.RenameNativeRemoteAsync("claude", id, "First", "first", revision);
+                Assert.IsFalse(incomplete.Ok, "a partial later title must not be skipped when reconciling the current title");
+                Assert.AreEqual("prepared", restarted.Store.ManagementOperations["first"].State);
+                Assert.AreEqual(incompleteSource, File.ReadAllText(path));
+                File.WriteAllText(path, validSource);
+            }
+            var beforeReconcile = File.ReadAllText(path);
+            var retry = await restarted.RenameNativeRemoteAsync("claude", id, "First", "first", revision);
+            Assert.IsTrue(retry.Ok, retry.Detail);
+            Assert.AreEqual("Newer external title", restarted.Store.Sessions[id].Title);
+            Assert.AreEqual(beforeReconcile, File.ReadAllText(path), "reconciliation must confirm the marker without another transcript write");
+        }
+        finally { Directory.Delete(root, true); }
+    }
+
+    [TestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task NativeRename_RefusesExternalTitleChangedSinceArchiveRevision(bool titleOutsideTail)
+    {
+        var root = Path.Combine(Path.GetTempPath(), "rename-external-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        var path = Path.Combine(root, "source.jsonl");
+        const string original = "{\"type\":\"custom-title\",\"customTitle\":\"Original\"}\n";
+        File.WriteAllText(path, original);
+        try
+        {
+            var archive = new ArchiveService(storePath: Path.Combine(root, "store.json"), sourceOverride: Array.Empty<CodexLocalRetrieval.Core.Models.SessionSource>());
+            var id = Guid.NewGuid().ToString();
+            archive.Store.Sessions[id] = new CodexLocalRetrieval.Core.Models.ArchiveSession
+                { Id = id, Tool = "claude", SourcePath = path, Title = "Original" };
+            await archive.SaveAsync();
+            var revision = archive.RemoteManagementRevision(archive.Store.Sessions[id]);
+            File.AppendAllText(path, "{\"type\":\"custom-title\",\"customTitle\":\"External new title\"}\n");
+            if (titleOutsideTail)
+                File.AppendAllText(path, "{\"type\":\"assistant\",\"message\":{\"content\":\"" + new string('x', 128 * 1024) + "\"}}\n");
+            var latest = File.ReadAllText(path);
+            var outcome = await archive.RenameNativeRemoteAsync("claude", id, "Stale browser title", "external-race", revision);
+            Assert.IsFalse(outcome.Ok, "archive revision alone must not overwrite a newer native title");
+            Assert.AreEqual(latest, File.ReadAllText(path));
+        }
+        finally { Directory.Delete(root, true); }
+    }
+
+    [TestMethod]
+    public async Task NativeRename_WrongToolCannotWriteIndexedTranscript()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "rename-tool-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        var path = Path.Combine(root, "source.jsonl");
+        const string original = "{\"type\":\"user\",\"message\":{\"content\":\"Original prompt\"}}\n";
+        File.WriteAllText(path, original);
+        try
+        {
+            var archive = new ArchiveService(storePath: Path.Combine(root, "store.json"));
+            var session = new CodexLocalRetrieval.Core.Models.ArchiveSession
+                { Id = Guid.NewGuid().ToString(), Tool = "claude", SourcePath = path, Title = "Original title" };
+            archive.Store.Sessions[session.Id] = session;
+            var status = await archive.RenameNativeByIdAsync("codex", session.Id, "Wrong tool title");
+            Assert.IsFalse(ArchiveService.NativeRenameSucceeded(status));
+            Assert.AreEqual(original, File.ReadAllText(path));
+            Assert.AreEqual("Original title", session.Title);
+        }
+        finally { Directory.Delete(root, true); }
+    }
+
+    [TestMethod]
+    public async Task NativeRename_HeldLaunchClaimPreservesBothPaths()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "rename-claim-" + Guid.NewGuid().ToString("N"));
+        var project = Path.Combine(root, "project");
+        Directory.CreateDirectory(project);
+        var id = Guid.NewGuid().ToString();
+        var path = Path.Combine(project, id + ".jsonl");
+        const string original = "{\"type\":\"user\",\"message\":{\"content\":\"Original\"}}\n";
+        File.WriteAllText(path, original);
+        try
+        {
+            Assert.IsTrue(SessionLaunchClaims.TryAcquire(id, null, "disposable rename test", out var claim, out var detail), detail);
+            using (claim)
+            {
+                var sessions = new CodexLocalRetrieval.Core.Agents.ClaudeSessionStore(root);
+                Assert.IsFalse(sessions.RenameSession(id, "must not write"));
+                Assert.AreEqual(original, File.ReadAllText(path));
+                var archive = new ArchiveService(storePath: Path.Combine(root, "store.json"));
+                var session = new CodexLocalRetrieval.Core.Models.ArchiveSession
+                {
+                    Id = id, Tool = "claude", SourcePath = path, Title = "Native original", CustomTitle = "App original"
+                };
+                archive.Store.Sessions[id] = session;
+                Assert.IsFalse(ArchiveService.NativeRenameSucceeded(await archive.RenameNativeAsync(session, "must not write")));
+                Assert.AreEqual("Native original", session.Title);
+                Assert.AreEqual("App original", session.CustomTitle);
+                Assert.AreEqual(original, File.ReadAllText(path));
+            }
+        }
+        finally { Directory.Delete(root, true); }
+    }
+
+    [TestMethod]
+    public async Task NativeRename_OpenWriterRefusesBothPathsAndReleasesReservation()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "rename-writer-" + Guid.NewGuid().ToString("N"));
+        var project = Path.Combine(root, "project");
+        Directory.CreateDirectory(project);
+        var id = Guid.NewGuid().ToString();
+        var path = Path.Combine(project, id + ".jsonl");
+        const string original = "{\"type\":\"user\",\"message\":{\"content\":\"Original\"}}\n";
+        File.WriteAllText(path, original);
+        try
+        {
+            var sessions = new CodexLocalRetrieval.Core.Agents.ClaudeSessionStore(root);
+            var archive = new ArchiveService(storePath: Path.Combine(root, "store.json"));
+            var session = new CodexLocalRetrieval.Core.Models.ArchiveSession
+            {
+                Id = id, Tool = "claude", SourcePath = path, Title = "Native original", CustomTitle = "App original"
+            };
+            archive.Store.Sessions[id] = session;
+            using (var writer = new FileStream(path, FileMode.Open, FileAccess.Write, FileShare.ReadWrite))
+            {
+                Assert.IsFalse(sessions.RenameSession(id, "must not write"));
+                Assert.IsFalse(ArchiveService.NativeRenameSucceeded(await archive.RenameNativeAsync(session, "must not write")));
+                Assert.AreEqual("Native original", session.Title);
+                Assert.AreEqual("App original", session.CustomTitle);
+                Assert.HasCount(0, SessionLaunchClaims.ReadClaimsForSession(id));
+            }
+            Assert.AreEqual(original, File.ReadAllText(path));
+            Assert.IsTrue(ArchiveService.NativeRenameSucceeded(await archive.RenameNativeAsync(session, "Idle title")));
+            var once = File.ReadAllText(path);
+            Assert.IsTrue(ArchiveService.NativeRenameSucceeded(await archive.RenameNativeAsync(session, "Idle title")));
+            Assert.AreEqual(once, File.ReadAllText(path));
+            Assert.HasCount(0, SessionLaunchClaims.ReadClaimsForSession(id));
+        }
+        finally { Directory.Delete(root, true); }
+    }
+
+    [TestMethod]
+    public async Task ArchiveNativeRename_UnknownOwnershipPreservesNativeAndAppTitles()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "rename-archive-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        var path = Path.Combine(root, "session.jsonl");
+        const string original = "{\"type\":\"user\",\"message\":{\"content\":\"Original\"}}\n";
+        File.WriteAllText(path, original);
+        try
+        {
+            var archive = new ArchiveService(storePath: Path.Combine(root, "store.json"));
+            var session = new CodexLocalRetrieval.Core.Models.ArchiveSession
+            {
+                Id = "rename-unknown", Tool = "claude", SourcePath = path,
+                Title = "Native original", CustomTitle = "App original"
+            };
+            archive.Store.Sessions[session.Id] = session;
+            foreach (var ownership in new[] { "scan-failure", "registry-failure", "registry-owner", "handle-owner" })
+            {
+                _scanFails = ownership == "scan-failure";
+                _registryFails = ownership == "registry-failure";
+                _registryRows.Clear(); _scanRows.Clear(); _handleRows.Clear();
+                if (ownership == "registry-owner") _registryRows[session.Id] = 12345;
+                if (ownership == "handle-owner")
+                {
+                    _scanRows.Add(new ArchiveService.RunningSessionInfo(12345, "claude", "", "Terminal", "", ""));
+                    _handleRows[session.Id] = 12345;
+                }
+                var status = await archive.RenameNativeAsync(session, "Must not appear");
+                Assert.AreEqual(original, File.ReadAllText(path), ownership);
+                Assert.AreEqual("Native original", session.Title, ownership);
+                Assert.AreEqual("App original", session.CustomTitle, ownership);
+                StringAssert.Contains(status, "deferred");
+                Assert.IsFalse(ArchiveService.NativeRenameSucceeded(status));
+            }
+        }
+        finally { Directory.Delete(root, true); }
+    }
+
     // Stands in for TryScan: counts itself against the same counter the real WMI pass ticks, so a test asserting
     // "one sweep" is asserting on the number the perf gates record.
     private (bool Ok, List<ArchiveService.RunningSessionInfo> Sessions, string Detail) FakeScan()
@@ -50,7 +568,7 @@ public class ScanCacheTests
         PerfCounters.WmiSweep();
         return _scanFails
             ? (false, new List<ArchiveService.RunningSessionInfo>(), "injected scan failure")
-            : (true, new List<ArchiveService.RunningSessionInfo>(), "");
+            : (true, new List<ArchiveService.RunningSessionInfo>(_scanRows), "");
     }
 
     // Stands in for TryClaudeLiveSessionIds. Not a WMI pass, so it does NOT tick wmiSweeps — it gets its own
@@ -60,10 +578,172 @@ public class ScanCacheTests
         Interlocked.Increment(ref _registryReads);
         return _registryFails
             ? (false, new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase), new HashSet<int> { 4242 }, "injected registry failure")
-            : (true, new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase), new HashSet<int>(), "");
+            : (true, new Dictionary<string, int>(_registryRows, StringComparer.OrdinalIgnoreCase), new HashSet<int>(), "");
     }
 
+    private (bool Ok, Dictionary<string, int> Map, HashSet<int> Unverifiable, string Detail) FakeOpenTranscripts(HashSet<int> livePids)
+        => (_handleUnverifiable.Count == 0,
+            new Dictionary<string, int>(_handleRows, StringComparer.OrdinalIgnoreCase),
+            new HashSet<int>(_handleUnverifiable),
+            _handleUnverifiable.Count == 0 ? "" : "injected handle failure");
+
     private static long Sweeps() => PerfCounters.Snapshot()["wmiSweeps"];
+
+    [TestMethod]
+    public async Task RunningBridge_PreservesEnrichedIdentityAndVerificationFailure()
+    {
+        _scanRows = new() { new(500, "codex", "", "Terminal", "", "") };
+        _handleRows["exact-handle-id"] = 500;
+        _handleUnverifiable.Add(500);
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        System.Text.Json.JsonElement observed = default;
+        var bridge = new RemoteBridge(() => new RemoteBridge.Settings("loopback", 1), () => false,
+            new CodexLocalRetrieval.Core.Agents.ClaudeSessionStore(Path.GetTempPath()), "",
+            isolationFixture: true,
+            transport: (_, operation, body, _, _) =>
+            {
+                if (operation == RemoteBridge.BridgeOperation.Running)
+                {
+                    observed = System.Text.Json.JsonSerializer.Deserialize<System.Text.Json.JsonElement>(body!);
+                    cancellation.Cancel();
+                }
+                return Task.FromResult((0, operation == RemoteBridge.BridgeOperation.Lease ? "[]" : "{}"));
+            });
+        await bridge.RunLoopAsync(cancellation.Token).WaitAsync(TimeSpan.FromSeconds(15));
+        Assert.AreEqual(System.Text.Json.JsonValueKind.Object, observed.ValueKind);
+        Assert.IsFalse(observed.GetProperty("runningVerified").GetBoolean());
+        var row = observed.GetProperty("runningSessions")[0];
+        Assert.AreEqual(500, row.GetProperty("pid").GetInt32());
+        Assert.AreEqual("exact-handle-id", row.GetProperty("sessionId").GetString());
+        Assert.AreEqual("unverifiable", row.GetProperty("identityStatus").GetString());
+    }
+
+    // SESSION-001: the two publish lanes must carry the SAME identity evidence for a running row.
+    // The GUI-active lane pushes the full /api/projects projection (ArchiveService.BuildProjectsProjectionJson);
+    // the closed-GUI lane pushes the light /api/running partial (RemoteBridge.PushRunningAsync). The web
+    // derives liveness from the row's aliases AND prints "identity unresolved/unverifiable" from
+    // identityStatus, so a lane that dropped either would make the same process read as running-or-not and
+    // identified-or-not depending only on which lane happened to push last. The two lanes deliberately
+    // differ in the collection fields (the light push must not clobber the projection the app last pushed);
+    // the identity fields are the part that must be identical.
+    [TestMethod]
+    public async Task RunningProjection_BothLanesCarryTheSameIdentityEvidence()
+    {
+        _scanRows = new()
+        {
+            new(600, "claude", "", "Terminal", "2026-06-29T01:00:00Z", ""),
+            new(700, "codex", "", "Terminal", "2026-06-29T02:00:00Z", ""),
+        };
+        _handleRows["alias-600"] = 600;            // identified only by the open transcript handle
+        _registryRows["registry-700"] = 700;       // and this one only by the Claude live-session registry
+        _handleUnverifiable.Add(700);              // whose handle probe cannot be trusted this pass
+
+        // Lane 1: the closed-GUI bridge's light running push.
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        System.Text.Json.JsonElement light = default;
+        var bridge = new RemoteBridge(() => new RemoteBridge.Settings("loopback", 1), () => false,
+            new CodexLocalRetrieval.Core.Agents.ClaudeSessionStore(Path.GetTempPath()), "",
+            isolationFixture: true,
+            transport: (_, operation, body, _, _) =>
+            {
+                if (operation == RemoteBridge.BridgeOperation.Running)
+                {
+                    light = System.Text.Json.JsonSerializer.Deserialize<System.Text.Json.JsonElement>(body!);
+                    cancellation.Cancel();
+                }
+                return Task.FromResult((0, operation == RemoteBridge.BridgeOperation.Lease ? "[]" : "{}"));
+            });
+        await bridge.RunLoopAsync(cancellation.Token).WaitAsync(TimeSpan.FromSeconds(15));
+
+        // Lane 2: the GUI-active full projection, built from the same enriched scan.
+        Assert.IsFalse(RunningSessions.TryScanEnriched(out var rows, out var scanDetail), scanDetail);
+        var svc = new ArchiveService(useBundledStore: true);
+        using var doc = System.Text.Json.JsonDocument.Parse(
+            svc.BuildProjectsProjectionJson(null, rows, runningVerified: false, runningVerificationDetail: scanDetail));
+
+        static System.Text.Json.JsonElement RowByPid(System.Text.Json.JsonElement body, int pid)
+        {
+            foreach (var row in body.GetProperty("runningSessions").EnumerateArray())
+                if (row.GetProperty("pid").GetInt32() == pid) return row;
+            Assert.Fail("pid " + pid + " missing from the running projection");
+            return default;
+        }
+
+        foreach (var pid in new[] { 600, 700 })
+        {
+            var lightRow = RowByPid(light, pid);
+            var fullRow = RowByPid(doc.RootElement, pid);
+            Assert.AreEqual(lightRow.GetProperty("sessionId").GetString(), fullRow.GetProperty("sessionId").GetString(),
+                "lane disagreement on the resolved identity of pid " + pid);
+            CollectionAssert.AreEqual(
+                lightRow.GetProperty("sessionAliases").EnumerateArray().Select(a => a.GetString()).ToArray(),
+                fullRow.GetProperty("sessionAliases").EnumerateArray().Select(a => a.GetString()).ToArray(),
+                "lane disagreement on the alias set of pid " + pid);
+            Assert.AreEqual(lightRow.GetProperty("identityStatus").GetString(), fullRow.GetProperty("identityStatus").GetString(),
+                "lane disagreement on the identity status of pid " + pid);
+            Assert.AreEqual(lightRow.GetProperty("identitySource").GetString(), fullRow.GetProperty("identitySource").GetString(),
+                "lane disagreement on the identity source of pid " + pid);
+        }
+        // The honesty signals themselves, so a lane cannot "agree" by both dropping them.
+        Assert.AreEqual("alias-600", RowByPid(doc.RootElement, 600).GetProperty("sessionId").GetString());
+        Assert.AreEqual("resolved", RowByPid(doc.RootElement, 600).GetProperty("identityStatus").GetString());
+        Assert.AreEqual("registry-700", RowByPid(doc.RootElement, 700).GetProperty("sessionId").GetString());
+        Assert.AreEqual("unverifiable", RowByPid(doc.RootElement, 700).GetProperty("identityStatus").GetString());
+        Assert.AreEqual("open transcript", RowByPid(doc.RootElement, 600).GetProperty("identitySource").GetString());
+        Assert.IsFalse(light.GetProperty("runningVerified").GetBoolean());
+        Assert.IsFalse(doc.RootElement.GetProperty("runningVerified").GetBoolean());
+    }
+
+    [TestMethod]
+    public void EnrichedScan_UsesCommandLineRegistryAndOpenTranscriptIdentityWithoutGuessing()
+    {
+        _scanRows = new()
+        {
+            new(100, "claude", "command-id", "Terminal", "", ""),
+            new(200, "claude", "", "VS Code", "", ""),
+            new(300, "codex", "", "Terminal", "", ""),
+            new(400, "claude", "", "Terminal", "", ""),
+        };
+        _registryRows["registry-id"] = 200;
+        _handleRows["codex-id"] = 300;
+
+        Assert.IsTrue(RunningSessions.TryScanEnriched(out var rows, out var detail), detail);
+        Assert.AreEqual("command-id", rows.Single(r => r.Pid == 100).SessionId);
+        Assert.AreEqual("command line", rows.Single(r => r.Pid == 100).IdentitySource);
+        Assert.AreEqual("registry-id", rows.Single(r => r.Pid == 200).SessionId);
+        Assert.AreEqual("Claude registry", rows.Single(r => r.Pid == 200).IdentitySource);
+        Assert.AreEqual("codex-id", rows.Single(r => r.Pid == 300).SessionId);
+        Assert.AreEqual("open transcript", rows.Single(r => r.Pid == 300).IdentitySource);
+        Assert.AreEqual("", rows.Single(r => r.Pid == 400).SessionId);
+        Assert.AreEqual("unresolved", rows.Single(r => r.Pid == 400).IdentityStatus);
+    }
+
+    [TestMethod]
+    public void EnrichedScan_PreservesConflictingEvidenceAsAliases()
+    {
+        _scanRows = new() { new(100, "claude", "command-id", "Terminal", "", "") };
+        _registryRows["registry-id"] = 100;
+        _handleRows["handle-id"] = 100;
+
+        Assert.IsTrue(RunningSessions.TryScanEnriched(out var rows, out var detail), detail);
+        var row = rows.Single();
+        Assert.AreEqual("command-id", row.SessionId);
+        CollectionAssert.AreEquivalent(new[] { "registry-id", "handle-id" }, row.SessionAliases!.ToArray());
+        CollectionAssert.AreEquivalent(new[] { "command-id", "registry-id", "handle-id" }, row.AllSessionIds.ToArray());
+    }
+
+    [TestMethod]
+    public void EnrichedScan_ReportsUnverifiableIdentityButKeepsTheProcessVisible()
+    {
+        _scanRows = new() { new(500, "codex", "", "Terminal", "", "") };
+        _handleUnverifiable.Add(500);
+
+        Assert.IsFalse(RunningSessions.TryScanEnriched(out var rows, out var detail));
+        Assert.AreEqual(1, rows.Count);
+        Assert.AreEqual(500, rows[0].Pid);
+        Assert.AreEqual("unverifiable", rows[0].IdentityStatus);
+        StringAssert.Contains(detail, "handle failure");
+    }
 
     // ---- 1. a burst shares one sweep ----------------------------------------------------------------
 

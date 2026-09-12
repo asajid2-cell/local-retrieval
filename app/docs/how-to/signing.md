@@ -1,6 +1,6 @@
 # How to Sign a Windows Release
 
-Codex Local Retrieval currently ships as an unsigned portable ZIP. Windows can run it, but SmartScreen may warn on first launch.
+MUX currently ships as an unsigned portable ZIP. Windows can run it, but SmartScreen may warn on first launch.
 
 ## Trusted Public Signing
 
@@ -9,7 +9,7 @@ Use a trusted Authenticode certificate or Microsoft Trusted Signing. This is the
 Expected flow:
 
 1. Publish the Windows x64 build.
-2. Sign the top-level `Codex Local Retrieval.exe`, `app/CodexLocalRetrieval.Native.exe`, and any required binaries with the trusted certificate.
+2. Sign the top-level `MUX.exe`, `app/CodexLocalRetrieval.Native.exe`, and any required binaries with the trusted certificate. The `CodexLocalRetrieval.Native.exe` runtime name is an internal compatibility path.
 3. Verify the signature with `Get-AuthenticodeSignature`.
 4. Compress the signed publish directory.
 5. Upload the signed ZIP as a release asset.
@@ -17,7 +17,7 @@ Expected flow:
 Verification:
 
 ```powershell
-Get-AuthenticodeSignature ".\Codex Local Retrieval.exe"
+Get-AuthenticodeSignature ".\MUX.exe"
 Get-AuthenticodeSignature .\app\CodexLocalRetrieval.Native.exe
 ```
 
@@ -30,11 +30,11 @@ A self-signed certificate is useful only for local testing. It does not remove p
 ```powershell
 $cert = New-SelfSignedCertificate `
   -Type CodeSigningCert `
-  -Subject "CN=Codex Local Retrieval Dev" `
+  -Subject "CN=MUX Dev" `
   -CertStoreLocation Cert:\CurrentUser\My
 
 Set-AuthenticodeSignature `
-  -FilePath ".\Codex Local Retrieval.exe" `
+  -FilePath ".\MUX.exe" `
   -Certificate $cert
 ```
 

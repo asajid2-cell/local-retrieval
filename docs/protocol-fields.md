@@ -83,6 +83,11 @@ missing any of them fails `hostProtocolOk()` and the relay treats it as protocol
 | `resync` | optional | Host emits `resync` when one session's byte-bounded egress queue overflows and its backlog was dropped at a frame boundary. A relay that lacks the handler simply ignores the frame and shows the gap; it is deliberately **not** in `REQUIRED_HOST_CAPS`, so older hosts keep connecting. |
 | `inputDurable` | optional | Host admits a relay `i` frame to the PTY only when it carries a principal-signed `input.durable` proof for exactly those bytes on exactly that session, and replays an already-executed intent instead of re-running it. See [`input.durable`](#inputdurable--principal-authorized-pty-input-cap-inputdurable). |
 
+| `killFence` | optional | Local cleanup requests can require an exact session identity and generation; a replacement owner is refused. |
+| `relayKillFence` | optional | Required for browser hosted deletion: relay `kill` carries exact `sessionId` (empty only for an unbound shell), nonempty `generationId`, and `rid`. muxd checks under its launch lock and echoes these in `killed` or `killResult`. Old hosts remain viewable but deletion is refused. |
+| `inputFence` | optional | Local `input` requests carrying `sessionId` and `generationId` must match the current destination before fresh dispatch. A settled durable intent is replayed without another input effect. |
+| `resumeOnly` | optional | A resume-only `create` may reuse the matching live chat/command but cannot take over a different identity or command. |
+
 ### Reserved — terminal model (native prong)
 
 Registered ahead of implementation so the names are not taken by anything else. Each is
@@ -127,7 +132,8 @@ dispatch chain and are ignored.
 | `sb` | Scrollback replay answering a relay `sb` request, correlated by `rid`. |
 | `createResult` | Acknowledgement of a `create`, correlated by `rid`. |
 | `tailr` | Answer to `tail`, correlated by `rid`. |
-| `killed` | A session ended; relay drops it and tears down viewer state. |
+| `killed` | Confirms the exact requested generation ended. Relay removes projection/viewers only if their current identity still matches; a same-name replacement is preserved. |
+| `killResult` | Refused or unconfirmed stop, correlated by `rid`, `s`, `sessionId`, and `generationId`. `uncertain: true` is not terminal success. |
 | `resync` | This session's output backlog was dropped at a frame boundary (its per-session egress budget overflowed). Relay repaints that session's viewers with `CLEAR` + a scrollback replay; other sessions are untouched. |
 
 ### relay → muxd (`relay/server.js:255,313,674,705,720,2145,2200,2314`)
@@ -179,7 +185,8 @@ literals stay globally unique: `info`, `ls`, `err`, `killed`, `owner-ok`, `bind-
 | `tailr` | `rid`,`text` | string | Plain text, not base64. |
 | `rename` | `s`,`to` | string | `to` must be a strict mux name and must not already exist. |
 | `heal` | `s`,`on` | string,bool | |
-| `kill` / `killed` | `s` | string | |
+| `kill` / `killed` / `killResult` (relay link) | `s`,`rid`,`sessionId`,`generationId` | string | Exact name, request correlation, authoritative identity (may be empty), and nonempty generation. Browser DELETE uses the listed authoritative identity and generation, not an archive alias. |
+| `killResult` | `ok`,`uncertain`,`detail` | bool,bool,string | `ok: false`; uncertainty maps to retryable HTTP 504. Missing acknowledgement or mere disappearance does not prove completion. |
 
 ### Session payload fields
 

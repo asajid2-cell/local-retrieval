@@ -54,7 +54,7 @@ function loadReader(extra) {
 }
 
 const PAGE_ONE = {
-  schemaVersion: 1, sessionId: 's1', page: 1, pages: 2, availablePages: [1, 2],
+  schemaVersion: 1, sessionId: 's1', page: 2, pages: 2, availablePages: [1, 2],
   messages: [
     { role: 'user', text: 'add a reader view', ts: 1000 },
     { role: 'assistant', text: 'on it', ts: 2000 },
@@ -62,7 +62,7 @@ const PAGE_ONE = {
   ],
 };
 const PAGE_TWO = {
-  schemaVersion: 1, sessionId: 's1', page: 2, pages: 2, availablePages: [1, 2],
+  schemaVersion: 1, sessionId: 's1', page: 1, pages: 2, availablePages: [1, 2],
   messages: [
     { role: 'system', text: 'context compacted', ts: 4000 },
     { role: 'assistant', text: 'done — newest message', ts: 5000 },
@@ -173,7 +173,7 @@ test('readHealth reports the bridge dark when /api/projects says so or is unreac
 
 // Drives reader.refresh with a scripted relay. `statuses` is the sequence /api/app-commands/:id returns.
 function harness(options) {
-  const opts = options || {};
+  const opts = { mint: { scheme: 'mux-principal-v1', proof: 'fixture-grant' }, ...(options || {}) };
   const calls = { transcripts: 0, enqueued: [], polls: 0 };
   const statuses = opts.statuses ? opts.statuses.slice() : [{ status: 'done', detail: '2 pages fetched' }];
   let clock = 1_000_000;
@@ -199,7 +199,7 @@ function harness(options) {
     if (url.includes('/api/transcripts/')) {
       calls.transcripts += 1;
       if (opts.noPages) return { ok: false, status: 404, json: async () => ({ error: 'no transcript pages for this session' }) };
-      return { ok: true, status: 200, json: async () => (url.includes('page=2') ? PAGE_TWO : PAGE_ONE) };
+      return { ok: true, status: 200, json: async () => (url.includes('page=2') ? PAGE_ONE : PAGE_TWO) };
     }
     throw new Error('unexpected fetch ' + url);
   };
@@ -274,7 +274,7 @@ test('the enqueue carries a principalAuth envelope the relay will accept', async
     return Object.entries(value).flatMap(([k, v]) => [String(k).toLowerCase(), ...walk(v)]);
   };
 
-  for (const mint of [null, { scheme: 'mux-principal-v1', proof: 'sig:abc', issuedAt: 1 }]) {
+  for (const mint of [{ scheme: 'mux-principal-v1', proof: 'sig:abc', issuedAt: 1 }]) {
     const { reader, calls } = harness(mint ? { mint } : {});
     await reader.refresh('s1', { timeoutMs: 30000, intervalMs: 1000 });
     const payload = calls.enqueued[0].payload;
@@ -287,15 +287,14 @@ test('the enqueue carries a principalAuth envelope the relay will accept', async
   }
 });
 
-test('the un-minted fallback envelope declares that it carries no proof', async () => {
-  const { reader, calls } = harness();                          // /api/principal-auth answers 404
-  await reader.refresh('s1', { timeoutMs: 30000, intervalMs: 1000 });
-  const envelope = calls.enqueued[0].payload.principalAuth;
-
-  assert.equal(envelope.proof, 'none', 'it must not pretend to be attested');
-  assert.equal(envelope.intent, 'archive.read');
-  assert.equal(envelope.sessionId, 's1');
-  assert.ok(envelope.nonce, 'replayable envelopes are worse than unproven ones');
+test('missing transcript authorization refuses without enqueue or polling', async () => {
+  const { reader, calls } = harness({ mint: null });
+  const result = await reader.refresh('s1', { timeoutMs: 30000, intervalMs: 1000 });
+  assert.equal(result.ok, false);
+  assert.match(result.error, /authorization unavailable/i);
+  assert.equal(calls.enqueued.length, 0);
+  assert.equal(calls.polls, 0);
+  assert.equal(calls.transcripts, 0);
 });
 
 test('loadPages treats a missing transcript as expired rather than an error', async () => {
@@ -308,6 +307,15 @@ test('loadPages treats a missing transcript as expired rather than an error', as
   const mount = makeElement('main');
   reader.render(doc, mount, view);
   assert.match(mount.children[0].textContent, /expired/i);
+});
+
+test('failed older page cannot silently produce a successful partial transcript', async () => {
+  const reader = loadReader();
+  reader.base = '';
+  reader.fetch = async url => url.includes('?page=2')
+    ? { ok: false, status: 503 }
+    : { ok: true, json: async () => PAGE_TWO };
+  await assert.rejects(reader.loadPages('s1'), /transcript page 2 HTTP 503/);
 });
 
 // ==== 4. the page itself, and its entry points ======================================================

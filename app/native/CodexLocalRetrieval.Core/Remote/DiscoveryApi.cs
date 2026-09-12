@@ -15,6 +15,7 @@ public sealed record DiscoveryQuery(
     string? Date = null,
     int? MinUserMessages = null,
     bool? ShowHidden = null,
+    string? Archived = null,
     string? Project = null,
     string? Sort = null,
     int? Offset = null,
@@ -36,7 +37,13 @@ public sealed record DiscoveryChatRow(
     long MatchOffset = 0,
     long MatchLength = 0,
     string MatchProvenance = "",
-    bool Navigable = true);
+    bool Navigable = true,
+    string Revision = "",
+    bool Archived = false,
+    string CustomTitle = "",
+    IReadOnlyList<string>? CollectionIds = null);
+
+public sealed record DiscoveryMutationResult(bool Ok, string Message, string Id, bool Favorite, string Revision);
 
 public sealed record DiscoveryPage(
     string Query,
@@ -59,8 +66,12 @@ public sealed record DiscoveryFacets(
 
 public sealed record StartDeckRow(string Id, string Label);
 public sealed record StartDeckProjection(string ActiveDeckId, IReadOnlyList<StartDeckRow> Rows);
-public sealed record StartCollectionRow(string Id, string Label);
-public sealed record StartCollectionProjection(string DeckId, IReadOnlyList<StartCollectionRow> Rows);
+public sealed record StartCollectionRow(string Id, string Label, string Revision = "", string ManagementRevision = "");
+public sealed record StartCollectionProjection(string DeckId, IReadOnlyList<StartCollectionRow> Rows, IReadOnlyList<StartDeletedCollectionRow>? RecentlyDeleted = null);
+public sealed record StartDeletedCollectionRow(string Id, string Label, string DeckId, string DeletedAt, string Revision);
+public sealed record ContainerDeckRow(string Id, string Label, string Revision);
+public sealed record ContainerCollectionRow(string Id, string Label, string DeckId, string DeckLabel, string Revision, IReadOnlyList<string> SessionIds, IReadOnlyList<string>? Tags = null);
+public sealed record ContainerAdminProjection(IReadOnlyList<ContainerDeckRow> Decks, IReadOnlyList<ContainerCollectionRow> Collections, IReadOnlyList<StartDeletedCollectionRow> RecentlyDeleted, string ActiveDeckId, string RecentlyDeletedManagementRevision = "", string DeckOrderRevision = "");
 public sealed record StartCheckpointRow(
     string Id,
     string Label,
@@ -68,10 +79,41 @@ public sealed record StartCheckpointRow(
     string Tool,
     string WorkspaceLabel,
     string CreatedAt,
-    int MessageCount);
+    int MessageCount,
+    string Revision = "",
+    string SourceSessionId = "");
 public sealed record StartCheckpointProjection(IReadOnlyList<StartCheckpointRow> Rows);
 public sealed record StartWorkspaceRow(string Id, string Label, IReadOnlyList<string> Tools);
 public sealed record StartWorkspaceProjection(IReadOnlyList<StartWorkspaceRow> Rows);
+
+// The "deep search" projection: the desktop Search page's content-first transcript scan, reduced to what a
+// browser row needs. It is deliberately NOT a DiscoveryChatRow — these hits come from reading transcript
+// FILES, so each row carries its own snippet and provenance instead of looking one up in the in-memory hit
+// table the filtered list populates. `Ran` distinguishes "the scan found nothing" from "nothing was
+// scanned", so a caller can never report an empty query as an empty result.
+public sealed record DiscoveryDeepRow(
+    string Id,
+    string Title,
+    string Tool,
+    string WorkspaceLabel,
+    string UpdatedAt,
+    int UserMsgCount,
+    bool Pinned,
+    bool Resumable,
+    string MuxName,
+    string Snippet,
+    string Provenance,
+    string MatchedTerms,
+    int Score,
+    string Revision,
+    bool Archived);
+
+public sealed record DiscoveryDeepPage(
+    string Query,
+    int Limit,
+    int Count,
+    bool Ran,
+    IReadOnlyList<DiscoveryDeepRow> Rows);
 
 // HTTP-agnostic discovery surface. The server adapter binds query parameters onto DiscoveryQuery;
 // all archive semantics and response shaping stay here so they can be tested without a web host.
@@ -79,6 +121,10 @@ public sealed class DiscoveryApi
 {
     public const int DefaultLimit = 50;
     public const int MaxLimit = 100;
+
+    // The desktop app's Enter-on-search-box cap is 40 chats; the browser deep search keeps that number so
+    // the two surfaces report the same breadth for the same query.
+    public const int DefaultDeepLimit = 40;
 
     private static readonly HashSet<int> AllowedMinimums = new() { 0, 2, 3, 5, 10, 25 };
     private static readonly HashSet<string> AllowedAgents = new(StringComparer.OrdinalIgnoreCase) { "codex", "claude" };
@@ -116,6 +162,47 @@ public sealed class DiscoveryApi
             normalized.Offset + rows.Count < total,
             rows,
             _archive.LastSearchCoverage);
+    }
+
+    // The desktop app's Enter-on-search-box engine (ArchiveService.DeepSearchContentAsync): scan the real
+    // transcript files for the query's words and rank by frequency plus a title boost. Read-only and
+    // bounded by `limit`; it is a separate call so a heavy file scan is only ever paid for on purpose,
+    // never per keystroke. Archived chats are re-checked here because the indexed engine behind
+    // DeepSearchContentAsync can return them, and the desktop path skips them too.
+    public async Task<DiscoveryDeepPage> DeepSearchAsync(string? query, int? limit = null, bool showHidden = false)
+    {
+        var q = (query ?? "").Trim();
+        var take = Math.Clamp(limit ?? DefaultDeepLimit, 1, MaxLimit);
+        if (q.Length == 0) return new DiscoveryDeepPage(q, take, 0, false, Array.Empty<DiscoveryDeepRow>());
+
+        var hits = await _archive.DeepSearchContentAsync(q, take);
+        // A query of pure stopwords has no words to scan, so an empty result is "nothing was searched",
+        // not "nothing matched". The indexed engine can still return hits for such a query, and a hit
+        // obviously proves the search ran.
+        var ran = hits.Count > 0 || ArchiveService.HasSearchableContentQuery(q);
+        var rows = hits
+            .Where(hit => !hit.Session.Archived)
+            .Where(hit => showHidden || !ArchiveService.IsLowSignalChat(hit.Session))
+            .Take(take)
+            .Select(hit => new DiscoveryDeepRow(
+                hit.Session.Id,
+                SecretRedactor.Scrub(hit.Session.DisplayTitle),
+                NormalizeTool(hit.Session.Tool),
+                SecretRedactor.Scrub(WorkspaceLabel(hit.Session)),
+                hit.Session.UpdatedAt,
+                hit.Session.UserMessageCount,
+                hit.Session.Pinned,
+                _isResumable(hit.Session),
+                ArchiveService.MultiplexSessionName(hit.Session),
+                SecretRedactor.Scrub(hit.Snippet ?? ""),
+                hit.SourceLabel ?? "",
+                SecretRedactor.Scrub(hit.MatchedTerms ?? ""),
+                hit.Score,
+                _archive.RemoteManagementRevision(hit.Session),
+                hit.Session.Archived))
+            .ToList();
+
+        return new DiscoveryDeepPage(q, take, rows.Count, ran, rows);
     }
 
     public DiscoveryFacets Facets(DiscoveryQuery? query = null)
@@ -175,11 +262,28 @@ public sealed class DiscoveryApi
 
         var rows = _archive.CollectionsInDeck(deck.Id)
             .Where(collection => !string.IsNullOrWhiteSpace(collection.Id))
-            .Select(collection => new StartCollectionRow(collection.Id.Trim(), collection.Name.Trim()))
+            .Select(collection => new StartCollectionRow(collection.Id.Trim(), collection.Name.Trim(), _archive.CollectionMembershipRevision(collection.Id), _archive.CollectionManagementRevision(collection.Id)))
             .OrderBy(row => row.Label, StringComparer.OrdinalIgnoreCase)
             .ThenBy(row => row.Id, StringComparer.OrdinalIgnoreCase)
             .ToList();
-        return new StartCollectionProjection(requestedId, rows);
+        var deleted = _archive.Store.DeletedCollections
+            .Select(entry => new StartDeletedCollectionRow(entry.Collection.Id, entry.Collection.Name, ArchiveService.CollectionDeck(entry.Collection),
+                entry.DeletedAt, _archive.DeletedCollectionManagementRevision(entry.Collection.Id)))
+            .ToList();
+        return new StartCollectionProjection(requestedId, rows, deleted);
+    }
+
+    public ContainerAdminProjection ContainerAdmin()
+    {
+        _archive.EnsureDecks();
+        var decks = _archive.Decks.Select(deck => new ContainerDeckRow(deck.Id, deck.Name, _archive.DeckManagementRevision(deck.Id))).ToList();
+        var collections = _archive.Store.Collections.Values.Select(collection => new ContainerCollectionRow(
+            collection.Id, collection.Name, ArchiveService.CollectionDeck(collection),
+            _archive.Decks.FirstOrDefault(deck => deck.Id.Equals(ArchiveService.CollectionDeck(collection), StringComparison.OrdinalIgnoreCase))?.Name ?? "Main",
+            _archive.CollectionManagementRevision(collection.Id), collection.SessionIds.ToList(), collection.Tags.ToList())).ToList();
+        var deleted = _archive.Store.DeletedCollections.Select(entry => new StartDeletedCollectionRow(entry.Collection.Id, entry.Collection.Name,
+            ArchiveService.CollectionDeck(entry.Collection), entry.DeletedAt, _archive.DeletedCollectionManagementRevision(entry.Collection.Id))).ToList();
+        return new ContainerAdminProjection(decks, collections, deleted, _archive.ActiveDeckId, _archive.RecentlyDeletedManagementRevision(), _archive.DeckOrderRevision());
     }
 
     public StartCheckpointProjection StartCheckpoints()
@@ -192,7 +296,9 @@ public sealed class DiscoveryApi
                 NormalizeTool(snapshot.Tool),
                 SecretRedactor.Scrub(WorkspaceLabel(snapshot.WorkspaceName, snapshot.Workspace)),
                 snapshot.CreatedAt,
-                snapshot.MessageCount))
+                snapshot.MessageCount,
+                _archive.TemplateSnapshotManagementRevision(snapshot.Id),
+                snapshot.SourceSessionId))
             .ToList();
         return new StartCheckpointProjection(rows);
     }
@@ -235,6 +341,7 @@ public sealed class DiscoveryApi
             DateMode = query.Sort == "recent" ? "" : query.Sort,
             MinUserMessages = query.MinUserMessages,
             ShowHidden = query.ShowHidden,
+            Archived = query.Archived,
         };
 
         var filtered = _archive.FilterChats(filter);
@@ -266,7 +373,11 @@ public sealed class DiscoveryApi
             hit?.ByteOffset ?? 0,
             hit?.ByteLength ?? 0,
             hit?.Provenance ?? "",
-            hit?.Navigable ?? File.Exists(session.SourcePath));
+            hit?.Navigable ?? File.Exists(session.SourcePath),
+            _archive.RemoteManagementRevision(session),
+            session.Archived,
+            SecretRedactor.Scrub(session.CustomTitle),
+            _archive.CollectionIdsForSession(session.Id));
     }
 
     private static string RowTitle(ArchiveSession session, string sort) => sort switch
@@ -335,6 +446,8 @@ public sealed class DiscoveryApi
         var date = CleanEnum(raw.Date, AllowedDates);
         var sort = CleanEnum(raw.Sort, AllowedSorts);
         if (sort.Length == 0) sort = "recent";
+        var archived = CleanEnum(raw.Archived, new(StringComparer.OrdinalIgnoreCase) { "active", "archived", "all" });
+        if (archived.Length == 0) archived = "active";
 
         var minimum = raw.MinUserMessages.GetValueOrDefault();
         if (!AllowedMinimums.Contains(minimum)) minimum = 0;
@@ -348,6 +461,7 @@ public sealed class DiscoveryApi
             date,
             minimum,
             raw.ShowHidden == true,
+            archived,
             (raw.Project ?? "").Trim(),
             sort,
             Math.Max(0, raw.Offset.GetValueOrDefault()),
@@ -490,6 +604,7 @@ public sealed class DiscoveryApi
         string Date,
         int MinUserMessages,
         bool ShowHidden,
+        string Archived,
         string Project,
         string Sort,
         int Offset,

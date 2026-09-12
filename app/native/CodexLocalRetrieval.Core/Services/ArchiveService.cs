@@ -40,6 +40,8 @@ public sealed partial class ArchiveService
     private const int SearchTextCap = 6_000; // capped, in-memory searchable text per session (full content lazy-loads)
     private const int MaxDiskSearchParallelism = 4;
     private const long MaxDiskSearchBytesPerFile = 128L * 1024 * 1024;
+    private const int StoreLockAttempts = 1200;
+    private const int StoreLockRetryDelayMilliseconds = 25;
 
     private static string CapText(string s) => string.IsNullOrEmpty(s) || s.Length <= SearchTextCap ? s : s[^SearchTextCap..];
 
@@ -74,10 +76,12 @@ public sealed partial class ArchiveService
         return sr.ReadToEnd();
     }
 
-    public static IEnumerable<string> SafeReadLines(string path)
+    public static IEnumerable<string> SafeReadLines(string path, bool captureOpeningLength = false)
     {
         using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-        using var sr = new StreamReader(fs, Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
+        var openingLength = fs.Length;
+        using var limited = captureOpeningLength ? new ReadLimitStream(fs, openingLength) : null;
+        using var sr = new StreamReader((Stream?)limited ?? fs, Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
         var reader = new BoundedTextLineReader(
             sr,
             MaxLineChars,
@@ -87,7 +91,12 @@ public sealed partial class ArchiveService
             string? line;
             try { line = reader.ReadLine(); }
             catch (InvalidDataException) { continue; }
-            if (line is null) yield break;
+            if (line is null)
+            {
+                if (captureOpeningLength && fs.Position < openingLength)
+                    throw new IOException("Transcript was truncated during capture.");
+                yield break;
+            }
             yield return line;
         }
     }
@@ -150,7 +159,7 @@ public sealed partial class ArchiveService
     // Recompute UserMessageCount from the source file for chats the disk scan couldn't reach this pass —
     // recovered chats in backup folders OUTSIDE the scan roots, or a file that was momentarily locked. Only
     // the zero-counts with real content, so it stays cheap; off the UI thread.
-    private async Task BackfillUserCountsAsync()
+    private async Task BackfillUserCountsAsync(CancellationToken cancellationToken = default)
     {
         var candidates = Store.Sessions.Values
             .Where(s => s.UserMessageCount == 0 && s.MessageCount >= 5 && !string.IsNullOrEmpty(s.SourcePath))
@@ -160,10 +169,11 @@ public sealed partial class ArchiveService
         {
             foreach (var s in candidates)
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 try { if (File.Exists(s.SourcePath)) s.UserMessageCount = CountUserPrompts(s.SourcePath, s.Tool); }
                 catch { }
             }
-        });
+        }, cancellationToken);
     }
 
     private readonly string _rootPath;
@@ -200,8 +210,12 @@ public sealed partial class ArchiveService
     private IReadOnlyDictionary<string, ArchiveSearchHit> _lastSearchHits =
         new Dictionary<string, ArchiveSearchHit>(StringComparer.OrdinalIgnoreCase);
 
+    internal Action<DurableWriteStage>? StoreWriteFault { get; set; }
+    internal Action<string, double>? SavePhaseMeasured { get; set; }
     public AppStoreData Store { get; private set; } = new();
     public ObservableCollection<ArchiveSession> Sessions { get; } = new();
+
+    private readonly IReadOnlyList<SessionSource>? _sourceOverride;
 
     public ArchiveService(
         string? storePath = null,
@@ -212,8 +226,10 @@ public sealed partial class ArchiveService
         string? templatesRoot = null,
         Func<ArchiveSession, string, string, bool>? codexThreadRegistrar = null,
         string? transcriptSearchIndexPath = null,
-        bool? enableTranscriptSearchIndex = null)
+        bool? enableTranscriptSearchIndex = null,
+        IReadOnlyList<SessionSource>? sourceOverride = null)
     {
+        _sourceOverride = sourceOverride?.Select(s => new SessionSource { Tool = s.Tool, Root = s.Root, Enabled = s.Enabled }).ToArray();
         _rootPath = FindProjectRoot();
         _bundledStorePath = Path.Combine(_rootPath, "data", "app-store.json");
         _storePath = useBundledStore
@@ -249,14 +265,37 @@ public sealed partial class ArchiveService
         _parseSessionOverride = parseSessionOverride ?? throw new ArgumentNullException(nameof(parseSessionOverride));
     }
 
-    public async Task LoadAsync()
+    public async Task LoadAsync(CancellationToken cancellationToken = default)
     {
-        await LoadStoreStateAsync();
+        await LoadStoreStateAsync(cancellationToken);
+        cancellationToken.ThrowIfCancellationRequested();
         await MigrateLegacyTemplatesAsync();
+        cancellationToken.ThrowIfCancellationRequested();
         await BackfillTemplateSnapshotMetadataAsync();
+        cancellationToken.ThrowIfCancellationRequested();
         RefreshTemplateSnapshotCounts();
         RefreshSessions(OrderedVisibleSessions(Store.Sessions.Values));
-        StartTranscriptSearchIndexBuild();
+        StartTranscriptSearchIndexBuild(cancellationToken);
+    }
+
+    // Startup cache phase: read the last durable snapshot without waiting on the writer lock or performing
+    // migrations/index work. The page can bind and render this state while maintenance runs afterward.
+    public async Task LoadCachedAsync(CancellationToken cancellationToken = default)
+    {
+        await LoadStoreStateAsync(cancellationToken, acquireWriterLock: false, restoreBackup: false);
+        cancellationToken.ThrowIfCancellationRequested();
+        RefreshSessions(OrderedVisibleSessions(Store.Sessions.Values));
+    }
+
+    // Call before a serialized server operation, not after mutating its in-memory store.
+    public async Task ReloadExternalStoreCommitAsync(CancellationToken cancellationToken = default)
+    {
+        await using var storeLock = await AcquireStoreLockAsync(cancellationToken);
+        var generation = await Task.Run(() => File.Exists(_storePath) ? ReadStoreGeneration(_storePath) : 0, cancellationToken);
+        if (generation == _loadedGeneration) return;
+        await LoadStoreStateAsync(cancellationToken, acquireWriterLock: false, restoreBackup: false);
+        RefreshTemplateSnapshotCounts();
+        RefreshSessions(OrderedVisibleSessions(Store.Sessions.Values));
     }
 
     public TranscriptSearchIndexStatus TranscriptSearchStatus =>
@@ -339,27 +378,43 @@ public sealed partial class ArchiveService
         }
     }
 
-    internal async Task LoadStoreStateAsync()
+    internal async Task LoadStoreStateAsync(
+        CancellationToken cancellationToken = default,
+        bool acquireWriterLock = true,
+        bool restoreBackup = true)
     {
         if (File.Exists(_storePath) || StoreBackupFiles().Any())
         {
-            await using var storeLock = await AcquireStoreLockAsync();
-            Store = await LoadStoreWithRecoveryAsync();
+            FileStream? storeLock = null;
+            try
+            {
+                if (acquireWriterLock)
+                    storeLock = await AcquireStoreLockAsync(cancellationToken);
+                Store = await LoadStoreWithRecoveryAsync(cancellationToken, restoreBackup);
+            }
+            finally
+            {
+                if (storeLock is not null) await storeLock.DisposeAsync();
+            }
         }
         else if (File.Exists(_bundledStorePath))
         {
-            Store = await Task.Run(() => ReadStore(_bundledStorePath));
+            Store = await Task.Run(() => ReadStore(_bundledStorePath), cancellationToken);
         }
+        cancellationToken.ThrowIfCancellationRequested();
         NormalizeBranchIdentityAliases();
         _loadedGeneration = Store.Generation;
         NormalizeSettings();
         EnsureDecks();
     }
 
-    private async Task<AppStoreData> LoadStoreWithRecoveryAsync()
+    private async Task<AppStoreData> LoadStoreWithRecoveryAsync(
+        CancellationToken cancellationToken = default,
+        bool restoreBackup = true)
     {
         return await Task.Run(async () =>
         {
+            cancellationToken.ThrowIfCancellationRequested();
             Exception? primaryError = null;
             var candidates = new List<(string Path, byte[] Bytes, AppStoreData Store, DateTime WrittenAt, bool Primary)>();
             if (File.Exists(_storePath))
@@ -403,7 +458,7 @@ public sealed partial class ArchiveService
                     "The app store is corrupt or missing and no valid durable backup could be recovered.",
                     primaryError);
             }
-            if (selected.Primary)
+            if (selected.Primary || !restoreBackup)
                 return selected.Store;
 
             var supersededBackup = Path.Combine(
@@ -684,36 +739,49 @@ public sealed partial class ArchiveService
     // The last-write time of a session's source transcript, for cheap "did it change?" polling.
     public DateTime SourceWriteTimeUtc(ArchiveSession session) => SourceFileWriteTimeUtc(session);
 
-    public async Task<bool> EnrichTitlesFromLocalStateAsync()
+    public async Task<bool> EnrichTitlesFromLocalStateAsync(CancellationToken cancellationToken = default)
     {
         // Read the (potentially slow) sqlite/jsonl off-thread, but APPLY the changes on the caller
         // (UI) thread — mutating bound sessions raises INotifyPropertyChanged, which must not fire
         // from a worker.
-        var titles = await Task.Run(LoadThreadTitles);
+        var titles = await Task.Run(LoadThreadTitles, cancellationToken);
+        cancellationToken.ThrowIfCancellationRequested();
         var changed = ApplyThreadTitles(titles);
         if (changed) ReapplyList();
         return changed;
     }
 
-    public async Task SaveAsync()
+    public async Task SaveAsync(CancellationToken cancellationToken = default)
     {
         // Serialize only after this save owns the gate. The resulting byte array is the immutable commit
         // candidate; a shallow object copy is unsafe because bound sessions/settings can keep mutating
         // while a worker thread serializes them.
+        var phase = SavePhaseMeasured is null ? null : System.Diagnostics.Stopwatch.StartNew();
+        void MeasurePhase(string name)
+        {
+            if (phase is null) return;
+            SavePhaseMeasured?.Invoke(name, phase.Elapsed.TotalMilliseconds);
+            phase.Restart();
+        }
         var storeDir = Path.GetDirectoryName(_storePath)!;
         Directory.CreateDirectory(storeDir);
-        await _saveGate.WaitAsync();
+        await _saveGate.WaitAsync(cancellationToken);
+        MeasurePhase("directoryAndGate");
         try
         {
-            await using var storeLock = await AcquireStoreLockAsync();
+            await using var storeLock = await AcquireStoreLockAsync(cancellationToken);
+            MeasurePhase("lock");
             var diskGeneration = File.Exists(_storePath) ? ReadStoreGeneration(_storePath) : 0;
+            MeasurePhase("generation");
             if (diskGeneration != _loadedGeneration)
                 throw new StoreGenerationConflictException(_loadedGeneration, diskGeneration);
 
+            cancellationToken.ThrowIfCancellationRequested();
             var previousGeneration = Store.Generation;
             var nextGeneration = checked(diskGeneration + 1);
             NormalizeBranchIdentityAliases();
             Store.Generation = nextGeneration;
+            MeasurePhase("normalize");
             // Serialization stays on the CALLER'S thread on purpose. The backlog asked for it to move
             // into the Task.Run below, but that is unsafe for the reason this method already documented:
             // the gate does not stop the UI thread from running, so once we yield, a click can mutate
@@ -721,11 +789,13 @@ public sealed partial class ArchiveService
             // cheaper without introducing that race; a snapshot cheap enough to hand off does not exist,
             // because building one costs the same walk as serializing.
             var bytes = JsonSerializer.SerializeToUtf8Bytes(Store, StorePayloadJsonOptions);
+            MeasurePhase("serialize");
             PerfCounters.StoreBytesWritten(bytes.LongLength);
             try
             {
                 await Task.Run(async () =>
                 {
+                    cancellationToken.ThrowIfCancellationRequested();
                     // `bytes` is immutable from here, so validating it off-thread is safe -- and this
                     // replaces a full Deserialize<AppStoreData> of every chat whose result was discarded.
                     // The shape check is what the commit actually depends on.
@@ -736,7 +806,7 @@ public sealed partial class ArchiveService
                     var previousBackup = Path.Combine(
                         StoreBackupsDir,
                         StoreBackupPrefix + stamp + "-previous.json");
-                    await DurableFileStore.WriteAtomicAsync(_storePath, bytes, previousBackup);
+                    await DurableFileStore.WriteAtomicAsync(_storePath, bytes, previousBackup, StoreWriteFault);
                     var committedBackup = Path.Combine(
                         StoreBackupsDir,
                         StoreBackupPrefix + stamp + "-committed.json");
@@ -772,13 +842,14 @@ public sealed partial class ArchiveService
         finally { _saveGate.Release(); }
     }
 
-    private async Task<FileStream> AcquireStoreLockAsync()
+    private async Task<FileStream> AcquireStoreLockAsync(CancellationToken cancellationToken = default)
     {
         var lockPath = _storePath + ".lock";
         Directory.CreateDirectory(Path.GetDirectoryName(lockPath)!);
         IOException? last = null;
-        for (var attempt = 0; attempt < 200; attempt++)
+        for (var attempt = 0; attempt < StoreLockAttempts; attempt++)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             try
             {
                 return new FileStream(
@@ -792,9 +863,10 @@ public sealed partial class ArchiveService
             catch (IOException error)
             {
                 last = error;
-                await Task.Delay(25);
+                await Task.Delay(StoreLockRetryDelayMilliseconds, cancellationToken);
             }
         }
+
         throw new IOException("Timed out waiting for the cross-process app-store writer lock.", last);
     }
 
@@ -924,6 +996,23 @@ public sealed partial class ArchiveService
         }
 
         PerfCounters.SessionListOps(ObservableDiff.Apply(Sessions, desired, static s => s.Id));
+    }
+
+    private IReadOnlyList<ArchiveSession> SearchIncludingArchived(string query)
+    {
+        var q = (query ?? "").Trim();
+        if (q.Length >= 3 && q[0] == '[' && q[^1] == ']')
+        {
+            var phrase = q[1..^1].Trim();
+            return Store.Sessions.Values
+                .Where(s => s.SpecialPhrases.Any(p => string.Equals(p, phrase, StringComparison.OrdinalIgnoreCase)))
+                .OrderByDescending(s => s.Pinned).ThenByDescending(s => s.UpdatedAt, StringComparer.Ordinal).ToList();
+        }
+        var terms = q.ToLowerInvariant().Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        return Store.Sessions.Values
+            .Where(session => terms.All(term => SearchText(session).Contains(term, StringComparison.OrdinalIgnoreCase)))
+            .OrderByDescending(session => Score(session, terms)).ThenByDescending(session => session.Pinned)
+            .ThenByDescending(session => session.UpdatedAt).ToList();
     }
 
     public IReadOnlyList<ArchiveSession> Search(string query)
@@ -1122,6 +1211,11 @@ public sealed partial class ArchiveService
             .Distinct()
             .Take(12)
             .ToList();
+
+    // True when a query contains words worth scanning transcripts for. Callers that report a result to a
+    // human need this to tell "the search ran and matched nothing" apart from "there was nothing to
+    // search" — printing "0 matches" for a query of stopwords is a wrong answer, not an empty one.
+    public static bool HasSearchableContentQuery(string? query) => ContentQueryTokens(query ?? "").Count > 0;
 
     // Count (capped) case-insensitive, non-overlapping occurrences of a needle in a haystack.
     private static int CountOccurrencesCI(string haystack, string needle, int cap = 50)
@@ -1493,9 +1587,119 @@ public sealed partial class ArchiveService
         var existing = Store.Sessions.Values.FirstOrDefault(s =>
             string.Equals(s.Id, sessionId, StringComparison.OrdinalIgnoreCase) ||
             s.Aliases.Any(a => string.Equals(a, sessionId, StringComparison.OrdinalIgnoreCase)));
-        if (existing is not null) return await RenameNativeAsync(existing, title);
+        if (existing is not null)
+        {
+            if (!string.Equals(existing.Tool, tool, StringComparison.OrdinalIgnoreCase))
+                return "Session tool does not match the requested native rename; names unchanged.";
+            return await RenameNativeAsync(existing, title);
+        }
         var transient = new ArchiveSession { Id = sessionId, Tool = tool, SourcePath = ResolveClaudeTranscriptPath(tool, sessionId) ?? "" };
         return await TryWriteCanonicalNameAsync(transient, title);
+    }
+
+    public async Task<(bool Ok, string Detail, bool Uncertain)> RenameNativeRemoteAsync(
+        string tool, string sessionId, string title, string intentId, string expectedRevision)
+    {
+        if (tool != "claude") return (false, "Codex titles its own sessions; native rename requires Claude", false);
+        if (string.IsNullOrWhiteSpace(intentId) || string.IsNullOrWhiteSpace(expectedRevision)
+            || string.IsNullOrWhiteSpace(sessionId) || string.IsNullOrWhiteSpace(title))
+            return (false, "session, title, intentId and expectedRevision required", false);
+        var clean = CleanTitle(title);
+        var fingerprint = Revision(JsonSerializer.Serialize(new { tool, sessionId, title = clean, expectedRevision }));
+        // Reload before both replay and revision checks: an in-memory receipt is not durable proof.
+        await LoadStoreStateAsync();
+        if (Store.ManagementOperations.TryGetValue(intentId, out var prior))
+        {
+            if (prior.Type != "rename" || prior.PayloadFingerprint != fingerprint)
+                return (false, "intent collision", false);
+            if (prior.State == "applied") return (true, "native rename already applied", false);
+            if (prior.State == "refused") return (false, prior.Detail, false);
+            var pendingSession = ResolveSessionByIdOrAlias(sessionId, tool);
+            if (pendingSession is null) return (false, "native rename source unavailable for reconciliation", true);
+            try
+            {
+                if (!new CodexLocalRetrieval.Core.Remote.SessionLaunchGovernor().TryAcquire(
+                    new(pendingSession.Id, pendingSession.Aliases, "claude", "native-rename", "native title reconciliation", "", "", ""),
+                    out var recoveryClaim, out _))
+                    return (false, "native rename reconciliation custody is busy or unverified", true);
+                using var recoveryCustody = recoveryClaim;
+                // Exclude writers while checking the marker and committing the recovered model title.
+                using var source = new FileStream(pendingSession.SourcePath, FileMode.Open, FileAccess.Read, FileShare.Read);
+                using var reader = new StreamReader(source);
+                var lines = new BoundedTextLineReader(reader, MaxLineChars);
+                var clock = System.Diagnostics.Stopwatch.StartNew();
+                var found = false;
+                string? latestTitle = null;
+                while (lines.ReadLine() is { } line)
+                {
+                    if (clock.Elapsed > TimeSpan.FromSeconds(10))
+                        return (false, "native rename reconciliation deadline exceeded; outcome unconfirmed", true);
+                    using var record = JsonDocument.Parse(line);
+                    var row = record.RootElement;
+                    if (row.ValueKind != JsonValueKind.Object) continue;
+                    if (!row.TryGetProperty("type", out var type) || type.GetString() != "custom-title") continue;
+                    if (row.TryGetProperty("customTitle", out var value) && value.ValueKind == JsonValueKind.String)
+                        latestTitle = value.GetString();
+                    if (row.TryGetProperty("muxRenameIntent", out var marker) && marker.GetString() == intentId
+                        && row.TryGetProperty("muxRenameFingerprint", out var digest) && digest.GetString() == fingerprint)
+                        found = true;
+                }
+                if (!found) return (false, "native rename outcome unconfirmed; source has no committed intent marker", true);
+                // A later native title wins; confirming an old intent must never restore its old title.
+                if (latestTitle is not null) pendingSession.Title = latestTitle;
+                prior.State = "applied";
+                prior.UpdatedAt = DateTime.UtcNow.ToString("O");
+                ReapplyList();
+                await SaveAsync();
+                return (true, "native rename reconciled from transcript intent marker", false);
+            }
+            catch
+            {
+                await LoadStoreStateAsync();
+                return (false, "native rename reconciliation unconfirmed", true);
+            }
+        }
+        var session = ResolveSessionByIdOrAlias(sessionId, tool);
+        if (session is null) return (false, "exact chat not found in the authoritative archive", false);
+        if (RemoteManagementRevision(session) != expectedRevision)
+            return (false, "chat metadata changed; refresh and retry", false);
+        if (Store.ManagementOperations.Values.Any(op => op.Type == "rename" && op.ResultId == session.Id && op.State == "prepared"))
+            return (false, "an earlier native rename is unconfirmed; reconcile before renaming", false);
+        var receipt = new ManagementOperation
+        {
+            Type = "rename", PayloadFingerprint = fingerprint, ResultId = session.Id,
+            State = "prepared", UpdatedAt = DateTime.UtcNow.ToString("O")
+        };
+        Store.ManagementOperations[intentId] = receipt;
+        CodexLocalRetrieval.Core.Remote.SessionLaunchLease? writeClaim = null;
+        FileStream? writeHandle = null;
+        try
+        {
+            // A generation conflict here prevents touching the transcript at all.
+            await SaveAsync();
+            var writeStarted = false;
+            var status = await Task.Run(() => WriteClaudeCustomTitle(session, clean, intentId, fingerprint,
+                () => writeStarted = true, (claim, handle) => { writeClaim = claim; writeHandle = handle; }));
+            if (NativeRenameSucceeded(status)) session.Title = clean;
+            receipt.State = NativeRenameSucceeded(status) ? "applied" : writeStarted ? "prepared" : "refused";
+            receipt.Detail = status ?? "native rename not confirmed";
+            receipt.UpdatedAt = DateTime.UtcNow.ToString("O");
+            ReapplyList();
+            await SaveAsync();
+            return (receipt.State == "applied", receipt.Detail, receipt.State == "prepared");
+        }
+        catch
+        {
+            await LoadStoreStateAsync();
+            // The transcript and app store are separate durable boundaries. Do not retry a write
+            // when the applied receipt could not be confirmed, even if the requested title is visible.
+            return (false, "native rename outcome unconfirmed; reconcile before issuing another rename", true);
+        }
+        finally
+        {
+            writeHandle?.Dispose();
+            writeClaim?.Dispose();
+        }
     }
 
     private static string? ResolveClaudeTranscriptPath(string tool, string id)
@@ -1609,6 +1813,13 @@ public sealed partial class ArchiveService
         var changed = false;
         foreach (var p in Store.PendingNewChats)
         {
+            // Durable remote starts require launch-owned identity evidence, not a cwd/time candidate.
+            if (Store.ManagementOperations.Values.Any(operation => operation.Type == "startchat"
+                    && operation.StartChatLaunch?.PendingIntentId == p.IntentId))
+            {
+                keep.Add(p);
+                continue;
+            }
             if (!DateTimeOffset.TryParse(p.CreatedAt, null, System.Globalization.DateTimeStyles.AdjustToUniversal, out var created))
             {
                 keep.Add(p);
@@ -2052,9 +2263,99 @@ public sealed partial class ArchiveService
     // Remove a single chat from a project without deleting the project or the chat.
     public async Task RemoveFromCollectionAsync(string collectionId, string sessionId)
     {
-        if (Store.Collections.TryGetValue(collectionId, out var collection) && collection.SessionIds.Remove(sessionId))
+        if (!Store.Collections.TryGetValue(collectionId, out var collection)) return;
+        var snapshot = collection.SessionIds.ToList();
+        if (!collection.SessionIds.Remove(sessionId)) return;
+        try
+        {
             await SaveAsync();
+        }
+        catch (DurableWriteException error) when (!error.Committed && !error.VerificationUnknown)
+        {
+            collection.SessionIds = snapshot;
+            throw;
+        }
+        catch (StoreGenerationConflictException)
+        {
+            collection.SessionIds = snapshot;
+            throw;
+        }
+        catch
+        {
+            collection.SessionIds = snapshot;
+            throw;
+        }
     }
+
+    // Collection membership mutations use a projection token derived from the complete authoritative
+    // collection row. The token is checked before mutation and again after a generation-conflict reload;
+    // membership is desired-state/idempotent and never touches session or source transcript data.
+    public string CollectionMembershipRevision(string collectionId)
+    {
+        if (!Store.Collections.TryGetValue(collectionId, out var collection)) return "";
+        var payload = string.Join("\u001f", collection.Id, collection.Name, collection.DeckId,
+            string.Join("\u001e", collection.SessionIds));
+        return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(payload))).ToLowerInvariant();
+    }
+
+    public async Task<bool> ExecuteRemoteCollectionMembershipAsync(
+        string collectionId,
+        string sessionId,
+        bool add,
+        string expectedRevision)
+    {
+        if (string.IsNullOrWhiteSpace(collectionId) || string.IsNullOrWhiteSpace(sessionId)
+            || string.IsNullOrWhiteSpace(expectedRevision)) return false;
+        for (var attempt = 0; attempt < 2; attempt++)
+        {
+            if (!Store.Collections.TryGetValue(collectionId, out var collection)
+                || !Store.Sessions.ContainsKey(sessionId)
+                || !string.Equals(expectedRevision, CollectionMembershipRevision(collectionId), StringComparison.Ordinal))
+                return false;
+            var snapshot = collection.SessionIds.ToList();
+            var wasMember = collection.SessionIds.Contains(sessionId);
+            if (add)
+            {
+                if (!wasMember) collection.SessionIds.Add(sessionId);
+            }
+            else if (wasMember) collection.SessionIds.Remove(sessionId);
+            try
+            {
+                await SaveAsync();
+                return true;
+            }
+            catch (StoreGenerationConflictException) when (attempt == 0)
+            {
+                await LoadAsync();
+            }
+            catch (StoreGenerationConflictException)
+            {
+                collection.SessionIds = snapshot;
+                return false;
+            }
+            catch (DurableWriteException error)
+            {
+                if (error.Committed || error.VerificationUnknown)
+                    await LoadAsync();
+                else
+                    collection.SessionIds = snapshot;
+                return false;
+            }
+            catch
+            {
+                collection.SessionIds = snapshot;
+                return false;
+            }
+        }
+        return false;
+    }
+
+    public IReadOnlyList<string> CollectionIdsForSession(string sessionId) =>
+        Store.Collections.Values.Where(c => c.SessionIds.Contains(sessionId)).Select(c => c.Id).OrderBy(id => id, StringComparer.OrdinalIgnoreCase).ToList();
+
+    public IReadOnlyList<(string Id, string Name, string Revision)> CollectionMembershipProjection() =>
+        Store.Collections.Values.Select(c => (c.Id, c.Name, CollectionMembershipRevision(c.Id))).ToList();
+
 
     // Narrow by-id operations for the co-pilot tools. App metadata only — these never write the
     // canonical agent store and never touch source .jsonl files.
@@ -2062,6 +2363,16 @@ public sealed partial class ArchiveService
         Store.Sessions.TryGetValue(sessionId, out var session)
             ? session
             : _transcriptSearchIndex?.TryGetSession(sessionId);
+
+    // Stable optimistic-concurrency token for the authoritative chat row. It covers the metadata
+    // controlled by the first remote mutation slice, including the desired favorite bit.
+    public string RemoteManagementRevision(ArchiveSession session)
+    {
+        var payload = string.Join("\u001f", session.Id, session.Tool, session.Title, session.CustomTitle,
+            session.Pinned ? "1" : "0", session.Archived ? "1" : "0",
+            string.Join("\u001e", session.Tags), string.Join("\u001e", session.SpecialPhrases));
+        return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(payload))).ToLowerInvariant();
+    }
 
     public async Task<bool> SetFavoriteAsync(string sessionId, bool favorite)
     {
@@ -2082,6 +2393,114 @@ public sealed partial class ArchiveService
         }
         return false;
     }
+
+    // Executes one authoritative app-metadata mutation. The delegate only changes the supplied
+    // in-memory row; this method owns the revision gate, single SaveAsync, conflict reload/recheck,
+    // and rollback of every metadata field touched by the remote slice.
+    public async Task<bool> ExecuteRemoteMetadataMutationAsync(
+        string sessionId,
+        string? tool,
+        string expectedRevision,
+        Func<ArchiveSession, bool> mutation)
+    {
+        if (mutation is null || expectedRevision.Length == 0) return false;
+        for (var attempt = 0; attempt < 2; attempt++)
+        {
+            var session = ResolveSessionByIdOrAlias(sessionId, tool);
+            if (session is null || !string.Equals(expectedRevision, RemoteManagementRevision(session), StringComparison.Ordinal))
+                return false;
+            var snapshot = new MetadataSnapshot(session);
+            try
+            {
+                if (!mutation(session)) return false;
+                await SaveAsync();
+                ReapplyList();
+                return true;
+            }
+            catch (StoreGenerationConflictException) when (attempt == 0)
+            {
+                await LoadAsync();
+            }
+            catch (DurableWriteException error)
+            {
+                if (error.Committed || error.VerificationUnknown) await LoadAsync();
+                else snapshot.Restore(session);
+                return false;
+            }
+            catch
+            {
+                snapshot.Restore(session);
+                return false;
+            }
+        }
+        return false;
+    }
+
+    private sealed class MetadataSnapshot
+    {
+        private readonly string _title;
+        private readonly bool _pinned, _archived;
+        private readonly List<string> _tags, _phrases;
+        public MetadataSnapshot(ArchiveSession s)
+        {
+            _title = s.CustomTitle; _pinned = s.Pinned; _archived = s.Archived;
+            _tags = s.Tags.ToList(); _phrases = s.SpecialPhrases.ToList();
+        }
+        public void Restore(ArchiveSession s)
+        {
+            s.CustomTitle = _title; s.Pinned = _pinned; s.Archived = _archived;
+            s.Tags.Clear(); foreach (var x in _tags) s.Tags.Add(x);
+            s.SpecialPhrases.Clear(); foreach (var x in _phrases) s.SpecialPhrases.Add(x);
+        }
+    }
+
+    // Remote favorite mutation retains its special no-revision same-state replay contract.
+    public async Task<bool> SetFavoriteRemoteAsync(string sessionId, bool favorite, string expectedRevision)
+    {
+        var session = ResolveSessionByIdOrAlias(sessionId);
+        if (session is null) return false;
+        if (expectedRevision.Length == 0)
+        {
+            if (session.Pinned != favorite) return false;
+            return await SaveRemoteFavoriteNoRevisionAsync(sessionId, favorite);
+        }
+        return await ExecuteRemoteMetadataMutationAsync(sessionId, null, expectedRevision, s => { s.Pinned = favorite; return true; });
+    }
+
+    private async Task<bool> SaveRemoteFavoriteNoRevisionAsync(string sessionId, bool favorite)
+    {
+        var session = ResolveSessionByIdOrAlias(sessionId);
+        if (session is null || session.Pinned != favorite) return false;
+        var snapshot = new MetadataSnapshot(session);
+        try { await SaveAsync(); ReapplyList(); return true; }
+        catch (DurableWriteException error) { if (error.Committed || error.VerificationUnknown) await LoadAsync(); else snapshot.Restore(session); return false; }
+        catch { snapshot.Restore(session); return false; }
+    }
+
+    public static string NormalizeRemoteTitle(string? title) => CleanTitle(title ?? "");
+
+    public async Task<bool> SetArchivedRemoteAsync(string sessionId, string? tool, bool archived, string expectedRevision) =>
+        await ExecuteRemoteMetadataMutationAsync(sessionId, tool, expectedRevision, s => { s.Archived = archived; return true; });
+
+    public async Task<bool> SetAppTitleRemoteAsync(string sessionId, string? tool, string title, string expectedRevision) =>
+        await ExecuteRemoteMetadataMutationAsync(sessionId, tool, expectedRevision, s => { s.CustomTitle = NormalizeRemoteTitle(title); return true; });
+
+    public async Task<bool> SetPhrasesRemoteAsync(string sessionId, string? tool, IEnumerable<string> phrases, string expectedRevision) =>
+        await ExecuteRemoteMetadataMutationAsync(sessionId, tool, expectedRevision, s => { s.SpecialPhrases.Clear(); foreach (var p in CleanSpecialPhrases(phrases)) s.SpecialPhrases.Add(p); return true; });
+
+    public async Task<bool> SetTagRemoteAsync(string sessionId, string? tool, string tag, bool enabled, string expectedRevision) =>
+        await ExecuteRemoteMetadataMutationAsync(sessionId, tool, expectedRevision, s =>
+        {
+            var normalized = NormalizeTag(tag);
+            if (enabled) { if (!s.Tags.Any(x => string.Equals(x, normalized, StringComparison.OrdinalIgnoreCase))) s.Tags.Add(normalized); }
+            else
+            {
+                for (var i = s.Tags.Count - 1; i >= 0; i--)
+                    if (string.Equals(s.Tags[i], normalized, StringComparison.OrdinalIgnoreCase)) s.Tags.RemoveAt(i);
+            }
+            return true;
+        });
+
 
     public async Task<bool> RenameLocalAsync(string sessionId, string title)
     {
@@ -2514,7 +2933,7 @@ public sealed partial class ArchiveService
     private async Task<ArchiveSession?> EnsureSessionIndexedAsync(string id, string? tool)
     {
         if (ResolveSessionByIdOrAlias(id, tool) is { } existing) return existing;
-        var sources = Store.Settings.Sources.Count > 0 ? Store.Settings.Sources : DefaultSources();
+        var sources = EffectiveSources();
         foreach (var src in sources)
         {
             if (!string.IsNullOrWhiteSpace(tool) && !string.Equals(src.Tool, tool, StringComparison.OrdinalIgnoreCase)) continue;
@@ -2649,31 +3068,99 @@ public sealed partial class ArchiveService
         else
             status = await Task.Run(() => WriteClaudeCustomTitle(session, clean));
         // Reflect the new native name in the app's model (Title = native; DisplayTitle falls back to it).
-        if (!string.IsNullOrWhiteSpace(clean)) session.Title = clean;
+        if (NativeRenameSucceeded(status)) session.Title = clean;
         return status;
     }
 
+    public static bool NativeRenameSucceeded(string? status) => status is
+        "Native name written to Claude (shows in claude --resume)." or
+        "Renamed in Codex (app + remote views).";
+
     // Append a `custom-title` line to a Claude transcript — the same record Claude Code writes on rename,
     // and the first title its resume picker reads (customTitle wins over aiTitle). Returns a status string.
-    private static string WriteClaudeCustomTitle(ArchiveSession session, string title)
+    private static string WriteClaudeCustomTitle(ArchiveSession session, string title, string? intentId = null, string? fingerprint = null, Action? beforeWrite = null,
+        Action<CodexLocalRetrieval.Core.Remote.SessionLaunchLease, FileStream>? retainCustody = null)
     {
+        var writeStarted = false;
         try
         {
             var path = session.SourcePath;
-            if (string.IsNullOrEmpty(path) || !File.Exists(path)) return "Claude transcript not found; local name updated.";
+            if (string.IsNullOrEmpty(path) || !File.Exists(path)) return "Claude transcript not found; names unchanged.";
             // Don't append into a transcript a live agent is writing — a concurrent append can interleave
             // and corrupt its record. Defer the native rename until the session is idle.
-            if (IsSessionProcessLive(session)) return "Session is running — native rename deferred (app name updated); rename again once it's idle.";
+            var verified = CodexLocalRetrieval.Core.Remote.RunningSessions.TryAllLiveSessionIds(
+                out var live, out var unverifiable, out _, bypassCache: true);
+            if (!verified || unverifiable.Count != 0 || live.Contains(session.Id) || session.Aliases.Any(live.Contains))
+                return "Session ownership is live or unverified — native rename deferred; names unchanged.";
             var id = string.IsNullOrEmpty(session.Id) ? Path.GetFileNameWithoutExtension(path) : session.Id;
-            var rec = JsonSerializer.Serialize(new { type = "custom-title", sessionId = id, customTitle = title });
-            using var fs = new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite);
-            using var sw = new StreamWriter(fs);
-            sw.Write(rec + "\n");
-            return "Native name written to Claude (shows in claude --resume).";
+            if (!new CodexLocalRetrieval.Core.Remote.SessionLaunchGovernor().TryAcquire(
+                new(id, session.Aliases, "claude", "native-rename", "native title write", "", "", ""),
+                out var claim, out _))
+                return "Session custody is busy or unverified — native rename deferred; names unchanged.";
+            FileStream? fs = null;
+            var custodyTransferred = false;
+            try
+            {
+                fs = new FileStream(path, FileMode.Open, FileAccess.Write, FileShare.Read);
+                if (retainCustody is not null)
+                {
+                    retainCustody(claim!, fs);
+                    custodyTransferred = true;
+                }
+                var nativeTitle = ClaudeTailTitle(path);
+                if (intentId is not null)
+                {
+                    string? custom = null, ai = null;
+                    var clock = System.Diagnostics.Stopwatch.StartNew();
+                    using var source = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                    using var reader = new StreamReader(source);
+                    var lines = new BoundedTextLineReader(reader, MaxLineChars);
+                    while (lines.ReadLine() is { } line)
+                    {
+                        if (clock.Elapsed > TimeSpan.FromSeconds(10))
+                            return "Native title verification deadline exceeded; names unchanged.";
+                        using var record = JsonDocument.Parse(line);
+                        var row = record.RootElement;
+                        if (row.ValueKind != JsonValueKind.Object) continue;
+                        if (row.TryGetProperty("customTitle", out var customValue) && customValue.ValueKind == JsonValueKind.String)
+                            custom = customValue.GetString();
+                        else if (row.TryGetProperty("aiTitle", out var aiValue) && aiValue.ValueKind == JsonValueKind.String)
+                            ai = aiValue.GetString();
+                    }
+                    nativeTitle = (custom, ai);
+                }
+                var explicitTitle = nativeTitle.custom ?? nativeTitle.ai;
+                if (intentId is not null && explicitTitle is not null
+                    && !string.Equals(CleanTitle(explicitTitle), session.Title, StringComparison.Ordinal))
+                    return "Native title changed since archive refresh; names unchanged. Refresh and retry.";
+                if (intentId is null && string.Equals(nativeTitle.custom, title, StringComparison.Ordinal))
+                    return "Native name written to Claude (shows in claude --resume).";
+                fs.Seek(0, SeekOrigin.End);
+                var rec = intentId is null
+                    ? JsonSerializer.Serialize(new { type = "custom-title", sessionId = id, customTitle = title })
+                    : JsonSerializer.Serialize(new { type = "custom-title", sessionId = id, customTitle = title,
+                        muxRenameIntent = intentId, muxRenameFingerprint = fingerprint });
+                using var sw = new StreamWriter(fs, new UTF8Encoding(false), 1024, leaveOpen: true);
+                beforeWrite?.Invoke();
+                writeStarted = true;
+                sw.Write(rec + "\n");
+                sw.Flush();
+                fs.Flush(flushToDisk: true);
+                return "Native name written to Claude (shows in claude --resume).";
+            }
+            finally
+            {
+                if (!custodyTransferred)
+                {
+                    fs?.Dispose();
+                    claim?.Dispose();
+                }
+            }
         }
         catch (Exception ex)
         {
-            return "Claude native rename failed (" + ex.Message + "); local name updated.";
+            return "Claude native rename failed (" + ex.Message + "); "
+                + (writeStarted ? "outcome unconfirmed; reconcile before retrying." : "names unchanged.");
         }
     }
 
@@ -2682,7 +3169,7 @@ public sealed partial class ArchiveService
         try
         {
             var path = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".codex", "state_5.sqlite");
-            if (!File.Exists(path)) return "Codex title DB not found; local name updated.";
+            if (!File.Exists(path)) return "Codex title DB not found; names unchanged.";
             var builder = new SqliteConnectionStringBuilder { DataSource = path, Mode = SqliteOpenMode.ReadWrite };
             using var connection = new SqliteConnection(builder.ToString());
             connection.Open();
@@ -2694,11 +3181,11 @@ public sealed partial class ArchiveService
             // NB: this sets threads.title (what THIS app + the remote views read). `codex resume` shows
             // its OWN auto-generated title, which Codex computes from the conversation and exposes no
             // settable field for — so we don't claim it changes there.
-            return command.ExecuteNonQuery() > 0 ? "Renamed in Codex (app + remote views)." : "No matching Codex thread; local name updated.";
+            return command.ExecuteNonQuery() > 0 ? "Renamed in Codex (app + remote views)." : "No matching Codex thread; names unchanged.";
         }
         catch (Exception ex)
         {
-            return "Codex canonical rename failed (" + ex.Message + "); local name updated.";
+            return "Codex canonical rename failed (" + ex.Message + "); names unchanged.";
         }
     }
 
@@ -3121,8 +3608,15 @@ public sealed partial class ArchiveService
     public IReadOnlyList<ArchiveSession> FilterChats(ChatFilter f)
     {
         IEnumerable<ArchiveSession> baseSet = string.IsNullOrWhiteSpace(f.Query)
-            ? OrderedVisibleSessions(Store.Sessions.Values)
-            : Search(f.Query);
+            ? Store.Sessions.Values
+            : f.Archived == "active" ? Search(f.Query) : SearchIncludingArchived(f.Query);
+
+        baseSet = f.Archived switch
+        {
+            "archived" => baseSet.Where(s => s.Archived),
+            "all" => baseSet,
+            _ => baseSet.Where(s => !s.Archived),
+        };
 
         if (!string.IsNullOrEmpty(f.CollectionId) && Store.Collections.TryGetValue(f.CollectionId, out var col))
         {
@@ -3344,19 +3838,23 @@ public sealed partial class ArchiveService
         return DeepSearch(question, limit);
     }
 
-    public string CopyPayload(ArchiveSession session, string mode)
+    public string CopyPayload(
+        ArchiveSession session,
+        string mode,
+        string? launchModeOverride = null)
     {
         if (mode is not ("path" or "paths")) EnsureContent(session); // restore/code/resume need content (lazy)
-        return BuildCopyPayload(session, mode);
+        return BuildCopyPayload(session, mode, launchModeOverride);
     }
 
     public async Task<string> CopyPayloadAsync(
         ArchiveSession session,
         string mode,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        string? launchModeOverride = null)
     {
         if (mode is "path" or "paths")
-            return BuildCopyPayload(session, mode);
+            return BuildCopyPayload(session, mode, launchModeOverride);
 
         var gate = _contentLoadGates.GetValue(session, static _ => new SemaphoreSlim(1, 1));
         await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -3364,7 +3862,7 @@ public sealed partial class ArchiveService
         {
             if (!session.ContentLoaded)
                 await LoadContentCoreAsync(session).ConfigureAwait(false);
-            return BuildCopyPayload(session, mode);
+            return BuildCopyPayload(session, mode, launchModeOverride);
         }
         finally
         {
@@ -3372,7 +3870,10 @@ public sealed partial class ArchiveService
         }
     }
 
-    private string BuildCopyPayload(ArchiveSession session, string mode)
+    private string BuildCopyPayload(
+        ArchiveSession session,
+        string mode,
+        string? launchModeOverride = null)
     {
         return mode switch
         {
@@ -3382,18 +3883,18 @@ public sealed partial class ArchiveService
             "path" => session.SourcePath,
             "paths" => $"Chat source: {session.SourcePath}\nWorkspace: {session.Workspace}",
             "restore" => BuildRestorePacket(session),
-            "command" => ResumeCommandText(session),   // the actual CLI resume command (codex resume <id> / claude --resume <id>)
+            "command" => ResumeCommandText(session, launchModeOverride),   // the actual CLI resume command (codex resume <id> / claude --resume <id>)
             _ => ResumePrompt(session)
         };
     }
 
     // The actual CLI resume command for a chat — `codex resume <id>` / `claude --resume <id>` (with any
     // configured launch args). What you paste into a terminal to bring the exact chat back.
-    public string ResumeCommandText(ArchiveSession session)
+    public string ResumeCommandText(ArchiveSession session, string? launchModeOverride = null)
     {
-        var cmd = BuildMultiplexCommand(session);
+        var cmd = BuildMultiplexCommand(session, launchModeOverride: launchModeOverride);
         if (!string.IsNullOrWhiteSpace(cmd)) return cmd;
-        var launch = BuildResumeLaunch(session);
+        var launch = BuildResumeLaunch(session, launchModeOverride: launchModeOverride);
         return string.IsNullOrWhiteSpace(launch.DisplayCommand)
             ? "No resume command for this chat (shell-only, or its session id couldn't be resolved)."
             : launch.DisplayCommand;
@@ -3454,35 +3955,40 @@ public sealed partial class ArchiveService
 
     // The roots to scan: whatever the user/agent configured, else the codex + claude defaults.
     public IReadOnlyList<SessionSource> EffectiveSources() =>
-        Store.Settings.Sources.Count > 0 ? Store.Settings.Sources : DefaultSources();
+        _sourceOverride ?? (Store.Settings.Sources.Count > 0 ? Store.Settings.Sources : DefaultSources());
 
     // Resurface everything in one call (tests + simple callers). UI callers split this across
     // threads: ScanDiskAsync on a worker (no shared state) then MergeScanAsync on the UI thread.
-    public async Task<int> SyncFromDiskAsync(IProgress<string>? progress = null, bool refreshList = true)
+    public async Task<int> SyncFromDiskAsync(IProgress<string>? progress = null, bool refreshList = true, CancellationToken cancellationToken = default)
     {
-        var scan = await ScanDiskAsync(progress);
-        return await MergeScanAsync(scan, refreshList);
+        var scan = await ScanDiskAsync(progress, cancellationToken);
+        cancellationToken.ThrowIfCancellationRequested();
+        return await MergeScanAsync(scan, refreshList, cancellationToken);
     }
 
     // OFF-THREAD SAFE: reads files only and returns parsed/changed sessions + current file stamps.
     // Iterates every configured source (codex + claude), skips files whose stamp is unchanged
     // (incremental), and routes parsing by the source's tool. Touches no shared mutable state.
-    public async Task<DiskScan> ScanDiskAsync(IProgress<string>? progress = null)
+    public async Task<DiskScan> ScanDiskAsync(IProgress<string>? progress = null, CancellationToken cancellationToken = default)
     {
-        var bundled = Store.Settings.BundledHistoryAbsorbed ? new List<ArchiveSession>() : LoadBundledHistory(progress);
-        // Honor the incremental cache only when the parser version matches; otherwise re-parse all.
+        var sources = EffectiveSources()
+            .Select(source => new SessionSource { Tool = source.Tool, Root = source.Root, Enabled = source.Enabled })
+            .ToList();
+        var bundledAbsorbed = Store.Settings.BundledHistoryAbsorbed;
         var fullRescan = Store.Settings.IndexVersion != CurrentIndexVersion;
         var known = fullRescan
             ? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
             : new Dictionary<string, string>(Store.FileStamps, StringComparer.OrdinalIgnoreCase);
+        var bundled = bundledAbsorbed ? new List<ArchiveSession>() : LoadBundledHistory(progress);
         var disk = new List<ArchiveSession>();
         var stamps = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         var anyRoot = false;
-        foreach (var src in EffectiveSources())
+        foreach (var src in sources)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             if (!src.Enabled || string.IsNullOrWhiteSpace(src.Root) || !Directory.Exists(src.Root)) continue;
             anyRoot = true;
-            var (parsed, srcStamps) = await ParseSourceAsync(src, known, progress);
+            var (parsed, srcStamps) = await ParseSourceAsync(src, known, progress, cancellationToken);
             disk.AddRange(parsed);
             foreach (var kv in srcStamps) stamps[kv.Key] = kv.Value;
         }
@@ -3492,13 +3998,15 @@ public sealed partial class ArchiveService
 
     // Enumerate one source, skip unchanged files (incremental), parse the rest by tool.
     private async Task<(List<ArchiveSession> Parsed, Dictionary<string, string> Stamps)> ParseSourceAsync(
-        SessionSource src, IReadOnlyDictionary<string, string> known, IProgress<string>? progress)
+        SessionSource src, IReadOnlyDictionary<string, string> known, IProgress<string>? progress,
+        CancellationToken cancellationToken = default)
     {
         var files = new List<(FileInfo File, DateTime LastWriteUtc)>();
         try
         {
             foreach (var path in Directory.EnumerateFiles(src.Root, "*.jsonl", TranscriptEnumerationOptions()))
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 try
                 {
                     var file = new FileInfo(path);
@@ -3521,6 +4029,7 @@ public sealed partial class ArchiveService
         var stamps = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         foreach (var entry in newestFiles)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             var file = entry.File;
             try
             {
@@ -3543,12 +4052,16 @@ public sealed partial class ArchiveService
                 }
 
                 var session = await ParseSessionAsync(file.FullName, src.Tool);
+                var complete = session is null || FinalRecordIsComplete(file.FullName); // valid JSON is enough for non-message records; message records require their text field.
                 if (session is not null)
                 {
                     ReleaseIndexedContent(session);
                     parsed.Add(session);
                 }
-                stamps[file.FullName] = stamp; // stamp only after a successful parse (or intentional sidechain skip)
+                if (complete)
+                    stamps[file.FullName] = stamp; // an incomplete transcript must be retried on the next scan
+                else
+                    progress?.Report($"Deferred {file.Name}: incomplete transcript");
             }
             catch (Exception ex)
             {
@@ -3559,6 +4072,42 @@ public sealed partial class ArchiveService
         progress?.Report($"{src.Tool}: {parsed.Count} new/changed of {newestFiles.Count}");
         return (parsed, stamps);
     }
+
+    private static bool FinalRecordIsComplete(string path)
+    {
+        try
+        {
+            var last = SafeReadLines(path).LastOrDefault(line => !string.IsNullOrWhiteSpace(line));
+            return last is null || IsCompleteJsonRecord(last); // message records are also checked for their required text field.
+        }
+        catch { return false; }
+    }
+
+    private static bool IsValidJsonRecord(string line)
+    {
+        try { using var doc = JsonDocument.Parse(line); return doc.RootElement.ValueKind == JsonValueKind.Object; }
+        catch { return false; }
+    }
+
+    private static bool IsCompleteJsonRecord(string line)
+    {
+        if (!IsValidJsonRecord(line)) return false;
+        try
+        {
+            using var doc = JsonDocument.Parse(line);
+            var root = doc.RootElement;
+            if (!root.TryGetProperty("type", out var type)) return true;
+            if (type.GetString() is not ("event_msg" or "response_item" or "assistant" or "user")) return true;
+            if (!root.TryGetProperty("payload", out var payload)
+                || payload.ValueKind != JsonValueKind.Object
+                || !payload.TryGetProperty("type", out var payloadType)) return true;
+            if (payloadType.GetString() is not ("user_message" or "agent_message")) return true;
+            return payload.TryGetProperty("message", out var message)
+                && message.ValueKind == JsonValueKind.String;
+        }
+        catch (JsonException) { return false; }
+    }
+
 
     private static void ReleaseIndexedContent(ArchiveSession session)
     {
@@ -3633,11 +4182,12 @@ public sealed partial class ArchiveService
         }).ToList();
     }
 
-    // Read the WHOLE transcript (UNCAPPED) but build ONLY the requested kind ("user" | "assistant"), so a
-    // long chat's View:you / View:agent shows EVERY such message. ParseFull caps at 18000 lines, which hid
-    // most of a huge chat's turns (a 67k-line chat showed 3 of 29 user prompts). "user" is sparse (cheap).
-    public async Task<List<ArchiveMessage>> ExtractReaderMessagesAsync(ArchiveSession session, string kind)
+    // Role-filtered local views scan the whole transcript; "all" captures both roles in file order
+    // for remote transfer and propagates I/O failures instead of publishing a partial successful read.
+    public async Task<List<ArchiveMessage>> ExtractReaderMessagesAsync(ArchiveSession session, string kind,
+        CancellationToken cancellationToken = default)
     {
+        var allRoles = string.Equals(kind, "all", StringComparison.OrdinalIgnoreCase);
         var wantUser = string.Equals(kind, "user", StringComparison.OrdinalIgnoreCase);
         var isClaude = string.Equals(session.Tool, "claude", StringComparison.OrdinalIgnoreCase);
         var list = new List<ArchiveMessage>();
@@ -3647,8 +4197,9 @@ public sealed partial class ArchiveService
         {
             try
             {
-                foreach (var line in SafeReadLines(path))
+                foreach (var line in SafeReadLines(path, captureOpeningLength: allRoles))
                 {
+                    cancellationToken.ThrowIfCancellationRequested();
                     if (line.Length < 8 || line.Length > MaxLineChars) continue;
                     try
                     {
@@ -3656,12 +4207,15 @@ public sealed partial class ArchiveService
                         var root = doc.RootElement;
                         var timestamp = root.TryGetProperty("timestamp", out var ts) ? ts.GetString() ?? "" : "";
                         string? text = null;
+                        bool isUser;
                         if (isClaude)
                         {
                             var type = root.TryGetProperty("type", out var tp) ? tp.GetString() : null;
-                            if (wantUser ? type != "user" : type != "assistant") continue;
+                            if (type != "user" && type != "assistant") continue;
+                            isUser = type == "user";
+                            if (!allRoles && isUser != wantUser) continue;
                             if (!root.TryGetProperty("message", out var msg)) continue;
-                            if (wantUser)
+                            if (isUser)
                             {
                                 if (line.Contains("\"tool_result\"", StringComparison.Ordinal)) continue;   // tool results are role=user but not prompts
                                 if (!ClaudeContentIsRealText(msg)) continue;
@@ -3673,17 +4227,20 @@ public sealed partial class ArchiveService
                             if (!root.TryGetProperty("payload", out var payload)) continue;
                             if ((root.TryGetProperty("type", out var rt) ? rt.GetString() : null) != "event_msg") continue;
                             var pt = payload.TryGetProperty("type", out var ptp) ? ptp.GetString() : null;
-                            if (wantUser ? pt != "user_message" : pt != "agent_message") continue;
+                            if (pt != "user_message" && pt != "agent_message") continue;
+                            isUser = pt == "user_message";
+                            if (!allRoles && isUser != wantUser) continue;
                             text = Field(payload, "message");
                         }
                         if (!string.IsNullOrWhiteSpace(text))
-                            list.Add(new ArchiveMessage { Role = wantUser ? "user" : "assistant", Kind = wantUser ? "user" : "assistant", Text = text!, Timestamp = timestamp });
+                            list.Add(new ArchiveMessage { Role = isUser ? "user" : "assistant", Kind = isUser ? "user" : "assistant", Text = text!, Timestamp = timestamp });
                     }
-                    catch { }
+                    catch (JsonException) { }
+                    catch (InvalidOperationException) { }
                 }
             }
-            catch { }
-        });
+            catch (Exception ex) when (!allRoles && ex is not OperationCanceledException) { }
+        }, cancellationToken);
         return list;
     }
 
@@ -3743,20 +4300,28 @@ public sealed partial class ArchiveService
     // reads app-owned fields from the CURRENT store, so re-running it against the fresh one is the
     // designed operation, same recovery idiom as the small ops above. Bounded: three writers
     // interleaving that fast means something is genuinely wrong, and the conflict should surface.
-    public async Task<int> MergeScanAsync(DiskScan scan, bool refreshList = true)
+    public async Task<int> MergeScanAsync(
+        DiskScan scan,
+        bool refreshList = true,
+        CancellationToken cancellationToken = default)
     {
         for (var attempt = 0; ; attempt++)
         {
-            try { return await MergeScanOnceAsync(scan, refreshList); }
+            cancellationToken.ThrowIfCancellationRequested();
+            try { return await MergeScanOnceAsync(scan, refreshList, cancellationToken); }
             catch (StoreGenerationConflictException) when (attempt < 2)
             {
-                await LoadAsync();
+                await LoadAsync(cancellationToken);
             }
         }
     }
 
-    private async Task<int> MergeScanOnceAsync(DiskScan scan, bool refreshList)
+    private async Task<int> MergeScanOnceAsync(
+        DiskScan scan,
+        bool refreshList,
+        CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         var imported = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var sourceRekeys = FindSourcePathRekeys(scan.Disk);
         var idsRekeyedFrom = new HashSet<string>(sourceRekeys.Values.Select(s => s.Id), StringComparer.OrdinalIgnoreCase);
@@ -3794,7 +4359,8 @@ public sealed partial class ArchiveService
             // Read the (slow) sqlite/jsonl titles OFF the UI thread; apply on this (UI) thread so the
             // INotifyPropertyChanged raised by ApplyThreadTitles never fires from a worker. The final
             // RefreshSessions below repaints the list, so we don't refresh here.
-            var titles = await Task.Run(LoadThreadTitles);
+            var titles = await Task.Run(LoadThreadTitles, cancellationToken);
+            cancellationToken.ThrowIfCancellationRequested();
             ApplyThreadTitles(titles);
         }
         // On a parser-version migration every file was re-parsed: prune sessions whose file WAS
@@ -3811,10 +4377,13 @@ public sealed partial class ArchiveService
         foreach (var kv in scan.Stamps) Store.FileStamps[kv.Key] = kv.Value;
         ReconcilePendingNewChats();   // file freshly-started chats into their target collection (folder-diff identity)
         Store.Settings.BundledHistoryAbsorbed = true;
-        if (scan.FullRescan) await BackfillUserCountsAsync();   // recompute user counts the disk scan couldn't reach (backup-folder chats, previously-locked live files)
+        if (scan.FullRescan)
+        {
+            await BackfillUserCountsAsync(cancellationToken);
+        }
         Store.Settings.IndexVersion = CurrentIndexVersion;
         RefreshTemplateSnapshotCounts();
-        await SaveAsync();
+        await SaveAsync(cancellationToken);
         if (refreshList) ReapplyList();
         StartTranscriptSearchIndexBuild();
         return scan.Disk.Count + recovered;
@@ -4302,7 +4871,7 @@ public sealed partial class ArchiveService
         string Workspace,
         string LaunchMode);
 
-    public sealed record PendingMuxBinding(string MuxName, RemoteMuxLaunch Launch);
+    public sealed record PendingMuxBinding(string MuxName, RemoteMuxLaunch Launch, string Generation);
 
     public bool TryBuildRemoteMuxLaunch(
         string? sessionId,
@@ -4381,7 +4950,23 @@ public sealed partial class ArchiveService
     // Core enriches Title/Collection by matching it to the archive.
     public sealed record RunningSessionInfo(
         int Pid, string Tool, string SessionId, string Parent, string StartedAt, string Cwd,
-        string RealTitle = "", string Preview = "");
+        string RealTitle = "", string Preview = "", IReadOnlyList<string>? SessionAliases = null,
+        string IdentitySource = "", string IdentityStatus = "resolved")
+    {
+        public IReadOnlyList<string> AllSessionIds
+        {
+            get
+            {
+                var ids = new List<string>();
+                if (!string.IsNullOrWhiteSpace(SessionId)) ids.Add(SessionId);
+                foreach (var alias in SessionAliases ?? Array.Empty<string>())
+                    if (!string.IsNullOrWhiteSpace(alias)
+                        && !ids.Contains(alias, StringComparer.OrdinalIgnoreCase))
+                        ids.Add(alias);
+                return ids;
+            }
+        }
+    }
 
     // The chat's REAL claude/codex name (and a one-line preview), read from the tool's own store — so a
     // session that isn't in our archive (no app title) still shows what it actually is. Codex keeps a
@@ -4540,6 +5125,15 @@ public sealed partial class ArchiveService
                     pid = r.Pid,
                     tool = r.Tool,
                     sessionId = r.SessionId,
+                    // The identity evidence must ride every lane that publishes a running row. The web
+                    // recomputes liveness from these rows (aliases included) and prints "identity
+                    // unresolved/unverifiable" for any row that is not resolved, so a full projection that
+                    // omitted them would silently upgrade an unidentified process into an identified one
+                    // whenever the desktop app was the freshest pusher. Same shape as the light /api/running
+                    // push in RemoteBridge.PushRunningAsync.
+                    sessionAliases = r.SessionAliases ?? Array.Empty<string>(),
+                    identityStatus = r.IdentityStatus,
+                    identitySource = r.IdentitySource,
                     parent = r.Parent,
                     startedAt = r.StartedAt,
                     title = hit.Title,             // null when the running session isn't in any collection
@@ -4591,15 +5185,14 @@ public sealed partial class ArchiveService
     }
 
     private readonly object _resolvedMuxBindingsGate = new();
-    private Dictionary<string, (string Id, string Tool, string Cwd)> _resolvedMuxBindings =
+    private Dictionary<string, (string Id, string Tool, string Cwd, string Generation)> _resolvedMuxBindings =
         new(StringComparer.OrdinalIgnoreCase);
 
     // Deterministically link each unresolved mux tab (a shell-started agent or a fresh trusted CLI launch)
-    // to its live chat. Once a fresh launch is identified, callers bind the trusted resume command into muxd.
-    // live chat, so it can be filed into a collection / relaunched by real id. muxd writes {tab:{pid,cwd}} to
-    // live-tabs.json; we match a running claude/codex to its tab by walking the process's ancestry to that
-    // shell pid, then take the resume id from its command line, or (fresh agent) the newest transcript in the
-    // tab's folder — skipping any folder shared by 2+ tabs so we never mislabel. Refreshed each projection push.
+    // to its live chat. Once identified, callers bind the trusted resume command into muxd. muxd writes
+    // {tab:{pid,cwd}} to live-tabs.json; we match a running Claude/Codex/Gateway process to its tab by walking
+    // process ancestry to that exact shell pid, then take the id from its resume command or Claude's PID-keyed
+    // live-session registry. No cwd, transcript timestamp, or newest-session fallback is accepted.
     private Dictionary<string, object> ResolveMuxTabChats()
     {
         var result = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase);
@@ -4616,6 +5209,7 @@ public sealed partial class ArchiveService
 
         var shellPidToTab = new Dictionary<int, string>();
         var tabCwd = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var tabGeneration = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         foreach (var (name, el) in tabs)
         {
             try
@@ -4632,6 +5226,8 @@ public sealed partial class ArchiveService
                 {
                     shellPidToTab[pid] = name;
                     tabCwd[name] = cwd;
+                    tabGeneration[name] = el.TryGetProperty("generationId", out var generation)
+                        && generation.ValueKind == JsonValueKind.String ? generation.GetString() ?? "" : "";
                 }
             }
             catch { }
@@ -4645,8 +5241,6 @@ public sealed partial class ArchiveService
 
         var ppid = RunningSessions.ProcessParentMap();
         var agents = RunningSessions.ScanAgentsWithPpid();
-        var cwdShareCount = tabCwd.Values.Where(c => !string.IsNullOrEmpty(c))
-            .GroupBy(c => c, StringComparer.OrdinalIgnoreCase).ToDictionary(g => g.Key, g => g.Count(), StringComparer.OrdinalIgnoreCase);
 
         bool AncestorTab(int startPid, out string tab)
         {
@@ -4661,41 +5255,27 @@ public sealed partial class ArchiveService
             return false;
         }
 
-        // PASS 1 — propose a (tab, id) for each live agent under a tab, with a CONFIDENCE (delta, smaller =
-        // surer): an explicit --resume id is certain (-1); a fresh agent is correlated to the transcript
-        // created nearest its process start (delta = seconds apart); the cwd fallback is last-resort.
+        // PASS 1 — propose only identities bound to a live process under the exact tab shell. Native resumed
+        // sessions expose --resume; fresh Claude and Gateway sessions expose the PID-keyed Claude registry.
+        // If neither signal exists, leave the tab identityPending rather than guessing by cwd or file time.
         var proposals = new List<(string tab, string id, string tool, double delta)>();
         foreach (var ag in agents)
         {
             if (!AncestorTab(ag.Ppid, out var tab) && !AncestorTab(ag.Pid, out tab)) continue;
-            if (!string.IsNullOrEmpty(ag.SessionId)) { proposals.Add((tab, ag.SessionId, ag.Tool, -1)); continue; }
-
-            var cwd = tabCwd.TryGetValue(tab, out var cw) ? cw : "";
-            var (fid, fdelta) = FreshAgentSessionIdByStart(ag.Tool, cwd, ag.StartedUtc);
-            if (!string.IsNullOrEmpty(fid)) { proposals.Add((tab, fid!, ag.Tool, fdelta)); continue; }
-
-            // Last resort (only when correlation found nothing AND the cwd is unambiguous): newest chat in cwd.
-            if (!string.IsNullOrEmpty(cwd) && !(cwdShareCount.TryGetValue(cwd, out var n) && n > 1))
-            {
-                var cand = Store.Sessions.Values
-                    .Where(s => string.Equals(s.Workspace, cwd, StringComparison.OrdinalIgnoreCase)
-                                && string.Equals(s.Tool, ag.Tool, StringComparison.OrdinalIgnoreCase))
-                    .OrderByDescending(s => s.UpdatedAt, StringComparer.Ordinal)
-                    .FirstOrDefault();
-                if (cand is not null) proposals.Add((tab, cand.Id, ag.Tool, 1e9));   // huge delta = least confident
-            }
+            if (!string.IsNullOrEmpty(ag.SessionId))
+                proposals.Add((tab, ag.SessionId, ag.Tool, -1));
         }
 
         // PASS 2 — greedy best-match assignment: no TAB or CHAT id is used twice, so two tabs can NEVER bind
         // the same chat (a contested fresh chat goes to the tab whose start-time matches best).
         var assignments = AssignTabChats(proposals).ToList();
-        var resolvedBindings = new Dictionary<string, (string Id, string Tool, string Cwd)>(StringComparer.OrdinalIgnoreCase);
+        var resolvedBindings = new Dictionary<string, (string Id, string Tool, string Cwd, string Generation)>(StringComparer.OrdinalIgnoreCase);
         foreach (var (tab, id, tool) in assignments)
         {
             Store.Sessions.TryGetValue(id, out var chat);
             var title = chat?.DisplayTitle ?? tab;
             RecordTabChat(tab, id, tool, title);   // rotate the tab's session history
-            resolvedBindings[tab] = (id, tool, tabCwd.TryGetValue(tab, out var cwd) ? cwd : "");
+            resolvedBindings[tab] = (id, tool, tabCwd.TryGetValue(tab, out var cwd) ? cwd : "", tabGeneration.GetValueOrDefault(tab, ""));
         }
         lock (_resolvedMuxBindingsGate) _resolvedMuxBindings = resolvedBindings;
 
@@ -4722,13 +5302,14 @@ public sealed partial class ArchiveService
     public IReadOnlyList<PendingMuxBinding> ResolvePendingMuxBindings()
     {
         ResolveMuxTabChats();
-        Dictionary<string, (string Id, string Tool, string Cwd)> snapshot;
+        Dictionary<string, (string Id, string Tool, string Cwd, string Generation)> snapshot;
         lock (_resolvedMuxBindingsGate)
             snapshot = new(_resolvedMuxBindings, StringComparer.OrdinalIgnoreCase);
 
         var bindings = new List<PendingMuxBinding>();
         foreach (var (muxName, resolved) in snapshot)
         {
+            if (string.IsNullOrWhiteSpace(resolved.Generation)) continue;
             var session = ResolveSessionByIdOrAlias(resolved.Id, resolved.Tool)
                           ?? new ArchiveSession
                           {
@@ -4748,15 +5329,13 @@ public sealed partial class ArchiveService
                     session.Aliases.ToArray(),
                     session.DisplayTitle,
                     session.Workspace,
-                    NormalizeLaunchMode(session.LaunchMode))));
+                    NormalizeLaunchMode(session.LaunchMode)), resolved.Generation));
         }
         return bindings;
     }
 
-    // Greedy best-match assignment of live agents to their tabs: process proposals most-confident first
-    // (smaller delta = surer; explicit --resume id = -1), and use each TAB and each CHAT id at most once.
-    // GUARANTEE: two tabs can never be bound to the same chat, so flopping between 5 chats never confuses
-    // them — a contested fresh chat goes to the tab whose process start-time matches its transcript best.
+    // Greedy assignment of process-owned identities to tabs. Each tab and chat id is used at most once.
+    // GUARANTEE: two tabs can never be bound to the same chat; unresolved or contested identities stay pending.
     public static IEnumerable<(string tab, string id, string tool)> AssignTabChats(
         IEnumerable<(string tab, string id, string tool, double delta)> proposals)
     {
@@ -4772,58 +5351,6 @@ public sealed partial class ArchiveService
         }
         return winners;
     }
-
-    // The session id whose transcript was created CLOSEST to when a fresh agent (launched without an explicit
-    // --resume id) started, within its cwd. Reads the transcript folder directly so a brand-new chat is caught
-    // immediately, and correlates by process-start-time so it never relabels a fresh session as an old one.
-    private (string? Id, double Delta) FreshAgentSessionIdByStart(string tool, string cwd, DateTime startUtc)
-    {
-        try
-        {
-            if (startUtc == default) return (null, double.MaxValue);
-            const double windowSec = 240;   // a fresh session's transcript appears within a few minutes of launch
-            if (string.Equals(tool, "codex", StringComparison.OrdinalIgnoreCase))
-            {
-                var root = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".codex", "sessions");
-                if (!Directory.Exists(root)) return (null, double.MaxValue);
-                string? best = null; var bestDelta = double.MaxValue;
-                foreach (var dayDir in RecentCodexDayDirs(root, 2))          // only the newest day-dirs can hold a just-now session
-                    foreach (var f in SafeEnumerateFiles(dayDir, "rollout-*.jsonl"))
-                    {
-                        DateTime ct; try { ct = File.GetCreationTimeUtc(f); } catch { continue; }
-                        var delta = Math.Abs((ct - startUtc).TotalSeconds);
-                        if (delta > windowSec || delta >= bestDelta) continue;
-                        var uuid = CodexRolloutFileId(f);
-                        if (!string.IsNullOrEmpty(uuid)) { best = uuid; bestDelta = delta; }
-                    }
-                return (best, bestDelta);
-            }
-            // Claude: the transcript in this cwd's project folder whose creation time is nearest the launch.
-            var m = ClaudeFolderTranscripts(cwd)
-                .Where(t => Math.Abs((t.created - startUtc).TotalSeconds) <= windowSec)
-                .OrderBy(t => Math.Abs((t.created - startUtc).TotalSeconds))
-                .Select(t => (id: (string?)t.id, delta: Math.Abs((t.created - startUtc).TotalSeconds)))
-                .FirstOrDefault();
-            return (m.id, m.id is null ? double.MaxValue : m.delta);
-        }
-        catch { return (null, double.MaxValue); }
-    }
-
-    // The most-recent N day-directories under ~/.codex/sessions (year/month/day), newest first — so a
-    // fresh-session scan only walks today/yesterday, not the whole history.
-    private static IEnumerable<string> RecentCodexDayDirs(string root, int n)
-    {
-        var days = new List<string>();
-        foreach (var y in SafeEnumerateDirs(root))
-            foreach (var m in SafeEnumerateDirs(y))
-                foreach (var d in SafeEnumerateDirs(m))
-                    days.Add(d);
-        days.Sort(StringComparer.Ordinal);   // date-named dirs sort chronologically
-        days.Reverse();
-        return days.Take(n);
-    }
-    private static IEnumerable<string> SafeEnumerateDirs(string p) { try { return Directory.EnumerateDirectories(p); } catch { return Array.Empty<string>(); } }
-    private static IEnumerable<string> SafeEnumerateFiles(string p, string pat) { try { return Directory.EnumerateFiles(p, pat); } catch { return Array.Empty<string>(); } }
 
     // Refresh tab→chat links + rotate each tab's session history NOW (for the fast tab-tracking tick), so a
     // brief `claude` → `codex` → exit is captured even between the slower projection pushes. In-memory only;
@@ -5094,10 +5621,11 @@ public sealed partial class ArchiveService
             catch (InvalidDataException) { continue; }
             if (line is null) break;
             if (string.IsNullOrWhiteSpace(line)) continue;
-            if (line.Length > MaxLineChars) continue;
+            if (line.Length > MaxLineChars) { continue; }
             JsonDocument doc;
             // A partial/malformed line — common at the tail of an in-progress rollout, i.e. the
-            // very session you most want to resume — must not discard the whole file. Skip the line.
+            // very session you most want to resume — must not discard the whole file. Skip the line,
+            // but keep the source unstamped when that bad line is the tail so the next scan retries it.
             try { doc = JsonDocument.Parse(line); } catch { continue; }
             using (doc)
             {

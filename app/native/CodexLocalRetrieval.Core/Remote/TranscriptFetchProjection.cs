@@ -88,7 +88,8 @@ public static class TranscriptFetchProjection
             var text = m?.Text ?? "";
             if (string.IsNullOrWhiteSpace(text)) continue;
             if (redact) text = SecretRedactor.Scrub(text);
-            clean.Add(new WireMessage(NormalizeRole(m!.Role), text, m.Timestamp ?? ""));
+            clean.Add(new WireMessage(NormalizeRole(m!.Role), text,
+                DateTimeOffset.TryParse(m.Timestamp, out var timestamp) ? timestamp.ToUnixTimeMilliseconds() : 0));
         }
 
         // Walk oldest->newest is wrong for a newest-first page 1: fill from the END backwards, so the
@@ -135,14 +136,14 @@ public static class TranscriptFetchProjection
     {
         if (!IsOpaqueId(sessionId)) throw new ArgumentException("session id is not opaque", nameof(sessionId));
         if (!IsCredential(bridgeToken)) throw new ArgumentException("bridge credential is not well formed", nameof(bridgeToken));
-        return $"curl -s -X POST http://127.0.0.1:{port}/api/transcripts/{sessionId} "
-             + $"-H 'Content-Type: application/json' -H 'Authorization: Bearer {bridgeToken}' --data-binary @-";
+        return $"curl --fail --silent --show-error -X POST http://127.0.0.1:{port}/api/transcripts/{sessionId} "
+             + $"-H 'Content-Type: application/json' -H 'X-Mux-Transcript-Bridge: {bridgeToken}' --data-binary @-";
     }
 
     private sealed record WireMessage(
         [property: System.Text.Json.Serialization.JsonPropertyName("role")] string Role,
         [property: System.Text.Json.Serialization.JsonPropertyName("text")] string Text,
-        [property: System.Text.Json.Serialization.JsonPropertyName("ts")] string Ts);
+        [property: System.Text.Json.Serialization.JsonPropertyName("ts")] long Ts);
 
     private static string NormalizeRole(string? role)
         => string.Equals(role, "user", StringComparison.OrdinalIgnoreCase) ? "user" : "assistant";

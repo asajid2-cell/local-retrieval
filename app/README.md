@@ -1,12 +1,13 @@
-# Codex Local Retrieval — your Codex & Claude chat archive
+# MUX — your Codex & Claude chat archive
 
-**A WinUI 3 / .NET 8 Windows desktop app that indexes your local Codex and Claude sessions into one
-archive — so a months-old chat resurfaces, reads cleanly, files into a project, and relaunches its
-`codex resume` / `claude --resume` command in a terminal.** A built-in DeepSeek **co-pilot** can
-search, organize, and resume your chats by tool-calling over the archive; a Claude or Codex session
-can even file itself in through a local JSON inbox. The app never edits your source transcript files.
+**MUX is a WinUI 3 / .NET 8 Windows desktop app that indexes your local Codex and Claude sessions
+into one archive — so a months-old chat resurfaces, reads cleanly, files into a project, and
+relaunches its `codex resume` / `claude --resume` command in a terminal.** A built-in DeepSeek
+**co-pilot** can search, organize, and resume your chats by tool-calling over the archive; a Claude
+or Codex session can even file itself in through a local JSON inbox. MUX never edits your source
+transcript files.
 
-![Codex Local Retrieval — a tour of the app](docs/media/hero.gif)
+![MUX — a tour of the app](docs/media/hero.gif)
 
 *Real app screens: browse chats grouped by project, read a Claude chat with the noise stripped,
 inspect the raw event timeline, organize into projects, and open the theme picker.*
@@ -60,8 +61,8 @@ preserve, not clobber — all off the UI thread so the window never stalls on a 
 ## Run it
 
 ```powershell
-git clone https://github.com/asajid2-cell/codex-local-retrieval
-cd codex-local-retrieval/native/CodexLocalRetrieval.Native
+git clone https://github.com/asajid2-cell/local-retrieval.git
+cd local-retrieval/app/native/CodexLocalRetrieval.Native
 dotnet run -c Debug
 ```
 
@@ -140,7 +141,7 @@ dotnet build CodexLocalRetrieval.sln -c Debug
 dotnet test native/CodexLocalRetrieval.Native.Tests   # service tests: parsing, sync, resume, agent ops
 ```
 
-A portable Windows x64 release is produced by [`tools/release/package-win-x64.ps1`](tools/release/package-win-x64.ps1).
+A portable MUX Windows x64 release is produced by [`tools/release/package-win-x64.ps1`](tools/release/package-win-x64.ps1). The package is `mux-win-x64.zip` and its top-level launcher is `MUX.exe`; the runtime executable under `app/` retains its internal name `CodexLocalRetrieval.Native.exe`.
 
 ## Known limits
 

@@ -76,6 +76,8 @@ async function startBrowserRelay(harness) {
       PORT: String(harness.port),
       MUX_HOST_TOKEN: 'test-token',
       MUX_TEST_MODE: '1',
+      MUX_TEST_FIXTURE: '1',
+      MUX_BIND_HOST: '127.0.0.1',
       MUX_AUTOHEAL: '0',
       MUX_STATE_DIR: harness.tmp,
       MUX_TEST_PERSIST_FAULT_FILE: path.join(harness.tmp, '.persist-fault.json'),
@@ -91,7 +93,7 @@ async function startBrowserRelay(harness) {
   harness.proc.stdout.on('data', data => { harness.stdout += data.toString(); });
   harness.proc.stderr.on('data', data => { harness.stderr += data.toString(); });
   await waitFor(
-    () => harness.stdout.includes(`multiplex-app on 0.0.0.0:${harness.port}`),
+    () => harness.stdout.includes(`multiplex-app on 127.0.0.1:${harness.port}`),
     'browser relay start',
     5000,
   );
@@ -118,6 +120,209 @@ async function withBrowserRelay(session, callback) {
     await harness.stop();
   }
 }
+
+test('hosted kill browser retains confirmed identity when the name is replaced', async t => {
+  if (skipWithoutChromium(t)) return;
+  const session = { name: 'kill-browser', alive: true, shellOnly: true, sessionId: '', generationId: 'original-generation' };
+  await withBrowserRelay(session, async ({ harness, host, page }) => {
+    await page.goto(`http://127.0.0.1:${harness.port}/`);
+    await page.getByRole('button', { name: 'Sessions', exact: true }).click();
+    await page.getByRole('button', { name: 'Actions for kill-browser', exact: true }).click();
+    const dialog = page.waitForEvent('dialog');
+    const click = page.locator('#menu [data-a="kill"]').click();
+    click.catch(() => {});
+    const confirmation = await dialog;
+    const replacement = { ...session, generationId: 'replacement-generation' };
+    host.sendSessions([replacement]);
+    await waitFor(async () => (await harness.json('GET', '/api/sessions'))[0]?.generationId === replacement.generationId, 'replacement projection');
+    const request = page.waitForRequest(r => r.method() === 'DELETE');
+    await confirmation.accept();
+    await click;
+    const sent = await request;
+    assert.equal(sent.postDataJSON().generationId, session.generationId);
+    assert.equal(sent.postDataJSON().sessionId, '');
+    const response = await sent.response();
+    assert.equal(response.status(), 409);
+    assert.equal(host.messages.filter(m => m.t === 'kill').length, 0);
+    assert.equal((await harness.json('GET', '/api/sessions'))[0].generationId, replacement.generationId);
+  });
+});
+
+test('bulk hosted deletion retains history and sends each snapshot generation', async t => {
+  if (skipWithoutChromium(t)) return;
+  await withBrowserRelay({ name: 'bulk-one', alive: true, shellOnly: true, generationId: 'bulk-generation' }, async ({ harness, page }) => {
+    const deletions = [], commands = [];
+    let projectsRead = false;
+    page.on('response', response => { if (response.url().endsWith('/api/projects')) projectsRead = true; });
+    await page.route('**/api/projects', route => route.fulfill({ json: { appLive: true, collections: [], decks: [] } }));
+    await page.route('**/api/sessions/bulk-one', route => {
+      deletions.push(route.request().postDataJSON());
+      return route.fulfill({ status: 409, json: { error: 'replacement preserved' } });
+    });
+    await page.route('**/api/app-commands', route => {
+      commands.push(route.request().postDataJSON());
+      return route.fulfill({ json: { id: 'must-not-clear' } });
+    });
+    await page.goto(`http://127.0.0.1:${harness.port}/`);
+    await page.getByRole('button', { name: 'Sessions', exact: true }).click();
+    await waitFor(() => projectsRead, 'live projection read');
+    await page.locator('#managebtn').click();
+    page.once('dialog', dialog => dialog.accept());
+    await page.locator('#killalltabs').click();
+    await page.waitForFunction(() => document.querySelector('#statustext').textContent.includes('1 failed'));
+    assert.equal(deletions.length, 1);
+    assert.equal(deletions[0].generationId, 'bulk-generation');
+    assert.equal(deletions[0].sessionId, '');
+    assert.equal(commands.some(c => c.type === 'cleartabhistory'), false);
+    assert.equal((await harness.json('GET', '/api/sessions')).length, 1);
+  });
+});
+
+test('Projects reclaim cleans up a local agent through one revision-fenced intent', async t => {
+  if (skipWithoutChromium(t)) return;
+  // A plain local agent: no mux session hosts it. The old running-list control only offered a "kill"
+  // that the PC bridge always refuses, so a local agent could never be stopped from the web.
+  await withBrowserRelay({ name: 'projects-reclaim-host', alive: true, shellOnly: true }, async ({ harness, page }) => {
+    const requests = [];
+    let done = false;
+    await page.route('**/api/projects', route => route.fulfill({ json: {
+      appLive: true, bridgeLive: true, live: true, runningVerified: true, collections: [], decks: [],
+      runningSessions: [{ pid: 321, tool: 'claude', sessionId: 'local-exact', title: 'Local exact', parent: 'fixture' }],
+    } }));
+    await page.route('**/pc/api/discovery/chats?*', route => route.fulfill({ json: {
+      rows: [{ id: 'local-exact', tool: 'claude', revision: 'local-revision' }],
+    } }));
+    await page.route('**/api/app-commands', route => {
+      requests.push(route.request().postDataJSON());
+      return route.fulfill({ json: { id: 'projects-reclaim-command' } });
+    });
+    await page.route('**/api/app-commands/projects-reclaim-command', route => done
+      ? route.fulfill({ json: { status: 'done', detail: 'cleanup verified' } })
+      : route.abort('failed'));
+    page.on('dialog', dialog => dialog.accept());
+    await page.goto(`http://127.0.0.1:${harness.port}/projects.html`);
+    await page.locator('#runpill').click();
+    const firstClick = page.locator('.runrow').getByRole('button', { name: 'Reclaim', exact: true }).click();
+    firstClick.catch(() => {});
+    await waitFor(() => requests.length === 1, 'Projects reclaim request');
+    assert.equal(requests[0].type, 'reclaim');
+    assert.equal(requests[0].confirmed, true);
+    assert.equal(requests[0].sessionId, 'local-exact');
+    assert.equal(requests[0].tool, 'claude');
+    assert.equal(requests[0].expectedRevision, 'local-revision');
+    const first = requests[0];
+    // An unconfirmed outcome is not success: the row survives and the intent is retained, not replaced.
+    await waitFor(() => page.evaluate(() => localStorage.length > 0), 'Projects retained reclaim intent');
+    await page.reload();
+    await page.locator('#runpill').click();
+    done = true;
+    await page.locator('.runrow').getByRole('button', { name: 'Reclaim', exact: true }).click();
+    await waitFor(() => requests.length === 2, 'Projects reclaim reconciliation');
+    assert.deepEqual(requests[1], first, 'the retained intent is replayed verbatim');
+    await page.locator('.runrow').waitFor({ state: 'detached' });
+  });
+});
+
+test('Projects reclaim refuses a running agent with no authoritative archived chat', async t => {
+  if (skipWithoutChromium(t)) return;
+  await withBrowserRelay({ name: 'projects-unarchived-host', alive: true, shellOnly: true }, async ({ harness, page }) => {
+    const requests = [];
+    const dialogs = [];
+    await page.route('**/api/projects', route => route.fulfill({ json: {
+      appLive: true, bridgeLive: true, live: true, runningVerified: true, collections: [], decks: [],
+      runningSessions: [{ pid: 654, tool: 'codex', sessionId: 'unarchived-exact', title: 'Unarchived', parent: 'fixture' }],
+    } }));
+    await page.route('**/pc/api/discovery/chats?*', route => route.fulfill({ json: { rows: [] } }));
+    await page.route('**/api/app-commands', route => {
+      requests.push(route.request().postDataJSON());
+      return route.fulfill({ json: { id: 'should-not-happen' } });
+    });
+    page.on('dialog', dialog => { dialogs.push(dialog.message()); dialog.accept(); });
+    await page.goto(`http://127.0.0.1:${harness.port}/projects.html`);
+    await page.locator('#runpill').click();
+    await page.locator('.runrow').getByRole('button', { name: 'Reclaim', exact: true }).click();
+    await waitFor(() => dialogs.some(m => m.includes('no authoritative archived chat')), 'Projects reclaim refusal');
+    assert.equal(requests.length, 0, 'an unarchived agent must not enqueue a cleanup command');
+  });
+});
+
+test('Projects native rename preserves original revision and intent after reload', async t => {
+  if (skipWithoutChromium(t)) return;
+  await withBrowserRelay({ name: 'projects-native', alive: true, shellOnly: true }, async ({ harness, page }) => {
+    let revision = 'native-original-revision', done = false;
+    const requests = [];
+    await page.route('**/api/projects', route => route.fulfill({ json: {
+      appLive: true, bridgeLive: true, live: true, runningVerified: true, collections: [], decks: [],
+      runningSessions: [{ pid: 123, tool: 'claude', sessionId: 'native-exact', title: 'Native exact', parent: 'fixture' }],
+    } }));
+    await page.route('**/pc/api/discovery/chats?*', route => route.fulfill({ json: { rows: [{ id: 'native-exact', tool: 'claude', revision }] } }));
+    await page.route('**/api/app-commands', route => {
+      requests.push(route.request().postDataJSON());
+      return route.fulfill({ json: { id: 'projects-native-command' } });
+    });
+    await page.route('**/api/app-commands/projects-native-command', route => done
+      ? route.fulfill({ json: { status: 'done' } }) : route.abort('failed'));
+    await page.goto(`http://127.0.0.1:${harness.port}/projects.html`);
+    await page.locator('#runpill').click();
+    await page.getByRole('button', { name: 'Rename native name' }).click();
+    await page.locator('.reninput').fill('Durable native title');
+    await page.locator('.rensave').click();
+    await waitFor(() => requests.length === 1, 'Projects native first request');
+    assert.equal(requests[0].expectedRevision, revision);
+    const first = requests[0];
+    revision = 'native-newer-revision';
+    await page.reload();
+    await page.locator('#runpill').click();
+    await page.getByRole('button', { name: 'Rename native name' }).click();
+    assert.equal(await page.locator('.reninput').inputValue(), 'Durable native title');
+    await page.locator('.reninput').fill('Do not replace unknown intent');
+    await page.locator('.rensave').click();
+    await page.waitForFunction(() => document.querySelector('.renstat').textContent.includes('earlier native rename is unconfirmed'));
+    assert.equal(requests.length, 1, 'a different title cannot replace the pending operation');
+    await page.locator('.reninput').fill('Durable native title');
+    done = true;
+    await page.locator('.rensave').click();
+    await waitFor(() => requests.length === 2, 'Projects native replay');
+    assert.deepEqual(requests[1], first);
+    await page.locator('.renedit').waitFor({ state: 'detached' });
+  });
+});
+
+test('Projects empty unverified running snapshot is unknown rather than no agents', async t => {
+  if (skipWithoutChromium(t)) return;
+  await withBrowserRelay({ name: 'running-unknown', alive: true, shellOnly: true }, async ({ harness, page }) => {
+    await page.route('**/api/projects', route => route.fulfill({ json: {
+      bridgeLive: true, live: true, runningVerified: false, runningVerificationDetail: 'fixture scan unavailable',
+      collections: [], decks: [], runningSessions: [],
+    } }));
+    await page.goto(`http://127.0.0.1:${harness.port}/projects.html`);
+    await page.locator('#runpill').click();
+    assert.match(await page.locator('#viewDetail').innerText(), /Cannot determine whether agents are running/);
+    assert.doesNotMatch(await page.locator('#viewDetail').innerText(), /No agents running|0 agents/);
+  });
+});
+
+test('Projects open running view marks a later failed scan without discarding last-known rows', async t => {
+  if (skipWithoutChromium(t)) return;
+  await withBrowserRelay({ name: 'running-transition', alive: true, shellOnly: true }, async ({ harness, page }) => {
+    let verified = true;
+    await page.route('**/api/projects', route => route.fulfill({ json: {
+      bridgeLive: true, live: true, runningVerified: verified,
+      runningVerificationDetail: verified ? '' : 'fixture subsequent scan failed',
+      collections: [], decks: [],
+      runningSessions: [{ pid: 456, tool: 'claude', sessionId: '', identityStatus: 'unresolved', parent: 'fixture' }],
+    } }));
+    await page.goto(`http://127.0.0.1:${harness.port}/projects.html`);
+    await page.locator('#runpill').click();
+    assert.equal(await page.locator('.runrow').count(), 1);
+    assert.equal(await page.getByRole('button', { name: 'Rename native name' }).isDisabled(), true);
+    verified = false;
+    await page.waitForResponse(async response => response.url().endsWith('/api/projects') && (await response.json()).runningVerified === false, { timeout: 20000 });
+    await page.waitForFunction(() => document.querySelector('#viewDetail').textContent.includes('fixture subsequent scan failed'));
+    assert.equal(await page.locator('.runrow').count(), 1, 'last-known unidentified process must remain visible');
+    assert.doesNotMatch(await page.locator('#viewDetail').innerText(), /Live claude\/codex agents/);
+  });
+});
 
 async function withSessionPage(options, callback) {
   const session = {
@@ -162,6 +367,50 @@ async function withSessionPage(options, callback) {
     await callback(resources);
   });
 }
+
+test('native rename retries its original durable request after reload and revision change', async t => {
+  if (skipWithoutChromium(t)) return;
+  await withBrowserRelay({ name: SESSION_NAME, alive: true, shellOnly: true, ready: true }, async ({ harness, page }) => {
+    let revision = 'original-revision';
+    let confirmed = false;
+    const requests = [];
+    await page.route('**/pc/api/discovery/chats?*', route => route.fulfill({
+      json: { rows: [{ id: 'rename-chat', tool: 'claude', revision }], total: 1 },
+    }));
+    await page.route('**/api/app-commands', route => {
+      requests.push(route.request().postDataJSON());
+      return route.fulfill({ json: { id: 'rename-receipt' } });
+    });
+    await page.route('**/api/app-commands/rename-receipt', route => confirmed
+      ? route.fulfill({ json: { status: 'done', detail: 'native rename reconciled' } })
+      : route.abort('failed'));
+    await page.goto(`http://127.0.0.1:${harness.port}/`);
+    const open = () => page.evaluate(() => openRenameDialog({
+      name: 'unchanged-tab', sessionId: 'rename-chat', tool: 'claude', nativeTitle: 'Original title',
+    }));
+    await open();
+    await page.locator('#renamenative').fill('Desired title');
+    await page.locator('#dorename').click();
+    await waitFor(() => requests.length === 1, 'first native request', TEST_TIMEOUT_MS);
+    const first = requests[0];
+    // Reload while PC completion is unavailable; subsequent discovery has a different revision.
+    revision = 'later-revision';
+    await page.reload();
+    confirmed = true;
+    await open();
+    assert.equal(await page.locator('#renamenative').inputValue(), 'Desired title', 'reopen restores pending title');
+    await page.locator('#renamenative').fill('Different title');
+    await page.locator('#dorename').click();
+    await waitFor(async () => (await page.locator('#renamestatus').innerText()).includes('earlier native rename is unconfirmed'), 'replacement intent refusal', TEST_TIMEOUT_MS);
+    assert.equal(requests.length, 1, 'unresolved rename cannot be replaced by a new payload');
+    await page.locator('#renamenative').fill('Desired title');
+    await page.locator('#dorename').click();
+    await waitFor(() => requests.length === 2, 'replayed native request', TEST_TIMEOUT_MS);
+    assert.deepEqual(requests[1], first, 'queue admission must not discard the original intent or revision');
+    await page.waitForFunction(() => !document.querySelector('#renamedlg').open);
+    assert.equal(await page.evaluate(() => Object.keys(localStorage).filter(key => key.startsWith('mux.native-rename.v1:')).length), 0, 'terminal success clears the pending workflow');
+  });
+});
 
 // SCOPE, measured rather than assumed: this does NOT reproduce the production freeze. That bug
 // needed a real mobile visual viewport whose offsetTop shifts under the keyboard, and headless

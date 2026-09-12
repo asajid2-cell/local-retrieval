@@ -44,15 +44,20 @@ public sealed partial class MainPage
             if (_runningCache is not null && (DateTime.UtcNow - _runningCacheAt).TotalSeconds < 4)
                 return _runningCache;
         }
-        var fresh = GetRunningSessionsUncached();
-        lock (_runningCacheLock) { _runningCache = fresh; _runningCacheAt = DateTime.UtcNow; }
+        var (ok, fresh, _) = GetRunningSessionsUncached();
+        if (ok)
+            lock (_runningCacheLock) { _runningCache = fresh; _runningCacheAt = DateTime.UtcNow; }
         return fresh;
     }
 
-    private List<ArchiveService.RunningSessionInfo> GetRunningSessionsUncached()
+    private (bool Ok, List<ArchiveService.RunningSessionInfo> Sessions, string Detail) GetRunningSessionsUncached()
     {
-        CodexLocalRetrieval.Core.Remote.RunningSessions.TryScan(out var list, out _);
-        return list;
+        if (!CodexLocalRetrieval.Core.Remote.RunningSessions.TryScanEnriched(out var list, out var scanDetail))
+        {
+            Diag.Log("Running session scan unavailable: " + scanDetail);
+            return (false, list, scanDetail);
+        }
+        return (true, list, "");
     }
 
     private static string LabelParent(string name)
@@ -70,73 +75,40 @@ public sealed partial class MainPage
     private Dictionary<string, int> GetRunningChats()
     {
         var map = new Dictionary<string, int>();
-        var pids = new List<int>();
         foreach (var r in GetRunningSessions())
         {
-            if (r.Pid > 0) pids.Add(r.Pid);
-            if (!string.IsNullOrEmpty(r.SessionId) && !map.ContainsKey(r.SessionId))
-                map[r.SessionId] = r.Pid;   // resumed sessions carry their id on the command line
+            foreach (var id in r.AllSessionIds)
+                if (!map.ContainsKey(id)) map[id] = r.Pid;
         }
-        // GROUND TRUTH for sessions whose id ISN'T on the command line â€” a chat forked/started locally
-        // without --resume, or one sitting IDLE in the background. This is what stops two live copies of the
-        // same session (a double-writer that loses progress). Two reliable sources, unioned:
-        var livePids = new HashSet<int>(pids);
-        //  â€¢ Claude keeps its OWN registry (~/.claude/sessions/<pid>.json) of every live session, idle or
-        //    forked â€” claude open-append-closes its transcript so a file check can't see an idle one.
-        try
-        {
-            foreach (var kv in CodexLocalRetrieval.Core.Remote.RunningSessions.ClaudeLiveSessionIds(livePids))
-                if (!map.ContainsKey(kv.Key)) map[kv.Key] = kv.Value;
-        }
-        catch { }
-        //  â€¢ Codex holds its rollout file OPEN for the whole session, so which transcript each agent has open
-        //    is the ground truth there (also catches a claude that's mid-write).
-        try
-        {
-            if (CodexLocalRetrieval.Core.Remote.RunningSessions.TryOpenTranscriptSessionIds(
-                    pids,
-                    out var openIds,
-                    out _))
-            {
-                foreach (var kv in openIds)
-                    if (!map.ContainsKey(kv.Key)) map[kv.Key] = kv.Value;
-            }
-        }
-        catch { }
         return map;
     }
 
-    private enum RelayMuxState { None, Hosted, Legacy }
+    private enum RelayMuxState { Unavailable, None, Hosted, Legacy }
 
     // What does the relay know about this name? The relay can report PC-hosted muxd sessions as well as
-    // legacy tmux sessions, so parse the JSON instead of string-searching and never treat this as a
-    // creation fallback. It is only a duplicate-run guard and cleanup path.
+    // legacy tmux sessions. Unavailable is distinct from a verified-empty response because launch and
+    // takeover decisions must fail closed when the remote owner cannot be checked.
     private static async Task<RelayMuxState> RelayMuxStateAsync(string target, int port, string name)
     {
         try
         {
-            // Hardened + hard-timeout via RunSshAsync (no -n/timeout here was another way to hang the app).
-            var (_, outText) = await RunSshAsync(target, $"curl -s http://127.0.0.1:{port}/api/sessions");
-            using var doc = JsonDocument.Parse(outText);
-            if (doc.RootElement.ValueKind != JsonValueKind.Array) return RelayMuxState.None;
+            var response = await RunSshAsync(target, $"curl -sS -f http://127.0.0.1:{port}/api/sessions");
+            if (response.code != 0) return RelayMuxState.Unavailable;
+            using var doc = JsonDocument.Parse(response.outText);
+            if (doc.RootElement.ValueKind != JsonValueKind.Array) return RelayMuxState.Unavailable;
             foreach (var s in doc.RootElement.EnumerateArray())
             {
                 if (!s.TryGetProperty("name", out var n) || !string.Equals(n.GetString(), name, StringComparison.OrdinalIgnoreCase))
                     continue;
-                // A DORMANT session (e.g. every tab after a reboot) is just a placeholder â€” NOT a running
-                // agent. Treat it as none so resume doesn't false-warn "already running / kill it"; the
-                // separate local-process check still fires if the chat is actually running on this PC.
                 var alive = s.TryGetProperty("alive", out var a) && a.ValueKind == JsonValueKind.True;
                 if (!alive) return RelayMuxState.None;
                 if (s.TryGetProperty("hosted", out var hosted) && hosted.ValueKind == JsonValueKind.True)
                     return RelayMuxState.Hosted;
-                if (s.TryGetProperty("legacy", out var legacy) && legacy.ValueKind == JsonValueKind.True)
-                    return RelayMuxState.Legacy;
                 return RelayMuxState.Legacy;
             }
+            return RelayMuxState.None;
         }
-        catch { }
-        return RelayMuxState.None;
+        catch { return RelayMuxState.Unavailable; }
     }
 
     // DELETE a relay-visible mux session. This is cleanup/duplicate prevention only; creation is local muxd.
@@ -198,7 +170,14 @@ public sealed partial class MainPage
         var relayState = !localMuxUp && !string.IsNullOrEmpty(target)
             ? await RelayMuxStateAsync(target, settings.MultiplexApiPort, muxName)
             : RelayMuxState.None;
-        var relayMuxUp = relayState != RelayMuxState.None;
+        if (!localMuxUp && relayState == RelayMuxState.Unavailable)
+        {
+            const string detail = "couldn't verify the relay multiplex session; refusing to risk a second writer";
+            SyncStatus.Text = detail;
+            Diag.Log("Launch guard could not verify relay mux state: " + muxName);
+            return new GuardResult(new RunGuardDecision(RunGuardOutcome.Unverifiable, detail));
+        }
+        var relayMuxUp = relayState is RelayMuxState.Hosted or RelayMuxState.Legacy;
         var muxUp = localMuxUp || relayMuxUp;
         Dictionary<string, HashSet<int>> running;
         try

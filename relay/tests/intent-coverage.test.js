@@ -48,6 +48,26 @@ test('r.1.6.2 static: no un-allowlisted raw mutating fetch in browser sources', 
   }
 });
 
+test('explicit workflow intent survives transport retries without journal replacement', async () => {
+  const vm = require('node:vm');
+  const sent = [];
+  const context = vm.createContext({
+    fetch: async (url, options) => {
+      sent.push(JSON.parse(options.body));
+      if (sent.length === 1) throw new Error('response lost');
+      return { status: 200 };
+    },
+    setTimeout: callback => callback(),
+  });
+  vm.runInContext(read('public/intent-journal.js'), context);
+  await context.postIntent('/api/app-commands', { type: 'deckcreate', intentId: 'durable-workflow-id' });
+  assert.equal(sent.length, 2);
+  assert.deepEqual(sent[0], sent[1]);
+  assert.equal(sent[1].intentId, 'durable-workflow-id');
+  await assert.rejects(context.postIntent('/api/app-commands', { intentId: '../invalid' }), /invalid explicit/);
+  assert.equal(sent.length, 2);
+});
+
 test('r.1.6.2 static: NEGATIVE CONTROL — scanner is not vacuously passing', () => {
   const raw = "await fetch(base+'/api/sessions/x',{method:'DELETE'});";
   assert.equal(rawMutatingFetches(raw).length, 1, 'bare raw mutating fetch must be flagged');
@@ -121,14 +141,14 @@ function shellSession(name) {
 
 test('r.1.6.3 integration: session.kill intent replays exactly-once and rejects fingerprint reuse', async t => {
   const h = new RelayHarness();
-  await h.start();
   t.after(async () => h.stop());
-  const host = await h.connectHost([shellSession('kill-intent')]);
+  await h.start();
+  const host = await h.connectHost([{ ...shellSession('kill-intent'), generationId: 'kill-intent-generation' }]);
   t.after(() => host.close());
 
   // (a) First kill: no COMPLETED record yet, so the raw handler runs, ships the
   // kill frame to muxd, and blocks until the hosted row is confirmed gone.
-  const first = h.request('DELETE', '/api/sessions/kill-intent', { intentId: 't-kill-1' });
+  const first = h.request('DELETE', '/api/sessions/kill-intent', { intentId: 't-kill-1', sessionId: '', generationId: 'kill-intent-generation' });
   await host.waitFor(m => m.t === 'kill' && m.s === 'kill-intent', 'kill frame');
   host.sendKilled('kill-intent');
   const firstRes = await first;
@@ -137,7 +157,7 @@ test('r.1.6.3 integration: session.kill intent replays exactly-once and rejects 
 
   // Byte-identical replay: intentId 't-kill-1' is now COMPLETED, so the stored
   // {code, body} is replayed and the handler is skipped entirely.
-  const replayRes = await h.request('DELETE', '/api/sessions/kill-intent', { intentId: 't-kill-1' });
+  const replayRes = await h.request('DELETE', '/api/sessions/kill-intent', { intentId: 't-kill-1', sessionId: '', generationId: 'kill-intent-generation' });
   assert.equal(replayRes.status, firstRes.status);
   assert.deepEqual(replayRes.body, firstRes.body);
 
@@ -147,15 +167,15 @@ test('r.1.6.3 integration: session.kill intent replays exactly-once and rejects 
   assert.equal(killFrames.length, 1, `expected exactly one kill frame, got ${killFrames.length}`);
 
   // (c) Same intentId, different session name => different fingerprint => 409.
-  const conflict = await h.request('DELETE', '/api/sessions/kill-other', { intentId: 't-kill-1' });
+  const conflict = await h.request('DELETE', '/api/sessions/kill-other', { intentId: 't-kill-1', sessionId: '', generationId: 'kill-intent-generation' });
   assert.equal(conflict.status, 409);
   assert.deepEqual(conflict.body, { error: 'intent id already used for a different operation' });
 });
 
 test('r.1.6.3 integration: session.autoheal intent replays exactly-once', async t => {
   const h = new RelayHarness();
-  await h.start();
   t.after(async () => h.stop());
+  await h.start();
   const host = await h.connectHost([shellSession('heal-intent')]);
   t.after(() => host.close());
 
@@ -185,8 +205,8 @@ test('r.1.6.3 integration: session.autoheal intent replays exactly-once', async 
 
 test('r.1.6.4 integration: session.rename intent replays exactly-once and preserves legacy path', async t => {
   const h = new RelayHarness();
-  await h.start();
   t.after(async () => h.stop());
+  await h.start();
   const host = await h.connectHost([shellSession('rename-from')]);
   t.after(() => host.close());
 

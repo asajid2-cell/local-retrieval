@@ -25,7 +25,11 @@ function hostTokenOk(t) { if (!HOST_TOKEN || !t || t.length !== HOST_TOKEN.lengt
 
 const app = express();
 const TEST_MODE = process.env.MUX_TEST_MODE === '1';
+const TEST_MARKER = process.env.MUX_TEST_FIXTURE === '1';
 const STATE_DIR = process.env.MUX_STATE_DIR || __dirname;
+if (TEST_MODE && (!TEST_MARKER || String(process.env.MUX_BIND_HOST || '').trim() !== '127.0.0.1')) {
+  throw new Error('MUX_TEST_MODE requires MUX_TEST_FIXTURE=1 and MUX_BIND_HOST=127.0.0.1');
+}
 fs.mkdirSync(STATE_DIR, { recursive: true });
 let persistenceFailure = '';
 let persistenceBlocked = '';
@@ -112,12 +116,31 @@ const LOCAL_BRIDGE_ROUTES = [
   { m: 'POST', p: /^\/api\/projects\/?$/ },
   { m: 'POST', p: /^\/api\/running\/?$/ },
   { m: 'GET',  p: /^\/api\/app-commands\/?$/ },
-  { m: 'POST', p: /^\/api\/app-commands\/lease\/?$/ },
-  { m: 'POST', p: /^\/api\/app-commands\/[^/]+\/ack\/?$/ },
 ];
 function isLocalBridgeRoute(req) {
   const p = String(req.originalUrl || req.url || '').split('?')[0];
   return LOCAL_BRIDGE_ROUTES.some(r => r.m === req.method && r.p.test(p));
+}
+// Command consumption is a separate capability: loopback alone is not consumer identity.
+// No owner cookie, host credential, or test-mode exemption substitutes for this token.
+const COMMAND_BRIDGE_TOKEN = process.env.MUX_COMMAND_BRIDGE_TOKEN || '';
+const COMMAND_BRIDGE_HEADER = 'x-mux-command-bridge';
+function commandBridgeTokenOk(value) {
+  if (!COMMAND_BRIDGE_TOKEN || typeof value !== 'string' || !value) return false;
+  const presented = Buffer.from(value);
+  const expected = Buffer.from(COMMAND_BRIDGE_TOKEN);
+  return presented.length === expected.length && crypto.timingSafeEqual(presented, expected);
+}
+function isCommandBridgeRoute(req) {
+  // Match Express's default case-insensitive routing, including its optional trailing slash.
+  return req.method === 'POST'
+    && /^\/api\/app-commands\/(?:lease|[^/]+\/ack)\/?$/i.test(String(req.path || ''));
+}
+function refuseUnlessCommandBridge(req, res) {
+  if (!COMMAND_BRIDGE_TOKEN) return res.status(503).json({ error: 'command bridge credential not configured' });
+  if (!isTrustedLocal(req) || !commandBridgeTokenOk(req.headers[COMMAND_BRIDGE_HEADER]))
+    return res.status(403).json({ error: 'local command bridge credential required' });
+  return null;
 }
 // Dedicated dispatch capability for the ops-bot fix factory. Deliberately narrow: it authorises
 // exactly ONE route (POST /api/sessions/:name/relaunch) for an allowlisted session name, and
@@ -166,27 +189,20 @@ function wsOriginOk(req) {
 function testModeLocalTrust(req) {
   return TEST_MODE && isTrustedLocal(req);
 }
-// A credential SCOPED to one job: the desktop app pushes transcript pages with it, and it authorizes
-// nothing else. Derived from the host credential so it never equals it, and it buys no read back — the
-// GET side stays owner-only. Fails closed: no host credential and no explicit override = no pushes.
-const TRANSCRIPT_BRIDGE_TOKEN = String(
-  process.env.MUX_TRANSCRIPT_BRIDGE_TOKEN
-  || (process.env.MUX_HOST_TOKEN
-    ? crypto.createHash('sha256').update('mux-transcript-bridge:v1:' + process.env.MUX_HOST_TOKEN).digest('hex')
-    : ''),
-);
+// Page pushes require a live per-fetch lease credential; reads remain owner-only.
 const TRANSCRIPT_BRIDGE_HEADER = 'x-mux-transcript-bridge';
-function transcriptBridgeTokenOk(value) {
-  const t = String(value || '');
-  if (!TRANSCRIPT_BRIDGE_TOKEN || !t || t.length !== TRANSCRIPT_BRIDGE_TOKEN.length) return false;
-  try { return crypto.timingSafeEqual(Buffer.from(t), Buffer.from(TRANSCRIPT_BRIDGE_TOKEN)); } catch { return false; }
-}
 function isTranscriptBridgePush(req) {
   return req.method === 'POST'
     && /^\/api\/transcripts\/[^/]+$/.test(String(req.path || ''))
-    && transcriptBridgeTokenOk(req.headers[TRANSCRIPT_BRIDGE_HEADER]);
+    && !!transcriptPushAuthority(req.params.sessionId || req.path.split('/').pop(), req.headers[TRANSCRIPT_BRIDGE_HEADER]);
 }
 app.use(async (req, res, next) => {
+  // This gate must precede every owner/local/test exemption, including terminal ACK retries.
+  if (isCommandBridgeRoute(req)) {
+    const refusal = refuseUnlessCommandBridge(req, res);
+    if (refusal) return refusal;
+    return next();
+  }
   // INTEGRATION NOTE: r.2.16 arrived with a blanket `if (isTrustedLocal(req)) return next();` here.
   // That bypass was deliberately REMOVED on master — containers run network_mode: host and share
   // 127.0.0.1, so loopback is not a trust boundary and any compromised app satisfied it. Restoring it
@@ -205,6 +221,36 @@ app.use(async (req, res, next) => {
   }
   return res.status(403).send('Forbidden â€” owner only.');
 });
+
+// Isolated fixture-only PC proxy. Production has this mapping in nginx; the bounded fixture
+// supplies an explicit loopback target so the real browser page can use the same relay URL shape.
+const TEST_PC_BASE = String(process.env.MUX_TEST_PC_BASE || '').replace(/\/+$/, '');
+if (TEST_MODE && TEST_PC_BASE) {
+  let testPcUrl;
+  try { testPcUrl = new URL(TEST_PC_BASE); } catch { throw new Error('MUX_TEST_PC_BASE must be a valid loopback URL'); }
+  if (testPcUrl.protocol !== 'http:' || !['127.0.0.1', 'localhost', '::1'].includes(testPcUrl.hostname))
+    throw new Error('MUX_TEST_PC_BASE must target loopback over http');
+  if (testPcUrl.username || testPcUrl.password || testPcUrl.pathname !== '/')
+    throw new Error('MUX_TEST_PC_BASE must be a bare loopback origin');
+  process.env.MUX_TEST_PC_BASE = testPcUrl.origin;
+  app.use('/multiplex/pc', async (req, res, next) => {
+    try {
+      const target = TEST_PC_BASE + req.originalUrl.replace(/^\/multiplex\/pc/, '');
+      const targetUrl = new URL(target);
+      if (targetUrl.protocol !== 'http:' || !['127.0.0.1', 'localhost', '::1'].includes(targetUrl.hostname))
+        return res.status(502).json({ error: 'fixture proxy target escaped loopback' });
+      if (targetUrl.port !== testPcUrl.port)
+        return res.status(502).json({ error: 'fixture proxy target changed port' });
+      const headers = { accept: req.headers.accept || 'application/json' };
+      if (!['GET', 'HEAD'].includes(req.method)) headers['Content-Type'] = 'application/json';
+      if (req.headers.authorization) headers.authorization = req.headers.authorization;
+      else if (process.env.MUX_TEST_PC_AUTH) headers.authorization = process.env.MUX_TEST_PC_AUTH;
+      const upstream = await fetch(target, { method: req.method, headers, body: ['GET', 'HEAD'].includes(req.method) ? undefined : JSON.stringify(req.body || {}) });
+      const text = await upstream.text();
+      res.status(upstream.status).type(upstream.headers.get('content-type') || 'application/json').send(text);
+    } catch (error) { next(error); }
+  });
+}
 
 app.use(express.static(__dirname + '/public', {
   setHeaders(res, filePath) {
@@ -277,6 +323,7 @@ const hostUp = () => !!(hostWs && hostWs.readyState === 1);
 function sendHost(obj) { if (hostUp()) { try { hostWs.send(JSON.stringify(obj)); return true; } catch {} } return false; }
 const hostedHas = name => hostUp() && hostSessions.has(name);
 const pendingHostCreates = new Map();
+const pendingHostKills = new Map();
 let _hostRequestSeq = 0;
 function normalizeHostSession(s) {
   // agentTruth carries an "exe" key, which the forbidden-remote-key scan reads as the PC smuggling an
@@ -308,6 +355,8 @@ function normalizeHostSession(s) {
     hasCommand, shellOnly, ready: Object.prototype.hasOwnProperty.call(s, 'ready') ? !!s.ready : alive,
     kind: String(s.kind || (alive ? (shellOnly ? 'shell' : 'command') : 'dormant')),
     sessionId, aliases, identityPending: !!s.identityPending,
+    generationId: commandIntentId(s.generationId),
+    tool: ['claude', 'codex'].includes(s.tool) ? s.tool : '',
     childPid: Number.isSafeInteger(Number(s.childPid)) && Number(s.childPid) > 0 ? Number(s.childPid) : 0,
     agentState: String(s.agentState || ''), agentLabel: String(s.agentLabel || ''),
     agentDetail: String(s.agentDetail || ''), agentConfidence: String(s.agentConfidence || ''),
@@ -820,7 +869,10 @@ function listSessions() {
                   kind: h.kind || (dormant ? 'dormant' : (h.shellOnly ? 'shell' : 'command')),
                   sessionId: String(chat && chat.id || h.sessionId || ''), aliases: Array.isArray(h.aliases) ? h.aliases : [],
                   identityPending: !!h.identityPending,
-                  tool: String(chat && chat.tool || ''),
+                  generationId: String(h.generationId || ''),
+                  authoritativeSessionId: String(h.sessionId || ''),
+                  authoritativeTool: String(h.tool || ''),
+                  tool: String(chat && chat.tool || h.tool || ''),
                   chatTitle: String(chat && chat.title || ''), projectMuxName: String(chat && chat.muxName || ''),
                   nativeTitle: String(chat && chat.nativeTitle || ''), appTitle: String(chat && chat.appTitle || ''),
                   chatLinked: !!chat,
@@ -1202,19 +1254,31 @@ app.patch('/api/sessions/:name', withMutationIntent('session.rename', req => ({
 
 app.delete('/api/sessions/:name', withMutationIntent('session.kill', req => ({
   name: strictMuxName(req.params.name),
+  sessionId: req.body && req.body.sessionId,
+  generationId: req.body && req.body.generationId,
 }), async (req, res) => {
   const name = strictMuxName(req.params.name);
   if (!name) return res.status(400).json({ error: 'invalid session name' });
   if (tmuxHas(name)) return failLegacy(res, name);
+  const { sessionId, generationId } = req.body || {};
+  if (typeof sessionId !== 'string' || (sessionId && opaqueIdentity(sessionId) !== sessionId)
+      || !generationId || commandIntentId(generationId) !== generationId)
+    return res.status(400).json({ error: 'exact sessionId and generationId required' });
+  if (!requireHostCapability(res, 'relayKillFence', 'refusing to kill a hosted session')) return;
   const hosted = hostSessions.get(name);
-  const detachedAdopted = !!(hosted && hosted.adopted && hosted.alive === false
-    && locallyRunningMuxName(name));
-  if (hostedHas(name)) {
-    if (!requireHostProtocol(res, 'refusing to kill a hosted session')) return;
-    if (!sendHost({ t: 'kill', s: name })) return failHost(res, 503, 'PC mux host offline', 'host socket closed before kill could be sent');
-    const confirmed = await waitForHostState(() => !hostSessions.has(name), 6000);
-    if (!confirmed.ok) return failHost(res, 504, 'muxd kill not confirmed', confirmed.error);
-  }
+  if (!hosted) return res.status(409).json({ error: 'selected session is absent; stop outcome is unconfirmed' });
+  if (hosted.sessionId !== sessionId || hosted.generationId !== generationId)
+    return res.status(409).json({ error: 'selected session identity or generation changed; refresh before deleting' });
+  const detachedAdopted = !!(hosted.adopted && hosted.alive === false && locallyRunningMuxName(name));
+  const rid = crypto.randomUUID();
+  const confirmed = await new Promise(resolve => {
+    const finish = result => { clearTimeout(timer); pendingHostKills.delete(rid); resolve(result); };
+    const timer = setTimeout(() => finish({ ok: false, status: 504, detail: 'muxd stop outcome unconfirmed' }), 6000);
+    pendingHostKills.set(rid, { name, sessionId, generationId, finish });
+    if (!sendHost({ t: 'kill', s: name, rid, sessionId, generationId }))
+      finish({ ok: false, status: 503, detail: 'host socket closed before kill could be sent' });
+  });
+  if (!confirmed.ok) return failHost(res, confirmed.status || 409, 'muxd kill not confirmed', confirmed.detail);
   res.json({
     ok: true,
     detail: detachedAdopted
@@ -1332,6 +1396,9 @@ function normalizeRunning(row) {
   row = row || {};
   return {
     pid: Number(row.pid) || 0, tool: text(row.tool, 20), sessionId: opaqueIdentity(row.sessionId),
+    sessionAliases: (Array.isArray(row.sessionAliases) ? row.sessionAliases : []).map(opaqueIdentity).filter(Boolean),
+    identityStatus: ['resolved', 'unresolved', 'unverifiable'].includes(row.identityStatus) ? row.identityStatus : '',
+    identitySource: text(row.identitySource, 200),
     parent: text(row.parent, 200), startedAt: text(row.startedAt, 64),
     title: row.title == null ? null : text(row.title), collection: row.collection == null ? null : text(row.collection, 200),
     collectionDeckId: row.collectionDeckId == null ? null : text(row.collectionDeckId, 200),
@@ -1914,9 +1981,34 @@ const COMMAND_REPLAY_POLICY = new Map([
   ['rename', 'idempotent'],
   ['setapptitle', 'idempotent'],
   ['addtocollection', 'idempotent'],
+  ['removefromcollection', 'idempotent'],
+  ['setfavorite', 'idempotent'],
+  ['archive', 'idempotent'],
+  ['setphrases', 'idempotent'],
+  ['settag', 'idempotent'],
+  ['deckcreate', 'intent-fenced'],
+  ['collectioncreate', 'intent-fenced'],
+  ['deckrename', 'intent-fenced'],
+  ['collectionrename', 'intent-fenced'],
+  ['collectionmove', 'intent-fenced'],
+  ['deckdelete', 'intent-fenced'],
+  ['collectiondelete', 'intent-fenced'],
+  ['collectionrecover', 'intent-fenced'],
+  ['collectionpurge', 'intent-fenced'],
+  ['collectionempty', 'intent-fenced'],
+  ['collectionsettag', 'intent-fenced'],
+  ['collectionreorder', 'intent-fenced'],
+  ['deckreorder', 'intent-fenced'],
+  ['captureworkspace', 'intent-fenced'],
+  ['checkpointcreate', 'intent-fenced'],
+  ['checkpointrename', 'intent-fenced'],
+  ['checkpointdelete', 'intent-fenced'],
+  ['checkpointspawn', 'intent-fenced'],
+  ['branchcreate', 'intent-fenced'],
   ['startmux', 'intent-fenced'],
   ['mirrorlocal', 'intent-fenced'],
   ['startchat', 'intent-fenced'],
+  ['reclaim', 'intent-fenced'],
   ['cleartabhistory', 'idempotent'],
   ['settabcolor', 'idempotent'],
 ]);
@@ -1927,7 +2019,7 @@ function commandIntentId(value) {
 }
 const STARTCHAT_ALLOWED_FIELDS = new Set([
   'type', 'intentId', 'muxName', 'title', 'tool', 'checkpointId', 'workspaceId', 'subfolder',
-  'deckId', 'collectionId', 'collection', 'phrase',
+  'deckId', 'collectionId', 'collection', 'phrase', 'checkpointRevision', 'collectionRevision', 'launchMode', 'handoffFromId',
 ]);
 const STARTCHAT_MAX_TEXT = 200;
 function startChatString(source, key) {
@@ -1974,12 +2066,16 @@ function normalizeStartChatFields(source) {
     title: startChatString(source, 'title'),
     tool,
     checkpointId: startChatIdentity(source, 'checkpointId'),
+    checkpointRevision: startChatString(source, 'checkpointRevision'),
+    collectionRevision: startChatString(source, 'collectionRevision'),
     workspaceId: startChatIdentity(source, 'workspaceId'),
     subfolder: startChatSubfolder(source),
     deckId: startChatIdentity(source, 'deckId'),
     collectionId: startChatIdentity(source, 'collectionId'),
     collection: startChatString(source, 'collection'),
     phrase: startChatString(source, 'phrase'),
+    launchMode: startChatString(source, 'launchMode'),
+    handoffFromId: startChatIdentity(source, 'handoffFromId'),
   };
   return Object.values(fields).some(value => value === null) ? null : fields;
 }
@@ -1987,9 +2083,13 @@ function startChatValidationError(fields) {
   if (!fields || !fields.intentId) return 'startchat requires a valid intent id';
   if (!fields.muxName) return 'startchat requires a valid mux session name';
   if (!fields.deckId) return 'startchat requires a valid deck identity';
+  if (fields.launchMode && !['native', 'gateway'].includes(fields.launchMode)) return 'unsupported startchat launch mode';
+  if (fields.handoffFromId && (fields.tool !== 'claude' || fields.launchMode !== 'gateway' || fields.checkpointId)) return 'handoff requires new Claude Gateway chat';
   if (fields.collectionId && fields.collection)
     return 'startchat collectionId and collection are mutually exclusive';
+  if (fields.collectionId && !fields.collectionRevision) return 'startchat requires collection revision';
   if (fields.checkpointId) {
+    if (!fields.checkpointRevision) return 'startchat requires checkpoint revision';
     if (fields.tool || fields.workspaceId || fields.subfolder)
       return 'checkpoint startchat cannot include tool, workspaceId, or subfolder';
     return '';
@@ -2022,8 +2122,21 @@ function commandFingerprint(command) {
     muxName: String(command.muxName || ''), sessionName: String(command.sessionName || ''),
     insert: String(command.insert || ''), collection: String(command.collection || ''),
     collectionId: String(command.collectionId || ''), deckId: String(command.deckId || ''),
+    targetDeckId: String(command.targetDeckId || ''), name: String(command.name || ''),
+    expectedRecentlyDeletedRevision: String(command.expectedRecentlyDeletedRevision || ''),
+    sessionIds: Array.isArray(command.sessionIds) ? command.sessionIds.map(String) : [],
+    deckIds: Array.isArray(command.deckIds) ? command.deckIds.slice() : [],
+    ...(['startmux', 'startchat'].includes(command.type) ? { launchMode: command.launchMode || '' } : {}),
+    ...(command.type === 'startchat' ? { handoffFromId: command.handoffFromId || '' } : {}),
+    tabs: Array.isArray(command.tabs) ? command.tabs : [],
+    tag: String(command.tag || ''), enabled: !!command.enabled,
     deck: String(command.deck || ''), deckName: String(command.deckName || ''),
-    checkpointId: String(command.checkpointId || ''), workspaceId: String(command.workspaceId || ''),
+    checkpointRevision: String(command.checkpointRevision || ''), collectionRevision: String(command.collectionRevision || ''),
+    checkpointId: String(command.checkpointId || ''), snapshotId: String(command.snapshotId || ''), workspaceId: String(command.workspaceId || ''),
+    expectedRevision: String(command.expectedRevision || ''), expectedCollectionRevision: String(command.expectedCollectionRevision || ''), expectedDeletedRevision: String(command.expectedDeletedRevision || ''), favorite: !!command.favorite,
+    archived: !!command.archived,
+    ...(command.type === 'reclaim' ? { confirmed: command.confirmed === true } : {}),
+    phrases: Array.isArray(command.phrases) ? command.phrases : [],
     subfolder: String(command.subfolder || ''), phrase: String(command.phrase || ''),
     takeover: !!command.takeover,
   };
@@ -2041,6 +2154,41 @@ function principalAuthEnvelope(value) {
   try { text = JSON.stringify(value); } catch { return null; }
   if (!text || text === '{}' || Buffer.byteLength(text, 'utf8') > PRINCIPAL_AUTH_MAX_BYTES) return null;
   return JSON.parse(text);
+}
+const TRANSCRIPT_GRANT_TTL_MS = 5 * 60 * 1000;
+function transcriptGrantProof(grant) {
+  return crypto.createHmac('sha256', COMMAND_BRIDGE_TOKEN)
+    .update(JSON.stringify([grant.scheme, grant.intent, grant.sessionId, grant.subject, grant.expiresAt, grant.nonce]))
+    .digest('hex');
+}
+function transcriptGrantSubject(req) {
+  return crypto.createHash('sha256').update(testModeLocalTrust(req)
+    ? 'isolated-owner' : String(cookieVal(req, HL_COOKIE) || '')).digest('hex');
+}
+function validTranscriptGrant(grant, sessionId, req) {
+  if (!COMMAND_BRIDGE_TOKEN || !principalAuthEnvelope(grant) || grant.scheme !== 'mux-owner-read-v1'
+      || grant.intent !== 'archive.read' || grant.sessionId !== sessionId
+      || grant.subject !== transcriptGrantSubject(req)
+      || !Number.isSafeInteger(grant.expiresAt) || grant.expiresAt <= Date.now()
+      || grant.expiresAt > Date.now() + TRANSCRIPT_GRANT_TTL_MS
+      || typeof grant.nonce !== 'string' || !/^[a-f0-9]{32}$/.test(grant.nonce)
+      || typeof grant.proof !== 'string' || !/^[a-f0-9]{64}$/.test(grant.proof)) return false;
+  return crypto.timingSafeEqual(Buffer.from(grant.proof), Buffer.from(transcriptGrantProof(grant)));
+}
+app.post('/api/principal-auth', (req, res) => {
+  if (!COMMAND_BRIDGE_TOKEN) return res.status(503).json({ error: 'transcript authorization unavailable' });
+  const sessionId = opaqueIdentity(req.body && req.body.sessionId);
+  if (!sessionId || req.body.intent !== 'archive.read')
+    return res.status(400).json({ error: 'one opaque session and archive.read intent required' });
+  const grant = { scheme: 'mux-owner-read-v1', intent: 'archive.read', sessionId,
+    subject: transcriptGrantSubject(req), expiresAt: Date.now() + TRANSCRIPT_GRANT_TTL_MS,
+    nonce: crypto.randomBytes(16).toString('hex') };
+  grant.proof = transcriptGrantProof(grant);
+  res.set('Cache-Control', 'no-store').json(grant);
+});
+function createdContainerId(type, status, value) {
+  if (status !== 'done' || !['deckcreate', 'collectioncreate'].includes(type)) return '';
+  return typeof value === 'string' && /^[A-Za-z0-9._-]{1,200}$/.test(value) ? value : '';
 }
 function commandOutcomeDetail(type, status, onPc = false) {
   if (status === 'pending' || status === 'leased') return '';
@@ -2083,6 +2231,7 @@ function commandOutcomeDetail(type, status, onPc = false) {
       ? COMMAND_REPLAY_POLICY.get(type)
       : String(c.replayPolicy || COMMAND_REPLAY_POLICY.get(type) || ''),
     sessionId: opaqueIdentity(c.sessionId),
+    generationId: commandIntentId(c.generationId),
     tool: ['claude', 'codex'].includes(String(c.tool || '').toLowerCase()) ? String(c.tool).toLowerCase() : '',
     pid: Number(c.pid) || 0,
     uploadId: /^u[a-z0-9]+-[a-z0-9]+$/i.test(String(c.uploadId || '')) ? String(c.uploadId) : '',
@@ -2092,8 +2241,20 @@ function commandOutcomeDetail(type, status, onPc = false) {
     insert: String(c.insert || ''), collection: String(c.collection || '').slice(0, 200),
     collectionId: String(c.collectionId || '').slice(0, 200), deckId: String(c.deckId || '').slice(0, 200),
     deck: String(c.deck || '').slice(0, 200), deckName: String(c.deckName || '').slice(0, 200),
+    name: String(c.name || '').trim().slice(0, 200), snapshotId: String(c.snapshotId || '').slice(0, 200), targetDeckId: String(c.targetDeckId || '').slice(0, 200),
+    expectedRevision: commandIntentId(c.expectedRevision), expectedCollectionRevision: commandIntentId(c.expectedCollectionRevision), expectedDeletedRevision: commandIntentId(c.expectedDeletedRevision), expectedRecentlyDeletedRevision: commandIntentId(c.expectedRecentlyDeletedRevision), favorite: !!c.favorite,
+    archived: !!c.archived, enabled: !!c.enabled, tag: String(c.tag || ''),
+    ...(type === 'reclaim' ? { confirmed: c.confirmed === true } : {}),
+    phrases: Array.isArray(c.phrases) ? c.phrases.map(x => String(x)) : [],
+    sessionIds: Array.isArray(c.sessionIds) ? c.sessionIds.slice() : [],
+    deckIds: Array.isArray(c.deckIds) ? c.deckIds.slice() : [],
+    ...(['startmux', 'startchat'].includes(type) ? { launchMode: c.launchMode || '' } : {}),
+    ...(type === 'startchat' ? { handoffFromId: c.handoffFromId || '' } : {}),
+    tabs: Array.isArray(c.tabs) ? c.tabs : [],
     ...(type === 'startchat' ? {
       checkpointId: startChatFields.checkpointId,
+      checkpointRevision: startChatFields.checkpointRevision,
+      collectionRevision: startChatFields.collectionRevision,
       workspaceId: startChatFields.workspaceId,
       subfolder: startChatFields.subfolder,
       phrase: startChatFields.phrase,
@@ -2113,6 +2274,7 @@ function commandOutcomeDetail(type, status, onPc = false) {
       status,
       !!c.onPc,
     ),
+    ...(createdContainerId(type, status, c.resultId) ? { resultId: createdContainerId(type, status, c.resultId) } : {}),
     doneAt: Number(c.doneAt) || 0,
     leaseOwner: status === 'leased' ? commandIntentId(c.leaseOwner) : '',
     leaseToken: status === 'leased' || status === 'done' || status === 'failed'
@@ -2161,15 +2323,29 @@ function enqueueAppCommand(b) {
   if (!replayPolicy) throw new Error('command type has no declared replay policy');
   const startChatFields = type === 'startchat' ? normalizeStartChatFields(b) : null;
   const cmd = { id, intentId, type, replayPolicy,
-                sessionId: String(b.sessionId || ''), tool: String(b.tool || ''),
+                sessionId: String(b.sessionId || ''), generationId: commandIntentId(b.generationId), tool: String(b.tool || ''),
                 pid: Number(b.pid) || 0, uploadId: String(b.uploadId || ''), filename: String(b.filename || ''),
                 title: String(b.title || '').slice(0, 200), keep: !!b.keep, label: String(b.label || ''),
                 muxName: String(b.muxName || ''), sessionName: String(b.sessionName || ''), insert: String(b.insert || ''),
                 collection: String(b.collection || '').slice(0, 200), collectionId: String(b.collectionId || '').slice(0, 200),
                 deckId: String(b.deckId || '').slice(0, 200), deck: String(b.deck || '').slice(0, 200),
-                deckName: String(b.deckName || '').slice(0, 200), takeover: !!b.takeover,
+                deckName: String(b.deckName || '').slice(0, 200),
+                name: String(b.name || '').trim().slice(0, 200), snapshotId: String(b.snapshotId || '').slice(0, 200), targetDeckId: String(b.targetDeckId || '').slice(0, 200),
+                expectedDeletedRevision: commandIntentId(b.expectedDeletedRevision), expectedRecentlyDeletedRevision: commandIntentId(b.expectedRecentlyDeletedRevision),
+                takeover: !!b.takeover,
+                expectedRevision: commandIntentId(b.expectedRevision), expectedCollectionRevision: commandIntentId(b.expectedCollectionRevision), favorite: !!b.favorite,
+                archived: !!b.archived, enabled: !!b.enabled, tag: String(b.tag || ''),
+                ...(type === 'reclaim' ? { confirmed: b.confirmed === true } : {}),
+                phrases: Array.isArray(b.phrases) ? b.phrases.map(x => String(x)) : [],
+                sessionIds: Array.isArray(b.sessionIds) ? b.sessionIds.slice() : [],
+                deckIds: Array.isArray(b.deckIds) ? b.deckIds.slice() : [],
+                ...(['startmux', 'startchat'].includes(type) ? { launchMode: b.launchMode || '' } : {}),
+                ...(type === 'startchat' ? { handoffFromId: b.handoffFromId || '' } : {}),
+                tabs: Array.isArray(b.tabs) ? b.tabs.map(tab => ({ name: tab.name, generationId: tab.generationId, sessionId: tab.sessionId, tool: tab.tool, alive: tab.alive, identityPending: tab.identityPending, shellOnly: tab.shellOnly })) : [],
                 ...(type === 'startchat' ? {
                   checkpointId: startChatFields.checkpointId,
+      checkpointRevision: startChatFields.checkpointRevision,
+      collectionRevision: startChatFields.collectionRevision,
                   workspaceId: startChatFields.workspaceId,
                   subfolder: startChatFields.subfolder,
                   phrase: startChatFields.phrase,
@@ -2224,6 +2400,10 @@ function waitForCommandResult(id, timeoutMs) {
 }
 app.post('/api/app-commands', (req, res) => {     // web (owner) enqueues
   const b = req.body || {};
+  if (b.type === 'reclaim') {
+    const allowed = new Set(['type', 'intentId', 'sessionId', 'tool', 'expectedRevision', 'confirmed']);
+    if (Object.keys(b).some(key => !allowed.has(key))) return res.status(400).json({ error: 'unsupported reclaim field' });
+  }
   if (hasForbiddenRemoteField(b)) return res.status(400).json({ error: 'executable commands and local paths are forbidden' });
   if (!COMMAND_REPLAY_POLICY.has(b.type)) return res.status(400).json({ error: 'unsupported command' });
   if (b.type === 'startchat') {
@@ -2251,13 +2431,15 @@ app.post('/api/app-commands', (req, res) => {     // web (owner) enqueues
   if (b.type === 'kill' && !b.sessionId && !b.pid) return res.status(400).json({ error: 'sessionId or pid required' });
   if (b.type === 'transcript' && !b.sessionId) return res.status(400).json({ error: 'sessionId required' });
   if (b.type === 'transcriptfetch' && !b.sessionId) return res.status(400).json({ error: 'sessionId required' });
-  if (b.type === 'transcriptfetch' && !principalAuthEnvelope(b.principalAuth))
-    return res.status(400).json({ error: 'transcriptfetch requires a principal auth envelope' });
+  if (b.type === 'transcriptfetch' && !validTranscriptGrant(b.principalAuth, b.sessionId, req))
+    return res.status(403).json({ error: 'valid owner transcript grant required' });
   if (b.type === 'fetchfile' && !b.uploadId) return res.status(400).json({ error: 'uploadId required' });
   if (b.type === 'fetchfile' && b.insert && !['path', 'element'].includes(String(b.insert).toLowerCase()))
     return res.status(400).json({ error: 'fetchfile insert must be path or element' });
   if (b.type === 'fetchfile' && b.insert && !(b.muxName || b.sessionName))
     return res.status(400).json({ error: 'fetchfile insertion requires muxName/sessionName' });
+  if (b.type === 'fetchfile' && b.insert && (!opaqueIdentity(b.sessionId) || !commandIntentId(b.generationId)))
+    return res.status(400).json({ error: 'fetchfile insertion requires exact sessionId and generationId' });
   if (b.type === 'fetchfile') {
     const uploadId = String(b.uploadId || '');
     if (!/^u[a-z0-9]+-[a-z0-9]+$/i.test(uploadId))
@@ -2269,8 +2451,53 @@ app.post('/api/app-commands', (req, res) => {     // web (owner) enqueues
   }
   if (b.type === 'rename' && (!b.sessionId || !String(b.title || '').trim())) return res.status(400).json({ error: 'sessionId and title required' });
   if (b.type === 'setapptitle' && !b.sessionId) return res.status(400).json({ error: 'sessionId required' });   // empty title = clear the app override
-  if (b.type === 'addtocollection' && (!(b.muxName || b.sessionName) || !(String(b.collection || '').trim() || String(b.collectionId || '').trim()))) return res.status(400).json({ error: 'muxName/sessionName and collection required' });
-  if (b.type === 'addtocollection' && !appLive()) return res.status(409).json({ error: 'desktop app is not live; collection changes are disabled' });
+  if (['setfavorite', 'setapptitle', 'archive', 'setphrases', 'settag'].includes(b.type)) {
+    if (!b.sessionId) return res.status(400).json({ error: 'sessionId required' });
+    if (b.type !== 'setfavorite' && !commandIntentId(b.expectedRevision)) return res.status(400).json({ error: 'expectedRevision required' });
+    if (b.type === 'setfavorite' && typeof b.favorite !== 'boolean') return res.status(400).json({ error: 'favorite must be a boolean' });
+    if (b.type === 'archive' && typeof b.archived !== 'boolean') return res.status(400).json({ error: 'archived must be a boolean' });
+    if (b.type === 'setapptitle' && typeof b.title !== 'string') return res.status(400).json({ error: 'title must be a string' });
+    if (b.type === 'setphrases' && (!Array.isArray(b.phrases) || b.phrases.some(x => typeof x !== 'string'))) return res.status(400).json({ error: 'phrases must be an array of strings' });
+    if (b.type === 'settag' && (typeof b.tag !== 'string' || typeof b.enabled !== 'boolean')) return res.status(400).json({ error: 'tag and enabled are required' });
+  }
+  if (['addtocollection', 'removefromcollection'].includes(b.type)) {
+    if (!b.sessionId || !opaqueIdentity(b.sessionId)) return res.status(400).json({ error: 'sessionId required' });
+    if (!b.collectionId || !opaqueIdentity(b.collectionId)) return res.status(400).json({ error: 'opaque collectionId required' });
+    if (!commandIntentId(b.expectedCollectionRevision)) return res.status(400).json({ error: 'expectedCollectionRevision required' });
+  }
+  if (['deckcreate', 'collectioncreate'].includes(b.type) && !String(b.name || '').trim()) return res.status(400).json({ error: 'name required' });
+  if (['deckrename', 'collectionrename'].includes(b.type) && (!b.name || !String(b.name).trim())) return res.status(400).json({ error: 'name required' });
+  if (['deckrename', 'deckdelete'].includes(b.type) && !b.deckId) return res.status(400).json({ error: 'deckId required' });
+  if (['collectionrename', 'collectionmove', 'collectiondelete', 'collectionrecover', 'collectionpurge'].includes(b.type) && !b.collectionId) return res.status(400).json({ error: 'collectionId required' });
+  if (['deckrename', 'deckdelete', 'collectionrename', 'collectionmove', 'collectiondelete', 'collectionrecover'].includes(b.type) && !commandIntentId(b.expectedRevision)) return res.status(400).json({ error: 'expectedRevision required' });
+  if (['checkpointcreate', 'checkpointrename', 'checkpointdelete', 'checkpointspawn', 'branchcreate'].includes(b.type)) {
+    if (!commandIntentId(b.intentId) || !commandIntentId(b.expectedRevision)) return res.status(400).json({ error: 'intentId and expectedRevision required' });
+    const source = ['checkpointcreate', 'branchcreate'].includes(b.type);
+    if (source) {
+      if (!b.sessionId || !opaqueIdentity(b.sessionId)) return res.status(400).json({ error: 'sessionId required' });
+      if (!['claude', 'codex'].includes(tool)) return res.status(400).json({ error: 'tool must be claude or codex' });
+    } else if (!b.snapshotId || !opaqueIdentity(b.snapshotId)) return res.status(400).json({ error: 'snapshotId required' });
+    if (['checkpointcreate', 'checkpointrename'].includes(b.type) && (typeof b.name !== 'string' || !b.name.trim())) return res.status(400).json({ error: 'name required' });
+  }
+  if (b.type === 'reclaim') {
+    if (b.confirmed !== true) return res.status(400).json({ error: 'explicit cleanup confirmation required' });
+    if (!commandIntentId(b.intentId) || !commandIntentId(b.expectedRevision)) return res.status(400).json({ error: 'intentId and expectedRevision required' });
+    if (!b.sessionId || !opaqueIdentity(b.sessionId) || !['claude', 'codex'].includes(tool)) return res.status(400).json({ error: 'exact sessionId and tool required' });
+  }
+  if (b.type === 'captureworkspace') {
+    if (!b.collectionId || !commandIntentId(b.expectedCollectionRevision) || !Array.isArray(b.tabs) || b.tabs.length === 0 || b.tabs.length > 200) return res.status(400).json({ error: 'collection revision and 1-200 tabs required' });
+    if (b.tabs.some(tab => !tab || typeof tab !== 'object' || !strictMuxName(tab.name) || typeof tab.generationId !== 'string' || !tab.generationId || typeof tab.sessionId !== 'string' || typeof tab.tool !== 'string' || tab.alive !== true || typeof tab.identityPending !== 'boolean' || typeof tab.shellOnly !== 'boolean') || new Set(b.tabs.map(tab => tab.name)).size !== b.tabs.length) return res.status(400).json({ error: 'exact unique live tab identities required' });
+  }
+  if (['collectionsettag', 'collectionreorder'].includes(b.type) && (!b.collectionId || !commandIntentId(b.expectedRevision))) return res.status(400).json({ error: 'collectionId and expectedRevision required' });
+  if (b.type === 'collectionsettag' && (typeof b.tag !== 'string' || !b.tag.trim() || typeof b.enabled !== 'boolean')) return res.status(400).json({ error: 'tag and explicit enabled boolean required' });
+  if (b.type === 'startmux' && b.launchMode != null && (!['native', 'gateway'].includes(b.launchMode) || (b.launchMode === 'gateway' && b.tool !== 'claude'))) return res.status(400).json({ error: 'supported tool-specific resume mode required' });
+  if (b.type === 'deckreorder' && (!commandIntentId(b.expectedRevision) || !Array.isArray(b.deckIds) || b.deckIds.some(id => typeof id !== 'string' || !id) || new Set(b.deckIds).size !== b.deckIds.length)) return res.status(400).json({ error: 'expectedRevision and unique deckIds array required' });
+  if (b.type === 'collectionreorder' && (!Array.isArray(b.sessionIds) || b.sessionIds.some(id => typeof id !== 'string' || !id) || new Set(b.sessionIds).size !== b.sessionIds.length)) return res.status(400).json({ error: 'unique sessionIds array required' });
+  if (b.type === 'collectionpurge' && !commandIntentId(b.expectedDeletedRevision)) return res.status(400).json({ error: 'expectedDeletedRevision required' });
+  if (b.type === 'collectionempty' && !commandIntentId(b.expectedRecentlyDeletedRevision)) return res.status(400).json({ error: 'expectedRecentlyDeletedRevision required' });
+  if (['collectionpurge', 'collectionempty'].includes(b.type) && !commandIntentId(b.intentId)) return res.status(400).json({ error: 'intentId required' });
+  if (b.type === 'collectionmove' && !b.targetDeckId) return res.status(400).json({ error: 'targetDeckId required' });
+  if (b.type === 'collectionrecover' && !b.expectedRevision) return res.status(400).json({ error: 'expectedRevision required' });
   if (b.type === 'startmux' && !(b.muxName || b.sessionName)) return res.status(400).json({ error: 'muxName/sessionName required' });
   if (b.type === 'startmux' && !b.sessionId && !['claude', 'codex'].includes(String(b.tool || '').toLowerCase()))
     return res.status(400).json({ error: 'startmux requires sessionId or tool' });
@@ -2330,7 +2557,11 @@ function leaseAppCommands(owner, limit, leaseMs) {
     changed = true;
   }
   if (changed) commitCommands(candidate);
-  return leased;
+  return leased.map(command => command.type === 'transcriptfetch' ? {
+    ...command,
+    bridgeToken: transcriptPushToken(command),
+    ttlMs: Math.max(0, Math.min(600000, (command.principalAuth?.expiresAt || 0) - Date.now())),
+  } : command);
 }
 
 // Long-poll waiters: lease requests that found an empty queue and asked (waitMs) to be held open
@@ -2369,7 +2600,8 @@ function dropLeaseWaiter(waiter) {
 }
 
 app.post('/api/app-commands/lease', (req, res) => {
-  if (!isTrustedLocal(req)) return res.status(403).json({ error: 'forbidden' });
+  const refusal = refuseUnlessCommandBridge(req, res);
+  if (refusal) return refusal;
   const owner = commandIntentId(req.body && req.body.owner);
   if (!owner) return res.status(400).json({ error: 'valid lease owner required' });
   const limit = Math.max(1, Math.min(16, Number(req.body && req.body.limit) || 8));
@@ -2398,8 +2630,9 @@ app.get('/api/app-commands', (req, res) => {
   if (!isTrustedLocal(req)) return res.status(403).json({ error: 'forbidden' });
   return res.status(410).json({ error: 'unleased command pulls are disabled; use POST /api/app-commands/lease' });
 });
-app.post('/api/app-commands/:id/ack', (req, res) => {   // app (loopback) reports a result
-  if (!isTrustedLocal(req)) return res.status(403).json({ error: 'forbidden' });
+app.post('/api/app-commands/:id/ack', (req, res) => {   // authenticated local consumer reports a result
+  const refusal = refuseUnlessCommandBridge(req, res);
+  if (refusal) return refusal;
   const index = _commands.findIndex(x => x.id === req.params.id);
   if (index < 0) return res.status(404).json({ error: 'command not found' });
   const prior = _commands[index];
@@ -2422,6 +2655,7 @@ app.post('/api/app-commands/:id/ack', (req, res) => {   // app (loopback) report
     ...prior,
     status,
     detail: commandOutcomeDetail(prior.type, status, !!(req.body && req.body.onPc)),
+    ...(createdContainerId(prior.type, status, req.body && req.body.resultId) ? { resultId: createdContainerId(prior.type, status, req.body.resultId) } : {}),
     doneAt: Date.now(),
     leaseExpiresAt: 0,
   };
@@ -2447,7 +2681,7 @@ app.post('/api/app-commands/:id/ack', (req, res) => {   // app (loopback) report
 app.get('/api/app-commands/:id', (req, res) => {  // web (owner) polls a command's outcome
   const c = _commands.find(x => x.id === req.params.id);
   if (!c) return res.status(404).json({ error: 'not found' });
-  res.json({ id: c.id, status: c.status, detail: c.detail || '' });
+  res.json({ id: c.id, status: c.status, detail: c.detail || '', ...(c.resultId ? { resultId: c.resultId } : {}) });
 });
 
 // --- transcript page store: PC archive -> VPS (briefly) -> the owner's browser -------------------
@@ -2542,9 +2776,26 @@ function authorizingTranscriptFetch(sessionId, now = Date.now()) {
       && now - (Number(command.ts) || 0) <= TRANSCRIPT_TTL_MS)
     .sort((a, b) => (Number(b.ts) || 0) - (Number(a.ts) || 0))[0] || null;
 }
+function transcriptPushToken(command) {
+  return crypto.createHmac('sha256', COMMAND_BRIDGE_TOKEN)
+    .update(JSON.stringify(['transcript-push-v1', command.id, command.sessionId, command.leaseToken, command.principalAuth?.expiresAt]))
+    .digest('hex');
+}
+function transcriptPushAuthority(sessionId, token) {
+  if (!COMMAND_BRIDGE_TOKEN || typeof token !== 'string' || !/^[a-f0-9]{64}$/.test(token)) return null;
+  const command = authorizingTranscriptFetch(sessionId);
+  if (!command || command.status !== 'leased' || command.leaseExpiresAt <= Date.now()
+      || !(command.principalAuth?.expiresAt > Date.now())) return null;
+  const grant = command.principalAuth;
+  if (grant.scheme !== 'mux-owner-read-v1' || grant.intent !== 'archive.read'
+      || grant.sessionId !== sessionId || typeof grant.proof !== 'string'
+      || !/^[a-f0-9]{64}$/.test(grant.proof)
+      || !crypto.timingSafeEqual(Buffer.from(grant.proof), Buffer.from(transcriptGrantProof(grant)))) return null;
+  return crypto.timingSafeEqual(Buffer.from(token), Buffer.from(transcriptPushToken(command))) ? command : null;
+}
 app.post('/api/transcripts/:sessionId', (req, res) => {
-  if (!TRANSCRIPT_BRIDGE_TOKEN) return res.status(503).json({ error: 'transcript bridge credential is not configured' });
-  if (!transcriptBridgeTokenOk(req.headers[TRANSCRIPT_BRIDGE_HEADER]))
+  if (!COMMAND_BRIDGE_TOKEN) return res.status(503).json({ error: 'transcript bridge credential is not configured' });
+  if (!transcriptPushAuthority(req.params.sessionId, req.headers[TRANSCRIPT_BRIDGE_HEADER]))
     return res.status(403).json({ error: 'scoped transcript bridge credential required' });
   const sessionId = opaqueIdentity(req.params.sessionId);
   if (!sessionId) return res.status(400).json({ error: 'invalid session identity' });
@@ -3081,11 +3332,25 @@ wssHost.on('connection', (ws, req) => {
       // Host unreachable: never strand viewers buffering forever — go live and let output repaint.
       if (!asked) for (const c of st.clients.values()) { c.sbWait = false; c.wentLive = true; }
     } else if (m.t === 'tailr') { const f = pendingTails.get(m.rid); if (f) { pendingTails.delete(m.rid); f(String(m.text || ''), String(m.sig || '')); }
-    } else if (m.t === 'killed') {
+    } else if (m.t === 'killed' || m.t === 'killResult') {
       const n = strictMuxName(m.s);
-      hostSessions.delete(n);
-      leaseConduit.forgetSession(n);
-      deleteSessionViewerState(n, 'session ended');
+      const pending = pendingHostKills.get(String(m.rid || ''));
+      const matches = pending && pending.name === n && pending.sessionId === m.sessionId
+        && pending.generationId === m.generationId;
+      if (pending && !matches) {
+        pending.finish({ ok: false, status: 504, detail: 'muxd stop acknowledgement identity mismatch; outcome unconfirmed' });
+        return;
+      }
+      if (m.t === 'killed') {
+        const current = hostSessions.get(n);
+        if (current && current.sessionId === m.sessionId && current.generationId === m.generationId) {
+          hostSessions.delete(n);
+          leaseConduit.forgetSession(n);
+          deleteSessionViewerState(n, 'session ended');
+        }
+      }
+      if (matches) pending.finish(m.t === 'killed' ? { ok: true }
+        : { ok: false, status: m.uncertain ? 504 : 409, detail: String(m.detail || 'muxd refused stop') });
     }
   });
   const ka = setInterval(() => { if (ws.readyState === 1) { try { ws.ping(); } catch {} } }, 20000);
@@ -3093,6 +3358,8 @@ wssHost.on('connection', (ws, req) => {
     clearInterval(ka);
     if (hostWs === ws) {
       hostWs = null; hostProtocol = { protocol: 0, caps: [] };
+      for (const pending of pendingHostKills.values())
+        pending.finish({ ok: false, status: 503, detail: 'host disconnected; stop outcome unconfirmed' });
       for (const st of sessions.values()) {
         clearScrollbackRequest(st);
       }
@@ -3584,10 +3851,10 @@ wss.on('connection', async (ws, req) => {
 });
 
 const PORT = +process.env.PORT || 7682;
-// 0.0.0.0: the PC's muxd dials us directly over the LAN (ws://<vps>:7682/host, token-gated; ufw scopes
-// the port to the LAN). Loopback-trust semantics are unchanged â€” a LAN caller is NOT trusted-local and
-// still hits the hl-auth owner gate for everything except /host-with-token.
-server.listen(PORT, '0.0.0.0', () => console.log('multiplex-app on 0.0.0.0:' + PORT));
+const BIND_HOST = String(process.env.MUX_BIND_HOST || '0.0.0.0').trim() || '0.0.0.0';
+// Production defaults to LAN reachability for the token-gated PC host connection. Isolated fixtures
+// explicitly set MUX_BIND_HOST=127.0.0.1 and assert the emitted bind address.
+server.listen(PORT, BIND_HOST, () => console.log('multiplex-app on ' + BIND_HOST + ':' + PORT));
 
 // --- ops alerts: push on degraded-health edge transitions (r.1.17) ---
 // Secret (ntfy topic URL) lives in /etc/multiplex-app.env as MUX_ALERT_NTFY_URL.

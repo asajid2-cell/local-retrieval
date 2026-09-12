@@ -319,7 +319,7 @@ test('app command enqueue and acknowledgement fail closed on persistence errors'
   const ackFailed = await h.request('POST', `/api/app-commands/${queued.id}/ack`, {
     leaseToken: leased.leaseToken,
     ok: true,
-  });
+  }, { 'X-Mux-Command-Bridge': h.commandBridgeToken });
   assert.equal(ackFailed.status, 503);
   assert.equal((await h.json('GET', `/api/app-commands/${queued.id}`)).status, 'leased');
 
@@ -402,25 +402,26 @@ test('app command intents deduplicate, conflict on payload reuse, and require an
   });
   assert.equal(conflict.status, 409);
 
-  const leased = await h.json('POST', '/api/app-commands/lease', { owner: 'consumer-a' });
+  const commandHeaders = { 'X-Mux-Command-Bridge': h.commandBridgeToken };
+  const leased = await h.json('POST', '/api/app-commands/lease', { owner: 'consumer-a' }, commandHeaders);
   assert.equal(leased.length, 1);
   assert.equal(leased[0].id, first.id);
   assert.equal(leased[0].intentId, intentId);
   assert.match(leased[0].leaseToken, /^[A-Za-z0-9._-]+$/);
 
-  const competing = await h.json('POST', '/api/app-commands/lease', { owner: 'consumer-b' });
+  const competing = await h.json('POST', '/api/app-commands/lease', { owner: 'consumer-b' }, commandHeaders);
   assert.deepEqual(competing, []);
 
   const wrongToken = await h.request('POST', `/api/app-commands/${first.id}/ack`, {
     leaseToken: 'wrong-token',
     ok: true,
-  });
+  }, commandHeaders);
   assert.equal(wrongToken.status, 409);
 
   await h.json('POST', `/api/app-commands/${first.id}/ack`, {
     leaseToken: leased[0].leaseToken,
     ok: true,
-  });
+  }, commandHeaders);
   await h.restart();
 
   const afterRestart = await h.json('POST', '/api/app-commands', {
@@ -452,17 +453,18 @@ test('pending commands are never age-pruned and expired leases are durably recla
   fs.writeFileSync(file, JSON.stringify(commands));
   await h.start();
 
+  const commandHeaders = { 'X-Mux-Command-Bridge': h.commandBridgeToken };
   const firstLease = await h.json('POST', '/api/app-commands/lease', {
     owner: 'consumer-a',
     leaseMs: 120,
-  });
+  }, commandHeaders);
   assert.equal(firstLease.some(command => command.id === queued.id), true);
 
-  const beforeExpiry = await h.json('POST', '/api/app-commands/lease', { owner: 'consumer-b' });
+  const beforeExpiry = await h.json('POST', '/api/app-commands/lease', { owner: 'consumer-b' }, commandHeaders);
   assert.equal(beforeExpiry.some(command => command.id === queued.id), false);
   await sleep(180);
 
-  const reclaimed = await h.json('POST', '/api/app-commands/lease', { owner: 'consumer-b' });
+  const reclaimed = await h.json('POST', '/api/app-commands/lease', { owner: 'consumer-b' }, commandHeaders);
   const retry = reclaimed.find(command => command.id === queued.id);
   assert.ok(retry);
   assert.equal(retry.attempt, 2);
@@ -1121,6 +1123,42 @@ test('adopted host metadata reaches the session list without executable data', a
   assert.equal(Object.prototype.hasOwnProperty.call(row, 'cmd'), false);
 });
 
+test('Gateway resume mode survives relay restart without changing default resume semantics', async t => {
+  const h = new RelayHarness();
+  await h.start();
+  t.after(async () => h.stop());
+  await h.json('POST', '/api/projects', { schemaVersion: 3, decks: [], collections: [], allChats: [], runningSessions: [], runningVerified: true });
+  const gateway = await h.json('POST', '/api/app-commands', { type: 'startmux', sessionId: 'claude-chat', tool: 'claude', muxName: 'gateway-chat', launchMode: 'gateway' });
+  const ordinary = await h.json('POST', '/api/app-commands', { type: 'startmux', sessionId: 'other-chat', tool: 'claude', muxName: 'ordinary-chat' });
+  const refused = await h.request('POST', '/api/app-commands', { type: 'startmux', sessionId: 'codex-chat', tool: 'codex', muxName: 'wrong-tool', launchMode: 'gateway' });
+  assert.equal(refused.status, 400);
+  await h.restart();
+  const commands = await leaseCommands(h);
+  assert.equal(commands.find(c => c.id === gateway.id).launchMode, 'gateway');
+  assert.equal(commands.find(c => c.id === ordinary.id).launchMode, '');
+});
+
+test('deck order command preserves exact IDs through restart and rejects malformed orders', async t => {
+  const h = new RelayHarness();
+  await h.start();
+  t.after(async () => h.stop());
+  for (const deckIds of [null, ['main', 'main'], ['main', 7]]) {
+    const refused = await h.request('POST', '/api/app-commands', { type: 'deckreorder', expectedRevision: 'revision-one', deckIds });
+    assert.equal(refused.status, 400);
+  }
+  const body = { type: 'deckreorder', intentId: 'deck-order-test', expectedRevision: 'revision-one', deckIds: ['deck-b', 'main', 'deck-a'] };
+  const queued = await h.json('POST', '/api/app-commands', body);
+  await h.restart();
+  const command = (await leaseCommands(h)).find(c => c.id === queued.id);
+  assert.ok(command);
+  assert.deepEqual(command.deckIds, body.deckIds);
+  assert.equal(command.expectedRevision, body.expectedRevision);
+  await ackLeased(h, command, { ok: true, detail: 'decks' });
+  const replay = await h.json('POST', '/api/app-commands', body);
+  assert.equal(replay.id, queued.id);
+  assert.equal(replay.deduplicated, true);
+});
+
 test('app command acknowledgements never return or persist a local PC path', async t => {
   const h = new RelayHarness();
   await h.start();
@@ -1140,11 +1178,15 @@ test('app command acknowledgements never return or persist a local PC path', asy
     type: 'fetchfile',
     uploadId: uploaded.body.uploadId,
     filename: '../../not-the-relay-owned-name.png',
+    sessionId: 'chat-one', generationId: 'generation-one',
     muxName: 'tab-one',
     insert: 'path',
   });
+  await h.restart();
   const queuedCommand = (await leaseCommands(h)).find(c => c.id === queued.id);
   assert.equal(queuedCommand.filename, 'input.png');
+  assert.equal(queuedCommand.sessionId, 'chat-one');
+  assert.equal(queuedCommand.generationId, 'generation-one');
   const localPath = 'C:\\Users\\Ahmed\\AppData\\Local\\secret\\input.png';
   await ackLeased(h, queuedCommand, {
     ok: true,
@@ -2092,6 +2134,10 @@ test('projects sync preserves decks and app commands preserve collection deck ta
 
   const queued = await h.request('POST', '/api/app-commands', {
     type: 'addtocollection',
+    intentId: 'collection-deck-target',
+    sessionId: 'chat-one',
+    expectedRevision: 'chat-revision',
+    expectedCollectionRevision: 'collection-revision',
     muxName: 'chat-one',
     collectionId: 'client-a--ops',
     collection: 'Ops',
@@ -2137,9 +2183,11 @@ test('projects save-tabs dialog keeps new-deck row hidden until selected', () =>
   assert.match(html, /id="wsdecknewrow" hidden/);
   assert.match(html, /#wscoldlg\s+\.dlgrow\s*\{[^}]*display:flex/);
   assert.match(html, /#wscoldlg\s+\.dlgrow\[hidden\]\s*\{[^}]*display:none/);
-  assert.match(html, /sessionId:s\.sessionId\|\|''/);
-  assert.match(html, /muxName:s\.projectMuxName\|\|s\.name/);
-  assert.match(html, /sessionId:tab\.sessionId\|\|''/);
+  // Filing a tab must use the AUTHORITATIVE session id. The older `sessionId:s.sessionId||''` form filed
+  // the tab against a merely-reported identity, so pin its absence instead of the obsolete literal.
+  assert.equal(html.includes("sessionId:s.sessionId||''"), false);
+  assert.ok(html.includes("generationId:s.generationId||''"));
+  assert.ok(html.includes("sessionId:s.authoritativeSessionId??s.sessionId??''"));
 });
 
 test('terminal add-to-collection dialog supports decks and stable chat identity', () => {
@@ -2157,7 +2205,8 @@ test('terminal add-to-collection dialog supports decks and stable chat identity'
   assert.match(html, /deckId:choice\.deckId\|\|''/);
   assert.match(html, /deckName:choice\.deckName\|\|''/);
   assert.match(html, /pollUploadCmd\(queued\.id,\s*20000\)/);
-  assert.match(html, /type:'fetchfile'[^}]*muxName:current[^}]*insert:insert\|\|'path'/);
+  assert.match(html, /type:'fetchfile'[^}]*\.\.\.destination[^}]*insert:insert\|\|'path'/);
+  assert.match(html, /generationId: selected\.generationId/);
 });
 
 test('terminal tab strip converts hovered wheel input to horizontal scrolling', () => {
@@ -2336,14 +2385,143 @@ test('terminal command retention is bounded without pruning pending work', async
   assert.equal(leased.some(command => command.id === 'old-pending'), true);
 });
 
+test('running projection preserves unresolved identity evidence without claiming absence', async t => {
+  const h = new RelayHarness();
+  t.after(() => h.stop());
+  await h.start();
+  const response = await h.request('POST', '/api/running', {
+    schemaVersion: 3, runningVerified: false, runningVerificationDetail: 'handle lookup unavailable',
+    runningSessions: [{ pid: 456, tool: 'codex', sessionId: 'known-id', sessionAliases: ['other-id'],
+      identityStatus: 'unverifiable', identitySource: 'open transcript' }],
+  });
+  assert.equal(response.status, 200);
+  const projects = await h.json('GET', '/api/projects');
+  assert.equal(projects.runningVerified, false);
+  assert.equal(projects.runningSessions.length, 1);
+  assert.deepEqual(projects.runningSessions[0].sessionAliases, ['other-id']);
+  assert.equal(projects.runningSessions[0].identityStatus, 'unverifiable');
+});
+
+// The GUI-active lane pushes the FULL /api/projects projection (collections + running rows together),
+// the closed-GUI lane pushes the light /api/running partial. Both must land the same identity evidence
+// in the stored projection, or the web's "identity unresolved/unverifiable" label and its alias-based
+// liveness would depend on which lane happened to push last. This is the full-projection counterpart of
+// the test above, and it also pins that a running push never clobbers the collections projection.
+test('full projection preserves unresolved running identity evidence alongside collections', async t => {
+  const h = new RelayHarness();
+  t.after(() => h.stop());
+  await h.start();
+  const posted = await h.json('POST', '/api/projects', {
+    schemaVersion: 3, host: 'PC',
+    decks: [{ id: 'deck-1', name: 'Main' }],
+    collections: [{
+      id: 'collection-1', name: 'Cortex', deckId: 'deck-1', deckName: 'Main',
+      chats: [{ id: 'known-id', title: 'Known chat', tool: 'codex', muxName: 'known-tab' }],
+    }],
+    allChats: [{ id: 'known-id', title: 'Known chat', tool: 'codex', muxName: 'known-tab' }],
+    runningVerified: false, runningVerificationDetail: 'handle lookup unavailable',
+    runningSessions: [{ pid: 456, tool: 'codex', sessionId: 'known-id', sessionAliases: ['other-id'],
+      identityStatus: 'unverifiable', identitySource: 'open transcript' }],
+  });
+  assert.equal(posted.ok, true);
+  const projects = await h.json('GET', '/api/projects');
+  assert.equal(projects.collections.length, 1);
+  assert.equal(projects.collections[0].chats[0].id, 'known-id');
+  assert.equal(projects.runningVerified, false);
+  assert.equal(projects.runningSessions.length, 1);
+  assert.equal(projects.runningSessions[0].identityStatus, 'unverifiable');
+  assert.equal(projects.runningSessions[0].identitySource, 'open transcript');
+  assert.deepEqual(projects.runningSessions[0].sessionAliases, ['other-id']);
+});
+
+test('hosted kill rejects a stale generation before sending any stop', async t => {
+  const h = new RelayHarness();
+  t.after(() => h.stop());
+  await h.start();
+  const host = await h.connectHost([{ ...shellSession('kill-replaced'), generationId: 'replacement-generation' }]);
+  t.after(() => host.close());
+  const response = await h.request('DELETE', '/api/sessions/kill-replaced', {
+    sessionId: '', generationId: 'original-generation',
+  });
+  assert.equal(response.status, 409);
+  assert.equal(host.messages.filter(m => m.t === 'kill').length, 0);
+  assert.equal((await h.json('GET', '/api/sessions'))[0].generationId, 'replacement-generation');
+});
+
+test('hosted kill carries exact shell identity and generation to muxd', async t => {
+  const h = new RelayHarness();
+  t.after(() => h.stop());
+  await h.start();
+  const host = await h.connectHost([{ ...shellSession('kill-fenced'), generationId: 'shell-generation' }]);
+  t.after(() => host.close());
+  const deletion = h.request('DELETE', '/api/sessions/kill-fenced', { sessionId: '', generationId: 'shell-generation' });
+  const kill = await host.waitFor(m => m.t === 'kill', 'fenced kill');
+  // Supply a response even against the old server so the counterexample leaves no pending request.
+  host.ws.send(JSON.stringify({ t: 'killed', s: kill.s, rid: kill.rid, sessionId: '', generationId: 'shell-generation' }));
+  const response = await deletion;
+  assert.equal(kill.sessionId, '');
+  assert.equal(kill.generationId, 'shell-generation');
+  assert.ok(kill.rid, 'stop completion must be correlated');
+  assert.equal(response.status, 200);
+});
+
+test('late killed frame cannot remove a same-name replacement projection', async t => {
+  const h = new RelayHarness();
+  t.after(() => h.stop());
+  await h.start();
+  const host = await h.connectHost([{ ...shellSession('kill-late'), generationId: 'replacement-generation' }]);
+  t.after(() => host.close());
+  // A correlated tail response is a host-link barrier, not a scheduling sleep.
+  const tail = h.request('GET', '/api/sessions/kill-late/tail');
+  const request = await host.waitFor(m => m.t === 'tail', 'host barrier');
+  host.ws.send(JSON.stringify({ t: 'killed', s: 'kill-late', rid: 'old-kill', sessionId: '', generationId: 'original-generation' }));
+  host.sendTail('kill-late', '', { request });
+  await tail;
+  assert.equal((await h.json('GET', '/api/sessions')).find(s => s.name === 'kill-late')?.generationId, 'replacement-generation');
+});
+
+test('hosted kill rejects missing identity and does not infer success from disappearance', async t => {
+  const h = new RelayHarness();
+  t.after(() => h.stop());
+  await h.start();
+  const session = { ...shellSession('kill-unknown'), generationId: 'unknown-generation' };
+  const host = await h.connectHost([session]);
+  t.after(() => host.close());
+  assert.equal((await h.request('DELETE', '/api/sessions/kill-unknown')).status, 400);
+  const deletion = h.request('DELETE', '/api/sessions/kill-unknown', { sessionId: '', generationId: session.generationId });
+  await host.waitFor(m => m.t === 'kill', 'pending kill');
+  host.sendSessions([]);
+  host.close();
+  assert.equal((await deletion).status, 503, 'disconnect after disappearance is not confirmed completion');
+});
+
+test('hosted kill completion preserves a replacement and fingerprints generation', async t => {
+  const h = new RelayHarness();
+  t.after(() => h.stop());
+  await h.start();
+  const session = { ...shellSession('kill-race'), generationId: 'first-generation' };
+  const host = await h.connectHost([session]);
+  t.after(() => host.close());
+  const body = { intentId: 'kill-race-intent', sessionId: '', generationId: session.generationId };
+  const deletion = h.request('DELETE', '/api/sessions/kill-race', body);
+  const request = await host.waitFor(m => m.t === 'kill', 'original stop');
+  host.sendSessions([{ ...session, generationId: 'second-generation' }]);
+  host.ws.send(JSON.stringify({ ...request, t: 'killed' }));
+  assert.equal((await deletion).status, 200);
+  assert.equal((await h.json('GET', '/api/sessions'))[0].generationId, 'second-generation');
+  assert.equal((await h.request('DELETE', '/api/sessions/kill-race', body)).status, 200);
+  assert.equal((await h.request('DELETE', '/api/sessions/kill-race', { ...body, generationId: 'second-generation' })).status, 409);
+  assert.equal(host.messages.filter(m => m.t === 'kill').length, 1);
+});
+
 test('DELETE /api/sessions sends kill and waits until hosted row is gone', async t => {
   const h = new RelayHarness();
   await h.start();
   t.after(async () => h.stop());
-  const host = await h.connectHost([shellSession('killcase')]);
+  const host = await h.connectHost([{ ...shellSession('killcase'), generationId: 'killcase-generation' }]);
   t.after(() => host.close());
 
-  const del = h.request('DELETE', '/api/sessions/killcase');
+  const del = h.request('DELETE', '/api/sessions/killcase', { sessionId: '', generationId: 'killcase-generation' });
   const kill = await host.waitFor(m => m.t === 'kill' && m.s === 'killcase', 'kill request');
   assert.equal(kill.s, 'killcase');
 

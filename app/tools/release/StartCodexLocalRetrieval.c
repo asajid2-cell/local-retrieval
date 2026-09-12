@@ -14,7 +14,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR commandLine, i
     wchar_t launcherPath[MAX_PATH];
     if (GetModuleFileNameW(NULL, launcherPath, MAX_PATH) == 0)
     {
-        MessageBoxW(NULL, L"Could not locate the launcher.", L"Codex Local Retrieval", MB_ICONERROR);
+        MessageBoxW(NULL, L"Could not locate the launcher.", L"MUX", MB_ICONERROR);
         return 1;
     }
 
@@ -23,7 +23,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR commandLine, i
     wchar_t *lastSlash = wcsrchr(rootPath, L'\\');
     if (lastSlash == NULL)
     {
-        MessageBoxW(NULL, L"Could not locate the application folder.", L"Codex Local Retrieval", MB_ICONERROR);
+        MessageBoxW(NULL, L"Could not locate the application folder.", L"MUX", MB_ICONERROR);
         return 1;
     }
     *lastSlash = L'\0';
@@ -42,7 +42,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR commandLine, i
 
     if (!CreateProcessW(appPath, NULL, NULL, NULL, FALSE, 0, NULL, appDirectory, &startup, &process))
     {
-        MessageBoxW(NULL, L"Could not start app\\CodexLocalRetrieval.Native.exe. Keep the app folder next to this launcher.", L"Codex Local Retrieval", MB_ICONERROR);
+        MessageBoxW(NULL, L"Could not start app\\CodexLocalRetrieval.Native.exe. Keep the app folder next to the MUX launcher.", L"MUX", MB_ICONERROR);
         return 1;
     }
 

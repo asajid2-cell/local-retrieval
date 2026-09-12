@@ -28,6 +28,7 @@ public sealed class BranchRealCorpusRepro
     }
 
     [TestMethod]
+    [TestCategory("RealStore")]
     public async Task BranchingRealClaudeTranscripts_Succeeds()
     {
         var sources = RealClaudeTranscripts(6);

@@ -202,11 +202,24 @@ public sealed class ClaudeSessionStore
         // Invariant: the app never writes into a transcript a LIVE agent owns. Defer the rename if the
         // session is currently running (its own writes take precedence; retry once it's idle).
         if (IsIdLive(id)) return false;
-        var rec = JsonSerializer.Serialize(new { type = "custom-title", sessionId = id, customTitle = title });
-        using var fs = new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite);
-        using var sw = new StreamWriter(fs);
-        sw.Write(rec + "\n");
-        return true;
+        if (!new CodexLocalRetrieval.Core.Remote.SessionLaunchGovernor().TryAcquire(
+            new(id, null, "claude", "native-rename", "native title write", "", "", ""),
+            out var claim, out _)) return false;
+        using (claim)
+        {
+            try
+            {
+                using var fs = new FileStream(path, FileMode.Open, FileAccess.Write, FileShare.Read);
+                if (string.Equals(TailTitle(path).custom, title, StringComparison.Ordinal)) return true;
+                fs.Seek(0, SeekOrigin.End);
+                var rec = JsonSerializer.Serialize(new { type = "custom-title", sessionId = id, customTitle = title });
+                using var sw = new StreamWriter(fs);
+                sw.Write(rec + "\n");
+                return true;
+            }
+            catch (IOException) { return false; }
+            catch (UnauthorizedAccessException) { return false; }
+        }
     }
 
     // True if a live claude/codex agent is currently resuming this session id (so its transcript is owned).
@@ -215,12 +228,11 @@ public sealed class ClaudeSessionStore
         try
         {
             if (string.IsNullOrEmpty(id)) return false;
-            foreach (var r in CodexLocalRetrieval.Core.Remote.RunningSessions.Scan())
-                if (!string.IsNullOrEmpty(r.SessionId) && string.Equals(r.SessionId, id, StringComparison.OrdinalIgnoreCase))
-                    return true;
-            return false;
+            if (!CodexLocalRetrieval.Core.Remote.RunningSessions.TryAllLiveSessionIds(
+                out var live, out var unverifiable, out _, bypassCache: true)) return true;
+            return unverifiable.Count != 0 || live.Contains(id);
         }
-        catch { return false; }
+        catch { return true; }
     }
 
     private static string? FirstUserText(JsonElement content)

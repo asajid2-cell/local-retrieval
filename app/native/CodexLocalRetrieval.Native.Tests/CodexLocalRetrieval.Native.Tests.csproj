@@ -18,6 +18,7 @@
 
   <ItemGroup>
     <Compile Include="..\CodexLocalRetrieval.Native\Diag.cs" Link="Native\Diag.cs" />
+    <Compile Include="..\CodexLocalRetrieval.Native\GuiVerificationFixture.cs" Link="Native\GuiVerificationFixture.cs" />
   </ItemGroup>
 
   <ItemGroup>

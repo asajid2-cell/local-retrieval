@@ -1,6 +1,6 @@
 # v0.2.0
 
-Multi-agent archive: index Codex and Claude, resume in a terminal, and let agents file themselves in.
+MUX multi-agent archive release: index Codex and Claude, resume in a terminal, and let agents file themselves in.
 
 ## Highlights
 
@@ -46,7 +46,7 @@ Patch release for local session indexing.
 
 # v0.1.0
 
-First public release of Codex Local Retrieval.
+First public release under the historical product name Codex Local Retrieval; MUX is the active product name.
 
 ## Highlights
 
@@ -61,9 +61,9 @@ First public release of Codex Local Retrieval.
 
 ## Release Artifact
 
-- `codex-local-retrieval-win-x64.zip`
-- Portable Windows x64 build.
-- Contains a top-level `Codex Local Retrieval.exe` launcher and an `app` folder for runtime files.
+- `mux-win-x64.zip`
+- Portable Windows x64 MUX build.
+- Contains a top-level `MUX.exe` launcher and an `app` folder for runtime files. The runtime executable remains `CodexLocalRetrieval.Native.exe` for internal compatibility.
 - Unsigned; Windows SmartScreen may warn on first launch.
 
 ## Validation

@@ -108,6 +108,90 @@ public sealed class StaleGuardedRefresherTests
     }
 
     [TestMethod]
+    public async Task RecomputedKey_DoesNotMakeACompletedRefreshLookUnverified()
+    {
+        var refresher = new StaleGuardedRefresher<Box>();
+
+        var first = await refresher.RefreshAsync("session|before", () => new Box("verified"), force: true);
+        Assert.IsTrue(first.IsCurrent);
+        Assert.IsNotNull(refresher.CurrentFor("session|before"));
+
+        // A sync changes the key before the caller consumes the result. This is the exact reclaim shape:
+        // asking CurrentFor(the-new-key) must not be treated as proof that the completed refresh was stale.
+        var currentKey = "session|after-sync";
+        Assert.IsNull(refresher.CurrentFor(currentKey));
+        Assert.AreEqual("verified", first.Value?.Value);
+        Assert.IsTrue(first.IsCurrent);
+
+    }
+
+    [TestMethod]
+    public async Task SupersededRefresh_IsNotConsumedAsPostState()
+    {
+        using var releaseOld = new ManualResetEventSlim(false);
+        using var oldEntered = new ManualResetEventSlim(false);
+        var refresher = new StaleGuardedRefresher<Box>();
+        var old = refresher.RefreshAsync("session", () =>
+        {
+            oldEntered.Set();
+            releaseOld.Wait(Patience);
+            return new Box("old");
+        }, force: true);
+        Wait(oldEntered.WaitHandle, "the first build to start");
+        var current = await refresher.RefreshAsync("session|new", () => new Box("current"), force: true);
+        releaseOld.Set();
+        await old;
+
+        Assert.IsTrue(current.IsCurrent);
+        Assert.IsFalse(old.Result.IsCurrent);
+        Assert.AreEqual("current", current.Value?.Value);
+    }
+
+    [TestMethod]
+    public async Task InvalidateThenSameKeyRefresh_StartsNewBuild_AndOldCompletionCannotClearIt()
+    {
+        var oldStarted = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var newStarted = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseOld = new TaskCompletionSource<Box>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseNew = new TaskCompletionSource<Box>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var refresher = new StaleGuardedRefresher<Box>();
+
+        var old = refresher.RefreshAsync("k", () =>
+        {
+            oldStarted.SetResult(true);
+            return releaseOld.Task.GetAwaiter().GetResult();
+        }, force: true);
+        Assert.IsTrue(await Task.WhenAny(oldStarted.Task, Task.Delay(Patience)) == oldStarted.Task);
+
+        refresher.Invalidate();
+        var current = refresher.RefreshAsync("k", () =>
+        {
+            newStarted.SetResult(true);
+            return releaseNew.Task.GetAwaiter().GetResult();
+        }, force: true);
+
+        Assert.IsTrue(
+            await Task.WhenAny(newStarted.Task, Task.Delay(Patience)) == newStarted.Task,
+            "invalidation must prevent coalescing onto the superseded same-key build");
+        Assert.AreEqual(2, refresher.BuildCount);
+        Assert.IsTrue(refresher.IsRefreshing, "the replacement build must still be in flight");
+
+        releaseOld.SetResult(new Box("old"));
+        var oldOutcome = await old;
+        Assert.IsFalse(oldOutcome.IsCurrent);
+        Assert.IsTrue(refresher.IsRefreshing, "the superseded old build cleared the replacement slot");
+        Assert.IsNull(refresher.Current);
+
+        releaseNew.SetResult(new Box("current"));
+        var currentOutcome = await current;
+        Assert.IsTrue(currentOutcome.IsCurrent);
+        Assert.AreEqual("current", refresher.Current?.Value);
+        Assert.IsFalse(refresher.IsRefreshing);
+        Assert.AreEqual("old", oldOutcome.Value?.Value);
+        Assert.AreEqual("current", currentOutcome.Value?.Value);
+    }
+
+    [TestMethod]
     public void ForceRefresh_CoalescesWithAnInFlightBuildForTheSameKey()
     {
         using var release = new ManualResetEventSlim(false);

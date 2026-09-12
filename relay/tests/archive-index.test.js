@@ -93,6 +93,8 @@ class Harness {
         MUX_HOST_TOKEN: HOST_TOKEN,
         MUX_BRIDGE_TOKEN: BRIDGE_TOKEN,
         MUX_TEST_MODE: '1',
+        MUX_TEST_FIXTURE: '1',
+        MUX_BIND_HOST: '127.0.0.1',
         MUX_AUTOHEAL: '0',
         MUX_STATE_DIR: this.tmp,
         HLAUTH_BASE: 'http://127.0.0.1:1',
@@ -102,7 +104,7 @@ class Harness {
     });
     this.proc.stdout.on('data', d => { this.stdout += d.toString(); });
     this.proc.stderr.on('data', d => { this.stderr += d.toString(); });
-    await waitFor(() => this.stdout.includes(`multiplex-app on 0.0.0.0:${this.port}`), 'relay start', 8000);
+    await waitFor(() => this.stdout.includes(`multiplex-app on 127.0.0.1:${this.port}`), 'relay start', 8000);
   }
 
   async stopProcess() {

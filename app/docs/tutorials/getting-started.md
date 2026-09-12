@@ -1,6 +1,6 @@
 # Getting Started
 
-This tutorial builds and opens the native app with sanitized sample data.
+This tutorial builds and opens MUX with sanitized sample data.
 
 ## Prerequisites
 
@@ -37,4 +37,4 @@ Expected result: all service tests pass.
 .\tools\release\package-win-x64.ps1
 ```
 
-Expected result: `artifacts/codex-local-retrieval-win-x64.zip` is created. The release ZIP should contain a top-level `Codex Local Retrieval.exe` launcher and an `app` folder. The first release ZIP is unsigned.
+Expected result: `artifacts/mux-win-x64.zip` is created. The release ZIP should contain a top-level `MUX.exe` launcher and an `app` folder. The runtime executable in that folder is `CodexLocalRetrieval.Native.exe` for internal compatibility. The first release ZIP is unsigned.

@@ -7,6 +7,30 @@ namespace CodexLocalRetrieval.Native.Tests;
 public sealed class SessionIntegrityTests
 {
     [TestMethod]
+    public void BuildPostStateNotice_UsesAuthoritativeBlockedOutcome()
+    {
+        var (store, session) = Seed(filed: true);
+        var blocked = Build(store, session, liveIds: new[] { session.Id });
+        var report = new ReclaimReport(true, "ok", true, "ok", Array.Empty<ReclaimKilledPid>(), Array.Empty<ReclaimClaimResult>(), Array.Empty<string>(), false, false, "", "ready to continue");
+
+        var notice = SessionReclaim.BuildPostStateNotice(report, blocked);
+
+        StringAssert.StartsWith(notice, "Reclaim incomplete:");
+        StringAssert.Contains(notice, "live owner");
+        Assert.DoesNotContain("Reclaim completed", notice);
+    }
+
+    [TestMethod]
+    public void BuildPostStateNotice_ReportsCompletedOnlyWhenPostStateIsClear()
+    {
+        var (store, session) = Seed(filed: true);
+        var clear = Build(store, session);
+        var report = new ReclaimReport(true, "ok", true, "ok", Array.Empty<ReclaimKilledPid>(), Array.Empty<ReclaimClaimResult>(), Array.Empty<string>(), false, false, "", "ready to continue");
+
+        StringAssert.StartsWith(SessionReclaim.BuildPostStateNotice(report, clear), "Reclaim completed");
+    }
+
+    [TestMethod]
     public void Build_DangerWhenLiveOwnerScanIsUnverified()
     {
         var (store, session) = Seed(filed: true);
@@ -204,7 +228,7 @@ public sealed class SessionIntegrityTests
     }
 
     [TestMethod]
-    public void Build_DangerForRecentFailedOwnershipEvent()
+    public void Build_HistoricalFailedOwnershipEventNeedsReviewButDoesNotBlock()
     {
         using var events = TempDir("integrity-events");
         var now = DateTimeOffset.Parse("2026-07-08T12:00:00Z");
@@ -216,9 +240,28 @@ public sealed class SessionIntegrityTests
 
         var summary = Build(store, session, eventRoot: events.Path, now: now);
 
-        Assert.AreEqual("danger", summary.Severity);
-        Assert.AreEqual("danger", Check(summary, "Recent events").Severity);
+        Assert.AreEqual("warn", summary.Severity);
+        Assert.AreEqual("warn", Check(summary, "Recent events").Severity);
+        StringAssert.Contains(Check(summary, "Recent events").Summary, "history alone does not block continuation");
         Assert.AreEqual(1, summary.RecentEvents.Count);
+    }
+
+    [TestMethod]
+    public void Build_ActiveOwnerRemainsBlockedDespiteHistoricalEvents()
+    {
+        using var events = TempDir("integrity-events");
+        var now = DateTimeOffset.Parse("2026-07-08T12:00:00Z");
+        var (store, session) = Seed(filed: true);
+        Assert.IsTrue(SessionEventLedger.TryAppend(
+            SessionEventLedger.Create("mux.failed", "mux failed", session.Id, severity: "error", at: now),
+            out var detail,
+            new SessionEventLedger.Options(events.Path, now)), detail);
+
+        var summary = Build(store, session, liveIds: new[] { session.Id }, eventRoot: events.Path, now: now);
+
+        Assert.AreEqual("danger", summary.Severity);
+        Assert.AreEqual("danger", Check(summary, "Live owner").Severity);
+        Assert.AreEqual("warn", Check(summary, "Recent events").Severity);
     }
 
     private static (AppStoreData store, ArchiveSession session) Seed(bool filed)

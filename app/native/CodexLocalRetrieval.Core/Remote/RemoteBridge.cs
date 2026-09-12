@@ -9,6 +9,7 @@ using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using CodexLocalRetrieval.Core.Agents;
+using CodexLocalRetrieval.Core.Models;
 using CodexLocalRetrieval.Core.Services;
 
 namespace CodexLocalRetrieval.Core.Remote;
@@ -32,7 +33,28 @@ public sealed class RemoteBridge
     private readonly Action<string> _log;
     private readonly Func<string?, string?, string?, Task<(bool ok, ArchiveService.RemoteMuxLaunch? launch, string detail)>>? _resolveMuxLaunch;
     private readonly Func<Task<IReadOnlyList<ArchiveService.PendingMuxBinding>>>? _resolvePendingMuxBindings;
+    private readonly Func<JsonElement, Task<(bool ok, string detail)>>? _executeArchiveCommand;
+    private readonly Func<StartChatPreparationRequest, Func<object, Task<string>>, Task<StartChatPreparationResult>>? _executeStartChat;
+    private readonly Func<JsonElement, Task<(bool ok, string detail)>>? _fetchTranscript;
+    private readonly Func<string, string, string, Task<bool>>? _fixtureDownload;
+    private readonly string? _fixtureSshConfigPath;
+    private readonly string? _fixtureUploadRoot;
+    // Test-only loopback transport. Call sites name the operation; the production path remains SSH.
+    private readonly Func<Settings, BridgeOperation, string?, string?, TimeSpan?, Task<(int code, string outText)>>? _transport;
     private readonly IProcessContainment? _processContainment;
+    private readonly bool _isolationFixture;
+    private readonly Func<JsonElement, string, Task<(bool ok, string detail)>>? _captureWorkspace;
+    private readonly Func<Task<string>>? _fixtureWorkspaceListing;
+    private readonly Func<object, Task<string>>? _fixtureMuxRequest;
+    private readonly Func<(bool verified, List<ArchiveService.RunningSessionInfo> sessions, string detail)>? _runningSnapshot;
+    public bool IsolationFixture => _isolationFixture;
+
+    internal static string ValidateIsolationPort(int port) =>
+        int.TryParse(Environment.GetEnvironmentVariable("CLR_REMOTE_TEST_RELAY_PORT"), out var expected) && expected == port
+            ? ""
+            : "isolated remote test profile requires CLR_REMOTE_TEST_RELAY_PORT to match the archive relay port";
+
+    public enum BridgeOperation { Running, Lease, Ack }
     private readonly string _commandLeaseOwner = RemoteCommandProtocol.LeaseOwner("headless");
     // At-most-once fence for intent-fenced polled commands — see MainPage.Remote.cs for the GUI twin.
     private readonly RemoteCommandProtocol.IntentLedger _commandIntents = new();
@@ -51,8 +73,39 @@ public sealed class RemoteBridge
         Action<string>? log = null,
         Func<string?, string?, string?, Task<(bool ok, ArchiveService.RemoteMuxLaunch? launch, string detail)>>? resolveMuxLaunch = null,
         Func<Task<IReadOnlyList<ArchiveService.PendingMuxBinding>>>? resolvePendingMuxBindings = null,
-        IProcessContainment? processContainment = null)
+        Func<JsonElement, Task<(bool ok, string detail)>>? executeArchiveCommand = null,
+        IProcessContainment? processContainment = null,
+        Func<Settings, BridgeOperation, string?, string?, TimeSpan?, Task<(int code, string outText)>>? transport = null,
+        bool isolationFixture = false,
+        Func<(bool verified, List<ArchiveService.RunningSessionInfo> sessions, string detail)>? runningSnapshot = null,
+        Func<JsonElement, string, Task<(bool ok, string detail)>>? captureWorkspace = null,
+        Func<Task<string>>? fixtureWorkspaceListing = null,
+        Func<StartChatPreparationRequest, Func<object, Task<string>>, Task<StartChatPreparationResult>>? executeStartChat = null,
+        Func<object, Task<string>>? fixtureMuxRequest = null,
+        Func<string, Task<bool>>? reconcileStartChatBindings = null,
+        Func<JsonElement, Func<object, Task<string>>, Task<ReclaimOperationResult>>? executeReclaim = null,
+        Func<JsonElement, Task<(bool ok, string detail)>>? fetchTranscript = null,
+        Func<string, string, string, Task<bool>>? fixtureDownload = null,
+        string? fixtureUploadRoot = null,
+        string? fixtureSshConfigPath = null)
     {
+        if (isolationFixture && transport is null)
+            throw new ArgumentException("isolated bridge requires an injected relay transport", nameof(transport));
+        if ((fixtureDownload is not null || fixtureUploadRoot is not null || fixtureSshConfigPath is not null) && !isolationFixture)
+            throw new ArgumentException("fixture upload transport requires isolation");
+        _fixtureSshConfigPath = fixtureSshConfigPath;
+        _fixtureDownload = fixtureDownload;
+        _fixtureUploadRoot = fixtureUploadRoot;
+        _isolationFixture = isolationFixture;
+        _runningSnapshot = runningSnapshot;
+        if (fixtureWorkspaceListing is not null && !isolationFixture)
+            throw new ArgumentException("fixture workspace listing requires isolation", nameof(fixtureWorkspaceListing));
+        _captureWorkspace = captureWorkspace;
+        _fixtureWorkspaceListing = fixtureWorkspaceListing;
+        if (fixtureMuxRequest is not null && !isolationFixture)
+            throw new ArgumentException("fixture mux transport requires isolation", nameof(fixtureMuxRequest));
+        _fixtureMuxRequest = fixtureMuxRequest;
+
         _settings = settings;
         _guiPrimaryRunning = guiPrimaryRunning;
         _claude = claude;
@@ -60,7 +113,13 @@ public sealed class RemoteBridge
         _log = log ?? (_ => { });
         _resolveMuxLaunch = resolveMuxLaunch;
         _resolvePendingMuxBindings = resolvePendingMuxBindings;
+        _executeArchiveCommand = executeArchiveCommand;
+        _executeStartChat = executeStartChat;
+        _fetchTranscript = fetchTranscript;
+        _reconcileStartChatBindings = reconcileStartChatBindings;
+        _executeReclaim = executeReclaim;
         _processContainment = processContainment;
+        _transport = transport;
     }
 
     // The running heartbeat and the command drain used to share one 3s tick, with the push taken every 3rd
@@ -102,7 +161,8 @@ public sealed class RemoteBridge
                     var s = _settings();
                     if (s is not null && !string.IsNullOrWhiteSpace(s.Target))
                     {
-                        await ReconcilePendingMuxBindingsAsync();
+                        if (!_isolationFixture || _fixtureMuxRequest is not null)
+                            await ReconcilePendingMuxBindingsAsync();
 
                         now = DateTimeOffset.UtcNow;
                         if (now >= nextPushAt)
@@ -142,12 +202,19 @@ public sealed class RemoteBridge
 
     private static readonly TimeSpan MinLoopDelay = TimeSpan.FromSeconds(3);
 
+    private readonly Func<string, Task<bool>>? _reconcileStartChatBindings;
+    private readonly Func<JsonElement, Func<object, Task<string>>, Task<ReclaimOperationResult>>? _executeReclaim;
+
     private async Task ReconcilePendingMuxBindingsAsync()
     {
-        if (_resolvePendingMuxBindings is null) return;
+        if (_isolationFixture && _fixtureMuxRequest is null) return;
+        if (_resolvePendingMuxBindings is null && _reconcileStartChatBindings is null) return;
+        Task<string> Request(object frame) => _fixtureMuxRequest is not null
+            ? _fixtureMuxRequest(frame) : LocalMuxdRequestAsync(frame);
         try
         {
-            var listing = await LocalMuxdRequestAsync(new { t = "ls" });
+            var listing = await Request(new { t = "ls" });
+            if (_reconcileStartChatBindings is not null) await _reconcileStartChatBindings(listing);
             using var listDoc = JsonDocument.Parse(listing);
             if (!listDoc.RootElement.TryGetProperty("list", out var list) || list.ValueKind != JsonValueKind.Array)
                 return;
@@ -159,6 +226,7 @@ public sealed class RemoteBridge
         }
         catch { return; }
 
+        if (_isolationFixture || _resolvePendingMuxBindings is null) return;
         foreach (var binding in await _resolvePendingMuxBindings())
         {
             try
@@ -168,6 +236,7 @@ public sealed class RemoteBridge
                 {
                     t = "bind",
                     s = binding.MuxName,
+                    generationId = binding.Generation,
                     cmd = launch.Command,
                     sessionId = launch.SessionId,
                     aliases = launch.Aliases
@@ -185,11 +254,21 @@ public sealed class RemoteBridge
     // so the collections projection the desktop app last pushed is left intact.
     private async Task PushRunningAsync(Settings s)
     {
-        var verified = RunningSessions.TryScan(out var scanned, out var verificationDetail);
-        var running = scanned.Select(r => new
+        bool verified;
+        List<ArchiveService.RunningSessionInfo> scanned;
+        string verificationDetail;
+        if (_runningSnapshot is not null)
+            (verified, scanned, verificationDetail) = _runningSnapshot();
+        else
+        {
+            verified = RunningSessions.TryScanEnriched(out scanned, out verificationDetail);
+        }
+        var running = (scanned ?? new List<ArchiveService.RunningSessionInfo>()).Select(r => new
         {
             pid = r.Pid, tool = r.Tool, sessionId = r.SessionId, parent = r.Parent,
             startedAt = r.StartedAt,
+            sessionAliases = r.SessionAliases ?? Array.Empty<string>(),
+            identityStatus = r.IdentityStatus, identitySource = r.IdentitySource,
             title = (string?)null, collection = (string?)null,
             realTitle = RealTitle(r.Tool, r.SessionId),
         }).OrderByDescending(r => r.startedAt, StringComparer.Ordinal).ToList();
@@ -202,7 +281,7 @@ public sealed class RemoteBridge
             runningVerificationDetail = verified ? "" : verificationDetail,
         });
         var remote = $"curl -s -X POST http://127.0.0.1:{s.Port}/api/running -H 'Content-Type: application/json' --data-binary @-";
-        await RunSshAsync(s.Target, remote, json);
+        await RunTransportAsync(s, BridgeOperation.Running, json, null);
     }
 
     // The tool's OWN name where it's a cheap point-lookup (codex thread title). Claude's custom title needs
@@ -228,11 +307,13 @@ public sealed class RemoteBridge
         // immediately — the backoff alone then paces the polling, exactly as before. The ssh
         // timeout for this one call must sit well above the hold (the relay caps the hold at 25s).
         var leaseJson = JsonSerializer.Serialize(new { owner = _commandLeaseOwner, limit = 1, waitMs = (int)LeaseHoldWait.TotalMilliseconds });
-        var outText = (await RunSshAsync(
-            s.Target,
-            $"curl -s -X POST http://127.0.0.1:{s.Port}/api/app-commands/lease -H 'Content-Type: application/json' --data-binary @-",
+        var lease = await RunTransportAsync(
+            s,
+            BridgeOperation.Lease,
             leaseJson,
-            timeout: LeaseHoldWait + SshHardTimeout)).outText;
+            LeaseHoldWait + SshHardTimeout);
+        if (lease.code != 0) return false;
+        var outText = lease.outText;
         if (string.IsNullOrWhiteSpace(outText)) return false;
         List<Cmd>? cmds;
         try { cmds = JsonSerializer.Deserialize<List<Cmd>>(outText); } catch { return false; }
@@ -247,6 +328,7 @@ public sealed class RemoteBridge
             // ONE gate, before any side effect: replay policy AND (for intent-fenced types) a live lease
             // token + a stable intent id that has not already been delivered.
             var admission = _commandIntents.Admit(c.type, c.replayPolicy, c.intentId, c.leaseToken, out var gated);
+            if (admission == RemoteCommandAdmission.Busy) continue;
             if (admission != RemoteCommandAdmission.Execute)
             {
                 if (admission == RemoteCommandAdmission.Refused)
@@ -276,9 +358,22 @@ public sealed class RemoteBridge
                 case "transcript":
                     res = (true, ReadTranscriptTail(c.tool ?? "claude", c.sessionId ?? "")); break;
                 case "rename":
-                    res = Rename(c.tool ?? "claude", c.sessionId ?? "", c.title ?? ""); changed |= res.ok; break;
+                {
+                    if (_executeArchiveCommand is null) { res = (false, "native rename authority unavailable"); break; }
+                    using var command = JsonDocument.Parse(JsonSerializer.Serialize(c));
+                    try { res = await _executeArchiveCommand(command.RootElement); }
+                    catch (RemoteCommandUnconfirmedException)
+                    {
+                        _commandIntents.Release(c.intentId);
+                        continue;
+                    }
+                    changed |= res.ok;
+                    break;
+                }
                 case "fetchfile":
                 {
+                    if (_isolationFixture && (_fixtureMuxRequest is null || (_fixtureDownload is null && _fixtureSshConfigPath is null) || _fixtureUploadRoot is null))
+                    { res = (false, "isolated upload transport unavailable"); break; }
                     var transfer = await RemoteUploadTransfer.FetchAndInsertAsync(
                         s.Target,
                         c.uploadId ?? "",
@@ -287,13 +382,145 @@ public sealed class RemoteBridge
                         c.muxName ?? c.sessionName,
                         c.insert,
                         c.intentId,
-                        LocalMuxdRequestAsync);
+                        _isolationFixture ? _fixtureMuxRequest! : LocalMuxdRequestAsync,
+                        c.sessionId, c.generationId, _fixtureDownload, _fixtureUploadRoot, _fixtureSshConfigPath);
+                    if (transfer.Uncertain)
+                    {
+                        _commandIntents.Release(c.intentId);
+                        continue;
+                    }
                     res = (transfer.Ok, transfer.Detail);
                     onPc = transfer.OnPc;
                     break;
                 }
+                case "transcriptfetch":
+                {
+                    if (_fetchTranscript is null) { res = (false, "transcript authority unavailable"); break; }
+                    using var command = JsonDocument.Parse(JsonSerializer.Serialize(c));
+                    res = await _fetchTranscript(command.RootElement);
+                    break;
+                }
+                case "setfavorite":
+                case "setapptitle":
+                case "archive":
+                case "setphrases":
+                case "settag":
+                {
+                    if (_executeArchiveCommand is null)
+                    {
+                        res = (false, "archive command dispatch unavailable");
+                        break;
+                    }
+                    using var command = JsonDocument.Parse(JsonSerializer.Serialize(c));
+                    res = await _executeArchiveCommand(command.RootElement);
+                    break;
+                }
+                case "checkpointcreate":
+                case "checkpointrename":
+                case "checkpointdelete":
+                case "checkpointspawn":
+                case "branchcreate":
+                {
+                    if (_executeArchiveCommand is null)
+                    {
+                        res = (false, "archive command dispatch unavailable");
+                        break;
+                    }
+                    using var command = JsonDocument.Parse(JsonSerializer.Serialize(c));
+                    res = await _executeArchiveCommand(command.RootElement);
+                    break;
+                }
+                case "captureworkspace":
+                {
+                    if (_captureWorkspace is null || (_isolationFixture && _fixtureWorkspaceListing is null))
+                    {
+                        res = (false, "workspace authority unavailable");
+                        break;
+                    }
+                    var listing = _isolationFixture ? await _fixtureWorkspaceListing!() : await LocalMuxdRequestAsync(new { t = "ls" });
+                    using var command = JsonDocument.Parse(JsonSerializer.Serialize(c));
+                    res = await _captureWorkspace(command.RootElement, listing);
+                    break;
+                }
                 case "addtocollection":
-                    res = (false, "desktop app required for collection changes"); break;
+                case "removefromcollection":
+                case "deckcreate":
+                case "collectioncreate":
+                case "deckrename":
+                case "collectionrename":
+                case "collectionmove":
+                case "deckdelete":
+                case "collectiondelete":
+                case "collectionrecover":
+                case "collectionpurge":
+                case "collectionempty":
+                case "collectionsettag":
+                case "collectionreorder":
+                case "deckreorder":
+                {
+                    if (_executeArchiveCommand is null)
+                    {
+                        res = (false, "archive command dispatch unavailable");
+                        break;
+                    }
+                    using var command = JsonDocument.Parse(JsonSerializer.Serialize(c));
+                    res = await _executeArchiveCommand(command.RootElement);
+                    break;
+                }
+                case "reclaim":
+                {
+                    if (!c.confirmed || _executeReclaim is null || (_isolationFixture && _fixtureMuxRequest is null))
+                    {
+                        res = (false, "confirmed reclaim authority unavailable");
+                        break;
+                    }
+                    ReclaimOperationResult outcome;
+                    try
+                    {
+                        using var command = JsonDocument.Parse(JsonSerializer.Serialize(c));
+                        outcome = await _executeReclaim(command.RootElement, _isolationFixture ? _fixtureMuxRequest! : LocalMuxdRequestAsync);
+                    }
+                    catch
+                    {
+                        _commandIntents.Release(c.intentId);
+                        continue;
+                    }
+                    var reply = ReclaimCommandOutcome.Reply(outcome.Status);
+                    if (!reply.Acknowledge)
+                    {
+                        _commandIntents.Release(c.intentId);
+                        continue;
+                    }
+                    res = (reply.Ok, outcome.Detail);
+                    break;
+                }
+                case "startchat":
+                {
+                    if ((_isolationFixture && _fixtureMuxRequest is null) || _executeStartChat is null)
+                    {
+                        res = (false, "startchat launch authority unavailable in this profile");
+                        break;
+                    }
+                    var request = new StartChatPreparationRequest(c.intentId, c.muxName ?? c.sessionName ?? "",
+                        c.deckId ?? "", c.tool ?? "", c.workspaceId ?? "", c.subfolder ?? "",
+                        c.checkpointId ?? "", c.checkpointRevision ?? "", c.collectionId ?? "",
+                        c.collectionRevision ?? "", c.collection ?? "", c.title ?? "", c.phrase ?? "",
+                        c.launchMode ?? ArchiveService.NativeLaunchMode, c.handoffFromId ?? "");
+                    StartChatPreparationResult outcome;
+                    try { outcome = await _executeStartChat(request, _isolationFixture ? _fixtureMuxRequest! : LocalMuxdRequestAsync); }
+                    catch
+                    {
+                        _commandIntents.Release(c.intentId);
+                        continue;
+                    }
+                    if (outcome.Uncertain)
+                    {
+                        _commandIntents.Release(c.intentId);
+                        continue;
+                    }
+                    res = (outcome.Ok, outcome.Detail);
+                    break;
+                }
                 case "startmux":
                     res = await StartMuxHeadlessAsync(
                         c.muxName ?? c.sessionName ?? "",
@@ -314,19 +541,12 @@ public sealed class RemoteBridge
                     res = (false, "unknown command"); break;
             }
             if (admission == RemoteCommandAdmission.Execute) _commandIntents.Record(c.intentId, res.ok, res.detail);
-            var ackJson = JsonSerializer.Serialize(new { leaseToken = c.leaseToken, ok = res.ok, detail = res.detail, onPc });
+            var resultId = res.ok && (c.type is "deckcreate" or "collectioncreate") ? res.detail : null;
+            var ackJson = JsonSerializer.Serialize(new { leaseToken = c.leaseToken, ok = res.ok, detail = res.detail, resultId, onPc });
             await AckCommandAsync(s, c.id, ackJson);
         }
         if (changed) { await Task.Delay(300); await PushRunningAsync(s); }   // reflect a kill/rename fast
         return true;
-    }
-
-    private (bool ok, string detail) Rename(string tool, string id, string title)
-    {
-        title = (title ?? "").Trim();
-        if (string.IsNullOrEmpty(id) || string.IsNullOrEmpty(title)) return (false, "id and title required");
-        if (string.Equals(tool, "codex", StringComparison.OrdinalIgnoreCase)) return (false, "Codex titles its own sessions");
-        return _claude.RenameSession(id, title) ? (true, "renamed") : (false, "session not found");
     }
 
     private async Task<(bool ok, string detail)> StartMuxHeadlessAsync(
@@ -337,6 +557,9 @@ public sealed class RemoteBridge
         bool takeover = false,
         string? launchMode = null)
     {
+        if (_isolationFixture && (_fixtureMuxRequest is null || takeover || string.IsNullOrWhiteSpace(requestedSessionId)))
+            return (false, "isolated fixture resume requires an existing identity and forbids takeover");
+        Task<string> Request(object frame) => _isolationFixture ? _fixtureMuxRequest!(frame) : LocalMuxdRequestAsync(frame);
         name = (name ?? "").Trim();
         var eventSessionId = (requestedSessionId ?? "").Trim();
         if (string.IsNullOrEmpty(name))
@@ -371,6 +594,10 @@ public sealed class RemoteBridge
                 return (false, resolved.detail);
             }
             var launch = resolved.launch;
+            using var capability = JsonDocument.Parse(await Request(new { t = "info" }));
+            if (!capability.RootElement.TryGetProperty("caps", out var caps) || caps.ValueKind != JsonValueKind.Array
+                || !caps.EnumerateArray().Any(cap => cap.ValueKind == JsonValueKind.String && cap.GetString() == "resumeOnly"))
+                return (false, "mux daemon does not support protected resume; update it before resuming remotely");
             if (takeover)
             {
                 var transferred = await MuxIdentityTransfer.ExecuteAsync(
@@ -390,7 +617,7 @@ public sealed class RemoteBridge
                     return (false, transferred.Detail);
                 }
             }
-            var text = await LocalMuxdRequestAsync(new
+            var text = await Request(new
             {
                 t = "create",
                 s = name,
@@ -401,11 +628,20 @@ public sealed class RemoteBridge
                 aliases = launch.Aliases,
                 identityPending = string.IsNullOrWhiteSpace(launch.SessionId),
                 relaunch = takeover,
+                resumeOnly = true,
                 intentId
             });
             using var doc = JsonDocument.Parse(text);
             if (doc.RootElement.TryGetProperty("t", out var t) && t.GetString() == "created")
             {
+                var reply = doc.RootElement;
+                if (!reply.TryGetProperty("s", out var returnedName) || returnedName.GetString() != name
+                    || !reply.TryGetProperty("generationId", out var generation) || string.IsNullOrWhiteSpace(generation.GetString()))
+                    return (false, "mux resume response did not identify the requested generation");
+                var rows = SessionReclaim.ParseMuxRowsStrict(await Request(new { t = "ls" }), out _);
+                if (rows is null || !rows.Any(row => row.Name == name && row.GenerationId == generation.GetString()
+                    && row.SessionId == launch.SessionId && row.Alive))
+                    return (false, "mux resume could not verify the exact live chat generation");
                 RecordSessionEvent(
                     launch.SessionId,
                     launch.Aliases,
@@ -445,6 +681,7 @@ public sealed class RemoteBridge
         string tool,
         int pid)
     {
+        if (_isolationFixture) return (false, "isolated fixture bridge disables local mirror");
         name = (name ?? "").Trim();
         var eventSessionId = (requestedSessionId ?? "").Trim();
         if (string.IsNullOrWhiteSpace(name)) return (false, "missing mux session name");
@@ -577,10 +814,31 @@ public sealed class RemoteBridge
         catch (Exception ex) { return "(error reading transcript: " + ex.Message + ")"; }
     }
 
+    private Task<(int code, string outText)> RunTransportAsync(Settings settings, BridgeOperation operation, string? stdin, TimeSpan? timeout, string? commandId = null)
+    {
+        if (operation == BridgeOperation.Ack && !RemoteCommandProtocol.IsWellFormedEnvelopeToken(commandId))
+            return Task.FromResult((-1, ""));
+        if (_transport is not null) return _transport(settings, operation, stdin, commandId, timeout);
+        return RunSshAsync(settings.Target, settings.Port, operation, stdin, timeout, commandId); /* production retains the typed route */
+    }
+
     // Hardened ssh + hard timeout (see class note). `-n` (stdin from /dev/null) only when not feeding
     // stdin. `timeout` widens the wall clock for calls that are held open ON PURPOSE (the long-poll
     // lease); everything else keeps the tight default.
-    private async Task<(int code, string outText)> RunSshAsync(string target, string remoteCmd, string? stdin = null, TimeSpan? timeout = null)
+    private async Task<(int code, string outText)> RunSshAsync(string target, int port, BridgeOperation operation, string? stdin = null, TimeSpan? timeout = null, string? commandId = null)
+    {
+        const string commandBridgeHeader = "h=\"$HOME/.config/mux/command-bridge.header\"; [ -f \"$h\" ] && [ ! -L \"$h\" ] && [ -s \"$h\" ] && [ -r \"$h\" ] && [ $(stat -c %u -- \"$h\") -eq $(id -u) ] || exit 77; p=$(stat -c %A -- \"$h\") || exit 77; case $p in ?r??------) ;; *) exit 77;; esac; ";
+        var remoteCmd = operation switch
+        {
+            BridgeOperation.Running => $"curl -s -X POST http://127.0.0.1:{port}/api/running -H 'Content-Type: application/json' --data-binary @-",
+            BridgeOperation.Lease => $"{commandBridgeHeader}curl --fail --silent --show-error -X POST http://127.0.0.1:{port}/api/app-commands/lease -H 'Content-Type: application/json' --header \"@$h\" --data-binary @-",
+            BridgeOperation.Ack => $"{commandBridgeHeader}curl --fail --silent --show-error -X POST http://127.0.0.1:{port}/api/app-commands/{commandId}/ack -H 'Content-Type: application/json' --header \"@$h\" --data-binary @-",
+            _ => throw new ArgumentOutOfRangeException(nameof(operation))
+        };
+        return await RunSshCommandAsync(target, remoteCmd, stdin, timeout);
+    }
+
+    private async Task<(int code, string outText)> RunSshCommandAsync(string target, string remoteCmd, string? stdin = null, TimeSpan? timeout = null)
     {
         var hardTimeout = timeout ?? SshHardTimeout;
         try
@@ -620,10 +878,7 @@ public sealed class RemoteBridge
     {
         for (var attempt = 1; attempt <= 3; attempt++)
         {
-            var result = await RunSshAsync(
-                settings.Target,
-                $"curl -sS -X POST http://127.0.0.1:{settings.Port}/api/app-commands/{commandId}/ack -H 'Content-Type: application/json' --data-binary @-",
-                ackJson);
+            var result = await RunTransportAsync(settings, BridgeOperation.Ack, ackJson, null, commandId);
             if (result.code == 0 && RemoteCommandProtocol.AckSucceeded(result.outText)) return;
             if (attempt < 3) await Task.Delay(attempt * 500);
         }
@@ -638,13 +893,43 @@ public sealed class RemoteBridge
         public string type { get; set; } = "";
         public string replayPolicy { get; set; } = "";
         public string? sessionId { get; set; }
+        public string? snapshotId { get; set; }
+        public string? checkpointId { get; set; }
+        public string? checkpointRevision { get; set; }
+        public string? collectionRevision { get; set; }
+        public string? workspaceId { get; set; }
+        public string? subfolder { get; set; }
+        public string? phrase { get; set; }
         public string? tool { get; set; }
         public string? launchMode { get; set; }
+        public string? handoffFromId { get; set; }
         public int pid { get; set; }
+        public string? generationId { get; set; }
         public string? uploadId { get; set; }
         public string? filename { get; set; }
         public string? title { get; set; }
+        public string? expectedRevision { get; set; }
+        public bool confirmed { get; set; }
+        public string? bridgeToken { get; set; }
+        public int ttlMs { get; set; }
+        public string? expectedCollectionRevision { get; set; }
+        public string? collectionId { get; set; }
+        public string? collection { get; set; }
+        public string? name { get; set; }
+        public string? deckId { get; set; }
+        public string? targetDeckId { get; set; }
+        public string? expectedDeletedRevision { get; set; }
+        public string? expectedRecentlyDeletedRevision { get; set; }
+        public bool favorite { get; set; }
+        public bool archived { get; set; }
+        public bool enabled { get; set; }
+        public string[]? phrases { get; set; }
+        public string? tag { get; set; }
+        public string[]? sessionIds { get; set; }
+        public string[]? deckIds { get; set; }
+        public JsonElement? tabs { get; set; }
         public bool keep { get; set; }
+
         public string? muxName { get; set; }
         public string? sessionName { get; set; }
         public string? insert { get; set; }

@@ -57,9 +57,9 @@ Verification: the status line reports how many local excerpts were used. The app
 ## How to Package a ZIP Release
 
 1. Run `.\tools\release\package-win-x64.ps1` from the repository root.
-2. Upload `artifacts/codex-local-retrieval-win-x64.zip` as the GitHub release asset.
+2. Upload `artifacts/mux-win-x64.zip` as the GitHub release asset.
 
-Verification: the ZIP contains top-level `Codex Local Retrieval.exe`, an `app` folder, and `app/CodexLocalRetrieval.Native.exe`.
+Verification: the ZIP contains top-level `MUX.exe`, an `app` folder, and `app/CodexLocalRetrieval.Native.exe`. The runtime executable name is retained for internal compatibility.
 
 ## How to Keep Public Data Safe
 

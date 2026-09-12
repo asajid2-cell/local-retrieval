@@ -122,8 +122,8 @@ public static class SessionIntegrity
             .ToList();
         var eventIncidents = recentEvents.Count(e => IsIncident(e.Kind, e.Severity));
         if (eventIncidents > 0)
-            checks.Add(new SessionIntegrityCheck("Recent events", recentEvents.Any(e => string.Equals(e.Severity, "error", StringComparison.OrdinalIgnoreCase)) ? "danger" : "warn",
-                eventIncidents + " recent ownership event" + (eventIncidents == 1 ? " needs" : "s need") + " review."));
+            checks.Add(new SessionIntegrityCheck("Recent events", "warn",
+                eventIncidents + " recent ownership event" + (eventIncidents == 1 ? " needs" : "s need") + " review; history alone does not block continuation."));
         else
             checks.Add(new SessionIntegrityCheck("Recent events", "ok", recentEvents.Count == 0 ? "No session event ledger entries yet." : "No recent refused or failed ownership events."));
 

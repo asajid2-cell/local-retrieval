@@ -6,7 +6,7 @@ using CodexLocalRetrieval.Core.Agents;
 
 namespace CodexLocalRetrieval.Core.Remote;
 
-public sealed record RemoteUploadResult(bool Ok, string Detail, bool OnPc);
+public sealed record RemoteUploadResult(bool Ok, string Detail, bool OnPc, bool Uncertain = false);
 
 public static class RemoteUploadTransfer
 {
@@ -95,12 +95,17 @@ public static class RemoteUploadTransfer
         string? muxName,
         string? insert,
         string intentId,
-        Func<object, Task<string>> muxRequest)
+        Func<object, Task<string>> muxRequest,
+        string? sessionId = null,
+        string? generationId = null,
+        Func<string, string, string, Task<bool>>? download = null,
+        string? destinationRoot = null,
+        string? sshConfigPath = null)
     {
         var safe = SanitizeFilename(filename);
-        var destRoot = keep
+        var destRoot = destinationRoot ?? (keep
             ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "CodexMultiplexUploads")
-            : Path.Combine(Path.GetTempPath(), "multiplex-uploads");
+            : Path.Combine(Path.GetTempPath(), "multiplex-uploads"));
 
         // Validate before any filesystem or scp side effect.
         if (!TryResolveUploadDirectory(destRoot, uploadId, out var destDir, out var refusal))
@@ -117,6 +122,17 @@ public static class RemoteUploadTransfer
 
         var dest = Path.Combine(destDir, safe);
 
+        if (download is not null)
+        {
+            try
+            {
+                if (!await download(uploadId, safe, dest))
+                    return new RemoteUploadResult(false, "file download failed", false);
+            }
+            catch { return new RemoteUploadResult(false, "file download failed", false); }
+            return await InsertDownloadedPathAsync(dest, filename, muxName, insert, intentId, muxRequest, sessionId, generationId);
+        }
+
         var remote = $"{target}:multiplex-app/uploads/{uploadId}/{safe}";
         try
         {
@@ -128,6 +144,11 @@ public static class RemoteUploadTransfer
                 RedirectStandardError = true,
                 CreateNoWindow = true
             };
+            if (sshConfigPath is not null)
+            {
+                start.ArgumentList.Add("-F");
+                start.ArgumentList.Add(sshConfigPath);
+            }
             start.ArgumentList.Add("-q");
             start.ArgumentList.Add("-o");
             start.ArgumentList.Add("BatchMode=yes");
@@ -151,7 +172,7 @@ public static class RemoteUploadTransfer
             return new RemoteUploadResult(false, "file download failed", false);
         }
 
-        return await InsertDownloadedPathAsync(dest, filename, muxName, insert, intentId, muxRequest);
+        return await InsertDownloadedPathAsync(dest, filename, muxName, insert, intentId, muxRequest, sessionId, generationId);
     }
 
     public static async Task<RemoteUploadResult> InsertDownloadedPathAsync(
@@ -160,7 +181,9 @@ public static class RemoteUploadTransfer
         string? muxName,
         string? insert,
         string intentId,
-        Func<object, Task<string>> muxRequest)
+        Func<object, Task<string>> muxRequest,
+        string? sessionId = null,
+        string? generationId = null)
     {
         var insertion = (insert ?? "").Trim().ToLowerInvariant();
         if (insertion.Length == 0)
@@ -170,15 +193,28 @@ public static class RemoteUploadTransfer
         if (string.IsNullOrWhiteSpace(muxName))
             return new RemoteUploadResult(false, "file downloaded but no mux tab was selected for insertion", true);
 
+        if (string.IsNullOrWhiteSpace(sessionId) || string.IsNullOrWhiteSpace(generationId))
+            return new RemoteUploadResult(false, "file downloaded but exact session identity is required for insertion", true);
+
         var input = insertion == "element"
             ? BuildElement(filename, localPath)
             : localPath;
+        var inputAttempted = false;
         try
         {
+            using var info = JsonDocument.Parse(await muxRequest(new { t = "info" }));
+            if (!info.RootElement.TryGetProperty("caps", out var caps) || caps.ValueKind != JsonValueKind.Array
+                || !caps.EnumerateArray().Any(cap => cap.ValueKind == JsonValueKind.String && cap.GetString() == "inputFence")
+                || !caps.EnumerateArray().Any(cap => cap.ValueKind == JsonValueKind.String && cap.GetString() == "inputDurable")
+                || string.IsNullOrWhiteSpace(intentId))
+                return new RemoteUploadResult(false, "file downloaded but mux daemon does not support identity-fenced insertion", true);
+            inputAttempted = true;
             var response = await muxRequest(new
             {
                 t = "input",
                 s = muxName,
+                sessionId,
+                generationId,
                 d = Convert.ToBase64String(Encoding.UTF8.GetBytes(input)),
                 intentId
             });
@@ -186,11 +222,16 @@ public static class RemoteUploadTransfer
             var root = doc.RootElement;
             if (root.TryGetProperty("t", out var type) && type.GetString() == "input-ok")
                 return new RemoteUploadResult(true, "downloaded to PC and inserted into the mux prompt", true);
+            if (!root.TryGetProperty("t", out var responseType) || responseType.GetString() != "err"
+                || (root.TryGetProperty("m", out var message) && message.GetString()?.Contains("uncertain", StringComparison.OrdinalIgnoreCase) == true))
+                return new RemoteUploadResult(false, "file downloaded; prompt insertion outcome is unconfirmed", true, true);
             return new RemoteUploadResult(false, "file downloaded but prompt insertion failed", true);
         }
         catch
         {
-            return new RemoteUploadResult(false, "file downloaded but prompt insertion failed", true);
+            return inputAttempted
+                ? new RemoteUploadResult(false, "file downloaded; prompt insertion outcome is unconfirmed", true, true)
+                : new RemoteUploadResult(false, "file downloaded but mux capability verification failed", true);
         }
     }
 

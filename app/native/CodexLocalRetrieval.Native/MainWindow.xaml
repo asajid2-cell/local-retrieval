@@ -6,7 +6,7 @@
     xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
     xmlns:local="using:CodexLocalRetrieval_Native"
     xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
-    Title="Codex Local Retrieval"
+    Title="MUX"
     mc:Ignorable="d">
     <Grid Background="{StaticResource AmoledBrush}">
         <Grid.RowDefinitions>
@@ -14,7 +14,7 @@
             <RowDefinition Height="*" />
         </Grid.RowDefinitions>
 
-        <TitleBar x:Name="AppTitleBar" Title="Codex Local Retrieval">
+        <TitleBar x:Name="AppTitleBar" Title="MUX" ToolTipService.ToolTip="MUX build 2026.08.28-gw1">
             <TitleBar.IconSource>
                 <ImageIconSource ImageSource="Assets/AppIcon.ico" />
             </TitleBar.IconSource>

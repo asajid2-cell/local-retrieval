@@ -9,6 +9,35 @@ namespace CodexLocalRetrieval.Native.Tests;
 [TestClass]
 public sealed class DiscoveryApiTests
 {
+    [TestMethod]
+    public async Task SourceOverride_SurvivesForeignStoreConfigurationAndReload()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "discovery-source-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var storePath = Path.Combine(root, "app-store.json");
+            var isolated = Path.Combine(root, "isolated");
+            var foreign = Path.Combine(root, "foreign");
+            var data = new AppStoreData();
+            data.Settings.Sources.Add(new SessionSource { Tool = "claude", Root = foreign });
+            await File.WriteAllTextAsync(storePath, JsonSerializer.Serialize(data));
+            var source = new SessionSource { Tool = "claude", Root = isolated };
+            var archive = new ArchiveService(storePath: storePath, enableTranscriptSearchIndex: false,
+                sourceOverride: new[] { source });
+            source.Root = foreign;
+            await archive.LoadCachedAsync();
+            Assert.AreEqual(isolated, archive.EffectiveSources().Single().Root);
+            archive.Store.Settings.Sources.Clear();
+            await archive.LoadCachedAsync();
+            Assert.AreEqual(isolated, archive.EffectiveSources().Single().Root);
+            var ordinary = new ArchiveService(storePath: storePath, enableTranscriptSearchIndex: false);
+            await ordinary.LoadCachedAsync();
+            Assert.AreEqual(foreign, ordinary.EffectiveSources().Single().Root);
+        }
+        finally { Directory.Delete(root, recursive: true); }
+    }
+
     private static ArchiveSession Chat(
         string id,
         string title,
@@ -41,8 +70,10 @@ public sealed class DiscoveryApiTests
         var hidden = Chat("c", "One Shot", "codex", "2026-07-31T10:00:00Z", 1);
         hidden.MessageCount = 2;
         var unsafeChat = Chat("bad id", "Unsafe Resume", "codex", "2026-07-30T10:00:00Z", 5, "web");
+        var archived = Chat("old", "Archived Work", "codex", "2026-07-29T10:00:00Z", 4, "archive");
+        archived.Archived = true;
 
-        foreach (var chat in new[] { alpha, beta, hidden, unsafeChat })
+        foreach (var chat in new[] { alpha, beta, hidden, unsafeChat, archived })
             archive.Store.Sessions[chat.Id] = chat;
         archive.Store.Collections["project-web"] = new ArchiveCollection
         {
@@ -63,7 +94,7 @@ public sealed class DiscoveryApiTests
     [TestMethod]
     public void Chats_ReusesCompoundFiltersAndDefaultsToHidingOneOffs()
     {
-        var (_, api) = Fixture();
+        var (archive, api) = Fixture();
 
         var page = api.Chats(new DiscoveryQuery(
             Include: "active, ACTIVE",
@@ -78,8 +109,19 @@ public sealed class DiscoveryApiTests
 
         var hidden = api.Chats(new DiscoveryQuery());
         CollectionAssert.DoesNotContain(hidden.Rows.Select(row => row.Id).ToList(), "c");
+        CollectionAssert.DoesNotContain(hidden.Rows.Select(row => row.Id).ToList(), "old");
         var revealed = api.Chats(new DiscoveryQuery(ShowHidden: true));
         CollectionAssert.Contains(revealed.Rows.Select(row => row.Id).ToList(), "c");
+
+        var archived = api.Chats(new DiscoveryQuery(Archived: "archived", ShowHidden: true));
+        Assert.AreEqual(1, archived.Total);
+        Assert.IsTrue(archived.Rows.Single().Archived);
+        var all = api.Chats(new DiscoveryQuery(Archived: "all", ShowHidden: true));
+        Assert.AreEqual(5, all.Total);
+        archive.Store.Sessions["old"].Archived = false;
+        var afterUnarchive = api.Chats(new DiscoveryQuery());
+        CollectionAssert.Contains(afterUnarchive.Rows.Select(row => row.Id).ToList(), "old");
+        Assert.IsFalse(afterUnarchive.Rows.Single(row => row.Id == "old").Archived);
     }
 
     [TestMethod]
@@ -111,6 +153,7 @@ public sealed class DiscoveryApiTests
         Assert.AreEqual("web-parity", good.Phrases.Single());
         Assert.AreEqual(10, good.UserMsgCount);
         Assert.IsTrue(good.Pinned);
+        Assert.IsFalse(good.Archived);
         Assert.IsTrue(good.Resumable);
         Assert.IsFalse(bad.Resumable);
         Assert.IsTrue(good.MuxName.Length > 0);
@@ -120,6 +163,60 @@ public sealed class DiscoveryApiTests
         Assert.IsFalse(json.Contains("workingDirectory", StringComparison.OrdinalIgnoreCase));
         Assert.IsFalse(json.Contains("\"command\"", StringComparison.OrdinalIgnoreCase));
         Assert.IsFalse(json.Contains(".jsonl", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [TestMethod]
+    public async Task DeepSearch_ScansTranscriptFilesAndSeparatesNoMatchFromNothingScanned()
+    {
+        var (archive, api) = Fixture();
+        // The scan reads real files, so point the two transcripts at a private directory instead of the
+        // shared temp names the fixture hands out.
+        var root = Path.Combine(Path.GetTempPath(), "discovery-deep-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        var keptPath = Path.Combine(root, "kept.jsonl");
+        var oneShotPath = Path.Combine(root, "one-shot.jsonl");
+        archive.Store.Sessions["b"].SourcePath = keptPath;
+        archive.Store.Sessions["c"].SourcePath = oneShotPath;
+        try
+        {
+            await File.WriteAllTextAsync(keptPath,
+                "{\"type\":\"user\",\"text\":\"promicro venpod magenta parity work\"}\n");
+            await File.WriteAllTextAsync(oneShotPath,
+                "{\"type\":\"user\",\"text\":\"promicro venpod in a one off chat\"}\n");
+
+            var page = await api.DeepSearchAsync("promicro venpod");
+            Assert.IsTrue(page.Ran);
+            Assert.AreEqual("promicro venpod", page.Query);
+            Assert.AreEqual(DiscoveryApi.DefaultDeepLimit, page.Limit);
+            var row = page.Rows.Single();
+            Assert.AreEqual("b", row.Id);
+            Assert.AreEqual("chat content", row.Provenance);
+            Assert.IsTrue(row.Snippet.Length > 0, "a file-scan hit must carry its own snippet");
+            Assert.IsTrue(row.Score > 0);
+
+            // The desktop Enter path keeps one-off chats hidden unless they were revealed; the browser
+            // deep section has to agree or the same query returns two different answers.
+            var revealed = await api.DeepSearchAsync("promicro venpod", null, showHidden: true);
+            CollectionAssert.AreEquivalent(new[] { "b", "c" }, revealed.Rows.Select(r => r.Id).ToList());
+
+            // An empty query is not an empty result: Ran=false means no scan happened at all.
+            var blank = await api.DeepSearchAsync("   ");
+            Assert.IsFalse(blank.Ran);
+            Assert.AreEqual(0, blank.Count);
+
+            // A query with no searchable words also never ran, so the web cannot print "0 matches".
+            var noTokens = await api.DeepSearchAsync("a of");
+            Assert.IsFalse(noTokens.Ran);
+            Assert.AreEqual(0, noTokens.Count);
+
+            var miss = await api.DeepSearchAsync("zeppelin airship");
+            Assert.IsTrue(miss.Ran, "a real query that matched nothing still ran");
+            Assert.AreEqual(0, miss.Count);
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
     }
 
     [TestMethod]

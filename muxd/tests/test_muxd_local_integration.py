@@ -216,7 +216,7 @@ async def owner_collision(port, name, cmd, timeout=14):
 
 
 class DisposableMuxd:
-    def __init__(self):
+    def __init__(self, relay_port=1):
         self.root = Path(tempfile.mkdtemp(prefix="muxd-it-"))
         self.port = free_port()
         mux_home = self.root / "muxd"
@@ -225,7 +225,7 @@ class DisposableMuxd:
             "\n".join(
                 [
                     "MUX_HOST_TOKEN=test-token",
-                    "RELAY_LAN=ws://127.0.0.1:1/host",
+                    f"RELAY_LAN=ws://127.0.0.1:{int(relay_port)}/host",
                     f"LOCAL_PORT={self.port}",
                     f"INSTANCE_MUTEX_NAME=Local\\CodexMuxdTest-{self.port}",
                     f"DEFAULT_CWD={self.root}",
@@ -238,6 +238,7 @@ class DisposableMuxd:
             encoding="utf-8",
         )
         self.env = os.environ.copy()
+        self.env["MUX_HOST_TOKEN"] = "test-token"
         self.env["HOME"] = str(self.root)
         self.env["USERPROFILE"] = str(self.root)
         self.env["HOMEDRIVE"] = self.root.drive or "C:"
@@ -508,6 +509,48 @@ class MuxdLocalIntegrationTests(unittest.TestCase):
             ))
             self.assertTrue(all(result.get("t") == "created" for result in results), results)
             self.assertEqual(1, sum(bool(result.get("created")) for result in results), results)
+        finally:
+            self.kill(name)
+
+    def test_protected_resume_preserves_occupied_generation(self):
+        name = "it-protected-resume"
+        self.kill(name)
+        try:
+            original = {"t": "create", "s": name, "cmd": "Write-Output original; # codex resume original-chat", "sessionId": "original-chat"}
+            run_request(self.muxd.port, original, timeout=15)
+            before = self.session(name)
+            refused = run_request(self.muxd.port, {**original, "resumeOnly": True,
+                "cmd": "Write-Output replacement; # codex resume different-chat", "sessionId": "different-chat"}, timeout=15)
+            self.assertEqual("err", refused.get("t"), refused)
+            after = self.session(name)
+            self.assertEqual(before["generationId"], after["generationId"])
+            self.assertEqual("original-chat", after["sessionId"])
+            self.assertTrue(after["alive"])
+            accepted = run_request(self.muxd.port, {**original, "resumeOnly": True}, timeout=15)
+            self.assertEqual("created", accepted.get("t"), accepted)
+            self.assertEqual(before["generationId"], self.session(name)["generationId"])
+        finally:
+            self.kill(name)
+
+    def test_fenced_input_refuses_wrong_generation_and_preserves_replay(self):
+        name = "it-fenced-input"
+        self.kill(name)
+        try:
+            created = run_request(self.muxd.port, {"t": "create", "s": name, "cmd": "Write-Output ready; # codex resume input-chat", "ids": ["input-chat"]}, timeout=15)
+            self.assertNotEqual("err", created.get("t"), created)
+            rows = run_request(self.muxd.port, {"t": "ls"})["list"]
+            row = next(row for row in rows if row["name"] == name)
+            payload = {"t": "input", "s": name, "sessionId": row["sessionId"],
+                       "generationId": "wrong-generation", "intentId": "fenced-input-test",
+                       "d": base64.b64encode(b"# fenced input").decode("ascii")}
+            refused = run_request(self.muxd.port, payload, timeout=15)
+            self.assertEqual("err", refused.get("t"), refused)
+            self.assertIn("identity changed", refused.get("m", ""))
+            payload["generationId"] = row["generationId"]
+            applied = run_request(self.muxd.port, payload, timeout=15)
+            self.assertEqual("input-ok", applied.get("t"), applied)
+            replay = run_request(self.muxd.port, payload, timeout=15)
+            self.assertEqual(applied, replay)
         finally:
             self.kill(name)
 
@@ -1189,13 +1232,26 @@ class MuxdLocalIntegrationTests(unittest.TestCase):
                 {
                     "t": "create",
                     "s": name,
-                    "cmd": f"Write-Output '{marker}'; while($true){{Start-Sleep -Milliseconds 200}}",
+                    "cmd": f"$d=Join-Path $env:USERPROFILE '.claude/sessions'; New-Item -ItemType Directory -Force $d | Out-Null; @{{pid=$PID;sessionId='captured-id'}} | ConvertTo-Json | Set-Content (Join-Path $d \"$PID.json\"); Write-Output '{marker}'; while($true){{Start-Sleep -Milliseconds 200}}",
                     "identityPending": True,
                 },
                 timeout=12,
             )
             self.assertTrue(first.get("created"))
             pending = self.wait_for_tail(name, marker)
+            projection_path = self.muxd.root / "muxd" / "live-tabs.json"
+            deadline = time.monotonic() + 12
+            projected = None
+            while time.monotonic() < deadline:
+                if projection_path.exists():
+                    projected = json.loads(projection_path.read_text(encoding="utf-8")).get(name)
+                    if projected and projected.get("generationId") == first.get("generationId"):
+                        break
+                time.sleep(0.05)
+            self.assertIsNotNone(projected, "Local identity projection must not require a relay connection")
+            self.assertEqual(first["generationId"], projected["generationId"])
+            self.assertGreater(projected["pid"], 0)
+            self.assertTrue(projected["identityPending"])
             self.assertTrue(pending.get("identityPending"))
             self.assertEqual("", pending.get("sessionId"))
 
@@ -1208,11 +1264,29 @@ class MuxdLocalIntegrationTests(unittest.TestCase):
             self.assertIn("identity has not been captured", refused.get("m", ""))
 
             resume_marker = marker + "_RESUMED"
+            for generation in ("", "replacement-generation"):
+                rejected = run_request(self.muxd.port, {
+                    "t": "bind", "s": name, "generationId": generation,
+                    "cmd": "# codex resume wrong-id", "sessionId": "wrong-id",
+                }, timeout=12)
+                self.assertEqual("err", rejected.get("t"), rejected)
+                self.assertIn("generation mismatch", rejected.get("m", ""))
+                self.assertTrue(self.session(name).get("identityPending"))
+                self.assertEqual("", self.session(name).get("sessionId"))
+            unowned = run_request(self.muxd.port, {
+                "t": "bind", "s": name,
+                "generationId": self.session(name)["generationId"],
+                "cmd": "# codex resume absent-id", "sessionId": "absent-id",
+            }, timeout=12)
+            self.assertEqual("err", unowned.get("t"), unowned)
+            self.assertIn("verified live descendant", unowned.get("m", ""))
+            self.assertTrue(self.session(name).get("identityPending"))
             bound = run_request(
                 self.muxd.port,
                 {
                     "t": "bind",
                     "s": name,
+                    "generationId": self.session(name)["generationId"],
                     "cmd": f"Write-Output '{resume_marker}'; # codex resume captured-id",
                     "sessionId": "captured-id",
                     "aliases": [],
@@ -1262,6 +1336,83 @@ class MuxdLocalIntegrationTests(unittest.TestCase):
         self.assertIn("no such session", result.get("m", ""))
         self.assertIsNone(self.session(name))
 
+    def test_relay_kill_fences_shell_generation_and_correlates_result(self):
+        async def scenario():
+            connected = asyncio.get_running_loop().create_future()
+            finished = asyncio.Event()
+
+            async def relay(ws):
+                hello = json.loads(await ws.recv())
+                if not connected.done():
+                    connected.set_result((ws, hello))
+                await finished.wait()
+
+            async with websockets.serve(relay, '127.0.0.1', 0) as listener:
+                fixture = await asyncio.to_thread(DisposableMuxd, listener.sockets[0].getsockname()[1])
+                try:
+                    ws, hello = await asyncio.wait_for(connected, 20)
+                    self.assertIn('killFence', hello['caps'])
+                    name = 'it-relay-kill'
+                    created = await request_json(fixture.port, {'t': 'create', 's': name, 'cols': 80, 'rows': 24})
+                    self.assertTrue(created.get('created'), created)
+                    listing = await request_json(fixture.port, {'t': 'ls'})
+                    original = next(row for row in listing['list'] if row['name'] == name)
+                    self.assertEqual('', original.get('sessionId', ''))
+                    for invalid_id in [None, 'invalid/identity']:
+                        invalid = await request_json(fixture.port, {'t': 'kill', 's': name,
+                            'sessionId': invalid_id, 'generationId': original['generationId']})
+                        self.assertEqual('err', invalid.get('t'), invalid)
+
+                    async def send_kill(rid, generation):
+                        await ws.send(json.dumps({'t': 'kill', 's': name, 'rid': rid,
+                                                  'sessionId': '', 'generationId': generation}))
+                        async def result():
+                            while True:
+                                frame = json.loads(await ws.recv())
+                                if frame.get('rid') == rid or frame.get('t') == 'killed':
+                                    return frame
+                        return await asyncio.wait_for(result(), 15)
+
+                    refused = await send_kill('stale-stop', 'obsolete-generation')
+                    self.assertEqual('killResult', refused.get('t'), refused)
+                    self.assertFalse(refused.get('ok'))
+                    alive = next(row for row in (await request_json(fixture.port, {'t': 'ls'}))['list'] if row['name'] == name)
+                    self.assertEqual(original['generationId'], alive['generationId'])
+                    self.assertTrue(alive['alive'])
+                    killed = await send_kill('exact-stop', original['generationId'])
+                    self.assertEqual('killed', killed.get('t'), killed)
+                    self.assertEqual('exact-stop', killed.get('rid'))
+                    self.assertEqual(original['generationId'], killed.get('generationId'))
+                    self.assertEqual('', killed.get('sessionId'))
+                    self.assertNotIn(name, [row['name'] for row in (await request_json(fixture.port, {'t': 'ls'}))['list']])
+                finally:
+                    finished.set()
+                    await asyncio.to_thread(fixture.close)
+
+        asyncio.run(scenario())
+
+    def test_fenced_kill_requires_matching_identity_and_generation(self):
+        name = "it-fenced-kill"
+        self.kill(name)
+        created = run_request(self.muxd.port, {
+            "t": "create", "s": name, "cmd": "while($true){Start-Sleep -Milliseconds 200}",
+            "sessionId": "fenced-session",
+        }, timeout=18)
+        self.assertEqual("created", created.get("t"), created)
+        row = next(item for item in run_request(self.muxd.port, {"t": "ls"})["list"] if item["name"] == name)
+        self.assertTrue(row.get("generationId"), row)
+        wrong_id = run_request(self.muxd.port, {"t": "kill", "s": name,
+                                                "sessionId": "wrong", "generationId": row["generationId"]})
+        self.assertEqual("err", wrong_id.get("t"), wrong_id)
+        self.assertIsNotNone(self.session(name))
+        wrong_generation = run_request(self.muxd.port, {"t": "kill", "s": name,
+                                                        "sessionId": "fenced-session", "generationId": "wrong"})
+        self.assertEqual("err", wrong_generation.get("t"), wrong_generation)
+        self.assertIsNotNone(self.session(name))
+        killed = run_request(self.muxd.port, {"t": "kill", "s": name,
+                                              "sessionId": "fenced-session", "generationId": row["generationId"]}, timeout=18)
+        self.assertEqual("killed", killed.get("t"), killed)
+
     def test_kill_removes_session_from_manifest_and_listing(self):
         name = "it-kill"
         self.kill(name)
@@ -1303,6 +1454,7 @@ class MuxdLocalIntegrationTests(unittest.TestCase):
 
         self.assertEqual("err", result.get("t"), result)
         self.assertIn("durably reserve session start", result.get("m", ""))
+        self.assertIsInstance(result.get("retryable"), bool, "local create errors must retain retry classification")
         self.assertIsNone(self.session(name))
         self.muxd.restart()
         self.assertIsNone(self.session(name))
@@ -1408,12 +1560,13 @@ class MuxdLocalIntegrationTests(unittest.TestCase):
                 {
                     "t": "create",
                     "s": name,
-                    "cmd": "while($true){Start-Sleep -Milliseconds 200}",
+                    "cmd": "$d=Join-Path $env:USERPROFILE '.claude/sessions'; New-Item -ItemType Directory -Force $d | Out-Null; @{pid=$PID;sessionId='durable-bind-id'} | ConvertTo-Json | Set-Content (Join-Path $d \"$PID.json\"); Write-Output 'BIND_ID_READY'; while($true){Start-Sleep -Milliseconds 200}",
                     "identityPending": True,
                 },
                 timeout=12,
             )
             self.assertTrue(created.get("created"), created)
+            self.wait_for_tail(name, "BIND_ID_READY")
             self.muxd.fail_persistence("before_write")
 
             result = run_request(
@@ -1421,6 +1574,7 @@ class MuxdLocalIntegrationTests(unittest.TestCase):
                 {
                     "t": "bind",
                     "s": name,
+                    "generationId": self.session(name)["generationId"],
                     "cmd": "Write-Output bound; # codex resume durable-bind-id",
                     "sessionId": "durable-bind-id",
                 },
@@ -1444,12 +1598,13 @@ class MuxdLocalIntegrationTests(unittest.TestCase):
                 {
                     "t": "create",
                     "s": name,
-                    "cmd": "while($true){Start-Sleep -Milliseconds 200}",
+                    "cmd": "$d=Join-Path $env:USERPROFILE '.claude/sessions'; New-Item -ItemType Directory -Force $d | Out-Null; @{pid=$PID;sessionId='durable-bind-post-replace'} | ConvertTo-Json | Set-Content (Join-Path $d \"$PID.json\"); Write-Output 'BIND_ID_READY'; while($true){Start-Sleep -Milliseconds 200}",
                     "identityPending": True,
                 },
                 timeout=12,
             )
             self.assertTrue(created.get("created"), created)
+            self.wait_for_tail(name, "BIND_ID_READY")
             self.muxd.fail_persistence("before_directory_fsync")
 
             result = run_request(
@@ -1457,6 +1612,7 @@ class MuxdLocalIntegrationTests(unittest.TestCase):
                 {
                     "t": "bind",
                     "s": name,
+                    "generationId": self.session(name)["generationId"],
                     "cmd": "Write-Output bound; # codex resume durable-bind-post-replace",
                     "sessionId": "durable-bind-post-replace",
                 },

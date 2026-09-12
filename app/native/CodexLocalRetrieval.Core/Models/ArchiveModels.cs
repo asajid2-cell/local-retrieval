@@ -37,6 +37,11 @@ public sealed class AppStoreData
     [JsonPropertyName("deletedCollections")]
     public List<DeletedCollection> DeletedCollections { get; set; } = new();
 
+    // Durable intent/result ledger for remote container metadata operations. It is deliberately part of
+    // the same app-store commit as the object mutation; it never records transcript or chat content.
+    [JsonPropertyName("managementOperations")]
+    public Dictionary<string, ManagementOperation> ManagementOperations { get; set; } = new(StringComparer.Ordinal);
+
     // Incremental sync: source file path -> "mtimeTicks:size". Unchanged files are skipped on
     // re-scan so relaunches are fast. Deletions are never propagated (chats keep accumulating).
     [JsonPropertyName("fileStamps")]
@@ -317,6 +322,10 @@ public sealed class ChatFilter
     // IsEmpty (turning it on doesn't count as "filtering").
     public bool ShowHidden { get; set; }
 
+    // Archive scope is separate from ShowHidden: active is the default, archived exposes only
+    // archived sessions, and all is an explicit recovery/debug view.
+    public string Archived { get; set; } = "active";
+
     public bool IsEmpty => string.IsNullOrWhiteSpace(Query) && IncludeTags.Count == 0
         && ExcludeTags.Count == 0 && string.IsNullOrEmpty(CollectionId) && string.IsNullOrEmpty(DateMode)
         && string.IsNullOrEmpty(DateRange) && string.IsNullOrEmpty(Tool) && MinUserMessages <= 0;
@@ -331,6 +340,34 @@ public sealed class DeletedCollection
 
     [JsonPropertyName("deletedAt")]
     public string DeletedAt { get; set; } = "";
+}
+
+public sealed class ManagementOperation
+{
+    [JsonPropertyName("type")] public string Type { get; set; } = "";
+    [JsonPropertyName("payloadFingerprint")] public string PayloadFingerprint { get; set; } = "";
+    [JsonPropertyName("resultId")] public string ResultId { get; set; } = "";
+    [JsonPropertyName("state")] public string State { get; set; } = "prepared";
+    [JsonPropertyName("detail")] public string Detail { get; set; } = "";
+    [JsonPropertyName("startChatMuxGeneration")] public string StartChatMuxGeneration { get; set; } = "";
+    [JsonPropertyName("startChatPreparedTool")] public string StartChatPreparedTool { get; set; } = "";
+    [JsonPropertyName("startChatPreparedWorkingDirectory")] public string StartChatPreparedWorkingDirectory { get; set; } = "";
+    [JsonPropertyName("startChatLaunch")] public StartChatLaunchDescriptor? StartChatLaunch { get; set; }
+    [JsonPropertyName("updatedAt")] public string UpdatedAt { get; set; } = "";
+}
+
+// Frozen when startchat preparation becomes ready. Dispatchers use this descriptor verbatim on retries;
+// they must not re-resolve a workspace, CLI, branch, or launch mode after the durable boundary.
+public sealed class StartChatLaunchDescriptor
+{
+    [JsonPropertyName("muxName")] public string MuxName { get; set; } = "";
+    [JsonPropertyName("command")] public string Command { get; set; } = "";
+    [JsonPropertyName("workingDirectory")] public string WorkingDirectory { get; set; } = "";
+    [JsonPropertyName("tool")] public string Tool { get; set; } = "";
+    [JsonPropertyName("launchMode")] public string LaunchMode { get; set; } = "native";
+    [JsonPropertyName("sessionId")] public string SessionId { get; set; } = "";
+    [JsonPropertyName("aliases")] public List<string> Aliases { get; set; } = new();
+    [JsonPropertyName("pendingIntentId")] public string PendingIntentId { get; set; } = "";
 }
 
 public sealed class TemplateSnapshot

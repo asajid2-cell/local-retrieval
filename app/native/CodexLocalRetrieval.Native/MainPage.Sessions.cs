@@ -21,36 +21,169 @@ namespace CodexLocalRetrieval_Native;
 public sealed partial class MainPage
 {
     private bool _syncing;
+    private readonly SemaphoreSlim _syncGate = new(1, 1);
+    private static readonly TimeSpan StartupSyncBudget = TimeSpan.FromSeconds(90);
+
+    private void StartArchiveSourceWatches()
+    {
+        StopArchiveSourceWatches();
+        foreach (var source in _archive.EffectiveSources())
+        {
+            if (!source.Enabled || string.IsNullOrWhiteSpace(source.Root)) continue;
+            try
+            {
+                _archiveSourceWatches.Add(FileWatch.WatchDirectory(
+                    source.Root,
+                    "*.jsonl",
+                    recurse: true,
+                    () =>
+                    {
+                        Interlocked.Exchange(ref _archiveSyncPending, 1);
+                        ScheduleArchiveSourceSync();
+                    }));
+            }
+            catch (Exception ex) { Diag.Log("Archive source watch failed " + source.Root + ": " + ex.Message); }
+        }
+        Diag.Log("Archive source watches armed: " + _archiveSourceWatches.Count);
+    }
+
+    private void StopArchiveSourceWatches()
+    {
+        foreach (var watch in _archiveSourceWatches) { try { watch.Dispose(); } catch { } }
+        _archiveSourceWatches.Clear();
+    }
+
+    private void ScheduleArchiveSourceSync()
+    {
+        if (Interlocked.CompareExchange(ref _archiveSyncWorkerActive, 1, 0) != 0) return;
+        if (DispatcherQueue.TryEnqueue(async () =>
+        {
+            try
+            {
+                while (Volatile.Read(ref _archiveSyncPending) == 1)
+                {
+                    if (_syncing)
+                    {
+                        await Task.Delay(100);
+                        continue;
+                    }
+                    Interlocked.Exchange(ref _archiveSyncPending, 0);
+                    await SyncNowAsync(initial: false);
+                }
+            }
+            finally
+            {
+                Volatile.Write(ref _archiveSyncWorkerActive, 0);
+                if (Volatile.Read(ref _archiveSyncPending) == 1) ScheduleArchiveSourceSync();
+            }
+        })) return;
+
+        Volatile.Write(ref _archiveSyncWorkerActive, 0);
+        Diag.Log("Archive source sync could not be queued on the UI dispatcher");
+    }
 
     // After the cached store has painted, resurface the live store so months-old chats reappear
     // and persist forward. The manual Sync button reuses the same path.
     private async Task StartupResurfaceAsync()
     {
-        try { await _archive.EnrichTitlesFromLocalStateAsync(); } catch { }
-        await SyncNowAsync(initial: true);
-        try { StartProjectSync(); } catch { }   // keep the web's Projects view synced while the app is open
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+        Diag.Log("Startup resurface: start");
+        using var cancellation = new CancellationTokenSource(StartupSyncBudget);
+        try
+        {
+            try { await _archive.EnrichTitlesFromLocalStateAsync(cancellation.Token); }
+            catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { }
+            catch (Exception ex) { Diag.Log("Startup title enrichment failed: " + ex.Message); }
+            await SyncNowAsync(initial: true, suppliedCancellationToken: cancellation.Token);
+            try { StartProjectSync(); } catch (Exception ex) { Diag.Log("Project sync start failed: " + ex.Message); }   // keep the web's Projects view synced while the app is open
+        }
+        finally
+        {
+            Diag.Log("Startup resurface: end (" + stopwatch.ElapsedMilliseconds + " ms)");
+        }
     }
 
     private async void Sync_Click(object sender, RoutedEventArgs e) => await SyncNowAsync(initial: false);
 
-    private async Task SyncNowAsync(bool initial)
+    private async Task SyncNowAsync(
+        bool initial,
+        CancellationToken suppliedCancellationToken = default,
+        bool waitForActive = false)
     {
-        if (_syncing) return;
+        if (!_pageInitialized && !initial) return;
+        if (!waitForActive && _syncing) return;
+        await _syncGate.WaitAsync();
+        if (!waitForActive && _syncing)
+        {
+            _syncGate.Release();
+            return;
+        }
         _syncing = true;
+        using var ownedCancellation = initial && !suppliedCancellationToken.CanBeCanceled
+            ? new CancellationTokenSource(StartupSyncBudget)
+            : null;
+        var cancellationToken = suppliedCancellationToken.CanBeCanceled
+            ? suppliedCancellationToken
+            : ownedCancellation?.Token ?? CancellationToken.None;
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
         var before = _archive.Store.Sessions.Count;
         var keepId = _selected?.Id;
+        var selectionRevision = SelectionRevision;
+        ArchiveSession? RestoreSelectionIfUnchanged()
+        {
+            var id = SelectionRaceGuard.Resolve(
+                keepId,
+                selectionRevision,
+                SelectionRevision,
+                _selected?.Id,
+                _archive.Sessions.Select(s => s.Id));
+            return id is not null
+                ? _archive.Sessions.FirstOrDefault(s => string.Equals(s.Id, id, StringComparison.OrdinalIgnoreCase))
+                : null;
+        }
+        bool CanRestoreSelection() => SelectionRevision == selectionRevision;
+
+        void RestoreSelectionIfStillAuthoritative()
+        {
+            if (!CanRestoreSelection()) return;
+            var restored = RestoreSelectionIfUnchanged();
+            RunSessionListRefresh(() =>
+            {
+                _selected = restored;
+                SelectSessionRow(restored);
+            });
+            RenderCurrent();
+        }
         try
         {
             SyncButton.IsEnabled = false;
             SyncStatus.Text = initial ? "Resurfacing your chat history..." : "Syncing sessions...";
-            // Progress<T> marshals callbacks to this (UI) thread. The heavy file parse runs on a
-            // worker and touches no shared state; the store mutation + list refresh happen back on
-            // the UI thread, so nothing races the renders (and launch never looks like it hung).
+            if (_archiveLoadFailed)
+            {
+                Diag.Log("Sync: retrying archive load before disk merge");
+                await _archive.LoadAsync(cancellationToken);
+                _archiveLoadFailed = false;
+                if (CanRestoreSelection())
+                {
+                    var retryRestored = RestoreSelectionIfUnchanged();
+                    RunSessionListRefresh(() =>
+                    {
+                        _selected = retryRestored;
+                        SelectSessionRow(retryRestored);
+                    });
+                    RenderCurrent();
+                }
+                Diag.Log("Sync: archive load retry succeeded (" + _archive.Sessions.Count + " sessions)");
+            }
             var progress = new Progress<string>(s => SyncStatus.Text = s);
-            var scan = await Task.Run(() => _archive.ScanDiskAsync(progress));
-            var indexed = await _archive.MergeScanAsync(scan, refreshList: true);
+            Diag.Log("Sync: scan start");
+            var scan = await Task.Run(() => _archive.ScanDiskAsync(progress, cancellationToken), cancellationToken);
+            Diag.Log("Sync: scan end (" + stopwatch.ElapsedMilliseconds + " ms)");
+            var indexed = await _archive.MergeScanAsync(scan, refreshList: true, cancellationToken: cancellationToken);
+            cancellationToken.ThrowIfCancellationRequested();
+            Diag.Log("Sync: merge end (" + stopwatch.ElapsedMilliseconds + " ms)");
             var added = _archive.Store.Sessions.Count - before;
-            Diag.Log($"Sync: indexed {indexed}, store now {_archive.Store.Sessions.Count} (was {before}, +{added})");
+            Diag.Log($"Sync: indexed {indexed}, store now {_archive.Store.Sessions.Count} (was {before}, +{added}, {stopwatch.ElapsedMilliseconds} ms)");
             RecordAppEvent(
                 "sync.succeeded",
                 $"Session sync indexed {indexed} chats; the store now has {_archive.Store.Sessions.Count} chats.",
@@ -62,17 +195,23 @@ public sealed partial class MainPage
                 });
 
             // MergeScanAsync's refresh now routes through OnReapplyFilter (ReapplyActiveFilter), which keeps
-            // the active filter/sort AND the current selection — so a background sync no longer drops filters.
-            _selected = (keepId is not null ? _archive.Sessions.FirstOrDefault(s => s.Id == keepId) : null)
-                        ?? _archive.Sessions.FirstOrDefault();
-            SelectSessionRow(_selected);
-            RenderCurrent();
+            // the active filter/sort AND the current selection. Only restore the pre-scan selection when no
+            // newer user click happened while the scan/merge was awaiting; otherwise that click is authoritative.
+            RestoreSelectionIfStillAuthoritative();
+            // If the selected chat disappeared, leave selection empty rather than navigating to an unrelated row.
             SyncStatus.Text = $"{_archive.Sessions.Count} chats - synced {DateTime.Now:h:mm tt}"
                               + (added > 0 ? $" - +{added} new" : "");
         }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            Diag.Log("Sync timed out/cancelled after " + stopwatch.ElapsedMilliseconds + " ms");
+            SyncStatus.Text = initial
+                ? "Initial resurface timed out; cached chats remain available. Click Sync sessions to retry."
+                : "Sync cancelled; cached chats remain available.";
+        }
         catch (Exception ex)
         {
-            Diag.Log("Sync error " + ex);
+            Diag.Log("Sync error after " + stopwatch.ElapsedMilliseconds + " ms: " + ex);
             RecordAppEvent(
                 "sync.failed",
                 ex.Message,
@@ -84,6 +223,7 @@ public sealed partial class MainPage
         {
             SyncButton.IsEnabled = true;
             _syncing = false;
+            _syncGate.Release();
         }
     }
 
@@ -287,6 +427,9 @@ public sealed partial class MainPage
                 return;
             }
 
+            if (guard.KilledPids.Count > 0)
+                ClearClaimsAfterVerifiedKill(session, session.Id, session.Aliases, guard.KilledPids, "terminal");
+
             var launch = _archive.BuildResumeLaunch(session, launchModeOverride: launchModeOverride);
             if (string.IsNullOrEmpty(launch.Exe))
             {
@@ -377,7 +520,7 @@ public sealed partial class MainPage
         }
         finally
         {
-            if (ReferenceEquals(_selected, session)) RenderIntegrity(force: true);
+            if (IsSelectedSession(session)) RenderIntegrity(force: true);
         }
     }
 

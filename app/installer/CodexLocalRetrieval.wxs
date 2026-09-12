@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  Per-user MSI for Codex Local Retrieval.
+  Per-user MSI for MUX.
 
-  Installs the Release build output to %LOCALAPPDATA%\Programs\CodexLocalRetrieval (no admin,
+  Installs the Release build output to %LOCALAPPDATA%\Programs\MUX (no admin,
   no code signing), creates Start Menu + Desktop shortcuts, and registers in Add/Remove Programs.
   The package contents are harvested from the build output via the BuildDir bind variable; the
   version comes from the Version variable. Both are passed by scripts\build-msi.ps1:
@@ -12,14 +12,14 @@
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
   <Package
-      Name="Codex Local Retrieval"
+      Name="MUX"
       Manufacturer="Ahmed Sajid"
       Version="$(var.Version)"
       UpgradeCode="7B2C9E14-3A6D-4F58-9C21-0E5A7D8B4F33"
       Scope="perUser"
       Compressed="yes">
 
-    <MajorUpgrade DowngradeErrorMessage="A newer version of Codex Local Retrieval is already installed." />
+    <MajorUpgrade AllowDowngrades="yes" />
     <MediaTemplate EmbedCab="yes" />
 
     <!-- Add/Remove Programs metadata -->
@@ -28,16 +28,16 @@
     <Property Id="ARPNOREPAIR" Value="1" />
     <Property Id="ARPHELPLINK" Value="https://github.com/asajid2-cell" />
 
-    <!-- Per-user install root: %LOCALAPPDATA%\Programs\CodexLocalRetrieval -->
+    <!-- Canonical per-user install root: %LOCALAPPDATA%\Programs\MUX -->
     <StandardDirectory Id="LocalAppDataFolder">
       <Directory Id="ProgramsFolder" Name="Programs">
-        <Directory Id="INSTALLFOLDER" Name="CodexLocalRetrieval" />
+        <Directory Id="INSTALLFOLDER" Name="MUX" />
       </Directory>
     </StandardDirectory>
     <StandardDirectory Id="ProgramMenuFolder" />
     <StandardDirectory Id="DesktopFolder" />
 
-    <Feature Id="Main" Title="Codex Local Retrieval" Level="1">
+    <Feature Id="Main" Title="MUX" Level="1">
       <ComponentGroupRef Id="AppFiles" />
       <ComponentRef Id="StartMenuShortcut" />
       <ComponentRef Id="DesktopShortcut" />
@@ -48,24 +48,24 @@
       <Files Include="$(var.BuildDir)\**" />
     </ComponentGroup>
 
-    <Component Id="StartMenuShortcut" Directory="ProgramMenuFolder" Guid="6F1B2D90-9C44-4E22-8A77-1B0E3F5C6A21">
+    <Component Id="StartMenuShortcut" Directory="ProgramMenuFolder" Guid="A8E3C2F1-7D64-4B90-9F15-2C6D8E0A473B">
       <Shortcut Id="StartMenuLnk"
-                Name="Codex Local Retrieval"
+                Name="MUX"
                 Description="Your local Claude/Codex chat hub"
                 Target="[INSTALLFOLDER]CodexLocalRetrieval.Native.exe"
                 WorkingDirectory="INSTALLFOLDER"
                 Icon="AppIcon.ico" />
-      <RegistryValue Root="HKCU" Key="Software\CodexLocalRetrieval" Name="startMenu" Type="integer" Value="1" KeyPath="yes" />
+      <RegistryValue Root="HKCU" Key="Software\MUX" Name="startMenu" Type="integer" Value="1" KeyPath="yes" />
     </Component>
 
-    <Component Id="DesktopShortcut" Directory="DesktopFolder" Guid="C3E8A45B-7D12-49F6-B0A9-2F6D8C1E4B70">
+    <Component Id="DesktopShortcut" Directory="DesktopFolder" Guid="D9F4B3E2-8A75-4CA1-A026-3D7E9F1B584C">
       <Shortcut Id="DesktopLnk"
-                Name="Codex Local Retrieval"
+                Name="MUX"
                 Description="Your local Claude/Codex chat hub"
                 Target="[INSTALLFOLDER]CodexLocalRetrieval.Native.exe"
                 WorkingDirectory="INSTALLFOLDER"
                 Icon="AppIcon.ico" />
-      <RegistryValue Root="HKCU" Key="Software\CodexLocalRetrieval" Name="desktop" Type="integer" Value="1" KeyPath="yes" />
+      <RegistryValue Root="HKCU" Key="Software\MUX" Name="desktop" Type="integer" Value="1" KeyPath="yes" />
     </Component>
   </Package>
 </Wix>
