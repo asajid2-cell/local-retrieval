@@ -31,7 +31,10 @@ public sealed class DiscoveryApiTests
             archive.Store.Settings.Sources.Clear();
             await archive.LoadCachedAsync();
             Assert.AreEqual(isolated, archive.EffectiveSources().Single().Root);
-            var ordinary = new ArchiveService(storePath: storePath, enableTranscriptSearchIndex: false);
+            // Account-home discovery is ambient, so point it at an empty root: this assertion is about the
+            // persisted source alone and must not depend on which account homes exist on the machine.
+            var ordinary = new ArchiveService(storePath: storePath, enableTranscriptSearchIndex: false,
+                codexAccountsRoot: Path.Combine(root, "no-accounts"));
             await ordinary.LoadCachedAsync();
             Assert.AreEqual(foreign, ordinary.EffectiveSources().Single().Root);
         }
