@@ -547,6 +547,9 @@ public sealed partial class MainPage
                 WorkingDirectory = cwd,
                 UseShellExecute = true
             };
+        if (launch.Environment is not null)
+            foreach (var (name, value) in launch.Environment)
+                psi.Environment[name] = value;
         var wrapper = Process.Start(psi);
         RecordSessionOwner(session.Id, session.Aliases, wrapper, "terminal");
         return (true, launch.DisplayCommand);

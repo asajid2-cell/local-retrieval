@@ -277,6 +277,7 @@ var canonicalSessionResolver = new CanonicalSessionResolver(async ct =>
                     Tool = s.Tool,
                     LaunchMode = s.LaunchMode,
                     Workspace = s.Workspace,
+                    SourcePath = s.SourcePath,
                     Aliases = new(s.Aliases.ToArray()),
                 })
                 .ToArray()),

@@ -362,6 +362,128 @@ public sealed class ArchiveServiceTests
     }
 
     // Review #2: a parser-version migration prunes an orphan whose file now parses to a new id.
+    // ---- Per-account Codex homes (<accountsRoot>/<account>/sessions) ----
+    // Account homes are discovered independently of the persisted source list, while explicit source
+    // overrides remain an isolation boundary for fixture and test profiles.
+    private static string MakeAccountsRoot(out string accountsRoot)
+    {
+        accountsRoot = Path.Combine(Path.GetTempPath(), "clr-accts-" + Guid.NewGuid().ToString("N"));
+        var account = Path.Combine(accountsRoot, "acct-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(Path.Combine(account, "sessions"));
+        return account;
+    }
+
+    [TestMethod]
+    public async Task SyncFromDisk_IndexesRolloutsInPerAccountHomes()
+    {
+        var account = MakeAccountsRoot(out var accountsRoot);
+        try
+        {
+            WriteRollout(Path.Combine(account, "sessions"), "rollout-acct.jsonl", "acctsession1", "2026-08-20T00:00:00Z", "from an account home");
+            var service = new ArchiveService(
+                storePath: Path.Combine(accountsRoot, "store.json"),
+                codexAccountsRoot: accountsRoot);
+            service.Store.Settings.BundledHistoryAbsorbed = true;
+            // A non-empty configured list suppresses the machine defaults, while account roots are still
+            // appended dynamically by EffectiveSources().
+            service.Store.Settings.Sources.Add(new SessionSource
+            {
+                Tool = "codex",
+                Root = Path.Combine(accountsRoot, "configured-but-empty"),
+            });
+
+            var scan = await service.ScanDiskAsync();
+            Assert.IsTrue(scan.Disk.Any(s => s.Id == "acctsession1"),
+                "the dynamically discovered account source must be scanned");
+            await service.MergeScanAsync(scan, refreshList: false);
+
+            Assert.IsTrue(service.Store.Sessions.ContainsKey("acctsession1"));
+            Assert.IsTrue(service.EffectiveSources().Any(s =>
+                string.Equals(s.Root, Path.Combine(account, "sessions"), StringComparison.OrdinalIgnoreCase)));
+        }
+        finally { try { Directory.Delete(accountsRoot, true); } catch { } }
+    }
+
+    [TestMethod]
+    public void EffectiveSources_AlwaysIncludesAccountHomes_EvenWithPersistedSettings()
+    {
+        var account = MakeAccountsRoot(out var accountsRoot);
+        try
+        {
+            var service = new ArchiveService(
+                storePath: Path.Combine(accountsRoot, "store.json"),
+                codexAccountsRoot: accountsRoot);
+            service.Store.Settings.Sources.AddRange(ArchiveService.DefaultSources());
+            service.Store.Settings.Sources.Add(new SessionSource { Tool = "claude", Root = "d:\\custom\\claude" });
+
+            var sources = service.EffectiveSources();
+
+            Assert.IsTrue(sources.Any(s => s.Tool == "codex"
+                && string.Equals(s.Root, Path.Combine(account, "sessions"), StringComparison.OrdinalIgnoreCase)));
+            Assert.AreEqual(1, sources.Count(s => string.Equals(
+                s.Root, ArchiveService.DefaultCodexSessionsRoot, StringComparison.OrdinalIgnoreCase)));
+        }
+        finally { try { Directory.Delete(accountsRoot, true); } catch { } }
+    }
+
+    [TestMethod]
+    public void EffectiveSources_SkipsAccountDirsWithoutSessionsSubdir()
+    {
+        var account = MakeAccountsRoot(out var accountsRoot);
+        var bare = Path.Combine(accountsRoot, "bare-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(bare);
+        try
+        {
+            var service = new ArchiveService(
+                storePath: Path.Combine(accountsRoot, "store.json"),
+                codexAccountsRoot: accountsRoot);
+
+            Assert.IsFalse(service.EffectiveSources().Any(s =>
+                s.Root.StartsWith(bare, StringComparison.OrdinalIgnoreCase)));
+        }
+        finally { try { Directory.Delete(accountsRoot, true); } catch { } }
+    }
+
+    [TestMethod]
+    public void BuildResumeLaunch_AccountHomeTranscript_SetsCodexHomeEnvironment()
+    {
+        var account = MakeAccountsRoot(out var accountsRoot);
+        try
+        {
+            var transcript = WriteRollout(Path.Combine(account, "sessions"), "rollout-env.jsonl", "envsession1", "2026-08-20T00:00:00Z", "hi");
+            var service = new ArchiveService(
+                storePath: Path.Combine(accountsRoot, "store.json"),
+                codexAccountsRoot: accountsRoot);
+            var session = new ArchiveSession { Id = "envsession1", SourcePath = transcript, Tool = "codex" };
+
+            var launch = service.BuildResumeLaunch(session, exeOverride: @"C:\\codex.exe");
+
+            Assert.IsNotNull(launch.Environment);
+            Assert.AreEqual(account, launch.Environment!["CODEX_HOME"]);
+        }
+        finally { try { Directory.Delete(accountsRoot, true); } catch { } }
+    }
+
+    [TestMethod]
+    public void BuildResumeLaunch_DefaultHomeTranscript_InheritsAmbientEnv()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "clr-envnone-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var transcript = WriteRollout(root, "rollout-none.jsonl", "defaultsession1", "2026-08-20T00:00:00Z", "hi");
+            var service = new ArchiveService(
+                storePath: Path.Combine(root, "store.json"),
+                codexAccountsRoot: Path.Combine(root, "no-accounts"));
+            var session = new ArchiveSession { Id = "defaultsession1", SourcePath = transcript, Tool = "codex" };
+
+            var launch = service.BuildResumeLaunch(session, exeOverride: @"C:\\codex.exe");
+
+            Assert.IsNull(launch.Environment);
+        }
+        finally { try { Directory.Delete(root, true); } catch { } }
+    }
+
     [TestMethod]
     public async Task FullRescan_PrunesOrphanFromOldIdScheme()
     {
@@ -1953,9 +2075,11 @@ public sealed class ArchiveServiceTests
         WriteRollout(dir, "rollout-b.jsonl", "b-1", "2026-06-14T00:00:01Z", "second chat");
         try
         {
-            var service = new ArchiveService(storePath: Path.Combine(dir, "store.json"));
+            var service = new ArchiveService(
+                storePath: Path.Combine(dir, "store.json"),
+                codexAccountsRoot: Path.Combine(dir, "no-accounts"),
+                sourceOverride: new[] { new SessionSource { Tool = "codex", Root = dir } });
             service.Store.Settings.BundledHistoryAbsorbed = true;
-            service.Store.Settings.Sources.Add(new SessionSource { Tool = "codex", Root = dir });
 
             var first = await service.ScanDiskAsync();
             Assert.AreEqual(2, first.Disk.Count, "first scan parses both files");

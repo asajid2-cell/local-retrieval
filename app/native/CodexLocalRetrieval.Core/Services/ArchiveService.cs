@@ -216,6 +216,7 @@ public sealed partial class ArchiveService
     public ObservableCollection<ArchiveSession> Sessions { get; } = new();
 
     private readonly IReadOnlyList<SessionSource>? _sourceOverride;
+    private readonly string? _codexAccountsRootOverride;
 
     public ArchiveService(
         string? storePath = null,
@@ -227,9 +228,11 @@ public sealed partial class ArchiveService
         Func<ArchiveSession, string, string, bool>? codexThreadRegistrar = null,
         string? transcriptSearchIndexPath = null,
         bool? enableTranscriptSearchIndex = null,
-        IReadOnlyList<SessionSource>? sourceOverride = null)
+        IReadOnlyList<SessionSource>? sourceOverride = null,
+        string? codexAccountsRoot = null)
     {
         _sourceOverride = sourceOverride?.Select(s => new SessionSource { Tool = s.Tool, Root = s.Root, Enabled = s.Enabled }).ToArray();
+        _codexAccountsRootOverride = codexAccountsRoot;
         _rootPath = FindProjectRoot();
         _bundledStorePath = Path.Combine(_rootPath, "data", "app-store.json");
         _storePath = useBundledStore
@@ -3947,15 +3950,100 @@ public sealed partial class ArchiveService
     public static string DefaultClaudeSessionsRoot =>
         Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".claude", "projects");
 
+    // The account manager keeps complete Codex homes here. Every account has its own credentials,
+    // configuration, and sessions folder, so all homes must be scanned even when only one is active.
+    public static string CodexAccountsRoot =>
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".codex-accounts");
+
+    private string EffectiveCodexAccountsRoot => _codexAccountsRootOverride ?? CodexAccountsRoot;
+
     public static List<SessionSource> DefaultSources() => new()
     {
         new SessionSource { Tool = "codex", Root = DefaultCodexSessionsRoot },
         new SessionSource { Tool = "claude", Root = DefaultClaudeSessionsRoot },
     };
 
-    // The roots to scan: whatever the user/agent configured, else the codex + claude defaults.
-    public IReadOnlyList<SessionSource> EffectiveSources() =>
-        _sourceOverride ?? (Store.Settings.Sources.Count > 0 ? Store.Settings.Sources : DefaultSources());
+    // Returns the owning CODEX_HOME only for a transcript inside
+    // <accountsRoot>/<account>/sessions. Prefix checks stop at directory boundaries so sibling names
+    // such as "sessions-backup" cannot be mistaken for the account's live transcript store.
+    public bool TryGetCodexAccountHome(string? sourcePath, out string accountHome) =>
+        TryGetCodexAccountHome(sourcePath, EffectiveCodexAccountsRoot, out accountHome);
+
+    public static bool TryGetCodexAccountHome(string? sourcePath, string? accountsRoot, out string accountHome)
+    {
+        accountHome = "";
+        if (string.IsNullOrWhiteSpace(sourcePath) || string.IsNullOrWhiteSpace(accountsRoot)) return false;
+
+        var pathComparison = OperatingSystem.IsWindows()
+            ? StringComparison.OrdinalIgnoreCase
+            : StringComparison.Ordinal;
+        try
+        {
+            var fullSource = Path.GetFullPath(sourcePath);
+            var fullAccountsRoot = Path.TrimEndingDirectorySeparator(Path.GetFullPath(accountsRoot));
+            if (fullAccountsRoot.Length == 0) return false;
+
+            var relative = Path.GetRelativePath(fullAccountsRoot, fullSource);
+            if (Path.IsPathRooted(relative)
+                || relative.Equals("..", StringComparison.Ordinal)
+                || relative.StartsWith(".." + Path.DirectorySeparatorChar, StringComparison.Ordinal))
+                return false;
+
+            var segments = relative.Split(
+                new[] { Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar },
+                StringSplitOptions.RemoveEmptyEntries);
+            if (segments.Length < 3 || !segments[1].Equals("sessions", pathComparison)) return false;
+
+            accountHome = Path.Combine(fullAccountsRoot, segments[0]);
+            return true;
+        }
+        catch (Exception ex) when (ex is ArgumentException or IOException or NotSupportedException or UnauthorizedAccessException)
+        {
+            return false;
+        }
+    }
+
+    private List<SessionSource> CodexAccountSources()
+    {
+        var sources = new List<SessionSource>();
+        try
+        {
+            var accountsRoot = EffectiveCodexAccountsRoot;
+            if (!Directory.Exists(accountsRoot)) return sources;
+            foreach (var accountHome in Directory.EnumerateDirectories(accountsRoot))
+            {
+                var sessionsRoot = Path.Combine(accountHome, "sessions");
+                if (Directory.Exists(sessionsRoot))
+                    sources.Add(new SessionSource { Tool = "codex", Root = sessionsRoot });
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // An unreadable account root contributes no sources this scan; other configured roots remain usable.
+        }
+        return sources;
+    }
+
+    // Explicit source overrides are an isolation boundary for tests and fixture profiles. Normal profiles
+    // combine configured/default roots with account homes discovered live on each scan, without mutating
+    // persisted settings and without returning duplicate roots.
+    public IReadOnlyList<SessionSource> EffectiveSources()
+    {
+        if (_sourceOverride is not null) return _sourceOverride;
+
+        var configured = Store.Settings.Sources.Count > 0
+            ? Store.Settings.Sources
+            : DefaultSources();
+        var sources = configured
+            .Select(source => new SessionSource { Tool = source.Tool, Root = source.Root, Enabled = source.Enabled })
+            .ToList();
+        var seen = new HashSet<string>(
+            sources.Select(source => source.Root),
+            OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal);
+        foreach (var accountSource in CodexAccountSources())
+            if (seen.Add(accountSource.Root)) sources.Add(accountSource);
+        return sources;
+    }
 
     // Resurface everything in one call (tests + simple callers). UI callers split this across
     // threads: ScanDiskAsync on a worker (no shared state) then MergeScanAsync on the UI thread.
@@ -4598,7 +4686,17 @@ public sealed partial class ArchiveService
         if (!string.IsNullOrEmpty(ParseResumedSessionId(extra)))
             return new ResumeLaunch("", "", cwd, "Refused: configured launch args must not contain a resume/session id.");
         var args = string.IsNullOrEmpty(extra) ? baseArgs : $"{extra} {baseArgs}";
-        return new ResumeLaunch(exe, args, cwd, $"\"{exe}\" {args}");
+        IReadOnlyDictionary<string, string>? environment =
+            !isClaude && TryGetCodexAccountHome(session.SourcePath, out var accountHome)
+                ? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+                {
+                    ["CODEX_HOME"] = accountHome,
+                }
+                : null;
+        return new ResumeLaunch(exe, args, cwd, $"\"{exe}\" {args}")
+        {
+            Environment = environment,
+        };
     }
 
     public bool CanBuildTrustedResumeLaunch(ArchiveSession session)
