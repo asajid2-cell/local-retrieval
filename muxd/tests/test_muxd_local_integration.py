@@ -52,6 +52,24 @@ def process_alive(pid):
         k.CloseHandle(handle)
 
 
+def claude_registry_command(session_id, marker):
+    """PowerShell fake agent that publishes a verifiably-live Claude registry record for its own PID.
+
+    muxd fences registry records against PID recycling by comparing the record's startedAt with the
+    live process creation time, so the record must carry this process's real start time; a hard-coded
+    stamp would be rejected as a recycled PID.
+    """
+    return (
+        "$d=Join-Path $env:USERPROFILE '.claude/sessions'; "
+        "New-Item -ItemType Directory -Force $d | Out-Null; "
+        "$s=[DateTimeOffset]::new((Get-Process -Id $PID).StartTime).ToUnixTimeMilliseconds(); "
+        f"@{{pid=$PID;sessionId='{session_id}';startedAt=$s}} | ConvertTo-Json | "
+        "Set-Content (Join-Path $d \"$PID.json\"); "
+        f"Write-Output '{marker}'; "
+        "while($true){Start-Sleep -Milliseconds 200}"
+    )
+
+
 async def request_json(port, payload, timeout=8):
     async with websockets.connect(f"ws://127.0.0.1:{port}", open_timeout=timeout, close_timeout=1, ping_interval=None) as ws:
         await asyncio.wait_for(ws.send(json.dumps(payload)), timeout)
@@ -1232,7 +1250,7 @@ class MuxdLocalIntegrationTests(unittest.TestCase):
                 {
                     "t": "create",
                     "s": name,
-                    "cmd": f"$d=Join-Path $env:USERPROFILE '.claude/sessions'; New-Item -ItemType Directory -Force $d | Out-Null; @{{pid=$PID;sessionId='captured-id'}} | ConvertTo-Json | Set-Content (Join-Path $d \"$PID.json\"); Write-Output '{marker}'; while($true){{Start-Sleep -Milliseconds 200}}",
+                    "cmd": claude_registry_command("captured-id", marker),
                     "identityPending": True,
                 },
                 timeout=12,
@@ -1560,7 +1578,7 @@ class MuxdLocalIntegrationTests(unittest.TestCase):
                 {
                     "t": "create",
                     "s": name,
-                    "cmd": "$d=Join-Path $env:USERPROFILE '.claude/sessions'; New-Item -ItemType Directory -Force $d | Out-Null; @{pid=$PID;sessionId='durable-bind-id'} | ConvertTo-Json | Set-Content (Join-Path $d \"$PID.json\"); Write-Output 'BIND_ID_READY'; while($true){Start-Sleep -Milliseconds 200}",
+                    "cmd": claude_registry_command("durable-bind-id", "BIND_ID_READY"),
                     "identityPending": True,
                 },
                 timeout=12,
@@ -1598,7 +1616,7 @@ class MuxdLocalIntegrationTests(unittest.TestCase):
                 {
                     "t": "create",
                     "s": name,
-                    "cmd": "$d=Join-Path $env:USERPROFILE '.claude/sessions'; New-Item -ItemType Directory -Force $d | Out-Null; @{pid=$PID;sessionId='durable-bind-post-replace'} | ConvertTo-Json | Set-Content (Join-Path $d \"$PID.json\"); Write-Output 'BIND_ID_READY'; while($true){Start-Sleep -Milliseconds 200}",
+                    "cmd": claude_registry_command("durable-bind-post-replace", "BIND_ID_READY"),
                     "identityPending": True,
                 },
                 timeout=12,
