@@ -57,7 +57,11 @@ public sealed class SshConsoleWindowTests
                     if (end < 0) continue;
 
                     var body = text.Substring(open + 1, end - open - 1);
-                    if (!Regex.IsMatch(body, @"FileName\s*=\s*""ssh""")) continue;
+                    // Two sanctioned spellings: bare "ssh" (PATH-resolved, the GUI site) and the explicit
+                    // system OpenSSH path (the headless bridge, which must not be hijackable via PATH).
+                    var isSshSpawn = Regex.IsMatch(body, @"FileName\s*=\s*""ssh""")
+                        || body.Contains("\"OpenSSH\", \"ssh.exe\"", StringComparison.Ordinal);
+                    if (!isSshSpawn) continue;
                     yield return (Path.GetRelativePath(root, file), body);
                 }
             }

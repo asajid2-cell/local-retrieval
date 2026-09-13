@@ -306,7 +306,13 @@ public sealed class RemoteBridge
         // the backoff's idle cadence. A relay predating waitMs ignores the field and answers
         // immediately — the backoff alone then paces the polling, exactly as before. The ssh
         // timeout for this one call must sit well above the hold (the relay caps the hold at 25s).
-        var leaseJson = JsonSerializer.Serialize(new { owner = _commandLeaseOwner, limit = 1, waitMs = (int)LeaseHoldWait.TotalMilliseconds });
+        var leaseJson = JsonSerializer.Serialize(new
+        {
+            owner = _commandLeaseOwner,
+            limit = 1,
+            waitMs = (int)LeaseHoldWait.TotalMilliseconds,
+            commandTypes = RemoteCommandProtocol.HeadlessCommandTypes,
+        });
         var lease = await RunTransportAsync(
             s,
             BridgeOperation.Lease,
@@ -542,7 +548,12 @@ public sealed class RemoteBridge
             }
             if (admission == RemoteCommandAdmission.Execute) _commandIntents.Record(c.intentId, res.ok, res.detail);
             var resultId = res.ok && (c.type is "deckcreate" or "collectioncreate") ? res.detail : null;
-            var ackJson = JsonSerializer.Serialize(new { leaseToken = c.leaseToken, ok = res.ok, detail = res.detail, resultId, onPc });
+            // The relay's redelivery/reconcile decision rides on these two flags: an uncertain outcome must
+            // be reconciled against the authoritative owner before any retry, and a start-chat whose launch
+            // succeeded but whose filing is pending must be retried (reconciled), not re-launched.
+            var retryable = RemoteCommandProtocol.IsPendingStartChatFiling(c.type, res);
+            var uncertain = RemoteCommandProtocol.IsUncertainOutcome(res);
+            var ackJson = JsonSerializer.Serialize(new { leaseToken = c.leaseToken, ok = res.ok, detail = res.detail, resultId, onPc, uncertain, retryable });
             await AckCommandAsync(s, c.id, ackJson);
         }
         if (changed) { await Task.Delay(300); await PushRunningAsync(s); }   // reflect a kill/rename fast
@@ -846,7 +857,9 @@ public sealed class RemoteBridge
             var stdinFlag = stdin is null ? "-n " : "";
             var psi = new ProcessStartInfo
             {
-                FileName = "ssh",
+                // Name the system OpenSSH explicitly rather than resolving "ssh" from PATH: a hijacked/earlier
+                // PATH entry must not be able to intercept the bridge's credentials or command stream.
+                FileName = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "OpenSSH", "ssh.exe"),
                 Arguments = $"{stdinFlag}{SshHardenOpts} {target} \"{remoteCmd}\"",
                 UseShellExecute = false, CreateNoWindow = true,
                 RedirectStandardInput = stdin is not null,

@@ -433,7 +433,13 @@ public sealed partial class MainPage
             // waitMs long-polls the relay (held open, fulfilled the moment work lands); the ssh
             // timeout for this one call sits above the relay's 25s hold cap. _cmdPolling makes the
             // overlapping timer ticks no-ops while the hold is out.
-            var leaseJson = JsonSerializer.Serialize(new { owner = _commandLeaseOwner, limit = 1, waitMs = (int)RemoteBridge.LeaseHoldWait.TotalMilliseconds });
+            var leaseJson = JsonSerializer.Serialize(new
+            {
+                owner = _commandLeaseOwner,
+                limit = 1,
+                waitMs = (int)RemoteBridge.LeaseHoldWait.TotalMilliseconds,
+                commandTypes = RemoteCommandProtocol.GuiCommandTypes,
+            });
             var lease = GuiVerificationFixture.Enabled
                 ? await GuiVerificationFixture.SendAsync("/api/app-commands/lease", leaseJson, RemoteBridge.LeaseHoldWait + SshHardTimeout)
                 : await RunSshAsync(
@@ -666,7 +672,12 @@ public sealed partial class MainPage
                 else res = (false, "unknown command");
                 if (admission == RemoteCommandAdmission.Execute) _commandIntents.Record(c.intentId, res.ok, res.detail);
                 var resultId = res.ok && (c.type is "deckcreate" or "collectioncreate") ? res.detail : null;
-                var ackJson = JsonSerializer.Serialize(new { leaseToken = c.leaseToken, ok = res.ok, detail = res.detail, resultId, onPc });
+                // The relay's redelivery/reconcile decision rides on these two flags: an uncertain outcome
+                // must be reconciled against the authoritative owner before any retry, and a start-chat
+                // whose launch succeeded but whose filing is pending must be retried, not re-launched.
+                var retryable = RemoteCommandProtocol.IsPendingStartChatFiling(c.type, res);
+                var uncertain = RemoteCommandProtocol.IsUncertainOutcome(res);
+                var ackJson = JsonSerializer.Serialize(new { leaseToken = c.leaseToken, ok = res.ok, detail = res.detail, resultId, onPc, uncertain, retryable });
                 await AckCommandAsync(target, port, c.id, ackJson);
             }
             if (killed || renamed || added)
@@ -710,7 +721,7 @@ public sealed partial class MainPage
     private async Task<(bool ok, string detail)> PushTranscriptPagesAsync(string target, int port, AppCommand c)
     {
         var sessionId = (c.sessionId ?? "").Trim();
-        var admission = TranscriptFetchProjection.AdmitFetch(sessionId, c.bridgeToken, c.ttlMs);
+        var admission = TranscriptFetchProjection.AdmitFetch(sessionId, c.id, c.bridgeToken, c.ttlMs);
         if (!admission.Allowed) return (false, admission.Reason);
 
         var deadline = Stopwatch.StartNew();
@@ -725,13 +736,13 @@ public sealed partial class MainPage
                 var session = _archive.ResolveSessionByIdOrAlias(sessionId, c.tool);
                 if (session is null) return (false, "chat not in this app's archive");
                 var messages = await _archive.ExtractReaderMessagesAsync(session, "all", captureDeadline.Token);
-                pages = TranscriptFetchProjection.BuildPages(sessionId, messages, redact);
+                pages = TranscriptFetchProjection.BuildPages(sessionId, c.id, messages, redact);
             }
             finally { _syncGate.Release(); }
         }
         catch (OperationCanceledException) { return (false, "transcript fetch authorization expired"); }
         catch { return (false, "transcript fetch failed"); }
-        if (pages.Count == 0) return (false, "no readable messages in that chat");
+        if (pages.Count == 0) return (true, "no readable messages in that chat");
 
         string remote;
         try { remote = TranscriptFetchProjection.PushCommand(port, sessionId, c.bridgeToken!); }

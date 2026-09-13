@@ -14,6 +14,9 @@ namespace CodexLocalRetrieval.Native.Tests;
 public sealed class TranscriptFetchTests
 {
     private const string Sid = "1f2e3d4c-5b6a-7980-abcd-ef0123456789";
+    // The relay command id travels with every page so a redelivered fetch is filed under the SAME
+    // fetch, never mistaken for a newer one; it is an opaque envelope token like any other.
+    private const string FetchId = "cmd-1f2e3d4c-5b6a-7980-abcd-ef0123456789";
 
     private static string WriteJsonl(params string[] lines)
     {
@@ -42,12 +45,13 @@ public sealed class TranscriptFetchTests
             Msg("user", "second ask", "2026-07-01T00:00:02Z"),
         };
 
-        var pages = TranscriptFetchProjection.BuildPages(Sid, msgs, redact: false);
+        var pages = TranscriptFetchProjection.BuildPages(Sid, FetchId, msgs, redact: false);
 
         Assert.AreEqual(1, pages.Count);
         var root = Parse(pages[0].Json);
         Assert.AreEqual(1, root.GetProperty("schemaVersion").GetInt32());
         Assert.AreEqual(Sid, root.GetProperty("sessionId").GetString());
+        Assert.AreEqual(FetchId, root.GetProperty("fetchId").GetString());
         Assert.AreEqual(1, root.GetProperty("page").GetInt32());
         Assert.AreEqual(1, root.GetProperty("pages").GetInt32());
 
@@ -62,13 +66,26 @@ public sealed class TranscriptFetchTests
         Assert.AreEqual(DateTimeOffset.Parse("2026-07-01T00:00:00Z").ToUnixTimeMilliseconds(), wire[0].GetProperty("ts").GetInt64());
     }
 
+    // An empty or blank transcript is a DEFINITIVE capture: the relay stores it so an older parked
+    // transcript for the same chat is replaced rather than left stale. One page, zero messages.
     [TestMethod]
-    public void BuildPages_OnEmptyOrBlankTranscript_EmitsNoPages()
+    public void BuildPages_OnEmptyOrBlankTranscript_EmitsAuthoritativeEmptyCapture()
     {
-        Assert.AreEqual(0, TranscriptFetchProjection.BuildPages(Sid, new List<ArchiveMessage>(), false).Count);
-        Assert.AreEqual(0, TranscriptFetchProjection.BuildPages(Sid, null, false).Count);
-        var blank = new List<ArchiveMessage> { Msg("user", "   ", "t"), Msg("assistant", "", "t") };
-        Assert.AreEqual(0, TranscriptFetchProjection.BuildPages(Sid, blank, false).Count);
+        foreach (var (msgs, label) in new (IReadOnlyList<ArchiveMessage>?, string)[]
+        {
+            (new List<ArchiveMessage>(), "empty"),
+            (null, "null"),
+            (new List<ArchiveMessage> { Msg("user", "   ", "t"), Msg("assistant", "", "t") }, "blank"),
+        })
+        {
+            var pages = TranscriptFetchProjection.BuildPages(Sid, FetchId, msgs, false);
+            Assert.AreEqual(1, pages.Count, label);
+            var root = Parse(pages[0].Json);
+            Assert.AreEqual(Sid, root.GetProperty("sessionId").GetString());
+            Assert.AreEqual(FetchId, root.GetProperty("fetchId").GetString());
+            Assert.AreEqual(1, root.GetProperty("pages").GetInt32());
+            Assert.AreEqual(0, root.GetProperty("messages").GetArrayLength(), label);
+        }
     }
 
     // Page 1 is the NEWEST slice (the web wants the end of the conversation first) but a page reads
@@ -81,7 +98,7 @@ public sealed class TranscriptFetchTests
             .Select(i => Msg(i % 2 == 0 ? "user" : "assistant", $"m{i:D3} {body}", $"2026-07-01T00:{i:D2}:00Z"))
             .ToList();
 
-        var pages = TranscriptFetchProjection.BuildPages(Sid, msgs, redact: false);
+        var pages = TranscriptFetchProjection.BuildPages(Sid, FetchId, msgs, redact: false);
 
         Assert.IsTrue(pages.Count > 1, "40 x 40KB messages must span multiple pages");
         foreach (var p in pages)
@@ -114,7 +131,7 @@ public sealed class TranscriptFetchTests
             .Select(i => Msg("assistant", $"m{i:D3} {body}", $"2026-07-01T{i / 60:D2}:{i % 60:D2}:00Z"))
             .ToList();
 
-        var pages = TranscriptFetchProjection.BuildPages(Sid, msgs, redact: false);
+        var pages = TranscriptFetchProjection.BuildPages(Sid, FetchId, msgs, redact: false);
 
         Assert.AreEqual(TranscriptFetchProjection.MaxPages, pages.Count);
         var newest = Parse(pages[0].Json).GetProperty("messages").EnumerateArray().Last().GetProperty("text").GetString();
@@ -129,7 +146,7 @@ public sealed class TranscriptFetchTests
     {
         var msgs = new List<ArchiveMessage> { Msg("user", new string('z', 900 * 1024), "2026-07-01T00:00:00Z") };
 
-        var pages = TranscriptFetchProjection.BuildPages(Sid, msgs, redact: false);
+        var pages = TranscriptFetchProjection.BuildPages(Sid, FetchId, msgs, redact: false);
 
         Assert.AreEqual(1, pages.Count);
         Assert.IsTrue(Encoding.UTF8.GetByteCount(pages[0].Json) <= TranscriptFetchProjection.MaxPageBytes);
@@ -145,11 +162,11 @@ public sealed class TranscriptFetchTests
         const string key = "sk-ant-api03-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
         var msgs = new List<ArchiveMessage> { Msg("user", $"here is my key {key} use it", "2026-07-01T00:00:00Z") };
 
-        var raw = Parse(TranscriptFetchProjection.BuildPages(Sid, msgs, redact: false)[0].Json)
+        var raw = Parse(TranscriptFetchProjection.BuildPages(Sid, FetchId, msgs, redact: false)[0].Json)
             .GetProperty("messages").EnumerateArray().Single().GetProperty("text").GetString()!;
         StringAssert.Contains(raw, key);
 
-        var scrubbed = Parse(TranscriptFetchProjection.BuildPages(Sid, msgs, redact: true)[0].Json)
+        var scrubbed = Parse(TranscriptFetchProjection.BuildPages(Sid, FetchId, msgs, redact: true)[0].Json)
             .GetProperty("messages").EnumerateArray().Single().GetProperty("text").GetString()!;
         Assert.IsFalse(scrubbed.Contains(key, StringComparison.Ordinal), "the key must not leave the machine");
         StringAssert.Contains(scrubbed, "[redacted-secret]");
@@ -240,7 +257,7 @@ public sealed class TranscriptFetchTests
         {
             var session = new ArchiveSession { Id = Sid, Tool = "claude", SourcePath = path };
             var messages = await NewArchive().ExtractReaderMessagesAsync(session, "all");
-            var wire = Parse(TranscriptFetchProjection.BuildPages(Sid, messages, false)[0].Json)
+            var wire = Parse(TranscriptFetchProjection.BuildPages(Sid, FetchId, messages, false)[0].Json)
                 .GetProperty("messages").EnumerateArray().ToArray();
             CollectionAssert.AreEqual(new[] { "first prompt", "first answer", "second prompt", "second answer" },
                 wire.Select(m => m.GetProperty("text").GetString()).ToArray());
@@ -345,7 +362,7 @@ public sealed class TranscriptFetchTests
             var session = new ArchiveSession { Id = Sid, Tool = "claude", SourcePath = path };
 
             var merged = await archive.ExtractReaderMessagesAsync(session, "all");
-            var pages = TranscriptFetchProjection.BuildPages(Sid, merged, redact: false);
+            var pages = TranscriptFetchProjection.BuildPages(Sid, FetchId, merged, redact: false);
 
             Assert.AreEqual(1, pages.Count);
             var wire = Parse(pages[0].Json).GetProperty("messages").EnumerateArray().ToArray();
@@ -373,7 +390,7 @@ public sealed class TranscriptFetchTests
             var session = new ArchiveSession { Id = Sid, Tool = "codex", SourcePath = path };
 
             var merged = await archive.ExtractReaderMessagesAsync(session, "all");
-            var pages = TranscriptFetchProjection.BuildPages(Sid, merged, redact: false);
+            var pages = TranscriptFetchProjection.BuildPages(Sid, FetchId, merged, redact: false);
 
             Assert.AreEqual(1, pages.Count);
             var wire = Parse(pages[0].Json).GetProperty("messages").EnumerateArray().ToArray();
@@ -398,7 +415,7 @@ public sealed class TranscriptFetchTests
             var session = new ArchiveSession { Id = Sid, Tool = "claude", SourcePath = path };
 
             var merged = await archive.ExtractReaderMessagesAsync(session, "all");
-            var pages = TranscriptFetchProjection.BuildPages(Sid, merged, redact: true);
+            var pages = TranscriptFetchProjection.BuildPages(Sid, FetchId, merged, redact: true);
 
             Assert.AreEqual(1, pages.Count);
             Assert.IsFalse(pages[0].Json.Contains(key, StringComparison.Ordinal));
@@ -408,9 +425,10 @@ public sealed class TranscriptFetchTests
         finally { File.Delete(path); }
     }
 
-    // A missing source path is a normal outcome (the chat was deleted under us), not a crash.
+    // A missing source path is a normal outcome (the chat was deleted under us), not a crash. It still
+    // publishes the authoritative empty capture so a stale parked transcript cannot survive.
     [TestMethod]
-    public async Task MissingSourcePath_YieldsNoPagesRatherThanThrowing()
+    public async Task MissingSourcePath_YieldsEmptyCaptureRatherThanThrowing()
     {
         var archive = NewArchive();
         var session = new ArchiveSession { Id = Sid, Tool = "claude", SourcePath = Path.Combine(Path.GetTempPath(), "clr-tfetch-absent.jsonl") };
@@ -419,7 +437,9 @@ public sealed class TranscriptFetchTests
             await archive.ExtractReaderMessagesAsync(session, "user"),
             await archive.ExtractReaderMessagesAsync(session, "assistant"));
 
-        Assert.AreEqual(0, TranscriptFetchProjection.BuildPages(Sid, merged, redact: false).Count);
+        var pages = TranscriptFetchProjection.BuildPages(Sid, FetchId, merged, redact: false);
+        Assert.AreEqual(1, pages.Count);
+        Assert.AreEqual(0, Parse(pages[0].Json).GetProperty("messages").GetArrayLength());
     }
 
     // transcriptfetch is an archive.read, so replay must be safe — the closed policy switch has to
@@ -440,7 +460,7 @@ public sealed class TranscriptFetchTests
     [TestMethod]
     public void AdmitFetch_AdmitsAWellFormedRequest()
     {
-        var a = TranscriptFetchProjection.AdmitFetch(Sid, GoodToken, 30_000);
+        var a = TranscriptFetchProjection.AdmitFetch(Sid, FetchId, GoodToken, 30_000);
         Assert.IsTrue(a.Allowed);
         Assert.AreEqual("", a.Reason);
     }
@@ -448,7 +468,7 @@ public sealed class TranscriptFetchTests
     [TestMethod]
     public void AdmitFetch_TrimsSurroundingWhitespaceOnTheId()
     {
-        Assert.IsTrue(TranscriptFetchProjection.AdmitFetch("  " + Sid + "  ", GoodToken, 30_000).Allowed);
+        Assert.IsTrue(TranscriptFetchProjection.AdmitFetch("  " + Sid + "  ", FetchId, GoodToken, 30_000).Allowed);
     }
 
     [DataRow(null)]
@@ -464,9 +484,28 @@ public sealed class TranscriptFetchTests
     [DataTestMethod]
     public void AdmitFetch_RejectsAnIdThatIsNotOpaque(string? id)
     {
-        var a = TranscriptFetchProjection.AdmitFetch(id, GoodToken, 30_000);
+        var a = TranscriptFetchProjection.AdmitFetch(id, FetchId, GoodToken, 30_000);
         Assert.IsFalse(a.Allowed);
         Assert.AreEqual("transcript fetch needs one explicit opaque session id", a.Reason);
+    }
+
+    // The fetch id is a second opaque value on the same wire: it names WHICH fetch a page belongs to, so
+    // it is held to the identical alphabet as the session id and refused before any capture work.
+    [DataRow(null)]
+    [DataRow("")]
+    [DataRow("   ")]
+    [DataRow("a b")]
+    [DataRow("a\"b")]
+    [DataRow("../etc/passwd")]
+    [DataRow("a\rb")]
+    [DataRow("a\nb")]
+    [DataRow("a;rm -rf /")]
+    [DataTestMethod]
+    public void AdmitFetch_RejectsAFetchIdThatIsNotOpaque(string? fetchId)
+    {
+        var a = TranscriptFetchProjection.AdmitFetch(Sid, fetchId, GoodToken, 30_000);
+        Assert.IsFalse(a.Allowed);
+        Assert.AreEqual("transcript fetch needs one explicit opaque fetch id", a.Reason);
     }
 
     [DataRow(null)]
@@ -477,7 +516,7 @@ public sealed class TranscriptFetchTests
     [DataTestMethod]
     public void AdmitFetch_RejectsACredentialThatIsNotScoped(string? token)
     {
-        var a = TranscriptFetchProjection.AdmitFetch(Sid, token, 30_000);
+        var a = TranscriptFetchProjection.AdmitFetch(Sid, FetchId, token, 30_000);
         Assert.IsFalse(a.Allowed);
         Assert.AreEqual("transcript fetch needs a scoped bridge credential", a.Reason);
     }
@@ -489,7 +528,7 @@ public sealed class TranscriptFetchTests
     [DataTestMethod]
     public void AdmitFetch_RejectsAnUnboundedTtl(int ttlMs)
     {
-        var a = TranscriptFetchProjection.AdmitFetch(Sid, GoodToken, ttlMs);
+        var a = TranscriptFetchProjection.AdmitFetch(Sid, FetchId, GoodToken, ttlMs);
         Assert.IsFalse(a.Allowed);
         Assert.AreEqual(
             $"transcript fetch needs a bounded ttlMs in 1..{TranscriptFetchProjection.MaxFetchTtlMs}",
@@ -501,7 +540,7 @@ public sealed class TranscriptFetchTests
     [DataTestMethod]
     public void AdmitFetch_TtlBoundsAreInclusive(int ttlMs)
     {
-        Assert.IsTrue(TranscriptFetchProjection.AdmitFetch(Sid, GoodToken, ttlMs).Allowed);
+        Assert.IsTrue(TranscriptFetchProjection.AdmitFetch(Sid, FetchId, GoodToken, ttlMs).Allowed);
     }
 
     // Order matters: an operator debugging a bad request should be told about the id first, because
@@ -509,7 +548,7 @@ public sealed class TranscriptFetchTests
     [TestMethod]
     public void AdmitFetch_ReportsTheSessionIdReasonFirstWhenEverythingIsWrong()
     {
-        var a = TranscriptFetchProjection.AdmitFetch("bad id/../", "x", 0);
+        var a = TranscriptFetchProjection.AdmitFetch("bad id/../", FetchId, "x", 0);
         Assert.IsFalse(a.Allowed);
         Assert.AreEqual("transcript fetch needs one explicit opaque session id", a.Reason);
     }
@@ -517,7 +556,7 @@ public sealed class TranscriptFetchTests
     [TestMethod]
     public void AdmitFetch_ReportsTheCredentialReasonBeforeTheTtlReason()
     {
-        var a = TranscriptFetchProjection.AdmitFetch(Sid, "x", 0);
+        var a = TranscriptFetchProjection.AdmitFetch(Sid, FetchId, "x", 0);
         Assert.IsFalse(a.Allowed);
         Assert.AreEqual("transcript fetch needs a scoped bridge credential", a.Reason);
     }

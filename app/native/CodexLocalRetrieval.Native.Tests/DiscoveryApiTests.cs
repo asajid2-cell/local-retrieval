@@ -234,6 +234,72 @@ public sealed class DiscoveryApiTests
         Assert.AreEqual(1, facets.Projects.Single(project => project.Id == "project-notes").Count);
     }
 
+    // A restricted/isolated archive must never offer the machine's home directory as a start target; that
+    // would silently widen an authenticated consumer's view back to the whole profile.
+    [TestMethod]
+    public void WorkspaceRegistry_RestrictedArchiveDoesNotImplicitlyAddTheUserProfile()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "discovery-restricted-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var codexRoot = Path.Combine(root, "codex");
+            var claudeRoot = Path.Combine(root, "claude");
+            Directory.CreateDirectory(codexRoot);
+            Directory.CreateDirectory(claudeRoot);
+            var workspace = Path.Combine(root, "workspace", "Demo");
+            Directory.CreateDirectory(workspace);
+
+            var archive = new ArchiveService(
+                storePath: Path.Combine(root, "app-store.json"),
+                enableTranscriptSearchIndex: false,
+                codexSessionsRoot: codexRoot,
+                claudeSessionsRoot: claudeRoot,
+                codexStateDbPath: Path.Combine(root, "state_5.sqlite"),
+                restrictTranscriptSources: true);
+            var chat = Chat("r", "Restricted Chat", "codex", "2026-08-02T10:00:00Z", 5);
+            chat.Workspace = workspace;
+            chat.WorkspaceName = "demo";
+            archive.Store.Sessions[chat.Id] = chat;
+            var api = new DiscoveryApi(archive, _ => true);
+
+            Assert.IsTrue(archive.RestrictsTranscriptSources);
+            var rows = api.StartWorkspaces().Rows;
+            Assert.AreEqual(1, rows.Count, "only the session's real workspace may appear");
+            Assert.IsTrue(api.TryResolveWorkspace(rows[0].Id, out var resolved));
+            Assert.AreEqual(workspace, resolved);
+            Assert.IsFalse(api.TryResolveWorkspace(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), out _));
+            CollectionAssert.DoesNotContain(
+                rows.Select(row => row.Label).ToList(),
+                new DirectoryInfo(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)).Name);
+        }
+        finally { Directory.Delete(root, recursive: true); }
+    }
+
+    [TestMethod]
+    public void Chats_CarryAliasAwareCollectionAndManagementIdentity()
+    {
+        var (archive, api) = Fixture();
+        var chat = archive.Store.Sessions["b"];
+        chat.Aliases.Add("legacy-b");
+        chat.BranchOfId = "a";
+        chat.FromSnapshotId = "snap-1";
+        chat.CustomTitle = "Renamed Beta";
+        archive.Store.Collections["project-notes"].SessionIds.Clear();
+        archive.Store.Collections["project-notes"].SessionIds.Add("legacy-b");
+
+        var row = api.Chats(new DiscoveryQuery(ShowHidden: true)).Rows.Single(r => r.Id == "b");
+
+        CollectionAssert.Contains(row.CollectionIds.ToList(), "project-notes");
+        Assert.AreEqual("project-notes", row.CollectionId);
+        Assert.AreEqual("b", row.BranchId);
+        Assert.AreEqual("a", row.BranchOfId);
+        Assert.AreEqual("snap-1", row.FromSnapshotId);
+        Assert.AreEqual("snap-1", row.CheckpointId);
+        Assert.AreEqual("Beta Notes", row.NativeTitle);
+        Assert.AreEqual("Renamed Beta", row.AppTitle);
+    }
+
     [TestMethod]
     public void Chats_ClampsPagingAndRejectsUnsupportedPresetValues()
     {

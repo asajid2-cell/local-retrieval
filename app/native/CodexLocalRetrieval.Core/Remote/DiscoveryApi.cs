@@ -41,7 +41,16 @@ public sealed record DiscoveryChatRow(
     string Revision = "",
     bool Archived = false,
     string CustomTitle = "",
-    IReadOnlyList<string>? CollectionIds = null);
+    IReadOnlyList<string>? CollectionIds = null,
+    // Safe authoritative identities used by the management queue. These are deliberately opaque;
+    // local paths, transcript names, and launch details never enter the discovery projection.
+    string CollectionId = "",
+    string BranchId = "",
+    string CheckpointId = "",
+    string NativeTitle = "",
+    string AppTitle = "",
+    string BranchOfId = "",
+    string FromSnapshotId = "");
 
 public sealed record DiscoveryMutationResult(bool Ok, string Message, string Id, bool Favorite, string Revision);
 
@@ -351,6 +360,16 @@ public sealed class DiscoveryApi
     private DiscoveryChatRow ToRow(ArchiveSession session, string sort)
     {
         var hit = _archive.LastSearchHit(session.Id);
+        // Alias-aware membership: a chat resumed/adopted from elsewhere is filed under its canonical id
+        // OR one of its aliases, and the management queue must see that membership to mutate it.
+        var collectionIds = _archive.Store.Collections.Values
+            .Where(collection => collection.SessionIds.Any(id =>
+                string.Equals(id, session.Id, StringComparison.OrdinalIgnoreCase)
+                || session.Aliases.Any(alias => string.Equals(alias, id, StringComparison.OrdinalIgnoreCase))))
+            .Select(collection => collection.Id)
+            .OrderBy(id => id, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        var checkpointId = session.FromSnapshotId ?? "";
         return new DiscoveryChatRow(
             session.Id,
             SecretRedactor.Scrub(RowTitle(session, sort)),
@@ -377,7 +396,14 @@ public sealed class DiscoveryApi
             _archive.RemoteManagementRevision(session),
             session.Archived,
             SecretRedactor.Scrub(session.CustomTitle),
-            _archive.CollectionIdsForSession(session.Id));
+            collectionIds,
+            collectionIds.FirstOrDefault() ?? "",
+            session.IsBranch ? session.Id : "",
+            checkpointId,
+            SecretRedactor.Scrub(session.Title),
+            SecretRedactor.Scrub(session.CustomTitle),
+            session.BranchOfId ?? "",
+            session.FromSnapshotId ?? "");
     }
 
     private static string RowTitle(ArchiveSession session, string sort) => sort switch
@@ -508,7 +534,11 @@ public sealed class DiscoveryApi
     {
         var entries = new Dictionary<string, WorkspaceAccumulator>(StringComparer.OrdinalIgnoreCase);
 
-        AddWorkspace(entries, Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), null);
+        // In restricted mode the user profile is NOT implicitly a workspace: discovery runs against an
+        // isolated/authenticated archive, and offering the whole home directory as a launch target would
+        // silently widen it back to the machine.
+        if (!_archive.RestrictsTranscriptSources)
+            AddWorkspace(entries, Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), null);
         foreach (var session in _archive.Store.Sessions.Values)
             AddWorkspace(entries, session.Workspace, session.Tool);
 

@@ -493,9 +493,10 @@ if (Environment.GetEnvironmentVariable("CLR_REMOTE_BRIDGE") != "0")
             fetchTranscript: async command =>
             {
                 var id = command.GetProperty("sessionId").GetString() ?? "";
+                var fetchId = command.TryGetProperty("id", out var commandId) ? commandId.GetString() ?? "" : "";
                 var credential = command.GetProperty("bridgeToken").GetString();
                 var ttl = command.GetProperty("ttlMs").GetInt32();
-                var admission = TranscriptFetchProjection.AdmitFetch(id, credential, ttl);
+                var admission = TranscriptFetchProjection.AdmitFetch(id, fetchId, credential, ttl);
                 if (!admission.Allowed) return (false, admission.Reason);
                 var clock = System.Diagnostics.Stopwatch.StartNew();
                 try
@@ -508,7 +509,7 @@ if (Environment.GetEnvironmentVariable("CLR_REMOTE_BRIDGE") != "0")
                         if (remaining <= 0) return null;
                         using var captureDeadline = new CancellationTokenSource(TimeSpan.FromMilliseconds(remaining));
                         var messages = await loaded.ExtractReaderMessagesAsync(session, "all", captureDeadline.Token);
-                        return TranscriptFetchProjection.BuildPages(id, messages, redactReads);
+                        return TranscriptFetchProjection.BuildPages(id, fetchId, messages, redactReads);
                     });
                     if (pages is null || pages.Count == 0) return (false, "no readable transcript for this chat");
                     foreach (var page in pages)

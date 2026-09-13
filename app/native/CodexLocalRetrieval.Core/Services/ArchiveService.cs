@@ -170,7 +170,12 @@ public sealed partial class ArchiveService
             foreach (var s in candidates)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                try { if (File.Exists(s.SourcePath)) s.UserMessageCount = CountUserPrompts(s.SourcePath, s.Tool); }
+                try
+                {
+                    if (_restrictTranscriptSources)
+                        ValidateRestrictedPath(s.SourcePath, _codexSessionsRoot, _claudeSessionsRoot, _templatesRoot);
+                    if (File.Exists(s.SourcePath)) s.UserMessageCount = CountUserPrompts(s.SourcePath, s.Tool);
+                }
                 catch { }
             }
         }, cancellationToken);
@@ -215,8 +220,13 @@ public sealed partial class ArchiveService
     public AppStoreData Store { get; private set; } = new();
     public ObservableCollection<ArchiveSession> Sessions { get; } = new();
 
+    // True when this archive serves an isolated/authenticated consumer: it scans ONLY the constructor's
+    // explicit roots, ignores the user's saved external sources, and never absorbs bundled demo history.
+    public bool RestrictsTranscriptSources => _restrictTranscriptSources;
+
     private readonly IReadOnlyList<SessionSource>? _sourceOverride;
     private readonly string? _codexAccountsRootOverride;
+    private readonly bool _restrictTranscriptSources;
 
     public ArchiveService(
         string? storePath = null,
@@ -229,8 +239,18 @@ public sealed partial class ArchiveService
         string? transcriptSearchIndexPath = null,
         bool? enableTranscriptSearchIndex = null,
         IReadOnlyList<SessionSource>? sourceOverride = null,
-        string? codexAccountsRoot = null)
+        string? codexAccountsRoot = null,
+        bool restrictTranscriptSources = false)
     {
+        // Restricted/isolated mode has NO ambient defaults: the codex + claude roots and the codex state
+        // db must be named explicitly and be absolute, so an isolated archive can never silently widen
+        // to the user's real ~/.codex or ~/.claude and serve them to a remote consumer.
+        if (restrictTranscriptSources && (string.IsNullOrWhiteSpace(codexSessionsRoot)
+            || string.IsNullOrWhiteSpace(claudeSessionsRoot)
+            || !Path.IsPathFullyQualified(codexSessionsRoot) || !Path.IsPathFullyQualified(claudeSessionsRoot)
+            || string.IsNullOrWhiteSpace(codexStateDbPath) || !Path.IsPathFullyQualified(codexStateDbPath)))
+            throw new ArgumentException("Restricted scanning requires explicit absolute transcript roots.");
+        _restrictTranscriptSources = restrictTranscriptSources;
         _sourceOverride = sourceOverride?.Select(s => new SessionSource { Tool = s.Tool, Root = s.Root, Enabled = s.Enabled }).ToArray();
         _codexAccountsRootOverride = codexAccountsRoot;
         _rootPath = FindProjectRoot();
@@ -400,7 +420,7 @@ public sealed partial class ArchiveService
                 if (storeLock is not null) await storeLock.DisposeAsync();
             }
         }
-        else if (File.Exists(_bundledStorePath))
+        else if (!_restrictTranscriptSources && File.Exists(_bundledStorePath))
         {
             Store = await Task.Run(() => ReadStore(_bundledStorePath), cancellationToken);
         }
@@ -494,7 +514,36 @@ public sealed partial class ArchiveService
         var data = JsonSerializer.Deserialize<AppStoreData>(bytes, _jsonOptions)
             ?? throw new InvalidDataException("App store deserialized to null: " + source);
         NormalizeLoadedStore(data);
+        // In restricted mode every persisted transcript/snapshot path must still live inside the explicit
+        // roots; a store written while unrestricted (or tampered with) must not widen the read surface.
+        if (_restrictTranscriptSources)
+        {
+            foreach (var session in data.Sessions.Values)
+                if (!string.IsNullOrWhiteSpace(session.SourcePath))
+                    ValidateRestrictedPath(session.SourcePath, _codexSessionsRoot, _claudeSessionsRoot, _templatesRoot);
+            foreach (var snapshot in data.TemplateSnapshots.Values)
+                if (!string.IsNullOrWhiteSpace(snapshot.SnapshotPath))
+                    ValidateRestrictedPath(snapshot.SnapshotPath, _templatesRoot);
+        }
         return data;
+    }
+
+    // Restricted-mode path fence: every transcript/snapshot path that could be read or written must be
+    // absolute, live under one of the configured roots, and not traverse a reparse point (junction/symlink)
+    // that would escape those roots after the fact.
+    private static void ValidateRestrictedPath(string path, params string[] roots)
+    {
+        if (!Path.IsPathFullyQualified(path))
+            throw new InvalidDataException("Isolated archive paths must be absolute.");
+        var fullPath = Path.GetFullPath(path);
+        if (!roots.Any(root => fullPath.StartsWith(
+            Path.TrimEndingDirectorySeparator(Path.GetFullPath(root)) + Path.DirectorySeparatorChar,
+            StringComparison.OrdinalIgnoreCase)))
+            throw new InvalidDataException("Isolated archive path is outside configured roots.");
+        for (FileSystemInfo? entry = new FileInfo(fullPath); entry is not null;
+            entry = entry is FileInfo file ? file.Directory : ((DirectoryInfo)entry).Parent)
+            if (entry.Exists && (entry.Attributes & FileAttributes.ReparsePoint) != 0)
+                throw new InvalidDataException("Isolated archive paths cannot traverse reparse points.");
     }
 
     private static void ValidateStoreShape(byte[] bytes, string source)
@@ -1773,12 +1822,12 @@ public sealed partial class ArchiveService
     // (id, creation-time) of every Claude transcript currently in the project folder for `cwd`. The folder
     // name is the cwd with [\/:.\s] -> '-' (Claude may also lowercase the drive letter), so we match the
     // directory case-insensitively. Returns empty if the folder doesn't exist yet (no chats there).
-    private static List<(string id, DateTime created)> ClaudeFolderTranscripts(string cwd)
+    private List<(string id, DateTime created)> ClaudeFolderTranscripts(string cwd)
     {
         var list = new List<(string, DateTime)>();
         try
         {
-            var root = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".claude", "projects");
+            var root = _claudeSessionsRoot;
             if (!Directory.Exists(root)) return list;
             var want = EncodeClaudeProjectFolder(cwd);
             var folder = Directory.EnumerateDirectories(root)
@@ -1786,6 +1835,7 @@ public sealed partial class ArchiveService
             if (folder is not null)
                 foreach (var f in Directory.EnumerateFiles(folder, "*.jsonl"))
                 {
+                    if (_restrictTranscriptSources) ValidateRestrictedPath(f, _claudeSessionsRoot);
                     DateTime ct; try { ct = File.GetCreationTimeUtc(f); } catch { ct = DateTime.UtcNow; }
                     list.Add((Path.GetFileNameWithoutExtension(f), ct));
                 }
@@ -4031,6 +4081,22 @@ public sealed partial class ArchiveService
     {
         if (_sourceOverride is not null) return _sourceOverride;
 
+        // Restricted/isolated mode scans ONLY the explicit constructor roots: persisted user sources and
+        // live account-home discovery are both ambient and must never widen an isolated consumer's surface.
+        if (_restrictTranscriptSources)
+        {
+            var restricted = new List<SessionSource>
+            {
+                new() { Tool = "codex", Root = _codexSessionsRoot },
+                new() { Tool = "claude", Root = _claudeSessionsRoot },
+            };
+            foreach (var source in restricted)
+                for (var directory = new DirectoryInfo(source.Root); directory is not null; directory = directory.Parent)
+                    if (directory.Exists && (directory.Attributes & FileAttributes.ReparsePoint) != 0)
+                        throw new InvalidOperationException("Restricted transcript roots cannot traverse reparse points.");
+            return restricted;
+        }
+
         var configured = Store.Settings.Sources.Count > 0
             ? Store.Settings.Sources
             : DefaultSources();
@@ -4067,7 +4133,9 @@ public sealed partial class ArchiveService
         var known = fullRescan
             ? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
             : new Dictionary<string, string>(Store.FileStamps, StringComparer.OrdinalIgnoreCase);
-        var bundled = bundledAbsorbed ? new List<ArchiveSession>() : LoadBundledHistory(progress);
+        var bundled = (_restrictTranscriptSources || bundledAbsorbed)
+            ? new List<ArchiveSession>()
+            : LoadBundledHistory(progress);
         var disk = new List<ArchiveSession>();
         var stamps = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         var anyRoot = false;
@@ -6824,12 +6892,13 @@ public sealed partial class ArchiveService
         return result;
     }
 
-    private static IEnumerable<string> CandidateSessionIndexFiles()
+    private IEnumerable<string> CandidateSessionIndexFiles()
     {
-        var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        var root = Path.Combine(home, ".codex");
+        var root = Path.GetDirectoryName(_codexStateDbPath)!;
         var live = Path.Combine(root, "session_index.jsonl");
+        if (_restrictTranscriptSources) ValidateRestrictedPath(live, root);
         if (File.Exists(live)) yield return live;
+        if (_restrictTranscriptSources) yield break;
         var backups = Path.Combine(root, "repair-backups");
         if (!Directory.Exists(backups)) yield break;
         foreach (var file in Directory.EnumerateFiles(backups, "session_index.jsonl", SearchOption.AllDirectories))
@@ -6838,9 +6907,10 @@ public sealed partial class ArchiveService
         }
     }
 
-    private static void LoadSqliteThreadTitles(Dictionary<string, ThreadTitle> result)
+    private void LoadSqliteThreadTitles(Dictionary<string, ThreadTitle> result)
     {
-        var path = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".codex", "state_5.sqlite");
+        var path = _codexStateDbPath;
+        if (_restrictTranscriptSources) ValidateRestrictedPath(path, Path.GetDirectoryName(path)!);
         if (!File.Exists(path)) return;
 
         try

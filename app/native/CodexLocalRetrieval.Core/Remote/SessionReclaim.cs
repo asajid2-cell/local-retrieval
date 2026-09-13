@@ -288,8 +288,7 @@ public static class SessionReclaim
         if (options.PruneMuxCurrent is not null)
         {
             progress("Checking mux custody...");
-            try { pruned = options.PruneMuxCurrent(ids) ?? Array.Empty<string>(); }
-            catch { pruned = Array.Empty<string>(); }
+            pruned = options.PruneMuxCurrent(ids) ?? Array.Empty<string>();
         }
 
         var report = new ReclaimReport(
