@@ -284,8 +284,8 @@ class FakeHost {
     try { this.ws.close(); } catch {}
   }
 
-  sendHello(sessions = [], profile = '') {
-    this.ws.send(JSON.stringify({ t: 'hello', host: 'FAKEPC', protocol: 4, caps: HOST_CAPS, sessions, profile }));
+  sendHello(sessions = []) {
+    this.ws.send(JSON.stringify({ t: 'hello', host: 'FAKEPC', protocol: 4, caps: HOST_CAPS, sessions }));
   }
 
   sendSessions(list) {
