@@ -117,7 +117,8 @@ class TestDeployManifest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertRegex(
             result.stdout + result.stderr,
-            r"enforce deployment requires a\s+DPAPI-protected provisioned principal",
+            # Windows PowerShell may wrap the error stream between "requires" and "a".
+            r"enforce deployment requires\s+a\s+DPAPI-protected provisioned principal",
         )
 
     def test_preflight_refuses_when_a_local_module_is_missing_from_dst(self):
