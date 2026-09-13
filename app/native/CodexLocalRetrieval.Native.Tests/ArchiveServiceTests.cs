@@ -382,20 +382,24 @@ public sealed class ArchiveServiceTests
             WriteRollout(Path.Combine(account, "sessions"), "rollout-acct.jsonl", "acctsession1", "2026-08-20T00:00:00Z", "from an account home");
             var service = new ArchiveService(
                 storePath: Path.Combine(accountsRoot, "store.json"),
-                codexAccountsRoot: accountsRoot,
-                sourceOverride: new[]
-                {
-                    new SessionSource
-                    {
-                        Tool = "codex",
-                        Root = Path.Combine(account, "sessions"),
-                    },
-                });
+                codexAccountsRoot: accountsRoot);
             service.Store.Settings.BundledHistoryAbsorbed = true;
+            // A non-empty configured list suppresses the machine defaults, while account roots are still
+            // appended dynamically by EffectiveSources().
+            service.Store.Settings.Sources.Add(new SessionSource
+            {
+                Tool = "codex",
+                Root = Path.Combine(accountsRoot, "configured-but-empty"),
+            });
 
-            await service.SyncFromDiskAsync(refreshList: false);
+            var scan = await service.ScanDiskAsync();
+            Assert.IsTrue(scan.Disk.Any(s => s.Id == "acctsession1"),
+                "the dynamically discovered account source must be scanned");
+            await service.MergeScanAsync(scan, refreshList: false);
 
             Assert.IsTrue(service.Store.Sessions.ContainsKey("acctsession1"));
+            Assert.IsTrue(service.EffectiveSources().Any(s =>
+                string.Equals(s.Root, Path.Combine(account, "sessions"), StringComparison.OrdinalIgnoreCase)));
         }
         finally { try { Directory.Delete(accountsRoot, true); } catch { } }
     }
