@@ -187,7 +187,16 @@ function wsOriginOk(req) {
 // TEST_MODE half and an unauthenticated loopback caller gets a terminal; drop the isTrustedLocal half
 // and anything arriving through nginx (which stamps X-Forwarded-For) does.
 function testModeLocalTrust(req) {
+  const pathName = String(req.originalUrl || req.url || '').split('?')[0];
+  // Intent recovery is explicitly owner-authenticated even in test mode: treating an intent id as a
+  // local capability would make the durable browser journal a command-disclosure oracle.
+  if (/^\/api\/app-commands\/by-intent\/[^/]+\/?$/.test(pathName)) return false;
   return TEST_MODE && isTrustedLocal(req);
+}
+
+function intentRecoveryRoute(req) {
+  const pathName = String(req.originalUrl || req.url || '').split('?')[0];
+  return req.method === 'GET' && /^\/api\/app-commands\/by-intent\/[^/]+\/?$/.test(pathName);
 }
 // Page pushes require a live per-fetch lease credential; reads remain owner-only.
 const TRANSCRIPT_BRIDGE_HEADER = 'x-mux-transcript-bridge';
