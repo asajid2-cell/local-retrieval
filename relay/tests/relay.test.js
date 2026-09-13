@@ -1315,6 +1315,32 @@ test('malformed host candidates cannot replace an already validated host', async
   }
 });
 
+test('an isolated relay accepts only its configured muxd profile', async t => {
+  const h = new RelayHarness({ MUX_HOST_PROFILE: 'multiplex-test' });
+  await h.start();
+  t.after(async () => h.stop());
+
+  for (const profile of ['production', '']) {
+    const wrong = new FakeHost(h.port);
+    await wrong.connect();
+    const wrongClosed = once(wrong.ws, 'close');
+    wrong.sendHello([], profile);
+    await wrongClosed;
+    assert.equal((await h.json('GET', '/api/health')).host.connected, false);
+  }
+
+  const expected = new FakeHost(h.port);
+  await expected.connect();
+  t.after(() => expected.close());
+  expected.sendHello([], 'multiplex-test');
+  const health = await waitFor(async () => {
+    const value = await h.json('GET', '/api/health');
+    return value.host.connected ? value : null;
+  }, 'profile-matched host');
+  assert.equal(health.host.profile, 'multiplex-test');
+  assert.equal(health.host.name, 'FAKEPC');
+});
+
 test('GET /api/sessions reports trustable attention states from host facts', async t => {
   const h = new RelayHarness();
   await h.start();

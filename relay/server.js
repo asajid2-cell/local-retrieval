@@ -287,8 +287,13 @@ function opaqueIdentity(value) {
 // VIEWER a blip â€” the agent never notices. If this link is down, creation/attach fail loudly instead of
 // making a VPS tmux twin that can silently diverge.
 const HOST_TOKEN = process.env.MUX_HOST_TOKEN || '';
+// Pin this relay to one muxd profile so an isolated instance (e.g. multiplex-test on 7683) can never
+// accept the production host (and vice versa). Empty = unconfigured, so production behaviour is the
+// same as before this gate existed.
+const HOST_PROFILE = String(process.env.MUX_HOST_PROFILE || '').trim();
 let hostWs = null;                 // the PC's muxd link (one at a time; newest wins)
 let hostLabel = '';
+let hostProfile = '';
 const hostSessions = new Map();    // name -> { alive, created, lastOut, tail }
 // A just-created hosted session muxd hasn't reported back yet. A muxd status push (built before it
 // processed our `create`) must NOT evict this optimistic entry â€” otherwise the imminent /ws attach or a
@@ -1968,7 +1973,7 @@ function healthSnapshot() {
            // signed envelopes we hold in custody but never read.
            stateDirBytes: retention ? retention.stateDirBytes : null,
            retention,
-           host: { connected: hostUp(), name: hostLabel, sessions: hostSessions.size, protocol: hostProtocol.protocol, caps: hostProtocol.caps, protocolOk: hostProtocolOk() },
+           host: { connected: hostUp(), name: hostLabel, profile: hostProfile, sessions: hostSessions.size, protocol: hostProtocol.protocol, caps: hostProtocol.caps, protocolOk: hostProtocolOk() },
            node: process.version, at: Date.now() };
 }
 
@@ -3281,7 +3286,8 @@ wssHost.on('connection', (ws, req) => {
     if (m.t === 'hello') {
       const announced = announcedHostProtocol(m);
       const incoming = normalizeHostSessionList(m.sessions);
-      if (!announced || !incoming) {
+      const announcedProfile = opaqueIdentity(m.profile);
+      if (!announced || !incoming || (HOST_PROFILE && announcedProfile !== HOST_PROFILE)) {
         console.log('[host] rejected incompatible or malformed hello');
         try { ws.close(1008, 'host hello violated protocol'); } catch {}
         return;
@@ -3290,6 +3296,7 @@ wssHost.on('connection', (ws, req) => {
       hostWs = ws;
       helloAccepted = true;
       hostLabel = opaqueIdentity(m.host) || 'pc';
+      hostProfile = announcedProfile;
       hostProtocol = announced;
       hostSessions.clear();
       for (const [name, value] of incoming) hostSessions.set(name, value);
@@ -3464,7 +3471,7 @@ wssHost.on('connection', (ws, req) => {
   ws.on('close', () => {
     clearInterval(ka);
     if (hostWs === ws) {
-      hostWs = null; hostProtocol = { protocol: 0, caps: [] };
+      hostWs = null; hostProfile = ''; hostProtocol = { protocol: 0, caps: [] };
       for (const pending of pendingHostKills.values())
         pending.finish({ ok: false, status: 503, detail: 'host disconnected; stop outcome unconfirmed' });
       for (const st of sessions.values()) {
