@@ -685,7 +685,7 @@
           state.lastOutcome = {
             state: 'queued', id: queued.id, intentId: queued.intentId || '',
             muxName: payload.muxName,
-            detail: 'Still waiting on the PC. The start request remains queued.',
+            detail: result.detail || 'Still waiting on the PC. The start request remains queued.',
           };
           state.lastPayload = payloadKey;
           state.error = state.lastOutcome.detail;

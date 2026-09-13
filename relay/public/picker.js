@@ -150,7 +150,15 @@
       return parts.join(' — ');
     }
 
-    async function poll(id, deadlineMs) {
+    // Terminal truth is resolved by the durable intent first: an accepted startmux is journaled, so a
+    // by-intent lookup still resolves the SAME command after a reload, when the in-memory id is gone.
+    // Falling back to the id keeps the picker usable against a relay that has not learned the route.
+    async function poll(id, intentId, deadlineMs) {
+      if (intentId && typeof global.pollIntent === 'function') {
+        return global.pollIntent(intentId, {
+          base: base, fetch: fetchFn, timeoutMs: deadlineMs, intervalMs: pollIntervalMs, now: now, sleep: sleep,
+        });
+      }
       var until = now() + deadlineMs;
       var last = { status: 'pending', detail: '' };
       while (now() < until) {
@@ -166,6 +174,14 @@
       }
       return last;
     }
+
+    // On a reload, intent-journal.js is loaded before picker.js. Resolve every accepted resume before the
+    // user taps again, so an in-flight startmux is not silently forgotten across a refresh.
+    async function recoverPending() {
+      if (typeof global.recoverPendingIntents !== 'function') return [];
+      return global.recoverPendingIntents({ base: base, fetch: fetchFn });
+    }
+    recoverPending();
 
     // One tap. Deliberately NOT guarded by an in-flight lock: a double-tap must reach the relay twice
     // and be collapsed THERE, because the intent journal — not the button's disabled state — is what
@@ -208,7 +224,7 @@
       var queued = (await res.json()) || {};
       // Offline gets a short deadline so the UI says "queued" quickly instead of spinning for a minute
       // at a PC that is not listening. The command itself stays queued either way.
-      var outcome = await poll(queued.id, state.appLive ? pollTimeoutMs : offlineTimeoutMs);
+      var outcome = await poll(queued.id, queued.intentId, state.appLive ? pollTimeoutMs : offlineTimeoutMs);
       var result = {
         muxName: muxName,
         id: queued.id,

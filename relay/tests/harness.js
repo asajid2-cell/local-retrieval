@@ -145,10 +145,20 @@ class RelayHarness {
   }
 
   async stopProcess() {
-    if (this.proc && this.proc.exitCode === null) {
-      this.proc.kill();
-      await Promise.race([once(this.proc, 'exit'), sleep(2000)]);
-      if (this.proc.exitCode === null) this.proc.kill('SIGKILL');
+    const proc = this.proc;
+    if (proc && proc.exitCode === null) {
+      proc.kill();
+      // Wait for 'close', not 'exit': the process object can be gone while its stdio pipes are still
+      // draining, and tearing the tmp dir down underneath them is how a teardown turns into a flake.
+      await Promise.race([once(proc, 'close'), sleep(2000)]);
+      if (proc.exitCode === null) {
+        proc.kill('SIGKILL');
+        await Promise.race([once(proc, 'close'), sleep(1000)]);
+      }
+    }
+    if (proc) {                       // release the pipes even if the child never reported close
+      proc.stdout?.destroy();
+      proc.stderr?.destroy();
     }
     this.proc = null;
   }

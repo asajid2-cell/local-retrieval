@@ -218,7 +218,7 @@ app.use(async (req, res, next) => {
   // while merging would have silently undone that fix, so the narrow route list below stands and the
   // transcript push gets its own scoped, token-checked exemption instead.
   if (isTranscriptBridgePush(req)) return next();   // re-verified in the route; see the transcript store
-  if (isTrustedLocal(req) && isLocalBridgeRoute(req)) return next();   // loopback admits ONLY the desktop-bridge routes
+  if (isTrustedLocal(req) && isLocalBridgeRoute(req) && !intentRecoveryRoute(req)) return next();   // loopback admits ONLY the desktop-bridge routes
   if (dispatchRouteOk(req)) return next();   // scoped fix-factory dispatch capability
   if (testModeLocalTrust(req)) return next();
   if (await isOwner(cookieVal(req, HL_COOKIE))) return next();
@@ -1512,7 +1512,7 @@ let _projects = emptyProjects();
 // durableJsonLoad from its backup or fails startup without overwriting the primary.
 writeJsonState(PROJECTS_FILE, _projects);
 function appSyncedAt() { return _projects.appSyncedAt || _projects.syncedAt || 0; }
-function runningSyncedAt() { return _projects.runningSyncedAt || _projects.syncedAt || 0; }
+function runningSyncedAt() { return _projects.runningSyncedAt ?? _projects.syncedAt ?? 0; }
 function appLive() { return Date.now() - appSyncedAt() < 45000; }
 function bridgeLive() { return Date.now() - runningSyncedAt() < 45000; }
 function runningVerified() { return bridgeLive() && _projects.runningVerified === true; }
@@ -1712,6 +1712,14 @@ app.post('/api/projects', (req, res) => {
   if (projectionHasInvalidIdentity(b))
     return res.status(400).json({ error: 'projection contains an invalid opaque identity' });
   const candidate = normalizeProjects(b, _projects);
+  // A metadata-only mirror push (collections/decks changed) carries no fresh liveness evidence.
+  // Keep the last verified running set rather than letting a metadata sync manufacture a "0 running".
+  if (b.metadataOnly === true) {
+    candidate.runningSessions = _projects.runningSessions;
+    candidate.runningVerified = _projects.runningVerified;
+    candidate.runningVerificationDetail = _projects.runningVerificationDetail;
+    candidate.runningSyncedAt = _projects.runningSyncedAt;
+  }
   try {
     writeJsonState(PROJECTS_FILE, candidate);
   } catch (error) {
@@ -2092,7 +2100,7 @@ function startChatValidationError(fields) {
   if (!fields || !fields.intentId) return 'startchat requires a valid intent id';
   if (!fields.muxName) return 'startchat requires a valid mux session name';
   if (!fields.deckId) return 'startchat requires a valid deck identity';
-  if (fields.launchMode && !['native', 'gateway'].includes(fields.launchMode)) return 'unsupported startchat launch mode';
+  if (fields.launchMode && !['native', 'gateway', 'deepseek', 'luna'].includes(fields.launchMode)) return 'unsupported startchat launch mode';
   if (fields.handoffFromId && (fields.tool !== 'claude' || fields.launchMode !== 'gateway' || fields.checkpointId)) return 'handoff requires new Claude Gateway chat';
   if (fields.collectionId && fields.collection)
     return 'startchat collectionId and collection are mutually exclusive';
@@ -2199,8 +2207,10 @@ function createdContainerId(type, status, value) {
   if (status !== 'done' || !['deckcreate', 'collectioncreate'].includes(type)) return '';
   return typeof value === 'string' && /^[A-Za-z0-9._-]{1,200}$/.test(value) ? value : '';
 }
-function commandOutcomeDetail(type, status, onPc = false) {
+function commandOutcomeDetail(type, status, onPc = false, uncertain = false) {
   if (status === 'pending' || status === 'leased') return '';
+  if (uncertain)
+    return `${type} outcome is uncertain; automatic replay is fenced and authoritative reconciliation is required`;
   if (type === 'fetchfile') {
     if (status === 'done') return 'downloaded to PC';
     return onPc ? 'downloaded to PC but prompt insertion failed' : 'file download failed';
@@ -2282,7 +2292,10 @@ function commandOutcomeDetail(type, status, onPc = false) {
       type,
       status,
       !!c.onPc,
+      status === 'failed' && c.uncertain === true,
     ),
+    uncertain: status === 'failed' && c.uncertain === true,
+    ...(type === 'startchat' ? { reconcileOnly: c.reconcileOnly === true } : {}),
     ...(createdContainerId(type, status, c.resultId) ? { resultId: createdContainerId(type, status, c.resultId) } : {}),
     doneAt: Number(c.doneAt) || 0,
     leaseOwner: status === 'leased' ? commandIntentId(c.leaseOwner) : '',
@@ -2302,7 +2315,8 @@ function commandOutcomeDetail(type, status, onPc = false) {
 }
 function saveCommands(candidate = _commands) { writeJsonState(COMMANDS_FILE, candidate); }
 function compactCommands(candidate, now = Date.now()) {
-  const live = candidate.filter(command => command.status === 'pending' || command.status === 'leased');
+  const live = candidate.filter(command => command.status === 'pending' || command.status === 'leased'
+    || (command.status === 'failed' && command.uncertain === true));
   const terminal = candidate
     .filter(command => command.status === 'done' || command.status === 'failed')
     .filter(command => now - (Number(command.doneAt) || Number(command.ts) || 0) <= COMMAND_TERMINAL_RETENTION_MS)
@@ -2366,7 +2380,7 @@ function enqueueAppCommand(b) {
                   deckId: startChatFields.deckId,
                 } : {}),
                 principalAuth: principalAuthEnvelope(b.principalAuth),
-                ts: Date.now(), status: 'pending', detail: '',
+                ts: Date.now(), status: 'pending', detail: '', uncertain: false,
                 doneAt: 0, leaseOwner: '', leaseToken: '', leaseExpiresAt: 0, attempt: 0 };
   if (COMMAND_REQUIRES_PRINCIPAL_AUTH.has(type) && !cmd.principalAuth) {
     const error = new Error('command type requires a principal auth envelope');
@@ -2399,7 +2413,7 @@ function waitForCommandResult(id, timeoutMs) {
     const tick = () => {
       const c = _commands.find(x => x.id === id);
       if (c && c.status === 'done') return resolve({ ok: true, retryable: false, detail: c.detail || '' });
-      if (c && c.status === 'failed') return resolve({ ok: false, retryable: false, detail: c.detail || '' });
+      if (c && c.status === 'failed') return resolve({ ok: false, retryable: false, uncertain: c.uncertain === true, detail: c.detail || '' });
       if (Date.now() >= deadline)
         return resolve({ ok: false, retryable: true, detail: 'timeout waiting for PC bridge ack' });
       setTimeout(tick, 200);
@@ -2415,6 +2429,10 @@ app.post('/api/app-commands', (req, res) => {     // web (owner) enqueues
   }
   if (hasForbiddenRemoteField(b)) return res.status(400).json({ error: 'executable commands and local paths are forbidden' });
   if (!COMMAND_REPLAY_POLICY.has(b.type)) return res.status(400).json({ error: 'unsupported command' });
+  // An explicitly present launch mode must be one we understand; a bare '' or a non-string is a
+  // caller bug, not "no preference", and must not silently fall back to a device default.
+  if (Object.prototype.hasOwnProperty.call(b, 'launchMode') && !['native', 'gateway', 'deepseek', 'luna'].includes(b.launchMode))
+    return res.status(400).json({ error: 'invalid launch mode' });
   if (b.type === 'startchat') {
     const normalized = normalizeStartChatPayload(b);
     if (normalized.error) return res.status(400).json({ error: normalized.error });
@@ -2499,7 +2517,7 @@ app.post('/api/app-commands', (req, res) => {     // web (owner) enqueues
   }
   if (['collectionsettag', 'collectionreorder'].includes(b.type) && (!b.collectionId || !commandIntentId(b.expectedRevision))) return res.status(400).json({ error: 'collectionId and expectedRevision required' });
   if (b.type === 'collectionsettag' && (typeof b.tag !== 'string' || !b.tag.trim() || typeof b.enabled !== 'boolean')) return res.status(400).json({ error: 'tag and explicit enabled boolean required' });
-  if (b.type === 'startmux' && b.launchMode != null && (!['native', 'gateway'].includes(b.launchMode) || (b.launchMode === 'gateway' && b.tool !== 'claude'))) return res.status(400).json({ error: 'supported tool-specific resume mode required' });
+  if (b.type === 'startmux' && b.launchMode != null && (!['native', 'gateway', 'deepseek', 'luna'].includes(b.launchMode) || (b.launchMode === 'gateway' && b.tool !== 'claude'))) return res.status(400).json({ error: 'supported tool-specific resume mode required' });
   if (b.type === 'deckreorder' && (!commandIntentId(b.expectedRevision) || !Array.isArray(b.deckIds) || b.deckIds.some(id => typeof id !== 'string' || !id) || new Set(b.deckIds).size !== b.deckIds.length)) return res.status(400).json({ error: 'expectedRevision and unique deckIds array required' });
   if (b.type === 'collectionreorder' && (!Array.isArray(b.sessionIds) || b.sessionIds.some(id => typeof id !== 'string' || !id) || new Set(b.sessionIds).size !== b.sessionIds.length)) return res.status(400).json({ error: 'unique sessionIds array required' });
   if (b.type === 'collectionpurge' && !commandIntentId(b.expectedDeletedRevision)) return res.status(400).json({ error: 'expectedDeletedRevision required' });
@@ -2534,15 +2552,60 @@ app.post('/api/app-commands', (req, res) => {     // web (owner) enqueues
     ok: true,
     id: queued.command.id,
     intentId: queued.command.intentId,
+    fingerprint: queued.command.fingerprint,
     status: queued.command.status,
+    uncertain: queued.command.uncertain === true,
+    detail: queued.command.detail || '',
     deduplicated: queued.deduplicated,
   });
+});
+// Owner-only recovery path for browser intent journals. Owner authentication is the disclosure
+// boundary; an authenticated intent-only request bootstraps the fingerprint when the enqueue response
+// was lost before the browser learned it. Once the browser has a fingerprint, it must send it and the
+// relay rejects any mismatch. The response intentionally contains no command payload, lease token,
+// principal envelope, or desktop result beyond the relay-safe terminal detail.
+app.get('/api/app-commands/by-intent/:intentId', (req, res) => {
+  const intentId = commandIntentId(req.params.intentId);
+  const fingerprint = String((req.query && req.query.fingerprint) || '');
+  if (!intentId) return res.status(400).json({ error: 'valid intent id required' });
+  if (fingerprint && !/^[a-f0-9]{64}$/.test(fingerprint))
+    return res.status(400).json({ error: 'valid intent fingerprint required' });
+  const command = _commands.find(item => item.intentId === intentId);
+  if (!command) return res.status(404).json({ error: 'intent not found' });
+  if (fingerprint && command.fingerprint !== fingerprint)
+    return res.status(409).json({ error: 'intent fingerprint does not match command' });
+  return res.json({
+    id: command.id,
+    intentId: command.intentId,
+    fingerprint: command.fingerprint,
+    status: command.status,
+    detail: command.detail || '',
+    uncertain: command.uncertain === true,
+  });
+});
+app.post('/api/app-commands/:id/reconcile', (req, res) => {
+  const command = _commands.find(item => item.id === req.params.id);
+  if (!command) return res.status(404).json({ error: 'command not found' });
+  if (!req.body || req.body.fingerprint !== command.fingerprint)
+    return res.status(409).json({ error: 'intent fingerprint does not match command' });
+  if (command.type !== 'startchat') return res.status(409).json({ error: 'reconciliation unsupported for this command' });
+  if (command.reconcileOnly && ['pending', 'leased', 'done'].includes(command.status))
+    return res.json({ id: command.id, status: command.status });
+  if (command.status !== 'failed' || command.uncertain !== true)
+    return res.status(409).json({ error: 'command has no uncertain outcome to reconcile' });
+  const updated = { ...command, reconcileOnly: true, status: 'pending', uncertain: false,
+    detail: '', doneAt: 0, leaseOwner: '', leaseToken: '', leaseExpiresAt: 0 };
+  try { commitCommands(_commands.map(item => item.id === command.id ? updated : item)); }
+  catch (error) { return failPersistence(res, error); }
+  notifyLeaseWaiters();
+  return res.json({ id: updated.id, status: updated.status });
 });
 // One lease pass over the queue: recover expired leases, then claim up to `limit` pending
 // commands for `owner`. Throws whatever commitCommands throws (persistence), so each caller
 // decides how to answer its own response.
-function leaseAppCommands(owner, limit, leaseMs) {
+function leaseAppCommands(owner, limit, leaseMs, commandTypes, reconcileStartChat = false) {
   const now = Date.now();
+  const acceptedTypes = commandTypes instanceof Set && commandTypes.size ? commandTypes : null;
   let changed = false;
   const candidate = _commands.map(command => {
     if (command.status !== 'leased' || command.leaseExpiresAt > now) return command;
@@ -2553,6 +2616,8 @@ function leaseAppCommands(owner, limit, leaseMs) {
   for (let index = 0; index < candidate.length && leased.length < limit; index++) {
     const command = candidate[index];
     if (command.status !== 'pending') continue;
+    if (command.reconcileOnly && !reconcileStartChat) continue;
+    if (acceptedTypes && !acceptedTypes.has(command.type)) continue;
     const updated = {
       ...command,
       status: 'leased',
@@ -2588,7 +2653,7 @@ function notifyLeaseWaiters() {
     const waiter = _leaseWaiters[0];
     let leased;
     try {
-      leased = leaseAppCommands(waiter.owner, waiter.limit, waiter.leaseMs);
+      leased = leaseAppCommands(waiter.owner, waiter.limit, waiter.leaseMs, waiter.commandTypes, waiter.reconcileStartChat);
     } catch (error) {
       _leaseWaiters.shift();
       clearTimeout(waiter.timer);
@@ -2619,15 +2684,30 @@ app.post('/api/app-commands/lease', (req, res) => {
     : COMMAND_LEASE_MS;
   // waitMs opts into the long poll; absent/0 keeps the classic answer-now contract for old clients.
   const waitMs = Math.max(0, Math.min(LEASE_WAIT_MAX_MS, Number(req.body && req.body.waitMs) || 0));
+  // Optional consumer capability filter: a consumer that understands only some command types
+  // (e.g. the recovery-aware browser) declares them so it never steals work it cannot settle.
+  let commandTypes = null;
+  if (Object.prototype.hasOwnProperty.call(req.body || {}, 'commandTypes')) {
+    if (!Array.isArray(req.body.commandTypes) || req.body.commandTypes.length === 0 || req.body.commandTypes.length > COMMAND_REPLAY_POLICY.size)
+      return res.status(400).json({ error: 'commandTypes must be a non-empty array of supported command types' });
+    commandTypes = new Set();
+    for (const raw of req.body.commandTypes) {
+      const type = String(raw || '').trim().toLowerCase();
+      if (!COMMAND_REPLAY_POLICY.has(type))
+        return res.status(400).json({ error: 'commandTypes contains an unsupported command type' });
+      commandTypes.add(type);
+    }
+  }
+  const reconcileStartChat = req.body && req.body.reconcileStartChat === true;
   let leased;
   try {
-    leased = leaseAppCommands(owner, limit, leaseMs);
+    leased = leaseAppCommands(owner, limit, leaseMs, commandTypes, reconcileStartChat);
   } catch (error) {
     return failPersistence(res, error);
   }
   if (leased.length || waitMs === 0) return res.json(leased);
 
-  const waiter = { owner, limit, leaseMs, res, timer: null };
+  const waiter = { owner, limit, leaseMs, commandTypes, reconcileStartChat, res, timer: null };
   waiter.timer = setTimeout(() => {
     dropLeaseWaiter(waiter);
     if (!res.writableEnded) res.json([]);
@@ -2646,7 +2726,16 @@ app.post('/api/app-commands/:id/ack', (req, res) => {   // authenticated local c
   if (index < 0) return res.status(404).json({ error: 'command not found' });
   const prior = _commands[index];
   const leaseToken = commandIntentId(req.body && req.body.leaseToken);
-  const status = (req.body && req.body.ok) ? 'done' : 'failed';
+  const retryable = (prior.type === 'fetchfile' || prior.type === 'startchat') && req.body && req.body.retryable === true;
+  const requestedUncertain = req.body && req.body.uncertain === true;
+  if (requestedUncertain && COMMAND_REPLAY_POLICY.get(prior.type) !== 'intent-fenced')
+    return res.status(400).json({ error: 'uncertain outcomes are valid only for intent-fenced commands' });
+  const uncertain = requestedUncertain || (prior.reconcileOnly === true && !retryable && !(req.body && req.body.ok));
+  if (retryable && uncertain)
+    return res.status(400).json({ error: 'command outcome cannot be both retryable and uncertain' });
+  if (uncertain && req.body && req.body.ok)
+    return res.status(400).json({ error: 'a successful command outcome cannot be uncertain' });
+  const status = (req.body && req.body.ok) ? 'done' : (retryable ? 'pending' : 'failed');
   if (prior.status === 'done' || prior.status === 'failed') {
     if (!leaseToken || leaseToken !== prior.leaseToken || status !== prior.status)
       return res.status(409).json({ error: 'terminal command outcome is immutable' });
@@ -2663,9 +2752,17 @@ app.post('/api/app-commands/:id/ack', (req, res) => {   // authenticated local c
   const updated = {
     ...prior,
     status,
-    detail: commandOutcomeDetail(prior.type, status, !!(req.body && req.body.onPc)),
+    detail: uncertain
+      ? `${prior.type} outcome is uncertain; automatic replay is fenced and authoritative reconciliation is required`
+      : (retryable
+        ? (prior.type === 'startchat' && req.body.detail === 'startchat launch confirmed; authoritative filing is pending'
+          ? 'Chat launched; waiting for its first transcript to finish archive filing. Open the terminal to complete any CLI onboarding.' : '')
+        : commandOutcomeDetail(prior.type, status, !!(req.body && req.body.onPc))),
     ...(createdContainerId(prior.type, status, req.body && req.body.resultId) ? { resultId: createdContainerId(prior.type, status, req.body.resultId) } : {}),
-    doneAt: Date.now(),
+    doneAt: retryable ? 0 : Date.now(),
+    uncertain,
+    leaseOwner: retryable ? '' : prior.leaseOwner,
+    leaseToken: retryable ? '' : prior.leaseToken,
     leaseExpiresAt: 0,
   };
   if (updated.type === 'fetchfile' && updated.status === 'done' && updated.insert)
@@ -2685,12 +2782,13 @@ app.post('/api/app-commands/:id/ack', (req, res) => {   // authenticated local c
   } catch (error) {
     return failPersistence(res, error);
   }
+  if (retryable && _leaseWaiters.length) setImmediate(notifyLeaseWaiters);
   res.json({ ok: true, status: updated.status, deduplicated: false });
 });
 app.get('/api/app-commands/:id', (req, res) => {  // web (owner) polls a command's outcome
   const c = _commands.find(x => x.id === req.params.id);
   if (!c) return res.status(404).json({ error: 'not found' });
-  res.json({ id: c.id, status: c.status, detail: c.detail || '', ...(c.resultId ? { resultId: c.resultId } : {}) });
+  res.json({ id: c.id, status: c.status, detail: c.detail || '', uncertain: c.uncertain === true, ...(c.resultId ? { resultId: c.resultId } : {}) });
 });
 
 // --- transcript page store: PC archive -> VPS (briefly) -> the owner's browser -------------------

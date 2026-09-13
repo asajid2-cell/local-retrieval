@@ -232,7 +232,17 @@
   READER.mintPrincipalAuth = mintPrincipalAuth;
 
   // Terminal truth ONLY. `null` means we never saw a bridge-signed outcome — the caller must not say "done".
-  async function pollCommand(id, timeoutMs, intervalMs) {
+  // The durable intent id is preferred: an accepted transcriptfetch is journaled, so by-intent polling
+  // still resolves the SAME command after a reload, when the in-memory command id is gone. Falling back
+  // to the command id keeps the reader usable against a relay that has not learned the by-intent route.
+  async function pollCommand(id, intentId, timeoutMs, intervalMs) {
+    if (intentId && typeof global.pollIntent === 'function') {
+      const record = await global.pollIntent(intentId, {
+        base: apiBase(), fetch: theFetch(), timeoutMs: Number(timeoutMs) || 90000,
+        intervalMs: Number(intervalMs) || 1200, now, sleep,
+      });
+      return record && (record.status === 'done' || record.status === 'failed') ? record : null;
+    }
     const started = now();
     const limit = Number(timeoutMs) || 90000;
     const step = Number(intervalMs) || 1200;
@@ -248,6 +258,14 @@
     return null;
   }
   READER.pollCommand = pollCommand;
+
+  // On a reload, intent-journal.js is loaded before reader.js. Resolve every accepted transcript command
+  // before rendering a new fetch request, so a completed command remains pollable by its stable intentId.
+  READER.recoverPending = async function () {
+    if (typeof global.recoverPendingIntents !== 'function') return [];
+    return global.recoverPendingIntents({ base: apiBase(), fetch: theFetch() });
+  };
+  READER.recoverPending();
 
   async function refresh(sessionId, options) {
     const opts = options || {};
@@ -272,7 +290,7 @@
     }
     const queued = await response.json();
 
-    const settled = await pollCommand(queued && queued.id, opts.timeoutMs, opts.intervalMs);
+    const settled = await pollCommand(queued && queued.id, queued && queued.intentId, opts.timeoutMs, opts.intervalMs);
     if (!settled) return { ok: false, requested: true, pending: true, id: queued && queued.id };
     if (settled.status !== 'done') return { ok: false, requested: true, failed: true, detail: String(settled.detail || '') };
 
