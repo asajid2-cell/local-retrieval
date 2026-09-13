@@ -17,21 +17,44 @@ import concurrent.futures
 from ctypes import wintypes
 from datetime import datetime, timedelta, timezone
 import faulthandler
-try: faulthandler.enable(open(os.path.join(os.path.expanduser("~"), "muxd", "muxd.crash"), "a"))
-except Exception: pass
+from profile import PROFILE, ProfileError
 from winpty import PtyProcess
 import host_input_intent
 
 HOME = os.path.expanduser("~")
-DIR = os.path.join(HOME, "muxd")
+# PROFILE is the only source of muxd resource identity. In particular, non-production profiles
+# never derive state from HOME or silently reuse the production runtime directory.
+DIR = PROFILE.state_root
+if PROFILE.name != "production":
+    os.environ["CODEX_HOME"] = os.path.join(DIR, "codex")
+    os.environ["CLAUDE_CONFIG_DIR"] = os.path.join(DIR, "claude")
 MANIFEST = os.path.join(DIR, "sessions.json")
 LOG = os.path.join(DIR, "muxd.log")
-ENVF = os.path.join(DIR, "muxd.env")
+ENVF = PROFILE.env_file
 DEPLOY_FENCE = os.path.join(DIR, "deploying.flag")
 # {name: {pid, cwd, alive}} — the desktop app reads this to link a live claude/codex process to its mux
 # TAB by walking the process's ancestor pids to a shell pid here (deterministic; no folder guessing). Lets
 # a shell-launched agent be added to a collection / relaunched by its real chat id.
 LIVE_TABS = os.path.join(DIR, "live-tabs.json")
+
+try: faulthandler.enable(open(os.path.join(DIR, "muxd.crash"), "a"))
+except Exception: pass
+
+def _validate_profile_argument():
+    if "--profile" not in sys.argv:
+        if PROFILE.name != "production":
+            raise ProfileError("non-production muxd must carry its profile identity in --profile")
+        return
+    index = sys.argv.index("--profile")
+    if index + 1 >= len(sys.argv) or sys.argv[index + 1] != PROFILE.name:
+        raise ProfileError("--profile does not match MUXD_PROFILE")
+
+
+_validate_profile_argument()
+PROFILE_ID = PROFILE.name
+# Production keeps its historical host identity; a profile advertises its own explicit identity.
+HOST_IDENTITY = (os.environ.get("COMPUTERNAME", "pc") if PROFILE.name == "production"
+                 else PROFILE.host_identity)
 
 _DURABLE_TEMP_SEQUENCE = 0
 
@@ -1030,48 +1053,65 @@ def resume_conflict(cmd, live=None, ids=None):
 # The guardian (transcript_guardian.py) byte-mirrors every live transcript so no fork/truncation can
 # erase a conversation. muxd is the always-on process, so muxd keeps it running — decoupled from WHO
 # launched it: if nothing is listening on the guardian's single-instance lock port, spawn one.
-GUARDIAN_PY   = os.path.join(DIR, "transcript_guardian.py")
-GUARDIAN_PORT = 7690
+GUARDIAN_PY   = PROFILE.guardian_script
+GUARDIAN_PORT = PROFILE.guardian_lock_port
+
 def _guardian_data_dir():
-    lad = os.environ.get("LOCALAPPDATA") or os.path.join(HOME, "AppData", "Local")
-    return os.environ.get("GUARDIAN_DIR") or os.path.join(lad, "CodexLocalRetrieval", "transcript-guardian")
-GUARDIAN_PIDFILE = os.path.join(_guardian_data_dir(), "guardian.pid")
+    if PROFILE.name == "production":
+        lad = os.environ.get("LOCALAPPDATA") or os.path.join(HOME, "AppData", "Local")
+        return os.environ.get("GUARDIAN_DIR") or os.path.join(lad, "CodexLocalRetrieval", "transcript-guardian")
+    return PROFILE.guardian_dir
 
-def _guardian_running():
-    # Primary signal: the guardian's published pid is a live process. Robust (no TCP-backlog fragility).
-    try:
-        with open(GUARDIAN_PIDFILE, encoding="utf-8") as f:
-            if _pid_alive(int(f.read().strip())):
-                return True
-    except (OSError, ValueError):
-        pass
-    # Fallback: probe the single-instance lock port (covers a missing/stale pidfile with a live instance).
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.settimeout(0.4)
-    try:
-        s.connect(("127.0.0.1", GUARDIAN_PORT))
+GUARDIAN_PIDFILE = os.path.join(_guardian_data_dir(), "guardian.pid") if PROFILE.guardian_enabled else ""
+
+if not PROFILE.guardian_enabled:
+    # A profile may disable the guardian outright; keepalive becomes an explicit no-op.
+    def _guardian_running():
         return True
-    except OSError:
-        return False
-    finally:
-        try: s.close()
-        except OSError: pass
 
-def _guardian_keepalive():
-    while True:
+    def _guardian_keepalive():
+        return
+else:
+    def _guardian_running():
+        # Primary signal: the guardian's published pid is a live process. Robust (no TCP-backlog fragility).
         try:
-            if os.path.exists(GUARDIAN_PY) and not _guardian_running():
-                flags = 0x00000008 | 0x08000000   # DETACHED_PROCESS | CREATE_NO_WINDOW
-                subprocess.Popen([sys.executable, GUARDIAN_PY],
-                                 creationflags=flags, close_fds=True,
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                log("[guardian] not running — launched transcript_guardian.py")
-        except Exception as e:
-            log(f"[guardian] keepalive error: {e}")
-        time.sleep(30)
+            with open(GUARDIAN_PIDFILE, encoding="utf-8") as f:
+                if _pid_alive(int(f.read().strip())):
+                    return True
+        except (OSError, ValueError):
+            pass
+        # Fallback: probe the single-instance lock port (covers a missing/stale pidfile with a live instance).
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(0.4)
+        try:
+            s.connect(("127.0.0.1", GUARDIAN_PORT))
+            return True
+        except OSError:
+            return False
+        finally:
+            try: s.close()
+            except OSError: pass
+
+    def _guardian_keepalive():
+        while True:
+            try:
+                if os.path.exists(GUARDIAN_PY) and not _guardian_running():
+                    flags = 0x00000008 | 0x08000000   # DETACHED_PROCESS | CREATE_NO_WINDOW
+                    # Production keeps its historical argument-free spawn; a profile carries its
+                    # identity so an isolated guardian cannot inherit production custody.
+                    guardian_argv = [sys.executable, GUARDIAN_PY]
+                    if PROFILE.name != "production":
+                        guardian_argv += ["--profile", PROFILE.name]
+                    subprocess.Popen(guardian_argv,
+                                     creationflags=flags, close_fds=True,
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    log("[guardian] not running — launched transcript_guardian.py")
+            except Exception as e:
+                log(f"[guardian] keepalive error: {e}")
+            time.sleep(30)
 
 LOG_Q = queue.Queue(maxsize=4000)
-INSTANCE_MUTEX_NAME = os.environ.get("INSTANCE_MUTEX_NAME", "Local\\CodexMuxdSessionHost")
+INSTANCE_MUTEX_NAME = PROFILE.mutex_name
 _INSTANCE_MUTEX_HANDLE = None
 
 def _log_writer():
@@ -1139,13 +1179,22 @@ def loadenv():
     except Exception: pass
     return env
 
-ENV = loadenv()
-# Prefer the token from the process environment (keysafe injects it as MUX_HOST_TOKEN at launch, so
-# it never sits plaintext-at-rest); fall back to muxd.env for dev/manual runs.
-TOKEN = os.environ.get("MUX_HOST_TOKEN") or ENV.get("MUX_HOST_TOKEN", "")
-RELAYS = [u for u in [ENV.get("RELAY_LAN", ""), ENV.get("RELAY_PUBLIC", "")] if u]
-DEFAULT_CWD = ENV.get("DEFAULT_CWD", r"Z:\328\CMPUT328-A2\codexworks\301")
-LOCAL_PORT = int(ENV.get("LOCAL_PORT", "7699"))   # muxctl local-attach loopback port
+if PROFILE.name == "production":
+    ENV = loadenv()
+    # Prefer the token from the process environment (keysafe injects it as MUX_HOST_TOKEN at launch, so
+    # it never sits plaintext-at-rest); fall back to muxd.env for dev/manual runs.
+    TOKEN = os.environ.get("MUX_HOST_TOKEN") or ENV.get("MUX_HOST_TOKEN", "")
+    RELAYS = [u for u in [ENV.get("RELAY_LAN", ""), ENV.get("RELAY_PUBLIC", "")] if u]
+    DEFAULT_CWD = ENV.get("DEFAULT_CWD", r"Z:\328\CMPUT328-A2\codexworks\301")
+    LOCAL_PORT = int(ENV.get("LOCAL_PORT", "7699"))   # muxctl local-attach loopback port
+else:
+    # Every runtime identity comes from PROFILE. Token resolution is deliberately deferred until the
+    # process is actually started, avoiding plaintext token copies in profile metadata.
+    ENV = dict(PROFILE.env)
+    TOKEN = PROFILE.resolve_token()
+    RELAYS = list(PROFILE.relay_urls)
+    DEFAULT_CWD = PROFILE.default_cwd
+    LOCAL_PORT = PROFILE.control_port   # muxctl local-attach loopback port
 LAN_RETURN_INTERVAL = max(10, int(ENV.get("LAN_RETURN_INTERVAL", "30")))
 RING_CAP = 800_000           # per-session scrollback bytes kept
 SB_SEND = 260_000            # bytes replayed to a newly-attached viewer
@@ -1153,11 +1202,14 @@ LOCAL_SB_SEND = int(ENV.get("LOCAL_SB_SEND", "60000"))  # local muxctl attach sh
 LOCAL_FIRST_TIMEOUT = float(ENV.get("LOCAL_FIRST_TIMEOUT", "3"))
 LOOP_WATCHDOG_WARN = float(ENV.get("LOOP_WATCHDOG_WARN", "30"))
 LOOP_WATCHDOG_EXIT = float(ENV.get("LOOP_WATCHDOG_EXIT", "12"))
-CLAIM_ROOT = ENV.get("LAUNCH_CLAIM_ROOT") or os.path.join(
-    os.environ.get("LOCALAPPDATA") or tempfile.gettempdir(),
-    "CodexLocalRetrieval",
-    "launch-claims",
-)
+if PROFILE.name == "production":
+    CLAIM_ROOT = ENV.get("LAUNCH_CLAIM_ROOT") or os.path.join(
+        os.environ.get("LOCALAPPDATA") or tempfile.gettempdir(),
+        "CodexLocalRetrieval",
+        "launch-claims",
+    )
+else:
+    CLAIM_ROOT = PROFILE.claim_root
 CLAIM_TTL_SECONDS = max(10, int(ENV.get("LAUNCH_CLAIM_TTL_SECONDS", "120")))
 # Custody TTL: how long a session record muxd is no longer running stays on the books. A dormant tab
 # is a promise to relaunch; a record nobody has touched for a day is landfill that the relay would
@@ -1182,9 +1234,18 @@ CAPS = ["ls", "info", "create", "createAck", "bind", "input", "open", "attach", 
 # The relay is a conduit, not an authority: a host-link `i` frame only reaches the PTY when it
 # carries a principal-signed input.durable proof this endpoint verifies. Empty until pairing
 # provisions a principal, which means "refuse everything" — the correct posture, not a gap.
+def _load_profile_principal_endpoint():
+    """Production keeps the historical default registry; a profile reads its own registry path."""
+    if PROFILE.name == "production":
+        return host_input_intent.load_principal_endpoint()
+    return host_input_intent.load_principal_endpoint(PROFILE.principal_registry)
+
+
 try:
-    PRINCIPAL_ENDPOINT = host_input_intent.load_principal_endpoint()
+    PRINCIPAL_ENDPOINT = _load_profile_principal_endpoint()
 except Exception as error:
+    if PROFILE.name != "production":
+        raise ProfileError("profile principal registry is unavailable: " + str(error)) from error
     PRINCIPAL_ENDPOINT = host_input_intent.PrincipalEndpoint()
     log("[principal] registry unavailable: " + str(error))
 
@@ -2372,11 +2433,15 @@ class Session:
 
     def spawn(self):
         self.lifecycle = "starting"
-        cmdline = "powershell.exe -NoLogo"
+        shell_args = ["powershell.exe", "-NoLogo"]
+        if PROFILE.name != "production":
+            # An isolated profile must not inherit the user's interactive PowerShell profile.
+            shell_args.append("-NoProfile")
+        cmdline = subprocess.list2cmdline(shell_args)
         direct_cmd = False
         if self.cmd:
             encoded = base64.b64encode(self.cmd.encode("utf-16le")).decode("ascii")
-            cmdline = subprocess.list2cmdline(["powershell.exe", "-NoLogo", "-NoExit", "-EncodedCommand", encoded])
+            cmdline = subprocess.list2cmdline(shell_args + ["-NoExit", "-EncodedCommand", encoded])
             direct_cmd = True
         with _CONPTY_SPAWN_LOCK:
             with _ORPHANED_CONPTY_LOCK:
@@ -2397,7 +2462,7 @@ class Session:
                         raise
                     # If a saved command hits a Windows command-line edge case, keep the session usable and
                     # fall back to typing the command into an already-started shell.
-                    pty = PtyProcess.spawn("powershell.exe -NoLogo", dimensions=(self.rows, self.cols), cwd=self.cwd)
+                    pty = PtyProcess.spawn(subprocess.list2cmdline(shell_args), dimensions=(self.rows, self.cols), cwd=self.cwd)
                     direct_cmd = False
             except Exception:
                 try:
@@ -4827,18 +4892,21 @@ async def main():
 
                 if first.get("t") == "info":
                     snap = watch_snapshot()
-                    await ws.send(json.dumps({"t": "info", "protocol": PROTOCOL, "caps": CAPS,
-                                              "host": os.environ.get("COMPUTERNAME", "pc"),
-                                              "instanceId": PRINCIPAL_ENDPOINT.instance_id,
-                                              "sessions": len(sessions), "pid": os.getpid(),
-                                              "uptimeSec": int(time.time() - STARTED),
-                                              "loopLagMs": round(float(snap.get("last_lag", 0.0)) * 1000, 1),
-                                              "maxLoopLagMs": round(float(snap.get("max_lag", 0.0)) * 1000, 1),
-                                              "localActive": max(0, int(snap.get("local_active", 0)) - 1),
-                                              "localTotal": snap.get("local_total", 0),
-                                              "localErrors": snap.get("local_errors", 0),
-                                              "lastLocalMs": round(float(snap.get("last_local_ms", 0.0)), 1),
-                                              "lastLocalT": snap.get("last_local_t", "")})); return
+                    info = {"t": "info", "protocol": PROTOCOL, "caps": CAPS,
+                            "host": HOST_IDENTITY,
+                            "instanceId": PRINCIPAL_ENDPOINT.instance_id,
+                            "sessions": len(sessions), "pid": os.getpid(),
+                            "uptimeSec": int(time.time() - STARTED),
+                            "loopLagMs": round(float(snap.get("last_lag", 0.0)) * 1000, 1),
+                            "maxLoopLagMs": round(float(snap.get("max_lag", 0.0)) * 1000, 1),
+                            "localActive": max(0, int(snap.get("local_active", 0)) - 1),
+                            "localTotal": snap.get("local_total", 0),
+                            "localErrors": snap.get("local_errors", 0),
+                            "lastLocalMs": round(float(snap.get("last_local_ms", 0.0)), 1),
+                            "lastLocalT": snap.get("last_local_t", "")}
+                    if PROFILE.name != "production":
+                        info["profile"] = PROFILE_ID
+                    await ws.send(json.dumps(info)); return
                 if first.get("t") == "ls":
                     await ws.send(json.dumps({"t": "ls", "list": sess_list()})); return
                 if first.get("t") == "kill":
@@ -5056,10 +5124,13 @@ async def main():
                             f"dropped={outq.dropped}; session rings remain available for scrollback"
                         )
                         outq.dropped = 0
-                    await ws.send(json.dumps({"t": "hello", "host": os.environ.get("COMPUTERNAME", "pc"),
-                                              "protocol": PROTOCOL, "caps": CAPS,
-                                              "instanceId": PRINCIPAL_ENDPOINT.instance_id,
-                                              "sessions": sess_list()}))
+                    hello = {"t": "hello", "host": HOST_IDENTITY,
+                             "protocol": PROTOCOL, "caps": CAPS,
+                             "instanceId": PRINCIPAL_ENDPOINT.instance_id,
+                             "sessions": sess_list()}
+                    if PROFILE.name != "production":
+                        hello["profile"] = PROFILE_ID
+                    await ws.send(json.dumps(hello))
 
                     async def pump_out():
                         while True:

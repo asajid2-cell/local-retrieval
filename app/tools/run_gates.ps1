@@ -807,7 +807,7 @@ try {
         $muxdCompile = Run-ExternalGate `
             -Name 'muxd-compile' `
             -FilePath 'python' `
-            -Arguments @('-m', 'py_compile', 'muxd.py', 'transcript_guardian.py') `
+            -Arguments @('-m', 'py_compile', 'muxd.py', 'transcript_guardian.py', 'profile.py') `
             -WorkingDirectory $muxdRootInfo.Full `
             -TimeoutMs 60000 `
             -SourceInfo $muxSourceInfo `

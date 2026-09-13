@@ -17,15 +17,34 @@ import tempfile
 import time
 from ctypes import wintypes
 
+from profile import PROFILE, ProfileError
+
+
+def _consume_profile_arg(argv):
+    args = list(argv)
+    if "--profile" not in args:
+        if PROFILE.name != "production":
+            raise ProfileError("non-production muxrun requires --profile <profile> identity")
+        return args
+    index = args.index("--profile")
+    if index + 1 >= len(args) or args[index + 1] != PROFILE.name:
+        raise ProfileError("--profile does not match MUXD_PROFILE")
+    return args[:index] + args[index + 2:]
+
+
+if PROFILE.name == "production":
+    URL = "ws://127.0.0.1:" + os.environ.get("MUXCTL_PORT", "7699")
+    TASK_NAME = os.environ.get("MUXD_TASK", "MuxdSessionHost")
+else:
+    URL = PROFILE.control_url
+    TASK_NAME = PROFILE.task_name
+CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
 try:
     import websockets
 except ImportError:
     print("muxrun needs: pip install websockets", file=sys.stderr)
     sys.exit(1)
-
-URL = "ws://127.0.0.1:" + os.environ.get("MUXCTL_PORT", "7699")
-TASK_NAME = os.environ.get("MUXD_TASK", "MuxdSessionHost")
-CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 class OwnerSupersededError(RuntimeError):
     pass
@@ -1155,7 +1174,7 @@ def main():
     p.add_argument("--cmd-b64", default="")
     p.add_argument("--session-id", default="")
     p.add_argument("--alias", action="append", default=[])
-    args = p.parse_args()
+    args = p.parse_args(_consume_profile_arg(sys.argv[1:]))
     try:
         raise SystemExit(asyncio.run(main_async(args)))
     except KeyboardInterrupt:

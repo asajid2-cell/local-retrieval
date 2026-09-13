@@ -6,14 +6,31 @@
 #   muxctl kill <name>      kill and remove a local muxd session
 import asyncio, base64, json, sys, os, re, ctypes, threading, subprocess, time, shutil, contextlib, atexit, queue
 import host_input_intent
+from profile import PROFILE
 try:
     import websockets
 except ImportError:
     print("muxctl needs: pip install websockets"); sys.exit(1)
 
-URL = "ws://127.0.0.1:" + os.environ.get("MUXCTL_PORT", "7699")
+URL = "ws://127.0.0.1:" + os.environ.get("MUXCTL_PORT", "7699") if PROFILE.name == "production" else PROFILE.control_url
 SHORT_TIMEOUT = float(os.environ.get("MUXCTL_TIMEOUT", "5"))
-TASK_NAME = os.environ.get("MUXD_TASK", "MuxdSessionHost")
+TASK_NAME = os.environ.get("MUXD_TASK", "MuxdSessionHost") if PROFILE.name == "production" else PROFILE.task_name
+PROFILE_ID = PROFILE.name
+
+def _profile_args(args):
+    # schtasks itself has no profile switch; the profile-specific task name is the identity fence.
+    return list(args)
+
+
+def _consume_profile_arg(argv):
+    args = list(argv)
+    if "--profile" not in args:
+        return args
+    index = args.index("--profile")
+    if index + 1 >= len(args) or args[index + 1] != PROFILE_ID:
+        raise RuntimeError("--profile does not match MUXD_PROFILE")
+    return args[:index] + args[index + 2:]
+
 AUTOSTART = os.environ.get("MUXCTL_AUTOSTART", "1").lower() not in ("0", "false", "no", "off")
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 LOCAL_SCROLLBACK = max(0, int(os.environ.get("MUXCTL_SCROLLBACK", "60000")))
@@ -465,7 +482,9 @@ def ensure_muxd_started():
     if os.name != "nt" or not AUTOSTART:
         return False
     try:
-        q = _run_quiet(["schtasks", "/Query", "/TN", TASK_NAME, "/FO", "CSV", "/NH"])
+        q = _run_quiet(_profile_args(["schtasks", "/Query", "/TN", TASK_NAME, "/FO", "CSV", "/NH"]))
+        # The profile marker is part of the task/process contract; wrappers must not query an
+        # unprofiled production task while operating a test profile.
     except Exception as e:
         sys.stderr.write("[muxctl] could not query scheduled task %s: %s\n" % (TASK_NAME, e))
         return False
@@ -513,6 +532,10 @@ async def fetch_info():
     m = await request_json({"t": "info"})
     if m.get("t") != "info":
         raise RuntimeError("running muxd does not advertise protocol info; restart MuxdSessionHost to load the current muxd")
+    if PROFILE.name != "production" and (
+        m.get("profile") != PROFILE.name or m.get("instanceId") != PROFILE.principal_instance_id
+    ):
+        raise RuntimeError("muxd control endpoint identity does not match the selected profile")
     return m
 
 async def require_cap(cap):
@@ -785,7 +808,7 @@ async def do_attach(name, create=False):
         sys.stdout.write("\r\n[muxctl] detached\r\n")
 
 def main():
-    a = sys.argv[1:]
+    a = _consume_profile_arg(sys.argv[1:])
     try:
         if not a or a[0] in ("ls", "list"):
             asyncio.run(do_ls())

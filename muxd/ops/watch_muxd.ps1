@@ -1,11 +1,23 @@
 [CmdletBinding()]
-param()
-
+param(
+    [string]$Profile = $(if ($env:MUXD_PROFILE) { $env:MUXD_PROFILE } else { "production" }),
+    [string]$RuntimeRoot = ""
+)
 $ErrorActionPreference = "Stop"
-$root = Split-Path -Parent $PSScriptRoot
+if ($Profile -ne "production" -and -not $RuntimeRoot) { throw "non-production watchdog requires -RuntimeRoot" }
+$env:MUXD_PROFILE = $Profile
+if ($RuntimeRoot) {
+    $env:MUXD_RUNTIME_ROOT = [IO.Path]::GetFullPath($RuntimeRoot)
+    $env:MUXD_ENV_FILE = Join-Path $env:MUXD_RUNTIME_ROOT "muxd.env"
+}
+$root = if ($RuntimeRoot) { $env:MUXD_RUNTIME_ROOT } else { Split-Path -Parent $PSScriptRoot }
 $python = "C:\Python311\python.exe"
-$taskName = "MuxdSessionHost"
-$logPath = Join-Path $root "muxd-watchdog.log"
+$profileRaw = & $python (Join-Path $root "profile.py") --json
+if ($LASTEXITCODE -ne 0) { throw 'Profile validation failed; no process or task changes permitted' }
+$profileJson = $profileRaw | ConvertFrom-Json
+if ($null -eq $profileJson -or $profileJson.Name -cne $Profile) { throw 'Profile identity validation failed' }
+$taskName = $profileJson.TaskName
+$logPath = Join-Path $profileJson.StateRoot "muxd-watchdog.log"
 
 function Write-WatchdogLog([string]$Message) {
     $line = "{0:yyyy-MM-dd HH:mm:ss} {1}" -f (Get-Date), $Message
@@ -13,18 +25,19 @@ function Write-WatchdogLog([string]$Message) {
 }
 
 function Get-MuxdProcesses {
-    @(
-        Get-CimInstance Win32_Process |
-            Where-Object {
-                $_.CommandLine -match "C:\\Users\\Ahmed\\muxd\\muxd\.py"
-            }
-    )
+    $processes = @(Get-CimInstance Win32_Process | Select-Object ProcessId, CommandLine)
+    $payload = ConvertTo-Json -InputObject $processes -Compress
+    $payload = [regex]::Replace($payload, '[^\x00-\x7F]', { param($match) '\u{0:x4}' -f [int][char]$match.Value })
+    $matched = $payload | & $python (Join-Path $root "profile.py") --matching-pids
+    if ($LASTEXITCODE -ne 0) { throw 'Profile process ownership validation failed' }
+    $ids = $matched | ConvertFrom-Json
+    @($processes | Where-Object { $_.ProcessId -in $ids })
 }
 
 $previousAutostart = $env:MUXCTL_AUTOSTART
 try {
     $env:MUXCTL_AUTOSTART = "0"
-    & $python (Join-Path $root "muxctl.py") status *> $null
+    & $python (Join-Path $root "muxctl.py") status --profile $Profile *> $null
     if ($LASTEXITCODE -eq 0) {
         exit 0
     }
@@ -49,7 +62,7 @@ do {
     $previousAutostart = $env:MUXCTL_AUTOSTART
     try {
         $env:MUXCTL_AUTOSTART = "0"
-        & $python (Join-Path $root "muxctl.py") status *> $null
+        & $python (Join-Path $root "muxctl.py") status --profile $Profile *> $null
         if ($LASTEXITCODE -eq 0) {
             $pidValue = [int](Get-MuxdProcesses | Select-Object -First 1 -ExpandProperty ProcessId)
             Write-WatchdogLog "muxd recovered; pid=$pidValue"

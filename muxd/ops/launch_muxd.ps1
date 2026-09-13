@@ -9,8 +9,31 @@
 # GUI-subsystem exe that PowerShell would NOT wait on, which would make the scheduled task flip to
 # 'Ready' while muxd runs orphaned -- so Start-Process -Wait keeps the whole chain attached and the
 # task 'Running', exactly as the old direct-pythonw action behaved.
+[CmdletBinding()]
+param(
+    [string]$Profile = $(if ($env:MUXD_PROFILE) { $env:MUXD_PROFILE } else { "production" }),
+    [string]$RuntimeRoot = ""
+)
 $ErrorActionPreference = "Stop"
-$keysafe = Join-Path $env:USERPROFILE ".claude\skills\keysafe\scripts\keysafe.ps1"
-$child = "Start-Process -Wait -FilePath 'C:\Python311\pythonw.exe' -ArgumentList 'C:\Users\Ahmed\muxd\muxd.py'"
-& $keysafe run mux-host-token -EnvVar MUX_HOST_TOKEN -Command $child
+$root = if ($RuntimeRoot) { [IO.Path]::GetFullPath($RuntimeRoot) } else { Split-Path -Parent $PSScriptRoot }
+$env:MUXD_PROFILE = $Profile
+if ($Profile -ne "production") {
+    $env:MUXD_RUNTIME_ROOT = $root
+    $env:MUXD_ENV_FILE = Join-Path $root "muxd.env"
+}
+$profileArgs = @("--profile", $Profile)
+$python = if ($Profile -eq "production") { "C:\Python311\pythonw.exe" } else { "C:\Python311\python.exe" }
+$entry = Join-Path $root "muxd.py"
+if (-not (Test-Path -LiteralPath $entry)) { throw "muxd entrypoint not found: $entry" }
+# Profile-scoped launches do not consult production keysafe/task/path resources. The profile
+# contract resolves MUXD_TOKEN_SOURCE and refuses missing isolation before the child starts.
+if ($Profile -eq "production") {
+    $quotedPython = $python.Replace("'", "''")
+    $quotedArguments = ('"' + $entry + '" --profile production').Replace("'", "''")
+    $child = "Start-Process -Wait -FilePath '$quotedPython' -ArgumentList '$quotedArguments'"
+    $keysafe = Join-Path $env:USERPROFILE ".claude\skills\keysafe\scripts\keysafe.ps1"
+    & $keysafe run mux-host-token -EnvVar MUX_HOST_TOKEN -Command $child
+    exit $LASTEXITCODE
+}
+& $python $entry @profileArgs
 exit $LASTEXITCODE
