@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Fail closed before the isolated relay starts. This root-only check compares credential sources
+# directly without exposing either secret to the unprivileged service process or the logs.
+set -euo pipefail
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ENV_FILE=/etc/multiplex-test.env
+PRODUCTION_ENV=/etc/multiplex-app.env
+
+die() { printf 'multiplex-test-config-check: %s\n' "$*" >&2; exit 1; }
+[ "$(id -u)" -eq 0 ] || die 'must run as root'
+for file in "$ENV_FILE" "$PRODUCTION_ENV"; do
+  [ -f "$file" ] && [ ! -L "$file" ] || die "$file is missing or unsafe"
+  [ "$(stat -c %U "$file")" = root ] && [ "$(stat -c %G "$file")" = root ] || die "$file must be root-owned"
+  [ "$(stat -c %a "$file")" = 600 ] || die "$file must have mode 0600"
+done
+
+value() {
+  local file="$1" key="$2"
+  awk -F= -v key="$key" '$1 == key { value=substr($0,index($0,"=")+1); gsub(/^[[:space:]]+|[[:space:]]+$/, "", value); if (value != "" && value != "\"\"" && value != "\047\047") { print value; exit } }' "$file"
+}
+TEST_TOKEN="$(value "$ENV_FILE" MUX_HOST_TOKEN)"
+PRODUCTION_TOKEN="$(value "$PRODUCTION_ENV" MUX_HOST_TOKEN)"
+[ -n "$TEST_TOKEN" ] || die 'dedicated MUX_HOST_TOKEN is absent'
+[ -n "$PRODUCTION_TOKEN" ] || die 'production MUX_HOST_TOKEN is absent; token separation cannot be proven'
+[ "$TEST_TOKEN" != "$PRODUCTION_TOKEN" ] || die 'test token equals the production token'
+[ -n "$(value "$ENV_FILE" HL_INTERNAL_KEY)" ] || die 'dedicated HL_INTERNAL_KEY is absent'
+[ -z "$(value "$ENV_FILE" RELAY_LAN)" ] || die 'RELAY_LAN belongs to the Windows muxd profile, not the relay service'
+[ -z "$(value "$ENV_FILE" RELAY_PUBLIC)" ] || die 'RELAY_PUBLIC belongs to the Windows muxd profile, not the relay service'
+printf '%s\n' 'multiplex-test configuration valid; relay credentials are present and separated from production'

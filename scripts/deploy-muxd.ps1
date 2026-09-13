@@ -95,29 +95,25 @@ function Invoke-RestartAndVerify([switch]$Recovery, [string]$RecoveryToken = '')
       throw "rollback recovery restart failed with exit $LASTEXITCODE"
     }
   } else {
-    $before = Get-ScheduledTaskInfo -TaskName $restartTask
-    $beforePids = @(
-      Get-CimInstance Win32_Process |
-        Where-Object { $_.CommandLine -match "C:\\Users\\Ahmed\\muxd\\muxd\.py" } |
-        ForEach-Object { [int]$_.ProcessId }
-    )
     Start-ScheduledTask -TaskName $restartTask
     $deadline = (Get-Date).AddSeconds(90)
+    $healthy = $false
     do {
       Start-Sleep -Milliseconds 250
-      $task = Get-ScheduledTask -TaskName $restartTask
-      $info = Get-ScheduledTaskInfo -TaskName $restartTask
-      if ($info.LastRunTime -gt $before.LastRunTime -and $task.State -ne 'Running') {
-        break
+      $previousAutostart = $env:MUXCTL_AUTOSTART
+      try {
+        $env:MUXCTL_AUTOSTART = '0'
+        & python (Join-Path $dst 'muxctl.py') status *> $null
+        $healthy = $LASTEXITCODE -eq 0
       }
-    } while ((Get-Date) -lt $deadline)
+      finally {
+        $env:MUXCTL_AUTOSTART = $previousAutostart
+      }
+    } while (-not $healthy -and (Get-Date) -lt $deadline)
 
-    if ($info.LastRunTime -le $before.LastRunTime -or $task.State -eq 'Running') {
-      throw "$restartTask did not complete within 90 seconds"
-    }
-
-    if ($info.LastTaskResult -ne 0) {
-      Write-Warning "$restartTask reported task result $($info.LastTaskResult); accepting only if a replacement muxd becomes healthy"
+    if (-not $healthy) {
+      $info = Get-ScheduledTaskInfo -TaskName $restartTask
+      throw "$restartTask did not produce a healthy muxd replacement within 90 seconds (task result $($info.LastTaskResult))"
     }
   }
 

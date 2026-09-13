@@ -1,0 +1,183 @@
+#!/usr/bin/env bash
+# Root-owned fixed-policy release installer for the isolated parallel relay test endpoint.
+# Only the test service, release root, symlink, state, and env are referenced here.
+set -euo pipefail
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+RELEASES=/opt/multiplex-test-releases
+CURRENT=/opt/multiplex-test-app
+STATE=/var/lib/multiplex-test
+UNIT=multiplex-test.service
+ENV_FILE=/etc/multiplex-test.env
+CHECKER=/usr/local/bin/multiplex-test-config-check
+INCOMING=/home/admin/multiplex-test-incoming
+
+fail() { printf 'deploy-multiplex-test: %s\n' "$*" >&2; exit 1; }
+log() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" | tee -a /var/log/multiplex-test-deploy.log; }
+[ "$(id -u)" -eq 0 ] || fail 'must run as root'
+
+require_unit_value() {
+  local property="$1" expected="$2" actual
+  actual="$(systemctl show "$UNIT" -p "$property" --value)"
+  [ "$actual" = "$expected" ] || fail "$UNIT must have $property=$expected (found ${actual:-<empty>})"
+}
+
+config_ok() {
+  "$CHECKER" >/dev/null
+}
+
+preflight() {
+  config_ok
+  require_unit_value User svc-multiplex-test
+  require_unit_value Group svc-multiplex-test
+  require_unit_value SupplementaryGroups ''
+  require_unit_value NoNewPrivileges yes
+  require_unit_value ProtectSystem strict
+  require_unit_value ReadWritePaths "$STATE"
+  [[ " $(systemctl show "$UNIT" -p Environment --value) " == *' PORT=7683 '* ]] || fail "$UNIT must pin PORT=7683"
+  [[ " $(systemctl show "$UNIT" -p Environment --value) " == *' PUBLIC_RETURN=/multiplex-test '* ]] || fail "$UNIT must pin PUBLIC_RETURN=/multiplex-test"
+}
+
+if [ "$#" -eq 1 ] && [ "$1" = --preflight ]; then
+  preflight
+  printf '%s\n' 'deploy-multiplex-test preflight ok'
+  exit 0
+fi
+
+[ "$#" -eq 2 ] || fail 'usage: deploy-multiplex-test --preflight | <40-hex-commit> <64-hex-sha256>'
+COMMIT="$1"
+EXPECTED_SHA="$2"
+[[ "$COMMIT" =~ ^[0-9a-f]{40}$ ]] || fail 'invalid commit'
+[[ "$EXPECTED_SHA" =~ ^[0-9a-f]{64}$ ]] || fail 'invalid sha256'
+preflight
+
+ARCHIVE="$INCOMING/multiplex-test-$COMMIT.tgz"
+[ -f "$ARCHIVE" ] && [ ! -L "$ARCHIVE" ] || fail 'release archive missing or unsafe'
+[ "$(stat -c %U "$ARCHIVE")" = admin ] || fail 'release archive must be owned by admin'
+QUARANTINE="$STATE/deploy-incoming"
+install -d -o root -g root -m 0700 "$QUARANTINE"
+mv -- "$ARCHIVE" "$QUARANTINE/multiplex-test-$COMMIT.tgz"
+ARCHIVE="$QUARANTINE/multiplex-test-$COMMIT.tgz"
+ACTUAL_SHA="$(sha256sum "$ARCHIVE" | awk '{print $1}')"
+[ "$ACTUAL_SHA" = "$EXPECTED_SHA" ] || fail 'release archive checksum mismatch'
+
+STAGE="$(mktemp -d /opt/multiplex-test-stage.XXXXXX)"
+NEXT_LINK=/opt/.multiplex-test-app.next
+cleanup() { rm -rf -- "$STAGE" "$NEXT_LINK"; }
+trap cleanup EXIT
+
+python3 - "$ARCHIVE" "$STAGE" <<'PY'
+import pathlib, sys, tarfile
+archive, stage = sys.argv[1:]
+root = pathlib.Path(stage).resolve()
+with tarfile.open(archive, "r:gz") as tf:
+    for member in tf.getmembers():
+        path = pathlib.PurePosixPath(member.name)
+        if path.is_absolute() or ".." in path.parts:
+            raise SystemExit("unsafe archive path: " + member.name)
+        if not (member.isdir() or member.isfile()):
+            raise SystemExit("archive links/devices are refused: " + member.name)
+        target = (root / pathlib.Path(*path.parts)).resolve()
+        if root not in target.parents and target != root:
+            raise SystemExit("archive path escapes staging: " + member.name)
+    tf.extractall(root)
+PY
+
+[ "$(cat "$STAGE/RELEASE_COMMIT")" = "$COMMIT" ] || fail 'archive commit marker mismatch'
+APP="$STAGE/relay"
+[ -f "$APP/server.js" ] || fail 'release is missing relay/server.js'
+[ -f "$APP/package.json" ] && [ -f "$APP/package-lock.json" ] || fail 'release is missing npm manifests'
+chown -R svc-multiplex-test:svc-multiplex-test "$STAGE"
+runuser -u svc-multiplex-test -- env HOME="$STATE" npm --prefix "$APP" ci --omit=dev --ignore-scripts
+runuser -u svc-multiplex-test -- node --check "$APP/server.js"
+chown -R root:root "$STAGE"
+chmod -R u+rwX,go+rX,go-w "$STAGE"
+
+RELEASE="$RELEASES/$COMMIT"
+install -d -o root -g root -m 0755 "$RELEASES"
+if [ -e "$RELEASE" ]; then
+  [ -f "$RELEASE/RELEASE_COMMIT" ] && [ "$(cat "$RELEASE/RELEASE_COMMIT")" = "$COMMIT" ] || fail 'existing release directory does not match commit'
+  rm -rf -- "$STAGE"
+else
+  mv -- "$STAGE" "$RELEASE"
+fi
+
+PREVIOUS=''
+if [ -L "$CURRENT" ]; then
+  PREVIOUS="$(readlink -f "$CURRENT")"
+  case "$PREVIOUS" in "$RELEASES"/*) ;; *) fail 'current symlink points outside the test release root' ;; esac
+elif [ -e "$CURRENT" ]; then
+  fail 'current test app path exists but is not a symlink'
+fi
+
+unit_pid() {
+  systemctl show "$UNIT" -p MainPID --value
+}
+
+stop_unit_and_wait() {
+  local prior="$1" current
+  systemctl stop "$UNIT" || fail "$UNIT failed to stop"
+  for _ in $(seq 1 40); do
+    current="$(unit_pid)"
+    if ! systemctl is-active --quiet "$UNIT" && { [ "$current" = 0 ] || [ -z "$current" ]; } \
+       && { [ -z "$prior" ] || [ "$prior" = 0 ] || [ ! -e "/proc/$prior" ]; }; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  fail "$UNIT stop did not retire its previous PID"
+}
+
+release_health_ok() {
+  local pid listeners
+  pid="$(unit_pid)"
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  listeners="$(ss -H -ltnp 'sport = :7683' 2>/dev/null || true)"
+  [ -n "$listeners" ] || return 1
+  printf '%s\n' "$listeners" | grep -Eq '127\.0\.0\.1:7683' || return 1
+  printf '%s\n' "$listeners" | grep -Eq "pid=$pid[,)]" || return 1
+  if printf '%s\n' "$listeners" | grep -Ev '127\.0\.0\.1:7683' >/dev/null; then return 1; fi
+  curl -fsS --max-time 3 'http://127.0.0.1:7683/api/health' |
+    python3 -c '
+import json, sys
+health = json.load(sys.stdin)
+persistence = health.get("persistence") or {}
+ok = (isinstance(health.get("uptimeSec"), (int, float)) and bool(health.get("node")) and persistence.get("ok") is True)
+raise SystemExit(0 if ok else 1)
+'
+}
+
+log "deploy start commit=$COMMIT sha256=$EXPECTED_SHA"
+OLD_PID="$(unit_pid)"
+stop_unit_and_wait "$OLD_PID"
+ln -s "$RELEASE/relay" "$NEXT_LINK"
+mv -Tf -- "$NEXT_LINK" "$CURRENT"
+
+if systemctl start "$UNIT"; then
+  for _ in $(seq 1 40); do
+    release_health_ok && break
+    sleep 0.5
+  done
+fi
+
+if ! systemctl is-active --quiet "$UNIT" || ! release_health_ok; then
+  log "deploy health failed commit=$COMMIT; rolling back"
+  FAILED_PID="$(unit_pid)"
+  stop_unit_and_wait "$FAILED_PID"
+  if [ -n "$PREVIOUS" ] && [ -d "$PREVIOUS" ]; then
+    ln -s "$PREVIOUS" "$NEXT_LINK"
+    mv -Tf -- "$NEXT_LINK" "$CURRENT"
+    systemctl start "$UNIT" || true
+    for _ in $(seq 1 40); do
+      release_health_ok && break
+      sleep 0.5
+    done
+    release_health_ok || fail 'deployment and rollback health checks failed'
+    fail 'deployment failed; previous test release restored'
+  fi
+  rm -f -- "$CURRENT"
+  fail 'deployment failed; no previous test release existed'
+fi
+
+rm -f -- "$ARCHIVE"
+log "deploy healthy commit=$COMMIT"
