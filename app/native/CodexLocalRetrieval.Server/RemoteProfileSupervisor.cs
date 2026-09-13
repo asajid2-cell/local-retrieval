@@ -51,8 +51,8 @@ internal static class RemoteProfileSupervisor
                     children[i] = jobs[i]!.StartContained(specifications[i]);
                     children[i]!.StandardInput.Close();
                     drains[i] = Task.WhenAll(
-                        children[i]!.StandardOutput.BaseStream.CopyToAsync(Stream.Null),
-                        children[i]!.StandardError.BaseStream.CopyToAsync(Stream.Null));
+                        DrainAsync(children[i]!.StandardOutput, Path.Combine(profile.StateRoot, $"service-{i}.out.log")),
+                        DrainAsync(children[i]!.StandardError, Path.Combine(profile.StateRoot, $"service-{i}.err.log")));
                     Console.WriteLine($"supervisor service {i} started pid={children[i]!.Id}");
                 }
                 stop.Wait(TimeSpan.FromSeconds(5));
@@ -69,6 +69,16 @@ internal static class RemoteProfileSupervisor
                 try { children[i]?.Dispose(); }
                 catch (Exception ex) { Console.Error.WriteLine("Supervisor handle cleanup failed: " + ex.Message); }
             }
+        }
+    }
+
+    private static async Task DrainAsync(StreamReader reader, string path)
+    {
+        while (await reader.ReadLineAsync() is { } line)
+        {
+            if (File.Exists(path) && new FileInfo(path).Length > 1024 * 1024)
+                File.Move(path, path + ".previous", overwrite: true);
+            await File.AppendAllTextAsync(path, line + Environment.NewLine);
         }
     }
 
