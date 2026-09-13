@@ -307,6 +307,19 @@ def _same_process_instance(pid, expected_start_token):
     expected = str(expected_start_token or "")
     return bool(expected) and _pid_alive(pid) and _process_start_token(pid) == expected
 
+CLAUDE_REGISTRY_START_TOLERANCE_MS = 2000
+WINDOWS_EPOCH_OFFSET_100NS = 116444736000000000
+
+def _process_start_time_ms(pid):
+    token = _process_start_token(pid)
+    if not token:
+        return 0
+    try:
+        value = int(token, 16) - WINDOWS_EPOCH_OFFSET_100NS
+    except (TypeError, ValueError):
+        return 0
+    return value // 10000 if value > 0 else 0
+
 def _terminate_process_instance(pid, expected_start_token, timeout=3):
     """Terminate exactly one Windows process instance, fenced by its creation time."""
     if os.name != "nt":
@@ -923,6 +936,9 @@ def try_live_session_ids():
     own registry (~/.claude/sessions/<pid>.json — covers IDLE and FORKED ones with no id on the command
     line); codex + any explicit resume come from live agent command lines."""
     out = {}
+    ok, cmdlines, detail = _try_agent_cmdlines()
+    if not ok:
+        return False, out, detail or "could not verify live claude/codex processes"
     try:
         for fn in glob.glob(os.path.join(HOME, ".claude", "sessions", "*.json")):
             file_pid = 0
@@ -934,15 +950,34 @@ def try_live_session_ids():
                 with open(fn, encoding="utf-8") as f:
                     j = json.load(f)
                 pid = j.get("pid"); sid = j.get("sessionId")
-                if sid and _pid_alive(pid):
-                    out.setdefault(str(sid).lower(), int(pid))
+                if not sid or not _pid_alive(pid):
+                    continue
+                pid = int(pid)
+                # PID recycling is fenced by process start time, not executable name: real Claude Code
+                # sessions currently run as bun.exe, so any executable allowlist rejects live sessions.
+                try:
+                    registry_start_ms = int(float(j.get("startedAt")))
+                except (TypeError, ValueError):
+                    return False, out, (
+                        f"could not verify Claude live-session registry file {os.path.basename(fn)}: "
+                        "missing or invalid startedAt"
+                    )
+                actual_start_ms = _process_start_time_ms(pid)
+                if actual_start_ms <= 0:
+                    return False, out, (
+                        f"could not verify Claude process instance for {os.path.basename(fn)} "
+                        f"(pid {pid})"
+                    )
+                # A genuine process starts at or before its session record is written. If the live
+                # process began meaningfully AFTER the record, the PID was recycled by an unrelated
+                # process and the record is not a live session. Arbitrarily earlier starts are genuine.
+                if actual_start_ms - registry_start_ms > CLAUDE_REGISTRY_START_TOLERANCE_MS:
+                    continue
+                out.setdefault(str(sid).lower(), pid)
             except Exception as e:
                 return False, out, f"could not verify Claude live-session registry file {os.path.basename(fn)}: {e}"
     except Exception as e:
         return False, out, f"could not enumerate Claude live-session registry: {e}"
-    ok, cmdlines, detail = _try_agent_cmdlines()
-    if not ok:
-        return False, out, detail or "could not verify live claude/codex processes"
     for pid, cl in cmdlines:
         sid = _parse_resume_id(cl)
         if sid and _pid_alive(pid):

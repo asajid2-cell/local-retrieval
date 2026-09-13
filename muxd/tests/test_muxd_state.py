@@ -736,6 +736,112 @@ class MuxdStateTests(unittest.TestCase):
         self.assertEqual([], values)
         self.assertIn("Name='node.exe'", " ".join(calls[0]))
 
+    def test_live_session_scan_fences_recycled_claude_registry_pids(self):
+        old_home = muxd.HOME
+        with tempfile.TemporaryDirectory(prefix="muxd-claude-registry-") as root:
+            registry = os.path.join(root, ".claude", "sessions")
+            os.makedirs(registry)
+            records = {
+                # PID recycled by a process that began long after the session record: not this session.
+                "4242.json": {
+                    "pid": 4242,
+                    "sessionId": "recycled-later",
+                    "startedAt": 1000,
+                },
+                # Same, but only just over the tolerance boundary.
+                "4243.json": {
+                    "pid": 4243,
+                    "sessionId": "recycled-just-over",
+                    "startedAt": 1000,
+                },
+                # Genuine session whose process started well BEFORE its record was written (the real
+                # world shape: deltas are negative because the registry is written after startup).
+                "4343.json": {
+                    "pid": 4343,
+                    "sessionId": "genuine-earlier",
+                    "startedAt": 5000000,
+                },
+                # Genuine session whose process start matches the record exactly.
+                "4344.json": {
+                    "pid": 4344,
+                    "sessionId": "genuine-exact",
+                    "startedAt": 7000000,
+                },
+                # Record written up to the tolerance after process start: still accepted.
+                "4345.json": {
+                    "pid": 4345,
+                    "sessionId": "genuine-within-tolerance",
+                    "startedAt": 1000,
+                },
+            }
+            for name, record in records.items():
+                with open(os.path.join(registry, name), "w", encoding="utf-8") as stream:
+                    json.dump(record, stream)
+
+            try:
+                muxd.HOME = root
+                # No CIM rows at all: real Claude sessions run as bun.exe and never appear in the
+                # claude/codex/node command-line query, yet their registry records must still be trusted.
+                with mock.patch.object(
+                    muxd, "_try_agent_cmdlines", return_value=(True, [], "")
+                ), mock.patch.object(
+                    muxd, "_pid_alive", return_value=True
+                ), mock.patch.object(
+                    muxd,
+                    "_process_start_time_ms",
+                    side_effect={
+                        4242: 10000,
+                        4243: 1000 + muxd.CLAUDE_REGISTRY_START_TOLERANCE_MS + 1,
+                        4343: 4990000,
+                        4344: 7000000,
+                        4345: 1000 + muxd.CLAUDE_REGISTRY_START_TOLERANCE_MS,
+                    }.get,
+                ):
+                    ok, live, detail = muxd.try_live_session_ids()
+            finally:
+                muxd.HOME = old_home
+
+        self.assertTrue(ok, detail)
+        self.assertEqual(
+            {
+                "genuine-earlier": 4343,
+                "genuine-exact": 4344,
+                "genuine-within-tolerance": 4345,
+            },
+            live,
+        )
+
+    def test_live_session_scan_fails_closed_on_unverifiable_claude_registry(self):
+        old_home = muxd.HOME
+        cases = {
+            "missing-startedAt": ({"pid": 5151, "sessionId": "no-start"}, 9999, "startedAt"),
+            "invalid-startedAt": ({"pid": 5152, "sessionId": "bad-start", "startedAt": "soon"}, 9999, "startedAt"),
+            "unreadable-process-start": ({"pid": 5153, "sessionId": "no-process-time", "startedAt": 1000}, 0, "process instance"),
+        }
+        for label, (record, computed_start, needle) in cases.items():
+            with self.subTest(case=label):
+                with tempfile.TemporaryDirectory(prefix="muxd-claude-registry-") as root:
+                    registry = os.path.join(root, ".claude", "sessions")
+                    os.makedirs(registry)
+                    with open(os.path.join(registry, f"{record['pid']}.json"), "w", encoding="utf-8") as stream:
+                        json.dump(record, stream)
+                    try:
+                        muxd.HOME = root
+                        with mock.patch.object(
+                            muxd, "_try_agent_cmdlines", return_value=(True, [], "")
+                        ), mock.patch.object(
+                            muxd, "_pid_alive", return_value=True
+                        ), mock.patch.object(
+                            muxd, "_process_start_time_ms", return_value=computed_start
+                        ):
+                            ok, live, detail = muxd.try_live_session_ids()
+                    finally:
+                        muxd.HOME = old_home
+
+                self.assertFalse(ok, f"{label}: expected fail-closed, got live={live!r}")
+                self.assertIn(needle, detail, f"{label}: unhelpful detail: {detail!r}")
+                self.assertEqual({}, live)
+
     def test_relay_output_backlog_is_bounded(self):
         q = muxd.RelayOutQueue(maxsize=2)
 
