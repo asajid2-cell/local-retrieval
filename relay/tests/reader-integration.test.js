@@ -24,6 +24,7 @@ const vm = require('node:vm');
 const { once } = require('node:events');
 
 const REPO = path.resolve(__dirname, '..');
+const INTENT_SOURCE = fs.readFileSync(path.join(REPO, 'public', 'intent-journal.js'), 'utf8');
 const READER_SOURCE = fs.readFileSync(path.join(REPO, 'public', 'reader.js'), 'utf8');
 const HOST_TOKEN = 'test-token';
 const BRIDGE_HEADER = 'x-mux-transcript-bridge';
@@ -174,6 +175,21 @@ async function withHarness(fn, env) {
   }
 }
 
+// `GET /api/app-commands/by-intent/:intentId` is owner-authenticated ONLY — the relay deliberately
+// refuses to let MUX_TEST_MODE loopback trust stand in for owner identity, because an intent id must
+// never become a command-disclosure oracle. The reader now polls that route first, so this harness
+// needs the same thing the browser has in production: a real hl_session cookie validated by a live
+// owner oracle. Every test that drives refresh() supplies this base.
+async function ownerOracle(t) {
+  const auth = http.createServer((req, res) => {
+    res.setHeader('content-type', 'application/json');
+    res.end(JSON.stringify({ authenticated: true, user: { isOwner: true } }));
+  });
+  await new Promise(resolve => auth.listen(0, '127.0.0.1', resolve));
+  t.after(() => auth.close());
+  return `http://127.0.0.1:${auth.address().port}`;
+}
+
 // --- the reader, loaded exactly as the browser gets it ------------------------------------------------
 // Two deliberate departures from reader-ui.test.js's loader: fetch is node's REAL fetch (not a stub), and
 // the origin the reader derives its api base from points at the live relay. `base` is reader.js's own
@@ -181,27 +197,31 @@ async function withHarness(fn, env) {
 // relatively, which node's fetch cannot do, so the seam is what stands in for that.
 function loadReader(h, postRecord) {
   const record = postRecord || { calls: [], statuses: [] };
+  const storageValues = new Map();
   const sandbox = {
     console, module: { exports: {} }, setTimeout, clearTimeout, Math, Date, JSON,
-    fetch: (...args) => fetch(...args),
+    fetch: (url, options = {}) => fetch(url, {
+      ...options,
+      headers: { ...(options.headers || {}), cookie: 'hl_session=owner' },   // the owner cookie the browser carries
+    }),
     crypto: { randomUUID: () => crypto.randomUUID() },
+    localStorage: { getItem: key => storageValues.has(key) ? storageValues.get(key) : null,
+      setItem: (key, value) => storageValues.set(key, value) },
+    sessionStorage: null,
     location: { origin: h.origin, pathname: '/reader.html', href: `${h.origin}/reader.html` },
   };
   sandbox.globalThis = sandbox;
   vm.createContext(sandbox);
+  vm.runInContext(INTENT_SOURCE, sandbox, { filename: 'intent-journal.js' });
   vm.runInContext(READER_SOURCE, sandbox, { filename: 'reader.js' });
   const reader = sandbox.MuxReader;
   assert.ok(reader, 'reader.js must publish global.MuxReader');
   reader.base = h.origin;
-  // intent-journal.js needs localStorage, which does not exist under node, so the reader's postIntent seam
-  // gets a thin REAL post instead — same wire shape, and it records what the reader actually sent.
+  // Keep the reader's injectable seam observable while sending through the real durable browser journal:
+  // the journal mints the intentId and owns the by-intent lookup reader.js now polls first.
   reader.postIntent = async (url, body, label) => {
     record.calls.push({ url, body, label });
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-      body: JSON.stringify(body),
-    });
+    const response = await sandbox.postIntent(url, body, label);
     record.statuses.push(response.status);
     return response;
   };
@@ -295,7 +315,7 @@ test('loadPages() surfaces the absent/expired state from the real 404 instead of
   });
 });
 
-test('the enqueue body refresh() mints is accepted by the real relay and stored verbatim', async () => {
+test('the enqueue body refresh() mints is accepted by the real relay and stored verbatim', async t => {
   await withHarness(async h => {
     await markBridgeLive(h);
     const reader = loadReader(h);
@@ -349,10 +369,10 @@ test('the enqueue body refresh() mints is accepted by the real relay and stored 
     const oversized = await h.request('POST', '/api/app-commands',
       { type: 'transcriptfetch', sessionId, principalAuth: { ...envelope, pad: 'x'.repeat(PRINCIPAL_AUTH_MAX_BYTES) } });
     assert.equal(oversized.status, 403);
-  });
+  }, { HLAUTH_BASE: await ownerOracle(t) });
 });
 
-test('refresh() round-trips through a real bridge lease/push/ack and loads the pages newest-last', async () => {
+test('refresh() round-trips through a real bridge lease/push/ack and loads the pages newest-last', async t => {
   await withHarness(async h => {
     await markBridgeLive(h);
     const reader = loadReader(h);
@@ -386,10 +406,10 @@ test('refresh() round-trips through a real bridge lease/push/ack and loads the p
     const doc = { createElement: tag => ({ tag, className: '', textContent: '', children: [], appendChild(c) { this.children.push(c); return c; }, setAttribute() {} }) };
     const mount = doc.createElement('div');
     assert.deepEqual(plain(reader.render(doc, mount, result)), { count: 4, empty: false });
-  });
+  }, { HLAUTH_BASE: await ownerOracle(t) });
 });
 
-test('a bridge-signed FAILED ack is never shown as success, even with pages already parked', async () => {
+test('a bridge-signed FAILED ack is never shown as success, even with pages already parked', async t => {
   await withHarness(async h => {
     await markBridgeLive(h);
     const reader = loadReader(h);
@@ -414,5 +434,5 @@ test('a bridge-signed FAILED ack is never shown as success, even with pages alre
     const stored = await reader.loadPages(sessionId);
     assert.equal(stored.pages.length, 1);
     assert.deepEqual(plain(reader.orderedMessages(stored.pages).map(m => m.text)), ['partial capture']);
-  });
+  }, { HLAUTH_BASE: await ownerOracle(t) });
 });
