@@ -14,7 +14,7 @@ Environment=HOME=/var/lib/multiplex-test
 Environment=PORT=7683
 Environment=BIND_HOST=127.0.0.1
 Environment=PUBLIC_RETURN=/multiplex-test
-Environment=MUX_HOST_PROFILE=test
+Environment=MUX_HOST_PROFILE=multiplex-test
 Environment=NODE_ENV=production
 ExecStartPre=+/usr/local/bin/multiplex-test-config-check
 ExecStart=/usr/bin/node /opt/multiplex-test-app/server.js
