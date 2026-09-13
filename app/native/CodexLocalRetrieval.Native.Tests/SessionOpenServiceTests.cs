@@ -150,6 +150,62 @@ public sealed class SessionOpenServiceTests
     }
 
     [TestMethod]
+    public void SessionLauncher_AccountHomeCodexResumeSetsEnvironmentOnTerminal()
+    {
+        using var workspace = new TempDirectory("account workspace");
+        using var accounts = new TempDirectory("account root");
+        var accountHome = System.IO.Path.Combine(accounts.Path, "acct");
+        var transcript = System.IO.Path.Combine(accountHome, "sessions", "rollout.jsonl");
+        Directory.CreateDirectory(System.IO.Path.GetDirectoryName(transcript)!);
+        File.WriteAllText(transcript, "{}");
+        var starts = new List<ProcessStartInfo>();
+        var launcher = Launcher(starts, windowsTerminal: null, codexAccountsRoot: accounts.Path);
+        var session = new TrustedSessionLaunch(
+            "codex-session-id",
+            SessionTool.Codex,
+            workspace.Path,
+            new[] { "codex-session-id" })
+        {
+            SourcePath = transcript,
+        };
+
+        var result = launcher.Open(session, SessionOpenTarget.Terminal);
+
+        Assert.IsTrue(result.ok, result.message);
+        Assert.HasCount(1, starts);
+        Assert.AreEqual(accountHome, starts[0].Environment["CODEX_HOME"]);
+    }
+
+    [TestMethod]
+    public void SessionLauncher_DefaultHomeCodexResumeLeavesEnvironmentUnmodified()
+    {
+        using var workspace = new TempDirectory("default workspace");
+        using var accounts = new TempDirectory("account root");
+        var transcript = System.IO.Path.Combine(workspace.Path, "rollout.jsonl");
+        File.WriteAllText(transcript, "{}");
+        var starts = new List<ProcessStartInfo>();
+        var launcher = Launcher(starts, windowsTerminal: null, codexAccountsRoot: accounts.Path);
+        var session = new TrustedSessionLaunch(
+            "codex-session-id",
+            SessionTool.Codex,
+            workspace.Path,
+            new[] { "codex-session-id" })
+        {
+            SourcePath = transcript,
+        };
+
+        var result = launcher.Open(session, SessionOpenTarget.Terminal);
+
+        Assert.IsTrue(result.ok, result.message);
+        Assert.HasCount(1, starts);
+        var ambientCodexHome = Environment.GetEnvironmentVariable("CODEX_HOME");
+        var hasLaunchCodexHome = starts[0].Environment.TryGetValue("CODEX_HOME", out var launchCodexHome);
+        Assert.AreEqual(ambientCodexHome is not null, hasLaunchCodexHome);
+        if (ambientCodexHome is not null)
+            Assert.AreEqual(ambientCodexHome, launchCodexHome);
+    }
+
+    [TestMethod]
     public void SessionLauncher_GatewayMode_UsesCcResume()
     {
         using var workspace = new TempDirectory("gateway workspace");
@@ -378,7 +434,8 @@ public sealed class SessionOpenServiceTests
 
     private static SessionLauncher Launcher(
         List<ProcessStartInfo> starts,
-        string? windowsTerminal = null) =>
+        string? windowsTerminal = null,
+        string? codexAccountsRoot = null) =>
         new(
             @"C:\trusted\claude.exe",
             @"C:\trusted\codex.exe",
@@ -390,7 +447,8 @@ public sealed class SessionOpenServiceTests
             windowsTerminal: windowsTerminal,
             discoverWindowsTerminal: false,
             ownerRecordOptions: new(
-                RootDirectory: Path.Combine(Path.GetTempPath(), "clr-session-open-tests", Guid.NewGuid().ToString("N"))));
+                RootDirectory: Path.Combine(Path.GetTempPath(), "clr-session-open-tests", Guid.NewGuid().ToString("N"))),
+            codexAccountsRoot: codexAccountsRoot);
 
     private static string FindRepoRoot()
     {

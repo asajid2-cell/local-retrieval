@@ -833,6 +833,10 @@ public sealed record ResumeLaunch(string Exe, string Arguments, string WorkingDi
 {
     // Gateway callers use this exact argv instead of reparsing DisplayCommand through another shell.
     public IReadOnlyList<string> ArgumentList { get; init; } = Array.Empty<string>();
+
+    // Environment the launch must run with. Account-home Codex resumes use this to point CODEX_HOME
+    // at the home that owns the transcript; null means inherit the ambient environment unchanged.
+    public IReadOnlyDictionary<string, string>? Environment { get; init; }
 }
 
 public sealed record RawEvent(string Kind, string Timestamp, string Preview);

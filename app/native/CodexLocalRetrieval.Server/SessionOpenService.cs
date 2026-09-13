@@ -55,7 +55,12 @@ public sealed class CanonicalSessionResolver
                 tool,
                 workspace,
                 aliases,
-                CodexLocalRetrieval.Core.Services.ArchiveService.NormalizeLaunchMode(session.LaunchMode)),
+                CodexLocalRetrieval.Core.Services.ArchiveService.NormalizeLaunchMode(session.LaunchMode))
+            {
+                SourcePath = string.IsNullOrWhiteSpace(session.SourcePath) || !Path.IsPathRooted(session.SourcePath)
+                    ? null
+                    : Path.GetFullPath(session.SourcePath),
+            },
             "ok");
     }
 

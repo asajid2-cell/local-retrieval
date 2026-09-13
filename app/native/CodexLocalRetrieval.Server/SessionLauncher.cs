@@ -17,6 +17,7 @@ public sealed class SessionLauncher
     private readonly SessionLaunchGovernor _launchGovernor;
     private readonly Func<ProcessStartInfo, Process?> _startProcess;
     private readonly SessionOwnerRecords.Options? _ownerRecordOptions;
+    private readonly string _codexAccountsRoot;
 
     public SessionLauncher(
         string claudeExe,
@@ -30,9 +31,11 @@ public sealed class SessionLauncher
         bool discoverWindowsTerminal = true,
         SessionOwnerRecords.Options? ownerRecordOptions = null,
         string? gatewayCliScript = null,
-        string? cmdExe = null)
+        string? cmdExe = null,
+        string? codexAccountsRoot = null)
     {
         _ownerRecordOptions = ownerRecordOptions;
+        _codexAccountsRoot = codexAccountsRoot ?? ArchiveService.CodexAccountsRoot;
         _claudeExe = claudeExe;
         _codexExe = codexExe;
         _gatewayCliScript = gatewayCliScript ?? ArchiveService.ResolveGatewayCliScript();
@@ -130,11 +133,22 @@ public sealed class SessionLauncher
                 : session.Tool == SessionTool.Claude
                     ? new[] { "--resume", id }
                     : new[] { "resume", id };
+            IReadOnlyDictionary<string, string>? environment =
+                session.Tool == SessionTool.Codex
+                    && ArchiveService.TryGetCodexAccountHome(
+                        session.SourcePath,
+                        _codexAccountsRoot,
+                        out var accountHome)
+                    ? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+                    {
+                        ["CODEX_HOME"] = accountHome,
+                    }
+                    : null;
             using (lease)
             {
                 try
                 {
-                    var wrapper = OpenTerminal(dir, exe, arguments);
+                    var wrapper = OpenTerminal(dir, exe, arguments, environment);
                     lease?.MarkStarted("Opening terminal resume from server.");
                     RecordOwner(id, aliases, wrapper, "server");
                 }
@@ -273,7 +287,11 @@ public sealed class SessionLauncher
     private void OpenUri(string uri) =>
         _startProcess(new ProcessStartInfo { FileName = uri, UseShellExecute = true });
 
-    private Process? OpenTerminal(string dir, string exe, IReadOnlyList<string> arguments)
+    private Process? OpenTerminal(
+        string dir,
+        string exe,
+        IReadOnlyList<string> arguments,
+        IReadOnlyDictionary<string, string>? environment)
     {
         if (_wt is not null)
         {
@@ -282,6 +300,7 @@ public sealed class SessionLauncher
                 FileName = _wt,
                 UseShellExecute = true,
             };
+            ApplyLaunchEnvironment(psi, environment);
             psi.ArgumentList.Add("-d");
             psi.ArgumentList.Add(dir);
             psi.ArgumentList.Add(exe);
@@ -295,8 +314,18 @@ public sealed class SessionLauncher
             WorkingDirectory = dir,
             UseShellExecute = true,
         };
+        ApplyLaunchEnvironment(fallback, environment);
         foreach (var argument in arguments) fallback.ArgumentList.Add(argument);
         return _startProcess(fallback);
+    }
+
+    private static void ApplyLaunchEnvironment(
+        ProcessStartInfo psi,
+        IReadOnlyDictionary<string, string>? environment)
+    {
+        if (environment is null) return;
+        foreach (var (name, value) in environment)
+            psi.Environment[name] = value;
     }
 
     private static string WorkspaceUri(string dir) =>
@@ -396,4 +425,8 @@ public sealed record TrustedSessionLaunch(
     SessionTool Tool,
     string WorkingDirectory,
     IReadOnlyList<string> Aliases,
-    string LaunchMode = ArchiveService.NativeLaunchMode);
+    string LaunchMode = ArchiveService.NativeLaunchMode)
+{
+    // Absolute transcript path from trusted archive metadata. Used only to select the owning Codex home.
+    public string? SourcePath { get; init; }
+}
