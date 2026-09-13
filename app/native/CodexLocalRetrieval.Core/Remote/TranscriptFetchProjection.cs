@@ -14,7 +14,8 @@ namespace CodexLocalRetrieval.Core.Remote;
 // references Core, not Native). MainPage.Remote.cs is only the wire: lease -> project -> push -> ack.
 //
 // Page contract (pinned IDENTICALLY on the relay side):
-//   { "schemaVersion":1, "sessionId":"<opaque>", "page":<1-based>, "pages":<total>,
+//   { "schemaVersion":1, "sessionId":"<opaque>", "fetchId":"<command id>",
+//     "page":<1-based>, "pages":<total>,
 //     "messages":[ { "role":"user"|"assistant", "text":"...", "ts":"..." }, ... ] }
 // Page 1 carries the NEWEST slice; messages stay chronological INSIDE a page so a page reads
 // forwards. Oldest overflow past MaxPages is dropped, not truncated mid-page.
@@ -47,10 +48,12 @@ public static class TranscriptFetchProjection
     // credential, and a bounded TTL — never a bulk mirror of history. Evaluated in a fixed order so
     // the operator-visible reason is deterministic; the reason strings are the wire text MainPage
     // returns, so they must not drift.
-    public static FetchAdmission AdmitFetch(string? sessionId, string? bridgeToken, int ttlMs)
+    public static FetchAdmission AdmitFetch(string? sessionId, string? fetchId, string? bridgeToken, int ttlMs)
     {
         if (!IsOpaqueId(sessionId?.Trim()))
             return new FetchAdmission(false, "transcript fetch needs one explicit opaque session id");
+        if (!IsOpaqueId(fetchId))
+            return new FetchAdmission(false, "transcript fetch needs one explicit opaque fetch id");
         if (!IsCredential(bridgeToken))
             return new FetchAdmission(false, "transcript fetch needs a scoped bridge credential");
         if (ttlMs <= 0 || ttlMs > MaxFetchTtlMs)
@@ -79,6 +82,7 @@ public static class TranscriptFetchProjection
     // Pack newest-first into <=MaxPageBytes pages, at most MaxPages of them.
     public static IReadOnlyList<TranscriptPage> BuildPages(
         string sessionId,
+        string fetchId,
         IReadOnlyList<ArchiveMessage>? messages,
         bool redact)
     {
@@ -99,7 +103,7 @@ public static class TranscriptFetchProjection
         while (index >= 0 && slices.Count < MaxPages)
         {
             var slice = new List<WireMessage>();
-            var budget = MaxPageBytes - EnvelopeOverhead(sessionId);
+            var budget = MaxPageBytes - EnvelopeOverhead(sessionId, fetchId);
             while (index >= 0)
             {
                 var candidate = Fit(clean[index], budget, slice.Count == 0);
@@ -113,6 +117,8 @@ public static class TranscriptFetchProjection
             slices.Add(slice);
         }
 
+        // Publish an authoritative empty capture so an older parked transcript is replaced.
+        if (slices.Count == 0) slices.Add(new List<WireMessage>());
         var pages = new List<TranscriptPage>(slices.Count);
         for (var i = 0; i < slices.Count; i++)
         {
@@ -120,6 +126,7 @@ public static class TranscriptFetchProjection
             {
                 schemaVersion = SchemaVersion,
                 sessionId,
+                fetchId,
                 page = i + 1,
                 pages = slices.Count,
                 messages = slices[i],
@@ -153,11 +160,12 @@ public static class TranscriptFetchProjection
     private static int MessageBytes(WireMessage m)
         => Encoding.UTF8.GetByteCount(JsonSerializer.Serialize(m));
 
-    private static int EnvelopeOverhead(string sessionId)
+    private static int EnvelopeOverhead(string sessionId, string fetchId)
         => Encoding.UTF8.GetByteCount(JsonSerializer.Serialize(new
         {
             schemaVersion = SchemaVersion,
             sessionId,
+            fetchId,
             page = MaxPages,
             pages = MaxPages,
             messages = Array.Empty<WireMessage>(),

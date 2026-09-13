@@ -241,4 +241,77 @@ public sealed class RemoteCommandProtocolTests
             RemoteCommandAdmission.Execute,
             ledger.Admit("fetchfile", "intent-fenced", "never-admitted", "lease-1", out _));
     }
+
+    // ---- capability advertisement and mux/reconcile contract shapes ---------------------------------
+
+    [TestMethod]
+    public void CommandTypeAdvertisements_CoverEveryIntentFencedTypeAndNoDuplicate()
+    {
+        // The relay routes a queued command only to a leaser whose commandTypes covers it, so anything the
+        // at-most-once fence requires an envelope for must be advertised by BOTH consumers.
+        foreach (var type in new[]
+        {
+            "fetchfile", "startmux", "startchat", "reclaim", "mirrorlocal",
+            "checkpointcreate", "checkpointspawn", "branchcreate",
+            "collectioncreate", "collectiondelete", "deckcreate", "deckdelete",
+        })
+        {
+            Assert.IsTrue(RemoteCommandProtocol.GuiCommandTypes.Contains(type), $"gui must advertise {type}");
+            Assert.IsTrue(RemoteCommandProtocol.HeadlessCommandTypes.Contains(type), $"headless must advertise {type}");
+        }
+        Assert.AreEqual(
+            RemoteCommandProtocol.GuiCommandTypes.Distinct(StringComparer.Ordinal).Count(),
+            RemoteCommandProtocol.GuiCommandTypes.Count);
+        Assert.AreEqual(
+            RemoteCommandProtocol.HeadlessCommandTypes.Distinct(StringComparer.Ordinal).Count(),
+            RemoteCommandProtocol.HeadlessCommandTypes.Count);
+    }
+
+    [TestMethod]
+    public void LeaseOwner_EmbedsThePrincipalInstanceIdWhenSupplied()
+    {
+        var machine = RemoteCommandProtocol.LeaseOwner("gui");
+        StringAssert.StartsWith(machine, "gui-");
+        StringAssert.Contains(machine, Environment.ProcessId.ToString());
+
+        var principal = RemoteCommandProtocol.LeaseOwner("gui", "test-principal");
+        StringAssert.Contains(principal, "test-principal");
+    }
+
+    [TestMethod]
+    public void ParseMuxCreateResponse_OnlyAnExplicitCreatedIsSuccess()
+    {
+        Assert.IsTrue(RemoteCommandProtocol.ParseMuxCreateResponse("""{"t":"created"}""").ok);
+
+        var refused = RemoteCommandProtocol.ParseMuxCreateResponse("""{"t":"err","m":"identity busy"}""");
+        Assert.IsFalse(refused.ok);
+        Assert.AreEqual("identity busy", refused.detail);
+
+        // An explicit uncertainty marker, a malformed body, and any unknown shape are all UNKNOWN: the
+        // caller must reconcile, never retry blind.
+        var uncertain = RemoteCommandProtocol.ParseMuxCreateResponse("""{"t":"err","uncertain":true}""");
+        Assert.IsFalse(uncertain.ok);
+        Assert.IsTrue(RemoteCommandProtocol.IsUncertainOutcome(uncertain));
+
+        foreach (var response in new[] { "", "not json", """{"t":"something-else"}""" })
+        {
+            var unknown = RemoteCommandProtocol.ParseMuxCreateResponse(response);
+            Assert.IsFalse(unknown.ok);
+            Assert.IsTrue(RemoteCommandProtocol.IsUncertainOutcome(unknown), $"'{response}' must be uncertain");
+        }
+    }
+
+    [TestMethod]
+    public void PendingStartChatFiling_IsRetryableAndNotAnUncertainOutcome()
+    {
+        var pending = (ok: false, detail: RemoteCommandProtocol.StartChatFilingPending);
+        Assert.IsTrue(RemoteCommandProtocol.IsPendingStartChatFiling("startchat", pending));
+        Assert.IsFalse(RemoteCommandProtocol.IsPendingStartChatFiling("startmux", pending));
+        Assert.IsFalse(RemoteCommandProtocol.IsPendingStartChatFiling("startchat", (false, "some other failure")));
+        Assert.IsFalse(RemoteCommandProtocol.IsUncertainOutcome(pending));
+
+        Assert.IsFalse(RemoteCommandProtocol.IsUncertainOutcome((true, "started")));
+        Assert.IsTrue(RemoteCommandProtocol.IsUncertainOutcome(
+            (false, "start chat outcome uncertain: authoritative reconciliation is required before retry")));
+    }
 }

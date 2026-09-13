@@ -17,13 +17,79 @@ public sealed class RemoteCommandUnconfirmedException(string detail) : Exception
 
 public static class RemoteCommandProtocol
 {
-    public static string LeaseOwner(string role)
+    // What each native consumer advertises it can execute. The relay routes a queued command only to a
+    // leased consumer whose commandTypes advertisement covers it, so these lists are a wire contract: a
+    // type omitted here is never delivered. They mirror the real dispatcher switches (MainPage.Remote.cs
+    // for GUI, RemoteBridge.cs for headless) — do not advertise a type the switch cannot execute.
+    public static readonly IReadOnlyList<string> GuiCommandTypes =
+    [
+        "kill", "transcript", "transcriptfetch", "fetchfile", "rename", "setapptitle",
+        "addtocollection", "startmux", "mirrorlocal", "startchat", "reclaim", "branchcreate",
+        "captureworkspace", "checkpointcreate", "checkpointspawn", "checkpointrename",
+        "checkpointdelete", "archive", "removefromcollection", "setfavorite", "setphrases",
+        "settag", "collectioncreate", "collectionrename", "collectiondelete", "collectionmove",
+        "collectionsettag", "collectionreorder", "collectionrecover", "collectionpurge",
+        "collectionempty", "deckcreate", "deckrename", "deckdelete", "deckreorder",
+        "cleartabhistory", "settabcolor",
+    ];
+
+    // The headless bridge owns an ArchiveService too, so it can run the same store-backed operations the
+    // GUI can except the two tab-presentation setters, which only exist on an open desktop tab.
+    public static readonly IReadOnlyList<string> HeadlessCommandTypes =
+    [
+        "kill", "transcript", "transcriptfetch", "fetchfile", "rename", "setapptitle",
+        "addtocollection", "startmux", "mirrorlocal", "startchat", "reclaim", "branchcreate",
+        "captureworkspace", "checkpointcreate", "checkpointspawn", "checkpointrename",
+        "checkpointdelete", "archive", "removefromcollection", "setfavorite", "setphrases",
+        "settag", "collectioncreate", "collectionrename", "collectiondelete", "collectionmove",
+        "collectionsettag", "collectionreorder", "collectionrecover", "collectionpurge",
+        "collectionempty", "deckcreate", "deckrename", "deckdelete", "deckreorder",
+    ];
+
+    public static string LeaseOwner(string role, string? principalInstanceId = null)
     {
         var clean = new StringBuilder();
-        foreach (var ch in Environment.MachineName)
+        foreach (var ch in principalInstanceId ?? Environment.MachineName)
             clean.Append(char.IsLetterOrDigit(ch) || ch is '.' or '-' or '_' ? ch : '-');
         return $"{role}-{clean}-{Environment.ProcessId}";
     }
+
+    // A mux "create" response is the only place the relay learns whether a durable mux session exists.
+    // Anything that is not an explicit "created" (or an explicit, non-uncertain "err") is UNKNOWN, and
+    // an unknown create must be reconciled against muxd before a retry — never retried blind.
+    public static (bool ok, string detail) ParseMuxCreateResponse(string response)
+    {
+        const string uncertain = "mux start outcome uncertain: authoritative reconciliation is required before retry";
+        try
+        {
+            using var doc = JsonDocument.Parse(response);
+            var root = doc.RootElement;
+            if (!root.TryGetProperty("t", out var type)) return (false, uncertain);
+            if (type.GetString() == "created") return (true, "mux session created");
+            if (type.GetString() != "err") return (false, uncertain);
+            if (root.TryGetProperty("uncertain", out var uncertainty) && uncertainty.ValueKind == JsonValueKind.True)
+                return (false, uncertain);
+            return (false, root.TryGetProperty("m", out var message) && message.ValueKind == JsonValueKind.String
+                ? message.GetString() ?? "muxd error" : "muxd error");
+        }
+        catch (Exception ex) when (ex is JsonException or InvalidOperationException or ArgumentException)
+        {
+            return (false, uncertain);
+        }
+    }
+
+    // The launch crossed its durable boundary (the mux session is created) but the authoritative filing of
+    // the resulting chat is not yet confirmed. This is NOT a failure: the relay must retry it, and the
+    // consumer reconciles rather than re-launching.
+    public const string StartChatFilingPending = "startchat launch confirmed; authoritative filing is pending";
+
+    public static bool IsPendingStartChatFiling(string? type, (bool ok, string detail) result)
+        => type == "startchat" && !result.ok && result.detail == StartChatFilingPending;
+
+    public static bool IsUncertainOutcome((bool ok, string detail) result)
+        => !result.ok
+           && result.detail.Contains("outcome uncertain:", StringComparison.OrdinalIgnoreCase)
+           && result.detail.Contains("authoritative reconciliation is required", StringComparison.OrdinalIgnoreCase);
 
     public static string NewIntent(string prefix)
         => $"{prefix}-{Guid.NewGuid():N}";

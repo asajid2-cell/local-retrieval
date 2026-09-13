@@ -3980,4 +3980,88 @@ public sealed class ArchiveServiceTests
         {
         }
     }
+
+    // ---- restricted/isolated transcript sources ------------------------------------------------------
+
+    private static ArchiveService RestrictedArchive(string root) => new(
+        storePath: Path.Combine(root, "app-store.json"),
+        enableTranscriptSearchIndex: false,
+        codexSessionsRoot: Path.Combine(root, "codex"),
+        claudeSessionsRoot: Path.Combine(root, "claude"),
+        codexStateDbPath: Path.Combine(root, "state_5.sqlite"),
+        restrictTranscriptSources: true);
+
+    [TestMethod]
+    public void RestrictedMode_RequiresExplicitAbsoluteTranscriptRoots()
+    {
+        Assert.ThrowsExactly<ArgumentException>(() => new ArchiveService(
+            storePath: Path.Combine(Path.GetTempPath(), "restricted-" + Guid.NewGuid().ToString("N") + ".json"),
+            enableTranscriptSearchIndex: false,
+            restrictTranscriptSources: true));
+        Assert.ThrowsExactly<ArgumentException>(() => new ArchiveService(
+            storePath: Path.Combine(Path.GetTempPath(), "restricted-" + Guid.NewGuid().ToString("N") + ".json"),
+            enableTranscriptSearchIndex: false,
+            codexSessionsRoot: "relative/codex",
+            claudeSessionsRoot: Path.Combine(Path.GetTempPath(), "claude"),
+            codexStateDbPath: Path.Combine(Path.GetTempPath(), "state.sqlite"),
+            restrictTranscriptSources: true));
+    }
+
+    [TestMethod]
+    public async Task RestrictedMode_IgnoresPersistedSourcesAndNeverAbsorbsBundledHistory()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "clr-restricted-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var codex = Path.Combine(root, "codex");
+            var claude = Path.Combine(root, "claude");
+            Directory.CreateDirectory(codex);
+            Directory.CreateDirectory(claude);
+            var service = RestrictedArchive(root);
+            service.Store.Settings.Sources.Add(new SessionSource { Tool = "claude", Root = Path.Combine(root, "foreign") });
+
+            var sources = service.EffectiveSources();
+            CollectionAssert.AreEquivalent(
+                new[] { codex, claude },
+                sources.Select(source => source.Root).ToList());
+            Assert.IsFalse(sources.Any(source => source.Root.Contains("foreign", StringComparison.OrdinalIgnoreCase)));
+
+            // Restricted mode is not allowed to absorb the bundled demo history either.
+            var scan = await service.ScanDiskAsync();
+            Assert.AreEqual(0, scan.Bundled.Count);
+        }
+        finally { try { Directory.Delete(root, recursive: true); } catch { } }
+    }
+
+    [TestMethod]
+    public async Task RestrictedMode_RejectsAStoredSessionPathOutsideTheConfiguredRoots()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "clr-restricted-path-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            Directory.CreateDirectory(Path.Combine(root, "codex"));
+            Directory.CreateDirectory(Path.Combine(root, "claude"));
+            var storePath = Path.Combine(root, "app-store.json");
+            var data = new AppStoreData();
+            data.Sessions["escapee"] = new ArchiveSession
+            {
+                Id = "escapee",
+                Tool = "codex",
+                SourcePath = Path.Combine(Path.GetTempPath(), "outside-" + Guid.NewGuid().ToString("N") + ".jsonl"),
+            };
+            await File.WriteAllTextAsync(storePath, JsonSerializer.Serialize(data));
+
+            var service = new ArchiveService(
+                storePath: storePath,
+                enableTranscriptSearchIndex: false,
+                codexSessionsRoot: Path.Combine(root, "codex"),
+                claudeSessionsRoot: Path.Combine(root, "claude"),
+                codexStateDbPath: Path.Combine(root, "state_5.sqlite"),
+                restrictTranscriptSources: true);
+            await Assert.ThrowsExactlyAsync<InvalidDataException>(() => service.LoadStoreStateAsync());
+        }
+        finally { try { Directory.Delete(root, recursive: true); } catch { } }
+    }
 }
