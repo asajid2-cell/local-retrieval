@@ -5,6 +5,22 @@ const path = require("node:path");
 const vm = require("node:vm");
 
 const source = fs.readFileSync(path.join(__dirname, "..", "public", "index.html"), "utf8");
+const serverSource = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
+
+// The real fleet `state` vocabulary comes from relay/server.js, NOT from fleet.js: a browser row's state
+// is attentionStatusForHosted()'s output. Parse it from the server so this suite fails if fleet.js ever
+// drifts from the payload again. Every return path sets `state: '<name>'`, except when the function
+// returns hostAgentStatus()'s result verbatim (the `provided` branch), whose state is a ternary mapping.
+function readServerStates() {
+  const states = new Set();
+  for (const m of serverSource.matchAll(/\bstate:\s*'([a-z]+)'/g)) states.add(m[1]);
+  const agentFn = serverSource.slice(
+    serverSource.indexOf("function hostAgentStatus"),
+    serverSource.indexOf("function attentionStatusForHosted"));
+  for (const m of agentFn.matchAll(/\?\s*'([a-z]+)'/g)) states.add(m[1]);
+  for (const m of agentFn.matchAll(/:\s*'([a-z]+)'\s*;/g)) states.add(m[1]);
+  return states;
+}
 
 function indexOf(needle, from) {
   return source.indexOf(needle, from || 0);
@@ -92,10 +108,16 @@ test("--info custom property exists in :root", () => {
 test("fleet-state chip colour rules exist", () => {
   const css = section(":root {", "</style>");
   assert.match(css, /\.fleet-state-green\s+\.fleet-chip\s*\{[^}]*background:\s*var\(--live\)/);
-  assert.match(css, /\.fleet-state-amber\s+\.fleet-chip\s*\{[^}]*background:\s*var\(--warn\)/);
+  assert.match(css, /\.fleet-state-yellow\s+\.fleet-chip\s*\{[^}]*background:\s*var\(--warn\)/);
   assert.match(css, /\.fleet-state-red\s+\.fleet-chip\s*\{[^}]*background:\s*var\(--rose\)/);
-  assert.match(css, /\.fleet-state-blue\s+\.fleet-chip\s*\{[^}]*background:\s*var\(--info\)/);
+  assert.match(css, /\.fleet-state-white\s+\.fleet-chip\s*\{[^}]*background:\s*var\(--txt\)/);
+  assert.match(css, /\.fleet-state-detached\s+\.fleet-chip\s*\{[^}]*background:\s*var\(--info\)/);
+  assert.match(css, /\.fleet-state-dormant\s+\.fleet-chip\s*\{[^}]*background:\s*var\(--muted\)/);
   assert.match(css, /\.fleet-state-unknown\s+\.fleet-chip\s*\{[^}]*background:\s*var\(--faint\)/);
+  // The dead colour names must be gone, not merely unused.
+  for (const dead of ["amber", "grey", "gray", "blue"]) {
+    assert.equal(css.indexOf(".fleet-state-" + dead), -1, `stale .fleet-state-${dead} rule remains`);
+  }
 });
 
 test("fleet-row CSS exists", () => {
@@ -144,7 +166,7 @@ test("every fleet.js emitted class token has a CSS selector in index.html", () =
   // Build fixture with at least two sessions, distinct names, different states, non-empty snippets
   const fixture = [
     { name: "codex-worker", state: "green", snippet: "build: SUCCESS\ntests: OK", autoheal: true, snippetSig: "abc123", snippetDegraded: false },
-    { name: "shell-host", state: "amber", snippet: "top -bn1\nload average: 2.3", autoheal: false, snippetSig: null, snippetDegraded: true },
+    { name: "shell-host", state: "yellow", snippet: "top -bn1\nload average: 2.3", autoheal: false, snippetSig: null, snippetDegraded: true },
   ];
 
   // Render and assert rowCount > 0
@@ -188,12 +210,16 @@ test("every fleet.js emitted class token has a CSS selector in index.html", () =
     }
   }
 
-  // 4. From stateClass for each recognized state + one unrecognized
-  const testStates = ["green", "amber", "red", "grey", "gray", "blue", "garbage"];
-  for (const s of testStates) {
+  // 4. Every state the server can emit, plus one unrecognized token. The vocabulary is read from
+  // relay/server.js (the payload's source of truth) rather than from fleet.js's own STATES list, so a
+  // drifted fleet.js fails here instead of testing its drift against itself.
+  const serverStates = readServerStates();
+  for (const s of [...serverStates, "garbage"]) {
     const sc = MuxFleet.stateClass({ state: s });
     classTokens.add(sc);
   }
+  assert.deepStrictEqual([...MuxFleet.STATES].sort(), [...serverStates].sort(),
+    "fleet.js STATES drifted from relay/server.js attentionStatusForHosted()");
 
   // Now verify each token has a CSS selector in index.html
   const cssBlock = section(":root {", "</style>");
