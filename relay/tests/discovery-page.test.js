@@ -159,7 +159,7 @@ test('query parameters encode the frozen discovery contract', () => {
   const params = MuxChats.queryParams({
     q: '[web-parity]', include: new Set(['active', 'ACTIVE']), exclude: new Set(['done']),
     matchAll: true, agent: 'codex', date: 'week', minUserMessages: 5,
-    showHidden: true, archived: 'archived', project: 'project-web', sort: 'created-newest',
+    showHidden: true, showAutomationWorkers: true, archived: 'archived', project: 'project-web', sort: 'created-newest',
   }, 40, 40);
 
   assert.equal(params.get('q'), '[web-parity]');
@@ -170,6 +170,7 @@ test('query parameters encode the frozen discovery contract', () => {
   assert.equal(params.get('date'), 'week');
   assert.equal(params.get('minUserMessages'), '5');
   assert.equal(params.get('showHidden'), 'true');
+  assert.equal(params.get('showAutomationWorkers'), 'true');
   assert.equal(params.get('archived'), 'archived');
   assert.equal(params.get('project'), 'project-web');
   assert.equal(params.get('sort'), 'created-newest');
@@ -424,7 +425,7 @@ test('page markup exposes every primary control and loads scripts in dependency 
   const html = fs.readFileSync(path.join(PUBLIC, 'chats.html'), 'utf8');
   for (const id of [
     'searchform', 'query', 'filters', 'agent', 'sort', 'date', 'minimum', 'project',
-    'hidden', 'matchall', 'archived', 'tagchips', 'phrasechips', 'status', 'state', 'chatlist',
+    'hidden', 'automation', 'matchall', 'archived', 'tagchips', 'phrasechips', 'status', 'state', 'chatlist',
     'deepresults', 'deepheading', 'deeplist', 'pager', 'prev', 'next',
   ]) assert.ok(html.includes(`id="${id}"`), `missing #${id}`);
   assert.ok(html.indexOf('intent-journal.js') < html.indexOf('picker.js'));

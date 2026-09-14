@@ -57,6 +57,7 @@ public sealed partial class MainPage
     private string ToolFilterLabel() => ToolFilters.FirstOrDefault(t => t.Value == _toolFilter).Label ?? "Any agent";
 
     private bool _showHidden;   // reveal the auto-hidden one-off / spam chats (default off = they're hidden)
+    private bool _showAutomationWorkers;   // reveal tandem/orchestration workers (default off = they're hidden)
     private int _minUserMsgs;   // hide chats with fewer than this many real user prompts (0 = off)
     private static readonly (int Value, string Label)[] MinUserMsgOptions =
     {
@@ -80,7 +81,8 @@ public sealed partial class MainPage
         DateRange = _dateRange,
         Tool = _toolFilter,
         MinUserMessages = _minUserMsgs,
-        ShowHidden = _showHidden
+        ShowHidden = _showHidden,
+        ShowAutomationWorkers = _showAutomationWorkers
     };
 
     // The funnel filters WITHOUT the text query — used to constrain the Deep-search results to the same
@@ -96,6 +98,7 @@ public sealed partial class MainPage
         Tool = _toolFilter,
         MinUserMessages = _minUserMsgs,
         ShowHidden = _showHidden,
+        ShowAutomationWorkers = _showAutomationWorkers,
     };
 
     // Session ids that pass the active funnel filters (no text query). Empty filters -> null (no restriction).
@@ -217,6 +220,7 @@ public sealed partial class MainPage
         {
             if (have.Contains(s.Id) || s.Archived) continue;
             if (!_showHidden && ArchiveService.IsLowSignalChat(s)) continue;   // keep one-offs hidden unless revealed
+            if (!_showAutomationWorkers && ArchiveService.ShouldAutoHideAutomationWorker(s)) continue;
             s.RowTitleMode = titleMode;
             _archive.Sessions.Add(s);
             added++;
@@ -585,6 +589,20 @@ public sealed partial class MainPage
         shRow.Children.Add(shToggle);
         root.Children.Add(shRow);
 
+        // Automation toggle: reveal tandem/orchestration worker sessions, while apex/controller chats
+        // remain visible by default because the core classifier explicitly retains them.
+        var automationN = _archive.AutomationWorkerCount();
+        var awRow = new Grid { ColumnDefinitions = { new ColumnDefinition(), new ColumnDefinition { Width = GridLength.Auto } } };
+        var awLabel = new StackPanel { Orientation = Orientation.Vertical, VerticalAlignment = VerticalAlignment.Center };
+        awLabel.Children.Add(new TextBlock { Text = "Show automation workers", Foreground = new SolidColorBrush(ChipText), FontSize = 12 });
+        awLabel.Children.Add(new TextBlock { Text = $"{automationN} tandem/orchestration worker{(automationN == 1 ? "" : "s")} auto-hidden", Foreground = MutedBrush(), FontSize = 11 });
+        awRow.Children.Add(awLabel);
+        var awToggle = new ToggleSwitch { IsOn = _showAutomationWorkers, OnContent = "On", OffContent = "Off", MinWidth = 0, HorizontalAlignment = HorizontalAlignment.Right };
+        awToggle.Toggled += (_, _) => { if (_showAutomationWorkers != awToggle.IsOn) { _showAutomationWorkers = awToggle.IsOn; RefreshFilterFlyout(); ApplyFilters(); } };
+        Grid.SetColumn(awToggle, 1);
+        awRow.Children.Add(awToggle);
+        root.Children.Add(awRow);
+
         // Project (collection) scope: restrict the whole filter to one project's chats.
         if (_archive.Store.Collections.Count > 0)
         {
@@ -610,10 +628,10 @@ public sealed partial class MainPage
             root.Children.Add(projRow);
         }
 
-        if (_includeTags.Count > 0 || _excludeTags.Count > 0 || _filterCollectionId is not null || _dateMode.Length > 0 || _dateRange.Length > 0 || _toolFilter.Length > 0 || _minUserMsgs > 0 || _showHidden)
+        if (_includeTags.Count > 0 || _excludeTags.Count > 0 || _filterCollectionId is not null || _dateMode.Length > 0 || _dateRange.Length > 0 || _toolFilter.Length > 0 || _minUserMsgs > 0 || _showHidden || _showAutomationWorkers)
         {
             var clear = new Button { Style = (Style)Resources["PillButtonStyle"], HorizontalAlignment = HorizontalAlignment.Stretch, Content = new TextBlock { Text = "Clear filters", FontSize = 12 } };
-            clear.Click += (_, _) => { _includeTags.Clear(); _excludeTags.Clear(); _filterCollectionId = null; _dateMode = ""; _dateRange = ""; _toolFilter = ""; _minUserMsgs = 0; _showHidden = false; RefreshFilterFlyout(); ApplyFilters(); };
+            clear.Click += (_, _) => { _includeTags.Clear(); _excludeTags.Clear(); _filterCollectionId = null; _dateMode = ""; _dateRange = ""; _toolFilter = ""; _minUserMsgs = 0; _showHidden = false; _showAutomationWorkers = false; RefreshFilterFlyout(); ApplyFilters(); };
             root.Children.Add(clear);
         }
         return root;
@@ -680,7 +698,7 @@ public sealed partial class MainPage
             _filterCollectionId = null;   // collection was deleted
 
         TagFilterBar.Children.Clear();
-        if (_includeTags.Count == 0 && _excludeTags.Count == 0 && _filterCollectionId is null && _dateMode.Length == 0 && _dateRange.Length == 0 && _toolFilter.Length == 0 && _minUserMsgs == 0 && !_showHidden)
+        if (_includeTags.Count == 0 && _excludeTags.Count == 0 && _filterCollectionId is null && _dateMode.Length == 0 && _dateRange.Length == 0 && _toolFilter.Length == 0 && _minUserMsgs == 0 && !_showHidden && !_showAutomationWorkers)
         {
             TagFilterScroller.Visibility = Visibility.Collapsed;
             return;
@@ -691,6 +709,11 @@ public sealed partial class MainPage
             TagFilterBar.Children.Add(TagChip("showing hidden", active: true,
                 onTap: () => { _showHidden = false; ApplyFilters(); },
                 onRemove: () => { _showHidden = false; ApplyFilters(); }));
+
+        if (_showAutomationWorkers)
+            TagFilterBar.Children.Add(TagChip("showing automation", active: true,
+                onTap: () => { _showAutomationWorkers = false; ApplyFilters(); },
+                onRemove: () => { _showAutomationWorkers = false; ApplyFilters(); }));
 
         if (_toolFilter.Length > 0)
             TagFilterBar.Children.Add(TagChip(ToolFilterLabel(), active: true,
@@ -735,7 +758,7 @@ public sealed partial class MainPage
                 onTap: () => { _excludeTags.Remove(t); ApplyFilters(); },
                 onRemove: () => { _excludeTags.Remove(t); ApplyFilters(); }));
         }
-        TagFilterBar.Children.Add(AddChip("clear", () => { _includeTags.Clear(); _excludeTags.Clear(); _filterCollectionId = null; _dateMode = ""; _dateRange = ""; _toolFilter = ""; _minUserMsgs = 0; _showHidden = false; ApplyFilters(); }));
+        TagFilterBar.Children.Add(AddChip("clear", () => { _includeTags.Clear(); _excludeTags.Clear(); _filterCollectionId = null; _dateMode = ""; _dateRange = ""; _toolFilter = ""; _minUserMsgs = 0; _showHidden = false; _showAutomationWorkers = false; ApplyFilters(); }));
     }
 
     // ---- Per-chat tag editor (right panel) ---------------------------------------------------

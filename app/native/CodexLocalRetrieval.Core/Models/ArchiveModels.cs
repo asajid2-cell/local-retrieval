@@ -322,6 +322,11 @@ public sealed class ChatFilter
     // IsEmpty (turning it on doesn't count as "filtering").
     public bool ShowHidden { get; set; }
 
+    // By default the list also hides strongly-marked tandem/orchestration worker sessions. Apex/controller
+    // sessions are retained by the classifier, and deliberate user curation still wins. This is a
+    // visibility toggle, not a narrowing filter, so it is excluded from IsEmpty.
+    public bool ShowAutomationWorkers { get; set; }
+
     // Archive scope is separate from ShowHidden: active is the default, archived exposes only
     // archived sessions, and all is an explicit recovery/debug view.
     public string Archived { get; set; } = "active";
@@ -536,11 +541,11 @@ public sealed class ArchiveSession : INotifyPropertyChanged
     // re-sync), so they notify their computed display props to keep the live ListView in sync.
     private string _title = "";
     [JsonPropertyName("title")]
-    public string Title { get => _title; set { _title = value; InvalidateSearchText(); Raise(); Raise(nameof(DisplayTitle)); Raise(nameof(ListTitle)); } }
+    public string Title { get => _title; set { _title = value; InvalidateSearchText(); BumpAggregateEpoch(); Raise(); Raise(nameof(DisplayTitle)); Raise(nameof(ListTitle)); } }
 
     private string _customTitle = "";
     [JsonPropertyName("customTitle")]
-    public string CustomTitle { get => _customTitle; set { _customTitle = value; InvalidateSearchText(); Raise(); Raise(nameof(DisplayTitle)); Raise(nameof(ListTitle)); } }
+    public string CustomTitle { get => _customTitle; set { _customTitle = value; InvalidateSearchText(); BumpAggregateEpoch(); Raise(); Raise(nameof(DisplayTitle)); Raise(nameof(ListTitle)); } }
 
     private string _sourcePath = "";
     [JsonPropertyName("sourcePath")]
@@ -716,11 +721,13 @@ public sealed class ArchiveSession : INotifyPropertyChanged
 
     // The last / first thing the USER typed in this chat (capped, single line). Captured at parse time from
     // the FULL transcript so the last/first-user-message list sorts + titles work without loading per row.
+    private string _lastUserMessage = "";
     [JsonPropertyName("lastUserMessage")]
-    public string LastUserMessage { get; set; } = "";
+    public string LastUserMessage { get => _lastUserMessage; set { _lastUserMessage = value; BumpAggregateEpoch(); } }
 
+    private string _firstUserMessage = "";
     [JsonPropertyName("firstUserMessage")]
-    public string FirstUserMessage { get; set; } = "";
+    public string FirstUserMessage { get => _firstUserMessage; set { _firstUserMessage = value; BumpAggregateEpoch(); } }
 
     // How many REAL user prompts this chat has (your turns, not tool results) — counted from the FULL
     // transcript at parse time. Drives the "min user messages" filter and is shown on the row.

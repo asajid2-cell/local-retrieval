@@ -34,6 +34,7 @@
     put('minUserMessages', Number(f.minUserMessages) || 0);
     put('archived', f.archived || 'active');
     if (f.showHidden) params.set('showHidden', 'true');
+    if (f.showAutomationWorkers) params.set('showAutomationWorkers', 'true');
     put('project', f.project || '');
     put('sort', f.sort || 'recent');
     if (offset != null) params.set('offset', String(Math.max(0, Number(offset) || 0)));
@@ -71,7 +72,7 @@
     var state = {
       filters: {
         q: '', include: new Set(), exclude: new Set(), matchAll: false,
-        agent: '', date: '', minUserMessages: 0, showHidden: false,
+        agent: '', date: '', minUserMessages: 0, showHidden: false, showAutomationWorkers: false,
         archived: 'active', project: '', sort: 'recent',
       },
       rows: [], facets: { tags: [], phrases: [], projects: [], hidden: 0 },
@@ -1346,7 +1347,7 @@
       } else if (!controller.state.total && deepExtras) {
         stateBox.innerHTML = '<strong>No chats match these filters</strong>The full-transcript scan below found chats containing your phrase.';
       } else if (!controller.state.total) {
-        stateBox.innerHTML = '<strong>No matching chats</strong>Clear a filter or show hidden one-off chats.';
+        stateBox.innerHTML = '<strong>No matching chats</strong>Clear a filter or reveal hidden one-off or automation chats.';
       }
     }
 
@@ -1410,6 +1411,11 @@
     var hidden = $('#hidden');
     if (hidden) hidden.onchange = function () {
       controller.state.filters.showHidden = hidden.checked;
+      controller.load(true);
+    };
+    var automation = $('#automation');
+    if (automation) automation.onchange = function () {
+      controller.state.filters.showAutomationWorkers = automation.checked;
       controller.load(true);
     };
     $('#prev').onclick = function () { controller.page(-1); };

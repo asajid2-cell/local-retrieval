@@ -123,6 +123,7 @@ public static class DiscoveryEndpoints
             Project: S("project"),
             Sort: S("sort"),
             Offset: I("offset"),
-            Limit: I("limit"));
+            Limit: I("limit"),
+            ShowAutomationWorkers: B("showAutomationWorkers"));
     }
 }
