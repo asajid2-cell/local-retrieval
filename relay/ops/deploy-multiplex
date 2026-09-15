@@ -72,9 +72,14 @@ preflight() {
     env_mode="$(stat -c %a "$ENV_FILE")"
     [ "$env_owner:$env_group" = "root:root" ] || die "$ENV_FILE must be owned by root:root"
     [ "$env_mode" = 600 ] || die "$ENV_FILE must have mode 0600"
-    for key in PORT MUX_HOST_TOKEN HL_INTERNAL_KEY MUX_BRIDGE_TOKEN; do
+    for key in PORT MUX_HOST_TOKEN HL_INTERNAL_KEY; do
         env_has_value "$key" || die "$ENV_FILE is missing a non-empty $key"
     done
+    # MUX_BRIDGE_TOKEN is optional, and the relay fails CLOSED without it: the archive-index routes
+    # stay 403. No PC-side producer ships in this tree, so requiring it would gate every deploy on a
+    # credential nothing exercises. Warn rather than die, so an absent capability stays visible.
+    env_has_value MUX_BRIDGE_TOKEN ||
+        log "MUX_BRIDGE_TOKEN absent; relay archive-index routes stay closed (no producer in this tree)"
 
     require_unit_value User svc-multiplex
     require_unit_value Group svc-multiplex
@@ -107,9 +112,9 @@ EXPECTED_SHA="$2"
 [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{64}$ ]] || die "invalid sha256"
 preflight
 
-ARCHIVE="/home/sub/multiplex-incoming/multiplex-$COMMIT.tgz"
+ARCHIVE="/home/admin/multiplex-incoming/multiplex-$COMMIT.tgz"
 [ -f "$ARCHIVE" ] && [ ! -L "$ARCHIVE" ] || die "release archive missing or unsafe"
-[ "$(stat -c %U "$ARCHIVE")" = sub ] || die "release archive must be owned by sub"
+[ "$(stat -c %U "$ARCHIVE")" = admin ] || die "release archive must be owned by admin"
 QUARANTINE="$STATE/deploy-incoming"
 install -d -o root -g root -m 0700 "$QUARANTINE"
 mv -- "$ARCHIVE" "$QUARANTINE/multiplex-$COMMIT.tgz"
@@ -152,6 +157,10 @@ runuser -u svc-multiplex -- env HOME="$STATE" npm --prefix "$APP" ci --omit=dev 
 runuser -u svc-multiplex -- node --check "$APP/server.js"
 chown -R root:root "$STAGE"
 chmod -R go-w "$STAGE"
+# `mktemp -d` creates the stage 0700, and `go-w` cannot widen it. Without this the release directory
+# reaches root-owned but untraversable, so the service account cannot read /opt/multiplex-app after
+# the swap and the health gate only discovers it by rolling back.
+chmod 0755 "$STAGE" "$STAGE/relay"
 
 RELEASE="$RELEASES/$COMMIT"
 install -d -o root -g root -m 0755 "$RELEASES"
@@ -162,6 +171,7 @@ if [ -e "$RELEASE" ]; then
 else
     mv -- "$STAGE" "$RELEASE"
 fi
+chmod 0755 "$RELEASE" "$RELEASE/relay"
 
 install -o root -g root -m 0755 "$RELEASE/scripts/backup-state.sh" /usr/local/bin/mux-backup-state.sh
 

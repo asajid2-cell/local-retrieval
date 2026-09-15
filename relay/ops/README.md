@@ -10,9 +10,8 @@ security layers; a Multiplex deploy does not rewrite their keys or routes.
 
 ## One-time provisioning
 
-Changing root-owned policy requires an authorized admin/root session (the existing
-`harmonizer` admin path), not the routine `harmonizer-sub` release account. Stage
-this directory on the VPS, inspect it, then run:
+Changing root-owned policy requires an authorized admin/root session. Stage this
+directory on the VPS, inspect it, then run:
 
 ```sh
 sudo bash relay/ops/provision-multiplex-deploy.sh
@@ -24,15 +23,25 @@ The provisioner:
 - installs the consolidated non-root service and backup units;
 - removes the stale Docker supplementary-group drop-in;
 - locks `/etc/multiplex-app.env` to `root:root` mode `0600`;
-- adds one sudo rule for `sub`: `deploy-multiplex` only;
 - reloads systemd, restarts the existing relay once so its live process drops Docker
   access immediately, and verifies the effective unit, runtime UID/GID/groups, nginx,
   and loopback `hl-auth` boundary.
 
+It writes **no sudoers rule**, and deliberately provides no lower-privileged deploy
+account. The wrapper is not a privilege boundary: it validates an archive but cannot
+authenticate its provenance, because the caller supplies both the commit and its
+sha256. Anyone allowed to run it is therefore allowed to install any code as the
+relay, and the service's systemd `EnvironmentFile` hands that code `MUX_HOST_TOKEN`
+and `HL_INTERNAL_KEY`. That is a system change, which is tier 3 by definition, so
+provisioning and releases both run as admin. The wrapper still earns its place as a
+safety mechanism — content-addressed releases, archive validation, drain, atomic
+swap, health gate with automatic rollback — but not as a way to let a read-only
+account deploy.
+
 Verify before the first release:
 
 ```sh
-sudo -l -U sub
+ls -l /usr/local/bin/deploy-multiplex        # root-owned, mode 0755
 systemctl show multiplex-app.service -p User -p Group -p SupplementaryGroups
 systemctl cat multiplex-app.service
 pid=$(systemctl show multiplex-app.service -p MainPID --value)
@@ -51,7 +60,7 @@ bash scripts/deploy-relay.sh
 The client first runs the wrapper's read-only preflight, so missing provisioning or
 security drift is reported before an archive is built or uploaded.
 
-The client uploads only to `harmonizer-sub`. The root-owned wrapper accepts exactly a
+The client uploads only to `harmonizer-admin`. The root-owned wrapper accepts exactly a
 40-hex commit and 64-hex SHA-256, quarantines and validates the archive, refuses links
 or path traversal, installs dependencies as `svc-multiplex`, makes code root-owned,
 drains with SIGTERM, atomically switches the release symlink, checks `/api/health`,

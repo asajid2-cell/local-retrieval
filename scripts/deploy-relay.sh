@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 # Package the committed relay and hand it to the root-owned, fixed-policy VPS installer.
+#
+# Runs as admin (tier 3). Installing a release is a system change: the wrapper validates the archive
+# but cannot authenticate its provenance, and the service it installs receives the relay's env file.
 set -euo pipefail
 
-VPS=harmonizer-sub
+VPS=harmonizer-admin
 REMOTE_DEPLOY=/usr/local/bin/deploy-multiplex
-REMOTE_INCOMING=/home/sub/multiplex-incoming
+REMOTE_INCOMING=/home/admin/multiplex-incoming
 
 die() { printf 'deploy-relay.sh: %s\n' "$*" >&2; exit 1; }
 

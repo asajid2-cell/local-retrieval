@@ -11,8 +11,8 @@ const provisioner = fs.readFileSync(path.join(REPO, 'ops', 'provision-multiplex-
 const service = fs.readFileSync(path.join(REPO, 'ops', 'multiplex-app.service'), 'utf8');
 const backupService = fs.readFileSync(path.join(REPO, 'ops', 'mux-relay-backup.service'), 'utf8');
 
-test('release client packages only a clean immutable commit for harmonizer-sub', () => {
-  assert.match(deployClient, /^VPS=harmonizer-sub$/m);
+test('release client packages only a clean immutable commit for the admin release account', () => {
+  assert.match(deployClient, /^VPS=harmonizer-admin$/m);
   assert.match(deployClient, /^REMOTE_DEPLOY=\/usr\/local\/bin\/deploy-multiplex$/m);
   assert.match(deployClient, /git status --porcelain/);
   assert.match(deployClient, /git rev-parse HEAD/);
@@ -25,7 +25,10 @@ test('release client packages only a clean immutable commit for harmonizer-sub',
   assert.match(deployClient, /RELEASE_COMMIT/);
   assert.match(deployClient, /sha256sum/);
   assert.match(deployClient, /sudo '\$REMOTE_DEPLOY' '\$COMMIT' '\$SHA256'/);
-  assert.doesNotMatch(deployClient, /harmonizer-admin|deploy-stack|MUX_DEPLOY_CONFIRM/);
+  // Admin IS the sanctioned path: installing a release is a system change, not an operate action.
+  // The guard is against the other routes — the retired read-only release account, and ad-hoc
+  // deploy tooling that would bypass the wrapper entirely.
+  assert.doesNotMatch(deployClient, /harmonizer-sub|deploy-stack|MUX_DEPLOY_CONFIRM/);
 });
 
 test('root installer accepts identities, never caller-controlled paths or commands', () => {
@@ -33,7 +36,8 @@ test('root installer accepts identities, never caller-controlled paths or comman
   assert.match(installer, /\[ "\$#" -eq 2 \]/);
   assert.match(installer, /\^\[0-9a-f\]\{40\}\$/);
   assert.match(installer, /\^\[0-9a-f\]\{64\}\$/);
-  assert.match(installer, /ARCHIVE="\/home\/sub\/multiplex-incoming\/multiplex-\$COMMIT\.tgz"/);
+  assert.match(installer, /ARCHIVE="\/home\/admin\/multiplex-incoming\/multiplex-\$COMMIT\.tgz"/);
+  assert.match(installer, /release archive must be owned by admin/);
   assert.match(installer, /QUARANTINE="\$STATE\/deploy-incoming"/);
   assert.match(installer, /mv -- "\$ARCHIVE" "\$QUARANTINE\/multiplex-\$COMMIT\.tgz"/);
   assert.match(installer, /archive links\/devices are refused/);
@@ -46,6 +50,10 @@ test('deployment installs dependencies unprivileged and code root-owned', () => 
   assert.match(installer, /--omit=dev --ignore-scripts/);
   assert.match(installer, /chown -R root:root "\$STAGE"/);
   assert.match(installer, /chmod -R go-w "\$STAGE"/);
+  // `mktemp -d` creates the stage 0700 and `go-w` cannot widen it, so an unwidened stage reaches
+  // the release root untraversable and the service account cannot read the swapped symlink target.
+  assert.match(installer, /chmod 0755 "\$STAGE" "\$STAGE\/relay"/);
+  assert.match(installer, /chmod 0755 "\$RELEASE" "\$RELEASE\/relay"/);
 });
 
 test('service is non-root and explicitly has no docker supplementary group', () => {
@@ -69,9 +77,14 @@ test('deploy preflight validates the existing auth and host security boundary', 
   assert.match(installer, /ENV_FILE=\/etc\/multiplex-app\.env/);
   assert.match(installer, /must be owned by root:root/);
   assert.match(installer, /must have mode 0600/);
-  for (const key of ['PORT', 'MUX_HOST_TOKEN', 'HL_INTERNAL_KEY', 'MUX_BRIDGE_TOKEN']) {
+  for (const key of ['PORT', 'MUX_HOST_TOKEN', 'HL_INTERNAL_KEY']) {
     assert.match(installer, new RegExp(`for key in[\\s\\S]*${key}`));
   }
+  // MUX_BRIDGE_TOKEN gates only the archive-index routes, no producer in this tree exercises them,
+  // and the relay fails closed without it. It must stay out of the death-on-absent list so a deploy
+  // is not gated on a credential nothing uses, while remaining visible as a warning.
+  assert.match(installer, /for key in PORT MUX_HOST_TOKEN HL_INTERNAL_KEY; do/);
+  assert.match(installer, /MUX_BRIDGE_TOKEN absent/);
   assert.match(installer, /require_unit_value User svc-multiplex/);
   assert.match(installer, /require_unit_value Group svc-multiplex/);
   assert.match(installer, /require_unit_value NoNewPrivileges yes/);
@@ -100,11 +113,16 @@ test('deploy drains, verifies health, and atomically rolls back', () => {
   assert.match(installer, /previous release restored/);
 });
 
-test('one-time provisioner removes stale docker drop-ins and installs only the narrow sudo command', () => {
+test('one-time provisioner removes stale docker drop-ins and grants no sudo command', () => {
   assert.match(provisioner, /10-docker-group\.conf/);
   assert.match(provisioner, /gpasswd -d svc-multiplex docker/);
-  assert.match(provisioner, /sub ALL=\(root\) NOPASSWD: \/usr\/local\/bin\/deploy-multiplex \*/);
-  assert.match(provisioner, /visudo -cf/);
+  // No sudoers grant of any kind. A fixed-policy wrapper cannot authenticate the provenance of the
+  // archive it installs (the caller supplies the sha256), so "may run the wrapper" is "may install
+  // arbitrary code beside the relay's secrets" — a system change, which is tier 3 by definition.
+  assert.doesNotMatch(provisioner, /NOPASSWD/);
+  assert.doesNotMatch(provisioner, /visudo -cf/);
+  // And the retired tier-2 path must not reappear on a host provisioned by an older revision.
+  assert.match(provisioner, /grants a lower-privileged deploy; remove it first/);
   assert.match(provisioner, /chown root:root \/etc\/multiplex-app\.env/);
   assert.match(provisioner, /chmod 0600 \/etc\/multiplex-app\.env/);
   assert.match(provisioner, /systemctl restart multiplex-app\.service/);
