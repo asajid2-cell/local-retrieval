@@ -19,7 +19,8 @@ public sealed record DiscoveryQuery(
     string? Project = null,
     string? Sort = null,
     int? Offset = null,
-    int? Limit = null);
+    int? Limit = null,
+    bool? ShowAutomationWorkers = null);
 
 public sealed record DiscoveryChatRow(
     string Id,
@@ -350,6 +351,7 @@ public sealed class DiscoveryApi
             DateMode = query.Sort == "recent" ? "" : query.Sort,
             MinUserMessages = query.MinUserMessages,
             ShowHidden = query.ShowHidden,
+            ShowAutomationWorkers = query.ShowAutomationWorkers,
             Archived = query.Archived,
         };
 
@@ -491,7 +493,8 @@ public sealed class DiscoveryApi
             (raw.Project ?? "").Trim(),
             sort,
             Math.Max(0, raw.Offset.GetValueOrDefault()),
-            Math.Clamp(raw.Limit ?? DefaultLimit, 1, MaxLimit));
+            Math.Clamp(raw.Limit ?? DefaultLimit, 1, MaxLimit),
+            raw.ShowAutomationWorkers == true);
     }
 
     private static string CleanEnum(string? value, HashSet<string> allowed)
@@ -638,5 +641,6 @@ public sealed class DiscoveryApi
         string Project,
         string Sort,
         int Offset,
-        int Limit);
+        int Limit,
+        bool ShowAutomationWorkers);
 }

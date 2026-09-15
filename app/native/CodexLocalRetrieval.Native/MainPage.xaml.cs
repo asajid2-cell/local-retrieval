@@ -756,6 +756,7 @@ public sealed partial class MainPage : Page
             // No query: show the most-recent chats as a starting point.
             var recents = _archive.DeepSearch("", 60);
             if (!_showHidden) recents = recents.Where(h => !CodexLocalRetrieval.Core.Services.ArchiveService.IsLowSignalChat(h.Session)).ToList();
+            if (!_showAutomationWorkers) recents = recents.Where(h => !CodexLocalRetrieval.Core.Services.ArchiveService.ShouldAutoHideAutomationWorker(h.Session)).ToList();
             foreach (var h in recents) MainContent.Children.Add(SearchHitResult(h));
             return;
         }
@@ -784,6 +785,7 @@ public sealed partial class MainPage : Page
         var list = hits.AsEnumerable();
         if (allowed is not null) list = list.Where(h => allowed.Contains(h.Session.Id));
         if (!_showHidden) list = list.Where(h => !CodexLocalRetrieval.Core.Services.ArchiveService.IsLowSignalChat(h.Session));
+        if (!_showAutomationWorkers) list = list.Where(h => !CodexLocalRetrieval.Core.Services.ArchiveService.ShouldAutoHideAutomationWorker(h.Session));
         _deepResults = list.ToList();
         _lastSearchQuery = q;
         _searchShown = 0;

@@ -3583,23 +3583,26 @@ public sealed partial class ArchiveService
         return true;
     }
 
-    // Both aggregates below walk every chat in the store, and the filter strip asks for both on every
+    // These aggregates walk every chat in the store, and the filter strip asks for them on every
     // keystroke. They are cached against the session count and ArchiveSession.AggregateEpoch, which is
-    // bumped by any mutation either one depends on (tags, codenames, pinned, archived, message counts).
-    // The session count covers chats being added or removed wholesale, which no per-session setter sees.
+    // bumped by any mutation they depend on (tags, codenames, titles, first/last user messages, pinned,
+    // archived, message counts). The session count covers chats being added or removed wholesale, which
+    // no per-session setter sees.
     private (long Epoch, int Sessions) _aggregateKey = (-1, -1);
     private IReadOnlyList<TagCount>? _cachedAllChatTags;
     private int _cachedHiddenChatCount = -1;
+    private int _cachedAutomationWorkerCount = -1;
 
     private bool AggregatesAreStale()
     {
         var key = (ArchiveSession.AggregateEpoch, Store.Sessions.Count);
-        if (_aggregateKey == key && _cachedAllChatTags is not null && _cachedHiddenChatCount >= 0) return false;
+        if (_aggregateKey == key && _cachedAllChatTags is not null && _cachedHiddenChatCount >= 0 && _cachedAutomationWorkerCount >= 0) return false;
         if (_aggregateKey != key)
         {
             _aggregateKey = key;
             _cachedAllChatTags = null;
             _cachedHiddenChatCount = -1;
+            _cachedAutomationWorkerCount = -1;
         }
         return true;
     }
@@ -3636,6 +3639,53 @@ public sealed partial class ArchiveService
 
     // The compound filter: text search, then restrict to a collection (if set), then keep chats that
     // satisfy the include set (ANY or ALL) and carry NONE of the exclude set.
+    // Strong identity markers emitted by tandem/orchestration infrastructure. Deliberately avoid broad
+    // words such as "orch", "engine", "builder", or "apex": those also appear in normal user chats.
+    private static bool IdentityContains(ArchiveSession session, string marker)
+        => session.DisplayTitle.Contains(marker, StringComparison.OrdinalIgnoreCase)
+           || session.Title.Contains(marker, StringComparison.OrdinalIgnoreCase)
+           || session.CustomTitle.Contains(marker, StringComparison.OrdinalIgnoreCase)
+           || session.FirstUserMessage.Contains(marker, StringComparison.OrdinalIgnoreCase)
+           || session.LastUserMessage.Contains(marker, StringComparison.OrdinalIgnoreCase);
+
+    // An apex/controller is an automation session we intentionally keep in the normal list. The
+    // explicit markers cover both tandem apex bodies and durable orchestration apex candidates without
+    // treating every chat that merely discusses apex/orchestration as infrastructure noise.
+    public static bool IsOrchestrationApex(ArchiveSession session)
+        => IdentityContains(session, "[tandem apex")
+           || IdentityContains(session, "orchestration apex seat")
+           || IdentityContains(session, "fleet-apex")
+           || IdentityContains(session, "active apex body");
+
+    // True only for infrastructure worker/controller sessions, not ordinary discussions about those
+    // systems. Apex/controller sessions are intentionally excluded so they remain visible by default.
+    public static bool IsAutomationWorker(ArchiveSession session)
+    {
+        if (IsOrchestrationApex(session)) return false;
+
+        return IdentityContains(session, "[tandem")
+               || IdentityContains(session, "tandem-coupling:")
+               || IdentityContains(session, "bridge-managed worker session")
+               || IdentityContains(session, "[orch-worker")
+               || IdentityContains(session, "[orch-builder")
+               || IdentityContains(session, "[orch-headless")
+               || IdentityContains(session, "[engine]")
+               || IdentityContains(session, "worker brief")
+               || IdentityContains(session, "builder brief")
+               || IdentityContains(session, "headless worker")
+               || IdentityContains(session, "background worker")
+               || IdentityContains(session, "sealed junior lane");
+    }
+
+    // Pinned, user-tagged, codename-stashed, and project-scoped chats are deliberate user curation.
+    // They stay visible unless the user explicitly asks to reveal all automation workers.
+    public static bool ShouldAutoHideAutomationWorker(ArchiveSession session)
+        => !session.Archived
+           && IsAutomationWorker(session)
+           && !session.Pinned
+           && !HasUserTags(session)
+           && session.SpecialPhrases.Count == 0;
+
     // A "one-off" / spam chat: exactly one (or zero) user prompt AND a tiny transcript — the hundreds
     // of spawned judge/probe/render sessions that each fire a single message. Pinned, tagged, and
     // collection-member chats are NEVER treated as spam (the user deliberately kept them). The tiny-
@@ -3656,6 +3706,16 @@ public sealed partial class ArchiveService
         if (_cachedHiddenChatCount >= 0) return _cachedHiddenChatCount;
         PerfCounters.TagAggregateScan();
         return _cachedHiddenChatCount = Store.Sessions.Values.Count(IsLowSignalChat);
+    }
+
+    // How many automation workers are hidden by the default list policy. The same deliberate-keep rules
+    // as ShouldAutoHideAutomationWorker are used so the UI count matches what the toggle reveals.
+    public int AutomationWorkerCount()
+    {
+        AggregatesAreStale();
+        if (_cachedAutomationWorkerCount >= 0) return _cachedAutomationWorkerCount;
+        PerfCounters.TagAggregateScan();
+        return _cachedAutomationWorkerCount = Store.Sessions.Values.Count(ShouldAutoHideAutomationWorker);
     }
 
     public IReadOnlyList<ArchiveSession> FilterChats(ChatFilter f)
@@ -3680,10 +3740,12 @@ public sealed partial class ArchiveService
         // Auto-hide one-off / spam chats unless the user asked to see them, or is browsing a specific
         // collection (those are deliberately-kept chats). Applies to the plain list AND text search.
         bool hideSpam = !f.ShowHidden && string.IsNullOrEmpty(f.CollectionId);
+        bool hideAutomation = !f.ShowAutomationWorkers && string.IsNullOrEmpty(f.CollectionId);
 
         var result = baseSet
             .Where(s => string.IsNullOrEmpty(f.Tool) || string.Equals(s.Tool, f.Tool, StringComparison.OrdinalIgnoreCase))
             .Where(s => !hideSpam || !IsLowSignalChat(s))
+            .Where(s => !hideAutomation || !ShouldAutoHideAutomationWorker(s))
             .Where(s => f.MinUserMessages <= 0 || s.UserMessageCount >= f.MinUserMessages)
             .Where(s => f.IncludeTags.Count == 0
                         || (f.MatchAllIncludes

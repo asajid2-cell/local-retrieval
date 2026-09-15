@@ -3061,6 +3061,82 @@ public sealed class ArchiveServiceTests
         finally { if (File.Exists(store)) File.Delete(store); }
     }
 
+    [TestMethod]
+    public void FilterChats_HidesAutomationWorkersKeepsApexAndSupportsReveal()
+    {
+        var svc = TempService(out var store);
+        try
+        {
+            ArchiveSession Worker(string id, string title, string firstUser)
+            {
+                var session = new ArchiveSession
+                {
+                    Id = id,
+                    Title = title,
+                    FirstUserMessage = firstUser,
+                    UpdatedAt = "2026-06-01T00:00:00Z",
+                    UserMessageCount = 3,
+                    MessageCount = 12,
+                };
+                svc.Store.Sessions[id] = session;
+                return session;
+            }
+
+            Worker("orch-worker", "Worker result", "[ORCH-WORKER campaign=demo node=r.1 role=build] # Worker brief");
+            Worker("tandem-worker", "[TANDEM junior label=demo] worker task", "[TANDEM junior] sealed lane");
+            Worker("engine", "Document session state", "[ENGINE] refresh the campaign context");
+            Worker("apex", "Execute FLEET-APEX charter", "[TANDEM apex label=demo-apex] You are the apex.");
+            Worker("ordinary", "Discuss orchestration engine", "We need an orchestration engine for the product.");
+            var curated = Worker("curated", "Curated worker result", "[ORCH-WORKER campaign=demo node=kept]");
+            curated.Tags.Add("keep");
+
+            Assert.IsTrue(ArchiveService.IsAutomationWorker(svc.Store.Sessions["orch-worker"]));
+            Assert.IsFalse(ArchiveService.IsAutomationWorker(svc.Store.Sessions["apex"]));
+            Assert.IsTrue(ArchiveService.IsOrchestrationApex(svc.Store.Sessions["apex"]));
+            Assert.IsFalse(ArchiveService.IsAutomationWorker(svc.Store.Sessions["ordinary"]));
+            Assert.AreEqual(3, svc.AutomationWorkerCount(), "curated and Apex sessions are not in the hidden count");
+
+            var defaultIds = svc.FilterChats(new ChatFilter()).Select(s => s.Id).ToArray();
+            CollectionAssert.AreEquivalent(new[] { "apex", "ordinary", "curated" }, defaultIds);
+
+            var revealedIds = svc.FilterChats(new ChatFilter { ShowAutomationWorkers = true }).Select(s => s.Id).ToArray();
+            CollectionAssert.AreEquivalent(
+                new[] { "orch-worker", "tandem-worker", "engine", "apex", "ordinary", "curated" },
+                revealedIds);
+            Assert.IsTrue(new ChatFilter { ShowAutomationWorkers = true }.IsEmpty);
+        }
+        finally { if (File.Exists(store)) File.Delete(store); }
+    }
+
+    // The worker classifier reads Title/CustomTitle/first/last user message, but the hidden COUNT is cached
+    // against ArchiveSession.AggregateEpoch. If a rename (e.g. a re-parse relabels a chat) did not bump the
+    // epoch, the cached count would stay stale until some unrelated mutation. This pins that the epoch
+    // covers titles so the toggle label can never disagree with what the toggle reveals.
+    [TestMethod]
+    public void AutomationWorkerCount_RefreshesWhenATitleBecomesAWorkerMarker()
+    {
+        var svc = TempService(out var store);
+        try
+        {
+            var session = new ArchiveSession
+            {
+                Id = "renamed",
+                Title = "Ordinary notes",
+                UpdatedAt = "2026-06-01T00:00:00Z",
+                UserMessageCount = 3,
+                MessageCount = 12,
+            };
+            svc.Store.Sessions[session.Id] = session;
+
+            Assert.AreEqual(0, svc.AutomationWorkerCount(), "a plain title is not a worker");
+
+            session.Title = "[TANDEM junior label=demo] worker task";
+
+            Assert.AreEqual(1, svc.AutomationWorkerCount(), "a rename into a worker marker must invalidate the cached count");
+        }
+        finally { if (File.Exists(store)) File.Delete(store); }
+    }
+
     // The compound filter: include + exclude + match-all. The user's case: "active chats that aren't cpp".
     [TestMethod]
     public void FilterChats_IncludeExcludeAndMatchAll()

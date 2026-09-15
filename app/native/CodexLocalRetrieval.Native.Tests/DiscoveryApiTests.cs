@@ -128,6 +128,26 @@ public sealed class DiscoveryApiTests
     }
 
     [TestMethod]
+    public void Chats_HidesAutomationWorkersKeepsApexAndSupportsReveal()
+    {
+        var (archive, api) = Fixture();
+        var worker = Chat("worker", "Worker result", "codex", "2026-08-03T10:00:00Z", 3);
+        worker.FirstUserMessage = "[ORCH-WORKER campaign=demo node=r.1 role=build] # Worker brief";
+        var apex = Chat("apex", "Execute FLEET-APEX charter", "codex", "2026-08-03T09:00:00Z", 3);
+        apex.FirstUserMessage = "[TANDEM apex label=demo-apex] You are the apex.";
+        archive.Store.Sessions[worker.Id] = worker;
+        archive.Store.Sessions[apex.Id] = apex;
+
+        var hidden = api.Chats(new DiscoveryQuery());
+        CollectionAssert.DoesNotContain(hidden.Rows.Select(row => row.Id).ToList(), "worker");
+        CollectionAssert.Contains(hidden.Rows.Select(row => row.Id).ToList(), "apex");
+
+        var revealed = api.Chats(new DiscoveryQuery(ShowAutomationWorkers: true));
+        CollectionAssert.Contains(revealed.Rows.Select(row => row.Id).ToList(), "worker");
+        CollectionAssert.Contains(revealed.Rows.Select(row => row.Id).ToList(), "apex");
+    }
+
+    [TestMethod]
     public void Chats_ExactPhraseSearchAndStableOffsetPagination()
     {
         var (_, api) = Fixture();
