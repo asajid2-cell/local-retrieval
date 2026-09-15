@@ -1,6 +1,6 @@
 # muxd — PC-local terminal session host for the multiplex.
 #
-# THE POINT (from full-review.md): the agent's console must be owned by THIS machine, not by an
+# THE POINT: the agent's console must be owned by THIS machine, not by an
 # ssh pipe from the VPS. muxd owns a ConPTY per session; claude/codex live in it. Wi-Fi drops,
 # VPS reboots, relay deploys — the agent never notices; viewers just reattach. muxd dials OUT
 # to the VPS relay (no inbound port on the PC) and multiplexes all sessions over one WebSocket.

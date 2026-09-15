@@ -919,7 +919,7 @@ if ($null -ne $artifactDir) {
         declaredGatewaySha = $GatewaySha.ToLowerInvariant()
         muxMonorepoRoot = if ($null -ne $muxRoot) { $muxRoot } else { 'unresolved' }
         acceptedStatePreserved = $true
-        historicalRecordsUntouched = @('app/CURRENT.md', 'app/LOOPS.md')
+        historicalRecordsUntouched = @()
         gates = @($results.Values)
     }
     try {
