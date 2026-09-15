@@ -318,6 +318,22 @@ public sealed class RolloutAndLiveMappingTests
 
         var res = ClaudeStreamMapper.Map("{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"done\"}").ToList();
         Assert.AreEqual(AgentEventKind.TurnResult, res[0].Kind);
+        Assert.IsNull(res[0].Usage, "a result with no usage object reports null, not a zeroed one");
         Assert.AreEqual("idle", res[1].Text);
+    }
+
+    // A Gateway/Claude turn must report token usage the same way a codex turn does (both codex mappers set
+    // AgentEvent.Usage). Without this the PRIMARY runtime was the one silently dropping usage off the wire.
+    [TestMethod]
+    public void ClaudeStream_ResultCarriesTokenUsage()
+    {
+        var res = ClaudeStreamMapper.Map(
+            "{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"done\",\"usage\":{\"input_tokens\":1234,\"cache_read_input_tokens\":900,\"output_tokens\":56}}").ToList();
+
+        Assert.AreEqual(AgentEventKind.TurnResult, res[0].Kind);
+        var usage = (JsonElement)res[0].Usage!;
+        Assert.AreEqual(1234, usage.GetProperty("input_tokens").GetInt32());
+        Assert.AreEqual(900, usage.GetProperty("cache_read_input_tokens").GetInt32());
+        Assert.AreEqual(56, usage.GetProperty("output_tokens").GetInt32());
     }
 }

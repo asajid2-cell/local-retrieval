@@ -47,7 +47,10 @@ public static class ClaudeStreamMapper
 
             case "result":
                 if (Str(m, "subtype") == "success")
-                    yield return new AgentEvent { Kind = AgentEventKind.TurnResult };
+                    // Token usage rides the same field the codex mappers populate, so a Gateway/Claude turn
+                    // reports usage the way a codex turn does. Absent JSON leaves it null rather than a
+                    // zeroed object, so a consumer can tell "not reported" from "reported zero".
+                    yield return new AgentEvent { Kind = AgentEventKind.TurnResult, Usage = m.TryGetProperty("usage", out var usage) ? usage.Clone() : null };
                 else
                     yield return AgentEvent.Err(Str(m, "result") ?? Str(m, "subtype") ?? "claude error");
                 yield return AgentEvent.Stat("idle");
