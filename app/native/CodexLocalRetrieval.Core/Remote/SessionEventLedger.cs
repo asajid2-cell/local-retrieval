@@ -35,6 +35,7 @@ public static class SessionEventLedger
     // that mentions that id, so ReadForSession costs O(events-of-that-session) instead of an all-time scan.
     private const string IndexDirectoryName = "events-index";
     private const string IndexCompleteMarker = ".complete";
+    private const string IndexDirtyMarker = ".dirty";
     private const int MaxIndexKeyLength = 120;
     private const int BackfillFlushChars = 8_000_000;
 
@@ -165,13 +166,16 @@ public static class SessionEventLedger
             // Index FIRST, at the offset the event is about to occupy. A crash between the two writes then
             // leaves a DANGLING index entry (the reader re-verifies every hit, so it is discarded) rather
             // than a MISSING one, which would silently shrink a session's history. If the sidecar write
-            // fails we drop the completeness marker so the next read rebuilds from the ledger itself.
+            // fails - typically a bounded-timeout loss against a backfill holding the index mutex - the
+            // index is invalidated only AFTER the event bytes are on disk, so the sticky dirty sentinel
+            // never becomes visible before the bytes it exists to protect.
             var offset = fs.Position;
-            if (!TryWriteIndexEntries(root, IndexKeysForEvent(ev), Path.GetFileName(path), offset, options.EffectiveLockTimeout))
-                InvalidateIndex(root);
+            var indexed = TryWriteIndexEntries(root, IndexKeysForEvent(ev), Path.GetFileName(path), offset, options.EffectiveLockTimeout);
 
             fs.Write(bytes, 0, bytes.Length);
             fs.Flush(flushToDisk: true);
+            if (!indexed)
+                InvalidateIndex(root);
             EnforceRetention(root, path, options);
             return true;
         }
@@ -587,9 +591,21 @@ public static class SessionEventLedger
     private static string IndexLine(string fileName, long offset)
         => "{\"f\":\"" + fileName + "\",\"o\":" + offset.ToString(System.Globalization.CultureInfo.InvariantCulture) + "}\n";
 
+    // Sticky invalidation. Deleting the completeness marker alone is not enough: while a backfill holds the
+    // index mutex the marker does not exist yet, so the delete is a no-op and the sweep stamps it AFTER this
+    // append's bytes landed in a file the sweep had already passed - hiding the event behind a marker forever.
+    // The dirty sentinel survives that stamp: it is only ever cleared under the index mutex immediately before
+    // a fresh full sweep, and a marker accompanied by the sentinel is never trusted.
     private static void InvalidateIndex(string root)
     {
-        try { File.Delete(Path.Combine(IndexDirectory(root), IndexCompleteMarker)); } catch { }
+        var dir = IndexDirectory(root);
+        try
+        {
+            Directory.CreateDirectory(dir);
+            File.WriteAllText(Path.Combine(dir, IndexDirtyMarker), DateTimeOffset.UtcNow.UtcDateTime.ToString("O") + "\n");
+        }
+        catch { }
+        try { File.Delete(Path.Combine(dir, IndexCompleteMarker)); } catch { }
     }
 
     private static void ResetIndex(string root, TimeSpan timeout)
@@ -652,10 +668,15 @@ public static class SessionEventLedger
         }
     }
 
+    // A stamped marker is trustworthy only while no dirty sentinel sits beside it: an append whose index
+    // write timed out may have landed event bytes a finished sweep never saw.
+    private static bool IndexLooksComplete(string dir)
+        => File.Exists(Path.Combine(dir, IndexCompleteMarker)) && !File.Exists(Path.Combine(dir, IndexDirtyMarker));
+
     private static bool EnsureIndexComplete(string root, TimeSpan timeout)
     {
         var dir = IndexDirectory(root);
-        if (File.Exists(Path.Combine(dir, IndexCompleteMarker))) return true;
+        if (IndexLooksComplete(dir)) return true;
         Mutex? mutex = null;
         var acquired = false;
         try
@@ -665,8 +686,13 @@ public static class SessionEventLedger
             try { acquired = mutex.WaitOne(timeout); }
             catch (AbandonedMutexException) { acquired = true; }
             if (!acquired) return false;
+            // The fast path raced: a concurrent reader may have just finished a sweep and stamped .complete,
+            // or an append may have marked the index dirty after that check.
+            if (IndexLooksComplete(dir)) return true;
             var marker = Path.Combine(dir, IndexCompleteMarker);
-            if (File.Exists(marker)) return true;
+            // Consume the sentinel only here, under the mutex and immediately before the full sweep: the sweep
+            // is about to re-read the whole ledger, so it picks up any append whose index write had failed.
+            try { File.Delete(Path.Combine(dir, IndexDirtyMarker)); } catch { }
             Backfill(root, dir);
             File.WriteAllText(marker, DateTimeOffset.UtcNow.UtcDateTime.ToString("O") + "\n");
             return true;

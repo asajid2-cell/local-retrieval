@@ -8,7 +8,8 @@ using System.Text.RegularExpressions;
 namespace CodexLocalRetrieval.Core.Remote;
 
 // GROUND-TRUTH "is this session live?": which live claude/codex process (by pid) currently holds which
-// session TRANSCRIPT (.jsonl under ~/.claude/projects or ~/.codex/sessions) OPEN. An agent keeps its
+// session TRANSCRIPT (.jsonl under ~/.claude/projects, or a rollout under any codex home — the canonical
+// ~/.codex/sessions or a per-account ~/.codex-accounts/<account>/sessions that CODEX_HOME redirects to) OPEN. An agent keeps its
 // transcript handle open for the WHOLE session regardless of activity, so this catches sessions the
 // command-line check misses (forked/started without --resume) AND idle sessions the mtime check misses.
 // Windows-only, best-effort (skips protected/unreadable handles). Uses DuplicateHandle +
@@ -81,7 +82,17 @@ public static class OpenHandles
     {
         if (!path.EndsWith(".jsonl", StringComparison.OrdinalIgnoreCase)) return false;
         var low = path.Replace('/', '\\').ToLowerInvariant();
-        return low.Contains("\\.claude\\projects\\") || low.Contains("\\.codex\\sessions\\");
+        if (low.Contains("\\.claude\\projects\\")) return true;
+        // The canonical codex home: anything jsonl under ~/.codex/sessions.
+        if (low.Contains("\\.codex\\sessions\\")) return true;
+        // Per-account codex homes. MUX launches codex with CODEX_HOME=~/.codex-accounts/<account>, so a live
+        // rollout lives at <home>\sessions\<yyyy>\<mm>\<dd>\rollout-<ts>-<uuid>.jsonl, which the canonical
+        // "\\.codex\\sessions\\" test cannot see — a fresh codex tab then has no identity signal at all and
+        // stays identityPending forever. Anchor on the rollout FILENAME plus a \sessions\ segment rather than
+        // the home prefix, so other jsonl under a codex home (~/.codex/repair-backups/.../session_index.jsonl)
+        // is still rejected.
+        return low.Contains("\\sessions\\")
+            && Path.GetFileName(path).StartsWith("rollout-", StringComparison.OrdinalIgnoreCase);
     }
 
     // The session id encoded in a transcript path: claude = the filename (a uuid); codex = the uuid suffix

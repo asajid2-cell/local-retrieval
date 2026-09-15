@@ -35,9 +35,10 @@
     return text.length > SNIPPET_BYTES ? text.slice(-SNIPPET_BYTES) : text;
   }
 
-  // Only the state vocabulary the relay actually emits becomes a class; anything else collapses to
-  // "unknown" rather than injecting an attacker-chosen token into the class attribute.
-  var STATES = ['green', 'amber', 'red', 'grey', 'gray', 'blue'];
+  // Exactly the `state` vocabulary relay/server.js's attentionStatusForHosted() puts on a fleet row:
+  // green, yellow, red, white, detached, dormant. Only one of these becomes a class; anything else
+  // collapses to "unknown" rather than injecting an attacker-chosen token into the class attribute.
+  var STATES = ['green', 'yellow', 'red', 'white', 'detached', 'dormant'];
   function stateClass(row) {
     var state = String((row && row.state) || '').toLowerCase();
     return 'fleet-state-' + (STATES.indexOf(state) >= 0 ? state : 'unknown');
@@ -124,6 +125,7 @@
     esc: esc,
     cleanTerminalText: cleanTerminalText,
     snippetText: snippetText,
+    STATES: STATES,
     stateClass: stateClass,
     ageText: ageText,
     fleetRowHtml: fleetRowHtml,
