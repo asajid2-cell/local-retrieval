@@ -15,10 +15,16 @@
 //   createNotifier({ url, fetchImpl }) -> notifier.push({ title, body, tags, priority, click }) -> { ok, ... }
 // push() never throws. Injection is what lets the tests drive this with a mock and no network.
 //
-// The ntfy topic URL is a secret — the topic IS the credential. It lives in /etc/multiplex-app.env
-// (read by the systemd unit's EnvironmentFile) as:
+// The ntfy topic URL is a secret — the topic IS the credential. The caller (server.js) takes it from
+// the environment and passes it in; on the box it lives in /etc/multiplex-app.env (read by the systemd
+// unit's EnvironmentFile) as:
 //
-//   MUX_ALERT_NTFY_URL=https://ntfy.sh/<unguessable-topic>   # or NTFY_URL, whichever notify.js settles on
+//   MUX_ALERT_NTFY_URL=https://ntfy.sh/<unguessable-topic>
+//
+// This key is not the attention lane's: that one is created bare (server.js) and falls back to
+// notify.js's own default, MUX_NTFY_URL. Setting either one does nothing for the other lane. Get this
+// name wrong and nothing errors — the lane never starts (server.js wires it only when this variable is
+// set) and notify.js degrades to a no-op, so "no alerts" reads identical to "alerts working".
 //
 // This module never reads env and never logs the URL — it only ever holds an already-constructed
 // notifier. Nothing here is committed with a real topic in it.
