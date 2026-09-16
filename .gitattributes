@@ -1,6 +1,18 @@
 # These files are consumed by Linux (bash shebang / systemd unit parsing).
 # They must never be checked out with CRLF: a CR in the shebang makes the
 # kernel look for a program literally named "bash\r" and the unit fails.
+#
+# A suffix rule is not enough. relay/ops holds the scripts the deploy host
+# installs and EXECS directly - `deploy-multiplex` and `multiplex-healthcheck`
+# have no extension, so `*.sh` missed them, and on a Windows checkout with
+# core.autocrlf=true `git archive` handed both to the release tarball with CRLF.
+# The installer then wrote them to /usr/local/bin verbatim and every direct exec
+# died with `/usr/bin/env: 'bash\r': No such file or directory` (exit 127) -
+# including `deploy-multiplex --preflight` on the host that runs deploys.
+# Pin the shipped directories wholesale so a new extensionless script is covered
+# by default rather than by whoever remembers this comment.
+relay/ops/* text eol=lf
+scripts/* text eol=lf
 *.sh text eol=lf
 *.service text eol=lf
 *.timer text eol=lf

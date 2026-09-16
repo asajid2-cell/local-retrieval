@@ -2,6 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
+const { execFileSync } = require('node:child_process');
 
 const REPO = path.resolve(__dirname, '..');
 const ROOT = path.resolve(REPO, '..');
@@ -154,4 +155,33 @@ test('backup timer runs as svc-multiplex with a bounded writable surface', () =>
 test('the sigprobe debug scaffolding stays deleted', () => {
   assert.equal(fs.existsSync(path.join(REPO, 'sigprobe.js')), false);
   assert.equal(fs.existsSync(path.join(REPO, 'sigprobe-child.js')), false);
+});
+
+// The release tarball is produced by `git archive` on a Windows checkout, and core.autocrlf=true
+// rewrites anything .gitattributes does not pin. *.sh/*.service/*.timer were pinned; the two
+// extensionless scripts the host EXECS directly were not, so they reached the release with CRLF -
+// and `deploy-multiplex --preflight` died with `/usr/bin/env: 'bash\r': No such file or directory`
+// (exit 127) on the very host that runs deploys, while the healthcheck timer failed the same way
+// every minute. Assert the archive itself, not the working tree: the working tree was always LF,
+// which is exactly why nothing caught this.
+test('the shipped ops and scripts trees reach the release archive with LF endings', () => {
+  const git = (args, opts = {}) => execFileSync('git', args, { cwd: ROOT, ...opts });
+  const shipped = git(['ls-files', '-z', 'relay/ops', 'scripts'], { encoding: 'utf8' })
+    .split('\0').filter(Boolean);
+  assert.ok(shipped.length > 0, 'git reported no files under relay/ops or scripts');
+
+  for (const rel of shipped) {
+    const attr = git(['check-attr', 'eol', '--', rel], { encoding: 'utf8' }).trim();
+    assert.match(
+      attr, /: eol: lf$/,
+      `${rel} is not pinned to LF; a CR in a shebang makes the kernel look for "bash\\r"`,
+    );
+  }
+
+  // The end-to-end proof: the bytes the host actually receives, straight out of git archive.
+  const archived = git(['archive', '--format=tar', 'HEAD', 'relay/ops', 'scripts']);
+  assert.equal(
+    archived.includes(0x0d), false,
+    'the release archive carries CRLF; the host execs these files directly and they will exit 127',
+  );
 });
