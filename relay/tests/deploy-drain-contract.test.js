@@ -141,9 +141,19 @@ test('backup timer runs as svc-multiplex with a bounded writable surface', () =>
   // in cmd, POSIX sh and PowerShell, so this asserts the ROUTE rather than the remote shell's dialect.
   // RequestTTY=no and -n keep a non-interactive hourly run from ever waiting on a terminal.
   assert.match(backupService, /^ExecCondition=\/usr\/bin\/ssh .* -n win exit 0$/m);
+  // Both probes must name the route file. ssh reads its per-user config from the account's PASSWD
+  // home rather than the HOME these units export, and svc-multiplex has no passwd home on disk -
+  // so discovery silently found nothing and every probe failed on "Could not resolve hostname win".
+  assert.match(
+    backupService,
+    /^ExecCondition=\/usr\/bin\/ssh -F \/var\/lib\/multiplex\/\.ssh\/config .* -n win exit 0$/m,
+  );
   assert.match(backupService, /^ReadOnlyPaths=\/var\/lib\/multiplex$/m);
   assert.match(backupService, /^NoNewPrivileges=yes$/m);
-  assert.match(installer, /runuser -u svc-multiplex[\s\S]*ssh[\s\S]*win exit 0/);
+  assert.match(
+    installer,
+    /runuser -u svc-multiplex[\s\S]*ssh -F "\$STATE\/\.ssh\/config"[\s\S]*win exit 0/,
+  );
   assert.match(installer, /systemctl enable --now mux-relay-backup\.timer/);
   assert.match(installer, /timer activation failed; application release remains healthy/);
   assert.match(installer, /systemctl is-enabled --quiet mux-relay-backup\.timer/);

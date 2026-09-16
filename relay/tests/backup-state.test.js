@@ -205,6 +205,14 @@ test('the real run drives sftp with a create-then-put batch, never a remote shel
   assert.ok(args.includes('-b'), '-b reads the batch from stdin');
   assert.ok(args.includes('-'), 'the batch is the stdin operand');
   assert.ok(args.includes('win'), 'the destination alias is passed through');
+  // -F pins the route file. ssh takes its per-user config from the account's PASSWD home, not from
+  // the HOME this unit exports, and svc-multiplex's passwd home does not exist - so relying on
+  // discovery meant the `Host win` alias never applied and the run died on "Could not resolve
+  // hostname win" before it ever reached the key or the host key.
+  assert.ok(
+    args.includes('-F') && args.includes('/var/lib/multiplex/.ssh/config'),
+    `the send must name its ssh config explicitly; got ${JSON.stringify(args)}`,
+  );
   for (const opt of ['BatchMode=yes', 'ConnectTimeout=10', 'StrictHostKeyChecking=yes']) {
     assert.ok(args.includes(opt), `unattended runs must pin ${opt}; got ${JSON.stringify(args)}`);
   }

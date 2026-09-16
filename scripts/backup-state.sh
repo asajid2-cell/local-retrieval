@@ -54,6 +54,12 @@ STATE_DIR_ARG=""
 DRY_RUN_TO=""
 VERIFY=0
 SSH_HOST="win"
+# ssh resolves its per-user config - and the default IdentityFile/UserKnownHostsFile that hang off
+# it - from the account's PASSWD home, not from $HOME. svc-multiplex's passwd home is
+# /home/svc-multiplex and does not exist, so ssh read no user config at all: the `Host win` alias
+# never applied and the run died on "Could not resolve hostname win". mux-relay-backup.service also
+# sets ProtectHome=yes, so the route can never move under /home. Name the file explicitly.
+SSH_CONFIG="/var/lib/multiplex/.ssh/config"
 REMOTE_DIR="mux-relay-backups"
 ARCHIVE_NAME=""
 
@@ -231,7 +237,7 @@ else
   # unattended run from ever blocking on a trust prompt: an unknown host fails loudly instead.
   printf -- '-mkdir %s\nput %s %s/%s\n' \
     "$REMOTE_DIR" "$ARCHIVE" "$REMOTE_DIR" "$ARCHIVE_NAME" \
-    | sftp -q -b - -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=yes "$SSH_HOST" \
+    | sftp -q -b - -F "$SSH_CONFIG" -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=yes "$SSH_HOST" \
     || die "cannot reach $SSH_HOST — the 'win' sftp route to the PC is down, or its host key is not in known_hosts"
   note "sent $ARCHIVE_NAME to $SSH_HOST:$REMOTE_DIR/ (${#MEMBERS[@]} file(s))"
 fi

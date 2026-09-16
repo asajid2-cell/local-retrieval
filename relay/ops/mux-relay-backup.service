@@ -21,7 +21,13 @@ Environment=HOME=/var/lib/multiplex
 # false on every tick, the unit was skipped, and `mux-relay-backup.service` had no
 # journal entries at all. `exit 0` is a builtin in cmd, in POSIX sh, and in
 # PowerShell, so the probe tests the ROUTE and not the remote shell's dialect.
-ExecCondition=/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=yes -o RequestTTY=no -n win exit 0
+#
+# -F is not decoration. ssh takes its per-user config from the account's PASSWD home,
+# not from $HOME (which this unit sets), and svc-multiplex's passwd home does not
+# exist - so without it the `Host win` alias never resolved and the probe failed on
+# "Could not resolve hostname win" however correct the key and known_hosts were.
+# ProtectHome=yes below is the other half of why the route cannot simply live in /home.
+ExecCondition=/usr/bin/ssh -F /var/lib/multiplex/.ssh/config -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=yes -o RequestTTY=no -n win exit 0
 
 # --verify proves a restore roundtrip against the freshly built archive BEFORE it is
 # sent, so a corrupt or empty backup fails the unit instead of silently replacing a
