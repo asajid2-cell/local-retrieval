@@ -1,0 +1,18 @@
+[Unit]
+Description=Multiplex relay healthcheck
+Documentation=http://127.0.0.1:7682/api/health
+Wants=multiplex-app.service
+After=network-online.target multiplex-app.service
+
+[Service]
+Type=oneshot
+# harmonizer, not root: this unit only reads /api/health over loopback. It needs no privilege, and a
+# read-only probe is exactly the kind of thing tier 1 is allowed to hold.
+User=harmonizer
+Group=harmonizer
+# PORT is the relay's bind port (server.js: `+process.env.PORT || 7682`). Keep this in step with the
+# service's EnvironmentFile; a stale port here reads as "relay down" while the relay is fine.
+Environment=MULTIPLEX_HEALTH_URL=http://127.0.0.1:7682/api/health
+Environment=MULTIPLEX_MIN_NODE_MAJOR=20
+Environment=MULTIPLEX_HEALTH_TIMEOUT_MS=5000
+ExecStart=/usr/local/bin/multiplex-healthcheck

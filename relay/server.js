@@ -9,8 +9,8 @@ const path = require('path');
 const crypto = require('crypto');
 const { execSync, execFile } = require('child_process');
 const { durableJsonLoad, durableJsonWrite, durableWrite, fsyncDirectory, recoveryWriteFailureReport } = require('./durable-state');
-const { createHealthAlerts, startHealthAlerts } = require("./health-alerts");
-const { createNotifier } = require("./notify");
+const { createHealthAlerts, startHealthAlerts, degradedReasons } = require("./health-alerts");
+const { createNotifier, createJournalNotifier } = require("./notify");
 const { createRetention, pruneTranscripts: pruneTranscriptRetention } = require('./retention');
 // Every acknowledged state mutation commits through durable-state.js before it is published in memory.
 const { createLeaseConduit } = require('./lease-conduit');
@@ -1952,7 +1952,7 @@ function healthSnapshot() {
   const degraded = TEST_MODE
     ? (!hostUp() || !hostProtocolOk() || legacyNames.length > 0 || !!persistenceFailure || renameIntents.length > 0 || uploadRecoveryWarnings.length > 0 || stateRecoveryFailures.length > 0)
     : (!hostUp() || !hostProtocolOk() || _pcHealth.reachable === false || gaveUp > 0 || hostedArmedDown > 0 || legacyNames.length > 0 || !projects.bridgeLive || !!persistenceFailure || renameIntents.length > 0 || uploadRecoveryWarnings.length > 0 || stateRecoveryFailures.length > 0);
-  return { ok: !degraded, degraded, uptimeSec: Math.round(process.uptime()), tmuxAvailable, sessions: hostSessions.size,
+  const snapshot = { ok: !degraded, degraded, uptimeSec: Math.round(process.uptime()), tmuxAvailable, sessions: hostSessions.size,
            legacySessions: legacyNames.length, legacyNames, legacyPolicy: "blocked", armed, gaveUp, hostedArmedDown, pc: _pcHealth,
            // How many times we have actually spawned tmux. Each one is a hard event-loop freeze, so
            // this is the rate to watch if the terminal feels stuttery — and it is what proves the
@@ -1970,6 +1970,17 @@ function healthSnapshot() {
            retention,
            host: { connected: hostUp(), name: hostLabel, sessions: hostSessions.size, protocol: hostProtocol.protocol, caps: hostProtocol.caps, protocolOk: hostProtocolOk() },
            node: process.version, at: Date.now() };
+  // `degraded` alone says something is wrong but never what, which forces every consumer to re-derive
+  // the answer from the same fields and drift independently. Publish the breakdown instead: the ops
+  // alert body already uses it, and the on-box healthcheck reports it verbatim rather than hardcoding
+  // a second copy of the disjunction.
+  //
+  // Precisely: this answers "why is `ok` false". It is empty whenever the relay is not degraded, even
+  // if a term it could name is individually true — otherwise the field would contradict `degraded` on
+  // every relay with no desktop app open. degradedReasons() mirrors the PRODUCTION disjunction, where
+  // bridgeLive IS a term; TEST_MODE drops that term from `degraded`, so tests must not expect reasons.
+  snapshot.degradedReasons = degraded ? degradedReasons(snapshot) : [];
+  return snapshot;
 }
 
 app.get('/api/health', (req, res) => {
@@ -3966,12 +3977,22 @@ server.listen(PORT, BIND_HOST, () => console.log('multiplex-app on ' + BIND_HOST
 // --- ops alerts: push on degraded-health edge transitions (r.1.17) ---
 // Secret (ntfy topic URL) lives in /etc/multiplex-app.env as MUX_ALERT_NTFY_URL.
 // The topic IS the credential — never committed, never logged.
-if (process.env.MUX_ALERT_NTFY_URL) {
-  startHealthAlerts({
-    notifier: createNotifier({ url: process.env.MUX_ALERT_NTFY_URL }),
-    getHealth: healthSnapshot,
-  });
-}
+//
+// The lane starts EITHER WAY. Gating it on the secret meant a missing key produced total silence, and
+// total silence is what a healthy fleet also produces — so a dark lane read exactly like a quiet one
+// and stayed dark. Without the key the notifier is the journal sink: same conditions, same dedupe, same
+// edges, printed to the journal instead of pushed. Configure the key and the pushes come back; nothing
+// else changes. The selected mode is logged once so the current posture is never a guess.
+const opsAlertNotifier = process.env.MUX_ALERT_NTFY_URL
+  ? createNotifier({ url: process.env.MUX_ALERT_NTFY_URL })
+  : createJournalNotifier({ label: 'ops-alert' });
+console.log('ops alerts: ' + (opsAlertNotifier.enabled
+  ? 'ntfy'
+  : 'journal only (MUX_ALERT_NTFY_URL unset) — alerts are logged, not pushed'));
+startHealthAlerts({
+  notifier: opsAlertNotifier,
+  getHealth: healthSnapshot,
+});
 
 // ---- RESTART DRAIN: a deploy must be invisible, not a black hole --------------------------------
 // A deploy sends SIGTERM. With no handler node dies mid-frame: every socket is reset, the browser sees

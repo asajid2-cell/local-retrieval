@@ -1,0 +1,12 @@
+[Unit]
+Description=Run Multiplex relay healthcheck
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+AccuracySec=10s
+Persistent=true
+Unit=multiplex-healthcheck.service
+
+[Install]
+WantedBy=timers.target

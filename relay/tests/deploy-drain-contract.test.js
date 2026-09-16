@@ -134,10 +134,15 @@ test('backup timer runs as svc-multiplex with a bounded writable surface', () =>
   assert.match(backupService, /^User=svc-multiplex$/m);
   assert.match(backupService, /^Group=svc-multiplex$/m);
   assert.match(backupService, /^Environment=HOME=\/var\/lib\/multiplex$/m);
-  assert.match(backupService, /^ExecCondition=\/usr\/bin\/ssh .* win true$/m);
+  // The probe's remote command is `exit 0`, not `true`. The PC runs Windows OpenSSH with cmd.exe as its
+  // shell, where `true` does not exist and exits 1 — so the old probe failed on every tick, the unit was
+  // skipped without a journal entry, and the off-box backup never ran even once. `exit 0` is a builtin
+  // in cmd, POSIX sh and PowerShell, so this asserts the ROUTE rather than the remote shell's dialect.
+  // RequestTTY=no and -n keep a non-interactive hourly run from ever waiting on a terminal.
+  assert.match(backupService, /^ExecCondition=\/usr\/bin\/ssh .* -n win exit 0$/m);
   assert.match(backupService, /^ReadOnlyPaths=\/var\/lib\/multiplex$/m);
   assert.match(backupService, /^NoNewPrivileges=yes$/m);
-  assert.match(installer, /runuser -u svc-multiplex[\s\S]*ssh[\s\S]*win true/);
+  assert.match(installer, /runuser -u svc-multiplex[\s\S]*ssh[\s\S]*win exit 0/);
   assert.match(installer, /systemctl enable --now mux-relay-backup\.timer/);
   assert.match(installer, /timer activation failed; application release remains healthy/);
   assert.match(installer, /systemctl is-enabled --quiet mux-relay-backup\.timer/);

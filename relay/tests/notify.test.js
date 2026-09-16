@@ -271,3 +271,47 @@ test('with MUX_NTFY_URL unset the detector is a silent no-op', async () => {
     await ntfy.stop();
   }
 });
+
+// The ops-alert lane must exist even with no ntfy topic. It used to be gated on MUX_ALERT_NTFY_URL, so
+// an unset key meant the lane never started — and a lane that never starts produces exactly the output
+// of a fleet with nothing wrong. The lane now always runs; the key only chooses the sink.
+test('with no alert topic the relay still starts the ops-alert lane, journal-only', async () => {
+  const harness = new RelayHarness({ MUX_ALERT_NTFY_URL: '' });
+  await harness.start();
+  try {
+    assert.match(harness.stdout, /ops alerts: journal only/,
+      'the relay must state that alerts are logged, not pushed — silence must never be the only signal');
+  } finally {
+    await harness.stop();
+  }
+});
+
+// `/api/health.degraded` is a boolean, so it can only ever say THAT something is wrong. Every consumer
+// that wanted the "what" had to re-derive it from the same fields and could drift. The relay publishes
+// the breakdown now: the ops-alert body prints it, the on-box healthcheck reports it verbatim, and no
+// third copy of the disjunction has to exist.
+test('a degraded relay names its reasons, and a healthy one names none', async () => {
+  const harness = new RelayHarness();
+  await harness.start();
+  try {
+    const dark = await harness.json('GET', '/api/health');
+    assert.equal(dark.degraded, true, 'no muxd host has connected yet');
+    // A flat list of the degraded terms that are currently true, not a root-cause analysis: with no host
+    // link the protocol and bridge terms are true as consequences, and degradedReasons() deliberately
+    // names every one of them (see its unit test in alerts.test.js).
+    assert.ok(dark.degradedReasons.includes('host link down'),
+      'a degraded relay must name the terms, not just report a boolean; got ' + JSON.stringify(dark.degradedReasons));
+
+    const host = await harness.connectHost([hostSession('alpha', 'working')]);
+    try {
+      const lit = await harness.json('GET', '/api/health');
+      assert.equal(lit.ok, true);
+      assert.deepEqual(lit.degradedReasons, [],
+        'reasons explain `degraded`, so a relay that is not degraded reports none');
+    } finally {
+      host.close();
+    }
+  } finally {
+    await harness.stop();
+  }
+});

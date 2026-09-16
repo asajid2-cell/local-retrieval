@@ -4,10 +4,10 @@
 # The relay keeps its whole recoverable identity in a handful of JSON files under
 # STATE_DIR (relay/server.js: MUX_STATE_DIR || __dirname), each with a .bak sibling
 # written by durable-state.js. If the VPS dies, those files die with it. This script
-# tars exactly those files and scp's the archive to the PC over the existing 'win'
-# ssh route (the alias the VPS already uses to reach the PC host).
+# tars exactly those files and sends the archive over sftp to the PC, using the
+# existing 'win' route (the alias the VPS already uses to reach the PC host).
 #
-#   backup-state.sh                                  # tar + scp to win:~/mux-relay-backups
+#   backup-state.sh                                  # tar + sftp to win:~/mux-relay-backups
 #   backup-state.sh --verify                         # ...and prove a restore roundtrip first
 #   backup-state.sh --dry-run-to /tmp/out            # build the archive locally, never touch the network
 #   backup-state.sh --dry-run-to /tmp/out --verify   # both
@@ -67,14 +67,14 @@ usage() {
 Options:
   --state-dir <dir>     Relay state directory. Resolved against the CURRENT working
                         directory. Default: $MUX_STATE_DIR, else <repo>/relay.
-  --dry-run-to <dir>    Write the archive into <dir> and skip scp entirely. The name is
+  --dry-run-to <dir>    Write the archive into <dir> and skip the network entirely. The name is
                         fixed (mux-relay-state-dryrun.tgz) so repeat runs overwrite in
                         place rather than piling up; nothing else in <dir> is touched.
   --verify              Extract the freshly built archive into a temp dir, check every
                         file against its recorded sha256, byte-compare it with the live
                         state file, and re-run the refusal sweep. Fails the run on any
-                        mismatch. In scp mode this happens BEFORE the archive is sent.
-  --ssh-host <host>     ssh/scp destination alias (default: win).
+                        mismatch. On a real run this happens BEFORE the archive is sent.
+  --ssh-host <host>     sftp destination alias (default: win).
   --remote-dir <dir>    Remote directory, relative to the remote home (default: mux-relay-backups).
   --archive-name <name> Override the archive filename.
   -h, --help            This text.
@@ -214,11 +214,24 @@ fi
 if [ -n "$DRY_RUN_TO" ]; then
   mkdir -p -- "$DRY_RUN_TO"
   cp -- "$ARCHIVE" "$DRY_RUN_TO/$ARCHIVE_NAME"
-  note "dry run — wrote $DRY_RUN_TO/$ARCHIVE_NAME (${#MEMBERS[@]} file(s), no scp)"
+  note "dry run — wrote $DRY_RUN_TO/$ARCHIVE_NAME (${#MEMBERS[@]} file(s), nothing sent)"
 else
-  ssh "$SSH_HOST" "mkdir -p '$REMOTE_DIR'" \
-    || die "cannot reach $SSH_HOST — the 'win' ssh route to the PC is down"
-  scp -q -- "$ARCHIVE" "$SSH_HOST:$REMOTE_DIR/$ARCHIVE_NAME" \
-    || die "scp to $SSH_HOST:$REMOTE_DIR/$ARCHIVE_NAME failed"
+  # SFTP, NOT `ssh <cmd>` + scp.
+  #
+  # The destination is a Windows OpenSSH server whose shell is cmd.exe (sshd_config sets no
+  # DefaultShell), so a remote command is parsed by cmd, not sh. The first revision ran
+  # `ssh win "mkdir -p 'mux-relay-backups'"`, which cmd reads as "make a directory literally named
+  # 'mux-relay-backups'" (single quotes are not quoting characters to cmd) and `-p` as a second
+  # directory name — the destination it created was not the one scp was told to write. SFTP speaks
+  # the protocol directly and never invokes the remote shell, so the route stops depending on which
+  # shell answers.
+  #
+  # `-mkdir` (leading dash) means "create it, and do not fail if it is already there" — the same
+  # idempotence `mkdir -p` was there for. StrictHostKeyChecking=yes + BatchMode=yes keep an hourly
+  # unattended run from ever blocking on a trust prompt: an unknown host fails loudly instead.
+  printf -- '-mkdir %s\nput %s %s/%s\n' \
+    "$REMOTE_DIR" "$ARCHIVE" "$REMOTE_DIR" "$ARCHIVE_NAME" \
+    | sftp -q -b - -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=yes "$SSH_HOST" \
+    || die "cannot reach $SSH_HOST — the 'win' sftp route to the PC is down, or its host key is not in known_hosts"
   note "sent $ARCHIVE_NAME to $SSH_HOST:$REMOTE_DIR/ (${#MEMBERS[@]} file(s))"
 fi

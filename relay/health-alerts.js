@@ -22,12 +22,16 @@
 //   MUX_ALERT_NTFY_URL=https://ntfy.sh/<unguessable-topic>
 //
 // This key is not the attention lane's: that one is created bare (server.js) and falls back to
-// notify.js's own default, MUX_NTFY_URL. Setting either one does nothing for the other lane. Get this
-// name wrong and nothing errors — the lane never starts (server.js wires it only when this variable is
-// set) and notify.js degrades to a no-op, so "no alerts" reads identical to "alerts working".
+// notify.js's own default, MUX_NTFY_URL. Setting either one does nothing for the other lane.
 //
-// This module never reads env and never logs the URL — it only ever holds an already-constructed
-// notifier. Nothing here is committed with a real topic in it.
+// The key being absent must not switch this module off. It used to: server.js wired the lane only when
+// the variable was set, so a missing key meant no alerts, no errors, and no log — which is byte-for-byte
+// what a quiet, healthy fleet looks like. The lane therefore always starts, and the caller picks the
+// sink: notify.js's createNotifier when the key is present, else its createJournalNotifier, which runs
+// the identical conditions through the identical dedupe and prints the result to the journal. This
+// module is unchanged by that choice — it only ever holds an already-constructed notifier.
+//
+// This module never reads env and never logs the URL. Nothing here is committed with a real topic in it.
 
 'use strict';
 
@@ -257,14 +261,13 @@ function createHealthAlerts(options = {}) {
  * Optional wiring seam for server.js: poll a health producer on an interval.
  * The timer is unref'd so it can never hold the process open (tests, CLI runs).
  *
- *   const { createNotifier } = require('./notify');
+ *   const { createNotifier, createJournalNotifier } = require('./notify');
  *   const { startHealthAlerts } = require('./health-alerts');
- *   if (process.env.MUX_ALERT_NTFY_URL) {          // secret from /etc/multiplex-app.env
- *     startHealthAlerts({
- *       notifier: createNotifier({ url: process.env.MUX_ALERT_NTFY_URL }),
- *       getHealth: () => healthSnapshot(),
- *     });
- *   }
+ *   // Always start. The secret only selects the sink, so an unset key is a logged lane, not a dead one.
+ *   const notifier = process.env.MUX_ALERT_NTFY_URL  // secret from /etc/multiplex-app.env
+ *     ? createNotifier({ url: process.env.MUX_ALERT_NTFY_URL })
+ *     : createJournalNotifier({ label: 'ops-alert' });
+ *   startHealthAlerts({ notifier, getHealth: () => healthSnapshot() });
  */
 function startHealthAlerts(options = {}) {
   const getHealth = options.getHealth;

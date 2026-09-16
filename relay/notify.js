@@ -54,7 +54,8 @@ function nodeRequest(url, options, timeoutMs) {
 /**
  * createNotifier({url, fetchImpl, timeoutMs}) -> { push, enabled, url }
  * `url` defaults to process.env.MUX_NTFY_URL (a full ntfy topic URL). With no URL configured the
- * notifier is a no-op: push() resolves {ok:false, disabled:true} without touching the network.
+ * notifier is a no-op: push() resolves {ok:false, disabled:true} without touching the network. A
+ * caller that must remain observable with no URL wants createJournalNotifier() below instead.
  * push({title, body, tags, priority, click}) resolves {ok, status} or {ok, error} and NEVER throws.
  */
 function createNotifier(options) {
@@ -102,10 +103,39 @@ function createNotifier(options) {
   return { push, enabled: Boolean(url), url };
 }
 
+// createJournalNotifier() -> { push, enabled, url } — the same interface with a different sink.
+//
+// Why this exists: createNotifier() with no URL is a NO-OP, and a no-op is indistinguishable from a
+// quiet night. That is exactly how the ops-alert lane sat dead for weeks — no MUX_ALERT_NTFY_URL meant
+// push() resolved {ok:false, disabled:true} and never touched the network, so "no operator was ever
+// paged" and "nothing was ever wrong" produced identical output. A lane that can go dark must say so.
+//
+// So when no topic is configured the caller injects THIS instead: alerts still fire, still dedupe, and
+// still print — into the journal, where they are readable with `journalctl -u multiplex-app`. `enabled`
+// is false so the absence of a real push stays greppable, and push() reports ok:true because the write
+// it was asked to do did happen.
+function createJournalNotifier(options) {
+  const opts = options || {};
+  const log = typeof opts.log === 'function' ? opts.log : (line) => console.warn(line);
+  const label = opts.label ? String(opts.label) : 'ops-alert';
+  async function push(message) {
+    const msg = message || {};
+    const priority = headerSafe(msg.priority == null ? '' : msg.priority) || 'default';
+    const head = '[' + label + '][journal] ' + priority + ' ' + headerSafe(msg.title == null ? '' : msg.title);
+    const body = msg.body == null ? '' : String(msg.body);
+    const lines = [head].concat(body ? body.split('\n').map((l) => '  ' + l) : []);
+    const url = headerSafe(msg.click == null ? '' : msg.click);
+    if (url) lines.push('  ' + url);
+    try { log(lines.join('\n')); } catch { /* a broken logger must not break the never-throws contract */ }
+    return { ok: true, journal: true };
+  }
+  return { push, enabled: false, url: '' };
+}
+
 function describe(err, timeoutMs) {
   if (err && (err.name === 'TimeoutError' || err.name === 'AbortError' || err.code === 'ETIMEDOUT'))
     return 'ntfy push timed out after ' + timeoutMs + 'ms';
   return String((err && err.message) || err || 'unknown ntfy push failure');
 }
 
-module.exports = { createNotifier, NOTIFY_TIMEOUT_MS };
+module.exports = { createNotifier, createJournalNotifier, NOTIFY_TIMEOUT_MS };

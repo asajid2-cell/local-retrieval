@@ -208,9 +208,12 @@ distributed_health_ok() {
         python3 -c 'import json,sys; raise SystemExit(0 if json.load(sys.stdin).get("ok") is True else 1)'
 }
 
+# The remote command is `exit 0`, not `true`: the PC runs Windows OpenSSH with cmd.exe as its shell,
+# where `true` is not a command at all and exits 1. A probe that always fails meant this gate never
+# passed, so the backup timer was never enabled and the route was never actually exercised.
 backup_route_ready() {
     runuser -u svc-multiplex -- env HOME="$STATE" \
-        ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=yes win true \
+        ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=yes -o RequestTTY=no -n win exit 0 \
         >/dev/null 2>&1
 }
 

@@ -15,6 +15,12 @@ install -o root -g root -m 0755 "$HERE/deploy-multiplex" /usr/local/bin/deploy-m
 install -o root -g root -m 0644 "$HERE/multiplex-app.service" /etc/systemd/system/multiplex-app.service
 install -o root -g root -m 0644 "$HERE/mux-relay-backup.service" /etc/systemd/system/mux-relay-backup.service
 install -o root -g root -m 0644 "$HERE/mux-relay-backup.timer" /etc/systemd/system/mux-relay-backup.timer
+# The healthcheck triple used to exist only on the box, hand-installed in July and tracked nowhere, so
+# nothing could re-create it and no reviewer could see it. It is provisioned here so the monitored
+# state is a property of the release rather than of one machine's history.
+install -o root -g root -m 0755 "$HERE/multiplex-healthcheck" /usr/local/bin/multiplex-healthcheck
+install -o root -g root -m 0644 "$HERE/multiplex-healthcheck.service" /etc/systemd/system/multiplex-healthcheck.service
+install -o root -g root -m 0644 "$HERE/multiplex-healthcheck.timer" /etc/systemd/system/multiplex-healthcheck.timer
 install -d -o svc-multiplex -g svc-multiplex -m 0700 /var/lib/multiplex
 [ -f /etc/multiplex-app.env ] || { echo "/etc/multiplex-app.env is missing" >&2; exit 1; }
 chown root:root /etc/multiplex-app.env
@@ -40,5 +46,11 @@ fi
 if systemctl is-active --quiet multiplex-app.service; then
     systemctl restart multiplex-app.service
 fi
+# Enable and start the healthcheck; a provisioned-but-disabled timer is indistinguishable from the
+# hand-installed state this replaces. `enable --now` is idempotent, so re-running provisioning is safe.
+systemctl enable --now multiplex-healthcheck.timer
 /usr/local/bin/deploy-multiplex --preflight
 echo "Multiplex deploy wrapper provisioned; live service identity refreshed and preflight passed."
+echo "Healthcheck installed and multiplex-healthcheck.timer is enabled."
+echo "Human paging still requires MUX_ALERT_NTFY_URL in /etc/multiplex-app.env; without it both the"
+echo "relay's ops-alert lane and this healthcheck are journal-only (see relay/ops/README.md)."

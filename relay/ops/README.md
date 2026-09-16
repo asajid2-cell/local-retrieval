@@ -21,6 +21,7 @@ The provisioner:
 
 - installs the fixed `/usr/local/bin/deploy-multiplex` wrapper;
 - installs the consolidated non-root service and backup units;
+- installs the healthcheck triple and enables `multiplex-healthcheck.timer`;
 - removes the stale Docker supplementary-group drop-in;
 - locks `/etc/multiplex-app.env` to `root:root` mode `0600`;
 - reloads systemd, restarts the existing relay once so its live process drops Docker
@@ -66,6 +67,50 @@ or path traversal, installs dependencies as `svc-multiplex`, makes code root-own
 drains with SIGTERM, atomically switches the release symlink, checks `/api/health`,
 and restores the previous release on failure.
 
+## Monitoring and alerting
+
+Two independent watchers cover different failures, and only one of them can survive the
+relay dying:
+
+- `multiplex-healthcheck.timer` runs `/usr/local/bin/multiplex-healthcheck` every minute.
+  It reads `/api/health` over loopback as `harmonizer` and exits non-zero only for a
+  genuine fault (host link down, protocol mismatch, missing host capabilities, PC
+  unreachable, persistence not writing, legacy tmux sessions, a pending rename intent, an
+  outstanding upload warning, a store recovered but not rewritten, an unsupported node).
+  A stale desktop push is **not** a fault: `ok` is `!degraded`, and `degraded` includes
+  the projects bridge, which is false whenever no desktop app is running. Failing on that
+  made the unit fail ~614 times in four days for a relay that was serving correctly, and a
+  monitor that cries wolf every minute trains an operator to ignore it. Those states are
+  printed as `WARN` lines on every run at exit 0 instead.
+- The relay's in-process ops-alert lane (`relay/health-alerts.js`) pushes on degraded
+  **edges** with sustain windows and 30-minute dedupe. It starts whether or not a topic is
+  configured; an unset topic selects the journal sink rather than switching the lane off.
+  The lane cannot report the relay's own death, which is why the timer exists.
+
+```sh
+systemctl list-timers multiplex-healthcheck.timer
+journalctl -u multiplex-healthcheck -n 20          # OK / WARN / FAIL lines
+journalctl -u multiplex-app -n 20 | grep ops-alert # alert edges, journal sink
+```
+
+### Turning on real paging
+
+Both watchers need the same one secret, and neither reaches a human without it:
+
+```sh
+# as root, in /etc/multiplex-app.env — the topic IS the credential, never commit it
+MUX_ALERT_NTFY_URL=https://ntfy.sh/<unguessable-topic>
+```
+
+then `systemctl restart multiplex-app.service`. The relay logs one line at startup naming
+the sink it chose (`ops alerts: ntfy` or `ops alerts: journal only`), so the current
+posture is never a guess. With no topic both watchers are journal-only by design: alerts
+still fire, dedupe, and print — they are simply read with `journalctl` instead of received
+as a push.
+
+`MUX_ALERT_NTFY_URL` is not the attention lane's key. That lane is constructed bare and
+falls back to `MUX_NTFY_URL`; setting one does nothing for the other.
+
 ## Backup
 
 The deploy wrapper installs `mux-backup-state.sh`. It enables
@@ -105,4 +150,12 @@ cd relay
 bash ../scripts/backup-state.sh --dry-run-to /tmp/mux-backup-test \
   --state-dir tests/fixtures/backup-state --verify
 npm test
+```
+
+The healthcheck's exit code is a paging contract, so it is tested against synthetic health
+blobs rather than trusted by inspection — including the closed-desktop-app state that must
+stay a warning:
+
+```sh
+node --test --test-concurrency=1 tests/healthcheck-severity.test.js
 ```

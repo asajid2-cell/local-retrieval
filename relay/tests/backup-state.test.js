@@ -73,7 +73,10 @@ const built = runBackup(['--dry-run-to', posix(outDir), '--state-dir', FIXTURE, 
 test('dry run with --verify builds an archive and proves the restore roundtrip', () => {
   assert.equal(built.status, 0, `backup-state.sh failed:\n${built.stdout}\n${built.stderr}`);
   assert.match(built.stdout, /verified restore roundtrip: 7 file\(s\) byte-identical/);
-  assert.match(built.stdout, /no scp/);
+  // The dry run must say it sent nothing. The wording tracks the transport: it used to say "no scp",
+  // and the real run now uses sftp (the PC's sshd has cmd.exe as its shell, so a remote `mkdir` there
+  // is not sh-parsed). What this line guards is unchanged — that a dry run never touches the network.
+  assert.match(built.stdout, /nothing sent/);
   assert.ok(fs.existsSync(archive), 'dry run did not write the archive');
 });
 
@@ -167,5 +170,53 @@ test('the state dir is resolved against the caller cwd, not the script location'
   // The committed verifier runs from relay/ and passes a relay-relative path.
   const res = runBackup(['--dry-run-to', posix(tmp('mux-backup-rel-')), '--state-dir', 'tests/fixtures/backup-state']);
   assert.equal(res.status, 0, res.stderr);
-  assert.match(res.stdout, /7 file\(s\), no scp/);
+  assert.match(res.stdout, /7 file\(s\), nothing sent/);
+});
+
+// The send path is the one place this script must not guess about the far side. The destination is a
+// Windows OpenSSH server whose shell is cmd.exe (its sshd_config sets no DefaultShell), so the original
+// `ssh win "mkdir -p 'mux-relay-backups'"` was parsed by cmd: single quotes do not quote there, and the
+// directory that got created was not the one scp was told to write. The run now drives sftp instead,
+// which never invokes the remote shell. A stub captures exactly what was sent, so the batch commands
+// are asserted rather than assumed — no route, no host key, no network.
+//
+// The stub is an EXPORTED BASH FUNCTION, not a script on PATH: this suite runs under MSYS bash on
+// Windows, where a shebang file with no extension cannot be exec'd, so a PATH stub would silently
+// fall through to the real sftp. An exported function is inherited by the child shell and shadows the
+// command outright (verified: bash 5.2 exports via BASH_FUNC_<name>%%).
+test('the real run drives sftp with a create-then-put batch, never a remote shell command', () => {
+  const binDir = tmp('mux-backup-bin-');
+  const argsFile = posix(path.join(binDir, 'sftp-args.txt'));
+  const batchFile = posix(path.join(binDir, 'sftp-batch.txt'));
+
+  const res = spawnSync(BASH, [SCRIPT, '--state-dir', FIXTURE, '--ssh-host', 'win'], {
+    cwd: RELAY_DIR,
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      // `cat` with no argument consumes the batch on stdin, which is the whole point of `-b -`.
+      'BASH_FUNC_sftp%%': `() { printf '%s\\n' "$@" >> '${argsFile}'; cat > '${batchFile}'; }`,
+    },
+  });
+
+  assert.equal(res.status, 0, `the stubbed send should succeed:\n${res.stdout}\n${res.stderr}`);
+  const args = fs.readFileSync(argsFile, 'utf8').split('\n').filter(Boolean);
+  assert.equal(args[0], '-q', 'quiet: an hourly timer must not fill the journal');
+  assert.ok(args.includes('-b'), '-b reads the batch from stdin');
+  assert.ok(args.includes('-'), 'the batch is the stdin operand');
+  assert.ok(args.includes('win'), 'the destination alias is passed through');
+  for (const opt of ['BatchMode=yes', 'ConnectTimeout=10', 'StrictHostKeyChecking=yes']) {
+    assert.ok(args.includes(opt), `unattended runs must pin ${opt}; got ${JSON.stringify(args)}`);
+  }
+
+  // The batch itself is the contract with the far side. `-mkdir` is the idempotent form of `mkdir -p`
+  // (create it, do not fail if it exists); `put` names the archive once, relatively, so nothing about
+  // the destination path depends on a remote shell expanding it.
+  const batch = fs.readFileSync(batchFile, 'utf8').split('\n').map((l) => l.trim()).filter(Boolean);
+  assert.equal(batch.length, 2, `exactly two batch commands; got ${JSON.stringify(batch)}`);
+  assert.equal(batch[0], '-mkdir mux-relay-backups');
+  assert.match(batch[1], /^put .*mux-relay-state-.*\.tgz mux-relay-backups\/mux-relay-state-.*\.tgz$/);
+  assert.ok(!/\bmkdir\b\s+-p/.test(batch.join('\n')), 'the sh-only `mkdir -p` form must be gone');
+
+  assert.match(res.stdout, /sent mux-relay-state-.*\.tgz to win:mux-relay-backups\//);
 });

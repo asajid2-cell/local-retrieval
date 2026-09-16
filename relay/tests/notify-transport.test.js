@@ -5,7 +5,7 @@ const test = require('node:test');
 const assert = require('node:assert');
 const http = require('node:http');
 
-const { createNotifier, NOTIFY_TIMEOUT_MS } = require('../notify');
+const { createNotifier, createJournalNotifier, NOTIFY_TIMEOUT_MS } = require('../notify');
 
 // A capture target standing in for the ntfy topic. `respond` shapes the reply so status-code and
 // hang behaviour can be driven per test.
@@ -222,4 +222,52 @@ test('push tolerates a missing or empty message', async (t) => {
   assert.deepStrictEqual(await notifier.push({}), { ok: true, status: 200 });
   assert.strictEqual(target.received.length, 3);
   assert.strictEqual(target.received[0].body, '');
+});
+
+// ── the journal sink ─────────────────────────────────────────────────────────────────────────────
+// createJournalNotifier exists so an alert lane with no ntfy topic is still OBSERVABLE. These tests
+// pin the two properties that make that true: it reports itself as not-a-push, and it prints the whole
+// message somewhere readable — because "nothing was printed" is the failure mode being eliminated.
+
+test('the journal notifier never claims to be a push and writes the message where it can be read', async () => {
+  const lines = [];
+  const notifier = createJournalNotifier({ log: (line) => lines.push(line) });
+
+  assert.strictEqual(notifier.enabled, false, 'a journal sink must not read as a configured push target');
+  assert.strictEqual(notifier.url, '');
+
+  const result = await notifier.push({
+    title: 'Relay degraded',
+    body: 'Health has been degraded for 3m.\n- projects bridge down\n- PC unreachable (192.168.1.162)',
+    tags: ['warning'],
+    priority: 'high',
+    click: 'https://mux.example/',
+  });
+
+  assert.deepStrictEqual(result, { ok: true, journal: true });
+  assert.strictEqual(lines.length, 1, 'one push is one journal entry');
+  const entry = lines[0];
+  assert.match(entry, /\[ops-alert\]\[journal\]/, 'the entry is greppable as journal-only');
+  assert.match(entry, /high/);
+  assert.match(entry, /Relay degraded/);
+  for (const line of ['- projects bridge down', '- PC unreachable (192.168.1.162)', 'https://mux.example/']) {
+    assert.ok(entry.includes(line), `the operator needs "${line}" in the entry; got: ${entry}`);
+  }
+});
+
+test('a journal entry stays one entry even when a title carries newlines', async () => {
+  const lines = [];
+  const notifier = createJournalNotifier({ log: (line) => lines.push(line) });
+  const result = await notifier.push({ title: 'bad\nTITLE: forged\nPriority: urgent', body: 'x' });
+
+  assert.deepStrictEqual(result, { ok: true, journal: true });
+  assert.strictEqual(lines.length, 1);
+  assert.strictEqual(lines[0].split('\n').length, 2, 'a title may not inject extra lines into the journal');
+  assert.ok(!/^Priority: urgent/m.test(lines[0]), 'a title may not forge a second header line');
+});
+
+test('a journal notifier with a broken logger still honours the never-throws contract', async () => {
+  const notifier = createJournalNotifier({ log: () => { throw new Error('journal write failed'); } });
+  const result = await notifier.push({ title: 'x', body: 'y' });
+  assert.deepStrictEqual(result, { ok: true, journal: true });
 });

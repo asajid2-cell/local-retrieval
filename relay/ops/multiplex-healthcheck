@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# multiplex-healthcheck — ask the relay whether it is actually broken.
+#
+# Installed at /usr/local/bin/multiplex-healthcheck by provision-multiplex-deploy.sh and driven by
+# multiplex-healthcheck.timer every minute. Exit 0 = no fault; exit 1 = a fault an operator must see.
+#
+# ── WHY THE SEVERITY SPLIT IS THE WHOLE POINT ────────────────────────────────────────────────────
+#
+# The first version of this script failed on `ok !== true` and on `projects.bridgeLive !== true`.
+# Both are wrong, and together they made the unit fail ~600 times over four days for a completely
+# normal steady state:
+#
+#   * `bridgeLive` requires a desktop push within 45s (server.js appLive()/bridgeLive()). Close the
+#     desktop app — the ordinary end-of-day state — and the relay reports ok:false, degraded:true.
+#     There is nothing broken. The relay is telling the truth about a stale projection.
+#   * `ok` is just `!degraded`, and `degraded` is a disjunction that INCLUDES bridgeLive. Failing on
+#     the aggregate inherits the false positive and hides which term actually tripped.
+#
+# A monitor that cries wolf every minute is worse than no monitor: it trains the operator to ignore
+# the one run that matters. So this script FAILS only on conditions that are faults no matter what
+# else is true, and WARNS on the states that are normal-but-notable. Warnings still print on every
+# run, so a warning that persists is visible in the journal without failing the unit.
+#
+# Concrete rule of thumb for editing this file: if the condition can be true while the relay is
+# serving every request correctly, it belongs in `warn`, not `fail`.
+#
+# ── OVERRIDES ───────────────────────────────────────────────────────────────────────────────────
+#   MULTIPLEX_HEALTH_URL         default http://127.0.0.1:7682/api/health  (the relay's PORT)
+#   MULTIPLEX_MIN_NODE_MAJOR     default 20
+#   MULTIPLEX_HEALTH_TIMEOUT_MS  default 5000
+set -euo pipefail
+URL="${MULTIPLEX_HEALTH_URL:-http://127.0.0.1:7682/api/health}"
+MIN_NODE_MAJOR="${MULTIPLEX_MIN_NODE_MAJOR:-20}"
+TIMEOUT_MS="${MULTIPLEX_HEALTH_TIMEOUT_MS:-5000}"
+node --input-type=module - "$URL" "$MIN_NODE_MAJOR" "$TIMEOUT_MS" <<'NODE'
+const [url, minNodeMajorRaw, timeoutRaw] = process.argv.slice(2);
+const minNodeMajor = Number(minNodeMajorRaw || 20);
+const timeoutMs = Number(timeoutRaw || 5000);
+const fail = [];
+const warn = [];
+let data = null;
+const ac = new AbortController();
+const timer = setTimeout(() => ac.abort(new Error(`timeout ${timeoutMs}ms`)), timeoutMs);
+try {
+  const res = await fetch(url, { signal: ac.signal });
+  const text = await res.text();
+  if (!res.ok) fail.push(`HTTP ${res.status}`);
+  try { data = JSON.parse(text); } catch (e) { fail.push(`invalid JSON: ${e.message}`); }
+} catch (e) {
+  fail.push(`request failed: ${e.message || e}`);
+} finally {
+  clearTimeout(timer);
+}
+if (data) {
+  // ── faults ────────────────────────────────────────────────────────────────────────────────────
+  if (Number(data.legacySessions || 0) !== 0) fail.push(`legacySessions=${data.legacySessions}`);
+  if (!data.host || data.host.connected !== true) fail.push('host disconnected');
+  if (!data.host || data.host.protocolOk !== true) fail.push(`host protocol not ok (${data.host?.protocol ?? 'missing'})`);
+  if (!data.host || Number(data.host.protocol || 0) < 2) fail.push(`host protocol ${data.host?.protocol ?? 'missing'} < 2`);
+  if (!Array.isArray(data.host?.caps) || !data.host.caps.includes('create') || !data.host.caps.includes('attach') || !data.host.caps.includes('kill')) fail.push('host caps incomplete');
+  if (data.pc && data.pc.reachable === false) fail.push(`PC ssh unreachable (${data.pc.host || 'unknown'})`);
+  // Covers `blocked` as well: persistence.blocked implies ok=false.
+  if (!data.persistence || data.persistence.ok !== true) fail.push(`persistence not ok (${data.persistence?.detail || 'no detail'})`);
+  // Each of these is a `degraded` term in its own right, so a fail here explains the aggregate
+  // instead of restating it. Pending intents mean a mutation never finished; upload warnings and a
+  // recovered-but-unwritten store mean the copy on disk is not the copy in memory.
+  if (Number(data.pendingRenameIntents || 0) > 0) fail.push(`pendingRenameIntents=${data.pendingRenameIntents}`);
+  const uploadWarnings = Array.isArray(data.uploadRecoveryWarnings) ? data.uploadRecoveryWarnings.length : 0;
+  if (uploadWarnings > 0) fail.push(`${uploadWarnings} upload recovery warning(s)`);
+  const recoveryFailures = Array.isArray(data.stateRecoveryFailures) ? data.stateRecoveryFailures.length : 0;
+  if (recoveryFailures > 0) fail.push(`${recoveryFailures} state store(s) recovered from .bak but not rewritten`);
+  const nodeMajor = Number(String(data.node || '').replace(/^v/, '').split('.')[0] || 0);
+  if (nodeMajor && nodeMajor < minNodeMajor) fail.push(`node ${data.node} < required major ${minNodeMajor}`);
+  else if (!nodeMajor) warn.push(`node version unparsable (${data.node})`);
+
+  // ── normal-but-notable ───────────────────────────────────────────────────────────────────────
+  // `degraded` is reported, never failed on: every fault it can name is already checked above, and
+  // the remaining terms (bridge staleness) are the app simply not being open.
+  const projects = data.projects || {};
+  if (data.degraded === true) {
+    const reasons = Array.isArray(data.degradedReasons) ? data.degradedReasons.filter(Boolean) : [];
+    warn.push(`degraded=true${reasons.length ? ` (${reasons.join('; ')})` : ' (no reason reported)'}`);
+  }
+  if (projects.appLive !== true) warn.push('desktop app sync stale — collection writes are disabled until it pushes again');
+  if (projects.bridgeLive !== true) warn.push('projects bridge stale — expected whenever no desktop app is running');
+  if (Number(projects.pendingCommands || 0) > 0) warn.push(`pendingCommands=${projects.pendingCommands}`);
+}
+if (fail.length) {
+  console.error(`[multiplex-healthcheck] FAIL ${new Date().toISOString()}`);
+  for (const x of fail) console.error(`- ${x}`);
+  if (data) console.error(JSON.stringify({ ok: data.ok, degraded: data.degraded, degradedReasons: data.degradedReasons, legacySessions: data.legacySessions, host: data.host, pc: data.pc, projects: data.projects, persistence: data.persistence, node: data.node }, null, 2));
+  process.exit(1);
+}
+for (const x of warn) console.log(`[multiplex-healthcheck] WARN - ${x}`);
+const h = data || {};
+const host = h.host || {};
+const projects = h.projects || {};
+const pc = h.pc || {};
+console.log(`[multiplex-healthcheck] OK host=${host.name || '?'} protocol=${host.protocol} sessions=${host.sessions} bridgeLive=${projects.bridgeLive} appLive=${projects.appLive} legacy=${h.legacySessions} pc=${pc.reachable === false ? 'down' : 'up'} node=${h.node} warnings=${warn.length}`);
+NODE
