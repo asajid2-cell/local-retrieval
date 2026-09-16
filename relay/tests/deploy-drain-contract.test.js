@@ -135,7 +135,7 @@ test('backup timer runs as svc-multiplex with a bounded writable surface', () =>
   assert.match(backupService, /^User=svc-multiplex$/m);
   assert.match(backupService, /^Group=svc-multiplex$/m);
   assert.match(backupService, /^Environment=HOME=\/var\/lib\/multiplex$/m);
-  // The probe's remote command is `exit 0`, not `true`. The PC runs Windows OpenSSH with cmd.exe as its
+  // The probe's remote command is `exit 0`, not `true`. The PC runs Windows OpenSSH with a non-POSIX
   // shell, where `true` does not exist and exits 1 — so the old probe failed on every tick, the unit was
   // skipped without a journal entry, and the off-box backup never ran even once. `exit 0` is a builtin
   // in cmd, POSIX sh and PowerShell, so this asserts the ROUTE rather than the remote shell's dialect.

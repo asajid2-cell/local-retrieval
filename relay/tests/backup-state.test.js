@@ -74,8 +74,8 @@ test('dry run with --verify builds an archive and proves the restore roundtrip',
   assert.equal(built.status, 0, `backup-state.sh failed:\n${built.stdout}\n${built.stderr}`);
   assert.match(built.stdout, /verified restore roundtrip: 7 file\(s\) byte-identical/);
   // The dry run must say it sent nothing. The wording tracks the transport: it used to say "no scp",
-  // and the real run now uses sftp (the PC's sshd has cmd.exe as its shell, so a remote `mkdir` there
-  // is not sh-parsed). What this line guards is unchanged — that a dry run never touches the network.
+  // and the real run now uses sftp (the PC's sshd runs a non-POSIX shell, so a remote `mkdir` there is
+  // not sh-parsed). What this line guards is unchanged — that a dry run never touches the network.
   assert.match(built.stdout, /nothing sent/);
   assert.ok(fs.existsSync(archive), 'dry run did not write the archive');
 });
@@ -174,9 +174,10 @@ test('the state dir is resolved against the caller cwd, not the script location'
 });
 
 // The send path is the one place this script must not guess about the far side. The destination is a
-// Windows OpenSSH server whose shell is cmd.exe (its sshd_config sets no DefaultShell), so the original
-// `ssh win "mkdir -p 'mux-relay-backups'"` was parsed by cmd: single quotes do not quote there, and the
-// directory that got created was not the one scp was told to write. The run now drives sftp instead,
+// Windows OpenSSH server with a non-POSIX login shell (measured: PowerShell 5.1, taken from OpenSSH's
+// registry DefaultShell, since sshd_config sets none), so the original
+// `ssh win "mkdir -p 'mux-relay-backups'"` was parsed by that shell: single quotes do not quote there,
+// and the directory that got created was not the one scp was told to write. The run now drives sftp instead,
 // which never invokes the remote shell. A stub captures exactly what was sent, so the batch commands
 // are asserted rather than assumed — no route, no host key, no network.
 //

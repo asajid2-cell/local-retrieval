@@ -208,7 +208,8 @@ distributed_health_ok() {
         python3 -c 'import json,sys; raise SystemExit(0 if json.load(sys.stdin).get("ok") is True else 1)'
 }
 
-# The remote command is `exit 0`, not `true`: the PC runs Windows OpenSSH with cmd.exe as its shell,
+# The remote command is `exit 0`, not `true`: the PC runs Windows OpenSSH with a non-POSIX login
+# shell - measured 2026-09-16, OpenSSH's registry DefaultShell hands the connection PowerShell 5.1 -
 # where `true` is not a command at all and exits 1. A probe that always fails meant this gate never
 # passed, so the backup timer was never enabled and the route was never actually exercised.
 #

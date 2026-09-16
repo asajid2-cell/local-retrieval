@@ -14,13 +14,15 @@ Environment=HOME=/var/lib/multiplex
 # without turning the oneshot into a failed unit. The deploy wrapper enables the
 # timer only after the same strict probe has succeeded at least once.
 #
-# The remote command must be one every plausible remote shell understands, because
-# the PC runs Windows OpenSSH with cmd.exe as the shell (sshd_config sets no
-# DefaultShell). The first revision sent `true`, which cmd reports as "'true' is not
-# recognized as an internal or external command" and exits 1 — so this condition was
-# false on every tick, the unit was skipped, and `mux-relay-backup.service` had no
-# journal entries at all. `exit 0` is a builtin in cmd, in POSIX sh, and in
-# PowerShell, so the probe tests the ROUTE and not the remote shell's dialect.
+# The remote command must be one every plausible remote shell understands. The PC's
+# sshd_config sets no DefaultShell, and OpenSSH then takes the login shell from its
+# registry key - which on this host is PowerShell 5.1 (measured, not assumed: the
+# `$PSVersionTable` probe returns 5.1.26100). The first revision sent `true`, which a
+# non-POSIX shell rejects either as "not recognized as an internal or external command"
+# (cmd) or as an unrecognized term (PowerShell) - so this condition was false on every
+# tick, the unit was skipped, and `mux-relay-backup.service` had no journal entries at
+# all. `exit 0` is a builtin in cmd, in POSIX sh, and in PowerShell, so the probe tests
+# the ROUTE and not the remote shell's dialect.
 #
 # -F is not decoration. ssh takes its per-user config from the account's PASSWD home,
 # not from $HOME (which this unit sets), and svc-multiplex's passwd home does not

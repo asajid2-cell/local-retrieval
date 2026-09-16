@@ -224,13 +224,14 @@ if [ -n "$DRY_RUN_TO" ]; then
 else
   # SFTP, NOT `ssh <cmd>` + scp.
   #
-  # The destination is a Windows OpenSSH server whose shell is cmd.exe (sshd_config sets no
-  # DefaultShell), so a remote command is parsed by cmd, not sh. The first revision ran
-  # `ssh win "mkdir -p 'mux-relay-backups'"`, which cmd reads as "make a directory literally named
-  # 'mux-relay-backups'" (single quotes are not quoting characters to cmd) and `-p` as a second
-  # directory name — the destination it created was not the one scp was told to write. SFTP speaks
-  # the protocol directly and never invokes the remote shell, so the route stops depending on which
-  # shell answers.
+  # The destination is a Windows OpenSSH server with a non-POSIX login shell — measured 2026-09-16,
+  # OpenSSH's registry DefaultShell hands the connection PowerShell 5.1, since sshd_config sets none —
+  # so a remote command is parsed by that shell, not by sh. The first revision ran
+  # `ssh win "mkdir -p 'mux-relay-backups'"`, which such a shell reads as "make a directory literally
+  # named 'mux-relay-backups'" (single quotes are not quoting characters to it) with `-p` as a second
+  # operand — the destination it created was not the one scp was told to write. SFTP speaks the
+  # protocol directly and never invokes the remote shell, so the route stops depending on which shell
+  # answers.
   #
   # `-mkdir` (leading dash) means "create it, and do not fail if it is already there" — the same
   # idempotence `mkdir -p` was there for. StrictHostKeyChecking=yes + BatchMode=yes keep an hourly
