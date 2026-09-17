@@ -441,10 +441,13 @@ SFTP
           printf 'bye\n'
         } > "$STAGE/prune.batch"
         # No sentinel here: this output is only used to report the remaining count, and
-        # a marker line would inflate it. `grep -c .` drops the sftp prompt echo, which
-        # has no trailing newline of its own.
+        # a marker line would inflate it. The `sftp>` echoes must be dropped for the
+        # same reason - one per command plus the closing prompt made a 2-entry
+        # directory report "9 entries remain" when this was first measured on the live
+        # route. A count that overstates what is there is worse than no count.
         REMAINING="$(sftp -q -b "$STAGE/prune.batch" -F "$SSH_CONFIG" -o BatchMode=yes \
-          -o ConnectTimeout=10 -o StrictHostKeyChecking=yes "$SSH_HOST" 2>/dev/null | grep -c . || true)"
+          -o ConnectTimeout=10 -o StrictHostKeyChecking=yes "$SSH_HOST" 2>/dev/null \
+          | grep -v '^sftp>' | grep -c . || true)"
         note "retention: kept $KEPT, pruned $DEL_COUNT of them from $REMOTE_DIR (${REMAINING:-?} entries remain)"
       fi
     fi
