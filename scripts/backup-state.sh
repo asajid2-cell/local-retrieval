@@ -62,6 +62,9 @@ SSH_HOST="win"
 SSH_CONFIG="/var/lib/multiplex/.ssh/config"
 REMOTE_DIR="mux-relay-backups"
 ARCHIVE_NAME=""
+# The glob the remote listing uses. Kept as the literal prefix rather than an
+# is_archive_name call because sftp matches it, not us.
+ARCHIVE_PREFIX="mux-relay-state-"
 
 # --- retention ---------------------------------------------------------------
 # The archive name carries a UTC stamp, so every run is a NEW file: without a
@@ -76,6 +79,11 @@ KEEP_RECENT=24
 KEEP_DAILY=30
 PRUNE=1
 PRUNE_PLAN=0
+# Printed as the last command of the listing batch and required before any delete is
+# attempted. A complete listing that happened to be EMPTY and a listing that never ran
+# both produce no entries; only this marker distinguishes them, and the difference is
+# the difference between "nothing to prune" and "do not touch what you cannot see".
+SENTINEL="sftp-mux-prune-sentinel"
 
 die() { printf '%s: %s\n' "$SELF" "$*" >&2; exit 1; }
 note() { printf '%s: %s\n' "$SELF" "$*"; }
@@ -157,6 +165,28 @@ prune_plan() {
     # Trim trailing blanks: an sftp listing may pad, and a trailing space would
     # otherwise ride into the batch file as part of the operand.
     while [ -n "$line" ] && [ "${line% }" != "$line" ]; do line="${line% }"; done
+    [ -n "$line" ] || continue
+    # Drop the command echo a batch-mode sftp prints. Measured against the real
+    # route (2026-09-17): `sftp -b -` writes the prompt and command line into the
+    # same stream as the listing, e.g.
+    #     sftp> ls -1 mux-relay-backups
+    #     mux-relay-backups/mux-relay-state-20260917T010033Z.tgz
+    # Without this, every entry also carries the REMOTE_DIR prefix stripped just
+    # below, no name matches the archive shape, and the sweep would classify the
+    # whole directory as foreign, keep all of it, and silently never prune.
+    case "$line" in "sftp>"*) continue ;; esac
+    # The completion sentinel is a liveness marker, not an entry. It reached the
+    # caller through this same pipe, so it reaches prune_plan too.
+    [ "$line" = "$SENTINEL" ] && continue
+    # sftp echoes each path relative to the directory it was given, so a bare
+    # `ls -1` answers "./name". Strip that prefix: without it no entry matches the
+    # archive shape and the sweep silently keeps the whole directory forever.
+    # The REMOTE_DIR form is stripped too, so a listing taken with the directory
+    # spelled out parses the same way.
+    case "$line" in ./"$REMOTE_DIR"/*) line="${line#./}" ;; esac
+    case "$line" in ./|../) continue ;; esac
+    case "$line" in ./*) line="${line#./}" ;; esac
+    case "$line" in "$REMOTE_DIR"/*) line="${line#"$REMOTE_DIR"/}" ;; esac
     [ -n "$line" ] || continue
     case "$line" in .|..) continue ;; esac
     if is_archive_name "$line"; then ours+=("$line"); else printf 'keep %s\n' "$line"; fi
@@ -354,12 +384,34 @@ SFTP
   # death: the backup itself succeeded, and failing the unit here would mean a full
   # 24-hour gap in backups over a directory that only needs a human to look at it.
   if [ "$PRUNE" -eq 1 ]; then
+    # The sentinel deliberately does NOT match the ls pattern: a glob that matches
+    # nothing makes sftp report an error and continue, so the batch still reaches the
+    # last command. It must be an equality match (a glob would swallow the sentinel
+    # into its own listing). The glob itself is what keeps sftp from having to tell a
+    # file from a directory - a bare `ls -1` lists directory CONTENTS, so pointing it
+    # at the remote dir answers with bare names and no prefix to strip at all.
     LISTING="$(sftp -q -b - -F "$SSH_CONFIG" -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=yes "$SSH_HOST" \
       <<SFTP 2>/dev/null
-ls -1 $REMOTE_DIR
+cd $REMOTE_DIR
+ls -1 $ARCHIVE_PREFIX*
+$SENTINEL
 SFTP
     )"
-    if [ -z "$(printf '%s' "$LISTING" | tr -d ' \t\r\n')" ]; then
+    # A missing sentinel means the listing did not run to completion - an unknown
+    # shell, a changed prompt, a truncated stream. Guessing at a partial listing
+    # would mean deciding what to DELETE from incomplete information, so refuse it
+    # and warn instead. This is the check that keeps the sweep from acting on a
+    # stream it does not understand; `sftp>` echoes are dropped in prune_plan.
+    case "$LISTING" in
+      *"$SENTINEL"*) : ;;
+      *)
+        note "retention: WARNING — the remote listing did not complete; nothing pruned this run"
+        LISTING=""
+        ;;
+    esac
+    if [ -z "$LISTING" ]; then
+      :
+    elif [ -z "$(printf '%s' "$LISTING" | tr -d ' \t\r\n')" ]; then
       note "retention: WARNING — could not list $SSH_HOST:$REMOTE_DIR/; nothing pruned this run"
     else
       PLAN="$(printf '%s\n' "$LISTING" | prune_plan)"
@@ -379,6 +431,9 @@ SFTP
           printf 'ls -1\n'
           printf 'bye\n'
         } > "$STAGE/prune.batch"
+        # No sentinel here: this output is only used to report the remaining count, and
+        # a marker line would inflate it. `grep -c .` drops the sftp prompt echo, which
+        # has no trailing newline of its own.
         REMAINING="$(sftp -q -b "$STAGE/prune.batch" -F "$SSH_CONFIG" -o BatchMode=yes \
           -o ConnectTimeout=10 -o StrictHostKeyChecking=yes "$SSH_HOST" 2>/dev/null | grep -c . || true)"
         note "retention: kept $KEPT, pruned $DEL_COUNT of them from $REMOTE_DIR (${REMAINING:-?} entries remain)"

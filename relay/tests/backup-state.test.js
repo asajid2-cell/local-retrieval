@@ -195,9 +195,12 @@ function stubEnv(binDir, listing = []) {
   const argsAt = (n) => posix(path.join(binDir, `args-${n}.txt`));
   const stdinAt = (n) => posix(path.join(binDir, `stdin-${n}.txt`));
   const copyAt = (n) => posix(path.join(binDir, `batch-${n}.txt`));
-  // The filenames are built INSIDE the shell by concatenation: a single-quoted
-  // `args-$n.txt` would never expand, so every call would overwrite one file and the
-  // per-call assertions below would silently read the first call's arguments.
+  // The batch arrives on stdin, so the LISTING is the call whose stdin carries
+  // `ls -1 mux-relay-state-*` - keying on the recorded arguments cannot work, because
+  // the arguments are the same for every call. Filenames are built inside the shell by
+  // concatenation: a single-quoted `args-$n.txt` would never expand, so every call
+  // would overwrite one file and the per-call assertions would silently read the
+  // first call's arguments instead of the one under test.
   const listLines = listing.map((l) => `'${l}'`).join(' ');
   return {
     argsAt,
@@ -209,14 +212,22 @@ function stubEnv(binDir, listing = []) {
         c='${base}/call-count'
         n=$(cat "$c" 2>/dev/null || printf 0); n=$((n+1)); printf '%s' "$n" > "$c"
         printf '%s\\n' "$@" > '${base}/args-'"$n"'.txt'
+        batch='${base}/stdin-'"$n"'.txt'
         prev=""
         for a in "$@"; do
-          if [ "$prev" = "-b" ]; then
-            if [ "$a" = "-" ]; then cat > '${base}/stdin-'"$n"'.txt'; else cp "$a" '${base}/batch-'"$n"'.txt'; fi
-          fi
+          if [ "$prev" = "-b" ] && [ "$a" != "-" ]; then batch='${base}/batch-'"$n"'.txt'; cp "$a" "$batch"; fi
           prev="$a"
         done
-        if [ "$n" = "2" ]; then printf '%s\\n' ${listLines}; fi
+        case " $* " in *" -b - "*) cat > "$batch" ;; esac
+        if grep -q 'mux-relay-state-\\*' "$batch" 2>/dev/null; then
+          # The real route echoes the command and answers with the path relative to
+          # the directory it was given. Reproducing that shape matters: a clean
+          # bare-name listing would make the parser look correct while the live sweep
+          # matched nothing and silently kept the whole directory forever.
+          printf 'sftp> ls -1 mux-relay-state-*\\n'
+          for l in ${listLines}; do printf './%s\\n' "$l"; done
+          printf 'sftp-mux-prune-sentinel\\n'
+        fi
       }`,
     },
   };
@@ -432,17 +443,24 @@ test('--no-prune sends the archive and touches nothing else', () => {
   assert.ok(!/pruned/.test(res.stdout));
 });
 
-test('an unlistable remote directory warns instead of failing the backup', () => {
+test('an incomplete remote listing is refused, and the backup still succeeds', () => {
   // The put succeeded; failing the unit here would cost a full day of backups over a
-  // directory that only needs a human to glance at it.
+  // directory that only needs a human to glance at it. But an incomplete listing must
+  // never be ACTED on: deciding what to delete from a stream that stopped early is how
+  // a sweep eats backups. This stub answers every listing with nothing at all, which
+  // is the shape of an unknown shell or a truncated read - the sentinel never arrives.
   const binDir = tmp('mux-backup-nolist-');
   const stub = stubEnv(binDir, []);
+  const noAnswer = stub.env['BASH_FUNC_sftp%%'].replace('if grep -q', 'if false && grep -q');
+  assert.notEqual(noAnswer, stub.env['BASH_FUNC_sftp%%'], 'the stub could not be silenced');
   const res = spawnSync(BASH, [SCRIPT, '--state-dir', FIXTURE, '--ssh-host', 'win'], {
     cwd: RELAY_DIR,
     encoding: 'utf8',
-    env: stub.env,
+    env: { ...stub.env, 'BASH_FUNC_sftp%%': noAnswer },
   });
   assert.equal(res.status, 0, `a failed listing must not fail the run:\n${res.stdout}\n${res.stderr}`);
-  assert.match(res.stdout, /retention: WARNING — could not list/);
+  assert.match(res.stdout, /retention: WARNING — the remote listing did not complete/);
   assert.match(res.stdout, /sent mux-relay-state-.*\.tgz to win/);
+  // And it must not have tried to delete anything.
+  assert.equal(fs.existsSync(stub.argsAt(3)), false, 'an incomplete listing must not reach a prune call');
 });
