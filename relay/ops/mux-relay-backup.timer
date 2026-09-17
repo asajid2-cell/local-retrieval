@@ -3,8 +3,13 @@ Description=Hourly off-box backup of multiplex relay durable state
 Documentation=file:///opt/multiplex-app/ops/README.md
 
 [Timer]
+# Hourly is affordable because the far side is bounded: the unit prunes after every
+# successful send (newest 24 archives outright, then one per older day for 30 days),
+# so the copy count tracks the retention window and not the cadence. The archive name
+# carries a UTC stamp, so without that sweep an hourly tick would leave ~8760
+# near-identical copies a year.
 OnCalendar=hourly
-# Spread the scp so a fleet of hosts does not hit the PC route at :00 together.
+# Spread the sftp so a fleet of hosts does not hit the PC route at :00 together.
 RandomizedDelaySec=300
 # If the VPS was down at the scheduled time, run once on the next boot rather than
 # skipping the window entirely — the whole point is surviving a host that goes away.

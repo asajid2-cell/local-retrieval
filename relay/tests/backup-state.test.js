@@ -185,19 +185,53 @@ test('the state dir is resolved against the caller cwd, not the script location'
 // Windows, where a shebang file with no extension cannot be exec'd, so a PATH stub would silently
 // fall through to the real sftp. An exported function is inherited by the child shell and shadows the
 // command outright (verified: bash 5.2 exports via BASH_FUNC_<name>%%).
-test('the real run drives sftp with a create-then-put batch, never a remote shell command', () => {
-  const binDir = tmp('mux-backup-bin-');
-  const argsFile = posix(path.join(binDir, 'sftp-args.txt'));
-  const batchFile = posix(path.join(binDir, 'sftp-batch.txt'));
-
-  const res = spawnSync(BASH, [SCRIPT, '--state-dir', FIXTURE, '--ssh-host', 'win'], {
-    cwd: RELAY_DIR,
-    encoding: 'utf8',
+// A single stub has to serve every sftp invocation the run makes (the put, the
+// listing, and the prune), so it numbers its calls and records each one separately.
+// `-b -` batches arrive on stdin; a `-b <path>` batch is a file the run built, so it
+// is copied out before the temp dir it lives in is cleaned up. `LISTING` is printed
+// on the listing call so retention has something to decide about.
+function stubEnv(binDir, listing = []) {
+  const base = posix(binDir);
+  const argsAt = (n) => posix(path.join(binDir, `args-${n}.txt`));
+  const stdinAt = (n) => posix(path.join(binDir, `stdin-${n}.txt`));
+  const copyAt = (n) => posix(path.join(binDir, `batch-${n}.txt`));
+  // The filenames are built INSIDE the shell by concatenation: a single-quoted
+  // `args-$n.txt` would never expand, so every call would overwrite one file and the
+  // per-call assertions below would silently read the first call's arguments.
+  const listLines = listing.map((l) => `'${l}'`).join(' ');
+  return {
+    argsAt,
+    stdinAt,
+    copyAt,
     env: {
       ...process.env,
-      // `cat` with no argument consumes the batch on stdin, which is the whole point of `-b -`.
-      'BASH_FUNC_sftp%%': `() { printf '%s\\n' "$@" >> '${argsFile}'; cat > '${batchFile}'; }`,
+      'BASH_FUNC_sftp%%': `() {
+        c='${base}/call-count'
+        n=$(cat "$c" 2>/dev/null || printf 0); n=$((n+1)); printf '%s' "$n" > "$c"
+        printf '%s\\n' "$@" > '${base}/args-'"$n"'.txt'
+        prev=""
+        for a in "$@"; do
+          if [ "$prev" = "-b" ]; then
+            if [ "$a" = "-" ]; then cat > '${base}/stdin-'"$n"'.txt'; else cp "$a" '${base}/batch-'"$n"'.txt'; fi
+          fi
+          prev="$a"
+        done
+        if [ "$n" = "2" ]; then printf '%s\\n' ${listLines}; fi
+      }`,
     },
+  };
+}
+
+test('the real run drives sftp with a create-then-put batch, never a remote shell command', () => {
+  const binDir = tmp('mux-backup-bin-');
+  const stub = stubEnv(binDir);
+  const argsFile = stub.argsAt(1);
+  const batchFile = stub.stdinAt(1);
+
+  const res = spawnSync(BASH, [SCRIPT, '--state-dir', FIXTURE, '--ssh-host', 'win', '--no-prune'], {
+    cwd: RELAY_DIR,
+    encoding: 'utf8',
+    env: stub.env,
   });
 
   assert.equal(res.status, 0, `the stubbed send should succeed:\n${res.stdout}\n${res.stderr}`);
@@ -228,4 +262,187 @@ test('the real run drives sftp with a create-then-put batch, never a remote shel
   assert.ok(!/\bmkdir\b\s+-p/.test(batch.join('\n')), 'the sh-only `mkdir -p` form must be gone');
 
   assert.match(res.stdout, /sent mux-relay-state-.*\.tgz to win:mux-relay-backups\//);
+});
+
+// --- retention ----------------------------------------------------------------
+// The archive name carries a UTC stamp, so every run is a new file and an hourly
+// timer would leave ~8760 near-identical copies a year on the far side. These tests
+// pin both halves: the decision (pure, so it is asserted exhaustively offline) and
+// the wiring (the deletes must ride an sftp batch that runs AFTER the put, and the
+// sweep must never name anything that is not one of our archives).
+
+const stamp = (iso, hh, mm = '00', ss = '00') => `mux-relay-state-${iso}T${hh}${mm}${ss}Z.tgz`;
+
+function plan(lines, args = []) {
+  const res = spawnSync(BASH, [SCRIPT, '--prune-plan', ...args], {
+    input: lines.join('\n') + '\n',
+    encoding: 'utf8',
+  });
+  assert.equal(res.status, 0, `--prune-plan failed: ${res.stderr}`);
+  const decisions = new Map();
+  for (const line of res.stdout.split('\n').filter(Boolean)) {
+    const [verb, ...rest] = line.split(' ');
+    decisions.set(rest.join(' '), verb);
+  }
+  return decisions;
+}
+
+const dayOf = (name) => name.slice('mux-relay-state-'.length, 'mux-relay-state-'.length + 8);
+
+// Builds a valid stamp for N consecutive days starting 2026-01-01. Written with a real
+// date object because the date field must be exactly 8 digits: a hand-rolled
+// `2026010${d}` produces a 9-digit field for d >= 10, which fails the archive match,
+// and every entry then reads as a foreign file that is always kept.
+function daysFrom(startIso, count, perDay = 1) {
+  const out = [];
+  const start = Date.parse(`${startIso}T00:00:00Z`);
+  for (let d = 0; d < count; d += 1) {
+    const iso = new Date(start + d * 86400000).toISOString().slice(0, 10).replace(/-/g, '');
+    for (let i = 0; i < perDay; i += 1) {
+      out.push(stamp(iso, String(Math.floor((i * 24) / perDay)).padStart(2, '0')));
+    }
+  }
+  return out;
+}
+
+test('retention stops at keep-daily and never keeps an unbounded history', () => {
+  // The cap is the whole point of the flag: with more distinct days than keep-daily,
+  // everything past it must go. Exercised with 45 distinct days and a small window so
+  // the branch that deletes on the cap is actually reached.
+  const lines = daysFrom('2026-01-01', 45);
+  assert.equal(new Set(lines.map(dayOf)).size, 45, 'the fixture must span 45 distinct days');
+  const decisions = plan(lines, ['--keep-recent', '2', '--keep-daily', '5']);
+  const kept = [...decisions.entries()].filter(([, v]) => v === 'keep').map(([k]) => k);
+  assert.equal(kept.length, 7, '2 newest outright plus one for each of 5 older days');
+  assert.equal([...decisions.values()].filter((v) => v === 'delete').length, 38);
+  // The 7 keepers are the two newest days and the newest of the five days before them.
+  // Anything older than that window must be pruned — 45 distinct days, 7 retained.
+  const distinct = [...new Set(lines.map(dayOf))].sort();
+  assert.deepEqual(kept.map(dayOf).sort(), distinct.slice(-7),
+    'the keepers must be a suffix of the day sequence, not an arbitrary subset');
+});
+
+test('retention keeps the newest N outright and one archive per older day', () => {
+  // 30 days x 2 archives/day = 60. The newest 24 outright is the last 12 days entire,
+  // leaving 18 older days at 2 each; each of those contributes its newest and deletes
+  // the other. So 24 + 18 kept, 18 deleted.
+  const lines = [];
+  for (let d = 1; d <= 30; d += 1) {
+    const iso = `202608${String(d).padStart(2, '0')}`;
+    lines.push(stamp(iso, '00'), stamp(iso, '12'));
+  }
+  const decisions = plan(lines);
+  assert.equal([...decisions.values()].filter((v) => v === 'keep').length, 42);
+  assert.equal([...decisions.values()].filter((v) => v === 'delete').length, 18);
+  // The keeper for each older day is that day's NEWEST archive, not an arbitrary one.
+  assert.equal(decisions.get(stamp('20260805', '12')), 'keep');
+  assert.equal(decisions.get(stamp('20260805', '00')), 'delete');
+});
+
+test('retention bounds a year of hourly archives to the same ceiling as daily ones', () => {
+  // The regression that matters: cadence must not change the ceiling. 24 days of
+  // hourly archives (576) and 24 daily archives both land at 24 + 30.
+  const hourly = [];
+  for (let d = 1; d <= 24; d += 1) {
+    for (let h = 0; h < 24; h += 1) {
+      hourly.push(stamp(`202608${String(d).padStart(2, '0')}`, String(h).padStart(2, '0'), '00'));
+    }
+  }
+  const decisions = plan(hourly);
+  const kept = [...decisions.entries()].filter(([, v]) => v === 'keep').map(([k]) => k);
+  // 24 newest hours = the whole last day; the other 23 days contribute one each.
+  assert.equal(kept.length, 47, 'an hourly year must not grow without bound');
+  const newest = [...hourly].sort().reverse().slice(0, 24);
+  for (const name of kept) {
+    if (newest.includes(name)) continue;
+    const sameDay = kept.filter((n) => dayOf(n) === dayOf(name));
+    assert.equal(sameDay.length, 1, `day ${dayOf(name)} kept ${sameDay.length} archives, not 1`);
+  }
+});
+
+test('retention never deletes anything it does not recognise', () => {
+  // The directory may be shared, and a name this script did not write is not this
+  // script's to remove. Whitespace and traversal shapes are refused by the same
+  // strict match, which is also what keeps a newline out of the sftp batch.
+  const foreign = ['notes.txt', 'mux-relay-state-BAD.tgz', 'mux-relay-state-20260916T224625Z.tgz.bak',
+    'mux-relay-state-20260916T224625Z.tgz.1', '../escape', 'mux-relay-state-20260916T22462Z.tgz'];
+  const decisions = plan([...foreign, stamp('20260916', '22', '46', '25')]);
+  for (const name of foreign) assert.equal(decisions.get(name), 'keep', `${name} must be left alone`);
+});
+
+test('retention flags refuse values that would turn a sweep into a wipe', () => {
+  const zero = spawnSync(BASH, [SCRIPT, '--prune-plan', '--keep-recent', '0'], { input: '', encoding: 'utf8' });
+  assert.notEqual(zero.status, 0);
+  assert.match(zero.stderr, /at least the archive just sent/);
+  const junk = spawnSync(BASH, [SCRIPT, '--prune-plan', '--keep-recent', 'abc'], { input: '', encoding: 'utf8' });
+  assert.notEqual(junk.status, 0);
+  assert.match(junk.stderr, /non-negative integer/);
+});
+
+test('a real run lists, then prunes over the same sftp route, after the put', () => {
+  const binDir = tmp('mux-backup-prune-');
+  // The listing the PC actually held on 2026-09-17: five archives over two days, plus
+  // a file this script did not write.
+  const listing = [stamp('20260916', '22', '46', '25'), stamp('20260916', '22', '49', '43'),
+    stamp('20260916', '23', '03', '17'), stamp('20260917', '00', '02', '34'),
+    stamp('20260917', '01', '00', '33'), 'README.txt'];
+  const stub = stubEnv(binDir, listing);
+
+  const res = spawnSync(BASH, [SCRIPT, '--state-dir', FIXTURE, '--ssh-host', 'win',
+    '--keep-recent', '2', '--keep-daily', '1'], {
+    cwd: RELAY_DIR,
+    encoding: 'utf8',
+    env: stub.env,
+  });
+  assert.equal(res.status, 0, `pruning run failed:\n${res.stdout}\n${res.stderr}`);
+
+  // Three calls, in this order: put, listing, prune. The listing comes after the put
+  // so a fresh archive is never a candidate for its own sweep.
+  const call1 = fs.readFileSync(stub.stdinAt(1), 'utf8');
+  assert.match(call1, /-mkdir mux-relay-backups/, 'call 1 is the put');
+  const listArgs = fs.readFileSync(stub.argsAt(2), 'utf8');
+  assert.match(listArgs, /StrictHostKeyChecking=yes/, 'the listing pins the route too');
+  const pruneArgs = fs.readFileSync(stub.argsAt(3), 'utf8');
+  assert.match(pruneArgs, /-b/, 'the prune rides a batch file, not stdin');
+
+  const batch = fs.readFileSync(stub.copyAt(3), 'utf8');
+  assert.match(batch, /^cd mux-relay-backups$/m, 'deletes are relative to the remote dir');
+  // keep-recent=2 holds the two 09-17 archives outright. The next one, 09-16T230317Z,
+  // is the newest archive of the older day, so keep-daily=1 holds that too. The two
+  // remaining same-day copies are the surplus, and only they may be named.
+  assert.match(batch, /^rm mux-relay-state-20260916T224943Z\.tgz$/m);
+  assert.match(batch, /^rm mux-relay-state-20260916T224625Z\.tgz$/m);
+  for (const keep of ['20260917T010033Z', '20260917T000234Z', '20260916T230317Z']) {
+    assert.doesNotMatch(batch, new RegExp(keep), `${keep} must survive the sweep`);
+  }
+  assert.ok(!batch.includes('README.txt'), 'a foreign file must never be named in a delete batch');
+  assert.match(res.stdout, /retention: kept 4, pruned 2 of them from mux-relay-backups/);
+});
+
+test('--no-prune sends the archive and touches nothing else', () => {
+  const binDir = tmp('mux-backup-noprune-');
+  const stub = stubEnv(binDir, [stamp('20260916', '22', '46', '25')]);
+  const res = spawnSync(BASH, [SCRIPT, '--state-dir', FIXTURE, '--ssh-host', 'win', '--no-prune'], {
+    cwd: RELAY_DIR,
+    encoding: 'utf8',
+    env: stub.env,
+  });
+  assert.equal(res.status, 0, res.stderr);
+  assert.equal(fs.existsSync(stub.argsAt(2)), false, '--no-prune must not make a second call');
+  assert.ok(!/pruned/.test(res.stdout));
+});
+
+test('an unlistable remote directory warns instead of failing the backup', () => {
+  // The put succeeded; failing the unit here would cost a full day of backups over a
+  // directory that only needs a human to glance at it.
+  const binDir = tmp('mux-backup-nolist-');
+  const stub = stubEnv(binDir, []);
+  const res = spawnSync(BASH, [SCRIPT, '--state-dir', FIXTURE, '--ssh-host', 'win'], {
+    cwd: RELAY_DIR,
+    encoding: 'utf8',
+    env: stub.env,
+  });
+  assert.equal(res.status, 0, `a failed listing must not fail the run:\n${res.stdout}\n${res.stderr}`);
+  assert.match(res.stdout, /retention: WARNING — could not list/);
+  assert.match(res.stdout, /sent mux-relay-state-.*\.tgz to win/);
 });

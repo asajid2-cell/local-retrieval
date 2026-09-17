@@ -63,6 +63,20 @@ SSH_CONFIG="/var/lib/multiplex/.ssh/config"
 REMOTE_DIR="mux-relay-backups"
 ARCHIVE_NAME=""
 
+# --- retention ---------------------------------------------------------------
+# The archive name carries a UTC stamp, so every run is a NEW file: without a
+# pruning pass an hourly timer leaves ~8760 near-identical copies a year on the
+# far side. Retention runs over the remote directory AFTER a successful put, and
+# it is deliberately coarse: keep the newest KEEP_RECENT outright (that is the
+# recent-granularity window), then keep the newest archive of each older day for
+# KEEP_DAILY more days. All of the logic lives on this side — the far side is a
+# Windows OpenSSH server with a non-POSIX shell, so it is only ever asked to list
+# and delete over SFTP, never to evaluate anything.
+KEEP_RECENT=24
+KEEP_DAILY=30
+PRUNE=1
+PRUNE_PLAN=0
+
 die() { printf '%s: %s\n' "$SELF" "$*" >&2; exit 1; }
 note() { printf '%s: %s\n' "$SELF" "$*"; }
 
@@ -83,6 +97,15 @@ Options:
   --ssh-host <host>     sftp destination alias (default: win).
   --remote-dir <dir>    Remote directory, relative to the remote home (default: mux-relay-backups).
   --archive-name <name> Override the archive filename.
+  --keep-recent <n>     Retention: keep this many newest archives outright (default: 24).
+  --keep-daily <n>      Retention: then keep the newest archive of each of this many older days
+                        (default: 30). Together these bound the far side at roughly
+                        keep-recent + keep-daily archives however often the timer fires.
+  --no-prune            Send the archive and delete nothing.
+  --prune-plan          Read a remote listing on stdin (the shape `ls -1` prints over sftp) and
+                        print the retention decision for each entry, in the form
+                        "keep <name>" / "delete <name>". Touches no network and no files, so it
+                        answers "what would a real run delete?" before one runs.
   -h, --help            This text.
 EOF
 }
@@ -94,11 +117,91 @@ while [ $# -gt 0 ]; do
     --ssh-host)     [ $# -ge 2 ] || die "--ssh-host needs a value";     SSH_HOST="$2";      shift 2 ;;
     --remote-dir)   [ $# -ge 2 ] || die "--remote-dir needs a value";   REMOTE_DIR="$2";    shift 2 ;;
     --archive-name) [ $# -ge 2 ] || die "--archive-name needs a value"; ARCHIVE_NAME="$2";  shift 2 ;;
+    --keep-recent)  [ $# -ge 2 ] || die "--keep-recent needs a value";  KEEP_RECENT="$2";   shift 2 ;;
+    --keep-daily)   [ $# -ge 2 ] || die "--keep-daily needs a value";   KEEP_DAILY="$2";    shift 2 ;;
+    --no-prune)     PRUNE=0; shift ;;
+    --prune-plan)   PRUNE_PLAN=1; shift ;;
     --verify)       VERIFY=1; shift ;;
     -h|--help)      usage; exit 0 ;;
     *)              die "unknown argument: $1 (try --help)" ;;
   esac
 done
+
+# is_archive_name <name> — the ONLY shape retention is ever allowed to delete.
+# Everything below leans on this being strict: it is what keeps a stray file in the
+# remote directory, or a name carrying whitespace or a newline (which would inject a
+# second command into the sftp batch), out of reach of the sweep.
+is_archive_name() {
+  case "$1" in
+    mux-relay-state-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z.tgz) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# prune_plan — reads a remote listing (one name per line, the shape `ls -1` prints
+# over sftp) on stdin and prints the retention decision for each entry. Pure: no
+# network, no filesystem, so the same function answers "what would a real run
+# delete?" offline and drives the real deletes on the far side.
+#
+# Order is the whole algorithm. The stamps are fixed-width UTC, so a plain reverse
+# sort is chronological, newest first. Keep the newest KEEP_RECENT outright — that
+# is the recent-granularity window — then walk what is left and keep the newest
+# archive of each distinct day for KEEP_DAILY days. Entries that are not our
+# archives are always kept: this directory may be shared, and a sweep that deletes
+# what it does not recognise is a sweep nobody can run unattended.
+prune_plan() {
+  local line name stamp day
+  local -a ours=()
+  while IFS= read -r line; do
+    line="${line%$'\r'}"
+    # Trim trailing blanks: an sftp listing may pad, and a trailing space would
+    # otherwise ride into the batch file as part of the operand.
+    while [ -n "$line" ] && [ "${line% }" != "$line" ]; do line="${line% }"; done
+    [ -n "$line" ] || continue
+    case "$line" in .|..) continue ;; esac
+    if is_archive_name "$line"; then ours+=("$line"); else printf 'keep %s\n' "$line"; fi
+  done
+
+  if [ "${#ours[@]}" -eq 0 ]; then return 0; fi
+
+  local -a sorted=()
+  while IFS= read -r name; do sorted+=("$name"); done < <(printf '%s\n' "${ours[@]}" | LC_ALL=C sort -r)
+
+  local index=0
+  declare -A seen_day=()
+  local daily_kept=0
+  for name in "${sorted[@]}"; do
+    index=$((index + 1))
+    if [ "$index" -le "$KEEP_RECENT" ]; then
+      printf 'keep %s\n' "$name"
+      continue
+    fi
+    stamp="${name#mux-relay-state-}"; stamp="${stamp%.tgz}"; day="${stamp%%T*}"
+    if [ -n "${seen_day[$day]:-}" ]; then
+      printf 'delete %s\n' "$name"
+    elif [ "$daily_kept" -lt "$KEEP_DAILY" ]; then
+      seen_day[$day]=1; daily_kept=$((daily_kept + 1))
+      printf 'keep %s\n' "$name"
+    else
+      seen_day[$day]=1
+      printf 'delete %s\n' "$name"
+    fi
+  done
+}
+
+# Floors, so a fat-fingered flag cannot turn retention into a directory wipe.
+# Validated in every mode, including --prune-plan: a mode that answers "what would
+# this delete?" must not answer it for values a real run would refuse.
+case "$KEEP_RECENT" in ''|*[!0-9]*) die "--keep-recent must be a non-negative integer" ;; esac
+case "$KEEP_DAILY"  in ''|*[!0-9]*) die "--keep-daily must be a non-negative integer"  ;; esac
+[ "$KEEP_RECENT" -ge 1 ] || die "--keep-recent must keep at least the archive just sent"
+
+if [ "$PRUNE_PLAN" -eq 1 ]; then
+  # Offline decision surface. Deliberately before any state-dir or checksum probe:
+  # this mode answers a question about a LISTING, and needs neither.
+  prune_plan
+  exit 0
+fi
 
 if command -v sha256sum >/dev/null 2>&1; then
   SHA=(sha256sum)
@@ -236,9 +339,50 @@ else
   # `-mkdir` (leading dash) means "create it, and do not fail if it is already there" — the same
   # idempotence `mkdir -p` was there for. StrictHostKeyChecking=yes + BatchMode=yes keep an hourly
   # unattended run from ever blocking on a trust prompt: an unknown host fails loudly instead.
-  printf -- '-mkdir %s\nput %s %s/%s\n' \
-    "$REMOTE_DIR" "$ARCHIVE" "$REMOTE_DIR" "$ARCHIVE_NAME" \
-    | sftp -q -b - -F "$SSH_CONFIG" -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=yes "$SSH_HOST" \
+  sftp -q -b - -F "$SSH_CONFIG" -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=yes "$SSH_HOST" \
+    <<SFTP \
     || die "cannot reach $SSH_HOST — the 'win' sftp route to the PC is down, or its host key is not in known_hosts"
+-mkdir $REMOTE_DIR
+put $ARCHIVE $REMOTE_DIR/$ARCHIVE_NAME
+SFTP
   note "sent $ARCHIVE_NAME to $SSH_HOST:$REMOTE_DIR/ (${#MEMBERS[@]} file(s))"
+
+  # --- retention, applied AFTER a successful put -----------------------------
+  # Order matters: the archive is on the far side before anything is pruned, so an
+  # interrupted run leaves one extra copy rather than deleting the oldest backup to
+  # make room for one that never landed. Retention failure is a WARNING, never a
+  # death: the backup itself succeeded, and failing the unit here would mean a full
+  # 24-hour gap in backups over a directory that only needs a human to look at it.
+  if [ "$PRUNE" -eq 1 ]; then
+    LISTING="$(sftp -q -b - -F "$SSH_CONFIG" -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=yes "$SSH_HOST" \
+      <<SFTP 2>/dev/null
+ls -1 $REMOTE_DIR
+SFTP
+    )"
+    if [ -z "$(printf '%s' "$LISTING" | tr -d ' \t\r\n')" ]; then
+      note "retention: WARNING — could not list $SSH_HOST:$REMOTE_DIR/; nothing pruned this run"
+    else
+      PLAN="$(printf '%s\n' "$LISTING" | prune_plan)"
+      DELETES="$(printf '%s\n' "$PLAN" | while IFS= read -r l; do
+        case "$l" in "delete "*) printf '%s\n' "${l#delete }" ;; esac
+      done)"
+      KEPT="$(printf '%s\n' "$PLAN" | grep -c '^keep ')"; KEPT="${KEPT:-0}"
+      if [ -z "$DELETES" ]; then
+        note "retention: kept $KEPT entr(ies) in $REMOTE_DIR, nothing to prune"
+      else
+        DEL_COUNT="$(printf '%s\n' "$DELETES" | grep -c .)"
+        {
+          printf 'cd %s\n' "$REMOTE_DIR"
+          printf '%s\n' "$DELETES" | while IFS= read -r name; do
+            printf 'rm %s\n' "$name"
+          done
+          printf 'ls -1\n'
+          printf 'bye\n'
+        } > "$STAGE/prune.batch"
+        REMAINING="$(sftp -q -b "$STAGE/prune.batch" -F "$SSH_CONFIG" -o BatchMode=yes \
+          -o ConnectTimeout=10 -o StrictHostKeyChecking=yes "$SSH_HOST" 2>/dev/null | grep -c . || true)"
+        note "retention: kept $KEPT, pruned $DEL_COUNT of them from $REMOTE_DIR (${REMAINING:-?} entries remain)"
+      fi
+    fi
+  fi
 fi

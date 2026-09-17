@@ -127,13 +127,45 @@ systemctl list-timers mux-relay-backup.timer
 journalctl -u mux-relay-backup.service -n 50
 sudo -u svc-multiplex /usr/local/bin/mux-backup-state.sh \
   --state-dir /var/lib/multiplex --verify
-ssh win 'ls -lt mux-relay-backups | head'
 ```
 
 The archive includes only relay-tier durable state: projects, queued app commands,
 pins, upload metadata, rename intents, and `.bak` siblings. It refuses identity keys,
 private keys, credentials, principal registries, and ACL state. The backup destination
 still inherits the relay's exposure profile and must be protected accordingly.
+
+### Retention
+
+The archive name carries a UTC stamp, so every run writes a NEW file. Left alone, an
+hourly timer would leave ~8760 near-identical copies a year on the PC. Each successful
+send therefore prunes the remote directory: the newest `--keep-recent` archives
+(default 24) are kept outright, then the newest archive of each older day is kept for
+`--keep-daily` more days (default 30). The copy count tracks the retention window, not
+the cadence — hourly and daily schedules land at the same ceiling.
+
+Ordering is deliberate. The sweep runs **after** a successful `put`, so an interrupted
+run leaves one extra copy rather than deleting the oldest backup to make room for one
+that never landed. A failed listing or prune is a **warning**, not a unit failure: the
+backup itself succeeded, and failing here would cost a 24-hour gap over a directory
+that only needs a human to look at it. Every retention line in the journal is prefixed
+`retention:`.
+
+The decision logic runs entirely on the VPS. The far side is a Windows OpenSSH server
+with a non-POSIX shell, so it is only ever asked to list and delete over SFTP, never to
+evaluate anything. Only names matching the exact archive shape are candidates, so a
+shared directory keeps its foreign files.
+
+```sh
+# what WOULD a run delete? offline, against a listing — touches no network, no files
+ssh win 'ls -1 mux-relay-backups' | awk '{print $NF}' \
+  | sudo -u svc-multiplex /usr/local/bin/mux-backup-state.sh --prune-plan
+# send now and skip retention entirely
+sudo -u svc-multiplex /usr/local/bin/mux-backup-state.sh --state-dir /var/lib/multiplex --no-prune
+```
+
+`--prune-plan` validates `--keep-recent`/`--keep-daily` exactly as a real run does, so
+a plan shown for values a real run would refuse is never printed. `--keep-recent 0` is
+rejected: a sweep must always be able to keep the archive it just sent.
 
 ## Restore
 
