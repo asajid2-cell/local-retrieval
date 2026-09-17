@@ -390,8 +390,17 @@ SFTP
     # into its own listing). The glob itself is what keeps sftp from having to tell a
     # file from a directory - a bare `ls -1` lists directory CONTENTS, so pointing it
     # at the remote dir answers with bare names and no prefix to strip at all.
+    #
+    # `|| true` is load-bearing, not laziness. The sentinel is not a valid sftp
+    # command, so the server raises an error and sftp exits NON-ZERO on every listing
+    # - measured on the live route (2026-09-17), where the first version of this
+    # exit status was fatal: under `set -e` the pipeline died at this assignment, the
+    # unit failed with status 1, and the pruning never ran. The exit status of the
+    # listing is not the signal we want anyway; the SENTINEL's presence is. Absence
+    # of the marker already covers every way this can go wrong, so the status is
+    # discarded and completeness is judged by what the stream contains.
     LISTING="$(sftp -q -b - -F "$SSH_CONFIG" -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=yes "$SSH_HOST" \
-      <<SFTP 2>/dev/null
+      <<SFTP 2>/dev/null || true
 cd $REMOTE_DIR
 ls -1 $ARCHIVE_PREFIX*
 $SENTINEL

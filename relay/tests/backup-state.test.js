@@ -226,7 +226,12 @@ function stubEnv(binDir, listing = []) {
           # matched nothing and silently kept the whole directory forever.
           printf 'sftp> ls -1 mux-relay-state-*\\n'
           for l in ${listLines}; do printf './%s\\n' "$l"; done
-          printf 'sftp-mux-prune-sentinel\\n'
+          printf 'sftp> sftp-mux-prune-sentinel\\n'
+          # The sentinel is not a valid sftp command, so the real server raises an
+          # error and sftp exits NON-ZERO on every listing. A stub that returned 0
+          # let a version of this script die on the live route while its tests
+          # passed, so the status is reproduced here too.
+          return 1
         fi
       }`,
     },
