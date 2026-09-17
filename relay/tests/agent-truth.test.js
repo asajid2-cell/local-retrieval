@@ -154,8 +154,13 @@ function truth(procAlive, extra = {}) {
 
 async function withRelay(t, fn) {
   const h = new Harness();
-  await h.start();
+  // Register teardown BEFORE start(). Harness.start() rethrows when the relay misses its boot
+  // window, and node does not run t.after for a test that failed before the hook was registered -
+  // so start-then-register leaks the spawned server.js for the life of the test process. A leaked
+  // relay then contends with every later suite run and shows up as THEIR startup timeout. stop() is
+  // safe against a half-started harness: it null-checks this.proc and force-removes this.tmp.
   t.after(() => h.stop());
+  await h.start();
   return await fn(h);
 }
 
