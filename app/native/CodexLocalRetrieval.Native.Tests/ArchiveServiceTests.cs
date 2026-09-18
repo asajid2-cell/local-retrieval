@@ -26,6 +26,142 @@ public sealed class ArchiveServiceTests
         return path;
     }
 
+    // Mirrors the live failure exactly: another process holds the store open but grants only read, so the
+    // atomic replace's DELETE access is refused while our own read of the previous bytes still succeeds.
+    private static FileStream HoldWithoutSharingDelete(string path) =>
+        new(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+
+    [TestMethod]
+    public async Task SaveAsync_RefusedStoreReplacementSkipsTheDoomedRollbackAndPrunesSnapshots()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "clr-store-refused-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            var store = Path.Combine(dir, "app-store.json");
+            var service = new ArchiveService(storePath: store);
+            service.Store.Sessions["s1"] = new ArchiveSession { Id = "s1", Tool = "codex", Title = "first" };
+            await service.SaveAsync();
+            var bytesBefore = await File.ReadAllBytesAsync(store);
+
+            var replaceAttempts = 0;
+            var verificationReads = 0;
+            service.StoreWriteFault = stage =>
+            {
+                if (stage == DurableWriteStage.BeforeReplace) replaceAttempts++;
+                if (stage == DurableWriteStage.BeforeVerificationRead) verificationReads++;
+            };
+
+            using var holder = HoldWithoutSharingDelete(store);
+            for (var attempt = 0; attempt < 12; attempt++)
+            {
+                service.Store.Sessions["s2"] = new ArchiveSession { Id = "s2", Tool = "claude", Title = "n" + attempt };
+                var error = await Assert.ThrowsExactlyAsync<DurableWriteException>(() => service.SaveAsync());
+                Assert.IsFalse(error.Committed, "a refused replacement never committed");
+                Assert.IsTrue(error.Recovered, "the previous generation was never touched");
+            }
+
+            // One replace attempt per failed save, not two: a refused replace can only have happened before
+            // the swap, so the previous generation is already in place and re-writing it over itself would
+            // be a second whole-store rewrite inside a second retry budget. The verification read belongs to
+            // that skipped rollback path.
+            Assert.AreEqual(12, replaceAttempts, "each failed save attempted exactly one replacement");
+            Assert.AreEqual(0, verificationReads, "no rollback verification read on a refused replacement");
+            CollectionAssert.AreEqual(bytesBefore, await File.ReadAllBytesAsync(store), "the store is untouched");
+
+            // Retention must hold whether or not the commit succeeds. Pruning used to run only after a
+            // successful commit, so a store that stopped committing grew by a whole-store snapshot per
+            // attempt without bound - 5.8 GB in under an hour live. Thirteen snapshot writes happened;
+            // only the bounded prefix survives.
+            Assert.AreEqual(8, Directory.GetFiles(service.StoreBackupsDir, "*.json").Length,
+                "snapshots stay bounded while the store cannot be committed");
+        }
+        finally { try { Directory.Delete(dir, true); } catch { } }
+    }
+
+    [TestMethod]
+    public async Task SaveAsync_SweepsAbandonedCommitTempsButNotALiveOne()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "clr-store-temps-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            var service = new ArchiveService(storePath: Path.Combine(dir, "app-store.json"));
+            service.Store.Sessions["s1"] = new ArchiveSession { Id = "s1", Tool = "codex", Title = "first" };
+            await service.SaveAsync();
+            Directory.CreateDirectory(service.StoreBackupsDir);
+
+            var storeDir = Path.GetDirectoryName(Path.Combine(dir, "app-store.json"))!;
+            var abandonedStore = Path.Combine(storeDir, "app-store.json.0000000000000000000000000000000.tmp");
+            var abandonedSnapshot = Path.Combine(service.StoreBackupsDir, "app-store-x-committed.json.0000000000000000000000000000000.tmp");
+            var inFlight = Path.Combine(service.StoreBackupsDir, "app-store-y-previous.json.1111111111111111111111111111111.tmp");
+            foreach (var path in new[] { abandonedStore, abandonedSnapshot, inFlight })
+                await File.WriteAllTextAsync(path, "candidate");
+            var old = DateTime.UtcNow - TimeSpan.FromHours(3);
+            File.SetLastWriteTimeUtc(abandonedStore, old);
+            File.SetLastWriteTimeUtc(abandonedSnapshot, old);
+
+            service.Store.Sessions["s2"] = new ArchiveSession { Id = "s2", Tool = "codex", Title = "second" };
+            await service.SaveAsync();
+
+            // A temp file is deleted in a `finally`, so anything this old is a process that died mid-write:
+            // 162 MB of them were sitting in the live data directory and the snapshot directory.
+            Assert.IsFalse(File.Exists(abandonedStore), "an abandoned primary temp is swept");
+            Assert.IsFalse(File.Exists(abandonedSnapshot), "an abandoned snapshot temp is swept");
+            Assert.IsTrue(File.Exists(inFlight), "a temp file young enough to be a write in flight is left alone");
+        }
+        finally { try { Directory.Delete(dir, true); } catch { } }
+    }
+
+    [TestMethod]
+    public async Task SaveAsync_RetainsOnlyTheNewestSnapshots()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "clr-store-retention-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            var service = new ArchiveService(storePath: Path.Combine(dir, "app-store.json"));
+            for (var save = 0; save < 6; save++)
+            {
+                service.Store.Sessions["s" + save] = new ArchiveSession { Id = "s" + save, Tool = "codex", Title = "t" };
+                await service.SaveAsync();
+            }
+
+            // Two snapshots per accepted save, so six saves leave twelve files for an unbounded pruner.
+            Assert.AreEqual(8, Directory.GetFiles(service.StoreBackupsDir, "*.json").Length);
+            var newest = Directory.GetFiles(service.StoreBackupsDir, "*.json").OrderByDescending(File.GetLastWriteTimeUtc).First();
+            Assert.IsTrue(File.Exists(newest), "the newest snapshot - the recovery candidate - is always kept");
+        }
+        finally { try { Directory.Delete(dir, true); } catch { } }
+    }
+
+    [TestMethod]
+    public async Task SaveAsync_SupersededSnapshotsAreSweptNotAccumulated()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "clr-store-superseded-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            var service = new ArchiveService(storePath: Path.Combine(dir, "app-store.json"));
+            service.Store.Sessions["s1"] = new ArchiveSession { Id = "s1", Tool = "codex", Title = "first" };
+            await service.SaveAsync();
+            Directory.CreateDirectory(service.StoreBackupsDir);
+            for (var index = 0; index < 12; index++)
+                await File.WriteAllTextAsync(
+                    Path.Combine(service.StoreBackupsDir, $"superseded-app-store-20260101-0000{index:00}-x.json"),
+                    "{}");
+            service.Store.Sessions["s2"] = new ArchiveSession { Id = "s2", Tool = "codex", Title = "second" };
+            await service.SaveAsync();
+
+            // Nothing enumerates these for recovery, so without an explicit sweep they live forever. They
+            // also carry their own budget rather than competing with the recoverable generations.
+            Assert.AreEqual(2, Directory.GetFiles(service.StoreBackupsDir, "superseded-*.json").Length);
+            Assert.AreEqual(3, Directory.GetFiles(service.StoreBackupsDir, "app-store-*.json").Length,
+                "both saves' recoverable generations are untouched by the superseded sweep");
+        }
+        finally { try { Directory.Delete(dir, true); } catch { } }
+    }
+
     // A Codex session must be keyed by its THREAD id (session_meta), not a later rs_... response id.
     // This mis-keying is why CODEX_THREAD_ID self-add never matched the indexed chat.
     [TestMethod]

@@ -234,4 +234,83 @@ public sealed class RemotePollBackoffTests
         Assert.AreEqual(4, (int)(60 / backoff.Current.TotalSeconds), "idle steady state must be 4 polls/min");
         Assert.AreEqual(20, (int)(60 / Active.TotalSeconds), "the cadence it replaces was 20 polls/min");
     }
+
+    // ---- the muxd tab probe ----
+    // A failed muxd probe is not a cheap failed probe: the app answers it by relaunching muxd's scheduled
+    // task, a whole schtasks -> wscript -> powershell -> pythonw chain, and then waits 1.2s for the retry.
+    // Against a muxd that is alive but no longer serving its control port that relaunch can NEVER succeed
+    // (muxd's single-instance mutex makes the fresh launch log "refusing to start duplicate muxd" and exit),
+    // so a fixed tick is a permanent process-spawn loop - observed at ~5 spawns/minute for three days.
+
+    [TestMethod]
+    public void TheMuxdProbeStaysFastWhileMuxdAnswers()
+    {
+        var backoff = MuxdProbeCadence.NewBackoff();
+
+        Assert.AreEqual(TimeSpan.FromSeconds(5), MuxdProbeCadence.Healthy);
+        Assert.AreEqual(MuxdProbeCadence.Healthy, backoff.Current, "a live control port must still be polled every 5s");
+    }
+
+    [TestMethod]
+    public void TheMuxdProbeToleratesABlipBeforeStretching()
+    {
+        var backoff = MuxdProbeCadence.NewBackoff();
+
+        for (var i = 1; i < MuxdProbeCadence.EmptyProbesBeforeBackoff; i++)
+        {
+            Assert.AreEqual(
+                MuxdProbeCadence.Healthy,
+                backoff.OnEmptyPoll(),
+                $"failure #{i} is a blip (a muxd restart) and must not stretch the probe");
+            Assert.IsFalse(backoff.IsBackedOff, $"failure #{i} must not have backed off yet");
+        }
+    }
+
+    [TestMethod]
+    public void TheMuxdProbeStretchesToTheUnreachableCeilingAndCutsTheSpawnRateSixtyFold()
+    {
+        var backoff = MuxdProbeCadence.NewBackoff();
+        for (var i = 0; i < 100; i++) backoff.OnEmptyPoll();
+
+        Assert.AreEqual(TimeSpan.FromMinutes(5), MuxdProbeCadence.Unreachable);
+        Assert.AreEqual(MuxdProbeCadence.Unreachable, backoff.Current, "a long-unreachable muxd must settle on the ceiling");
+
+        // The number that matters: relaunch-triggering probes per hour, versus the fixed 5s tick.
+        var hour = TimeSpan.FromHours(1).TotalSeconds;
+        Assert.AreEqual(720, (int)(hour / MuxdProbeCadence.Healthy.TotalSeconds), "the cadence this replaces was 12/min");
+        Assert.AreEqual(
+            12,
+            (int)(hour / MuxdProbeCadence.Unreachable.TotalSeconds),
+            "an unreachable muxd must cost ~12 probes/hour, a 60x cut");
+    }
+
+    [TestMethod]
+    public void AMuxdThatAnswersAgainSnapsStraightBackToTheFastProbe()
+    {
+        var backoff = MuxdProbeCadence.NewBackoff();
+        for (var i = 0; i < 50; i++) backoff.OnEmptyPoll();
+        Assert.AreEqual(MuxdProbeCadence.Unreachable, backoff.Current, "precondition: fully stretched first");
+
+        var afterAnswer = backoff.OnCommandsReceived();
+
+        Assert.AreEqual(MuxdProbeCadence.Healthy, afterAnswer, "a recovered muxd must be noticed immediately");
+        Assert.IsFalse(backoff.IsBackedOff);
+    }
+
+    [TestMethod]
+    public void TheGuiMuxdProbeDrivesItsTimerFromTheBackoff()
+    {
+        // A backoff nothing consults is a well-tested unused class. This pins the wiring that makes the 5s
+        // spawn loop impossible: the tab timer takes its interval from the cadence, and a failed muxd
+        // request reports the failure to it.
+        var text = ReadProductionFile("CodexLocalRetrieval.Native", "MainPage.Remote.cs");
+
+        Assert.Contains("MuxdProbeCadence.NewBackoff()", text, "the tab probe must own a muxd backoff");
+        Assert.Contains("_tabBackoff.OnEmptyPoll()", text, "a failed muxd request must stretch the probe");
+        Assert.Contains("_tabBackoff.OnCommandsReceived()", text, "an answered muxd request must snap it back");
+        Assert.DoesNotContain(
+            "_tabTimer ??= new DispatcherTimer { Interval = TimeSpan.FromSeconds(5) }",
+            text,
+            "the tab timer must start from the cadence's interval, not a hardcoded 5s");
+    }
 }

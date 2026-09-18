@@ -16,6 +16,9 @@
 
   <ItemGroup>
     <InternalsVisibleTo Include="CodexLocalRetrieval.Native.Tests" />
+    <!-- The server is the archive's unattended host: it needs the same diagnostic seams the GUI has
+         (SavePhaseMeasured), which are internal so they stay out of the public surface. -->
+    <InternalsVisibleTo Include="CodexLocalRetrieval.Server" />
   </ItemGroup>
 
 </Project>

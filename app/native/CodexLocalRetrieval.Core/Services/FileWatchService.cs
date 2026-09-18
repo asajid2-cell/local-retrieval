@@ -253,18 +253,46 @@ public sealed class FileWatchService : IDisposable
     }
 
     /// Stamp for a directory: how many matching files exist and the newest write among them. Enough to
-    /// notice "a new transcript appeared" without reading a byte of content.
+    /// notice "a new transcript appeared" without reading a byte of content. The traversal is iterative
+    /// and does not follow reparse-point directories: recursive enumeration over a large or cyclic source
+    /// tree can otherwise exhaust the process stack before the watcher can report a useful error.
     public static string DirectoryStamp(string directory, string pattern, bool recurse)
     {
         if (!Directory.Exists(directory)) return "-";
-        var option = recurse ? SearchOption.AllDirectories : SearchOption.TopDirectoryOnly;
+        var pending = new Stack<string>();
+        pending.Push(directory);
         long count = 0, newest = 0;
-        foreach (var file in Directory.EnumerateFiles(directory, pattern, option))
+        while (pending.Count > 0)
         {
-            count++;
-            long ticks;
-            try { ticks = File.GetLastWriteTimeUtc(file).Ticks; } catch { continue; }
-            if (ticks > newest) newest = ticks;
+            var current = pending.Pop();
+            IEnumerable<string> files;
+            try { files = Directory.EnumerateFiles(current, pattern, SearchOption.TopDirectoryOnly); }
+            catch (IOException) { continue; }
+            catch (UnauthorizedAccessException) { continue; }
+
+            foreach (var file in files)
+            {
+                count++;
+                long ticks;
+                try { ticks = File.GetLastWriteTimeUtc(file).Ticks; } catch { continue; }
+                if (ticks > newest) newest = ticks;
+            }
+
+            if (!recurse) continue;
+            IEnumerable<string> directories;
+            try { directories = Directory.EnumerateDirectories(current, "*", SearchOption.TopDirectoryOnly); }
+            catch (IOException) { continue; }
+            catch (UnauthorizedAccessException) { continue; }
+            foreach (var child in directories)
+            {
+                try
+                {
+                    if ((File.GetAttributes(child) & FileAttributes.ReparsePoint) == 0)
+                        pending.Push(child);
+                }
+                catch (IOException) { }
+                catch (UnauthorizedAccessException) { }
+            }
         }
         return count.ToString() + ":" + newest.ToString();
     }

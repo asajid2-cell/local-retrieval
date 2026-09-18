@@ -22,6 +22,22 @@ internal static class Diag
         Write(LogPath, msg, DefaultMaxBytes, DefaultRetainedFiles, DateTime.Now);
     }
 
+    private static readonly System.Diagnostics.Process Self = System.Diagnostics.Process.GetCurrentProcess();
+
+    /// Records where memory actually is at a phase boundary so a spike can be attributed to a phase
+    /// instead of guessed at. `heap` is the managed side; `ws`/`priv` include native + mapped pages.
+    public static void Mem(string label)
+    {
+        try
+        {
+            Self.Refresh();
+            Log($"MEM {label}: heap={GC.GetTotalMemory(false) / 1048576.0:F0}MB"
+                + $" ws={Self.WorkingSet64 / 1048576.0:F0}MB priv={Self.PrivateMemorySize64 / 1048576.0:F0}MB"
+                + $" g0={GC.CollectionCount(0)} g1={GC.CollectionCount(1)} g2={GC.CollectionCount(2)}");
+        }
+        catch { /* tracing must never throw */ }
+    }
+
     internal static void Write(string path, string msg, long maxBytes, int retainedFiles, DateTime now)
     {
         try

@@ -303,9 +303,16 @@ public sealed partial class MainPage
     // replays its recorded ack instead of downloading/starting a second time.
     private readonly RemoteCommandProtocol.IntentLedger _commandIntents = new();
     private bool _tabTracking;
+    // Paces the muxd tab probe. A failed probe triggers a muxd RELAUNCH, and against a muxd that is alive
+    // but no longer serving its control port that relaunch can never succeed - muxd's single-instance mutex
+    // makes the fresh launch log "refusing to start duplicate muxd" and exit. At a fixed 5s tick that was a
+    // permanent process-spawn loop; this stretches the probe once muxd has proved unreachable.
+    private readonly RemotePollBackoff _tabBackoff = MuxdProbeCadence.NewBackoff();
 
     public void StartProjectSync()
     {
+        if (_syncStarted || _unloaded) return;
+        _syncStarted = true;
         _ = PushProjectsAsync();
         _syncTimer ??= new DispatcherTimer { Interval = TimeSpan.FromSeconds(30) };
         _syncTimer.Tick -= OnSyncTick;
@@ -323,7 +330,8 @@ public sealed partial class MainPage
         // Track which chat each mux tab is hosting on a fast loop (off the UI thread) so a brief
         // `claude` → `codex` → exit is caught into the tab's session history even between 30s pushes.
         if (GuiVerificationFixture.Enabled) return;
-        _tabTimer ??= new DispatcherTimer { Interval = TimeSpan.FromSeconds(5) };
+        _tabBackoff.Reset();
+        _tabTimer ??= new DispatcherTimer { Interval = MuxdProbeCadence.Healthy };
         _tabTimer.Tick -= OnTabTick;
         _tabTimer.Tick += OnTabTick;
         _tabTimer.Start();
@@ -345,13 +353,35 @@ public sealed partial class MainPage
             finally { _syncGate.Release(); }
             foreach (var binding in bindings)
                 await BindPendingMuxIdentityAsync(binding);
-            var listing = await LocalMuxdRequestAsync(new { t = "ls" });
+
+            // Only the muxd request itself is the reachability signal: a failure anywhere else in this tick
+            // must not be mistaken for muxd being down and slow the probe.
+            string listing;
+            try { listing = await LocalMuxdRequestAsync(new { t = "ls" }); }
+            catch
+            {
+                // muxd did not answer. The request already relaunched its scheduled task and retried;
+                // stretching the cadence here is what stops that relaunch from repeating every tick forever.
+                ApplyTabProbeInterval(_tabBackoff.OnEmptyPoll());
+                return;
+            }
+            _tabBackoff.OnCommandsReceived();
+            ApplyTabProbeInterval(_tabBackoff.Current);
+
             await _syncGate.WaitAsync();
             try { await _archive.ReconcileStartChatBindingsAsync(listing); }
             finally { _syncGate.Release(); }
         }
         catch { }
         finally { _tabTracking = false; }
+    }
+
+    // DispatcherTimer.Interval only takes effect from the next scheduled tick, so this is safe to call on
+    // the UI thread from inside a tick.
+    private void ApplyTabProbeInterval(TimeSpan interval)
+    {
+        if (_tabTimer is null || _tabTimer.Interval == interval) return;
+        _tabTimer.Interval = interval;
     }
 
     private async Task BindPendingMuxIdentityAsync(ArchiveService.PendingMuxBinding binding)

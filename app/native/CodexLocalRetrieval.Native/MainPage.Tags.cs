@@ -145,8 +145,7 @@ public sealed partial class MainPage
             _archive.RefreshSessions(results, preserveOrder: preserve);
             if (selection is not null)
             {
-                _selected = selection;
-                SelectSessionRow(selection);
+                ApplySelection(selection);
             }
             else
             {
@@ -193,8 +192,7 @@ public sealed partial class MainPage
             var restored = !string.IsNullOrEmpty(keep)
                 ? _archive.Sessions.FirstOrDefault(x => string.Equals(x.Id, keep, StringComparison.OrdinalIgnoreCase))
                 : null;
-            _selected = restored;
-            SelectSessionRow(restored);
+            ApplySelection(restored);
         });
         RenderTagFilterBar();
     }

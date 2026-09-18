@@ -33,7 +33,16 @@ public sealed partial class MainPage : Page
         set
         {
             if (ReferenceEquals(_selectedField, value)) return;
+            var previous = _selectedField;
             _selectedField = value;
+            if (previous is not null && !ReferenceEquals(previous, value))
+            {
+                if (ReferenceEquals(_contentLoadingSession, previous))
+                    _ = ReleaseWhenContentLoadCompletesAsync(previous);
+                else
+                    _archive.ReleaseContent(previous);
+            }
+            ClearFilteredMessages();
             ArmLiveWatch();
         }
     }
@@ -58,6 +67,7 @@ public sealed partial class MainPage : Page
         InitializeComponent();
         Diag.Log("MP.ctor: after InitializeComponent");
         Loaded += MainPage_Loaded;
+        Unloaded += MainPage_Unloaded;
         // Responsive: below this width the right rail + chat reader can't both fit, so the right
         // panel (secondary actions, all reachable from the header + ... menu) folds away.
         SizeChanged += (_, _) =>
@@ -71,14 +81,41 @@ public sealed partial class MainPage : Page
 
     private const double RightPanelMinWidth = 1120;
     private bool _narrowLayout;
+    private bool _syncStarted;
+    private bool _pageLoadStarted;
+    private bool _unloaded;
+
+    private void MainPage_Unloaded(object sender, RoutedEventArgs e)
+    {
+        _unloaded = true;
+        StopArchiveSourceWatches();
+        _agentWatch?.Dispose();
+        _agentWatch = null;
+        _liveWatch?.Dispose();
+        _liveWatch = null;
+        _fileWatchService?.Dispose();
+        _fileWatchService = null;
+        _syncTimer?.Stop();
+        _cmdTimer?.Stop();
+        _tabTimer?.Stop();
+        StopCaptureHarness();
+    }
 
     private async void MainPage_Loaded(object sender, RoutedEventArgs e)
     {
+        _unloaded = false;
+        if (_pageInitialized || _pageLoadStarted) return;
+        _pageLoadStarted = true;
         Diag.Log("MP.Loaded: start");
+        // Route the core's parse/scan/save tracing into the same file the startup timeline goes to, so
+        // a memory spike can be attributed to a named phase from one log.
+        CodexLocalRetrieval.Core.Services.PerfCounters.Trace ??= Diag.Log;
+        Diag.Mem("loaded.start");
         try
         {
             await _archive.LoadCachedAsync();
             Diag.Log("MP.Loaded: archive loaded (" + _archive.Sessions.Count + " sessions)");
+            Diag.Mem("loaded.afterCacheLoad");
         }
         catch (Exception ex)
         {
@@ -99,10 +136,12 @@ public sealed partial class MainPage : Page
             _archive.OnReapplyFilter = ReapplyActiveFilter;   // mutations/sync re-run the active filter instead of dropping it
             SessionList.ItemsSource = _archive.Sessions;
             Diag.Log("MP.Loaded: list bound");
+            Diag.Mem("loaded.listBound");
             SelectFirstSession();
             Diag.Log("MP.Loaded: first selected");
             RenderCurrent();
             Diag.Log("MP.Loaded: render done");
+            Diag.Mem("loaded.renderDone");
             StartCaptureHarness();
             if (!GuiVerificationFixture.Enabled) StartAgentBridge();
             StartLiveReader();
@@ -121,6 +160,7 @@ public sealed partial class MainPage : Page
         }
         catch (Exception ex)
         {
+            _pageLoadStarted = false;
             Diag.Log("MP.Loaded: page initialization failed: " + ex);
         }
     }
@@ -138,7 +178,6 @@ public sealed partial class MainPage : Page
     // all ride it, and it keeps ONE FileSystemWatcher per top-level directory underneath.
     private FileWatchService? _fileWatchService;
     private FileWatchService FileWatch => _fileWatchService ??= new FileWatchService();
-    private bool _openFreshenDone;   // one fresh re-parse per chat-open, so a cached transcript is never stale
 
     // Force a fresh re-parse of the just-opened chat from disk, then repaint if it actually changed. This
     // defeats stale index-time transcripts (e.g. a huge Codex chat that was head-capped days ago) — the
@@ -248,11 +287,7 @@ public sealed partial class MainPage : Page
                 var restored = keepId is not null
                     ? _archive.Sessions.FirstOrDefault(s => string.Equals(s.Id, keepId, StringComparison.OrdinalIgnoreCase))
                     : null;
-                RunSessionListRefresh(() =>
-                {
-                    _selected = restored;
-                    SelectSessionRow(restored);
-                });
+                RunSessionListRefresh(() => ApplySelection(restored));
                 RenderCurrent();
             }
         }
@@ -290,6 +325,20 @@ public sealed partial class MainPage : Page
         _refreshingSessionList = true;
         try { refresh(); }
         finally { _refreshingSessionList = false; }
+    }
+
+    // Re-point the list's selection ONLY when it actually moved. Assigning SelectedItem is not a no-op in
+    // WinUI: it scrolls that row back into view, re-realizes its container, and takes the keyboard/pointer
+    // focus onto the list. A background sync fires every 30s for as long as an agent is writing, and both
+    // ReapplyActiveFilter and the post-sync restore used to re-point the selection unconditionally, so an
+    // untouched selection was being torn out from under the user twice per cycle. Object identity is the
+    // right test: a merge that changed a chat replaces its ArchiveSession (Store.Sessions[id] = incoming),
+    // so a genuinely changed chat still re-points while an unchanged one is left alone.
+    private void ApplySelection(ArchiveSession? restored)
+    {
+        if (ReferenceEquals(restored, _selected)) return;
+        _selected = restored;
+        SelectSessionRow(restored);
     }
 
     private bool SessionListSelectionSuppressed => _suppressSelChanged || _refreshingSessionList;
@@ -489,6 +538,21 @@ public sealed partial class MainPage : Page
     private List<ArchiveMessage>? _fullMsgs; // FULL transcript (no 600-window) for the filtered views
     private string _fullMsgsFor = "";
     private bool _fullMsgsLoading;
+    private const int MaxFilteredMessages = 1200;
+
+    private void ClearFilteredMessages()
+    {
+        _fullMsgs = null;
+        _fullMsgsFor = "";
+    }
+
+    private async Task ReleaseWhenContentLoadCompletesAsync(ArchiveSession session)
+    {
+        while (ReferenceEquals(_contentLoadingSession, session))
+            await Task.Delay(50);
+        if (!ReferenceEquals(_selected, session))
+            _archive.ReleaseContent(session);
+    }
 
     // The messages the reader currently shows, after the agent-only / user-only toggle. "all" uses the real
     // (windowed) collection; the filtered modes scan the FULL transcript so a long agent run whose recent
@@ -518,6 +582,8 @@ public sealed partial class MainPage : Page
         try
         {
             var full = await _archive.ExtractReaderMessagesAsync(sess, filter);
+            if (full.Count > MaxFilteredMessages)
+                full = full.Skip(Math.Max(0, full.Count - MaxFilteredMessages)).ToList();
             if (IsSelectedSession(sess) && _msgFilter == filter) { _fullMsgs = full; _fullMsgsFor = sess.Id + "|" + filter; }
         }
         catch (Exception ex) { Diag.Log("ExtractReaderMessages: " + ex.Message); }
@@ -640,7 +706,7 @@ public sealed partial class MainPage : Page
         }
 
         // New chat selected -> start fresh and jump to the newest messages once it renders.
-        if (!string.Equals(_selected?.Id, _lastArchiveSession?.Id, StringComparison.OrdinalIgnoreCase)) { _archiveShown = 0; _lastArchiveSession = _selected; _scrollArchiveToBottom = true; _msgFilter = "all"; _jumpUserAnchor = null; _fullMsgs = null; _fullMsgsFor = ""; _openFreshenDone = false; UpdateMsgViewToggle(); }
+        if (!string.Equals(_selected?.Id, _lastArchiveSession?.Id, StringComparison.OrdinalIgnoreCase)) { _archiveShown = 0; _lastArchiveSession = _selected; _scrollArchiveToBottom = true; _msgFilter = "all"; _jumpUserAnchor = null; ClearFilteredMessages(); UpdateMsgViewToggle(); }
 
         // Content lazy-loads from the source file the first time you open a chat (the store holds only
         // metadata). The reader shows the MOST RECENT messages at the bottom; scrolling up auto-loads
@@ -657,13 +723,8 @@ public sealed partial class MainPage : Page
             return;
         }
 
-        // Content is cached (from index time or a prior open) — render it now, but force ONE fresh re-parse
-        // per open so a chat NEVER shows a stale transcript from a previous session (the "3 days old" bug).
-        if (selected is not null && !_openFreshenDone && !selected.IsReadOnlySnapshot)
-        {
-            _openFreshenDone = true;
-            _ = FreshenOpenChatAsync(selected);
-        }
+        // Cached content is authoritative until the live watcher observes a source change. Avoid the
+        // previous unconditional second parse on every open; that doubled transient allocations for large chats.
 
         var messages = CurrentReaderMessages();
         if (selected is null) return;

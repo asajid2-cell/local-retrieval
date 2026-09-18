@@ -31,7 +31,7 @@ public sealed partial class MainPage
 
     private void StartCaptureHarness()
     {
-        if (Environment.GetEnvironmentVariable("CLR_CAPTURE") != "1") return;
+        if (Environment.GetEnvironmentVariable("CLR_CAPTURE") != "1" || _capTimer is not null) return;
         try { Directory.CreateDirectory(Path.Combine(CapDir, "out")); } catch { }
         Diag.Log("Capture harness ENABLED, dir=" + CapDir);
         _capTimer = DispatcherQueue.CreateTimer();
@@ -39,6 +39,13 @@ public sealed partial class MainPage
         _capTimer.Tick += async (_, _) => await PollCaptureAsync();
         _capTimer.Start();
         try { File.WriteAllText(Path.Combine(CapDir, "ready.txt"), DateTime.Now.ToString("o")); } catch { }
+    }
+
+    private void StopCaptureHarness()
+    {
+        _capTimer?.Stop();
+        _capTimer = null;
+        _capBusy = false;
     }
 
     private async Task PollCaptureAsync()
