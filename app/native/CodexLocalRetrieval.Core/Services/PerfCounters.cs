@@ -25,6 +25,10 @@ public static class PerfCounters
     private static long _storeBytesWritten;
     private static long _storeHeaderScans;
 
+    /// Diagnostics seam. Null unless a harness installs a sink, so production pays one null check.
+    /// Used to attribute time / bytes read / heap growth to a named phase without a profiler.
+    public static Action<string>? Trace;
+
     /// One SearchText(session) interpolation — recomposed per session per term today.
     public static void SearchTextComposed(long count = 1) => Interlocked.Add(ref _searchTextCompositions, count);
 

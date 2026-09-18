@@ -1,6 +1,7 @@
 using System.Collections.ObjectModel;
 using System.Runtime.CompilerServices;
 using System.Security.Cryptography;
+using System.Buffers;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
@@ -33,10 +34,13 @@ public sealed partial class ArchiveService
     // The reader keeps the MOST RECENT messages (not the oldest), so a long chat opens on its latest
     // turns. The first prompt is still captured for the title before this window is applied.
     private const int RecentMessageWindow = 600;
-    private const int MaxLinesPerSession = 18_000;
+    private const int MaxLinesPerSession = 6_000;
     private const int MaxLineChars = 512_000;
-    private const int ClaudeTailBytes = 32 * 1024 * 1024;
-    private const int CodexTailBytes = 16 * 1024 * 1024;
+    // Final-record probe window. The last line is the only thing that check needs, and a live transcript
+    // can be hundreds of MB, so the whole file is no longer re-read to find its own tail.
+    private const int FinalRecordProbeBytes = 1024 * 1024;
+    private const int ClaudeTailBytes = 8 * 1024 * 1024;
+    private const int CodexTailBytes = 8 * 1024 * 1024;
     private const int SearchTextCap = 6_000; // capped, in-memory searchable text per session (full content lazy-loads)
     private const int MaxDiskSearchParallelism = 4;
     private const long MaxDiskSearchBytesPerFile = 128L * 1024 * 1024;
@@ -101,50 +105,110 @@ public sealed partial class ArchiveService
         }
     }
 
-    // Count REAL user prompts across the ENTIRE transcript (NOT bounded by the 18000-line parse cap), so a
-    // long autonomous run's user-message count is accurate for the "min user messages" filter. The windowed
-    // parse only saw prompts in its window and badly undercounted (a 52-prompt chat read as 1). Cheap: a
-    // pre-filtered line scan that JSON-parses only the candidate lines.
+    // Count REAL user prompts across the ENTIRE transcript (NOT bounded by the parse line cap), so a long
+    // autonomous run's user-message count is accurate for the "min user messages" filter. The windowed
+    // parse only saw prompts in its window and badly undercounted (a 52-prompt chat read as 1).
+    //
+    // The scan is RESUMABLE. A live transcript is append-only, so a sync that re-parsed a 500 MB rollout
+    // because 17 KB had been appended was re-reading all 500 MB just to re-derive a number it already had.
+    // The cursor is a byte offset, never a line count: a line number would still have to walk the file to
+    // find. A file that shrank (truncated or replaced) restarts from zero, exactly like AppendCursor.
+    private sealed record PromptCountCursor(long Offset, int Count);
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, PromptCountCursor> PromptCounts =
+        new(StringComparer.OrdinalIgnoreCase);
+
     private static int CountUserPrompts(string filePath, string tool)
     {
         var isClaude = string.Equals(tool, "claude", StringComparison.OrdinalIgnoreCase);
         var count = 0;
         try
         {
+            var length = new FileInfo(filePath).Length;
+            var offset = 0L;
+            if (PromptCounts.TryGetValue(filePath, out var cached) && cached.Offset <= length)
+            {
+                count = cached.Count;
+                offset = cached.Offset;
+            }
+            if (length <= offset) return count;
+
             // Shared read (ReadWrite|Delete) so a LIVE rollout — one the running agent still has open for
             // append — is counted instead of throwing a sharing violation (which silently zeroed the count).
-            foreach (var line in SafeReadLines(filePath))
+            using var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read,
+                FileShare.ReadWrite | FileShare.Delete, 256 * 1024, FileOptions.SequentialScan);
+            fs.Seek(offset, SeekOrigin.Begin);
+
+            var chunk = new byte[256 * 1024];
+            var lineBytes = new List<byte>(4096);
+            var oversized = false;
+            var consumed = offset;      // byte position just past the last COMPLETE line
+            var basePos = offset;
+            int read;
+            while ((read = fs.Read(chunk, 0, chunk.Length)) > 0)
             {
-                if (line.Length < 12 || line.Length > MaxLineChars) continue;
-                try
+                PerfCounters.TranscriptBytesRead(read);
+                var start = 0;
+                for (var i = 0; i < read; i++)
                 {
-                    if (isClaude)
-                    {
-                        // Claude files a real prompt as type "user" with text content; tool_results are also
-                        // role=user but aren't prompts, so require a text block and reject tool_result lines.
-                        if (!line.Contains("\"user\"", StringComparison.Ordinal)) continue;
-                        if (line.Contains("\"tool_result\"", StringComparison.Ordinal)) continue;
-                        using var doc = JsonDocument.Parse(line);
-                        var root = doc.RootElement;
-                        if (!root.TryGetProperty("type", out var tp) || tp.GetString() != "user") continue;
-                        if (!root.TryGetProperty("message", out var msg)) continue;
-                        if (msg.TryGetProperty("role", out var r) && r.GetString() != "user") continue;
-                        if (ClaudeContentIsRealText(msg)) count++;
-                    }
-                    else
-                    {
-                        // Codex records the typed prompt as an event_msg with payload.type "user_message".
-                        if (!line.Contains("\"user_message\"", StringComparison.Ordinal)) continue;
-                        using var doc = JsonDocument.Parse(line);
-                        if (doc.RootElement.TryGetProperty("payload", out var p)
-                            && p.TryGetProperty("type", out var t) && t.GetString() == "user_message") count++;
-                    }
+                    if (chunk[i] != (byte)'\n') continue;
+                    AppendLineBytes(lineBytes, chunk, start, i - start, ref oversized);
+                    if (!oversized && IsUserPromptLine(DecodeLine(lineBytes), isClaude)) count++;
+                    lineBytes.Clear();
+                    oversized = false;
+                    start = i + 1;
+                    consumed = basePos + i + 1;   // 0x0A never occurs inside a multi-byte character
                 }
-                catch { }
+                AppendLineBytes(lineBytes, chunk, start, read - start, ref oversized);
+                basePos += read;
             }
+            // Anything after `consumed` is a half-written tail; it is left for the next scan rather than
+            // counted, so a mid-append read can neither lose a prompt nor count one twice.
+            PromptCounts[filePath] = new PromptCountCursor(consumed, count);
         }
         catch { }
         return count;
+    }
+
+    // Accumulate one line's bytes, abandoning the buffer once it can no longer be a countable record.
+    private static void AppendLineBytes(List<byte> target, byte[] source, int start, int length, ref bool oversized)
+    {
+        if (oversized || length <= 0) return;
+        var limit = (long)MaxLineChars * 4;   // upper bound on a UTF-8 encoding of MaxLineChars chars
+        if (target.Count + length > limit) { oversized = true; target.Clear(); return; }
+        for (var i = start; i < start + length; i++) target.Add(source[i]);
+    }
+
+    private static string DecodeLine(List<byte> bytes)
+    {
+        var text = Encoding.UTF8.GetString(bytes.ToArray());
+        return text.Length > 0 && text[0] == '\uFEFF' ? text[1..] : text;
+    }
+
+    private static bool IsUserPromptLine(string line, bool isClaude)
+    {
+        if (line.Length < 12 || line.Length > MaxLineChars) return false;
+        try
+        {
+            if (isClaude)
+            {
+                // Claude files a real prompt as type "user" with text content; tool_results are also
+                // role=user but aren't prompts, so require a text block and reject tool_result lines.
+                if (!line.Contains("\"user\"", StringComparison.Ordinal)) return false;
+                if (line.Contains("\"tool_result\"", StringComparison.Ordinal)) return false;
+                using var doc = JsonDocument.Parse(line);
+                var root = doc.RootElement;
+                if (!root.TryGetProperty("type", out var tp) || tp.GetString() != "user") return false;
+                if (!root.TryGetProperty("message", out var msg)) return false;
+                if (msg.TryGetProperty("role", out var r) && r.GetString() != "user") return false;
+                return ClaudeContentIsRealText(msg);
+            }
+            // Codex records the typed prompt as an event_msg with payload.type "user_message".
+            if (!line.Contains("\"user_message\"", StringComparison.Ordinal)) return false;
+            using var doc2 = JsonDocument.Parse(line);
+            return doc2.RootElement.TryGetProperty("payload", out var p)
+                && p.TryGetProperty("type", out var t) && t.GetString() == "user_message";
+        }
+        catch { return false; }
     }
     private static bool ClaudeContentIsRealText(JsonElement msg)
     {
@@ -217,6 +281,13 @@ public sealed partial class ArchiveService
 
     internal Action<DurableWriteStage>? StoreWriteFault { get; set; }
     internal Action<string, double>? SavePhaseMeasured { get; set; }
+
+    // Observations from the most recent merge, for the server's phase trace. A merge's duration is not
+    // actionable on its own: adopting another writer's store costs a full LoadAsync, and a fresh index
+    // build runs in the background, so the two are reported separately rather than lumped into one number.
+    public int LastMergeLoadRetries { get; private set; }
+    public bool LastMergeSearchIndexQueued { get; private set; }
+
     public AppStoreData Store { get; private set; } = new();
     public ObservableCollection<ArchiveSession> Sessions { get; } = new();
 
@@ -439,50 +510,75 @@ public sealed partial class ArchiveService
         {
             cancellationToken.ThrowIfCancellationRequested();
             Exception? primaryError = null;
-            var candidates = new List<(string Path, byte[] Bytes, AppStoreData Store, DateTime WrittenAt, bool Primary)>();
+
+            // The primary is read eagerly: it wins unless a backup holds a STRICTLY newer generation.
+            AppStoreData? primaryStore = null;
             if (File.Exists(_storePath))
             {
-                try
-                {
-                    var bytes = File.ReadAllBytes(_storePath);
-                    candidates.Add((_storePath, bytes, ReadStore(bytes, _storePath), File.GetLastWriteTimeUtc(_storePath), true));
-                }
-                catch (Exception error)
-                {
-                    primaryError = error;
-                }
+                try { primaryStore = ReadStore(_storePath); }
+                catch (Exception error) { primaryError = error; }
             }
             else
             {
                 primaryError = new FileNotFoundException("The primary app store is missing.", _storePath);
             }
 
+            // Rank the backups by persisted generation WITHOUT materializing them first. Every backup is a
+            // complete store -- tens of MB on a real archive -- and deserializing all of them at launch
+            // solely to compare a number inflated ~30 whole archives into the managed heap, discarding
+            // every one but the winner. That was the largest single allocation of startup, by an order of
+            // magnitude. ReadStoreGeneration answers from each file's bounded header instead, and only a
+            // candidate that can actually win is read whole, in rank order.
+            var primaryGeneration = primaryStore?.Generation ?? long.MinValue;
+            var ranked = new List<(string Path, long Generation, DateTime WrittenAt)>();
             foreach (var backup in StoreBackupFiles())
             {
                 try
                 {
-                    var bytes = File.ReadAllBytes(backup);
-                    candidates.Add((backup, bytes, ReadStore(bytes, backup), File.GetLastWriteTimeUtc(backup), false));
+                    var generation = ReadStoreGeneration(backup);
+                    if (primaryStore is not null && generation <= primaryGeneration) continue;
+                    ranked.Add((backup, generation, File.GetLastWriteTimeUtc(backup)));
                 }
                 catch
                 {
                     // Keep scanning. Recovery is selected by persisted generation, not directory order.
                 }
             }
+            PerfCounters.Trace?.Invoke(
+                $"load primaryMB={(primaryStore is null ? 0 : new FileInfo(_storePath).Length / 1048576)}"
+                + $" backups={StoreBackupFiles().Count()} candidates={ranked.Count}"
+                + $" heapMB={GC.GetTotalMemory(false) / 1048576.0:F0}");
 
-            var selected = candidates
-                .OrderByDescending(candidate => candidate.Store.Generation)
-                .ThenByDescending(candidate => candidate.Primary)
-                .ThenByDescending(candidate => candidate.WrittenAt)
-                .FirstOrDefault();
-            if (selected.Store is null)
+            var selectedPath = _storePath;
+            var selectedStore = primaryStore;
+            byte[]? selectedBytes = null;
+            foreach (var candidate in ranked
+                         .OrderByDescending(entry => entry.Generation)
+                         .ThenByDescending(entry => entry.WrittenAt))
+            {
+                try
+                {
+                    var bytes = File.ReadAllBytes(candidate.Path);
+                    selectedStore = ReadStore(bytes, candidate.Path);
+                    selectedBytes = bytes;
+                    selectedPath = candidate.Path;
+                    break;
+                }
+                catch
+                {
+                    // That snapshot is unreadable. The next-ranked one is still a better answer than
+                    // nothing, and the primary remains the fallback below.
+                }
+            }
+
+            if (selectedStore is null)
             {
                 throw new InvalidDataException(
                     "The app store is corrupt or missing and no valid durable backup could be recovered.",
                     primaryError);
             }
-            if (selected.Primary || !restoreBackup)
-                return selected.Store;
+            if (string.Equals(selectedPath, _storePath, StringComparison.OrdinalIgnoreCase) || !restoreBackup)
+                return selectedStore;
 
             var supersededBackup = Path.Combine(
                 StoreBackupsDir,
@@ -490,7 +586,7 @@ public sealed partial class ArchiveService
                 + Guid.NewGuid().ToString("N") + ".json");
             try
             {
-                await DurableFileStore.WriteAtomicAsync(_storePath, selected.Bytes, supersededBackup);
+                await DurableFileStore.WriteAtomicAsync(_storePath, selectedBytes!, supersededBackup);
             }
             catch (Exception restoreError)
             {
@@ -498,7 +594,7 @@ public sealed partial class ArchiveService
                     "The newest valid app-store backup could not be restored.",
                     restoreError);
             }
-            return selected.Store;
+            return selectedStore;
         });
     }
 
@@ -546,7 +642,7 @@ public sealed partial class ArchiveService
                 throw new InvalidDataException("Isolated archive paths cannot traverse reparse points.");
     }
 
-    private static void ValidateStoreShape(byte[] bytes, string source)
+    private static void ValidateStoreShape(ReadOnlyMemory<byte> bytes, string source)
     {
         PerfCounters.StoreJsonParse();
         using var document = JsonDocument.Parse(bytes);
@@ -772,6 +868,14 @@ public sealed partial class ArchiveService
         Task.Run(() => EnsureContentAsync(session)).GetAwaiter().GetResult();
     }
 
+    // Drop parsed transcript content while retaining the durable metadata. This keeps the archive bounded
+    // when the user moves between chats instead of retaining every opened transcript forever.
+    public void ReleaseContent(ArchiveSession session)
+    {
+        if (session is null || !session.ContentLoaded) return;
+        ReleaseIndexedContent(session);
+    }
+
     // Force a fresh re-parse from disk (the live tail of an open chat as the agent keeps writing it).
     public async Task ReloadContentAsync(ArchiveSession session)
     {
@@ -801,6 +905,24 @@ public sealed partial class ArchiveService
         var changed = ApplyThreadTitles(titles);
         if (changed) ReapplyList();
         return changed;
+    }
+
+    // One reusable serialization buffer, retained across saves. The store is ~57 MB and is rewritten on
+    // every sync, so `SerializeToUtf8Bytes` was allocating a fresh 57 MB large-object-heap array each time
+    // AND growing it by doubling (16 -> 32 -> 64 MB, ~112 MB of dead LOH per save) before copying into the
+    // final one. `ArrayBufferWriter.Clear()` resets the written count while KEEPING its buffer, so after
+    // the first save of a given size this costs no allocation at all.
+    // The returned span aliases this buffer, so it is valid only until the next save - which is exactly
+    // the lifetime the caller needs, because the save gate is held for the whole operation.
+    private ArrayBufferWriter<byte>? _serializationBuffer;
+
+    private ReadOnlyMemory<byte> SerializeStore()
+    {
+        var writer = _serializationBuffer ??= new ArrayBufferWriter<byte>(1 << 20);
+        writer.Clear();
+        using (var json = new Utf8JsonWriter(writer))
+            JsonSerializer.Serialize(json, Store, StorePayloadJsonOptions);
+        return writer.WrittenMemory;
     }
 
     public async Task SaveAsync(CancellationToken cancellationToken = default)
@@ -840,44 +962,70 @@ public sealed partial class ArchiveService
             // Store.Sessions while a worker is midway through walking it. Compact output makes this step
             // cheaper without introducing that race; a snapshot cheap enough to hand off does not exist,
             // because building one costs the same walk as serializing.
-            var bytes = JsonSerializer.SerializeToUtf8Bytes(Store, StorePayloadJsonOptions);
+            var bytes = SerializeStore();
             MeasurePhase("serialize");
-            PerfCounters.StoreBytesWritten(bytes.LongLength);
+            PerfCounters.StoreBytesWritten(bytes.Length);
+            PerfCounters.Trace?.Invoke(
+                $"save serialize storeMB={bytes.Length / 1048576.0:F0} sessions={Store.Sessions.Count}"
+                + $" heapMB={GC.GetTotalMemory(false) / 1048576.0:F0}");
             try
             {
-                await Task.Run(async () =>
+                try
                 {
-                    cancellationToken.ThrowIfCancellationRequested();
-                    // `bytes` is immutable from here, so validating it off-thread is safe -- and this
-                    // replaces a full Deserialize<AppStoreData> of every chat whose result was discarded.
-                    // The shape check is what the commit actually depends on.
-                    ValidateStoreShape(bytes, "serialized app store");
-                    Directory.CreateDirectory(StoreBackupsDir);
-                    var stamp = DateTime.UtcNow.ToString("yyyyMMdd-HHmmss-fff") + "-"
-                                + Guid.NewGuid().ToString("N");
-                    var previousBackup = Path.Combine(
-                        StoreBackupsDir,
-                        StoreBackupPrefix + stamp + "-previous.json");
-                    await DurableFileStore.WriteAtomicAsync(_storePath, bytes, previousBackup, StoreWriteFault);
-                    var committedBackup = Path.Combine(
-                        StoreBackupsDir,
-                        StoreBackupPrefix + stamp + "-committed.json");
-                    try
+                    await Task.Run(async () =>
                     {
-                        await DurableFileStore.WriteAtomicAsync(committedBackup, bytes);
-                    }
-                    catch (Exception backupError)
-                    {
-                        throw new DurableWriteException(
-                            "The app store committed, but its redundant committed-generation snapshot failed.",
-                            backupError,
-                            committed: true,
-                            recovered: false,
-                            verificationUnknown: backupError is DurableWriteException durable
-                                                 && durable.VerificationUnknown);
-                    }
-                    PruneOldFiles(StoreBackupsDir, StoreBackupPrefix + "*.json", MaxAutoBackups);
-                });
+                        cancellationToken.ThrowIfCancellationRequested();
+                        // `bytes` is immutable from here, so validating it off-thread is safe -- and this
+                        // replaces a full Deserialize<AppStoreData> of every chat whose result was
+                        // discarded. The shape check is what the commit actually depends on.
+                        ValidateStoreShape(bytes, "serialized app store");
+                        Directory.CreateDirectory(StoreBackupsDir);
+                        var stamp = DateTime.UtcNow.ToString("yyyyMMdd-HHmmss-fff") + "-"
+                                    + Guid.NewGuid().ToString("N");
+                        var previousBackup = Path.Combine(
+                            StoreBackupsDir,
+                            StoreBackupPrefix + stamp + "-previous.json");
+                        // `bytes` aliases the reusable serialization buffer. Both writes complete inside
+                        // this task, and the buffer is only reused by a later save, so the alias is safe
+                        // for exactly as long as it is needed.
+                        var commitWatch = System.Diagnostics.Stopwatch.StartNew();
+                        await DurableFileStore.WriteAtomicAsync(
+                            _storePath, bytes, previousBackup, StoreWriteFault);
+                        var primaryMs = commitWatch.ElapsedMilliseconds;
+                        var committedBackup = Path.Combine(
+                            StoreBackupsDir,
+                            StoreBackupPrefix + stamp + "-committed.json");
+                        try
+                        {
+                            await DurableFileStore.WriteAtomicAsync(committedBackup, bytes);
+                            PerfCounters.Trace?.Invoke(
+                                $"save commit primaryMs={primaryMs} snapshotMs={commitWatch.ElapsedMilliseconds - primaryMs}"
+                                + $" storeMB={bytes.Length / 1048576.0:F0}");
+                        }
+                        catch (Exception backupError)
+                        {
+                            throw new DurableWriteException(
+                                "The app store committed, but its redundant committed-generation snapshot failed.",
+                                backupError,
+                                committed: true,
+                                recovered: false,
+                                verificationUnknown: backupError is DurableWriteException durable
+                                                     && durable.VerificationUnknown);
+                        }
+                    });
+                }
+                finally
+                {
+                    // Retention is a `finally` on purpose: it must also run when the commit itself failed,
+                    // which is exactly the case that used to grow this directory without bound. Pruning
+                    // used to be the last statement of the success path, so the moment a commit started
+                    // failing the snapshots stopped being bounded and grew by two whole-store copies per
+                    // attempt - 5.8 GB in under an hour of app-store.json being held open elsewhere.
+                    var pruneWatch = System.Diagnostics.Stopwatch.StartNew();
+                    PruneStoreBackups();
+                    if (pruneWatch.ElapsedMilliseconds >= 100)
+                        PerfCounters.Trace?.Invoke($"save pruneMs={pruneWatch.ElapsedMilliseconds}");
+                }
                 _loadedGeneration = nextGeneration;
             }
             catch (DurableWriteException error) when (error.Committed)
@@ -1172,6 +1320,9 @@ public sealed partial class ArchiveService
             return new UnifiedSearchResult(legacy, coverage);
         }
 
+        // Build the large transcript index lazily when search is actually requested. Starting it during
+        // archive startup competes with the initial scan and creates a large transient memory/disk spike.
+        StartTranscriptSearchIndexBuild(cancellationToken);
         var indexed = await _transcriptSearchIndex.SearchAsync(
             query,
             Math.Max(limit, 100),
@@ -2193,6 +2344,24 @@ public sealed partial class ArchiveService
     // ---- Backup / export / import (lightweight metadata only) -------------------------------------
 
     private const int MaxAutoBackups = 30;
+
+    // Store-snapshot retention. Every accepted save writes TWO whole-store snapshots (the pre-replace
+    // bytes, plus a redundant copy of the committed bytes), so a count cap is really a disk cap: keeping
+    // 30 of them for one 57 MB store is 1.7 GB of snapshots sitting beside a 57 MB store. Bound the count
+    // AND the bytes. Recovery ranks the newest generations first, so older ones are worth their disk only
+    // as far as the floor; nothing beyond that is worth a gigabyte.
+    private const int MaxStoreBackups = 8;
+    private const int MinStoreBackups = 3;
+    private const long MaxStoreBackupBytes = 512L * 1024 * 1024;
+
+    // Superseded snapshots hold the bytes of a primary that was corrupt enough to be replaced. That is
+    // corruption evidence, not a recovery candidate - nothing enumerates them - so they get a small
+    // budget of their own rather than competing with the genuine generations for the store budget.
+    private const int MaxSupersededBackups = 2;
+
+    // A commit's temp file only exists between its creation and its rename, so anything this old is
+    // memory of a process that died mid-write rather than a write in progress.
+    private static readonly TimeSpan AbandonedTempAge = TimeSpan.FromHours(1);
     public string StoreBackupsDir => Path.Combine(Path.GetDirectoryName(_storePath)!, "store-backups");
     public string CollectionBackupsDir => Path.Combine(Path.GetDirectoryName(_storePath)!, "collection-backups");
 
@@ -2283,6 +2452,61 @@ public sealed partial class ArchiveService
         {
             foreach (var old in Directory.GetFiles(dir, pattern).OrderByDescending(f => f).Skip(Math.Max(1, keep)))
                 TryDeleteFile(old);
+        }
+        catch { }
+    }
+
+    // Bound the store-snapshot directory. Two things this has to get right that the generic prune did not:
+    //  - it must also sweep `superseded-app-store-*.json`, the snapshots written before a corrupt primary
+    //    is restored over. Nothing enumerates them for recovery, so without an explicit sweep nothing
+    //    ever removes them.
+    //  - it must keep the NEWEST snapshot of a class unconditionally: that is the generation recovery
+    //    ranks first, and it is also the only copy of the pre-save bytes when a commit has just been
+    //    refused.
+    private void PruneStoreBackups()
+    {
+        try
+        {
+            if (!Directory.Exists(StoreBackupsDir)) return;
+            PruneSnapshotSet(StoreBackupsDir, StoreBackupPrefix + "*.json", MaxStoreBackups, MinStoreBackups, MaxStoreBackupBytes);
+            PruneSnapshotSet(StoreBackupsDir, "superseded-" + StoreBackupPrefix + "*.json", MaxSupersededBackups, 0, 0);
+            // A commit's temp file is removed in a `finally`, so one that survives means the process died
+            // mid-write. Nothing reads `*.tmp`, and at whole-store sizes they are not small: 162 MB of them
+            // were sitting in the live data directory and the snapshot directory. Sweep both, age-gated so
+            // a write in flight right now (its temp file is milliseconds old) is never the one removed.
+            var abandoned = DateTime.UtcNow - AbandonedTempAge;
+            PruneAbandonedTemps(StoreBackupsDir, abandoned);
+            PruneAbandonedTemps(Path.GetDirectoryName(_storePath)!, abandoned);
+        }
+        catch { }
+    }
+
+    // Keep the newest `keep` snapshots, never fewer than `floor`, and never let the running total exceed
+    // `maxBytes` past that floor. `bytes` accumulates newest-first, so the first file that pushes the set
+    // over a bound takes every older one with it - the retained set is always a newest-first prefix.
+    private static void PruneSnapshotSet(string dir, string pattern, int keep, int floor, long maxBytes)
+    {
+        var ranked = Directory.EnumerateFiles(dir, pattern)
+            .Select(path => new FileInfo(path))
+            .OrderByDescending(file => file.LastWriteTimeUtc)
+            .ToList();
+        long bytes = 0;
+        for (var index = 0; index < ranked.Count; index++)
+        {
+            bytes += ranked[index].Length;
+            if (index == 0) continue;
+            if (index < floor) continue;
+            if (index < keep && (maxBytes <= 0 || bytes <= maxBytes)) continue;
+            TryDeleteFile(ranked[index].FullName);
+        }
+    }
+
+    private static void PruneAbandonedTemps(string dir, DateTime cutoff)
+    {
+        try
+        {
+            foreach (var temp in Directory.EnumerateFiles(dir, "*.tmp"))
+                if (File.GetLastWriteTimeUtc(temp) < cutoff) TryDeleteFile(temp);
         }
         catch { }
     }
@@ -4187,6 +4411,8 @@ public sealed partial class ArchiveService
     // (incremental), and routes parsing by the source's tool. Touches no shared mutable state.
     public async Task<DiskScan> ScanDiskAsync(IProgress<string>? progress = null, CancellationToken cancellationToken = default)
     {
+        var scanWatch = System.Diagnostics.Stopwatch.StartNew();
+        var bytesAtScanStart = PerfCounters.Snapshot()["transcriptBytesRead"];
         var sources = EffectiveSources()
             .Select(source => new SessionSource { Tool = source.Tool, Root = source.Root, Enabled = source.Enabled })
             .ToList();
@@ -4211,6 +4437,10 @@ public sealed partial class ArchiveService
             foreach (var kv in srcStamps) stamps[kv.Key] = kv.Value;
         }
         if (!anyRoot) progress?.Report("No session folders found.");
+        var bytesRead = PerfCounters.Snapshot()["transcriptBytesRead"] - bytesAtScanStart;
+        PerfCounters.Trace?.Invoke(
+            $"scan files={disk.Count} bundled={bundled.Count} fullRescan={fullRescan}"
+            + $" transcriptMB={bytesRead / 1048576.0:F0} ms={scanWatch.ElapsedMilliseconds}");
         return new DiskScan(disk, bundled) { Stamps = stamps, FullRescan = fullRescan };
     }
 
@@ -4245,6 +4475,7 @@ public sealed partial class ArchiveService
             .ToList();
         var parsed = new List<ArchiveSession>();
         var stamps = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        long unchanged = 0;
         foreach (var entry in newestFiles)
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -4266,10 +4497,14 @@ public sealed partial class ArchiveService
                 if (known.TryGetValue(file.FullName, out var old) && old == stamp)
                 {
                     stamps[file.FullName] = stamp; // unchanged: carry the stamp forward, skip the parse
+                    unchanged++;
                     continue;
                 }
 
+                var fileWatch = System.Diagnostics.Stopwatch.StartNew();
+                var heapBefore = GC.GetTotalMemory(false);
                 var session = await ParseSessionAsync(file.FullName, src.Tool);
+                var parseMs = fileWatch.ElapsedMilliseconds;
                 var complete = session is null || FinalRecordIsComplete(file.FullName); // valid JSON is enough for non-message records; message records require their text field.
                 if (session is not null)
                 {
@@ -4280,6 +4515,12 @@ public sealed partial class ArchiveService
                     stamps[file.FullName] = stamp; // an incomplete transcript must be retried on the next scan
                 else
                     progress?.Report($"Deferred {file.Name}: incomplete transcript");
+                // Only files big enough to matter are traced; a small chat's parse is not interesting and
+                // the trace itself is not free.
+                if (file.Length >= 1_000_000)
+                    PerfCounters.Trace?.Invoke(
+                        $"parse {file.Name} size={file.Length} parseMs={parseMs} verifyMs={fileWatch.ElapsedMilliseconds - parseMs}"
+                        + $" heapDeltaMB={(GC.GetTotalMemory(false) - heapBefore) / 1048576.0:F1} heapNowMB={GC.GetTotalMemory(false) / 1048576.0:F0}");
             }
             catch (Exception ex)
             {
@@ -4288,15 +4529,63 @@ public sealed partial class ArchiveService
             }
         }
         progress?.Report($"{src.Tool}: {parsed.Count} new/changed of {newestFiles.Count}");
+        PerfCounters.Trace?.Invoke(
+            $"source {src.Tool} {src.Root} files={newestFiles.Count} unchanged={unchanged} parsed={parsed.Count}");
         return (parsed, stamps);
     }
 
+    // Whether the FINAL record of a transcript is complete, so an in-progress rollout is retried on the
+    // next scan rather than stamped forever from a half-written turn. Only the tail can answer this: the
+    // previous implementation drained the whole enumeration for its last element, which re-read every byte
+    // of a live transcript (hundreds of MB here) on each scan purely to examine its own last line.
     private static bool FinalRecordIsComplete(string path)
     {
         try
         {
+            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            var length = fs.Length;
+            var window = (int)Math.Min(length, FinalRecordProbeBytes);
+            if (window <= 0) return true;
+            var offset = length - window;
+            fs.Seek(offset, SeekOrigin.Begin);
+            var buf = new byte[window];
+            var read = fs.Read(buf, 0, window);
+            PerfCounters.TranscriptBytesRead(read);
+            var text = Encoding.UTF8.GetString(buf, 0, read);
+
+            var lastNewline = text.LastIndexOf('\n');
+            if (lastNewline < 0)
+            {
+                // The file is shorter than the window and holds a single line: nothing was truncated, so
+                // it is the final record outright.
+                return IsCompleteJsonRecord(text.Trim());
+            }
+
+            var tail = text[(lastNewline + 1)..].Trim();
+            if (tail.Length == 0)
+            {
+                // The file ends on a newline; the record is the line before it.
+                var prior = text[..lastNewline];
+                var priorNewline = prior.LastIndexOf('\n');
+                tail = (priorNewline < 0 ? prior : prior[(priorNewline + 1)..]).Trim();
+            }
+
+            // A line at or past the reader's cap is dropped by the streaming reader and the previous line is
+            // tested instead; a window this size cannot rule out truncation of such a line, so defer to the
+            // streaming read rather than guess.
+            if (tail.Length >= MaxLineChars || (offset > 0 && tail.Length >= window)) return FinalRecordIsCompleteSlow(path);
+            return IsCompleteJsonRecord(tail);
+        }
+        catch { return false; }
+    }
+
+    private static bool FinalRecordIsCompleteSlow(string path)
+    {
+        try
+        {
+            try { PerfCounters.TranscriptBytesRead(new FileInfo(path).Length); } catch { }
             var last = SafeReadLines(path).LastOrDefault(line => !string.IsNullOrWhiteSpace(line));
-            return last is null || IsCompleteJsonRecord(last); // message records are also checked for their required text field.
+            return last is null || IsCompleteJsonRecord(last);
         }
         catch { return false; }
     }
@@ -4521,14 +4810,16 @@ public sealed partial class ArchiveService
     public async Task<int> MergeScanAsync(
         DiskScan scan,
         bool refreshList = true,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        bool buildSearchIndex = true)
     {
         for (var attempt = 0; ; attempt++)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            try { return await MergeScanOnceAsync(scan, refreshList, cancellationToken); }
+            try { return await MergeScanOnceAsync(scan, refreshList, cancellationToken, buildSearchIndex); }
             catch (StoreGenerationConflictException) when (attempt < 2)
             {
+                LastMergeLoadRetries = attempt + 1;
                 await LoadAsync(cancellationToken);
             }
         }
@@ -4537,9 +4828,15 @@ public sealed partial class ArchiveService
     private async Task<int> MergeScanOnceAsync(
         DiskScan scan,
         bool refreshList,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool buildSearchIndex)
     {
         cancellationToken.ThrowIfCancellationRequested();
+        if (!scan.FullRescan && scan.Disk.Count == 0 && scan.Bundled.Count == 0)
+        {
+            if (refreshList) ReapplyList();
+            return 0;
+        }
         var imported = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var sourceRekeys = FindSourcePathRekeys(scan.Disk);
         var idsRekeyedFrom = new HashSet<string>(sourceRekeys.Values.Select(s => s.Id), StringComparer.OrdinalIgnoreCase);
@@ -4577,9 +4874,14 @@ public sealed partial class ArchiveService
             // Read the (slow) sqlite/jsonl titles OFF the UI thread; apply on this (UI) thread so the
             // INotifyPropertyChanged raised by ApplyThreadTitles never fires from a worker. The final
             // RefreshSessions below repaints the list, so we don't refresh here.
+            var titleWatch = System.Diagnostics.Stopwatch.StartNew();
             var titles = await Task.Run(LoadThreadTitles, cancellationToken);
             cancellationToken.ThrowIfCancellationRequested();
+            var loadTitlesMs = titleWatch.ElapsedMilliseconds;
             ApplyThreadTitles(titles);
+            PerfCounters.Trace?.Invoke(
+                $"merge titles loadMs={loadTitlesMs} applyMs={titleWatch.ElapsedMilliseconds - loadTitlesMs}"
+                + $" count={titles.Count}");
         }
         // On a parser-version migration every file was re-parsed: prune sessions whose file WAS
         // scanned but no longer yields that id (old id scheme, or the file is now a skipped sidechain).
@@ -4603,7 +4905,8 @@ public sealed partial class ArchiveService
         RefreshTemplateSnapshotCounts();
         await SaveAsync(cancellationToken);
         if (refreshList) ReapplyList();
-        StartTranscriptSearchIndexBuild();
+        if (buildSearchIndex) StartTranscriptSearchIndexBuild(cancellationToken);
+        LastMergeSearchIndexQueued = buildSearchIndex && _transcriptSearchIndex is not null;
         return scan.Disk.Count + recovered;
     }
 
@@ -5936,6 +6239,8 @@ public sealed partial class ArchiveService
             }
         }
 
+        try { PerfCounters.TranscriptBytesRead(stream.Position); } catch { }
+
         if (!sawEventMessages && fallbackMessages.Count > 0)
         {
             var merged = fallbackMessages
@@ -6107,6 +6412,8 @@ public sealed partial class ArchiveService
             }
         }
 
+        try { PerfCounters.TranscriptBytesRead(stream.Position); } catch { }
+
         // Sidechain (subagent) transcripts aren't independently resumable conversations — skip them
         // so the list shows one entry per real chat instead of hundreds of subagent fragments.
         if (isSidechain) return null;
@@ -6174,6 +6481,54 @@ public sealed partial class ArchiveService
     // Recent-message window for a Codex rollout that overflowed the head line-cap: read the FILE TAIL and
     // rebuild the latest messages (event_msg turns + response_item tool steps), mirroring ParseClaudeTail.
     // Meta (id/cwd/created/title) is still taken from the head pass; this only supplies the recent messages.
+    // Read only the last `maxBytes` of a transcript and return its complete lines, keeping at most the
+    // last `maxLines`. Both tail parsers used to do this as `byte[]` -> one whole-window `GetString` ->
+    // another whole-window `Replace("\r\n", "\n")` -> `Split('\n')` -> `Skip().ToList()`. On an 8 MB tail
+    // that is ~32 MB of large-object-heap garbage per parse, several times per sync cycle, when the only
+    // strings the parser actually needs are the individual lines. Splitting on the byte span allocates
+    // just the line strings - small, short-lived - plus one pooled buffer.
+    private static List<string> ReadTailLines(string path, int maxBytes, int maxLines)
+    {
+        var lines = new List<string>();
+        using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        var n = (int)Math.Min(fs.Length, maxBytes);
+        if (n <= 0) return lines;
+        var offset = fs.Length - n;
+        fs.Seek(offset, SeekOrigin.Begin);
+        var buffer = ArrayPool<byte>.Shared.Rent(n);
+        try
+        {
+            var read = 0;
+            while (read < n)
+            {
+                var got = fs.Read(buffer, read, n - read);
+                if (got <= 0) break;
+                read += got;
+            }
+            PerfCounters.TranscriptBytesRead(read);
+            var span = buffer.AsSpan(0, read);
+            var start = 0;
+            for (var index = 0; index <= span.Length; index++)
+            {
+                // '\n' is a single byte and can never be part of a multi-byte UTF-8 sequence, so splitting
+                // on the raw bytes is safe; the trailing '\r' of CRLF is trimmed off the decoded line.
+                if (index != span.Length && span[index] != (byte)'\n') continue;
+                var length = index - start;
+                if (length > 0 && span[start + length - 1] == (byte)'\r') length--;
+                lines.Add(Encoding.UTF8.GetString(span.Slice(start, length)));
+                start = index + 1;
+            }
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
+        }
+        // The first line is partial when the window began mid-file.
+        if (offset > 0 && lines.Count > 0) lines.RemoveAt(0);
+        if (lines.Count > maxLines) lines.RemoveRange(0, lines.Count - maxLines);
+        return lines;
+    }
+
     private static (ObservableCollection<ArchiveMessage> messages, ObservableCollection<CodeBlock> codeBlocks, string cwd, string updated)
         ParseCodexTail(string path, FileInfo info)
     {
@@ -6190,16 +6545,7 @@ public sealed partial class ArchiveService
 
         try
         {
-            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-            var n = (int)Math.Min(fs.Length, CodexTailBytes);
-            if (n <= 0) return (messages, codeBlocks, cwd, updated);
-            var offset = fs.Length - n;
-            fs.Seek(offset, SeekOrigin.Begin);
-            var buf = new byte[n];
-            var read = fs.Read(buf, 0, n);
-            var lines = Encoding.UTF8.GetString(buf, 0, read).Replace("\r\n", "\n").Split('\n');
-            var usable = lines.Skip(offset > 0 ? 1 : 0).ToList();   // first line is partial when starting mid-file
-            if (usable.Count > MaxLinesPerSession) usable = usable.Skip(usable.Count - MaxLinesPerSession).ToList();
+            var usable = ReadTailLines(path, CodexTailBytes, MaxLinesPerSession);
 
             foreach (var line in usable)
             {
@@ -6283,16 +6629,7 @@ public sealed partial class ArchiveService
 
         try
         {
-            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-            var n = (int)Math.Min(fs.Length, ClaudeTailBytes);
-            if (n <= 0) return (messages, codeBlocks, cwd, summary, updated);
-            var offset = fs.Length - n;
-            fs.Seek(offset, SeekOrigin.Begin);
-            var buf = new byte[n];
-            var read = fs.Read(buf, 0, n);
-            var lines = Encoding.UTF8.GetString(buf, 0, read).Replace("\r\n", "\n").Split('\n');
-            var usable = lines.Skip(offset > 0 ? 1 : 0).ToList(); // first line is partial when starting mid-file
-            if (usable.Count > MaxLinesPerSession) usable = usable.Skip(usable.Count - MaxLinesPerSession).ToList();
+            var usable = ReadTailLines(path, ClaudeTailBytes, MaxLinesPerSession);
 
             foreach (var line in usable)
             {
@@ -6626,18 +6963,26 @@ public sealed partial class ArchiveService
         return value.Length > 0 && !value.StartsWith("<environment_context>") && !value.StartsWith("<goal_context>");
     }
 
+    // Compiled, like every other regex in this codebase. CleanTitle runs once per session on the merge
+    // path -- 4121 calls in one measured pass -- and a fresh Regex.Replace there re-parses the pattern
+    // and builds its automaton on every call, which measured at 2944ms of the merge's gated time.
+    private static readonly Regex WhitespaceRun = new(@"\s+", RegexOptions.Compiled);
+    private static readonly Regex IdeSetupPrefix = new(@"^#\s*Context from my IDE setup:\s*", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private static readonly Regex OpenTabsPrefix = new(@"^##\s*Open tabs:\s*-\s*", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private static readonly Regex EnvironmentContextBlock = new(@"^<environment_context>.*?</environment_context>\s*", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.Singleline);
+
     private static string CleanTitle(string text)
     {
-        var value = Regex.Replace(text.Trim(), "\\s+", " ");
+        var value = WhitespaceRun.Replace(text.Trim(), " ");
         return value[..Math.Min(120, value.Length)];
     }
 
     private static string CleanFallbackTitle(string text)
     {
-        var value = Regex.Replace(text.Trim(), "\\s+", " ");
-        value = Regex.Replace(value, @"^#\s*Context from my IDE setup:\s*", "", RegexOptions.IgnoreCase);
-        value = Regex.Replace(value, @"^##\s*Open tabs:\s*-\s*", "", RegexOptions.IgnoreCase);
-        value = Regex.Replace(value, @"^<environment_context>.*?</environment_context>\s*", "", RegexOptions.IgnoreCase | RegexOptions.Singleline);
+        var value = WhitespaceRun.Replace(text.Trim(), " ");
+        value = IdeSetupPrefix.Replace(value, "");
+        value = OpenTabsPrefix.Replace(value, "");
+        value = EnvironmentContextBlock.Replace(value, "");
         if (string.IsNullOrWhiteSpace(value)) value = "Untitled chat";
         return CleanTitle(value);
     }

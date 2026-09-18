@@ -23,6 +23,29 @@ public sealed partial class MainPage
     private bool _syncing;
     private readonly SemaphoreSlim _syncGate = new(1, 1);
     private static readonly TimeSpan StartupSyncBudget = TimeSpan.FromSeconds(90);
+    private static readonly TimeSpan ArchiveWatchSyncCooldown = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan ArchiveSyncMaxBackoff = TimeSpan.FromMinutes(5);
+    private DateTime _lastArchiveSyncUtc = DateTime.MinValue;
+
+    // When a sync fails, the automatic watcher cadence backs off instead of retrying the identical work
+    // every 30s. The case this was observed on was a store that could not commit at all because another
+    // process held app-store.json without sharing delete: each attempt re-read the changed transcripts,
+    // re-serialized the whole store, and burned seconds of a core inside the durable-write retry budget,
+    // indefinitely, with nothing changing but the clock. A user pressing Sync is new information and
+    // bypasses this entirely; only the watcher waits longer.
+    private TimeSpan _archiveSyncBackoff = TimeSpan.Zero;
+
+    private void RecordArchiveSyncOutcome(bool succeeded)
+    {
+        if (succeeded)
+        {
+            _archiveSyncBackoff = TimeSpan.Zero;
+            return;
+        }
+        _archiveSyncBackoff = _archiveSyncBackoff == TimeSpan.Zero
+            ? ArchiveWatchSyncCooldown
+            : TimeSpan.FromTicks(Math.Min(ArchiveSyncMaxBackoff.Ticks, _archiveSyncBackoff.Ticks * 2));
+    }
 
     private void StartArchiveSourceWatches()
     {
@@ -67,7 +90,16 @@ public sealed partial class MainPage
                         await Task.Delay(100);
                         continue;
                     }
+                    var now = DateTime.UtcNow;
+                    var sinceLast = now - _lastArchiveSyncUtc;
+                    var cooldown = ArchiveWatchSyncCooldown + _archiveSyncBackoff;
+                    if (sinceLast < cooldown)
+                    {
+                        await Task.Delay(cooldown - sinceLast);
+                        continue;
+                    }
                     Interlocked.Exchange(ref _archiveSyncPending, 0);
+                    _lastArchiveSyncUtc = DateTime.UtcNow;
                     await SyncNowAsync(initial: false);
                 }
             }
@@ -88,6 +120,7 @@ public sealed partial class MainPage
     {
         var stopwatch = System.Diagnostics.Stopwatch.StartNew();
         Diag.Log("Startup resurface: start");
+        Diag.Mem("resurface.start");
         using var cancellation = new CancellationTokenSource(StartupSyncBudget);
         try
         {
@@ -147,6 +180,17 @@ public sealed partial class MainPage
         {
             if (!CanRestoreSelection()) return;
             var restored = RestoreSelectionIfUnchanged();
+            // Skip the repaint entirely when the merge did not replace the open chat. RenderCurrent()
+            // rebuilds the WHOLE ACTIVE SCREEN - search results, co-pilot, collections, settings, not just
+            // the archive list - and this runs on a 30s timer for as long as an agent is writing. Rendering
+            // unconditionally there rebuilt whatever screen the user was on every half minute for a chat
+            // that had not changed. The list itself is already correct: MergeScanAsync's ReapplyList routes
+            // through ReapplyActiveFilter, which diffs the bound list in place.
+            if (ReferenceEquals(restored, _selected))
+            {
+                Diag.Log("Sync: open chat unchanged; skipped repaint");
+                return;
+            }
             RunSessionListRefresh(() =>
             {
                 _selected = restored;
@@ -166,22 +210,26 @@ public sealed partial class MainPage
                 if (CanRestoreSelection())
                 {
                     var retryRestored = RestoreSelectionIfUnchanged();
-                    RunSessionListRefresh(() =>
-                    {
-                        _selected = retryRestored;
-                        SelectSessionRow(retryRestored);
-                    });
+                    RunSessionListRefresh(() => ApplySelection(retryRestored));
                     RenderCurrent();
                 }
                 Diag.Log("Sync: archive load retry succeeded (" + _archive.Sessions.Count + " sessions)");
             }
             var progress = new Progress<string>(s => SyncStatus.Text = s);
             Diag.Log("Sync: scan start");
+            Diag.Mem("sync.scanStart");
             var scan = await Task.Run(() => _archive.ScanDiskAsync(progress, cancellationToken), cancellationToken);
             Diag.Log("Sync: scan end (" + stopwatch.ElapsedMilliseconds + " ms)");
-            var indexed = await _archive.MergeScanAsync(scan, refreshList: true, cancellationToken: cancellationToken);
+            Diag.Mem("sync.scanEnd");
+            var indexed = await _archive.MergeScanAsync(
+                scan,
+                refreshList: true,
+                cancellationToken: cancellationToken,
+                buildSearchIndex: false);
             cancellationToken.ThrowIfCancellationRequested();
             Diag.Log("Sync: merge end (" + stopwatch.ElapsedMilliseconds + " ms)");
+            Diag.Mem("sync.mergeEnd");
+            RecordArchiveSyncOutcome(succeeded: true);
             var added = _archive.Store.Sessions.Count - before;
             Diag.Log($"Sync: indexed {indexed}, store now {_archive.Store.Sessions.Count} (was {before}, +{added}, {stopwatch.ElapsedMilliseconds} ms)");
             RecordAppEvent(
@@ -198,6 +246,7 @@ public sealed partial class MainPage
             // the active filter/sort AND the current selection. Only restore the pre-scan selection when no
             // newer user click happened while the scan/merge was awaiting; otherwise that click is authoritative.
             RestoreSelectionIfStillAuthoritative();
+            Diag.Mem("sync.restoreSelection");
             // If the selected chat disappeared, leave selection empty rather than navigating to an unrelated row.
             SyncStatus.Text = $"{_archive.Sessions.Count} chats - synced {DateTime.Now:h:mm tt}"
                               + (added > 0 ? $" - +{added} new" : "");
@@ -211,6 +260,7 @@ public sealed partial class MainPage
         }
         catch (Exception ex)
         {
+            RecordArchiveSyncOutcome(succeeded: false);
             Diag.Log("Sync error after " + stopwatch.ElapsedMilliseconds + " ms: " + ex);
             RecordAppEvent(
                 "sync.failed",
