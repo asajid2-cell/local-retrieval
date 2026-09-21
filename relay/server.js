@@ -351,6 +351,20 @@ function rememberHostInputOrigin(key, clientId) {
 const hostUp = () => !!(hostWs && hostWs.readyState === 1);
 function sendHost(obj) { if (hostUp()) { try { hostWs.send(JSON.stringify(obj)); return true; } catch {} } return false; }
 const hostedHas = name => hostUp() && hostSessions.has(name);
+
+// A host that still holds its socket but has stopped pushing `sessions` frames is WEDGED, not up. It
+// accepts a frame and answers nothing, so every request against it burns its entire deadline and then
+// reports only "did not confirm the change" -- 15s of a click that reads as a hang and names no cause.
+// The age was already measured for /api/health (see tests/host-frame-liveness.test.js); these expose the
+// same measurement to the REQUEST paths so a stalled host is refused at once and by name.
+function hostFrameAge() {
+  return hostUp() && hostFrame.sessionsAt ? Date.now() - hostFrame.sessionsAt : null;
+}
+function hostStallReason() {
+  const age = hostFrameAge();
+  if (age === null || age <= HOST_FRAME_STALE_MS) return '';
+  return `PC mux host is connected but not responding (no status frame for ${Math.round(age / 1000)}s); restart MuxdSessionHost on the PC`;
+}
 const pendingHostCreates = new Map();
 const pendingHostKills = new Map();
 let _hostRequestSeq = 0;
@@ -445,6 +459,8 @@ function announcedHostProtocol(message) {
 }
 function requestHostCreate(message, timeoutMs = 20000, suppliedIntentId = '') {
   if (!hostUp()) return Promise.resolve({ ok: false, detail: 'PC mux host offline' });
+  const stall = hostStallReason();
+  if (stall) return Promise.resolve({ ok: false, status: 503, detail: stall });
   const expectedName = strictMuxName(message && message.s);
   if (!expectedName) return Promise.resolve({ ok: false, detail: 'invalid mux session name' });
   const rid = commandIntentId(suppliedIntentId)
@@ -496,12 +512,23 @@ function hostSupportsCap(cap) {
 }
 function hostProtocolDetail() {
   if (!hostUp()) return 'muxd is not connected';
+  const stall = hostStallReason();
+  if (stall) return stall;
   return `muxd protocol ${hostProtocol.protocol || 'unknown'} lacks the required capabilities; restart MuxdSessionHost to load the current muxd`;
 }
 function requireHostProtocol(res, action) {
-  if (hostProtocolOk()) return true;
-  failHost(res, 503, 'PC mux host protocol mismatch', `${action}: ${hostProtocolDetail()}`);
-  return false;
+  if (!hostProtocolOk()) {
+    failHost(res, 503, 'PC mux host protocol mismatch', `${action}: ${hostProtocolDetail()}`);
+    return false;
+  }
+  // A stalled host passes every check above -- the socket is up and the protocol still agrees -- and then
+  // answers nothing. Refuse it here, before the request reaches a deadline it was never going to meet.
+  const stall = hostStallReason();
+  if (stall) {
+    failHost(res, 503, 'PC mux host not responding', `${action}: ${stall}`);
+    return false;
+  }
+  return true;
 }
 function requireHostCapability(res, cap, action) {
   if (!requireHostProtocol(res, action)) return false;
@@ -516,6 +543,11 @@ function waitForHostState(check, timeoutMs = 6000) {
       let value = null;
       try { value = check(); } catch {}
       if (value) return resolve({ ok: true, value });
+      // Every caller is waiting on hostSessions, which only a `sessions` frame can refresh -- so once the
+      // host has stopped sending them the wait is already lost. Report the stall now instead of spinning
+      // out the rest of the deadline and blaming muxd for "not confirming".
+      const stall = hostStallReason();
+      if (stall) return resolve({ ok: false, error: stall });
       if (Date.now() - started >= timeoutMs) return resolve({ ok: false, error: 'muxd did not confirm the change' });
       setTimeout(tick, 100);
     };
