@@ -934,34 +934,54 @@ def _agent_cmdlines_ttl():
         return 1.5
 
 
-def _try_agent_cmdlines():
-    """[(pid, cmdline)] for every live claude.exe/codex.exe — one CIM query (used for codex, which has
-    no registry). Best-effort: a failure just means codex-resume conflicts aren't caught this pass.
+AGENT_CMDLINE_NAMES = {"claude.exe", "codex.exe", "node.exe"}
 
-    MEMOIZED FOR A SHORT WINDOW, because this query is a whole `powershell.exe` process, not a syscall.
-    Measured on this box: 1.24 s p50 per call while 118 powershell.exe processes were already resident.
-    It was previously paid on EVERY call, and one session launch pays it twice: `reserve_launch_claim`
-    calls `try_live_session_ids()` (muxd.py:4289) and then `acquire_launch_claim` calls it again
-    (muxd.py:2014), with `acquire_launch_claim` paying a THIRD query for its own second-live re-check
-    (muxd.py:2074). A create that carries a command measured 4.0 s against this box's live instance
-    versus 1.2 s against an isolated instance of the same code whose claim root was empty — the
-    difference is exactly the number of these queries on the path.
 
-    Only a SUCCESSFUL result is cached. A failure stays uncached so the next caller re-queries: the
-    failure mode here is "a resume conflict went unchecked", and caching that would extend it.
-
-    The window is deliberately shorter than a human's create/kill sequence (1.5 s) and far longer than
-    the burst of calls one launch makes, so the three queries above collapse to one while the staleness
-    a user could observe is a process that started <1.5 s ago and is therefore already live.
-    AGENT_CMDLINES_TTL=0 restores a query per call.
-    """
+def _join_cmdline(parts):
+    """An argv list back into one command-line string, quoting only the args that need it so a token
+    containing a space stays ONE token for `_parse_resume_id`."""
     out = []
-    ttl = _agent_cmdlines_ttl()
-    if ttl > 0:
-        with _AGENT_CMDLINES_LOCK:
-            rows = _AGENT_CMDLINES_CACHE["rows"]
-            if rows is not None and (time.monotonic() - _AGENT_CMDLINES_CACHE["at"]) < ttl:
-                return True, list(rows), ""
+    for a in parts:
+        a = str(a)
+        out.append('"%s"' % a if (" " in a or "\t" in a) else a)
+    return " ".join(out)
+
+
+def _agent_cmdlines_psutil():
+    """[(pid, cmdline)] for the agent processes, as a SYSCALL SWEEP instead of a whole `powershell.exe`.
+    Returns (None, detail) when psutil cannot answer, so the caller falls back — an unavailable psutil
+    and a box with no agents running must not look alike.
+
+    Measured on this box with a fresh process, first call included: 2.3-2.5 ms to sweep the live table and
+    filter to the agent names, against 385-392 ms for the powershell process the CIM query spawns. Both
+    forms name the same 22 processes, and `_parse_resume_id` reads the same ids out of both, which is the
+    equality that matters: a missed candidate is an unchecked resume conflict, not a slow query.
+    """
+    try:
+        import psutil
+    except Exception as e:
+        return None, f"psutil unavailable: {e}"
+    out = []
+    try:
+        for p in psutil.process_iter(["pid", "name"]):
+            info = p.info or {}
+            if str(info.get("name") or "").lower() not in AGENT_CMDLINE_NAMES:
+                continue
+            try:
+                out.append((int(info.get("pid") or 0), _join_cmdline(p.cmdline() or [])))
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                # Exited mid-sweep, or a process this user may not read: not a candidate, since the
+                # caller can only ever use an id it can identify anyway.
+                continue
+    except Exception as e:
+        return None, f"psutil sweep failed: {e}"
+    return out, ""
+
+
+def _agent_cmdlines_cim():
+    """The powershell/CIM form of the same query: (rows, "") or (None, detail). Kept as the fallback
+    because it needs nothing installed."""
+    out = []
     try:
         ps = ("Get-CimInstance Win32_Process -Filter \"Name='claude.exe' or Name='codex.exe' or Name='node.exe'\" | "
               "Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress")
@@ -969,7 +989,7 @@ def _try_agent_cmdlines():
                            capture_output=True, text=True, timeout=15,
                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         if r.returncode != 0:
-            return False, out, (r.stderr or r.stdout or "CIM process query failed").strip()
+            return None, (r.stderr or r.stdout or "CIM process query failed").strip()
         data = json.loads(r.stdout) if r.stdout.strip() else []
         if isinstance(data, dict):
             data = [data]
@@ -979,7 +999,47 @@ def _try_agent_cmdlines():
             except Exception:
                 pass
     except Exception as e:
-        return False, out, str(e)
+        return None, str(e)
+    return out, ""
+
+
+def _try_agent_cmdlines():
+    """[(pid, cmdline)] for every live claude.exe/codex.exe/node.exe (used for codex, which has no
+    registry). Best-effort: a failure just means codex-resume conflicts aren't caught this pass.
+
+    MEMOIZED FOR A SHORT WINDOW, because this query USED to be a whole `powershell.exe` process rather
+    than a syscall. Measured on this box: 1.24 s p50 per call while 118 powershell.exe processes were
+    already resident. It was previously paid on EVERY call, and one session launch pays it twice:
+    `reserve_launch_claim` calls `try_live_session_ids()` (muxd.py:4289) and then `acquire_launch_claim`
+    calls it again (muxd.py:2014), with `acquire_launch_claim` paying a THIRD query for its own
+    second-live re-check (muxd.py:2074). A create that carries a command measured 4.0 s against this
+    box's live instance versus 1.2 s against an isolated instance of the same code whose claim root was
+    empty — the difference is exactly the number of these queries on the path.
+
+    THE QUERY IS NO LONGER A POWERSHELL PROCESS: it is a psutil sweep, measured at 2.3-2.5 ms against
+    the CIM query's 385-392 ms, with the CIM form kept as the fallback for a box without psutil. Note what
+    the memo window is and is not — at 1.5 s it is SHORTER than the gap between two human clicks, so a
+    person's first resume/create still pays the query in full; what it collapses is the burst of calls
+    ONE launch makes. Measured on the live instance, a resume-carrying create that missed the window
+    cost 500-575 ms against a plain-shell create's 90-180 ms: a ~460 ms tax on the click, which is what
+    this path removes.
+
+    Only a SUCCESSFUL result is cached. A failure stays uncached so the next caller re-queries: the
+    failure mode here is "a resume conflict went unchecked", and caching that would extend it.
+    AGENT_CMDLINES_TTL=0 restores a query per call.
+    """
+    ttl = _agent_cmdlines_ttl()
+    if ttl > 0:
+        with _AGENT_CMDLINES_LOCK:
+            rows = _AGENT_CMDLINES_CACHE["rows"]
+            if rows is not None and (time.monotonic() - _AGENT_CMDLINES_CACHE["at"]) < ttl:
+                return True, list(rows), ""
+    out, detail = _agent_cmdlines_psutil()
+    if out is None:
+        log(f"agent-cmdline psutil sweep unavailable ({detail}); using the powershell CIM query")
+        out, detail = _agent_cmdlines_cim()
+        if out is None:
+            return False, [], detail
     if ttl > 0:
         with _AGENT_CMDLINES_LOCK:
             _AGENT_CMDLINES_CACHE["at"] = time.monotonic()

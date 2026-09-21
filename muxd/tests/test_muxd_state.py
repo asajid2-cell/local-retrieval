@@ -38,6 +38,19 @@ class FakeSession:
         return self._tail
 
 
+NO_PSUTIL = "psutil unavailable (test)"
+
+
+def _without_psutil():
+    """Take the psutil sweep out of the picture so the powershell/CIM branch is the one under test.
+
+    `_try_agent_cmdlines` prefers the psutil sweep and only falls back to CIM, and psutil IS installed on
+    this box -- so a test that patches `subprocess.run` to count CIM queries would observe ZERO calls and
+    silently assert nothing. Forcing the fallback keeps those tests measuring the query they name.
+    """
+    return mock.patch.object(muxd, "_agent_cmdlines_psutil", return_value=(None, NO_PSUTIL))
+
+
 class MuxdStateTests(unittest.TestCase):
     def test_relay_link_failure_detail_explains_invalid_handshake_response(self):
         detail = muxd.relay_link_failure_detail(
@@ -725,12 +738,17 @@ class MuxdStateTests(unittest.TestCase):
 
         calls = []
         old_run = muxd.subprocess.run
+        old_cache = muxd._AGENT_CMDLINES_CACHE.copy()
         try:
             muxd.subprocess.run = lambda args, **kwargs: calls.append(args) or Result()
+            muxd._AGENT_CMDLINES_CACHE["at"] = 0.0
+            muxd._AGENT_CMDLINES_CACHE["rows"] = None
 
-            ok, values, detail = muxd._try_agent_cmdlines()
+            with _without_psutil():
+                ok, values, detail = muxd._try_agent_cmdlines()
         finally:
             muxd.subprocess.run = old_run
+            muxd._AGENT_CMDLINES_CACHE.update(old_cache)
 
         self.assertTrue(ok, detail)
         self.assertEqual([], values)
@@ -764,7 +782,8 @@ class MuxdStateTests(unittest.TestCase):
             muxd._AGENT_CMDLINES_CACHE["rows"] = None
 
             for _ in range(3):
-                ok, values, detail = muxd._try_agent_cmdlines()
+                with _without_psutil():
+                    ok, values, detail = muxd._try_agent_cmdlines()
                 self.assertTrue(ok, detail)
                 self.assertEqual([], values)
         finally:
@@ -796,7 +815,8 @@ class MuxdStateTests(unittest.TestCase):
             muxd._AGENT_CMDLINES_CACHE["rows"] = None
 
             for _ in range(2):
-                ok, _, detail = muxd._try_agent_cmdlines()
+                with _without_psutil():
+                    ok, _, detail = muxd._try_agent_cmdlines()
                 self.assertFalse(ok)
                 self.assertIn("WMI unavailable", detail)
             self.assertIsNone(muxd._AGENT_CMDLINES_CACHE["rows"],
@@ -824,14 +844,75 @@ class MuxdStateTests(unittest.TestCase):
             muxd._AGENT_CMDLINES_CACHE["at"] = 0.0
             muxd._AGENT_CMDLINES_CACHE["rows"] = None
 
-            muxd._try_agent_cmdlines()
-            time.sleep(0.08)
-            muxd._try_agent_cmdlines()
+            with _without_psutil():
+                muxd._try_agent_cmdlines()
+                time.sleep(0.08)
+                muxd._try_agent_cmdlines()
         finally:
             muxd.subprocess.run = old_run
             muxd._AGENT_CMDLINES_CACHE.update(old_ttl)
 
         self.assertEqual(2, len(calls), "the query must be re-paid once the window passes")
+
+    def test_agent_cmdline_scan_prefers_the_syscall_sweep_over_a_powershell_process(self):
+        """The CIM form is a whole `powershell.exe` (measured 385-392 ms on this box); the psutil sweep is
+        2.3-2.5 ms. The preference is what removes the ~460 ms tax a resume-carrying create paid, so if the
+        sweep silently stops being used the click pays the powershell process again -- and nothing else in
+        this file would notice, because every other test here forces the fallback."""
+        rows = [(4242, "claude.exe --resume x")]
+        calls = []
+
+        def cim_must_not_run(args, **kwargs):
+            calls.append(args)
+            raise AssertionError("the CIM query ran even though the sweep answered")
+
+        old_run = muxd.subprocess.run
+        old_cache = muxd._AGENT_CMDLINES_CACHE.copy()
+        try:
+            muxd.subprocess.run = cim_must_not_run
+            muxd._AGENT_CMDLINES_CACHE["at"] = 0.0
+            muxd._AGENT_CMDLINES_CACHE["rows"] = None
+
+            with mock.patch.object(muxd, "_agent_cmdlines_psutil", return_value=(rows, "")):
+                ok, values, detail = muxd._try_agent_cmdlines()
+        finally:
+            muxd.subprocess.run = old_run
+            muxd._AGENT_CMDLINES_CACHE.update(old_cache)
+
+        self.assertTrue(ok, detail)
+        self.assertEqual(rows, values)
+        self.assertEqual([], calls, "a psutil answer must not also spawn a powershell.exe")
+        # The sweep filters by NAME, so the names it must keep in step with the CIM filter are pinned here.
+        self.assertIn("node.exe", muxd.AGENT_CMDLINE_NAMES)
+        self.assertIn("claude.exe", muxd.AGENT_CMDLINE_NAMES)
+        self.assertIn("codex.exe", muxd.AGENT_CMDLINE_NAMES)
+
+    def test_agent_cmdline_scan_falls_back_to_cim_when_the_sweep_cannot_answer(self):
+        """An unavailable psutil and a box with no agents running must not look alike: a sweep that cannot
+        answer runs the CIM query and still yields the ids, rather than reporting "no agents"."""
+
+        class Result:
+            returncode = 0
+            stdout = '[{"ProcessId": 4242, "CommandLine": "claude.exe --resume x"}]'
+            stderr = ""
+
+        calls = []
+        old_run = muxd.subprocess.run
+        old_cache = muxd._AGENT_CMDLINES_CACHE.copy()
+        try:
+            muxd.subprocess.run = lambda args, **kwargs: calls.append(args) or Result()
+            muxd._AGENT_CMDLINES_CACHE["at"] = 0.0
+            muxd._AGENT_CMDLINES_CACHE["rows"] = None
+
+            with _without_psutil():
+                ok, values, detail = muxd._try_agent_cmdlines()
+        finally:
+            muxd.subprocess.run = old_run
+            muxd._AGENT_CMDLINES_CACHE.update(old_cache)
+
+        self.assertTrue(ok, detail)
+        self.assertEqual(1, len(calls), "the sweep failing must actually run the CIM query")
+        self.assertEqual([4242], [pid for pid, _ in values])
 
     def test_live_session_scan_fences_recycled_claude_registry_pids(self):
         old_home = muxd.HOME
