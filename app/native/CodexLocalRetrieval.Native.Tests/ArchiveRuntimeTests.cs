@@ -120,6 +120,93 @@ public sealed class ArchiveRuntimeTests
     }
 
     [TestMethod]
+    public async Task UseAsync_DoesNotQueueBehindTheWatcherDiskWalk()
+    {
+        // The regression this guards: the watcher sync used to run its ENTIRE disk walk inside the same
+        // gate as every remote read, so a scan that took 22s made an unrelated read wait 22s. The walk is
+        // off-thread safe and belongs outside the gate; only the merge needs it.
+        using var fixture = new RuntimeFixture();
+        var runtime = new ArchiveRuntime(fixture.Archive, syncOnLoad: true);
+        var releaseScan = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        try
+        {
+            // Warm it with no hook installed: the cold path runs its own sync, and parking that one would
+            // just stall the load rather than test anything.
+            await runtime.UseAsync((archive, _) => Task.FromResult(archive.Store.Sessions.Count));
+
+            var scanEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            runtime.SyncScanHook = async _ =>
+            {
+                scanEntered.TrySetResult();
+                await releaseScan.Task;
+            };
+
+            runtime.MarkRefreshPending();
+            await scanEntered.Task.WaitAsync(TimeSpan.FromSeconds(10));
+
+            // The scan is parked mid-walk, and the pending flag it consumed is already clear, so this read
+            // has no sync of its own to run. It must complete now: if the walk held the archive gate, it
+            // would block until the scan is released and the timeout below would fire instead.
+            var read = runtime.UseAsync((archive, _) => Task.FromResult(archive.Store.Sessions.Count));
+            var finished = await Task.WhenAny(read, Task.Delay(TimeSpan.FromSeconds(5)));
+            Assert.AreSame(read, finished, "a remote read queued behind the watcher's disk walk");
+
+            releaseScan.SetResult();
+            Assert.AreEqual(1, await read);
+        }
+        finally
+        {
+            releaseScan.TrySetResult();
+            runtime.Dispose();
+        }
+    }
+
+    [TestMethod]
+    public async Task UseAsync_DoesNotRunTheWatchersScanOnTheRequestThread()
+    {
+        // The regression this guards: a warm read that happened to win the watcher's pending flag paid the
+        // entire disk walk inline (measured refresh=28339ms on the live bridge). The watcher's refresh is
+        // background work, so the read must hand it to the worker and answer from the store it already has.
+        using var fixture = new RuntimeFixture();
+        var runtime = new ArchiveRuntime(fixture.Archive, syncOnLoad: true);
+        var releaseScan = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        try
+        {
+            await runtime.UseAsync((archive, _) => Task.FromResult(archive.Store.Sessions.Count));
+
+            var scanEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            runtime.SyncScanHook = async _ =>
+            {
+                scanEntered.TrySetResult();
+                await releaseScan.Task;
+            };
+
+            runtime.MarkRefreshPending();
+            await scanEntered.Task.WaitAsync(TimeSpan.FromSeconds(10));
+
+            // The worker is parked mid-walk, so it cannot consume a fresh flag: SchedulePendingRefresh is a
+            // no-op while _refreshWorkerActive is set. Marking again therefore leaves the flag SET when the
+            // read arrives -- which is the race that used to hand the walk to the request thread.
+            runtime.MarkRefreshPending();
+
+            // The read must answer from the store it has, not wait on the walk the worker is holding.
+            var read = runtime.UseAsync((archive, _) => Task.FromResult(archive.Store.Sessions.Count));
+            var finished = await Task.WhenAny(read, Task.Delay(TimeSpan.FromSeconds(5)));
+            Assert.AreSame(read, finished, "a warm read ran the watcher's disk walk on the request thread");
+            Assert.AreEqual(1, await read);
+
+            // And the merge it deferred still lands, so deferring did not drop the refresh.
+            releaseScan.SetResult();
+            await WaitUntilAsync(() => fixture.Archive.Store.FileStamps.Count > 0);
+        }
+        finally
+        {
+            releaseScan.TrySetResult();
+            runtime.Dispose();
+        }
+    }
+
+    [TestMethod]
     public async Task TryUnloadIfIdleAsync_WaitsForActiveArchiveOperation()
     {
         using var store = new TempStore();
@@ -172,9 +259,16 @@ public sealed class ArchiveRuntimeTests
             Directory.CreateDirectory(Root);
             StorePath = System.IO.Path.Combine(_directory, "store.json");
             File.WriteAllText(StorePath, "{\"sessions\":{},\"settings\":{\"sources\":[{\"tool\":\"codex\",\"root\":\"" + Root.Replace("\\", "\\\\") + "\"}]},\"collections\":{}}");
-            Archive = new ArchiveService(storePath: StorePath, codexSessionsRoot: Root);
+            Archive = new ArchiveService(
+                storePath: StorePath,
+                codexSessionsRoot: Root,
+                sourceOverride: new[]
+                {
+                    new CodexLocalRetrieval.Core.Models.SessionSource { Tool = "codex", Root = Root },
+                });
             Archive.Store.Settings.Sources.Clear();
             Archive.Store.Settings.Sources.Add(new CodexLocalRetrieval.Core.Models.SessionSource { Tool = "codex", Root = Root });
+            Archive.Store.Settings.BundledHistoryAbsorbed = true;
             WriteRollout("rollout-existing.jsonl", "existing-1", "existing work");
             Runtime = new ArchiveRuntime(Archive, syncOnLoad: true);
         }

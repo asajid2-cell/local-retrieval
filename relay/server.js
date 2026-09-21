@@ -320,6 +320,26 @@ function clampTermDimension(value, fallback, maximum) {
 const REQUIRED_HOST_PROTOCOL = 4;
 const REQUIRED_HOST_CAPS = new Set(['create', 'createAck', 'kill', 'rename', 'heal', 'tail', 'scrollback']);
 let hostProtocol = { protocol: 0, caps: [] };
+
+// ---- HOST FRAME LIVENESS: TCP-alive-but-stalled is invisible, and that is the failure we actually had
+// muxd's pump_status() pushes a `t:"sessions"` frame every 5s, unconditionally, for as long as its event
+// loop runs. That makes the frame a heartbeat for free - and it is the ONLY one the relay has.
+//
+// `host.connected` (hostWs.readyState === 1) cannot see the failure that mattered: when muxd's loop
+// stalled, the socket stayed open, so the relay reported a healthy host while no output frame moved for
+// three days. A readiness check answers "is the TCP session up", never "is the process running".
+//
+// The staleness bound is deliberately far looser than the 5s cadence. A stall is a MINUTES-to-HOURS
+// event; a threshold near the cadence would page on a garbage-collection pause or a Wi-Fi blip, and a
+// monitor that cries wolf is one an operator learns to ignore. This threshold is also what gives the
+// signal its specificity: a relay process that is ITSELF wedged cannot evaluate it, so a stale frame age
+// is evidence about muxd specifically.
+//
+// No skip-when-idle branch: pump_status() has no idle case, so a silent muxd is a stalled muxd, not a
+// quiet one. The cost of being wrong is bounded to one health field, and inventing an idle exemption for
+// a condition muxd does not have would suppress the only symptom the 3-day stall produced.
+const HOST_FRAME_STALE_MS = Math.max(1000, Number(process.env.MUX_HOST_FRAME_STALE_MS) || 15000);
+let hostFrame = { helloAt: 0, sessionsAt: 0 };
 const hostInputOrigins = new Map();
 function rememberHostInputOrigin(key, clientId) {
   const prior = hostInputOrigins.get(key);
@@ -523,39 +543,71 @@ function requestHostTail(name, lines) {
     sendHost({ t: 'tail', s: name, lines, rid });
   });
 }
-// SYNCHRONOUS SPAWN ON THE STREAMING LOOP. This is execSync, so every call FREEZES the event loop --
-// no keystroke forwarded, no PTY output flushed, no ws frame written -- until the child exits. Measured
-// on the dev box (win32, tmux NOT installed, so the number is only process spawn and contains no tmux
-// IPC at all): 14.9ms p50, 18.2ms p95, 230.7ms max per call. Timer lateness p95 across the loop went
-// 11.0ms -> 105.9ms (max 629.9ms) with these probes running. That is a lower bound, and the 1500ms
+// NO SYNCHRONOUS SPAWN ON THE STREAMING LOOP. This used to be execSync, so every call FREEZED the event
+// loop -- no keystroke forwarded, no PTY output flushed, no ws frame written -- until the child exited.
+// Measured on the dev box (win32, tmux NOT installed, so the number is only process spawn and contains
+// no tmux IPC at all): 14.9ms p50, 18.2ms p95, 230.7ms max per call. Timer lateness p95 across the loop
+// went 11.0ms -> 105.9ms (max 629.9ms) with these probes running. That is a lower bound, and the 1500ms
 // timeout above is the tail.
 //
-// It is called from: every /ws upgrade (so it blocks attach), listSessions() on GET /api/sessions
-// (polled every 4s BY EVERY OPEN TAB), /api/health (twice -- also `tmux -V`), and every mutating route.
-// Six tabs idling is ~6 spawns per 4s window on the process whose entire job is relaying bytes
-// promptly. This is the most concrete mechanical explanation available for the "stuttery" complaint.
+// It is reached from every /ws upgrade (so it used to block attach), listSessions() on GET /api/sessions
+// (polled every 4s BY EVERY OPEN TAB), /api/health, and every mutating route. Six tabs idling is ~6
+// spawns per 4s window on the process whose entire job is relaying bytes promptly -- the concrete
+// mechanical explanation for the "stuttery" complaint, and for a create/erase that feels delayed in odd
+// ways rather than merely slow.
 //
-// The proper fix is to make it async behind a snapshot, which ripples through several sync call sites
-// (tmuxHas is used inline in route guards and in the upgrade handler). This is the contained half of
-// it: a short TTL cache, which collapses the N-tabs-polling case -- the dominant one -- to a single
-// probe per window without changing any call site's sync/async shape. legacyProbes on /api/health
-// makes the remaining spawn rate observable instead of assumed.
+// The shape is now: an async refresh fills a snapshot, and the hot readers (listSessions, the route
+// guards, the upgrade handler) read that snapshot SYNCHRONOUSLY and NEVER spawn. A stale-but-present
+// snapshot is served while a refresh is in flight, so a caller never queues behind the child, and only
+// the first caller of a window pays the spawn -- on the thread pool, where it cannot stall the loop.
 //
-// Staleness is acceptable here BY DESIGN: legacy tmux sessions are a blocking diagnostic that the
-// relay never creates and that an operator is expected to clean up manually, so noticing one up to
-// TTL late costs nothing. Do not reach for this cache for anything with real freshness requirements.
+// Staleness is acceptable here BY DESIGN: legacy tmux sessions are a blocking diagnostic that the relay
+// never creates and that an operator is expected to clean up manually, so noticing one up to TTL late
+// costs nothing. The one case that must NOT be late is an operator killing a legacy session to unblock
+// a name: the refresh is kicked off on every call, so the next request after that TTL already sees it.
+// Do not reach for this snapshot for anything with real freshness requirements.
 const LEGACY_TMUX_TTL_MS = Math.max(0, +process.env.MUX_LEGACY_TMUX_TTL_MS || 2000);
 let _legacyTmux = { at: 0, names: [], probes: 0 };
+let _legacyRefreshing = false;
+function readLegacyTmuxProbe() {
+  return new Promise(resolve => {
+    // execFile, not execSync: the child runs off the event loop, so a slow or hung tmux costs a
+    // callback instead of every byte the relay was supposed to forward in the meantime.
+    execFile('tmux', ['list-sessions', '-F', '#{session_name}'], { encoding: 'utf8', timeout: 1500 }, (err, stdout) => {
+      if (err) return resolve([]);
+      resolve(String(stdout || '').trim().split('\n').map(SAFE).filter(Boolean));
+    });
+  });
+}
+function refreshLegacyTmux() {
+  if (_legacyRefreshing) return;
+  _legacyRefreshing = true;
+  readLegacyTmuxProbe().then(names => {
+    _legacyTmux = { at: Date.now(), names, probes: _legacyTmux.probes + 1 };
+  }).catch(() => {
+    // A probe that could not run is an empty list, never a stale one: "we could not ask" must not read
+    // as "the legacy session is gone" (nor as "it is still there"). The stamp still advances so a
+    // failing probe cannot turn into a spawn per request.
+    _legacyTmux = { at: Date.now(), names: [], probes: _legacyTmux.probes + 1 };
+  }).finally(() => { _legacyRefreshing = false; });
+}
 function legacyTmuxNames() {
   const now = Date.now();
-  if (_legacyTmux.at && now - _legacyTmux.at < LEGACY_TMUX_TTL_MS) return _legacyTmux.names;
-  let names = [];
-  try {
-    const out = execSync(`tmux list-sessions -F '#{session_name}' 2>/dev/null`, { encoding: 'utf8', timeout: 1500 });
-    names = out.trim().split('\n').map(SAFE).filter(Boolean);
-  } catch { names = []; }
-  _legacyTmux = { at: now, names, probes: _legacyTmux.probes + 1 };
-  return names;
+  const fresh = _legacyTmux.at && now - _legacyTmux.at < LEGACY_TMUX_TTL_MS;
+  if (!fresh) refreshLegacyTmux();
+  return _legacyTmux.names;
+}
+
+// `tmux -V` is a second synchronous spawn in the same health path, and it answers a question whose
+// answer cannot change while the process runs: whether a tmux BINARY exists. Probing it per request
+// spent an event-loop freeze to re-learn a constant. Cached for the process lifetime; a tmux installed
+// mid-run is picked up on the next restart, which is the only time it could have appeared.
+let _tmuxAvailable = null;
+function tmuxAvailableCached() {
+  if (_tmuxAvailable !== null) return _tmuxAvailable;
+  try { execSync(`tmux -V`, { encoding: "utf8", timeout: 1500 }); _tmuxAvailable = true; }
+  catch { _tmuxAvailable = false; }
+  return _tmuxAvailable;
 }
 function tmuxHas(name) { const n = SAFE(name); return !!n && legacyTmuxNames().includes(n); }
 function legacyDetail(name) {
@@ -1935,11 +1987,15 @@ if (!TEST_MODE) { _probeBootTimer = setTimeout(probePc, 2000); _probeTimer = set
 // into healthSnapshot() so the ops-alert lane could read health without going through HTTP — and it
 // registers the route below. Taking both openers would have bound /api/health twice.
 function healthSnapshot() {
-  let tmuxAvailable = false;
-  try { execSync(`tmux -V`, { encoding: "utf8", timeout: 1500 }); tmuxAvailable = true; } catch {}
+  const tmuxAvailable = tmuxAvailableCached();
   const legacyNames = legacyTmuxNames();
   const armed = [...hostSessions.values()].filter(h => h && h.heal).length;
   const gaveUp = 0;
+  // The host's frame age, in the only two cases where it means anything: connected, and already stamped.
+  // Null everywhere else, so "no link" and "no heartbeat yet" stay distinguishable from "stalled" -
+  // collapsing them into one falsy value is how a metric turns into a confident wrong answer.
+  const hostFrameAgeMs = hostUp() && hostFrame.sessionsAt ? Date.now() - hostFrame.sessionsAt : null;
+  const hostFrameStale = hostFrameAgeMs !== null && hostFrameAgeMs > HOST_FRAME_STALE_MS;
   const projects = projectsHealth();
   const retention = retentionGauges();
   // A2 #9: if the PC host is down, armed sessions are hosted-and-unreachable (can't be healed) → surface
@@ -1950,8 +2006,8 @@ function healthSnapshot() {
   // save lands, so it stays visible instead of reading as a clean boot.
   const stateRecoveryFailures = recoveryWriteFailureReport();
   const degraded = TEST_MODE
-    ? (!hostUp() || !hostProtocolOk() || legacyNames.length > 0 || !!persistenceFailure || renameIntents.length > 0 || uploadRecoveryWarnings.length > 0 || stateRecoveryFailures.length > 0)
-    : (!hostUp() || !hostProtocolOk() || _pcHealth.reachable === false || gaveUp > 0 || hostedArmedDown > 0 || legacyNames.length > 0 || !projects.bridgeLive || !!persistenceFailure || renameIntents.length > 0 || uploadRecoveryWarnings.length > 0 || stateRecoveryFailures.length > 0);
+    ? (!hostUp() || !hostProtocolOk() || hostFrameStale || legacyNames.length > 0 || !!persistenceFailure || renameIntents.length > 0 || uploadRecoveryWarnings.length > 0 || stateRecoveryFailures.length > 0)
+    : (!hostUp() || !hostProtocolOk() || hostFrameStale || _pcHealth.reachable === false || gaveUp > 0 || hostedArmedDown > 0 || legacyNames.length > 0 || !projects.bridgeLive || !!persistenceFailure || renameIntents.length > 0 || uploadRecoveryWarnings.length > 0 || stateRecoveryFailures.length > 0);
   const snapshot = { ok: !degraded, degraded, uptimeSec: Math.round(process.uptime()), tmuxAvailable, sessions: hostSessions.size,
            legacySessions: legacyNames.length, legacyNames, legacyPolicy: "blocked", armed, gaveUp, hostedArmedDown, pc: _pcHealth,
            // How many times we have actually spawned tmux. Each one is a hard event-loop freeze, so
@@ -1968,7 +2024,12 @@ function healthSnapshot() {
            // signed envelopes we hold in custody but never read.
            stateDirBytes: retention ? retention.stateDirBytes : null,
            retention,
-           host: { connected: hostUp(), name: hostLabel, sessions: hostSessions.size, protocol: hostProtocol.protocol, caps: hostProtocol.caps, protocolOk: hostProtocolOk() },
+           host: { connected: hostUp(), name: hostLabel, sessions: hostSessions.size, protocol: hostProtocol.protocol, caps: hostProtocol.caps, protocolOk: hostProtocolOk(),
+                   // `connected` is TCP state and stays true through the stall this field exists to catch.
+                   // frameAgeMs is the measured gap since muxd's last 5s push (null = nothing to measure);
+                   // frameStale is the threshold applied HERE, so no consumer has to re-derive it with a
+                   // window of its own and drift.
+                   frameAgeMs: hostFrameAgeMs, frameStale: hostFrameStale, frameStaleMs: HOST_FRAME_STALE_MS },
            node: process.version, at: Date.now() };
   // `degraded` alone says something is wrong but never what, which forces every consumer to re-derive
   // the answer from the same fields and drift independently. Publish the breakdown instead: the ops
@@ -3302,6 +3363,10 @@ wssHost.on('connection', (ws, req) => {
       helloAccepted = true;
       hostLabel = opaqueIdentity(m.host) || 'pc';
       hostProtocol = announced;
+      // The hello carries a full session list, so it is the first heartbeat: without this stamp the age
+      // would be measured from the process start until the first 5s pump, and a host that had just
+      // connected would read as stale.
+      hostFrame = { helloAt: Date.now(), sessionsAt: Date.now() };
       hostSessions.clear();
       for (const [name, value] of incoming) hostSessions.set(name, value);
       console.log(`[host] hello from ${hostLabel} (${hostSessions.size} session(s), protocol ${hostProtocol.protocol})`);
@@ -3334,6 +3399,10 @@ wssHost.on('connection', (ws, req) => {
         try { ws.close(1008, 'host session list violated protocol'); } catch {}
         return;
       }
+      // Stamped AFTER validation, on the one branch that accepted the frame. A rejected frame closes the
+      // link instead, so counting it as liveness would let a malformed loop keep the age fresh while the
+      // relay refuses every update.
+      hostFrame.sessionsAt = Date.now();
       hostSessions.clear();
       for (const [n, v] of incoming) hostSessions.set(n, v);
       for (const [n, st] of sessions) {
@@ -3476,6 +3545,10 @@ wssHost.on('connection', (ws, req) => {
     clearInterval(ka);
     if (hostWs === ws) {
       hostWs = null; hostProtocol = { protocol: 0, caps: [] };
+      // Zeroed, not left at its last value. A down link is already reported by host.connected, and a
+      // frozen age from the previous host would describe a socket that no longer exists - the field has
+      // to read "nothing to measure" rather than "the last one was 3 days old".
+      hostFrame = { helloAt: 0, sessionsAt: 0 };
       for (const pending of pendingHostKills.values())
         pending.finish({ ok: false, status: 503, detail: 'host disconnected; stop outcome unconfirmed' });
       for (const st of sessions.values()) {

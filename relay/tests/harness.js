@@ -27,6 +27,28 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+// CHROMIUM MUST NOT USE THE SYSTEM PROXY CONFIGURATION.
+//
+// Measured on the dev box: a page load of a loopback URL that the relay answers in ~30ms took 26.5s
+// (and 6.0s on a second, quieter run) through playwright's default launch, against 159ms with
+// --no-proxy-server. The delay lands entirely on the FIRST request of the browser's life -- the main
+// document -- because that is when chromium resolves the system proxy (WPAD/PAC auto-detection, which
+// on this box has nothing to answer it). Every later subresource is then a few ms, which is why the
+// failure looks like "the relay is slow to serve index.html" rather than "the browser stalled".
+//
+// The effect is a coin flip around playwright's 30s default goto timeout: ws-auth-gate.test.js failed
+// with `page.goto: Timeout 30000ms exceeded` in one run and passed in 487s in the next, with the same
+// code on both sides. That flake is indistinguishable from a product defect at the call site, and it
+// poisons any suite whose verdict anyone wants to trust.
+//
+// --no-proxy-server is correct beyond the timing: every test here talks to 127.0.0.1, and a test that
+// silently routes loopback traffic through a machine's proxy configuration is testing something other
+// than what it claims. This is a property of the browser the tests launch, so it lives here once
+// rather than at each call site.
+function launchBrowser() {
+  return require('playwright').chromium.launch({ headless: true, args: ['--no-proxy-server'] });
+}
+
 async function waitFor(fn, label, timeoutMs = 4000) {
   const started = Date.now();
   let last;
@@ -139,7 +161,21 @@ class RelayHarness {
     try {
       await waitFor(() => this.stdout.includes(`multiplex-app on 127.0.0.1:${this.port}`), 'relay start', 5000);
     } catch (error) {
+      // Capture the diagnostics BEFORE stopping: stop() nulls this.proc, and the pid/exit/stdout
+      // numbers are the whole reason a boot timeout is readable.
       error.message += `; pid=${this.proc.pid}; exit=${this.proc.exitCode}; signal=${this.proc.signalCode}; stdoutBytes=${Buffer.byteLength(this.stdout)}; stderrBytes=${Buffer.byteLength(this.stderr)}`;
+      // A failed start MUST NOT leave its child behind. The banner can arrive after the 5s window
+      // while server.js is bound and healthy, and a survivor keeps holding its port and contending
+      // with every later suite run -- surfacing THERE as their own startup timeout, which is how one
+      // flake reads as a product defect in an unrelated test. Cleaning up here covers every call
+      // site, including the ones that register teardown only after start() returns; without it the
+      // teardown they register never runs, because node skips t.after for a test that failed before
+      // the hook was registered.
+      //
+      // stopProcess(), NOT stop(): a failed start is itself an assertion in some tests -- the relay
+      // refuses to boot on an invalid projection and the test then reads the temp dir to prove the
+      // bad state was not overwritten. stop() would rmSync that evidence out from under it.
+      await this.stopProcess();
       throw error;
     }
   }
@@ -361,4 +397,5 @@ module.exports = {
   waitForWsFrame,
   RelayHarness,
   FakeHost,
+  launchBrowser,
 };

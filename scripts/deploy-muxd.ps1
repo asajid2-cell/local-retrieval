@@ -87,7 +87,32 @@ if (-not $PSBoundParameters.ContainsKey('AuthzMode')) {
   $AuthzMode = if ($requestedMode -in @('audit','enforce')) { $requestedMode } else { 'audit' }
 }
 
+function Get-LiveMuxdPid {
+  $previousAutostart = $env:MUXCTL_AUTOSTART
+  try {
+    $env:MUXCTL_AUTOSTART = '0'
+    $raw = & python (Join-Path $dst 'muxctl.py') status 2>$null
+    if ($LASTEXITCODE -ne 0) { return 0 }
+    $match = [regex]::Match(($raw -join "`n"), 'pid:\s*(\d+)')
+    if ($match.Success) { return [int]$match.Groups[1].Value }
+    return 0
+  }
+  catch {
+    return 0
+  }
+  finally {
+    $env:MUXCTL_AUTOSTART = $previousAutostart
+  }
+}
+
 function Invoke-RestartAndVerify([switch]$Recovery, [string]$RecoveryToken = '') {
+  # The live pid before we ask for a restart. Verification must be against a DIFFERENT pid: the
+  # replaced process keeps answering `status` perfectly well for as long as it takes the restart
+  # task to reach it (preflight, backups, pid kill, scheduled start), so a bare health poll is
+  # satisfied by the process we are replacing and reports success for a restart that has not
+  # happened yet. That is how a "healthy deployment" was reported while the old code was still
+  # serving every request.
+  $beforePid = Get-LiveMuxdPid
   if ($Recovery) {
     & powershell -NoProfile -ExecutionPolicy Bypass -File $restartScript `
       -Recovery -RecoveryToken $RecoveryToken
@@ -96,38 +121,24 @@ function Invoke-RestartAndVerify([switch]$Recovery, [string]$RecoveryToken = '')
     }
   } else {
     Start-ScheduledTask -TaskName $restartTask
-    $deadline = (Get-Date).AddSeconds(90)
-    $healthy = $false
-    do {
-      Start-Sleep -Milliseconds 250
-      $previousAutostart = $env:MUXCTL_AUTOSTART
-      try {
-        $env:MUXCTL_AUTOSTART = '0'
-        & python (Join-Path $dst 'muxctl.py') status *> $null
-        $healthy = $LASTEXITCODE -eq 0
-      }
-      finally {
-        $env:MUXCTL_AUTOSTART = $previousAutostart
-      }
-    } while (-not $healthy -and (Get-Date) -lt $deadline)
-
-    if (-not $healthy) {
-      $info = Get-ScheduledTaskInfo -TaskName $restartTask
-      throw "$restartTask did not produce a healthy muxd replacement within 90 seconds (task result $($info.LastTaskResult))"
-    }
   }
 
-  $previousAutostart = $env:MUXCTL_AUTOSTART
-  try {
-    $env:MUXCTL_AUTOSTART = '0'
-    & python (Join-Path $dst 'muxctl.py') status *> $null
-    if ($LASTEXITCODE -ne 0) {
-      throw 'replacement muxd failed its local status check'
-    }
+  $deadline = (Get-Date).AddSeconds(120)
+  $afterPid = 0
+  do {
+    Start-Sleep -Milliseconds 500
+    $afterPid = Get-LiveMuxdPid
+  } while (($afterPid -eq 0 -or $afterPid -eq $beforePid) -and (Get-Date) -lt $deadline)
+
+  if ($afterPid -eq 0) {
+    throw 'no muxd is answering its local status check after the restart'
   }
-  finally {
-    $env:MUXCTL_AUTOSTART = $previousAutostart
+  if ($afterPid -eq $beforePid) {
+    $info = Get-ScheduledTaskInfo -TaskName $restartTask
+    throw ("$restartTask left pid $beforePid in place; the replacement never started " +
+           "(task result $($info.LastTaskResult))")
   }
+  Write-Output "restart verified: pid $beforePid -> $afterPid"
 }
 
 $restartScript = Join-Path $dst 'ops\restart_muxd.ps1'

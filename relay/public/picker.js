@@ -190,20 +190,28 @@
       if (launchMode && launchMode !== 'native' && launchMode !== 'gateway') return { state: 'failed', muxName: '', detail: 'Unsupported resume mode.' };
       if (launchMode === 'gateway' && toolFor(chat) !== 'claude') return { state: 'failed', muxName: '', detail: 'Codex requires a new Gateway handoff chat, not same-chat resume.' };
       var muxName = muxNameFor(chat);
+      // A refused resume has to name a cause the user can act on, so "the PC would not answer" must not
+      // be reported as "your chat is ambiguous". The distinction matters because the two are not equally
+      // fatal: an AMBIGUOUS answer is the PC's own verdict and still refuses the tap, but a listing we
+      // could not READ tells us nothing, and treating it as fatal made the whole resume hinge on a second
+      // endpoint that this file has no authority over. That endpoint is relay-owned, its route runs the
+      // synchronous legacy-tmux probe, and it is polled every 4s by every open tab, so it is the least
+      // reliable answer in the sequence — while the relay independently refuses a genuine second writer at
+      // startmux time (ensureNoLocalOwnerForMuxName against the PC's own live-agent scan, which is
+      // authoritative in a way this listing is not). Refusing here therefore produced the worst of both:
+      // a dead-end the user cannot act on, for a condition the relay would have caught anyway.
       try {
         var liveResponse = await fetchFn(base + '/api/sessions');
-        if (!liveResponse.ok) throw new Error('session authority unavailable');
-        var liveRows = await liveResponse.json();
-        if (!Array.isArray(liveRows)) throw new Error('invalid session listing');
-        var owners = liveRows.filter(function (row) {
-          return row.alive && !row.identityPending && row.generationId
-            && (row.sessionId === chat.id || (Array.isArray(row.aliases) && row.aliases.includes(chat.id)));
-        });
-        if (owners.length > 1) return { state: 'failed', muxName: '', detail: 'Multiple live owners; refresh and resolve ownership before resuming.' };
-        if (owners.length === 1) muxName = muxNameFor({ muxName: owners[0].name });
-      } catch (error) {
-        return { state: 'failed', muxName: '', detail: 'Could not verify the live resume destination.' };
-      }
+        var liveRows = liveResponse && liveResponse.ok ? await liveResponse.json() : null;
+        if (Array.isArray(liveRows)) {
+          var owners = liveRows.filter(function (row) {
+            return row.alive && !row.identityPending && row.generationId
+              && (row.sessionId === chat.id || (Array.isArray(row.aliases) && row.aliases.includes(chat.id)));
+          });
+          if (owners.length > 1) return { state: 'failed', muxName: '', detail: 'Multiple live owners; refresh and resolve ownership before resuming.' };
+          if (owners.length === 1) muxName = muxNameFor({ muxName: owners[0].name });
+        }
+      } catch (error) { /* unreadable listing: fall through to the name we already hold and let the relay decide */ }
       if (!muxName) return { state: 'failed', muxName: '', detail: 'this chat has no resumable session name' };
       var payload = {
         type: 'startmux',

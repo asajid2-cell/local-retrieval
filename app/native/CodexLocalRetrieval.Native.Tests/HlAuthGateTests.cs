@@ -34,8 +34,8 @@ public sealed class HlAuthGateTests
         => Assert.AreEqual(GateOutcome.Forbid, HlAuthGate.Evaluate(Access(true, ("other", true)), "remote"));
 
     [TestMethod]
-    public void Evaluate_MalformedJson_FailsClosed()
-        => Assert.AreEqual(GateOutcome.Forbid, HlAuthGate.Evaluate("not json", "remote"));
+    public void Evaluate_MalformedJson_IsUnavailableNotForbid()
+        => Assert.AreEqual(GateOutcome.Unavailable, HlAuthGate.Evaluate("not json", "remote"));
 
     [TestMethod]
     public async Task Check_NoCookie_SendsToLogin()
@@ -44,14 +44,26 @@ public sealed class HlAuthGateTests
         Assert.AreEqual(GateOutcome.Login, await gate.CheckAsync(""));
     }
 
+    // An auth service we could not reach denies the request, but it must NOT be reported as a verdict
+    // on the account: a signed-in owner was being told "your account isn't allowed" for what was
+    // really a timed-out fetch, and the false Forbid was cached for the full TTL.
     [TestMethod]
-    public async Task Check_AuthServiceUnreachable_FailsClosed()
+    public async Task Check_AuthServiceUnreachable_IsUnavailableNotForbid()
     {
         var nullFetch = new HlAuthGate((_, _) => Task.FromResult<string?>(null), "remote");
-        Assert.AreEqual(GateOutcome.Forbid, await nullFetch.CheckAsync("hl_session=abc"));
+        Assert.AreEqual(GateOutcome.Unavailable, await nullFetch.CheckAsync("hl_session=abc"));
 
         var throwFetch = new HlAuthGate((_, _) => throw new HttpRequestException("down"), "remote");
-        Assert.AreEqual(GateOutcome.Forbid, await throwFetch.CheckAsync("hl_session=abc"));
+        Assert.AreEqual(GateOutcome.Unavailable, await throwFetch.CheckAsync("hl_session=abc"));
+    }
+
+    // The refinement must not have blunted a real denial: the auth service answering "this account
+    // may not open this page" is still a Forbid, and it is still cached.
+    [TestMethod]
+    public void Evaluate_PageNotOpenable_StaysForbid()
+    {
+        Assert.AreEqual(GateOutcome.Forbid, HlAuthGate.Evaluate(Access(true, ("remote", false)), "remote"));
+        Assert.AreEqual(GateOutcome.Forbid, HlAuthGate.Evaluate(Access(true, ("other", true)), "remote"));
     }
 
     [TestMethod]

@@ -3421,7 +3421,14 @@ async function pollHealth(){
     dot.className = 'hdot ' + (h.ok ? 'ok' : (h.degraded ? 'warn' : 'bad'));
     const up = h.uptimeSec>=3600 ? Math.round(h.uptimeSec/3600)+'h' : Math.round(h.uptimeSec/60)+'m';
     const pc = (h.pc && h.pc.reachable) ? ('PC '+h.pc.rttMs+'ms') : ((h.pc && h.pc.reachable===false) ? 'PC UNREACHABLE' : 'PC …');
-    const host = h.host && h.host.connected ? `host ${h.host.name||'pc'} proto ${h.host.protocol||'?'}` : 'host offline';
+    // "host NAME proto 4" describes a link, and it stays true through the one failure where the link is
+    // up and nothing is moving. An amber dot whose tooltip says the host is fine sends the reader away
+    // from the actual cause, so a stalled host is named here instead of being left to the aggregate.
+    const host = h.host && h.host.connected
+      ? (h.host.frameStale
+        ? `host ${h.host.name||'pc'} STALLED ${Math.round((h.host.frameAgeMs||0)/1000)}s`
+        : `host ${h.host.name||'pc'} proto ${h.host.protocol||'?'}`)
+      : 'host offline';
     dot.title = (h.degraded?'DEGRADED':'healthy')+` · ${h.legacySessions||0} legacy · ${pc} · ${host} · ${h.armed} armed`
       + (h.gaveUp?` · ${h.gaveUp} gave-up`:'') + ` · up ${up} · node ${h.node}`;
   }catch(e){ dot.className='hdot bad'; dot.title='relay unreachable'; }

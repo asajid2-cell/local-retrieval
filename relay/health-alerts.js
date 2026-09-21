@@ -39,6 +39,7 @@ const DEFAULTS = {
   dedupeMs: 30 * 60 * 1000,      // one push per condition per 30 minutes
   degradedSustainMs: 2 * 60 * 1000,   // healthy -> degraded must hold >2min
   hostDownSustainMs: 5 * 60 * 1000,   // host link down must hold >5min
+  hostStallSustainMs: 5 * 60 * 1000,  // host stalled must hold >5min
 };
 
 function bool(value) {
@@ -54,6 +55,17 @@ function degradedReasons(health) {
   const projects = health.projects || {};
   const persistence = health.persistence || {};
   if (host.connected === false) out.push('host link down');
+  // Listed AFTER the link terms on purpose: a down link means there is no frame to be late, so "stalled"
+  // must never be the reason an operator reads for a host that simply went away.
+  if (host.frameStale === true) {
+    // Null-checked, not coerced: Number(null) is 0 and Number.isFinite(0) is true, so a bare
+    // isFinite(Number(...)) would render a missing age as a perfectly fresh "0s".
+    const age = host.frameAgeMs;
+    const ageText = age === null || age === undefined || !Number.isFinite(Number(age))
+      ? 'unknown'
+      : `${Math.round(Number(age) / 1000)}s`;
+    out.push(`host stalled (no frame for ${ageText})`);
+  }
   if (host.protocolOk === false) out.push('host protocol mismatch');
   if (pc.reachable === false) out.push(`PC unreachable (${pc.host || 'unknown'})`);
   if (Number(health.legacySessions) > 0) out.push(`${health.legacySessions} legacy tmux session(s)`);
@@ -107,6 +119,36 @@ const CONDITIONS = [
     priority: 'high',
   },
   {
+    key: 'host-stalled',
+    sustainKey: 'hostStallSustainMs',
+    // The failure this exists for: muxd's event loop stops turning while its WebSocket stays open, so
+    // `connected` is still true, protocolOk is still true, caps are still complete — every existing
+    // check passes while no byte moves. That is exactly how the 3-day stall went unreported.
+    //
+    // Explicit `=== true` only, and only when a frame age was actually measured: server.js emits
+    // frameStale=false for a down link (there is no frame to be late) and frameAgeMs=null before the
+    // first one arrives, so an absent host block, a dead link and an unstamped host are all silence.
+    // Treating "no evidence" as "stalled" is the false-positive shape this module was rewritten for.
+    detect: (health) => (health.host || {}).frameStale === true,
+    title: () => 'Host stalled',
+    body: (health, heldMs) => {
+      const host = health.host || {};
+      // Same null trap as degradedReasons: a coerced null reads as a fresh 0s.
+      const age = host.frameAgeMs;
+      const ageText = age === null || age === undefined || !Number.isFinite(Number(age))
+        ? 'an unknown time'
+        : `${Math.round(Number(age) / 1000)}s`;
+      return `muxd is connected but has pushed no status frame for ${ageText}`
+        + `${host.name ? ` (${host.name})` : ''} — held ${minutes(heldMs)}m.`
+        + '\nThe link is up, so nothing else reports this: terminals will not create, attach, or update.'
+        + '\nA stalled event loop is the usual cause (scheduling priority / a blocking call on the loop).';
+    },
+    recoveryTitle: () => 'Host frames flowing again',
+    recoveryBody: (health, heldMs) => `muxd resumed pushing status frames after ${minutes(heldMs)}m stalled.`,
+    tags: ['hourglass_flowing_sand'],
+    priority: 'urgent',
+  },
+  {
     key: 'persistence-blocked',
     sustainMs: 0,
     // Blocked persistence does not self-heal — it is latched until an operator clears it
@@ -147,6 +189,7 @@ const CONDITIONS = [
  * @param {number} [options.dedupeMs]
  * @param {number} [options.degradedSustainMs]
  * @param {number} [options.hostDownSustainMs]
+ * @param {number} [options.hostStallSustainMs]
  * @param {string} [options.click]   URL the push opens (the relay dashboard).
  * @param {string} [options.label]   prefix for push titles, e.g. the host name.
  */
@@ -159,6 +202,7 @@ function createHealthAlerts(options = {}) {
     dedupeMs: Number(options.dedupeMs) >= 0 ? Number(options.dedupeMs) : DEFAULTS.dedupeMs,
     degradedSustainMs: Number(options.degradedSustainMs) >= 0 ? Number(options.degradedSustainMs) : DEFAULTS.degradedSustainMs,
     hostDownSustainMs: Number(options.hostDownSustainMs) >= 0 ? Number(options.hostDownSustainMs) : DEFAULTS.hostDownSustainMs,
+    hostStallSustainMs: Number(options.hostStallSustainMs) >= 0 ? Number(options.hostStallSustainMs) : DEFAULTS.hostStallSustainMs,
   };
   const click = options.click || undefined;
   const label = options.label ? String(options.label) : '';

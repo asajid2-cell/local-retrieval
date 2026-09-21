@@ -588,6 +588,11 @@ async def do_status():
         print("pid: %s uptime: %ss" % (info.get("pid"), info.get("uptimeSec", "?")))
     if "loopLagMs" in info:
         print("loop lag: %sms current, %sms max" % (info.get("loopLagMs"), info.get("maxLoopLagMs")))
+    # The scheduling class explains lag that has no other cause: a below-normal muxd is starved by
+    # any normal-priority load on the box, and from the outside that is indistinguishable from a
+    # stalled one. Printed only when the host reports it, so older hosts stay readable.
+    if info.get("priorityClass"):
+        print("scheduling: priority=%s" % info["priorityClass"])
     if "localTotal" in info:
         print("local control: active=%s total=%s errors=%s last=%sms %s" % (
             info.get("localActive", "?"), info.get("localTotal", "?"), info.get("localErrors", "?"),

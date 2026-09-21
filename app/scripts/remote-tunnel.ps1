@@ -25,6 +25,15 @@ $outLog = Join-Path $here 'tunnel.log'
 $errLog = Join-Path $here 'tunnel.err.log'
 $ErrorActionPreference = 'Continue'
 
+# The tunnel must never run below Normal priority. A BelowNormal ssh.exe is descheduled often enough
+# that the VPS-side listener still accepts TCP instantly while the forward stalls for seconds -- which
+# the edge sees as 502/503 and 60s timeouts, and which is indistinguishable from "the PC is down".
+# This supervisor inherits its priority from whatever launched it (the CodexArchiveRemote task's
+# Settings.Priority), and that setting lives only on the machine and is not versioned with the code, so
+# assert the invariant here too. The long-lived `ssh.exe` doing the forwarding is our child and inherits it.
+try { [System.Diagnostics.Process]::GetCurrent().PriorityClass = [System.Diagnostics.ProcessPriorityClass]::Normal }
+catch { }
+
 function Write-TunnelLog([string]$message) {
     $stamp = (Get-Date).ToString('o')
     Add-Content -LiteralPath $outLog -Value "[$stamp] $message"

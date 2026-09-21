@@ -22,7 +22,7 @@ const { once } = require('node:events');
 const WebSocket = require('ws');
 const http = require('node:http');
 
-const { RelayHarness, sleep } = require('./harness');
+const { RelayHarness, sleep, launchBrowser } = require('./harness');
 
 // A real deploy only ever sees browser upgrades, which always carry an Origin. wsOriginOk() answers
 // TEST_MODE for a MISSING Origin, so a no-Origin probe would be destroyed before the handshake and
@@ -91,15 +91,35 @@ test('production middleware distinguishes anonymous, non-owner, and owner over H
       }
     }
   }
-  const { chromium } = require('playwright');
-  const browser = await chromium.launch({ headless: true });
+  const browser = await launchBrowser();
   t.after(() => browser.close());
   for (const [token, expected] of [[null, 401], ['fixture-member', 403], ['fixture-owner', 200]]) {
+    // The anonymous pass has no cookie, so the relay answers a *page* navigation the way it answers a
+    // real logged-out visitor: a 302 to HL_LOGIN = https://harmonizerlabs.cc/auth/login. Following that
+    // leaves the browser on the PUBLIC SITE, and every `fetch('/api/sessions')` below then runs against
+    // harmonizerlabs.cc instead of against the relay — the assertion still reads 401, so it passes while
+    // testing nothing. Measured directly: document origin https://harmonizerlabs.cc, fetch URL
+    // https://harmonizerlabs.cc/api/sessions, plus a third-party beacon request. It is also where the
+    // 30s `page.goto` timeouts came from, since `waitUntil:'load'` waited on that internet fetch.
+    //
+    // Asking for JSON keeps the document on the relay's own origin: the middleware refuses a non-HTML
+    // request with `401 {"error":"login required"}` IN PLACE (server.js:229) rather than redirecting, so
+    // no third-party hop exists to be slow or to answer on the relay's behalf. The refusal under test —
+    // a browser with no owner cookie is not authorized — is identical either way.
+    //
+    // The header has to be rewritten on the ROUTE, not via context.extraHTTPHeaders: a navigation
+    // supplies its own `Accept: text/html,...` that wins over the context default, so the redirect
+    // survived the context-level attempt (verified: final URL still https://harmonizerlabs.cc).
     const context = await browser.newContext();
     try {
+      if (!token) await context.route(`http://127.0.0.1:${h.port}/`, route => route.continue({
+        headers: { ...route.request().headers(), accept: 'application/json' },
+      }));
       if (token) await context.addCookies([{ name: 'hl_session', value: token, url: `http://127.0.0.1:${h.port}` }]);
       const page = await context.newPage();
       await page.goto(`http://127.0.0.1:${h.port}/`);
+      assert.equal(new URL(page.url()).origin, `http://127.0.0.1:${h.port}`,
+        'the browser must stay on the relay origin, or the assertions below would be answered by whatever site it landed on');
       const result = await page.evaluate(async () => {
         const response = await fetch('/api/sessions');
         return { status: response.status, body: await response.text() };
@@ -175,14 +195,23 @@ test('owner browser mutation reaches real headless archive and survives reload',
   await waitFor(async () => { try { return await archiveGet('/healthz'); } catch { return false; } }, 'headless authority', 30000);
   const row = (await archiveGet('/api/discovery/chats?showHidden=true&archived=all')).rows.find(row => row.id === 'target');
   const beforeUnrelated = (await archiveGet('/api/discovery/chats?showHidden=true&archived=all')).rows.find(row => row.id === 'unrelated');
-  const browser = await require('playwright').chromium.launch({ headless: true });
+  const browser = await launchBrowser();
   t.after(() => browser.close());
   let commandId;
   for (const [cookie, expected] of [[null, 401], ['fixture-member', 403], ['fixture-owner', 200]]) {
+    // Same trap as the test above: without a cookie a page navigation is 302'd to harmonizerlabs.cc, and
+    // the browser would then mutate THAT site's store rather than the relay's. Ask for JSON so the
+    // refusal is answered in place on the relay's own origin.
     const context = await browser.newContext();
     try {
+      if (!cookie) await context.route(`http://127.0.0.1:${h.port}/`, route => route.continue({
+        headers: { ...route.request().headers(), accept: 'application/json' },
+      }));
       if (cookie) await context.addCookies([{ name: 'hl_session', value: cookie, url: `http://127.0.0.1:${h.port}` }]);
-      const page = await context.newPage(); await page.goto(`http://127.0.0.1:${h.port}/`);
+      const page = await context.newPage();
+      await page.goto(`http://127.0.0.1:${h.port}/`);
+      assert.equal(new URL(page.url()).origin, `http://127.0.0.1:${h.port}`,
+        'the browser must stay on the relay origin, or the assertions below would be answered by whatever site it landed on');
       const response = await page.evaluate(async revision => {
         const r = await fetch('/api/app-commands', { method: 'POST', headers: { 'content-type': 'application/json' },
           body: JSON.stringify({ type: 'setfavorite', sessionId: 'target', favorite: true, expectedRevision: revision, intentId: 'owner-to-archive' }) });

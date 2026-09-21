@@ -72,9 +72,24 @@ preflight() {
     env_mode="$(stat -c %a "$ENV_FILE")"
     [ "$env_owner:$env_group" = "root:root" ] || die "$ENV_FILE must be owned by root:root"
     [ "$env_mode" = 600 ] || die "$ENV_FILE must have mode 0600"
-    for key in PORT MUX_HOST_TOKEN HL_INTERNAL_KEY; do
+    for key in PORT MUX_HOST_TOKEN HL_INTERNAL_KEY MUX_COMMAND_BRIDGE_TOKEN; do
         env_has_value "$key" || die "$ENV_FILE is missing a non-empty $key"
     done
+    # Both halves of the command-bridge credential, or the PC can never drain the queue. The server
+    # half alone is the failure that matters: with the env value present but the header file missing
+    # or mis-shaped, every lease attempt exits 77 before curl runs and the web sees a 30s timeout on
+    # every Start-chat / Resume with no server-side error at all. Check the file with the SAME
+    # predicate the consumer applies, so "preflight ok" means the PC's guard would pass too.
+    hdr="/home/$(id -un harmonizer)/.config/mux/command-bridge.header"
+    if [ ! -f "$hdr" ] || [ -L "$hdr" ] || [ ! -s "$hdr" ] || [ ! -r "$hdr" ]; then
+        die "$hdr is missing or unsafe (the PC command consumer needs it)"
+    fi
+    [ "$(stat -c %u "$hdr")" = "$(id -u harmonizer)" ] ||
+        die "$hdr must be owned by the harmonizer account the PC's ssh route authenticates as"
+    case "$(stat -c %A "$hdr")" in
+        ?r??------) ;;
+        *) die "$hdr must be mode 0400/0500/0600 (owner read only), as the consumer requires" ;;
+    esac
     # MUX_BRIDGE_TOKEN is optional, and the relay fails CLOSED without it: the archive-index routes
     # stay 403. No PC-side producer ships in this tree, so requiring it would gate every deploy on a
     # credential nothing exercises. Warn rather than die, so an absent capability stays visible.

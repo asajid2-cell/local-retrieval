@@ -49,6 +49,73 @@ pid=$(systemctl show multiplex-app.service -p MainPID --value)
 grep -E '^(Uid|Gid|Groups):' "/proc/$pid/status"
 ```
 
+### The command-bridge credential
+
+`MUX_COMMAND_BRIDGE_TOKEN` is the only thing that authorizes the PC to consume the
+command queue, and it has **two halves that must be minted together**. It gates three
+things, all of which fail closed when it is unset:
+
+- `POST /api/app-commands/lease` and `/api/app-commands/:id/ack` — the PC's only command
+  channel. Without it the web can enqueue but nothing ever drains the queue, so every
+  Start-chat / Resume / metadata action waits out its full 30s deadline and reports
+  "PC bridge did not confirm mux start".
+- `POST /api/principal-auth` — transcript read authorization.
+- `POST /api/transcripts/:sessionId` — transcript page push.
+
+The loopback address is **not** the trust boundary here: the relay and every app share
+host networking, so `127.0.0.1` alone would let any co-resident process drain the queue.
+The token is what distinguishes the PC's poller from a co-resident impostor.
+
+Two artifacts, and neither is generated automatically:
+
+```sh
+# 1) the relay's half — server env, root:root 0600, like every other secret in the file
+tok=$(openssl rand -hex 32)
+printf 'MUX_COMMAND_BRIDGE_TOKEN=%s\n' "$tok" | sudo tee -a /etc/multiplex-app.env
+sudo chown root:root /etc/multiplex-app.env && sudo chmod 0600 /etc/multiplex-app.env
+
+# 2) the PC consumer's half — a header FILE the PC's ssh session can read
+#    /home/harmonizer/.config/mux/command-bridge.header
+sudo install -d -o harmonizer -g harmonizer -m 0700 /home/harmonizer/.config/mux
+printf 'X-Mux-Command-Bridge: %s\n' "$tok" \
+  | sudo tee /home/harmonizer/.config/mux/command-bridge.header >/dev/null
+sudo chown harmonizer:harmonizer /home/harmonizer/.config/mux/command-bridge.header
+sudo chmod 400 /home/harmonizer/.config/mux/command-bridge.header
+unset tok
+```
+
+The header file's form is **not** free: the PC passes it to `curl --header "@$h"`, which
+parses one `Name: value` pair per line (this is libcurl's netrc-style header file, not a
+netrc file). A netrc body (`machine … login … password …`) is read as a *header* and
+rejected with 403. The PC also refuses to use the file at all — exiting 77 before it ever
+calls curl — unless it is a regular file, non-empty, readable, owned by the ssh user, and
+exactly `?r??------` (0600/0400/0500). That is why the file is `400 harmonizer:harmonizer`
+and not root-owned: `harmonizer` is the account the PC's ssh route authenticates as.
+
+Verify without printing the value:
+
+```sh
+# configured at all? (names only)
+sudo grep -c '^MUX_COMMAND_BRIDGE_TOKEN=' /etc/multiplex-app.env
+sudo stat -c '%A %U:%G %s' /home/harmonizer/.config/mux/command-bridge.header
+# the real gate: no credential must be 403, never 503
+curl -s -o /dev/null -w '%{http_code}\n' -X POST \
+  http://127.0.0.1:7682/api/app-commands/lease \
+  -H 'Content-Type: application/json' -d '{"owner":"probe","limit":1,"waitMs":0}'
+# the real consumer path, as the ssh user, using the file
+sudo -u harmonizer bash -c 'h="$HOME/.config/mux/command-bridge.header"; \
+  curl -s -o /dev/null -w "%{http_code}\n" -X POST \
+  http://127.0.0.1:7682/api/app-commands/lease \
+  -H "Content-Type: application/json" --header "@$h" \
+  -d "{\"owner\":\"probe\",\"limit\":1,\"waitMs\":0}"'
+```
+
+`503 {"error":"command bridge credential not configured"}` means the *server* half is
+missing. `403 {"error":"local command bridge credential required"}` from the consumer path
+means the server half is fine and the *file* half is missing, mis-shaped, or mis-owned —
+check the exit-77 preconditions above before suspecting the token. A `403` from the
+unauthenticated probe is the healthy answer.
+
 ## Routine release
 
 The worktree must be clean because the archive is built from `HEAD`, stamped with the
@@ -74,18 +141,30 @@ relay dying:
 
 - `multiplex-healthcheck.timer` runs `/usr/local/bin/multiplex-healthcheck` every minute.
   It reads `/api/health` over loopback as `harmonizer` and exits non-zero only for a
-  genuine fault (host link down, protocol mismatch, missing host capabilities, PC
-  unreachable, persistence not writing, legacy tmux sessions, a pending rename intent, an
-  outstanding upload warning, a store recovered but not rewritten, an unsupported node).
+  genuine fault (host link down, **host connected but stalled**, protocol mismatch, missing
+  host capabilities, PC unreachable, persistence not writing, legacy tmux sessions, a pending
+  rename intent, an outstanding upload warning, a store recovered but not rewritten, an
+  unsupported node).
   A stale desktop push is **not** a fault: `ok` is `!degraded`, and `degraded` includes
   the projects bridge, which is false whenever no desktop app is running. Failing on that
   made the unit fail ~614 times in four days for a relay that was serving correctly, and a
   monitor that cries wolf every minute trains an operator to ignore it. Those states are
   printed as `WARN` lines on every run at exit 0 instead.
+
+  **The stalled-host check is the one that catches a link that is up but dead.** muxd pushes
+  a `t:"sessions"` frame every 5s, so `/api/health.host.frameAgeMs` measures the heartbeat
+  and `host.frameStale` is the relay's own staleness verdict (`MUX_HOST_FRAME_STALE_MS`,
+  default 15000). `host.connected` is TCP state and stays `true` through a stalled event
+  loop — which is exactly how muxd once stopped moving for three days while `/api/health`
+  reported a healthy host. A down link reports `frameAgeMs: null` and `frameStale: false`
+  (there is no frame to be late); the check never fires for it. The OK line prints
+  `frameAge=…` (or `n/a`) so the heartbeat is readable on healthy runs too.
 - The relay's in-process ops-alert lane (`relay/health-alerts.js`) pushes on degraded
   **edges** with sustain windows and 30-minute dedupe. It starts whether or not a topic is
   configured; an unset topic selects the journal sink rather than switching the lane off.
-  The lane cannot report the relay's own death, which is why the timer exists.
+  The lane cannot report the relay's own death, which is why the timer exists. Alongside the
+  aggregate it carries a `host-stalled` condition (5min dwell, same source field), so a
+  silent muxd pages by name instead of only colouring the degraded aggregate.
 
 ```sh
 systemctl list-timers multiplex-healthcheck.timer

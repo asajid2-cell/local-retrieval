@@ -2,12 +2,12 @@ const assert = require('node:assert/strict');
 const childProcess = require('node:child_process');
 const path = require('node:path');
 const { test } = require('node:test');
-const { chromium } = require('playwright');
 
 const {
   RelayHarness,
   REPO,
   freePort,
+  launchBrowser,
   waitFor,
 } = require('./harness');
 
@@ -30,7 +30,7 @@ let browserError = null;
 
 test.before(async () => {
   try {
-    browser = await chromium.launch({ headless: true });
+    browser = await launchBrowser();
   } catch (error) {
     browserError = error;
     console.warn(

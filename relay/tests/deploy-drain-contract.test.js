@@ -78,13 +78,24 @@ test('deploy preflight validates the existing auth and host security boundary', 
   assert.match(installer, /ENV_FILE=\/etc\/multiplex-app\.env/);
   assert.match(installer, /must be owned by root:root/);
   assert.match(installer, /must have mode 0600/);
-  for (const key of ['PORT', 'MUX_HOST_TOKEN', 'HL_INTERNAL_KEY']) {
+  for (const key of ['PORT', 'MUX_HOST_TOKEN', 'HL_INTERNAL_KEY', 'MUX_COMMAND_BRIDGE_TOKEN']) {
     assert.match(installer, new RegExp(`for key in[\\s\\S]*${key}`));
   }
+  // MUX_COMMAND_BRIDGE_TOKEN is the PC's ONLY command channel. With it absent the relay's lease
+  // handler answers 503 before the PC's curl runs, so every web-enqueued startmux/startchat sits
+  // pending and the browser reports "PC bridge did not confirm mux start" after its full 30s
+  // deadline. Nothing else in the deploy noticed: the relay was healthy, nginx was healthy, and the
+  // process identity was correct. It is therefore death-on-absent, unlike MUX_BRIDGE_TOKEN below.
+  assert.match(installer, /for key in PORT MUX_HOST_TOKEN HL_INTERNAL_KEY MUX_COMMAND_BRIDGE_TOKEN; do/);
+  // The credential is TWO halves and the env var alone is the half that looks fine while the PC is
+  // still locked out, because the consumer exits 77 on the missing header before it ever calls curl.
+  // Preflight must check the header with the consumer's own predicate, or "preflight ok" lies.
+  assert.match(installer, /command-bridge\.header/);
+  assert.match(installer, /\?r\?\?------/);
+  assert.match(installer, /id -u harmonizer/);
   // MUX_BRIDGE_TOKEN gates only the archive-index routes, no producer in this tree exercises them,
   // and the relay fails closed without it. It must stay out of the death-on-absent list so a deploy
   // is not gated on a credential nothing uses, while remaining visible as a warning.
-  assert.match(installer, /for key in PORT MUX_HOST_TOKEN HL_INTERNAL_KEY; do/);
   assert.match(installer, /MUX_BRIDGE_TOKEN absent/);
   assert.match(installer, /require_unit_value User svc-multiplex/);
   assert.match(installer, /require_unit_value Group svc-multiplex/);

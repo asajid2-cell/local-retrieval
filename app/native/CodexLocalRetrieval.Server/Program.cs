@@ -76,7 +76,17 @@ var archive = new ArchiveService(
 // DON'T load it at startup; the first archive-backed request triggers a one-time load (+ disk sync). An
 // idle server (Agent-only use, or just sitting there) stays light until you actually browse your archive.
 var syncOnLoad = Environment.GetEnvironmentVariable("CLR_REMOTE_SYNC") != "0";
-var archiveRuntime = new ArchiveRuntime(archive, syncOnLoad, Console.Error.WriteLine);
+// The archive's phase trace (scan/parse/merge timings, bytes read, heap deltas) has a sink in the GUI
+// but had NONE here, so a slow remote load could only be measured from the outside as one opaque
+// request duration. Point it at stderr so the bridge's own log says which phase actually cost the time.
+PerfCounters.Trace ??= message => Console.Error.WriteLine("[perf] " + message);
+// The save already measures its own phases but only reported them to the GUI, so a remote merge's cost
+// could be seen (mergeMs=35364) but not attributed. Route it to the same trace sink.
+archive.SavePhaseMeasured = (phase, ms) =>
+{
+    if (ms >= 100) PerfCounters.Trace?.Invoke($"savephase {phase} ms={ms:F0}");
+};
+var archiveRuntime = new ArchiveRuntime(archive, syncOnLoad, Console.Error.WriteLine, deferInitialRefresh: true);
 
 IChatBackend? BackendFactory()
 {
@@ -109,7 +119,9 @@ if (hlAuthOn)
 {
     // hl-auth SSO gate: every request (except /healthz) must carry an hl_session cookie that the
     // hl-auth account system says can open this page. Not signed in -> bounce to the hl-auth login
-    // page; signed in but not allowed -> 403. Decision cached ~30s per cookie. Fails closed.
+    // page; signed in but not allowed -> 403; auth service unreachable -> 503 so the visitor can
+    // retry. Decisions are cached ~30s per cookie; a decision we could NOT make is never cached.
+    // Fails closed either way — nothing is served without a positive Allow.
     var http = new HttpClient { Timeout = TimeSpan.FromSeconds(10) };
     var gate = new HlAuthGate(async (cookieVal, ct) =>
     {
@@ -127,12 +139,28 @@ if (hlAuthOn)
         GateOutcome outcome;
         if (string.IsNullOrEmpty(cookie)) outcome = GateOutcome.Login;
         else if (cache.TryGet(cookie, out var hit)) outcome = hit;
-        else { outcome = await gate.CheckAsync(cookie, ctx.RequestAborted); cache.Set(cookie, outcome); }
+        else
+        {
+            outcome = await gate.CheckAsync(cookie, ctx.RequestAborted);
+            // Only a decision we actually reached is worth remembering. Caching Unavailable would
+            // replay "the auth service was down" for the full TTL after it came back — which is how
+            // a transient hiccup kept the archive refused for 30s at a time.
+            if (outcome != GateOutcome.Unavailable) cache.Set(cookie, outcome);
+        }
 
         if (outcome == GateOutcome.Allow) { await next(); return; }
         if (outcome == GateOutcome.Login)
         {
             ctx.Response.Redirect($"{hlBase}/auth/login?next={Uri.EscapeDataString(hlReturn)}");
+            return;
+        }
+        if (outcome == GateOutcome.Unavailable)
+        {
+            // The account was never judged, so do not claim it was refused. 503 + Retry-After tells
+            // the page (and any proxy) this is transient and the same cookie is worth trying again.
+            ctx.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
+            ctx.Response.Headers.RetryAfter = "2";
+            await ctx.Response.WriteAsync("The sign-in service could not be reached. Please retry.");
             return;
         }
         ctx.Response.StatusCode = StatusCodes.Status403Forbidden;

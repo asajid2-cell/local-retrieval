@@ -19,4 +19,10 @@
     <ProjectReference Include="..\CodexLocalRetrieval.Core\CodexLocalRetrieval.Core.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- The runtime's test seam (SyncScanHook) is internal so it stays out of the shipped surface, same
+         as ArchiveService.SavePhaseMeasured. The test project is the only assembly that needs it. -->
+    <InternalsVisibleTo Include="CodexLocalRetrieval.Native.Tests" />
+  </ItemGroup>
+
 </Project>

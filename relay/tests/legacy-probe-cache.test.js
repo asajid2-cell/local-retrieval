@@ -12,6 +12,8 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
 
 const { RelayHarness, sleep } = require('./harness');
 
@@ -20,8 +22,15 @@ test('repeated session polls share one tmux probe instead of spawning per reques
   await h.start();
   t.after(() => h.stop());
 
+  // The probe now runs OFF the event loop, so its count lands asynchronously rather than during the
+  // request that triggered it. Nothing probes until something asks, so the first health read is what
+  // kicks the fill off; settle THAT before taking the baseline, or the baseline races the promise and
+  // the test measures when it resolved instead of how many spawns the polls caused.
+  await h.json('GET', '/api/health');
+  await sleep(500);
   const before = (await h.json('GET', '/api/health')).legacyProbes;
   assert.equal(typeof before, 'number', '/api/health must expose the tmux probe count');
+  assert.ok(before >= 1, `the first health read must have completed a probe (probes ${before})`);
 
   // The real pattern: several tabs polling the session list at once.
   for (let i = 0; i < 8; i++) await h.json('GET', '/api/sessions');
@@ -32,6 +41,25 @@ test('repeated session polls share one tmux probe instead of spawning per reques
     `8 session polls inside one TTL window must not spawn tmux again (probes ${before} -> ${after}); `
     + 'each spawn is a hard event-loop freeze measured at ~15ms p50',
   );
+});
+
+// The spawn count is only half the property. The complaint it explains is a STALL -- a create or an
+// erase that lands seconds late, in odd bunches -- and a spawn that runs off the loop costs latency
+// without stalling anything. So the shape itself is pinned: this path must not call a synchronous
+// spawner. A structural assertion, not a timing one, because a timing assertion on a shared box
+// measures the box.
+test('the legacy tmux probe never spawns synchronously on the event loop', () => {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'server.js'), 'utf8');
+  const start = source.indexOf('function readLegacyTmuxProbe');
+  assert.ok(start > 0, 'the probe reader must exist');
+  const body = source.slice(start, source.indexOf('function legacyTmuxNames'));
+  assert.match(body, /execFile\(/, 'the probe must spawn through execFile');
+  assert.doesNotMatch(body, /execSync\(/, 'a synchronous spawn here freezes every byte the relay forwards');
+
+  // And the health path's own spawn must be cached rather than repeated per request.
+  const health = source.slice(source.indexOf('function healthSnapshot'), source.indexOf('function healthSnapshot') + 400);
+  assert.doesNotMatch(health, /execSync\(/, 'health must not spawn synchronously per request');
+  assert.match(health, /tmuxAvailableCached\(\)/);
 });
 
 test('the probe still refreshes once its TTL expires', async t => {

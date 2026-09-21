@@ -42,9 +42,29 @@
     return params;
   }
 
+  // Why the read failed decides what the user should DO about it, and these families need opposite
+  // remedies. An auth verdict is not a silent PC: telling someone to check their tunnel when the
+  // real answer was "this account may not open the archive" sends them to fix a healthy component.
+  function failureFor(state) {
+    var status = Number((state || {}).errorStatus) || 0;
+    if (status === 401) {
+      return { title: 'Sign in required', detail: 'Your sign-in session is no longer valid. Sign in again to read chats from your PC.' };
+    }
+    if (status === 403) {
+      return { title: 'Archive access not allowed', detail: 'Your PC answered and refused this account. Ask the owner to grant it access to the archive page.' };
+    }
+    if (status === 503) {
+      return { title: 'Archive temporarily unavailable', detail: 'Your PC answered, but a service it depends on was not reachable. This is usually momentary — retry in a moment.' };
+    }
+    if (status === 404) {
+      return { title: 'Archive view not available', detail: 'Your PC is running an archive server that does not expose this view. Update the server on the PC.' };
+    }
+    return { title: 'PC archive unavailable', detail: 'Your PC did not answer. Check that the archive server is running there and that the reverse tunnel is up.' };
+  }
+
   function statusFor(state) {
     var s = state || {};
-    if (s.error) return { tone: 'error', text: 'PC archive unavailable: ' + s.error };
+    if (s.error) return { tone: 'error', text: failureFor(s).title + ': ' + s.error };
     if (s.loading) return { tone: 'loading', text: 'Loading chats from your PC...' };
     if (s.coverage && s.coverage.complete === false) {
       return {
@@ -77,7 +97,7 @@
       },
       rows: [], facets: { tags: [], phrases: [], projects: [], hidden: 0 },
       offset: 0, limit: d.limit || PAGE_SIZE, total: 0, hasMore: false,
-      loading: false, error: '', coverage: null, generation: 0,
+      loading: false, error: '', errorStatus: 0, coverage: null, generation: 0,
       // The full-transcript scan is a SEPARATE, explicitly requested result set. It is never folded into
       // `rows` because the two answer different questions ("what matches the filters" vs "what else
       // contains this phrase"), and merging them would make `total` and the pager lie.
@@ -105,6 +125,7 @@
       var generation = ++state.generation;
       state.loading = true;
       state.error = '';
+      state.errorStatus = 0;
       if (d.onChange) d.onChange(state);
       try {
         var params = queryParams(state.filters, state.offset, state.limit);
@@ -131,10 +152,15 @@
       } catch (error) {
         if (generation !== state.generation) return state;
         state.rows = [];
-        state.total = 0;
-        state.hasMore = false;
+        // total/hasMore are deliberately NOT reset. The pager's visibility is derived from them
+        // (renderPager hides it when total <= limit), so zeroing them on a failure made a single
+        // transient error DESTROY the navigation: the rows vanished, the pager vanished with them, and
+        // the only way off the failed page was a reload. Keeping the last known count leaves the user on
+        // the page they asked for, with the error visible and Prev/Next still there to retry or step back.
         state.coverage = null;
         state.error = (error && error.message) || String(error);
+        // Carry the status so the message can name the actual fault (see failureFor).
+        state.errorStatus = (error && error.status) || 0;
       } finally {
         if (generation === state.generation) {
           state.loading = false;
@@ -1179,8 +1205,20 @@
               }
               var value = await response.json();
               if (value.sessionId !== chat.id || value.tool !== chat.tool || value.mode !== mode || typeof value.payload !== 'string') throw new Error('Copy response identity did not match');
-              if (!global.navigator.clipboard || !global.navigator.clipboard.writeText) throw new Error('Clipboard access unavailable; use a secure browser connection');
-              await global.navigator.clipboard.writeText(value.payload);
+              var clipboard = global.navigator && global.navigator.clipboard;
+              if (!clipboard || !clipboard.writeText) throw new Error('Clipboard access unavailable; use a secure browser connection');
+              // The payload is already in hand at this point, and the browser has no reason to hand out a
+              // 1 MiB string twice for the same tap. A clipboard write is also the step most likely to be
+              // refused outright (it needs a user gesture, a secure context, and a page the browser will
+              // grant it to), and a retry that re-POSTs only changes the odds of the WRITE, never the
+              // answer the PC already gave. So the failure path offers the text directly instead of
+              // repeating the request — and the retry that does happen stays honest about the cause.
+              try { await clipboard.writeText(value.payload); }
+              catch (error) {
+                copyButton.disabled = false;
+                global.prompt('The clipboard was blocked. Copy the text below:', value.payload);
+                return;
+              }
               rowStatus(article, option[1].replace('Copy ', 'Copied ') + '.', 'ok');
             } catch (error) { rowStatus(article, error.message || 'Copy failed', 'bad'); }
             finally { copyButton.disabled = false; }
@@ -1343,7 +1381,8 @@
       if (controller.state.loading) {
         stateBox.innerHTML = '<strong>Loading chats</strong>Reading the archive directly from your PC.';
       } else if (controller.state.error) {
-        stateBox.innerHTML = '<strong>PC archive unavailable</strong>Your PC did not answer. Check that the archive server is running there and that the reverse tunnel is up.';
+        var failure = failureFor(controller.state);
+        stateBox.innerHTML = '<strong>' + failure.title + '</strong>' + failure.detail;
       } else if (!controller.state.total && deepExtras) {
         stateBox.innerHTML = '<strong>No chats match these filters</strong>The full-transcript scan below found chats containing your phrase.';
       } else if (!controller.state.total) {
@@ -1593,6 +1632,7 @@
   global.MuxChats = {
     queryParams: queryParams,
     statusFor: statusFor,
+    failureFor: failureFor,
     createController: createController,
     createStartChat: createStartChat,
     createManagement: createManagement,

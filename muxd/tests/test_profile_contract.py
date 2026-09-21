@@ -151,6 +151,37 @@ class ProfileContractTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(json.loads(result.stdout), [101])
 
+    def test_process_filter_accepts_a_bom_prefixed_payload(self):
+        """PowerShell 5.1 BOM-prefixes the pipe, and that must not fail the custody preflight.
+
+        `Get-MuxdProcesses` writes `$payload | python profile.py --matching-pids`, and PS 5.1
+        encodes that payload with `[Console]::InputEncoding`. On a UTF-8 console that encoding
+        carries a BOM, so the child receives b'\\xef\\xbb\\xbf[...]'. The old `json.load(sys.stdin)`
+        decoded it to a leading U+FEFF and died with "Expecting value: line 1 column 1", which
+        blocked deploy-muxd.ps1 and MuxdSessionHostRestart - the reason a stalled muxd could not
+        be replaced. Bytes, not text, is the correct read here.
+        """
+        with tempfile.TemporaryDirectory(prefix="muxd-pid-bom-") as temp:
+            env, _ = profile_env(Path(temp))
+            runtime = env["MUXD_RUNTIME_ROOT"]
+            processes = [
+                {"ProcessId": 101, "CommandLine": f'python "{runtime}/muxd.py" --profile test'},
+                {"ProcessId": 102, "CommandLine": f'python "{runtime}-other/muxd.py" --profile test'},
+            ]
+            payload = b"\xef\xbb\xbf" + json.dumps(processes).encode("utf-8")
+            result = subprocess.run([sys.executable, str(MUXD / "profile.py"), "--matching-pids"],
+                                    input=payload, env=env, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout), [101])
+
+    def test_process_filter_rejects_non_array_input_with_a_clear_error(self):
+        with tempfile.TemporaryDirectory(prefix="muxd-pid-bad-") as temp:
+            env, _ = profile_env(Path(temp))
+            result = subprocess.run([sys.executable, str(MUXD / "profile.py"), "--matching-pids"],
+                                    input=b"not json", env=env, capture_output=True)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn(b"must be a JSON array", result.stderr)
+
     @unittest.skipUnless(os.name == "nt", "requires Windows PowerShell")
     def test_operations_process_filter_runs_actual_powershell_pipeline(self):
         script = r'''

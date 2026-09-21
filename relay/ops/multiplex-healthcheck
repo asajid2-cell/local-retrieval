@@ -55,6 +55,19 @@ if (data) {
   // ── faults ────────────────────────────────────────────────────────────────────────────────────
   if (Number(data.legacySessions || 0) !== 0) fail.push(`legacySessions=${data.legacySessions}`);
   if (!data.host || data.host.connected !== true) fail.push('host disconnected');
+  // A connected-but-silent muxd. `connected` is TCP state, and it stays true through the stall this
+  // catches — the relay reported a healthy host for three days while no frame moved, so this is a fault
+  // and not a warning. The relay already applied the staleness threshold (server.js host.frameStale), so
+  // the age is reported, never re-judged: a second threshold here would be a second thing to keep in step.
+  if (data.host && data.host.frameStale === true) {
+    // Same null trap as the OK line below: Number(null) is 0, so a missing age must be checked for
+    // nullness rather than coerced and then tested for finiteness.
+    const ageMs = data.host.frameAgeMs;
+    const ageText = ageMs === null || ageMs === undefined || !Number.isFinite(Number(ageMs))
+      ? 'unknown'
+      : `${Math.round(Number(ageMs) / 1000)}s`;
+    fail.push(`host stalled (no status frame for ${ageText}; limit ${Math.round(Number(data.host.frameStaleMs || 0) / 1000)}s)`);
+  }
   if (!data.host || data.host.protocolOk !== true) fail.push(`host protocol not ok (${data.host?.protocol ?? 'missing'})`);
   if (!data.host || Number(data.host.protocol || 0) < 2) fail.push(`host protocol ${data.host?.protocol ?? 'missing'} < 2`);
   if (!Array.isArray(data.host?.caps) || !data.host.caps.includes('create') || !data.host.caps.includes('attach') || !data.host.caps.includes('kill')) fail.push('host caps incomplete');
@@ -96,5 +109,16 @@ const h = data || {};
 const host = h.host || {};
 const projects = h.projects || {};
 const pc = h.pc || {};
-console.log(`[multiplex-healthcheck] OK host=${host.name || '?'} protocol=${host.protocol} sessions=${host.sessions} bridgeLive=${projects.bridgeLive} appLive=${projects.appLive} legacy=${h.legacySessions} pc=${pc.reachable === false ? 'down' : 'up'} node=${h.node} warnings=${warn.length}`);
+// frameAge is on the OK line because the heartbeat is the one number that would have caught the 3-day
+// stall, and a healthy run is when an operator can still read it. 'n/a' for a host with no frame to
+// measure (down link, or a connection that has not stamped one yet) — not 0, which would read as fresh.
+//
+// The null check is explicit because Number(null) is 0 and Number.isFinite(0) is true: the obvious
+// isFinite(Number(...)) guard renders exactly the case it was written to exclude as a perfect 0s
+// heartbeat. The relay uses null, not 0, for "nothing to measure" for the same reason.
+const frameAgeMs = host.frameAgeMs;
+const frameAge = frameAgeMs === null || frameAgeMs === undefined || !Number.isFinite(Number(frameAgeMs))
+  ? 'n/a'
+  : `${Math.round(Number(frameAgeMs) / 1000)}s`;
+console.log(`[multiplex-healthcheck] OK host=${host.name || '?'} protocol=${host.protocol} sessions=${host.sessions} frameAge=${frameAge} bridgeLive=${projects.bridgeLive} appLive=${projects.appLive} legacy=${h.legacySessions} pc=${pc.reachable === false ? 'down' : 'up'} node=${h.node} warnings=${warn.length}`);
 NODE

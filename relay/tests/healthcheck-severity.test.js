@@ -94,6 +94,49 @@ test('a healthy relay with the desktop app closed is a WARNING, not a failure', 
   });
 });
 
+test('the stall is named on the failure line, not just dumped in the JSON blob', async () => {
+  // The journal is what an operator actually reads. An exit code plus a 40-line JSON dump makes them
+  // work out which field moved; the fault line has to say it.
+  await withHealthServer(async ({ url, respond }) => {
+    respond(200, healthAppClosed({
+      host: { connected: true, name: 'CRACKERBARREL', sessions: 0, protocol: 4, protocolOk: true, caps: ['create', 'attach', 'kill'], frameStale: true, frameAgeMs: 259_200_000, frameStaleMs: 15000 },
+    }));
+    const res = await runCheck(url);
+
+    assert.equal(res.status, 1);
+    assert.match(res.stderr, /host stalled \(no status frame for 259200s; limit 15s\)/);
+    assert.doesNotMatch(res.stderr, /host disconnected/, 'a live link must not be reported as a dead one');
+  });
+});
+
+test('a fresh heartbeat is reported on the OK line and never fails the unit', async () => {
+  await withHealthServer(async ({ url, respond }) => {
+    respond(200, healthAppClosed({
+      ok: true, degraded: false, degradedReasons: [],
+      projects: { appLive: true, bridgeLive: true, pendingCommands: 0 },
+      host: { connected: true, name: 'CRACKERBARREL', sessions: 2, protocol: 4, protocolOk: true, caps: ['create', 'attach', 'kill'], frameStale: false, frameAgeMs: 3200, frameStaleMs: 15000 },
+    }));
+    const res = await runCheck(url);
+
+    assert.equal(res.status, 0, `a healthy host must pass; stderr was:\n${res.stderr}`);
+    assert.match(res.stdout, /frameAge=3s/, 'the heartbeat is on the summary line an operator reads');
+  });
+});
+
+test('a host with no frame to measure reports n/a, not a fresh-looking 0', async () => {
+  // null is the honest value for "no link" / "nothing stamped yet"; rendering it as 0s would read as a
+  // perfectly fresh heartbeat on exactly the host that has none.
+  await withHealthServer(async ({ url, respond }) => {
+    respond(200, healthAppClosed({
+      host: { connected: true, name: 'win', sessions: 0, protocol: 4, protocolOk: true, caps: ['create', 'attach', 'kill'], frameStale: false, frameAgeMs: null, frameStaleMs: 15000 },
+    }));
+    const res = await runCheck(url);
+
+    assert.equal(res.status, 0);
+    assert.match(res.stdout, /frameAge=n\/a/);
+  });
+});
+
 test('a relay with no reason to warn exits clean', async () => {
   await withHealthServer(async ({ url, respond }) => {
     respond(200, healthAppClosed({
@@ -114,6 +157,10 @@ const FAULTS = [
   ['the host speaks an old protocol', { host: { connected: true, name: 'win', protocol: 1, protocolOk: true, caps: ['create', 'attach', 'kill'] } }],
   ['the host protocol did not agree', { host: { connected: true, name: 'win', protocol: 4, protocolOk: false, caps: ['create', 'attach', 'kill'] } }],
   ['the host cannot create sessions', { host: { connected: true, name: 'win', protocol: 4, protocolOk: true, caps: ['ls', 'attach', 'kill'] } }],
+  // Connected but silent. This is the case the pre-existing checks cannot see: the link is up, the
+  // protocol agrees and the caps are complete, so before frameStale every fault check passed while muxd
+  // had not pushed a frame in three days.
+  ['the host is connected but has stopped pushing frames', { host: { connected: true, name: 'win', protocol: 4, protocolOk: true, caps: ['create', 'attach', 'kill'], frameStale: true, frameAgeMs: 3 * 24 * 60 * 60 * 1000, frameStaleMs: 15000 } }],
   ['the PC is unreachable', { pc: { reachable: false, host: '192.168.1.162' } }],
   ['state persistence is failing', { persistence: { ok: false, detail: 'EACCES', blocked: false } }],
   ['a legacy tmux session survives', { legacySessions: 2 }],

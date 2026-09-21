@@ -3287,6 +3287,23 @@ public sealed partial class ArchiveService
         return aliases.Count == 1 ? aliases[0] : null;
     }
 
+    // Resolve an id/alias for a caller that is about to ACT on the chat (copy its command, resume it,
+    // kill it) rather than merely look it up. The resolver is the identity authority - it matches case
+    // insensitively and accepts an alias or a source-path fragment - so the follow-up check must use the
+    // SAME notion of identity. Requiring session.Id == requestedId (ordinal) here instead would resolve
+    // a chat by alias or by differing case and then immediately refuse it, which is precisely the set of
+    // chats this lookup exists to reach.
+    //
+    // What the guard genuinely has to exclude is a resolution that did NOT come from the store:
+    // SessionHasIdOrAlias also matches a SourcePath fragment, so a string that merely appears in some
+    // path could otherwise name a chat the store does not hold. Membership in Store.Sessions is that
+    // check, and it is the one thing the old ordinal comparison was standing in for.
+    public ArchiveSession? ResolveStoredSessionByIdOrAlias(string id, string? tool = null)
+    {
+        var session = ResolveSessionByIdOrAlias(id, tool);
+        return session is not null && Store.Sessions.ContainsKey(session.Id) ? session : null;
+    }
+
     private static bool ToolMatches(ArchiveSession session, string? tool) =>
         string.IsNullOrWhiteSpace(tool) || string.Equals(session.Tool, tool, StringComparison.OrdinalIgnoreCase);
 

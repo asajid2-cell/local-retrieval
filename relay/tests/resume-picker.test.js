@@ -262,15 +262,15 @@ async function bootPicker(t, { chats = [row(1), row(2), row(3)], running = [], d
   return { h, client, picker };
 }
 
-test('resume uses unique live alias owner and refuses ambiguous or unreadable authority', async () => {
-  for (const mode of ['alias', 'ambiguous', 'unreadable']) {
+test('resume uses unique live alias owner and refuses ambiguous authority', async () => {
+  for (const mode of ['alias', 'ambiguous']) {
     const sent = [];
     const owner = { name: 'actual-owner', sessionId: 'canonical', aliases: ['chat-1'], alive: true, generationId: 'gen-one' };
     const client = loadClient(async () => ({ ok: true, json: async () => [] }));
     const picker = client.MuxResumePicker.createPicker({
       base: '',
       fetch: async url => url === '/api/sessions'
-        ? { ok: mode !== 'unreadable', json: async () => mode === 'ambiguous' ? [owner, { ...owner, name: 'second-owner' }] : [owner] }
+        ? { ok: true, json: async () => mode === 'ambiguous' ? [owner, { ...owner, name: 'second-owner' }] : [owner] }
         : { ok: true, json: async () => ({ status: 'done' }) },
       postIntent: async (url, body) => { sent.push(body); return { ok: true, json: async () => ({ id: 'command' }) }; },
       pollIntervalMs: 1, offlineTimeoutMs: 100,
@@ -280,8 +280,57 @@ test('resume uses unique live alias owner and refuses ambiguous or unreadable au
     if (mode === 'alias') {
       assert.equal(sent[0].muxName, 'actual-owner');
       assert.equal(result.muxName, 'actual-owner');
-    } else assert.equal(result.state, 'failed');
+    } else {
+      // The PC's own verdict that two sessions own this chat. It is actionable ("refresh and resolve
+      // ownership"), so it stays a refusal rather than degrading into a blind attempt.
+      assert.equal(result.state, 'failed');
+      assert.match(result.detail, /Multiple live owners/);
+    }
   }
+});
+
+// The listing this reads is a relay route that runs the synchronous legacy-tmux probe, and every open
+// tab polls it every 4s. An answer we could not READ says nothing about the chat, so it must not be
+// reported as an unactionable "could not verify" dead end. The relay refuses a real second writer at
+// startmux time anyway (ensureNoLocalOwnerForMuxName, against the PC's own live-agent scan), so the tap
+// proceeds with the name the picker already holds and the authority that actually governs decides.
+test('an unreadable live listing does not dead-end the resume on a failure it cannot describe', async () => {
+  for (const broken of [
+    async () => { throw new Error('socket hang up'); },                        // the fetch itself failed
+    async () => ({ ok: false, status: 503, json: async () => ({}) }),          // the relay refused to answer
+    async () => ({ ok: true, json: async () => ({ not: 'an array' }) }),       // an answer we cannot parse
+  ]) {
+    const sent = [];
+    const client = loadClient(async () => ({ ok: true, json: async () => [] }));
+    const picker = client.MuxResumePicker.createPicker({
+      base: '',
+      fetch: async url => url === '/api/sessions' ? broken() : { ok: true, json: async () => ({ status: 'done' }) },
+      postIntent: async (url, body) => { sent.push(body); return { ok: true, json: async () => ({ id: 'command' }) }; },
+      pollIntervalMs: 1, offlineTimeoutMs: 100,
+    });
+    const result = await picker.resume(row(1));
+    assert.equal(result.state, 'done', 'the resume must still reach the relay');
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0].muxName, 'mux-1', "the name the picker already held is what travels, unredirected");
+  }
+});
+
+// The refusal above must not have been traded away for silence: a listing that DOES read and shows a
+// live owner for this chat still takes that owner's name, which is the whole reason for the probe.
+test('a readable listing still redirects the resume to the live owner name', async () => {
+  const sent = [];
+  const owner = { name: 'actual-owner', sessionId: 'chat-1', aliases: [], alive: true, generationId: 'gen-one' };
+  const client = loadClient(async () => ({ ok: true, json: async () => [] }));
+  const picker = client.MuxResumePicker.createPicker({
+    base: '',
+    fetch: async url => url === '/api/sessions'
+      ? { ok: true, json: async () => [owner] }
+      : { ok: true, json: async () => ({ status: 'done' }) },
+    postIntent: async (url, body) => { sent.push(body); return { ok: true, json: async () => ({ id: 'command' }) }; },
+    pollIntervalMs: 1, offlineTimeoutMs: 100,
+  });
+  assert.equal((await picker.resume(row(1))).state, 'done');
+  assert.equal(sent[0].muxName, 'actual-owner');
 });
 
 test('Gateway resume carries explicit mode and refuses Codex same-chat conversion', async () => {

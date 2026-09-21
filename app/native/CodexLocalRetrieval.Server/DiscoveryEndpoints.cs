@@ -71,8 +71,10 @@ public static class DiscoveryEndpoints
                 return Results.BadRequest(new { error = "exact chat, tool and supported copy mode required" });
             return await runtime.UseAsync<IResult>(async (archive, cancellation) =>
             {
-                var session = archive.ResolveSessionByIdOrAlias(request.SessionId, request.Tool);
-                if (session is null || session.Id != request.SessionId)
+                // Resolve for an action, not a lookup: same identity notion as the resolver, but the
+                // chat must be one the store actually holds. See ResolveStoredSessionByIdOrAlias.
+                var session = archive.ResolveStoredSessionByIdOrAlias(request.SessionId, request.Tool);
+                if (session is null)
                     return Results.NotFound(new { error = "exact chat not found" });
                 if (request.LaunchMode == "gateway" && (request.Mode != "command" || !ArchiveService.CanResumeThroughGateway(session.Tool)))
                     return Results.BadRequest(new { error = "Gateway resume command unavailable for this chat" });

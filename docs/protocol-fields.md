@@ -164,6 +164,7 @@ literals stay globally unique: `info`, `ls`, `err`, `killed`, `owner-ok`, `bind-
 | `hello` | `caps` | string[] | See [Capabilities](#capabilities). |
 | `hello` | `sessions` | object[] | Session payloads; a malformed entry closes the link. |
 | `sessions` | `list` | object[] | Full replacement list — not a delta. |
+| `sessions` | — | — | **No field added, but the frame itself is a signal.** It arrives every 5s from `pump_status()` (`muxd/muxd.py:5327`), so the relay times it and publishes `host.frameAgeMs` / `host.frameStale` in `/api/health`. A connected host whose frames stop is reported stalled. Do not make this push conditional or skip it when idle: an idle-looking host and a wedged one would become indistinguishable, which is the failure this signal exists to catch. |
 | `sessions` | `notice` | string | Optional. Set when a durability step failed (heal/rename/stop not persisted). |
 | `o` | `s` | string | Session name. |
 | `o` | `d` | string | base64 output bytes. |

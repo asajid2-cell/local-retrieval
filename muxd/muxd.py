@@ -926,10 +926,42 @@ def _parse_resume_id(cmd):
             return tok
     return ""
 
+def _agent_cmdlines_ttl():
+    """Seconds a successful agent-cmdline query may be reused. Read lazily because ENV is built below."""
+    try:
+        return max(0.0, float(ENV.get("AGENT_CMDLINES_TTL", "1.5")))
+    except (TypeError, ValueError):
+        return 1.5
+
+
 def _try_agent_cmdlines():
     """[(pid, cmdline)] for every live claude.exe/codex.exe — one CIM query (used for codex, which has
-    no registry). Best-effort: a failure just means codex-resume conflicts aren't caught this pass."""
+    no registry). Best-effort: a failure just means codex-resume conflicts aren't caught this pass.
+
+    MEMOIZED FOR A SHORT WINDOW, because this query is a whole `powershell.exe` process, not a syscall.
+    Measured on this box: 1.24 s p50 per call while 118 powershell.exe processes were already resident.
+    It was previously paid on EVERY call, and one session launch pays it twice: `reserve_launch_claim`
+    calls `try_live_session_ids()` (muxd.py:4289) and then `acquire_launch_claim` calls it again
+    (muxd.py:2014), with `acquire_launch_claim` paying a THIRD query for its own second-live re-check
+    (muxd.py:2074). A create that carries a command measured 4.0 s against this box's live instance
+    versus 1.2 s against an isolated instance of the same code whose claim root was empty — the
+    difference is exactly the number of these queries on the path.
+
+    Only a SUCCESSFUL result is cached. A failure stays uncached so the next caller re-queries: the
+    failure mode here is "a resume conflict went unchecked", and caching that would extend it.
+
+    The window is deliberately shorter than a human's create/kill sequence (1.5 s) and far longer than
+    the burst of calls one launch makes, so the three queries above collapse to one while the staleness
+    a user could observe is a process that started <1.5 s ago and is therefore already live.
+    AGENT_CMDLINES_TTL=0 restores a query per call.
+    """
     out = []
+    ttl = _agent_cmdlines_ttl()
+    if ttl > 0:
+        with _AGENT_CMDLINES_LOCK:
+            rows = _AGENT_CMDLINES_CACHE["rows"]
+            if rows is not None and (time.monotonic() - _AGENT_CMDLINES_CACHE["at"]) < ttl:
+                return True, list(rows), ""
     try:
         ps = ("Get-CimInstance Win32_Process -Filter \"Name='claude.exe' or Name='codex.exe' or Name='node.exe'\" | "
               "Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress")
@@ -948,6 +980,10 @@ def _try_agent_cmdlines():
                 pass
     except Exception as e:
         return False, out, str(e)
+    if ttl > 0:
+        with _AGENT_CMDLINES_LOCK:
+            _AGENT_CMDLINES_CACHE["at"] = time.monotonic()
+            _AGENT_CMDLINES_CACHE["rows"] = list(out)
     return True, out, ""
 
 def _agent_cmdlines():
@@ -1202,6 +1238,109 @@ LOCAL_SB_SEND = int(ENV.get("LOCAL_SB_SEND", "60000"))  # local muxctl attach sh
 LOCAL_FIRST_TIMEOUT = float(ENV.get("LOCAL_FIRST_TIMEOUT", "3"))
 LOOP_WATCHDOG_WARN = float(ENV.get("LOOP_WATCHDOG_WARN", "30"))
 LOOP_WATCHDOG_EXIT = float(ENV.get("LOOP_WATCHDOG_EXIT", "12"))
+# Scheduling priority is a CORRECTNESS requirement here, not tuning. muxd is launched by the
+# MuxdSessionHost scheduled task, whose default priority is 7 (BELOW_NORMAL_PRIORITY_CLASS), and
+# wscript -> powershell -> pythonw all inherit it. A BelowNormal process is descheduled whenever
+# anything at Normal wants a core, and this PC routinely has a game holding ~4 cores at Normal.
+# The result is not "a bit slow": the event loop stops being scheduled, so the terminal paints
+# nothing, kills time out against the relay's 6s fence, and a restart cannot complete - while the
+# watchdog's status probe times out and reports "running but unresponsive". Measured on this box
+# with a 3.9-core game resident: BelowNormal rtt p90=452ms p99=1769ms / loop lag max=2094ms,
+# vs AboveNormal p90=6ms p99=8ms / loop lag max=15ms - same process, same code, priority the only
+# variable (and the numbers returned when it was demoted back). AboveNormal is the minimum that
+# survives a loaded box; there is nothing to gain above it. MUXD_PRIORITY accepts a class name or
+# an integer, so an operator can still deliberately pin a different value.
+PRIORITY_CLASSES = {
+    "idle": 0x00000040, "belownormal": 0x00004000, "normal": 0x00000020,
+    "abovenormal": 0x00008000, "high": 0x00000080, "realtime": 0x00000100,
+}
+# The constants are NOT numerically ordered - HIGH is 0x80 and ABOVE_NORMAL is 0x8000, so a
+# `current >= wanted` test on the raw values treats High as lower than AboveNormal and would
+# raise a process an operator had deliberately put at High. Rank them explicitly instead.
+PRIORITY_ORDER = ("idle", "belownormal", "normal", "abovenormal", "high", "realtime")
+
+
+def priority_rank(value):
+    """Rank a class constant on the real idle..realtime scale, or None if it is not one."""
+    for index, name in enumerate(PRIORITY_ORDER):
+        if PRIORITY_CLASSES[name] == value:
+            return index
+    return None
+
+
+def resolve_priority_class(raw):
+    """Map MUXD_PRIORITY to a priority-class constant, or None if unrecognised."""
+    if raw is None:
+        return PRIORITY_CLASSES["abovenormal"]
+    token = str(raw).strip().lower().replace("_", "").replace("-", "").replace(" ", "")
+    if token in PRIORITY_CLASSES:
+        return PRIORITY_CLASSES[token]
+    if token in ("", "default"):
+        return PRIORITY_CLASSES["abovenormal"]
+    try:
+        value = int(token, 0)
+    except ValueError:
+        return None
+    return value if priority_rank(value) is not None else None
+
+
+MUXD_PRIORITY = resolve_priority_class(ENV.get("MUXD_PRIORITY", os.environ.get("MUXD_PRIORITY")))
+
+
+def _priority_kernel32():
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.GetPriorityClass.argtypes = [wintypes.HANDLE]
+    k32.GetPriorityClass.restype = wintypes.DWORD
+    k32.SetPriorityClass.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    k32.SetPriorityClass.restype = wintypes.BOOL
+    k32.GetCurrentProcess.restype = wintypes.HANDLE
+    return k32
+
+
+_PRIORITY_NAMES = {value: name for name, value in PRIORITY_CLASSES.items()}
+
+
+def current_priority_class():
+    """The class this process actually holds, by name. Reported through `info`."""
+    if os.name != "nt":
+        return "n/a"
+    try:
+        value = _priority_kernel32().GetPriorityClass(_priority_kernel32().GetCurrentProcess())
+    except Exception:
+        return "unknown"
+    return _PRIORITY_NAMES.get(value, f"{value:#x}")
+
+
+def apply_process_priority():
+    """Raise THIS process to the configured priority class; never lower an already-higher one.
+
+    Called from __main__ before the event loop starts, so no work is ever done at the inherited
+    (BelowNormal) class. Deliberately NOT at import time: this is a process-global mutation, and
+    muxd.py is imported by the test suite and by tooling, none of which should be rescheduled or
+    should write into the live muxd.log.
+    A failure is loud in the log but not fatal: the host is still usable, just vulnerable, and
+    refusing to start would turn a degraded terminal into no terminal.
+    """
+    if os.name != "nt":
+        return
+    if MUXD_PRIORITY is None:
+        log("priority: MUXD_PRIORITY is not a known priority class; leaving inherited priority")
+        return
+    try:
+        k32 = _priority_kernel32()
+        handle = k32.GetCurrentProcess()
+        current = k32.GetPriorityClass(handle)
+        if current == MUXD_PRIORITY:
+            return
+        if (priority_rank(current) or 0) >= priority_rank(MUXD_PRIORITY):
+            return                       # already at least as high; never lower an operator's choice
+        if not k32.SetPriorityClass(handle, MUXD_PRIORITY):
+            log(f"priority: SetPriorityClass({MUXD_PRIORITY:#x}) failed: {ctypes.get_last_error()}")
+            return
+        log(f"priority: raised {_PRIORITY_NAMES.get(current, hex(current))} -> "
+            f"{_PRIORITY_NAMES.get(MUXD_PRIORITY, hex(MUXD_PRIORITY))}")
+    except Exception as e:
+        log(f"priority: could not set process priority: {e}")
 if PROFILE.name == "production":
     CLAIM_ROOT = ENV.get("LAUNCH_CLAIM_ROOT") or os.path.join(
         os.environ.get("LOCALAPPDATA") or tempfile.gettempdir(),
@@ -1289,6 +1428,9 @@ AGENT_TRUTH_MAX_AGE = max(AGENT_TRUTH_TTL * 3, float(ENV.get("AGENT_TRUTH_MAX_AG
 AGENT_TRUTH_PROBE_TIMEOUT = min(3.0, max(0.5, float(ENV.get("AGENT_TRUTH_PROBE_TIMEOUT", "3"))))
 AGENT_TRUTH_MAX_INFLIGHT = 2        # hard ceiling on concurrent probes; a wedged probe cannot pile up
 AGENT_TRUTH_MAX_PIDS = 400          # bounded subtree walk
+# Windows error codes this module must treat as transient capacity pressure rather than a defect.
+ERROR_NOT_ENOUGH_MEMORY = 8         # ERROR_NOT_ENOUGH_MEMORY
+
 AGENT_TRUTH_MAX_DEPTH = 12
 ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]")
 STALE_CSI_RE = re.compile(r"\[[0-?]*[ -/]*[@-~]")
@@ -1458,6 +1600,34 @@ def _pid_descends_from(pid, ancestor_pid, timeout=15):
 _AGENT_TRUTH_LOCK = threading.Lock()      # guards the cache dict ONLY - never held across a probe
 _AGENT_TRUTH_CACHE = {}                   # (pid, start_token) -> entry
 _AGENT_TRUTH_INFLIGHT = 0
+# Probes that hit AGENT_TRUTH_PROBE_TIMEOUT and were left running as daemon threads. Not a cache
+# statistic: it is the process's drift indicator. Each one keeps whatever kernel resource it was
+# holding when it wedged, so a rising count predicts the event-loop stalls (and the black web
+# terminals that follow) before they happen.
+_AGENT_TRUTH_ABANDONED = 0
+_AGENT_TRUTH_ABANDONED_WARN_AT = 8        # first warning; then every ABANDONED_WARN_STEP after
+_AGENT_TRUTH_ABANDONED_WARN_STEP = 25
+_AGENT_TRUTH_ABANDONED_WARNED = 0
+
+
+def _report_abandoned_probe_pressure(count):
+    """Log a single escalating warning as abandoned probe threads accumulate.
+
+    Called from the probe worker, so it only ever touches the module-level counter under the lock
+    it already holds and never does I/O beyond one queued log line.
+    """
+    global _AGENT_TRUTH_ABANDONED_WARNED
+    if count < _AGENT_TRUTH_ABANDONED_WARN_AT:
+        return
+    # WARNED starts at 0, so the "one step later" test only applies once a warning has actually
+    # been emitted; without this the very first crossing of WARN_AT is swallowed by the step.
+    if _AGENT_TRUTH_ABANDONED_WARNED and \
+            count < _AGENT_TRUTH_ABANDONED_WARNED + _AGENT_TRUTH_ABANDONED_WARN_STEP:
+        return
+    _AGENT_TRUTH_ABANDONED_WARNED = count
+    log(f"agent-truth probe threads are accumulating: {count} abandoned. Each timed-out probe holds "
+        f"kernel resources it cannot release; this precedes event-loop stalls. Restart MuxdSessionHost "
+        f"when the terminal becomes unresponsive.")
 _AGENT_TRUTH_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
     max_workers=AGENT_TRUTH_MAX_INFLIGHT, thread_name_prefix="agent-truth"
 )
@@ -1469,9 +1639,28 @@ def _process_rows():
 
     Same machinery `_direct_child_pids` uses, walked once instead of once per parent:
     a descendant probe that re-snapshots per level costs O(depth) snapshots for nothing.
+
+    MEMOIZED FOR ONE TICK, because the snapshot is now the dominant cost of a status read and it
+    was being paid PER SESSION rather than per read. Measured on this box: one snapshot over ~570
+    processes costs 17.2 ms p50 / 23 ms max, and `sess_list()` -> `session_payload()` ->
+    `session_agent_truth()` reached this function once for every session on the box. With N live
+    sessions a single `ls` therefore cost N x 17 ms, and `create`/`kill`/`ls` measured 1.2-1.7 s p50
+    with a 43-48 s tail while muxd was otherwise healthy. The same call with ZERO sessions returns
+    in 4.6 ms, which is what identified the per-session term.
+
+    It matters beyond the read being slow: the relay confirms a create by polling `ls` every 100 ms
+    (relay/server.js waitForHostState), so a per-session cost inside `ls` is a per-session cost
+    inside create.
+
+    A whole-process-table snapshot is a single instant and every session in one `sess_list()` wants
+    the same instant, so the per-session calls were re-deriving one answer N times. The rows are
+    immutable tuples and no caller mutates the list, so sharing one list across a tick is safe.
     """
     if os.name != "nt":
         return []
+    cached = _process_rows_cached()
+    if cached is not None:
+        return cached
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     create_snapshot = kernel32.CreateToolhelp32Snapshot
     create_snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
@@ -1482,6 +1671,15 @@ def _process_rows():
     snapshot = create_snapshot(0x00000002, 0)  # TH32CS_SNAPPROCESS
     if snapshot == ctypes.c_void_p(-1).value:
         raise ctypes.WinError(ctypes.get_last_error())
+    # A Toolhelp snapshot handle is a KERNEL HANDLE. If this function leaves without closing it,
+    # the handle is not merely leaked -- the process's handle-table cleanup later has to unwind it,
+    # and under memory pressure that unwind is what parks the event loop. Observed on this box:
+    # 140x "[WinError 1455] The paging file is too small for this operation to complete" raised out
+    # of Process32FirstW, 682 open handles and 76 threads after 20h, and event-loop stalls of 30-126s
+    # (maxLoopLagMs=126562) that broke the relay host link and left web terminals black.
+    # 1455 is TRANSIENT (the paging file recovers), so it must never be fatal to the caller AND must
+    # never escape before the handle is released: return "no rows" and let agent-truth degrade to
+    # heuristic for one TTL instead of stranding a handle for the life of the process.
     entry = _PROCESSENTRY32W()
     entry.dwSize = ctypes.sizeof(entry)
     rows = []
@@ -1495,7 +1693,10 @@ def _process_rows():
         ctypes.set_last_error(0)
         if not first(snapshot, ctypes.byref(entry)):
             error = ctypes.get_last_error()
-            if error == 18:  # ERROR_NO_MORE_FILES
+            if error in (0, 18):  # 0/ERROR_NO_MORE_FILES: an empty snapshot is a valid answer
+                return []
+            if error == ERROR_NOT_ENOUGH_MEMORY:
+                log("process snapshot unavailable (out of memory); agent-truth degrades to heuristic")
                 return []
             raise ctypes.WinError(error)
         while True:
@@ -1503,12 +1704,56 @@ def _process_rows():
             ctypes.set_last_error(0)
             if not next_entry(snapshot, ctypes.byref(entry)):
                 error = ctypes.get_last_error()
-                if error not in (0, 18):
-                    raise ctypes.WinError(error)
-                break
+                if error in (0, 18):
+                    break
+                if error == ERROR_NOT_ENOUGH_MEMORY:
+                    # Partial rows are still useful and the handle is closed by the finally below;
+                    # a partial answer beats both a leak and a raised exception on the probe thread.
+                    log("process snapshot truncated (out of memory); using the rows collected so far")
+                    break
+                raise ctypes.WinError(error)
+        _process_rows_store(rows)
         return rows
     finally:
+        # Release the snapshot handle on EVERY exit path, including the raises above and the
+        # ERROR_NOT_ENOUGH_MEMORY returns. close_handle is deliberately not guarded by its own
+        # try/except: CloseHandle on a valid handle does not raise, and swallowing a real failure
+        # here is exactly the leak this function exists to prevent.
         close_handle(snapshot)
+
+
+# One snapshot per tick, shared by every session read inside it. The window is deliberately shorter
+# than the 5 s status pump so consecutive pumps never share an answer, while a burst of per-session
+# calls inside one read all reuse a single snapshot.
+PROCESS_ROWS_TTL = max(0.0, float(ENV.get("PROCESS_ROWS_TTL", "0.5")))
+_process_rows_cache = {"at": 0.0, "rows": None}
+_process_rows_lock = threading.Lock()
+
+
+def _process_rows_cached():
+    """The cached rows when they are still fresh, else None so the caller takes a new snapshot."""
+    if PROCESS_ROWS_TTL <= 0:
+        return None
+    with _process_rows_lock:
+        rows = _process_rows_cache["rows"]
+        if rows is None:
+            return None
+        if (time.monotonic() - _process_rows_cache["at"]) < PROCESS_ROWS_TTL:
+            return rows
+    return None
+
+
+def _process_rows_store(rows):
+    with _process_rows_lock:
+        _process_rows_cache["at"] = time.monotonic()
+        _process_rows_cache["rows"] = rows
+
+
+# The agent-cmdline CIM query (see _try_agent_cmdlines) costs a whole powershell.exe, so it gets the
+# same treatment as the process snapshot: one answer shared by a burst of callers inside a short
+# window. Only successful results are ever stored here.
+_AGENT_CMDLINES_LOCK = threading.Lock()
+_AGENT_CMDLINES_CACHE = {"at": 0.0, "rows": None}
 
 
 def _process_cpu_100ns(pid):
@@ -1610,7 +1855,7 @@ def _agent_truth_probe(pid, start_token, previous=None):
 
 
 def _agent_truth_refresh(key, pid, start_token, previous):
-    global _AGENT_TRUTH_INFLIGHT
+    global _AGENT_TRUTH_INFLIGHT, _AGENT_TRUTH_ABANDONED
     truth, cpu, agent_pid = AGENT_TRUTH_UNKNOWN, 0, 0
     ok = False
     try:
@@ -1631,8 +1876,20 @@ def _agent_truth_refresh(key, pid, start_token, previous):
         probe_thread.start()
         probe_thread.join(timeout=AGENT_TRUTH_PROBE_TIMEOUT)
         if probe_thread.is_alive():
-            log(f"agent-truth probe timed out after {AGENT_TRUTH_PROBE_TIMEOUT}s for pid {pid}")
-            # Thread abandoned as daemon; inflight counter recovers in finally.
+            # Abandoned, NOT reaped: a probe wedged inside a kernel32 call cannot be interrupted from
+            # here, so the thread survives and its `result` dict is simply never read. Two things are
+            # therefore true and both matter. (1) The counter must drop, or a single wedge disables
+            # agent-truth forever. (2) The stack must be counted, because on this box 400 of these
+            # accumulated over one run -- each still holding a snapshot handle -- which is how muxd
+            # reached 76 threads / 682 handles and 30-126s event-loop stalls. The count is the only
+            # warning available that the process is drifting; a silent abandonment is what let it run
+            # for days. Reporting a leak is not the same as fixing it, and the log says which it is.
+            with _AGENT_TRUTH_LOCK:
+                _AGENT_TRUTH_ABANDONED += 1
+                abandoned = _AGENT_TRUTH_ABANDONED
+            log(f"agent-truth probe timed out after {AGENT_TRUTH_PROBE_TIMEOUT}s for pid {pid} "
+                f"(thread abandoned, not reaped; {abandoned} abandoned so far)")
+            _report_abandoned_probe_pressure(abandoned)
         elif result.get("error"):
             raise result["error"]
         else:
@@ -4892,6 +5149,8 @@ async def main():
 
                 if first.get("t") == "info":
                     snap = watch_snapshot()
+                    with _AGENT_TRUTH_LOCK:
+                        abandoned_probes = _AGENT_TRUTH_ABANDONED
                     info = {"t": "info", "protocol": PROTOCOL, "caps": CAPS,
                             "host": HOST_IDENTITY,
                             "instanceId": PRINCIPAL_ENDPOINT.instance_id,
@@ -4899,6 +5158,17 @@ async def main():
                             "uptimeSec": int(time.time() - STARTED),
                             "loopLagMs": round(float(snap.get("last_lag", 0.0)) * 1000, 1),
                             "maxLoopLagMs": round(float(snap.get("max_lag", 0.0)) * 1000, 1),
+                            # Process drift, reported so a caller can see the stall coming rather
+                            # than inferring it from a black terminal. abandonedProbes counts probe
+                            # threads wedged in kernel calls; threadCount is the direct evidence that
+                            # the process is not reaping them.
+                            "abandonedProbes": abandoned_probes,
+                            "threadCount": threading.active_count(),
+                            # The scheduling class this process actually holds. A caller that sees
+                            # lag it cannot explain should look here first: a BelowNormal muxd is
+                            # starved by any Normal-priority load on the box, and that presents as
+                            # a black terminal with an idle-looking main thread.
+                            "priorityClass": current_priority_class(),
                             "localActive": max(0, int(snap.get("local_active", 0)) - 1),
                             "localTotal": snap.get("local_total", 0),
                             "localErrors": snap.get("local_errors", 0),
@@ -5210,6 +5480,16 @@ async def main():
                                         "retryable": False,
                                         "session": result.get("session") or {},
                                     }))
+                                    # The session now exists; say so on the list channel too, rather than
+                                    # waiting for the next pump_status tick (up to 5 s). The relay's
+                                    # create path queues the start over the app-command bridge and then
+                                    # confirms with waitForHostState against ITS OWN hostSessions, which
+                                    # only pump_status refreshes -- so a create that had already
+                                    # succeeded still read as "not visible on muxd" for as long as the
+                                    # timer had left to run. Pushing here makes the confirmation
+                                    # immediate. Sent only on the success branch: a refusal has no new
+                                    # list to announce.
+                                    await ws.send(json.dumps({"t": "sessions", "list": sess_list()}))
                                 continue
                             elif t == "heal" and name in sessions:
                                 healed, detail = await set_session_heal(name, bool(m.get("on")))
@@ -5308,6 +5588,13 @@ async def main():
                                                              "uncertain": True, "detail": detail}))
                                 else:
                                     await ws.send(json.dumps({**reply, "t": "killed"}))
+                                # Announce the new list IMMEDIATELY, not on the next pump_status tick.
+                                # pump_status is a fixed 5 s cadence, so without this the relay's
+                                # hostSessions still held the killed session when this very handler
+                                # returned, and the relay's confirmation poll (waitForHostState, 100 ms
+                                # interval) could not observe the removal for up to 5 s. That is the
+                                # "erasing a terminal takes a handful of seconds" delay: the removal had
+                                # already happened, and only its announcement was waiting on a timer.
                                 await ws.send(json.dumps({"t": "sessions", "list": sess_list()}))
                     finally:
                         for tk in tasks: tk.cancel()
@@ -5321,6 +5608,7 @@ async def main():
 if __name__ == "__main__":
     os.makedirs(DIR, exist_ok=True)
     log("=== muxd starting ===")
+    apply_process_priority()
     ok, detail = acquire_single_instance()
     if not ok:
         _log_now("FATAL: refusing to start duplicate muxd: " + detail)

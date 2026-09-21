@@ -736,6 +736,103 @@ class MuxdStateTests(unittest.TestCase):
         self.assertEqual([], values)
         self.assertIn("Name='node.exe'", " ".join(calls[0]))
 
+    def test_agent_cmdline_query_is_paid_once_per_window_not_once_per_caller(self):
+        """One session launch asks for live session ids up to three times.
+
+        `reserve_launch_claim` (muxd.py:4289), then `acquire_launch_claim`'s own call
+        (muxd.py:2014), then its second-live re-check (muxd.py:2074). Each was a whole
+        `powershell.exe` -- measured 1.24 s p50 on a box already running 118 powershell.exe
+        processes -- so a create carrying a command cost ~4 s live against ~1.2 s on an isolated
+        instance of the same code, the difference being exactly these queries.
+
+        Driven through the REAL function with a counting fake subprocess, so removing the cache
+        fails here instead of silently restoring the delay.
+        """
+
+        class Result:
+            returncode = 0
+            stdout = "[]"
+            stderr = ""
+
+        calls = []
+        old_run = muxd.subprocess.run
+        old_ttl = muxd._AGENT_CMDLINES_CACHE.copy()
+        try:
+            muxd.subprocess.run = lambda args, **kwargs: calls.append(args) or Result()
+            muxd._agent_cmdlines_ttl = lambda: 60.0
+            muxd._AGENT_CMDLINES_CACHE["at"] = 0.0
+            muxd._AGENT_CMDLINES_CACHE["rows"] = None
+
+            for _ in range(3):
+                ok, values, detail = muxd._try_agent_cmdlines()
+                self.assertTrue(ok, detail)
+                self.assertEqual([], values)
+        finally:
+            muxd.subprocess.run = old_run
+            muxd._AGENT_CMDLINES_CACHE.update(old_ttl)
+
+        self.assertEqual(
+            1, len(calls),
+            f"3 callers inside one window spawned {len(calls)} powershell.exe processes")
+
+    def test_agent_cmdline_failure_is_not_cached(self):
+        """A failed scan means a resume conflict went unchecked; caching it would extend that.
+
+        Only a successful answer may be reused, so the next caller must re-query.
+        """
+
+        class Result:
+            returncode = 1
+            stdout = ""
+            stderr = "WMI unavailable"
+
+        calls = []
+        old_run = muxd.subprocess.run
+        old_ttl = muxd._AGENT_CMDLINES_CACHE.copy()
+        try:
+            muxd.subprocess.run = lambda args, **kwargs: calls.append(args) or Result()
+            muxd._agent_cmdlines_ttl = lambda: 60.0
+            muxd._AGENT_CMDLINES_CACHE["at"] = 0.0
+            muxd._AGENT_CMDLINES_CACHE["rows"] = None
+
+            for _ in range(2):
+                ok, _, detail = muxd._try_agent_cmdlines()
+                self.assertFalse(ok)
+                self.assertIn("WMI unavailable", detail)
+            self.assertIsNone(muxd._AGENT_CMDLINES_CACHE["rows"],
+                              "a failed query must never be stored")
+        finally:
+            muxd.subprocess.run = old_run
+            muxd._AGENT_CMDLINES_CACHE.update(old_ttl)
+
+        self.assertEqual(2, len(calls), "a failure must be re-queried, not reused")
+
+    def test_agent_cmdline_cache_expires(self):
+        """A cache that never expires would let a resume conflict go unseen forever."""
+
+        class Result:
+            returncode = 0
+            stdout = '[{"ProcessId": 4242, "CommandLine": "claude --resume x"}]'
+            stderr = ""
+
+        calls = []
+        old_run = muxd.subprocess.run
+        old_ttl = muxd._AGENT_CMDLINES_CACHE.copy()
+        try:
+            muxd.subprocess.run = lambda args, **kwargs: calls.append(args) or Result()
+            muxd._agent_cmdlines_ttl = lambda: 0.05
+            muxd._AGENT_CMDLINES_CACHE["at"] = 0.0
+            muxd._AGENT_CMDLINES_CACHE["rows"] = None
+
+            muxd._try_agent_cmdlines()
+            time.sleep(0.08)
+            muxd._try_agent_cmdlines()
+        finally:
+            muxd.subprocess.run = old_run
+            muxd._AGENT_CMDLINES_CACHE.update(old_ttl)
+
+        self.assertEqual(2, len(calls), "the query must be re-paid once the window passes")
+
     def test_live_session_scan_fences_recycled_claude_registry_pids(self):
         old_home = muxd.HOME
         with tempfile.TemporaryDirectory(prefix="muxd-claude-registry-") as root:

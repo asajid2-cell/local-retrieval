@@ -196,6 +196,104 @@ test('an unknown/absent host block is not treated as a down link', async () => {
   assert.equal(notifier.sent.length, 0, 'missing evidence is not evidence of an outage');
 });
 
+// The failure that motivated this condition: muxd's event loop stops turning while its WebSocket stays
+// open. `connected` is true, the protocol agrees, the caps are complete — every pre-existing check
+// passes while nothing moves, which is how the stall ran unreported for three days.
+test('host stalled needs 5min and says the link is up, which is the whole problem', async () => {
+  const notifier = mockNotifier();
+  const alerts = createHealthAlerts({ notifier });
+  const t = 35_000_000;
+  const stalled = () => health({
+    degraded: true, ok: false,
+    host: { connected: true, name: 'CRACKERBARREL', protocolOk: true, frameStale: true, frameAgeMs: 62_000, frameStaleMs: 15_000 },
+  });
+  // The aggregate is true at the same time (a stalled host IS degraded), so this asserts on the STALL,
+  // not on silence: a blanket "nothing fired" would be wrong for the correct behavior.
+  const stallOnly = fired => fired.filter(f => f.key === 'host-stalled');
+  const stallPushes = () => notifier.sent.filter(m => m.title === 'Host stalled' || m.title === 'Host frames flowing again');
+
+  await alerts.observe(GREEN(), t);
+  await alerts.observe(stalled(), t);
+  assert.deepEqual(stallOnly(await alerts.observe(stalled(), t + 4 * MIN)), [],
+    '4min stalled is under the 5min dwell');
+  await alerts.observe(GREEN(), t + 4 * MIN + 1000);
+  assert.deepEqual(stallPushes(), [], 'a stall shorter than the dwell is a non-event in both directions');
+
+  await alerts.observe(stalled(), t + 10 * MIN);
+  const fired = await alerts.observe(stalled(), t + 15 * MIN);
+  const stall = fired.find(f => f.key === 'host-stalled');
+  assert.ok(stall, 'a sustained stall alerts');
+  assert.equal(stall.message.priority, 'urgent');
+  assert.equal(stall.message.title, 'Host stalled');
+  assert.match(stall.message.body, /no status frame for 62s \(CRACKERBARREL\)/);
+  assert.match(stall.message.body, /held 5m/);
+  assert.match(stall.message.body, /The link is up, so nothing else reports this/,
+    'the body has to explain why a connected host is still an outage');
+
+  const back = await alerts.observe(GREEN(), t + 16 * MIN);
+  const recovery = back.find(f => f.key === 'host-stalled');
+  assert.ok(recovery && recovery.kind === 'recovery');
+  assert.equal(recovery.message.title, 'Host frames flowing again');
+});
+
+test('host stalled stays silent for every state that merely lacks a frame to measure', async () => {
+  const notifier = mockNotifier();
+  const alerts = createHealthAlerts({ notifier });
+  const t = 36_000_000;
+  // Asserting on the STALL, not on total silence. The first fixture below is a genuinely down link, and
+  // that correctly alerts `host-link-down` on its own dwell — a blanket "nothing was sent" assertion
+  // would conflate "the stall was not reported" with "nothing at all was reported", and fail for the
+  // right behavior.
+  const stallTitles = ['Host stalled', 'Host frames flowing again'];
+  const stallPushes = () => notifier.sent.filter(m => stallTitles.includes(m.title));
+
+  // A down link: server.js emits frameStale=false here because a link with no frames cannot be late.
+  // Alerting "stalled" for a host that simply went away would send the operator to the wrong subsystem.
+  const linkDown = health({ host: { connected: false, name: 'win', protocolOk: false, frameStale: false, frameAgeMs: null } });
+  await alerts.observe(linkDown, t);
+  await alerts.observe(linkDown, t + 30 * MIN);
+
+  // Connected, but no frame stamped yet (a fresh connection whose hello has not landed).
+  const unstamped = health({ host: { connected: true, name: 'win', protocolOk: true, frameStale: false, frameAgeMs: null } });
+  await alerts.observe(unstamped, t + 31 * MIN);
+  await alerts.observe(unstamped, t + 60 * MIN);
+
+  // A host block that predates the field entirely — a relay and an alert module rolled out apart.
+  const oldShape = health({ host: { connected: true, name: 'win', protocolOk: true } });
+  await alerts.observe(oldShape, t + 61 * MIN);
+  await alerts.observe(oldShape, t + 90 * MIN);
+
+  assert.deepEqual(stallPushes(), [], 'no evidence of a stall must never be reported as one');
+  assert.ok(notifier.sent.some(m => m.title === 'Host link down'),
+    'and the down link is still reported as what it is');
+});
+
+test('a stalled host fires both its own condition and the aggregate, each on its own dwell', async () => {
+  const notifier = mockNotifier();
+  const alerts = createHealthAlerts({ notifier });
+  const t = 37_000_000;
+  // Production shape: a stalled host IS degraded, so the two conditions are true together and an
+  // operator gets the specific one (5min) after the aggregate (2min) rather than instead of it.
+  const stalled = () => health({
+    degraded: true, ok: false,
+    host: { connected: true, name: 'win', protocolOk: true, frameStale: true, frameAgeMs: 20_000, frameStaleMs: 15_000 },
+  });
+
+  await alerts.observe(GREEN(), t);
+  await alerts.observe(stalled(), t);                    // onset: both episodes start here
+  const at2 = await alerts.observe(stalled(), t + 2 * MIN);
+  assert.deepEqual(at2.map(f => f.key), ['degraded'], 'the aggregate waits out its own 2min first');
+  assert.match(notifier.sent[0].body, /host stalled \(no frame for 20s\)/,
+    'the aggregate body already names the stall from degradedReasons');
+
+  const at5 = await alerts.observe(stalled(), t + 5 * MIN);
+  // Only the stall: `degraded` already fired at 2min and is inside its 30min dedupe window.
+  assert.deepEqual(at5.map(f => f.key), ['host-stalled']);
+  const snapshot = alerts.snapshot();
+  assert.equal(snapshot.degraded.count, 1);
+  assert.equal(snapshot['host-stalled'].count, 1);
+});
+
 test('persistenceBlocked alerts on sight — it is latched until an operator clears it', async () => {
   const notifier = mockNotifier();
   const alerts = createHealthAlerts({ notifier });
@@ -347,6 +445,30 @@ test('degradedReasons mirrors the disjunction the server computes', () => {
     '1 upload recovery warning(s)',
   ]);
   assert.deepEqual(degradedReasons(health()), [], 'a green blob has no reasons');
+});
+
+test('degradedReasons names a stalled host, and never for a link that is simply down', () => {
+  const stalled = degradedReasons(health({
+    degraded: true,
+    host: { connected: true, protocolOk: true, name: 'win', frameStale: true, frameAgeMs: 61_500, frameStaleMs: 15_000 },
+  }));
+  assert.deepEqual(stalled, ['host stalled (no frame for 62s)']);
+
+  // A down link reports the link, not a stall: there is no frame to be late, and naming the wrong
+  // subsystem is worse than naming none.
+  const down = degradedReasons(health({
+    degraded: true,
+    host: { connected: false, protocolOk: true, name: 'win', frameStale: false, frameAgeMs: null },
+  }));
+  assert.deepEqual(down, ['host link down']);
+
+  // A stall flagged with no age at all — a malformed or partially-rolled-out blob. Number(null) is 0,
+  // so a coercing implementation would report a perfectly fresh "0s" stall. "unknown" is the honest read.
+  const noAge = degradedReasons(health({
+    degraded: true,
+    host: { connected: true, protocolOk: true, name: 'win', frameStale: true, frameAgeMs: null },
+  }));
+  assert.deepEqual(noAge, ['host stalled (no frame for unknown)']);
 });
 
 test('createHealthAlerts refuses to run without an injected transport', () => {

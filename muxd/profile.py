@@ -379,7 +379,18 @@ PROFILE = load_profile()
 
 if __name__ == "__main__":
     if sys.argv[1:] == ["--matching-pids"]:
-        processes = json.load(sys.stdin)
+        # Read BYTES, not text. PowerShell 5.1 encodes its pipeline payload with
+        # [Console]::InputEncoding, and on a UTF-8 console that encoding carries a BOM, so the
+        # caller's JSON arrives as b'\xef\xbb\xbf[...]'. Decoded as text that is a leading
+        # U+FEFF, and json.load then rejects it ("Expecting value: line 1 column 1") - which
+        # fails the custody preflight and blocks every deploy and restart. It looks
+        # intermittent because it depends on the console's input encoding, not on the caller.
+        # utf-8-sig strips the BOM when present and is byte-identical to utf-8 when it is not.
+        raw = sys.stdin.buffer.read()
+        try:
+            processes = json.loads(raw.decode("utf-8-sig"))
+        except (UnicodeDecodeError, ValueError) as error:
+            raise SystemExit(f"process input must be a JSON array: {error}")
         if not isinstance(processes, list):
             raise SystemExit("process input must be an array")
         print(json.dumps([p["ProcessId"] for p in processes

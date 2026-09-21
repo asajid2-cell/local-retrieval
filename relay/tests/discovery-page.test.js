@@ -154,6 +154,36 @@ async function mount(extra = {}, over = {}) {
 
 function submit(doc) { return doc.nodes.get('#searchform').onsubmit({ preventDefault() {} }); }
 
+// The pager's own visibility comes from `total`, so a failed page load used to be a dead end: the rows
+// went empty AND the pager went hidden with them (renderPager hides it when total <= limit), leaving no
+// Prev to step back with and no Next to retry. Reported as "pages outside the first don't work"; the
+// fault only needs ONE transient failure to strand the user, which is why it reads as intermittent.
+test('a failed page load keeps the pager alive so the user is not stranded', async () => {
+  let failNext = false;
+  const { doc, mounted } = await mount({}, {
+    fetch: async url => {
+      const text = String(url);
+      if (failNext && text.includes('/chats')) return { ok: false, status: 503, json: async () => ({}) };
+      return { ok: true, status: 200, json: async () => text.includes('/facets') ? FACETS : { ...PAGE, total: 120, hasMore: true } };
+    },
+  });
+  assert.equal(mounted.controller.state.total, 120);
+
+  failNext = true;
+  await mounted.controller.page(1);
+  assert.ok(mounted.controller.state.error, 'the failure must be visible, not silent');
+  assert.equal(mounted.controller.state.total, 120, 'the last known count survives a failed page');
+  assert.equal(mounted.controller.state.offset, 40, 'the user stays on the page they asked for');
+  assert.equal(doc.nodes.get('#pager').hidden, false, 'the pager must not vanish on a failed page');
+
+  // ...and the very next step works again, which is the point: the failure is recoverable in place.
+  failNext = false;
+  await mounted.controller.page(-1);
+  assert.equal(mounted.controller.state.offset, 0);
+  assert.equal(mounted.controller.state.error, '');
+  assert.ok(mounted.controller.state.rows.length, 'rows come back without a reload');
+});
+
 test('query parameters encode the frozen discovery contract', () => {
   const { MuxChats } = loadClient();
   const params = MuxChats.queryParams({
@@ -184,6 +214,34 @@ test('status text explicitly distinguishes loading, empty, online, and PC failur
   assert.match(MuxChats.statusFor({ total: 0 }).text, /No chats match/);
   assert.match(MuxChats.statusFor({ total: 12 }).text, /12 matching chats/);
   assert.match(MuxChats.statusFor({ error: 'HTTP 502' }).text, /PC archive unavailable/);
+});
+
+// The remedy depends on the fault. A 403 is the PC answering "this account may not read the
+// archive" — it must NOT be reported as a PC that stayed silent, or the user goes and debugs a
+// tunnel that is working.
+test('failure text separates an auth refusal from a PC that never answered', () => {
+  const { MuxChats } = loadClient();
+  const silent = MuxChats.failureFor({ error: 'HTTP 502', errorStatus: 502 });
+  assert.match(silent.title, /PC archive unavailable/);
+  assert.match(silent.detail, /tunnel is up/);
+
+  const forbidden = MuxChats.failureFor({ error: 'HTTP 403', errorStatus: 403 });
+  assert.match(forbidden.title, /access not allowed/);
+  assert.doesNotMatch(forbidden.detail, /tunnel/);
+
+  const signedOut = MuxChats.failureFor({ error: 'HTTP 401', errorStatus: 401 });
+  assert.match(signedOut.title, /Sign in required/);
+
+  // The PC gate answers 503 when it could not reach the auth service. That is retryable and must
+  // say so rather than blaming the PC.
+  const unavailable = MuxChats.failureFor({ error: 'HTTP 503', errorStatus: 503 });
+  assert.match(unavailable.title, /temporarily unavailable/);
+  assert.doesNotMatch(unavailable.detail, /tunnel/);
+
+  // A transport failure (aborted fetch, no status) still reads as the PC not answering.
+  assert.match(MuxChats.failureFor({ error: 'Failed to fetch' }).title, /PC archive unavailable/);
+
+  assert.match(MuxChats.statusFor({ error: 'HTTP 403', errorStatus: 403 }).text, /Archive access not allowed/);
 });
 
 test('DOM smoke renders discovery rows, facets, disabled resume, and delegates resume', async () => {
@@ -419,6 +477,30 @@ test('ordinary copy preserves stored launch mode while explicit Gateway copy ove
   assert.equal(requests[1].launchMode, 'gateway');
   assert.equal(requests[0].sessionId, 'chat-2');
   assert.equal(clipboard.length, 2);
+});
+
+// The payload is fetched once. When the browser refuses the clipboard write, re-POSTing cannot change
+// that answer, so the text has to reach the user another way or the tap is a dead end — and a dead end
+// is what a "Copy resume command" that fails on the second attempt looks like from the outside.
+test('a blocked clipboard surfaces the text instead of re-requesting a payload it already has', async () => {
+  const doc = fakeDocument(), requests = [], shown = [];
+  const sandbox = loadClient({
+    navigator: { clipboard: { writeText: async () => { throw new Error('NotAllowedError'); } } },
+    prompt: (message, value) => { shown.push({ message, value }); return null; },
+    fetch: async (url, options) => {
+      requests.push(JSON.parse(options.body));
+      return { ok: true, json: async () => ({ ...JSON.parse(options.body), payload: 'exact command' }) };
+    },
+  });
+  const mounted = sandbox.MuxChats.install({ document: doc, fetch: async url => ({ ok: true, json: async () => String(url).includes('/facets') ? FACETS : PAGE }) });
+  await mounted.controller.load(true);
+  const menu = doc.nodes.get('#chatlist').children[1].querySelector('details');
+  await menu.children.find(node => node.textContent === 'Copy resume command').onclick();
+
+  assert.equal(requests.length, 1, 'the PC is asked exactly once per tap');
+  assert.equal(shown.length, 1, 'the payload is offered to the user');
+  assert.equal(shown[0].value, 'exact command');
+  assert.equal(doc.nodes.get('#chatlist').children[1].querySelector('details'), menu, 'the menu survives the refusal');
 });
 
 test('page markup exposes every primary control and loads scripts in dependency order', () => {
