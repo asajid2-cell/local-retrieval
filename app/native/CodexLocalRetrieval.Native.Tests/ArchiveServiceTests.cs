@@ -4143,6 +4143,59 @@ public sealed class ArchiveServiceTests
         StringAssert.Contains(code, "export function score");
     }
 
+    // "command" is the web's most-used copy option ("Copy resume command", and "Copy Gateway command"
+    // maps onto it), and it is assembled from metadata alone - tool, id, workspace, launch mode - the
+    // same facts "path" needs. It used to pay the full lazy transcript parse anyway: the measured
+    // 2085ms and 3419ms cold-chat copies against 103ms on a chat whose content happened to be resident.
+    // The parse counter is the assertion - a command payload must parse the transcript ZERO times.
+    [TestMethod]
+    public void CopyPayload_CommandMode_DoesNotParseTranscript()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "clr-copy-command-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        var source = Path.Combine(dir, "session.jsonl");
+        File.WriteAllText(source, "{}");
+        var parseCount = 0;
+        var service = new ArchiveService(
+            storePath: Path.Combine(dir, "store.json"),
+            useBundledStore: false,
+            parseSessionOverride: async (_, _) =>
+            {
+                Interlocked.Increment(ref parseCount);
+                return new ArchiveSession
+                {
+                    MessageCount = 1,
+                    Messages = new ObservableCollection<ArchiveMessage>
+                    {
+                        new() { Id = "one", Role = "assistant", Text = "loaded" }
+                    }
+                };
+            });
+        var session = new ArchiveSession
+        {
+            Id = "copy-command-fast-path",
+            Tool = "codex",
+            Workspace = dir,
+            SourcePath = source,
+        };
+
+        try
+        {
+            var command = service.CopyPayload(session, "command");
+
+            Assert.AreEqual(0, Volatile.Read(ref parseCount), "a command payload must not parse the transcript");
+            Assert.IsFalse(session.ContentLoaded, "a command payload must not mark content loaded");
+            Assert.IsFalse(string.IsNullOrWhiteSpace(command), "a command payload must still emit the resume command");
+
+            var code = service.CopyPayload(session, "code");
+
+            Assert.AreEqual(1, Volatile.Read(ref parseCount), "a code payload does need the transcript");
+            Assert.IsTrue(session.ContentLoaded);
+            StringAssert.Contains(code, "No code blocks found.");
+        }
+        finally { Directory.Delete(dir, true); }
+    }
+
     [TestMethod]
     public void GatewayCopyPayload_ContainsCwdResolvedLauncherAndResumeId()
     {

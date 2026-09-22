@@ -4199,7 +4199,11 @@ public sealed partial class ArchiveService
         string mode,
         string? launchModeOverride = null)
     {
-        if (mode is not ("path" or "paths")) EnsureContent(session); // restore/code/resume need content (lazy)
+        // "command" is assembled from metadata alone (tool, id, workspace, launch mode) — the same facts
+        // "path" needs — so it must not pay the lazy transcript load the other modes do. It is the most
+        // used copy option, and a cold chat paid a full parse for it: measured 2085ms and 3419ms against
+        // 103ms on a chat whose content happened to be resident.
+        if (mode is not ("path" or "paths" or "command")) EnsureContent(session); // restore/code/resume need content (lazy)
         return BuildCopyPayload(session, mode, launchModeOverride);
     }
 
@@ -4209,7 +4213,9 @@ public sealed partial class ArchiveService
         CancellationToken cancellationToken = default,
         string? launchModeOverride = null)
     {
-        if (mode is "path" or "paths")
+        // "command" needs no transcript content — see CopyPayload. Without it here the web's most used
+        // copy option lazy-loads the whole chat on a cold open (measured 2.1s and 3.4s).
+        if (mode is "path" or "paths" or "command")
             return BuildCopyPayload(session, mode, launchModeOverride);
 
         var gate = _contentLoadGates.GetValue(session, static _ => new SemaphoreSlim(1, 1));
