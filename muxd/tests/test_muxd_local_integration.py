@@ -1326,6 +1326,88 @@ class MuxdLocalIntegrationTests(unittest.TestCase):
         finally:
             self.kill(name)
 
+    def test_bind_accepts_a_plain_shell_running_an_agent_inside_it(self):
+        """An agent started INSIDE a mux tab (`cc --resume <id>` typed at the shell) leaves muxd with
+        kind="shell", hasCommand=false, sessionId="" and identity_pending FALSE. That is a session with NO
+        identity, not one with a conflicting identity, so a bind must not be refused as "already has a
+        different canonical identity" - refusing it wedges the tab permanently: the desktop bridge re-proposes
+        the binding on every tick (alive && !hasCommand) and the tab can never become resumable. The bind must
+        instead go through the pending path, which verifies the tab's own live descendant before binding."""
+        name = "it-bare-shell-bind"
+        marker = f"MUXD_IT_BARE_{int(time.time() * 1000)}"
+        sid = "bare-shell-resume-id"
+        self.kill(name)
+        try:
+            created = run_request(self.muxd.port, {"t": "create", "s": name}, timeout=12)
+            self.assertTrue(created.get("created"), created)
+            shell = self.session(name)
+            self.assertTrue(shell.get("shellOnly"))
+            self.assertFalse(shell.get("hasCommand"))
+            self.assertFalse(shell.get("identityPending"))
+            self.assertEqual("", shell.get("sessionId"))
+
+            # Start a live descendant whose command line carries the resume id, exactly as the gateway does:
+            # node.exe is one of muxd's agent-cmdline executables and `--resume <id>` is what _parse_resume_id
+            # reads. It stays alive on the setInterval so the ownership check has something to find.
+            asyncio.run(attach_and_roundtrip(
+                self.muxd.port,
+                name,
+                f"node -e \"console.log('{marker}');setInterval(function(){{}},1000)\" -- --resume {sid}\r",
+                marker,
+            ))
+
+            # The agent-cmdline probe is TTL-cached, so allow a couple of refreshes before judging.
+            deadline = time.time() + 15
+            bound = None
+            while time.time() < deadline:
+                bound = run_request(self.muxd.port, {
+                    "t": "bind",
+                    "s": name,
+                    "generationId": self.session(name)["generationId"],
+                    "cmd": f"# cc --resume {sid}",
+                    "sessionId": sid,
+                    "aliases": [],
+                }, timeout=12)
+                if bound.get("t") == "bind-ok":
+                    break
+                self.assertNotIn(
+                    "different canonical identity", bound.get("m", ""),
+                    "a session holding no identity must never be reported as holding a different one")
+                time.sleep(0.5)
+            self.assertEqual("bind-ok", bound.get("t"), bound)
+            after = self.session(name)
+            self.assertFalse(after.get("identityPending"))
+            self.assertEqual(sid, after.get("sessionId"))
+        finally:
+            self.kill(name)
+
+    def test_bind_still_refuses_a_session_that_truly_has_a_different_identity(self):
+        """The conflict guard must survive the fix above: a session already bound to one identity must still
+        refuse a bind proposing another."""
+        name = "it-real-identity-conflict"
+        self.kill(name)
+        try:
+            run_request(self.muxd.port, {
+                "t": "create", "s": name,
+                "cmd": f"Write-Output '{name}'; # cc --resume real-identity-id",
+            }, timeout=12)
+            self.wait_for_tail(name, name)
+            current = self.session(name)
+            self.assertEqual("real-identity-id", current.get("sessionId"), current)
+
+            refused = run_request(self.muxd.port, {
+                "t": "bind",
+                "s": name,
+                "generationId": current["generationId"],
+                "cmd": "# cc --resume some-other-id",
+                "sessionId": "some-other-id",
+                "aliases": [],
+            }, timeout=12)
+            self.assertEqual("err", refused.get("t"), refused)
+            self.assertIn("different canonical identity", refused.get("m", ""))
+        finally:
+            self.kill(name)
+
     def test_different_command_replaces_wrong_live_session(self):
         name = "it-different-command"
         old_marker = f"MUXD_IT_OLD_{int(time.time() * 1000)}"

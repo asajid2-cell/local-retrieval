@@ -4843,7 +4843,15 @@ async def main():
                 current_ids = {str(value).lower() for value in ([getattr(current, "session_id", "")] + list(getattr(current, "aliases", []) or [])) if value}
                 if canonical_id.lower() in current_ids:
                     return current, ""
-                return None, "session already has a different canonical identity"
+                # A session holding NO identity at all is not a conflict. identity_pending is only set by a
+                # muxd-driven launch; when the agent is started INSIDE a plain shell (`cc --resume <id>` typed
+                # at the tab), the tab stays kind="shell"/hasCommand=false with an empty session_id and
+                # identity_pending false. Refusing that as "a different canonical identity" asserts an identity
+                # that does not exist, so the bind is refused forever and the tab never becomes resumable.
+                # Fall through to the pending path, which verifies this tab's OWN live descendant before
+                # binding - so a stale or foreign proposal still cannot be attached.
+                if current_ids:
+                    return None, "session already has a different canonical identity"
 
             pty = getattr(current, "pty", None)
             root_pid = int(getattr(pty, "pid", 0) or 0) if pty is not None else 0
