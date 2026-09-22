@@ -1,8 +1,14 @@
 [Unit]
 Description=Multiplex relay healthcheck
 Documentation=http://127.0.0.1:7682/api/health
-Wants=multiplex-app.service
-After=network-online.target multiplex-app.service
+# No Wants=/Requires= on multiplex-app.service, deliberately, and After= must not name it either.
+# Wants= is not a passive declaration: activating this unit queues a START for multiplex-app.service,
+# and when that lands inside a deploy's drain window systemd CANCELS the deploy's pending stop job.
+# `systemctl stop` then exits non-zero, `set -euo pipefail` aborts deploy-multiplex after the release
+# has been staged but before the symlink swap, and the relay silently keeps running the old code.
+# Measured 2026-09-21 on the 028bfad deploy: "Job for multiplex-app.service canceled." and nothing
+# else anywhere. A monitor must never be able to start the thing it monitors.
+After=network-online.target
 
 [Service]
 Type=oneshot

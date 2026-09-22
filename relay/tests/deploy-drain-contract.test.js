@@ -10,6 +10,7 @@ const deployClient = fs.readFileSync(path.join(ROOT, 'scripts', 'deploy-relay.sh
 const installer = fs.readFileSync(path.join(REPO, 'ops', 'deploy-multiplex'), 'utf8');
 const provisioner = fs.readFileSync(path.join(REPO, 'ops', 'provision-multiplex-deploy.sh'), 'utf8');
 const service = fs.readFileSync(path.join(REPO, 'ops', 'multiplex-app.service'), 'utf8');
+const healthcheckUnit = fs.readFileSync(path.join(REPO, 'ops', 'multiplex-healthcheck.service'), 'utf8');
 const backupService = fs.readFileSync(path.join(REPO, 'ops', 'mux-relay-backup.service'), 'utf8');
 
 test('release client packages only a clean immutable commit for the admin release account', () => {
@@ -123,6 +124,57 @@ test('deploy drains, verifies health, and atomically rolls back', () => {
   assert.match(installer, /distributed health remains degraded/);
   assert.match(installer, /rolling back/);
   assert.match(installer, /previous release restored/);
+});
+
+// The probe unit carried `Wants=multiplex-app.service` (added in e5815bf), and Wants= is not a
+// passive declaration: activating the probe queues a START for the app. A timer tick inside a deploy's
+// drain window therefore canceled the deploy's pending stop job, `systemctl stop` exited non-zero,
+// `set -euo pipefail` aborted deploy-multiplex after the release was staged but before the symlink
+// swap, and the relay silently kept running the old code - the only signal was "Job for
+// multiplex-app.service canceled." in the deploy log. Measured 2026-09-21 on the 028bfad deploy.
+test('the healthcheck monitor cannot start the service it monitors', () => {
+  assert.doesNotMatch(healthcheckUnit, /^Wants=multiplex-app\.service$/m);
+  assert.doesNotMatch(healthcheckUnit, /^Requires=multiplex-app\.service$/m);
+  // Ordering alone is safe, but naming the app in After= keeps the pairing looking intentional and
+  // invites the Wants= back. A probe reads a loopback socket; it has no business in that graph.
+  assert.doesNotMatch(healthcheckUnit, /^After=.*multiplex-app\.service/m);
+  assert.match(healthcheckUnit, /^After=network-online\.target$/m);
+  assert.match(healthcheckUnit, /A monitor must never be able to start the thing it monitors/);
+});
+
+// The unit fix is the root cause, but a deploy must not stake its correctness on another unit's
+// definition staying right. `systemctl stop` reports a CANCELED job as a failure even though the unit
+// is still running, so the wrapper retries and then judges by the observed state.
+test('a refused or canceled stop is retried, and judged by state rather than exit status', () => {
+  assert.match(installer, /^stop_unit\(\) \{$/m);
+  assert.match(installer, /if out="\$\(systemctl stop "\$UNIT" 2>&1\)"; then/);
+  assert.match(installer, /stop of \$UNIT was refused \(attempt \$attempt\)/);
+  assert.match(installer, /if systemctl is-active --quiet "\$UNIT"; then\s*\n\s*return 1/);
+  assert.match(installer, /stop_unit \|\| die "\$UNIT would not stop/);
+  // And the bare, unguarded stop that `set -e` turned into a silent abort must not come back.
+  assert.doesNotMatch(installer, /^systemctl stop "\$UNIT"$/m);
+});
+
+// The old gate was 40 polls at 0.5 s: a 20 s budget against a measured start-to-listen of 0, 0, 6, 16
+// and 30 s. Its losing side rolled back a release that was never broken.
+test('the health gate waits out a slow start instead of a 20 second coin flip', () => {
+  assert.doesNotMatch(installer, /for _ in \$\(seq 1 40\)/);
+  assert.match(installer, /^HEALTH_WAIT_SECS=(\d+)$/m);
+  assert.match(installer, /^wait_for_release_health\(\) \{$/m);
+  assert.match(installer, /systemctl is-failed --quiet "\$UNIT"/);
+  const budget = Number(installer.match(/^HEALTH_WAIT_SECS=(\d+)$/m)[1]);
+  assert.ok(budget >= 60, `health budget of ${budget}s does not cover a measured 30s start`);
+});
+
+// Every poll taken while the relay was down piped curl's empty stdout into the parser and leaked a
+// JSONDecodeError traceback to stderr - noise on the output a real failure has to stay legible through.
+test('the health probe cannot leak a parser traceback while the relay is down', () => {
+  assert.doesNotMatch(installer, /json\.load\(sys\.stdin\)/);
+  assert.match(
+    installer,
+    /body="\$\(curl -fsS --max-time 3 "http:\/\/127\.0\.0\.1:\$PORT\/api\/health"\)" \|\| return 1/,
+  );
+  assert.match(installer, /json\.loads\(sys\.argv\[1\]\)/);
 });
 
 test('one-time provisioner removes stale docker drop-ins and grants no sudo command', () => {

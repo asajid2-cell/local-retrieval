@@ -201,12 +201,25 @@ fi
 PORT="$(awk -F= '$1 == "PORT" { gsub(/[[:space:]]/, "", $2); print $2; exit }' "$ENV_FILE")"
 [[ "$PORT" =~ ^[0-9]{2,5}$ ]] || die "invalid PORT in $ENV_FILE"
 
+# Read the body into a variable BEFORE parsing it. The old form piped curl straight into python3, so
+# every poll taken while the relay was down handed the parser an empty stdin, and the traceback it
+# raised (`JSONDecodeError`) was written to stderr on every iteration - noise on exactly the output a
+# real failure has to stay legible through. Passing the body as an argument removes stdin from the
+# path, and the parse itself is total: a 200 that is not the JSON we expect returns 1 quietly instead
+# of raising. Curl's own exit status is still the first verdict (pipefail would have caught it, but
+# `|| return 1` states it).
 release_health_ok() {
+    local body
     runtime_identity_ok || return 1
-    curl -fsS --max-time 3 "http://127.0.0.1:$PORT/api/health" |
-        python3 -c '
+    body="$(curl -fsS --max-time 3 "http://127.0.0.1:$PORT/api/health")" || return 1
+    python3 -c '
 import json, sys
-health = json.load(sys.stdin)
+try:
+    health = json.loads(sys.argv[1])
+except ValueError:
+    raise SystemExit(1)
+if not isinstance(health, dict):
+    raise SystemExit(1)
 persistence = health.get("persistence") or {}
 ok = (
     isinstance(health.get("uptimeSec"), (int, float))
@@ -215,12 +228,20 @@ ok = (
     and persistence.get("ok") is True
 )
 raise SystemExit(0 if ok else 1)
-'
+' "$body"
 }
 
 distributed_health_ok() {
-    curl -fsS --max-time 3 "http://127.0.0.1:$PORT/api/health" |
-        python3 -c 'import json,sys; raise SystemExit(0 if json.load(sys.stdin).get("ok") is True else 1)'
+    local body
+    body="$(curl -fsS --max-time 3 "http://127.0.0.1:$PORT/api/health")" || return 1
+    python3 -c '
+import json, sys
+try:
+    ok = json.loads(sys.argv[1]).get("ok") is True
+except (ValueError, AttributeError):
+    ok = False
+raise SystemExit(0 if ok else 1)
+' "$body"
 }
 
 # The remote command is `exit 0`, not `true`: the PC runs Windows OpenSSH with a non-POSIX login
@@ -239,8 +260,60 @@ backup_route_ready() {
         >/dev/null 2>&1
 }
 
+# `systemctl stop` exits non-zero when systemd CANCELS the stop job rather than performing it, and a
+# cancel is not a failure to stop - the unit is still running. Measured 2026-09-21: the healthcheck
+# timer's tick activated multiplex-healthcheck.service inside the drain window, its Wants= queued a
+# start for multiplex-app.service, systemd canceled the pending stop, and `set -e` aborted this script
+# AFTER the release had been staged but BEFORE the symlink swap - so the relay silently kept serving
+# the old code and the only signal was "Job for multiplex-app.service canceled.". The unit no longer
+# pulls the app in (that is the actual fix), but a deploy must not stake its correctness on another
+# unit's definition staying right: retry, then judge by the observed state, never by the exit status.
+# Non-fatal by design, so the rollback path can call it without masking the failure that caused it.
+stop_unit() {
+    local attempt out
+    for attempt in 1 2 3; do
+        if out="$(systemctl stop "$UNIT" 2>&1)"; then
+            return 0
+        fi
+        log "stop of $UNIT was refused (attempt $attempt): ${out:-<no output>}"
+        sleep 2
+    done
+    if systemctl is-active --quiet "$UNIT"; then
+        return 1
+    fi
+    return 0
+}
+
+# The old gate polled 40 times at 0.5 s - a 20 s budget against a start-to-listen that measured 0, 0,
+# 6, 16 and 30 s across the last five live starts. That is not a safety margin, it is a coin flip, and
+# its losing side rolls back a release that was never broken. Wait on a budget that covers the worst
+# observed start (and stays inside the unit's own 90 s start timeout), and stop early once the unit
+# has actually failed so a real failure is reported in seconds rather than after the whole budget.
+HEALTH_WAIT_SECS=90
+wait_for_release_health() {
+    local started=$SECONDS deadline=$((SECONDS + HEALTH_WAIT_SECS)) elapsed
+    while :; do
+        if release_health_ok; then
+            elapsed=$((SECONDS - started))
+            if [ "$elapsed" -gt 5 ]; then
+                log "wait: health green after ${elapsed}s"
+            fi
+            return 0
+        fi
+        if systemctl is-failed --quiet "$UNIT"; then
+            log "wait: $UNIT entered the failed state after $((SECONDS - started))s; not waiting further"
+            return 1
+        fi
+        if [ "$SECONDS" -ge "$deadline" ]; then
+            log "wait: health not green after ${HEALTH_WAIT_SECS}s"
+            return 1
+        fi
+        sleep 0.5
+    done
+}
+
 log "deploy start commit=$COMMIT sha256=$EXPECTED_SHA"
-systemctl stop "$UNIT"
+stop_unit || die "$UNIT would not stop; refusing to swap the release under a running process"
 if [ -n "$LEGACY" ]; then
     mv -- "$CURRENT" "$LEGACY"
     PREVIOUS="$LEGACY"
@@ -249,23 +322,17 @@ ln -s "$RELEASE/relay" "$NEXT_LINK"
 mv -Tf -- "$NEXT_LINK" "$CURRENT"
 
 if systemctl start "$UNIT"; then
-    for _ in $(seq 1 40); do
-        release_health_ok && break
-        sleep 0.5
-    done
+    wait_for_release_health || true
 fi
 
 if ! systemctl is-active --quiet "$UNIT" || ! release_health_ok; then
     log "deploy health failed commit=$COMMIT; rolling back"
-    systemctl stop "$UNIT" || true
+    stop_unit || log "rollback: $UNIT would not stop; the restored symlink may not take effect until it restarts"
     if [ -n "$PREVIOUS" ] && [ -d "$PREVIOUS" ]; then
         ln -s "$PREVIOUS" "$NEXT_LINK"
         mv -Tf -- "$NEXT_LINK" "$CURRENT"
         systemctl start "$UNIT"
-        for _ in $(seq 1 40); do
-            release_health_ok && break
-            sleep 0.5
-        done
+        wait_for_release_health || true
     fi
     release_health_ok || die "deployment and rollback health checks failed"
     die "deployment failed; previous release restored"
