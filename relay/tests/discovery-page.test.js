@@ -503,6 +503,41 @@ test('a blocked clipboard surfaces the text instead of re-requesting a payload i
   assert.equal(doc.nodes.get('#chatlist').children[1].querySelector('details'), menu, 'the menu survives the refusal');
 });
 
+// A resume that ends "done" while the reader is still staring at the chat list is indistinguishable
+// from one that did nothing — which is how a working "Resume as Gateway" came to read as a refusal.
+// The session the command just created has to be brought on screen: a new tab when the browser allows
+// it, the same tab when it does not, but never silence.
+test('a done resume opens the session it just created, in a new tab or by navigating', async () => {
+  for (const allowPopup of [true, false]) {
+    const doc = fakeDocument();
+    const opened = [];
+    const location = { href: '' };
+    const sandbox = loadClient({
+      MuxResumePicker: {
+        createPicker: () => ({
+          state: {},
+          resume: async chat => ({ state: 'done', muxName: chat.muxName }),
+        }),
+      },
+      open: (url, target) => { opened.push({ url, target }); return allowPopup ? {} : null; },
+      location,
+    });
+    const mounted = sandbox.MuxChats.install({
+      document: doc,
+      fetch: async url => ({ ok: true, json: async () => String(url).includes('/facets') ? FACETS : PAGE }),
+    });
+    await mounted.controller.load(true);
+
+    await doc.nodes.get('#chatlist').children[0].querySelector('.resume').onclick();
+    assert.deepEqual(opened, [{ url: './?s=web-parity-chat1', target: '_blank' }]);
+    assert.equal(
+      location.href,
+      allowPopup ? '' : './?s=web-parity-chat1',
+      allowPopup ? 'a new tab is enough; the list stays put' : 'a blocked popup must still land the reader on the session',
+    );
+  }
+});
+
 test('page markup exposes every primary control and loads scripts in dependency order', () => {
   const html = fs.readFileSync(path.join(PUBLIC, 'chats.html'), 'utf8');
   for (const id of [

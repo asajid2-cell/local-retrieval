@@ -2633,8 +2633,16 @@ app.post('/api/app-commands', (req, res) => {     // web (owner) enqueues
   if (b.type === 'startmux' && !b.sessionId && !['claude', 'codex'].includes(String(b.tool || '').toLowerCase()))
     return res.status(400).json({ error: 'startmux requires sessionId or tool' });
   if (b.type === 'startmux') {
-    const localOwner = ensureNoLocalOwnerForMuxName(b.muxName || b.sessionName, b.sessionId || '');
-    if (!localOwner.ok) return res.status(409).json({ error: 'local copy is already running', detail: localOwner.detail });
+    // A live local writer is a refusal ONLY while nobody has agreed to replace it. `takeover: true` is
+    // the owner saying "stop that copy and start the mux session here" — the PC then stops that exact
+    // pid, verifies the transfer, and only then asks muxd to create the replacement. POST
+    // /api/sessions/:name/relaunch has always honored it (see queueStartMuxAndWait); without the same
+    // guard here the web could never bring a chat that is already open in a PC terminal into the
+    // gateway, which is exactly what "Resume as Gateway" is for.
+    if (b.takeover !== true) {
+      const localOwner = ensureNoLocalOwnerForMuxName(b.muxName || b.sessionName, b.sessionId || '');
+      if (!localOwner.ok) return res.status(409).json({ error: 'local copy is already running', detail: localOwner.detail });
+    }
   }
   if (b.type === 'mirrorlocal' && !(b.muxName || b.sessionName))
     return res.status(400).json({ error: 'mirrorlocal requires muxName/sessionName' });

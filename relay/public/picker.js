@@ -95,6 +95,7 @@
     var fetchFn = d.fetch || (global.fetch ? global.fetch.bind(global) : null);
     var postIntent = d.postIntent || global.postIntent;
     var sleep = d.sleep || function (ms) { return new Promise(function (r) { setTimeout(r, ms); }); };
+    var confirmFn = d.confirm || (global.confirm ? global.confirm.bind(global) : null);
     var now = d.now || function () { return Date.now(); };
     var pollIntervalMs = d.pollIntervalMs || DEFAULTS.pollIntervalMs;
     var pollTimeoutMs = d.pollTimeoutMs || DEFAULTS.pollTimeoutMs;
@@ -187,6 +188,7 @@
     // and be collapsed THERE, because the intent journal — not the button's disabled state — is what
     // makes this idempotent across a reload, a flaky retry, or a second phone.
     async function resume(chat, launchMode) {
+      var tookOver = false;
       if (launchMode && launchMode !== 'native' && launchMode !== 'gateway') return { state: 'failed', muxName: '', detail: 'Unsupported resume mode.' };
       if (launchMode === 'gateway' && toolFor(chat) !== 'claude') return { state: 'failed', muxName: '', detail: 'Codex requires a new Gateway handoff chat, not same-chat resume.' };
       var muxName = muxNameFor(chat);
@@ -226,6 +228,29 @@
       } catch (error) {
         return { state: 'failed', muxName: muxName, detail: 'could not queue the resume: ' + ((error && error.message) || error) };
       }
+      if (!res.ok && res.status === 409 && confirmFn) {
+        // The one refusal the user can actually resolve: the chat is already open in a local PC
+        // terminal, so the relay stopped here to avoid a second writer. The PC already knows how to
+        // resolve it — stop that exact owner and verify the handover before muxd starts the
+        // replacement — and the relay honors that on `takeover`. So ASK, naming what will be stopped,
+        // and only then retry. Without this the button is a dead end for any chat that is currently
+        // running on the PC, which is how a live chat reads as "it doesn't let us resume".
+        var refusal = await refusalText(res);
+        var agreed = false;
+        try { agreed = confirmFn(refusal + '\n\nStop that local copy and open it in the terminal here instead?'); }
+        catch (error) { agreed = false; }
+        if (agreed) {
+          // `takeover` is part of the intent signature, so this is a NEW intent — never a replay of
+          // the refused one, and never deduped against it.
+          payload.takeover = true;
+          try {
+            res = await postIntent(base + '/api/app-commands', payload, 'resume-takeover');
+          } catch (error) {
+            return { state: 'failed', muxName: muxName, detail: 'could not queue the takeover: ' + ((error && error.message) || error) };
+          }
+          tookOver = true;
+        }
+      }
       if (!res.ok) {
         return { state: 'failed', muxName: muxName, status: res.status, detail: await refusalText(res) };
       }
@@ -240,10 +265,12 @@
         deduplicated: queued.deduplicated === true,
         status: outcome.status,
         detail: outcome.detail,
+        tookOver: tookOver,
       };
       if (outcome.status === 'done') {
         result.state = 'done';
-        result.detail = outcome.detail || 'mux session started';
+        result.detail = (outcome.detail || 'mux session started')
+          + (tookOver ? ' (the local copy was stopped first)' : '');
         if (typeof d.loadSessions === 'function') {
           // Refresh the tab strip AND select the freshly hosted tab — the resume is only finished when
           // the user is looking at the session, not when the command says done.

@@ -500,6 +500,61 @@ test('a refused resume surfaces the PC-side detail, not a bare status code', asy
     `the actionable half of the refusal must survive; got ${outcome.detail}`);
 });
 
+// The refusal above has exactly one resolution available to the user: stop the local copy and take the
+// chat over here. The relay will not act on that until it is told to (`takeover`), so the picker must
+// ASK — naming what will be stopped — and a declined prompt must leave the refusal standing rather than
+// quietly retrying into a second writer.
+test('a 409 refusal prompts once, and only an accepted prompt retries with takeover:true', async () => {
+  for (const agreed of [false, true]) {
+    const sent = [];
+    const prompts = [];
+    const client = loadClient(async () => ({ ok: true, json: async () => [] }));
+    const picker = client.MuxResumePicker.createPicker({
+      base: '',
+      fetch: async url => url === '/api/sessions'
+        ? { ok: true, json: async () => [] }
+        : { ok: true, json: async () => ({ status: 'done' }) },
+      postIntent: async (url, body, prefix) => {
+        // The real postIntent hands the payload straight to fetch, so snapshot it here — the picker
+        // mutates the SAME object when it retries, and a by-reference capture would read the retry's
+        // takeover flag back onto the first tap.
+        const sentBody = { ...body, intentId: `${prefix}-${sent.length + 1}` };
+        sent.push(sentBody);
+        return sent.length === 1
+          ? { ok: false, status: 409, json: async () => ({
+              error: 'local copy is already running',
+              detail: 'mux-1 is already running locally (pid 4242) as chat-1; refusing remote relaunch because it would create a second writer.',
+            }) }
+          : { ok: true, json: async () => ({ id: 'takeover-command', intentId: sentBody.intentId, status: 'done' }) };
+      },
+      confirm: message => { prompts.push(message); return agreed; },
+      pollIntervalMs: 1, offlineTimeoutMs: 100,
+    });
+
+    const result = await picker.resume(row(1));
+    assert.equal(sent.length, agreed ? 2 : 1, 'the retry happens only after the user agrees');
+    assert.equal(sent[0].takeover, undefined, 'a bare tap never claims takeover on its own');
+    assert.equal(sent[0].intentId, 'resume-1');
+    assert.equal(prompts.length, 1, 'the user is asked exactly once');
+    assert.match(prompts[0], /local copy is already running/);
+    assert.match(prompts[0], /already running locally \(pid 4242\)/, 'the prompt names what will be stopped');
+    assert.match(prompts[0], /Stop that local copy/);
+
+    if (agreed) {
+      assert.equal(sent[1].takeover, true);
+      // `takeover` is part of the intent signature, so the retry is a NEW intent, never a replay.
+      assert.equal(sent[1].intentId, 'resume-takeover-2');
+      assert.equal(result.state, 'done');
+      assert.equal(result.tookOver, true);
+      assert.match(result.detail, /the local copy was stopped first/);
+    } else {
+      assert.equal(result.state, 'failed');
+      assert.equal(result.status, 409);
+      assert.match(result.detail, /local copy is already running/);
+    }
+  }
+});
+
 test('with the desktop app offline the resume queues visibly instead of failing silently', async t => {
   const { h, picker } = await bootPicker(t);
   await picker.load();

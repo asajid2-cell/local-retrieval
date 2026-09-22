@@ -1071,9 +1071,26 @@
       try { outcome = await resumePicker.resume(chat, launchMode); }
       catch (error) { outcome = { state: 'failed', detail: (error && error.message) || String(error) }; }
       button.disabled = chat.resumable === false;
-      if (outcome.state === 'done') rowStatus(article, 'Resumed as ' + outcome.muxName + '.', 'ok');
+      if (outcome.state === 'done') {
+        rowStatus(article, 'Resumed as ' + outcome.muxName + '.', 'ok');
+        openSession(outcome.muxName);
+      }
       else if (outcome.state === 'queued') rowStatus(article, outcome.detail || 'Queued for the desktop app.', 'warn');
       else rowStatus(article, outcome.detail || 'The PC refused this resume.', 'bad');
+    }
+
+    // A resume is only finished when the session is on screen. The picker's own dialog already selects
+    // the freshly hosted tab after a done resume; this page stopped at a status line instead, so
+    // tapping "Resume as Gateway" started a session the reader never saw — which is how a working
+    // resume read as a refusal. Open the console on that session in a new tab (the chat list stays
+    // put), falling back to a same-tab navigation when the browser blocks the popup, the way the
+    // reader link already does.
+    function openSession(name) {
+      if (!name) return;
+      var url = './?s=' + encodeURIComponent(name);   // same shape the start-chat flow navigates to
+      var opened = null;
+      try { opened = global.open ? global.open(url, '_blank') : null; } catch (error) { opened = null; }
+      if (!opened && global.location) global.location.href = url;
     }
 
     function renderRows() {

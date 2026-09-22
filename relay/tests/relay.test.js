@@ -2536,3 +2536,93 @@ test('DELETE /api/sessions sends kill and waits until hosted row is gone', async
   assert.equal(res.body.ok, true);
   assert.deepEqual(await h.json('GET', '/api/sessions'), []);
 });
+
+// A live local writer is a refusal only while nobody has agreed to replace it. The owner's own
+// browser says so with `takeover` after confirming what will be stopped, and the relay has to let
+// that through — otherwise a chat that is open in a PC terminal can never be brought into the mux,
+// which is the entire purpose of "Resume as Gateway".
+test('a confirmed takeover may replace a live local writer; a bare resume may not', async t => {
+  const h = new RelayHarness();
+  await h.start();
+  t.after(async () => h.stop());
+
+  const pushed = await h.request('POST', '/api/projects', {
+    schemaVersion: 3,
+    host: 'TAKEOVER-PC',
+    decks: [],
+    collections: [],
+    allChats: [{ id: 'live-chat', tool: 'claude', title: 'Live chat', muxName: 'live-chat-mux' }],
+    runningSessions: [{ pid: 4242, sessionId: 'live-chat', tool: 'claude', startedAt: '2026-07-09T00:00:00Z' }],
+    runningVerified: true,
+  });
+  assert.equal(pushed.status, 200);
+
+  const refused = await h.request('POST', '/api/app-commands', {
+    type: 'startmux', muxName: 'live-chat-mux', sessionId: 'live-chat', tool: 'claude',
+  });
+  assert.equal(refused.status, 409);
+  assert.equal(refused.body.error, 'local copy is already running');
+  assert.match(String(refused.body.detail), /already running locally/);
+  assert.deepEqual(await leaseCommands(h), [], 'a second writer must not be queued');
+
+  const accepted = await h.json('POST', '/api/app-commands', {
+    type: 'startmux', muxName: 'live-chat-mux', sessionId: 'live-chat', tool: 'claude',
+    intentId: 'takeover-intent-0001', takeover: true,
+  });
+  assert.equal(accepted.ok, true);
+  const leased = (await leaseCommands(h)).find(command => command.id === accepted.id);
+  assert.ok(leased, 'the takeover must reach the PC');
+  assert.equal(leased.takeover, true, 'the PC decides the transfer, so the intent must carry through');
+});
+
+// The relay answers a failed remote command with ITS OWN label. The bridge's `detail` is a free-form
+// diagnostic — it can name a local path, an executable, a pid, a command line — and the relay cannot
+// prove otherwise from the text alone, so none of it is relayed. This is the boundary that keeps the
+// browser free of PC internals (see command-bridge-auth and start-chat-command, which assert it for
+// created-container ids and startchat). Guards the resume path specifically, because a plausible
+// "just pass the reason through" change here is exactly how it gets broken.
+test('a failed startmux reports the relay label, never the bridge diagnostic', async t => {
+  const h = new RelayHarness();
+  await h.start();
+  t.after(async () => h.stop());
+  // `startmux` refuses unless local running state is VERIFIED, so the bridge has to have reported an
+  // empty running set first — the same prerequisite every other resume path in this suite establishes.
+  assert.equal((await h.request('POST', '/api/projects', {
+    schemaVersion: 3, decks: [], collections: [], allChats: [],
+    runningSessions: [], runningVerified: true,
+  })).status, 200);
+
+  const reason = 'session detail-chat already live (pid 45100)';
+  const queued = await h.json('POST', '/api/app-commands', {
+    type: 'startmux', muxName: 'detail-mux', sessionId: 'detail-chat', tool: 'claude',
+  });
+  const leased = (await leaseCommands(h)).find(command => command.id === queued.id);
+  await ackLeased(h, leased, { ok: false, detail: reason });
+  const stored = await h.json('GET', `/api/app-commands/${queued.id}`);
+  assert.equal(stored.status, 'failed');
+  assert.equal(stored.detail, 'PC bridge could not start mux session');
+  assert.ok(!stored.detail.includes(reason), 'the bridge diagnostic must not cross to the browser');
+});
+
+test('a failed startmux never relays a bridge detail that names a local path or command', async t => {
+  const h = new RelayHarness();
+  await h.start();
+  t.after(async () => h.stop());
+  assert.equal((await h.request('POST', '/api/projects', {
+    schemaVersion: 3, decks: [], collections: [], allChats: [],
+    runningSessions: [], runningVerified: true,
+  })).status, 200);
+
+  for (const detail of [
+    'Refused: the Gateway launcher was not found at a trusted path: C:\\Users\\Ahmed\\.local\\bin\\cc.cmd',
+    'claude --resume detail-chat-3 failed',
+  ]) {
+    const queued = await h.json('POST', '/api/app-commands', {
+      type: 'startmux', muxName: 'detail-mux-' + detail.length, sessionId: 'detail-chat-' + detail.length, tool: 'claude',
+    });
+    const leased = (await leaseCommands(h)).find(command => command.id === queued.id);
+    await ackLeased(h, leased, { ok: false, detail });
+    const stored = await h.json('GET', `/api/app-commands/${queued.id}`);
+    assert.equal(stored.detail, 'PC bridge could not start mux session', `leaked: ${detail}`);
+  }
+});
