@@ -94,8 +94,20 @@ while ($true) {
         $target `
         >> $outLog 2>> $errLog
 
+    # 255 is ssh's "I could not give you the connection you asked for". The recurring case here is
+    # `remote port forwarding failed for listen port N`: the VPS still has the port bound to an earlier
+    # session whose client stopped answering, and NOTHING ON THIS SIDE CAN CLEAR IT - that listener
+    # belongs to root's sshd. Waiting is therefore the entire recovery path, which is why sshd carries
+    # ClientAliveInterval/ClientAliveCountMax (see deploy/sshd-client-liveness.conf): once the dead
+    # session is reaped the very next retry succeeds. Without that setting the port stayed bound until
+    # OS TCP keepalive noticed, up to 7200s, and the published port ACCEPTED connections it could never
+    # forward - so the browser hung for the edge's whole read timeout and got a 504 rather than an
+    # error. Measured 2026-09-22: reaped in ~55s with the setting, never without it.
+    # A refused forward fails instantly, so keep this sleep short: it is the recovery resolution.
     $code = $LASTEXITCODE
-    Write-TunnelLog "ssh exited with code $code; restarting soon"
-    if ($code -eq 255) { Write-TunnelLog 'SSH refused the tunnel; leaving any existing remote listener untouched.' }
+    Write-TunnelLog "ssh exited with code $code; retrying in 5s"
+    if ($code -eq 255) {
+        Write-TunnelLog 'forward refused: the remote port is still bound by a session the far side has not reaped yet; retrying until it is released'
+    }
     Start-Sleep -Seconds 5
 }
