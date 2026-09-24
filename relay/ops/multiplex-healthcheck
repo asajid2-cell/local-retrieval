@@ -88,14 +88,18 @@ if (data) {
 
   // ── normal-but-notable ───────────────────────────────────────────────────────────────────────
   // `degraded` is reported, never failed on: every fault it can name is already checked above, and
-  // the remaining terms (bridge staleness) are the app simply not being open.
+  // the remaining terms (bridge staleness) mean no PC-side leaser has pushed lately — the desktop app
+  // while it is open, the always-on headless bridge while it is closed.
   const projects = data.projects || {};
   if (data.degraded === true) {
     const reasons = Array.isArray(data.degradedReasons) ? data.degradedReasons.filter(Boolean) : [];
     warn.push(`degraded=true${reasons.length ? ` (${reasons.join('; ')})` : ' (no reason reported)'}`);
   }
-  if (projects.appLive !== true) warn.push('desktop app sync stale — collection writes are disabled until it pushes again');
-  if (projects.bridgeLive !== true) warn.push('projects bridge stale — expected whenever no desktop app is running');
+  // The app's projection is the only source of the decks/collections mirror the web shows, and nothing
+  // in the relay refuses a write when it is stale — so the honest warning is "this view may be out of
+  // date", not "writes are disabled", which the code does not do.
+  if (projects.appLive !== true) warn.push('desktop app projection stale — the decks/collections mirror shows the last push and may be out of date');
+  if (projects.bridgeLive !== true) warn.push('projects bridge stale — no PC leaser (open desktop app or the always-on headless bridge) pushed within 45s');
   if (Number(projects.pendingCommands || 0) > 0) warn.push(`pendingCommands=${projects.pendingCommands}`);
 }
 if (fail.length) {

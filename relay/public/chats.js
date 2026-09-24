@@ -962,12 +962,10 @@
       };
       if (dialog.showModal) dialog.showModal();
     }
-    if (resumePicker) {
-      // Discovery proves the PC archive endpoint answered, not that the desktop app command poller is
-      // currently open. Keep the short queue deadline and report a queued outcome honestly.
-      resumePicker.state.loaded = true;
-      resumePicker.state.appLive = false;
-    }
+    // The picker reads the PC bridge's heartbeat itself, on every tap (picker.resume → readLeaser), so
+    // this page must NOT pre-empt that with a guess. It used to pin liveness to false on the premise
+    // that "the desktop app command poller" was the only thing that could drain a resume — which held
+    // every resume to the short queued deadline while the always-on bridge was answering.
 
     var controller = createController({
       fetch: h.fetch || global.fetch.bind(global),
@@ -1075,7 +1073,7 @@
         rowStatus(article, 'Resumed as ' + outcome.muxName + '.', 'ok');
         openSession(outcome.muxName);
       }
-      else if (outcome.state === 'queued') rowStatus(article, outcome.detail || 'Queued for the desktop app.', 'warn');
+      else if (outcome.state === 'queued') rowStatus(article, outcome.detail || 'Queued for the PC bridge.', 'warn');
       else rowStatus(article, outcome.detail || 'The PC refused this resume.', 'bad');
     }
 

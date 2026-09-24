@@ -151,6 +151,14 @@ class Harness {
     });
   }
 
+  // The LIGHT push the always-on headless bridge makes while the desktop app is closed: it carries the
+  // running list and nothing else, so it lights `bridgeLive` without ever touching `appSyncedAt`.
+  pushRunning(runningSessions = []) {
+    return this.request('POST', '/api/running', {
+      schemaVersion: 3, runningSessions, runningVerified: true,
+    });
+  }
+
   lease(owner = 'fake-host') {
     return this.request(
       'POST',
@@ -237,12 +245,12 @@ function row(i, over = {}) {
   };
 }
 
-async function bootPicker(t, { chats = [row(1), row(2), row(3)], running = [], deps = {} } = {}) {
+async function bootPicker(t, { chats = [row(1), row(2), row(3)], running = [], deps = {}, push = true } = {}) {
   const authBase = await startAuth(t);
   const h = new Harness({ HLAUTH_BASE: authBase });
   await h.start();
   t.after(async () => h.stop());
-  assert.equal((await h.pushProjects(running)).status, 200);
+  if (push) assert.equal((await h.pushProjects(running)).status, 200);
   const client = loadClient(browserFetch(h));
   const relayFetch = browserFetch(h);
   const pickerFetch = async (url, init) => {
@@ -250,9 +258,11 @@ async function bootPicker(t, { chats = [row(1), row(2), row(3)], running = [], d
       return {
         ok: true,
         status: 200,
-        json: async () => ({ rows: chats, total: chats.length, offset: 0, limit: 100, hasMore: false, appLive: true }),
+        json: async () => ({ rows: chats, total: chats.length, offset: 0, limit: 100, hasMore: false }),
       };
     }
+    // Liveness is NOT read off the discovery body: that server answers whether or not a command
+    // leaser is draining the queue, so the picker asks the relay for the leaser clocks instead.
     return relayFetch(url, init);
   };
   const picker = client.MuxResumePicker.createPicker({
@@ -390,8 +400,9 @@ test('every archive state produces a visible line — the picker is never silent
   const states = [
     [{ loaded: false, chats: [] }, 'loading'],
     [{ loaded: true, chats: [] }, 'empty'],
+    [{ loaded: true, chats: [row(1)], bridgeLive: true }, 'live'],
     [{ loaded: true, chats: [row(1)], appLive: true }, 'live'],
-    [{ loaded: true, chats: [row(1)], appLive: false }, 'offline'],
+    [{ loaded: true, chats: [row(1)], appLive: false, bridgeLive: false }, 'offline'],
     [{ loaded: true, chats: [row(1)], error: 'could not load your chat archive (HTTP 500)' }, 'error'],
   ];
   for (const [state, expected] of states) {
@@ -399,8 +410,29 @@ test('every archive state produces a visible line — the picker is never silent
     assert.equal(fresh.state, expected);
     assert.ok(fresh.label && fresh.label.length > 8, `${expected} must carry a sentence, got ${fresh.label}`);
   }
-  assert.equal(MuxResumePicker.freshness({ loaded: true, chats: [row(1)], appLive: true }).live, true);
-  assert.equal(MuxResumePicker.freshness({ loaded: true, chats: [row(1)], appLive: false }).live, false);
+});
+
+// A resume is a session operation, and NO session operation may hang on the Win32 desktop app being
+// open. Two leasers drain the queue — the app while it is open, the always-on headless bridge while it
+// is closed — so the app's own clock alone is neither necessary nor sufficient. Naming the app as the
+// requirement (2026-09-22) is what made a running PC bridge read as "may queue until the desktop app
+// is open", which is the opposite of what the code does.
+test('resume liveness is the bridge heartbeat, and no state names the desktop app as the requirement', () => {
+  const { MuxResumePicker } = loadClient(async () => { throw new Error('no fetch here'); });
+  const headlessOnly = { loaded: true, chats: [row(1)], appLive: false, bridgeLive: true };
+  assert.equal(MuxResumePicker.leaserLive(headlessOnly), true);
+  assert.equal(MuxResumePicker.freshness(headlessOnly).state, 'live');
+  assert.equal(MuxResumePicker.leaserLive({ appLive: true, bridgeLive: false }), true, 'the app leases while it is open');
+  assert.equal(MuxResumePicker.leaserLive({ appLive: false, bridgeLive: false }), false);
+
+  for (const state of [
+    headlessOnly,
+    { loaded: true, chats: [row(1)], appLive: true, bridgeLive: false },
+    { loaded: true, chats: [row(1)], appLive: false, bridgeLive: false },
+  ]) {
+    const fresh = MuxResumePicker.freshness(state);
+    assert.ok(!/desktop app/i.test(fresh.label), `no picker state may make the desktop app the requirement: ${fresh.label}`);
+  }
 });
 
 // ---- against a real relay -------------------------------------------------------------------
@@ -555,29 +587,46 @@ test('a 409 refusal prompts once, and only an accepted prompt retries with takeo
   }
 });
 
-test('with the desktop app offline the resume queues visibly instead of failing silently', async t => {
-  const { h, picker } = await bootPicker(t);
+test('the always-on bridge alone keeps a resume live with the desktop app never having synced', async t => {
+  // No projection push at all: the ONLY thing on the wire is the light running heartbeat the headless
+  // bridge sends while the app is closed. The desktop app has never answered on this relay.
+  const { h, picker } = await bootPicker(t, { push: false });
+  assert.equal((await h.pushRunning()).status, 200);
+
   await picker.load();
-  assert.equal(picker.state.appLive, true);
+  assert.equal(picker.state.appLive, false, 'no desktop projection has ever been pushed');
+  assert.equal(picker.state.bridgeLive, true);
+  assert.equal(picker.freshness().state, 'live');
+  assert.ok(!/desktop app/i.test(picker.freshness().label), picker.freshness().label);
+});
 
-  // Liveness is process-local by doctrine: the rows survive a restart, the claim that the PC is
-  // ANSWERING does not. This is the honest stand-in for "the desktop app is not open".
-  await h.restart();
-  assert.equal((await h.pushProjects()).status, 200);
-
-  picker.state.appLive = false;
-  assert.equal(picker.state.appLive, false);
-  assert.equal(picker.visible().length, 3, 'discovery rows remain available while the command poller is offline');
-  assert.equal(picker.freshness().state, 'offline');
+test('a resume the live bridge has not acked yet stays visibly queued, without blaming the desktop app', async t => {
+  const { h, picker } = await bootPicker(t, { deps: { pollTimeoutMs: 300, offlineTimeoutMs: 300 } });
+  await picker.load();
+  assert.equal(picker.freshness().state, 'live');
 
   const outcome = await picker.resume(picker.visible()[0]);
   assert.equal(outcome.state, 'queued');
-  assert.match(outcome.detail, /offline/);
   assert.ok(outcome.id, 'the command must really be sitting on the relay, not merely reported as queued');
+  assert.ok(!/desktop app/i.test(outcome.detail), outcome.detail);
 
   const still = await h.request('GET', `/api/app-commands/${outcome.id}`, undefined, OWNER_HEADERS);
   assert.equal(still.status, 200);
   assert.equal(still.body.status, 'pending');
+});
+
+test('a relay that has seen no leaser since boot says so — the rows survive, the claim does not', async t => {
+  const { h, picker } = await bootPicker(t);
+  await picker.load();
+  assert.equal(picker.freshness().state, 'live');
+
+  // Liveness is process-local by doctrine: the rows survive a restart, the claim that the PC is
+  // ANSWERING does not — and that claim is about the PC BRIDGE, not about a desktop window.
+  await h.restart();
+  await picker.load();
+  assert.equal(picker.visible().length, 3, 'discovery rows remain available while nothing is draining the queue');
+  assert.equal(picker.freshness().state, 'offline');
+  assert.ok(!/desktop app/i.test(picker.freshness().label), picker.freshness().label);
 });
 
 // ---- the page actually wires it -------------------------------------------------------------

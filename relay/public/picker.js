@@ -68,8 +68,21 @@
     });
   }
 
-  // Every branch produces a visible line. The discovery endpoint proves the PC archive answered, but
-  // it cannot prove the separate desktop app command poller is currently open.
+  // "Can a resume start now?" is answered by the LEASER clocks the relay keeps for this PC, and there
+  // are two leasers: the heavy desktop app while it is OPEN and the always-on headless bridge while it
+  // is CLOSED (the bridge suppresses itself whenever the app is running, so exactly one drains the
+  // queue). Each push lights its own clock, so `appLive || bridgeLive` is the honest signal.
+  //
+  // The desktop app is deliberately NOT the requirement. A resume is a session operation, and no
+  // session operation may depend on the Win32 app being open: the discovery catalogue is served by
+  // the same always-on server that leases `startmux`, and that server is up whether or not a window
+  // is. Naming the app as the requirement told users a running PC bridge was not enough.
+  function leaserLive(state) {
+    var s = state || {};
+    return s.appLive === true || s.bridgeLive === true;
+  }
+
+  // Every branch produces a visible line; none of them names the desktop app as a prerequisite.
   function freshness(state) {
     var s = state || {};
     var count = Array.isArray(s.chats) ? s.chats.length : 0;
@@ -79,13 +92,13 @@
       state: 'empty', live: false,
       label: 'No resumable chats are visible in the PC archive.',
     };
-    if (s.appLive === true) return {
+    if (leaserLive(s)) return {
       state: 'live', live: true,
-      label: '● desktop app live — a resume starts now',
+      label: '● PC bridge live — a resume starts now',
     };
     return {
       state: 'offline', live: false,
-      label: '○ PC archive connected — resume may queue until the desktop app is open',
+      label: '○ PC archive connected — a resume will queue until the PC bridge answers',
     };
   }
 
@@ -104,8 +117,20 @@
 
     var state = {
       chats: [], query: '', host: '', updatedAt: 0, ageMs: null,
-      appLive: false, loaded: false, error: '',
+      appLive: false, bridgeLive: false, loaded: false, error: '',
     };
+
+    // The catalogue comes from the PC's always-on discovery server; whether a RESUME would be picked
+    // up now comes from the relay's projection health, which mirrors each leaser's own heartbeat.
+    async function readLeaser() {
+      try {
+        var res = await fetchFn(base + '/api/projects');
+        if (!res || !res.ok) return;
+        var body = (await res.json()) || {};
+        state.appLive = body.appLive === true;
+        state.bridgeLive = body.bridgeLive === true;
+      } catch (error) { /* an unreadable health read is not a verdict on the catalogue */ }
+    }
 
     async function load() {
       var res;
@@ -129,9 +154,9 @@
       state.host = '';
       state.updatedAt = now();
       state.ageMs = 0;
-      state.appLive = body.appLive === true;
       state.loaded = true;
       state.error = '';
+      await readLeaser();
       return state;
     }
 
@@ -255,9 +280,13 @@
         return { state: 'failed', muxName: muxName, status: res.status, detail: await refusalText(res) };
       }
       var queued = (await res.json()) || {};
-      // Offline gets a short deadline so the UI says "queued" quickly instead of spinning for a minute
-      // at a PC that is not listening. The command itself stays queued either way.
-      var outcome = await poll(queued.id, queued.intentId, state.appLive ? pollTimeoutMs : offlineTimeoutMs);
+      // Re-read the leaser clocks NOW rather than at page load: the heartbeat may have lapsed since this
+      // picker was opened (the chats page never loads the catalogue at all), and the deadline below has
+      // to describe the PC as it is at this moment.
+      await readLeaser();
+      // A silent PC gets a short deadline so the UI says "queued" quickly instead of spinning for a
+      // minute at a bridge that is not listening. The command itself stays queued either way.
+      var outcome = await poll(queued.id, queued.intentId, leaserLive(state) ? pollTimeoutMs : offlineTimeoutMs);
       var result = {
         muxName: muxName,
         id: queued.id,
@@ -284,9 +313,9 @@
         return result;
       }
       result.state = 'queued';
-      result.detail = state.appLive
-        ? 'still waiting on the PC — the resume stays queued and starts when the app answers'
-        : 'queued — the desktop app is offline; this chat resumes when it is next open';
+      result.detail = leaserLive(state)
+        ? 'still waiting on the PC — the resume stays queued and starts when the bridge answers'
+        : 'the PC bridge is not answering right now — this chat resumes as soon as it does';
       return result;
     }
 
@@ -402,6 +431,7 @@
     filterChats: filterChats,
     muxNameFor: muxNameFor,
     toolFor: toolFor,
+    leaserLive: leaserLive,
     freshness: freshness,
     createPicker: createPicker,
     install: install,

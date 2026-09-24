@@ -193,7 +193,9 @@ test('QUEUED: an offline PC produces a visible queued sentence, never silence', 
   assert.equal(outcome.state, 'queued');
   const status = $('#resumestatus');
   assert.ok(status.textContent.startsWith('Queued: '), `must read as queued: ${status.textContent}`);
-  assert.ok(status.textContent.includes('offline'), `must say why: ${status.textContent}`);
+  assert.ok(status.textContent.includes('PC bridge'), `must name what is not answering: ${status.textContent}`);
+  assert.ok(!/desktop app/i.test(status.textContent),
+    `the desktop app is not a resume prerequisite and must never be named as one: ${status.textContent}`);
   assert.ok(status.className.includes('warn'), status.className);
 });
 
@@ -208,9 +210,15 @@ const INDEX_ROWS = [
 function archiveMount() {
   return mount({
     postIntent: async () => unexpected('postIntent'),
-    fetch: async (url) => (url.includes('/multiplex/pc/api/discovery/chats')
-      ? { ok: true, status: 200, json: async () => ({ rows: INDEX_ROWS, total: INDEX_ROWS.length, offset: 0, limit: 100, hasMore: false }) }
-      : unexpected(url)),
+    fetch: async (url) => {
+      if (url.includes('/multiplex/pc/api/discovery/chats'))
+        return { ok: true, status: 200, json: async () => ({ rows: INDEX_ROWS, total: INDEX_ROWS.length, offset: 0, limit: 100, hasMore: false }) };
+      // The bridge heartbeat the picker reads for liveness — the desktop app's own clock stays dark and
+      // the chip must still say a resume starts now.
+      if (url.includes('/api/projects'))
+        return { ok: true, status: 200, json: async () => ({ appLive: false, bridgeLive: true }) };
+      return unexpected(url);
+    },
   });
 }
 
@@ -226,7 +234,9 @@ test('RENDER: only offered rows are drawn, typing narrows them, and a dead query
   assert.deepEqual(list.children.map((c) => c.tagName), ['BUTTON', 'BUTTON']);
   assert.deepEqual(list.children.map((c) => c.dataset.chatId), ['chat-1', 'chat-2']);
   assert.equal(list.children[0].children[0].textContent, 'Cortex planning', 'the row must carry its title');
-  assert.ok($('#resumelive').textContent.includes('connected'), $('#resumelive').textContent);
+  // The chip is a claim about the always-on PC bridge, not about a desktop window.
+  assert.ok($('#resumelive').textContent.includes('PC bridge'), $('#resumelive').textContent);
+  assert.ok(!/desktop app/i.test($('#resumelive').textContent), $('#resumelive').textContent);
 
   const box = $('#resumeq');
   box.value = 'relay';
