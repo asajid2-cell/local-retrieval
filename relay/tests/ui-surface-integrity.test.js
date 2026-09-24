@@ -374,3 +374,58 @@ test('the integrity watch repairs a stale inert instead of only reporting it', a
     await waitFor(async () => (await page.evaluate(() => document.querySelector('#app').hasAttribute('inert'))) === false, 'stale inert repaired');
   });
 });
+
+test('the surface puts back rows the renderer dropped, with no transition to react to', async t => {
+  if (skipWithoutChromium(t)) return;
+  const session = { name: SESSION_NAME, alive: true, shellOnly: true, sessionId: 'lostrow-sid', generationId: 'lostrow-generation' };
+  await withSurfacePage(session, async ({ harness, host, page }) => {
+    await page.goto(`http://127.0.0.1:${harness.port}/`);
+    await waitFor(() => page.evaluate(() => typeof connect === 'function'), 'page boot');
+    await page.evaluate(name => connect(name), SESSION_NAME);
+    await sleep(400);
+
+    // A full-screen TUI frame. The lines stay comfortably inside the grid: a line that fills it exactly
+    // wraps one character onto the next row, and a single-character row is deliberately below the
+    // detector's "too little to judge" floor, so a frame like that cannot carry this test.
+    host.sendOutput(SESSION_NAME, '\x1b[?1049h\x1b[2J\x1b[H' +
+      Array.from({ length: 60 }, (_, i) => `[row ${String(i + 1).padStart(2, '0')}] ` + 'x'.repeat(20)).join('\r\n'));
+    await sleep(700);
+
+    // A healthy surface must read as healthy. If this ever reports loss on a good screen the watchdog
+    // repaints and re-seats the viewport every 2s, which is worse than the defect it was meant to fix.
+    const healthy = await page.evaluate(() => terminalPaintLostRows());
+    assert.ok(healthy, 'the surface must be judgeable at all');
+    assert.equal(healthy.lost, 0, `a healthy surface must report no lost rows (got ${JSON.stringify(healthy)})`);
+
+    // Drop rows the way the report shows them: the row elements stay, their text is gone. No transition, no
+    // output, nothing the transition-driven heals could react to - so only a watchdog that actually looks
+    // can find this. Blank and read in ONE synchronous task: a separate evaluate would let a pending
+    // term.refresh repaint some rows in between and the red state would be half gone before it is asserted.
+    const red = await page.evaluate(() => {
+      const host = document.querySelector('#term'), hr = host.getBoundingClientRect();
+      // Same floor the detector uses: a row with almost nothing on it is not judged, so it is not a
+      // candidate for this test either.
+      const rows = [...host.querySelectorAll('.xterm-rows > div')].filter(r => {
+        const b = r.getBoundingClientRect();
+        return r.textContent.trim().length >= 4 && b.bottom > hr.top + 2 && b.top < hr.bottom - 2;
+      });
+      const targets = rows.slice(2, 8);
+      for (const r of targets) r.textContent = '';
+      return { dropped: targets.length, seen: terminalPaintLostRows() };
+    });
+    assert.ok(red.dropped >= 4, `the frame must have left enough rows to drop (got ${red.dropped})`);
+    assert.ok(red.seen && red.seen.lost >= red.dropped, `every dropped row must be visible to the detector (got ${JSON.stringify(red)})`);
+
+    await waitFor(async () => {
+      const m = await page.evaluate(() => window.__muxLastLostRows);
+      return !!(m && m.lost >= 4);
+    }, 'row loss recorded by the watch', 6000);
+    // ...and the rows come back from the BUFFER, with nobody touching the page.
+    await waitFor(async () => {
+      const left = await page.evaluate(() => terminalPaintLostRows());
+      return !!left && left.lost === 0;
+    }, 'dropped rows repainted from the buffer', 6000);
+    const rec = await page.evaluate(() => window.__muxLastPaintRecovery);
+    assert.match(String(rec && rec.reason), /lost-rows/, `the repaint must come from the row-loss path (got ${JSON.stringify(rec)})`);
+  });
+});

@@ -949,6 +949,47 @@ function domRowsHaveVisibleText(host, hostRect){
   }
   return checked ? false : null;
 }
+// PER-ROW INTEGRITY. domRowsHaveVisibleText() only answers "is the whole surface blank", so a surface that
+// dropped SOME rows - or painted rows shorter than the buffer holds, the "half render" in the reports -
+// reads as healthy by construction and is never healed. Compare every VISIBLE buffer row against the DOM row
+// the renderer produced: a row the buffer calls non-empty whose visible DOM row is empty or materially
+// shorter than the buffer's text is dropped pixels, and it is exactly what a repaint restores.
+//
+// Only rows whose element is present and actually inside the host are judged. A row scrolled out of a
+// rowpan/pan surface, or hidden by a view switch, is not dropped - counting those would make the watchdog
+// repaint every 2s and fight the pan that put them there.
+function domRowsLosingBufferText(host, hostRect){
+  let buf; try{ buf=term.buffer.active; }catch(e){ return null; }
+  const rowEls=[...host.querySelectorAll('.xterm-rows > div')];
+  const base=buf.viewportY;
+  let rows=0, lost=0, sample=null;
+  for(let y=0; y<term.rows; y++){
+    const line=buf.getLine(base+y);
+    const want=line ? line.translateToString(true) : '';
+    if(want.trim().length<4) continue;                 // too little on the row to judge a paint against
+    const el=rowEls[y];
+    if(!el) continue;
+    const cs=getComputedStyle(el);
+    if(cs.display==='none' || cs.visibility==='hidden' || cs.opacity==='0') continue;
+    const r=el.getBoundingClientRect();
+    if(!(r.bottom>hostRect.top+2 && r.top<hostRect.bottom-2 && r.right>hostRect.left+2 && r.left<hostRect.right-2)) continue;
+    rows++;
+    const got=(el.textContent||'').replace(/\u00a0/g,' ');
+    if(got.trim().length < want.trim().length-1){
+      lost++; if(!sample) sample={y, why: got.trim() ? 'row-short' : 'row-empty', want:want.trim().length, got:got.trim().length};
+    }
+  }
+  return rows ? { rows, lost, sample } : null;
+}
+function terminalPaintLostRows(){
+  if(!current || $('#empty').style.display!=='none' || !visibleBufferHasText()) return null;
+  // Never judge mid-write: the DOM is legitimately a frame behind while the pump drains, and a false
+  // positive here would repaint and re-seat the viewport under live output.
+  if(termWriting || terminalWriteActive) return null;
+  const host=$('#term'), hostRect=host.getBoundingClientRect();
+  if(hostRect.height<80 || hostRect.width<80) return null;
+  return domRowsLosingBufferText(host, hostRect);
+}
 function terminalPaintLooksBlank(){
   if(!current || $('#empty').style.display!=='none' || !visibleBufferHasText()) return false;
   const host=$('#term'), hostRect=host.getBoundingClientRect();
@@ -991,7 +1032,14 @@ function recoverTerminalPaint(reason){
 }
 function verifyTerminalPaint(reason){
   try{
-    if(terminalPaintLooksBlank()) recoverTerminalPaint(reason);
+    if(terminalPaintLooksBlank()){ recoverTerminalPaint(reason); return; }
+    // Partial loss: the surface is not blank, but some rows the buffer holds never got painted. That is the
+    // "half render" the reports show, and it used to be invisible here by construction.
+    const m=terminalPaintLostRows();
+    if(m && m.lost){
+      window.__muxLastLostRows={ at:Date.now(), reason:reason||'paint-check', rows:m.rows, lost:m.lost, sample:m.sample };
+      recoverTerminalPaint(reason+':lost-rows');
+    }
   }catch(e){}
 }
 function schedulePaintHeal(delay=60){
@@ -1239,6 +1287,10 @@ function pumpTermWrite(){
 document.addEventListener('mouseup', ()=>{ setTimeout(maybeUnfreezeSelection, 0); }, true);
 setInterval(()=>{
   maybeUnfreezeSelection();                                                                                           // (1) lost-mouseup unfreeze
+  // (3) autonomous surface check. Every other paint heal is TRANSITION-driven (view switch, zen, font,
+  // visibility, a 'd' frame), so a surface that lost rows while it sat idle stayed broken until the user
+  // toggled something - which is exactly the "only fullscreen fixes it" report. Checking here bounds it to ~2s.
+  verifyTerminalPaint('watchdog');
   if(termWriting && termWriteStartedAt && Date.now()-termWriteStartedAt > 4000){                                     // (2) wedged write pump
     _wedgeStrikes++;
     activeTermWriteToken=++termWriteToken;
@@ -1263,7 +1315,7 @@ function reloadTerminal(quiet){
   connect(name, true);   // re-attach: CLEAR + scrollback replay + live, all client state reset
 }
 document.addEventListener('keydown', e=>{ if(e.ctrlKey && e.altKey && (e.key==='r'||e.key==='R')){ e.preventDefault(); e.stopPropagation(); reloadTerminal(); } }, true);
-window.__muxBuild='2026-09-24-forced-selection-and-nav-reach';   // bump per web deploy so a loaded version is verifiable
+window.__muxBuild='2026-09-24-autonomous-row-loss-heal';   // bump per web deploy so a loaded version is verifiable
 try{ console.info('multiplex build', window.__muxBuild); }catch(e){}
 const helper = $('#term').querySelector('.xterm-helper-textarea');
 function hardenHelperTextarea(){
