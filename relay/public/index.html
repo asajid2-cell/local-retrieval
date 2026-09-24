@@ -1013,6 +1013,67 @@ function healTerminalSurface(reason){
   schedulePaintHeal(60);
   try{ window.__muxLastSurfaceHeal = { at:Date.now(), reason:reason||'transition' }; }catch(e){}
 }
+// THE WATCH. healTerminalSurface covers the transitions we KNOW move the surface; this covers the ones
+// we cannot enumerate - a resize the ResizeObserver coalesced away, a viewport change while the tab was
+// backgrounded, a grid row that ended up a pixel over the nav. Measured with a real browser over the
+// whole transition matrix (boot, view switches, copy overlay, zen, font, keybar, dialogs, rotate,
+// keyboard shrink, alt-screen TUI with mouse tracking): the geometry is correct in every one of those
+// states, so a fault here is not something the user can be asked to reproduce - it is the state the
+// user describes as "black bottom nav" / "random area not rendering", and the ONLY reason it ever
+// needed a manual fullscreen toggle or refresh is that nothing checked for it.
+//
+// Deliberately narrow: it judges only states that are a fault no matter what else is true, and returns
+// the FIRST one. A hidden view, an open overlay, or no attached session are all legitimate reasons for
+// the terminal to be absent, and healing then would fight the transition that is in progress.
+function terminalSurfaceIntegrityFault(){
+  if(!current) return '';
+  if(document.hidden) return '';
+  const term=$('#term'); if(!term) return '';
+  if(!terminalSurfaceVisible()) return '';
+  const empty=$('#empty'); if(empty && empty.style.display!=='none') return '';
+  const cv=$('#copyview'); if(cv && !cv.hidden) return '';
+  if(document.querySelector('dialog[open]')) return '';
+  const menu=$('#menu');
+  if(menu && menu.offsetParent!==null && menu.children.length) return '';
+  const r=term.getBoundingClientRect(), vh=window.innerHeight;
+  if(r.height<80) return 'term-collapsed';
+  if(r.bottom>vh+1) return 'term-overflow';
+  const nav=$('#mobileNav');
+  if(nav && getComputedStyle(nav).display!=='none'){
+    const nr=nav.getBoundingClientRect();
+    if(nr.height<20) return 'nav-collapsed';
+    if(nr.top<0 || nr.bottom>vh+1) return 'nav-offscreen';
+    if(r.bottom>nr.top+1) return 'term-under-nav';
+  }
+  // An inert app with no overlay open swallows every pointer event: the exact "I can type but cannot
+  // scroll or select" report. #app[inert] is set by the copy overlay and cleared by its close, so a
+  // close that took another path leaves the whole surface dead.
+  if($('#app').hasAttribute('inert')) return 'app-inert';
+  // The terminal's own centre must be reachable by a pointer. A hit landing on the document body means
+  // the surface has no pointer target at all; a hit inside a known overlay means something is on top.
+  const hit=document.elementFromPoint(Math.round(r.left+r.width/2), Math.round(r.top+r.height/2));
+  if(!hit) return '';
+  if(hit===document.body || hit===document.documentElement) return 'term-not-hit';
+  if(hit.closest && hit.closest('#empty,#copyview,#menu')) return 'term-covered';
+  return '';
+}
+let integrityHealAt=0;
+function watchTerminalSurface(){
+  try{
+    const fault=terminalSurfaceIntegrityFault();
+    if(!fault) return;
+    const now=Date.now();
+    if(now-integrityHealAt<2500) return;         // a heal needs a moment to take effect; do not stampede
+    integrityHealAt=now;
+    // Repair first, then repaint. An inert app is the one fault with a repair that is not a repaint:
+    // no overlay is open (the fault test just proved it), so the attribute is stale and removing it is
+    // the fix. For the geometry faults the repair IS the repaint - which is precisely the manual
+    // fullscreen toggle the user performs today, minus the user.
+    if(fault==='app-inert'){ try{ $('#app').removeAttribute('inert'); }catch(e){} }
+    healTerminalSurface('integrity:'+fault);
+    try{ window.__muxLastIntegrityHeal={ at:now, fault }; }catch(e){}
+  }catch(e){}
+}
 function cancelViewportRestore(){
   viewportRestoreGeneration++;
   if(viewportRestoreRaf) cancelAnimationFrame(viewportRestoreRaf);
@@ -1180,7 +1241,7 @@ function reloadTerminal(quiet){
   connect(name, true);   // re-attach: CLEAR + scrollback replay + live, all client state reset
 }
 document.addEventListener('keydown', e=>{ if(e.ctrlKey && e.altKey && (e.key==='r'||e.key==='R')){ e.preventDefault(); e.stopPropagation(); reloadTerminal(); } }, true);
-window.__muxBuild='2026-09-23-surface-paint-heal';   // bump per web deploy so a loaded version is verifiable
+window.__muxBuild='2026-09-24-surface-integrity-watch';   // bump per web deploy so a loaded version is verifiable
 try{ console.info('multiplex build', window.__muxBuild); }catch(e){}
 const helper = $('#term').querySelector('.xterm-helper-textarea');
 function hardenHelperTextarea(){
@@ -3434,6 +3495,11 @@ setInterval(()=>{ if(document.visibilityState==='visible') loadSessions(); }, 40
 document.addEventListener('visibilitychange', ()=>{ if(document.visibilityState==='visible') schedulePaintHeal(80); });
 window.addEventListener('focus', ()=>schedulePaintHeal(80));
 window.addEventListener('pageshow', ()=>schedulePaintHeal(80));
+// The integrity watch runs on a timer because the faults it catches have no event to hang off - that is
+// what makes them feel random. Cheap by construction: a few getBoundingClientRect calls and one
+// elementFromPoint, and it exits immediately when a session is not attached or the tab is hidden.
+setInterval(watchTerminalSurface, 1500);
+document.addEventListener('visibilitychange', ()=>{ if(document.visibilityState==='visible') watchTerminalSurface(); });
 
 // ---- system health dot (P0 observability): polls /api/health → green ok / amber degraded / red down ----
 async function pollHealth(){

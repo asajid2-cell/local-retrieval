@@ -254,6 +254,32 @@ test('tab switches drain old parser work and reject stale write callbacks', () =
 // drops one, so a browser test cannot see the bug it prevents. What a browser test CAN see (and what the
 // reason string exists for) is that the heal is reachable: switching away from the terminal view and back
 // must leave window.__muxLastSurfaceHeal.reason === 'mobile-view-terminal'.
+// The transition matrix is covered for real by tests/ui-surface-integrity.test.js, which drives a browser
+// through every one of those states and asserts the surface stays reachable. This source-level guard
+// covers the OTHER half - the states nobody can enumerate, which is why they felt random: the watch must
+// exist, must be driven by a timer, and must repair the one fault whose repair is not a repaint.
+test('an unenumerable surface fault is watched for and repaired, not just reported', () => {
+  const fault = section('function terminalSurfaceIntegrityFault', 'let integrityHealAt');
+  // Every fault class the user described, named so a future edit cannot quietly drop one.
+  for (const cls of ['term-collapsed', 'term-overflow', 'nav-collapsed', 'nav-offscreen', 'term-under-nav', 'app-inert', 'term-not-hit', 'term-covered']) {
+    assert.match(fault, new RegExp(cls), `the fault test must cover ${cls}`);
+  }
+  // A hidden view, an open overlay and an unattached session are legitimate, not faults: healing then
+  // would fight the transition in progress.
+  assert.match(fault, /if\(!current\) return ''/);
+  assert.match(fault, /if\(document\.hidden\) return ''/);
+  assert.match(fault, /terminalSurfaceVisible\(\)/);
+  assert.match(fault, /dialog\[open\]/);
+  assert.match(fault, /#copyview/);
+
+  const watch = section('function watchTerminalSurface', 'function cancelViewportRestore');
+  assert.match(watch, /terminalSurfaceIntegrityFault\(\)/, 'the watch must consult the fault test');
+  assert.match(watch, /healTerminalSurface\('integrity:'\+fault\)/, 'a fault must trigger the same heal the transitions use');
+  assert.match(watch, /removeAttribute\('inert'\)/, 'a stale inert needs a repair, not a repaint');
+  assert.match(watch, /__muxLastIntegrityHeal/, 'the last integrity heal must be observable from the page');
+  assert.match(source, /setInterval\(watchTerminalSurface, \d+\)/, 'the watch must run on a timer - its faults have no event');
+});
+
 test('every transition that can strand a stale frame repaints, not only a grid change', () => {
   const heal = section('function healTerminalSurface', 'function cancelViewportRestore');
   assert.match(heal, /scheduleViewportFit\(0\)/, 'the grid must be re-measured, not just repainted');
