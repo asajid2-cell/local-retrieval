@@ -33,8 +33,11 @@ public static class RemoteCommandProtocol
         "cleartabhistory", "settabcolor",
     ];
 
-    // The headless bridge owns an ArchiveService too, so it can run the same store-backed operations the
-    // GUI can except the two tab-presentation setters, which only exist on an open desktop tab.
+    // The headless bridge owns an ArchiveService too, so it runs the same store-backed operations the GUI
+    // can — including the two tab-presentation setters. Those are not desktop-tab state: they write
+    // Store.MuxTabMeta / Store.MuxTabHistory, the very store the GUI writes, and the bridge projects the
+    // result on its next light push. Leaving them out here meant a tab colour or a cleared tab history
+    // queued while the app was closed was leased by nobody and pended until it expired.
     public static readonly IReadOnlyList<string> HeadlessCommandTypes =
     [
         "kill", "transcript", "transcriptfetch", "fetchfile", "rename", "setapptitle",
@@ -44,6 +47,7 @@ public static class RemoteCommandProtocol
         "settag", "collectioncreate", "collectionrename", "collectiondelete", "collectionmove",
         "collectionsettag", "collectionreorder", "collectionrecover", "collectionpurge",
         "collectionempty", "deckcreate", "deckrename", "deckdelete", "deckreorder",
+        "cleartabhistory", "settabcolor",
     ];
 
     public static string LeaseOwner(string role, string? principalInstanceId = null)

@@ -450,6 +450,8 @@ if (Environment.GetEnvironmentVariable("CLR_REMOTE_BRIDGE") != "0")
             ResolvePendingMuxBindingsAsync,
             executeArchiveCommand: command => archiveRuntime.UseAsync(
                 (loadedArchive, _) => ArchiveRemoteCommands.ExecuteAsync(loadedArchive, command)),
+            tabProjection: () => archiveRuntime.UseAsync(
+                (loadedArchive, _) => Task.FromResult(loadedArchive.BuildMuxTabProjection())),
             processContainment: childProcessJob,
             transport: isolatedProfile
                 ? LoopbackRelayTransport.Create()

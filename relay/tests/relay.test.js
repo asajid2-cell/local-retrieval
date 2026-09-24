@@ -2434,6 +2434,53 @@ test('full projection preserves unresolved running identity evidence alongside c
   assert.deepEqual(projects.runningSessions[0].sessionAliases, ['other-id']);
 });
 
+// The closed-GUI bridge owns the store's tab colour/history as much as the desktop app does, so its light
+// push may carry those two sections. When it does they REPLACE the app's — clearing a colour and clearing
+// a history are the REMOVAL of keys, which a merge could never express. When it does not carry them, the
+// app's last projection must survive untouched (that is the whole reason this route is a partial update).
+test('the light running push may refresh tab presentation without clobbering the app projection', async t => {
+  const h = new RelayHarness();
+  t.after(() => h.stop());
+  await h.start();
+  const host = await h.connectHost([shellSession('tab-a')]);
+  t.after(() => host.close());
+
+  await h.json('POST', '/api/projects', {
+    schemaVersion: 3, host: 'PC',
+    decks: [{ id: 'deck-1', name: 'Main' }],
+    collections: [{ id: 'collection-1', name: 'Cortex', deckId: 'deck-1', deckName: 'Main',
+      chats: [{ id: 'chat-a', title: 'Known chat', tool: 'codex', muxName: 'tab-a' }] }],
+    allChats: [{ id: 'chat-a', title: 'Known chat', tool: 'codex', muxName: 'tab-a' }],
+    muxTabMeta: { 'tab-a': { color: '#60a5fa', kind: 'remote-resumed' } },
+    muxTabChats: { 'tab-a': { id: 'chat-a', tool: 'codex', title: 'Known chat',
+      history: [{ id: 'old-a', tool: 'claude', title: 'Older chat', at: '2026-09-01T00:00:00Z' }] } },
+    runningVerified: true, runningSessions: [],
+  });
+  let row = (await h.json('GET', '/api/sessions')).find(s => s.name === 'tab-a');
+  assert.equal(row.tabColor, '#60a5fa');
+  assert.equal(row.tabKind, 'remote-resumed');
+  assert.equal(row.tabHistory.length, 1);
+
+  // A light push with no tab sections leaves the app's projection alone.
+  await h.json('POST', '/api/running', { schemaVersion: 3, runningVerified: true, runningSessions: [] });
+  row = (await h.json('GET', '/api/sessions')).find(s => s.name === 'tab-a');
+  assert.equal(row.tabColor, '#60a5fa');
+  assert.equal(row.tabHistory.length, 1);
+  assert.equal((await h.json('GET', '/api/projects')).collections.length, 1);
+
+  // A light push that DOES carry them replaces the sections outright.
+  await h.json('POST', '/api/running', {
+    schemaVersion: 3, runningVerified: true, runningSessions: [],
+    muxTabMeta: { 'tab-b': { color: '#34d399', kind: '' } },
+    muxTabChats: { 'tab-b': { id: 'chat-b', tool: 'codex', title: 'Another', history: [] } },
+  });
+  row = (await h.json('GET', '/api/sessions')).find(s => s.name === 'tab-a');
+  assert.equal(row.tabColor, '', 'a cleared colour is an absent key; the section is replaced, not merged');
+  assert.equal(row.tabHistory.length, 0);
+  assert.equal((await h.json('GET', '/api/projects')).collections.length, 1,
+    'the tab sections ride the light route; the collections projection stays the app\'s');
+});
+
 test('hosted kill rejects a stale generation before sending any stop', async t => {
   const h = new RelayHarness();
   t.after(() => h.stop());

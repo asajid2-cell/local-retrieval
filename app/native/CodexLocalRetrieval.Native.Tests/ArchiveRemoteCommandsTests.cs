@@ -57,6 +57,41 @@ public sealed class ArchiveRemoteCommandsTests
     }
 
     [TestMethod]
+    public async Task TabPresentationCommands_AreStoreBackedThroughTheHeadlessDispatcher()
+    {
+        var (directory, _, service) = await CreateStoreAsync();
+        try
+        {
+            // settabcolor carries the hex in `title` — the exact relay command shape the web posts, and the
+            // shape the GUI's own handler reads. A tab colour is Store.MuxTabMeta, not desktop-tab state.
+            var set = await ExecuteAsync(service, "{\"type\":\"settabcolor\",\"muxName\":\"tab-a\",\"title\":\"#e879f9\"}");
+            Assert.IsTrue(set.Ok, set.Detail);
+            Assert.AreEqual("#e879f9", service.Store.MuxTabMeta["tab-a"].Color);
+            Assert.IsTrue(service.BuildMuxTabProjection().Meta.ContainsKey("tab-a"),
+                "the projection the closed-GUI push carries must include the tab the command just tinted");
+
+            service.Store.MuxTabHistory["tab-a"] = new MuxTabRecord
+            {
+                FirstSeen = DateTime.UtcNow.ToString("O"),
+                Current = new MuxTabChat { Id = "s1", Tool = "claude", Title = "current" },
+            };
+            var cleared = await ExecuteAsync(service, "{\"type\":\"cleartabhistory\",\"muxName\":\"tab-a\"}");
+            Assert.IsTrue(cleared.Ok, cleared.Detail);
+            Assert.IsFalse(service.Store.MuxTabHistory.ContainsKey("tab-a"),
+                "a cleared history is the REMOVAL of the tab's entry, which is why the push replaces the section");
+
+            // Clearing the colour removes the entry entirely; a merge-shaped update could never express that.
+            var clearColor = await ExecuteAsync(service, "{\"type\":\"settabcolor\",\"muxName\":\"tab-a\",\"title\":\"\"}");
+            Assert.IsTrue(clearColor.Ok, clearColor.Detail);
+            Assert.IsFalse(service.Store.MuxTabMeta.ContainsKey("tab-a"));
+
+            var noName = await ExecuteAsync(service, "{\"type\":\"settabcolor\",\"muxName\":\"\",\"title\":\"#60a5fa\"}");
+            Assert.IsFalse(noName.Ok);
+        }
+        finally { Directory.Delete(directory, true); }
+    }
+
+    [TestMethod]
     public async Task RemoteBridge_RoundTripsCheckpointSnapshotIdentityToArchiveDispatch()
     {
         var dispatched = new TaskCompletionSource<JsonElement>(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -94,6 +129,54 @@ public sealed class ArchiveRemoteCommandsTests
         Assert.AreEqual("revision-1", command.GetProperty("expectedRevision").GetString());
         Assert.AreEqual("Renamed", command.GetProperty("name").GetString());
         Assert.IsTrue((await acknowledged.Task.WaitAsync(TimeSpan.FromSeconds(1))).GetProperty("ok").GetBoolean());
+    }
+
+    // The ack is not the deliverable: the web re-tints and drops history from the PROJECTION, so a tab
+    // command the closed-GUI bridge ran must reach the relay on the push that follows it. Without that,
+    // the command reports success and the tab looks unchanged until the desktop app is opened.
+    [TestMethod]
+    public async Task RemoteBridge_PushesTheTabProjectionAfterATabCommandItRan()
+    {
+        var pushed = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var cancellation = new CancellationTokenSource();
+        var leaseCount = 0;
+        var acked = 0;
+        var bridge = new RemoteBridge(
+            () => new RemoteBridge.Settings("loopback", 1),
+            () => false,
+            new ClaudeSessionStore(Path.Combine(Path.GetTempPath(), "clr-bridge-tabs-" + Guid.NewGuid().ToString("N"))),
+            "",
+            executeArchiveCommand: _ => Task.FromResult((true, "tab color set")),
+            transport: (_, operation, body, _, _) =>
+            {
+                if (operation == RemoteBridge.BridgeOperation.Lease)
+                    return Task.FromResult((0, Interlocked.Increment(ref leaseCount) == 1
+                        ? "[{\"id\":\"cmd-tab\",\"intentId\":\"intent-tab\",\"leaseToken\":\"lease-tab\",\"type\":\"settabcolor\",\"replayPolicy\":\"idempotent\",\"muxName\":\"tab-a\",\"title\":\"#e879f9\"}]"
+                        : "[]"));
+                if (operation == RemoteBridge.BridgeOperation.Ack)
+                {
+                    if (Interlocked.Increment(ref acked) == 1) return Task.FromResult((0, "{\"ok\":true}"));
+                    return Task.FromResult((0, "{}"));
+                }
+                // The heartbeat push is light; only the post-command push may carry the tab sections.
+                var text = body ?? "";
+                if (text.Contains("muxTabMeta", StringComparison.Ordinal))
+                {
+                    pushed.TrySetResult(text);
+                    cancellation.Cancel();
+                }
+                return Task.FromResult((0, "{}"));
+            },
+            isolationFixture: true,
+            runningSnapshot: () => (true, new List<ArchiveService.RunningSessionInfo>(), ""),
+            tabProjection: () => Task.FromResult((
+                new Dictionary<string, object> { ["tab-a"] = new { id = "s1", tool = "claude", title = "t", history = Array.Empty<object>() } },
+                new Dictionary<string, object> { ["tab-a"] = new { color = "#e879f9", kind = "" } })));
+
+        await bridge.RunLoopAsync(cancellation.Token).WaitAsync(TimeSpan.FromSeconds(10));
+        var json = JsonSerializer.Deserialize<JsonElement>(await pushed.Task.WaitAsync(TimeSpan.FromSeconds(2)));
+        Assert.AreEqual("#e879f9", json.GetProperty("muxTabMeta").GetProperty("tab-a").GetProperty("color").GetString());
+        Assert.AreEqual("s1", json.GetProperty("muxTabChats").GetProperty("tab-a").GetProperty("id").GetString());
     }
 
     [TestMethod]

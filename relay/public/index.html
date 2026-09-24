@@ -743,7 +743,7 @@
   <h3>Session history</h3>
   <p class="hint">Every chat this tab has hosted. Relaunch any of them, or file any into a collection so nothing this tab ran is ever lost.</p>
   <div id="historylist" class="addcollist"></div>
-  <div class="row"><button class="act" id="historyclose">Close</button></div>
+  <div class="row"><button class="act" id="historyclear">Clear history</button><button class="act" id="historyclose">Close</button></div>
 </dialog>
 <dialog id="renamedlg">
   <h3>Rename</h3>
@@ -1241,7 +1241,7 @@ function reloadTerminal(quiet){
   connect(name, true);   // re-attach: CLEAR + scrollback replay + live, all client state reset
 }
 document.addEventListener('keydown', e=>{ if(e.ctrlKey && e.altKey && (e.key==='r'||e.key==='R')){ e.preventDefault(); e.stopPropagation(); reloadTerminal(); } }, true);
-window.__muxBuild='2026-09-24-surface-integrity-watch';   // bump per web deploy so a loaded version is verifiable
+window.__muxBuild='2026-09-24-tab-ownership-headless';   // bump per web deploy so a loaded version is verifiable
 try{ console.info('multiplex build', window.__muxBuild); }catch(e){}
 const helper = $('#term').querySelector('.xterm-helper-textarea');
 function hardenHelperTextarea(){
@@ -2502,10 +2502,10 @@ function openMenu(s, anchor){
   setTimeout(()=>m.querySelector('button')?.focus(), 0);   // move focus in for keyboard
 }
 function closeMenu(){ const o=menuOpener; $('#menu').classList.remove('show'); menuFor=null; menuOpener=null; if(o && o.isConnected) try{ o.focus(); }catch(e){} }
-// Per-tab color (PowerShell-style tab colors). Owned by the desktop app (settabcolor command).
+// Per-tab color (PowerShell-style tab colors). Store state (settabcolor), so the always-on bridge owns
+// it as much as the desktop app does — no app-live gate, or the picker would be dead whenever it's closed.
 const TABCOLORS=['#e879f9','#60a5fa','#34d399','#fbbf24','#f87171','#a78bfa','#f472b6','#22d3ee'];
 function pickTabColor(s){
-  if(!_appLive){ flash('Open the desktop app to set tab colors (it owns tab state)'); return; }
   const pop=document.createElement('div'); pop.className='menu show colorpop';
   pop.innerHTML='<div class="mtitle">Tab color · '+esc(s.name)+'</div><div class="swrow"></div><button class="clr">Clear color</button>';
   const row=pop.querySelector('.swrow');
@@ -2518,7 +2518,11 @@ function pickTabColor(s){
   setTimeout(()=>document.addEventListener('click',close,true),0);
 }
 async function setTabColor(name,hex){
-  try{ await postIntent(base+'/api/app-commands',{type:'settabcolor',muxName:name,title:hex},'tab-color'); flash(hex?'Tab color set':'Tab color cleared'); }
+  try{
+    const res=await postIntent(base+'/api/app-commands',{type:'settabcolor',muxName:name,title:hex},'tab-color');
+    if(!res.ok) throw new Error(await apiError(res));
+    flash(hex?'Tab color set':'Tab color cleared');
+  }
   catch(e){ flash('Couldn’t set tab color'); }
 }
 document.addEventListener('click', e=>{ if(menuFor && !e.target.closest('#menu') && !e.target.closest('.kebab')) closeMenu(); });
@@ -2815,12 +2819,14 @@ function openReader(sessionId, title){
   const tab = window.open(url,'_blank');                 // new tab keeps the terminal alive behind it…
   if(!tab) location.href = url;                          // …but a phone popup-blocker just navigates instead
 }
+let historyFor=null;
 function openTabHistory(s){
+  historyFor=s;
   const list=$('#historylist'); list.innerHTML='';
   const entries=[];
   if(s.sessionId) entries.push({ id:s.sessionId, tool:s.tool||'', title:s.chatTitle||s.name, current:true });
   (s.tabHistory||[]).forEach(h=> entries.push({ id:h.id, tool:h.tool||'', title:h.title||h.id, current:false }));
-  if(!entries.length){ const p=document.createElement('div'); p.className='hint'; p.textContent='This tab has no linked chat yet — open claude or codex in it and it starts tracking (needs the desktop app live).'; list.appendChild(p); }
+  if(!entries.length){ const p=document.createElement('div'); p.className='hint'; p.textContent='This tab has no linked chat yet — open claude or codex in it and it starts tracking.'; list.appendChild(p); }
   entries.forEach(e=>{
     const row=document.createElement('div'); row.className='histrow';
     const label=document.createElement('div'); label.className='histlabel';
@@ -2833,6 +2839,15 @@ function openTabHistory(s){
   });
   openDialog('#historydlg');
 }
+$('#historyclear').onclick=async()=>{
+  const s=historyFor; if(!s) return;
+  if(!confirm('Clear the stored session history for tab "'+s.name+'"?\n\nThe tab keeps running; only the list of chats it has hosted is dropped.')) return;
+  try{
+    const res=await postIntent(base+'/api/app-commands',{type:'cleartabhistory',muxName:s.name},'tab-history');
+    if(!res.ok) throw new Error(await apiError(res));
+    $('#historydlg').close(); flash('Tab history cleared'); loadSessions();
+  }catch(e){ flash('Couldn’t clear tab history: '+(e.message||e)); }
+};
 // Relaunch a TAB to a specific (possibly historical) session — its resume command restarts THAT chat here.
 async function relaunchTabTo(name, e){
   if(!confirm('Relaunch tab "'+name+'" as:\n\n'+((e.title||e.id).slice(0,90))+'\n\nStops any running copy first, then starts that session on your PC.')) return;

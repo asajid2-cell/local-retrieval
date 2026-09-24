@@ -267,6 +267,19 @@ public sealed class RemoteCommandProtocolTests
             RemoteCommandProtocol.HeadlessCommandTypes.Count);
     }
 
+    // Tab colour and tab history are STORE state (Store.MuxTabMeta / Store.MuxTabHistory), not the state
+    // of an open desktop tab. A consumer that does not advertise a type is never leased it, so advertising
+    // these only on the GUI made them pend until lease expiry whenever the desktop app was closed.
+    [TestMethod]
+    public void CommandTypeAdvertisements_IncludeTabPresentationOnBothConsumers()
+    {
+        foreach (var type in new[] { "cleartabhistory", "settabcolor" })
+        {
+            Assert.IsTrue(RemoteCommandProtocol.GuiCommandTypes.Contains(type), $"gui must advertise {type}");
+            Assert.IsTrue(RemoteCommandProtocol.HeadlessCommandTypes.Contains(type), $"headless must advertise {type}");
+        }
+    }
+
     [TestMethod]
     public void LeaseOwner_EmbedsThePrincipalInstanceIdWhenSupplied()
     {

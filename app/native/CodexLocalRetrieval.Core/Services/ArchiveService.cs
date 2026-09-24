@@ -5718,6 +5718,18 @@ public sealed partial class ArchiveService
         });
     }
 
+    // The two per-tab sections of the projects projection, WITHOUT the collections/running halves the
+    // heavy projection carries. They are pure store reads, so the always-on headless bridge can project
+    // them on its light push after it performed a settabcolor/cleartabhistory — the web then re-tints or
+    // drops a tab's history while the desktop app is closed, instead of waiting for it to open.
+    public (Dictionary<string, object> Chats, Dictionary<string, object> Meta) BuildMuxTabProjection()
+    {
+        var chats = ResolveMuxTabChats();
+        var meta = Store.MuxTabMeta.ToDictionary(
+            kv => kv.Key, kv => (object)new { color = kv.Value.Color, kind = kv.Value.Kind }, StringComparer.OrdinalIgnoreCase);
+        return (chats, meta);
+    }
+
     // Set a tab's color (hex like "#e879f9", or "" to clear) — the web tab-color picker.
     public async Task SetTabColorAsync(string tabName, string? color)
     {

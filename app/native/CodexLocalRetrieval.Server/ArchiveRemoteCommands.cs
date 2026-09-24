@@ -11,6 +11,20 @@ public static class ArchiveRemoteCommands
         if (!command.TryGetProperty("type", out var typeValue) || typeValue.ValueKind != JsonValueKind.String)
             return (false, "command type required");
         var type = typeValue.GetString() ?? "";
+        // Tab presentation is store state, not desktop-tab state: the same Store.MuxTabMeta/MuxTabHistory
+        // the GUI writes. Both are reachable from the closed-GUI bridge for exactly that reason.
+        if (type == "settabcolor")
+        {
+            var tabName = StringProperty(command, "muxName") ?? StringProperty(command, "sessionName");
+            if (string.IsNullOrWhiteSpace(tabName)) return (false, "muxName required");
+            await archive.SetTabColorAsync(tabName, StringProperty(command, "title"));
+            return (true, "tab color set");
+        }
+        if (type == "cleartabhistory")
+        {
+            var cleared = await archive.ClearMuxTabHistoryAsync(StringProperty(command, "muxName"));
+            return (true, cleared > 0 ? $"cleared session history for {cleared} tab(s)" : "no tab history to clear");
+        }
         if (type == "rename")
         {
             var outcome = await archive.RenameNativeRemoteAsync(StringProperty(command, "tool") ?? "",

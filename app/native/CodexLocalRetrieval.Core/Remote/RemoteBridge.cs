@@ -47,6 +47,9 @@ public sealed class RemoteBridge
     private readonly Func<Task<string>>? _fixtureWorkspaceListing;
     private readonly Func<object, Task<string>>? _fixtureMuxRequest;
     private readonly Func<(bool verified, List<ArchiveService.RunningSessionInfo> sessions, string detail)>? _runningSnapshot;
+    // The store's per-tab colour/history projection, read on the push that follows a tab command so the
+    // web reflects it without the desktop app. Absent in profiles with no archive authority.
+    private readonly Func<Task<(Dictionary<string, object> Chats, Dictionary<string, object> Meta)>>? _tabProjection;
     public bool IsolationFixture => _isolationFixture;
 
     internal static string ValidateIsolationPort(int port) =>
@@ -87,7 +90,8 @@ public sealed class RemoteBridge
         Func<JsonElement, Task<(bool ok, string detail)>>? fetchTranscript = null,
         Func<string, string, string, Task<bool>>? fixtureDownload = null,
         string? fixtureUploadRoot = null,
-        string? fixtureSshConfigPath = null)
+        string? fixtureSshConfigPath = null,
+        Func<Task<(Dictionary<string, object> Chats, Dictionary<string, object> Meta)>>? tabProjection = null)
     {
         if (isolationFixture && transport is null)
             throw new ArgumentException("isolated bridge requires an injected relay transport", nameof(transport));
@@ -120,6 +124,7 @@ public sealed class RemoteBridge
         _executeReclaim = executeReclaim;
         _processContainment = processContainment;
         _transport = transport;
+        _tabProjection = tabProjection;
     }
 
     // The running heartbeat and the command drain used to share one 3s tick, with the push taken every 3rd
@@ -251,8 +256,10 @@ public sealed class RemoteBridge
     }
 
     // Keep the web's running list + `live` flag fresh via a LIGHT partial update (only runningSessions),
-    // so the collections projection the desktop app last pushed is left intact.
-    private async Task PushRunningAsync(Settings s)
+    // so the collections projection the desktop app last pushed is left intact. `includeTabProjection`
+    // adds the two per-tab sections — only after a tab command this bridge executed, because building the
+    // history half walks live-tabs.json and process ancestry, which the idle heartbeat must not pay.
+    private async Task PushRunningAsync(Settings s, bool includeTabProjection = false)
     {
         bool verified;
         List<ArchiveService.RunningSessionInfo> scanned;
@@ -272,14 +279,29 @@ public sealed class RemoteBridge
             title = (string?)null, collection = (string?)null,
             realTitle = RealTitle(r.Tool, r.SessionId),
         }).OrderByDescending(r => r.startedAt, StringComparer.Ordinal).ToList();
-        var json = JsonSerializer.Serialize(new
+        object payload = new
         {
             schemaVersion = 3,
             host = Environment.MachineName,
             runningSessions = running,
             runningVerified = verified,
             runningVerificationDetail = verified ? "" : verificationDetail,
-        });
+        };
+        if (includeTabProjection && _tabProjection is not null)
+        {
+            var tabs = await _tabProjection();
+            payload = new
+            {
+                schemaVersion = 3,
+                host = Environment.MachineName,
+                runningSessions = running,
+                runningVerified = verified,
+                runningVerificationDetail = verified ? "" : verificationDetail,
+                muxTabChats = tabs.Chats,
+                muxTabMeta = tabs.Meta,
+            };
+        }
+        var json = JsonSerializer.Serialize(payload);
         var remote = $"curl -s -X POST http://127.0.0.1:{s.Port}/api/running -H 'Content-Type: application/json' --data-binary @-";
         await RunTransportAsync(s, BridgeOperation.Running, json, null);
     }
@@ -326,6 +348,7 @@ public sealed class RemoteBridge
         if (cmds is null || cmds.Count == 0) return false;
 
         var changed = false;
+        var tabPresentationChanged = false;
         foreach (var c in cmds)
         {
             if (string.IsNullOrEmpty(c.id)) continue;
@@ -473,6 +496,21 @@ public sealed class RemoteBridge
                     res = await _executeArchiveCommand(command.RootElement);
                     break;
                 }
+                case "cleartabhistory":
+                case "settabcolor":
+                {
+                    if (_executeArchiveCommand is null)
+                    {
+                        res = (false, "archive command dispatch unavailable");
+                        break;
+                    }
+                    using var command = JsonDocument.Parse(JsonSerializer.Serialize(c));
+                    res = await _executeArchiveCommand(command.RootElement);
+                    // A true ack is not enough: the web re-tints and drops history from the PROJECTION, so
+                    // the changed store has to reach the relay on the push that follows.
+                    tabPresentationChanged |= res.ok;
+                    break;
+                }
                 case "reclaim":
                 {
                     if (!c.confirmed || _executeReclaim is null || (_isolationFixture && _fixtureMuxRequest is null))
@@ -556,7 +594,11 @@ public sealed class RemoteBridge
             var ackJson = JsonSerializer.Serialize(new { leaseToken = c.leaseToken, ok = res.ok, detail = res.detail, resultId, onPc, uncertain, retryable });
             await AckCommandAsync(s, c.id, ackJson);
         }
-        if (changed) { await Task.Delay(300); await PushRunningAsync(s); }   // reflect a kill/rename fast
+        if (changed || tabPresentationChanged)
+        {
+            await Task.Delay(300);
+            await PushRunningAsync(s, includeTabProjection: tabPresentationChanged);   // reflect a kill/rename/tab change fast
+        }
         return true;
     }
 

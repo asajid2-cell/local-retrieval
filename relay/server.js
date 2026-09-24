@@ -1972,6 +1972,12 @@ app.post('/api/running', (req, res) => {
     host: b.host ? String(b.host) : _projects.host,
     runningSyncedAt: Date.now(),
   };
+  // The bridge that owns the closed-GUI lane owns the store's tab colour/history too, so it may carry
+  // those two sections on this light push (it does so only after a settabcolor/cleartabhistory it ran).
+  // Present means complete: REPLACE, never merge — clearing a colour and clearing a history are the
+  // REMOVAL of keys, which a merge could not express, so a stale tint would outlive the clear.
+  if (Object.prototype.hasOwnProperty.call(b, 'muxTabMeta')) candidate.muxTabMeta = normalizeMuxTabMeta(b.muxTabMeta);
+  if (Object.prototype.hasOwnProperty.call(b, 'muxTabChats')) candidate.muxTabChats = normalizeMuxTabChats(b.muxTabChats);
   try {
     writeJsonState(PROJECTS_FILE, candidate);
   } catch (error) {
