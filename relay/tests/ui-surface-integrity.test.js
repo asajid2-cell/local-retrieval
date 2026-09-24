@@ -195,6 +195,164 @@ test('the terminal surface stays reachable across every transition', async t => 
   });
 });
 
+// The transition matrix above proves the surface is REACHABLE in a full-screen TUI; it does not prove the
+// session is USABLE there. With mouse tracking on, xterm hands every button event to the app, so the three
+// things the report names have to be driven for real: a selection (Shift-drag on a desktop, the Sel toggle
+// on a phone), a scroll that reaches the app, and the bottom bar.
+test('a full-screen TUI can still be scrolled, selected and driven from the nav', async t => {
+  if (skipWithoutChromium(t)) return;
+  const session = { name: SESSION_NAME, alive: true, shellOnly: true, sessionId: 'tui-sid', generationId: 'tui-generation' };
+  await withSurfacePage(session, async ({ harness, host, page }) => {
+    await page.goto(`http://127.0.0.1:${harness.port}/`);
+    await waitFor(() => page.evaluate(() => typeof connect === 'function'), 'page boot');
+    await page.evaluate(name => connect(name), SESSION_NAME);
+    await sleep(400);
+
+    host.sendOutput(SESSION_NAME, '\x1b[?1049h\x1b[?1002h\x1b[?1006h\x1b[2J\x1b[H' +
+      Array.from({ length: 24 }, (_, i) => `TUI line ${i + 1}`).join('\r\n'));
+    await sleep(500);
+    assert.equal(await page.evaluate(() => window.__muxMouseGuard.stats().tracking), true,
+      'the app must own the mouse for this test to mean anything');
+
+    // Everything the browser actually sent the session, in order.
+    const forwarded = () => host.messages
+      .filter(m => m.t === 'i' && m.s === SESSION_NAME)
+      .map(m => Buffer.from(m.d, 'base64').toString('utf8')).join('');
+    const centre = await page.evaluate(() => {
+      const r = document.querySelector('#term').getBoundingClientRect();
+      return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+    });
+    const selection = () => page.evaluate(() => ({ has: term.hasSelection(), text: term.getSelection() || '' }));
+    const drag = async () => {
+      await page.mouse.move(centre.x - 60, centre.y - 20);
+      await page.mouse.down();
+      await page.mouse.move(centre.x + 60, centre.y + 20, { steps: 6 });
+      await page.mouse.up();
+      await sleep(200);
+    };
+    const reset = () => page.evaluate(() => {
+      if (selectMode) toggleSelect();
+      autoFreeze = false;
+      try { term.clearSelection(); } catch (e) {}
+      flushFrozen();
+    });
+
+    // 1. Shift-drag: the desktop escape hatch. The highlight must survive the mouseup.
+    const beforeShift = forwarded().length;
+    await page.keyboard.down('Shift');
+    await drag();
+    await page.keyboard.up('Shift');
+    const shifted = await selection();
+    assert.ok(shifted.has, `Shift-drag in a mouse-tracking TUI must leave a selection (got ${JSON.stringify(shifted)})`);
+    assert.ok(shifted.text.trim().length > 0, 'Shift-drag must select real text, not an empty range');
+    // ...and the gesture must not have been reported to the app as a click: it was a selection, not a click.
+    assert.equal(/\x1b\[<[0-9]+;/.test(forwarded().slice(beforeShift)), false,
+      'a selection gesture must not be forwarded to the app as a mouse report');
+    await reset();
+
+    // 2. The phone's Sel toggle: the same promise, with no modifier to hold.
+    await page.evaluate(() => toggleSelect());
+    await drag();
+    const toggled = await selection();
+    assert.ok(toggled.has, `the Sel toggle must make a drag select in a mouse-tracking TUI (got ${JSON.stringify(toggled)})`);
+    assert.ok(toggled.text.trim().length > 0, 'the Sel toggle must select real text');
+    await reset();
+
+    // 3. A plain drag is NOT a selection: the app asked for the mouse and must still get it. This is the
+    // guard against "fixing" selection by switching mouse reporting off for everything.
+    const beforePlain = forwarded().length;
+    await drag();
+    assert.ok(/^\x1b\[<[0-9]+;[0-9]+;[0-9]+[Mm]/m.test(forwarded().slice(beforePlain)),
+      'a plain drag in a mouse-tracking TUI must still be forwarded to the app');
+    assert.equal((await selection()).has, false, 'a plain drag must not steal the gesture from the app');
+
+    // 4. The wheel must reach the app. The alternate buffer has no scrollback of its own, so the app owns
+    // scrolling: what has to leave the page is the wheel mouse REPORT (SGR button 64/65), not a local
+    // scroll and not an arrow key. This is the "no scrolling" half of the report.
+    const beforeWheel = forwarded().length;
+    await page.mouse.move(centre.x, centre.y);
+    await page.mouse.wheel(0, -600);
+    await sleep(250);
+    const wheeled = forwarded().slice(beforeWheel);
+    assert.ok(/\x1b\[<6[45];[0-9]+;[0-9]+[Mm]/.test(wheeled),
+      `the wheel must reach the app as a wheel report in a full-screen session (got ${JSON.stringify(wheeled)})`);
+
+    // 5. The bottom bar must be pressable while the app owns the mouse.
+    await page.getByRole('button', { name: 'Sessions', exact: true }).click();
+    await sleep(350);
+    assert.ok(await page.evaluate(() => document.querySelector('#app').classList.contains('mobile-view-sessions')),
+      'the bottom nav must drive the views in a full-screen session');
+    await page.getByRole('button', { name: 'Terminal', exact: true }).click();
+    await sleep(350);
+
+    // 6. A leak-tripped guard must not take selection down with it. When the session echoes one of our own
+    // reports straight back the guard stops forwarding (proof nothing consumed it) and clears its mode
+    // mirror so the next DECSET reads as a real re-arm - but xterm's mouse reporting is untouched, so its
+    // selection service stays disabled while the wheel keeps working. That divergence is "scroll works,
+    // selection won't at all", and the forced-selection gesture has to survive it: it is gated on xterm's
+    // state, not on our forwarding policy.
+    const beforeLeak = forwarded().length;
+    await drag();
+    const echoed = forwarded().slice(beforeLeak);
+    assert.ok(/\x1b\[<[0-9]+;[0-9]+;[0-9]+[Mm]/.test(echoed), 'an armed guard must forward a plain drag');
+    host.sendOutput(SESSION_NAME, echoed);
+    await waitFor(async () => await page.evaluate(() => window.__muxMouseGuard.stats().blocked), 'leak detector tripped');
+    assert.equal(await page.evaluate(() => window.__muxMouseGuard.stats().mouseActive), true,
+      'xterm must still own the mouse after the guard trips, or this test proves nothing');
+    await page.keyboard.down('Shift');
+    await drag();
+    await page.keyboard.up('Shift');
+    const afterLeak = await selection();
+    assert.ok(afterLeak.has, `selection must survive a leak-tripped guard (got ${JSON.stringify(afterLeak)})`);
+    await reset();
+
+    assert.equal(await page.evaluate(() => window.__muxLastIntegrityHeal || null), null,
+      'a usable full-screen session must never be healed by the integrity watch');
+  });
+});
+
+// The watch judged only geometry and the terminal's centre, so a bar that was perfectly placed but covered
+// by something invisible read as healthy - and the user was left to toggle fullscreen. It must now judge
+// whether a pointer can actually REACH the controls.
+test('the integrity watch notices a bottom bar a pointer can no longer reach', async t => {
+  if (skipWithoutChromium(t)) return;
+  const session = { name: SESSION_NAME, alive: true, shellOnly: true, sessionId: 'nav-sid', generationId: 'nav-generation' };
+  await withSurfacePage(session, async ({ harness, page }) => {
+    await page.goto(`http://127.0.0.1:${harness.port}/`);
+    await waitFor(() => page.evaluate(() => typeof connect === 'function'), 'page boot');
+    await page.evaluate(name => connect(name), SESSION_NAME);
+    await sleep(400);
+
+    // The bar keeps its exact geometry; an invisible layer takes the pointer. Nothing about the layout is
+    // wrong, which is precisely why the geometry-only check called this healthy.
+    await page.evaluate(() => {
+      window.__muxLastIntegrityHeal = null;
+      const cover = document.createElement('div');
+      cover.id = 'pointer-cover';
+      cover.style.cssText = 'position:fixed;left:0;right:0;bottom:0;height:80px;z-index:9;background:transparent';
+      document.body.appendChild(cover);
+    });
+    await waitFor(async () => await page.evaluate(() => window.__muxLastIntegrityHeal && window.__muxLastIntegrityHeal.fault), 'integrity fault recorded');
+    assert.equal(await page.evaluate(() => window.__muxLastIntegrityHeal.fault), 'nav-not-hit',
+      'an unreachable bottom bar must be a fault, not a healthy surface');
+
+    // ...and once the pointer can reach it again the watch must go quiet, or it would repaint under the
+    // user's fingers forever.
+    await page.evaluate(() => { window.__muxLastIntegrityHeal = null; document.querySelector('#pointer-cover').remove(); });
+    await sleep(3200);
+    assert.equal(await page.evaluate(() => window.__muxLastIntegrityHeal || null), null,
+      'a reachable bottom bar must not be healed');
+    assert.ok(await page.evaluate(() => {
+      const nav = document.querySelector('#mobileNav');
+      return [...nav.querySelectorAll('button,a')].every(b => {
+        const r = b.getBoundingClientRect();
+        const h = document.elementFromPoint(Math.round(r.left + r.width / 2), Math.round(r.top + r.height / 2));
+        return h && (h === b || b.contains(h));
+      });
+    }), 'every nav control must be the pointer target at its own centre');
+  });
+});
+
 test('the integrity watch repairs a stale inert instead of only reporting it', async t => {
   if (skipWithoutChromium(t)) return;
   const session = { name: SESSION_NAME, alive: true, shellOnly: true, sessionId: 'inert-sid', generationId: 'inert-generation' };

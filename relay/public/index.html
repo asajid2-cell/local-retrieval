@@ -1035,6 +1035,11 @@ function terminalSurfaceIntegrityFault(){
   if(document.querySelector('dialog[open]')) return '';
   const menu=$('#menu');
   if(menu && menu.offsetParent!==null && menu.children.length) return '';
+  // An inert app with no overlay open swallows every pointer event: the exact "I can type but cannot
+  // scroll or select" report. #app[inert] is set by the copy overlay and cleared by its close, so a
+  // close that took another path leaves the whole surface dead. Judged BEFORE any hit-testing: inertness
+  // is why nothing is reachable, so it must not be misread as whatever it made unreachable.
+  if($('#app').hasAttribute('inert')) return 'app-inert';
   const r=term.getBoundingClientRect(), vh=window.innerHeight;
   if(r.height<80) return 'term-collapsed';
   if(r.bottom>vh+1) return 'term-overflow';
@@ -1044,17 +1049,27 @@ function terminalSurfaceIntegrityFault(){
     if(nr.height<20) return 'nav-collapsed';
     if(nr.top<0 || nr.bottom>vh+1) return 'nav-offscreen';
     if(r.bottom>nr.top+1) return 'term-under-nav';
+    // Geometry can be perfect while something invisible sits on top of the bar - and that is the report
+    // verbatim: the terminal works, the bottom bar is simply not there to press. Every control must be the
+    // pointer's target at its OWN centre. A control that is off screen is the geometry fault above, so this
+    // only judges the ones the user can actually see.
+    for(const b of nav.querySelectorAll('button,a')){
+      const br=b.getBoundingClientRect();
+      if(!br.width || !br.height) continue;
+      const cy=Math.round(br.top+br.height/2);
+      if(cy<0 || cy>vh) continue;
+      const nh=document.elementFromPoint(Math.round(br.left+br.width/2), cy);
+      if(!nh || !(nh===b || b.contains(nh))) return 'nav-not-hit';
+    }
   }
-  // An inert app with no overlay open swallows every pointer event: the exact "I can type but cannot
-  // scroll or select" report. #app[inert] is set by the copy overlay and cleared by its close, so a
-  // close that took another path leaves the whole surface dead.
-  if($('#app').hasAttribute('inert')) return 'app-inert';
-  // The terminal's own centre must be reachable by a pointer. A hit landing on the document body means
-  // the surface has no pointer target at all; a hit inside a known overlay means something is on top.
+  // The terminal's own centre must be reachable by a pointer, and it must land INSIDE the terminal. A hit
+  // on the document body means the surface has no pointer target at all; a hit anywhere else - another
+  // grid row, an overlay we did not enumerate, a stale transform's ghost - means something is on top of
+  // the rows the user is looking at, which is "no scrolling and no interaction" with the pixels still lit.
   const hit=document.elementFromPoint(Math.round(r.left+r.width/2), Math.round(r.top+r.height/2));
   if(!hit) return '';
   if(hit===document.body || hit===document.documentElement) return 'term-not-hit';
-  if(hit.closest && hit.closest('#empty,#copyview,#menu')) return 'term-covered';
+  if(!term.contains(hit)) return 'term-covered';
   return '';
 }
 let integrityHealAt=0;
@@ -1070,6 +1085,13 @@ function watchTerminalSurface(){
     // the fix. For the geometry faults the repair IS the repaint - which is precisely the manual
     // fullscreen toggle the user performs today, minus the user.
     if(fault==='app-inert'){ try{ $('#app').removeAttribute('inert'); }catch(e){} }
+    // "The surface is lit but the pointer does not reach it" has exactly one repairable cause we know of:
+    // a pan/rowpan transform or scroll offset left over from a previous geometry. Re-assert the align
+    // before repainting, so the repair is the fix and not only a fresh frame of the same stale layout.
+    if(fault==='nav-not-hit' || fault==='term-covered' || fault==='term-not-hit'){
+      try{ const xt=$('#term').querySelector('.xterm'); if(xt) xt.style.transform=''; }catch(e){}
+      try{ alignTerminalSurface(); }catch(e){}
+    }
     healTerminalSurface('integrity:'+fault);
     try{ window.__muxLastIntegrityHeal={ at:now, fault }; }catch(e){}
   }catch(e){}
@@ -1241,7 +1263,7 @@ function reloadTerminal(quiet){
   connect(name, true);   // re-attach: CLEAR + scrollback replay + live, all client state reset
 }
 document.addEventListener('keydown', e=>{ if(e.ctrlKey && e.altKey && (e.key==='r'||e.key==='R')){ e.preventDefault(); e.stopPropagation(); reloadTerminal(); } }, true);
-window.__muxBuild='2026-09-24-tab-ownership-headless';   // bump per web deploy so a loaded version is verifiable
+window.__muxBuild='2026-09-24-forced-selection-and-nav-reach';   // bump per web deploy so a loaded version is verifiable
 try{ console.info('multiplex build', window.__muxBuild); }catch(e){}
 const helper = $('#term').querySelector('.xterm-helper-textarea');
 function hardenHelperTextarea(){
@@ -1975,8 +1997,15 @@ function createMouseGuard(){
   let blocked = false;    // a leak was caught — forward nothing until a fresh DECSET re-arms us
   let pending = [];       // {report, at} press/release reports we forwarded, waiting to be caught echoed
   let leaks = 0;
+  // What XTERM believes, which is a different question from what we are willing to forward. The leak path
+  // clears `modes` so the next DECSET reads as a genuine off→on transition, but it cannot clear xterm: its
+  // mouse reporting is still on, so its selection service is still disabled and a plain drag still selects
+  // nothing — while the wheel keeps working. That divergence ("scroll works, selection won't at all") is
+  // why the forced-selection gesture gates on this and not on inputAllowed().
+  let xtermModes = Object.create(null);
 
   const tracking = () => TRACK.some(m => modes[m]);
+  const mouseActive = () => TRACK.some(m => xtermModes[m]);
   function reader(chunk){
     return typeof chunk === 'string'
       ? { length: chunk.length, at: i => chunk.charCodeAt(i) & 0xff }
@@ -2016,7 +2045,8 @@ function createMouseGuard(){
         if(enable){
           if(!modes[mode]) blocked = false;             // a genuine off→on DECSET is the ONLY re-arm
           modes[mode] = true;
-        } else delete modes[mode];
+          xtermModes[mode] = true;
+        } else { delete modes[mode]; delete xtermModes[mode]; }
       }
       i = end;
     }
@@ -2058,11 +2088,12 @@ function createMouseGuard(){
     }
     if(pending.length > PENDING_MAX) pending = pending.slice(-PENDING_MAX);
   }
-  function reset(){ tail = []; modes = Object.create(null); blocked = false; pending = []; }
+  function reset(){ tail = []; modes = Object.create(null); xtermModes = Object.create(null); blocked = false; pending = []; }
   return {
     ingestOutput, noteForwarded, reset,
     inputAllowed: () => !blocked && tracking(),
-    stats: () => ({ tracking:tracking(), blocked, leaks, pending:pending.length, modes:Object.keys(modes).map(Number) }),
+    mouseActive,
+    stats: () => ({ tracking:tracking(), mouseActive:mouseActive(), blocked, leaks, pending:pending.length, modes:Object.keys(modes).map(Number) }),
   };
 }
 const mouseGuard = createMouseGuard();
@@ -2120,6 +2151,124 @@ term.onData(d => {
   if ((mods.ctrl||mods.alt||mods.shift) && d.length===1) { d = applyModsToChar(d); clearMods(); }
   send('i', d);
 });
+
+// ---- SELECTION WHILE THE APP OWNS THE MOUSE -------------------------------------------------------
+// A full-screen TUI (codex/claude/vim) turns mouse reporting on, and xterm then routes every button event
+// to the app: its selection service is disabled, so a plain drag selects nothing. The documented escape
+// hatches fail too. A Shift-drag DOES start a highlight, but xterm emits the button RELEASE to the app as
+// user input, and its own selection service clears any selection on user input - so the highlight dies the
+// instant the button comes up. (Read out of the vendored build: CoreMouseService.triggerMouseEvent ->
+// CoreService.triggerDataEvent -> the onUserInput listener that calls clearSelection. The release is not a
+// keystroke, but xterm cannot tell the difference.) That is "sometimes scroll will work and selection
+// won't at all", and it is why the Sel toggle did not help either.
+//
+// So while an app owns the mouse, the force-select gesture belongs to US: we keep xterm out of the gesture
+// entirely - no press/release report ever reaches the app for a gesture that is a selection - build the
+// highlight ourselves from the pointer, and latch the existing freeze so a live repaint cannot eat it.
+// Plain drags still go to the app, because it asked for the mouse and that is what granting it means.
+// The modifier must be read from the PLATFORM, exactly as xterm reads it - a UA sniff is wrong here, since
+// every iPhone UA says "like Mac OS X" and would silently move the gesture to a key no phone has. xterm's
+// own rule is Shift (Alt on a Mac), so ours is a superset of it: Shift always, and Alt on a Mac as well,
+// which is the only escape hatch a Mac user would otherwise have (xterm's macOptionClickForcesSelection
+// defaults to off). Column-select on a non-Mac is Alt-drag and is deliberately left alone.
+const FORCE_SEL_MAC = ['Macintosh','MacIntel','MacPPC','Mac68K'].includes(navigator.platform || '');
+function forceSelectGesture(e){ return selectMode || e.shiftKey || (FORCE_SEL_MAC && e.altKey); }
+// "The app owns the mouse" is XTERM's state, not our forwarding policy: they differ exactly when the leak
+// detector has tripped (press/release stripped, mode mirror cleared, xterm's selection still disabled).
+// Reading inputAllowed() here would leave the one state that matches the report - "scroll works, selection
+// won't at all" - with no gesture of ours in it.
+function appOwnsMouse(){ try{ return mouseGuard.mouseActive(); }catch(_){ return false; } }
+// The buffer cell under a viewport point, in the same 0-based scrollback-absolute coordinates
+// term.select() takes. Measured off the renderer's own screen element, so pan/rowpan scroll is included.
+function bufferCellAt(clientX, clientY){
+  const host=$('#term'), scr=host && host.querySelector('.xterm-screen');
+  if(!scr) return null;
+  const r=scr.getBoundingClientRect(), cols=term.cols|0, rows=term.rows|0;
+  if(!r.width || !r.height || !cols || !rows) return null;
+  const col=Math.floor((clientX-r.left)/(r.width/cols));
+  const row=Math.floor((clientY-r.top)/(r.height/rows));
+  return [Math.min(cols-1, Math.max(0,col)), Math.min(rows-1, Math.max(0,row)) + (term.buffer.active.viewportY|0)];
+}
+const forceSel={ active:false, moved:false, anchor:null, last:null };
+function forceSelApply(){
+  if(!forceSel.anchor || !forceSel.last) return false;
+  const a=forceSel.anchor, b=forceSel.last;
+  const reversed = b[1]<a[1] || (b[1]===a[1] && b[0]<a[0]);
+  const s = reversed ? b : a, e = reversed ? a : b;
+  const length = (e[1]-s[1])*(term.cols|0) + (e[0]-s[0]) + 1;   // inclusive, linear - the same range a drag makes
+  try{ term.select(s[0], s[1], Math.max(1, length)); }catch(_){ return false; }
+  return termHasSelection();
+}
+function forceSelStart(x,y){
+  const cell=bufferCellAt(x,y);
+  if(!cell) return false;
+  forceSel.active=true; forceSel.moved=false; forceSel.anchor=cell; forceSel.last=cell;
+  return true;
+}
+function forceSelTrack(x,y){
+  if(!forceSel.active) return false;
+  const cell=bufferCellAt(x,y);
+  if(!cell) return false;
+  if(cell[0]===forceSel.last[0] && cell[1]===forceSel.last[1]) return false;
+  forceSel.last=cell; forceSel.moved=true;
+  return forceSelApply();
+}
+function forceSelEnd(){
+  if(!forceSel.active) return false;
+  const moved=forceSel.moved;
+  forceSel.active=false; forceSel.moved=false; forceSel.anchor=null; forceSel.last=null;
+  if(!moved){
+    // A force-click that never moved is not a selection: it must leave no one-cell highlight and no latched
+    // freeze behind. Like the drag, it is also not a click the app gets to see - the gesture meant "select".
+    try{ term.clearSelection(); }catch(_){}
+    maybeUnfreezeSelection();
+    return false;
+  }
+  const had=termHasSelection();
+  if(had){ if(!selectMode) autoFreeze=true; if(autoCopyOnSelect) copySelectionNow(); }
+  return had;
+}
+try{ window.__muxForceSel = forceSel; }catch(e){}
+(function(){
+  const host=$('#term');
+  host.addEventListener('mousedown', e=>{
+    if(e.button!==0 || !appOwnsMouse() || !forceSelectGesture(e)) return;
+    if(!forceSelStart(e.clientX, e.clientY)) return;
+    e.preventDefault(); e.stopPropagation();   // xterm must not turn a selection into a report to the app
+  }, true);
+  // The drag and its release live on the document: the gesture is allowed to leave the terminal.
+  document.addEventListener('mousemove', e=>{ if(forceSel.active) forceSelTrack(e.clientX, e.clientY); }, true);
+  // The release must not reach xterm. Its element-level mouseup listener is installed by the mouse protocol
+  // itself (not by the mousedown), so keeping the mousedown out is not enough: it would emit the release to
+  // the app, and xterm's own onUserInput listener - which cannot tell a release report from a keystroke -
+  // would clear the highlight we just made. Capture on the document is the last point where the whole
+  // subtree can still be kept out of a gesture that is entirely ours.
+  document.addEventListener('mouseup', e=>{
+    if(!forceSel.active) return;
+    e.preventDefault(); e.stopPropagation();
+    forceSelEnd();
+  }, true);
+  // The phone's Sel toggle is the same gesture with a finger. While the app owns the mouse a touch drag
+  // cannot fall through to xterm - this build has no touch selection at all - so it comes here instead.
+  host.addEventListener('touchstart', e=>{
+    if(!selectMode || !appOwnsMouse() || e.touches.length!==1) return;
+    const t=e.touches[0];
+    if(!forceSelStart(t.clientX, t.clientY)) return;
+    e.preventDefault(); e.stopPropagation();
+  }, {capture:true, passive:false});
+  host.addEventListener('touchmove', e=>{
+    if(!forceSel.active || e.touches.length!==1) return;
+    const t=e.touches[0];
+    forceSelTrack(t.clientX, t.clientY);
+    e.preventDefault(); e.stopPropagation();
+  }, {capture:true, passive:false});
+  host.addEventListener('touchend', e=>{
+    if(!forceSel.active) return;
+    e.preventDefault(); e.stopPropagation();
+    forceSelEnd();
+  }, {capture:true, passive:false});
+  host.addEventListener('touchcancel', ()=>{ if(forceSel.active) forceSelEnd(); }, {capture:true, passive:false});
+})();
 
 // ---- status ----
 function setStatusState(state){ const s=$('#status'); s.className=''; if(state) s.classList.add(state); }
