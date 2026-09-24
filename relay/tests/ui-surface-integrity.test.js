@@ -429,3 +429,74 @@ test('the surface puts back rows the renderer dropped, with no transition to rea
     assert.match(String(rec && rec.reason), /lost-rows/, `the repaint must come from the row-loss path (got ${JSON.stringify(rec)})`);
   });
 });
+
+test('the surface notices a frame drawn for a narrower grid than it has', async t => {
+  if (skipWithoutChromium(t)) return;
+  const session = { name: SESSION_NAME, alive: true, shellOnly: true, sessionId: 'stalewidth-sid', generationId: 'stalewidth-generation' };
+  await withSurfacePage(session, async ({ harness, host, page }) => {
+    await page.goto(`http://127.0.0.1:${harness.port}/`);
+    await waitFor(() => page.evaluate(() => typeof connect === 'function'), 'page boot');
+    await page.evaluate(name => connect(name), SESSION_NAME);
+    await sleep(600);
+
+    // Frames are built inside the page so they always use the LIVE grid; a cols read out here can be stale
+    // by the time the relay's first 'd' frame lands, and a frame that misses the grid width by accident
+    // would test nothing. Autowrap is off so an over-wide line truncates instead of wrapping a stray
+    // character onto the next row.
+    const built = await page.evaluate(() => {
+      const cols = term.cols, rows = term.rows;
+      const lines = (ch, n) => Array.from({ length: rows }, () => ch.repeat(Math.max(8, n))).join('\r\n');
+      return {
+        grid: { cols, rows },
+        fills: '\x1b[?1049h\x1b[?7l\x1b[2J\x1b[H' + lines('x', cols - 1),
+        narrow: '\x1b[2J\x1b[H' + lines('y', cols - 31),
+        // Ragged: half the rows fill the grid, so the shortfall is not unanimous and this is NOT stale.
+        ragged: '\x1b[2J\x1b[H' + Array.from({ length: rows }, (_, i) => (i % 2 ? 'z'.repeat(cols - 31) : 'w'.repeat(cols - 1))).join('\r\n'),
+      };
+    });
+    assert.ok(built.grid.cols >= 40, `the grid must be wide enough to draw a narrow frame (got ${built.grid.cols})`);
+
+    // A full-screen app that fills its grid is the healthy shape and must never be reported - a false
+    // positive here re-fits and repaints the surface every couple of seconds on a perfectly good screen.
+    host.sendOutput(SESSION_NAME, built.fills);
+    await sleep(700);
+    const healthy = await page.evaluate(() => staleFrameWidth());
+    assert.equal(healthy, null, `a frame that fills the grid is not stale (got ${JSON.stringify(healthy)})`);
+
+    // Ragged widths are ordinary content, not a stale frame: the near-unanimous shortfall is what separates
+    // "the app drew for the wrong width" from "the app left some rows short".
+    host.sendOutput(SESSION_NAME, built.ragged);
+    await sleep(700);
+    const ragged = await page.evaluate(() => staleFrameWidth());
+    assert.equal(ragged, null, `a ragged frame is not stale (got ${JSON.stringify(ragged)})`);
+
+    // The same app, now drawing 30 columns narrower than the grid: every row stops short of term.cols, which
+    // is the "black to the right" in the reports. The buffer and the DOM agree, so the row-loss check is
+    // blind to this by construction - which is exactly why the surface used to need a fullscreen toggle.
+    host.sendOutput(SESSION_NAME, built.narrow);
+    await sleep(700);
+    const seen = await page.evaluate(() => ({ stale: staleFrameWidth(), dom: terminalPaintLostRows() }));
+    assert.ok(seen.stale, 'a frame drawn for a narrower grid must be reported');
+    assert.ok(seen.stale.maxW < seen.stale.cols - 3, `the drawn width must fall short of the grid (got ${JSON.stringify(seen.stale)})`);
+    assert.ok(seen.stale.short / seen.stale.judged >= 0.9, `the shortfall must be near-unanimous (got ${JSON.stringify(seen.stale)})`);
+    assert.ok(!seen.dom || seen.dom.lost === 0, `the row-loss check is blind to this class (got ${JSON.stringify(seen.dom)})`);
+
+    // A shell is NOT the alternate buffer and its rows are ragged, so the same short rows must stay quiet.
+    await page.evaluate(() => { term.write('\x1b[?1049l'); });
+    host.sendOutput(SESSION_NAME, '\x1b[2J\x1b[H' + Array.from({ length: built.grid.rows }, () => 'q'.repeat(built.grid.cols - 31)).join('\r\n'));
+    await sleep(700);
+    const shell = await page.evaluate(() => staleFrameWidth());
+    assert.equal(shell, null, `a normal-buffer shell is not a stale full-screen frame (got ${JSON.stringify(shell)})`);
+
+    // The watch must act on the real case - and through the fullscreen-equivalent heal, not the
+    // repaint-only one, because only a size change reaches the app that drew the stale frame.
+    await page.evaluate(() => { term.write('\x1b[?1049h'); });
+    host.sendOutput(SESSION_NAME, built.narrow);
+    await waitFor(async () => {
+      const m = await page.evaluate(() => window.__muxLastStaleWidth);
+      return !!(m && m.maxW < m.cols - 3);
+    }, 'stale width recorded by the watch', 6000);
+    const rec = await page.evaluate(() => window.__muxLastPaintRecovery);
+    assert.match(String(rec && rec.reason), /stale-width/, `the heal must come from the stale-width path (got ${JSON.stringify(rec)})`);
+  });
+});

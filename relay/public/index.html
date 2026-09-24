@@ -1030,23 +1030,85 @@ function recoverTerminalPaint(reason){
   });
   window.__muxLastPaintRecovery = { at:now, reason:reason||'paint-check', rows:term.rows, cols:term.cols };
 }
+// The class NEITHER check above can see. domRowsLosingBufferText() compares DOM against BUFFER, so an app
+// that drew its frames for a NARROWER grid than this surface has reads as healthy: every row stops short of
+// term.cols with black to the right, and the buffer agrees with the DOM. A repaint re-renders that same
+// buffer and changes nothing; what clears it is a size change - a SIGWINCH to the app and a full redraw -
+// which is precisely why the remedy that works by hand is the fullscreen toggle.
+//
+// A full-screen (alternate-buffer) app fills its grid: borders, a status bar, a full-width pane. So this
+// fires only when essentially EVERY judged row stops short AND they all end in the same narrow band, which
+// a shell prompt (not the alternate buffer) or a centred dialog (ragged, with full-width rows around it)
+// does not satisfy. Judged only while the pump is idle, so a mid-redraw frame is never mistaken for a
+// settled one.
+function staleFrameWidth(){
+  if(!current || $('#empty').style.display!=='none') return null;
+  if(termWriting || terminalWriteActive) return null;
+  let buf; try{ buf=term.buffer.active; }catch(e){ return null; }
+  if(buf.type!=='alternate') return null;
+  const host=$('#term'); if(!terminalSurfaceVisible()) return null;
+  if(host.classList.contains('pan')) return null;                 // a grid wider than the viewport is panned, not stale
+  if(winSize && winSize.cols>term.cols+1) return null;
+  const rowEls=[...host.querySelectorAll('.xterm-rows > div')];
+  const base=buf.viewportY;
+  let judged=0, short=0, maxW=0;
+  for(let y=0; y<term.rows; y++){
+    const line=buf.getLine(base+y);
+    const want=(line ? line.translateToString(true) : '').replace(/\s+$/,'');
+    if(want.length<8) continue;
+    const el=rowEls[y]; if(!el) continue;
+    const cs=getComputedStyle(el);
+    if(cs.display==='none' || cs.visibility==='hidden' || cs.opacity==='0') continue;
+    judged++;
+    if(want.length>maxW) maxW=want.length;
+    if(want.length < term.cols-2) short++;
+  }
+  if(judged<8) return null;
+  const cols=term.cols;
+  if(short/judged<0.9 || cols-maxW<4) return null;
+  return { cols, rows:term.rows, judged, short, maxW };
+}
+// ONE home for "the surface is wrong, repair it". A repaint repairs a stale renderer; the re-fit is what
+// repairs a frame drawn at a stale width, because only a size change reaches the app. Both are cheap and
+// idempotent, and doing them together is exactly what the fullscreen toggle - the remedy that works today -
+// does, so the automatic path and the manual one cannot disagree.
+function healDetectedPaintFault(reason, kind){
+  recoverTerminalPaint((reason||'paint-check')+':'+kind);
+  scheduleViewportFit(0);
+}
+let staleWidthLastActedAt=0, staleWidthLastKey='';
 function verifyTerminalPaint(reason){
   try{
-    if(terminalPaintLooksBlank()){ recoverTerminalPaint(reason); return; }
+    if(terminalPaintLooksBlank()){ healDetectedPaintFault(reason, 'blank'); return; }
     // Partial loss: the surface is not blank, but some rows the buffer holds never got painted. That is the
     // "half render" the reports show, and it used to be invisible here by construction.
     const m=terminalPaintLostRows();
     if(m && m.lost){
       window.__muxLastLostRows={ at:Date.now(), reason:reason||'paint-check', rows:m.rows, lost:m.lost, sample:m.sample };
-      recoverTerminalPaint(reason+':lost-rows');
+      healDetectedPaintFault(reason, 'lost-rows');
+      return;
     }
+    const w=staleFrameWidth();
+    if(!w) return;
+    window.__muxLastStaleWidth={ at:Date.now(), reason:reason||'paint-check', ...w };
+    // Retry the same width at most every 10s: the fault is persistent, so hammering the fit every 2s would
+    // only churn if the size is already correct and something else is wrong.
+    const key=w.cols+':'+w.maxW;
+    if(key===staleWidthLastKey && Date.now()-staleWidthLastActedAt<10000) return;
+    staleWidthLastKey=key; staleWidthLastActedAt=Date.now();
+    healDetectedPaintFault(reason, 'stale-width');
   }catch(e){}
 }
 function schedulePaintHeal(delay=60){
   if(paintHealTimer) clearTimeout(paintHealTimer);
   paintHealTimer=setTimeout(()=>{
     paintHealTimer=0;
-    requestAnimationFrame(()=>{ healTerminalPaint(); requestAnimationFrame(()=>{ healTerminalPaint(); verifyTerminalPaint('scheduled'); }); });
+    // Judge the SETTLED surface FIRST. The previous order refreshed twice and only then verified, so the
+    // verify could never see the damage it exists to detect - the rows had already been repainted, and the
+    // one record that says "this surface really was broken" was never written. The refresh still follows
+    // unconditionally: it is the heal for the classes a repaint can repair, and it costs one refresh of the
+    // visible rows.
+    requestAnimationFrame(()=>{ verifyTerminalPaint('scheduled'); healTerminalPaint(); requestAnimationFrame(()=>{ healTerminalPaint(); }); });
   }, delay);
 }
 // THE ONE ENTRY POINT for "the surface lost custody of its own pixels". Call it whenever the terminal
@@ -1315,7 +1377,7 @@ function reloadTerminal(quiet){
   connect(name, true);   // re-attach: CLEAR + scrollback replay + live, all client state reset
 }
 document.addEventListener('keydown', e=>{ if(e.ctrlKey && e.altKey && (e.key==='r'||e.key==='R')){ e.preventDefault(); e.stopPropagation(); reloadTerminal(); } }, true);
-window.__muxBuild='2026-09-24-autonomous-row-loss-heal';   // bump per web deploy so a loaded version is verifiable
+window.__muxBuild='2026-09-24-stale-width-heal';   // bump per web deploy so a loaded version is verifiable
 try{ console.info('multiplex build', window.__muxBuild); }catch(e){}
 const helper = $('#term').querySelector('.xterm-helper-textarea');
 function hardenHelperTextarea(){
