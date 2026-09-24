@@ -846,6 +846,7 @@ function refreshFleet(){
 
 function setMobileView(view, persist=true){
   if(!MOBILE_VIEWS.includes(view)) view='terminal';
+  const wasTerminalHidden = mobileView==='sessions' || mobileView==='fleet';
   mobileView=view;
   if(persist) LS.set('mux_mobile_view', view);
   const app=$('#app'); if(!app) return;
@@ -865,7 +866,11 @@ function setMobileView(view, persist=true){
     if(fleetPollInterval){ clearInterval(fleetPollInterval); fleetPollInterval = null; }
   }
   if(isMobile() && view!=='sessions' && view!=='fleet'){
-    setTimeout(()=>{ applyViewport(); try{ term.focus(); }catch(e){} }, 60);
+    // applyViewport (not healTerminalSurface) does the height write, so it stays first; the heal is what
+    // repaints the rows xterm drew while this view was display:none. Only when the terminal was actually
+    // AWAY — a redundant re-set (a boot sync, a media-query refresh) has no stale frame to answer for.
+    const heal = wasTerminalHidden;
+    setTimeout(()=>{ applyViewport(); if(heal) healTerminalSurface('mobile-view-'+view); try{ term.focus(); }catch(e){} }, 60);
   }
 }
 function syncMobileView(){
@@ -995,6 +1000,18 @@ function schedulePaintHeal(delay=60){
     paintHealTimer=0;
     requestAnimationFrame(()=>{ healTerminalPaint(); requestAnimationFrame(()=>{ healTerminalPaint(); verifyTerminalPaint('scheduled'); }); });
   }, delay);
+}
+// THE ONE ENTRY POINT for "the surface lost custody of its own pixels". Call it whenever the terminal
+// changed STATE rather than receiving bytes: it came back from display:none (a mobile view switch), stopped
+// being covered by a full-screen overlay, or moved for a reason the grid already agrees with (font size,
+// zen/fullscreen, keybar). In all of those the server's size is unchanged, so nothing that only reacts to a
+// grid CHANGE will run — and while the host was hidden the browser was free to drop every frame xterm drew.
+// Re-measure AND repaint: the two are independent, and re-measuring alone resizes nothing when cols/rows
+// already match, which is why the manual workarounds (toggle fullscreen, hard refresh) were the only heals.
+function healTerminalSurface(reason){
+  scheduleViewportFit(0);
+  schedulePaintHeal(60);
+  try{ window.__muxLastSurfaceHeal = { at:Date.now(), reason:reason||'transition' }; }catch(e){}
 }
 function cancelViewportRestore(){
   viewportRestoreGeneration++;
@@ -1163,7 +1180,7 @@ function reloadTerminal(quiet){
   connect(name, true);   // re-attach: CLEAR + scrollback replay + live, all client state reset
 }
 document.addEventListener('keydown', e=>{ if(e.ctrlKey && e.altKey && (e.key==='r'||e.key==='R')){ e.preventDefault(); e.stopPropagation(); reloadTerminal(); } }, true);
-window.__muxBuild='2026-07-27-campaign-integration';   // bump per web deploy so a loaded version is verifiable
+window.__muxBuild='2026-09-23-surface-paint-heal';   // bump per web deploy so a loaded version is verifiable
 try{ console.info('multiplex build', window.__muxBuild); }catch(e){}
 const helper = $('#term').querySelector('.xterm-helper-textarea');
 function hardenHelperTextarea(){
@@ -1489,7 +1506,12 @@ function onControl(s){
   let m; try{ m=JSON.parse(s.slice(1)); }catch(e){ return; }
   winSize={cols:m.cols, rows:m.rows}; sizeModeLabel=m.modeLabel||'';
   sizePinned = m.mode==='pinned'; sizeMine = !!m.mine; sizeLocal = !!m.local; sizePinLabel = m.pinLabel||''; sizeClients = m.clients||[];
-  if(term.cols!==m.cols || term.rows!==m.rows){ try{ preserveTermViewport(()=>term.resize(m.cols, m.rows)); hardenHelperTextarea(); installMobileInputDelta(); schedulePaintHeal(20); }catch(e){} }
+  if(term.cols!==m.cols || term.rows!==m.rows){ try{ preserveTermViewport(()=>term.resize(m.cols, m.rows)); hardenHelperTextarea(); installMobileInputDelta(); }catch(e){} }
+  // Heal on EVERY size frame, not only on a grid change. A 'd' that re-asserts the size we already have is
+  // exactly the frame that used to be a no-op: it proves the relay and this surface disagree about the
+  // past (a reconnect, a re-measure, a lease handover), and the rows xterm drew under the old belief are
+  // still on screen. Repainting costs one refresh of the visible rows.
+  schedulePaintHeal(20);
   applyPan(); updateMeta(); updateSizeBtn();
 }
 // TAP the size chip = pin the shared window to THIS device (everyone mirrors/pans it) — last-pinner-wins.
@@ -1683,7 +1705,7 @@ $('#term').addEventListener('wheel', e=>{
   }catch(_){}
 }, {passive:false, capture:true});
 
-function setFont(px){ fontSize=Math.min(20,Math.max(11,px)); term.options.fontSize=fontSize; LS.set('mux_font',fontSize); doFit(); }
+function setFont(px){ fontSize=Math.min(20,Math.max(11,px)); term.options.fontSize=fontSize; LS.set('mux_font',fontSize); doFit(); healTerminalSurface('font'); }
 function updateMeta(){
   const b=$('#statusmeta'); if(!b) return;
   const view=sizeButtonPresentation();
@@ -3332,13 +3354,13 @@ $('#refresh').onclick=()=>{ loadSessions(); if(current) reloadTerminal(true); };
 $('#refresh').title='Refresh sessions + reload the open terminal (unfreeze)';
 $('#jumpbottom').onclick=()=>{ if(current) forceJumpBottom(); };
 // desktop keybar toggle: force-show the touch keybar (all the mobile buttons) on desktop; re-fit after
-function applyKeybarPref(){ const on=LS.get('mux_keybar',false); $('#app').classList.toggle('kb-on',on); const b=$('#kbtoggle'); if(b) b.classList.toggle('on',on); setTimeout(()=>applyViewport(),60); }
+function applyKeybarPref(){ const on=LS.get('mux_keybar',false); $('#app').classList.toggle('kb-on',on); const b=$('#kbtoggle'); if(b) b.classList.toggle('on',on); setTimeout(()=>{ applyViewport(); healTerminalSurface('keybar'); },60); }
 $('#kbtoggle').onclick=()=>{ LS.set('mux_keybar', !LS.get('mux_keybar',false)); applyKeybarPref(); };
 applyKeybarPref();
 function toggleZen(){ const z=$('#app').classList.toggle('zen'); $('#zen').classList.toggle('on',z);
   if(z && document.documentElement.requestFullscreen) document.documentElement.requestFullscreen().catch(()=>{});
   else if(!z && document.fullscreenElement) document.exitFullscreen().catch(()=>{});
-  setTimeout(doFit,60);
+  setTimeout(()=>{ doFit(); healTerminalSurface('zen'); },60);
 }
 $('#zen').onclick=toggleZen;
 $('#composebtn').onclick=openCompose;
@@ -3346,7 +3368,7 @@ $('#uploadbtn').onclick=openUpload;
 // exiting fullscreen by any means (Esc / F11 / browser) must drop zen so the chrome can't get stuck hidden
 document.addEventListener('fullscreenchange', ()=>{
   if(!document.fullscreenElement && $('#app').classList.contains('zen')){ $('#app').classList.remove('zen'); $('#zen').classList.remove('on'); }
-  setTimeout(doFit,60);
+  setTimeout(()=>{ doFit(); healTerminalSurface('fullscreenchange'); },60);
 });
 
 // ---- desktop keyboard shortcuts (app-level; xterm ignores these) ----
@@ -3391,7 +3413,7 @@ function openCopyView(){
   $('#copyview').hidden=false; $('#app').setAttribute('inert','');   // proper modal: background inert while open
   requestAnimationFrame(()=>{ pre.scrollTop=pre.scrollHeight; try{ pre.focus(); }catch(e){} });   // jump to latest + focus so Ctrl+C works
 }
-function closeCopyView(){ $('#copyview').hidden=true; $('#app').removeAttribute('inert'); try{ term.focus(); }catch(e){} }
+function closeCopyView(){ $('#copyview').hidden=true; $('#app').removeAttribute('inert'); healTerminalSurface('copyview-close'); try{ term.focus(); }catch(e){} }
 $('#copybtn').onclick = openCopyView;
 $('#copyclose').onclick = closeCopyView;
 $('#copyall').onclick = ()=>{

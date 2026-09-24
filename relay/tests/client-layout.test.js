@@ -248,3 +248,52 @@ test('tab switches drain old parser work and reject stale write callbacks', () =
     'the new socket must open only after the prior parser generation drains'
   );
 });
+
+// SCOPE, measured: this is a source-level guard ON PURPOSE. The defect it protects against is a frame the
+// browser dropped while the surface was display:none or covered by an overlay — headless chromium never
+// drops one, so a browser test cannot see the bug it prevents. What a browser test CAN see (and what the
+// reason string exists for) is that the heal is reachable: switching away from the terminal view and back
+// must leave window.__muxLastSurfaceHeal.reason === 'mobile-view-terminal'.
+test('every transition that can strand a stale frame repaints, not only a grid change', () => {
+  const heal = section('function healTerminalSurface', 'function cancelViewportRestore');
+  assert.match(heal, /scheduleViewportFit\(0\)/, 'the grid must be re-measured, not just repainted');
+  assert.match(heal, /schedulePaintHeal\(/, 'the rows must actually be repainted');
+  assert.match(heal, /__muxLastSurfaceHeal/, 'the last heal must be observable from the page');
+
+  const sites = {
+    'mobile view switch back to the terminal': section('function setMobileView', 'function syncMobileView'),
+    'zen / fullscreen': section('function toggleZen', "$('#zen').onclick"),
+    'leaving fullscreen by any route': section("document.addEventListener('fullscreenchange'", '// ---- desktop keyboard shortcuts'),
+  };
+  for (const [name, text] of Object.entries(sites)) {
+    assert.match(text, /healTerminalSurface\(/, `${name} must heal the surface`);
+  }
+  // A redundant re-set of the SAME view (the boot sync, a media-query refresh) has no stale frame to
+  // answer for, so the heal is gated on the terminal having actually been away.
+  assert.match(
+    sites['mobile view switch back to the terminal'],
+    /const heal = wasTerminalHidden/,
+    'only a real view change may heal — the boot sync must not'
+  );
+
+  // The one-line transitions move the surface without changing the grid, so nothing that reacts to a
+  // grid change would run: the overlay that covered the terminal, the font change, the keybar toggle.
+  for (const name of ['closeCopyView', 'setFont', 'applyKeybarPref']) {
+    assert.match(
+      source,
+      new RegExp(`function ${name}\\b[\\s\\S]{0,400}?healTerminalSurface\\(`),
+      `${name} must heal the surface`
+    );
+  }
+
+  // And the frame that used to be a silent no-op: a 'd' re-asserting the size we already have. The heal
+  // must sit OUTSIDE the grid-change branch, or that frame repaints nothing.
+  const control = section('function onControl', '// TAP the size chip');
+  const gridChangeLine = control.split('\n').find(line => line.includes('if(term.cols!==m.cols'));
+  assert.ok(gridChangeLine, 'onControl must still resize the grid when it changes');
+  assert.doesNotMatch(gridChangeLine, /schedulePaintHeal/, 'the heal must not be trapped inside the grid-change branch');
+  assert.ok(
+    control.indexOf('schedulePaintHeal(20)') > control.indexOf(gridChangeLine),
+    'a re-asserted size frame must still repaint'
+  );
+});
