@@ -957,7 +957,7 @@ function listSessions() {
                   healEligible: !!attn.healEligible,
                   autoheal: !!h.heal, hosted: true,
                   alive, dormant, detachedLocal, cols: h.cols || 0, rows: h.rows || 0,
-                  adopted: !!h.adopted, externalOwner: !!h.externalOwner,
+                  owner: !!h.owner, adopted: !!h.adopted, externalOwner: !!h.externalOwner,
                   hasCommand: !!h.hasCommand, shellOnly: !!h.shellOnly, ready: !!h.ready,
                   kind: h.kind || (dormant ? 'dormant' : (h.shellOnly ? 'shell' : 'command')),
                   sessionId: String(chat && chat.id || h.sessionId || ''), aliases: Array.isArray(h.aliases) ? h.aliases : [],
@@ -3973,6 +3973,14 @@ function handleClientMsg(name, client, s) {
     return true;
   }
   if (t === 'h') { try { applyActivity(client, JSON.parse(s.slice(1))); } catch {} return true; }
+  if (s === 'R' && client.hosted) {
+    const st = sessions.get(name);
+    const now = Date.now();
+    if (st && (!st.lastRedrawAt || now - st.lastRedrawAt >= 10000)) {
+      if (sendHost({ t: 'redraw', s: name })) st.lastRedrawAt = now;
+    }
+    return true;
+  }
   if (t === 'P') { const arg = s.slice(1); if (arg && arg[0] === '#') pinToDeviceId(name, arg.slice(1)); else pinToDevice(name, client, arg !== '0'); return true; }
   if (t === 's') { cycleMode(name, client); return true; }
   return false;

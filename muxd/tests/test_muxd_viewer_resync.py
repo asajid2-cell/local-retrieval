@@ -12,6 +12,7 @@ These tests pin the accounting the resync wiring is built on:
   * gap_seq is strictly monotonic: it advances again only after an offer has succeeded,
   * one viewer's overflow never costs a healthy sibling viewer a byte.
 """
+import asyncio
 import importlib
 import unittest
 
@@ -127,6 +128,23 @@ class FanoutLocalOutput(unittest.TestCase):
         self.assertEqual(slow.gap_seq, 1)
         self.assertEqual(slow.qsize(), 2)
 
+    def test_visible_owner_requests_snapshot_after_local_viewer_gap(self):
+        calls = []
+        session = muxd.OwnerSession("t", "", None, 120, 30, None, None, None)
+        session._send_owner = lambda frame: calls.append(frame)
+        slow = muxd.LocalViewerQueue(maxsize=1)
+        slow.offer(b"stale")
+        session.local.add(slow)
+
+        muxd.fanout_local_output(session, b"live")
+        self.assertEqual(calls, [{"t": "redraw"}])
+        muxd.fanout_local_output(session, b"next")
+        self.assertEqual(calls, [{"t": "redraw"}], "a contiguous gap must not flood the owner")
+        slow.get_nowait()
+        muxd.fanout_local_output(session, b"caught-up")
+        muxd.fanout_local_output(session, b"new-gap")
+        self.assertEqual(calls, [{"t": "redraw"}, {"t": "redraw"}])
+
     def test_fanout_still_nudges_a_redraw_on_a_dropped_chunk(self):
         session = make_session()
         slow = muxd.LocalViewerQueue(maxsize=1)
@@ -145,6 +163,95 @@ class FanoutLocalOutput(unittest.TestCase):
             self.assertEqual(calls, [], "a lossless fanout must not nudge")
         finally:
             muxd.redraw_nudge = original
+
+
+class OwnerViewerDrain(unittest.IsolatedAsyncioTestCase):
+    async def test_blocked_sender_retries_snapshot_after_its_backlog_drains(self):
+        sending = asyncio.Event()
+        release = asyncio.Event()
+
+        class Socket:
+            def __init__(self):
+                self.sent = []
+
+            async def send(self, data):
+                if not self.sent:
+                    sending.set()
+                    await release.wait()
+                self.sent.append(data)
+
+        calls = []
+        session = muxd.OwnerSession("t", "", None, 120, 30, None, None, None)
+        session._send_owner = lambda frame: calls.append(frame)
+        viewer = muxd.LocalViewerQueue(maxsize=2)
+        session.local.add(viewer)
+        viewer.offer(b"initial")
+        socket = Socket()
+        pump = asyncio.create_task(muxd.pump_local_viewer(socket, session, viewer))
+        try:
+            await asyncio.wait_for(sending.wait(), 2)
+            muxd.fanout_local_output(session, b"stale")
+            muxd.fanout_local_output(session, b"snapshot-that-will-be-evicted")
+            muxd.fanout_local_output(session, b"newer")
+            muxd.fanout_local_output(session, b"newest")
+            self.assertEqual(calls, [{"t": "redraw"}])
+            release.set()
+            for _ in range(20):
+                if len(socket.sent) == 3:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertEqual(socket.sent, [b"initial", b"newer", b"newest"])
+            self.assertEqual(calls, [{"t": "redraw"}, {"t": "redraw"}])
+        finally:
+            release.set()
+            pump.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await pump
+
+    async def test_evicted_repaint_is_requested_again_after_viewer_catches_up(self):
+        class Socket:
+            def __init__(self):
+                self.sent = []
+
+            async def send(self, data):
+                self.sent.append(data)
+
+        calls = []
+        session = muxd.OwnerSession("t", "", None, 120, 30, None, None, None)
+        session._send_owner = lambda frame: calls.append(frame)
+        viewer = muxd.LocalViewerQueue(maxsize=2)
+        session.local.add(viewer)
+        viewer.offer(b"stale-0")
+        viewer.offer(b"stale-1")
+
+        muxd.fanout_local_output(session, b"live")
+        self.assertEqual(calls, [{"t": "redraw"}])
+        muxd.fanout_local_output(session, b"repaint-that-will-be-evicted")
+        muxd.fanout_local_output(session, b"more-output")
+        muxd.fanout_local_output(session, b"latest-output")
+        self.assertEqual(viewer.gap_seq, 1)
+        self.assertEqual(calls, [{"t": "redraw"}])
+
+        socket = Socket()
+        pump = asyncio.create_task(muxd.pump_local_viewer(socket, session, viewer))
+        try:
+            for _ in range(20):
+                if len(socket.sent) == 2:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertEqual(socket.sent, [b"more-output", b"latest-output"])
+            self.assertEqual(calls, [{"t": "redraw"}, {"t": "redraw"}])
+            muxd.fanout_local_output(session, b"recovered-snapshot")
+            for _ in range(20):
+                if len(socket.sent) == 3:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertEqual(socket.sent[-1], b"recovered-snapshot")
+            self.assertEqual(calls, [{"t": "redraw"}, {"t": "redraw"}])
+        finally:
+            pump.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await pump
 
 
 if __name__ == "__main__":

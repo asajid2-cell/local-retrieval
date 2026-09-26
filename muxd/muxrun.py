@@ -10,6 +10,7 @@ import base64
 import ctypes
 import json
 import os
+import re
 import secrets
 import subprocess
 import sys
@@ -111,8 +112,17 @@ class KEY_EVENT_RECORD(ctypes.Structure):
     ]
 
 
+class MOUSE_EVENT_RECORD(ctypes.Structure):
+    _fields_ = [
+        ("dwMousePosition", COORD),
+        ("dwButtonState", wintypes.DWORD),
+        ("dwControlKeyState", wintypes.DWORD),
+        ("dwEventFlags", wintypes.DWORD),
+    ]
+
+
 class EVENT_UNION(ctypes.Union):
-    _fields_ = [("KeyEvent", KEY_EVENT_RECORD)]
+    _fields_ = [("KeyEvent", KEY_EVENT_RECORD), ("MouseEvent", MOUSE_EVENT_RECORD)]
 
 
 class INPUT_RECORD(ctypes.Structure):
@@ -343,8 +353,12 @@ def attach_existing_console(pid):
         raise RuntimeError("retroactive console attach is Windows-only")
     k = ctypes.windll.kernel32
     k.FreeConsole()
-    if not k.AttachConsole(int(pid)):
-        raise ctypes.WinError()
+    deadline = time.monotonic() + 3
+    while not k.AttachConsole(int(pid)):
+        error = ctypes.WinError()
+        if error.winerror != 6 or time.monotonic() >= deadline:
+            raise error
+        time.sleep(0.05)
 
 
 def open_attached_console(pid):
@@ -482,6 +496,9 @@ def pin_verified_descendants(root):
 
 
 KEY_EVENT = 0x0001
+MOUSE_EVENT_TYPE = 0x0002
+MOUSE_WHEELED = 0x0004
+MOUSE_HWHEELED = 0x0008
 VK_BACK = 0x08
 VK_TAB = 0x09
 VK_RETURN = 0x0D
@@ -497,6 +514,8 @@ VK_RIGHT = 0x27
 VK_DOWN = 0x28
 VK_INSERT = 0x2D
 VK_DELETE = 0x2E
+
+SGR_MOUSE_REPORT = re.compile(rb"\x1b\[<([0-9]+);([0-9]+);([0-9]+)[Mm]")
 
 VT_KEY_SEQUENCES = {
     b"\x1b[A": (VK_UP, "", 0),
@@ -632,45 +651,59 @@ def visible_size():
         except OSError:
             return 120, 30
     k = ctypes.windll.kernel32
-    info = CONSOLE_SCREEN_BUFFER_INFO()
-    h = k.GetStdHandle(STD_OUTPUT_HANDLE)
-    if k.GetConsoleScreenBufferInfo(h, ctypes.byref(info)):
-        return (
-            int(info.srWindow.Right - info.srWindow.Left + 1),
-            int(info.srWindow.Bottom - info.srWindow.Top + 1),
-        )
-    return 120, 30
+    k.CreateFileW.restype = wintypes.HANDLE
+    h = k.CreateFileW("CONOUT$", 0x80000000, 3, None, 3, 0, None)
+    if not h or h == INVALID_HANDLE_VALUE:
+        return 120, 30
+    try:
+        info = CONSOLE_SCREEN_BUFFER_INFO()
+        if k.GetConsoleScreenBufferInfo(h, ctypes.byref(info)):
+            return (
+                int(info.srWindow.Right - info.srWindow.Left + 1),
+                int(info.srWindow.Bottom - info.srWindow.Top + 1),
+            )
+        return 120, 30
+    finally:
+        k.CloseHandle(h)
 
 
 def read_visible_screen():
     if os.name != "nt":
         return visible_size()[0], visible_size()[1], ""
     k = ctypes.windll.kernel32
-    h = k.GetStdHandle(STD_OUTPUT_HANDLE)
-    info = CONSOLE_SCREEN_BUFFER_INFO()
-    if not k.GetConsoleScreenBufferInfo(h, ctypes.byref(info)):
-        cols, rows = visible_size()
-        return cols, rows, ""
-    left, top = int(info.srWindow.Left), int(info.srWindow.Top)
-    cols = int(info.srWindow.Right - info.srWindow.Left + 1)
-    rows = int(info.srWindow.Bottom - info.srWindow.Top + 1)
-    lines = []
-    read = wintypes.DWORD()
-    for y in range(rows):
-        buf = ctypes.create_unicode_buffer(cols)
-        coord = COORD(left, top + y)
-        ok = k.ReadConsoleOutputCharacterW(h, buf, cols, coord, ctypes.byref(read))
-        if not ok:
-            lines.append("")
-        else:
-            lines.append(buf.value[: int(read.value)].rstrip())
-    return cols, rows, "\r\n".join(lines)
+    k.CreateFileW.restype = wintypes.HANDLE
+    h = k.CreateFileW("CONOUT$", 0x80000000, 3, None, 3, 0, None)
+    if not h or h == INVALID_HANDLE_VALUE:
+        return None
+    try:
+        info = CONSOLE_SCREEN_BUFFER_INFO()
+        if not k.GetConsoleScreenBufferInfo(h, ctypes.byref(info)):
+            return None
+        left, top = int(info.srWindow.Left), int(info.srWindow.Top)
+        cols = int(info.srWindow.Right - info.srWindow.Left + 1)
+        rows = int(info.srWindow.Bottom - info.srWindow.Top + 1)
+        lines = []
+        read = wintypes.DWORD()
+        for y in range(rows):
+            buf = ctypes.create_unicode_buffer(cols)
+            coord = COORD(left, top + y)
+            ok = k.ReadConsoleOutputCharacterW(h, buf, cols, coord, ctypes.byref(read))
+            if not ok or read.value != cols:
+                return None
+            lines.append(buf[: int(read.value)].replace("\x00", " ").rstrip())
+        return cols, rows, "\r\n".join(lines)
+    finally:
+        k.CloseHandle(h)
 
 
 def repaint_frame(cols, rows, text):
-    # Remote is a mirror, so repainting the visible screen is acceptable. Local output
-    # is not touched; the child owns the local terminal directly.
-    return ("\x1b[?25l\x1b[2J\x1b[H" + text + "\x1b[?25h").encode("utf-8", "replace")
+    # Address each row independently: CRLF after a full-width line may wrap twice and
+    # displace the footer. The child owns the local terminal; only the mirror is repainted.
+    lines = text.split("\r\n")
+    frame = "\x1b[?25l\x1b[2J" + "".join(
+        f"\x1b[{y + 1};1H{line}" for y, line in enumerate(lines[:rows])
+    ) + "\x1b[?25h"
+    return frame.encode("utf-8", "replace")
 
 
 def vk_for_char(ch):
@@ -733,17 +766,46 @@ def console_key_events(data: bytes):
 
 def input_records(data: bytes):
     records = []
-    for vk, out_ch, control_state in console_key_events(data):
-        for down in (True, False):
+    offset = 0
+    while offset < len(data):
+        mouse = SGR_MOUSE_REPORT.search(data, offset)
+        end = mouse.start() if mouse else len(data)
+        for vk, out_ch, control_state in console_key_events(data[offset:end]):
+            for down in (True, False):
+                rec = INPUT_RECORD()
+                rec.EventType = KEY_EVENT
+                rec.Event.KeyEvent.bKeyDown = bool(down)
+                rec.Event.KeyEvent.wRepeatCount = 1
+                rec.Event.KeyEvent.wVirtualKeyCode = vk
+                rec.Event.KeyEvent.wVirtualScanCode = 0
+                rec.Event.KeyEvent.uChar.UnicodeChar = out_ch or "\x00"
+                rec.Event.KeyEvent.dwControlKeyState = control_state
+                records.append(rec)
+        if not mouse:
+            break
+        button = int(mouse.group(1))
+        if not (button & 32) and ((button & 64) or (button & 3) < 3):
             rec = INPUT_RECORD()
-            rec.EventType = KEY_EVENT
-            rec.Event.KeyEvent.bKeyDown = bool(down)
-            rec.Event.KeyEvent.wRepeatCount = 1
-            rec.Event.KeyEvent.wVirtualKeyCode = vk
-            rec.Event.KeyEvent.wVirtualScanCode = 0
-            rec.Event.KeyEvent.uChar.UnicodeChar = out_ch or "\x00"
-            rec.Event.KeyEvent.dwControlKeyState = control_state
+            rec.EventType = MOUSE_EVENT_TYPE
+            rec.Event.MouseEvent.dwMousePosition = COORD(
+                max(0, min(32767, int(mouse.group(2)) - 1)),
+                max(0, min(32767, int(mouse.group(3)) - 1)),
+            )
+            rec.Event.MouseEvent.dwButtonState = (
+                ((120 if (button & 3) in (0, 3) else -120) & 0xffff) << 16 if button & 64 else
+                0 if data[mouse.end() - 1:mouse.end()] == b"m" else (1, 4, 2)[button & 3]
+            )
+            rec.Event.MouseEvent.dwControlKeyState = (
+                (SHIFT_PRESSED if button & 4 else 0)
+                | (LEFT_ALT_PRESSED if button & 8 else 0)
+                | (LEFT_CTRL_PRESSED if button & 16 else 0)
+            )
+            rec.Event.MouseEvent.dwEventFlags = (
+                MOUSE_HWHEELED if button & 64 and button & 2 else
+                MOUSE_WHEELED if button & 64 else 0
+            )
             records.append(rec)
+        offset = mouse.end()
     return records
 
 
@@ -755,21 +817,27 @@ def write_console_input(data: bytes):
     if os.name != "nt" or not data:
         return False
     k = ctypes.windll.kernel32
-    hin = k.GetStdHandle(STD_INPUT_HANDLE)
-    mode = ctypes.c_uint()
-    if k.GetConsoleMode(hin, ctypes.byref(mode)) and should_generate_ctrl_c(data, mode.value):
-        if k.GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0):
-            return True
-    records = input_records(data)
-    if not records:
+    k.CreateFileW.restype = wintypes.HANDLE
+    hin = k.CreateFileW("CONIN$", 0xC0000000, 3, None, 3, 0, None)
+    if not hin or hin == INVALID_HANDLE_VALUE:
         return False
-    arr = (INPUT_RECORD * len(records))(*records)
-    written = wintypes.DWORD()
-    ok = bool(k.WriteConsoleInputW(hin, arr, len(records), ctypes.byref(written)))
-    return ok and int(written.value) == len(records)
+    try:
+        mode = ctypes.c_uint()
+        if k.GetConsoleMode(hin, ctypes.byref(mode)) and should_generate_ctrl_c(data, mode.value):
+            if k.GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0):
+                return True
+        records = input_records(data)
+        if not records:
+            return False
+        arr = (INPUT_RECORD * len(records))(*records)
+        written = wintypes.DWORD()
+        ok = bool(k.WriteConsoleInputW(hin, arr, len(records), ctypes.byref(written)))
+        return ok and int(written.value) == len(records)
+    finally:
+        k.CloseHandle(hin)
 
 
-async def listen_remote(ws, child):
+async def listen_remote(ws, child, redraw=None):
     async for raw in ws:
         try:
             import json
@@ -789,6 +857,9 @@ async def listen_remote(ws, child):
                     "rid": str(m.get("rid")),
                     "ok": bool(ok),
                 }))
+        elif m.get("t") == "redraw":
+            if redraw is not None:
+                redraw.set()
         elif m.get("t") == "kill":
             if isinstance(child, AttachedChild):
                 child.tree_stop_in_progress = True
@@ -888,18 +959,25 @@ def terminate_child_tree(child):
     return child.poll() is not None
 
 
-async def screen_pump(ws, stop):
+async def screen_pump(ws, stop, redraw=None):
     import json
 
     last = None
     last_size = None
     while not stop.is_set():
-        cols, rows, text = read_visible_screen()
+        snapshot = read_visible_screen()
+        if snapshot is None:
+            await asyncio.sleep(0.12)
+            continue
+        cols, rows, text = snapshot
         size = (cols, rows)
+        previous_size = last_size
         if size != last_size:
             await ws.send(json.dumps({"t": "size", "cols": cols, "rows": rows}))
             last_size = size
-        if text != last:
+        if text != last or size != previous_size or (redraw is not None and redraw.is_set()):
+            if redraw is not None:
+                redraw.clear()
             frame = repaint_frame(cols, rows, text)
             await ws.send(json.dumps({"t": "o", "d": base64.b64encode(frame).decode("ascii")}))
             last = text
@@ -987,9 +1065,10 @@ async def run_owner_link(ws, child):
     import json
 
     stop = asyncio.Event()
+    redraw = asyncio.Event()
     tasks = [
-        asyncio.create_task(listen_remote(ws, child)),
-        asyncio.create_task(screen_pump(ws, stop)),
+        asyncio.create_task(listen_remote(ws, child, redraw)),
+        asyncio.create_task(screen_pump(ws, stop, redraw)),
         asyncio.create_task(wait_child(child)),
     ]
     try:

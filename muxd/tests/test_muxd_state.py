@@ -113,6 +113,30 @@ class MuxdStateTests(unittest.TestCase):
             events,
         )
 
+    def test_redraw_nudge_only_resizes_an_alt_screen_pty(self):
+        class Pty:
+            def __init__(self):
+                self.sizes = []
+
+            def setwinsize(self, rows, cols):
+                self.sizes.append((rows, cols))
+
+        class Session:
+            def __init__(self):
+                self.cols, self.rows = 80, 24
+                self.replay_state = muxd.TerminalReplayState()
+                self.pty = Pty()
+                self._last_nudge = 0
+
+        session = Session()
+        muxd.redraw_nudge(session)
+        self.assertEqual(session.pty.sizes, [])
+        session.replay_state.ingest(b'\x1b[?1049h')
+        muxd.redraw_nudge(session)
+        self.assertEqual(session.pty.sizes, [(23, 80), (24, 80)])
+        muxd.redraw_nudge(session)
+        self.assertEqual(len(session.pty.sizes), 2)
+
     def test_remote_size_ownership_blocks_local_resize_and_release_restores_it(self):
         class SizedSession:
             def __init__(self):

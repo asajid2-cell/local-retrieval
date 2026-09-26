@@ -1033,14 +1033,13 @@ function recoverTerminalPaint(reason){
 // The class NEITHER check above can see. domRowsLosingBufferText() compares DOM against BUFFER, so an app
 // that drew its frames for a NARROWER grid than this surface has reads as healthy: every row stops short of
 // term.cols with black to the right, and the buffer agrees with the DOM. A repaint re-renders that same
-// buffer and changes nothing; what clears it is a size change - a SIGWINCH to the app and a full redraw -
-// which is precisely why the remedy that works by hand is the fullscreen toggle.
+// buffer and changes nothing; request a fresh owner snapshot or nudge the headless PTY to redraw.
+// A fullscreen toggle also forces a new frame, but a repeated viewport report does not.
 //
-// A full-screen (alternate-buffer) app fills its grid: borders, a status bar, a full-width pane. So this
-// fires only when essentially EVERY judged row stops short AND they all end in the same narrow band, which
-// a shell prompt (not the alternate buffer) or a centred dialog (ragged, with full-width rows around it)
-// does not satisfy. Judged only while the pump is idle, so a mid-redraw frame is never mistaken for a
-// settled one.
+// Many full-screen apps fill their grid: borders, a status bar, a full-width pane. This heuristic
+// fires only when essentially EVERY judged row stops short, but sparse full-screen layouts can also
+// trigger it; the recovery is bounded and never treated as proof that the app drew the wrong size.
+// Judged only while the pump is idle, so a mid-redraw frame is not mistaken for a settled one.
 function staleFrameWidth(){
   if(!current || $('#empty').style.display!=='none') return null;
   if(termWriting || terminalWriteActive) return null;
@@ -1068,13 +1067,12 @@ function staleFrameWidth(){
   if(short/judged<0.9 || cols-maxW<4) return null;
   return { cols, rows:term.rows, judged, short, maxW };
 }
-// ONE home for "the surface is wrong, repair it". A repaint repairs a stale renderer; the re-fit is what
-// repairs a frame drawn at a stale width, because only a size change reaches the app. Both are cheap and
-// idempotent, and doing them together is exactly what the fullscreen toggle - the remedy that works today -
-// does, so the automatic path and the manual one cannot disagree.
+// A repaint fixes DOM loss; a stale app frame needs the PC's TUI to redraw its own screen.
+// Reporting the same viewport size again does not resize the PTY and cannot repair that frame.
 function healDetectedPaintFault(reason, kind){
   recoverTerminalPaint((reason||'paint-check')+':'+kind);
   scheduleViewportFit(0);
+  if(kind==='stale-width') send('R', '');
 }
 let staleWidthLastActedAt=0, staleWidthLastKey='';
 function verifyTerminalPaint(reason){
@@ -1091,8 +1089,8 @@ function verifyTerminalPaint(reason){
     const w=staleFrameWidth();
     if(!w) return;
     window.__muxLastStaleWidth={ at:Date.now(), reason:reason||'paint-check', ...w };
-    // Retry the same width at most every 10s: the fault is persistent, so hammering the fit every 2s would
-    // only churn if the size is already correct and something else is wrong.
+    // Retry the same width at most every 10s: avoid repainting and requesting a full frame
+    // every watchdog tick when the app legitimately leaves its alternate grid sparse.
     const key=w.cols+':'+w.maxW;
     if(key===staleWidthLastKey && Date.now()-staleWidthLastActedAt<10000) return;
     staleWidthLastKey=key; staleWidthLastActedAt=Date.now();
@@ -1328,6 +1326,7 @@ function pumpTermWrite(){
           termWriteViewportState=null;
       }, 'write');
       schedulePaintHeal(40);
+      if(isMobile() && winSize && viewportFit && winSize.rows>viewportFit.rows+1) scheduleTerminalSurfaceAlign();
       showJump();
     });
   }catch(e){
@@ -1369,7 +1368,7 @@ setInterval(()=>{
 // "Reload terminal", the header refresh icon, and the wedge-watchdog above.
 function reloadTerminal(quiet){
   const name=current; if(!name){ loadSessions(); return; }
-  autoFreeze=false; selectMode=false; _frozenBuf=[]; _wedgeStrikes=0;
+  autoFreeze=false; selectMode=false; _frozenBuf=[]; _frozenBytes=0; _frozenLost=false; _wedgeStrikes=0;
   $('#term').classList.remove('selecting');
   try{ term.clearSelection(); }catch(e){}
   try{ term.write('\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l\x1b[?2004l\x1b[?1049l\x1b[?25h'); }catch(e){}
@@ -1377,7 +1376,7 @@ function reloadTerminal(quiet){
   connect(name, true);   // re-attach: CLEAR + scrollback replay + live, all client state reset
 }
 document.addEventListener('keydown', e=>{ if(e.ctrlKey && e.altKey && (e.key==='r'||e.key==='R')){ e.preventDefault(); e.stopPropagation(); reloadTerminal(); } }, true);
-window.__muxBuild='2026-09-24-stale-width-heal';   // bump per web deploy so a loaded version is verifiable
+window.__muxBuild='2026-09-26-phone-follows-app-redraw';   // bump per web deploy so a loaded version is verifiable
 try{ console.info('multiplex build', window.__muxBuild); }catch(e){}
 const helper = $('#term').querySelector('.xterm-helper-textarea');
 function hardenHelperTextarea(){
@@ -1505,8 +1504,7 @@ function maybeUnfreezeSelection(){
   if(!autoFreeze || selectMode) return false;   // selectMode is the phone's explicit Sel toggle — it owns its own unfreeze
   if(termHasSelection()) return false;          // drag-latch: text is still highlighted → stay frozen
   autoFreeze = false;
-  flushFrozen();
-  return true;
+  return flushFrozen();
 }
 // Wired to term.onSelectionChange: a selection born from a plain mouse drag latches the freeze exactly like
 // the explicit Sel toggle does, and clearing it (click away / new click) goes live again + replays.
@@ -1542,7 +1540,9 @@ function copySelectionNow(){
 (function(){
   const scr = $('#term');
   // freeze as soon as the mouse goes down, so the drag-select can't be repainted away mid-gesture
-  scr.addEventListener('mousedown', e=>{ if(e.button===0 && !selectMode) autoFreeze=true; }, true);
+  scr.addEventListener('mousedown', e=>{
+    if(e.button===0 && !selectMode && (!isVisibleOwner() || forceSelectGesture(e))) autoFreeze=true;
+  }, true);
   // a click that makes no selection (just focusing) goes live again + replays whatever was buffered;
   // a drag that DID select stays frozen and, if auto-copy is armed, copies itself on release
   scr.addEventListener('mouseup', ()=>{ setTimeout(()=>{ if(!maybeUnfreezeSelection()) autoCopyIfArmed(); }, 0); }, true);
@@ -1644,9 +1644,25 @@ function markActive(){ lastInputAt = Date.now(); }
 function actFlag(){ return (Date.now()-lastInputAt < 180000) ? 1 : 0; }
 let selectMode = false;            // when ON, the terminal FREEZES so text can be selected (a live repaint clears it)
 let _frozenBuf = [];               // output that arrived while frozen, buffered so the highlight survives; flushed on unfreeze
+let _frozenBytes = 0;
+let _frozenLost = false;
+const FROZEN_MAX_BYTES = 4 * 1024 * 1024;
 let autoFreeze = false;            // desktop: auto-frozen because a mouse selection is in progress (no "Sel" press needed)
 const isFrozen = ()=> selectMode || autoFreeze;
-function flushFrozen(){ const buf=_frozenBuf; _frozenBuf=[]; for(const chunk of buf){ enqueueTermWrite(chunk); } }
+function flushFrozen(){
+  const buf=_frozenBuf, lost=_frozenLost;
+  _frozenBuf=[]; _frozenBytes=0; _frozenLost=false;
+  if(lost){ reloadTerminal(true); return false; }
+  for(const chunk of buf) enqueueTermWrite(chunk);
+  return true;
+}
+function bufferFrozenOutput(out){
+  _frozenBuf.push(out); _frozenBytes+=out.byteLength;
+  while(_frozenBytes>FROZEN_MAX_BYTES && _frozenBuf.length){
+    _frozenBytes-=_frozenBuf.shift().byteLength;
+    _frozenLost=true;
+  }
+}
 function cellMetrics(){
   try { const d = term._core._renderService.dimensions.css.cell; if (d && d.height) return { w:d.width, h:d.height }; } catch(e){}
   return { w: fontSize*0.6, h: fontSize*1.2 };
@@ -1670,7 +1686,7 @@ function scheduleTerminalSurfaceAlign(){
   if(surfaceAlignRaf) cancelAnimationFrame(surfaceAlignRaf);
   surfaceAlignRaf=requestAnimationFrame(()=>{ surfaceAlignRaf=0; alignTerminalSurface(); });
 }
-let wasRowOverflow=false;
+let wasRowOverflow=false, alignedContentRow=-1, alignedScrollTop=0;
 function alignTerminalSurface(){
   const host=$('#term'), xt=host.querySelector('.xterm');
   if(!xt) return;
@@ -1679,7 +1695,7 @@ function alignTerminalSurface(){
   if(!rowOverflow){
     xt.style.transform='';
     if(wasRowOverflow) host.scrollTop=0;
-    wasRowOverflow=false;
+    wasRowOverflow=false; alignedContentRow=-1; alignedScrollTop=0;
     return;
   }
   xt.style.transform='';
@@ -1690,12 +1706,30 @@ function alignTerminalSurface(){
   if(!visibleH || !renderedH || renderedH<=visibleH+2){
     host.classList.remove('rowpan');
     host.scrollTop=0;
-    wasRowOverflow=false;
+    wasRowOverflow=false; alignedContentRow=-1; alignedScrollTop=0;
     return;
+  }
+  const buffer=term.buffer.active;
+  let lastContentRow=0;
+  for(let row=0; row<term.rows; row++){
+    if(buffer.getLine(row)?.translateToString(true).trim()) lastContentRow=row;
   }
   const maxScroll=Math.max(0, host.scrollHeight-host.clientHeight);
   const nearBottom=host.scrollTop>=maxScroll-8;
-  if(!wasRowOverflow || nearBottom || Date.now()-userScrolledAt>1200) host.scrollTop=maxScroll;
+  // Follow the app's content when it MOVES. The old guard was a 1.2s window off the user's last scroll, so a
+  // redraw that landed just after a swipe was never followed AND never retried - once output stopped, the
+  // phone stayed parked at the top while the app's real footer sat below the fold. "The user parked the view"
+  // is instead read from the offset itself: wherever WE last left it is ours to keep following, and any other
+  // offset that is not at the bottom is the user's, so we leave it alone until they come back down. We only
+  // absorb the offset while following, so a parked view stays parked instead of being reclaimed next tick.
+  const userMoved = Math.abs(host.scrollTop-alignedScrollTop)>2;
+  if(!(userMoved && !nearBottom)){
+    if(lastContentRow!==alignedContentRow || !wasRowOverflow || nearBottom){
+      host.scrollTop=Math.min(maxScroll, Math.max(0, (lastContentRow+1)*(cellMetrics().h||18)-visibleH));
+      alignedContentRow=lastContentRow;
+    }
+    alignedScrollTop=host.scrollTop;
+  }
   wasRowOverflow=true;
 }
 function onControl(s){
@@ -1850,15 +1884,16 @@ window.addEventListener('orientationchange', ()=>setTimeout(applyViewport,250));
     if(Math.abs(dy)>=Math.abs(dx)){
       const ch=cellMetrics().h||18; accY+=dy; accY=Math.max(-ch*8, Math.min(ch*8, accY)); const lines=Math.trunc(accY/ch);
       if(lines){
-        noteUserScroll();
         // Normal buffer (shell, claude transcript): scroll xterm's own scrollback.
         // Alternate buffer (codex / claude full-screen TUI) has NO scrollback, so scrollLines is a silent
         // no-op there ("can't read up"). Forward a wheel event instead and let xterm hand the app its
         // mouse-wheel / alternate-scroll sequence — the app scrolls its own transcript.
-        if(term.buffer.active.type==='alternate'){
-          scrollAlternate(-lines*ch);
-        } else {
-          try{ term.scrollLines(-lines); }catch(e){}
+        // Only the xterm-scrollback branch moves THIS viewport, so only it records a user scroll. The two
+        // app-owned branches leave the surface where it was, and claiming otherwise parked the phone off
+        // the app's real content: the app's redraw then looked like it was fighting a user scroll-up.
+        if(!sendOwnerWheel(-lines*ch, t.clientX, t.clientY)){
+          if(term.buffer.active.type==='alternate') scrollAlternate(-lines*ch);
+          else { noteUserScroll(); try{ term.scrollLines(-lines); }catch(e){} }
         }
         accY-=lines*ch;
       }
@@ -1869,16 +1904,28 @@ window.addEventListener('orientationchange', ()=>setTimeout(applyViewport,250));
   host.addEventListener('touchend', ()=>{ active=false; }, {passive:true});
 })();
 
-// Wheel scrolling that CAN'T get stuck. Runs at capture phase (before xterm's own handler), so a stuck
-// mouse-tracking mode (which would otherwise send the wheel to the app as a mouse event, freezing the
-// scrollback) can never eat it. In a NORMAL buffer we scroll xterm's scrollback OURSELVES and stop the
-// event; only in the ALTERNATE buffer (full-screen TUI with no scrollback) do we forward the wheel so the
-// app scrolls its own view.
+function isVisibleOwner(){ return !!(current && findSession(current)?.owner); }
+function sendOwnerWheel(deltaY, clientX, clientY){
+  if(!isVisibleOwner() || !deltaY) return false;
+  const cell=bufferCellAt(clientX, clientY);
+  if(!cell) return false;
+  const button=deltaY<0 ? 64 : 65;
+  const ticks=Math.min(8, Math.max(1, Math.round(Math.abs(deltaY)/120)));
+  const report=`\x1b[<${button};${cell[0]+1};${cell[1]-(term.buffer.active.viewportY|0)+1}M`;
+  for(let i=0; i<ticks; i++) sendMouseInput(report);
+  return true;
+}
+// Owner-backed consoles forward wheel records directly; their browser mirror has no pre-attach VT
+// mode history. Headless sessions keep xterm scrollback in the normal buffer and app scrolling in alt.
 $('#term').addEventListener('wheel', e=>{
   if(!e.isTrusted) return;   // synthetic forwarding must reach xterm, not recurse through this capture handler
   if(!(e.deltaX || e.deltaY)) return;
   noteUserScroll();
   const host=$('#term'), xt=host.querySelector('.xterm');
+  if(isVisibleOwner() && sendOwnerWheel(e.deltaY, e.clientX, e.clientY)){
+    e.preventDefault(); e.stopPropagation();
+    return;
+  }
   let alt=false; try{ alt = term.buffer.active.type==='alternate'; }catch(_){}
   if(!alt){
     const ch=(cellMetrics().h)||18;
@@ -2345,10 +2392,30 @@ function forceSelEnd(){
 try{ window.__muxForceSel = forceSel; }catch(e){}
 (function(){
   const host=$('#term');
+  let ownerPress=null;
   host.addEventListener('mousedown', e=>{
-    if(e.button!==0 || !appOwnsMouse() || !forceSelectGesture(e)) return;
+    if(e.button!==0 || !(appOwnsMouse() || isVisibleOwner()) || !forceSelectGesture(e)) return;
     if(!forceSelStart(e.clientX, e.clientY)) return;
     e.preventDefault(); e.stopPropagation();   // xterm must not turn a selection into a report to the app
+  }, true);
+  host.addEventListener('mousedown', e=>{
+    if(e.button>2 || !isVisibleOwner() || forceSelectGesture(e)) return;
+    const cell=bufferCellAt(e.clientX,e.clientY);
+    if(!cell) return;
+    const button=[0,1,2][e.button];
+    const report=`\x1b[<${button};${cell[0]+1};${cell[1]-(term.buffer.active.viewportY|0)+1}M`;
+    ownerPress={button, cell, session:current};
+    sendMouseInput(report);
+    e.preventDefault(); e.stopPropagation();
+  }, true);
+  document.addEventListener('mouseup', e=>{
+    if(!ownerPress) return;
+    const press=ownerPress;
+    ownerPress=null;
+    if(current!==press.session) return;
+    const cell=bufferCellAt(e.clientX,e.clientY) || press.cell;
+    sendMouseInput(`\x1b[<${press.button};${cell[0]+1};${cell[1]-(term.buffer.active.viewportY|0)+1}m`);
+    e.preventDefault(); e.stopPropagation();
   }, true);
   // The drag and its release live on the document: the gesture is allowed to leave the terminal.
   document.addEventListener('mousemove', e=>{ if(forceSel.active) forceSelTrack(e.clientX, e.clientY); }, true);
@@ -2365,7 +2432,7 @@ try{ window.__muxForceSel = forceSel; }catch(e){}
   // The phone's Sel toggle is the same gesture with a finger. While the app owns the mouse a touch drag
   // cannot fall through to xterm - this build has no touch selection at all - so it comes here instead.
   host.addEventListener('touchstart', e=>{
-    if(!selectMode || !appOwnsMouse() || e.touches.length!==1) return;
+    if(!selectMode || !(appOwnsMouse() || isVisibleOwner()) || e.touches.length!==1) return;
     const t=e.touches[0];
     if(!forceSelStart(t.clientX, t.clientY)) return;
     e.preventDefault(); e.stopPropagation();
@@ -2468,7 +2535,7 @@ $('#scrollstate').addEventListener('click', explainScrollAffordance);
 // selection first, flushes buffered output, then pins to the bottom across the next two frames so it lands
 // even while a write is settling. Bound to the ↓ keybar button, the desktop header ⤓ icon, and the pill.
 function forceJumpBottom(){
-  if(autoFreeze || selectMode){ autoFreeze=false; selectMode=false; $('#term').classList.remove('selecting'); try{ term.clearSelection(); }catch(e){} flushFrozen(); }
+  if(autoFreeze || selectMode){ autoFreeze=false; selectMode=false; $('#term').classList.remove('selecting'); try{ term.clearSelection(); }catch(e){} if(!flushFrozen()) return; }
   userScrolledAt=0;   // don't let the viewport-restore logic treat this as a recent manual scroll-up
   const go=()=>{
     try{ viewportRestoreApplying=true; term.scrollToBottom(); }catch(e){} finally{ viewportRestoreApplying=false; }
@@ -2541,7 +2608,7 @@ function connect(name, isRetry){
   current = name; LS.set('mux_last', name); markRead(name);
   $('#empty').style.display='none';
   clearTermWriteQueue();
-  autoFreeze=false; selectMode=false; _frozenBuf=[];
+  autoFreeze=false; selectMode=false; _frozenBuf=[]; _frozenBytes=0; _frozenLost=false;
   $('#term').classList.remove('selecting');
   try{ term.clearSelection(); }catch(e){}
   buildKeybar();
@@ -2576,7 +2643,7 @@ function connect(name, isRetry){
       if(typeof e.data==='string'){ onControl(e.data); return; }     // control frame: shared window size
       const out = new Uint8Array(e.data);
       noteSessionOutput(out);   // mouse-mode tracking + leak detection, BEFORE the frozen path can swallow it
-      if(isFrozen()){ _frozenBuf.push(out); if(_frozenBuf.length>6000) _frozenBuf.splice(0, _frozenBuf.length-6000); return; }   // FROZEN for selection: buffer output; a repaint would wipe the highlight
+      if(isFrozen()){ bufferFrozenOutput(out); return; }   // FROZEN for selection: buffer output; a repaint would wipe the highlight
       const wasBottom=atBottom(); enqueueTermWrite(out); markReadLive();
       if(!wasBottom){ newLines += 1; showJump(); } };
     sock.onclose = ev => {
@@ -3527,7 +3594,8 @@ function toggleSelect(){
   buildKeybar();
   if(selectMode){ flash('FROZEN — drag to select (hold Shift if the app grabs the mouse), then Copy'); }
   else {
-    autoFreeze=false; flushFrozen();                  // unfreeze: replay the output that arrived while frozen
+    autoFreeze=false;                          // unfreeze: replay intact output or reattach after overflow
+    if(!flushFrozen()) return;
     try{ term.scrollToBottom(); }catch(e){}
     term.focus(); flash('Live again');
   }

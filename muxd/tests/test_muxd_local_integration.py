@@ -10,6 +10,7 @@ import sys
 import tempfile
 import time
 import unittest
+import urllib.request
 from pathlib import Path
 from ctypes import wintypes
 
@@ -635,6 +636,315 @@ class MuxdLocalIntegrationTests(unittest.TestCase):
             self.wait_for_tail(name, marker)
         finally:
             self.kill(name)
+
+    def test_visible_owner_real_browser_gestures_and_recovery(self):
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError:
+            self.skipTest("Playwright is required for the real-browser integration")
+        relay_root = REPO.parent / "relay"
+        relay_port = free_port()
+        name = "it-owner-browser-interaction"
+        session_id = f"browser-footer-{int(time.time() * 1000)}"
+        target = None
+        sidecar = None
+        relay = None
+        private_muxd = None
+        root = Path(tempfile.mkdtemp(prefix="mux-owner-browser-"))
+        screenshot = root.with_suffix('.png')
+        mobile_screenshot = root.with_name(root.name + '-mobile.png')
+        bottom_screenshot = root.with_name(root.name + '-mobile-bottom.png')
+        try:
+            relay_state = root / "relay-state"
+            relay_state.mkdir()
+            relay_env = dict(os.environ)
+            relay_env.update(PORT=str(relay_port), MUX_HOST_TOKEN="test-token",
+                             MUX_TEST_MODE="1", MUX_TEST_FIXTURE="1", MUX_BIND_HOST="127.0.0.1",
+                             MUX_AUTOHEAL="0", MUX_STATE_DIR=str(relay_state),
+                             ALLOWED_WS_ORIGINS=f"http://127.0.0.1:{relay_port}",
+                             HLAUTH_BASE="http://127.0.0.1:1")
+            relay = subprocess.Popen(["node", "server.js"], cwd=relay_root, env=relay_env,
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                                     creationflags=CREATE_NO_WINDOW)
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline:
+                if relay.poll() is not None:
+                    self.fail(f"relay exited early: {relay.stderr.read()}")
+                try:
+                    urllib.request.urlopen(f"http://127.0.0.1:{relay_port}/api/health", timeout=1).close()
+                    break
+                except Exception:
+                    time.sleep(0.1)
+            else:
+                self.fail("test relay did not start")
+
+            profile_root = root / "profile"
+            profile_root.mkdir()
+            state = profile_root / "state"
+            state.mkdir()
+            control_port = free_port()
+            env_file = profile_root / "profile.env"
+            env_file.write_text("\n".join(f"{key}={value}" for key, value in {
+                "MUXD_STATE_ROOT": state,
+                "MUXD_CONTROL_PORT": control_port,
+                "MUXD_MUTEX_NAME": f"Local\\MuxOwnerBrowser-{control_port}",
+                "MUXD_PRINCIPAL_REGISTRY": profile_root / "principal.dpapi",
+                "MUXD_PRINCIPAL_INSTANCE_ID": f"browser-principal-{control_port}",
+                "MUXD_HOST_IDENTITY": f"browser-host-{control_port}",
+                "MUXD_RELAY_URLS": f"ws://127.0.0.1:{relay_port}/host",
+                "MUXD_TOKEN_SOURCE": "env:MUX_HOST_TOKEN",
+                "MUXD_LAUNCH_CLAIM_ROOT": profile_root / "claims",
+                "MUXD_TASK_NAME": f"MuxBrowser-{control_port}",
+                "MUXD_RESTART_TASK_NAME": f"MuxBrowserRestart-{control_port}",
+                "MUXD_WATCHDOG_TASK_NAME": f"MuxBrowserWatchdog-{control_port}",
+                "MUXD_GUARDIAN_DISABLED": "1",
+                "DEFAULT_CWD": root,
+            }.items()), encoding="utf-8")
+            env = dict(os.environ)
+            env.update(MUXD_PROFILE="browser-it", MUXD_RUNTIME_ROOT=str(profile_root / "runtime"),
+                       MUXD_ENV_FILE=str(env_file), MUX_HOST_TOKEN="test-token",
+                       MUXCTL_AUTOSTART="0")
+            private_muxd = subprocess.Popen([sys.executable, str(MUXD), "--profile", "browser-it"],
+                                            cwd=REPO, env=env, stdout=subprocess.DEVNULL,
+                                            stderr=subprocess.DEVNULL, creationflags=CREATE_NO_WINDOW)
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline:
+                if private_muxd.poll() is not None:
+                    self.fail(f"isolated muxd exited: {private_muxd.returncode}")
+                try:
+                    if run_request(control_port, {"t": "info"}, timeout=1).get("t") == "info":
+                        break
+                except Exception:
+                    time.sleep(0.1)
+            else:
+                self.fail("isolated muxd did not start")
+            fake_codex = root / "codex.exe"
+            shutil.copy2(sys.executable, fake_codex)
+            console_app = r"""import ctypes,sys
+sys.path.insert(0,sys.argv[1]); import muxrun
+k=ctypes.windll.kernel32
+k.CreateFileW.restype=ctypes.c_void_p
+out=k.CreateFileW('CONOUT$',0xC0000000,3,None,3,0,None)
+hin=k.CreateFileW('CONIN$',0xC0000000,3,None,3,0,None)
+mode=ctypes.c_uint()
+if not k.GetConsoleMode(out,ctypes.byref(mode)): raise ctypes.WinError()
+if not k.SetConsoleMode(out,mode.value|muxrun.ENABLE_VIRTUAL_TERMINAL_PROCESSING): raise ctypes.WinError()
+if not k.GetConsoleMode(hin,ctypes.byref(mode)): raise ctypes.WinError()
+if not k.SetConsoleMode(hin,(mode.value|0x0010|0x0080)&~0x0040): raise ctypes.WinError()
+def write(text):
+    n=ctypes.c_uint()
+    if not k.WriteConsoleW(out,text,len(text),ctypes.byref(n),None): raise ctypes.WinError()
+write('\x1b[?1049h\x1b[?1000h\x1b[?1006h'+'VISIBLE FOOTER\x1b[8;1HWHEEL=0 CLICK=0 KEY=0')
+wheel=click=release=key=0
+bottom=False
+last='-'
+records=(muxrun.INPUT_RECORD*16)(); count=ctypes.c_uint()
+while k.ReadConsoleInputW(hin,records,16,ctypes.byref(count)):
+    for i in range(count.value):
+        r=records[i]
+        if r.EventType==muxrun.MOUSE_EVENT_TYPE:
+            m=r.Event.MouseEvent
+            if m.dwEventFlags==muxrun.MOUSE_WHEELED: wheel+=1
+            elif m.dwButtonState==1:
+                click+=1
+                last='%d,%d'%(m.dwMousePosition.X+1,m.dwMousePosition.Y+1)
+            elif m.dwButtonState==0: release+=1
+        elif r.EventType==muxrun.KEY_EVENT and r.Event.KeyEvent.bKeyDown:
+            key+=1
+            if r.Event.KeyEvent.uChar.UnicodeChar=='b':
+                bottom=True
+                write('\x1b[2J\x1b[H')
+                write('\x1b[51;1HBOTTOM FOOTER')
+    write('\x1b[8;1HWHEEL=%d CLICK=%d KEY=%d REL=%d %s\x1b[K'%(wheel,click,key,release,last))
+    if bottom: write('\x1b[51;1HBOTTOM FOOTER')
+
+"""
+            target = subprocess.Popen([str(fake_codex), "-c", console_app, str(REPO),
+                                       "resume", session_id], cwd=root, creationflags=CREATE_NEW_CONSOLE)
+            sidecar = subprocess.Popen([sys.executable,
+                                        str(MUXRUN), name, "--attach-pid", str(target.pid),
+                                        "--cwd", str(root), "--cmd", f"codex resume {session_id}",
+                                        "--session-id", session_id, "--profile", "browser-it"],
+                                       cwd=REPO, env=env, stdout=subprocess.DEVNULL,
+                                       stderr=subprocess.PIPE, text=True,
+                                       creationflags=DETACHED_PROCESS | CREATE_NO_WINDOW, close_fds=True)
+            deadline = time.monotonic() + 20
+            last_row = None
+            while time.monotonic() < deadline:
+                if sidecar.poll() is not None:
+                    self.fail(f"owner exited: {sidecar.returncode}: {sidecar.stderr.read()}")
+                row = next((s for s in run_request(control_port, {"t": "ls"}).get("list", [])
+                            if s.get("name") == name and s.get("owner")), None)
+                last_row = row or run_request(control_port, {"t": "ls"}).get("list", [])
+                if row:
+                    break
+                time.sleep(0.1)
+            else:
+                sidecar.kill(); sidecar.wait(timeout=5)
+                self.fail(f"visible owner did not register; last={last_row}; sidecar={sidecar.poll()}, stderr="
+                          f"{sidecar.stderr.read() if sidecar.poll() is not None else 'still running'}, muxd="
+                          f"{(state / 'muxd.log').read_text(encoding='utf-8', errors='replace')[-2500:] if (state / 'muxd.log').exists() else 'no log'}")
+            # The console app itself enables alternate screen and mouse reporting, and
+            # records which input events it actually receives after browser gestures.
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                if target.poll() is not None:
+                    self.fail(f"console app exited before displaying footer: {target.returncode}")
+                try:
+                    if "VISIBLE FOOTER" in run_request(control_port, {"t": "ls"}).get("list", [])[0].get("tail", ""):
+                        break
+                except Exception:
+                    pass
+                time.sleep(0.1)
+            else:
+                self.fail("app console footer never reached isolated muxd")
+            # The owner has now forwarded the active screen; the browser must show the
+            # same source cells after relay scrollback and live output have settled.
+            with sync_playwright() as playwright:
+                browser = playwright.chromium.launch(headless=False, args=["--no-proxy-server"])
+                try:
+                    page = browser.new_page(viewport={"width": 1440, "height": 900})
+                    page.goto(f"http://127.0.0.1:{relay_port}/", timeout=30000)
+                    page.evaluate("name => connect(name)", name)
+                    page.wait_for_function("() => [...document.querySelectorAll('.xterm-rows > div')].some(r => r.textContent.includes('VISIBLE FOOTER'))", timeout=20000)
+                    self.assertIn("VISIBLE FOOTER", page.locator(".xterm-rows").inner_text())
+                    # The browser never saw the app's pre-attach DECSET, but session ownership
+                    # remains explicit; real pointer gestures must reach the visible console.
+                    page.wait_for_function("() => isVisibleOwner()")
+                    self.assertEqual(page.evaluate("() => term.buffer.active.type"), "normal")
+                    self.assertFalse(page.evaluate("() => window.__muxMouseGuard.mouseActive()"))
+                    centre = page.locator('#term .xterm-screen').bounding_box()
+                    self.assertIsNotNone(centre)
+                    x = centre['x'] + centre['width'] / 2
+                    y = centre['y'] + centre['height'] / 2
+                    page.mouse.move(x, y)
+                    page.mouse.wheel(0, -480)
+                    page.mouse.click(x, y)
+                    self.assertFalse(page.evaluate('() => isFrozen()'), 'a plain owner click must not freeze live output')
+                    page.mouse.move(x, y)
+                    page.mouse.down()
+                    page.mouse.move(x + 70, y + 15, steps=5)
+                    page.mouse.up()
+                    self.assertFalse(page.evaluate('() => term.hasSelection()'), 'a plain owner drag belongs to the app')
+                    self.assertFalse(page.evaluate('() => isFrozen()'), 'a plain owner drag must not freeze live output')
+                    page.keyboard.press('k')
+                    page.wait_for_function("() => [...document.querySelectorAll('.xterm-rows > div')].some(r => /WHEEL=[1-9]/.test(r.textContent) && /CLICK=[1-9]/.test(r.textContent) && /KEY=[1-9]/.test(r.textContent))", timeout=10000)
+                    # Pointer fidelity at the LEFT EDGE of the grid: the cell the app receives must be
+                    # the cell that was clicked. A clamped or off-by-one report would silently put every
+                    # click on the wrong cell of a TUI - and a dropped release would leave it stuck in a
+                    # drag. Both are invisible to a test that only counts that SOME click arrived.
+                    before = page.evaluate("() => document.querySelector('.xterm-rows').textContent.match(/ (\\d+),(\\d+)/).slice(1).map(Number)")
+                    counter_box = page.locator('.xterm-rows > div').filter(has_text='WHEEL=').first.bounding_box()
+                    self.assertIsNotNone(counter_box)
+                    page.mouse.click(centre['x'] + 5, counter_box['y'] + counter_box['height'] / 2)
+                    page.wait_for_function("prev => { const m=document.querySelector('.xterm-rows').textContent.match(/ (\\d+),(\\d+)/); return m && (Number(m[1])!==prev[0] || Number(m[2])!==prev[1]); }", arg=before, timeout=10000)
+                    reported = page.evaluate("() => document.querySelector('.xterm-rows').textContent.match(/ (\\d+),(\\d+)/).slice(1).map(Number)")
+                    self.assertEqual(reported, [1, 8], f'owner click reported the wrong cell: {reported}')
+                    counters = page.evaluate("() => document.querySelector('.xterm-rows').textContent.match(/WHEEL=(\\d+) CLICK=(\\d+) KEY=(\\d+) REL=(\\d+)/).slice(1).map(Number)")
+                    self.assertEqual(counters[3], counters[1], f'every owner press must be released: {counters}')
+                    self.assertGreaterEqual(counters[1], 3, counters)
+                    footer = page.locator('.xterm-rows > div').filter(has_text='VISIBLE FOOTER').first
+                    footer_box = footer.bounding_box()
+                    self.assertIsNotNone(footer_box)
+                    page.mouse.move(footer_box['x'] + 5, footer_box['y'] + footer_box['height'] / 2)
+                    page.keyboard.down('Shift')
+                    page.mouse.down()
+                    page.mouse.move(footer_box['x'] + 90, footer_box['y'] + footer_box['height'] / 2, steps=5)
+                    page.mouse.up()
+                    page.keyboard.up('Shift')
+                    page.screenshot(path=str(screenshot), full_page=True)
+                    observed = {
+                        'key': page.evaluate("() => [...document.querySelectorAll('.xterm-rows > div')].some(r => /KEY=[1-9]/.test(r.textContent))"),
+                        'wheel': page.evaluate("() => [...document.querySelectorAll('.xterm-rows > div')].some(r => /WHEEL=[1-9]/.test(r.textContent))"),
+                        'click': page.evaluate("() => [...document.querySelectorAll('.xterm-rows > div')].some(r => /CLICK=[1-9]/.test(r.textContent))"),
+                        'selection': page.evaluate("() => term.hasSelection() && !!term.getSelection().trim()"),
+                    }
+                    phone = browser.new_page(viewport={'width': 390, 'height': 700}, is_mobile=True, has_touch=True)
+                    phone.goto(f'http://127.0.0.1:{relay_port}/', timeout=30000)
+                    phone.evaluate('name => connect(name)', name)
+                    phone.wait_for_function("() => [...document.querySelectorAll('.xterm-rows > div')].some(r => /WHEEL=[1-9]/.test(r.textContent))", timeout=20000)
+                    phone.get_by_role('button', name='Sessions', exact=True).click()
+                    self.assertTrue(phone.evaluate("() => document.querySelector('#app').classList.contains('mobile-view-sessions')"))
+                    phone.get_by_role('button', name='Terminal', exact=True).click()
+                    observed['nav'] = not phone.evaluate("() => document.querySelector('#app').classList.contains('mobile-view-sessions')")
+                    phone.wait_for_function("""() => { const host=document.querySelector('#term'); const row=[...host.querySelectorAll('.xterm-rows > div')].find(r=>r.textContent.includes('VISIBLE FOOTER')); if(!row) return false; const a=row.getBoundingClientRect(), b=host.getBoundingClientRect(); return a.bottom>b.top && a.top<b.bottom; }""")
+                    mobile_surface = phone.evaluate("""() => { const host=document.querySelector('#term'); const xt=host.querySelector('.xterm'); const rows=host.querySelector('.xterm-rows'); return {
+                        hostTop:host.scrollTop, hostHeight:host.clientHeight, hostScrollHeight:host.scrollHeight,
+                        xtermHeight:xt.clientHeight, xtermScrollHeight:xt.scrollHeight,
+                        classes:host.className, rowsText:rows.textContent.slice(0,250),
+                        footerRow:[...rows.children].findIndex(r=>r.textContent.includes('VISIBLE FOOTER')),
+                        counterRow:[...rows.children].findIndex(r=>r.textContent.includes('WHEEL=')),
+                        winSize, viewportFit
+                    }; }""")
+                    phone.screenshot(path=str(mobile_screenshot), full_page=True)
+                    try:
+                        from PIL import Image
+                    except ImportError:
+                        Image = None
+                    if Image is not None:
+                        with Image.open(mobile_screenshot) as image:
+                            # DOM rows can exist even when the phone pans into blank space.
+                            text_pixels = sum(1 for y in range(115, 155) for x in range(3, 160)
+                                              if max(image.getpixel((x, y))[:3]) > 100)
+                        self.assertGreater(text_pixels, 25, f'phone screenshot has no visible terminal text: {mobile_surface}; screenshot={mobile_screenshot}')
+                    touch = phone.context.new_cdp_session(phone)
+                    touch.send('Input.dispatchTouchEvent', {'type': 'touchStart', 'touchPoints': [{'x': 90, 'y': 330, 'id': 1}]})
+                    touch.send('Input.dispatchTouchEvent', {'type': 'touchMove', 'touchPoints': [{'x': 90, 'y': 250, 'id': 1}]})
+                    touch.send('Input.dispatchTouchEvent', {'type': 'touchEnd', 'touchPoints': []})
+                    phone.wait_for_function("() => [...document.querySelectorAll('.xterm-rows > div')].some(r => /WHEEL=[5-9]/.test(r.textContent))", timeout=10000)
+                    observed['touch_scroll'] = True
+                    print(f'owner browser gesture outcome: {observed}; mobile={mobile_surface}; screenshots={screenshot}, {mobile_screenshot}', flush=True)
+                    self.assertTrue(observed['nav'], observed)
+                    self.assertTrue(observed['selection'], observed)
+                    self.assertTrue(observed['key'], observed)
+                    self.assertTrue(observed['wheel'], observed)
+                    self.assertTrue(observed['click'], observed)
+                    # The app then redraws its actual footer at row 51. The phone must
+                    # follow content that moved after attach, without the user reloading.
+                    page.keyboard.press('b')
+                    phone.wait_for_function("() => [...document.querySelectorAll('.xterm-rows > div')].some(r=>r.textContent.includes('BOTTOM FOOTER'))", timeout=15000)
+                    phone.wait_for_function("""() => { const host=document.querySelector('#term'); const row=[...host.querySelectorAll('.xterm-rows > div')].find(r=>r.textContent.includes('BOTTOM FOOTER'));
+                      if(!row) return false; const a=row.getBoundingClientRect(), b=host.getBoundingClientRect(); return a.bottom>b.top && a.top<b.bottom; }""", timeout=5000)
+                    bottom_surface = phone.evaluate("""() => { const host=document.querySelector('#term'); const row=[...host.querySelectorAll('.xterm-rows > div')].find(r=>r.textContent.includes('BOTTOM FOOTER'));
+                      const a=row.getBoundingClientRect(), b=host.getBoundingClientRect(); return { top:host.scrollTop, visible:a.bottom>b.top && a.top<b.bottom }; }""")
+                    print(f'owner bottom redraw: {bottom_surface}; screenshot={bottom_screenshot}', flush=True)
+                    self.assertTrue(bottom_surface['visible'], bottom_surface)
+                    phone.screenshot(path=str(bottom_screenshot), full_page=True)
+                    # Damage only the browser mirror; after a selection gesture the
+                    # viewer is frozen until the user explicitly resumes live output.
+                    # The app's CURRENT content is BOTTOM FOOTER plus the counters, so the
+                    # repair has to restore those - VISIBLE FOOTER is gone from the app too.
+                    page.evaluate("() => new Promise(resolve => term.write('\\x1b[2J\\x1b[H', resolve))")
+                    page.wait_for_function("() => ![...document.querySelectorAll('.xterm-rows > div')].some(r => r.textContent.includes('BOTTOM FOOTER'))")
+                    page.evaluate("() => send('R', '')")
+                    page.evaluate("() => forceJumpBottom()")
+                    page.wait_for_function("() => [...document.querySelectorAll('.xterm-rows > div')].some(r => r.textContent.includes('BOTTOM FOOTER'))", timeout=20000)
+                    self.assertIn("WHEEL=", page.locator(".xterm-rows").inner_text())
+                finally:
+                    browser.close()
+        finally:
+            if private_muxd is not None and private_muxd.poll() is None:
+                try:
+                    run_request(control_port, {"t": "kill", "s": name}, timeout=10)
+                except Exception:
+                    pass
+            if sidecar is not None and sidecar.poll() is None:
+                sidecar.kill()
+                sidecar.wait(timeout=5)
+            if sidecar is not None and sidecar.stderr is not None:
+                sidecar.stderr.close()
+            if target is not None and target.poll() is None:
+                target.kill()
+                target.wait(timeout=5)
+            if private_muxd is not None and private_muxd.poll() is None:
+                private_muxd.terminate()
+                private_muxd.wait(timeout=10)
+            if relay is not None and relay.poll() is None:
+                relay.terminate()
+                relay.wait(timeout=10)
+            if relay is not None and relay.stderr is not None:
+                relay.stderr.close()
+            shutil.rmtree(root, ignore_errors=True)
 
     def test_visible_owner_registration_has_one_identity_owner(self):
         name = "it-owner-claim"

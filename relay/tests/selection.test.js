@@ -85,6 +85,28 @@ test('a mouse-drag selection latches the freeze and no unfreeze path can flush t
   assert.equal(ctx.flushes, 1);
 });
 
+test('frozen output overflow reattaches instead of replaying a truncated escape stream', () => {
+  const ctx = {
+    _frozenBuf: [], _frozenBytes: 0, _frozenLost: false, FROZEN_MAX_BYTES: 8,
+    enqueued: [], reloads: 0,
+  };
+  ctx.enqueueTermWrite = chunk => { ctx.enqueued.push(chunk); };
+  ctx.reloadTerminal = () => { ctx.reloads++; };
+  load(ctx, ['bufferFrozenOutput', 'flushFrozen']);
+  ctx.bufferFrozenOutput(Uint8Array.of(27, 91, 50, 74, 65, 66));
+  ctx.bufferFrozenOutput(Uint8Array.of(67, 68, 69, 70, 71, 72));
+  assert.equal(ctx._frozenLost, true, 'dropping the head must mark the stream incomplete');
+  assert.equal(ctx.flushFrozen(), false, 'a truncated stream must not be replayed');
+  assert.equal(ctx.reloads, 1, 'the viewer must reattach for a fresh snapshot');
+  assert.equal(ctx.enqueued.length, 0, 'no fragment may enter the parser');
+  assert.equal(ctx._frozenBytes, 0);
+  assert.equal(ctx._frozenLost, false);
+  ctx.bufferFrozenOutput(Uint8Array.of(65, 66));
+  assert.equal(ctx.flushFrozen(), true);
+  assert.equal(ctx.reloads, 1);
+  assert.equal(ctx.enqueued.length, 1, 'intact frozen output should replay normally');
+});
+
 test('the phone Sel toggle still owns its own unfreeze (drag latch never touches selectMode)', () => {
   const ctx = freezeCtx();
   ctx.selectMode = true;

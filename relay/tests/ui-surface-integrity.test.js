@@ -488,8 +488,8 @@ test('the surface notices a frame drawn for a narrower grid than it has', async 
     const shell = await page.evaluate(() => staleFrameWidth());
     assert.equal(shell, null, `a normal-buffer shell is not a stale full-screen frame (got ${JSON.stringify(shell)})`);
 
-    // The watch must act on the real case - and through the fullscreen-equivalent heal, not the
-    // repaint-only one, because only a size change reaches the app that drew the stale frame.
+    // The watch must request an authoritative frame, not just repaint its own buffer or report
+    // unchanged viewport dimensions, which do not reach the app that drew the stale frame.
     await page.evaluate(() => { term.write('\x1b[?1049h'); });
     host.sendOutput(SESSION_NAME, built.narrow);
     await waitFor(async () => {
@@ -498,5 +498,11 @@ test('the surface notices a frame drawn for a narrower grid than it has', async 
     }, 'stale width recorded by the watch', 6000);
     const rec = await page.evaluate(() => window.__muxLastPaintRecovery);
     assert.match(String(rec && rec.reason), /stale-width/, `the heal must come from the stale-width path (got ${JSON.stringify(rec)})`);
+    await host.waitFor(m => m.t === 'redraw' && m.s === SESSION_NAME, 'stale frame redraw request');
+    const before = host.messages.filter(m => m.t === 'resize').length;
+    host.sendOutput(SESSION_NAME, built.fills);
+    await waitFor(async () => page.evaluate(() => staleFrameWidth() === null), 'authoritative frame restored');
+    assert.equal(host.messages.filter(m => m.t === 'resize').length, before,
+      'redraw must repair the frame without resizing the shared PTY');
   });
 });

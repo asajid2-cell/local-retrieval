@@ -1110,6 +1110,7 @@ test('adopted host metadata reaches the session list without executable data', a
     kind: 'adopted-local',
     adopted: true,
     externalOwner: true,
+    owner: true,
     childPid: 5151,
     heal: false,
   }]);
@@ -1118,6 +1119,7 @@ test('adopted host metadata reaches the session list without executable data', a
   const row = (await h.json('GET', '/api/sessions')).find(item => item.name === 'adopted-tab');
   assert.equal(row.adopted, true);
   assert.equal(row.externalOwner, true);
+  assert.equal(row.owner, true);
   assert.equal(row.kind, 'adopted-local');
   assert.equal(row.autoheal, false);
   assert.equal(Object.prototype.hasOwnProperty.call(row, 'cmd'), false);
@@ -1750,6 +1752,28 @@ test('last viewer removal deletes session state so reconnect recomputes and re-r
     'second resize after state cleanup',
   );
   second.close();
+});
+
+test('redraw asks the PC owner for a fresh frame without resizing or treating it as input', async t => {
+  const h = new RelayHarness();
+  await h.start();
+  t.after(async () => h.stop());
+  const host = await h.connectHost([commandSession('needs-redraw', 'redraw-id', Date.now())]);
+  t.after(() => host.close());
+
+  const ws = new WebSocket(`ws://127.0.0.1:${h.port}/ws?session=needs-redraw&cols=81&rows=25`);
+  await once(ws, 'open');
+  await host.waitFor(m => m.t === 'resize' && m.s === 'needs-redraw', 'initial size');
+  const before = host.messages.length;
+  ws.send('R');
+  await host.waitFor(m => m.t === 'redraw' && m.s === 'needs-redraw', 'redraw request');
+  assert.equal(host.messages.slice(before).some(m => m.t === 'resize' || m.t === 'i'), false);
+  ws.send('R');
+  ws.send('Rjunk');
+  await sleep(100);
+  assert.equal(host.messages.slice(before).filter(m => m.t === 'redraw').length, 1,
+    'duplicate or malformed viewer requests cannot amplify owner snapshots');
+  ws.close();
 });
 
 test('viewer dimensions are clamped before they can resize the shared PTY', async t => {

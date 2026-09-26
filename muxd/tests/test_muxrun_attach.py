@@ -13,7 +13,152 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import muxrun
 
 
+class OwnerRedrawTests(unittest.IsolatedAsyncioTestCase):
+    async def test_requested_redraw_repaints_a_unchanged_screen(self):
+        class Socket:
+            def __init__(self):
+                self.sent = []
+
+            async def send(self, data):
+                self.sent.append(__import__('json').loads(data))
+
+        ws = Socket()
+        stop = asyncio.Event()
+        redraw = asyncio.Event()
+        with mock.patch.object(muxrun, 'read_visible_screen', return_value=(80, 24, 'fixed frame')):
+            task = asyncio.create_task(muxrun.screen_pump(ws, stop, redraw))
+            try:
+                await asyncio.sleep(0.15)
+                self.assertEqual(len([m for m in ws.sent if m['t'] == 'o']), 1)
+                redraw.set()
+                await asyncio.sleep(0.15)
+                self.assertEqual(len([m for m in ws.sent if m['t'] == 'o']), 2)
+            finally:
+                stop.set()
+                await task
+
+    async def test_failed_console_read_does_not_erase_the_browser_mirror(self):
+        class Socket:
+            def __init__(self):
+                self.sent = []
+
+            async def send(self, data):
+                self.sent.append(__import__('json').loads(data))
+
+        ws = Socket()
+        stop = asyncio.Event()
+        redraw = asyncio.Event()
+        samples = [(80, 24, 'VISIBLE FOOTER'), None, (80, 24, 'VISIBLE FOOTER')]
+
+        def read():
+            value = samples.pop(0)
+            if value is None:
+                redraw.set()
+            if not samples:
+                stop.set()
+            return value
+
+        with mock.patch.object(muxrun, 'read_visible_screen', side_effect=read):
+            await muxrun.screen_pump(ws, stop, redraw)
+        self.assertEqual([m['t'] for m in ws.sent], ['size', 'o', 'o'])
+        self.assertFalse(redraw.is_set())
+        self.assertEqual(ws.sent[1]['d'], ws.sent[2]['d'])
+
+    async def test_size_change_repaints_even_when_screen_text_is_unchanged(self):
+        class Socket:
+            def __init__(self):
+                self.sent = []
+
+            async def send(self, data):
+                self.sent.append(__import__('json').loads(data))
+
+        ws = Socket()
+        stop = asyncio.Event()
+        with mock.patch.object(muxrun, 'read_visible_screen', side_effect=[
+            (80, 24, 'same frame'), (100, 24, 'same frame'), (100, 24, 'same frame')
+        ]):
+            task = asyncio.create_task(muxrun.screen_pump(ws, stop))
+            try:
+                await asyncio.sleep(0.2)
+            finally:
+                stop.set()
+                await task
+        self.assertEqual([m['t'] for m in ws.sent], ['size', 'o', 'size', 'o'])
+
+    def test_owner_snapshot_addresses_rows_instead_of_wrapping_full_width_lines(self):
+        frame = muxrun.repaint_frame(5, 3, 'AAAAA\r\nBBBBB\r\nFOOT!')
+        self.assertIn(b'\x1b[1;1HAAAAA\x1b[2;1HBBBBB\x1b[3;1HFOOT!', frame)
+        self.assertNotIn(b'AAAAA\r\nBBBBB', frame)
+        self.assertIn(b'\x1b[3;1HFOOT!', muxrun.repaint_frame(5, 3, 'A\r\n\r\nFOOT!'))
+
+    async def test_owner_redraw_request_does_not_write_console_input(self):
+        class Socket:
+            def __init__(self):
+                self.messages = [__import__('json').dumps({'t': 'redraw'})]
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                if self.messages:
+                    return self.messages.pop(0)
+                raise StopAsyncIteration
+
+        redraw = asyncio.Event()
+        with mock.patch.object(muxrun, 'write_console_input') as write:
+            await muxrun.listen_remote(Socket(), object(), redraw)
+        self.assertTrue(redraw.is_set())
+        write.assert_not_called()
+
+
 class AttachedChildTests(unittest.TestCase):
+    def test_attaching_to_new_console_retries_only_while_it_is_starting(self):
+        class Kernel:
+            def __init__(self, failures):
+                self.failures = failures
+                self.calls = []
+
+            def FreeConsole(self):
+                self.calls.append("free")
+
+            def AttachConsole(self, pid):
+                self.calls.append(pid)
+                if self.failures:
+                    self.failures -= 1
+                    return False
+                return True
+
+        kernel = Kernel(2)
+        error = OSError(6, "invalid handle")
+        error.winerror = 6
+        with mock.patch.object(muxrun.ctypes, "windll", type("Windll", (), {"kernel32": kernel})()), \
+             mock.patch.object(muxrun.ctypes, "WinError", return_value=error), \
+             mock.patch.object(muxrun.time, "sleep"):
+            muxrun.attach_existing_console(4242)
+        self.assertEqual(kernel.calls, ["free", 4242, 4242, 4242])
+
+    def test_console_attach_does_not_retry_unrelated_errors(self):
+        class Kernel:
+            calls = 0
+
+            def FreeConsole(self):
+                pass
+
+            def AttachConsole(self, pid):
+                self.calls += 1
+                return False
+
+        kernel = Kernel()
+        error = OSError(5, "access denied")
+        error.winerror = 5
+        with mock.patch.object(muxrun.ctypes, "windll", type("Windll", (), {"kernel32": kernel})()), \
+             mock.patch.object(muxrun.ctypes, "WinError", return_value=error), \
+             mock.patch.object(muxrun.time, "sleep") as sleep:
+            with self.assertRaises(OSError):
+                muxrun.attach_existing_console(4242)
+        self.assertEqual(kernel.calls, 1)
+        sleep.assert_not_called()
+
     def test_console_attach_opens_exact_process_handle_first(self):
         events = []
         original_child = muxrun.AttachedChild
@@ -227,6 +372,40 @@ class AttachedChildTests(unittest.TestCase):
             [(muxrun.VK_UP, "", 0), (muxrun.VK_END, "", 0)],
             muxrun.console_key_events(b"\x1bOA\x1bOF"),
         )
+
+    def test_web_mouse_reports_reach_the_owner_as_console_mouse_events(self):
+        up = muxrun.input_records(b"\x1b[<64;93;24M")
+        down = muxrun.input_records(b"\x1b[<65;93;24M")
+        self.assertEqual(len(up), 1)
+        self.assertEqual(len(down), 1)
+        self.assertEqual(up[0].EventType, muxrun.MOUSE_EVENT_TYPE)
+        self.assertEqual(up[0].Event.MouseEvent.dwEventFlags, muxrun.MOUSE_WHEELED)
+        self.assertEqual(up[0].Event.MouseEvent.dwButtonState >> 16, 120)
+        self.assertEqual(down[0].Event.MouseEvent.dwButtonState >> 16, (-120) & 0xffff)
+        left = muxrun.input_records(b"\x1b[<66;93;24M")[0].Event.MouseEvent
+        right = muxrun.input_records(b"\x1b[<67;93;24M")[0].Event.MouseEvent
+        self.assertEqual((left.dwEventFlags, right.dwEventFlags), (muxrun.MOUSE_HWHEELED,) * 2)
+        self.assertEqual((left.dwButtonState >> 16, right.dwButtonState >> 16),
+                         ((-120) & 0xffff, 120))
+        self.assertEqual((up[0].Event.MouseEvent.dwMousePosition.X,
+                          up[0].Event.MouseEvent.dwMousePosition.Y), (92, 23))
+        click = muxrun.input_records(b"\x1b[<0;93;24M\x1b[<0;93;24m")
+        self.assertEqual(len(click), 2, 'app-owned clicks must reach its console without typing text')
+        self.assertEqual([rec.EventType for rec in click], [muxrun.MOUSE_EVENT_TYPE] * 2)
+        self.assertEqual([rec.Event.MouseEvent.dwButtonState for rec in click], [1, 0])
+        self.assertEqual([rec.Event.MouseEvent.dwEventFlags for rec in click], [0, 0])
+        self.assertEqual(muxrun.input_records(b"\x1b[<1;93;24M")[0].Event.MouseEvent.dwButtonState,
+                         4, 'SGR button 1 is the middle console button')
+        self.assertEqual(muxrun.input_records(b"\x1b[<2;93;24M")[0].Event.MouseEvent.dwButtonState,
+                         2, 'SGR button 2 is the right console button')
+        self.assertEqual(muxrun.input_records(b"\x1b[<32;93;24M"), [], 'motion remains dropped')
+        self.assertEqual(muxrun.input_records(b"\x1b[<3;93;24M"), [], 'unowned release is dropped')
+        self.assertEqual(muxrun.input_records(b"\x1b[<64;93;24Mhello")[-2].EventType, muxrun.KEY_EVENT)
+        self.assertEqual(muxrun.input_records(b"hello\x1b[<64;93;24M")[-1].EventType, muxrun.MOUSE_EVENT_TYPE)
+        self.assertEqual(muxrun.input_records(b"\x1b[<68;93;24M")[0].Event.MouseEvent.dwControlKeyState,
+                         muxrun.SHIFT_PRESSED)
+        self.assertEqual(muxrun.console_key_events(b"hello"),
+                         [muxrun.vk_for_char(c) for c in 'hello'])
 
     def test_verified_descendants_reject_reused_parent_chain(self):
         rows = [

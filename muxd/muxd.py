@@ -2525,12 +2525,28 @@ class LocalViewerQueue(asyncio.Queue):
 def fanout_local_output(session, data):
     for local_queue in list(session.local):
         if not local_queue.offer(data):
-            # The viewer lost a chunk. Keep nudging a full repaint so the gap still heals on the
-            # alternate screen exactly as before; the explicit resync frame supersedes this later.
-            try:
-                redraw_nudge(session)
-            except Exception:
-                pass
+            if isinstance(session, OwnerSession):
+                if local_queue.gap_seq != getattr(local_queue, "_redraw_gap_seq", 0):
+                    local_queue._redraw_gap_seq = local_queue.gap_seq
+                    session._send_owner({"t": "redraw"})
+            else:
+                try:
+                    redraw_nudge(session)
+                except Exception:
+                    pass
+
+async def pump_local_viewer(ws, session, local_queue):
+    while True:
+        data = await local_queue.get()
+        if data is LOCAL_VIEWER_SLOW:
+            await ws.close(code=1013, reason="local viewer is not draining output")
+            return
+        await ws.send(data)
+        if isinstance(session, OwnerSession) and local_queue.empty():
+            drops = local_queue.dropped_chunks
+            if drops != getattr(local_queue, "_redraw_after_drain_drops", 0):
+                local_queue._redraw_after_drain_drops = drops
+                session._send_owner({"t": "redraw"})
 
 def attach_replay_payload(session, sb_limit):
     """First frame for a new viewer. With scrollback disabled (sb<=0) the MODE PREFIX must still
@@ -5371,16 +5387,12 @@ async def main():
                     )
                     if replay:
                         await ws.send(replay)
-                    # Guarantee a full frame for an alt-screen TUI attached locally.
-                    await asyncio.get_running_loop().run_in_executor(None, redraw_nudge, s)
-                    async def pump():
-                        while True:
-                            data = await lq.get()
-                            if data is LOCAL_VIEWER_SLOW:
-                                await ws.close(code=1013, reason="local viewer is not draining output")
-                                return
-                            await ws.send(data)
-                    pt = asyncio.create_task(pump())
+                    # A visible owner needs an explicit snapshot; PTY resize nudges only work for headless sessions.
+                    if isinstance(s, OwnerSession):
+                        s._send_owner({"t": "redraw"})
+                    else:
+                        await asyncio.get_running_loop().run_in_executor(None, redraw_nudge, s)
+                    pt = asyncio.create_task(pump_local_viewer(ws, s, lq))
                     try:
                         async for raw in ws:
                             if isinstance(raw, (bytes, bytearray)):
@@ -5594,6 +5606,12 @@ async def main():
                                         )))
                             elif t == "resize" and name in sessions:
                                 apply_remote_session_size(sessions[name], m)
+                            elif t == "redraw" and name in sessions:
+                                session = sessions[name]
+                                if isinstance(session, OwnerSession):
+                                    session._send_owner({"t": "redraw"})
+                                else:
+                                    await asyncio.get_running_loop().run_in_executor(None, redraw_nudge, session)
                             elif t == "sb" and name in sessions:
                                 session = sessions[name]
                                 scrollback_limit = m.get("max", SB_SEND)
