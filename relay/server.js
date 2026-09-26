@@ -2019,8 +2019,46 @@ function probePc() {
   sock.on('error', () => done(false));
   sock.on('timeout', () => done(false));
 }
+// The sshd probe above answers "can we reach the PC", which stays TRUE when the PC's archive server has
+// died: the reverse tunnel (`ssh -N -R 8765`) never notices its upstream is gone, so the VPS port stays
+// bound and drops every forwarded connection — /multiplex/pc/api/discovery returns 502 while pc.reachable
+// is a healthy green. That is exactly how a dead archive server went unreported for ~15h on 2026-09-26
+// (24 WER access-violation reports, one every few days, and the site read as "PC archive unavailable"
+// until someone opened the desktop app).
+//
+// So probe the mount the browser actually uses — loopback:8765, the port the tunnel publishes — and
+// require a REAL answer from the archive server. A TCP connect is not enough: a bound-but-dead port
+// accepts the connection and then fails, which is the whole failure being detected.
+let _pcArchive = TEST_MODE ? { ok: true, rttMs: 0, at: Date.now(), error: null } : { ok: null, rttMs: null, at: 0, error: null };
+const PC_ARCHIVE_URL = process.env.MUX_PC_ARCHIVE_URL || 'http://127.0.0.1:8765/healthz';
+function probePcArchive() {
+  const t0 = Date.now();   // `http` is already required at the top of this file
+  const fail = (error) => { _pcArchive = { ok: false, rttMs: null, at: Date.now(), error: error || 'no answer' }; };
+  const req = http.get(PC_ARCHIVE_URL, { timeout: 5000 }, (res) => {
+    let body = '';
+    res.setEncoding('utf8');
+    res.on('data', (chunk) => { if (body.length < 4096) body += chunk; });
+    res.on('end', () => {
+      let parsed = null;
+      try { parsed = JSON.parse(body); } catch {}
+      // The service name is checked, not just ok: nginx and hl-auth also answer on this box, and a 200
+      // from the wrong thing must not read as a live archive.
+      if (res.statusCode === 200 && parsed && parsed.ok === true && parsed.service === 'codex-local-retrieval') {
+        _pcArchive = { ok: true, rttMs: Date.now() - t0, at: Date.now(), error: null };
+      } else {
+        fail(res.statusCode === 200 ? 'unexpected health body' : `HTTP ${res.statusCode}`);
+      }
+    });
+  });
+  req.on('timeout', () => { req.destroy(); fail('timed out'); });
+  req.on('error', (error) => fail((error && error.code) || String(error)));
+}
 let _probeBootTimer = null, _probeTimer = null;   // held so the restart drain can let the event loop empty
-if (!TEST_MODE) { _probeBootTimer = setTimeout(probePc, 2000); _probeTimer = setInterval(probePc, 30000); }
+let _archiveProbeBootTimer = null, _archiveProbeTimer = null;
+if (!TEST_MODE) {
+  _probeBootTimer = setTimeout(probePc, 2000); _probeTimer = setInterval(probePc, 30000);
+  _archiveProbeBootTimer = setTimeout(probePcArchive, 2500); _archiveProbeTimer = setInterval(probePcArchive, 30000);
+}
 // r.1.4.3 opened an `app.get('/api/health', ...)` here, but r.1.17 had already lifted this body out
 // into healthSnapshot() so the ops-alert lane could read health without going through HTTP — and it
 // registers the route below. Taking both openers would have bound /api/health twice.
@@ -2045,9 +2083,12 @@ function healthSnapshot() {
   const stateRecoveryFailures = recoveryWriteFailureReport();
   const degraded = TEST_MODE
     ? (!hostUp() || !hostProtocolOk() || hostFrameStale || legacyNames.length > 0 || !!persistenceFailure || renameIntents.length > 0 || uploadRecoveryWarnings.length > 0 || stateRecoveryFailures.length > 0)
-    : (!hostUp() || !hostProtocolOk() || hostFrameStale || _pcHealth.reachable === false || gaveUp > 0 || hostedArmedDown > 0 || legacyNames.length > 0 || !projects.bridgeLive || !!persistenceFailure || renameIntents.length > 0 || uploadRecoveryWarnings.length > 0 || stateRecoveryFailures.length > 0);
+    : (!hostUp() || !hostProtocolOk() || hostFrameStale || _pcHealth.reachable === false || _pcArchive.ok === false || gaveUp > 0 || hostedArmedDown > 0 || legacyNames.length > 0 || !projects.bridgeLive || !!persistenceFailure || renameIntents.length > 0 || uploadRecoveryWarnings.length > 0 || stateRecoveryFailures.length > 0);
   const snapshot = { ok: !degraded, degraded, uptimeSec: Math.round(process.uptime()), tmuxAvailable, sessions: hostSessions.size,
-           legacySessions: legacyNames.length, legacyNames, legacyPolicy: "blocked", armed, gaveUp, hostedArmedDown, pc: _pcHealth,
+           // `archive` rides inside `pc` because it is the same question asked properly: `reachable` is
+           // "the PC's sshd answers", `archive.ok` is "the mount /multiplex/pc proxies to actually
+           // serves chat discovery". They diverge exactly when the PC-side server has died.
+           legacySessions: legacyNames.length, legacyNames, legacyPolicy: "blocked", armed, gaveUp, hostedArmedDown, pc: { ..._pcHealth, archive: _pcArchive },
            // How many times we have actually spawned tmux. Each one is a hard event-loop freeze, so
            // this is the rate to watch if the terminal feels stuttery — and it is what proves the
            // TTL cache is doing its job rather than being assumed to.
@@ -4148,6 +4189,8 @@ function drainForRestart(signal) {
   clearInterval(_pinRetryTimer);
   if (_probeBootTimer) clearTimeout(_probeBootTimer);
   if (_probeTimer) clearInterval(_probeTimer);
+  if (_archiveProbeBootTimer) clearTimeout(_archiveProbeBootTimer);
+  if (_archiveProbeTimer) clearInterval(_archiveProbeTimer);
 
   const viewers = new Set(wss.clients);
   for (const st of sessions.values()) {

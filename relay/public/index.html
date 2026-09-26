@@ -3854,7 +3854,12 @@ async function pollHealth(){
     const h = await (await fetch(base+'/api/health')).json();
     dot.className = 'hdot ' + (h.ok ? 'ok' : (h.degraded ? 'warn' : 'bad'));
     const up = h.uptimeSec>=3600 ? Math.round(h.uptimeSec/3600)+'h' : Math.round(h.uptimeSec/60)+'m';
-    const pc = (h.pc && h.pc.reachable) ? ('PC '+h.pc.rttMs+'ms') : ((h.pc && h.pc.reachable===false) ? 'PC UNREACHABLE' : 'PC …');
+    // The archive term outranks the RTT reading on purpose: the tunnel keeps the VPS port bound when the
+    // PC's archive server dies, so sshd still answers and "PC 12ms" is exactly the green lie that let a
+    // dead mount read as healthy. /multiplex/pc is a 502 in that state, so say so here.
+    const pc = (h.pc && h.pc.reachable===false) ? 'PC UNREACHABLE'
+      : ((h.pc && h.pc.archive && h.pc.archive.ok===false) ? 'PC ARCHIVE DOWN'
+      : ((h.pc && h.pc.reachable) ? ('PC '+h.pc.rttMs+'ms') : 'PC …'));
     // "host NAME proto 4" describes a link, and it stays true through the one failure where the link is
     // up and nothing is moving. An amber dot whose tooltip says the host is fine sends the reader away
     // from the actual cause, so a stalled host is named here instead of being left to the aggregate.

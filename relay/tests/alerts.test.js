@@ -447,6 +447,39 @@ test('degradedReasons mirrors the disjunction the server computes', () => {
   assert.deepEqual(degradedReasons(health()), [], 'a green blob has no reasons');
 });
 
+test('degradedReasons names a dead archive mount, and never for a link that is simply down', () => {
+  // The reverse tunnel keeps the VPS port bound when the PC's archive server dies, so sshd still answers:
+  // `reachable` is green and the mount is a 502. That is the state the push has to name, and it is the
+  // only state it may name - an unreachable PC already says why.
+  const dead = degradedReasons(health({
+    degraded: true,
+    pc: { reachable: true, rttMs: 29, host: '192.168.1.154', archive: { ok: false, error: 'ECONNRESET' } },
+  }));
+  assert.deepEqual(dead, ['PC archive mount down (ECONNRESET)']);
+
+  // No error text at all still reads as a fault, not as a green mount.
+  const bare = degradedReasons(health({
+    degraded: true,
+    pc: { reachable: true, rttMs: 29, host: '192.168.1.154', archive: { ok: false, error: null } },
+  }));
+  assert.deepEqual(bare, ['PC archive mount down (no answer)']);
+
+  // Link down: the cause, not the consequence. Two lines here would read as two faults.
+  const linkDown = degradedReasons(health({
+    degraded: true,
+    pc: { reachable: false, host: '192.168.1.154', archive: { ok: false, error: 'ECONNRESET' } },
+  }));
+  assert.deepEqual(linkDown, ['PC unreachable (192.168.1.154)']);
+
+  // A probe that has not answered yet (`ok: null`), or a relay too old to emit the field: silence.
+  assert.deepEqual(degradedReasons(health({
+    degraded: true, pc: { reachable: true, rttMs: 29, archive: { ok: null } },
+  })), []);
+  assert.deepEqual(degradedReasons(health({
+    degraded: true, pc: { reachable: true, rttMs: 29 },
+  })), []);
+});
+
 test('degradedReasons names a stalled host, and never for a link that is simply down', () => {
   const stalled = degradedReasons(health({
     degraded: true,

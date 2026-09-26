@@ -72,6 +72,12 @@ if (data) {
   if (!data.host || Number(data.host.protocol || 0) < 2) fail.push(`host protocol ${data.host?.protocol ?? 'missing'} < 2`);
   if (!Array.isArray(data.host?.caps) || !data.host.caps.includes('create') || !data.host.caps.includes('attach') || !data.host.caps.includes('kill')) fail.push('host caps incomplete');
   if (data.pc && data.pc.reachable === false) fail.push(`PC ssh unreachable (${data.pc.host || 'unknown'})`);
+  // Distinct from `reachable` above, and the reason the reverse tunnel hides this: the PC's sshd answering
+  // says nothing about the archive server behind it. `ssh -N -R 8765` keeps the VPS port bound when that
+  // server dies, so every forwarded request is dropped — /multiplex/pc is a 502 to every browser while
+  // `reachable` is still green. A fault, not a warning: the chat page is unusable and nothing self-heals it.
+  // Explicit === false only, so a relay too old to emit `archive` is silence rather than a false alarm.
+  if (data.pc && data.pc.archive && data.pc.archive.ok === false) fail.push(`PC archive mount down (${data.pc.archive.error || 'no answer'})`);
   // Covers `blocked` as well: persistence.blocked implies ok=false.
   if (!data.persistence || data.persistence.ok !== true) fail.push(`persistence not ok (${data.persistence?.detail || 'no detail'})`);
   // Each of these is a `degraded` term in its own right, so a fail here explains the aggregate
@@ -113,6 +119,9 @@ const h = data || {};
 const host = h.host || {};
 const projects = h.projects || {};
 const pc = h.pc || {};
+// 'archive-down' outranks the RTT reading: a green "PC 12ms" while /multiplex/pc answers 502 is exactly
+// the misleading display this OK line exists to prevent.
+const pcState = pc.reachable === false ? 'down' : (pc.archive && pc.archive.ok === false ? 'archive-down' : 'up');
 // frameAge is on the OK line because the heartbeat is the one number that would have caught the 3-day
 // stall, and a healthy run is when an operator can still read it. 'n/a' for a host with no frame to
 // measure (down link, or a connection that has not stamped one yet) — not 0, which would read as fresh.
@@ -124,5 +133,5 @@ const frameAgeMs = host.frameAgeMs;
 const frameAge = frameAgeMs === null || frameAgeMs === undefined || !Number.isFinite(Number(frameAgeMs))
   ? 'n/a'
   : `${Math.round(Number(frameAgeMs) / 1000)}s`;
-console.log(`[multiplex-healthcheck] OK host=${host.name || '?'} protocol=${host.protocol} sessions=${host.sessions} frameAge=${frameAge} bridgeLive=${projects.bridgeLive} appLive=${projects.appLive} legacy=${h.legacySessions} pc=${pc.reachable === false ? 'down' : 'up'} node=${h.node} warnings=${warn.length}`);
+console.log(`[multiplex-healthcheck] OK host=${host.name || '?'} protocol=${host.protocol} sessions=${host.sessions} frameAge=${frameAge} bridgeLive=${projects.bridgeLive} appLive=${projects.appLive} legacy=${h.legacySessions} pc=${pcState} node=${h.node} warnings=${warn.length}`);
 NODE

@@ -162,6 +162,10 @@ const FAULTS = [
   // had not pushed a frame in three days.
   ['the host is connected but has stopped pushing frames', { host: { connected: true, name: 'win', protocol: 4, protocolOk: true, caps: ['create', 'attach', 'kill'], frameStale: true, frameAgeMs: 3 * 24 * 60 * 60 * 1000, frameStaleMs: 15000 } }],
   ['the PC is unreachable', { pc: { reachable: false, host: '192.168.1.162' } }],
+  // sshd answering says nothing about the archive server behind the reverse tunnel: `ssh -N -R 8765`
+  // keeps the VPS port bound when that server dies, so every forwarded request is dropped and
+  // /multiplex/pc is a 502 to every browser while `reachable` is green. This is that exact state.
+  ['the PC archive mount is dead behind a live tunnel', { pc: { reachable: true, rttMs: 29, host: '192.168.1.162', archive: { ok: false, error: 'ECONNRESET' } } }],
   ['state persistence is failing', { persistence: { ok: false, detail: 'EACCES', blocked: false } }],
   ['a legacy tmux session survives', { legacySessions: 2 }],
   ['a rename intent never completed', { pendingRenameIntents: 1 }],
@@ -183,6 +187,35 @@ for (const [label, overrides] of FAULTS) {
     });
   });
 }
+
+test('a dead archive mount is named on the OK line, not hidden behind a green RTT', async () => {
+  // The display failure this exists to kill: sshd answers in 29ms, so a summary line reading `pc=up`
+  // while /multiplex/pc 502s sends the operator looking somewhere else. It has to say which half is dead.
+  await withHealthServer(async ({ url, respond }) => {
+    respond(200, healthAppClosed({ pc: { reachable: true, rttMs: 29, host: '192.168.1.162', archive: { ok: false, error: 'timed out' } } }));
+    const res = await runCheck(url);
+
+    assert.equal(res.status, 1);
+    assert.match(res.stderr, /PC archive mount down \(timed out\)/);
+  });
+});
+
+test('a relay that does not report an archive probe is not failed for it', async () => {
+  // The field is additive, so an older relay (or one whose probe has not answered its first sample yet,
+  // which is `ok: null`) must read as silence rather than as a fault. This is the false-positive shape
+  // that the ok/archive split exists to prevent.
+  await withHealthServer(async ({ url, respond }) => {
+    respond(200, healthAppClosed({ pc: { reachable: true, rttMs: 29, host: '192.168.1.162', archive: { ok: null, rttMs: null, error: null } } }));
+    let res = await runCheck(url);
+    assert.equal(res.status, 0, `an unanswered probe is not a fault; stderr was:\n${res.stderr}`);
+    assert.match(res.stdout, /pc=up/);
+
+    respond(200, healthAppClosed({ pc: { reachable: true, rttMs: 29, host: '192.168.1.162' } }));
+    res = await runCheck(url);
+    assert.equal(res.status, 0, 'a relay with no archive field at all still passes');
+    assert.match(res.stdout, /pc=up/);
+  });
+});
 
 test('fails when the relay cannot be reached at all', async () => {
   // Nothing listening: the case this monitor exists for, since the relay's own alert lane cannot

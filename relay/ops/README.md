@@ -142,7 +142,8 @@ relay dying:
 - `multiplex-healthcheck.timer` runs `/usr/local/bin/multiplex-healthcheck` every minute.
   It reads `/api/health` over loopback as `harmonizer` and exits non-zero only for a
   genuine fault (host link down, **host connected but stalled**, protocol mismatch, missing
-  host capabilities, PC unreachable, persistence not writing, legacy tmux sessions, a pending
+  host capabilities, PC unreachable, **PC archive mount dead behind a live tunnel**,
+  persistence not writing, legacy tmux sessions, a pending
   rename intent, an outstanding upload warning, a store recovered but not rewritten, an
   unsupported node).
   A stale desktop push is **not** a fault: `ok` is `!degraded`, and `degraded` includes
@@ -159,6 +160,19 @@ relay dying:
   reported a healthy host. A down link reports `frameAgeMs: null` and `frameStale: false`
   (there is no frame to be late); the check never fires for it. The OK line prints
   `frameAge=…` (or `n/a`) so the heartbeat is readable on healthy runs too.
+
+  **The archive-mount check is the same lesson one layer out.** `pc.reachable` is a TCP
+  connect to the PC's sshd, and it stays green when the PC's archive server has died: the
+  reverse tunnel (`ssh -N -R 8765`) never notices its upstream is gone, so the VPS port
+  stays bound and drops every forwarded connection. `/multiplex/pc` is then a 502 to every
+  browser while the relay reports a healthy PC — which is how a dead archive server went
+  unreported for ~15h, with the site reading "PC archive unavailable" until someone opened
+  the desktop app. So the relay also probes the mount the browser actually uses
+  (`pc.archive`, loopback `:8765/healthz`, `MUX_PC_ARCHIVE_URL` to override) and requires a
+  real answer carrying `service: codex-local-retrieval`, because a TCP connect would succeed
+  against the bound-but-dead port and a bare 200 could come from anything else on the box.
+  A failed probe is a `degraded` term, a healthcheck `FAIL`, and a named reason in the alert
+  body; it is silent when the PC link itself is down, since that already says why.
 - The relay's in-process ops-alert lane (`relay/health-alerts.js`) pushes on degraded
   **edges** with sustain windows and 30-minute dedupe. It starts whether or not a topic is
   configured; an unset topic selects the journal sink rather than switching the lane off.

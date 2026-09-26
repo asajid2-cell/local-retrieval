@@ -46,8 +46,10 @@ function bool(value) {
   return value === true;
 }
 
-// Why the whole health blob is degraded, in the operator's words. Mirrors the disjunction at
-// server.js:1175-1177 — if a term is added there, add it here so the push says which one tripped.
+// Why the whole health blob is degraded, in the operator's words. Mirrors the `degraded` disjunction
+// inside server.js's healthSnapshot() — if a term is added there, add it here so the push says which one
+// tripped. (Named by symbol, not by line: the old line number pointed at unrelated relaunch code, which
+// is worse than no pointer at all for a comment whose whole job is "keep these two in step".)
 function degradedReasons(health) {
   const out = [];
   const host = health.host || {};
@@ -68,6 +70,14 @@ function degradedReasons(health) {
   }
   if (host.protocolOk === false) out.push('host protocol mismatch');
   if (pc.reachable === false) out.push(`PC unreachable (${pc.host || 'unknown'})`);
+  // Separate from `reachable` on purpose, and listed after it: the PC's sshd answering says nothing about
+  // whether the archive server behind the reverse tunnel is alive. When it is dead the port stays bound
+  // and every request is dropped, so /multiplex/pc is a 502 while `reachable` is still green.
+  //
+  // Only when the link itself is up. An unreachable PC takes its archive down with it, so naming the
+  // consequence next to the cause is the same noise the link term above already avoids - and this is a
+  // push an operator reads half-asleep, where one unambiguous cause beats two true-but-nested ones.
+  else if (pc.archive && pc.archive.ok === false) out.push(`PC archive mount down (${pc.archive.error || 'no answer'})`);
   if (Number(health.legacySessions) > 0) out.push(`${health.legacySessions} legacy tmux session(s)`);
   if (projects.bridgeLive === false) out.push('projects bridge down');
   if (persistence.blocked) out.push(`persistence blocked: ${persistence.detail || 'unknown'}`);
