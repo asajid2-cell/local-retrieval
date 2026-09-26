@@ -69,7 +69,16 @@ function Stop-AppAndDeps {
             Where-Object { $_.CommandLine -like '*CodexArchiveRemote*remote-tunnel.ps1*' -or $_.CommandLine -like '*CodexArchiveRemote*run-remote.ps1*' } |
             ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
     } catch {}
-    try { Stop-ScheduledTask -TaskName 'CodexArchiveRemote' -ErrorAction SilentlyContinue } catch {}   # the bridge task can relaunch the app mid-install
+    # The bridge task can relaunch the app mid-install, and the watchdog would restart the very server we
+    # are replacing -- a restart during the swap locks the files. Stop both, and record the stop with the
+    # same marker the app's Stop button writes, so an already-running watchdog tick leaves the server down
+    # while the installer holds the directory. The marker is cleared once the new build is live.
+    foreach ($t in 'CodexArchiveRemote','CodexArchiveRemoteWatchdog') {
+        try { Stop-ScheduledTask -TaskName $t -ErrorAction SilentlyContinue } catch {}
+    }
+    if (Test-Path $remoteDir) {
+        try { Set-Content -LiteralPath (Join-Path $remoteDir 'watchdog.pause') -Value (Get-Date).ToString('o') -Encoding UTF8 } catch {}
+    }
 }
 
 function Protect-OwnerSecret([string]$Path) {
@@ -192,10 +201,14 @@ if (Test-Path $remoteDir) {
     Protect-OwnerSecret (Join-Path $remoteStaging 'signing.key')
     $remoteTunnelTemplate = Join-Path $repo 'scripts\remote-tunnel.ps1'
     if (Test-Path $remoteTunnelTemplate) { Copy-Item $remoteTunnelTemplate (Join-Path $remoteStaging 'remote-tunnel.ps1') -Force }
+    $remoteWatchdogTemplate = Join-Path $repo 'scripts\watch-remote-server.ps1'
+    if (Test-Path $remoteWatchdogTemplate) { Copy-Item $remoteWatchdogTemplate (Join-Path $remoteStaging 'watch-remote-server.ps1') -Force }
+    $remoteWatchdogVbs = Join-Path $repo 'scripts\watch-remote-server.vbs'
+    if (Test-Path $remoteWatchdogVbs) { Copy-Item $remoteWatchdogVbs (Join-Path $remoteStaging 'watch-remote-server.vbs') -Force }
     Get-ChildItem -LiteralPath $serverBuildDir -Exclude '*.pdb' | Copy-Item -Destination $remoteStaging -Recurse -Force
 
     $remoteCritical = @('CodexLocalRetrieval.Server.exe','CodexLocalRetrieval.Server.dll','CodexLocalRetrieval.Core.dll',
-        'CodexLocalRetrieval.Server.runtimeconfig.json','CodexLocalRetrieval.Server.deps.json','run-remote.ps1','remote-tunnel.ps1')
+        'CodexLocalRetrieval.Server.runtimeconfig.json','CodexLocalRetrieval.Server.deps.json','run-remote.ps1','remote-tunnel.ps1','watch-remote-server.ps1','watch-remote-server.vbs')
     $remoteMissing = $remoteCritical | Where-Object { -not (Test-Path (Join-Path $remoteStaging $_)) }
     if ($remoteMissing) { Remove-Item $remoteStaging -Recurse -Force -ErrorAction SilentlyContinue; throw "Refusing to update remote bridge: staged bridge is missing [$($remoteMissing -join ', ')]." }
 
@@ -203,10 +216,34 @@ if (Test-Path $remoteDir) {
     Rename-Item -LiteralPath $remoteStaging -NewName (Split-Path $remoteDir -Leaf) -ErrorAction Stop
     Protect-OwnerSecret (Join-Path $remoteDir 'signing.key')
     if (Test-Path $remoteBackup) { Remove-Item $remoteBackup -Recurse -Force -ErrorAction SilentlyContinue }
+
+    # The server only ever came back when the desktop app was opened or the machine relogged in, so the
+    # site looked like it depended on the app. A per-minute watchdog task removes that dependency; it is
+    # registered here so a GUI install cannot leave the bridge unsupervised. Its action is a hidden
+    # wscript launcher (see watch-remote-server.vbs) because a direct powershell action flashes a console
+    # once a minute. The stop marker is the app's own, so a deliberate Stop still outranks the watchdog.
+    $watchdogVbs = Join-Path $remoteDir 'watch-remote-server.vbs'
+    if (Test-Path $watchdogVbs) {
+        $watchdogSettings = New-ScheduledTaskSettingsSet `
+            -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+            -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -StartWhenAvailable
+        Register-ScheduledTask `
+            -TaskName 'CodexArchiveRemoteWatchdog' `
+            -Action (New-ScheduledTaskAction -Execute "$env:SystemRoot\System32\wscript.exe" -Argument "//B //NoLogo `"$watchdogVbs`"") `
+            -Trigger (New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 1)) `
+            -Principal (New-ScheduledTaskPrincipal -UserId ([System.Security.Principal.WindowsIdentity]::GetCurrent().Name) -LogonType Interactive -RunLevel Limited) `
+            -Settings $watchdogSettings `
+            -Description "Restart the MUX remote archive server when it is down, unless the stop was deliberate." `
+            -Force | Out-Null
+    }
 } else {
     Write-Host "MUX remote bridge folder not found; skipped update." -ForegroundColor DarkYellow
 }
+# The server is wanted again: clear the installer's stop marker BEFORE anything can restart, then bring
+# back both the bridge task and its watchdog.
+try { Remove-Item -LiteralPath (Join-Path $remoteDir 'watchdog.pause') -Force -ErrorAction SilentlyContinue } catch {}
 try { Start-ScheduledTask -TaskName 'CodexArchiveRemote' -ErrorAction SilentlyContinue } catch {}   # restart the bridge we paused
+try { Start-ScheduledTask -TaskName 'CodexArchiveRemoteWatchdog' -ErrorAction SilentlyContinue } catch {}
 
 # A small marker so you can tell what's installed.
 @{ product = 'MUX'; installedAt = (Get-Date).ToString('o') } | ConvertTo-Json | Set-Content (Join-Path $installDir 'install.json') -Encoding utf8
