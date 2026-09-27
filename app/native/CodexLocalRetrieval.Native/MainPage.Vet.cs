@@ -25,6 +25,44 @@ public sealed partial class MainPage
     {
         if (session is null) return;
 
+        var entered = await ShowVetDialogAsync(session, null);
+        if (entered is null) return;   // cancelled - nothing changes
+
+        SyncStatus.Text = (await CommitVetAsync(session, entered.Value.Name, entered.Value.Phrase)).Line;
+        UpdateChrome();
+        RenderCurrent();
+    }
+
+    // Vet a multi-selection: the gate is the SAME screen, opened once per chat with the position in the run
+    // as its title, so a batch is vetted one decision at a time - each chat still earns its own name and its
+    // own phrase, rather than one decision being stamped across all of them. Cancelling stops the run where
+    // it stands; the chats already vetted in it keep their names and phrases.
+    private async Task VetManyAsync(IReadOnlyList<ArchiveSession> targets)
+    {
+        if (targets.Count == 0) return;
+
+        var vetted = 0;
+        for (var i = 0; i < targets.Count; i++)
+        {
+            var entered = await ShowVetDialogAsync(targets[i], $"Vet chat {i + 1} of {targets.Count}");
+            if (entered is null) break;
+            if ((await CommitVetAsync(targets[i], entered.Value.Name, entered.Value.Phrase)).Ok) vetted++;
+        }
+
+        SessionList.SelectedItems.Clear();
+        UpdateChrome();
+        RenderCurrent();
+        SyncStatus.Text = vetted == 0
+            ? "No chats were vetted."
+            : vetted == targets.Count
+                ? $"Vetted {vetted} chat{(vetted == 1 ? "" : "s")} into Active."
+                : $"Vetted {vetted} of {targets.Count} chats into Active.";
+    }
+
+    // The gate itself: the fields, the phrase pickers and the validation, shown once. Returns the name and
+    // phrase the user entered, or null when they cancelled, so the caller decides what committing means.
+    private async Task<(string Name, string Phrase)?> ShowVetDialogAsync(ArchiveSession session, string? title)
+    {
         var panel = new StackPanel { Spacing = 10, MinWidth = 470 };
         panel.Children.Add(new TextBlock
         {
@@ -204,7 +242,7 @@ public sealed partial class MainPage
         };
         var dialog = new ContentDialog
         {
-            Title = session.Vetted ? "Name and phrase" : "Vet this chat",
+            Title = title ?? (session.Vetted ? "Name and phrase" : "Vet this chat"),
             Content = content,
             PrimaryButtonText = session.Vetted ? "Save" : "Vet",
             CloseButtonText = "Cancel",
@@ -238,33 +276,31 @@ public sealed partial class MainPage
         {
             _openVetDialog = null;
         }
-        if (result != ContentDialogResult.Primary) return;
+        if (result != ContentDialogResult.Primary) return null;
+        return (nameBox.Text, phraseBox.Text);
+    }
 
+    // Apply ONE vetting decision, and say what to show for it. Shared by the single vet and the batch so a
+    // chat is promoted by the same code either way; a failure (a save the store's fence refuses even after
+    // the service's retry) is reported rather than thrown, because both callers are click handlers.
+    private async Task<(bool Ok, string Line)> CommitVetAsync(ArchiveSession session, string name, string phrase)
+    {
         (bool Vetted, string? RenameStatus) vetted;
         try
         {
-            vetted = await _archive.VetSessionAsync(session, nameBox.Text, phraseBox.Text);
+            vetted = await _archive.VetSessionAsync(session, name, phrase);
         }
         catch (Exception error)
         {
-            // The store is shared with the retrieval server, and its generation fence can refuse a save
-            // even after the service's own retry. Report it here rather than letting it escape a click
-            // handler, where it would take the app down with no explanation.
             Diag.Log("vet failed: " + error.Message);
-            SyncStatus.Text = "Could not vet this chat: " + error.Message;
-            return;
+            return (false, "Could not vet this chat: " + error.Message);
         }
-        if (!vetted.Vetted)
-        {
-            SyncStatus.Text = vetted.RenameStatus ?? "Chat was not vetted.";
-            return;
-        }
+        if (!vetted.Vetted) return (false, vetted.RenameStatus ?? "Chat was not vetted.");
+
+        var shown = Trim(name, 40);
         var status = vetted.RenameStatus;
-        var shown = Trim(nameBox.Text, 40);
-        SyncStatus.Text = ArchiveService.NativeRenameSucceeded(status)
-            ? $"Vetted \"{shown}\" into Active as {phraseBox.Text.Trim()}."
-            : $"Vetted \"{shown}\" into Active as {phraseBox.Text.Trim()}; the tool's own name could not be written, so it is kept as the app name ({status}).";
-        UpdateChrome();
-        RenderCurrent();
+        return (true, ArchiveService.NativeRenameSucceeded(status)
+            ? $"Vetted \"{shown}\" into Active as {phrase.Trim()}."
+            : $"Vetted \"{shown}\" into Active as {phrase.Trim()}; the tool's own name could not be written, so it is kept as the app name ({status}).");
     }
 }

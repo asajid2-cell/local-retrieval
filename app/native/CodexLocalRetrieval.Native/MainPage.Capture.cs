@@ -104,10 +104,11 @@ public sealed partial class MainPage
         if (GuiVerificationFixture.Enabled)
         {
             if (step.nav is not (null or "Archive") || step.clipboard is true
-                || step.vet is not null || step.vetClose is true || step.confirm is not null
+                || step.vet is not null || step.vetClose is true || step.vetMany is not null || step.unvetMany is not null
+                || step.confirm is not null
                 || (step.click is not null && !IsFixtureShellToggle(step.click)))
                 throw new InvalidOperationException("GUI metadata fixture permits read-only capture steps only");
-            foreach (var name in new[] { step.shot, step.dump, step.snapshot })
+            foreach (var name in new[] { step.shot, step.dump, step.snapshot, step.bulkMenu, step.dumpList })
                 if (name is not null && !System.Text.RegularExpressions.Regex.IsMatch(name, @"\A[A-Za-z0-9_-]{1,80}\z"))
                     throw new InvalidOperationException("GUI fixture artifact name refused");
         }
@@ -151,6 +152,61 @@ public sealed partial class MainPage
             await SettleAsync(2);
         }
 
+        // A batch vet: the SAME gate as `vet`, but opened once per chat by the app itself, so the harness
+        // waits for each dialog to appear instead of settling a fixed number of frames - the app commits
+        // one chat before opening the next gate.
+        if (step.vetMany is { Length: > 0 })
+        {
+            var batch = new List<ArchiveSession>();
+            foreach (var id in step.vetMany)
+                batch.Add(_archive.Store.Sessions.Values.FirstOrDefault(s =>
+                    string.Equals(s.Id, id, StringComparison.OrdinalIgnoreCase))
+                    ?? throw new InvalidOperationException($"Session '{id}' was not found."));
+
+            SessionList.SelectedItems.Clear();
+            foreach (var target in batch) AddDisplayedSessionToSelection(target.Id);
+
+            var pending = VetManyAsync(batch);
+            ContentDialog? previous = null;
+            for (var i = 0; i < batch.Count; i++)
+            {
+                var dialog = await NextVetDialogAsync(previous)
+                    ?? throw new InvalidOperationException($"The gate for chat {i + 1} of {batch.Count} never opened.");
+                previous = dialog;
+                // The dialog object exists before its popup content is laid out, so let it open first: the
+                // named fields are not in the tree yet when NextVetDialogAsync hands it over.
+                await SettleAsync(4);
+                if (step.vetManyNames is { Length: > 0 } names && i < names.Length) SetPopupBoxText("VetNameBox", names[i]);
+                if (step.vetManyPhrases is { Length: > 0 } phrases && i < phrases.Length) SetPopupBoxText("VetPhraseBox", phrases[i]);
+                await SettleAsync(6);
+                // Shot of the gate itself, filled and still up: the per-chat screen a batch shows
+                // ("Vet chat i of N") is the thing being proven, and it exists for a second or two only.
+                if (i == 0 && step.vetManyShot is not null) artifacts.Add(await CaptureAsync(step.vetManyShot));
+                InvokePopupButton(dialog.PrimaryButtonText ?? "Vet");
+                await SettleAsync(2);
+            }
+            await pending;
+            await SettleAsync(2);
+        }
+
+        // A bulk "send back to the general populace", driven through the same method the menu item's click
+        // calls. A MenuFlyoutItem cannot be clicked from outside (its click is raised by the framework), so
+        // the menu's labels are recorded by WriteMenuDump and the ACTION is proven here, against the same
+        // selection the menu was built from.
+        if (step.unvetMany is { Length: > 0 })
+        {
+            var back = new List<ArchiveSession>();
+            foreach (var id in step.unvetMany)
+                back.Add(_archive.Store.Sessions.Values.FirstOrDefault(s =>
+                    string.Equals(s.Id, id, StringComparison.OrdinalIgnoreCase))
+                    ?? throw new InvalidOperationException($"Session '{id}' was not found."));
+
+            SessionList.SelectedItems.Clear();
+            foreach (var target in back) AddDisplayedSessionToSelection(target.Id);
+            await UnvetManyAsync(back);
+            await SettleAsync(2);
+        }
+
         // Press a button inside whatever dialog is open (a confirm step: the button is in the popup layer,
         // which InvokeByText - a walk from the page - cannot reach).
         if (step.confirm is not null)
@@ -170,6 +226,26 @@ public sealed partial class MainPage
         if (step.clipboard is true
             && step.click is not ("CopyGatewayCommandButton" or "Copy Gateway command"))
             throw new InvalidOperationException("Clipboard snapshot requires a CopyGatewayCommandButton click in the same step.");
+        if (step.selectSessionIds is { Length: > 0 })
+        {
+            SessionList.SelectedItems.Clear();
+            foreach (var id in step.selectSessionIds) AddDisplayedSessionToSelection(id);
+        }
+        // The multi-selection menu is a popup, which the visual-tree dump cannot reach, so it is recorded
+        // from the menu object itself - the same one a right-click shows, built from the same selection.
+        // A step that wants the menu must select first (selectSessionIds), because the menu is built from
+        // the selection, exactly as the pointer handler builds it.
+        if (step.bulkMenu is not null)
+        {
+            var selection = SessionList.SelectedItems.OfType<ArchiveSession>().ToList();
+            if (selection.Count == 0) throw new InvalidOperationException("bulkMenu needs a selection to act on.");
+            var menu = BuildBulkMenu(RightClickTargets(selection[0]));
+            artifacts.Add(WriteMenuDump(step.bulkMenu, menu));
+            menu.ShowAt(SessionList, new Windows.Foundation.Point(40, 40));
+            await SettleAsync(3);
+            try { artifacts.Add(await CaptureAsync(step.bulkMenu + "-shot")); }
+            finally { menu.Hide(); await SettleAsync(2); }
+        }
         if (step.selectSessionId is not null) SelectDisplayedSession(step.selectSessionId);
         if (step.waitMs is not null)
         {
@@ -179,6 +255,7 @@ public sealed partial class MainPage
         await SettleAsync(step.wait ?? 3);
         if (step.shot is not null) artifacts.Add(await CaptureAsync(step.shot));
         if (step.dump is not null) artifacts.Add(DumpTree(step.dump));
+        if (step.dumpList is not null) artifacts.Add(WriteListDump(step.dumpList));
         if (step.snapshot is not null) artifacts.Add(WriteStateSnapshot(step.snapshot));
         if (step.clipboard is true) artifacts.Add(await WriteClipboardSnapshotAsync());
         if (step.scroll is { Length: 1 })
@@ -216,6 +293,89 @@ public sealed partial class MainPage
         throw new InvalidOperationException($"Displayed session '{id}' was not found.");
     }
 
+    // Grow the selection the way Ctrl-click does, so a bulk step acts on a real multi-selection; Select()
+    // would collapse the selection back down to the one row.
+    private void AddDisplayedSessionToSelection(string id)
+    {
+        for (var index = 0; index < SessionList.Items.Count; index++)
+        {
+            if (SessionList.Items[index] is not ArchiveSession session
+                || !string.Equals(session.Id, id, StringComparison.OrdinalIgnoreCase)) continue;
+
+            var peer = new ListViewItemDataAutomationPeer(session, new ListViewAutomationPeer(SessionList));
+            if (peer.GetPattern(PatternInterface.SelectionItem) is not ISelectionItemProvider selection)
+                throw new InvalidOperationException("Displayed session item has no selection automation pattern.");
+            selection.AddToSelection();
+            return;
+        }
+
+        throw new InvalidOperationException($"Displayed session '{id}' was not found.");
+    }
+
+    // A batch vet commits one chat before opening the next gate, so a fixed frame settle cannot know when
+    // that happened: wait for the dialog on top to be a different one. Bounded by TIME, not frames: the
+    // commit between two gates rewrites the chat's native title and saves the store (tens of seconds on a
+    // large one), and a frame count would time out on exactly the stores this batch is for.
+    private async Task<ContentDialog?> NextVetDialogAsync(ContentDialog? previous)
+    {
+        var deadline = DateTime.UtcNow.AddSeconds(150);
+        while (DateTime.UtcNow < deadline)
+        {
+            if (_openVetDialog is not null && !ReferenceEquals(_openVetDialog, previous)) return _openVetDialog;
+            await SettleAsync(1);
+        }
+        return null;
+    }
+
+    // The menu's own items, as an artifact: a flyout lives in the popup layer, so the labels a user sees are
+    // recorded here rather than inferred from the tree.
+    private string WriteMenuDump(string name, MenuFlyout menu)
+    {
+        var items = new List<object>();
+        void Walk(IEnumerable<MenuFlyoutItemBase> entries)
+        {
+            foreach (var entry in entries)
+            {
+                if (entry is MenuFlyoutSubItem sub)
+                {
+                    items.Add(new { type = "sub", text = sub.Text, enabled = sub.IsEnabled });
+                    Walk(sub.Items);
+                }
+                else if (entry is MenuFlyoutItem item) items.Add(new { type = "item", text = item.Text, enabled = item.IsEnabled });
+                else if (entry is MenuFlyoutSeparator) items.Add(new { type = "separator", text = "", enabled = true });
+            }
+        }
+        Walk(menu.Items);
+        var path = Path.Combine(CapDir, "out", name + ".json");
+        try { File.WriteAllText(path, JsonSerializer.Serialize(new { items })); } catch { }
+        return path;
+    }
+
+    // The chat list's BOUND rows, in order: the tree dump carries no text, so a step that must name a row
+    // (the bulk menu needs a real selection) reads it from here. Bounded by the list cap, so a huge scope
+    // still writes a few hundred rows rather than the whole store.
+    private string WriteListDump(string name)
+    {
+        var rows = new List<object>();
+        foreach (var item in SessionList.Items)
+        {
+            if (item is not ArchiveSession session) continue;
+            rows.Add(new
+            {
+                id = session.Id,
+                title = session.Title,
+                customTitle = session.CustomTitle,
+                vetted = session.Vetted,
+                archived = session.Archived,
+                phrases = session.SpecialPhrases.ToList(),
+                updatedAt = session.UpdatedAt
+            });
+        }
+        var path = Path.Combine(CapDir, "out", name + ".json");
+        try { File.WriteAllText(path, JsonSerializer.Serialize(new { count = rows.Count, rows })); } catch { }
+        return path;
+    }
+
     private string WriteStateSnapshot(string name)
     {
         var selectedItemId = (SessionList.SelectedItem as ArchiveSession)?.Id;
@@ -237,6 +397,7 @@ public sealed partial class MainPage
             scopeActive = scopes.Active,
             scopeArchived = scopes.Archived,
             renderedTitle = TitleText.Text,
+            syncStatus = SyncStatus.Text,
             screen = _screen,
             syncInProgress = _syncing,
             count = _archive.Sessions.Count,
@@ -289,7 +450,13 @@ public sealed partial class MainPage
     private UIElement CaptureSubject()
     {
         var popups = OpenPopups();
-        for (var i = popups.Count - 1; i >= 0; i--)   // z-order: the last is the one on top
+        // A ContentDialog is hosted alongside its own full-window smoke layer, and the smoke layer is the
+        // topmost popup: rendering whatever is on top captures a flat dim frame instead of the dialog. So a
+        // dialog is preferred first, and only then the plain topmost child (a flyout, whose presenter IS
+        // the topmost child, is unaffected).
+        for (var i = popups.Count - 1; i >= 0; i--)
+            if (popups[i].Child is ContentDialog dialog) return dialog;
+        for (var i = popups.Count - 1; i >= 0; i--)
             if (popups[i].Child is UIElement child) return child;
         return this;
     }
@@ -537,14 +704,22 @@ internal sealed class CapStep
     public string? click { get; set; }
     public string? expectedSessionId { get; set; }
     public string? selectSessionId { get; set; }
+    public string[]? selectSessionIds { get; set; }
+    public string? bulkMenu { get; set; }
     public string? vet { get; set; }
     public string? vetName { get; set; }
     public string? vetPhrase { get; set; }
     public bool? vetClose { get; set; }
+    public string[]? vetMany { get; set; }
+    public string[]? vetManyNames { get; set; }
+    public string[]? vetManyPhrases { get; set; }
+    public string? vetManyShot { get; set; }
+    public string[]? unvetMany { get; set; }
     public string? confirm { get; set; }
     public string? shot { get; set; }
     public string? dump { get; set; }
     public string? snapshot { get; set; }
+    public string? dumpList { get; set; }
     public bool? clipboard { get; set; }
     public int[]? scroll { get; set; }
     public int? wait { get; set; }

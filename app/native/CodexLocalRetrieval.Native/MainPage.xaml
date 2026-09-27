@@ -401,7 +401,8 @@
                         </StackPanel>
 
                         <!-- Extended selection: plain click opens a chat; Ctrl/Shift-click builds a multi-selection
-                             (right-click one of them -> Add all to a collection). See SessionList_SelectionChanged. -->
+                             (right-click one of them -> the bulk menu: vet, archive, send back, add to a
+                             collection). See SessionList_SelectionChanged / BuildBulkMenu. -->
                         <ListView
                             x:Name="SessionList"
                             Grid.Row="4"

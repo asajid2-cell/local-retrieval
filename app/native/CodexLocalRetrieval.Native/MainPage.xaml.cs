@@ -384,7 +384,7 @@ public sealed partial class MainPage : Page
 
         else if (sel.Count > 1)
         {
-            SyncStatus.Text = $"{sel.Count} chats selected — right-click to add them to a collection.";
+            SyncStatus.Text = $"{sel.Count} chats selected — right-click to vet, archive, or send them back.";
         }
     }
 
@@ -2756,25 +2756,11 @@ public sealed partial class MainPage : Page
 
         var targets = RightClickTargets(session);
 
-        // Multi-select: right-clicking one of several selected rows -> a compact bulk menu (add all to a
-        // collection, archive all, clear). Don't collapse the selection.
+        // Multi-select: right-clicking one of several selected rows -> the bulk menu. Don't collapse the
+        // selection.
         if (targets.Count > 1)
         {
-            var bulk = new MenuFlyout { AreOpenCloseAnimationsEnabled = false };
-            var header = new MenuFlyoutItem { Text = $"{targets.Count} chats selected", IsEnabled = false };
-            bulk.Items.Add(header);
-            bulk.Items.Add(new MenuFlyoutSeparator());
-            var addAll = new MenuFlyoutSubItem { Text = "Add to collection" };
-            BuildAddToCollectionItems(addAll.Items, targets, () => RenderCurrent());
-            bulk.Items.Add(addAll);
-            var archiveAll = new MenuFlyoutItem { Text = $"Archive {targets.Count} chats" };
-            archiveAll.Click += async (_, _) => await ArchiveManyAsync(targets);
-            bulk.Items.Add(archiveAll);
-            bulk.Items.Add(new MenuFlyoutSeparator());
-            var clear = new MenuFlyoutItem { Text = "Clear selection" };
-            clear.Click += (_, _) => { SessionList.SelectedItems.Clear(); SyncStatus.Text = ""; };
-            bulk.Items.Add(clear);
-            bulk.ShowAt(SessionList, e.GetPosition(SessionList));
+            BuildBulkMenu(targets).ShowAt(SessionList, e.GetPosition(SessionList));
             return;
         }
 
@@ -3153,6 +3139,66 @@ public sealed partial class MainPage : Page
         SelectFirstSession();
         RenderCurrent();
         SyncStatus.Text = $"Archived {targets.Count} chat{(targets.Count == 1 ? "" : "s")}.";
+    }
+
+    // Bulk "back to the general populace": the honest inverse of the tier move, applied to every chat in the
+    // selection that is above the pile (a vet, a retire, or both).
+    private async Task UnvetManyAsync(IReadOnlyList<ArchiveSession> targets)
+    {
+        foreach (var t in targets) await _archive.UnvetSessionAsync(t);
+        SessionList.SelectedItems.Clear();
+        SelectFirstSession();
+        RenderCurrent();
+        SyncStatus.Text = $"Sent {targets.Count} chat{(targets.Count == 1 ? "" : "s")} back to the general populace.";
+    }
+
+    // The multi-selection menu, built from the selection alone so the whole of it - and every one of its
+    // bulk actions - is defined in one place rather than inline in a pointer handler.
+    private MenuFlyout BuildBulkMenu(IReadOnlyList<ArchiveSession> targets)
+    {
+        var bulk = new MenuFlyout { AreOpenCloseAnimationsEnabled = false };
+        bulk.Items.Add(new MenuFlyoutItem { Text = $"{targets.Count} chats selected", IsEnabled = false });
+        bulk.Items.Add(new MenuFlyoutSeparator());
+
+        var addAll = new MenuFlyoutSubItem { Text = "Add to collection" };
+        BuildAddToCollectionItems(addAll.Items, targets, () => RenderCurrent());
+        bulk.Items.Add(addAll);
+
+        var vetAll = new MenuFlyoutItem
+        {
+            Text = targets.All(t => t.Vetted || t.Archived)
+                ? $"Change name / phrase for {targets.Count} chats..."
+                : $"Vet {targets.Count} chats..."
+        };
+        ToolTipService.SetToolTip(vetAll, "Name each chat and give it a phrase, one screen at a time.");
+        vetAll.Click += async (_, _) => await VetManyAsync(targets);
+        bulk.Items.Add(vetAll);
+
+        var archiveAll = new MenuFlyoutItem { Text = $"Archive {targets.Count} chats" };
+        archiveAll.Click += async (_, _) => await ArchiveManyAsync(targets);
+        bulk.Items.Add(archiveAll);
+
+        // Only what has been vetted or retired has anywhere to go back to, so the action is offered only
+        // when the selection holds one - and it counts the chats it will move, not the whole selection.
+        var above = targets.Where(t => t.Vetted || t.Archived).ToList();
+        if (above.Count > 0)
+        {
+            var unvetAll = new MenuFlyoutItem
+            {
+                Text = above.Count == targets.Count
+                    ? $"Send {above.Count} chats to the general populace"
+                    : $"Send {above.Count} of {targets.Count} chats to the general populace"
+            };
+            ToolTipService.SetToolTip(unvetAll, "Undo the vet (and the retire): the chats go back to the All pile.");
+            unvetAll.Click += async (_, _) => await UnvetManyAsync(above);
+            bulk.Items.Add(unvetAll);
+        }
+
+        bulk.Items.Add(new MenuFlyoutSeparator());
+        var clear = new MenuFlyoutItem { Text = "Clear selection" };
+        clear.Click += (_, _) => { SessionList.SelectedItems.Clear(); SyncStatus.Text = ""; };
+        bulk.Items.Add(clear);
+        return bulk;
     }
 
     private async Task ShowInfoAsync(string title, string message)
