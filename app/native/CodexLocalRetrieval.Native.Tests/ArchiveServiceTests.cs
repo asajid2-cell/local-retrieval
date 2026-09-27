@@ -2202,6 +2202,117 @@ public sealed class ArchiveServiceTests
         finally { Directory.Delete(claudeDir, true); }
     }
 
+    // A compacted rollout opens with the compaction preamble, which is harness text and not a prompt: the
+    // chat must be named after the first thing a person actually asked, not after "This session is being
+    // continued from a previous conversation". Measured live: 7 codex chats titled exactly that.
+    [TestMethod]
+    public async Task Scan_CodexCompactionPreambleFirst_IsNotTheChatTitle()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "clr-cx-title-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        var path = Path.Combine(dir, "rollout-cx-title.jsonl");
+        File.WriteAllLines(path, new[]
+        {
+            "{\"timestamp\":\"2026-05-22T00:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"cx-title\",\"type\":\"session_meta\",\"cwd\":\"z:/proj\"}}",
+            "{\"timestamp\":\"2026-05-22T00:00:01Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"" + CompactionPreamble + "\"}}",
+            "{\"timestamp\":\"2026-05-22T00:00:02Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"Wire the retry budget into the fetch lane\"}}",
+        });
+        try
+        {
+            var service = new ArchiveService(
+                storePath: Path.Combine(dir, "store.json"),
+                codexAccountsRoot: Path.Combine(dir, "no-accounts"),
+                sourceOverride: new[] { new SessionSource { Tool = "codex", Root = dir } });
+            service.Store.Settings.BundledHistoryAbsorbed = true;
+
+            await service.SyncFromDiskAsync(refreshList: false);
+
+            Assert.AreEqual("Wire the retry budget into the fetch lane", service.Store.Sessions["cx-title"].Title,
+                "the preamble is not a title; the first real prompt is");
+        }
+        finally { Directory.Delete(dir, true); }
+    }
+
+    // Titles persist, and a chat nobody writes to again is never re-parsed - so a row that was named by
+    // the earlier, unfiltered title rule would stay wrong forever. Loading the store must repair it from
+    // the transcript, for either tool.
+    [TestMethod]
+    public async Task LoadState_RepairsAStoredTitleTakenFromTheCompactionPreamble()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "clr-title-repair-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        var path = Path.Combine(dir, "rollout-cx-repair.jsonl");
+        File.WriteAllLines(path, new[]
+        {
+            "{\"timestamp\":\"2026-05-22T00:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"cx-repair\",\"type\":\"session_meta\",\"cwd\":\"z:/proj\"}}",
+            "{\"timestamp\":\"2026-05-22T00:00:01Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"" + CompactionPreamble + "\"}}",
+            "{\"timestamp\":\"2026-05-22T00:00:02Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"Wire the retry budget into the fetch lane\"}}",
+        });
+        var store = Path.Combine(dir, "store.json");
+        try
+        {
+            var seeded = new ArchiveService(
+                storePath: store,
+                codexAccountsRoot: Path.Combine(dir, "no-accounts"),
+                sourceOverride: new[] { new SessionSource { Tool = "codex", Root = dir } });
+            seeded.Store.Settings.BundledHistoryAbsorbed = true;
+            seeded.Store.Sessions["cx-repair"] = new ArchiveSession
+            {
+                Id = "cx-repair", Tool = "codex", SourcePath = path, Title = CompactionPreamble
+            };
+            await seeded.SaveAsync();
+
+            var reloaded = new ArchiveService(
+                storePath: store,
+                codexAccountsRoot: Path.Combine(dir, "no-accounts"),
+                sourceOverride: new[] { new SessionSource { Tool = "codex", Root = dir } });
+            await reloaded.LoadStoreStateAsync();
+
+            Assert.AreEqual("Wire the retry budget into the fetch lane", reloaded.Store.Sessions["cx-repair"].Title,
+                "the stored machine title must be re-derived from the transcript");
+        }
+        finally { Directory.Delete(dir, true); }
+    }
+
+    // Codex records its own thread name in session_index.jsonl, and for a compacted rollout that recorded
+    // name IS the compaction preamble. The thread-title merge runs AFTER the load-time title repair, so an
+    // unfiltered apply puts the preamble back in the list on every sync (measured live: 7 codex chats, all
+    // of them named exactly that, which is why the repair alone kept appearing to fail).
+    [TestMethod]
+    public async Task Merge_CodexThreadNameThatIsTheCompactionPreamble_DoesNotRenameTheChat()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "clr-cx-threadname-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        File.WriteAllLines(Path.Combine(dir, "rollout-cx-threadname.jsonl"), new[]
+        {
+            "{\"timestamp\":\"2026-05-22T00:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"cx-tn\",\"type\":\"session_meta\",\"cwd\":\"z:/proj\"}}",
+            "{\"timestamp\":\"2026-05-22T00:00:01Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"Wire the retry budget into the fetch lane\"}}",
+        });
+        File.WriteAllLines(Path.Combine(dir, "session_index.jsonl"), new[]
+        {
+            "{\"id\":\"cx-tn\",\"thread_name\":\"" + CompactionPreamble + "\",\"updated_at\":\"2026-05-22T00:00:02Z\"}",
+        });
+        try
+        {
+            var service = new ArchiveService(
+                storePath: Path.Combine(dir, "store.json"),
+                codexAccountsRoot: Path.Combine(dir, "no-accounts"),
+                codexStateDbPath: Path.Combine(dir, "state_5.sqlite"),
+                sourceOverride: new[] { new SessionSource { Tool = "codex", Root = dir } });
+            service.Store.Settings.BundledHistoryAbsorbed = true;
+
+            await service.SyncFromDiskAsync(refreshList: false);
+
+            Assert.AreEqual("Wire the retry budget into the fetch lane", service.Store.Sessions["cx-tn"].Title,
+                "a recorded thread name that is really the compaction preamble must not name the chat");
+        }
+        finally { Directory.Delete(dir, true); }
+    }
+
+    private const string CompactionPreamble =
+        "This session is being continued from a previous conversation that ran out of context. "
+        + "The summary below covers the earlier portion of the conversation.";
+
     // N3: a second scan with no file changes parses nothing (incremental skip).
     [TestMethod]
     public async Task Scan_IsIncremental_SkipsUnchangedFiles()
@@ -2635,6 +2746,38 @@ public sealed class ArchiveServiceTests
             Assert.IsTrue((status ?? "").Contains("Claude", StringComparison.OrdinalIgnoreCase), "status mentions Claude");
         }
         finally { if (Directory.Exists(dir)) Directory.Delete(dir, true); if (File.Exists(store)) File.Delete(store); }
+    }
+
+    // A chat renamed while it was still running keeps that name even after the session writes far more
+    // output. The name lives in a custom-title record, and only the file TAIL used to be searched for one,
+    // so once a live session had appended past that window the next re-parse found no name at all and
+    // reverted the row to the pre-rename title. Seen live: a vet landed with its phrase and its tier but
+    // the list kept showing the chat's old name.
+    [TestMethod]
+    public async Task ParseClaude_KeepsANameBuriedFarFromTheTail()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "clr-buried-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var transcript = Path.Combine(root, "buried-name.jsonl");
+            var text = new StringBuilder();
+            text.Append("{\"type\":\"user\",\"sessionId\":\"buried-name\",\"cwd\":\"C:/work\",\"timestamp\":\"2026-08-01T00:00:00Z\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"start the work\"}]}}\n");
+            text.Append("{\"type\":\"custom-title\",\"sessionId\":\"buried-name\",\"customTitle\":\"A name of its own\"}\n");
+            // The session runs on and buries its own rename well past the tail window.
+            for (var i = 0; i < 400; i++)
+                text.Append("{\"type\":\"assistant\",\"sessionId\":\"buried-name\",\"timestamp\":\"2026-08-01T00:00:01Z\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"" + new string('x', 600) + "\"}]}}\n");
+            File.WriteAllText(transcript, text.ToString());
+            Assert.IsTrue(new FileInfo(transcript).Length > 200_000,
+                "the fixture must bury the rename further from the tail than the tail window reaches");
+
+            var service = new ArchiveService(storePath: Path.Combine(root, "app-store.json"), enableTranscriptSearchIndex: false);
+            await service.IndexRootAsync(root);
+
+            Assert.AreEqual("A name of its own", service.Store.Sessions["buried-name"].Title,
+                "the chat's own name outlives the output written after it");
+        }
+        finally { Directory.Delete(root, true); }
     }
 
     // RenameNativeById (the remote/web path): a running session not in the archive still renames by id —

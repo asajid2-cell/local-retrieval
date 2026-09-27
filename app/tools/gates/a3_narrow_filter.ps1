@@ -21,7 +21,7 @@ if (-not (Test-Path -LiteralPath $target)) {
     exit 1
 }
 
-$start = Select-String -LiteralPath $target -Pattern '^\s*private\s+void\s+ApplyFilters\s*\(\s*\)' |
+$start = Select-String -LiteralPath $target -Pattern '^\s*private\s+void\s+ApplyFilters\s*\([^)]*\)' |
     Select-Object -First 1
 if (-not $start) {
     Write-Host "[FAIL] a3_narrow_filter: ApplyFilters not found in $target - the gate cannot assert anything."

@@ -30,6 +30,12 @@ public sealed class CodexCliBackend : IChatBackend
     // keep the whole prompt comfortably under that.
     private const int MaxPromptChars = 28_000;
     private const int MaxOutputChars = 24_000;
+    private const int MaxErrorChars = 16_000;
+
+    // stdout here is the --json EVENT STREAM, not the reply: reasoning and tool events dwarf the answer,
+    // and the answer arrives at the end. So this bounds the transport and is deliberately generous - the
+    // reply itself is still capped at MaxOutputChars below.
+    private const int MaxStreamChars = 4 * 1024 * 1024;
 
     public async Task<BackendReply> CompleteAsync(IReadOnlyList<ChatMessage> messages, IReadOnlyList<ChatToolSpec> tools, CancellationToken cancellationToken)
     {
@@ -56,39 +62,26 @@ public sealed class CodexCliBackend : IChatBackend
         if (!string.IsNullOrWhiteSpace(_model)) { psi.ArgumentList.Add("-m"); psi.ArgumentList.Add(_model!); }
         psi.ArgumentList.Add(prompt);
 
-        using var process = new Process { StartInfo = psi };
-        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        timeoutCts.CancelAfter(_timeoutMs);
-        var token = timeoutCts.Token;
-
-        if (!process.Start()) throw new InvalidOperationException("Could not start the Codex CLI.");
-        try { process.StandardInput.Close(); } catch { }   // EOF so codex exec doesn't block on stdin
-
-        var stderrTask = process.StandardError.ReadToEndAsync(token);
-        var sb = new StringBuilder();
-        try
-        {
-            string? line;
-            while ((line = await process.StandardOutput.ReadLineAsync(token)) is not null)
-            {
-                // Pull the final assistant text out of the JSONL event stream (ignores reasoning/tools).
-                foreach (var ev in CodexEventMapper.Map(line))
-                    if (ev.Kind == AgentEventKind.AssistantText && !string.IsNullOrEmpty(ev.Text))
-                        sb.Append(ev.Text);
-            }
-            await process.WaitForExitAsync(token);
-        }
-        catch (OperationCanceledException)
-        {
-            try { process.Kill(entireProcessTree: true); } catch { }
+        // Same surface as the other CLI backends: a job-contained process with both pipes bounded. stdin
+        // is handed a closed pipe (no input) so codex exec does not wait on it.
+        var result = await ContainedProcessRunner.RunAsync(
+            psi,
+            TimeSpan.FromMilliseconds(_timeoutMs),
+            stdin: null,
+            maxStdoutChars: MaxStreamChars,
+            maxStderrChars: MaxErrorChars,
+            cancellationToken: cancellationToken);
+        if (result.TimedOut)
             throw new InvalidOperationException("The Codex CLI did not respond in time.");
-        }
+        if (result.ExitCode != 0)
+            throw new InvalidOperationException($"Codex CLI failed ({result.ExitCode}): {Trim(result.Stderr)}");
 
-        if (process.ExitCode != 0)
-        {
-            var err = (await stderrTask).Replace("\r", " ").Replace("\n", " ").Trim();
-            throw new InvalidOperationException($"Codex CLI failed ({process.ExitCode}): {err[..Math.Min(300, err.Length)]}");
-        }
+        // Pull the final assistant text out of the JSONL event stream (ignores reasoning/tools).
+        var sb = new StringBuilder();
+        foreach (var line in result.Stdout.Split('\n'))
+            foreach (var ev in CodexEventMapper.Map(line))
+                if (ev.Kind == AgentEventKind.AssistantText && !string.IsNullOrEmpty(ev.Text))
+                    sb.Append(ev.Text);
 
         var answer = sb.ToString().Trim();
         if (answer.Length > MaxOutputChars) answer = answer[..MaxOutputChars] + "...(truncated)";
@@ -97,5 +90,11 @@ public sealed class CodexCliBackend : IChatBackend
             Message = new ChatMessage { Role = "assistant", Content = string.IsNullOrWhiteSpace(answer) ? "(no response)" : answer },
             FinishReason = "stop",
         };
+    }
+
+    private static string Trim(string s)
+    {
+        var clean = s.Replace("\r", " ").Replace("\n", " ").Trim();
+        return clean[..Math.Min(300, clean.Length)];
     }
 }

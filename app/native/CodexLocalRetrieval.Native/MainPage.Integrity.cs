@@ -34,6 +34,7 @@ public sealed partial class MainPage
             SetRiskySessionActionsEnabled(false);
             IntegrityItems.Children.Clear();
             IntegrityItems.Children.Add(IntegrityChip("Isolated metadata fixture; runtime actions disabled"));
+            UpdateInspectorBadge(null);   // nothing to flag in the fixture
             return;
         }
         if (_selected is null)
@@ -76,6 +77,7 @@ public sealed partial class MainPage
         {
             SetRiskySessionActionsEnabled(false);
             IntegrityItems.Children.Add(new TextBlock { Text = "No chat selected", Foreground = MutedBrush(), FontSize = 12 });
+            UpdateInspectorBadge(null);
             return;
         }
 
@@ -92,9 +94,13 @@ public sealed partial class MainPage
             IntegrityItems.Children.Add(checking
                 ? IntegrityChip("Checking integrity...")
                 : IntegrityHeadline("danger", "Integrity checks failed. Refusing to treat this chat as clear."));
+            // While a build is in flight the badge keeps its last answer; an unverifiable chat fails closed.
+            if (!checking) UpdateInspectorBadge("danger");
+            RenderActivityTab();
             return;
         }
 
+        UpdateInspectorBadge(summary.Severity);
         IntegrityItems.Children.Add(IntegrityHeadline(summary.Severity, summary.Headline));
         if (_reclaimNoticeSessionId is not null
             && string.Equals(_reclaimNoticeSessionId, _selected.Id, StringComparison.OrdinalIgnoreCase)
@@ -128,21 +134,9 @@ public sealed partial class MainPage
         foreach (var check in summary.Checks)
             IntegrityItems.Children.Add(IntegrityCheckRow(check));
 
-        if (summary.MuxTabs.Count > 0)
-            IntegrityItems.Children.Add(IntegrityEvidenceBlock("Mux custody", summary.MuxTabs.Take(3).Select(t =>
-                $"{t.Name}: {(t.IsCurrent ? "current" : "history")}{(string.IsNullOrWhiteSpace(t.Kind) ? "" : " - " + t.Kind)}")));
-
-        if (summary.LaunchClaims.Count > 0)
-            IntegrityItems.Children.Add(IntegrityEvidenceBlock("Launch claims", summary.LaunchClaims.Take(3).Select(c =>
-                $"{(c.Expired ? "expired" : "active")} - {c.OwnerProcess} pid {c.OwnerPid}")));
-
-        if (summary.PendingIntents.Count > 0)
-            IntegrityItems.Children.Add(IntegrityEvidenceBlock("Pending filing", summary.PendingIntents.Take(3).Select(p =>
-                $"{p.Tool} - {p.Workspace}")));
-
-        if (summary.RecentEvents.Count > 0)
-            IntegrityItems.Children.Add(IntegrityEvidenceBlock("Recent events", summary.RecentEvents.Take(4).Select(e =>
-                $"{e.Kind}: {Trim(e.Summary, 92)}")));
+        // WHAT HAPPENED (live owner, claims, mux custody, filing intents, recent events) belongs to the
+        // Activity tab - this tab answers only "is it safe to continue".
+        RenderActivityTab();
     }
 
     // M7. Reclaim is the take-control op, so its affordance may never depend on the oracle that take-control

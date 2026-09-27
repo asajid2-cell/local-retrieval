@@ -8,16 +8,19 @@
     Background="{StaticResource AmoledBrush}"
     mc:Ignorable="d">
 
+    <!-- Three elevations only: the app background (Amoled), panels (PanelBrush) and interactive
+         cards/popovers (RaisedBrush). Sidebar rows and most bar buttons carry NO border and NO fill
+         until hover/selection; the bright accent is reserved for the one primary action per surface
+         (Resume, + New chat) and for the active state of a nav row / scope segment. -->
     <Page.Resources>
         <Style x:Key="PillButtonStyle" TargetType="Button">
-            <Setter Property="MinHeight" Value="40" />
-            <Setter Property="Padding" Value="16,0" />
-            <Setter Property="CornerRadius" Value="12" />
-            <Setter Property="BorderBrush" Value="{StaticResource LineBrush}" />
-            <Setter Property="BorderThickness" Value="1" />
-            <Setter Property="Background" Value="{StaticResource PanelBrush}" />
+            <Setter Property="MinHeight" Value="34" />
+            <Setter Property="Padding" Value="12,0" />
+            <Setter Property="CornerRadius" Value="10" />
+            <Setter Property="BorderThickness" Value="0" />
+            <Setter Property="Background" Value="Transparent" />
             <Setter Property="Foreground" Value="{StaticResource TextStrongBrush}" />
-            <Setter Property="FontSize" Value="14" />
+            <Setter Property="FontSize" Value="13" />
         </Style>
 
         <Style x:Key="PrimaryPillButtonStyle" BasedOn="{StaticResource PillButtonStyle}" TargetType="Button">
@@ -28,20 +31,50 @@
         </Style>
 
         <Style x:Key="IconButtonStyle" TargetType="Button">
-            <Setter Property="Width" Value="42" />
-            <Setter Property="Height" Value="42" />
-            <Setter Property="MinWidth" Value="42" />
-            <Setter Property="MinHeight" Value="42" />
+            <Setter Property="Width" Value="38" />
+            <Setter Property="Height" Value="38" />
+            <Setter Property="MinWidth" Value="38" />
+            <Setter Property="MinHeight" Value="38" />
             <Setter Property="Padding" Value="0" />
-            <Setter Property="CornerRadius" Value="21" />
-            <Setter Property="BorderBrush" Value="{StaticResource LineBrush}" />
-            <Setter Property="BorderThickness" Value="1" />
-            <Setter Property="Background" Value="{StaticResource PanelBrush}" />
+            <Setter Property="CornerRadius" Value="19" />
+            <Setter Property="BorderThickness" Value="0" />
+            <Setter Property="Background" Value="Transparent" />
             <Setter Property="Foreground" Value="{StaticResource TextStrongBrush}" />
         </Style>
 
+        <!-- A full-width, left-aligned row: sidebar destinations, tool rows, inspector action rows.
+             Borderless until hover, like the sidebar items the brief asks for. -->
+        <Style x:Key="RowButtonStyle" BasedOn="{StaticResource PillButtonStyle}" TargetType="Button">
+            <Setter Property="MinHeight" Value="38" />
+            <Setter Property="HorizontalAlignment" Value="Stretch" />
+            <Setter Property="HorizontalContentAlignment" Value="Left" />
+        </Style>
+
+        <!-- Inspector action rows ARE the interactive-card elevation, so unlike the sidebar rows they
+             carry a fill at rest. Without it an enabled action was the ONLY thing in the panel with no
+             surface: a disabled sibling still paints the system disabled fill, so the enabled command
+             read as the odd one out. -->
+        <Style x:Key="ActionCardButtonStyle" BasedOn="{StaticResource RowButtonStyle}" TargetType="Button">
+            <Setter Property="Background" Value="{StaticResource RaisedBrush}" />
+            <Setter Property="Padding" Value="12,0" />
+        </Style>
+
+        <Style x:Key="ScopeButtonStyle" BasedOn="{StaticResource PillButtonStyle}" TargetType="Button">
+            <Setter Property="MinHeight" Value="26" />
+            <Setter Property="Padding" Value="10,0" />
+            <Setter Property="CornerRadius" Value="8" />
+            <Setter Property="FontSize" Value="12" />
+        </Style>
+
+        <Style x:Key="TabButtonStyle" BasedOn="{StaticResource PillButtonStyle}" TargetType="Button">
+            <Setter Property="MinHeight" Value="28" />
+            <Setter Property="Padding" Value="10,0" />
+            <Setter Property="CornerRadius" Value="8" />
+            <Setter Property="FontSize" Value="12" />
+        </Style>
+
         <DataTemplate x:Key="SessionTemplate">
-            <Grid MinHeight="40" Padding="12,6">
+            <Grid MinHeight="40" Padding="10,6">
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="Auto" />
                     <ColumnDefinition Width="*" />
@@ -85,207 +118,428 @@
         </DataTemplate>
     </Page.Resources>
 
+    <Page.KeyboardAccelerators>
+        <KeyboardAccelerator Key="B" Modifiers="Control" Invoked="ToggleSidebar_Invoked" />
+        <KeyboardAccelerator Key="B" Modifiers="Control,Shift" Invoked="ToggleInspector_Invoked" />
+    </Page.KeyboardAccelerators>
+
     <Grid>
-        <Grid.ColumnDefinitions>
-            <ColumnDefinition Width="308" />
-            <ColumnDefinition Width="*" />
-            <ColumnDefinition x:Name="RightColumn" Width="292" />
-        </Grid.ColumnDefinitions>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
 
+        <!-- ===== TOP BAR = the current session: where you are, how it stands, one primary action. ===== -->
         <Border
-            Grid.Column="0"
+            x:Name="TopBar"
+            Grid.Row="0"
+            Padding="14,10"
             BorderBrush="{StaticResource LineBrush}"
-            BorderThickness="0,0,1,0"
-            Background="{StaticResource AmoledBrush}"
-            Padding="14">
+            BorderThickness="0,0,0,1">
             <Grid>
-                <Grid.RowDefinitions>
-                    <RowDefinition Height="Auto" />
-                    <RowDefinition Height="Auto" />
-                    <RowDefinition Height="Auto" />
-                    <RowDefinition Height="*" />
-                    <RowDefinition Height="Auto" />
-                </Grid.RowDefinitions>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
 
-                <Button
-                    x:Name="BackButton"
-                    Margin="2,6,0,0"
-                    HorizontalAlignment="Left"
-                    Click="Back_Click"
-                    Style="{StaticResource IconButtonStyle}">
-                    <FontIcon
-                        FontFamily="Segoe Fluent Icons"
-                        FontSize="18"
-                        Glyph="&#xE72B;" />
-                </Button>
-
-                <StackPanel Grid.Row="1" Margin="0,22,0,14" Spacing="8">
-                    <Grid>
-                        <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="*" />
-                            <ColumnDefinition Width="Auto" />
-                        </Grid.ColumnDefinitions>
-                        <TextBox
-                            x:Name="SearchBox"
-                            Height="42"
-                            CornerRadius="12"
-                            KeyDown="SearchBox_KeyDown"
-                            PlaceholderText="Search chats"
-                            TextChanged="SearchBox_TextChanged" />
-                        <Button
-                            x:Name="TagFilterButton"
-                            Grid.Column="1"
-                            Width="42"
-                            Height="42"
-                            Margin="8,0,0,0"
-                            Click="TagFilter_Click"
-                            Style="{StaticResource IconButtonStyle}"
-                            ToolTipService.ToolTip="Filter chats by tag">
-                            <FontIcon FontFamily="Segoe Fluent Icons" FontSize="16" Glyph="&#xE71C;" />
-                        </Button>
-                    </Grid>
-                    <ScrollViewer
-                        x:Name="TagFilterScroller"
-                        HorizontalScrollBarVisibility="Auto"
-                        HorizontalScrollMode="Auto"
-                        VerticalScrollBarVisibility="Disabled"
-                        Visibility="Collapsed">
-                        <StackPanel x:Name="TagFilterBar" Orientation="Horizontal" Spacing="6" />
-                    </ScrollViewer>
-                </StackPanel>
-
-                <StackPanel Grid.Row="2" Spacing="8">
-                    <Button Click="StartChat_Click" Style="{StaticResource PrimaryPillButtonStyle}">
-                        <StackPanel Orientation="Horizontal" Spacing="10">
-                            <FontIcon FontFamily="Segoe Fluent Icons" FontSize="15" Foreground="Black" Glyph="&#xE710;" />
-                            <TextBlock Text="Start chat" />
-                        </StackPanel>
-                    </Button>
-                    <Button x:Name="ArchiveButton" Click="Nav_Click" Style="{StaticResource PrimaryPillButtonStyle}" Tag="Archive">
-                        <StackPanel Orientation="Horizontal" Spacing="10">
-                            <SymbolIcon Symbol="Library" />
-                            <TextBlock Text="Archive" />
-                        </StackPanel>
-                    </Button>
-                    <Button Click="Nav_Click" Style="{StaticResource PillButtonStyle}" Tag="Search">
-                        <StackPanel Orientation="Horizontal" Spacing="10">
-                            <SymbolIcon Symbol="Find" />
-                            <TextBlock Text="Deep search" />
-                        </StackPanel>
-                    </Button>
-                    <Button Click="Nav_Click" Style="{StaticResource PillButtonStyle}" Tag="Ask">
-                        <StackPanel Orientation="Horizontal" Spacing="10">
-                            <SymbolIcon Symbol="Message" />
-                            <TextBlock Text="Co-pilot" />
-                        </StackPanel>
-                    </Button>
-                    <Button Click="Nav_Click" Style="{StaticResource PillButtonStyle}" Tag="Workspaces">
-                        <StackPanel Orientation="Horizontal" Spacing="10">
-                            <SymbolIcon Symbol="Folder" />
-                            <TextBlock Text="Workspaces" />
-                        </StackPanel>
-                    </Button>
-                    <Button Click="Nav_Click" Style="{StaticResource PillButtonStyle}" Tag="Collections">
-                        <StackPanel Orientation="Horizontal" Spacing="10">
-                            <SymbolIcon Symbol="AllApps" />
-                            <TextBlock Text="Collections" />
-                        </StackPanel>
-                    </Button>
-                    <Button Click="Nav_Click" Style="{StaticResource PillButtonStyle}" Tag="Running">
-                        <StackPanel Orientation="Horizontal" Spacing="10">
-                            <SymbolIcon Symbol="Play" />
-                            <TextBlock Text="Running" />
-                        </StackPanel>
-                    </Button>
-                    <Button Click="Nav_Click" Style="{StaticResource PillButtonStyle}" Tag="Fleet">
-                        <StackPanel Orientation="Horizontal" Spacing="10">
-                            <FontIcon FontFamily="Segoe Fluent Icons" FontSize="15" Glyph="&#xE7F4;" />
-                            <TextBlock Text="Fleet" />
-                        </StackPanel>
-                    </Button>
-                    <Button Click="Nav_Click" Style="{StaticResource PillButtonStyle}" Tag="Phrases">
-                        <StackPanel Orientation="Horizontal" Spacing="10">
-                            <FontIcon FontFamily="Segoe Fluent Icons" FontSize="15" Glyph="&#xE8EC;" />
-                            <TextBlock Text="Phrases" />
-                        </StackPanel>
-                    </Button>
-                    <Button Click="Nav_Click" Style="{StaticResource PillButtonStyle}" Tag="Custody">
-                        <StackPanel Orientation="Horizontal" Spacing="10">
-                            <FontIcon FontFamily="Segoe Fluent Icons" FontSize="15" Glyph="&#xE72E;" />
-                            <TextBlock Text="Custody" />
-                        </StackPanel>
-                    </Button>
-                    <Button Click="Nav_Click" Style="{StaticResource PillButtonStyle}" Tag="Settings">
-                        <StackPanel Orientation="Horizontal" Spacing="10">
-                            <SymbolIcon Symbol="Setting" />
-                            <TextBlock Text="Settings" />
-                        </StackPanel>
-                    </Button>
-                </StackPanel>
-
-                <!-- Extended selection: plain click opens a chat; Ctrl/Shift-click builds a multi-selection
-                     (right-click one of them -> Add all to a collection). See SessionList_SelectionChanged. -->
-                <ListView
-                    x:Name="SessionList"
-                    Grid.Row="3"
-                    Margin="0,18,0,0"
-                    Background="Transparent"
-                    BorderThickness="0"
-                    ItemTemplate="{StaticResource SessionTemplate}"
-                    RightTapped="SessionList_RightTapped"
-                    SelectionChanged="SessionList_SelectionChanged"
-                    SelectionMode="Extended" />
-
-                <StackPanel Grid.Row="4" Spacing="10">
-                    <Button
-                        x:Name="SyncButton"
-                        HorizontalAlignment="Stretch"
-                        Click="Sync_Click"
-                        Style="{StaticResource PillButtonStyle}">
-                        <StackPanel Orientation="Horizontal" Spacing="10">
-                            <SymbolIcon Symbol="Sync" />
-                            <TextBlock Text="Sync sessions" />
-                        </StackPanel>
-                    </Button>
-                    <TextBlock
-                        x:Name="SyncStatus"
-                        FontSize="12"
-                        Foreground="{StaticResource TextMutedBrush}"
-                        Text="Source files stay untouched."
-                        TextWrapping="Wrap" />
-                </StackPanel>
-            </Grid>
-        </Border>
-
-        <Grid Grid.Column="1">
-            <Grid.RowDefinitions>
-                <RowDefinition Height="Auto" />
-                <RowDefinition Height="*" />
-            </Grid.RowDefinitions>
-            <Border
-                BorderBrush="{StaticResource LineBrush}"
-                BorderThickness="0,0,0,1"
-                Padding="24,14">
-                <Grid>
+                <Grid VerticalAlignment="Center">
                     <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="*" />
                         <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="*" />
                     </Grid.ColumnDefinitions>
-                    <StackPanel>
+                    <Button
+                        x:Name="BackButton"
+                        Click="Back_Click"
+                        Style="{StaticResource IconButtonStyle}"
+                        ToolTipService.ToolTip="Back">
+                        <FontIcon
+                            FontFamily="Segoe Fluent Icons"
+                            FontSize="16"
+                            Glyph="&#xE72B;" />
+                    </Button>
+                    <Button
+                        x:Name="SidebarToggleButton"
+                        Grid.Column="1"
+                        Margin="4,0,6,0"
+                        Click="SidebarToggle_Click"
+                        Style="{StaticResource IconButtonStyle}"
+                        ToolTipService.ToolTip="Show or hide the chat list (Ctrl+B)">
+                        <FontIcon
+                            FontFamily="Segoe Fluent Icons"
+                            FontSize="15"
+                            Glyph="&#xE700;" />
+                    </Button>
+                    <Grid Grid.Column="2">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="Auto" />
+                            <ColumnDefinition Width="Auto" />
+                            <ColumnDefinition Width="*" />
+                        </Grid.ColumnDefinitions>
                         <TextBlock
                             x:Name="ScreenLabel"
+                            VerticalAlignment="Center"
                             FontSize="12"
                             Foreground="{StaticResource TextMutedBrush}"
                             Text="Archive reader" />
                         <TextBlock
+                            x:Name="ScreenSeparator"
+                            Grid.Column="1"
+                            Margin="6,0"
+                            VerticalAlignment="Center"
+                            FontSize="12"
+                            Foreground="{StaticResource TextMutedBrush}"
+                            Text="/" />
+                        <TextBlock
                             x:Name="TitleText"
-                            MaxLines="2"
+                            Grid.Column="2"
+                            MaxLines="1"
+                            VerticalAlignment="Center"
                             TextTrimming="CharacterEllipsis"
-                            FontSize="24"
+                            FontSize="16"
                             FontWeight="SemiBold"
                             Foreground="{StaticResource TextStrongBrush}" />
-                    </StackPanel>
-                    <StackPanel x:Name="HeaderActions" Grid.Column="1" Orientation="Horizontal" Spacing="10">
+                    </Grid>
+                </Grid>
+
+                <StackPanel
+                    Grid.Column="1"
+                    Orientation="Horizontal"
+                    Spacing="8"
+                    VerticalAlignment="Center">
+                    <TextBlock
+                        x:Name="SyncStatus"
+                        MaxWidth="340"
+                        MaxLines="1"
+                        VerticalAlignment="Center"
+                        FontSize="12"
+                        Foreground="{StaticResource TextMutedBrush}"
+                        Text="Source files stay untouched."
+                        TextTrimming="CharacterEllipsis" />
+                    <Button
+                        x:Name="SyncButton"
+                        Click="Sync_Click"
+                        Style="{StaticResource IconButtonStyle}"
+                        ToolTipService.ToolTip="Sync sessions">
+                        <SymbolIcon Symbol="Sync" />
+                    </Button>
+                    <Button
+                        x:Name="TopBarCollapseButton"
+                        Click="TopBarCollapse_Click"
+                        Style="{StaticResource IconButtonStyle}"
+                        ToolTipService.ToolTip="Compact the top bar">
+                        <FontIcon
+                            FontFamily="Segoe Fluent Icons"
+                            FontSize="14"
+                            Glyph="&#xE70E;" />
+                    </Button>
+                    <!-- One canonical Resume: the header slot also carries the launch variants, and it is
+                         the only primary action on this surface. -->
+                    <Button
+                        x:Name="ResumeTerminalButton"
+                        Style="{StaticResource PrimaryPillButtonStyle}"
+                        ToolTipService.ToolTip="Resume with this chat's native CLI, or expand for Gateway (cc) continuation">
+                        <Button.Flyout>
+                            <MenuFlyout>
+                                <MenuFlyoutItem
+                                    x:Name="HeaderResumeNativeItem"
+                                    Text="Resume as Claude"
+                                    Click="ResumeInTerminal_Click"
+                                    ToolTipService.ToolTip="Resume with this chat's native Codex or Claude CLI." />
+                                <MenuFlyoutItem
+                                    x:Name="HeaderResumeGatewayItem"
+                                    Text="Resume as Gateway"
+                                    Click="ResumeAsGateway_Click"
+                                    ToolTipService.ToolTip="Continue through the custom cc Gateway." />
+                            </MenuFlyout>
+                        </Button.Flyout>
+                        <StackPanel Orientation="Horizontal" Spacing="8">
+                            <FontIcon
+                                FontFamily="Segoe Fluent Icons"
+                                FontSize="14"
+                                Foreground="Black"
+                                Glyph="&#xE756;" />
+                            <TextBlock x:Name="ResumePrimaryText" Text="Resume" />
+                        </StackPanel>
+                    </Button>
+                    <Button
+                        x:Name="HeaderMoreButton"
+                        Click="HeaderMore_Click"
+                        Style="{StaticResource IconButtonStyle}"
+                        ToolTipService.ToolTip="More session commands">
+                        <FontIcon
+                            FontFamily="Segoe Fluent Icons"
+                            FontSize="16"
+                            Glyph="&#xE712;" />
+                    </Button>
+                    <Grid>
+                        <Button
+                            x:Name="InspectorButton"
+                            Click="InspectorToggle_Click"
+                            Style="{StaticResource IconButtonStyle}"
+                            ToolTipService.ToolTip="Inspector (Ctrl+Shift+B)">
+                            <FontIcon
+                                FontFamily="Segoe Fluent Icons"
+                                FontSize="15"
+                                Glyph="&#xE946;" />
+                        </Button>
+                        <Border
+                            x:Name="InspectorBadge"
+                            Width="9"
+                            Height="9"
+                            Margin="0,3,3,0"
+                            HorizontalAlignment="Right"
+                            VerticalAlignment="Top"
+                            Background="{StaticResource AccentBrush}"
+                            CornerRadius="5"
+                            Visibility="Collapsed" />
+                    </Grid>
+                </StackPanel>
+            </Grid>
+        </Border>
+
+        <Grid Grid.Row="1">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition x:Name="LeftColumn" Width="300" />
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition x:Name="RightColumn" Width="0" />
+            </Grid.ColumnDefinitions>
+
+            <!-- ===== LEFT = navigate. Chat-first; the destinations live behind one Tools surface. ===== -->
+            <Border
+                x:Name="LeftPaneBorder"
+                Grid.Column="0"
+                Padding="12"
+                Background="{StaticResource AmoledBrush}"
+                BorderBrush="{StaticResource LineBrush}"
+                BorderThickness="0,0,1,0">
+                <Grid>
+                    <!-- Chats pane: the default surface. -->
+                    <Grid x:Name="ChatsPane">
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="*" />
+                            <RowDefinition Height="Auto" />
+                        </Grid.RowDefinitions>
+
+                        <Button
+                            Click="StartChat_Click"
+                            Style="{StaticResource PrimaryPillButtonStyle}"
+                            ToolTipService.ToolTip="Start a new Claude/Codex chat in a folder you choose">
+                            <StackPanel Orientation="Horizontal" Spacing="10">
+                                <FontIcon FontFamily="Segoe Fluent Icons" FontSize="14" Foreground="Black" Glyph="&#xE710;" />
+                                <TextBlock Text="New chat" />
+                            </StackPanel>
+                        </Button>
+
+                        <StackPanel Grid.Row="1" Margin="0,12,0,0" Spacing="8">
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="Auto" />
+                                </Grid.ColumnDefinitions>
+                                <TextBox
+                                    x:Name="SearchBox"
+                                    Height="38"
+                                    CornerRadius="10"
+                                    KeyDown="SearchBox_KeyDown"
+                                    PlaceholderText="Search chats"
+                                    TextChanged="SearchBox_TextChanged" />
+                                <Button
+                                    x:Name="TagFilterButton"
+                                    Grid.Column="1"
+                                    Width="38"
+                                    Height="38"
+                                    Margin="6,0,0,0"
+                                    Click="TagFilter_Click"
+                                    Style="{StaticResource IconButtonStyle}"
+                                    ToolTipService.ToolTip="Filter chats by tag">
+                                    <FontIcon FontFamily="Segoe Fluent Icons" FontSize="15" Glyph="&#xE71C;" />
+                                </Button>
+                            </Grid>
+                            <ScrollViewer
+                                x:Name="TagFilterScroller"
+                                HorizontalScrollBarVisibility="Auto"
+                                HorizontalScrollMode="Auto"
+                                VerticalScrollBarVisibility="Disabled"
+                                Visibility="Collapsed">
+                                <StackPanel x:Name="TagFilterBar" Orientation="Horizontal" Spacing="6" />
+                            </ScrollViewer>
+                        </StackPanel>
+
+                        <!-- The lifecycle, in the order you work it: Active (the vetted ones worth looking
+                             at - and the view the app opens on), then Archived (retired), then All (the
+                             general populace everything lands in). -->
+                        <StackPanel Grid.Row="2" Margin="0,12,0,0" Orientation="Horizontal" Spacing="4">
+                            <Button
+                                x:Name="ScopeActiveButton"
+                                Click="ChatScope_Click"
+                                Style="{StaticResource ScopeButtonStyle}"
+                                Tag="active"
+                                ToolTipService.ToolTip="Vetted chats: named and phrased, the ones worth keeping">
+                                <TextBlock x:Name="ScopeActiveText" Text="Active" />
+                            </Button>
+                            <Button
+                                x:Name="ScopeArchivedButton"
+                                Click="ChatScope_Click"
+                                Style="{StaticResource ScopeButtonStyle}"
+                                Tag="archived"
+                                ToolTipService.ToolTip="Retired chats: they were active, and are no longer needed">
+                                <TextBlock x:Name="ScopeArchivedText" Text="Archived" />
+                            </Button>
+                            <Button
+                                x:Name="ScopeAllButton"
+                                Click="ChatScope_Click"
+                                Style="{StaticResource ScopeButtonStyle}"
+                                Tag="unvetted"
+                                ToolTipService.ToolTip="The general populace: chats nobody has vetted yet. Right-click one to vet it.">
+                                <TextBlock x:Name="ScopeAllText" Text="All" />
+                            </Button>
+                        </StackPanel>
+
+                        <!-- Extended selection: plain click opens a chat; Ctrl/Shift-click builds a multi-selection
+                             (right-click one of them -> Add all to a collection). See SessionList_SelectionChanged. -->
+                        <ListView
+                            x:Name="SessionList"
+                            Grid.Row="4"
+                            Margin="0,10,0,0"
+                            Background="Transparent"
+                            BorderThickness="0"
+                            ItemTemplate="{StaticResource SessionTemplate}"
+                            RightTapped="SessionList_RightTapped"
+                            SelectionChanged="SessionList_SelectionChanged"
+                            SelectionMode="Extended" />
+
+                        <Grid Grid.Row="5" Margin="0,8,0,0">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <Button
+                                x:Name="ToolsButton"
+                                Click="Tools_Click"
+                                Style="{StaticResource RowButtonStyle}"
+                                ToolTipService.ToolTip="Deep search, collections, running sessions, fleet, custody and settings">
+                                <StackPanel Orientation="Horizontal" Spacing="10">
+                                    <SymbolIcon Symbol="AllApps" />
+                                    <TextBlock Text="Tools" />
+                                </StackPanel>
+                            </Button>
+                            <Button
+                                x:Name="SettingsButton"
+                                Grid.Column="1"
+                                Click="Settings_Click"
+                                Style="{StaticResource IconButtonStyle}"
+                                ToolTipService.ToolTip="Settings">
+                                <SymbolIcon Symbol="Setting" />
+                            </Button>
+                        </Grid>
+                    </Grid>
+
+                    <!-- Tools pane: the same destinations, one coherent surface instead of a menu of twelve. -->
+                    <Grid x:Name="ToolsPane" Visibility="Collapsed">
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="*" />
+                        </Grid.RowDefinitions>
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="Auto" />
+                                <ColumnDefinition Width="*" />
+                            </Grid.ColumnDefinitions>
+                            <Button
+                                x:Name="ToolsBackButton"
+                                Click="ToolsBack_Click"
+                                Style="{StaticResource IconButtonStyle}"
+                                ToolTipService.ToolTip="Back to chats">
+                                <FontIcon FontFamily="Segoe Fluent Icons" FontSize="16" Glyph="&#xE72B;" />
+                            </Button>
+                            <TextBlock
+                                Grid.Column="1"
+                                Margin="8,0,0,0"
+                                VerticalAlignment="Center"
+                                FontSize="15"
+                                FontWeight="SemiBold"
+                                Foreground="{StaticResource TextStrongBrush}"
+                                Text="Tools" />
+                        </Grid>
+                        <ScrollViewer Grid.Row="1" Margin="0,10,0,0" VerticalScrollBarVisibility="Auto">
+                            <StackPanel Spacing="2">
+                                <Button x:Name="NavSearch" Click="Nav_Click" Style="{StaticResource RowButtonStyle}" Tag="Search">
+                                    <StackPanel Orientation="Horizontal" Spacing="10">
+                                        <SymbolIcon Symbol="Find" />
+                                        <TextBlock Text="Deep search" />
+                                    </StackPanel>
+                                </Button>
+                                <Button x:Name="NavAsk" Click="Nav_Click" Style="{StaticResource RowButtonStyle}" Tag="Ask">
+                                    <StackPanel Orientation="Horizontal" Spacing="10">
+                                        <SymbolIcon Symbol="Message" />
+                                        <TextBlock Text="Co-pilot" />
+                                    </StackPanel>
+                                </Button>
+                                <Button x:Name="NavWorkspaces" Click="Nav_Click" Style="{StaticResource RowButtonStyle}" Tag="Workspaces">
+                                    <StackPanel Orientation="Horizontal" Spacing="10">
+                                        <SymbolIcon Symbol="Folder" />
+                                        <TextBlock Text="Workspaces" />
+                                    </StackPanel>
+                                </Button>
+                                <Button x:Name="NavCollections" Click="Nav_Click" Style="{StaticResource RowButtonStyle}" Tag="Collections">
+                                    <StackPanel Orientation="Horizontal" Spacing="10">
+                                        <SymbolIcon Symbol="AllApps" />
+                                        <TextBlock Text="Collections" />
+                                    </StackPanel>
+                                </Button>
+                                <Button x:Name="NavRunning" Click="Nav_Click" Style="{StaticResource RowButtonStyle}" Tag="Running">
+                                    <StackPanel Orientation="Horizontal" Spacing="10">
+                                        <SymbolIcon Symbol="Play" />
+                                        <TextBlock Text="Running" />
+                                    </StackPanel>
+                                </Button>
+                                <Button x:Name="NavFleet" Click="Nav_Click" Style="{StaticResource RowButtonStyle}" Tag="Fleet">
+                                    <StackPanel Orientation="Horizontal" Spacing="10">
+                                        <FontIcon FontFamily="Segoe Fluent Icons" FontSize="15" Glyph="&#xE7F4;" />
+                                        <TextBlock Text="Fleet" />
+                                    </StackPanel>
+                                </Button>
+                                <Button x:Name="NavPhrases" Click="Nav_Click" Style="{StaticResource RowButtonStyle}" Tag="Phrases">
+                                    <StackPanel Orientation="Horizontal" Spacing="10">
+                                        <FontIcon FontFamily="Segoe Fluent Icons" FontSize="15" Glyph="&#xE8EC;" />
+                                        <TextBlock Text="Phrases" />
+                                    </StackPanel>
+                                </Button>
+                                <Button x:Name="NavCustody" Click="Nav_Click" Style="{StaticResource RowButtonStyle}" Tag="Custody">
+                                    <StackPanel Orientation="Horizontal" Spacing="10">
+                                        <FontIcon FontFamily="Segoe Fluent Icons" FontSize="15" Glyph="&#xE72E;" />
+                                        <TextBlock Text="Custody" />
+                                    </StackPanel>
+                                </Button>
+                                <Button x:Name="NavSettings" Click="Nav_Click" Style="{StaticResource RowButtonStyle}" Tag="Settings">
+                                    <StackPanel Orientation="Horizontal" Spacing="10">
+                                        <SymbolIcon Symbol="Setting" />
+                                        <TextBlock Text="Settings" />
+                                    </StackPanel>
+                                </Button>
+                            </StackPanel>
+                        </ScrollViewer>
+                    </Grid>
+                </Grid>
+            </Border>
+
+            <!-- ===== CENTER = work. A slim transcript toolbar over a deliberately narrow, centred column. -->
+            <Grid Grid.Column="1">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="*" />
+                </Grid.RowDefinitions>
+                <Border
+                    x:Name="HeaderActions"
+                    Padding="24,8"
+                    BorderBrush="{StaticResource LineBrush}"
+                    BorderThickness="0,0,0,1">
+                    <StackPanel Orientation="Horizontal" Spacing="8">
                         <Button
                             x:Name="MsgViewToggle"
                             Click="MsgViewToggle_Click"
@@ -294,6 +548,7 @@
                             <TextBlock x:Name="MsgViewToggleText" Text="View: all" />
                         </Button>
                         <Button
+                            x:Name="JumpPrevUser"
                             Click="JumpPrevUser_Click"
                             Style="{StaticResource PillButtonStyle}"
                             ToolTipService.ToolTip="Jump to your previous message (repeat to step back through your messages)">
@@ -303,188 +558,199 @@
                             </StackPanel>
                         </Button>
                         <Button
+                            x:Name="JumpStart"
                             Click="JumpStart_Click"
                             Style="{StaticResource PillButtonStyle}"
                             ToolTipService.ToolTip="Jump to the very first message, then scroll down">
                             <TextBlock Text="Start" />
                         </Button>
-                        <Button Click="CopyContext_Click" Style="{StaticResource PillButtonStyle}">
-                            <StackPanel Orientation="Horizontal" Spacing="8">
-                                <SymbolIcon Symbol="Copy" />
-                                <TextBlock Text="Copy context" />
-                            </StackPanel>
+                    </StackPanel>
+                </Border>
+
+                <ScrollViewer x:Name="MainScroller" Grid.Row="1">
+                    <StackPanel
+                        x:Name="MainContent"
+                        Padding="28,26"
+                        Spacing="18" />
+                </ScrollViewer>
+            </Grid>
+
+            <!-- ===== RIGHT = inspect. Closed by default; the badge is how it asks for attention. ===== -->
+            <Border
+                x:Name="RightColumnBorder"
+                Grid.Column="2"
+                Margin="14,18,14,14"
+                Padding="14,12,14,8"
+                VerticalAlignment="Stretch"
+                Background="{StaticResource PanelBrush}"
+                BorderBrush="{StaticResource LineBrush}"
+                BorderThickness="1"
+                CornerRadius="12"
+                Visibility="Collapsed">
+                <Grid>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="*" />
+                    </Grid.RowDefinitions>
+
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+                        <TextBlock
+                            VerticalAlignment="Center"
+                            FontSize="15"
+                            FontWeight="SemiBold"
+                            Foreground="{StaticResource TextStrongBrush}"
+                            Text="Inspector" />
+                        <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="2">
+                            <Button
+                                x:Name="InspectorPinButton"
+                                Click="InspectorPin_Click"
+                                Style="{StaticResource IconButtonStyle}"
+                                ToolTipService.ToolTip="Keep the inspector open when the window is narrow">
+                                <FontIcon FontFamily="Segoe Fluent Icons" FontSize="14" Glyph="&#xE718;" />
+                            </Button>
+                            <Button
+                                x:Name="InspectorCloseButton"
+                                Click="InspectorClose_Click"
+                                Style="{StaticResource IconButtonStyle}"
+                                ToolTipService.ToolTip="Close the inspector">
+                                <FontIcon FontFamily="Segoe Fluent Icons" FontSize="14" Glyph="&#xE711;" />
+                            </Button>
+                        </StackPanel>
+                    </Grid>
+
+                    <StackPanel Grid.Row="1" Margin="0,8,0,0" Orientation="Horizontal" Spacing="2">
+                        <Button x:Name="InspectorTabIntegrity" Click="InspectorTab_Click" Style="{StaticResource TabButtonStyle}" Tag="Integrity">
+                            <TextBlock Text="Integrity" />
                         </Button>
-                        <Button
-                            x:Name="HeaderMoreButton"
-                            Click="HeaderMore_Click"
-                            Style="{StaticResource IconButtonStyle}"
-                            ToolTipService.ToolTip="More actions">
-                            <FontIcon FontFamily="Segoe Fluent Icons" FontSize="16" Glyph="&#xE712;" />
+                        <Button x:Name="InspectorTabContext" Click="InspectorTab_Click" Style="{StaticResource TabButtonStyle}" Tag="Context">
+                            <TextBlock Text="Context" />
                         </Button>
-                        <Button Style="{StaticResource PrimaryPillButtonStyle}" ToolTipService.ToolTip="Resume with this chat's native CLI, or expand for Gateway (cc) continuation">
-                            <Button.Flyout>
-                                <MenuFlyout>
-                                    <MenuFlyoutItem
-                                        x:Name="HeaderResumeNativeItem"
-                                        Text="Resume as Claude"
-                                        Click="ResumeInTerminal_Click"
-                                        ToolTipService.ToolTip="Resume with this chat's native Codex or Claude CLI." />
-                                    <MenuFlyoutItem
-                                        x:Name="HeaderResumeGatewayItem"
-                                        Text="Resume as Gateway"
-                                        Click="ResumeAsGateway_Click"
-                                        ToolTipService.ToolTip="Continue through the custom cc Gateway." />
-                                </MenuFlyout>
-                            </Button.Flyout>
-                            <StackPanel Orientation="Horizontal" Spacing="8">
-                                <FontIcon
-                                    FontFamily="Segoe Fluent Icons"
-                                    FontSize="15"
-                                    Foreground="Black"
-                                    Glyph="&#xE756;" />
-                                <TextBlock Text="Resume" />
-                            </StackPanel>
+                        <Button x:Name="InspectorTabActivity" Click="InspectorTab_Click" Style="{StaticResource TabButtonStyle}" Tag="Activity">
+                            <TextBlock Text="Activity" />
+                        </Button>
+                        <Button x:Name="InspectorTabActions" Click="InspectorTab_Click" Style="{StaticResource TabButtonStyle}" Tag="Actions">
+                            <TextBlock Text="Actions" />
                         </Button>
                     </StackPanel>
+
+                    <ScrollViewer
+                        x:Name="RightPanel"
+                        Grid.Row="2"
+                        Margin="0,10,0,0"
+                        HorizontalScrollBarVisibility="Disabled"
+                        VerticalScrollBarVisibility="Auto">
+                        <Grid>
+                            <StackPanel x:Name="InspectorIntegrityPanel" Spacing="8">
+                                <Button
+                                    Click="RefreshIntegrity_Click"
+                                    HorizontalAlignment="Left"
+                                    Style="{StaticResource PillButtonStyle}"
+                                    ToolTipService.ToolTip="Refresh custody checks for this chat">
+                                    <StackPanel Orientation="Horizontal" Spacing="6">
+                                        <SymbolIcon Symbol="Refresh" />
+                                        <TextBlock Text="Re-check" />
+                                    </StackPanel>
+                                </Button>
+                                <StackPanel x:Name="IntegrityItems" Spacing="6" />
+                            </StackPanel>
+
+                            <StackPanel x:Name="InspectorContextPanel" Spacing="8" Visibility="Collapsed">
+                                <StackPanel x:Name="ContextItems" Spacing="6" />
+                                <Border Height="1" Background="{StaticResource LineBrush}" />
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="Auto" />
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock
+                                        VerticalAlignment="Center"
+                                        FontSize="14"
+                                        FontWeight="SemiBold"
+                                        Foreground="{StaticResource TextStrongBrush}"
+                                        Text="Tags" />
+                                    <Button
+                                        x:Name="AddTagButton"
+                                        Grid.Column="1"
+                                        Padding="10,2"
+                                        Click="AddTag_Click"
+                                        Style="{StaticResource PillButtonStyle}"
+                                        ToolTipService.ToolTip="Add a tag to this chat">
+                                        <TextBlock FontSize="12" Text="+ Tag" />
+                                    </Button>
+                                </Grid>
+                                <StackPanel x:Name="TagsItems" Spacing="6" />
+                            </StackPanel>
+
+                            <StackPanel x:Name="InspectorActivityPanel" Spacing="8" Visibility="Collapsed">
+                                <StackPanel x:Name="ActivityItems" Spacing="8" />
+                            </StackPanel>
+
+                            <StackPanel x:Name="InspectorActionsPanel" Spacing="4" Visibility="Collapsed">
+                                <Button
+                                    x:Name="ResumeMultiplexButton"
+                                    Content="Resume multiplex"
+                                    Style="{StaticResource ActionCardButtonStyle}"
+                                    ToolTipService.ToolTip="Start this chat in multiplex with its stored launcher or explicitly through Gateway.">
+                                    <Button.Flyout>
+                                        <MenuFlyout>
+                                            <MenuFlyoutItem Text="Start multiplex" Click="ResumeInMultiplex_Click" />
+                                            <MenuFlyoutItem
+                                                x:Name="QuickGatewayMultiplexItem"
+                                                Text="Start Gateway multiplex"
+                                                Click="ResumeInGatewayMultiplex_Click" />
+                                        </MenuFlyout>
+                                    </Button.Flyout>
+                                </Button>
+                                <Button
+                                    x:Name="ResumeHeadlessMultiplexButton"
+                                    Content="Resume headless multiplex"
+                                    Style="{StaticResource ActionCardButtonStyle}"
+                                    ToolTipService.ToolTip="Start this chat headlessly with its stored launcher or explicitly through Gateway.">
+                                    <Button.Flyout>
+                                        <MenuFlyout>
+                                            <MenuFlyoutItem Text="Start headless multiplex" Click="ResumeInHeadlessMultiplex_Click" />
+                                            <MenuFlyoutItem
+                                                x:Name="QuickGatewayHeadlessItem"
+                                                Text="Start Gateway headless multiplex"
+                                                Click="ResumeInGatewayHeadlessMultiplex_Click" />
+                                        </MenuFlyout>
+                                    </Button.Flyout>
+                                </Button>
+                                <Button
+                                    x:Name="AddToProjectButton"
+                                    Click="AddToProject_Click"
+                                    Content="Add to project"
+                                    Style="{StaticResource ActionCardButtonStyle}" />
+                                <Button
+                                    x:Name="CopyCommandButton"
+                                    Click="CopyCommand_Click"
+                                    Content="Copy resume command"
+                                    Style="{StaticResource ActionCardButtonStyle}"
+                                    ToolTipService.ToolTip="Copy the trusted command for this chat's stored launcher, including Gateway (cc)." />
+                                <Button
+                                    x:Name="CopyGatewayCommandButton"
+                                    Click="CopyGatewayCommand_Click"
+                                    Content="Copy Gateway command"
+                                    Style="{StaticResource ActionCardButtonStyle}"
+                                    ToolTipService.ToolTip="Copy the trusted cc.cmd Gateway resume command for this Claude chat." />
+                                <Button
+                                    Click="Restore_Click"
+                                    Content="Build restore packet"
+                                    Style="{StaticResource ActionCardButtonStyle}" />
+                                <Button
+                                    Click="Source_Click"
+                                    Content="Inspect raw events"
+                                    Style="{StaticResource ActionCardButtonStyle}" />
+                            </StackPanel>
+                        </Grid>
+                    </ScrollViewer>
                 </Grid>
             </Border>
-
-            <ScrollViewer x:Name="MainScroller" Grid.Row="1" ViewChanged="MainScroller_ViewChanged">
-                <StackPanel x:Name="MainContent" Padding="28,26" Spacing="18" />
-            </ScrollViewer>
         </Grid>
-
-        <Border
-            x:Name="RightColumnBorder"
-            Grid.Column="2"
-            Margin="18,26,18,18"
-            Padding="16,16,16,8"
-            VerticalAlignment="Stretch"
-            BorderBrush="{StaticResource LineBrush}"
-            BorderThickness="1"
-            Background="{StaticResource PanelBrush}"
-            CornerRadius="12">
-            <ScrollViewer
-                HorizontalScrollBarVisibility="Disabled"
-                VerticalScrollBarVisibility="Auto">
-            <StackPanel x:Name="RightPanel" Spacing="12">
-                <Grid>
-                    <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="*" />
-                        <ColumnDefinition Width="Auto" />
-                    </Grid.ColumnDefinitions>
-                    <TextBlock
-                        VerticalAlignment="Center"
-                        FontSize="18"
-                        FontWeight="SemiBold"
-                        Foreground="{StaticResource TextStrongBrush}"
-                        Text="Integrity" />
-                    <Button
-                        Grid.Column="1"
-                        Padding="8,4"
-                        Click="RefreshIntegrity_Click"
-                        Style="{StaticResource PillButtonStyle}"
-                        ToolTipService.ToolTip="Refresh custody checks for this chat">
-                        <SymbolIcon Symbol="Refresh" />
-                    </Button>
-                </Grid>
-                <StackPanel x:Name="IntegrityItems" Spacing="6" />
-                <Border Height="1" Background="{StaticResource LineBrush}" />
-                <TextBlock
-                    FontSize="18"
-                    FontWeight="SemiBold"
-                    Foreground="{StaticResource TextStrongBrush}"
-                    Text="Quick actions" />
-                <Button
-                    x:Name="ResumeTerminalButton"
-                    Content="Resume"
-                    HorizontalAlignment="Stretch"
-                    Style="{StaticResource PrimaryPillButtonStyle}"
-                    ToolTipService.ToolTip="Resume with this chat's native CLI, or expand for Gateway (cc) continuation">
-                    <Button.Flyout>
-                        <MenuFlyout>
-                            <MenuFlyoutItem
-                                x:Name="QuickResumeNativeItem"
-                                Text="Resume as Claude"
-                                Click="ResumeInTerminal_Click"
-                                ToolTipService.ToolTip="Resume with this chat's native Codex or Claude CLI." />
-                            <MenuFlyoutItem
-                                x:Name="QuickResumeGatewayItem"
-                                Text="Resume as Gateway"
-                                Click="ResumeAsGateway_Click"
-                                ToolTipService.ToolTip="Continue through the custom cc Gateway." />
-                        </MenuFlyout>
-                    </Button.Flyout>
-                </Button>
-                <Button
-                    x:Name="ResumeMultiplexButton"
-                    Content="Start multiplex"
-                    ToolTipService.ToolTip="Start this chat in multiplex with its stored launcher or explicitly through Gateway."
-                    HorizontalAlignment="Stretch"
-                    Style="{StaticResource PillButtonStyle}">
-                    <Button.Flyout>
-                        <MenuFlyout>
-                            <MenuFlyoutItem Text="Start multiplex" Click="ResumeInMultiplex_Click" />
-                            <MenuFlyoutItem
-                                x:Name="QuickGatewayMultiplexItem"
-                                Text="Start Gateway multiplex"
-                                Click="ResumeInGatewayMultiplex_Click" />
-                        </MenuFlyout>
-                    </Button.Flyout>
-                </Button>
-                <Button
-                    x:Name="ResumeHeadlessMultiplexButton"
-                    Content="Start headless multiplex"
-                    ToolTipService.ToolTip="Start this chat headlessly with its stored launcher or explicitly through Gateway."
-                    HorizontalAlignment="Stretch"
-                    Style="{StaticResource PillButtonStyle}">
-                    <Button.Flyout>
-                        <MenuFlyout>
-                            <MenuFlyoutItem Text="Start headless multiplex" Click="ResumeInHeadlessMultiplex_Click" />
-                            <MenuFlyoutItem
-                                x:Name="QuickGatewayHeadlessItem"
-                                Text="Start Gateway headless multiplex"
-                                Click="ResumeInGatewayHeadlessMultiplex_Click" />
-                        </MenuFlyout>
-                    </Button.Flyout>
-                </Button>
-                <Button
-                    x:Name="AddToProjectButton"
-                    Click="AddToProject_Click"
-                    Content="Add to project"
-                    HorizontalAlignment="Stretch"
-                    Style="{StaticResource PillButtonStyle}" />
-                <Button Click="CopyContext_Click" Content="Copy resume prompt" HorizontalAlignment="Stretch" Style="{StaticResource PillButtonStyle}" />
-                <Button x:Name="CopyCommandButton" Click="CopyCommand_Click" Content="Copy resume command" ToolTipService.ToolTip="Copy the trusted command for this chat's stored launcher, including Gateway (cc)." HorizontalAlignment="Stretch" Style="{StaticResource PillButtonStyle}" />
-                <Button x:Name="CopyGatewayCommandButton" Click="CopyGatewayCommand_Click" Content="Copy Gateway command" ToolTipService.ToolTip="Copy the trusted cc.cmd Gateway resume command for this Claude chat." HorizontalAlignment="Stretch" Style="{StaticResource PillButtonStyle}" />
-                <Button Click="CopyPath_Click" Content="Copy chat path" HorizontalAlignment="Stretch" Style="{StaticResource PillButtonStyle}" />
-                <Button Click="CopyCode_Click" Content="Copy all code" HorizontalAlignment="Stretch" Style="{StaticResource PillButtonStyle}" />
-                <Button Click="Restore_Click" Content="Build restore packet" HorizontalAlignment="Stretch" Style="{StaticResource PillButtonStyle}" />
-                <Button Click="Source_Click" Content="Inspect raw events" HorizontalAlignment="Stretch" Style="{StaticResource PillButtonStyle}" />
-                <Grid Margin="0,6,0,0">
-                    <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="*" />
-                        <ColumnDefinition Width="Auto" />
-                    </Grid.ColumnDefinitions>
-                    <TextBlock
-                        VerticalAlignment="Center"
-                        FontSize="16"
-                        FontWeight="SemiBold"
-                        Foreground="{StaticResource TextStrongBrush}"
-                        Text="Tags" />
-                    <Button
-                        x:Name="AddTagButton"
-                        Grid.Column="1"
-                        Padding="10,4"
-                        Click="AddTag_Click"
-                        Style="{StaticResource PillButtonStyle}"
-                        ToolTipService.ToolTip="Add a tag to this chat">
-                        <TextBlock FontSize="12" Text="+ Tag" />
-                    </Button>
-                </Grid>
-                <StackPanel x:Name="TagsItems" Spacing="6" />
-            </StackPanel>
-            </ScrollViewer>
-        </Border>
     </Grid>
 </Page>

@@ -75,6 +75,33 @@ public sealed class AppStoreData
     // so you can tell at a glance it's a resumed-remote). Projected to the web to tint the tab.
     [JsonPropertyName("muxTabMeta")]
     public Dictionary<string, MuxTabMeta> MuxTabMeta { get; set; } = new();
+
+    // Phrases from the OLD scheme (single words like "petunia", ".mux"), detached from the chats when the
+    // phrase system moved to generated [trait][color][fruit][food] combinations. Keeping the phrase -> chat
+    // mapping means the detach is reversible and the old handles stay readable; nothing is thrown away.
+    [JsonPropertyName("legacyPhrases")]
+    public List<LegacyPhraseGroup> LegacyPhrases { get; set; } = new();
+
+    // Phrases the user saved for reuse ("apples" for mux work, "pears" for gateway), offered on the vet
+    // dialog instead of a fresh random combination. Note says what the phrase is for.
+    [JsonPropertyName("phraseCategories")]
+    public List<PhraseCategory> PhraseCategories { get; set; } = new();
+}
+
+// One phrase from the retired scheme plus every chat that carried it.
+public sealed class LegacyPhraseGroup
+{
+    [JsonPropertyName("phrase")] public string Phrase { get; set; } = "";
+    [JsonPropertyName("sessionIds")] public List<string> SessionIds { get; set; } = new();
+    [JsonPropertyName("detachedAt")] public string DetachedAt { get; set; } = "";
+}
+
+// A phrase the user chose to keep and reuse, with a note about what it is for.
+public sealed class PhraseCategory
+{
+    [JsonPropertyName("phrase")] public string Phrase { get; set; } = "";
+    [JsonPropertyName("note")] public string Note { get; set; } = "";
+    [JsonPropertyName("savedAt")] public string SavedAt { get; set; } = "";
 }
 
 // One chat that has lived in a mux tab (current or historical).
@@ -221,6 +248,24 @@ public sealed class ArchiveSettings
 
     [JsonPropertyName("multiplexApiPort")]
     public int MultiplexApiPort { get; set; } = 7682;
+
+    // Shell state, remembered per user so the frame you build once is the frame you get back: whether the
+    // chat list is folded away, whether the inspector is showing (and pinned against a narrow window),
+    // whether the top bar is in compact mode, and which inspector tab was last looked at.
+    [JsonPropertyName("shellSidebarCollapsed")]
+    public bool ShellSidebarCollapsed { get; set; }
+
+    [JsonPropertyName("shellInspectorOpen")]
+    public bool ShellInspectorOpen { get; set; }
+
+    [JsonPropertyName("shellInspectorPinned")]
+    public bool ShellInspectorPinned { get; set; }
+
+    [JsonPropertyName("shellTopCompact")]
+    public bool ShellTopCompact { get; set; }
+
+    [JsonPropertyName("shellInspectorTab")]
+    public string ShellInspectorTab { get; set; } = "Integrity";
 }
 
 public sealed class AiProviderSettings
@@ -327,9 +372,12 @@ public sealed class ChatFilter
     // visibility toggle, not a narrowing filter, so it is excluded from IsEmpty.
     public bool ShowAutomationWorkers { get; set; }
 
-    // Archive scope is separate from ShowHidden: active is the default, archived exposes only
-    // archived sessions, and all is an explicit recovery/debug view.
-    public string Archived { get; set; } = "active";
+    // Which lifecycle tier the list shows. The scope tabs name one explicitly: "unvetted" is the general
+    // populace everything lands in, "active" is what has been vetted, "archived" is retired, and "all"
+    // keeps every tier including retired. The default "" is deliberately tier-free - it means the whole
+    // LIVE store (unvetted + vetted), which is what the filter wrapper and the remote discovery API have
+    // always meant by leaving this unset.
+    public string Archived { get; set; } = "";
 
     public bool IsEmpty => string.IsNullOrWhiteSpace(Query) && IncludeTags.Count == 0
         && ExcludeTags.Count == 0 && string.IsNullOrEmpty(CollectionId) && string.IsNullOrEmpty(DateMode)
@@ -541,11 +589,11 @@ public sealed class ArchiveSession : INotifyPropertyChanged
     // re-sync), so they notify their computed display props to keep the live ListView in sync.
     private string _title = "";
     [JsonPropertyName("title")]
-    public string Title { get => _title; set { _title = value; InvalidateSearchText(); BumpAggregateEpoch(); Raise(); Raise(nameof(DisplayTitle)); Raise(nameof(ListTitle)); } }
+    public string Title { get => _title; set { _title = value; InvalidateSearchText(); BumpAggregateEpoch(); Raise(); Raise(nameof(DisplayTitle)); Raise(nameof(NativeTitle)); Raise(nameof(RowName)); Raise(nameof(ListTitle)); } }
 
     private string _customTitle = "";
     [JsonPropertyName("customTitle")]
-    public string CustomTitle { get => _customTitle; set { _customTitle = value; InvalidateSearchText(); BumpAggregateEpoch(); Raise(); Raise(nameof(DisplayTitle)); Raise(nameof(ListTitle)); } }
+    public string CustomTitle { get => _customTitle; set { _customTitle = value; InvalidateSearchText(); BumpAggregateEpoch(); Raise(); Raise(nameof(DisplayTitle)); Raise(nameof(NativeTitle)); Raise(nameof(RowName)); Raise(nameof(ListTitle)); } }
 
     private string _sourcePath = "";
     [JsonPropertyName("sourcePath")]
@@ -629,6 +677,14 @@ public sealed class ArchiveSession : INotifyPropertyChanged
     private bool _archived;
     [JsonPropertyName("archived")]
     public bool Archived { get => _archived; set { _archived = value; BumpAggregateEpoch(); } }
+
+    // The chat has been VETTED: someone opened it, gave it a real name and a phrase, and decided it is
+    // worth keeping. This is the middle tier of the lifecycle — unvetted chats pile up in "All" (the
+    // general populace), vetting promotes one to "Active", and archiving retires it. Absent from an older
+    // store, so every existing chat starts unvetted, which is exactly where the general populace belongs.
+    private bool _vetted;
+    [JsonPropertyName("vetted")]
+    public bool Vetted { get => _vetted; set { _vetted = value; BumpAggregateEpoch(); Raise(); } }
 
     // Branch linkage. When this chat was created by the app's Branch action, BranchOfId is the PARENT
     // chat's id and BranchedAt is when the clone was taken. Presence of BranchOfId ⇒ this is a branch.
@@ -716,8 +772,30 @@ public sealed class ArchiveSession : INotifyPropertyChanged
         + (IsBranch ? "⑂" : "")
         + (IsGatewayBranch ? " GW" : "");
 
+    // The app-assigned override wins: CustomTitle is what a mux rename writes (and what the web tab-rename
+    // calls the "App name"), so it is the name MUX gave the chat, not the one the agent carries.
     [JsonIgnore]
     public string DisplayTitle => string.IsNullOrWhiteSpace(CustomTitle) ? Title : CustomTitle;
+
+    // The agent's OWN name for the chat (Title), which is what `claude --resume` / `codex resume` list and
+    // what a NATIVE rename rewrites. Falls back to the app-assigned name so a chat with no native title
+    // still has something to show rather than a blank row.
+    [JsonIgnore]
+    public string NativeTitle => string.IsNullOrWhiteSpace(Title) ? CustomTitle : Title;
+
+    // Which of the two names the list shows. Set per-row by the list, exactly like RowTitleMode: false (the
+    // default) = the agent's native name, true = the app-assigned ("mux") name.
+    private bool _preferMuxName;
+    [JsonIgnore]
+    public bool PreferMuxName
+    {
+        get => _preferMuxName;
+        set { if (_preferMuxName == value) return; _preferMuxName = value; Raise(nameof(RowName)); Raise(nameof(ListTitle)); }
+    }
+
+    // The name a list row / chat header shows, under the current name-source setting.
+    [JsonIgnore]
+    public string RowName => _preferMuxName ? DisplayTitle : NativeTitle;
 
     // The last / first thing the USER typed in this chat (capped, single line). Captured at parse time from
     // the FULL transcript so the last/first-user-message list sorts + titles work without loading per row.
@@ -743,10 +821,10 @@ public sealed class ArchiveSession : INotifyPropertyChanged
 
     [JsonIgnore]
     public string ListTitle => _rowTitleMode == "last-user"
-            ? (string.IsNullOrWhiteSpace(LastUserMessage) ? "No messages · " + DisplayTitle : LastUserMessage)
+            ? (string.IsNullOrWhiteSpace(LastUserMessage) ? "No messages · " + RowName : LastUserMessage)
         : _rowTitleMode == "first-user"
-            ? (string.IsNullOrWhiteSpace(FirstUserMessage) ? DisplayTitle : FirstUserMessage)
-        : DisplayTitle;
+            ? (string.IsNullOrWhiteSpace(FirstUserMessage) ? RowName : FirstUserMessage)
+        : RowName;
 
     [JsonIgnore]
     public string PinGlyph => Pinned ? "*" : "";

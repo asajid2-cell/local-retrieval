@@ -20,8 +20,10 @@ public sealed partial class MainPage
             ColumnDefinitions =
             {
                 new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) },
+                new ColumnDefinition { Width = GridLength.Auto },
                 new ColumnDefinition { Width = GridLength.Auto }
-            }
+            },
+            ColumnSpacing = 8
         };
         top.Children.Add(new TextBlock
         {
@@ -31,11 +33,35 @@ public sealed partial class MainPage
             FontWeight = FontWeights.SemiBold,
             VerticalAlignment = VerticalAlignment.Center
         });
+
+        // The retirement is offered only while old-scheme handles remain, and retired once and for all:
+        // after it, the list below holds nothing and the button is gone.
+        var oldHandles = _archive.Store.Sessions.Values
+            .SelectMany(s => s.SpecialPhrases)
+            .Where(p => !string.IsNullOrWhiteSpace(p) && !CodexLocalRetrieval.Core.Services.PhraseGenerator.IsGenerated(p))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Count();
+        if (oldHandles > 0)
+        {
+            var retire = new Button
+            {
+                Content = $"Retire {oldHandles} old phrase{(oldHandles == 1 ? "" : "s")}",
+                Style = (Style)Resources["PillButtonStyle"]
+            };
+            ToolTipService.SetToolTip(retire,
+                "Park the phrases from the old naming scheme in a kept list, so the chats start clean under the new scheme.");
+            retire.Click += async (_, _) => await RetireOldPhrasesAsync(oldHandles);
+            Grid.SetColumn(retire, 1);
+            top.Children.Add(retire);
+        }
+
         var start = new Button { Content = "Start chat", Style = (Style)Resources["PrimaryPillButtonStyle"] };
         start.Click += async (_, _) => await StartChatAsync();
-        Grid.SetColumn(start, 1);
+        Grid.SetColumn(start, 2);
         top.Children.Add(start);
         MainContent.Children.Add(top);
+
+        if (_archive.Store.LegacyPhrases.Count > 0) MainContent.Children.Add(LegacyPhrasesPanel());
 
         var groups = _archive.Store.Sessions.Values
             .Where(s => !s.Archived)
@@ -56,13 +82,110 @@ public sealed partial class MainPage
         if (groups.Count == 0)
         {
             MainContent.Children.Add(EmptyBlock(
-                "No phrases yet",
-                "Start a chat and give it a special phrase. Chats sharing that phrase stay grouped here."));
+                "No live phrases yet",
+                "Vet a chat from the list (right-click it, then Vet chat) and give it a phrase. Chats sharing a phrase stay grouped here."));
             return;
         }
 
         foreach (var group in groups)
             MainContent.Children.Add(PhraseGroup(group.Phrase, group.Sessions));
+    }
+
+    // Retiring rewrites the phrase metadata of every chat carrying an old handle, so it is confirmed first
+    // and the result names the backup copy the service takes before it touches anything.
+    private async Task RetireOldPhrasesAsync(int count)
+    {
+        var dialog = new ContentDialog
+        {
+            Title = $"Retire {count} old phrase{(count == 1 ? "" : "s")}?",
+            Content = new TextBlock
+            {
+                Text = "The phrases from the old naming scheme come off every chat they are on, and are kept "
+                     + "in a list here with the chats each one covered.\n\nA copy of the app store is taken "
+                     + "first. Phrases issued by vetting are left where they are.",
+                TextWrapping = TextWrapping.Wrap
+            },
+            PrimaryButtonText = "Retire them",
+            CloseButtonText = "Keep them",
+            DefaultButton = ContentDialogButton.Close,
+            XamlRoot = XamlRoot
+        };
+        if (await dialog.ShowAsync() != ContentDialogResult.Primary) return;
+
+        // A retirement that could not be written must say so: an exception escaping here would leave the
+        // phrases in place with nothing shown, which reads as the button having done nothing.
+        try
+        {
+            var (phrases, chats, backup) = await _archive.DetachLegacyPhrasesAsync();
+            UpdateChrome();
+            RenderCurrent();
+            SyncStatus.Text = phrases == 0
+                ? "No old phrases were left to retire."
+                : $"Retired {phrases} old phrase{(phrases == 1 ? "" : "s")} off {chats} chat{(chats == 1 ? "" : "s")}."
+                  + (backup.Length == 0 ? " No backup copy could be taken." : $" Backup: {backup}");
+        }
+        catch (Exception ex)
+        {
+            RenderCurrent();
+            SyncStatus.Text = "Could not retire the old phrases: " + ex.Message;
+        }
+    }
+
+    // The retired handles, kept because a phrase-to-chats mapping is information worth having: you can
+    // still see which chats a "petunia" covered, and put one back by hand from the backup if you want it.
+    private UIElement LegacyPhrasesPanel()
+    {
+        var stack = new StackPanel { Spacing = 8 };
+        stack.Children.Add(new TextBlock
+        {
+            Text = "Retired phrases",
+            Foreground = StrongBrush(),
+            FontSize = 15,
+            FontWeight = FontWeights.SemiBold
+        });
+        stack.Children.Add(new TextBlock
+        {
+            Text = $"{_archive.Store.LegacyPhrases.Count} handles from the old scheme, with the chats each one covered.",
+            Foreground = MutedBrush(),
+            FontSize = 11,
+            TextWrapping = TextWrapping.Wrap
+        });
+
+        foreach (var group in _archive.Store.LegacyPhrases
+            .OrderByDescending(g => g.SessionIds.Count)
+            .ThenBy(g => g.Phrase, StringComparer.OrdinalIgnoreCase))
+        {
+            var row = new Grid
+            {
+                ColumnDefinitions = { new ColumnDefinition(), new ColumnDefinition { Width = GridLength.Auto } },
+                ColumnSpacing = 8
+            };
+            row.Children.Add(new TextBlock
+            {
+                Text = group.Phrase,
+                Foreground = StrongBrush(),
+                FontSize = 12,
+                FontWeight = FontWeights.SemiBold,
+                VerticalAlignment = VerticalAlignment.Center,
+                TextTrimming = TextTrimming.CharacterEllipsis
+            });
+            var count = new Border
+            {
+                Background = AccentVerySoftBrush(),
+                CornerRadius = new CornerRadius(6),
+                Padding = new Thickness(8, 2, 8, 2),
+                Child = new TextBlock
+                {
+                    Text = $"{group.SessionIds.Count} chat{(group.SessionIds.Count == 1 ? "" : "s")}",
+                    Foreground = MutedBrush(),
+                    FontSize = 11
+                }
+            };
+            Grid.SetColumn(count, 1);
+            row.Children.Add(count);
+            stack.Children.Add(row);
+        }
+        return Card(stack);
     }
 
     private UIElement PhraseGroup(string phrase, IReadOnlyList<ArchiveSession> sessions)

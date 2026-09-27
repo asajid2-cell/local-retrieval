@@ -352,12 +352,21 @@ public sealed class DiscoveryApi
             MinUserMessages = query.MinUserMessages,
             ShowHidden = query.ShowHidden,
             ShowAutomationWorkers = query.ShowAutomationWorkers,
-            Archived = query.Archived,
+            Archived = FilterScope(query.Archived),
         };
 
         var filtered = _archive.FilterChats(filter);
         return StableOrder(filtered, query);
     }
+
+    // The discovery vocabulary predates the lifecycle tiers: an archived=active query means a LIVE chat
+    // (not retired), which is the filter's "" - no tier chosen. Only the app's scope tabs name a tier.
+    private static string FilterScope(string archived) => archived switch
+    {
+        "archived" => "archived",
+        "all" => "all",
+        _ => "",
+    };
 
     private DiscoveryChatRow ToRow(ArchiveSession session, string sort)
     {

@@ -37,7 +37,20 @@ public sealed partial class MainPage : Page
             _selectedField = value;
             if (previous is not null && !ReferenceEquals(previous, value))
             {
-                if (ReferenceEquals(_contentLoadingSession, previous))
+                // A merge REPLACES a chat's instance on re-parse without changing which chat is open, so a
+                // re-point to the same chat id is not a chat change: the reader wants the same conversation,
+                // and releasing the old instance's window would leave the finished render on screen with an
+                // empty model behind it (a fossil whose scroll-up paging can never load more). Hand the
+                // window over instead and let the replaced instance go.
+                if (value is not null
+                    && previous.ContentLoaded
+                    && string.Equals(previous.Id, value.Id, StringComparison.OrdinalIgnoreCase))
+                {
+                    value.Messages = previous.Messages;
+                    value.CodeBlocks = previous.CodeBlocks;
+                    value.ContentLoaded = true;
+                }
+                else if (ReferenceEquals(_contentLoadingSession, previous))
                     _ = ReleaseWhenContentLoadCompletesAsync(previous);
                 else
                     _archive.ReleaseContent(previous);
@@ -66,6 +79,13 @@ public sealed partial class MainPage : Page
         Diag.Log("MP.ctor: before InitializeComponent");
         InitializeComponent();
         Diag.Log("MP.ctor: after InitializeComponent");
+        // The scroll viewer consumes the wheel for scrolling itself and marks the event handled, so an
+        // ordinary handler on it never sees a wheel-up - which is the gesture that pages in older
+        // messages. Listen past the handled flag.
+        MainScroller.AddHandler(
+            UIElement.PointerWheelChangedEvent,
+            new PointerEventHandler(MainScroller_PointerWheelChanged),
+            handledEventsToo: true);
         Loaded += MainPage_Loaded;
         Unloaded += MainPage_Unloaded;
         // Responsive: below this width the right rail + chat reader can't both fit, so the right
@@ -130,6 +150,7 @@ public sealed partial class MainPage : Page
                 Diag.Log("MP.Loaded: continuing with empty in-memory store after archive load failure");
 
             ApplyThemeAndShape();
+            InitShell();   // the frame is per user: read the saved pane state before the first paint
             if (_archive.Sessions.Count > 0)
                 SyncStatus.Text = _archive.Sessions.Count + " chats - cached";
             _storeLoaded = true;
@@ -137,6 +158,11 @@ public sealed partial class MainPage : Page
             SessionList.ItemsSource = _archive.Sessions;
             Diag.Log("MP.Loaded: list bound");
             Diag.Mem("loaded.listBound");
+            // The cached store paints BEFORE OnReapplyFilter is wired, so LoadCachedAsync's fallback refresh
+            // binds every chat in the store - harness probes included. Re-run the active filter once here so
+            // the first list the user sees is already filtered, instead of waiting for the startup resurface
+            // to finish (a minute or more on a large store) to re-paint it through ReapplyActiveFilter.
+            ApplyFilters();
             SelectFirstSession();
             Diag.Log("MP.Loaded: first selected");
             RenderCurrent();
@@ -445,49 +471,48 @@ public sealed partial class MainPage : Page
         UpdateBackButton();
     }
 
-    // The right panel (quick actions / tags) and the header actions (copy context /
-    // build restore packet) are session-specific - they only belong on screens tied to
-    // the selected chat. Hide them elsewhere and reclaim the space so each screen shows
-    // only what's relevant.
+    // The frame: which panes exist and how wide, what the top bar shows, and which session commands are
+    // reachable for the current screen. ApplyShellLayout (MainPage.Shell.cs) owns the pane geometry;
+    // this method owns the session-specific parts of the top bar and the inspector's Actions tab.
     private void UpdateChrome()
     {
         bool sessionContext = _screen is "Archive" or "Source" or "Restore";
         bool readOnlySnapshot = _selected?.IsReadOnlySnapshot == true;
-        bool showRight = sessionContext && !readOnlySnapshot && !_narrowLayout;   // fold the right rail when too narrow to fit
         bool showResume = sessionContext && !readOnlySnapshot;
+
+        ApplyShellLayout(sessionContext, readOnlySnapshot, showResume);
+
         bool gatewayContinuation = showResume
             && _selected is not null
             && ArchiveService.CanContinueInGateway(_selected.Tool);
         bool gatewayMultiplex = showResume
             && _selected is not null
             && ArchiveService.CanResumeThroughGateway(_selected.Tool);
-        RightColumnBorder.Visibility = showRight ? Visibility.Visible : Visibility.Collapsed;
-        RightColumn.Width = showRight ? new GridLength(292) : new GridLength(0);
-        HeaderActions.Visibility = sessionContext && !readOnlySnapshot ? Visibility.Visible : Visibility.Collapsed;
-        ResumeTerminalButton.Visibility = showResume ? Visibility.Visible : Visibility.Collapsed;
+
+        ResumePrimaryText.Text = _selected is null ? "Resume" : NativeResumeLabel(_selected);
         HeaderResumeNativeItem.Text = _selected is null ? "Resume" : NativeResumeLabel(_selected);
-        QuickResumeNativeItem.Text = _selected is null ? "Resume" : NativeResumeLabel(_selected);
         HeaderResumeGatewayItem.Text = _selected is null ? "Continue in Gateway" : GatewayResumeLabel(_selected);
-        QuickResumeGatewayItem.Text = _selected is null ? "Continue in Gateway" : GatewayResumeLabel(_selected);
         if (_selected is not null)
         {
+            ToolTipService.SetToolTip(ResumeTerminalButton,
+                NativeResumeLabel(_selected) + " - native CLI, or expand for the Gateway (cc) continuation.");
             ToolTipService.SetToolTip(
                 HeaderResumeNativeItem,
                 NativeResumeLabel(_selected) + " using the chat's native CLI.");
-            ToolTipService.SetToolTip(
-                QuickResumeNativeItem,
-                NativeResumeLabel(_selected) + " using the chat's native CLI.");
             ToolTipService.SetToolTip(HeaderResumeGatewayItem, GatewayResumeTooltip(_selected));
-            ToolTipService.SetToolTip(QuickResumeGatewayItem, GatewayResumeTooltip(_selected));
         }
         HeaderResumeGatewayItem.Visibility = gatewayContinuation ? Visibility.Visible : Visibility.Collapsed;
-        QuickResumeGatewayItem.Visibility = gatewayContinuation ? Visibility.Visible : Visibility.Collapsed;
         QuickGatewayMultiplexItem.Visibility = gatewayMultiplex ? Visibility.Visible : Visibility.Collapsed;
         QuickGatewayHeadlessItem.Visibility = gatewayMultiplex ? Visibility.Visible : Visibility.Collapsed;
-        CopyGatewayCommandButton.Visibility = showRight && _selected is not null
+        CopyGatewayCommandButton.Visibility = _selected is not null
             && ArchiveService.CanResumeThroughGateway(_selected.Tool)
             ? Visibility.Visible
             : Visibility.Collapsed;
+
+        // The transcript fills the reader pane at every size. Capping it to a fixed column left a narrow
+        // strip floating in the middle at full screen, with the user's own messages stranded inboard of
+        // the right edge; the rows span the pane instead, so "mine on the right, the agent's on the left"
+        // reads against the pane's actual edges.
     }
 
     // Header overflow menu: the same secondary actions as the right "Quick actions" rail, reachable
@@ -503,15 +528,13 @@ public sealed partial class MainPage : Page
             Add(GatewayResumeLabel(_selected), () => ResumeAsGateway(_selected!));
         flyout.Items.Add(ForkAsMenu(_selected));
         flyout.Items.Add(new MenuFlyoutSeparator());
-        Add("Copy resume prompt", () => Copy("resume"));
-        Add("Copy resume command", CopyResumeCommandIfClear);
-        if (ArchiveService.CanResumeThroughGateway(_selected.Tool))
-            Add("Copy Gateway command", CopyGatewayCommandIfClear);
+        // The launch variants and the restore/raw-events screens live in the inspector's Actions tab;
+        // this menu keeps only the copy commands that have no other home.
+        Add("Copy resume prompt", () => _ = Copy("resume"));
         Add("Copy chat path", () => Copy("path"));
         Add("Copy all code", () => Copy("code"));
         flyout.Items.Add(new MenuFlyoutSeparator());
-        Add("Build restore packet", () => Navigate("Restore"));
-        Add("Inspect raw events", () => Navigate("Source"));
+        Add(_inspectorOpen ? "Hide inspector" : "Show inspector", ToggleInspector);
         flyout.ShowAt(HeaderMoreButton);
     }
 
@@ -532,8 +555,9 @@ public sealed partial class MainPage : Page
     private const int ArchivePageSize = 25;
     private bool _scrollArchiveToBottom;   // jump to newest after the first render of a chat
     private bool _loadingOlder;            // re-entrancy guard while prepending older messages on scroll-up
+    private const double TopLoadThreshold = 48;   // within this many px of the top, older messages load
     private ArchiveSession? _contentLoadingSession;
-    private string _msgFilter = "all";      // reader: "all" | "assistant" (agent only) | "user" (your messages only)
+    private string _msgFilter = "chat";     // reader: "chat" (conversation) | "user" | "assistant" | "all" (raw events)
     private ArchiveMessage? _jumpUserAnchor; // reader: the user message we last jumped to (repeat = step further back)
     private List<ArchiveMessage>? _fullMsgs; // FULL transcript (no 600-window) for the filtered views
     private string _fullMsgsFor = "";
@@ -554,8 +578,10 @@ public sealed partial class MainPage : Page
             _archive.ReleaseContent(session);
     }
 
-    // The messages the reader currently shows, after the agent-only / user-only toggle. "all" uses the real
-    // (windowed) collection; the filtered modes scan the FULL transcript so a long agent run whose recent
+    // The messages the reader currently shows, after the view toggle. "all" is the raw indexed event list
+    // (tool steps included); "chat" is the conversation - your messages and the agent's replies - which is
+    // the default, because a transcript that renders every hook, tool call and machine preamble as a
+    // bubble is unreadable. The filtered modes scan the FULL transcript so a long agent run whose recent
     // window holds no user prompt still shows every user message (fixes the "No messages of this kind" bug).
     private System.Collections.Generic.IList<ArchiveMessage> CurrentReaderMessages()
     {
@@ -565,15 +591,44 @@ public sealed partial class MainPage : Page
         // The uncapped kind-extract for this chat+view is already the exact set — return it as-is.
         if (_fullMsgs is not null && _fullMsgsFor == key) return _fullMsgs;
         // Not loaded yet: show the windowed subset so there's something while the full extract lands.
-        if (_msgFilter == "assistant") return _selected.Messages.Where(m => m.EffectiveKind is "assistant" or "reasoning").ToList();
-        return _selected.Messages.Where(m => m.EffectiveKind == "user").ToList();
+        if (_msgFilter == "assistant")
+            return ConversationOnly(_selected.Messages.Where(m => m.EffectiveKind is "assistant" or "reasoning"));
+        if (_msgFilter == "user")
+            return ConversationOnly(_selected.Messages.Where(m => m.EffectiveKind == "user"));
+        return ConversationOnly(_selected.Messages);
+    }
+
+    private static IList<ArchiveMessage> ConversationOnly(IEnumerable<ArchiveMessage> messages) =>
+        messages.Where(IsConversation).ToList();
+
+    // The reader is on screen with no transcript behind it: whatever it is displaying is a leftover render,
+    // so a caller that would otherwise leave the screen alone (the periodic sync) must repaint instead.
+    private bool ReaderNeedsContent() =>
+        _screen == "Archive" && _selected is { ContentLoaded: false };
+
+    // Whether a message belongs in the CHAT view. Tool steps, reasoning and machine preambles
+    // (IDE/environment context, hook and system-reminder blocks) are not something you or the agent said,
+    // and a post-compaction summary is an artifact of the harness rather than talk - so none of them get a
+    // bubble. That last family is untagged, so it needs the shared predicate: compaction preambles, hook
+    // feedback, injected skill bodies and goal bookkeeping all arrive as ordinary user turns. It is applied
+    // to USER turns only - an assistant message that quotes such text is still the agent talking.
+    // The raw transcript is one View-toggle press away, and the source file always has everything.
+    private static bool IsConversation(ArchiveMessage message)
+    {
+        if (message.EffectiveKind is "tool" or "system") return false;
+        var text = ArchiveService.ForReading(message.Text);
+        if (message.EffectiveKind == "user" && ArchiveService.IsMachineUserText(text)) return false;
+        // ForReading also drops fenced code, so a message that is only code still counts as conversation.
+        return text.Length > 0 || message.CodeBlocks.Count > 0;
     }
 
     // Load the UNCAPPED, kind-specific message set once per chat+view, then re-render when it lands — so a
     // huge chat's View:you shows every user prompt (not just the few in the 18000-line parse window).
+    // "chat" deliberately uses the loaded window instead: it must stay fresh while an agent is writing,
+    // and re-reading a 200MB transcript on every live tick is not a trade this view is worth.
     private async Task EnsureFullMessagesAsync()
     {
-        if (_selected is null || _msgFilter == "all") return;
+        if (_selected is null || _msgFilter is "all" or "chat") return;
         var key = _selected.Id + "|" + _msgFilter;
         if (_fullMsgs is not null && _fullMsgsFor == key) return;
         if (_fullMsgsLoading) return;
@@ -581,9 +636,12 @@ public sealed partial class MainPage : Page
         var sess = _selected; var filter = _msgFilter;
         try
         {
-            var full = await _archive.ExtractReaderMessagesAsync(sess, filter);
+            // The extract is the raw transcript, so apply the same conversation filter the windowed path
+            // uses - the cached list IS what the reader displays, and its count drives paging.
+            var full = (await _archive.ExtractReaderMessagesAsync(sess, filter))
+                .Where(IsConversation).ToList();
             if (full.Count > MaxFilteredMessages)
-                full = full.Skip(Math.Max(0, full.Count - MaxFilteredMessages)).ToList();
+                full = full.Skip(full.Count - MaxFilteredMessages).ToList();
             if (IsSelectedSession(sess) && _msgFilter == filter) { _fullMsgs = full; _fullMsgsFor = sess.Id + "|" + filter; }
         }
         catch (Exception ex) { Diag.Log("ExtractReaderMessages: " + ex.Message); }
@@ -592,19 +650,25 @@ public sealed partial class MainPage : Page
     }
 
     private void UpdateMsgViewToggle() =>
-        MsgViewToggleText.Text = _msgFilter switch { "assistant" => "View: agent", "user" => "View: you", _ => "View: all" };
+        MsgViewToggleText.Text = _msgFilter switch
+        {
+            "user" => "View: you",
+            "assistant" => "View: agent",
+            "all" => "View: raw events",
+            _ => "View: chat"
+        };
 
-    // Cycle the transcript view: everything -> agent messages only (no tool steps / no your-messages) ->
-    // your messages only -> back. Re-renders from the newest of the filtered view.
+    // Cycle the transcript view: chat -> your messages -> the agent's messages -> the raw event list
+    // (tool calls, hooks, everything as indexed) -> back. Re-renders from the newest of that view.
     private async void MsgViewToggle_Click(object sender, RoutedEventArgs e)
     {
-        _msgFilter = _msgFilter switch { "all" => "assistant", "assistant" => "user", _ => "all" };
+        _msgFilter = _msgFilter switch { "chat" => "user", "user" => "assistant", "assistant" => "all", _ => "chat" };
         UpdateMsgViewToggle();
         _jumpUserAnchor = null;
         _archiveShown = ArchivePageSize;
         _scrollArchiveToBottom = true;
         RenderArchive();
-        if (_msgFilter != "all") await EnsureFullMessagesAsync();
+        await EnsureFullMessagesAsync();
     }
 
     // Step UP through YOUR messages: first press -> your most recent message; each further press -> the
@@ -614,12 +678,14 @@ public sealed partial class MainPage : Page
         if (_selected is null || !_selected.ContentLoaded) return;
         var msgs = _selected.Messages;
         if (msgs.Count == 0) return;
-        if (_msgFilter == "assistant") { _msgFilter = "all"; UpdateMsgViewToggle(); }   // your messages must be visible
+        if (_msgFilter == "assistant") { _msgFilter = "chat"; UpdateMsgViewToggle(); }   // your messages must be visible
         int from = _jumpUserAnchor is not null ? msgs.IndexOf(_jumpUserAnchor) : msgs.Count;
         if (from < 0) from = msgs.Count;
         int target = -1;
-        for (int i = from - 1; i >= 0; i--) if (msgs[i].EffectiveKind == "user") { target = i; break; }
-        if (target < 0) for (int i = msgs.Count - 1; i >= 0; i--) if (msgs[i].EffectiveKind == "user") { target = i; break; }   // wrap
+        // Only real prompts are jump targets: a hook or context line is role=user too, but jumping to one
+        // in the chat view would land on a message that view does not render.
+        for (int i = from - 1; i >= 0; i--) if (msgs[i].EffectiveKind == "user" && IsConversation(msgs[i])) { target = i; break; }
+        if (target < 0) for (int i = msgs.Count - 1; i >= 0; i--) if (msgs[i].EffectiveKind == "user" && IsConversation(msgs[i])) { target = i; break; }   // wrap
         if (target < 0) return;
         _jumpUserAnchor = msgs[target];
         ScrollToMessage(target);
@@ -647,7 +713,8 @@ public sealed partial class MainPage : Page
         var target = _selected.Messages[fullIndex];
         var disp = CurrentReaderMessages();
         int dispIdx = disp.IndexOf(target);
-        if (dispIdx < 0) { _msgFilter = "all"; UpdateMsgViewToggle(); disp = CurrentReaderMessages(); dispIdx = disp.IndexOf(target); }
+        // A jump target is a conversation message, so widen to the chat view rather than to raw events.
+        if (dispIdx < 0) { _msgFilter = "chat"; UpdateMsgViewToggle(); disp = CurrentReaderMessages(); dispIdx = disp.IndexOf(target); }
         if (dispIdx < 0) return;
         int needed = disp.Count - dispIdx;     // target must fall within the last `shown` of the window
         if ((_archiveShown <= 0 ? ArchivePageSize : _archiveShown) < needed)
@@ -666,6 +733,12 @@ public sealed partial class MainPage : Page
     private string _lastSearchQuery = "";
     private const int SearchPageSize = 25;
 
+    // The chat's name as the current name-source setting shows it: the agent's own (native) name unless the
+    // "Show MUX names" filter is on. Row labels read the same rule off ArchiveSession.RowName.
+    private string SessionName(ArchiveSession? session) => session is null
+        ? "No chat selected"
+        : (_useMuxNames ? session.DisplayTitle : session.NativeTitle);
+
     private void RenderArchive()
     {
         ScreenLabel.Text = _selected?.IsReadOnlySnapshot == true
@@ -673,17 +746,24 @@ public sealed partial class MainPage : Page
             : _selected is null
             ? "Archive reader"
             : $"{(string.Equals(_selected.Tool, "claude", StringComparison.OrdinalIgnoreCase) ? "Claude" : "Codex")} chat - archive reader";
-        TitleText.Text = _selected?.DisplayTitle ?? "No chat selected";
+        TitleText.Text = SessionName(_selected);
         MainContent.Children.Clear();
         if (_selected?.IsReadOnlySnapshot != true)
         {
             RenderIntegrity();
             RenderTags();
         }
+        RenderContextTab();
+        RenderActivityTab();
 
         if (_selected is null)
         {
-            MainContent.Children.Add(EmptyBlock("No chats indexed", "Import a sessions folder to begin."));
+            // An empty archive and an empty filtered VIEW are different problems with different fixes -
+            // now that Active/Archived/All can legitimately match nothing, they must not read the same.
+            // The store is the archive; _archive.Sessions is the FILTERED list, so it is 0 in both cases.
+            MainContent.Children.Add(_archive.Store.Sessions.Count == 0
+                ? EmptyBlock("No chats indexed", "Import a sessions folder to begin.")
+                : EmptyBlock("No chats in this view", "Change the scope or clear the search to see more."));
             return;
         }
 
@@ -706,7 +786,7 @@ public sealed partial class MainPage : Page
         }
 
         // New chat selected -> start fresh and jump to the newest messages once it renders.
-        if (!string.Equals(_selected?.Id, _lastArchiveSession?.Id, StringComparison.OrdinalIgnoreCase)) { _archiveShown = 0; _lastArchiveSession = _selected; _scrollArchiveToBottom = true; _msgFilter = "all"; _jumpUserAnchor = null; ClearFilteredMessages(); UpdateMsgViewToggle(); }
+        if (!string.Equals(_selected?.Id, _lastArchiveSession?.Id, StringComparison.OrdinalIgnoreCase)) { _archiveShown = 0; _lastArchiveSession = _selected; _scrollArchiveToBottom = true; _msgFilter = "chat"; _jumpUserAnchor = null; ClearFilteredMessages(); UpdateMsgViewToggle(); }
 
         // Content lazy-loads from the source file the first time you open a chat (the store holds only
         // metadata). The reader shows the MOST RECENT messages at the bottom; scrolling up auto-loads
@@ -730,9 +810,11 @@ public sealed partial class MainPage : Page
         if (selected is null) return;
         if (messages.Count == 0)
         {
+            var everything = _msgFilter == "all";
             MainContent.Children.Add(EmptyBlock(
-                _msgFilter == "all" ? "No conversation messages parsed" : "No messages of this kind in this chat",
-                _msgFilter == "all" ? selected.SourcePath : "Switch the View toggle back to all."));
+                everything ? "No conversation messages parsed" : "No messages of this kind in this chat",
+                everything ? selected.SourcePath
+                    : "Switch the View toggle to raw events to see tool calls and hooks."));
             return;
         }
         var shown = Math.Min(_archiveShown <= 0 ? ArchivePageSize : _archiveShown, messages.Count);
@@ -740,16 +822,34 @@ public sealed partial class MainPage : Page
 
         if (start > 0)
         {
-            MainContent.Children.Add(new TextBlock
+            // The label promised "scroll up" and there was no way to act on it if the scroll itself did
+            // not fire; it loads a page on click as well as on reach-the-top.
+            var more = new Button
             {
-                Text = $"Scroll up to load {start} earlier message{(start == 1 ? "" : "s")}",
+                Content = new TextBlock
+                {
+                    Text = $"Load {System.Math.Min(start, ArchivePageSize)} earlier message{(start == 1 ? "" : "s")}",
+                    FontSize = 12
+                },
                 Foreground = MutedBrush(),
-                FontSize = 12,
+                Background = null,
+                BorderThickness = new Thickness(0),
+                Padding = new Thickness(10, 4, 10, 4),
                 HorizontalAlignment = HorizontalAlignment.Center,
                 Margin = new Thickness(0, 2, 0, 8)
-            });
+            };
+            more.Click += (_, _) => LoadOlderPage();
+            ToolTipService.SetToolTip(more, start + " earlier message" + (start == 1 ? "" : "s") + " not shown yet");
+            MainContent.Children.Add(more);
         }
-        for (var i = start; i < messages.Count; i++) MainContent.Children.Add(MessageBubble(messages[i]));
+        for (var i = start; i < messages.Count; i++)
+        {
+            // Tag each row with the message it shows: paging up has to find this element again after a
+            // re-render to hold the reader's place, and a re-render recreates every element.
+            var element = MessageBubble(messages[i]);
+            if (element is FrameworkElement tagged) tagged.Tag = messages[i];
+            MainContent.Children.Add(element);
+        }
 
         if (_scrollArchiveToBottom && messages.Count > 0)
         {
@@ -760,31 +860,72 @@ public sealed partial class MainPage : Page
         }
     }
 
-    // Auto-paginate older messages when the user scrolls near the top - no manual "load more".
-    private void MainScroller_ViewChanged(object sender, Microsoft.UI.Xaml.Controls.ScrollViewerViewChangedEventArgs e)
+    // Older messages load when the reader asks for them, and only then: wheeling up at the top, or the
+    // "load earlier" button. Watching ViewChanged for a top-of-page offset instead was wrong twice over -
+    // at offset 0 a wheel-up leaves the offset unchanged so no event fires (nothing ever loaded), and a
+    // re-render drops the offset to 0, which arrives as the same event (a page nobody asked for).
+    private void MainScroller_PointerWheelChanged(object sender, PointerRoutedEventArgs e)
     {
-        if (e.IsIntermediate || _loadingOlder) return;
-        if (_screen != "Archive" || _selected is null || !_selected.ContentLoaded) return;
-        if (MainScroller.VerticalOffset > 48) return;   // only fire when near the top
+        if (MainScroller.VerticalOffset > TopLoadThreshold) return;
+        if (e.GetCurrentPoint(MainScroller).Properties.MouseWheelDelta <= 0) return;  // wheel down: not older
+        LoadOlderPage();
+    }
 
-        var count = CurrentReaderMessages().Count;
-        var shown = Math.Min(_archiveShown <= 0 ? ArchivePageSize : _archiveShown, count);
-        if (shown >= count) return;                       // nothing older to load
+    // No scroll-position guard here: the button is an explicit request and must work whenever it is
+    // reachable. Only the wheel needs to know the reader is at the top.
+    private void LoadOlderPage()
+    {
+        if (_loadingOlder) return;
+        if (_screen != "Archive" || _selected is null || !_selected.ContentLoaded) return;
+
+        var messages = CurrentReaderMessages();
+        var shown = Math.Min(_archiveShown <= 0 ? ArchivePageSize : _archiveShown, messages.Count);
+        if (shown >= messages.Count) return;               // nothing older to load
 
         _loadingOlder = true;
         try
         {
-            var oldExtent = MainScroller.ExtentHeight;
+            // The message at the top of the current page is what the reader is looking at, so hold onto
+            // IT: after the older page is rendered above it, the offset is raised by however far down it
+            // moved, and the reader stays where they were instead of being thrown to the top of the page
+            // that was just added.
+            var anchorMessage = messages[messages.Count - shown];
+            var before = MessageElement(anchorMessage);
+            var beforeY = before is null ? double.NaN : ContentY(before);
             var oldOffset = MainScroller.VerticalOffset;
-            _archiveShown = shown + ArchivePageSize;
-            RenderArchive();                              // re-renders with more older messages at the top
-            MainScroller.UpdateLayout();
-            // Keep the user's view anchored on the same message by absorbing the height added above.
-            var delta = MainScroller.ExtentHeight - oldExtent;
-            MainScroller.ChangeView(null, oldOffset + delta, null, disableAnimation: true);
+            _archiveShown = Math.Min(messages.Count, shown + ArchivePageSize);
+
+            RenderArchive();
+
+            var after = MessageElement(anchorMessage);
+            if (after is null || double.IsNaN(beforeY)) return;
+
+            // Position is only meaningful once the layout pass for the new page has committed - reading it
+            // straight after the render (or off ExtentHeight) measures a change of zero, which is exactly
+            // how the offset restore silently did nothing and left the reader parked at the top. So wait
+            // for the layout to land, with a few passes of slack in case it takes more than one.
+            var passes = 0;
+            void Restore(object? _, object __)
+            {
+                var delta = ContentY(after) - beforeY;
+                if (delta <= 0 && passes++ < 3) return;
+                MainContent.LayoutUpdated -= Restore;
+                if (delta <= 0) return;
+                MainScroller.ChangeView(null, oldOffset + delta, null, disableAnimation: true);
+                Diag.Log($"paging: {_archiveShown}/{messages.Count} messages shown, offset restored to {oldOffset + delta}");
+            }
+            MainContent.LayoutUpdated += Restore;
         }
         finally { _loadingOlder = false; }
     }
+
+    // Where a rendered row sits in the transcript's own coordinates (the panel's children are laid out
+    // top to bottom, so this is its distance from the top of the content, padding included).
+    private static double ContentY(FrameworkElement element) =>
+        element.TransformToVisual((UIElement)element.Parent).TransformPoint(new Windows.Foundation.Point(0, 0)).Y;
+
+    private FrameworkElement? MessageElement(ArchiveMessage message) =>
+        MainContent.Children.OfType<FrameworkElement>().FirstOrDefault(child => ReferenceEquals(child.Tag, message));
 
     private async Task EnsureContentThenRenderAsync(ArchiveSession session)
     {
@@ -796,7 +937,10 @@ public sealed partial class MainPage : Page
         }
         if (IsSelectedSession(session) && _screen == "Archive")
         {
-            _archiveShown = ArchivePageSize;
+            // Deliberately NOT resetting the page count: this also runs when a chat already on screen is
+            // re-read (the live tail, or a merge that handed us a fresh instance), and resetting there threw
+            // the reader back to the last 25 messages, discarding everything the user had paged up to.
+            // Opening a DIFFERENT chat resets the count in RenderArchive's chat-change branch.
             RenderArchive();
         }
     }
@@ -1209,33 +1353,41 @@ public sealed partial class MainPage : Page
             FontSize = 12,
             FontWeight = Microsoft.UI.Text.FontWeights.SemiBold
         });
-        stack.Children.Add(new TextBlock
+        var body = CleanReadingText(message.Text);
+        if (body.Length > 0)
         {
-            // A single message can carry a 500KB tool dump; laying that out in a wrapping TextBlock is what
-            // made opening a chat hitch. Cap the DISPLAYED text (full content stays in the source file -
-            // "Resume in terminal" / "Open in VS Code" shows it all).
-            Text = CapDisplay(CleanReadingText(message.Text), 4000),
-            TextWrapping = TextWrapping.Wrap,
-            Foreground = StrongBrush(),
-            LineHeight = 22,
-            FontSize = 14
-        });
+            stack.Children.Add(new TextBlock
+            {
+                // A single message can carry a 500KB tool dump; laying that out in a wrapping TextBlock is
+                // what made opening a chat hitch. Cap the DISPLAYED text (full content stays in the source
+                // file - "Resume in terminal" / "Open in VS Code" shows it all).
+                Text = CapDisplay(body, 4000),
+                TextWrapping = TextWrapping.Wrap,
+                Foreground = StrongBrush(),
+                LineHeight = 22,
+                FontSize = 14
+            });
+        }
         foreach (var block in message.CodeBlocks)
         {
             stack.Children.Add(CodeBlockPanel(block));
         }
 
-        return new Border
+        // The bubble hugs its own content, but the ROW spans the whole reader pane - so "your messages
+        // right, the agent's left" reads against the pane's real edges, and a wide message wraps instead
+        // of dragging the transcript sideways.
+        var row = new Grid();
+        row.Children.Add(new Border
         {
             Background = isUser ? AccentVerySoftBrush() : PanelBrush(),
             BorderBrush = LineBrush(),
             BorderThickness = new Thickness(1),
             CornerRadius = PanelCornerRadius(),
             Padding = new Thickness(18),
-            MaxWidth = 900,
             HorizontalAlignment = isUser ? HorizontalAlignment.Right : HorizontalAlignment.Left,
             Child = stack
-        };
+        });
+        return row;
     }
 
     // A tool call rendered as a single compact, collapsible step: badge + command on one line; expand
@@ -1347,7 +1499,7 @@ public sealed partial class MainPage : Page
             Spacing = 10,
             Children =
             {
-                new TextBlock { Text = session.DisplayTitle, Foreground = StrongBrush(), FontSize = 17, FontWeight = Microsoft.UI.Text.FontWeights.SemiBold, TextWrapping = TextWrapping.Wrap },
+                new TextBlock { Text = SessionName(session), Foreground = StrongBrush(), FontSize = 17, FontWeight = Microsoft.UI.Text.FontWeights.SemiBold, TextWrapping = TextWrapping.Wrap },
                 new TextBlock { Text = $"{session.WorkspaceName} - {session.SourcePath}", Foreground = MutedBrush(), TextWrapping = TextWrapping.Wrap },
                 button
             }
@@ -1377,7 +1529,7 @@ public sealed partial class MainPage : Page
             Spacing = 10,
             Children =
             {
-                new TextBlock { Text = hit.Session.DisplayTitle, Foreground = StrongBrush(), FontSize = 17, FontWeight = Microsoft.UI.Text.FontWeights.SemiBold, TextWrapping = TextWrapping.Wrap },
+                new TextBlock { Text = SessionName(hit.Session), Foreground = StrongBrush(), FontSize = 17, FontWeight = Microsoft.UI.Text.FontWeights.SemiBold, TextWrapping = TextWrapping.Wrap },
                 new TextBlock { Text = $"{(string.Equals(hit.Session.Tool, "claude", StringComparison.OrdinalIgnoreCase) ? "CLAUDE" : "CODEX")} · {hit.SourceLabel} · score {hit.Score} · {hit.MatchedTerms}", Foreground = MutedBrush(), FontSize = 12, TextWrapping = TextWrapping.Wrap },
                 new TextBlock { Text = hit.Snippet, Foreground = StrongBrush(), TextWrapping = TextWrapping.Wrap, LineHeight = 21 },
                 new StackPanel
@@ -1780,7 +1932,7 @@ public sealed partial class MainPage : Page
         {
             Spacing = 3,
             VerticalAlignment = VerticalAlignment.Center,
-            Children = { new TextBlock { Text = session.DisplayTitle, Foreground = StrongBrush(), TextTrimming = TextTrimming.CharacterEllipsis, MaxLines = 1 } }
+            Children = { new TextBlock { Text = SessionName(session), Foreground = StrongBrush(), TextTrimming = TextTrimming.CharacterEllipsis, MaxLines = 1 } }
         };
         var folder = ShortFolder(session.Workspace);
         if (folder.Length > 0)
@@ -2532,9 +2684,6 @@ public sealed partial class MainPage : Page
         };
     }
 
-    private void CopyContext_Click(object sender, RoutedEventArgs e) => _ = Copy("resume");
-    private void CopyCode_Click(object sender, RoutedEventArgs e) => _ = Copy("code");
-    private void CopyPath_Click(object sender, RoutedEventArgs e) => _ = Copy("path");
     private void CopyCommand_Click(object sender, RoutedEventArgs e) => CopyResumeCommandIfClear();
     private void CopyGatewayCommand_Click(object sender, RoutedEventArgs e) => CopyGatewayCommandIfClear();
 
@@ -2633,6 +2782,30 @@ public sealed partial class MainPage : Page
         SelectSessionRow(session);
 
         var flyout = new MenuFlyout { AreOpenCloseAnimationsEnabled = false }; // snap open instantly (no fade-in lag)
+
+        // The tier gate sits first: it is what turns one of the pile into a chat worth searching for.
+        var vetItem = new MenuFlyoutItem { Text = VetMenuLabel(session) };
+        ToolTipService.SetToolTip(vetItem, session.Vetted
+            ? "Change this chat's own name and its phrase."
+            : "Name this chat and give it a phrase, moving it out of the general populace into Active.");
+        vetItem.Click += async (_, _) => await VetDialogAsync(session);
+        flyout.Items.Add(vetItem);
+
+        if (session.Vetted && !session.Archived)
+        {
+            var unvetItem = new MenuFlyoutItem { Text = "Send back to the general populace" };
+            ToolTipService.SetToolTip(unvetItem, "Undo the vet: the chat returns to the All pile.");
+            unvetItem.Click += async (_, _) =>
+            {
+                var name = Trim(session.RowName, 40);
+                await _archive.UnvetSessionAsync(session);
+                UpdateChrome();
+                RenderCurrent();
+                SyncStatus.Text = $"\"{name}\" is back in the general populace.";
+            };
+            flyout.Items.Add(unvetItem);
+        }
+
         var pinItem = new MenuFlyoutItem { Text = session.Pinned ? "Unpin chat" : "Pin chat" };
         pinItem.Click += async (_, _) => await TogglePinSelected();
         flyout.Items.Add(pinItem);
@@ -3083,13 +3256,10 @@ public sealed partial class MainPage : Page
 
     private static string StripCode(string text) => Regex.Replace(text, "```[\\s\\S]*?```", "").Trim();
 
-    // Reading-mode cleanup (logic lives in Core.ArchiveService.ForReading so it's unit-tested):
-    // drop fenced code + machine-context noise; show a marker when a message was pure context.
-    private static string CleanReadingText(string text)
-    {
-        var value = ArchiveService.ForReading(text);
-        return value.Length == 0 ? "(IDE / environment context)" : value;
-    }
+    // Reading-mode cleanup (logic lives in Core.ArchiveService.ForReading so it's unit-tested): drop fenced
+    // code + machine-context noise, leaving "" when the message WAS only context. Callers decide what an
+    // empty reading means - the chat view drops such messages, the bubble shows only their code.
+    private static string CleanReadingText(string text) => ArchiveService.ForReading(text);
     private static string FormatDate(string value) => DateTime.TryParse(value, out var date) ? date.ToString("MMM d") : "";
     private static string HexFromColor(Windows.UI.Color color) => $"#{color.R:X2}{color.G:X2}{color.B:X2}".ToLowerInvariant();
 

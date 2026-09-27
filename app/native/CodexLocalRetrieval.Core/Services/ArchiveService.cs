@@ -36,6 +36,12 @@ public sealed partial class ArchiveService
     private const int RecentMessageWindow = 600;
     private const int MaxLinesPerSession = 6_000;
     private const int MaxLineChars = 512_000;
+    // How far into a transcript to look for the first real prompt when correcting a stored title. The
+    // line bound is the parser's own, so a corrected title is the one a re-parse would produce. It is
+    // normally the first few lines, but a chat that opens with a compaction summary can carry that for a
+    // while: the worst measured case has its first real prompt 3,148 lines and 29.9 MB in. The byte
+    // bound is a guard for transcripts whose lines run near the 512k line cap.
+    private const long MaxTitleHeadBytes = 32 * 1024 * 1024;
     // Final-record probe window. The last line is the only thing that check needs, and a live transcript
     // can be hundreds of MB, so the whole file is no longer re-read to find its own tail.
     private const int FinalRecordProbeBytes = 1024 * 1024;
@@ -261,6 +267,15 @@ public sealed partial class ArchiveService
     // first few dozen bytes; this is slack for a hand-formatted or reordered file.
     private const int StoreHeaderProbeBytes = 32 * 1024;
     private readonly SemaphoreSlim _saveGate = new(1, 1);
+    // A load REPLACES the live store object (LoadStoreStateAsync) and refreshes the generation fence with
+    // it. An operation that mutates the store and then saves is therefore racing two things: its mutation
+    // can land on an instance the load is about to drop, and its save can then serialize the replacement,
+    // pass the fence, and commit a store that never saw the change - reporting success for work that was
+    // thrown away. `_saveGate` cannot cover this: it is taken INSIDE SaveAsync, after the mutation, and the
+    // wait for it can last as long as another save's commit (seconds). This gate is held across
+    // apply-and-save by SaveSessionChangeAsync and by the load itself, so a replacement cannot land in
+    // that window. Lock order is always this gate, then _saveGate, then the store file lock.
+    private readonly SemaphoreSlim _storeSwapGate = new(1, 1);
     private readonly ConditionalWeakTable<ArchiveSession, SemaphoreSlim> _contentLoadGates = new();
     private readonly Func<string, string, Task<ArchiveSession?>>? _parseSessionOverride;
     private long _loadedGeneration;
@@ -477,6 +492,21 @@ public sealed partial class ArchiveService
         bool acquireWriterLock = true,
         bool restoreBackup = true)
     {
+        // Replacing the live store is exactly what makes a concurrent change-save unsound (see
+        // _storeSwapGate), so a load of any kind waits for one in flight and holds the gate itself.
+        await _storeSwapGate.WaitAsync(cancellationToken);
+        try
+        {
+            await LoadStoreStateCoreAsync(cancellationToken, acquireWriterLock, restoreBackup);
+        }
+        finally { _storeSwapGate.Release(); }
+    }
+
+    private async Task LoadStoreStateCoreAsync(
+        CancellationToken cancellationToken,
+        bool acquireWriterLock,
+        bool restoreBackup)
+    {
         if (File.Exists(_storePath) || StoreBackupFiles().Any())
         {
             FileStream? storeLock = null;
@@ -500,6 +530,15 @@ public sealed partial class ArchiveService
         _loadedGeneration = Store.Generation;
         NormalizeSettings();
         EnsureDecks();
+        // Read the corrected names OFF the UI thread, then apply them here: the Title setter raises
+        // change notification, and that must not fire from a worker (the thread-title merge splits load
+        // from apply for the same reason). Done at load rather than in the scan so a store written by the
+        // earlier title rule is corrected on the first launch after the upgrade, instead of waiting for
+        // each of those chats to be re-parsed - which for a finished chat is never.
+        var repairedTitles = await Task.Run(() => RepairMachineAuthoredTitlesAsync(cancellationToken), cancellationToken);
+        foreach (var (session, title) in repairedTitles) session.Title = title;
+        if (repairedTitles.Count > 0)
+            PerfCounters.Trace?.Invoke($"titles repaired from file head: {repairedTitles.Count}");
     }
 
     private async Task<AppStoreData> LoadStoreWithRecoveryAsync(
@@ -2113,9 +2152,78 @@ public sealed partial class ArchiveService
 
     public async Task ArchiveSessionAsync(ArchiveSession session)
     {
-        session.Archived = true;
-        await SaveAsync();
-        ReapplyList();
+        // Retiring is the LAST tier, so only something that was in play can be retired: a chat archived
+        // straight from the general populace still counts as vetted out of it, never as both.
+        await SaveSessionChangeAsync(session, s => { s.Vetted = true; s.Archived = true; return Task.CompletedTask; });
+    }
+
+    // The app and the retrieval server both keep this store, and the store's generation fence refuses a
+    // save that would clobber the other writer's work (correctly - the server's sync has parsed chats the
+    // app has not seen). So a refused save is not an error to show the user: re-read the authoritative
+    // store and re-apply the change to the live instance, once. `apply` must therefore be able to run
+    // twice, and works on whichever instance is current at the time.
+    private async Task<ArchiveSession> SaveSessionChangeAsync(ArchiveSession session, Func<ArchiveSession, Task> apply)
+    {
+        for (var attempt = 0; ; attempt++)
+        {
+            try
+            {
+                await _storeSwapGate.WaitAsync();
+                try
+                {
+                    // Resolve the live instance INSIDE the gate, then keep the store from being replaced
+                    // until the save has committed it: the instance this change lands on must be the one
+                    // that gets serialized. Both halves are needed. A lookup taken before the wait is
+                    // already defeated - waiting for the gate can itself outlast a concurrent load that
+                    // replaces the store - and without the hold the save serializes the replacement (which
+                    // never saw the change), passes the fence, and reports success for work thrown away.
+                    if (Store.Sessions.TryGetValue(session.Id, out var live)) session = live;
+                    await apply(session);
+                    await SaveAsync();
+                    ReapplyList();
+                    return session;
+                }
+                finally { _storeSwapGate.Release(); }
+            }
+            catch (StoreGenerationConflictException) when (attempt == 0)
+            {
+                // The other writer's commit won. Adopt their store and re-apply to the fresh instance -
+                // the gate is already released, so this load can take it.
+                await LoadAsync();
+                if (Store.Sessions.TryGetValue(session.Id, out var fresh)) session = fresh;
+            }
+        }
+    }
+
+    // Vet a chat: give it a real name and a phrase, and promote it out of the general populace into
+    // Active. The gate is a name AND a phrase, or nothing happens. The name goes to the chat's OWN
+    // (native) title so it reads the same here and in the tool's resume list; that write is made directly
+    // rather than through RenameNativeAsync, because the name, the phrase and the tier must land in ONE
+    // save - a vet that saved the name but not the promotion, or the phrase with no tier move, would be a
+    // half-vetted chat. Returns the native-write status so the caller can say when the tool's side
+    // refused it (a live or unverified transcript defers a native rename) - the vet still lands, and the
+    // typed name is kept as the app name so it is never silently thrown away.
+    public async Task<(bool Vetted, string? RenameStatus)> VetSessionAsync(ArchiveSession session, string nativeName, string phrase)
+    {
+        var name = CleanTitle(nativeName);
+        if (string.IsNullOrWhiteSpace(name) || string.IsNullOrWhiteSpace(phrase))
+            return (false, "Vetting needs a name and a phrase.");
+        string? status = null;
+        await SaveSessionChangeAsync(session, async s =>
+        {
+            status = await TryWriteCanonicalNameAsync(s, name);
+            if (!NativeRenameSucceeded(status)) s.CustomTitle = name;
+            ReplacePhrases(s, new[] { phrase.Trim() });
+            s.Vetted = true;
+        });
+        return (true, status);
+    }
+
+    // Undo a vet: the chat goes back to the general populace. Kept as the honest inverse of a right-click
+    // that was a mistake — without it a mis-vet would be permanent, since retiring is a different door.
+    public async Task UnvetSessionAsync(ArchiveSession session)
+    {
+        await SaveSessionChangeAsync(session, s => { s.Vetted = false; s.Archived = false; return Task.CompletedTask; });
     }
 
     public async Task AddToCollectionAsync(ArchiveSession session, string collectionName, string? deckId = null)
@@ -3097,11 +3205,155 @@ public sealed partial class ArchiveService
         var unchanged = current.Count == cleaned.Count
             && current.Zip(cleaned, (a, b) => string.Equals(a, b, StringComparison.Ordinal)).All(x => x);
         if (unchanged) return false;
-        session.SpecialPhrases.Clear();
-        foreach (var p in cleaned) session.SpecialPhrases.Add(p);
+        ReplacePhrases(session, cleaned);
         await SaveAsync();
         ReapplyList();
         return true;
+    }
+
+    // In memory only, so a caller that changes several things can save them together.
+    private static void ReplacePhrases(ArchiveSession session, IEnumerable<string> phrases)
+    {
+        var cleaned = CleanSpecialPhrases(phrases);
+        session.SpecialPhrases.Clear();
+        foreach (var p in cleaned) session.SpecialPhrases.Add(p);
+    }
+
+    // ---- saved phrase categories -------------------------------------------------------------------
+
+    // The saved phrases offered on the vet dialog, alphabetical so a long list stays scannable.
+    public IReadOnlyList<PhraseCategory> SavedPhraseCategories() =>
+        Store.PhraseCategories
+            .Where(c => !string.IsNullOrWhiteSpace(c.Phrase))
+            .OrderBy(c => c.Phrase, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+    // Keep a phrase for reuse, so a kind of work ("mux work") can carry the same phrase every time
+    // instead of taking a fresh random combination. Saving a phrase already saved just updates its note.
+    public async Task<PhraseCategory?> SavePhraseCategoryAsync(string phrase, string note)
+    {
+        var clean = (phrase ?? "").Trim();
+        if (clean.Length == 0) return null;
+        var existing = Store.PhraseCategories.FirstOrDefault(c =>
+            string.Equals(c.Phrase, clean, StringComparison.OrdinalIgnoreCase));
+        if (existing is null)
+        {
+            existing = new PhraseCategory { Phrase = clean, SavedAt = DateTime.UtcNow.ToString("O") };
+            Store.PhraseCategories.Add(existing);
+        }
+        existing.Note = (note ?? "").Trim();
+        await SaveAsync();
+        return existing;
+    }
+
+    public async Task RemovePhraseCategoryAsync(string phrase)
+    {
+        var clean = (phrase ?? "").Trim();
+        if (Store.PhraseCategories.RemoveAll(c => string.Equals(c.Phrase, clean, StringComparison.OrdinalIgnoreCase)) == 0) return;
+        await SaveAsync();
+    }
+
+    // Retire the OLD phrase scheme: every phrase a chat carries is parked in the legacy list along with
+    // the chats that carried it, and the chats come out clean so the tier system starts from a blank
+    // slate. Phrases the new generator could have produced are left alone, so running this after vetting
+    // has begun never sweeps a fresh phrase. A timestamped copy of the store is taken first, because this
+    // rewrites metadata for every chat at once. Returns (distinct phrases moved, chats cleared, backup
+    // path or ""); groups a previous run already parked are merged into, so a second run never duplicates.
+    public async Task<(int Phrases, int Chats, string Backup)> DetachLegacyPhrasesAsync()
+    {
+        // A bulk rewrite of every chat's phrase metadata, so it takes the store-swap gate and retries on a
+        // generation conflict for the same reason a single-session change does: a sync that loads while this
+        // runs replaces the store, and the save would then commit the replacement - reporting success for a
+        // retirement that was thrown away. The rewrite itself is re-applied to the fresh store on the retry.
+        var backup = "";
+        for (var attempt = 0; ; attempt++)
+        {
+            try
+            {
+                await _storeSwapGate.WaitAsync();
+                try
+                {
+                    var byPhrase = CollectLegacyPhrases();
+                    if (byPhrase.Count == 0) return (0, 0, backup);
+                    if (attempt == 0) backup = BackupStoreBeforeLegacyDetach();
+                    var chats = ClearAndParkLegacyPhrases(byPhrase);
+                    await SaveAsync();
+                    ReapplyList();
+                    return (byPhrase.Count, chats, backup);
+                }
+                finally { _storeSwapGate.Release(); }
+            }
+            catch (StoreGenerationConflictException) when (attempt == 0)
+            {
+                await LoadAsync();
+            }
+        }
+    }
+
+    // The two halves of the rewrite, each over whatever Store currently holds, so the conflict retry above
+    // re-applies them to the instance that won. Caller holds the swap gate.
+    private Dictionary<string, LegacyPhraseGroup> CollectLegacyPhrases()
+    {
+        var byPhrase = new Dictionary<string, LegacyPhraseGroup>(StringComparer.OrdinalIgnoreCase);
+        foreach (var session in Store.Sessions.Values)
+        {
+            foreach (var phrase in session.SpecialPhrases.Where(p => !string.IsNullOrWhiteSpace(p) && !PhraseGenerator.IsGenerated(p)))
+            {
+                if (!byPhrase.TryGetValue(phrase.Trim(), out var group))
+                    byPhrase[phrase.Trim()] = group = new LegacyPhraseGroup { Phrase = phrase.Trim() };
+                if (!group.SessionIds.Contains(session.Id, StringComparer.OrdinalIgnoreCase))
+                    group.SessionIds.Add(session.Id);
+            }
+        }
+        return byPhrase;
+    }
+
+    private int ClearAndParkLegacyPhrases(Dictionary<string, LegacyPhraseGroup> byPhrase)
+    {
+        var cleared = 0;
+        var now = DateTime.UtcNow.ToString("O");
+        foreach (var session in Store.Sessions.Values.Where(s => s.SpecialPhrases.Any(p => !PhraseGenerator.IsGenerated(p))))
+        {
+            foreach (var old in session.SpecialPhrases.Where(p => !PhraseGenerator.IsGenerated(p)).ToList())
+                session.SpecialPhrases.Remove(old);
+            cleared++;
+        }
+        foreach (var group in byPhrase.Values)
+        {
+            var existing = Store.LegacyPhrases.FirstOrDefault(g =>
+                string.Equals(g.Phrase, group.Phrase, StringComparison.OrdinalIgnoreCase));
+            if (existing is null)
+            {
+                group.DetachedAt = now;
+                Store.LegacyPhrases.Add(group);
+            }
+            else
+            {
+                foreach (var id in group.SessionIds)
+                    if (!existing.SessionIds.Contains(id, StringComparer.OrdinalIgnoreCase))
+                        existing.SessionIds.Add(id);
+            }
+        }
+        return cleared;
+    }
+
+    // Copy the store file before a bulk rewrite. Never throws and returns "" when no copy could be taken,
+    // so the caller can say so plainly rather than detaching quietly without one.
+    private string BackupStoreBeforeLegacyDetach()
+    {
+        try
+        {
+            if (string.IsNullOrEmpty(_storePath) || !File.Exists(_storePath)) return "";
+            var directory = Path.GetDirectoryName(_storePath) ?? "";
+            var target = Path.Combine(directory,
+                $"{Path.GetFileNameWithoutExtension(_storePath)}.pre-legacy-phrases-{DateTime.Now:yyyyMMdd-HHmmss}.json");
+            File.Copy(_storePath, target, overwrite: false);
+            return target;
+        }
+        catch
+        {
+            return "";
+        }
     }
 
     // Resolve a collection by the agent-supplied project name: first the deck-scoped id, then a
@@ -3833,17 +4085,21 @@ public sealed partial class ArchiveService
     private IReadOnlyList<TagCount>? _cachedAllChatTags;
     private int _cachedHiddenChatCount = -1;
     private int _cachedAutomationWorkerCount = -1;
+    private int _cachedMuxNamedChatCount = -1;
+    private (int Unvetted, int Active, int Archived)? _cachedScopeCounts;
 
     private bool AggregatesAreStale()
     {
         var key = (ArchiveSession.AggregateEpoch, Store.Sessions.Count);
-        if (_aggregateKey == key && _cachedAllChatTags is not null && _cachedHiddenChatCount >= 0 && _cachedAutomationWorkerCount >= 0) return false;
+        if (_aggregateKey == key && _cachedAllChatTags is not null && _cachedHiddenChatCount >= 0 && _cachedAutomationWorkerCount >= 0 && _cachedMuxNamedChatCount >= 0 && _cachedScopeCounts is not null) return false;
         if (_aggregateKey != key)
         {
             _aggregateKey = key;
             _cachedAllChatTags = null;
             _cachedHiddenChatCount = -1;
             _cachedAutomationWorkerCount = -1;
+            _cachedMuxNamedChatCount = -1;
+            _cachedScopeCounts = null;
         }
         return true;
     }
@@ -3932,13 +4188,55 @@ public sealed partial class ArchiveService
     // collection-member chats are NEVER treated as spam (the user deliberately kept them). The tiny-
     // transcript guard (MessageCount) protects any genuinely large chat whose user-count hasn't been
     // backfilled yet from being hidden by accident. Reveal these with the "Show hidden chats" toggle.
+    //
+    // The same toggle also covers harness chatter, which the one-off shape misses because the harness
+    // replays its prompt several times in one session (a leaf liveness probe is 9 user turns, not 1).
     public static bool IsLowSignalChat(ArchiveSession s)
         => !s.Pinned
            && !s.Archived
            && !HasUserTags(s)   // reserved auto-tags ("archive"/"code") are on EVERY chat — only a DELIBERATE user tag counts as "kept"
            && s.SpecialPhrases.Count == 0   // a codename ("special phrase") is a deliberate keep — never auto-hide a stashed chat
-           && s.UserMessageCount <= 1
-           && s.MessageCount <= 8;
+           && ((s.UserMessageCount <= 1 && s.MessageCount <= 8) || IsHarnessChatter(s));
+
+    // Session openings that are an INSTRUCTION to an agent rather than something a person says to one:
+    // the leaf liveness probes ("Reply with LEAF_LOCAL_PROOF"), the tandem/bridge token probes ("Reply
+    // with exactly: TANDEM-OK and the result of 7*8") and the fixtures the harness sends itself.
+    private static readonly string[] HarnessOpenings =
+    {
+        "reply with ", "reply exactly", "shared_context", "queue probe step", "interrupt test fixture",
+        "follow these steps in order and nothing else",
+    };
+
+    // A session whose opening turn is one of those instructions, or a stub the leaf harness left behind
+    // ("Leaf 3: Original" with two turns in it, a chat containing nothing but "ping"). The instruction
+    // identifies the first kind, so its guard only has to exclude a real chat that happens to START with
+    // those words — over the live corpus the largest is 90 messages, and not one carries a pin, user tag
+    // or codename. The second kind is identified by its tininess alone, so its guard is strict: a
+    // "Leaf <n>:" title is NOT enough on its own, because "Leaf 4: ProductShape" is 2375 messages of
+    // real work that has to stay in the list.
+    private const int HarnessMaxMessages = 120;
+    private const int HarnessMaxUserMessages = 12;
+    private const int StubMaxMessages = 6;
+    private const int StubMaxUserMessages = 2;
+    private static readonly Regex LeafStubTitle = new(@"^leaf \d+:", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    private static bool IsHarnessChatter(ArchiveSession s)
+    {
+        var opening = s.FirstUserMessage.Trim();
+        if (opening.Length > 0)
+        {
+            var instructed = opening.Contains("context return from leaf ", StringComparison.OrdinalIgnoreCase);
+            if (!instructed)
+                foreach (var prefix in HarnessOpenings)
+                    if (opening.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) { instructed = true; break; }
+            if (instructed) return s.MessageCount <= HarnessMaxMessages && s.UserMessageCount <= HarnessMaxUserMessages;
+        }
+
+        if (s.MessageCount > StubMaxMessages || s.UserMessageCount > StubMaxUserMessages) return false;
+        return LeafStubTitle.IsMatch(s.DisplayTitle)
+               || opening.Equals("ping", StringComparison.OrdinalIgnoreCase)
+               || opening.Equals("ping.", StringComparison.OrdinalIgnoreCase);
+    }
 
     // How many chats are currently auto-hidden as one-offs (for the "Show hidden (N)" label).
     public int HiddenChatCount()
@@ -3959,15 +4257,49 @@ public sealed partial class ArchiveService
         return _cachedAutomationWorkerCount = Store.Sessions.Values.Count(ShouldAutoHideAutomationWorker);
     }
 
+    // How many chats carry an app-assigned name — the "mux rename" override the list hides by default
+    // (for the "Show MUX names (N)" label). Informational, so it counts without the display policy.
+    public int MuxNamedChatCount()
+    {
+        AggregatesAreStale();
+        if (_cachedMuxNamedChatCount >= 0) return _cachedMuxNamedChatCount;
+        PerfCounters.TagAggregateScan();
+        return _cachedMuxNamedChatCount = Store.Sessions.Values.Count(s => !string.IsNullOrWhiteSpace(s.CustomTitle));
+    }
+
+    // The three lifecycle tiers for the scope tabs, counted in one pass. Disjoint by construction (a chat
+    // is counted once), so they sum to the whole store - which is the point of the tabs: the general
+    // populace is the pile, Active is what has been vetted, Archived is what was retired.
+    public (int Unvetted, int Active, int Archived) ChatScopeCounts()
+    {
+        AggregatesAreStale();
+        if (_cachedScopeCounts is not null) return _cachedScopeCounts.Value;
+        PerfCounters.TagAggregateScan();
+        int unvetted = 0, active = 0, archived = 0;
+        foreach (var session in Store.Sessions.Values)
+        {
+            if (session.Archived) archived++;
+            else if (session.Vetted) active++;
+            else unvetted++;
+        }
+        return (_cachedScopeCounts = (unvetted, active, archived)).Value;
+    }
+
     public IReadOnlyList<ArchiveSession> FilterChats(ChatFilter f)
     {
         IEnumerable<ArchiveSession> baseSet = string.IsNullOrWhiteSpace(f.Query)
             ? Store.Sessions.Values
-            : f.Archived == "active" ? Search(f.Query) : SearchIncludingArchived(f.Query);
+            : f.Archived is "archived" or "all" ? SearchIncludingArchived(f.Query) : Search(f.Query);
 
+        // Three DISJOINT tiers, one chat in exactly one of them: "unvetted" is the general populace (the
+        // pile everything lands in), "active" is vetted and in play, "archived" is retired. "all" keeps
+        // every tier, retired included, and "" (nothing chosen) keeps the whole live store - the meaning
+        // this field has always had for the tag-filter wrapper and the remote discovery API.
         baseSet = f.Archived switch
         {
             "archived" => baseSet.Where(s => s.Archived),
+            "unvetted" => baseSet.Where(s => !s.Archived && !s.Vetted),
+            "active" => baseSet.Where(s => !s.Archived && s.Vetted),
             "all" => baseSet,
             _ => baseSet.Where(s => !s.Archived),
         };
@@ -4936,9 +5268,26 @@ public sealed partial class ArchiveService
     // Refresh a session's content from disk while keeping the user's organization intact.
     private static void PreserveAppFields(ArchiveSession existing, ArchiveSession incoming)
     {
+        // A re-parse hands the store a FRESH instance for a chat that may be open in the reader right now,
+        // and a fresh instance has no content (the scan releases it - see ReleaseIndexedContent). The
+        // loaded transcript window is the reader's state, not transcript metadata, so carry it across:
+        // dropping it empties the model behind the on-screen messages (the render becomes a fossil whose
+        // scroll-up paging, which needs ContentLoaded, can never load another page). The live watch and
+        // FreshenOpenChatAsync re-parse the OPEN chat in place, so nothing goes stale from this.
+        if (existing.ContentLoaded && !incoming.ContentLoaded)
+        {
+            incoming.Messages = existing.Messages;
+            incoming.CodeBlocks = existing.CodeBlocks;
+            incoming.ContentLoaded = true;
+        }
         incoming.CustomTitle = existing.CustomTitle;
         incoming.Pinned = existing.Pinned;
         incoming.Archived = existing.Archived;
+        // Vetted is the other half of the lifecycle tier, and it is app-only - no transcript carries it.
+        // Leaving it out here meant a re-parse of a chat silently dropped it back to the general populace
+        // (seen live: a vet that reported success was undone by the next sync of the same chat, because
+        // appending the chat's own name had made its transcript dirty and so re-parsed it).
+        incoming.Vetted = existing.Vetted;
         incoming.Reviewed = existing.Reviewed;
         incoming.Starred = existing.Starred;
         foreach (var alias in existing.Aliases)
@@ -6392,6 +6741,10 @@ public sealed partial class ArchiveService
         var cwd = "";
         var created = "";
         var summary = "";
+        // The chat's own name lives in a custom-title (a rename) or ai-title record, which can sit
+        // anywhere in the file. Capture it on this pass, latest wins - the bytes are already being read.
+        var forwardCustom = "";
+        var forwardAi = "";
         var isSidechain = false;
         var seen = new HashSet<string>(StringComparer.Ordinal);
         var toolUseById = new Dictionary<string, ArchiveMessage>(StringComparer.Ordinal);  // tool_use id -> step (output attached from the later tool_result)
@@ -6429,6 +6782,13 @@ public sealed partial class ArchiveService
                     if (!string.IsNullOrWhiteSpace(timestamp)) updated = timestamp;
 
                     var type = root.TryGetProperty("type", out var typeProp) ? typeProp.GetString() : null;
+                    // Names are read here, where the whole file streams past, so a rename that a live
+                    // session has since buried under output is still seen - the 96KB tail read below
+                    // cannot reach one that far back.
+                    if (root.TryGetProperty("customTitle", out var ctProp) && ctProp.GetString() is { Length: > 0 } ctValue)
+                        forwardCustom = ctValue;
+                    else if (root.TryGetProperty("aiTitle", out var aiProp) && aiProp.GetString() is { Length: > 0 } aiValue)
+                        forwardAi = aiValue;
                     if (type == "summary" && root.TryGetProperty("summary", out var sumProp))
                     {
                         summary = sumProp.GetString() ?? summary;
@@ -6471,13 +6831,17 @@ public sealed partial class ArchiveService
 
         if (string.IsNullOrWhiteSpace(created)) created = info.CreationTimeUtc.ToString("O");
         // The session's real name: a user/agent custom-title wins, then Claude's ai-title, then a
-        // summary record, then the first prompt. Custom/ai titles are appended at the file TAIL (often
-        // far past the message window), so scan the tail for them rather than relying on the forward parse.
+        // summary record, then the first prompt. The tail read comes first because it looks at the very
+        // end of the file, so its record is the latest one when it finds anything; what the forward pass
+        // saw is the fallback for a name the tail window has scrolled past, which is what a chat renamed
+        // while it was still running looks like.
         var (tailCustom, tailAi) = ClaudeTailTitle(filePath);
+        var customName = !string.IsNullOrWhiteSpace(tailCustom) ? tailCustom : forwardCustom;
+        var aiName = UsableTitle(tailAi) ? tailAi! : forwardAi;
         var titleSource =
-            !string.IsNullOrWhiteSpace(tailCustom) ? tailCustom! :
-            !string.IsNullOrWhiteSpace(tailAi) ? tailAi! :
-            !string.IsNullOrWhiteSpace(summary) ? summary :
+            !string.IsNullOrWhiteSpace(customName) ? customName! :
+            UsableTitle(aiName) ? aiName :
+            UsableTitle(summary) ? summary :
             titleSeed ?? FirstMeaningfulUserText(messages) ?? Path.GetFileNameWithoutExtension(filePath);
         var title = CleanTitle(titleSource);
         return new ParsedTranscript(messages, codeBlocks, id, title, created, updated, cwd,
@@ -6918,6 +7282,95 @@ public sealed partial class ArchiveService
         catch { return (null, null); }
     }
 
+    // A stored title that reads as harness plumbing is a leftover from the store's earlier title rule,
+    // which took the first user turn verbatim - and for a compacted chat that turn IS the compaction
+    // preamble, while a skill run's first turn is the injected skill body. Titles persist and are
+    // re-derived only when a transcript is re-parsed, so a chat nobody writes to again would show the
+    // wrong name forever. Re-derive the name the way that chat's own parser would, read on a worker.
+    // Measured on the live store: 68 of 9,754 titles, so this is a short pass over a handful of files.
+    private async Task<List<(ArchiveSession Session, string Title)>> RepairMachineAuthoredTitlesAsync(
+        CancellationToken cancellationToken)
+    {
+        var repaired = new List<(ArchiveSession, string)>();
+        foreach (var session in Store.Sessions.Values)
+        {
+            if (!IsMachineUserText(session.Title)) continue;
+            var path = session.SourcePath;
+            if (string.IsNullOrWhiteSpace(path) || !File.Exists(path)) continue;
+            cancellationToken.ThrowIfCancellationRequested();
+            var tool = string.IsNullOrWhiteSpace(session.Tool) || session.Tool == "auto" ? DetectTool(path) : session.Tool;
+            if (string.Equals(tool, "claude", StringComparison.OrdinalIgnoreCase))
+            {
+                if (ClaudeHeadTitle(path) is { } seed) repaired.Add((session, CleanTitle(seed)));
+                continue;
+            }
+            // Codex names a chat after the first prompt too, but the prompt lives in the rollout's
+            // session_meta/event_msg payloads, so re-parsing those few files reuses the parser's own rule
+            // instead of keeping a second copy of the format. The guard above means only sessions still
+            // holding a machine title are read at all.
+            try
+            {
+                var parsed = await ParseCodexCoreAsync(path);
+                if (!IsMachineUserText(parsed.Title)) repaired.Add((session, parsed.Title));
+            }
+            catch
+            {
+                // An unreadable rollout keeps its stored title; the list is not worth failing a load over.
+            }
+        }
+        return repaired;
+    }
+
+    // The earliest user turn in the file that reads like something a person typed: the head-side twin of
+    // the parser's titleSeed, read directly so a stored title can be corrected without a re-parse. Falls
+    // back to the filename exactly as the parser does, so a corrected title is the one the next re-parse
+    // would produce and the row cannot change twice.
+    private static string? ClaudeHeadTitle(string path)
+    {
+        try
+        {
+            var messages = new ObservableCollection<ArchiveMessage>();
+            var codeBlocks = new ObservableCollection<CodeBlock>();
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+            var toolUseById = new Dictionary<string, ArchiveMessage>(StringComparer.Ordinal);
+            using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            using var streamReader = new StreamReader(stream, Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
+            var reader = new BoundedTextLineReader(streamReader, MaxLineChars, discardOversizedLine: true);
+            for (var lineCount = 0; lineCount < MaxLinesPerSession; lineCount++)
+            {
+                if (stream.Position > MaxTitleHeadBytes) break;
+                string? line;
+                try { line = reader.ReadLine(); }
+                catch (InvalidDataException) { continue; }
+                if (line is null) break;
+                if (string.IsNullOrWhiteSpace(line) || line.Length > MaxLineChars) continue;
+                JsonDocument doc;
+                try { doc = JsonDocument.Parse(line); } catch { continue; }
+                using (doc)
+                {
+                    var root = doc.RootElement;
+                    var type = root.TryGetProperty("type", out var typeProp) ? typeProp.GetString() : null;
+                    if (type != "user" && type != "assistant") continue;
+                    if (!root.TryGetProperty("message", out var message)) continue;
+                    var role = message.TryGetProperty("role", out var roleProp) ? roleProp.GetString() ?? type : type;
+                    if (!IsIndexedRole(role)) continue;
+                    ProcessClaudeMessage(message, role, "", messages, codeBlocks, seen, toolUseById);
+                }
+                if (FirstMeaningfulUserText(messages) is { } seed) return seed;
+            }
+            // Nothing a person typed in the head (a chat that is only an injected skill run, say): the
+            // parser answers with the filename, and so does this, so the two agree.
+            return messages.Count == 0 ? null : Path.GetFileNameWithoutExtension(path);
+        }
+        catch { return null; }
+    }
+
+    // A title has to read as a name for the chat, so a name that is really harness plumbing counts as
+    // absent and the next source in the chain wins. `tailCustom` is deliberately exempt: that is a name
+    // the user typed, and it is theirs to keep.
+    private static bool UsableTitle(string? text) =>
+        !string.IsNullOrWhiteSpace(text) && !IsMachineUserText(text);
+
     private void RemoveBundledSampleSessions(HashSet<string> importedIds)
     {
         var sampleIds = Store.Sessions.Values
@@ -6953,9 +7406,42 @@ public sealed partial class ArchiveService
         return builder.ToString();
     }
 
+    // Every tag here is machine-authored content that arrives as a user turn but is not something the
+    // person typed: IDE/environment preambles, reminders, slash-command plumbing, and the harness's own
+    // task notifications. Measured over the live corpus, task-notification alone is 11.5k of 37.6k user
+    // turns, so leaving any of these in makes the "chat" reader look like a log rather than a conversation.
     private static readonly Regex NoiseBlocks = new(
-        "<(environment_context|goal_context|ide_selection|ide_opened_file|ide_diagnostics|system-reminder|user_instructions|context|command-message|command-name|command-args|local-command-stdout|local-command-stderr)>[\\s\\S]*?</\\1>",
+        "<(environment_context|goal_context|ide_selection|ide_opened_file|ide_diagnostics|system-reminder|user_instructions|user-prompt-submit-hook|context|command-message|command-name|command-args|local-command-stdout|local-command-stderr|local-command-caveat|task-notification|fork-boilerplate)>[\\s\\S]*?</\\1>",
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    // Machine-authored text that arrives as a USER turn but is not something the person typed: compaction
+    // preambles, hook feedback, injected skill bodies, goal bookkeeping, peer/gateway notices and harness
+    // control prompts. Counts are from a pass over the live corpus (23.5k untagged user turns, 900 files),
+    // which is also why this is a prefix list and not a heuristic: every family above ~30 occurrences
+    // starts with one of these, and nothing a person typed does.
+    private static readonly string[] MachineUserPrefixes =
+    {
+        "This session is being continued from a previous conversation",   // compaction preamble
+        "Stop hook feedback:",                                           // hook feedback
+        "Base directory for this skill:",                                // injected skill body
+        "Goal review recorded:", "Goal review requires an active main-session goal",
+        "Goal active; original task retained.", "Goal blocked and retained.",
+        "[Request interrupted by user",                                  // interruption marker
+        "[message from another session, not the user]",
+        "Another Claude session sent a message:",
+        "Gateway peer operation result (", "Gateway peer collaboration request from ",
+        "CAMPAIGN WATCH", "# Active persist task", "Invalid checkpoint. Supply JSON with kind",
+        "CRITICAL: Respond with TEXT ONLY", "Continue from where you left off.",
+    };
+
+    public static bool IsMachineUserText(string text)
+    {
+        if (string.IsNullOrEmpty(text)) return false;
+        var value = text.TrimStart();
+        foreach (var prefix in MachineUserPrefixes)
+            if (value.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) return true;
+        return false;
+    }
 
     // First user message that reads like a real prompt (machine-context noise stripped) — used for
     // the chat title so the list shows what the chat is about, not an IDE/context preamble.
@@ -6964,7 +7450,7 @@ public sealed partial class ArchiveService
         foreach (var message in messages.Where(m => m.Role == "user"))
         {
             var clean = ForReading(message.Text);
-            if (clean.Length >= 8 && !clean.StartsWith("<")) return clean;
+            if (clean.Length >= 8 && !clean.StartsWith("<") && !IsMachineUserText(clean)) return clean;
         }
         return null;
     }
@@ -6995,7 +7481,11 @@ public sealed partial class ArchiveService
     private static bool IsTitleCandidate(string text)
     {
         var value = text.Trim();
-        return value.Length > 0 && !value.StartsWith("<environment_context>") && !value.StartsWith("<goal_context>");
+        // The machine families are not prompts: a compacted rollout opens with the compaction preamble, and
+        // naming the chat after it puts "This session is being continued…" in the list (measured: 7 codex
+        // chats, every one of them a rollout that begins mid-conversation).
+        return value.Length > 0 && !value.StartsWith("<environment_context>") && !value.StartsWith("<goal_context>")
+            && !IsMachineUserText(value);
     }
 
     // Compiled, like every other regex in this codebase. CleanTitle runs once per session on the merge
@@ -7289,6 +7779,12 @@ public sealed partial class ArchiveService
         foreach (var session in Store.Sessions.Values)
         {
             if (!titles.TryGetValue(session.Id, out var title) || string.IsNullOrWhiteSpace(title.Name)) continue;
+            // Codex names a thread after its first prompt, and for a compacted rollout that first prompt is
+            // the compaction preamble - the name recorded in session_index.jsonl (and the state db) is
+            // literally "This session is being continued from a previous conversation…". A name that reads
+            // as harness plumbing is not a name, so leave whatever the parser derived: this merge runs after
+            // the load-time title repair and would otherwise put the preamble back on every sync.
+            if (IsMachineUserText(title.Name)) continue;
             var clean = CleanTitle(title.Name);
             if (!string.Equals(session.Title, clean, StringComparison.Ordinal))
             {

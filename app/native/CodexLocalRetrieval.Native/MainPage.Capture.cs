@@ -85,11 +85,27 @@ public sealed partial class MainPage
         }
     }
 
+    // The only clicks the isolated fixture may perform: pure frame toggles. They rearrange the shell
+    // (pane visibility, inspector tab, chat scope) against disposable metadata - no navigation to a live
+    // screen, no launch, no store mutation - so the fixture can still verify every chrome state.
+    private static readonly string[] FixtureShellToggles =
+    {
+        "SidebarToggleButton", "ToolsButton", "ToolsBackButton", "SettingsButton", "TopBarCollapseButton",
+        "InspectorButton", "InspectorPinButton", "InspectorCloseButton",
+        "InspectorTabIntegrity", "InspectorTabContext", "InspectorTabActivity", "InspectorTabActions",
+        "ScopeActiveButton", "ScopeArchivedButton", "ScopeAllButton",
+    };
+
+    private static bool IsFixtureShellToggle(string text) =>
+        Array.Exists(FixtureShellToggles, name => string.Equals(name, text, StringComparison.Ordinal));
+
     private async Task RunStepAsync(CapStep step, List<string> artifacts)
     {
         if (GuiVerificationFixture.Enabled)
         {
-            if (step.nav is not (null or "Archive") || step.click is not null || step.clipboard is true)
+            if (step.nav is not (null or "Archive") || step.clipboard is true
+                || step.vet is not null || step.vetClose is true || step.confirm is not null
+                || (step.click is not null && !IsFixtureShellToggle(step.click)))
                 throw new InvalidOperationException("GUI metadata fixture permits read-only capture steps only");
             foreach (var name in new[] { step.shot, step.dump, step.snapshot })
                 if (name is not null && !System.Text.RegularExpressions.Regex.IsMatch(name, @"\A[A-Za-z0-9_-]{1,80}\z"))
@@ -98,6 +114,51 @@ public sealed partial class MainPage
         if (step.nav is not null) Navigate(step.nav);
         if (step.resize is { Length: 2 }) MainWindow.Instance?.AppWindow.Resize(new Windows.Graphics.SizeInt32(step.resize[0], step.resize[1]));
         if (step.type is not null) { SearchBox.Text = step.type; ApplySearch(step.type); }
+
+        // Open the vet dialog for a chat and LEAVE it open, so the next shot can render it. A later
+        // vetClose step dismisses it. Nothing is committed unless vetName is given - and then the dialog's
+        // REAL fields are filled and its REAL primary button pressed, so the run goes through the same
+        // gate a user's typing and click does (validate -> VetSessionAsync -> rename -> tier move).
+        if (step.vet is not null)
+        {
+            var target = _archive.Store.Sessions.Values.FirstOrDefault(s =>
+                string.Equals(s.Id, step.vet, StringComparison.OrdinalIgnoreCase))
+                ?? throw new InvalidOperationException($"Session '{step.vet}' was not found.");
+            _selected = target;
+            SelectSessionRow(target);
+            var pending = VetDialogAsync(target);
+            await SettleAsync(4);
+            if (step.vetName is not null || step.vetPhrase is not null)
+            {
+                SetPopupBoxText("VetNameBox", step.vetName);
+                SetPopupBoxText("VetPhraseBox", step.vetPhrase);
+                await SettleAsync(3);
+                InvokePopupButton(_openVetDialog?.PrimaryButtonText ?? "Vet");
+                // The commit saves the store and rewrites the transcript's own title, so it needs longer
+                // than a layout settle. Awaiting the dialog's own task covers ShowAsync returning; the
+                // fixed tail covers the store write that follows it.
+                await pending;
+                await Task.Delay(1200);
+            }
+            else
+            {
+                _ = pending;   // the dialog stays open on purpose; a later vetClose step dismisses it
+            }
+        }
+        if (step.vetClose is true)
+        {
+            _openVetDialog?.Hide();
+            await SettleAsync(2);
+        }
+
+        // Press a button inside whatever dialog is open (a confirm step: the button is in the popup layer,
+        // which InvokeByText - a walk from the page - cannot reach).
+        if (step.confirm is not null)
+        {
+            InvokePopupButton(step.confirm);
+            await SettleAsync(4);
+            await Task.Delay(900);   // the action behind a confirm dialog writes before the next step reads
+        }
         if (step.click is not null)
         {
             InvokeByText(step.click, step.expectedSessionId);
@@ -120,6 +181,14 @@ public sealed partial class MainPage
         if (step.dump is not null) artifacts.Add(DumpTree(step.dump));
         if (step.snapshot is not null) artifacts.Add(WriteStateSnapshot(step.snapshot));
         if (step.clipboard is true) artifacts.Add(await WriteClipboardSnapshotAsync());
+        if (step.scroll is { Length: 1 })
+        {
+            // Move the reader's viewport. This is a programmatic ChangeView, so it deliberately does NOT
+            // page: loading older messages is driven by a real wheel-up (or the "load earlier" button),
+            // and a synthetic offset change must not be mistaken for that gesture.
+            var target = Math.Clamp(MainScroller.VerticalOffset + step.scroll[0], 0, MainScroller.ScrollableHeight);
+            MainScroller.ChangeView(null, target, null, disableAnimation: true);
+        }
     }
 
     private void SelectDisplayedSession(string id)
@@ -151,14 +220,37 @@ public sealed partial class MainPage
     {
         var selectedItemId = (SessionList.SelectedItem as ArchiveSession)?.Id;
         var path = Path.Combine(CapDir, "out", name + ".json");
+        // Reader geometry + paging state: the transcript's centring and its scroll-up paging are both
+        // invisible in a screenshot, so the snapshot carries the numbers the fixes are judged against.
+        double mainX = 0, mainW = 0;
+        try { mainX = MainContent.TransformToVisual(this).TransformPoint(new Windows.Foundation.Point(0, 0)).X; } catch { }
+        try { mainW = MainContent.ActualWidth; } catch { }
+        var scopes = _archive.ChatScopeCounts();
         File.WriteAllText(path, JsonSerializer.Serialize(new
         {
             selectedId = _selected?.Id,
             selectedItemId,
+            selectedVetted = _selected?.Vetted,
+            selectedPhrases = _selected?.SpecialPhrases.ToList(),
+            chatScope = _chatScope,
+            scopeUnvetted = scopes.Unvetted,
+            scopeActive = scopes.Active,
+            scopeArchived = scopes.Archived,
             renderedTitle = TitleText.Text,
             screen = _screen,
             syncInProgress = _syncing,
-            count = _archive.Sessions.Count
+            count = _archive.Sessions.Count,
+            msgFilter = _msgFilter,
+            readerCount = _selected?.ContentLoaded == true ? CurrentReaderMessages().Count : 0,
+            archiveShown = _archiveShown,
+            pageSize = ArchivePageSize,
+            verticalOffset = MainScroller.VerticalOffset,
+            extentHeight = MainScroller.ExtentHeight,
+            viewportHeight = MainScroller.ViewportHeight,
+            viewportWidth = MainScroller.ViewportWidth,
+            mainX,
+            mainW,
+            mainChildren = MainContent.Children.Count
         }));
         return path;
     }
@@ -190,10 +282,90 @@ public sealed partial class MainPage
         await Task.Delay(120);
     }
 
+    // A dialog lives in the root's popup layer, so rendering the page would show the page behind it
+    // (dimmed by the dialog's smoke layer) and never the dialog itself. The subject is therefore the
+    // topmost open popup's child - the template root that carries the dialog's background. Rendering the
+    // dialog's CONTENT instead composites over nothing, which washes out every themed brush in it.
+    private UIElement CaptureSubject()
+    {
+        var popups = OpenPopups();
+        for (var i = popups.Count - 1; i >= 0; i--)   // z-order: the last is the one on top
+            if (popups[i].Child is UIElement child) return child;
+        return this;
+    }
+
+    private IReadOnlyList<Microsoft.UI.Xaml.Controls.Primitives.Popup> OpenPopups()
+    {
+        try { return XamlRoot is null ? Array.Empty<Microsoft.UI.Xaml.Controls.Primitives.Popup>() : VisualTreeHelper.GetOpenPopupsForXamlRoot(XamlRoot); }
+        catch { return Array.Empty<Microsoft.UI.Xaml.Controls.Primitives.Popup>(); }
+    }
+
+    private static T? FindNamed<T>(DependencyObject root, string name) where T : FrameworkElement
+    {
+        if (root is T match && string.Equals(match.Name, name, StringComparison.Ordinal)) return match;
+        var count = VisualTreeHelper.GetChildrenCount(root);
+        for (var i = 0; i < count; i++)
+        {
+            var found = FindNamed<T>(VisualTreeHelper.GetChild(root, i), name);
+            if (found is not null) return found;
+        }
+        return null;
+    }
+
+    private static T? FindByContent<T>(DependencyObject root, string content) where T : ContentControl
+    {
+        if (root is T match && match.Content is string text && string.Equals(text, content, StringComparison.Ordinal)) return match;
+        var count = VisualTreeHelper.GetChildrenCount(root);
+        for (var i = 0; i < count; i++)
+        {
+            var found = FindByContent<T>(VisualTreeHelper.GetChild(root, i), content);
+            if (found is not null) return found;
+        }
+        return null;
+    }
+
+    // Every open popup's child, for reaching INTO a dialog: a ContentDialog's controls are in the popup
+    // layer, which a walk from the page never enters.
+    private IEnumerable<DependencyObject> PopupRoots()
+    {
+        foreach (var popup in OpenPopups())
+            if (popup.Child is DependencyObject child) yield return child;
+    }
+
+    // Press a dialog's button the way a pointer would: through its automation peer, so the click runs the
+    // real handler (and the ContentDialog's own ShowAsync result plumbing) rather than a shortcut.
+    private void InvokePopupButton(string content)
+    {
+        Button? button = null;
+        foreach (var root in PopupRoots())
+        {
+            button = FindByContent<Button>(root, content);
+            if (button is not null) break;
+        }
+        if (button is null) throw new InvalidOperationException($"No open dialog has a '{content}' button.");
+        if (!button.IsEnabled) throw new InvalidOperationException($"The dialog's '{content}' button is disabled.");
+        if (new ButtonAutomationPeer(button).GetPattern(PatternInterface.Invoke) is not IInvokeProvider invoke)
+            throw new InvalidOperationException($"The dialog's '{content}' button cannot be invoked.");
+        invoke.Invoke();
+    }
+
+    private void SetPopupBoxText(string name, string? text)
+    {
+        if (text is null) return;
+        foreach (var root in PopupRoots())
+        {
+            var box = FindNamed<TextBox>(root, name);
+            if (box is null) continue;
+            box.Text = text;   // fires TextChanged, so the dialog's own validation gate runs
+            return;
+        }
+        throw new InvalidOperationException($"No open dialog has a '{name}' field.");
+    }
+
     private async Task<string> CaptureAsync(string name)
     {
         var rtb = new RenderTargetBitmap();
-        await rtb.RenderAsync(this);
+        await rtb.RenderAsync(CaptureSubject());
         var pixels = await rtb.GetPixelsAsync();
         var path = Path.Combine(CapDir, "out", name + ".png");
         using var fs = new FileStream(path, FileMode.Create);
@@ -265,6 +437,22 @@ public sealed partial class MainPage
             || text.Contains("kill", StringComparison.OrdinalIgnoreCase))
             throw new InvalidOperationException($"Destructive capture action '{text}' is not allowlisted.");
 
+        // A filter switch is not a Button, so it needs its own match. Flipping IsOn drives the same Toggled
+        // handler a pointer tap does - the harness has no pointer injection.
+        ToggleSwitch? toggle = null;
+        void FindToggle(DependencyObject d)
+        {
+            if (toggle is not null) return;
+            if (d is ToggleSwitch t && t.Name == text
+                && t.IsEnabled && t.Visibility == Visibility.Visible && t.ActualWidth > 0 && t.ActualHeight > 0)
+            {
+                toggle = t;
+                return;
+            }
+            int n = VisualTreeHelper.GetChildrenCount(d);
+            for (int i = 0; i < n; i++) FindToggle(VisualTreeHelper.GetChild(d, i));
+        }
+
         Button? unavailable = null;
         Button? Find(DependencyObject d)
         {
@@ -291,7 +479,24 @@ public sealed partial class MainPage
             return null;
         }
 
-        var btn = Find(this);
+        // The filter flyout is a popup, so the controls inside it are NOT under MainPage's visual tree and
+        // have to be reached through the flyout's own content.
+        var roots = new List<DependencyObject> { this };
+        if (_filterFlyout?.Content is DependencyObject flyoutContent) roots.Add(flyoutContent);
+
+        foreach (var root in roots) FindToggle(root);
+        if (toggle is not null)
+        {
+            toggle.IsOn = !toggle.IsOn;
+            return;
+        }
+
+        Button? btn = null;
+        foreach (var root in roots)
+        {
+            btn = Find(root);
+            if (btn is not null) break;
+        }
         if (btn is null)
         {
             if (unavailable is not null) throw new InvalidOperationException($"Button '{text}' is unavailable.");
@@ -332,10 +537,16 @@ internal sealed class CapStep
     public string? click { get; set; }
     public string? expectedSessionId { get; set; }
     public string? selectSessionId { get; set; }
+    public string? vet { get; set; }
+    public string? vetName { get; set; }
+    public string? vetPhrase { get; set; }
+    public bool? vetClose { get; set; }
+    public string? confirm { get; set; }
     public string? shot { get; set; }
     public string? dump { get; set; }
     public string? snapshot { get; set; }
     public bool? clipboard { get; set; }
+    public int[]? scroll { get; set; }
     public int? wait { get; set; }
     public int? waitMs { get; set; }
     public override string ToString() => JsonSerializer.Serialize(this);

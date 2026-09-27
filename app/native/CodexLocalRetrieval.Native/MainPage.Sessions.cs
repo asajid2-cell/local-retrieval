@@ -186,7 +186,11 @@ public sealed partial class MainPage
             // unconditionally there rebuilt whatever screen the user was on every half minute for a chat
             // that had not changed. The list itself is already correct: MergeScanAsync's ReapplyList routes
             // through ReapplyActiveFilter, which diffs the bound list in place.
-            if (ReferenceEquals(restored, _selected))
+            // ...unless the reader is showing that chat with no content behind it. A merge can hand the
+            // store a fresh instance for the open chat, and if its window is gone the finished render stays
+            // on screen over an empty model: a fossil whose scroll-up paging - which needs ContentLoaded -
+            // can never load another page. Repaint then; the reader re-reads and is whole again.
+            if (ReferenceEquals(restored, _selected) && !ReaderNeedsContent())
             {
                 Diag.Log("Sync: open chat unchanged; skipped repaint");
                 return;

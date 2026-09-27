@@ -58,6 +58,7 @@ public sealed partial class MainPage
 
     private bool _showHidden;   // reveal the auto-hidden one-off / spam chats (default off = they're hidden)
     private bool _showAutomationWorkers;   // reveal tandem/orchestration workers (default off = they're hidden)
+    private bool _useMuxNames;   // show the app-assigned ("mux rename") name instead of the agent's own (default off = native)
     private int _minUserMsgs;   // hide chats with fewer than this many real user prompts (0 = off)
     private static readonly (int Value, string Label)[] MinUserMsgOptions =
     {
@@ -82,7 +83,8 @@ public sealed partial class MainPage
         Tool = _toolFilter,
         MinUserMessages = _minUserMsgs,
         ShowHidden = _showHidden,
-        ShowAutomationWorkers = _showAutomationWorkers
+        ShowAutomationWorkers = _showAutomationWorkers,
+        Archived = _chatScope
     };
 
     // The funnel filters WITHOUT the text query — used to constrain the Deep-search results to the same
@@ -99,6 +101,7 @@ public sealed partial class MainPage
         MinUserMessages = _minUserMsgs,
         ShowHidden = _showHidden,
         ShowAutomationWorkers = _showAutomationWorkers,
+        Archived = _chatScope,
     };
 
     // Session ids that pass the active funnel filters (no text query). Empty filters -> null (no restriction).
@@ -137,7 +140,7 @@ public sealed partial class MainPage
         // A newer click owns selection even when filtering removed that row; never replace it with an unrelated first result.
         // last-user / first-user sorts flip each visible row's title to what YOU said.
         var titleMode = (_dateMode == "last-user" || _dateMode == "first-user") ? _dateMode : "";
-        foreach (var s in results) s.RowTitleMode = titleMode;
+        foreach (var s in results) { s.RowTitleMode = titleMode; s.PreferMuxName = _useMuxNames; }
         // A sort OR a search picks the order; preserve it (don't let RefreshSessions re-sort by recent).
         var preserve = _dateMode.Length > 0 || !string.IsNullOrWhiteSpace(SearchBox.Text);
         RunSessionListRefresh(() =>
@@ -184,7 +187,7 @@ public sealed partial class MainPage
         var keep = _selected?.Id;
         var results = _archive.FilterChats(CurrentChatFilter());
         var titleMode = (_dateMode == "last-user" || _dateMode == "first-user") ? _dateMode : "";
-        foreach (var s in results) s.RowTitleMode = titleMode;
+        foreach (var s in results) { s.RowTitleMode = titleMode; s.PreferMuxName = _useMuxNames; }
         var preserve = _dateMode.Length > 0 || !string.IsNullOrWhiteSpace(SearchBox.Text);
         RunSessionListRefresh(() =>
         {
@@ -220,6 +223,7 @@ public sealed partial class MainPage
             if (!_showHidden && ArchiveService.IsLowSignalChat(s)) continue;   // keep one-offs hidden unless revealed
             if (!_showAutomationWorkers && ArchiveService.ShouldAutoHideAutomationWorker(s)) continue;
             s.RowTitleMode = titleMode;
+            s.PreferMuxName = _useMuxNames;
             _archive.Sessions.Add(s);
             added++;
         }
@@ -601,6 +605,21 @@ public sealed partial class MainPage
         awRow.Children.Add(awToggle);
         root.Children.Add(awRow);
 
+        // Name source: chats are listed under the AGENT's own name by default. The app-assigned name is
+        // written by a mux rename (and by the web tab-rename's "App name" field) and lives only in this
+        // app's store, so it is shown on request rather than being what the list silently prefers.
+        var namedN = _archive.MuxNamedChatCount();
+        var mnRow = new Grid { ColumnDefinitions = { new ColumnDefinition(), new ColumnDefinition { Width = GridLength.Auto } } };
+        var mnLabel = new StackPanel { Orientation = Orientation.Vertical, VerticalAlignment = VerticalAlignment.Center };
+        mnLabel.Children.Add(new TextBlock { Text = "Show MUX names", Foreground = new SolidColorBrush(ChipText), FontSize = 12 });
+        mnLabel.Children.Add(new TextBlock { Text = $"{namedN} chat{(namedN == 1 ? "" : "s")} named in the app (otherwise the agent's own name)", Foreground = MutedBrush(), FontSize = 11 });
+        mnRow.Children.Add(mnLabel);
+        var mnToggle = new ToggleSwitch { Name = "ShowMuxNamesToggle", IsOn = _useMuxNames, OnContent = "On", OffContent = "Off", MinWidth = 0, HorizontalAlignment = HorizontalAlignment.Right };
+        mnToggle.Toggled += (_, _) => { if (_useMuxNames != mnToggle.IsOn) { _useMuxNames = mnToggle.IsOn; RefreshFilterFlyout(); ApplyFilters(); } };
+        Grid.SetColumn(mnToggle, 1);
+        mnRow.Children.Add(mnToggle);
+        root.Children.Add(mnRow);
+
         // Project (collection) scope: restrict the whole filter to one project's chats.
         if (_archive.Store.Collections.Count > 0)
         {
@@ -626,10 +645,10 @@ public sealed partial class MainPage
             root.Children.Add(projRow);
         }
 
-        if (_includeTags.Count > 0 || _excludeTags.Count > 0 || _filterCollectionId is not null || _dateMode.Length > 0 || _dateRange.Length > 0 || _toolFilter.Length > 0 || _minUserMsgs > 0 || _showHidden || _showAutomationWorkers)
+        if (_includeTags.Count > 0 || _excludeTags.Count > 0 || _filterCollectionId is not null || _dateMode.Length > 0 || _dateRange.Length > 0 || _toolFilter.Length > 0 || _minUserMsgs > 0 || _showHidden || _showAutomationWorkers || _useMuxNames)
         {
             var clear = new Button { Style = (Style)Resources["PillButtonStyle"], HorizontalAlignment = HorizontalAlignment.Stretch, Content = new TextBlock { Text = "Clear filters", FontSize = 12 } };
-            clear.Click += (_, _) => { _includeTags.Clear(); _excludeTags.Clear(); _filterCollectionId = null; _dateMode = ""; _dateRange = ""; _toolFilter = ""; _minUserMsgs = 0; _showHidden = false; _showAutomationWorkers = false; RefreshFilterFlyout(); ApplyFilters(); };
+            clear.Click += (_, _) => { _includeTags.Clear(); _excludeTags.Clear(); _filterCollectionId = null; _dateMode = ""; _dateRange = ""; _toolFilter = ""; _minUserMsgs = 0; _showHidden = false; _showAutomationWorkers = false; _useMuxNames = false; RefreshFilterFlyout(); ApplyFilters(); };
             root.Children.Add(clear);
         }
         return root;
