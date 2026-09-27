@@ -1105,7 +1105,13 @@ def launch_contained_child(command, cwd):
     job = ChildJob()
     child = None
     try:
-        child = subprocess.Popen(child_args(command, start_gate), cwd=cwd)
+        # Hide the allocated console: an unmasked console spawn from the console-less muxd
+        # tree is handed to Windows Terminal, which raises a tab and steals focus.
+        child = subprocess.Popen(
+            child_args(command, start_gate),
+            cwd=cwd,
+            creationflags=CREATE_NO_WINDOW,
+        )
         job.assign(child)
         with open(start_gate, "wb"):
             pass

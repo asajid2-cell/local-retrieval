@@ -706,5 +706,19 @@ class AttachedChildTests(unittest.TestCase):
                 parent.wait(timeout=5)
 
 
+class ContainedChildTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "nt", "Windows console flag test")
+    def test_contained_child_spawns_without_a_visible_console(self):
+        popen = mock.Mock(side_effect=RuntimeError("stop after recording the call"))
+        with mock.patch.object(muxrun, "ChildJob", return_value=mock.Mock()), \
+             mock.patch.object(muxrun.subprocess, "Popen", popen):
+            with self.assertRaises(RuntimeError):
+                muxrun.launch_contained_child("Write-Output probe", os.getcwd())
+
+        _, kwargs = popen.call_args
+        self.assertNotEqual(0, muxrun.CREATE_NO_WINDOW)
+        self.assertEqual(muxrun.CREATE_NO_WINDOW, kwargs.get("creationflags"))
+
+
 if __name__ == "__main__":
     unittest.main()
