@@ -734,10 +734,11 @@ public sealed partial class MainPage : Page
     private const int SearchPageSize = 25;
 
     // The chat's name as the current name-source setting shows it: the agent's own (native) name unless the
-    // "Show MUX names" filter is on. Row labels read the same rule off ArchiveSession.RowName.
+    // "Show MUX names" filter is on. Row labels read the SAME rule off ArchiveSession.PreferMuxName, so the
+    // header and the row can never disagree about what the chat is called.
     private string SessionName(ArchiveSession? session) => session is null
         ? "No chat selected"
-        : (_useMuxNames ? session.DisplayTitle : session.NativeTitle);
+        : (_useMuxNames || session.PreferMuxName ? session.DisplayTitle : session.NativeTitle);
 
     private void RenderArchive()
     {
@@ -2777,10 +2778,12 @@ public sealed partial class MainPage : Page
         vetItem.Click += async (_, _) => await VetDialogAsync(session);
         flyout.Items.Add(vetItem);
 
-        if (session.Vetted && !session.Archived)
+        // Anything above the pile has somewhere to go back to - a retired chat included, so that the
+        // Archived tab is a place you can leave rather than a dead end.
+        if (session.Vetted || session.Archived)
         {
             var unvetItem = new MenuFlyoutItem { Text = "Send back to the general populace" };
-            ToolTipService.SetToolTip(unvetItem, "Undo the vet: the chat returns to the All pile.");
+            ToolTipService.SetToolTip(unvetItem, "Undo the vet (and the retire): the chat returns to the All pile.");
             unvetItem.Click += async (_, _) =>
             {
                 var name = Trim(session.RowName, 40);

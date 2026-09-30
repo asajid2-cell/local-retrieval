@@ -1206,7 +1206,7 @@ public sealed partial class ArchiveService
     private void ReapplyList()
     {
         if (OnReapplyFilter is not null) OnReapplyFilter();
-        else RefreshSessions(Store.Sessions.Values);
+        else RefreshSessions(OrderedVisibleSessions(Store.Sessions.Values));
     }
 
     // How many rows the bound list ever holds. Everything past this is unreachable in the UI anyway.
@@ -1218,9 +1218,15 @@ public sealed partial class ArchiveService
     // filter now raises zero notifications and a one-row delta raises one.
     public void RefreshSessions(IEnumerable<ArchiveSession> sessions, bool preserveOrder = false)
     {
+        // WHICH chats are in the list is the caller's filter to decide - only the ORDER is decided here.
+        // That division matters for the Archived scope, which hands the retired chats over as its rows:
+        // dropping them again here (as this used to) left that tab permanently empty while its label
+        // counted them, so the number on the tab could never match what was under it.
         // preserveOrder: the caller already ordered the set deliberately (e.g. by creation date) —
         // re-sorting by pinned/recency here would silently undo that.
-        var ordered = preserveOrder ? sessions.Where(s => !s.Archived) : OrderedVisibleSessions(sessions);
+        var ordered = preserveOrder
+            ? sessions
+            : sessions.OrderByDescending(s => s.Pinned).ThenByDescending(s => s.UpdatedAt);
 
         var desired = new List<ArchiveSession>(SessionListCap);
         foreach (var session in ordered)
@@ -2212,7 +2218,11 @@ public sealed partial class ArchiveService
         await SaveSessionChangeAsync(session, async s =>
         {
             status = await TryWriteCanonicalNameAsync(s, name);
-            if (!NativeRenameSucceeded(status)) s.CustomTitle = name;
+            // The typed name has to be the name this chat is listed under, whichever side ends up carrying
+            // it: the tool's own field when the write landed, and otherwise the app-assigned name - which the
+            // list prefers for a vetted chat, precisely so a deferred native write cannot hide the name (the
+            // tool's field is stale then, and a stale name reads as a vet that did not save).
+            s.CustomTitle = NativeRenameSucceeded(status) ? "" : name;
             ReplacePhrases(s, new[] { phrase.Trim() });
             s.Vetted = true;
         });
@@ -4174,26 +4184,32 @@ public sealed partial class ArchiveService
                || IdentityContains(session, "sealed junior lane");
     }
 
-    // Pinned, user-tagged, codename-stashed, and project-scoped chats are deliberate user curation.
+    // Pinned, vetted, user-tagged, codename-stashed, and project-scoped chats are deliberate user curation.
     // They stay visible unless the user explicitly asks to reveal all automation workers.
     public static bool ShouldAutoHideAutomationWorker(ArchiveSession session)
         => !session.Archived
+           && !session.Vetted
            && IsAutomationWorker(session)
            && !session.Pinned
            && !HasUserTags(session)
            && session.SpecialPhrases.Count == 0;
 
     // A "one-off" / spam chat: exactly one (or zero) user prompt AND a tiny transcript — the hundreds
-    // of spawned judge/probe/render sessions that each fire a single message. Pinned, tagged, and
+    // of spawned judge/probe/render sessions that each fire a single message. Pinned, vetted, tagged, and
     // collection-member chats are NEVER treated as spam (the user deliberately kept them). The tiny-
     // transcript guard (MessageCount) protects any genuinely large chat whose user-count hasn't been
     // backfilled yet from being hidden by accident. Reveal these with the "Show hidden chats" toggle.
+    //
+    // VETTING is its own keep, deliberately independent of the phrase: a vetted chat whose phrase was
+    // retired under the old naming scheme would otherwise lose its only keep-guard and vanish from the
+    // very tier it was promoted into, which is how a chat could count as Active and list nothing.
     //
     // The same toggle also covers harness chatter, which the one-off shape misses because the harness
     // replays its prompt several times in one session (a leaf liveness probe is 9 user turns, not 1).
     public static bool IsLowSignalChat(ArchiveSession s)
         => !s.Pinned
            && !s.Archived
+           && !s.Vetted
            && !HasUserTags(s)   // reserved auto-tags ("archive"/"code") are on EVERY chat — only a DELIBERATE user tag counts as "kept"
            && s.SpecialPhrases.Count == 0   // a codename ("special phrase") is a deliberate keep — never auto-hide a stashed chat
            && ((s.UserMessageCount <= 1 && s.MessageCount <= 8) || IsHarnessChatter(s));

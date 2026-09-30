@@ -684,7 +684,7 @@ public sealed class ArchiveSession : INotifyPropertyChanged
     // store, so every existing chat starts unvetted, which is exactly where the general populace belongs.
     private bool _vetted;
     [JsonPropertyName("vetted")]
-    public bool Vetted { get => _vetted; set { _vetted = value; BumpAggregateEpoch(); Raise(); } }
+    public bool Vetted { get => _vetted; set { _vetted = value; BumpAggregateEpoch(); Raise(); Raise(nameof(PreferMuxName)); Raise(nameof(RowName)); Raise(nameof(ListTitle)); } }
 
     // Branch linkage. When this chat was created by the app's Branch action, BranchOfId is the PARENT
     // chat's id and BranchedAt is when the clone was taken. Presence of BranchOfId ⇒ this is a branch.
@@ -785,17 +785,23 @@ public sealed class ArchiveSession : INotifyPropertyChanged
 
     // Which of the two names the list shows. Set per-row by the list, exactly like RowTitleMode: false (the
     // default) = the agent's native name, true = the app-assigned ("mux") name.
+    //
+    // One case is not the row's choice: a VETTED chat that carries an app name shows that name whatever the
+    // row says. Vetting is the app giving a chat its name of record, and writing it into the tool's own
+    // transcript is often DEFERRED (a live or unverified session — the tool refuses the append), in which
+    // case the app name is the only place the name the user typed ever landed. Showing the tool's stale
+    // title there reads as a rename that did not save.
     private bool _preferMuxName;
     [JsonIgnore]
     public bool PreferMuxName
     {
-        get => _preferMuxName;
+        get => _preferMuxName || (Vetted && !string.IsNullOrWhiteSpace(CustomTitle));
         set { if (_preferMuxName == value) return; _preferMuxName = value; Raise(nameof(RowName)); Raise(nameof(ListTitle)); }
     }
 
     // The name a list row / chat header shows, under the current name-source setting.
     [JsonIgnore]
-    public string RowName => _preferMuxName ? DisplayTitle : NativeTitle;
+    public string RowName => PreferMuxName ? DisplayTitle : NativeTitle;
 
     // The last / first thing the USER typed in this chat (capped, single line). Captured at parse time from
     // the FULL transcript so the last/first-user-message list sorts + titles work without loading per row.

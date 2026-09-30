@@ -78,12 +78,13 @@ public sealed partial class MainPage
         // A chat entering the gate starts EMPTY: vetting is the moment it earns a name of its own, so the
         // gate is a typed name, not a rubber stamp on the auto-derived title. The old title is offered as
         // the placeholder hint so nothing is hidden. An already-vetted chat is being EDITED, not vetted,
-        // so there its current name is prefilled.
+        // so there its current name is prefilled — DisplayTitle, the name this chat is actually listed
+        // under, rather than the tool's own title, which is stale whenever the native write was deferred.
         panel.Children.Add(FieldLabel("Name"));
         var nameBox = new TextBox
         {
             Name = "VetNameBox",
-            Text = session.Vetted ? session.NativeTitle ?? "" : "",
+            Text = session.Vetted ? session.DisplayTitle : "",
             PlaceholderText = string.IsNullOrWhiteSpace(session.NativeTitle) ? "A short, recognisable name" : session.NativeTitle,
             CornerRadius = ControlCornerRadius()
         };
@@ -92,11 +93,13 @@ public sealed partial class MainPage
         panel.Children.Add(nameBox);
 
         // -- phrase: four words, autofilled, yours to change --
+        // A chat that is being EDITED keeps the phrase it already has: opening the gate to fix a name must
+        // not silently reroll the phrase, which would change the handle the chat is grouped under.
         panel.Children.Add(FieldLabel("Phrase"));
         var phraseBox = new TextBox
         {
             Name = "VetPhraseBox",
-            Text = PhraseGenerator.Next(),
+            Text = session.SpecialPhrases.FirstOrDefault(p => !string.IsNullOrWhiteSpace(p))?.Trim() ?? PhraseGenerator.Next(),
             CornerRadius = ControlCornerRadius()
         };
         ToolTipService.SetToolTip(phraseBox, "Four words: a trait, a colour, a fruit and a food. Edit it, or pick each word below.");

@@ -396,6 +396,11 @@ public sealed partial class MainPage
             scopeUnvetted = scopes.Unvetted,
             scopeActive = scopes.Active,
             scopeArchived = scopes.Archived,
+            // The tab LABELS as they are on screen, next to the tier sizes they came from: a run can assert
+            // that what a tab says and what it lists are the same number.
+            labelAll = ScopeAllText.Text,
+            labelActive = ScopeActiveText.Text,
+            labelArchived = ScopeArchivedText.Text,
             renderedTitle = TitleText.Text,
             syncStatus = SyncStatus.Text,
             screen = _screen,

@@ -228,8 +228,11 @@ public sealed class ListDiffRefreshTests
         finally { TryDelete(dir); }
     }
 
+    // The bound list holds EXACTLY the caller's set (capped), whatever tier that set came from: the live
+    // list keeps retired chats out because its filter says so, and the Archived scope's rows reach the list
+    // instead of being dropped on the way in.
     [TestMethod]
-    public void RefreshSessions_StillCapsTheListAndSkipsArchived()
+    public void RefreshSessions_StillCapsTheListAndKeepsTheCallersTier()
     {
         var svc = NewService(out var dir);
         try
@@ -243,10 +246,15 @@ public sealed class ListDiffRefreshTests
                     Archived = i % 100 == 0,
                 };
 
-            svc.RefreshSessions(svc.Store.Sessions.Values);
+            svc.RefreshSessions(svc.FilterChats(new ChatFilter { ShowHidden = true, ShowAutomationWorkers = true }));
 
             Assert.AreEqual(600, svc.Sessions.Count, "the 600-row cap must survive the rewrite");
-            Assert.IsFalse(svc.Sessions.Any(s => s.Archived), "archived chats must stay out of the list");
+            Assert.IsFalse(svc.Sessions.Any(s => s.Archived), "the live list does not keep retired chats");
+
+            svc.RefreshSessions(svc.FilterChats(new ChatFilter { Archived = "archived" }));
+
+            Assert.AreEqual(7, svc.Sessions.Count, "the Archived scope hands its rows over");
+            Assert.IsTrue(svc.Sessions.All(s => s.Archived), "and they are the retired chats");
         }
         finally { TryDelete(dir); }
     }

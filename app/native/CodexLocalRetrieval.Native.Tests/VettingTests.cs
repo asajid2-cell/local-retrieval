@@ -65,6 +65,119 @@ public sealed class VettingTests
         finally { Directory.Delete(root, true); }
     }
 
+    // The number on a tab has to be the number of rows under it. The Archived scope listed NOTHING while
+    // its label counted the retired chats, because the list itself discarded archived rows on the way in.
+    [TestMethod]
+    public async Task TheArchivedTabListsTheChatsItsNumberCounts()
+    {
+        var svc = TempService(out var root);
+        try
+        {
+            var retired = Chat("retired");
+            svc.Store.Sessions[retired.Id] = retired;
+            await svc.ArchiveSessionAsync(retired);   // exactly what the Archive action does
+
+            var counts = svc.ChatScopeCounts();
+            Assert.AreEqual(1, counts.Archived, "the retired chat is counted on the Archived tab");
+
+            var rows = svc.FilterChats(new ChatFilter { Archived = "archived" });
+            Assert.AreEqual(counts.Archived, rows.Count, "the tab's number and its rows agree");
+
+            svc.RefreshSessions(rows);   // the path the chat list takes when the scope changes
+            CollectionAssert.AreEqual(new[] { "retired" }, svc.Sessions.Select(s => s.Id).ToArray(),
+                "the retired chat reaches the bound list - the Archived tab is not a dead tab");
+        }
+        finally { Directory.Delete(root, true); }
+    }
+
+    // A vetted chat is a deliberate keep in its own right, not only through its phrase: the phrase can be
+    // taken away (the old-scheme retirement does exactly that) while the chat stays promoted.
+    [TestMethod]
+    public void AVettedChatIsNeverAutoHidden()
+    {
+        var svc = TempService(out var root);
+        try
+        {
+            ArchiveSession Probe(string id, bool vetted) => new()
+            {
+                Id = id,
+                Title = "Identity Check",
+                Tool = "claude",
+                FirstUserMessage = "Reply with exactly GATEWAY_IDENTITY_OK.",
+                UserMessageCount = 1,
+                MessageCount = 2,
+                Vetted = vetted,
+            };
+            var kept = Probe("kept", vetted: true);
+            var probe = Probe("probe", vetted: false);
+            svc.Store.Sessions[kept.Id] = kept;
+            svc.Store.Sessions[probe.Id] = probe;
+
+            Assert.IsTrue(ArchiveService.IsLowSignalChat(probe), "the same shape, unvetted, is still hidden");
+            Assert.IsFalse(ArchiveService.IsLowSignalChat(kept), "vetting is a keep, whether or not it has a phrase");
+
+            CollectionAssert.AreEqual(new[] { "kept" },
+                svc.FilterChats(new ChatFilter { Archived = "active" }).Select(s => s.Id).ToArray(),
+                "what the Active tab counts is what it lists");
+            Assert.AreEqual(svc.ChatScopeCounts().Active,
+                svc.FilterChats(new ChatFilter { Archived = "active" }).Count,
+                "the number on the Active tab and its rows are the same chat");
+        }
+        finally { Directory.Delete(root, true); }
+    }
+
+    [TestMethod]
+    public void AVettedAutomationWorkerIsNotHiddenEither()
+    {
+        var svc = TempService(out var root);
+        try
+        {
+            ArchiveSession Worker(string id, bool vetted) => new()
+            {
+                Id = id,
+                Title = "Worker result",
+                Tool = "claude",
+                FirstUserMessage = "[ORCH-WORKER campaign=demo node=kept]",
+                UserMessageCount = 3,
+                MessageCount = 12,
+                Vetted = vetted,
+            };
+            var kept = Worker("kept", vetted: true);
+            var hidden = Worker("auto", vetted: false);
+            svc.Store.Sessions[kept.Id] = kept;
+            svc.Store.Sessions[hidden.Id] = hidden;
+
+            Assert.IsTrue(ArchiveService.ShouldAutoHideAutomationWorker(hidden));
+            Assert.IsFalse(ArchiveService.ShouldAutoHideAutomationWorker(kept), "a vetted worker was kept on purpose");
+        }
+        finally { Directory.Delete(root, true); }
+    }
+
+    // The name typed at the gate must be the name the chat lists under even when the tool's own transcript
+    // cannot take it (a live or unverified session defers the write) - the tool's title is stale then, and a
+    // stale title on screen reads as a vet that did not save.
+    [TestMethod]
+    public async Task Vet_WithNoTranscriptToWrite_StillListsTheTypedName()
+    {
+        var svc = TempService(out var root);
+        try
+        {
+            var session = Chat("vet-nofile");
+            session.Title = "auto derived title";
+            svc.Store.Sessions[session.Id] = session;
+
+            var (vetted, status) = await svc.VetSessionAsync(session, "Chosen Name", "brave green apple pudding");
+
+            Assert.IsTrue(vetted);
+            Assert.IsFalse(ArchiveService.NativeRenameSucceeded(status), "nothing was written to the tool");
+            Assert.AreEqual("auto derived title", session.Title, "the tool's own name is not ours to invent");
+            Assert.AreEqual("Chosen Name", session.CustomTitle, "the typed name is kept as the app name");
+            Assert.AreEqual("Chosen Name", session.RowName, "and it is what the row - and the header - show");
+            Assert.AreEqual("Chosen Name", session.ListTitle);
+        }
+        finally { Directory.Delete(root, true); }
+    }
+
     // The default must not narrow: every caller that never named a tier (the tag-filter wrapper, the
     // remote API with no archived= parameter) has always meant "everything live".
     [TestMethod]
