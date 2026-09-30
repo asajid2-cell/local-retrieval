@@ -10,8 +10,8 @@ namespace CodexLocalRetrieval_Native;
 // Vetting is the door between the general populace and Active: a chat is not promoted until it has a name
 // of its own and a phrase. That is what makes the middle tier worth searching, so the dialog is
 // deliberately a gate - the primary button stays disabled until both fields are filled. The phrase starts
-// as a random [trait][color][fruit][food] combination, which can be rerolled, taken apart word by word,
-// or replaced with a phrase saved earlier for this kind of work.
+// as a random [trait][color][fruit][food] combination, which can be rerolled or rebuilt word by word from
+// the four slots. There is no second, older place to pick a phrase from - the slots ARE the picker.
 public sealed partial class MainPage
 {
     // The dialog is held while it is up so a capture-harness step can dismiss it (a ContentDialog lives in
@@ -181,61 +181,6 @@ public sealed partial class MainPage
             SyncSlotsFromBox();
             syncing = false;
         };
-
-        // -- reuse: a phrase saved earlier for this kind of work ("apples" for mux work) --
-        panel.Children.Add(new Border { Height = 1, Background = LineBrush(), Margin = new Thickness(0, 2, 0, 2) });
-        panel.Children.Add(FieldLabel("Saved phrases"));
-        var savedBox = new ComboBox
-        {
-            PlaceholderText = "Use a saved phrase...",
-            HorizontalAlignment = HorizontalAlignment.Stretch,
-            MinWidth = 0
-        };
-        void FillSaved()
-        {
-            savedBox.Items.Clear();
-            foreach (var category in _archive.SavedPhraseCategories())
-            {
-                var label = string.IsNullOrWhiteSpace(category.Note) ? category.Phrase : $"{category.Phrase} — {category.Note}";
-                savedBox.Items.Add(new ComboBoxItem { Content = label, Tag = category.Phrase });
-            }
-            savedBox.IsEnabled = savedBox.Items.Count > 0;
-        }
-        savedBox.SelectionChanged += (_, _) =>
-        {
-            if (savedBox.SelectedItem is not ComboBoxItem item || item.Tag is not string savedPhrase) return;
-            syncing = true;
-            phraseBox.Text = savedPhrase;
-            SyncSlotsFromBox();
-            syncing = false;
-            savedBox.SelectedIndex = -1;   // ready to pick again without a dead first click
-        };
-        FillSaved();
-        panel.Children.Add(savedBox);
-
-        var noteBox = new TextBox
-        {
-            PlaceholderText = "Keep this phrase for... (e.g. mux work)",
-            CornerRadius = ControlCornerRadius()
-        };
-        var savePhrase = new Button { Content = "Save phrase", Style = (Style)Resources["PillButtonStyle"], MinHeight = 32 };
-        savePhrase.Click += async (_, _) =>
-        {
-            var saved = await _archive.SavePhraseCategoryAsync(phraseBox.Text, noteBox.Text);
-            if (saved is null) return;
-            noteBox.Text = "";
-            FillSaved();
-            SyncStatus.Text = $"Saved phrase \"{saved.Phrase}\" for reuse.";
-        };
-        var saveRow = new Grid
-        {
-            ColumnSpacing = 8,
-            ColumnDefinitions = { new ColumnDefinition(), new ColumnDefinition { Width = GridLength.Auto } }
-        };
-        saveRow.Children.Add(noteBox);
-        Grid.SetColumn(savePhrase, 1);
-        saveRow.Children.Add(savePhrase);
-        panel.Children.Add(saveRow);
 
         var content = new ScrollViewer
         {

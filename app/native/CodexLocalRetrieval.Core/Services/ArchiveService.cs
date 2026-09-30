@@ -3229,40 +3229,6 @@ public sealed partial class ArchiveService
         foreach (var p in cleaned) session.SpecialPhrases.Add(p);
     }
 
-    // ---- saved phrase categories -------------------------------------------------------------------
-
-    // The saved phrases offered on the vet dialog, alphabetical so a long list stays scannable.
-    public IReadOnlyList<PhraseCategory> SavedPhraseCategories() =>
-        Store.PhraseCategories
-            .Where(c => !string.IsNullOrWhiteSpace(c.Phrase))
-            .OrderBy(c => c.Phrase, StringComparer.OrdinalIgnoreCase)
-            .ToList();
-
-    // Keep a phrase for reuse, so a kind of work ("mux work") can carry the same phrase every time
-    // instead of taking a fresh random combination. Saving a phrase already saved just updates its note.
-    public async Task<PhraseCategory?> SavePhraseCategoryAsync(string phrase, string note)
-    {
-        var clean = (phrase ?? "").Trim();
-        if (clean.Length == 0) return null;
-        var existing = Store.PhraseCategories.FirstOrDefault(c =>
-            string.Equals(c.Phrase, clean, StringComparison.OrdinalIgnoreCase));
-        if (existing is null)
-        {
-            existing = new PhraseCategory { Phrase = clean, SavedAt = DateTime.UtcNow.ToString("O") };
-            Store.PhraseCategories.Add(existing);
-        }
-        existing.Note = (note ?? "").Trim();
-        await SaveAsync();
-        return existing;
-    }
-
-    public async Task RemovePhraseCategoryAsync(string phrase)
-    {
-        var clean = (phrase ?? "").Trim();
-        if (Store.PhraseCategories.RemoveAll(c => string.Equals(c.Phrase, clean, StringComparison.OrdinalIgnoreCase)) == 0) return;
-        await SaveAsync();
-    }
-
     // Retire the OLD phrase scheme: every phrase a chat carries is parked in the legacy list along with
     // the chats that carried it, and the chats come out clean so the tier system starts from a blank
     // slate. Phrases the new generator could have produced are left alone, so running this after vetting

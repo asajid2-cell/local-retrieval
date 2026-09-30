@@ -82,8 +82,9 @@ public sealed class AppStoreData
     [JsonPropertyName("legacyPhrases")]
     public List<LegacyPhraseGroup> LegacyPhrases { get; set; } = new();
 
-    // Phrases the user saved for reuse ("apples" for mux work, "pears" for gateway), offered on the vet
-    // dialog instead of a fresh random combination. Note says what the phrase is for.
+    // A leftover slot from the vet dialog's saved-phrase picker, which is gone: a phrase is chosen from the
+    // four slots now. Kept so a store written while that picker existed still loads with its entries, and
+    // so dropping the field cannot silently discard them. Nothing writes it any more.
     [JsonPropertyName("phraseCategories")]
     public List<PhraseCategory> PhraseCategories { get; set; } = new();
 }

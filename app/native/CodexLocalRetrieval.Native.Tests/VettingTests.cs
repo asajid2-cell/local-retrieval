@@ -563,30 +563,6 @@ public sealed class VettingTests
         finally { Directory.Delete(root, true); }
     }
 
-    [TestMethod]
-    public async Task SavedPhraseCategories_UpdateInPlaceAndRemove()
-    {
-        var svc = TempService(out var root);
-        try
-        {
-            var saved = await svc.SavePhraseCategoryAsync("  brave green apple pudding  ", "mux work");
-            Assert.IsNotNull(saved);
-            Assert.AreEqual("brave green apple pudding", saved.Phrase);
-            Assert.AreEqual("mux work", saved.Note);
-
-            var again = await svc.SavePhraseCategoryAsync("BRAVE GREEN APPLE PUDDING", "mux and gateway");
-            Assert.AreSame(saved, again, "re-saving a phrase updates its note instead of duplicating it");
-            Assert.AreEqual(1, svc.Store.PhraseCategories.Count);
-            Assert.AreEqual("mux and gateway", svc.SavedPhraseCategories().Single().Note);
-
-            Assert.IsNull(await svc.SavePhraseCategoryAsync("   ", "no phrase"), "a blank phrase is not a category");
-
-            await svc.RemovePhraseCategoryAsync("brave green apple pudding");
-            Assert.AreEqual(0, svc.SavedPhraseCategories().Count);
-        }
-        finally { Directory.Delete(root, true); }
-    }
-
     // The tier and the retired handles are store state: they must survive a save/reload, and a store
     // written before any of this existed must read every chat as part of the general populace.
     [TestMethod]
