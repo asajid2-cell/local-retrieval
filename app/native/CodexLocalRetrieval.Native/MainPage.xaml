@@ -74,58 +74,99 @@
         </Style>
 
         <DataTemplate x:Key="SessionTemplate">
-            <Grid MinHeight="40" Padding="10,6">
-                <Grid.ColumnDefinitions>
-                    <ColumnDefinition Width="Auto" />
-                    <ColumnDefinition Width="*" />
-                    <ColumnDefinition Width="Auto" />
-                    <ColumnDefinition Width="Auto" />
-                    <ColumnDefinition Width="Auto" />
-                    <ColumnDefinition Width="Auto" />
-                </Grid.ColumnDefinitions>
-                <TextBlock
-                    Width="14"
-                    VerticalAlignment="Center"
-                    Foreground="{StaticResource AccentBrush}"
-                    Text="{Binding PinGlyph}" />
-                <TextBlock
-                    Grid.Column="1"
-                    MaxLines="1"
-                    Text="{Binding ListTitle}"
-                    TextTrimming="CharacterEllipsis" />
-                <!-- A family row is a whole leaf family held at its patriarch, not one chat; the tooltip
-                     names the members it is holding so the row says what is inside it without being opened. -->
-                <TextBlock
-                    Grid.Column="2"
-                    Margin="6,0,0,0"
-                    VerticalAlignment="Center"
-                    FontSize="10"
-                    Foreground="{StaticResource AccentBrush}"
-                    Text="{Binding FamilyBadge}"
-                    ToolTipService.ToolTip="{Binding FamilyTooltip}" />
-                <TextBlock
-                    Grid.Column="3"
-                    Margin="6,0,0,0"
-                    VerticalAlignment="Center"
-                    FontSize="12"
-                    Foreground="{StaticResource AccentBrush}"
-                    ToolTipService.ToolTip="Checkpoint count; ! legacy checkpoint pending; branch; GW Gateway branch"
-                    Text="{Binding ListMarks}" />
-                <TextBlock
-                    Grid.Column="4"
-                    Margin="8,0,0,0"
-                    VerticalAlignment="Center"
-                    FontSize="10"
-                    Opacity="0.65"
-                    Foreground="{StaticResource TextMutedBrush}"
-                    Text="{Binding ToolShort}" />
-                <TextBlock
-                    Grid.Column="5"
-                    Margin="8,0,0,0"
-                    VerticalAlignment="Center"
-                    Foreground="{StaticResource TextMutedBrush}"
-                    Text="{Binding DisplayDate}" />
-            </Grid>
+            <StackPanel>
+                <Grid MinHeight="40" Padding="10,6">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+                    <TextBlock
+                        Width="14"
+                        VerticalAlignment="Center"
+                        Foreground="{StaticResource AccentBrush}"
+                        Text="{Binding PinGlyph}" />
+                    <TextBlock
+                        Grid.Column="1"
+                        MaxLines="1"
+                        Text="{Binding ListTitle}"
+                        TextTrimming="CharacterEllipsis" />
+                    <!-- A family row is a whole leaf family held at its patriarch, not one chat. Clicking the
+                         badge opens the family: the roster below the row lists the members it is holding. The
+                         tooltip names them, so the row says what is inside it even before it is opened. -->
+                    <StackPanel
+                        Grid.Column="2"
+                        Margin="6,0,0,0"
+                        VerticalAlignment="Center"
+                        Orientation="Horizontal"
+                        Spacing="2"
+                        Tag="{Binding}"
+                        Tapped="FamilyBadge_Tapped"
+                        ToolTipService.ToolTip="{Binding FamilyTooltip}">
+                        <TextBlock
+                            FontSize="10"
+                            Foreground="{StaticResource AccentBrush}"
+                            Text="{Binding FamilyBadge}" />
+                        <TextBlock
+                            FontSize="10"
+                            Foreground="{StaticResource AccentBrush}"
+                            Text="{Binding FamilyToggleGlyph}" />
+                    </StackPanel>
+                    <StackPanel
+                        Grid.Column="3"
+                        Margin="6,0,0,0"
+                        VerticalAlignment="Center"
+                        Orientation="Horizontal"
+                        Spacing="2">
+                        <TextBlock
+                            FontSize="12"
+                            Foreground="{StaticResource AccentBrush}"
+                            ToolTipService.ToolTip="Checkpoint count; ! legacy checkpoint pending; branch; GW Gateway branch"
+                            Text="{Binding ListMarks}" />
+                        <!-- A chat that is a leaf of a gateway family, while the family is shown flat. Clicking
+                             the leaf goes to the family's patriarch - the chat the family is drawn at - rather
+                             than opening the leaf itself. -->
+                        <TextBlock
+                            FontSize="12"
+                            Foreground="{StaticResource AccentBrush}"
+                            Tag="{Binding}"
+                            Tapped="LeafGlyph_Tapped"
+                            Text="{Binding LeafGlyph}"
+                            ToolTipService.ToolTip="{Binding LeafGlyphTooltip}" />
+                    </StackPanel>
+                    <TextBlock
+                        Grid.Column="4"
+                        Margin="8,0,0,0"
+                        VerticalAlignment="Center"
+                        FontSize="10"
+                        Opacity="0.65"
+                        Foreground="{StaticResource TextMutedBrush}"
+                        Text="{Binding ToolShort}" />
+                    <TextBlock
+                        Grid.Column="5"
+                        Margin="8,0,0,0"
+                        VerticalAlignment="Center"
+                        Foreground="{StaticResource TextMutedBrush}"
+                        Text="{Binding DisplayDate}" />
+                </Grid>
+                <!-- The family's roster, drawn only while the badge is open: an empty list while it is shut,
+                     so the row takes no extra height and no visibility converter is needed. -->
+                <ItemsControl ItemsSource="{Binding FamilyRoster}" Margin="34,0,12,8">
+                    <ItemsControl.ItemTemplate>
+                        <DataTemplate>
+                            <TextBlock
+                                Margin="0,1"
+                                FontSize="11"
+                                Foreground="{StaticResource TextMutedBrush}"
+                                Text="{Binding RosterLine}"
+                                TextTrimming="CharacterEllipsis" />
+                        </DataTemplate>
+                    </ItemsControl.ItemTemplate>
+                </ItemsControl>
+            </StackPanel>
         </DataTemplate>
     </Page.Resources>
 

@@ -8,6 +8,7 @@ using Microsoft.UI.Text;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Controls.Primitives;
+using Microsoft.UI.Xaml.Input;
 using Microsoft.UI.Xaml.Media;
 
 namespace CodexLocalRetrieval_Native;
@@ -126,23 +127,28 @@ public sealed partial class MainPage
     // Every keystroke used to run ApplyFilters synchronously; this collapses a burst of typing into one
     // filter pass 150 ms after you stop. The dispatcher hop is injected (the debouncer's timer fires on
     // the thread pool, but every UI touch below must happen on the UI thread).
-    private TrailingDebouncer<(string Query, long SelectionRevision)>? _searchDebouncer;
-    internal TrailingDebouncer<(string Query, long SelectionRevision)> SearchDebouncer => _searchDebouncer ??= new TrailingDebouncer<(string Query, long SelectionRevision)>(
-        // Capture the selection revision when the keystroke is posted. If a click happens before the
-        // trailing callback runs, the callback must not select the first filtered row over that click.
-        posted => ApplyFilters(posted.SelectionRevision),
-        TrailingDebouncer<(string Query, long SelectionRevision)>.DefaultDelay,
+    private TrailingDebouncer<string>? _searchDebouncer;
+    internal TrailingDebouncer<string> SearchDebouncer => _searchDebouncer ??= new TrailingDebouncer<string>(
+        _ => ApplyFilters(),
+        TrailingDebouncer<string>.DefaultDelay,
         run => DispatcherQueue.TryEnqueue(() => run()));
 
-    private void ApplyFilters(long? postedSelectionRevision = null)
+    private void ApplyFilters()
     {
         var previousId = _selected?.Id;
-        var preserveSelection = postedSelectionRevision is not null && SelectionRevision != postedSelectionRevision.Value;
+        var current = _selected;
         var results = _archive.CollapseFamilies(_archive.FilterChats(CurrentChatFilter()), _groupFamilies);
-        var currentId = _selected?.Id;
-        var selection = preserveSelection && currentId is not null
-            ? results.FirstOrDefault(s => string.Equals(s.Id, currentId, StringComparison.OrdinalIgnoreCase))
-            : null;
+        // The chat you had open may have been folded into its family's row by the collapse above, which takes
+        // the chat itself out of the list. Following it to the row that stands for the family is "the family
+        // goes wherever the current patriarch is" read backwards - the chat went where its family is - and it
+        // is what keeps a grouping toggle from dropping you onto the first row of the list. A click that
+        // landed after this pass was posted needs none of it: the row it landed on is still a row, so it
+        // matches directly and the click owns the selection. That is why the debouncer no longer has to
+        // capture the selection revision to defend the click.
+        var selection = current is null
+            ? null
+            : results.FirstOrDefault(s => string.Equals(s.Id, current.Id, StringComparison.OrdinalIgnoreCase))
+                ?? _archive.FamilyRowFor(results, current);
         // A newer click owns selection even when filtering removed that row; never replace it with an unrelated first result.
         // last-user / first-user sorts flip each visible row's title to what YOU said.
         var titleMode = (_dateMode == "last-user" || _dateMode == "first-user") ? _dateMode : "";
@@ -191,6 +197,7 @@ public sealed partial class MainPage
     private void ReapplyActiveFilter()
     {
         var keep = _selected?.Id;
+        var keepRow = _selected;
         var results = _archive.CollapseFamilies(_archive.FilterChats(CurrentChatFilter()), _groupFamilies);
         var titleMode = (_dateMode == "last-user" || _dateMode == "first-user") ? _dateMode : "";
         foreach (var s in results) { s.RowTitleMode = titleMode; s.PreferMuxName = _useMuxNames; }
@@ -198,12 +205,59 @@ public sealed partial class MainPage
         RunSessionListRefresh(() =>
         {
             _archive.RefreshSessions(results, preserveOrder: preserve);
+            // A folded chat is not a row, so looking it up by id finds nothing and the selection would be
+            // dropped on every mutation and every sync - the reader blanking under a chat that is still on
+            // screen inside its family. Follow it to the family's row instead.
             var restored = !string.IsNullOrEmpty(keep)
                 ? _archive.Sessions.FirstOrDefault(x => string.Equals(x.Id, keep, StringComparison.OrdinalIgnoreCase))
+                    ?? _archive.FamilyRowFor(_archive.Sessions, keepRow)
                 : null;
             ApplySelection(restored);
         });
         RenderTagFilterBar();
+    }
+
+    // ---- the two family affordances on a chat row -------------------------------------------
+
+    // Clicking the "family of N" badge opens the family: the row lists the members it is holding, and the
+    // same click shuts it again. Row state, so it survives a filter pass and dies with the list.
+    private void FamilyBadge_Tapped(object sender, TappedRoutedEventArgs e)
+    {
+        if (sender is not FrameworkElement element || element.Tag is not ArchiveSession session) return;
+        e.Handled = true;   // the badge is the family's own control; the tap is not also a row click
+        ToggleFamilyRow(session);
+    }
+
+    private void ToggleFamilyRow(ArchiveSession session)
+    {
+        if (session.LeafFamily is null) return;
+        session.FamilyExpanded = !session.FamilyExpanded;
+    }
+
+    // Clicking the leaf glyph on a flat row goes to the family's PATRIARCH - the chat the family is drawn at
+    // - rather than opening the leaf itself. The leaf is a leaf: what you want from it is where its family
+    // lives, and that is wherever the designation says the head is now, not where it was when the leaf forked.
+    private void LeafGlyph_Tapped(object sender, TappedRoutedEventArgs e)
+    {
+        if (sender is not FrameworkElement element || element.Tag is not ArchiveSession session) return;
+        e.Handled = true;
+        GoToPatriarch(session);
+    }
+
+    private void GoToPatriarch(ArchiveSession session)
+    {
+        var patriarchId = session.MemberFamily?.PatriarchSessionId;
+        if (string.IsNullOrWhiteSpace(patriarchId)) return;
+        var patriarch = _archive.FindChat(patriarchId);
+        if (patriarch is null)
+        {
+            SyncStatus.Text = "That family's patriarch is not among your chats, so there is nothing to open.";
+            return;
+        }
+        OpenSession(patriarch);
+        SyncStatus.Text = session.MemberFamily?.RootName is { Length: > 0 } name
+            ? $"Went to the patriarch of the {name} family."
+            : "Went to the family's patriarch.";
     }
 
     // ENTER in the search box: scan the full transcript FILES (fuzzy word-overlap) and append any chats the

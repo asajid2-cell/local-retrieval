@@ -170,9 +170,14 @@ public sealed partial class MainPage
                 SelectionRevision,
                 _selected?.Id,
                 _archive.Sessions.Select(s => s.Id));
-            return id is not null
-                ? _archive.Sessions.FirstOrDefault(s => string.Equals(s.Id, id, StringComparison.OrdinalIgnoreCase))
-                : null;
+            if (id is not null)
+                return _archive.Sessions.FirstOrDefault(s => string.Equals(s.Id, id, StringComparison.OrdinalIgnoreCase));
+            // Nothing answers to that id: grouping folded the chat into its family's row, which is not a row
+            // by that id. Keep whatever the app is holding when it stands for that chat's family - the family
+            // row the collapse followed the selection onto. Blanking the reader there is the bug that made a
+            // grouping toggle (and the next sync after it) drop the chat you had open. A chat that really
+            // went away resolves to no family and still blanks the selection, as it should.
+            return _archive.FamilyRowFor(_archive.Sessions, _selected) is not null ? _selected : null;
         }
         bool CanRestoreSelection() => SelectionRevision == selectionRevision;
 

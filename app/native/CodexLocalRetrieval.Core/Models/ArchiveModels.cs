@@ -855,6 +855,8 @@ public sealed class ArchiveSession : INotifyPropertyChanged
             Raise(nameof(IsFamilyHead));
             Raise(nameof(FamilyBadge));
             Raise(nameof(FamilyTooltip));
+            Raise(nameof(FamilyToggleGlyph));
+            Raise(nameof(FamilyRoster));
         }
     }
 
@@ -874,6 +876,69 @@ public sealed class ArchiveSession : INotifyPropertyChanged
         : _leafFamily.RootName is { Length: > 0 } name
             ? $"{name} family: " + string.Join(", ", _leafFamily.Members.Select(m => m.Name))
             : "Leaf family: " + string.Join(", ", _leafFamily.Members.Select(m => m.Name));
+
+    // Whether the family held at this row is opened. Row state, like a pin: it lives in the list, never in
+    // the store, because it says how you are looking at a family rather than anything about the family.
+    private bool _familyExpanded;
+    [JsonIgnore]
+    public bool FamilyExpanded
+    {
+        get => _familyExpanded;
+        set
+        {
+            if (_familyExpanded == value) return;
+            _familyExpanded = value;
+            Raise(nameof(FamilyExpanded));
+            Raise(nameof(FamilyToggleGlyph));
+            Raise(nameof(FamilyRoster));
+        }
+    }
+
+    // The chevron on the badge, so the row says whether the family is open before you click it.
+    [JsonIgnore]
+    public string FamilyToggleGlyph => _leafFamily is null ? "" : _familyExpanded ? "▾" : "▸";
+
+    // The family's roster, shown inside the row once it is opened - empty while it is shut, which is how the
+    // row expands with no visibility converter to write: an empty list draws nothing and takes no space.
+    [JsonIgnore]
+    public IReadOnlyList<LeafFamilyMember> FamilyRoster =>
+        _familyExpanded && _leafFamily is not null ? _leafFamily.Members : Array.Empty<LeafFamilyMember>();
+
+    // ---- the chat's PLACE in a family, as opposed to the row that stands for one ----
+    // Set on a chat that is a leaf of a family, whether or not grouping is on: a flat list still marks its
+    // leaf rows and knows which chat their patriarch is. Never set on the head itself, so IsLeaf and
+    // IsFamilyHead cannot both be true.
+    private LeafFamily? _memberFamily;
+    [JsonIgnore]
+    public LeafFamily? MemberFamily
+    {
+        get => _memberFamily;
+        set
+        {
+            if (ReferenceEquals(_memberFamily, value)) return;
+            _memberFamily = value;
+            Raise(nameof(IsLeaf));
+            Raise(nameof(LeafGlyph));
+            Raise(nameof(LeafGlyphTooltip));
+        }
+    }
+
+    [JsonIgnore]
+    public bool IsLeaf => _memberFamily is not null;
+
+    // A small leaf, in the same corner as the branch fork, marking a row that is a leaf of a family rather
+    // than a chat in its own right.
+    [JsonIgnore]
+    public string LeafGlyph => _memberFamily is null ? "" : "❧";
+
+    // Clicking the leaf goes to the family's head - which is the only chat the family is drawn at - rather
+    // than opening the leaf itself.
+    [JsonIgnore]
+    public string LeafGlyphTooltip => _memberFamily is null
+        ? ""
+        : _memberFamily.RootName is { Length: > 0 } name
+            ? $"Leaf of the {name} family - click to go to the patriarch"
+            : "Leaf of a gateway family - click to go to the patriarch";
 
     [JsonIgnore]
     public string ToolShort => string.Equals(Tool, "claude", StringComparison.OrdinalIgnoreCase) ? "CL" : "CX";

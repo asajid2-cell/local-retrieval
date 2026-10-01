@@ -156,6 +156,42 @@ public sealed partial class MainPage
                 _ = pending;   // the dialog stays open on purpose; a later vetClose step dismisses it
             }
         }
+        // Prove the name box adopts the hint the way pressing Tab does. A KeyRoutedEventArgs cannot be
+        // constructed from outside the framework, so the run drives the OTHER real hook on the same
+        // gesture: focusing the field and then moving focus off it is what Tab does, and the box's own
+        // LostFocus handler runs. The two boxes are then recorded as they stand.
+        if (step.vetBlur is true)
+        {
+            TextBox? PopupBox(string name)
+            {
+                foreach (var root in PopupRoots())
+                {
+                    var box = FindNamed<TextBox>(root, name);
+                    if (box is not null) return box;
+                }
+                return null;
+            }
+
+            var nameBox = PopupBox("VetNameBox")
+                ?? throw new InvalidOperationException("No open dialog has a 'VetNameBox' field.");
+            var phraseBox = PopupBox("VetPhraseBox");
+            nameBox.Focus(FocusState.Programmatic);
+            await SettleAsync(2);
+            phraseBox?.Focus(FocusState.Programmatic);
+            await SettleAsync(3);
+            if (step.vetFields is not null)
+            {
+                var path = Path.Combine(CapDir, "out", step.vetFields + ".json");
+                File.WriteAllText(path, JsonSerializer.Serialize(new
+                {
+                    nameHint = nameBox.PlaceholderText,
+                    name = nameBox.Text,
+                    phrase = phraseBox?.Text ?? "",
+                    primaryEnabled = _openVetDialog?.IsPrimaryButtonEnabled
+                }));
+                artifacts.Add(path);
+            }
+        }
         if (step.vetClose is true)
         {
             _openVetDialog?.Hide();
@@ -257,6 +293,8 @@ public sealed partial class MainPage
             finally { menu.Hide(); await SettleAsync(2); }
         }
         if (step.selectSessionId is not null) SelectDisplayedSession(step.selectSessionId);
+        if (step.familyBadge is not null) ToggleFamilyRow(DisplayedRow(step.familyBadge, nameof(step.familyBadge)));
+        if (step.leafGlyph is not null) GoToPatriarch(DisplayedRow(step.leafGlyph, nameof(step.leafGlyph)));
         if (step.waitMs is not null)
         {
             if (step.waitMs is < 0 or > 10000) throw new ArgumentOutOfRangeException(nameof(step.waitMs), "waitMs must be between 0 and 10000 milliseconds.");
@@ -276,6 +314,17 @@ public sealed partial class MainPage
             var target = Math.Clamp(MainScroller.VerticalOffset + step.scroll[0], 0, MainScroller.ScrollableHeight);
             MainScroller.ChangeView(null, target, null, disableAnimation: true);
         }
+    }
+
+    // The row a family-badge or leaf-glyph step acts on: it has to be a row of the list AS IT IS NOW, which
+    // is what makes the step a test of the collapse - a folded member is not a row, so naming one fails
+    // loudly instead of quietly acting on a chat that is not on screen.
+    private ArchiveSession DisplayedRow(string id, string field)
+    {
+        foreach (var item in SessionList.Items)
+            if (item is ArchiveSession session && string.Equals(session.Id, id, StringComparison.OrdinalIgnoreCase))
+                return session;
+        throw new InvalidOperationException($"{field} names '{id}', which is not a row in the current list.");
     }
 
     private void SelectDisplayedSession(string id)
@@ -374,6 +423,9 @@ public sealed partial class MainPage
             {
                 id = session.Id,
                 title = session.Title,
+                // The name the row actually shows, so a roster line can be checked against what the list
+                // calls that chat rather than against the raw fields behind it.
+                listTitle = session.ListTitle,
                 customTitle = session.CustomTitle,
                 vetted = session.Vetted,
                 archived = session.Archived,
@@ -382,7 +434,14 @@ public sealed partial class MainPage
                 // A grouped row is the family's row: it says so here, and the folded members are simply not
                 // in this list at all, which is the whole claim the grouping has to prove.
                 familyHead = session.IsFamilyHead,
-                familyBadge = session.FamilyBadge
+                familyBadge = session.FamilyBadge,
+                // Whether the family is opened, and the roster it shows while it is - the two things a click
+                // on the badge changes.
+                familyExpanded = session.FamilyExpanded,
+                familyRoster = session.FamilyRoster.Select(m => m.RosterLine).ToList(),
+                // A flat row that is a leaf of a family, and the glyph that takes it to its patriarch.
+                isLeaf = session.IsLeaf,
+                leafGlyph = session.LeafGlyph
             });
         }
         var path = Path.Combine(CapDir, "out", name + ".json");
@@ -745,6 +804,15 @@ internal sealed class CapStep
     public string? dump { get; set; }
     public string? snapshot { get; set; }
     public string? dumpList { get; set; }
+    // The family badge and the leaf glyph live inside the row template, where InvokeByText cannot reach them
+    // (they are neither buttons with captions nor toggles). These name the ROW to act on and drive the same
+    // handler the tap does, so the run proves the behaviour without a pointer.
+    public string? familyBadge { get; set; }
+    public string? leafGlyph { get; set; }
+    // Whether to drive the vet dialog's name-autofill (focus the field, then move focus off it, which is
+    // what pressing Tab does) and, if named, the artifact the two fields are recorded into.
+    public bool? vetBlur { get; set; }
+    public string? vetFields { get; set; }
     public bool? closeFlyout { get; set; }
     public bool? clipboard { get; set; }
     public int[]? scroll { get; set; }

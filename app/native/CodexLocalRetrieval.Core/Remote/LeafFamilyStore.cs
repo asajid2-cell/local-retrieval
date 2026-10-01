@@ -186,6 +186,11 @@ public sealed class LeafFamilyStore
         if (creatorPointer?.RootName is { Length: > 0 } pointerName) rootName = pointerName;
 
         var patriarch = ResolvePatriarch(creatorPointer?.PatriarchSessionId, rootSessionId, members);
+        // Mark the head on the member row itself, so a roster can say which of the family's chats the family
+        // is drawn at without re-deriving it from the pointer on every draw.
+        foreach (var member in members)
+            if (string.Equals(member.SessionId, patriarch, StringComparison.OrdinalIgnoreCase))
+                member.IsPatriarch = true;
         return new LeafFamily
         {
             RootSessionId = rootSessionId,
@@ -281,6 +286,29 @@ public sealed class LeafFamilyMember
     // It is the family's head on exactly the same footing as any member - the flag only says where the row
     // came from, so nothing downstream has to guess why the creator has no number of its own history.
     public bool IsCreator { get; init; }
+
+    // The family's designated head, marked when the family is read.
+    public bool IsPatriarch { get; set; }
+
+    // The name this APP lists the member under, resolved from the store when the family is drawn. The family
+    // file's own `name` is whatever the tool had at fork time and is often a placeholder ("Conversation",
+    // "1"), so a roster reads the store and falls back to the file when the chat is not in it.
+    public string DisplayName { get; set; } = "";
+
+    // One roster line: the family's own number, the name, and the two things a reader needs to tell the rows
+    // apart - which one is the head, and whether the chat is still open.
+    public string RosterLine
+    {
+        get
+        {
+            var name = !string.IsNullOrWhiteSpace(DisplayName) ? DisplayName
+                : !string.IsNullOrWhiteSpace(Name) ? Name
+                : "(unnamed chat)";
+            var marks = IsPatriarch ? "  · patriarch" : "";
+            if (IsClosed) marks += "  · " + Status;
+            return (Number > 0 ? Number + ". " : "") + name + marks;
+        }
+    }
 
     // "promoted" is not closed: it is a status a member can be given, and it still names an open session.
     public bool IsClosed => string.Equals(Status, "closed", StringComparison.OrdinalIgnoreCase)

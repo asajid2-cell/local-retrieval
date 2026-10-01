@@ -92,6 +92,18 @@ public sealed partial class MainPage
             "Written to the chat's own name in Claude/Codex, so it shows in the list and in their resume list.");
         panel.Children.Add(nameBox);
 
+        // Tabbing out of an empty name box takes the name that is already there. The chat's own title is
+        // offered as the hint, and retyping it by hand is busywork - worse, leaving the box empty is what
+        // holds the gate shut, so adopting the hint is also what opens it. Both hooks are needed: the Tab
+        // key fills it the instant you leave the field, and a click that moves focus fills it too.
+        void AdoptNameHint()
+        {
+            if (string.IsNullOrWhiteSpace(nameBox.Text) && !string.IsNullOrWhiteSpace(nameBox.PlaceholderText))
+                nameBox.Text = nameBox.PlaceholderText;
+        }
+        nameBox.LostFocus += (_, _) => AdoptNameHint();
+        nameBox.KeyDown += (_, e) => { if (e.Key == Windows.System.VirtualKey.Tab) AdoptNameHint(); };
+
         // -- phrase: four words, autofilled, yours to change --
         // A chat that is being EDITED keeps the phrase it already has: opening the gate to fix a name must
         // not silently reroll the phrase, which would change the handle the chat is grouped under.

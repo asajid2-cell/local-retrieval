@@ -318,26 +318,46 @@ public sealed partial class ArchiveService
     // How many families grouping would actually fold, which is the number the option offers to act on.
     public int DrawableFamilyCount => _drawableFamilies.Count;
 
-    // The families that can be drawn at all, and the ids this app knows a chat by. Both are settled when the
+    // The families that can be drawn at all, and every id this app knows a chat by. Both are settled when the
     // store is re-read, because both change with it, and neither may be worked out per keystroke: asking
     // "does this app have a chat for this family's head?" by resolving an id costs a scan of every chat.
     private List<LeafFamily> _drawableFamilies = new();
-    private HashSet<string> _knownChatIds = new(StringComparer.OrdinalIgnoreCase);
+    private Dictionary<string, ArchiveSession> _chatById = new(StringComparer.OrdinalIgnoreCase);
 
     public void ReloadLeafFamilies()
     {
         _leafFamilies = new LeafFamilyStore(_leafFamilyOptions);
-        _knownChatIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        _chatById = new Dictionary<string, ArchiveSession>(StringComparer.OrdinalIgnoreCase);
         foreach (var session in Store.Sessions.Values)
         {
-            _knownChatIds.Add(session.Id);
-            foreach (var alias in session.Aliases) _knownChatIds.Add(alias);
+            _chatById[session.Id] = session;
+            foreach (var alias in session.Aliases) _chatById.TryAdd(alias, session);
         }
         // A family of one is already a single row, and a family whose head is not a chat this app holds has no
         // row to be drawn at - inventing one would list something that cannot be opened. Neither is drawable.
         _drawableFamilies = _leafFamilies.Families
-            .Where(f => !f.IsSingleMember && f.Patriarch is { } head && _knownChatIds.Contains(head.SessionId))
+            .Where(f => !f.IsSingleMember && f.Patriarch is { } head && _chatById.ContainsKey(head.SessionId))
             .ToList();
+        // The roster names each member by the name this app lists that chat under, because the family file
+        // carries whatever the tool had at fork time - "Conversation", "1" - and a roster of placeholders
+        // says nothing about which leaf is which. RowName, not DisplayTitle: it is the SAME rule the row
+        // shows its own name by (the tool's own name, the app-assigned one, or the app name a vetted chat is
+        // pinned to), so the roster and the list agree on what a chat is called. A chat this app does not
+        // hold keeps the family file's name.
+        foreach (var family in _drawableFamilies)
+            foreach (var member in family.Members)
+                if (_chatById.TryGetValue(member.SessionId, out var chat))
+                    member.DisplayName = chat.RowName;
+    }
+
+    // A chat by any id it answers to - its current id, or one of the ids it was resumed under. The store is
+    // keyed by the current id only, and a family's pointer names the id the chat was CREATED with, so a bare
+    // lookup misses the chat exactly when it has been resumed - which is the normal case for a leaf.
+    public ArchiveSession? FindChat(string? sessionId)
+    {
+        if (string.IsNullOrWhiteSpace(sessionId)) return null;
+        if (_chatById.TryGetValue(sessionId!, out var known)) return known;
+        return Store.Sessions.TryGetValue(sessionId!, out var direct) ? direct : null;
     }
 
     // Collapse each leaf family into the single row it is a family OF - the patriarch's own chat - and leave
@@ -353,8 +373,8 @@ public sealed partial class ArchiveService
     // cleared rather than surviving the toggle.
     public IReadOnlyList<ArchiveSession> CollapseFamilies(IReadOnlyList<ArchiveSession> rows, bool enabled)
     {
-        foreach (var row in rows) row.LeafFamily = null;
-        if (!enabled || _drawableFamilies.Count == 0) return rows;
+        foreach (var row in rows) { row.LeafFamily = null; row.MemberFamily = null; }
+        if (_drawableFamilies.Count == 0) return rows;
 
         // Every id a row answers to, so a head addressed by one of its alias ids still finds its row.
         var rowsById = new Dictionary<string, ArchiveSession>(StringComparer.OrdinalIgnoreCase);
@@ -363,6 +383,19 @@ public sealed partial class ArchiveService
             rowsById[row.Id] = row;
             foreach (var alias in row.Aliases) rowsById.TryAdd(alias, row);
         }
+
+        // Which family each visible chat is a LEAF of, stamped whether or not the collapse is on: a flat list
+        // still marks its leaf rows and knows which chat their patriarch is, so a leaf can take you to the
+        // family's head. The head itself is never stamped as a leaf - it is the row a family is drawn at, not
+        // something inside one. A chat whose family has no row to be drawn at is left unstamped: there is no
+        // patriarch to send it to.
+        foreach (var family in _drawableFamilies)
+            foreach (var member in family.Members)
+                if (!string.Equals(member.SessionId, family.PatriarchSessionId, StringComparison.OrdinalIgnoreCase)
+                    && rowsById.TryGetValue(member.SessionId, out var leafRow))
+                    leafRow.MemberFamily = family;
+
+        if (!enabled) return rows;
 
         var fold = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var family in _drawableFamilies)
@@ -384,6 +417,27 @@ public sealed partial class ArchiveService
             // A member is inside its family's row now, and is not a row of its own.
             if (!fold.Contains(row.Id)) collapsed.Add(row);
         return collapsed;
+    }
+
+    // The row that STANDS FOR a chat's family when the collapse folded the chat away, or null when the chat's
+    // family is not drawn among these rows. Grouping takes a folded member out of the list, so anything still
+    // pointing at that chat - the selection, a restore after a sync - has to follow it to the row the family
+    // is drawn at. That is the same rule the collapse uses, "the family goes wherever the patriarch is", read
+    // backwards: the chat went wherever its family is.
+    //
+    // A chat that is itself the head resolves to its own row, so this is safe to apply to any selection.
+    public ArchiveSession? FamilyRowFor(IReadOnlyList<ArchiveSession> rows, ArchiveSession? chat)
+    {
+        if (chat is null) return null;
+        foreach (var row in rows)
+        {
+            if (row.LeafFamily is not { } family) continue;
+            foreach (var member in family.Members)
+                if (string.Equals(member.SessionId, chat.Id, StringComparison.OrdinalIgnoreCase)
+                    || chat.Aliases.Any(alias => string.Equals(alias, member.SessionId, StringComparison.OrdinalIgnoreCase)))
+                    return row;
+        }
+        return null;
     }
 
     // True when this archive serves an isolated/authenticated consumer: it scans ONLY the constructor's
@@ -469,11 +523,17 @@ public sealed partial class ArchiveService
         await BackfillTemplateSnapshotMetadataAsync();
         cancellationToken.ThrowIfCancellationRequested();
         RefreshTemplateSnapshotCounts();
-        RefreshSessions(OrderedVisibleSessions(Store.Sessions.Values));
         // Now that the store is in memory, a family's head can be matched against the chats this app holds.
         // Without this the count is 0 - and the filter offers "no gateway leaf families found" - until the
         // first scan happens to land.
         ReloadLeafFamilies();
+        // Painted through ReapplyList, not RefreshSessions: the store just changed under a live list, and a
+        // flat repaint here - every chat in the store, unfiltered and uncollapsed - flashed the leaves of
+        // every grouped family back into the list for a frame before the next pass folded them again. A
+        // generation conflict during a save lands here, which is why it read as "vet something and the old
+        // leaves flash back". Before the page wires the callback (startup) ReapplyList is the flat paint, and
+        // that is what binds the list for the first time.
+        ReapplyList();
         StartTranscriptSearchIndexBuild(cancellationToken);
     }
 
@@ -483,8 +543,8 @@ public sealed partial class ArchiveService
     {
         await LoadStoreStateAsync(cancellationToken, acquireWriterLock: false, restoreBackup: false);
         cancellationToken.ThrowIfCancellationRequested();
-        RefreshSessions(OrderedVisibleSessions(Store.Sessions.Values));
         ReloadLeafFamilies();
+        ReapplyList();
     }
 
     // Call before a serialized server operation, not after mutating its in-memory store.
@@ -495,8 +555,8 @@ public sealed partial class ArchiveService
         if (generation == _loadedGeneration) return;
         await LoadStoreStateAsync(cancellationToken, acquireWriterLock: false, restoreBackup: false);
         RefreshTemplateSnapshotCounts();
-        RefreshSessions(OrderedVisibleSessions(Store.Sessions.Values));
         ReloadLeafFamilies();
+        ReapplyList();
     }
 
     public TranscriptSearchIndexStatus TranscriptSearchStatus =>
