@@ -2,9 +2,11 @@ using System;
 using System.Collections.ObjectModel;
 using System.Collections.Specialized;
 using System.ComponentModel;
+using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json.Serialization;
+using CodexLocalRetrieval.Core.Remote;
 using CodexLocalRetrieval.Core.Services;
 
 namespace CodexLocalRetrieval.Core.Models;
@@ -835,6 +837,43 @@ public sealed class ArchiveSession : INotifyPropertyChanged
 
     [JsonIgnore]
     public string PinGlyph => Pinned ? "*" : "";
+
+    // ---- gateway leaf family (set per-row by the list, never stored) ----
+    // The family this row STANDS FOR, when the family-grouping option is on and this chat is the family's
+    // patriarch. Null on every other row, which is what the row template keys off. It is deliberately not a
+    // second kind of row: the family is drawn at the patriarch's own chat, so opening, vetting, filing and
+    // every other row action keep working on the chat the family is filed by.
+    private LeafFamily? _leafFamily;
+    [JsonIgnore]
+    public LeafFamily? LeafFamily
+    {
+        get => _leafFamily;
+        set
+        {
+            if (ReferenceEquals(_leafFamily, value)) return;
+            _leafFamily = value;
+            Raise(nameof(IsFamilyHead));
+            Raise(nameof(FamilyBadge));
+            Raise(nameof(FamilyTooltip));
+        }
+    }
+
+    [JsonIgnore]
+    public bool IsFamilyHead => _leafFamily is not null;
+
+    // What the row is, in one phrase, when it is a whole family rather than one chat.
+    [JsonIgnore]
+    public string FamilyBadge => _leafFamily is null
+        ? ""
+        : $"family of {_leafFamily.Members.Count}";
+
+    // The family's members, by name, so the row says what it is holding without being opened.
+    [JsonIgnore]
+    public string FamilyTooltip => _leafFamily is null
+        ? ""
+        : _leafFamily.RootName is { Length: > 0 } name
+            ? $"{name} family: " + string.Join(", ", _leafFamily.Members.Select(m => m.Name))
+            : "Leaf family: " + string.Join(", ", _leafFamily.Members.Select(m => m.Name));
 
     [JsonIgnore]
     public string ToolShort => string.Equals(Tool, "claude", StringComparison.OrdinalIgnoreCase) ? "CL" : "CX";

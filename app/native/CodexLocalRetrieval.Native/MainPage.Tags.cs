@@ -59,6 +59,12 @@ public sealed partial class MainPage
     private bool _showHidden;   // reveal the auto-hidden one-off / spam chats (default off = they're hidden)
     private bool _showAutomationWorkers;   // reveal tandem/orchestration workers (default off = they're hidden)
     private bool _useMuxNames;   // show the app-assigned ("mux rename") name instead of the agent's own (default off = native)
+    // Draw each gateway leaf family as the ONE row it is a family of, at its patriarch, instead of leaving
+    // its chats scattered across the list as unrelated sessions. Off by default: a leaf is a session in its
+    // own right and is listed like one until you ask to see families. Filing still happens per chat - what
+    // changes is only which rows exist, and a family's row is the patriarch's own chat, so where the family
+    // sits in the tiers is wherever its patriarch sits.
+    private bool _groupFamilies;
     private int _minUserMsgs;   // hide chats with fewer than this many real user prompts (0 = off)
     private static readonly (int Value, string Label)[] MinUserMsgOptions =
     {
@@ -132,7 +138,7 @@ public sealed partial class MainPage
     {
         var previousId = _selected?.Id;
         var preserveSelection = postedSelectionRevision is not null && SelectionRevision != postedSelectionRevision.Value;
-        var results = _archive.FilterChats(CurrentChatFilter());
+        var results = _archive.CollapseFamilies(_archive.FilterChats(CurrentChatFilter()), _groupFamilies);
         var currentId = _selected?.Id;
         var selection = preserveSelection && currentId is not null
             ? results.FirstOrDefault(s => string.Equals(s.Id, currentId, StringComparison.OrdinalIgnoreCase))
@@ -185,7 +191,7 @@ public sealed partial class MainPage
     private void ReapplyActiveFilter()
     {
         var keep = _selected?.Id;
-        var results = _archive.FilterChats(CurrentChatFilter());
+        var results = _archive.CollapseFamilies(_archive.FilterChats(CurrentChatFilter()), _groupFamilies);
         var titleMode = (_dateMode == "last-user" || _dateMode == "first-user") ? _dateMode : "";
         foreach (var s in results) { s.RowTitleMode = titleMode; s.PreferMuxName = _useMuxNames; }
         var preserve = _dateMode.Length > 0 || !string.IsNullOrWhiteSpace(SearchBox.Text);
@@ -620,6 +626,28 @@ public sealed partial class MainPage
         mnRow.Children.Add(mnToggle);
         root.Children.Add(mnRow);
 
+        // Family grouping: draw each gateway leaf family as one row at its patriarch. The count says how many
+        // families this would actually fold, so an app on a box with no leaf families does not offer a switch
+        // that does nothing.
+        var familyN = _archive.DrawableFamilyCount;
+        var fmRow = new Grid { ColumnDefinitions = { new ColumnDefinition(), new ColumnDefinition { Width = GridLength.Auto } } };
+        var fmLabel = new StackPanel { Orientation = Orientation.Vertical, VerticalAlignment = VerticalAlignment.Center };
+        fmLabel.Children.Add(new TextBlock { Text = "Group leaf families", Foreground = new SolidColorBrush(ChipText), FontSize = 12 });
+        fmLabel.Children.Add(new TextBlock
+        {
+            Text = familyN == 0
+                ? "no gateway leaf families found"
+                : $"{familyN} family group{(familyN == 1 ? "" : "s")} of chats, shown at the patriarch",
+            Foreground = MutedBrush(),
+            FontSize = 11
+        });
+        fmRow.Children.Add(fmLabel);
+        var fmToggle = new ToggleSwitch { Name = "GroupFamiliesToggle", IsOn = _groupFamilies, OnContent = "On", OffContent = "Off", MinWidth = 0, HorizontalAlignment = HorizontalAlignment.Right };
+        fmToggle.Toggled += (_, _) => { if (_groupFamilies != fmToggle.IsOn) { _groupFamilies = fmToggle.IsOn; RefreshFilterFlyout(); ApplyFilters(); } };
+        Grid.SetColumn(fmToggle, 1);
+        fmRow.Children.Add(fmToggle);
+        root.Children.Add(fmRow);
+
         // Project (collection) scope: restrict the whole filter to one project's chats.
         if (_archive.Store.Collections.Count > 0)
         {
@@ -645,10 +673,10 @@ public sealed partial class MainPage
             root.Children.Add(projRow);
         }
 
-        if (_includeTags.Count > 0 || _excludeTags.Count > 0 || _filterCollectionId is not null || _dateMode.Length > 0 || _dateRange.Length > 0 || _toolFilter.Length > 0 || _minUserMsgs > 0 || _showHidden || _showAutomationWorkers || _useMuxNames)
+        if (_includeTags.Count > 0 || _excludeTags.Count > 0 || _filterCollectionId is not null || _dateMode.Length > 0 || _dateRange.Length > 0 || _toolFilter.Length > 0 || _minUserMsgs > 0 || _showHidden || _showAutomationWorkers || _useMuxNames || _groupFamilies)
         {
             var clear = new Button { Style = (Style)Resources["PillButtonStyle"], HorizontalAlignment = HorizontalAlignment.Stretch, Content = new TextBlock { Text = "Clear filters", FontSize = 12 } };
-            clear.Click += (_, _) => { _includeTags.Clear(); _excludeTags.Clear(); _filterCollectionId = null; _dateMode = ""; _dateRange = ""; _toolFilter = ""; _minUserMsgs = 0; _showHidden = false; _showAutomationWorkers = false; _useMuxNames = false; RefreshFilterFlyout(); ApplyFilters(); };
+            clear.Click += (_, _) => { _includeTags.Clear(); _excludeTags.Clear(); _filterCollectionId = null; _dateMode = ""; _dateRange = ""; _toolFilter = ""; _minUserMsgs = 0; _showHidden = false; _showAutomationWorkers = false; _useMuxNames = false; _groupFamilies = false; RefreshFilterFlyout(); ApplyFilters(); };
             root.Children.Add(clear);
         }
         return root;
@@ -715,12 +743,19 @@ public sealed partial class MainPage
             _filterCollectionId = null;   // collection was deleted
 
         TagFilterBar.Children.Clear();
-        if (_includeTags.Count == 0 && _excludeTags.Count == 0 && _filterCollectionId is null && _dateMode.Length == 0 && _dateRange.Length == 0 && _toolFilter.Length == 0 && _minUserMsgs == 0 && !_showHidden && !_showAutomationWorkers)
+        if (_includeTags.Count == 0 && _excludeTags.Count == 0 && _filterCollectionId is null && _dateMode.Length == 0 && _dateRange.Length == 0 && _toolFilter.Length == 0 && _minUserMsgs == 0 && !_showHidden && !_showAutomationWorkers && !_groupFamilies)
         {
             TagFilterScroller.Visibility = Visibility.Collapsed;
             return;
         }
         TagFilterScroller.Visibility = Visibility.Visible;
+
+        // Grouping gets a chip like any other filter because it is one: it changes WHICH rows exist, so a
+        // list that is missing a chat has to say why.
+        if (_groupFamilies)
+            TagFilterBar.Children.Add(TagChip("families grouped", active: true,
+                onTap: () => { _groupFamilies = false; RefreshFilterFlyout(); ApplyFilters(); },
+                onRemove: () => { _groupFamilies = false; RefreshFilterFlyout(); ApplyFilters(); }));
 
         if (_showHidden)
             TagFilterBar.Children.Add(TagChip("showing hidden", active: true,
@@ -775,7 +810,7 @@ public sealed partial class MainPage
                 onTap: () => { _excludeTags.Remove(t); ApplyFilters(); },
                 onRemove: () => { _excludeTags.Remove(t); ApplyFilters(); }));
         }
-        TagFilterBar.Children.Add(AddChip("clear", () => { _includeTags.Clear(); _excludeTags.Clear(); _filterCollectionId = null; _dateMode = ""; _dateRange = ""; _toolFilter = ""; _minUserMsgs = 0; _showHidden = false; _showAutomationWorkers = false; ApplyFilters(); }));
+        TagFilterBar.Children.Add(AddChip("clear", () => { _includeTags.Clear(); _excludeTags.Clear(); _filterCollectionId = null; _dateMode = ""; _dateRange = ""; _toolFilter = ""; _minUserMsgs = 0; _showHidden = false; _showAutomationWorkers = false; _groupFamilies = false; RefreshFilterFlyout(); ApplyFilters(); }));
     }
 
     // ---- Per-chat tag editor (right panel) ---------------------------------------------------

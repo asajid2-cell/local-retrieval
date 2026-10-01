@@ -116,6 +116,16 @@ public sealed partial class MainPage
         if (step.resize is { Length: 2 }) MainWindow.Instance?.AppWindow.Resize(new Windows.Graphics.SizeInt32(step.resize[0], step.resize[1]));
         if (step.type is not null) { SearchBox.Text = step.type; ApplySearch(step.type); }
 
+        // Dismiss an open popup. CaptureSubject prefers the topmost popup, so while the filter flyout is up a
+        // shot renders the flyout and never the page behind it; a step that wants to photograph the list it
+        // just changed has to put the flyout away first.
+        if (step.closeFlyout is true)
+        {
+            _filterFlyout?.Hide();
+            _collFilterFlyout?.Hide();
+            await SettleAsync(3);
+        }
+
         // Open the vet dialog for a chat and LEAVE it open, so the next shot can render it. A later
         // vetClose step dismisses it. Nothing is committed unless vetName is given - and then the dialog's
         // REAL fields are filled and its REAL primary button pressed, so the run goes through the same
@@ -368,7 +378,11 @@ public sealed partial class MainPage
                 vetted = session.Vetted,
                 archived = session.Archived,
                 phrases = session.SpecialPhrases.ToList(),
-                updatedAt = session.UpdatedAt
+                updatedAt = session.UpdatedAt,
+                // A grouped row is the family's row: it says so here, and the folded members are simply not
+                // in this list at all, which is the whole claim the grouping has to prove.
+                familyHead = session.IsFamilyHead,
+                familyBadge = session.FamilyBadge
             });
         }
         var path = Path.Combine(CapDir, "out", name + ".json");
@@ -396,6 +410,12 @@ public sealed partial class MainPage
             scopeUnvetted = scopes.Unvetted,
             scopeActive = scopes.Active,
             scopeArchived = scopes.Archived,
+            // Family grouping is derived state, so a run has to be able to tell "the switch is off" apart from
+            // "the switch is on and there is nothing to fold" - both look like a flat list otherwise.
+            groupFamilies = _groupFamilies,
+            drawableFamilies = _archive.DrawableFamilyCount,
+            leafFamiliesOnDisk = _archive.LeafFamilies.Families.Count,
+            leafFamilyMembersOnDisk = _archive.LeafFamilies.MemberCount,
             // The tab LABELS as they are on screen, next to the tier sizes they came from: a run can assert
             // that what a tab says and what it lists are the same number.
             labelAll = ScopeAllText.Text,
@@ -725,6 +745,7 @@ internal sealed class CapStep
     public string? dump { get; set; }
     public string? snapshot { get; set; }
     public string? dumpList { get; set; }
+    public bool? closeFlyout { get; set; }
     public bool? clipboard { get; set; }
     public int[]? scroll { get; set; }
     public int? wait { get; set; }

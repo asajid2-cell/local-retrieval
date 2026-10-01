@@ -81,6 +81,7 @@
                     <ColumnDefinition Width="Auto" />
                     <ColumnDefinition Width="Auto" />
                     <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="Auto" />
                 </Grid.ColumnDefinitions>
                 <TextBlock
                     Width="14"
@@ -92,8 +93,18 @@
                     MaxLines="1"
                     Text="{Binding ListTitle}"
                     TextTrimming="CharacterEllipsis" />
+                <!-- A family row is a whole leaf family held at its patriarch, not one chat; the tooltip
+                     names the members it is holding so the row says what is inside it without being opened. -->
                 <TextBlock
                     Grid.Column="2"
+                    Margin="6,0,0,0"
+                    VerticalAlignment="Center"
+                    FontSize="10"
+                    Foreground="{StaticResource AccentBrush}"
+                    Text="{Binding FamilyBadge}"
+                    ToolTipService.ToolTip="{Binding FamilyTooltip}" />
+                <TextBlock
+                    Grid.Column="3"
                     Margin="6,0,0,0"
                     VerticalAlignment="Center"
                     FontSize="12"
@@ -101,7 +112,7 @@
                     ToolTipService.ToolTip="Checkpoint count; ! legacy checkpoint pending; branch; GW Gateway branch"
                     Text="{Binding ListMarks}" />
                 <TextBlock
-                    Grid.Column="3"
+                    Grid.Column="4"
                     Margin="8,0,0,0"
                     VerticalAlignment="Center"
                     FontSize="10"
@@ -109,7 +120,7 @@
                     Foreground="{StaticResource TextMutedBrush}"
                     Text="{Binding ToolShort}" />
                 <TextBlock
-                    Grid.Column="4"
+                    Grid.Column="5"
                     Margin="8,0,0,0"
                     VerticalAlignment="Center"
                     Foreground="{StaticResource TextMutedBrush}"

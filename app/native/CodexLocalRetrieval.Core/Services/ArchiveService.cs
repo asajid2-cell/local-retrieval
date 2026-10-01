@@ -306,6 +306,86 @@ public sealed partial class ArchiveService
     public AppStoreData Store { get; private set; } = new();
     public ObservableCollection<ArchiveSession> Sessions { get; } = new();
 
+    // ---- gateway leaf families ----
+    // The gateway owns them; this app only reads. Re-read on every merge - the moment the chat list is
+    // rebuilt from disk - rather than cached for the life of the process, because a designation MOVES: when
+    // a patriarch leaves, the gateway hands the family to the next open member and republishes the pointers,
+    // and the row the family is drawn at has to follow it. Nothing here is ever written back: the app has no
+    // business writing into a store a running gateway is also writing.
+    private LeafFamilyStore _leafFamilies = null!;
+    public LeafFamilyStore LeafFamilies => _leafFamilies;
+
+    // How many families grouping would actually fold, which is the number the option offers to act on.
+    public int DrawableFamilyCount => _drawableFamilies.Count;
+
+    // The families that can be drawn at all, and the ids this app knows a chat by. Both are settled when the
+    // store is re-read, because both change with it, and neither may be worked out per keystroke: asking
+    // "does this app have a chat for this family's head?" by resolving an id costs a scan of every chat.
+    private List<LeafFamily> _drawableFamilies = new();
+    private HashSet<string> _knownChatIds = new(StringComparer.OrdinalIgnoreCase);
+
+    public void ReloadLeafFamilies()
+    {
+        _leafFamilies = new LeafFamilyStore(_leafFamilyOptions);
+        _knownChatIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var session in Store.Sessions.Values)
+        {
+            _knownChatIds.Add(session.Id);
+            foreach (var alias in session.Aliases) _knownChatIds.Add(alias);
+        }
+        // A family of one is already a single row, and a family whose head is not a chat this app holds has no
+        // row to be drawn at - inventing one would list something that cannot be opened. Neither is drawable.
+        _drawableFamilies = _leafFamilies.Families
+            .Where(f => !f.IsSingleMember && f.Patriarch is { } head && _knownChatIds.Contains(head.SessionId))
+            .ToList();
+    }
+
+    // Collapse each leaf family into the single row it is a family OF - the patriarch's own chat - and leave
+    // every other chat exactly as it was.
+    //
+    // Where a drawable family's head is one of the rows being shown, that row IS the family and its members
+    // fold into it. Where it is not, no member shows either: the family's row is the patriarch's chat, so a
+    // filter that excludes the patriarch excludes the family, and a leaf surfacing on its own would be the
+    // scattering that grouping exists to remove. That is the whole of "the family goes wherever the patriarch
+    // is" - including the tier it is filed under.
+    //
+    // Always called, with enabled false when the option is off, so a stamp a previous pass left on a row is
+    // cleared rather than surviving the toggle.
+    public IReadOnlyList<ArchiveSession> CollapseFamilies(IReadOnlyList<ArchiveSession> rows, bool enabled)
+    {
+        foreach (var row in rows) row.LeafFamily = null;
+        if (!enabled || _drawableFamilies.Count == 0) return rows;
+
+        // Every id a row answers to, so a head addressed by one of its alias ids still finds its row.
+        var rowsById = new Dictionary<string, ArchiveSession>(StringComparer.OrdinalIgnoreCase);
+        foreach (var row in rows)
+        {
+            rowsById[row.Id] = row;
+            foreach (var alias in row.Aliases) rowsById.TryAdd(alias, row);
+        }
+
+        var fold = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var family in _drawableFamilies)
+        {
+            var head = family.Patriarch!;
+            var drawnHere = rowsById.TryGetValue(head.SessionId, out var headRow);
+            if (drawnHere) headRow!.LeafFamily = family;
+            foreach (var member in family.Members)
+            {
+                if (drawnHere && string.Equals(member.SessionId, head.SessionId, StringComparison.OrdinalIgnoreCase))
+                    continue;   // the head is the row itself, not something folded into it
+                fold.Add(member.SessionId);
+            }
+        }
+        if (fold.Count == 0) return rows;
+
+        var collapsed = new List<ArchiveSession>(rows.Count);
+        foreach (var row in rows)
+            // A member is inside its family's row now, and is not a row of its own.
+            if (!fold.Contains(row.Id)) collapsed.Add(row);
+        return collapsed;
+    }
+
     // True when this archive serves an isolated/authenticated consumer: it scans ONLY the constructor's
     // explicit roots, ignores the user's saved external sources, and never absorbs bundled demo history.
     public bool RestrictsTranscriptSources => _restrictTranscriptSources;
@@ -313,6 +393,7 @@ public sealed partial class ArchiveService
     private readonly IReadOnlyList<SessionSource>? _sourceOverride;
     private readonly string? _codexAccountsRootOverride;
     private readonly bool _restrictTranscriptSources;
+    private readonly LeafFamilyStore.Options _leafFamilyOptions;
 
     public ArchiveService(
         string? storePath = null,
@@ -326,7 +407,8 @@ public sealed partial class ArchiveService
         bool? enableTranscriptSearchIndex = null,
         IReadOnlyList<SessionSource>? sourceOverride = null,
         string? codexAccountsRoot = null,
-        bool restrictTranscriptSources = false)
+        bool restrictTranscriptSources = false,
+        string? leafFamiliesDirectory = null)
     {
         // Restricted/isolated mode has NO ambient defaults: the codex + claude roots and the codex state
         // db must be named explicitly and be absolute, so an isolated archive can never silently widen
@@ -355,6 +437,10 @@ public sealed partial class ArchiveService
             "state_5.sqlite");
         _templatesRoot = templatesRoot ?? Path.Combine(Path.GetDirectoryName(_storePath)!, "templates");
         _codexThreadRegistrar = codexThreadRegistrar ?? RegisterCodexThread;
+        // The gateway resolves its own config home from CLAUDE_CONFIG_DIR and falls back to ~/.claude; the
+        // family directory is read from the same home, so a harness that moved it still finds its families.
+        _leafFamilyOptions = new LeafFamilyStore.Options { DirectoryOverride = leafFamiliesDirectory };
+        ReloadLeafFamilies();
         _transcriptSearchEnabled = enableTranscriptSearchIndex
             ?? (!useBundledStore && storePath is null);
         if (_transcriptSearchEnabled)
@@ -384,6 +470,10 @@ public sealed partial class ArchiveService
         cancellationToken.ThrowIfCancellationRequested();
         RefreshTemplateSnapshotCounts();
         RefreshSessions(OrderedVisibleSessions(Store.Sessions.Values));
+        // Now that the store is in memory, a family's head can be matched against the chats this app holds.
+        // Without this the count is 0 - and the filter offers "no gateway leaf families found" - until the
+        // first scan happens to land.
+        ReloadLeafFamilies();
         StartTranscriptSearchIndexBuild(cancellationToken);
     }
 
@@ -394,6 +484,7 @@ public sealed partial class ArchiveService
         await LoadStoreStateAsync(cancellationToken, acquireWriterLock: false, restoreBackup: false);
         cancellationToken.ThrowIfCancellationRequested();
         RefreshSessions(OrderedVisibleSessions(Store.Sessions.Values));
+        ReloadLeafFamilies();
     }
 
     // Call before a serialized server operation, not after mutating its in-memory store.
@@ -405,6 +496,7 @@ public sealed partial class ArchiveService
         await LoadStoreStateAsync(cancellationToken, acquireWriterLock: false, restoreBackup: false);
         RefreshTemplateSnapshotCounts();
         RefreshSessions(OrderedVisibleSessions(Store.Sessions.Values));
+        ReloadLeafFamilies();
     }
 
     public TranscriptSearchIndexStatus TranscriptSearchStatus =>
@@ -5169,6 +5261,9 @@ public sealed partial class ArchiveService
         bool buildSearchIndex)
     {
         cancellationToken.ThrowIfCancellationRequested();
+        // Before the no-change short circuit, so a family that moved - a patriarch that left while no
+        // transcript changed - is re-read on this beat rather than on the next real scan.
+        ReloadLeafFamilies();
         if (!scan.FullRescan && scan.Disk.Count == 0 && scan.Bundled.Count == 0)
         {
             if (refreshList) ReapplyList();
@@ -6093,7 +6188,7 @@ public sealed partial class ArchiveService
     private Dictionary<string, object> ResolveMuxTabChats()
     {
         var result = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase);
-        var path = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "muxd", "live-tabs.json");
+        var path = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "muxd-runtime", "live-tabs.json");
         Dictionary<string, JsonElement>? tabs = null;
         try { if (File.Exists(path)) tabs = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(File.ReadAllText(path)); }
         catch { }
