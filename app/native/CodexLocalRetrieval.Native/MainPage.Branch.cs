@@ -581,13 +581,14 @@ public sealed partial class MainPage
         var parentTitle = _archive.Store.Sessions.TryGetValue(branch.BranchOfId, out var parent)
             ? parent.DisplayTitle
             : branch.BranchOfId;
-        var panel = new StackPanel { Spacing = 2, Margin = new Thickness(0, 10, 0, 0) };
+        var panel = new StackPanel { Spacing = 3, Padding = InspectorRowPadding() };
         panel.Children.Add(new TextBlock
         {
-            Text = "Branch",
-            Foreground = StrongBrush(),
-            FontSize = 12,
-            FontWeight = FontWeights.SemiBold
+            Text = "BRANCH",
+            Foreground = MutedBrush(),
+            FontSize = 10,
+            FontWeight = FontWeights.SemiBold,
+            CharacterSpacing = 40
         });
         var link = new HyperlinkButton
         {
@@ -602,13 +603,14 @@ public sealed partial class MainPage
 
     private UIElement BranchesOfBlock(IReadOnlyList<ArchiveSession> branches)
     {
-        var panel = new StackPanel { Spacing = 4, Margin = new Thickness(0, 10, 0, 0) };
+        var panel = new StackPanel { Spacing = 4, Padding = InspectorRowPadding() };
         panel.Children.Add(new TextBlock
         {
-            Text = $"Branches ({branches.Count})",
-            Foreground = StrongBrush(),
-            FontSize = 12,
-            FontWeight = FontWeights.SemiBold
+            Text = $"BRANCHES ({branches.Count})",
+            Foreground = MutedBrush(),
+            FontSize = 10,
+            FontWeight = FontWeights.SemiBold,
+            CharacterSpacing = 40
         });
         foreach (var branch in branches.Take(6))
         {
@@ -626,16 +628,20 @@ public sealed partial class MainPage
             {
                 Text = branch.DisplayTitle + SnapshotOriginLabel(branch),
                 FontSize = 12,
-                Foreground = MutedBrush(),
+                Foreground = StrongBrush(),
                 TextWrapping = TextWrapping.Wrap,
                 VerticalAlignment = VerticalAlignment.Center
             });
             var view = new Button
             {
                 Content = "View",
-                Style = (Style)Resources["PillButtonStyle"],
-                MinHeight = 28,
-                Padding = new Thickness(9, 2, 9, 2)
+                FontSize = 11,
+                MinHeight = 26,
+                Padding = new Thickness(9, 2, 9, 2),
+                CornerRadius = new CornerRadius(6),
+                BorderThickness = new Thickness(0),
+                Background = RaisedBrush(),
+                Foreground = MutedBrush()
             };
             view.Click += (_, _) => OpenSession(captured);
             Grid.SetColumn(view, 1);

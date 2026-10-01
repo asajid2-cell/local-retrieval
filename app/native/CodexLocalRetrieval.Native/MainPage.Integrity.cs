@@ -33,7 +33,7 @@ public sealed partial class MainPage
             _integrity.Invalidate();
             SetRiskySessionActionsEnabled(false);
             IntegrityItems.Children.Clear();
-            IntegrityItems.Children.Add(IntegrityChip("Isolated metadata fixture; runtime actions disabled"));
+            AddInspectorRow(IntegrityItems, IntegrityChip("Isolated metadata fixture; runtime actions disabled"));
             UpdateInspectorBadge(null);   // nothing to flag in the fixture
             return;
         }
@@ -76,7 +76,7 @@ public sealed partial class MainPage
         if (_selected is null)
         {
             SetRiskySessionActionsEnabled(false);
-            IntegrityItems.Children.Add(new TextBlock { Text = "No chat selected", Foreground = MutedBrush(), FontSize = 12 });
+            AddInspectorRow(IntegrityItems, new TextBlock { Text = "No chat selected", Foreground = MutedBrush(), FontSize = 12, Padding = InspectorRowPadding() });
             UpdateInspectorBadge(null);
             return;
         }
@@ -91,7 +91,7 @@ public sealed partial class MainPage
 
         if (summary is null)
         {
-            IntegrityItems.Children.Add(checking
+            AddInspectorRow(IntegrityItems, checking
                 ? IntegrityChip("Checking integrity...")
                 : IntegrityHeadline("danger", "Integrity checks failed. Refusing to treat this chat as clear."));
             // While a build is in flight the badge keeps its last answer; an unverifiable chat fails closed.
@@ -101,38 +101,38 @@ public sealed partial class MainPage
         }
 
         UpdateInspectorBadge(summary.Severity);
-        IntegrityItems.Children.Add(IntegrityHeadline(summary.Severity, summary.Headline));
+        AddInspectorRow(IntegrityItems, IntegrityHeadline(summary.Severity, summary.Headline));
         if (_reclaimNoticeSessionId is not null
             && string.Equals(_reclaimNoticeSessionId, _selected.Id, StringComparison.OrdinalIgnoreCase)
             && !string.IsNullOrWhiteSpace(_reclaimNotice))
-            IntegrityItems.Children.Add(IntegrityHeadline(
+            AddInspectorRow(IntegrityItems, IntegrityHeadline(
                 _reclaimNotice.StartsWith("Reclaim completed", StringComparison.Ordinal) ? "ok" : "danger",
                 _reclaimNotice));
-        if (checking) IntegrityItems.Children.Add(IntegrityChip("Checking integrity..."));
+        if (checking) AddInspectorRow(IntegrityItems, IntegrityChip("Checking integrity..."));
         if (CanReclaim(summary))
-            IntegrityItems.Children.Add(IntegrityReclaimButton());
-        IntegrityItems.Children.Add(IntegrityMeta(summary));
+            AddInspectorRow(IntegrityItems, IntegrityReclaimButton());
+        AddInspectorRow(IntegrityItems, IntegrityMeta(summary));
 
         // Branch linkage — a branch links back to its original; a parent lists the branches taken off it.
         if (_selected.IsBranch)
-            IntegrityItems.Children.Add(BranchLinkBlock(_selected));
+            AddInspectorRow(IntegrityItems, BranchLinkBlock(_selected));
         else
         {
             var branches = BranchesOf(_selected);
-            if (branches.Count > 0) IntegrityItems.Children.Add(BranchesOfBlock(branches));
+            if (branches.Count > 0) AddInspectorRow(IntegrityItems, BranchesOfBlock(branches));
         }
         if (!string.IsNullOrWhiteSpace(_selected.HandoffFromId))
         {
             var sourceTitle = _archive.Store.Sessions.TryGetValue(_selected.HandoffFromId, out var source)
                 ? source.DisplayTitle
                 : _selected.HandoffFromId;
-            IntegrityItems.Children.Add(IntegrityEvidenceBlock(
+            AddInspectorRow(IntegrityItems, IntegrityEvidenceBlock(
                 "Gateway handoff",
                 new[] { $"Fresh chat from \"{sourceTitle}\" ({_selected.HandoffFromId})" }));
         }
 
         foreach (var check in summary.Checks)
-            IntegrityItems.Children.Add(IntegrityCheckRow(check));
+            AddInspectorRow(IntegrityItems, IntegrityCheckRow(check));
 
         // WHAT HAPPENED (live owner, claims, mux custody, filing intents, recent events) belongs to the
         // Activity tab - this tab answers only "is it safe to continue".
@@ -152,11 +152,27 @@ public sealed partial class MainPage
 
     private Button IntegrityReclaimButton()
     {
+        // A row of the section, like every other action in the rail - not a pill floating on the surface.
+        // It is the one destructive-ish row, so it carries the accent glyph and lets the row fill show hover.
         var button = new Button
         {
-            Content = "Reclaim",
-            HorizontalAlignment = HorizontalAlignment.Stretch,
-            Style = (Style)Resources["PrimaryPillButtonStyle"]
+            Style = (Style)Resources["InspectorRowButtonStyle"],
+            Content = new StackPanel
+            {
+                Orientation = Orientation.Horizontal,
+                Spacing = 8,
+                Children =
+                {
+                    new FontIcon
+                    {
+                        FontFamily = new FontFamily("Segoe Fluent Icons"),
+                        FontSize = 12,
+                        Glyph = "\uE7BA",
+                        Foreground = AccentBrush()
+                    },
+                    new TextBlock { Text = "Reclaim", FontSize = 12, VerticalAlignment = VerticalAlignment.Center }
+                }
+            }
         };
         ToolTipService.SetToolTip(button, "Take control: stop every owner of this chat, clear safe reservations, and leave it ready for explicit continuation.");
         button.Click += async (_, _) => await ReclaimSelectedSessionAsync();
@@ -483,7 +499,23 @@ public sealed partial class MainPage
         return path.TrimEnd(System.IO.Path.DirectorySeparatorChar, System.IO.Path.AltDirectorySeparatorChar);
     }
 
-    private Border IntegrityHeadline(string severity, string text)
+    // ---- inspector rows -------------------------------------------------------------------------
+    // Everything the rail shows is a ROW of the section container, not a card floating on the rail. A row
+    // is full-bleed with a fixed inset, and the hairline lives BETWEEN rows so the container's own border
+    // stays the only line at the top and bottom. Severity is carried by the row's tint and its dot, which
+    // is what makes a blocked chat read at a glance without the row lifting off the surface.
+
+    private Border InspectorDivider() => new() { Height = 1, Background = LineBrush() };
+
+    private void AddInspectorRow(Panel host, UIElement row)
+    {
+        if (host.Children.Count > 0) host.Children.Add(InspectorDivider());
+        host.Children.Add(row);
+    }
+
+    private static Thickness InspectorRowPadding() => new(12, 8, 12, 8);
+
+    private UIElement IntegrityHeadline(string severity, string text)
     {
         var stack = new StackPanel { Spacing = 4 };
         stack.Children.Add(new StackPanel
@@ -497,8 +529,9 @@ public sealed partial class MainPage
                 {
                     Text = IntegrityLabel(severity),
                     Foreground = IntegrityBrush(severity),
-                    FontSize = 12,
+                    FontSize = 11,
                     FontWeight = FontWeights.SemiBold,
+                    CharacterSpacing = 60,
                     VerticalAlignment = VerticalAlignment.Center
                 }
             }
@@ -512,24 +545,32 @@ public sealed partial class MainPage
             LineHeight = 17
         });
 
+        // Full-bleed row with the severity tint - no border, no corner radius, so it reads as the section's
+        // opening row rather than a card sitting on top of it.
         return new Border
         {
             Background = IntegrityBackground(severity),
-            BorderBrush = IntegrityBorderBrush(severity),
-            BorderThickness = new Thickness(1),
-            CornerRadius = new CornerRadius(8),
-            Padding = new Thickness(10, 8, 10, 8),
+            Padding = InspectorRowPadding(),
             Child = stack
         };
     }
 
     private UIElement IntegrityMeta(SessionIntegritySummary summary)
     {
-        var row = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 6 };
-        row.Children.Add(IntegrityChip(summary.Tool.Equals("claude", StringComparison.OrdinalIgnoreCase) ? "CL" : "CX"));
-        row.Children.Add(IntegrityChip(summary.SourceStatus));
-        row.Children.Add(IntegrityChip(summary.Collections.Count == 0 ? "unfiled" : summary.Collections.Count + " collection" + (summary.Collections.Count == 1 ? "" : "s")));
-        return row;
+        var parts = new List<string>
+        {
+            summary.Tool.Equals("claude", StringComparison.OrdinalIgnoreCase) ? "Claude" : "Codex",
+            summary.SourceStatus,
+            summary.Collections.Count == 0 ? "unfiled" : summary.Collections.Count + " collection" + (summary.Collections.Count == 1 ? "" : "s")
+        };
+        return new TextBlock
+        {
+            Text = string.Join("  ·  ", parts),
+            Foreground = MutedBrush(),
+            FontSize = 11,
+            TextWrapping = TextWrapping.Wrap,
+            Padding = InspectorRowPadding()
+        };
     }
 
     private UIElement IntegrityCheckRow(SessionIntegrityCheck check)
@@ -541,7 +582,8 @@ public sealed partial class MainPage
                 new ColumnDefinition { Width = GridLength.Auto },
                 new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) }
             },
-            ColumnSpacing = 8
+            ColumnSpacing = 8,
+            Padding = InspectorRowPadding()
         };
         grid.Children.Add(IntegrityDot(check.Severity));
         var text = new StackPanel { Spacing = 1 };
@@ -567,36 +609,37 @@ public sealed partial class MainPage
 
     private UIElement IntegrityEvidenceBlock(string title, IEnumerable<string> lines)
     {
-        var stack = new StackPanel { Spacing = 3 };
-        stack.Children.Add(new TextBlock { Text = title, Foreground = StrongBrush(), FontSize = 12, FontWeight = FontWeights.SemiBold });
+        var stack = new StackPanel { Spacing = 3, Padding = InspectorRowPadding() };
+        stack.Children.Add(new TextBlock
+        {
+            Text = title.ToUpperInvariant(),
+            Foreground = MutedBrush(),
+            FontSize = 10,
+            FontWeight = FontWeights.SemiBold,
+            CharacterSpacing = 40
+        });
         foreach (var line in lines)
         {
             stack.Children.Add(new TextBlock
             {
                 Text = line,
-                Foreground = MutedBrush(),
+                Foreground = StrongBrush(),
                 FontSize = 11,
                 TextWrapping = TextWrapping.Wrap,
                 LineHeight = 15
             });
         }
-        return new Border
-        {
-            BorderBrush = LineBrush(),
-            BorderThickness = new Thickness(1),
-            CornerRadius = new CornerRadius(8),
-            Padding = new Thickness(9, 7, 9, 7),
-            Child = stack
-        };
+        return stack;
     }
 
-    private Border IntegrityChip(string text) => new()
+    // A quiet inline note (checking, fixture, custody summary). A row of the container, not a pill.
+    private UIElement IntegrityChip(string text) => new TextBlock
     {
-        BorderBrush = LineBrush(),
-        BorderThickness = new Thickness(1),
-        CornerRadius = new CornerRadius(6),
-        Padding = new Thickness(7, 2, 7, 2),
-        Child = new TextBlock { Text = text, Foreground = MutedBrush(), FontSize = 10, FontWeight = FontWeights.SemiBold }
+        Text = text,
+        Foreground = MutedBrush(),
+        FontSize = 11,
+        TextWrapping = TextWrapping.Wrap,
+        Padding = InspectorRowPadding()
     };
 
     private UIElement IntegrityDot(string severity) => new FontIcon

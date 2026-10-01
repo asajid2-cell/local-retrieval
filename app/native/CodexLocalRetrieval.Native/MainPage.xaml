@@ -50,15 +50,6 @@
             <Setter Property="HorizontalContentAlignment" Value="Left" />
         </Style>
 
-        <!-- Inspector action rows ARE the interactive-card elevation, so unlike the sidebar rows they
-             carry a fill at rest. Without it an enabled action was the ONLY thing in the panel with no
-             surface: a disabled sibling still paints the system disabled fill, so the enabled command
-             read as the odd one out. -->
-        <Style x:Key="ActionCardButtonStyle" BasedOn="{StaticResource RowButtonStyle}" TargetType="Button">
-            <Setter Property="Background" Value="{StaticResource RaisedBrush}" />
-            <Setter Property="Padding" Value="12,0" />
-        </Style>
-
         <Style x:Key="ScopeButtonStyle" BasedOn="{StaticResource PillButtonStyle}" TargetType="Button">
             <Setter Property="MinHeight" Value="26" />
             <Setter Property="Padding" Value="10,0" />
@@ -66,11 +57,44 @@
             <Setter Property="FontSize" Value="12" />
         </Style>
 
-        <Style x:Key="TabButtonStyle" BasedOn="{StaticResource PillButtonStyle}" TargetType="Button">
-            <Setter Property="MinHeight" Value="28" />
-            <Setter Property="Padding" Value="10,0" />
-            <Setter Property="CornerRadius" Value="8" />
+        <!-- Inspector rail.
+             The rail is chrome, not a card: flush to the window edge, one hairline divider, no
+             inset and no rounded frame. Everything inside it is a ROW of a section rather than a
+             button floating on the surface - the tab strip is one container of segments, and each
+             tab's content is one container of rows. -->
+        <Style x:Key="SegmentButtonStyle" TargetType="Button">
+            <Setter Property="MinHeight" Value="30" />
+            <Setter Property="Padding" Value="4,0" />
+            <Setter Property="CornerRadius" Value="6" />
+            <Setter Property="BorderThickness" Value="0" />
+            <Setter Property="Background" Value="Transparent" />
+            <Setter Property="Foreground" Value="{StaticResource TextMutedBrush}" />
             <Setter Property="FontSize" Value="12" />
+            <Setter Property="HorizontalAlignment" Value="Stretch" />
+            <Setter Property="HorizontalContentAlignment" Value="Center" />
+        </Style>
+
+        <Style x:Key="InspectorRowButtonStyle" BasedOn="{StaticResource PillButtonStyle}" TargetType="Button">
+            <Setter Property="MinHeight" Value="38" />
+            <Setter Property="Padding" Value="10,0" />
+            <Setter Property="CornerRadius" Value="6" />
+            <Setter Property="HorizontalAlignment" Value="Stretch" />
+            <Setter Property="HorizontalContentAlignment" Value="Left" />
+        </Style>
+
+        <!-- The container every tab's rows live in. Rows carry the hairlines between them; the
+             container's own border is the only line at the top and bottom. -->
+        <Style x:Key="InspectorSectionStyle" TargetType="Border">
+            <Setter Property="Background" Value="{StaticResource PanelBrush}" />
+            <Setter Property="BorderBrush" Value="{StaticResource LineBrush}" />
+            <Setter Property="BorderThickness" Value="1" />
+            <Setter Property="CornerRadius" Value="10" />
+            <Setter Property="Padding" Value="0" />
+        </Style>
+
+        <Style x:Key="InspectorDividerStyle" TargetType="Border">
+            <Setter Property="Height" Value="1" />
+            <Setter Property="Background" Value="{StaticResource LineBrush}" />
         </Style>
 
         <DataTemplate x:Key="SessionTemplate">
@@ -354,7 +378,9 @@
             <Grid.ColumnDefinitions>
                 <ColumnDefinition x:Name="LeftColumn" Width="300" />
                 <ColumnDefinition Width="*" />
-                <ColumnDefinition x:Name="RightColumn" Width="0" />
+                <!-- Auto, not a fixed width: the rail's own Width is what animates, so the centre
+                     column gains and gives back the space as the rail slides. -->
+                <ColumnDefinition x:Name="RightColumn" Width="Auto" />
             </Grid.ColumnDefinitions>
 
             <!-- ===== LEFT = navigate. Chat-first; the destinations live behind one Tools surface. ===== -->
@@ -628,26 +654,26 @@
                 </ScrollViewer>
             </Grid>
 
-            <!-- ===== RIGHT = inspect. Closed by default; the badge is how it asks for attention. ===== -->
+            <!-- ===== RIGHT = inspect. A docked rail that slides out of the window's right edge;
+                 closed by default, and the badge is how it asks for attention. ===== -->
             <Border
                 x:Name="RightColumnBorder"
                 Grid.Column="2"
-                Margin="14,18,14,14"
-                Padding="14,12,14,8"
-                VerticalAlignment="Stretch"
-                Background="{StaticResource PanelBrush}"
+                Width="0"
+                Background="{StaticResource AmoledBrush}"
                 BorderBrush="{StaticResource LineBrush}"
-                BorderThickness="1"
-                CornerRadius="12"
+                BorderThickness="1,0,0,0"
                 Visibility="Collapsed">
-                <Grid>
+                <!-- Fixed-width content: the border's own Width is what animates, so the rail SLIDES
+                     out of the edge and its text never rewraps on the way. -->
+                <Grid Width="320" HorizontalAlignment="Left">
                     <Grid.RowDefinitions>
                         <RowDefinition Height="Auto" />
                         <RowDefinition Height="Auto" />
                         <RowDefinition Height="*" />
                     </Grid.RowDefinitions>
 
-                    <Grid>
+                    <Grid Padding="14,12,8,0">
                         <Grid.ColumnDefinitions>
                             <ColumnDefinition Width="*" />
                             <ColumnDefinition Width="Auto" />
@@ -676,20 +702,53 @@
                         </StackPanel>
                     </Grid>
 
-                    <StackPanel Grid.Row="1" Margin="0,8,0,0" Orientation="Horizontal" Spacing="2">
-                        <Button x:Name="InspectorTabIntegrity" Click="InspectorTab_Click" Style="{StaticResource TabButtonStyle}" Tag="Integrity">
-                            <TextBlock Text="Integrity" />
-                        </Button>
-                        <Button x:Name="InspectorTabContext" Click="InspectorTab_Click" Style="{StaticResource TabButtonStyle}" Tag="Context">
-                            <TextBlock Text="Context" />
-                        </Button>
-                        <Button x:Name="InspectorTabActivity" Click="InspectorTab_Click" Style="{StaticResource TabButtonStyle}" Tag="Activity">
-                            <TextBlock Text="Activity" />
-                        </Button>
-                        <Button x:Name="InspectorTabActions" Click="InspectorTab_Click" Style="{StaticResource TabButtonStyle}" Tag="Actions">
-                            <TextBlock Text="Actions" />
-                        </Button>
-                    </StackPanel>
+                    <!-- One segmented control in one container: the four tabs are segments of a single
+                         strip, not four buttons floating on the rail. -->
+                    <Border
+                        Grid.Row="1"
+                        Margin="14,10,14,0"
+                        Padding="2"
+                        Background="{StaticResource RaisedBrush}"
+                        BorderBrush="{StaticResource LineBrush}"
+                        BorderThickness="1"
+                        CornerRadius="9">
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="*" />
+                            </Grid.ColumnDefinitions>
+                            <Button
+                                x:Name="InspectorTabIntegrity"
+                                Grid.Column="0"
+                                Click="InspectorTab_Click"
+                                Content="Integrity"
+                                Style="{StaticResource SegmentButtonStyle}"
+                                Tag="Integrity" />
+                            <Button
+                                x:Name="InspectorTabContext"
+                                Grid.Column="1"
+                                Click="InspectorTab_Click"
+                                Content="Context"
+                                Style="{StaticResource SegmentButtonStyle}"
+                                Tag="Context" />
+                            <Button
+                                x:Name="InspectorTabActivity"
+                                Grid.Column="2"
+                                Click="InspectorTab_Click"
+                                Content="Activity"
+                                Style="{StaticResource SegmentButtonStyle}"
+                                Tag="Activity" />
+                            <Button
+                                x:Name="InspectorTabActions"
+                                Grid.Column="3"
+                                Click="InspectorTab_Click"
+                                Content="Actions"
+                                Style="{StaticResource SegmentButtonStyle}"
+                                Tag="Actions" />
+                        </Grid>
+                    </Border>
 
                     <ScrollViewer
                         x:Name="RightPanel"
@@ -697,108 +756,142 @@
                         Margin="0,10,0,0"
                         HorizontalScrollBarVisibility="Disabled"
                         VerticalScrollBarVisibility="Auto">
-                        <Grid>
-                            <StackPanel x:Name="InspectorIntegrityPanel" Spacing="8">
-                                <Button
-                                    Click="RefreshIntegrity_Click"
-                                    HorizontalAlignment="Left"
-                                    Style="{StaticResource PillButtonStyle}"
-                                    ToolTipService.ToolTip="Refresh custody checks for this chat">
-                                    <StackPanel Orientation="Horizontal" Spacing="6">
-                                        <SymbolIcon Symbol="Refresh" />
-                                        <TextBlock Text="Re-check" />
+                        <Grid Margin="14,0,14,12">
+                            <!-- Integrity: the re-check affordance is the section's first row, and every
+                                 item the oracle produces is a row under it. -->
+                            <StackPanel x:Name="InspectorIntegrityPanel">
+                                <Border Style="{StaticResource InspectorSectionStyle}">
+                                    <StackPanel>
+                                        <Button
+                                            Click="RefreshIntegrity_Click"
+                                            Style="{StaticResource InspectorRowButtonStyle}"
+                                            ToolTipService.ToolTip="Refresh custody checks for this chat">
+                                            <StackPanel Orientation="Horizontal" Spacing="8">
+                                                <FontIcon FontFamily="Segoe Fluent Icons" FontSize="12" Glyph="&#xE72C;" />
+                                                <TextBlock Text="Re-check" />
+                                            </StackPanel>
+                                        </Button>
+                                        <Border Style="{StaticResource InspectorDividerStyle}" />
+                                        <StackPanel x:Name="IntegrityItems" />
                                     </StackPanel>
-                                </Button>
-                                <StackPanel x:Name="IntegrityItems" Spacing="6" />
+                                </Border>
                             </StackPanel>
 
-                            <StackPanel x:Name="InspectorContextPanel" Spacing="8" Visibility="Collapsed">
-                                <StackPanel x:Name="ContextItems" Spacing="6" />
-                                <Border Height="1" Background="{StaticResource LineBrush}" />
-                                <Grid>
-                                    <Grid.ColumnDefinitions>
-                                        <ColumnDefinition Width="*" />
-                                        <ColumnDefinition Width="Auto" />
-                                    </Grid.ColumnDefinitions>
-                                    <TextBlock
-                                        VerticalAlignment="Center"
-                                        FontSize="14"
-                                        FontWeight="SemiBold"
-                                        Foreground="{StaticResource TextStrongBrush}"
-                                        Text="Tags" />
-                                    <Button
-                                        x:Name="AddTagButton"
-                                        Grid.Column="1"
-                                        Padding="10,2"
-                                        Click="AddTag_Click"
-                                        Style="{StaticResource PillButtonStyle}"
-                                        ToolTipService.ToolTip="Add a tag to this chat">
-                                        <TextBlock FontSize="12" Text="+ Tag" />
-                                    </Button>
-                                </Grid>
-                                <StackPanel x:Name="TagsItems" Spacing="6" />
+                            <!-- Context: what the chat IS, then the tags it carries - one section. -->
+                            <StackPanel x:Name="InspectorContextPanel" Visibility="Collapsed">
+                                <Border Style="{StaticResource InspectorSectionStyle}">
+                                    <StackPanel>
+                                        <StackPanel x:Name="ContextItems" />
+                                        <Border Style="{StaticResource InspectorDividerStyle}" />
+                                        <Grid Padding="10,8">
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="*" />
+                                                <ColumnDefinition Width="Auto" />
+                                            </Grid.ColumnDefinitions>
+                                            <TextBlock
+                                                VerticalAlignment="Center"
+                                                FontSize="12"
+                                                FontWeight="SemiBold"
+                                                Foreground="{StaticResource TextStrongBrush}"
+                                                Text="Tags" />
+                                            <Button
+                                                x:Name="AddTagButton"
+                                                Grid.Column="1"
+                                                MinHeight="26"
+                                                Padding="8,2"
+                                                CornerRadius="6"
+                                                BorderThickness="0"
+                                                Background="Transparent"
+                                                Foreground="{StaticResource TextMutedBrush}"
+                                                Click="AddTag_Click"
+                                                ToolTipService.ToolTip="Add a tag to this chat">
+                                                <StackPanel Orientation="Horizontal" Spacing="6">
+                                                    <FontIcon FontFamily="Segoe Fluent Icons" FontSize="11" Glyph="&#xE710;" />
+                                                    <TextBlock FontSize="12" Text="Tag" />
+                                                </StackPanel>
+                                            </Button>
+                                        </Grid>
+                                        <Border Style="{StaticResource InspectorDividerStyle}" />
+                                        <StackPanel x:Name="TagsItems" Padding="10,8" />
+                                    </StackPanel>
+                                </Border>
                             </StackPanel>
 
-                            <StackPanel x:Name="InspectorActivityPanel" Spacing="8" Visibility="Collapsed">
-                                <StackPanel x:Name="ActivityItems" Spacing="8" />
+                            <!-- Activity: what the chat has been doing - one section of rows. -->
+                            <StackPanel x:Name="InspectorActivityPanel" Visibility="Collapsed">
+                                <Border Style="{StaticResource InspectorSectionStyle}">
+                                    <StackPanel x:Name="ActivityItems" />
+                                </Border>
                             </StackPanel>
 
-                            <StackPanel x:Name="InspectorActionsPanel" Spacing="4" Visibility="Collapsed">
-                                <Button
-                                    x:Name="ResumeMultiplexButton"
-                                    Content="Resume multiplex"
-                                    Style="{StaticResource ActionCardButtonStyle}"
-                                    ToolTipService.ToolTip="Start this chat in multiplex with its stored launcher or explicitly through Gateway.">
-                                    <Button.Flyout>
-                                        <MenuFlyout>
-                                            <MenuFlyoutItem Text="Start multiplex" Click="ResumeInMultiplex_Click" />
-                                            <MenuFlyoutItem
-                                                x:Name="QuickGatewayMultiplexItem"
-                                                Text="Start Gateway multiplex"
-                                                Click="ResumeInGatewayMultiplex_Click" />
-                                        </MenuFlyout>
-                                    </Button.Flyout>
-                                </Button>
-                                <Button
-                                    x:Name="ResumeHeadlessMultiplexButton"
-                                    Content="Resume headless multiplex"
-                                    Style="{StaticResource ActionCardButtonStyle}"
-                                    ToolTipService.ToolTip="Start this chat headlessly with its stored launcher or explicitly through Gateway.">
-                                    <Button.Flyout>
-                                        <MenuFlyout>
-                                            <MenuFlyoutItem Text="Start headless multiplex" Click="ResumeInHeadlessMultiplex_Click" />
-                                            <MenuFlyoutItem
-                                                x:Name="QuickGatewayHeadlessItem"
-                                                Text="Start Gateway headless multiplex"
-                                                Click="ResumeInGatewayHeadlessMultiplex_Click" />
-                                        </MenuFlyout>
-                                    </Button.Flyout>
-                                </Button>
-                                <Button
-                                    x:Name="AddToProjectButton"
-                                    Click="AddToProject_Click"
-                                    Content="Add to project"
-                                    Style="{StaticResource ActionCardButtonStyle}" />
-                                <Button
-                                    x:Name="CopyCommandButton"
-                                    Click="CopyCommand_Click"
-                                    Content="Copy resume command"
-                                    Style="{StaticResource ActionCardButtonStyle}"
-                                    ToolTipService.ToolTip="Copy the trusted command for this chat's stored launcher, including Gateway (cc)." />
-                                <Button
-                                    x:Name="CopyGatewayCommandButton"
-                                    Click="CopyGatewayCommand_Click"
-                                    Content="Copy Gateway command"
-                                    Style="{StaticResource ActionCardButtonStyle}"
-                                    ToolTipService.ToolTip="Copy the trusted cc.cmd Gateway resume command for this Claude chat." />
-                                <Button
-                                    Click="Restore_Click"
-                                    Content="Build restore packet"
-                                    Style="{StaticResource ActionCardButtonStyle}" />
-                                <Button
-                                    Click="Source_Click"
-                                    Content="Inspect raw events"
-                                    Style="{StaticResource ActionCardButtonStyle}" />
+                            <!-- Actions: commands are rows of one section, divided by hairlines, not
+                                 cards floating on the rail. -->
+                            <StackPanel x:Name="InspectorActionsPanel" Visibility="Collapsed">
+                                <Border Style="{StaticResource InspectorSectionStyle}">
+                                    <StackPanel>
+                                        <Button
+                                            x:Name="ResumeMultiplexButton"
+                                            Content="Resume multiplex"
+                                            Style="{StaticResource InspectorRowButtonStyle}"
+                                            ToolTipService.ToolTip="Start this chat in multiplex with its stored launcher or explicitly through Gateway.">
+                                            <Button.Flyout>
+                                                <MenuFlyout>
+                                                    <MenuFlyoutItem Text="Start multiplex" Click="ResumeInMultiplex_Click" />
+                                                    <MenuFlyoutItem
+                                                        x:Name="QuickGatewayMultiplexItem"
+                                                        Text="Start Gateway multiplex"
+                                                        Click="ResumeInGatewayMultiplex_Click" />
+                                                </MenuFlyout>
+                                            </Button.Flyout>
+                                        </Button>
+                                        <Border Style="{StaticResource InspectorDividerStyle}" />
+                                        <Button
+                                            x:Name="ResumeHeadlessMultiplexButton"
+                                            Content="Resume headless multiplex"
+                                            Style="{StaticResource InspectorRowButtonStyle}"
+                                            ToolTipService.ToolTip="Start this chat headlessly with its stored launcher or explicitly through Gateway.">
+                                            <Button.Flyout>
+                                                <MenuFlyout>
+                                                    <MenuFlyoutItem Text="Start headless multiplex" Click="ResumeInHeadlessMultiplex_Click" />
+                                                    <MenuFlyoutItem
+                                                        x:Name="QuickGatewayHeadlessItem"
+                                                        Text="Start Gateway headless multiplex"
+                                                        Click="ResumeInGatewayHeadlessMultiplex_Click" />
+                                                </MenuFlyout>
+                                            </Button.Flyout>
+                                        </Button>
+                                        <Border Style="{StaticResource InspectorDividerStyle}" />
+                                        <Button
+                                            x:Name="AddToProjectButton"
+                                            Click="AddToProject_Click"
+                                            Content="Add to project"
+                                            Style="{StaticResource InspectorRowButtonStyle}" />
+                                        <Border Style="{StaticResource InspectorDividerStyle}" />
+                                        <Button
+                                            x:Name="CopyCommandButton"
+                                            Click="CopyCommand_Click"
+                                            Content="Copy resume command"
+                                            Style="{StaticResource InspectorRowButtonStyle}"
+                                            ToolTipService.ToolTip="Copy the trusted command for this chat's stored launcher, including Gateway (cc)." />
+                                        <Border Style="{StaticResource InspectorDividerStyle}" />
+                                        <Button
+                                            x:Name="CopyGatewayCommandButton"
+                                            Click="CopyGatewayCommand_Click"
+                                            Content="Copy Gateway command"
+                                            Style="{StaticResource InspectorRowButtonStyle}"
+                                            ToolTipService.ToolTip="Copy the trusted cc.cmd Gateway resume command for this Claude chat." />
+                                        <Border Style="{StaticResource InspectorDividerStyle}" />
+                                        <Button
+                                            Click="Restore_Click"
+                                            Content="Build restore packet"
+                                            Style="{StaticResource InspectorRowButtonStyle}" />
+                                        <Border Style="{StaticResource InspectorDividerStyle}" />
+                                        <Button
+                                            Click="Source_Click"
+                                            Content="Inspect raw events"
+                                            Style="{StaticResource InspectorRowButtonStyle}" />
+                                    </StackPanel>
+                                </Border>
                             </StackPanel>
                         </Grid>
                     </ScrollViewer>

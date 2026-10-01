@@ -8,6 +8,7 @@ using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Input;
 using Microsoft.UI.Xaml.Media;
+using Microsoft.UI.Xaml.Media.Animation;
 
 namespace CodexLocalRetrieval_Native;
 
@@ -31,6 +32,13 @@ public sealed partial class MainPage
     // that is what the app opens on; "archived" is retired; "unvetted" is the general populace everything
     // lands in. Separate from the text/tag filters: this chooses the tier, they narrow within it.
     private string _chatScope = "active";
+
+    // The rail's own Width is what animates, and the column that holds it is Auto - so the rail slides
+    // out of the window edge and the centre column gains and gives the space back as it goes. null means
+    // the rail has never been laid out yet: the first pass snaps to the remembered state rather than
+    // replaying the transition on startup.
+    private bool? _inspectorShown;
+    private Storyboard? _inspectorSlide;
 
     private static readonly string[] InspectorTabNames = { "Integrity", "Context", "Activity", "Actions" };
 
@@ -73,8 +81,7 @@ public sealed partial class MainPage
             && sessionContext
             && !readOnlySnapshot
             && (_inspectorPinned || !_narrowLayout);
-        RightColumnBorder.Visibility = showInspector ? Visibility.Visible : Visibility.Collapsed;
-        RightColumn.Width = showInspector ? new GridLength(InspectorWidth) : new GridLength(0);
+        ApplyInspectorRail(showInspector);
 
         ChatsPane.Visibility = _toolsPaneOpen ? Visibility.Collapsed : Visibility.Visible;
         ToolsPane.Visibility = _toolsPaneOpen ? Visibility.Visible : Visibility.Collapsed;
@@ -189,6 +196,62 @@ public sealed partial class MainPage
     }
 
     // ---- right pane: inspector ------------------------------------------------------------------
+
+    // The rail is chrome, not a card: it is docked to the window's right edge and its width is the only
+    // thing that moves, so opening and closing reads as the rail sliding out and back rather than a panel
+    // appearing and vanishing. Called from ApplyShellLayout, which is the one place that decides the frame.
+    private void ApplyInspectorRail(bool showInspector)
+    {
+        if (_inspectorShown == showInspector)
+        {
+            // Not a transition - just keep the width honest in case something else touched it.
+            if (showInspector) RightColumnBorder.Width = InspectorWidth;
+            return;
+        }
+
+        var first = _inspectorShown is null;
+        _inspectorShown = showInspector;
+
+        if (first)
+        {
+            // Startup: land in the remembered state without animating into it.
+            _inspectorSlide?.Stop();
+            _inspectorSlide = null;
+            RightColumnBorder.Width = showInspector ? InspectorWidth : 0;
+            RightColumnBorder.Visibility = showInspector ? Visibility.Visible : Visibility.Collapsed;
+            return;
+        }
+
+        if (showInspector) RightColumnBorder.Visibility = Visibility.Visible;
+        SlideInspectorTo(showInspector ? InspectorWidth : 0, hideAtEnd: !showInspector);
+    }
+
+    private void SlideInspectorTo(double width, bool hideAtEnd)
+    {
+        _inspectorSlide?.Stop();
+        var animation = new DoubleAnimation
+        {
+            To = width,
+            Duration = new Duration(TimeSpan.FromMilliseconds(150)),
+            // Width drives layout, so this is a dependent animation and must opt in explicitly.
+            EnableDependentAnimation = true,
+        };
+        Storyboard.SetTarget(animation, RightColumnBorder);
+        Storyboard.SetTargetProperty(animation, "Width");
+
+        var storyboard = new Storyboard();
+        storyboard.Children.Add(animation);
+        if (hideAtEnd)
+        {
+            storyboard.Completed += (_, _) =>
+            {
+                // A reopen part-way through the collapse must not be blanked by the close finishing.
+                if (_inspectorShown == false) RightColumnBorder.Visibility = Visibility.Collapsed;
+            };
+        }
+        _inspectorSlide = storyboard;
+        storyboard.Begin();
+    }
 
     private void InspectorToggle_Click(object sender, RoutedEventArgs e) => ToggleInspector();
 
@@ -310,25 +373,38 @@ public sealed partial class MainPage
             AddFact("Handoff from", session.HandoffFromId);
         if (session.IsReadOnlySnapshot) AddFact("Access", "read-only checkpoint");
 
+        // Facts are one block of label/value rows inside the section: a fixed label column keeps the values
+        // aligned so the tab scans as a definition list rather than a stack of loose text.
         void AddFact(string label, string value)
         {
-            var stack = new StackPanel { Spacing = 1 };
-            stack.Children.Add(new TextBlock
+            var row = new Grid
             {
-                Text = label.ToUpperInvariant(),
+                ColumnDefinitions =
+                {
+                    new ColumnDefinition { Width = new GridLength(86) },
+                    new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) }
+                },
+                ColumnSpacing = 10,
+                Padding = new Thickness(12, 6, 12, 6)
+            };
+            row.Children.Add(new TextBlock
+            {
+                Text = label,
                 Foreground = MutedBrush(),
-                FontSize = 10,
-                FontWeight = FontWeights.SemiBold
+                FontSize = 11,
+                VerticalAlignment = VerticalAlignment.Top
             });
-            stack.Children.Add(new TextBlock
+            var text = new TextBlock
             {
                 Text = value,
                 Foreground = StrongBrush(),
                 FontSize = 12,
                 TextWrapping = TextWrapping.Wrap,
                 LineHeight = 16
-            });
-            ContextItems.Children.Add(stack);
+            };
+            Grid.SetColumn(text, 1);
+            row.Children.Add(text);
+            ContextItems.Children.Add(row);
         }
     }
 
@@ -343,45 +419,53 @@ public sealed partial class MainPage
         // "Checking session state..." would be a spinner that can never finish. Say so instead.
         if (GuiVerificationFixture.Enabled)
         {
-            ActivityItems.Children.Add(IntegrityChip("Isolated metadata fixture; runtime actions disabled"));
+            AddInspectorRow(ActivityItems, IntegrityChip("Isolated metadata fixture; runtime actions disabled"));
             return;
         }
         if (_selected is null)
         {
-            ActivityItems.Children.Add(new TextBlock { Text = "No chat selected", Foreground = MutedBrush(), FontSize = 12 });
+            AddInspectorRow(ActivityItems, new TextBlock { Text = "No chat selected", Foreground = MutedBrush(), FontSize = 12, Padding = InspectorRowPadding() });
             return;
         }
 
         var summary = _integrity.CurrentFor(IntegrityKey(_selected));
         if (summary is null)
         {
-            ActivityItems.Children.Add(new TextBlock { Text = "Checking session state...", Foreground = MutedBrush(), FontSize = 12 });
+            AddInspectorRow(ActivityItems, new TextBlock { Text = "Checking session state...", Foreground = MutedBrush(), FontSize = 12, Padding = InspectorRowPadding() });
             return;
         }
 
-        var chips = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 6 };
-        chips.Children.Add(IntegrityChip(summary.LiveVerified ? "live verified" : "not live"));
-        chips.Children.Add(IntegrityChip(summary.SourceStatus));
-        chips.Children.Add(IntegrityChip(summary.MuxTabs.Count == 0 ? "no mux custody" : summary.MuxTabs.Count + " mux tab" + (summary.MuxTabs.Count == 1 ? "" : "s")));
-        ActivityItems.Children.Add(chips);
+        // The state of the chat as one row of facts, the same shape the Context tab uses for its facts.
+        var status = new List<string> { summary.LiveVerified ? "live verified" : "not live", summary.SourceStatus };
+        status.Add(summary.MuxTabs.Count == 0
+            ? "no mux custody"
+            : summary.MuxTabs.Count + " mux tab" + (summary.MuxTabs.Count == 1 ? "" : "s"));
+        AddInspectorRow(ActivityItems, new TextBlock
+        {
+            Text = string.Join("  ·  ", status),
+            Foreground = MutedBrush(),
+            FontSize = 11,
+            TextWrapping = TextWrapping.Wrap,
+            Padding = InspectorRowPadding()
+        });
 
         if (summary.MuxTabs.Count > 0)
-            ActivityItems.Children.Add(IntegrityEvidenceBlock("Mux custody", summary.MuxTabs.Take(3).Select(t =>
+            AddInspectorRow(ActivityItems, IntegrityEvidenceBlock("Mux custody", summary.MuxTabs.Take(3).Select(t =>
                 $"{t.Name}: {(t.IsCurrent ? "current" : "history")}{(string.IsNullOrWhiteSpace(t.Kind) ? "" : " - " + t.Kind)}")));
 
         if (summary.LaunchClaims.Count > 0)
-            ActivityItems.Children.Add(IntegrityEvidenceBlock("Launch claims", summary.LaunchClaims.Take(3).Select(c =>
+            AddInspectorRow(ActivityItems, IntegrityEvidenceBlock("Launch claims", summary.LaunchClaims.Take(3).Select(c =>
                 $"{(c.Expired ? "expired" : "active")} - {c.OwnerProcess} pid {c.OwnerPid}")));
 
         if (summary.PendingIntents.Count > 0)
-            ActivityItems.Children.Add(IntegrityEvidenceBlock("Pending filing", summary.PendingIntents.Take(3).Select(p =>
+            AddInspectorRow(ActivityItems, IntegrityEvidenceBlock("Pending filing", summary.PendingIntents.Take(3).Select(p =>
                 $"{p.Tool} - {p.Workspace}")));
 
         if (summary.RecentEvents.Count > 0)
-            ActivityItems.Children.Add(IntegrityEvidenceBlock("Recent events", summary.RecentEvents.Take(6).Select(e =>
+            AddInspectorRow(ActivityItems, IntegrityEvidenceBlock("Recent events", summary.RecentEvents.Take(6).Select(e =>
                 $"{e.Kind}: {Trim(e.Summary, 92)}")));
         else
-            ActivityItems.Children.Add(new TextBlock { Text = "No recorded events for this chat.", Foreground = MutedBrush(), FontSize = 12 });
+            AddInspectorRow(ActivityItems, new TextBlock { Text = "No recorded events for this chat.", Foreground = MutedBrush(), FontSize = 12, Padding = InspectorRowPadding() });
     }
 
     // ---- top bar: compact --------------------------------------------------------------------------
