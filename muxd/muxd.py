@@ -1496,12 +1496,30 @@ ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)
 STALE_CSI_RE = re.compile(r"\[[0-?]*[ -/]*[@-~]")
 CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 PRIVATE_MODE_RE = re.compile(br"\x1b\[\?([0-9;]+)([hl])")
+# Cursor-position queries: CSI ?6n (DECXCPR) and its plain CSI 6n twin. These are REQUESTS the app
+# writes to its own pty, never output that renders anything, so they are stripped from replay.
+DSR_QUERY_RE = re.compile(br"\x1b\[\??6n")
 # Alt-screen/bracketed-paste PLUS the mouse-tracking family: a viewer that attaches after the
 # app's ?1000h/?1006h scrolled out of the ring must still learn that the app owns the wheel,
 # or its wheel input falls back to arrow keys / dies entirely (the "can't scroll a TUI" bug).
 # DECCKM (?1) rides along so viewers pick the right arrow encoding (SS3 vs CSI) for that fallback
 # and for real cursor keys; readline treats both forms as arrows, so a dead TUI can't wedge input.
 REPLAY_PRIVATE_MODES = frozenset((1, 47, 1047, 1049, 2004, 9, 1000, 1002, 1003, 1005, 1006, 1007, 1015))
+
+
+def strip_replay_dsr(data):
+    """Drop historical cursor-position queries from a replay payload.
+
+    A TUI that probes its pty with CSI ?6n leaves those requests in the ring forever. A viewer
+    attaching later replays them and answers a BURST of stale cursor-position reports, which is
+    what stops the Gateway inline renderer settling its mouse arm (measured: 5946 replayed
+    probes vs 2 on an already-settled session). The queries are requests, not output - removing
+    them from replay changes nothing that renders - and the DECSET/DECRST reassertion in
+    TerminalReplayState.prefix() is emitted separately and is left untouched.
+    """
+    if b"\x1b[?6n" not in data and b"\x1b[6n" not in data:
+        return data
+    return DSR_QUERY_RE.sub(b"", data)
 
 
 def launch_candidate_ids(cmd="", ids=None):
@@ -3015,7 +3033,7 @@ class Session:
         for b in reversed(self._ring_snapshot()):
             out.append(b); n += len(b)
             if n >= limit: break
-        return self.replay_state.prefix() + b"".join(reversed(out))
+        return self.replay_state.prefix() + strip_replay_dsr(b"".join(reversed(out)))
 
     def tail_text(self, nbytes=1600, lines=0):
         raw = bytearray()
@@ -3171,7 +3189,7 @@ class OwnerSession:
         for b in reversed(self._ring_snapshot()):
             out.append(b); n += len(b)
             if n >= limit: break
-        return self.replay_state.prefix() + b"".join(reversed(out))
+        return self.replay_state.prefix() + strip_replay_dsr(b"".join(reversed(out)))
 
     def tail_text(self, nbytes=1600, lines=0):
         raw = bytearray()

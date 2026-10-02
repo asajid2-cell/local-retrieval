@@ -240,6 +240,65 @@ class MuxdStateTests(unittest.TestCase):
         finally:
             loop.close()
 
+    def test_strip_replay_dsr_removes_cursor_position_queries_only(self):
+        # Both query forms go; everything else in the stream survives byte-for-byte.
+        mixed = (b"\x1b[?6n" b"\x1b[6n" b"keep" b"\x1b[2J"
+                 b"\x1b[?1049h" b"\x1b[?16n" b"\x1b[?6;1n" b"\x1b[>0q")
+        self.assertEqual(
+            muxd.strip_replay_dsr(mixed),
+            b"keep\x1b[2J\x1b[?1049h\x1b[?16n\x1b[?6;1n\x1b[>0q",
+        )
+        # The common case (no query) is returned as the identical object, not a copy.
+        plain = b"no probes here\x1b[?1000h"
+        self.assertIs(muxd.strip_replay_dsr(plain), plain)
+
+    def test_scrollback_drops_historical_probe_queries_but_keeps_modes_and_text(self):
+        loop = asyncio.new_event_loop()
+        try:
+            session = muxd.Session(
+                "probe-flood-session",
+                "",
+                r"Z:\tmp",
+                100,
+                30,
+                loop,
+                asyncio.Queue(),
+                spawn_now=False,
+            )
+            # The app arms its mouse and probes repeatedly; the probes pile up in the ring forever.
+            stream = (b"\x1b[?1049h\x1b[?1000h\x1b[?1006h"
+                      b"CURRENT_TUI_FRAME"
+                      b"\x1b[?6n\x1b[6n" b"\x1b[?6n\x1b[6n" b"\x1b[?6n\x1b[6n")
+            session.replay_state.ingest(stream)
+            session._append_ring(stream)
+
+            replay = session.scrollback()
+            self.assertNotIn(b"\x1b[?6n", replay, "replayed probe queries are what flood a fresh viewer")
+            self.assertNotIn(b"\x1b[6n", replay)
+            for mode in (b"\x1b[?1049h", b"\x1b[?1000h", b"\x1b[?1006h"):
+                self.assertIn(mode, replay, "mode reassertion must survive the strip")
+            self.assertIn(b"CURRENT_TUI_FRAME", replay, "the strip must not eat real output")
+        finally:
+            loop.close()
+
+    def test_owner_scrollback_drops_historical_probe_queries_but_keeps_modes_and_text(self):
+        owner = muxd.OwnerSession(
+            "probe-flood-owner",
+            "",
+            r"Z:\tmp",
+            100,
+            30,
+            None,
+            None,
+            None,
+        )
+        owner.ingest(b"\x1b[?1000h\x1b[?1006hOWNER_FRAME\x1b[?6n\x1b[6n\x1b[?6n\x1b[6n")
+        replay = owner.scrollback()
+        self.assertNotIn(b"\x1b[?6n", replay)
+        self.assertNotIn(b"\x1b[6n", replay)
+        self.assertTrue(replay.startswith(b"\x1b[?1000h\x1b[?1006h"))
+        self.assertIn(b"OWNER_FRAME", replay)
+
     def test_all_pywinpty_spawns_are_inside_the_custody_critical_section(self):
         with open(muxd.__file__, encoding="utf-8") as stream:
             tree = ast.parse(stream.read())
