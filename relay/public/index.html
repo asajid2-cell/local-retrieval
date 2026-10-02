@@ -1376,7 +1376,7 @@ function reloadTerminal(quiet){
   connect(name, true);   // re-attach: CLEAR + scrollback replay + live, all client state reset
 }
 document.addEventListener('keydown', e=>{ if(e.ctrlKey && e.altKey && (e.key==='r'||e.key==='R')){ e.preventDefault(); e.stopPropagation(); reloadTerminal(); } }, true);
-window.__muxBuild='2026-09-26-phone-follows-app-redraw';   // bump per web deploy so a loaded version is verifiable
+window.__muxBuild='2026-10-01-gateway-seam-xtversion-and-mouse-modes';   // bump per web deploy so a loaded version is verifiable
 try{ console.info('multiplex build', window.__muxBuild); }catch(e){}
 const helper = $('#term').querySelector('.xterm-helper-textarea');
 function hardenHelperTextarea(){
@@ -1891,7 +1891,7 @@ window.addEventListener('orientationchange', ()=>setTimeout(applyViewport,250));
         // Only the xterm-scrollback branch moves THIS viewport, so only it records a user scroll. The two
         // app-owned branches leave the surface where it was, and claiming otherwise parked the phone off
         // the app's real content: the app's redraw then looked like it was fighting a user scroll-up.
-        if(!sendOwnerWheel(-lines*ch, t.clientX, t.clientY)){
+        if(!sendOwnerWheel(-lines*ch, t.clientX, t.clientY, true)){
           if(term.buffer.active.type==='alternate') scrollAlternate(-lines*ch);
           else { noteUserScroll(); try{ term.scrollLines(-lines); }catch(e){} }
         }
@@ -1905,32 +1905,88 @@ window.addEventListener('orientationchange', ()=>setTimeout(applyViewport,250));
 })();
 
 function isVisibleOwner(){ return !!(current && findSession(current)?.owner); }
-function sendOwnerWheel(deltaY, clientX, clientY){
-  if(!isVisibleOwner() || !deltaY) return false;
+// WHOSE SCREEN IS THIS? The alternate screen is the APP's: it has no scrollback and the app is the only
+// thing that can move its own content. The normal buffer is the HOST's: the mirror holds that session's
+// whole output, so the wheel scrolls it instantly with no round trip and a plain drag selects. That
+// normal-buffer rule is the deliberate, recorded divergence in docs/scroll-parity.json
+// (web/normal/tracking=true/*) -- a TUI that leaked DECSET 1000 and died would otherwise freeze the
+// scrollback forever, with no local console to fall back on. Getting this wrong is what made a shell's wheel
+// look dead: the reports were forwarded into the shell's stdin as escape bytes while the mirror's own
+// scrollback sat unused.
+function appOwnsScreen(){
+  try{ return term.buffer.active.type==='alternate'; }catch(e){ return false; }
+}
+// Did the app actually ASK for the mouse? mouseGuard reads the DECSET/DECRST stream out of the session's own
+// output, so a bare shell -- or a pager that never enabled reporting -- answers no and the gesture stays the
+// client's. inputAllowed(), not mouseActive(): the former is what we are willing to forward. Without this a
+// press built here went straight to the app's stdin (sendMouseInput does NOT pass through stripMouseReports)
+// and a shell echoed it back as garbage, while the drag that should have selected text was eaten.
+function appTakesMouse(){ try{ return mouseGuard.inputAllowed(); }catch(e){ return false; } }
+// One physical wheel notch is ~100-120 px in every engine, but a trackpad reports the same motion as dozens
+// of 2-8 px events. Rounding each event on its own turned one flick into ~30 scroll steps and ~30 round
+// trips (measured: 30 reports for a 30-event flick), so a continuous device accumulates and only advances
+// when a notch's worth has built up. The remainder carries, which is what makes small steps smooth instead
+// of being dropped or forced up to a whole unit each time. A DISCRETE event (line/page mode, or one whole
+// notch in pixel mode) is its own step and always advances, so a real notch still moves the moment it turns.
+const WHEEL_NOTCH_PX = 100;
+let wheelAcc = 0, wheelAccAt = 0;
+function wheelPx(e, ch){
+  const rows = (term.rows|0) || 24;
+  return e.deltaMode===1 ? e.deltaY*ch : (e.deltaMode===2 ? e.deltaY*rows*ch : e.deltaY);
+}
+function wheelDiscrete(e, px, step){ return e.deltaMode!==0 || Math.abs(px)>=step; }
+function wheelAdvance(px, step){
+  const now=Date.now();
+  if(now-wheelAccAt>250) wheelAcc=0;   // a fresh gesture starts clean, so a stale remainder cannot leak in
+  wheelAccAt=now;
+  wheelAcc+=px;
+  const units=Math.trunc(wheelAcc/step);
+  if(units) wheelAcc-=units*step;
+  return units;
+}
+function sendOwnerWheel(px, clientX, clientY, discrete){
+  if(!isVisibleOwner() || !appOwnsScreen() || !appTakesMouse() || !px) return false;
   const cell=bufferCellAt(clientX, clientY);
   if(!cell) return false;
-  const button=deltaY<0 ? 64 : 65;
-  const ticks=Math.min(8, Math.max(1, Math.round(Math.abs(deltaY)/120)));
+  const button=px<0 ? 64 : 65;
+  const ticks = discrete
+    ? Math.max(1, Math.min(8, Math.round(Math.abs(px)/WHEEL_NOTCH_PX)))
+    : wheelAdvance(px, WHEEL_NOTCH_PX);
+  if(!ticks) return false;
+  // wheelAdvance returns SIGNED units, and the direction already rides in the button (64 up / 65 down), so
+  // the count to emit is the magnitude. Looping to a negative bound emitted nothing at all: a wheel-up
+  // flick accumulated a whole notch and then silently sent no report.
+  const n=Math.abs(ticks);
   const report=`\x1b[<${button};${cell[0]+1};${cell[1]-(term.buffer.active.viewportY|0)+1}M`;
-  for(let i=0; i<ticks; i++) sendMouseInput(report);
+  // One frame per EVENT, not per notch: the reports are identical bytes, the PTY is a byte stream, and the app
+  // redraws once instead of n times. A flick used to leave as n separate websocket frames.
+  sendMouseInput(report.repeat(n));
   return true;
 }
-// Owner-backed consoles forward wheel records directly; their browser mirror has no pre-attach VT
-// mode history. Headless sessions keep xterm scrollback in the normal buffer and app scrolling in alt.
+// A wheel record goes to the app only when the app owns the screen (see appOwnsScreen); on a shell the
+// mirror scrolls its own scrollback, which is instant. The app path is the same record the app already
+// understands, so nothing about a full-screen TUI changes here.
 $('#term').addEventListener('wheel', e=>{
   if(!e.isTrusted) return;   // synthetic forwarding must reach xterm, not recurse through this capture handler
   if(!(e.deltaX || e.deltaY)) return;
   noteUserScroll();
   const host=$('#term'), xt=host.querySelector('.xterm');
-  if(isVisibleOwner() && sendOwnerWheel(e.deltaY, e.clientX, e.clientY)){
+  const px = wheelPx(e, (cellMetrics().h)||18);
+  // Ownership is exclusive: when the app owns the screen AND asked for the mouse, the wheel is the app's,
+  // even for an event that does not yet complete a notch. Falling through to the local scrollback here
+  // scrolled the mirror behind the app's back AND spent the accumulator twice at two different steps, so no
+  // notch ever completed and a trackpad flick produced no report at all.
+  if(isVisibleOwner() && appOwnsScreen() && appTakesMouse()){
+    sendOwnerWheel(px, e.clientX, e.clientY, wheelDiscrete(e, px, WHEEL_NOTCH_PX));
     e.preventDefault(); e.stopPropagation();
     return;
   }
   let alt=false; try{ alt = term.buffer.active.type==='alternate'; }catch(_){}
   if(!alt){
     const ch=(cellMetrics().h)||18;
-    const px = e.deltaMode===1 ? e.deltaY*ch : (e.deltaMode===2 ? e.deltaY*(term.rows||24)*ch : e.deltaY);
-    const lines = Math.trunc(px/ch) || (e.deltaY>0?1:(e.deltaY<0?-1:0));
+    const lines = wheelDiscrete(e, px, ch)
+      ? (Math.trunc(px/ch) || (px>0?1:(px<0?-1:0)))
+      : wheelAdvance(px, ch);
     if(lines){ try{ term.scrollLines(lines); }catch(_){} }
     e.preventDefault(); e.stopPropagation();
     return;
@@ -2249,7 +2305,18 @@ function createMouseGuard(){
     }
     if(pending.length > PENDING_MAX) pending = pending.slice(-PENDING_MAX);
   }
-  function reset(){ tail = []; modes = Object.create(null); xtermModes = Object.create(null); blocked = false; pending = []; }
+  // keepModes is for RE-attaching the SAME session. The mode map is derived from the session's own
+  // output, so on a reconnect to the same session it is still true - and wiping it is how a session
+  // whose app armed the mouse ONCE (and never re-emits DECSET) loses the wheel forever: the app is
+  // already tracking, nothing re-arms us, and every later wheel notch scrolls native scrollback instead
+  // of reaching the app. A switch to a DIFFERENT session still clears it, because that session's modes
+  // are genuinely unknown and keeping the old ones would forward reports into a shell that never asked.
+  // The leak latch (blocked) is always cleared: a re-attach deserves a fresh chance, and a session that
+  // really is echoing our reports re-blocks within the echo window.
+  function reset(keepModes){
+    tail = []; blocked = false; pending = [];
+    if(!keepModes){ modes = Object.create(null); xtermModes = Object.create(null); }
+  }
   return {
     ingestOutput, noteForwarded, reset,
     inputAllowed: () => !blocked && tracking(),
@@ -2313,6 +2380,20 @@ term.onData(d => {
   send('i', d);
 });
 
+// ---- XTVERSION: tell an app inside the session that this terminal is xterm.js ----------------------
+// CSI > 0 q asks the TERMINAL to identify itself; a real xterm answers DCS >| XTerm(370) ST. The reply
+// travels through the pty, so it survives SSH where TERM_PROGRAM does not - which is why an app running
+// INSIDE a session (Claude Code / Gateway) probes it instead of reading the environment. This build
+// never answered, so such an app classified us as a native terminal and drove the wrong wheel tuning
+// for an xterm.js client (its native window-scroll curve instead of xterm's decay curve). The bundle
+// exposes no version constant, so we answer the name alone - which is all the identification needs.
+try{
+  term.parser.registerCsiHandler({prefix:'>', final:'q'}, () => {
+    send('i', '\x1bP>|xterm.js\x1b\\');
+    return true;
+  });
+}catch(e){}
+
 // ---- SELECTION WHILE THE APP OWNS THE MOUSE -------------------------------------------------------
 // A full-screen TUI (codex/claude/vim) turns mouse reporting on, and xterm then routes every button event
 // to the app: its selection service is disabled, so a plain drag selects nothing. The documented escape
@@ -2323,10 +2404,18 @@ term.onData(d => {
 // keystroke, but xterm cannot tell the difference.) That is "sometimes scroll will work and selection
 // won't at all", and it is why the Sel toggle did not help either.
 //
-// So while an app owns the mouse, the force-select gesture belongs to US: we keep xterm out of the gesture
-// entirely - no press/release report ever reaches the app for a gesture that is a selection - build the
-// highlight ourselves from the pointer, and latch the existing freeze so a live repaint cannot eat it.
-// Plain drags still go to the app, because it asked for the mouse and that is what granting it means.
+// So the force-select gesture belongs to US: we keep xterm out of the gesture entirely - no press/release
+// report ever reaches the app for a gesture that is a selection - build the highlight ourselves from the
+// pointer, and latch the existing freeze so a live repaint cannot eat it.
+//
+// The gesture is ALWAYS ours, for EVERY session - it must not depend on the app's state. Shift (Alt on a
+// Mac) is the user saying "select, do not click the app", and gating it on the app taking the mouse OR on
+// the session being the visible owner left the single most common case - a plain shell created from the
+// web, which is neither - with NO shift selection at all, while a plain drag and a double-click still
+// worked because those are xterm's own gestures. That asymmetry ("double-click selects a word but
+// shift-drag does nothing") is this gate, and it is why selection looked broken on the sessions people
+// actually use. A PLAIN drag is deliberately untouched: it still goes to the app when the app asked for
+// the mouse, and is a native xterm selection otherwise.
 // The modifier must be read from the PLATFORM, exactly as xterm reads it - a UA sniff is wrong here, since
 // every iPhone UA says "like Mac OS X" and would silently move the gesture to a key no phone has. xterm's
 // own rule is Shift (Alt on a Mac), so ours is a superset of it: Shift always, and Alt on a Mac as well,
@@ -2334,11 +2423,6 @@ term.onData(d => {
 // defaults to off). Column-select on a non-Mac is Alt-drag and is deliberately left alone.
 const FORCE_SEL_MAC = ['Macintosh','MacIntel','MacPPC','Mac68K'].includes(navigator.platform || '');
 function forceSelectGesture(e){ return selectMode || e.shiftKey || (FORCE_SEL_MAC && e.altKey); }
-// "The app owns the mouse" is XTERM's state, not our forwarding policy: they differ exactly when the leak
-// detector has tripped (press/release stripped, mode mirror cleared, xterm's selection still disabled).
-// Reading inputAllowed() here would leave the one state that matches the report - "scroll works, selection
-// won't at all" - with no gesture of ours in it.
-function appOwnsMouse(){ try{ return mouseGuard.mouseActive(); }catch(_){ return false; } }
 // The buffer cell under a viewport point, in the same 0-based scrollback-absolute coordinates
 // term.select() takes. Measured off the renderer's own screen element, so pan/rowpan scroll is included.
 function bufferCellAt(clientX, clientY){
@@ -2394,12 +2478,12 @@ try{ window.__muxForceSel = forceSel; }catch(e){}
   const host=$('#term');
   let ownerPress=null;
   host.addEventListener('mousedown', e=>{
-    if(e.button!==0 || !(appOwnsMouse() || isVisibleOwner()) || !forceSelectGesture(e)) return;
+    if(e.button!==0 || !forceSelectGesture(e)) return;
     if(!forceSelStart(e.clientX, e.clientY)) return;
     e.preventDefault(); e.stopPropagation();   // xterm must not turn a selection into a report to the app
   }, true);
   host.addEventListener('mousedown', e=>{
-    if(e.button>2 || !isVisibleOwner() || forceSelectGesture(e)) return;
+    if(e.button>2 || !isVisibleOwner() || !appTakesMouse() || forceSelectGesture(e)) return;
     const cell=bufferCellAt(e.clientX,e.clientY);
     if(!cell) return;
     const button=[0,1,2][e.button];
@@ -2432,7 +2516,7 @@ try{ window.__muxForceSel = forceSel; }catch(e){}
   // The phone's Sel toggle is the same gesture with a finger. While the app owns the mouse a touch drag
   // cannot fall through to xterm - this build has no touch selection at all - so it comes here instead.
   host.addEventListener('touchstart', e=>{
-    if(!selectMode || !(appOwnsMouse() || isVisibleOwner()) || e.touches.length!==1) return;
+    if(!selectMode || e.touches.length!==1) return;
     const t=e.touches[0];
     if(!forceSelStart(t.clientX, t.clientY)) return;
     e.preventDefault(); e.stopPropagation();
@@ -2602,6 +2686,8 @@ function connect(name, isRetry){
   const blocker = attachBlocker(findSession(name));
   if(blocker){ stopAttach(name, blocker); return; }
   const generation=++attachGeneration;
+  const prevName = current;          // read BEFORE current=name below: a re-attach of the same session
+                                     // keeps its mouse modes, a switch to another session does not
   intentional = true;
   if (ws) { try{ ws.onclose=null; ws.close(); }catch(e){} ws=null; }
   intentional = false;
@@ -2623,7 +2709,8 @@ function connect(name, isRetry){
   afterTerminalParserDrain(generation, ()=>{
     if (!isRetry) term.reset();
     resetTerminalSurface();
-    mouseGuard.reset();      // a new attach knows nothing about the old session's mouse modes
+    mouseGuard.reset(prevName === name);   // same session keeps the modes its app already armed; a
+                                           // different session starts clean (see reset() for why)
     lastViewportReport='';
     lastViewportReportSocket=null;
     scheduleViewportFit(0);
