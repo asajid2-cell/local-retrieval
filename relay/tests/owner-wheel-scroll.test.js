@@ -1,4 +1,5 @@
-// Regression: a session the browser OWNS must still scroll its own scrollback on the NORMAL buffer.
+// Regression: the wheel must reach the APP when the app owns the SCREEN (alternate buffer) and has taken
+// the mouse, and must scroll the mirror locally otherwise - for EVERY session, regardless of who owns it.
 //
 // The owner wheel path used to forward a wheel record to the app whenever the session was the visible
 // owner (isVisibleOwner()), with no regard for WHICH screen was up or whether the app had ever asked for
@@ -11,8 +12,12 @@
 //
 // The fix: the wheel is the app's ONLY when the app owns the SCREEN (the alternate buffer) AND has
 // demonstrably taken the mouse. Otherwise the host's scrollback scrolls locally and nothing is forwarded.
-// This file pins both halves: the source gate (cheap, always runs) and the real behaviour on a live owner
-// shell (the proof).
+// The owner flag must NOT be consulted at all: a session created from the web is owner:false, so an owner
+// gate here ALSO killed the wheel for every browser-launched full-screen app - an alt-screen app that had
+// armed the mouse got no wheel, and fell through to a viewport that has no scrollback. That is the dead
+// wheel. The same trap, and the same correction, is already recorded for the shift gesture in
+// shift-select.test.js. This file pins both halves: the source gate (cheap, always runs) and the real
+// behaviour on a live owner shell (the proof).
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const childProcess = require('node:child_process');
@@ -39,10 +44,12 @@ test('sendOwnerWheel refuses unless the app owns the alternate screen and has ta
   const body = source.slice(at, end);
   assert.match(body, /appOwnsScreen\(\)/, 'sendOwnerWheel() no longer checks which screen is up');
   assert.match(body, /appTakesMouse\(\)/, 'sendOwnerWheel() no longer checks whether the app took the mouse');
-  // The owner guard itself must be the screen+intent pair, not bare ownership: ownership alone is what
-  // forwarded reports into a non-tracking shell.
-  assert.match(body, /!isVisibleOwner\(\)\s*\|\|\s*!appOwnsScreen\(\)\s*\|\|\s*!appTakesMouse\(\)/,
-    'the owner wheel guard must be the negation of isVisibleOwner() && appOwnsScreen() && appTakesMouse()');
+  // The guard must be the screen+intent pair, and must NOT consult ownership: a web-created session is
+  // owner:false, so an owner gate here killed the wheel for every browser-launched full-screen app.
+  assert.match(body, /if\(!appOwnsScreen\(\)\s*\|\|\s*!appTakesMouse\(\)/,
+    'the owner wheel guard must be the negation of appOwnsScreen() && appTakesMouse()');
+  assert.doesNotMatch(body, /isVisibleOwner/,
+    'sendOwnerWheel() consults isVisibleOwner() again - a web-created (owner:false) app would lose the wheel');
 });
 
 test('the wheel router only hands the app a record when it owns the screen and the mouse', () => {
@@ -51,10 +58,12 @@ test('the wheel router only hands the app a record when it owns the screen and t
   const end = source.indexOf('}, {passive:false, capture:true});', start);
   assert.notEqual(end, -1, 'could not find the end of the wheel router');
   const router = source.slice(start, end);
-  // The owner branch must require BOTH, so a normal-buffer owner session falls through to the local
-  // scrollback branch instead of forwarding a report.
-  assert.match(router, /if\(isVisibleOwner\(\)\s*&&\s*appOwnsScreen\(\)\s*&&\s*appTakesMouse\(\)\)/,
-    'the router owner branch is no longer gated on appOwnsScreen() && appTakesMouse()');
+  // The app branch must require BOTH, so a normal-buffer session falls through to the local scrollback
+  // branch instead of forwarding a report - and must NOT require ownership (see the header).
+  assert.match(router, /if\(appOwnsScreen\(\)\s*&&\s*appTakesMouse\(\)\)/,
+    'the router app branch is no longer gated on appOwnsScreen() && appTakesMouse()');
+  assert.doesNotMatch(router, /isVisibleOwner/,
+    'the wheel router consults isVisibleOwner() again - a web-created (owner:false) app would lose the wheel');
 });
 
 // ---- the real behaviour: an owner shell must scroll, and nothing may reach its stdin ------------------

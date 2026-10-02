@@ -1945,7 +1945,12 @@ function wheelAdvance(px, step){
   return units;
 }
 function sendOwnerWheel(px, clientX, clientY, discrete){
-  if(!isVisibleOwner() || !appOwnsScreen() || !appTakesMouse() || !px) return false;
+  // The gate is the SCREEN and the app's mouse intent, never the session's owner flag: a session created
+  // from the web is owner:false, so an owner gate here silently killed the wheel for every browser-launched
+  // full-screen app - the same trap the shift gesture already documents (see the FORCE_SEL comment). A bare
+  // shell is still protected: it sits on the NORMAL buffer, so appOwnsScreen() is false and this returns
+  // before anything can be forwarded into its stdin.
+  if(!appOwnsScreen() || !appTakesMouse() || !px) return false;
   const cell=bufferCellAt(clientX, clientY);
   if(!cell) return false;
   const button=px<0 ? 64 : 65;
@@ -1972,11 +1977,14 @@ $('#term').addEventListener('wheel', e=>{
   noteUserScroll();
   const host=$('#term'), xt=host.querySelector('.xterm');
   const px = wheelPx(e, (cellMetrics().h)||18);
-  // Ownership is exclusive: when the app owns the screen AND asked for the mouse, the wheel is the app's,
-  // even for an event that does not yet complete a notch. Falling through to the local scrollback here
-  // scrolled the mirror behind the app's back AND spent the accumulator twice at two different steps, so no
-  // notch ever completed and a trackpad flick produced no report at all.
-  if(isVisibleOwner() && appOwnsScreen() && appTakesMouse()){
+  // The app's screen and its mouse intent decide, NOT the session's owner flag: a browser-created session
+  // is owner:false, so an owner gate here meant the app branch never ran and an alt-screen wheel fell
+  // through to a viewport that has no scrollback (the dead wheel). When the app owns the screen AND asked
+  // for the mouse, the wheel is the app's, even for an event that does not yet complete a notch. Falling
+  // through to the local scrollback here scrolled the mirror behind the app's back AND spent the
+  // accumulator twice at two different steps, so no notch ever completed and a trackpad flick produced no
+  // report at all.
+  if(appOwnsScreen() && appTakesMouse()){
     sendOwnerWheel(px, e.clientX, e.clientY, wheelDiscrete(e, px, WHEEL_NOTCH_PX));
     e.preventDefault(); e.stopPropagation();
     return;
@@ -2483,7 +2491,7 @@ try{ window.__muxForceSel = forceSel; }catch(e){}
     e.preventDefault(); e.stopPropagation();   // xterm must not turn a selection into a report to the app
   }, true);
   host.addEventListener('mousedown', e=>{
-    if(e.button>2 || !isVisibleOwner() || !appTakesMouse() || forceSelectGesture(e)) return;
+    if(e.button>2 || !appTakesMouse() || forceSelectGesture(e)) return;
     const cell=bufferCellAt(e.clientX,e.clientY);
     if(!cell) return;
     const button=[0,1,2][e.button];
