@@ -170,6 +170,14 @@ class PrincipalEndpoint:
             "grant": dict(grant) if grant else None,
         }
 
+    def lookup_key(self, principal_id, key_id):
+        """The stored public key for a (principal, key) pair, independent of which sessions it has
+        grants on. This is the seam a registration uses to refuse silently replacing a key that
+        already authorizes input elsewhere: the key identifies the principal, so swapping it under
+        the same ids would transfer that authority to whoever now holds the replacement."""
+        record = self._principals.get((principal_id, key_id))
+        return None if record is None else record.get("publicKey")
+
     def provisioned(self):
         return bool(self.instance_id and self._principals)
 
@@ -301,6 +309,91 @@ def provision_principal(public_key_pem, principal_id, key_id, session_uuid,
     )
     save_principal_endpoint(endpoint, path)
     return endpoint
+
+
+def _key_fingerprint(public_key):
+    """A stable identity for a public key: its DER SubjectPublicKeyInfo bytes. PEM text is not a
+    fingerprint — re-wrapping or re-ordering the same key must not read as a key change."""
+    if hasattr(public_key, "public_bytes"):
+        return public_key.public_bytes(
+            serialization.Encoding.DER,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+    return str(public_key or "").encode("utf-8")
+
+
+class PrincipalRegistrationError(ValueError):
+    """A relay-carried registration that must fail by name. Unlike an input refusal this is an
+    explicit provisioning request the client is waiting on, so it carries a stable machine code
+    the relay can return rather than only prose."""
+
+    def __init__(self, code, detail):
+        super().__init__(detail)
+        self.code = code
+
+
+def register_principal_pem(public_key_pem, principal_id, key_id, session_uuid, endpoint,
+                           path=DEFAULT_REGISTRY, roles=("drive",)):
+    """Register a relay-carried principal into the live endpoint muxd is serving, then persist it.
+
+    Deliberately NOT `provision_principal()`: that helper reloads the registry from disk, and
+    `load_principal_endpoint()` mints a *fresh random* instance id when the file is absent. The
+    instance id is what `hello` advertises and what every `input.durable` proof must cite, so
+    saving a registry that carried a different one would strand the very proofs this registration
+    exists to admit — the client would be handed an id its own next keystroke could not match.
+    Mutating the live endpoint keeps the advertised and the persisted identity the same value.
+
+    Raises `PrincipalRegistrationError` with a stable code; returns the granted tuple as a
+    JSON-serializable dict for the caller to hand back to the client.
+    """
+    try:
+        public_key = serialization.load_pem_public_key(
+            public_key_pem if isinstance(public_key_pem, bytes)
+            else str(public_key_pem or "").encode("utf-8")
+        )
+    except Exception as error:
+        raise PrincipalRegistrationError(
+            "principal-invalid", "public key is not a PEM SubjectPublicKeyInfo"
+        ) from error
+    if not isinstance(public_key, ec.EllipticCurvePublicKey) or not isinstance(
+        public_key.curve, ec.SECP256R1
+    ):
+        raise PrincipalRegistrationError("principal-invalid", "principal public key must be P-256")
+
+    principal_id = _bounded_id(principal_id)
+    key_id = _bounded_id(key_id)
+    session_uuid = _bounded_id(session_uuid)
+    for value, label in (
+        (principal_id, "principal id"), (key_id, "key id"), (session_uuid, "session uuid")
+    ):
+        if not value:
+            raise PrincipalRegistrationError("principal-invalid", label + " is malformed")
+
+    # A bare string is not a role list: iterating it would mint one role per character.
+    if not isinstance(roles, (list, tuple, set)) or not roles:
+        roles = ("drive",)
+    roles = tuple(sorted({_bounded_id(role) for role in roles} - {""}))
+    if not roles:
+        raise PrincipalRegistrationError("principal-invalid", "no usable role in the registration")
+
+    existing = endpoint.lookup_key(principal_id, key_id)
+    if existing is not None and _key_fingerprint(existing) != _key_fingerprint(public_key):
+        raise PrincipalRegistrationError(
+            "principal-key-in-use", "that principal and key id already hold a different public key"
+        )
+
+    endpoint.register(principal_id, key_id, public_key, session_uuid=session_uuid, roles=roles)
+    save_principal_endpoint(endpoint, path)
+    grant = (endpoint.lookup(principal_id, key_id, session_uuid) or {}).get("grant") or {}
+    return {
+        "principalId": principal_id,
+        "keyId": key_id,
+        "sessionUuid": session_uuid,
+        "roles": sorted(grant.get("roles") or ()),
+        "aclRevision": int(grant.get("aclRevision", 1)),
+        "leaseEpoch": int(grant.get("leaseEpoch", 1)),
+        "leaseHolder": str(grant.get("leaseHolder") or ""),
+    }
 
 
 def canonical_transcript_bytes(op, instance_id, principal_id, key_id, session_uuid, channel_id,

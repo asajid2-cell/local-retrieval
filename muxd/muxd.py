@@ -1426,18 +1426,24 @@ CUSTODY_GC_INTERVAL_SECONDS = max(
 )
 CLAIM_SWEEP_SECONDS = max(15, int(ENV.get("LAUNCH_CLAIM_SWEEP_SECONDS", "60")))
 PROTOCOL = 4
-CAPS = ["ls", "info", "create", "createAck", "bind", "input", "open", "attach", "kill", "killFence", "relayKillFence", "rename", "heal", "tail", "scrollback", "resize", "owner", "relaunch", "agentTruth", "resync", "inputDurable", "inputFence", "resumeOnly"]
+CAPS = ["ls", "info", "create", "createAck", "bind", "input", "open", "attach", "kill", "killFence", "relayKillFence", "rename", "heal", "tail", "scrollback", "resize", "owner", "relaunch", "agentTruth", "resync", "inputDurable", "inputFence", "resumeOnly", "principalRegister"]
 
 # killFence is deliberately separate from legacy name-only kill. Reclaim must prove both
 # the advertised logical owner and this concrete mux generation before remove_session mutates state.
 # The relay is a conduit, not an authority: a host-link `i` frame only reaches the PTY when it
 # carries a principal-signed input.durable proof this endpoint verifies. Empty until pairing
 # provisions a principal, which means "refuse everything" — the correct posture, not a gap.
+def _principal_registry_path():
+    """The file muxd persists the principal registry to and reloads it from: the historical default
+    under the production runtime root, or the profile's own path off production."""
+    if PROFILE.name == "production":
+        return host_input_intent.DEFAULT_REGISTRY
+    return PROFILE.principal_registry
+
+
 def _load_profile_principal_endpoint():
     """Production keeps the historical default registry; a profile reads its own registry path."""
-    if PROFILE.name == "production":
-        return host_input_intent.load_principal_endpoint()
-    return host_input_intent.load_principal_endpoint(PROFILE.principal_registry)
+    return host_input_intent.load_principal_endpoint(_principal_registry_path())
 
 
 try:
@@ -5588,6 +5594,52 @@ async def main():
                                     # immediate. Sent only on the success branch: a refusal has no new
                                     # list to announce.
                                     await ws.send(json.dumps({"t": "sessions", "list": sess_list()}))
+                                continue
+                            elif t == "principal":
+                                # Principal registration (§3.4). muxd owns the registry, its ACL
+                                # revision and its lease epoch; the relay only carries the request
+                                # here and the granted tuple back. The registration mutates the
+                                # endpoint muxd is already serving -- not a fresh load from disk --
+                                # so the instanceId `hello` advertised is the one persisted; see
+                                # host_input_intent.register_principal_pem.
+                                request_id = str(m.get("rid", "") or "")
+                                principal_session = sessions.get(name)
+                                if str(m.get("op", "")) != "register":
+                                    await ws.send(json.dumps({
+                                        "t": "principalResult", "rid": request_id, "s": name,
+                                        "ok": False, "code": "principal-invalid",
+                                        "detail": "unsupported principal operation",
+                                    }))
+                                elif principal_session is None:
+                                    await ws.send(json.dumps({
+                                        "t": "principalResult", "rid": request_id, "s": name,
+                                        "ok": False, "code": "principal-unknown-session",
+                                        "detail": "no such session",
+                                    }))
+                                else:
+                                    try:
+                                        grant = await asyncio.get_running_loop().run_in_executor(
+                                            None,
+                                            lambda current=principal_session, frame=m: host_input_intent.register_principal_pem(
+                                                frame.get("publicKeyPem"), frame.get("principalId"),
+                                                frame.get("keyId"), host_input_intent.session_uuid_of(current),
+                                                PRINCIPAL_ENDPOINT, _principal_registry_path(),
+                                                roles=frame.get("roles"),
+                                            ),
+                                        )
+                                    except Exception as error:
+                                        code = getattr(error, "code", "principal-registration-failed")
+                                        log(f"[{name}] principal registration refused: {code}: {error}")
+                                        await ws.send(json.dumps({
+                                            "t": "principalResult", "rid": request_id, "s": name,
+                                            "ok": False, "code": code, "detail": str(error),
+                                        }))
+                                    else:
+                                        log(f"[{name}] principal registered: {grant.get('principalId')}")
+                                        await ws.send(json.dumps({
+                                            "t": "principalResult", "rid": request_id, "s": name,
+                                            "ok": True, **grant,
+                                        }))
                                 continue
                             elif t == "heal" and name in sessions:
                                 healed, detail = await set_session_heal(name, bool(m.get("on")))

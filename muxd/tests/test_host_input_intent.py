@@ -432,6 +432,9 @@ class MuxdWiringTests(unittest.TestCase):
         self.assertIn("inputDurable", muxd.CAPS)
         self.assertIn("input", muxd.CAPS)
 
+    def test_principal_register_is_advertised_in_the_protocol_4_registry(self):
+        self.assertIn("principalRegister", muxd.CAPS)
+
 
 @unittest.skipIf(os.name != "nt", "DPAPI registry requires Windows")
 class PrincipalRegistryTests(unittest.TestCase):
@@ -447,6 +450,125 @@ class PrincipalRegistryTests(unittest.TestCase):
             self.assertEqual(loaded.instance_id, INSTANCE)
             self.assertTrue(loaded.provisioned())
             self.assertIsNotNone(loaded.lookup(PRINCIPAL, KEY_ID, SESSION_UUID))
+
+
+def pem_of(private):
+    from cryptography.hazmat.primitives import serialization
+    return private.public_key().public_bytes(
+        serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
+    ).decode("ascii")
+
+
+@unittest.skipIf(os.name != "nt", "DPAPI registry requires Windows")
+class PrincipalRegistrationTests(unittest.TestCase):
+    """The §3.4 registration seam: a relay-carried key becomes input authority, but only for the
+    instance muxd is actually serving, and never by silently replacing an existing key."""
+
+    def test_registration_persists_the_live_instance_and_grants_drive(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "principals.dpapi")
+            endpoint = host_input_intent.PrincipalEndpoint(instance_id=INSTANCE)
+            private = ec.generate_private_key(ec.SECP256R1())
+
+            grant = host_input_intent.register_principal_pem(
+                pem_of(private), PRINCIPAL, KEY_ID, SESSION_UUID, endpoint, path
+            )
+
+            self.assertEqual(grant["sessionUuid"], SESSION_UUID)
+            self.assertEqual(grant["roles"], ["drive"])
+            self.assertEqual(grant["aclRevision"], 1)
+            self.assertEqual(grant["leaseEpoch"], 1)
+
+            # The instance the live endpoint advertised is the one on disk. A restart must not hand
+            # the client an id its own proofs cannot cite.
+            loaded = host_input_intent.load_principal_endpoint(path)
+            self.assertEqual(loaded.instance_id, INSTANCE)
+            record = loaded.lookup(PRINCIPAL, KEY_ID, SESSION_UUID)
+            self.assertIsNotNone(record)
+            self.assertIn("drive", record["grant"]["roles"])
+
+    def test_a_registered_principal_can_then_sign_input(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "principals.dpapi")
+            endpoint = host_input_intent.PrincipalEndpoint(instance_id=INSTANCE)
+            private = ec.generate_private_key(ec.SECP256R1())
+            host_input_intent.register_principal_pem(
+                pem_of(private), PRINCIPAL, KEY_ID, SESSION_UUID, endpoint, path
+            )
+
+            principal, body, refusal = muxd.authorize_relay_input(
+                signed_frame(private), RecordingSession(), endpoint=endpoint, now_ms=NOW_MS
+            )
+
+            self.assertIsNone(refusal)
+            self.assertEqual(body, b"ls -la\r")
+
+    def test_a_different_key_under_the_same_ids_is_refused(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "principals.dpapi")
+            endpoint = host_input_intent.PrincipalEndpoint(instance_id=INSTANCE)
+            host_input_intent.register_principal_pem(
+                pem_of(ec.generate_private_key(ec.SECP256R1())), PRINCIPAL, KEY_ID, SESSION_UUID,
+                endpoint, path,
+            )
+
+            with self.assertRaises(host_input_intent.PrincipalRegistrationError) as raised:
+                host_input_intent.register_principal_pem(
+                    pem_of(ec.generate_private_key(ec.SECP256R1())), PRINCIPAL, KEY_ID,
+                    SESSION_UUID, endpoint, path,
+                )
+            self.assertEqual(raised.exception.code, "principal-key-in-use")
+
+    def test_re_registering_the_same_key_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "principals.dpapi")
+            endpoint = host_input_intent.PrincipalEndpoint(instance_id=INSTANCE)
+            pem = pem_of(ec.generate_private_key(ec.SECP256R1()))
+
+            first = host_input_intent.register_principal_pem(
+                pem, PRINCIPAL, KEY_ID, SESSION_UUID, endpoint, path
+            )
+            second = host_input_intent.register_principal_pem(
+                pem, PRINCIPAL, KEY_ID, SESSION_UUID, endpoint, path
+            )
+
+            self.assertEqual(first, second)
+
+    def test_a_non_p256_key_is_refused_by_name(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "principals.dpapi")
+            endpoint = host_input_intent.PrincipalEndpoint(instance_id=INSTANCE)
+
+            with self.assertRaises(host_input_intent.PrincipalRegistrationError) as raised:
+                host_input_intent.register_principal_pem(
+                    pem_of(ec.generate_private_key(ec.SECP384R1())), PRINCIPAL, KEY_ID,
+                    SESSION_UUID, endpoint, path,
+                )
+            self.assertEqual(raised.exception.code, "principal-invalid")
+
+    def test_a_malformed_principal_id_is_refused_by_name(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "principals.dpapi")
+            endpoint = host_input_intent.PrincipalEndpoint(instance_id=INSTANCE)
+
+            with self.assertRaises(host_input_intent.PrincipalRegistrationError) as raised:
+                host_input_intent.register_principal_pem(
+                    pem_of(ec.generate_private_key(ec.SECP256R1())), "bad id", KEY_ID,
+                    SESSION_UUID, endpoint, path,
+                )
+            self.assertEqual(raised.exception.code, "principal-invalid")
+
+    def test_a_bare_string_roles_argument_cannot_mint_one_role_per_character(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "principals.dpapi")
+            endpoint = host_input_intent.PrincipalEndpoint(instance_id=INSTANCE)
+
+            grant = host_input_intent.register_principal_pem(
+                pem_of(ec.generate_private_key(ec.SECP256R1())), PRINCIPAL, KEY_ID, SESSION_UUID,
+                endpoint, path, roles="drive",
+            )
+
+            self.assertEqual(grant["roles"], ["drive"])
 
 
 @unittest.skipIf(os.name != "nt", "real PTY test requires Windows ConPTY")

@@ -87,6 +87,7 @@ missing any of them fails `hostProtocolOk()` and the relay treats it as protocol
 | `relayKillFence` | optional | Required for browser hosted deletion: relay `kill` carries exact `sessionId` (empty only for an unbound shell), nonempty `generationId`, and `rid`. muxd checks under its launch lock and echoes these in `killed` or `killResult`. Old hosts remain viewable but deletion is refused. |
 | `inputFence` | optional | Local `input` requests carrying `sessionId` and `generationId` must match the current destination before fresh dispatch. A settled durable intent is replayed without another input effect. |
 | `resumeOnly` | optional | A resume-only `create` may reuse the matching live chat/command but cannot take over a different identity or command. |
+| `principalRegister` | optional | Host accepts a relay-carried principal registration (`principal` frame, `op: register`) and answers `principalResult` with the granted tuple — `sessionUuid`, `roles`, `aclRevision`, `leaseEpoch`, `leaseHolder`. muxd owns the registry and is the sole authority; the relay only carries the request and the grant back. Registering confers no authorization by itself: muxd still evaluates every `input.durable` proof against the registry. Gate on `hostSupportsCap('principalRegister')` — never assume presence; a host without it is refused (never silently ignored). |
 
 ### Reserved — terminal model (native prong)
 
@@ -131,6 +132,7 @@ dispatch chain and are ignored.
 | `o` | Terminal output bytes for one session, base64. |
 | `sb` | Scrollback replay answering a relay `sb` request, correlated by `rid`. |
 | `createResult` | Acknowledgement of a `create`, correlated by `rid`. |
+| `principalResult` | Acknowledgement of a `principal` registration, correlated by `rid`. On success carries the granted tuple the client must cite in every `input.durable` proof; on refusal a stable `code`. |
 | `tailr` | Answer to `tail`, correlated by `rid`. |
 | `killed` | Confirms the exact requested generation ended. Relay removes projection/viewers only if their current identity still matches; a same-name replacement is preserved. |
 | `killResult` | Refused or unconfirmed stop, correlated by `rid`, `s`, `sessionId`, and `generationId`. `uncertain: true` is not terminal success. |
@@ -141,6 +143,7 @@ dispatch chain and are ignored.
 | `t` | Purpose |
 | --- | --- |
 | `create` | Create or adopt a session. Closed field set — see the registry rule. |
+| `principal` | Register a principal's public key for one session (`op: register`). Carried to muxd, which owns the registry; the relay is a conduit. |
 | `i` | Keystroke input bytes for a session, base64. |
 | `resize` | Set remote PTY geometry. Sent only when the viewer's dimensions actually change. |
 | `sb` | Request a scrollback replay, correlated by `rid`. |
@@ -180,6 +183,13 @@ literals stay globally unique: `info`, `ls`, `err`, `killed`, `owner-ok`, `bind-
 | `createResult` | `ok`,`created`,`retryable` | bool | `retryable` maps to HTTP `503` (uncertain) vs `409` (refused). |
 | `createResult` | `detail` | string | Human-readable failure reason; empty on success. |
 | `createResult` | `session` | object | Session payload. Required when `ok` is true and must carry the matching `name`. |
+| `principal` | `s`,`rid`,`op` | string | Session name, request correlation (like `create`), and operation. `op` is `register`; any other value is refused `principal-invalid`. |
+| `principal` | `principalId`,`keyId` | string | Bounded ids (`[A-Za-z0-9._-]{1,128}`). Identify the principal and which of its keys is being registered. |
+| `principal` | `publicKeyPem` | string | PEM SubjectPublicKeyInfo; **P-256 (`secp256r1`) only**. A malformed or non-P-256 key is refused `principal-invalid` at muxd. |
+| `principal` | `roles` | string[] | Optional; defaults to `["drive"]`. Each role is a bounded id. A role muxd does not recognize grants nothing — `input.durable` requires `drive`. |
+| `principalResult` | `ok`,`s`,`rid` | bool,string,string | Correlated like `createResult`. `s` must match the requested session. |
+| `principalResult` | `code`,`detail` | string | Refusal code (`principal-invalid`, `principal-key-in-use`, `principal-unknown-session`) plus human detail. |
+| `principalResult` | `principalId`,`keyId`,`sessionUuid`,`roles`,`aclRevision`,`leaseEpoch`,`leaseHolder` | id,id,id,string[],int,int,string | The granted tuple on success. The client must cite `instanceId` (from `hello`), `sessionUuid`, `aclRevision`, and `leaseEpoch` in every `input.durable` proof. `sessionUuid` is the durable session identity, **not** `sessionId`. |
 | `i` | `s`,`d` | string | Session name; base64 input bytes. |
 | `resize` | `s`,`cols`,`rows` | string,int,int | Clamped to `MAX_TERM_COLS` (1000) / `MAX_TERM_ROWS` (300). |
 | `tail` | `s`,`rid`,`lines` | string,string,int | `lines` defaults to 40. |
