@@ -407,6 +407,7 @@ function hostStallReason() {
 }
 const pendingHostCreates = new Map();
 const pendingHostKills = new Map();
+const pendingHostPrincipals = new Map();
 let _hostRequestSeq = 0;
 function normalizeHostSession(s) {
   // agentTruth carries an "exe" key, which the forbidden-remote-key scan reads as the PC smuggling an
@@ -540,6 +541,31 @@ function requestHostCreate(message, timeoutMs = 20000, suppliedIntentId = '') {
   const pending = pendingHostCreates.get(rid);
   if (pending) pending.promise = promise;
   return promise;
+}
+// §3.4 principal registration: the native app registers its public key as a principal for one session.
+// muxd owns the registry and decides roles/aclRevision/leaseEpoch, so this is a rid-correlated request
+// over the owner link exactly like create - the relay carries it and returns muxd's granted tuple
+// unchanged. The signed input.durable transcript never passes through here; that is the conduit path.
+function requestHostPrincipal(message, timeoutMs = 15000) {
+  if (!hostUp()) return Promise.resolve({ ok: false, status: 503, error: 'PC mux host offline', detail: 'PC mux host offline' });
+  const stall = hostStallReason();
+  if (stall) return Promise.resolve({ ok: false, status: 503, error: 'PC mux host not responding', detail: stall });
+  const rid = 'hp' + Date.now().toString(36) + '-' + (++_hostRequestSeq).toString(36);
+  return new Promise(resolve => {
+    const timer = setTimeout(() => {
+      pendingHostPrincipals.delete(rid);
+      resolve({ ok: false, status: 504, error: 'muxd did not answer the principal request', detail: 'muxd did not answer the principal registration request' });
+    }, timeoutMs);
+    pendingHostPrincipals.set(rid, {
+      expectedSession: String(message.s || ''),
+      finish: result => { clearTimeout(timer); resolve(result); },
+    });
+    if (!sendHost({ ...message, rid })) {
+      clearTimeout(timer);
+      pendingHostPrincipals.delete(rid);
+      resolve({ ok: false, status: 503, error: 'host socket closed before the principal request could be sent', detail: 'the registration was not sent; a later muxd connection will not have it' });
+    }
+  });
 }
 function hostProtocolOk() {
   if (!hostUp() || hostProtocol.protocol !== REQUIRED_HOST_PROTOCOL) return false;
@@ -2394,6 +2420,60 @@ app.post('/api/principal-auth', (req, res) => {
   grant.proof = transcriptGrantProof(grant);
   res.set('Cache-Control', 'no-store').json(grant);
 });
+// §3.4: register the native client's public key as a principal for one session. Owner-gated (the
+// hl_session cookie the browser uses, or the native credential). muxd is the sole authority - it owns
+// the registry and grants roles/aclRevision/leaseEpoch - so the relay is a conduit that returns muxd's
+// granted tuple unchanged. The signed input.durable transcript never reaches this route.
+const PRINCIPAL_FIELD_RE = /^[A-Za-z0-9._-]{1,128}$/;   // mirrors muxd's own principal/key/session id rule
+app.post('/api/principals', async (req, res) => {
+  const body = req.body || {};
+  const session = strictMuxName(body.session);
+  const principalId = String(body.principalId || '');
+  const keyId = String(body.keyId || '');
+  const publicKeyPem = String(body.publicKeyPem || '').trim();
+  const roles = Array.isArray(body.roles) ? body.roles.map(String) : [];
+  if (!session || session !== String(body.session || ''))
+    return res.status(400).json({ error: 'a valid mux session name is required' });
+  if (!PRINCIPAL_FIELD_RE.test(principalId)) return res.status(400).json({ error: 'principalId is malformed' });
+  if (!PRINCIPAL_FIELD_RE.test(keyId)) return res.status(400).json({ error: 'keyId is malformed' });
+  if (!/^-----BEGIN PUBLIC KEY-----/.test(publicKeyPem))
+    return res.status(400).json({ error: 'a PEM-encoded public key is required' });
+  if (!hostedHas(session)) return res.status(404).json({ error: 'no such hosted session' });
+  if (!requireHostCapability(res, 'principalRegister', 'principal registration')) return;
+  const result = await requestHostPrincipal({
+    t: 'principal', op: 'register', s: session, principalId, keyId, publicKeyPem, roles,
+  });
+  if (!result.ok) {
+    const payload = { error: result.error || 'principal registration failed' };
+    if (result.detail) payload.detail = result.detail;
+    if (result.code) payload.code = result.code;
+    return res.status(result.status || 502).json(payload);
+  }
+  const hosted = hostSessions.get(session);
+  res.json({
+    ok: true,
+    // The live muxd instance the signed proof must cite - reported here so the client never guesses it.
+    instanceId: String(hostProtocol.instanceId || ''),
+    // muxd's durable session identity (NOT the relay session name); fall back to the host's own record.
+    sessionUuid: result.sessionUuid || String(hosted && hosted.sessionUuid || ''),
+    principalId: result.principalId || principalId,
+    keyId: result.keyId || keyId,
+    roles: result.roles && result.roles.length ? result.roles : roles,
+    aclRevision: result.aclRevision,
+    leaseEpoch: result.leaseEpoch,
+    leaseHolder: result.leaseHolder || '',
+  });
+});
+// The app learns the live muxd instance id once after connect (the value its signed proofs must cite)
+// without registering first - e.g. on a re-attach when its key is already registered.
+app.get('/api/principals/capabilities', (req, res) => {
+  res.json({
+    instanceId: String(hostProtocol.instanceId || ''),
+    protocol: hostProtocol.protocol || 0,
+    caps: Array.isArray(hostProtocol.caps) ? hostProtocol.caps : [],
+    principalRegister: hostSupportsCap('principalRegister'),
+  });
+});
 function createdContainerId(type, status, value) {
   if (status !== 'done' || !['deckcreate', 'collectioncreate'].includes(type)) return '';
   return typeof value === 'string' && /^[A-Za-z0-9._-]{1,200}$/.test(value) ? value : '';
@@ -3574,6 +3654,35 @@ wssHost.on('connection', (ws, req) => {
         retryable: !!m.retryable,
         detail: m.ok ? '' : String(m.detail || 'muxd refused the create request'),
         session,
+      });
+    } else if (m.t === 'principalResult') {
+      const rid = String(m.rid || '');
+      const pending = pendingHostPrincipals.get(rid);
+      if (!pending) return;
+      pendingHostPrincipals.delete(rid);
+      if (strictMuxName(m.s) !== pending.expectedSession) {
+        pending.finish({ ok: false, status: 502, error: 'muxd acknowledgement identity did not match the request', detail: 'the registration result named a different session' });
+        return;
+      }
+      if (!m.ok) {
+        pending.finish({
+          ok: false, status: 409,
+          error: String(m.detail || 'muxd refused the principal registration'),
+          detail: String(m.detail || ''),
+          code: String(m.code || ''),
+        });
+        return;
+      }
+      // muxd is the authority; the relay only carries the granted tuple back unchanged.
+      pending.finish({
+        ok: true, status: 200,
+        principalId: String(m.principalId || ''),
+        keyId: String(m.keyId || ''),
+        sessionUuid: String(m.sessionUuid || ''),
+        roles: Array.isArray(m.roles) ? m.roles.map(String) : [],
+        aclRevision: Math.max(0, Number(m.aclRevision) || 0),
+        leaseEpoch: Math.max(0, Number(m.leaseEpoch) || 0),
+        leaseHolder: String(m.leaseHolder || ''),
       });
     } else if (m.t === 'o') {
       const n = strictMuxName(m.s); const h = hostSessions.get(n); if (h) h.lastOut = Date.now();

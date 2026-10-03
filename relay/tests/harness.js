@@ -275,10 +275,10 @@ class RelayHarness {
     });
   }
 
-  async connectHost(sessions = []) {
+  async connectHost(sessions = [], helloExtra = {}) {
     const host = new FakeHost(this.port);
     await host.connect();
-    host.sendHello(sessions);
+    host.sendHello(sessions, helloExtra);
     await waitFor(async () => {
       const health = await this.json('GET', '/api/health');
       return health.host && health.host.connected && health.host.protocolOk ? health : null;
@@ -320,8 +320,11 @@ class FakeHost {
     try { this.ws.close(); } catch {}
   }
 
-  sendHello(sessions = []) {
-    this.ws.send(JSON.stringify({ t: 'hello', host: 'FAKEPC', protocol: 4, caps: HOST_CAPS, sessions }));
+  sendHello(sessions = [], helloExtra = {}) {
+    // helloExtra lets a suite advertise a capability the fixed HOST_CAPS list does not carry (e.g. the
+    // §3.4 principal-register op) or the live muxd instance id, without changing every other suite's
+    // hello. `sessions` stays last so an extra can never silently drop the session list.
+    this.ws.send(JSON.stringify({ t: 'hello', host: 'FAKEPC', protocol: 4, caps: HOST_CAPS, ...helloExtra, sessions }));
   }
 
   sendSessions(list) {
@@ -362,6 +365,18 @@ class FakeHost {
       detail,
       retryable,
       session,
+    }));
+  }
+
+  // §3.4: answer a `t:'principal'` register request. The granted tuple is muxd's to decide; the relay
+  // only carries it back, so the fake host echoes whatever the test wants the relay to return.
+  sendPrincipalResult(request, {
+    ok = true, code = '', detail = '', principalId = '', keyId = '',
+    sessionUuid = '', roles = [], aclRevision = 1, leaseEpoch = 1, leaseHolder = '',
+  } = {}) {
+    this.ws.send(JSON.stringify({
+      t: 'principalResult', rid: request.rid, s: request.s, ok, code, detail,
+      principalId, keyId, sessionUuid, roles, aclRevision, leaseEpoch, leaseHolder,
     }));
   }
 
