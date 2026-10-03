@@ -289,8 +289,12 @@ function opaqueIdentity(value) {
 const HOST_TOKEN = process.env.MUX_HOST_TOKEN || '';
 // ---- NATIVE VIEWER credential (A1) ----------------------------------------------------------------
 // The iOS app is a first-class client of the SAME /ws viewer socket the browser uses. It has no
-// browser Origin and no hl_session cookie, so it presents a scoped bearer credential instead:
-//   wss://<relay>/ws?session=<name>&...&viewer=<token>
+// browser Origin and no hl_session cookie, so it presents a scoped bearer credential instead, as an
+// `Authorization: Bearer <token>` header on the upgrade request:
+//   GET /ws?session=<name>&cols=&rows=&dev=&label=   Authorization: Bearer <token>
+// A header, NOT a `?viewer=` query param: a token in a URL lands in access logs, proxy logs, referrers
+// and crash reports, which a device credential must not. This mirrors the relay's only other scoped
+// token, the bridge Bearer (MUX_BRIDGE_TOKEN).
 // It is accepted at the EXISTING upgrade gate as an alternative to the wsOriginOk + owner-cookie pair
 // (one auth path); the browser branch is left bit-identical. The token must be DISTINCT from the host
 // and bridge tokens - interchangeable credentials are not scoped credentials, the same rule the bridge
@@ -304,6 +308,15 @@ if (NATIVE_VIEWER_TOKEN && !NATIVE_VIEWER_USABLE)
 function nativeViewerTokenOk(t) {
   if (!NATIVE_VIEWER_USABLE || !t || t.length !== NATIVE_VIEWER_TOKEN.length) return false;
   try { return crypto.timingSafeEqual(Buffer.from(t), Buffer.from(NATIVE_VIEWER_TOKEN)); } catch { return false; }
+}
+// Extract a Bearer token from an `Authorization` header. Returns the token string when the scheme is
+// Bearer (possibly empty, so "presented but blank" is distinguishable from "absent"), or null when no
+// Bearer authorization was presented at all (the browser case, which falls through to wsOriginOk).
+function bearerViewerToken(req) {
+  const raw = req && req.headers && req.headers.authorization;
+  if (typeof raw !== 'string') return null;
+  const m = raw.match(/^\s*Bearer\s+(.*)$/i);
+  return m ? m[1].trim() : null;
 }
 let hostWs = null;                 // the PC's muxd link (one at a time; newest wins)
 let hostLabel = '';
@@ -3428,14 +3441,14 @@ server.on('upgrade', (req, socket, head) => {
   if (p === '/ws') {
     // Reject cross-site WebSocket hijacking BEFORE the handshake — a foreign/absent-in-prod Origin
     // never gets a 101, so a hostile page in the owner's browser can't open a credentialed terminal socket.
-    // Two ways onto the viewer socket, one gate: a native client presents the scoped `viewer`
-    // credential (no browser Origin, no owner cookie); a browser must satisfy the CSWSH Origin
-    // allowlist as before. A presented-but-WRONG native token is refused WITHOUT a 101 and never
-    // falls back to the browser branch, so a bad token cannot ride an allowlisted Origin.
-    let viewerParam = null;
-    try { viewerParam = new URL(req.url, 'http://x').searchParams.get('viewer'); } catch {}
-    if (viewerParam !== null) {
-      if (!nativeViewerTokenOk(viewerParam)) { try { socket.destroy(); } catch {} return; }
+    // Two ways onto the viewer socket, one gate: a native client presents the scoped viewer
+    // credential as `Authorization: Bearer <token>` (no browser Origin, no owner cookie); a browser
+    // must satisfy the CSWSH Origin allowlist as before. A presented-but-WRONG Bearer is refused
+    // WITHOUT a 101 and never falls back to the browser branch, so a bad token cannot ride an
+    // allowlisted Origin.
+    const viewerBearer = bearerViewerToken(req);
+    if (viewerBearer !== null) {
+      if (!nativeViewerTokenOk(viewerBearer)) { try { socket.destroy(); } catch {} return; }
     } else if (!wsOriginOk(req)) { try { socket.destroy(); } catch {} return; }
     wss.handleUpgrade(req, socket, head, ws => wss.emit('connection', ws, req));
   }
@@ -4056,11 +4069,12 @@ function handleClientMsg(name, client, s) {
 wss.on('connection', async (ws, req) => {
   // Terminal attach is owner-only; loopback is NOT a credential. testModeLocalTrust() is the same
   // TEST_MODE+loopback exemption the HTTP gate uses and is false in any deploy — see its definition.
-  // A native client presents the scoped viewer credential, re-verified here (as /host re-checks its
-  // token); it is never a weaker viewer - it passes the same post-handshake principal/lease checks
-  // below. testModeLocalTrust() and the owner cookie are unchanged, so the browser path is bit-identical.
-  let nativeViewer = false;
-  try { nativeViewer = nativeViewerTokenOk(new URL(req.url, 'http://x').searchParams.get('viewer')); } catch {}
+  // A native client presents the scoped viewer credential as an Authorization Bearer, re-verified here
+  // (as /host re-checks its token); it is never a weaker viewer - it passes the same post-handshake
+  // principal/lease checks below. testModeLocalTrust() and the owner cookie are unchanged, so the
+  // browser path is bit-identical.
+  const nativeBearer = bearerViewerToken(req);
+  const nativeViewer = nativeBearer !== null && nativeViewerTokenOk(nativeBearer);
   if (!nativeViewer && !testModeLocalTrust(req) && !(await isOwner(cookieVal(req, HL_COOKIE)))) { try { ws.close(1008, 'unauthorized'); } catch {} return; }
   try { req.socket.setNoDelay(true); } catch {}                       // low-latency keystrokes: no Nagle on the viewer link
   const u = new URL(req.url, 'http://x');

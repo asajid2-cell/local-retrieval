@@ -2,17 +2,19 @@
 //
 // The relay's /ws is browser-only in production: it demands an allowlisted Origin (WS upgrades are
 // not covered by CORS) AND the owner hl_session cookie. A native client has neither, so A1 adds a
-// scoped bearer to the EXISTING upgrade gate as an alternative, leaving the browser branch
-// bit-identical. These tests are the fence around that alternative:
+// scoped bearer — `Authorization: Bearer <token>` — to the EXISTING upgrade gate as an alternative,
+// leaving the browser branch bit-identical. (A header, not a `?viewer=` query param: a device
+// credential must not land in access logs, proxy logs, referrers or crash reports; this mirrors the
+// relay's only other scoped token, the bridge Bearer.) These tests are the fence around that branch:
 //
 //   (a) a VALID viewer credential attaches (and reaches muxd for its screen) - the positive control;
-//   (b) an INVALID one is refused BEFORE the handshake (no 101) and never reaches muxd;
+//   (b) an INVALID one is refused BEFORE the handshake (no 101, never a completed upgrade) and never
+//       reaches muxd - and a bad token cannot ride an allowlisted Origin either;
 //   (c) the browser path is UNCHANGED: an allowlisted Origin with no owner cookie is still refused
-//       1008, an owner cookie still attaches, and a missing Origin is still destroyed when no
-//       native credential is presented;
+//       1008, an owner cookie still attaches, and a missing Origin (no Bearer) is still destroyed;
 //   (d) the credential is SCOPED, not interchangeable: the viewer token is not a /host token and the
-//       host token is not a viewer token;
-//   (e) with no native token configured, nothing attaches via ?viewer= (no accidental open).
+//       host token is not a viewer credential;
+//   (e) with no native token configured, nothing attaches via an Authorization Bearer (closed default).
 //
 // All run with MUX_TEST_MODE unset, so the loopback browser bypass is OFF and only a real credential
 // works — the same posture a deploy runs in (testModeLocalTrust() returns false without MUX_TEST_MODE).
@@ -42,11 +44,13 @@ function shellSession(name) {
 }
 
 // Resolve with how the relay answered a /ws upgrade: a close code, 'open', or an {error} (socket
-// destroyed before the handshake - the ONLY shape a bad credential may produce).
-async function attachOutcome(port, session, { viewer, headers = {} } = {}) {
-  const q = `session=${encodeURIComponent(session)}&cols=80&rows=24`
-    + (viewer !== undefined ? `&viewer=${encodeURIComponent(viewer)}` : '');
-  const ws = new WebSocket(`ws://127.0.0.1:${port}/ws?${q}`, { headers });
+// destroyed before the handshake - the ONLY shape a bad credential may produce). `bearer` sets the
+// Authorization header; omitted entirely when absent (the browser case).
+async function attachOutcome(port, session, { bearer, headers = {} } = {}) {
+  const q = `session=${encodeURIComponent(session)}&cols=80&rows=24`;
+  const hdrs = { ...headers };
+  if (bearer !== undefined) hdrs.authorization = `Bearer ${bearer}`;
+  const ws = new WebSocket(`ws://127.0.0.1:${port}/ws?${q}`, { headers: hdrs });
   const outcome = await new Promise(resolve => {
     let settled = false;
     const done = value => { if (!settled) { settled = true; resolve(value); } };
@@ -81,7 +85,7 @@ test('a valid native viewer credential attaches with no Origin and no owner cook
   const host = await h.connectHost([shellSession('nativecase')]);
   t.after(() => host.close());
 
-  const outcome = await attachOutcome(h.port, 'nativecase', { viewer: VIEWER });
+  const outcome = await attachOutcome(h.port, 'nativecase', { bearer: VIEWER });
   assert.deepEqual(outcome, { code: 'open' },
     'a valid viewer credential must attach: it is the whole reason the native path exists');
   // Attaching means the viewer reached the hosted path and the relay asked muxd for its screen.
@@ -98,9 +102,18 @@ test('an invalid native viewer credential is refused with no 101 and never reach
   const host = await h.connectHost([shellSession('badnative')]);
   t.after(() => host.close());
 
-  const outcome = await attachOutcome(h.port, 'badnative', { viewer: crypto.randomBytes(32).toString('hex') });
+  const wrong = crypto.randomBytes(32).toString('hex');
+  // No Origin: the refusal must be the credential talking, and must be a destroyed socket (no 101).
+  const outcome = await attachOutcome(h.port, 'badnative', { bearer: wrong });
   assert.equal(outcome.code, undefined, `a bad credential must never complete the handshake: ${JSON.stringify(outcome)}`);
   assert.ok(outcome.error, 'the upgrade must be destroyed, not politely closed with a code');
+
+  // A bad token must not ride an allowlisted Origin either — presenting a WRONG Bearer never falls
+  // back to the browser branch.
+  const withOrigin = await attachOutcome(h.port, 'badnative', { bearer: wrong, headers: { origin: ORIGIN } });
+  assert.equal(withOrigin.code, undefined, `a bad token must not ride an allowlisted Origin: ${JSON.stringify(withOrigin)}`);
+  assert.ok(withOrigin.error, 'still destroyed before the handshake');
+
   await host.assertNo(m => m.t === 'sb' && m.s === 'badnative', 'a refused viewer must not make the relay query muxd');
 });
 
@@ -124,11 +137,11 @@ test('the browser path is unchanged by the native credential', async t => {
   const host = await h.connectHost([shellSession('browsercase')]);
   t.after(() => host.close());
 
-  // (1) allowlisted Origin, no cookie -> still refused 1008 (the native change opened nothing here).
+  // (1) allowlisted Origin, no cookie, no Bearer -> still refused 1008 (the native change opened nothing).
   const anon = await attachOutcome(h.port, 'browsercase', { headers: { origin: ORIGIN, 'x-forwarded-for': '203.0.113.7' } });
   assert.deepEqual(anon, { code: 1008 }, 'a browser with no owner cookie must still be refused');
 
-  // (2) no Origin and no viewer param -> destroyed before the handshake (browser-only in prod).
+  // (2) no Origin and no Bearer -> destroyed before the handshake (browser-only in prod).
   const noOrigin = await attachOutcome(h.port, 'browsercase', {});
   assert.equal(noOrigin.code, undefined, `a no-Origin, no-credential probe must be destroyed: ${JSON.stringify(noOrigin)}`);
   assert.ok(noOrigin.error, 'destroyed, not closed');
@@ -156,19 +169,18 @@ test('the viewer credential is not a host token and the host token is not a view
   assert.equal(asHost.code, undefined, `the viewer token must not authenticate /host: ${JSON.stringify(asHost)}`);
   assert.ok(asHost.error, 'the /host upgrade must be destroyed');
 
-  // The host token must not open the viewer socket.
-  const asViewer = await attachOutcome(h.port, 'scopecase', { viewer: HOST_TOKEN });
+  // The host token must not open the viewer socket as a Bearer.
+  const asViewer = await attachOutcome(h.port, 'scopecase', { bearer: HOST_TOKEN });
   assert.equal(asViewer.code, undefined, `the host token must not authenticate /ws: ${JSON.stringify(asViewer)}`);
   assert.ok(asViewer.error, 'the /ws upgrade must be destroyed');
 
-  // Both distinct credentials together still do not let an UNRELATED token through (sanity).
   await host.assertNo(m => m.t === 'sb' && m.s === 'scopecase', 'no scrollback from a cross-scoped token');
 });
 
 // ---------------------------------------------------------------------------------------------
-// (e) CLOSED BY DEFAULT. With no native token configured, ?viewer= opens nothing.
+// (e) CLOSED BY DEFAULT. With no native token configured, an Authorization Bearer opens nothing.
 // ---------------------------------------------------------------------------------------------
-test('with no native token configured, a ?viewer= credential is refused', async t => {
+test('with no native token configured, an Authorization Bearer is refused', async t => {
   const h = new RelayHarness(NATIVE_OFF);
   await h.start();
   t.after(() => h.stop());
@@ -176,7 +188,7 @@ test('with no native token configured, a ?viewer= credential is refused', async 
   t.after(() => host.close());
 
   // Even a well-formed 64-hex credential must fail when the relay holds no native token to compare.
-  const outcome = await attachOutcome(h.port, 'noviewercase', { viewer: crypto.randomBytes(32).toString('hex') });
+  const outcome = await attachOutcome(h.port, 'noviewercase', { bearer: crypto.randomBytes(32).toString('hex') });
   assert.equal(outcome.code, undefined, `an unconfigured native path must stay closed: ${JSON.stringify(outcome)}`);
   assert.ok(outcome.error, 'destroyed before the handshake');
   await sleep(50);
