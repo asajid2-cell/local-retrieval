@@ -221,6 +221,15 @@ app.use(async (req, res, next) => {
   if (isTrustedLocal(req) && isLocalBridgeRoute(req) && !intentRecoveryRoute(req)) return next();   // loopback admits ONLY the desktop-bridge routes
   if (dispatchRouteOk(req)) return next();   // scoped fix-factory dispatch capability
   if (testModeLocalTrust(req)) return next();
+  // The native client credential (A1) governs the native client across the WHOLE owner surface, not
+  // just /ws. A native app has no hl_session cookie to present, and A3 (full parity) has it drive the
+  // same owner-gated /api/* routes the browser uses - create/kill/rename/heal/tail, and principal
+  // registration - so the same credential is admitted here. Same token, same constant-time compare,
+  // same env guard as the /ws upgrade gate; one credential, one auth path.
+  // Strictly ADDITIVE: this branch only ADMITS a valid native credential and otherwise falls through to
+  // the unchanged testMode/cookie logic below, so no existing request changes behaviour. A browser
+  // sends no Authorization header and is untouched; a wrong Bearer simply meets the owner cookie gate.
+  if (nativeViewerTokenOk(bearerViewerToken(req))) return next();
   if (await isOwner(cookieVal(req, HL_COOKIE))) return next();
   const tok = cookieVal(req, HL_COOKIE);
   if (!tok) {
