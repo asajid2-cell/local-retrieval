@@ -156,7 +156,10 @@ async function dragCenter(page, host) {
   await sleep(200);
   const frames = host.messages.filter(m => m.t === 'i').map(m => Buffer.from(m.d, 'base64').toString('latin1'));
   const selected = await page.evaluate(() => {
-    try { return !!document.querySelector('#term .xterm-selection div'); } catch (e) { return false; }
+    // A selection is visible where the ACTIVE renderer draws it: DOM rects under the DOM renderer, a canvas
+    // under the shipped WebGL renderer. hasSelection() is the renderer-independent truth, since the whole
+    // point of this assertion is that the drag made a selection at all.
+    try { return !!term.hasSelection() && !!term.getSelection(); } catch (e) { return false; }
   });
   return { frames, selected };
 }

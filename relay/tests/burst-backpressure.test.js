@@ -376,16 +376,25 @@ test('output bursting while scrollback is pending is replayed behind one CLEAR i
   const snapshot = Buffer.from('QUEUED_SNAPSHOT_BODY');
   await host.sendScrollback('queuecase', snapshot);
 
-  const expected = Buffer.concat([CLEAR_SCREEN, snapshot, burstBuf]);
-  await waitFor(() => viewer.bytes >= expected.length, 'queued replay delivered', 15000);
+  // The replay BODY is no longer muxd's bytes verbatim: the relay keeps a screen model and serves its
+  // compact snapshot on reattach instead of the byte log (that is the reattach fix). The burst we just
+  // sent warmed the model, so what lands here is that screen snapshot - not `snapshot`. What this test
+  // is FOR is the ordering and the single CLEAR, so assert those and let the replay body be whatever the
+  // relay chose: it must still come before the buffered burst and after exactly one CLEAR.
+  const bodyFloor = CLEAR_SCREEN.length + snapshot.length + burstBuf.length;
+  await waitFor(() => viewer.bytes >= bodyFloor, 'queued replay delivered', 15000);
   await sleep(150);
 
   assert.equal(viewer.closed, false, 'the queued replay must not trip backpressure');
-  assert.equal(viewer.bytes, expected.length, 'replay byte count');
-  assert.ok(
-    viewer.received().equals(expected),
-    'replay must be exactly CLEAR + scrollback + buffered burst, in that order',
-  );
+  const got = viewer.received();
+  assert.ok(got.subarray(0, CLEAR_SCREEN.length).equals(CLEAR_SCREEN),
+    'the replay must open with one CLEAR');
+  assert.equal(got.indexOf(CLEAR_SCREEN, 1), -1, 'there must be exactly one CLEAR');
+  const burstAt = got.indexOf(burstBuf);
+  assert.ok(burstAt >= CLEAR_SCREEN.length,
+    'the buffered burst must arrive after the CLEAR, in arrival order');
+  assert.ok(got.subarray(burstAt).equals(burstBuf),
+    'the queued burst itself must be replayed verbatim and last');
 });
 
 // ---------------------------------------------------------------------------------------------
