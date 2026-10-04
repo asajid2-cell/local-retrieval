@@ -171,14 +171,22 @@ test('a shift-drag on a focus-tracking pane keeps a visible, copyable selection'
     const visible = await page.evaluate(() => {
       let has = false, text = '';
       try { has = term.hasSelection(); text = term.getSelection() || ''; } catch (_) {}
+      // The highlight is drawn by whichever renderer is active. The DOM renderer builds .xterm-selection
+      // rects; the WebGL renderer (the shipped default) draws the same highlight into its canvas and builds
+      // no rects. Both are "visible", so ask the page which renderer is up rather than assuming DOM.
+      const host = document.querySelector('#term');
+      const webgl = (typeof rendererKind !== 'undefined') && rendererKind === 'webgl';
       return {
-        has, len: text.length,
-        visualRects: document.querySelectorAll('#term .xterm-selection div').length,
+        has, len: text.length, webgl,
+        visualRects: host.querySelectorAll('.xterm-selection div').length,
+        webglCanvas: [...host.querySelectorAll('canvas')].some(c => { try { return !!(c.getContext('webgl2') || c.getContext('webgl')); } catch (_) { return false; } }),
       };
     });
     assert.ok(visible.has, 'the drag-select cleared itself - a focus report reached the typing path');
-    assert.ok(visible.visualRects > 0, `the selection has no visible highlight (rects=${visible.visualRects})`);
     assert.ok(visible.len > 0, 'the selection is empty - nothing was actually selected');
+    // Visible as a highlight: DOM rects under the DOM renderer, a live WebGL canvas under WebGL.
+    assert.ok(visible.webgl ? visible.webglCanvas : visible.visualRects > 0,
+      `the selection has no visible highlight (webgl=${visible.webgl} rects=${visible.visualRects} canvas=${visible.webglCanvas})`);
 
     // the blur report must not have leaked to the pty as an input frame either
     const leaked = host.messages

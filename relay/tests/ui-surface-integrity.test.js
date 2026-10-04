@@ -379,7 +379,10 @@ test('the surface puts back rows the renderer dropped, with no transition to rea
   if (skipWithoutChromium(t)) return;
   const session = { name: SESSION_NAME, alive: true, shellOnly: true, sessionId: 'lostrow-sid', generationId: 'lostrow-generation' };
   await withSurfacePage(session, async ({ harness, host, page }) => {
-    await page.goto(`http://127.0.0.1:${harness.port}/`);
+    // Force the DOM renderer: this test drops `.xterm-rows` elements to prove the row-loss watchdog puts
+    // them back, and rows only EXIST under the DOM renderer. Under the shipped WebGL renderer the rows
+    // live in a canvas and the watchdog correctly stands down, so there is nothing here to drop or repair.
+    await page.goto(`http://127.0.0.1:${harness.port}/?mux_render=dom`);
     await waitFor(() => page.evaluate(() => typeof connect === 'function'), 'page boot');
     await page.evaluate(name => connect(name), SESSION_NAME);
     await sleep(400);
@@ -434,7 +437,9 @@ test('the surface notices a frame drawn for a narrower grid than it has', async 
   if (skipWithoutChromium(t)) return;
   const session = { name: SESSION_NAME, alive: true, shellOnly: true, sessionId: 'stalewidth-sid', generationId: 'stalewidth-generation' };
   await withSurfacePage(session, async ({ harness, host, page }) => {
-    await page.goto(`http://127.0.0.1:${harness.port}/`);
+    // The stale-width detector compares row text against the grid, and row text is a DOM-renderer read.
+    // WebGL has no rows, so the detector stands down there and this check has nothing to measure.
+    await page.goto(`http://127.0.0.1:${harness.port}/?mux_render=dom`);
     await waitFor(() => page.evaluate(() => typeof connect === 'function'), 'page boot');
     await page.evaluate(name => connect(name), SESSION_NAME);
     await sleep(600);

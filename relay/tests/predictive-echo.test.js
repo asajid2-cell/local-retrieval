@@ -88,7 +88,9 @@ async function withBrowserRelay(session, callback) {
     // Attach the one session. `connect` is what a tab click calls, so this is the real attach path.
     await page.waitForFunction(() => window._sessions && window._sessions.some(s => s.name === 'predict'));
     await page.evaluate(() => connect('predict'));
-    await page.waitForFunction(() => !!document.querySelector('.xterm-rows'));
+    // The terminal is up once its textarea exists. We wait on that and not `.xterm-rows`, because the
+    // WebGL renderer (the shipped default) draws into a canvas and builds no row elements at all.
+    await page.waitForFunction(() => !!document.querySelector('#term .xterm-helper-textarea'));
     await new Promise(r => setTimeout(r, 300));
     await callback({ harness, host, page });
   } finally {
