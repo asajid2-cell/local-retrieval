@@ -2041,6 +2041,11 @@ function takeTerminalReport(s, at){
       while(k < len && ((ch=s.charCodeAt(k)) === 0x3b || (ch >= 0x30 && ch <= 0x39))) k++;
       if(s[k] === 'c') return k+1-i;
     }
+    // Focus reports: CSI I (gained focus) / CSI O (lost focus). xterm emits these through onData when the
+    // app enabled focus tracking (DECSET 1004), and it emits CSI O on every helper-textarea blur — which
+    // happens *during a mouse drag*. They are reports ABOUT this terminal, never a keystroke, so they go
+    // with the other terminal-generated reports; treating one as typing is what wiped every fresh selection.
+    if(s[i+2] === 'I' || s[i+2] === 'O') return i+3-i;
     let k = i+2, ch;
     while(k < len && ((ch=s.charCodeAt(k)) === 0x3b || (ch >= 0x30 && ch <= 0x39))) k++;
     if(s[k] === 'R') return k+1-i;                  // cursor-position report
