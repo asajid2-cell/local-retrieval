@@ -1426,7 +1426,50 @@ CUSTODY_GC_INTERVAL_SECONDS = max(
 )
 CLAIM_SWEEP_SECONDS = max(15, int(ENV.get("LAUNCH_CLAIM_SWEEP_SECONDS", "60")))
 PROTOCOL = 4
-CAPS = ["ls", "info", "create", "createAck", "bind", "input", "open", "attach", "kill", "killFence", "relayKillFence", "rename", "heal", "tail", "scrollback", "resize", "owner", "relaunch", "agentTruth", "resync", "inputDurable", "inputFence", "resumeOnly", "principalRegister"]
+CAPS = ["ls", "info", "create", "createAck", "bind", "input", "open", "attach", "kill", "killFence", "relayKillFence", "rename", "heal", "tail", "scrollback", "resize", "owner", "relaunch", "agentTruth", "resync", "inputDurable", "inputFence", "resumeOnly", "principalRegister", "binaryFrames"]
+
+# Lever 4. The `o` and unsigned `i` frames are the two hot paths over the host link, and both used to
+# pay base64 twice: muxd base64'd the payload into a JSON dict, and the relay decoded it back out. On a
+# small terminal the decode is cheap; on a busy full-screen agent it is the relay paying it for every
+# viewer, per frame. `binaryFrames` is the capability that lets the pair skip it: a one-byte kind, a
+# uint16 session-index, then the raw bytes, as one BINARY websocket frame. The session index is a slot
+# the hello assigns, so the frame carries an integer, not a repeated name -- and everything that used to
+# be JSON (sessions, createResult, the signed `i` proof, sb) stays JSON, so a field-level check of those
+# frames is unaffected.
+HOST_BIN_VERSION = 1
+HOST_BIN_KIND = {"r": 0, "i": 1, "o": 2}          # r=redraw, i=client->session, o=session->client
+_HOST_BIN_KIND_REVERSE = {v: k for k, v in HOST_BIN_KIND.items()}
+_HOST_BIN_HEADER = 4                               # ver | kind | idx_be16
+
+
+def encode_host_binary(kind, count, index, payload):
+    """One binary host-link frame: [ver][kind][idx:uint16][payload]. `count` bounds `index` so an
+    index past the current hello cannot address a slot the relay has not been told about."""
+    if index < 0 or index >= 0x10000 or index >= max(1, count) or count > 0x10000:
+        return None
+    return bytes((HOST_BIN_VERSION, HOST_BIN_KIND[kind], (index >> 8) & 0xFF, index & 0xFF)) + bytes(payload)
+
+
+def decode_host_binary(raw, count, dest):
+    """Return (kind, name, payload) or None. A frame whose version, kind, index or length is not exactly
+    right is refused whole -- a truncated or unknown frame must never be guessed at."""
+    if not isinstance(raw, (bytes, bytearray, memoryview)):
+        return None
+    data = bytes(raw)
+    if len(data) < _HOST_BIN_HEADER:
+        return None
+    if data[0] != HOST_BIN_VERSION:
+        return None
+    kind = _HOST_BIN_KIND_REVERSE.get(data[1])
+    if kind is None:
+        return None
+    index = (data[2] << 8) | data[3]
+    if index >= count or index < 0 or index >= len(dest):
+        return None
+    name = dest[index]
+    if not name:
+        return None
+    return kind, name, data[_HOST_BIN_HEADER:]
 
 # killFence is deliberately separate from legacy name-only kill. Reclaim must prove both
 # the advertised logical owner and this concrete mux generation before remove_session mutates state.
@@ -2777,6 +2820,11 @@ class Session:
         self.deaths = []
         self.loop, self.outq = loop, outq
         self.pending = bytearray(); self.plock = threading.Lock()   # output coalescing (flushed by the pump)
+        # Set by the PTY reader thread the instant it buffers new output, so the flush pump can wake and
+        # send at once instead of always waiting a fixed tick. The old fixed 12ms sleep rounded up to the
+        # Windows ~15.6ms system timer, which WAS the bulk of measured "local" latency (p50 15.5ms, of
+        # which output 13.8ms). A single echo now goes out immediately; a burst still coalesces.
+        self.wake = None                                            # asyncio.Event, bound when the loop starts
         self.local = set()                                          # local (muxctl) viewer queues — fanned the same output
         self.local_sizes = {}
         self.remote_size_active = False
@@ -2882,16 +2930,25 @@ class Session:
             b = data.encode("utf-8", "replace")
             self.replay_state.ingest(b)
             self._append_ring(b)
-            with self.plock:                           # coalesced; the pump flushes on a ~12ms timer
+            with self.plock:                           # coalesced; the pump flushes immediately then merges a burst
                 self.pending += b                       # backpressure: if a flood outruns a slow link, keep the
                 if len(self.pending) > 512_000:         # last ~512KB unsent (the ring still holds history for reattach)
                     del self.pending[:len(self.pending) - 512_000]
+            self.wake_pump()
 
     def drain(self):
         if not self.pending: return None
         with self.plock:
             chunk = bytes(self.pending); self.pending = bytearray()
         return chunk
+
+    def wake_pump(self):
+        # Called from the PTY reader THREAD, so hand the wake to the loop thread. The event may not be
+        # bound yet (only flush_out binds it), which is fine: the periodic fallback still runs.
+        ev = self.wake
+        if ev is None: return
+        try: self.loop.call_soon_threadsafe(ev.set)
+        except Exception: pass
 
     def _append_ring(self, data):
         with self._ring_lock:
@@ -3098,6 +3155,7 @@ class OwnerSession:
         self.deaths = []
         self.loop, self.outq = loop, outq
         self.pending = bytearray(); self.plock = threading.Lock()
+        self.wake = None       # asyncio.Event, bound by flush_out; ingest() wakes the pump directly
         self.local = set()
         self.local_sizes = {}
         self.remote_size_active = False
@@ -3130,12 +3188,21 @@ class OwnerSession:
             self.pending += data
             if len(self.pending) > 512_000:
                 del self.pending[:len(self.pending) - 512_000]
+        self.wake_pump()
 
     def drain(self):
         if not self.pending: return None
         with self.plock:
             chunk = bytes(self.pending); self.pending = bytearray()
         return chunk
+
+    def wake_pump(self):
+        # Called from the PTY reader THREAD, so hand the wake to the loop thread. The event may not be
+        # bound yet (only flush_out binds it), which is fine: the periodic fallback still runs.
+        ev = self.wake
+        if ev is None: return
+        try: self.loop.call_soon_threadsafe(ev.set)
+        except Exception: pass
 
     def _append_ring(self, data):
         with self._ring_lock:
@@ -5200,11 +5267,27 @@ async def main():
     start_supervised_background(background_tasks, "custody-gc", custody_gc_tick)
 
     async def flush_out():
-        # coalesce each session's output into ONE ws frame per ~12ms tick — far fewer frames/less b64+JSON
-        # overhead, smoother phone rendering, and a natural place to add backpressure.
+        # Output coalescing, but wake-driven rather than tick-driven. The old shape slept a fixed 12ms and
+        # only then shipped whatever had arrived, so a single echo waited out a whole tick — and on Windows
+        # a 12ms sleep rounds up to the ~15.6ms system timer, which was most of the measured "local"
+        # latency (p50 15.5ms, output 13.8ms of it). Now: flush the instant output arrives; a burst still
+        # coalesces, because after a flush we wait up to the burst window for the next bytes before sending
+        # again. Byte-identical output, same framing — just no forced wait on a quiet line.
+        wake = asyncio.Event()
+        # Bind every current AND future session's wake to this one event. New sessions register their own.
+        for s in list(sessions.values()):
+            s.wake = wake
+        BURST_WINDOW = 0.004   # merge output arriving within 4ms of a flush; a lone echo goes out at once
         while True:
-            await asyncio.sleep(0.012)
+            # Wait for the reader to signal new output, but never longer than the burst window so a
+            # coalesced burst still ships promptly.
+            try:
+                await asyncio.wait_for(wake.wait(), BURST_WINDOW)
+            except asyncio.TimeoutError:
+                pass
+            wake.clear()
             for s in list(sessions.values()):
+                if s.wake is None: s.wake = wake
                 chunk = s.drain()
                 if chunk:
                     outq.put_nowait(("o", s.name, chunk))
@@ -5502,6 +5585,12 @@ async def main():
                              "protocol": PROTOCOL, "caps": CAPS,
                              "instanceId": PRINCIPAL_ENDPOINT.instance_id,
                              "sessions": sess_list()}
+                    # The index the binary frames address by slot. Built from the SAME list the hello
+                    # carries, so slot N is `sessions[N].name` on the relay too, and it is rebuilt on every
+                    # reconnect because the session set can have changed while the link was down.
+                    hello_sessions = hello["sessions"]
+                    index_of = {str(s.get("name", "")): i for i, s in enumerate(hello_sessions)}
+                    session_at = [str(s.get("name", "")) for s in hello_sessions]
                     if PROFILE.name != "production":
                         hello["profile"] = PROFILE_ID
                     await ws.send(json.dumps(hello))
@@ -5510,7 +5599,14 @@ async def main():
                         while True:
                             kind, name, data = await outq.get()
                             if kind == "o":
-                                await ws.send(json.dumps({"t": "o", "s": name, "d": base64.b64encode(data).decode()}))
+                                frame = encode_host_binary("o", len(session_at), index_of.get(name, -1), data)
+                                if frame is not None:
+                                    await ws.send(frame)
+                                else:
+                                    # No slot: a session created after this hello reached the relay's list
+                                    # through `sessions`, but its index is only in the NEXT hello. Rather
+                                    # than drop output, fall back to the JSON frame the relay always reads.
+                                    await ws.send(json.dumps({"t": "o", "s": name, "d": base64.b64encode(data).decode()}))
                             elif kind == "resync":
                                 # This session alone blew its egress budget; its backlog was dropped at a
                                 # frame boundary. Tell the relay to repaint from scrollback, not from a gap.
@@ -5548,6 +5644,42 @@ async def main():
                         tasks.append(asyncio.create_task(lan_return()))
                     try:
                         async for raw in ws:
+                            # A binary frame is ours by construction: JSON frames always arrive as text,
+                            # so an opcode byte is unambiguous. It carries kind+slot+payload; anything
+                            # malformed is dropped rather than guessed at, exactly like a bad JSON frame.
+                            if isinstance(raw, (bytes, bytearray, memoryview)):
+                                decoded = decode_host_binary(raw, len(session_at), session_at)
+                                if decoded is None:
+                                    continue
+                                bkind, bname, bpayload = decoded
+                                if bkind == "i":
+                                    # muxd is a conduit for input too: a binary `i` may only carry bytes
+                                    # for a session that has a live signed-input path. Unsigned input is
+                                    # refused unless the legacy `d` proof path (enforce-mode) allows it, so
+                                    # a binary frame here is treated exactly as a JSON `i` whose body is
+                                    # the raw payload and whose proof it does not carry -- authorize_relay_input
+                                    # decides, and in enforce mode it refuses.
+                                    bm = {"t": "i", "s": bname, "d": base64.b64encode(bpayload).decode()}
+                                    bsession = sessions.get(bname)
+                                    if bsession is None:
+                                        continue
+                                    bprincipal, bbody, brefusal = authorize_relay_input(bm, bsession)
+                                    if brefusal is not None:
+                                        refused = brefusal.frame(bname)
+                                        await ws.send(json.dumps(refused))
+                                    else:
+                                        boutcome = await execute_input_intent(bm, bsession, bbody, principal=bprincipal)
+                                        if boutcome.get("t") == "err":
+                                            await ws.send(json.dumps(relay_input_error_frame(boutcome, bname, bm, bprincipal)))
+                                    continue
+                                if bkind == "r" and bname in sessions:
+                                    rsession = sessions[bname]
+                                    if isinstance(rsession, OwnerSession):
+                                        rsession._send_owner({"t": "redraw"})
+                                    else:
+                                        await asyncio.get_running_loop().run_in_executor(None, redraw_nudge, rsession)
+                                    continue
+                                continue
                             try: m = json.loads(raw)
                             except Exception: continue
                             t = m.get("t")

@@ -2697,3 +2697,79 @@ test('a failed startmux never relays a bridge detail that names a local path or 
     assert.equal(stored.detail, 'PC bridge could not start mux session', `leaked: ${detail}`);
   }
 });
+
+// LEVER 1 — the liveness push must not block the event loop on a durable rewrite it does not need.
+//
+// The bridge pushes runningSessions/runningVerified every ~12s. That data is TRANSIENT: every boot
+// zeroes runningSyncedAt/runningVerified/syncedAt/appSyncedAt (server.js ~1656), so persisting it
+// protects nothing — the next start discards it. But each push used to rewrite the whole store twice
+// (durableWrite writes the .bak, then the file) with fsyncs and a readback, which blocked the relay's
+// single event loop for ~240-420ms on the box's spinning disk. That is the ~12s stutter.
+//
+// The fix: persist only when the DURABLE subset changes. Liveness still advances IN MEMORY, so
+// bridgeLive/appLive (which the UI reads) stay fresh — proven here by reading them back.
+test('a liveness-only running push advances in memory without rewriting a byte to disk', async t => {
+  const h = new RelayHarness();
+  await h.start();
+  t.after(async () => h.stop());
+  const projectsFile = path.join(h.tmp, 'projects.json');
+
+  // Seed a durable projection so the file exists and has collections to protect.
+  await h.json('POST', '/api/projects', {
+    schemaVersion: 3, host: 'PC',
+    decks: [{ id: 'deck-1', name: 'Main' }],
+    collections: [{ id: 'collection-1', name: 'Cortex', deckId: 'deck-1', deckName: 'Main', chats: [] }],
+    allChats: [], runningSessions: [], runningVerified: false,
+  });
+  const before = fs.statSync(projectsFile);
+  await sleep(30);
+
+  // Three liveness-only pushes: running rows move, nothing durable does.
+  for (let i = 0; i < 3; i++) {
+    const pushed = await h.json('POST', '/api/running', {
+      schemaVersion: 3, runningVerified: true, runningSessions: [
+        { pid: 100 + i, tool: 'codex', sessionId: 'live-' + i },
+      ],
+    });
+    assert.equal(pushed.ok, true);
+    assert.equal(pushed.persisted, false, 'a liveness-only push must not claim to have persisted');
+  }
+
+  const after = fs.statSync(projectsFile);
+  assert.equal(after.mtimeMs, before.mtimeMs, 'the store was rewritten on a liveness-only push');
+  assert.equal(after.size, before.size, 'the store size changed on a liveness-only push');
+
+  // Memory DID advance: the UI-facing health reads the live liveness, not the disk.
+  const projects = await h.json('GET', '/api/projects');
+  assert.equal(projects.runningVerified, true);
+  assert.equal(projects.runningSessions.length, 1);
+  assert.equal(projects.runningSessions[0].sessionId, 'live-2');
+  assert.equal(projects.bridgeLive, true, 'bridge liveness must advance without a disk write');
+  assert.equal(projects.collections.length, 1, 'the durable projection must survive untouched');
+});
+
+// The other half of the guard: a push that DOES change durable data must still persist, or the fix
+// would silently drop real edits. Tab colour/history are the durable sections the bridge owns.
+test('a running push that changes durable tab state still persists', async t => {
+  const h = new RelayHarness();
+  await h.start();
+  t.after(async () => h.stop());
+  const projectsFile = path.join(h.tmp, 'projects.json');
+  await h.json('POST', '/api/projects', {
+    schemaVersion: 3, host: 'PC', decks: [], collections: [{ id: 'c1', name: 'C', deckId: '', deckName: '', chats: [] }],
+    allChats: [], runningSessions: [], runningVerified: false,
+  });
+  const before = fs.statSync(projectsFile);
+  await sleep(30);
+  const pushed = await h.json('POST', '/api/running', {
+    schemaVersion: 3, runningVerified: true, runningSessions: [],
+    muxTabMeta: { 'tab-z': { color: '#ff0000', kind: '' } },
+  });
+  assert.equal(pushed.persisted, true, 'a durable change must persist');
+  const after = fs.statSync(projectsFile);
+  assert.notEqual(after.mtimeMs, before.mtimeMs, 'a durable change must reach the disk');
+
+  // And a restart must find it (the whole point of persisting).
+  const reloaded = durableJsonLoad(projectsFile, null, null);
+  assert.equal(reloaded.muxTabMeta['tab-z'].color, '#ff0000');
+});

@@ -304,8 +304,18 @@ class FakeHost {
   async connect() {
     this.ws = new WebSocket(`ws://127.0.0.1:${this.port}/host?token=test-token`);
     await once(this.ws, 'open');
-    this.ws.on('message', raw => {
-      const msg = JSON.parse(raw.toString());
+    this.ws.on('message', (raw, isBinary) => {
+      // Lever 4: the relay now sends BINARY frames for `i`/`r` when this host advertised binaryFrames.
+      // Record them with their header split out so a suite can assert on the kind, the slot and the
+      // payload, and keep the JSON path unchanged for every host that did not opt in.
+      let msg;
+      if (isBinary) {
+        const buf = Buffer.isBuffer(raw) ? raw : Buffer.from(raw);
+        const kind = { 0: 'r', 1: 'i', 2: 'o' }[buf[1]];
+        msg = { __binary: true, version: buf[0], kind, index: buf.readUInt16BE(2), payload: buf.subarray(4) };
+      } else {
+        msg = JSON.parse(raw.toString());
+      }
       this.messages.push(msg);
       for (const waiter of [...this.waiters]) {
         if (waiter.match(msg)) {
@@ -333,6 +343,13 @@ class FakeHost {
 
   sendOutput(name, text) {
     this.ws.send(JSON.stringify({ t: 'o', s: name, d: Buffer.from(text, 'utf8').toString('base64') }));
+  }
+
+  // Lever 4: emit a binary `o` frame exactly as muxd does once binaryFrames is negotiated — the slot
+  // comes from the hello's own session order, so a suite that sent a hello can address slot 0/1/...
+  sendOutputBinary(index, text) {
+    const header = Buffer.from([1, 2, (index >> 8) & 0xff, index & 0xff]);
+    this.ws.send(Buffer.concat([header, Buffer.from(text, 'utf8')]));
   }
 
   sendScrollback(name, text = '', request = null) {

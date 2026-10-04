@@ -323,3 +323,43 @@ test('every transition that can strand a stale frame repaints, not only a grid c
     'a re-asserted size frame must still repaint'
   );
 });
+
+// LEVER 3 — an output burst must not repaint the whole viewport after every echo.
+//
+// schedulePaintHeal runs verifyTerminalPaint AND two full term.refresh passes over every row. On the DOM
+// renderer that rebuilds the whole viewport ~40ms after every completed write burst — exactly when the
+// next keystroke is arriving while typing fast. The write already painted its own rows, so that heal was
+// repainting a correct surface. The fix: the output path verifies (a cheap read-only check) and only pays
+// the two refreshes when the check finds a REAL fault; state transitions keep the unconditional heal.
+test('the output path verifies without repainting; only a detected fault heals', () => {
+  // The verify-only helper exists and does NOT refresh unconditionally.
+  const verify = section('function schedulePaintVerify', 'function healTerminalSurface');
+  assert.match(verify, /verifyTerminalPaint/, 'the post-write path must still DETECT a lost surface');
+  assert.doesNotMatch(verify, /healTerminalPaint\(\)/,
+    'the post-write path must not refresh unconditionally — that is the per-echo repaint');
+
+  // The two write-burst sites use the verify-only path, not the full heal.
+  const pump = section('function pumpTermWrite', "addEventListener('mouseup'");
+  const healCalls = (pump.match(/schedulePaintHeal\(/g) || []).length;
+  assert.equal(healCalls, 0, `the write pump still schedules ${healCalls} unconditional heal(s)`);
+  assert.match(pump, /schedulePaintVerify\(/, 'the write pump must verify its paint');
+
+  // And the heal the write path DOES keep is real: verifyTerminalPaint heals only on a detected fault.
+  const verifyFn = section('function verifyTerminalPaint', 'function schedulePaintVerify');
+  assert.match(verifyFn, /healDetectedPaintFault/,
+    'verifyTerminalPaint must still heal when it finds a fault — detection is not weakened');
+  // A blank or lost-rows surface still reaches the heal.
+  assert.match(verifyFn, /terminalPaintLooksBlank\(\)/, 'blank detection removed');
+  assert.match(verifyFn, /terminalPaintLostRows\(\)/, 'lost-rows detection removed');
+});
+
+test('state transitions still repaint unconditionally — only the write path changed', () => {
+  // The autonomous watchdog, the visibility/focus/pageshow returns, the control re-assert and the
+  // surface-transition heal must all keep the full repaint: those answer a surface that lost custody
+  // of its pixels, where a refresh (not just a verify) is the repair.
+  assert.match(section('function healTerminalSurface', 'function cancelViewportRestore'), /schedulePaintHeal\(/);
+  assert.match(source, /visibilitychange[\s\S]{0,120}schedulePaintHeal\(80\)/, 'visibility return must still heal');
+  assert.match(source, /addEventListener\('pageshow'[\s\S]{0,80}schedulePaintHeal\(80\)/, 'pageshow must still heal');
+  // The watch interval still verifies autonomously (the backstop the write path now relies on).
+  assert.match(source, /setInterval\(\(\)=>\{[\s\S]{0,700}verifyTerminalPaint\('watchdog'\)/, 'the watchdog verify must remain');
+});

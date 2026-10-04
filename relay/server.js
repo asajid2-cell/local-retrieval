@@ -41,6 +41,31 @@ function writeJsonState(file, value) {
   durableJsonWrite(file, value);
   persistenceFailure = '';
 }
+// The running projection's LIVENESS fields are transient by construction: every boot zeroes
+// runningSyncedAt/runningVerified/syncedAt/appSyncedAt (below), so persisting them protects nothing —
+// the next start discards them anyway. The bridge still pushes them on its ~12s liveness tick, and each
+// push was rewriting the whole 401KB store twice (durableWrite writes the .bak then the file), which
+// blocked the event loop for ~240-420ms on the box's spinning disk. So we persist projects.json only
+// when the DURABLE subset actually changes: collections/decks/allChats plus the tab presentation the
+// closed-GUI bridge owns. A push that only advances liveness updates memory and returns without a write.
+const PROJECTS_VOLATILE_KEYS = new Set(['runningSessions', 'runningVerified', 'runningVerificationDetail',
+  'runningSyncedAt', 'syncedAt', 'appSyncedAt']);
+function projectsDurableSubset(value) {
+  const out = {};
+  for (const key of Object.keys(value || {}).sort()) {
+    if (!PROJECTS_VOLATILE_KEYS.has(key)) out[key] = value[key];
+  }
+  return out;
+}
+// Did anything DURABLE change between what is live and the candidate? Cheap short-circuit first, then a
+// JSON compare of the durable subset only. A false "unchanged" would silently drop a real edit, so the
+// comparison is over every durable key, not a hand-picked few.
+function projectsDurableChanged(next, prev) {
+  const nextKeys = Object.keys(next || {}).filter(k => !PROJECTS_VOLATILE_KEYS.has(k));
+  const prevKeys = Object.keys(prev || {}).filter(k => !PROJECTS_VOLATILE_KEYS.has(k));
+  if (nextKeys.length !== prevKeys.length) return true;
+  return JSON.stringify(projectsDurableSubset(next)) !== JSON.stringify(projectsDurableSubset(prev));
+}
 function writeBytesState(file, value) {
   requirePersistenceWritable();
   durableWrite(file, value);
@@ -360,6 +385,9 @@ function clampTermDimension(value, fallback, maximum) {
 const REQUIRED_HOST_PROTOCOL = 4;
 const REQUIRED_HOST_CAPS = new Set(['create', 'createAck', 'kill', 'rename', 'heal', 'tail', 'scrollback']);
 let hostProtocol = { protocol: 0, caps: [] };
+// Slot table for binaryFrames, rebuilt on each accepted hello; null when the current muxd did not
+// advertise the capability, which is what keeps an old host link on the JSON path.
+let hostBinarySlots = null;
 
 // ---- HOST FRAME LIVENESS: TCP-alive-but-stalled is invisible, and that is the failure we actually had
 // muxd's pump_status() pushes a `t:"sessions"` frame every 5s, unconditionally, for as long as its event
@@ -390,6 +418,70 @@ function rememberHostInputOrigin(key, clientId) {
 }
 const hostUp = () => !!(hostWs && hostWs.readyState === 1);
 function sendHost(obj) { if (hostUp()) { try { hostWs.send(JSON.stringify(obj)); return true; } catch {} } return false; }
+// An unsigned `i` body is the other half of the Lever-4 fast path: when muxd advertised binaryFrames and
+// this session has a slot, the bytes go as one binary frame with no base64 in either direction. A session
+// with no slot (created since the last hello) falls back to the JSON frame, which is also the only format
+// an old muxd understands — so the capability gate and the slot check are the whole compatibility story.
+function sendHostInput(name, channelId, body) {
+  if (!hostUp()) return false;
+  const index = hostBinarySlots ? hostBinarySlots.names.get(name) : undefined;
+  if (index !== undefined) {
+    const frame = encodeHostBinary('i', index, body);
+    if (frame) { try { hostWs.send(frame); return true; } catch {} }
+  }
+  return sendHost({ t: 'i', s: name, channelId, d: Buffer.from(body).toString('base64') });
+}
+function sendHostInputRedraw(name) {
+  if (!hostUp()) return false;
+  const index = hostBinarySlots ? hostBinarySlots.names.get(name) : undefined;
+  if (index !== undefined) {
+    const frame = encodeHostBinary('r', index, Buffer.alloc(0));
+    if (frame) { try { hostWs.send(frame); return true; } catch {} }
+  }
+  return sendHost({ t: 'redraw', s: name });
+}
+// ---- Lever 4: binary host-link frames --------------------------------------------------------------
+// The `o` and unsigned `i` frames are the two hot paths between muxd and the relay. Both used to base64
+// the payload into a JSON dict only for the relay to decode it back out — a double conversion the relay
+// pays per frame, per viewer. `binaryFrames` (negotiated in hello) lets the pair send a BINARY websocket
+// frame with a four-byte header: [version][kind][session-index:uint16][raw payload]. The index addresses
+// the hello's own session list, so the frame carries an integer instead of repeating a name, and every
+// frame that is not one of these two kinds stays JSON and keeps its field-level checks.
+const HOST_BINARY_VERSION = 1;
+const HOST_BINARY_HEADER = 4;
+const HOST_BINARY_KIND = { r: 0, i: 1, o: 2 };
+const HOST_BINARY_KIND_REVERSE = new Map(Object.entries(HOST_BINARY_KIND).map(([k, v]) => [v, k]));
+// The slot table is rebuilt from every accepted hello, because the session set can change while the link
+// is down and the index has to address the list the CURRENT hello announced.
+function hostBinaryIndex(list) {
+  const names = new Map();               // name -> slot
+  const at = [];                          // slot -> name
+  let i = 0;
+  for (const name of (list || [])) {
+    if (names.has(name) || i >= 0x10000) continue;
+    names.set(name, i); at.push(name); i += 1;
+  }
+  return { names, at };
+}
+function encodeHostBinary(kind, index, payload) {
+  if (index == null || index < 0) return null;
+  const header = Buffer.allocUnsafe(HOST_BINARY_HEADER);
+  header[0] = HOST_BINARY_VERSION;
+  header[1] = HOST_BINARY_KIND[kind];
+  header.writeUInt16BE(index, 2);
+  return Buffer.concat([header, Buffer.isBuffer(payload) ? payload : Buffer.from(payload)]);
+}
+// Same exactness rule as the receive side: an unknown version, kind or an out-of-range slot is refused
+// whole, never guessed at. Returns { kind, name, payload } or null.
+function decodeHostBinary(raw, count, dest) {
+  if (!Buffer.isBuffer(raw) || raw.length < HOST_BINARY_HEADER) return null;
+  if (raw[0] !== HOST_BINARY_VERSION) return null;
+  const kind = HOST_BINARY_KIND_REVERSE.get(raw[1]);
+  if (!kind) return null;
+  const index = raw.readUInt16BE(2);
+  if (index >= count || !dest[index]) return null;
+  return { kind, name: dest[index], payload: raw.subarray(HOST_BINARY_HEADER) };
+}
 const hostedHas = name => hostUp() && hostSessions.has(name);
 
 // A host that still holds its socket but has stopped pushing `sessions` frames is WEDGED, not up. It
@@ -1870,6 +1962,12 @@ app.post('/api/projects', (req, res) => {
     candidate.runningVerificationDetail = _projects.runningVerificationDetail;
     candidate.runningSyncedAt = _projects.runningSyncedAt;
   }
+  // A full projection that repeats the durable content (same collections/decks, e.g. a re-push that
+  // changed nothing) must not pay the blocking rewrite. Liveness still advances in memory.
+  if (!projectsDurableChanged(candidate, _projects)) {
+    _projects = candidate;
+    return res.json({ ok: true, syncedAt: candidate.syncedAt, persisted: false });
+  }
   try {
     writeJsonState(PROJECTS_FILE, candidate);
   } catch (error) {
@@ -1877,7 +1975,7 @@ app.post('/api/projects', (req, res) => {
     return failPersistence(res, error);
   }
   _projects = candidate;
-  res.json({ ok: true, syncedAt: candidate.syncedAt });
+  res.json({ ok: true, syncedAt: candidate.syncedAt, persisted: true });
 });
 app.get('/api/projects', (req, res) => {
   const a = appSyncedAt(), r = runningSyncedAt();
@@ -2044,6 +2142,12 @@ app.post('/api/running', (req, res) => {
   // REMOVAL of keys, which a merge could not express, so a stale tint would outlive the clear.
   if (Object.prototype.hasOwnProperty.call(b, 'muxTabMeta')) candidate.muxTabMeta = normalizeMuxTabMeta(b.muxTabMeta);
   if (Object.prototype.hasOwnProperty.call(b, 'muxTabChats')) candidate.muxTabChats = normalizeMuxTabChats(b.muxTabChats);
+  // Liveness-only push: the durable subset is untouched, so skip the blocking rewrite. Memory still
+  // advances (bridgeLive/appLive read the live _projects), and the next durable change writes it all out.
+  if (!projectsDurableChanged(candidate, _projects)) {
+    _projects = candidate;
+    return res.json({ ok: true, runningSyncedAt: candidate.runningSyncedAt, persisted: false });
+  }
   try {
     writeJsonState(PROJECTS_FILE, candidate);
   } catch (error) {
@@ -2051,7 +2155,7 @@ app.post('/api/running', (req, res) => {
     return failPersistence(res, error);
   }
   _projects = candidate;
-  res.json({ ok: true, runningSyncedAt: candidate.runningSyncedAt });
+  res.json({ ok: true, runningSyncedAt: candidate.runningSyncedAt, persisted: true });
 });
 
 // muxd is the sole owner of persisted launch commands, boot recovery, and self-heal.
@@ -3556,7 +3660,19 @@ wssHost.on('connection', (ws, req) => {
   try { req.socket.setNoDelay(true); } catch {}                       // low-latency: no Nagle on the host link
   let helloAccepted = false;
   console.log('[host] PC session host candidate connected');
-  ws.on('message', raw => {
+  ws.on('message', (raw, isBinary) => {
+    // The opcode is the discriminator: a text frame is always JSON and a binary frame is always the
+    // Lever-4 fast path. A binary frame is only honoured once THIS socket completed a validated hello
+    // AND that hello advertised binaryFrames; before that (and for a host without the capability) the
+    // slot table is null and the frame is refused outright rather than parsed as JSON, which would only
+    // fail anyway.
+    if (isBinary) {
+      if (!helloAccepted || hostWs !== ws || !hostBinarySlots) return;
+      const decoded = decodeHostBinary(raw, hostBinarySlots.at.length, hostBinarySlots.at);
+      if (!decoded) return;
+      if (decoded.kind === 'o') deliverHostOutput(decoded.name, decoded.payload);
+      return;
+    }
     let m; try { m = JSON.parse(raw.toString()); } catch { return; }
     // "exe" is a forbidden remote key, and agentTruth legitimately carries one — scanning the raw frame
     // would close the link on every hello a truth-capable muxd sends. See withoutAgentTruth().
@@ -3584,6 +3700,9 @@ wssHost.on('connection', (ws, req) => {
       hostFrame = { helloAt: Date.now(), sessionsAt: Date.now() };
       hostSessions.clear();
       for (const [name, value] of incoming) hostSessions.set(name, value);
+      // The slot table is only meaningful when muxd advertised binaryFrames; the index must agree with
+      // the `sessions` array muxd built it from, so it is derived from the same incoming set.
+      hostBinarySlots = hostSupportsCap('binaryFrames') ? hostBinaryIndex([...incoming.keys()]) : null;
       console.log(`[host] hello from ${hostLabel} (${hostSessions.size} session(s), protocol ${hostProtocol.protocol})`);
       if (prior && prior !== ws) {
         try { prior.close(1000, 'replaced by validated host connection'); } catch {}
@@ -3685,31 +3804,7 @@ wssHost.on('connection', (ws, req) => {
         leaseHolder: String(m.leaseHolder || ''),
       });
     } else if (m.t === 'o') {
-      const n = strictMuxName(m.s); const h = hostSessions.get(n); if (h) h.lastOut = Date.now();
-      const st = sessions.get(n); if (!st) return;
-      const buf = Buffer.from(m.d || '', 'base64');
-      for (const c of st.clients.values()) {
-        if (!c.hosted || c.ws.readyState !== 1) continue;
-        if (c.sbWait) {
-          (c.q = c.q || []).push(buf); c.qBytes = (c.qBytes || 0) + buf.length;
-          // Flood while still waiting for scrollback: relieve memory, but NEVER blank-and-drop.
-          // The live stream itself repaints a TUI, so go live now â€” clear once (a fresh attach
-          // starts clean) and replay what we buffered. wentLive means a late sb is dropped, but
-          // only because real output is already painting the screen (never leaves it black).
-          if (c.qBytes > 2000000 || c.q.length > 4000) {
-            c.sbWait = false; c.wentLive = true;
-            st.sbWaiters.delete(c.id);
-            if (sendViewer(n, st, c, CLEAR_SCREEN, true)) {
-              for (const q of c.q) if (!sendViewer(n, st, c, q, true)) break;
-            }
-            c.q = []; c.qBytes = 0;
-          }
-          continue;
-        }
-        c.wentLive = true;
-        st.sbWaiters.delete(c.id);
-        sendViewer(n, st, c, buf);
-      }
+      deliverHostOutput(strictMuxName(m.s), Buffer.from(m.d || '', 'base64'));
     } else if (m.t === 'sb') {
       const n = strictMuxName(m.s); const st = sessions.get(n); if (!st) return;
       if (!st.sbInFlight || String(m.rid || '') !== st.sbRid) return;
@@ -3789,6 +3884,7 @@ wssHost.on('connection', (ws, req) => {
     clearInterval(ka);
     if (hostWs === ws) {
       hostWs = null; hostProtocol = { protocol: 0, caps: [] };
+      hostBinarySlots = null;      // the slot table belonged to that socket; the next hello rebuilds it
       // Zeroed, not left at its last value. A down link is already reported by host.connected, and a
       // frozen age from the previous host would describe a socket that no longer exists - the field has
       // to read "nothing to measure" rather than "the last one was 3 days old".
@@ -4013,6 +4109,35 @@ function sendViewer(name, st, client, data, replayBurst = false) {
     return false;
   }
 }
+// The single output fan-out. Both the JSON `o` frame and the binary one land here with the raw bytes
+// already in hand, so the buffering, the go-live clear and the per-viewer send live in exactly one place
+// and the two transports cannot drift apart.
+function deliverHostOutput(name, buf) {
+  const h = hostSessions.get(name); if (h) h.lastOut = Date.now();
+  const st = sessions.get(name); if (!st) return;
+  for (const c of st.clients.values()) {
+    if (!c.hosted || c.ws.readyState !== 1) continue;
+    if (c.sbWait) {
+      (c.q = c.q || []).push(buf); c.qBytes = (c.qBytes || 0) + buf.length;
+      // Flood while still waiting for scrollback: relieve memory, but NEVER blank-and-drop.
+      // The live stream itself repaints a TUI, so go live now — clear once (a fresh attach
+      // starts clean) and replay what we buffered. wentLive means a late sb is dropped, but
+      // only because real output is already painting the screen (never leaves it black).
+      if (c.qBytes > 2000000 || c.q.length > 4000) {
+        c.sbWait = false; c.wentLive = true;
+        st.sbWaiters.delete(c.id);
+        if (sendViewer(name, st, c, CLEAR_SCREEN, true)) {
+          for (const q of c.q) if (!sendViewer(name, st, c, q, true)) break;
+        }
+        c.q = []; c.qBytes = 0;
+      }
+      continue;
+    }
+    c.wentLive = true;
+    st.sbWaiters.delete(c.id);
+    sendViewer(name, st, c, buf);
+  }
+}
 function clearScrollbackRequest(st) {
   if (st.sbRequestTimer) clearTimeout(st.sbRequestTimer);
   st.sbRequestTimer = null;
@@ -4175,7 +4300,7 @@ function handleClientMsg(name, client, s) {
     const st = sessions.get(name);
     const now = Date.now();
     if (st && (!st.lastRedrawAt || now - st.lastRedrawAt >= 10000)) {
-      if (sendHost({ t: 'redraw', s: name })) st.lastRedrawAt = now;
+      if (sendHostInputRedraw(name)) st.lastRedrawAt = now;
     }
     return true;
   }
@@ -4261,8 +4386,7 @@ wss.on('connection', async (ws, req) => {
       const s = m.toString();
       if (s[0] === 'i') {
         rememberHostInputOrigin(name + ':', client.id);
-        if (!sendHost({ t: 'i', s: name, channelId: client.id,
-                        d: Buffer.from(s.slice(1), 'utf8').toString('base64') })) {
+        if (!sendHostInput(name, client.id, Buffer.from(s.slice(1), 'utf8'))) {
           try { ws.close(1013, 'PC mux host offline'); } catch {}
           return;
         }

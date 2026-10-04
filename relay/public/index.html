@@ -1109,6 +1109,19 @@ function schedulePaintHeal(delay=60){
     requestAnimationFrame(()=>{ verifyTerminalPaint('scheduled'); healTerminalPaint(); requestAnimationFrame(()=>{ healTerminalPaint(); }); });
   }, delay);
 }
+// VERIFY-ONLY, for the output path. The write burst just painted its own rows, so an unconditional
+// full heal here repaints a surface that is already correct: on the DOM renderer healTerminalPaint() is
+// a term.refresh over every row, and schedulePaintHeal runs it TWICE, 40ms after every echo - which is
+// exactly when the next keystroke is arriving while typing fast. Keep the DETECTION (a lost-rows or
+// blank surface must still self-heal) but only pay the two refreshes when the verify actually finds a
+// fault. State transitions (visibility, overlays, layout) still go through schedulePaintHeal above.
+function schedulePaintVerify(delay=40){
+  if(paintHealTimer) clearTimeout(paintHealTimer);
+  paintHealTimer=setTimeout(()=>{
+    paintHealTimer=0;
+    requestAnimationFrame(()=>{ verifyTerminalPaint('post-write'); });
+  }, delay);
+}
 // THE ONE ENTRY POINT for "the surface lost custody of its own pixels". Call it whenever the terminal
 // changed STATE rather than receiving bytes: it came back from display:none (a mobile view switch), stopped
 // being covered by a full-screen overlay, or moved for a reason the grid already agrees with (font size,
@@ -1314,7 +1327,7 @@ function pumpTermWrite(){
       if(termWriteQueue.length){
         if(Date.now()-lastWritePaintHealAt>250){
           lastWritePaintHealAt=Date.now();
-          schedulePaintHeal(20);
+          schedulePaintVerify(20);
         }
         setTimeout(pumpTermWrite, 0);
         return;
@@ -1325,7 +1338,7 @@ function pumpTermWrite(){
         if(!termWriting && !termWriteQueue.length && termWriteViewportState===scrollState)
           termWriteViewportState=null;
       }, 'write');
-      schedulePaintHeal(40);
+      schedulePaintVerify(40);
       if(isMobile() && winSize && viewportFit && winSize.rows>viewportFit.rows+1) scheduleTerminalSurfaceAlign();
       showJump();
     });
