@@ -2491,7 +2491,15 @@ try{ window.__muxForceSel = forceSel; }catch(e){}
     e.preventDefault(); e.stopPropagation();   // xterm must not turn a selection into a report to the app
   }, true);
   host.addEventListener('mousedown', e=>{
-    if(e.button>2 || !appTakesMouse() || forceSelectGesture(e)) return;
+    // The gate is the SCREEN the app owns, not whether the app happened to ARM mouse reporting. An app
+    // pane sits on the alternate screen and owns its own clicks; a bare shell sits on the normal buffer,
+    // so appOwnsScreen() is false there and the press still never reaches its stdin. Requiring
+    // appTakesMouse() here was the either/or: a session the app had not armed fell through to a null
+    // click (xterm's own reporting is off too), so you could select but never click - and an armed
+    // session suppressed native selection, so you could click but had to hold Shift to select. The
+    // screen discriminates the same danger the old gate protected against, and it does so in one arm
+    // state, so selection (Shift, or a plain drag on an unarmed app) and a click coexist.
+    if(e.button>2 || !appOwnsScreen() || forceSelectGesture(e)) return;
     const cell=bufferCellAt(e.clientX,e.clientY);
     if(!cell) return;
     const button=[0,1,2][e.button];
