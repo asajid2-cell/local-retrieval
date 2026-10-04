@@ -14,6 +14,7 @@ const { createNotifier, createJournalNotifier } = require("./notify");
 const { createRetention, pruneTranscripts: pruneTranscriptRetention } = require('./retention');
 // Every acknowledged state mutation commits through durable-state.js before it is published in memory.
 const { createLeaseConduit } = require('./lease-conduit');
+const screenModel = require('./screen-model');
 // The write lease lives in muxd. This relay holds no lease key and makes no lease decision; the
 // conduit forwards client-signed frames byte-for-byte and caches muxd's notices as UI hints only.
 const leaseConduit = createLeaseConduit();
@@ -3809,6 +3810,10 @@ wssHost.on('connection', (ws, req) => {
       const n = strictMuxName(m.s); const st = sessions.get(n); if (!st) return;
       if (!st.sbInFlight || String(m.rid || '') !== st.sbRid) return;
       const buf = Buffer.from(m.d || '', 'base64');
+      // Seed/refresh the screen model from muxd's replay so the next attach can serialize a few KB of
+      // screen instead of shipping this whole byte log again. The replay is the authoritative bytes, so
+      // feeding them to the model is safe even when the model was empty; the geometry is the shared one.
+      if (st.cur) screenModel.noteScrollback(n, st.cur.cols, st.cur.rows, buf);
       const waiters = [...st.sbWaiters];
       st.sbWaiters.clear();
       clearScrollbackRequest(st);
@@ -3820,7 +3825,12 @@ wssHost.on('connection', (ws, req) => {
         // (the old `!c.sbWait` guard) is exactly what left an idle terminal black.
         if (!c || !c.hosted || c.wentLive) continue;
         c.sbWait = false; c.wentLive = true;
-        if (sendViewer(n, st, c, CLEAR_SCREEN, true) && sendViewer(n, st, c, buf, true)) {
+        // Prefer the screen model: CLEAR + a compact serialized screen (a few KB) instead of the
+        // up-to-800KB byte replay. Falls back to `buf` when the model is unavailable (missing deps,
+        // just resized, never fed) — the replay is always correct, the model is only cheaper.
+        const snap = st.cur ? screenModel.snapshot(n, st.cur.cols, st.cur.rows) : null;
+        const replay = snap ? Buffer.from(snap, 'utf8') : buf;
+        if (sendViewer(n, st, c, CLEAR_SCREEN, true) && sendViewer(n, st, c, replay, true)) {
           for (const q of (c.q || [])) if (!sendViewer(n, st, c, q, true)) break;
         }
         c.q = []; c.qBytes = 0;
@@ -4045,6 +4055,7 @@ function sessionState(name) {
 function deleteEmptySessionState(name, st) {
   if (st.clients.size === 0 && sessions.get(name) === st) {
     clearScrollbackRequest(st);
+    screenModel.dispose(name);   // the session is gone; its screen model has no stream to stay in step with
     sessions.delete(name);
   }
 }
@@ -4115,6 +4126,10 @@ function sendViewer(name, st, client, data, replayBurst = false) {
 function deliverHostOutput(name, buf) {
   const h = hostSessions.get(name); if (h) h.lastOut = Date.now();
   const st = sessions.get(name); if (!st) return;
+  // Keep the screen model current with the same bytes the viewers get, at the shared geometry the
+  // viewers will render at. Off-geometry feeds are refused inside the model, so a resize simply makes
+  // the model unavailable until it is rebuilt rather than letting it drift out of step with the stream.
+  if (st.cur && screenModel.available()) screenModel.feed(name, st.cur.cols, st.cur.rows, buf);
   for (const c of st.clients.values()) {
     if (!c.hosted || c.ws.readyState !== 1) continue;
     if (c.sbWait) {
