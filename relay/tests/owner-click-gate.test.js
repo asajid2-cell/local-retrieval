@@ -1,18 +1,20 @@
 // Regression: a plain click on an APP pane must reach the pty whether or not the app ARMED mouse
-// reporting, and must still never reach a bare shell's stdin.
+// reporting, and a plain DRAG on the same pane must still select - both without a modifier. A bare
+// shell's stdin must never receive a mouse report.
 //
-// The bug (Ahmed, 2026-10-03): "shift drag forces terminal selection but it instantly goes away when let
-// go because the click event wins — we cannot actually copy anything. and in the case when selection wins
-// then we can never click even with shift. it's an either/or." The owner-press mousedown handler was
-// gated on appTakesMouse() — mouseGuard.inputAllowed(), true only once the app ARMS the mouse. On a
-// session the app had not armed, the handler returned early AND xterm's own native reporting was off
-// too, so the click forwarded NOTHING. Armed -> click works but native selection is suppressed (hold
-// Shift to select); unarmed -> selection works but the click is dead. One winner, never both.
+// The bug (Ahmed, 2026-10-03): "in the case when selection wins then we can never click even with shift.
+// it's an either/or ... the bad selection where it forces us to be either click or selection, instead of
+// letting us click and select both as needed." Two successive gates each picked ONE winner per pane:
+// first appTakesMouse() (arm state) then appOwnsScreen() (buffer type). Either way the decision was a
+// single boolean, so a pane got click-or-selection, never both, and Shift was the only escape - which
+// only proved the defect existed.
 //
-// The gate is now the SCREEN the app owns (appOwnsScreen()), not whether it happened to arm. A bare
-// shell sits on the normal buffer, so it stays protected; an app pane (alt screen) gets its click in
-// EITHER arm state, so selection (Shift) and clicking coexist. This file pins the source gate and both
-// halves of the behaviour, on a loopback relay with a fake host.
+// The fix is that the gesture stops being an either/or. What wants the click is neither the buffer type
+// nor the arm state: it is whether an APP is behind the pane at all (hasCommand / a chat-bound session
+// that is not shellOnly). And the click-vs-drag question is decided at RELEASE, not press - a press that
+// moved is a selection (run by us, so it works on an armed pane where xterm's own selection is off), a
+// press that did not move is a click. This file pins the source gate and the behaviour, on a loopback
+// relay with a fake host.
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const childProcess = require('node:child_process');
@@ -35,10 +37,10 @@ const source = fs.readFileSync(path.join(__dirname, '..', 'public', 'index.html'
 // The owner-press handler is the one that builds an SGR report. Pull just that listener out of the
 // shipped file (it is anonymous, so it is asserted against its source, not executed).
 function ownerPressMousedownSource() {
-  const call = source.indexOf('ownerPress={button, cell, session:current}');
-  assert.notEqual(call, -1, 'no mousedown handler sets ownerPress — the click forwarding is gone');
+  const call = source.indexOf('ownerPress={button:');
+  assert.notEqual(call, -1, 'no mousedown handler records a click candidate — the click forwarding is gone');
   const start = source.lastIndexOf("addEventListener('mousedown'", call);
-  assert.notEqual(start, -1, 'the owner-press report is no longer reached from a mousedown listener');
+  assert.notEqual(start, -1, 'the owner-press candidate is no longer recorded from a mousedown listener');
   const end = source.indexOf('}, true);', call);
   assert.notEqual(end, -1, 'could not find the end of the owner-press mousedown listener');
   // Strip comment lines: the gate is asserted against CODE. A comment explaining the old gate names it,
@@ -46,12 +48,17 @@ function ownerPressMousedownSource() {
   return source.slice(start, end).split('\n').filter(l => !/^\s*\/\//.test(l)).join('\n');
 }
 
-test('the click mousedown gate is the screen the app owns, not whether the app armed the mouse', () => {
+test('the click gate is "is there an app behind this pane", not the buffer type or the arm state', () => {
   const handler = ownerPressMousedownSource();
-  assert.match(handler, /appOwnsScreen\(\)/,
-    'the click gate no longer checks which screen is up — a bare shell could take a report on its stdin');
-  assert.doesNotMatch(handler, /appTakesMouse|inputAllowed|mouseActive/,
-    'the click gate depends on the app ARMED the mouse again — an unarmed app pane would lose every click');
+  // The gesture is decided at release, so the press handler records a candidate rather than forwarding.
+  assert.match(handler, /moved:false/,
+    'the press no longer records a click-or-drag candidate — the gesture is being decided at press time again');
+  // The either/or gates must be GONE from the click decision: neither the buffer type nor the arm state
+  // may select a single winner per pane.
+  assert.doesNotMatch(handler, /appOwnsScreen\(\)/,
+    'the click decision depends on the buffer type again — a normal-buffer app pane would lose every click');
+  assert.match(handler, /hasCommand|shellOnly/,
+    'the click gate does not consult whether an APP is behind the pane — a bare shell could take a report on its stdin');
   assert.doesNotMatch(handler, /isVisibleOwner/,
     'the click gate depends on the session being the visible owner again — a web-created pane would lose clicks');
 });
@@ -135,7 +142,26 @@ async function clickCenter(page, host) {
   return host.messages.filter(m => m.t === 'i').map(m => Buffer.from(m.d, 'base64').toString('latin1'));
 }
 
-test('a click on an ARMED app pane forwards press+release; a click on a bare shell forwards nothing', async t => {
+// Drag across the middle of the terminal; return {frames, selected}. A drag must SELECT and forward NOTHING.
+async function dragCenter(page, host) {
+  const box = await page.locator('#term').boundingBox();
+  host.messages.length = 0;
+  const y = box.y + box.height / 2;
+  const x1 = box.x + box.width * 0.2, x2 = box.x + box.width * 0.6;
+  await page.mouse.move(x1, y);
+  await page.mouse.down();
+  await page.mouse.move((x1 + x2) / 2, y, { steps: 4 });
+  await page.mouse.move(x2, y, { steps: 4 });
+  await page.mouse.up();
+  await sleep(200);
+  const frames = host.messages.filter(m => m.t === 'i').map(m => Buffer.from(m.d, 'base64').toString('latin1'));
+  const selected = await page.evaluate(() => {
+    try { return !!document.querySelector('#term .xterm-selection div'); } catch (e) { return false; }
+  });
+  return { frames, selected };
+}
+
+test('a click on an APP pane forwards press+release in EITHER arm state; a bare shell forwards nothing', async t => {
   if (!browser) return t.skip(`Chromium unavailable.\n${INSTALL}\n${browserError && browserError.message}`);
 
   const harness = new RelayHarness();
@@ -143,19 +169,15 @@ test('a click on an ARMED app pane forwards press+release; a click on a bare she
   let host = null, context = null;
   try {
     await harness.start();
+    // An APP pane: bound to a chat and carrying a command (what findSession reports for a cc/Gateway tab).
     host = await harness.connectHost([{
       name: SESSION, alive: true, created: Date.now(), cols: 80, rows: 24,
-      hasCommand: false, shellOnly: false, ready: true, owner: false, sessionId: 'click-gate-session',
+      hasCommand: true, shellOnly: false, ready: true, owner: false, sessionId: 'click-gate-session',
     }]);
     const booted = await bootPage(harness, host);
     context = booted.context; const page = booted.page;
 
-    // 1) BARE SHELL (normal buffer, no mouse tracking): a click must NOT reach its stdin.
-    const shellFrames = await clickCenter(page, host);
-    assert.equal(shellFrames.length, 0,
-      `a click on a normal-buffer shell leaked to its stdin: ${JSON.stringify(shellFrames)}`);
-
-    // 2) ARMED APP PANE (alt screen + mouse modes): a click must forward press+release.
+    // 1) ARMED APP PANE (alt screen + mouse modes): a click must forward press+release.
     host.sendOutput(SESSION, ALT + ARMED);
     await sleep(250);
     const armedFrames = await clickCenter(page, host);
@@ -164,7 +186,8 @@ test('a click on an ARMED app pane forwards press+release; a click on a bare she
     assert.ok(armedFrames.some(d => /M$/.test(d)) && armedFrames.some(d => /m$/.test(d)),
       `the forwarded report is not an SGR press+release pair: ${JSON.stringify(armedFrames)}`);
 
-    // 3) UNARMED APP PANE (alt screen, app never armed): the exact regression — the click must STILL forward.
+    // 2) UNARMED APP PANE (alt screen, app never armed): the either/or regression — the click must STILL
+    //    forward, because an app is behind the pane whether or not it armed the mouse.
     host.sendOutput(SESSION, '\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l');
     await sleep(250);
     const unarmedFrames = await clickCenter(page, host);
@@ -172,6 +195,35 @@ test('a click on an ARMED app pane forwards press+release; a click on a bare she
       `a click on an UNARMED app pane forwarded nothing (the either/or regression): ${JSON.stringify(unarmedFrames)}`);
     assert.ok(unarmedFrames.some(d => /M$/.test(d)) && unarmedFrames.some(d => /m$/.test(d)),
       `the forwarded report is not an SGR press+release pair: ${JSON.stringify(unarmedFrames)}`);
+
+    // 3) NORMAL-BUFFER APP PANE: the other half of the either/or — the user's cctest pane is an app on the
+    //    NORMAL buffer, and it lost every click under the appOwnsScreen() gate. It must forward now.
+    host.sendOutput(SESSION, '\x1b[?1049l');
+    host.sendOutput(SESSION, '\x1b[2J\x1b[H' + LINES.join('\r\n') + '\r\n');
+    await sleep(300);
+    const normalAppFrames = await clickCenter(page, host);
+    assert.equal(normalAppFrames.length, 2,
+      `a click on a normal-buffer APP pane forwarded nothing: ${JSON.stringify(normalAppFrames)}`);
+
+    // 4) DRAG on the SAME pane: both, as needed. A drag must select and forward NOTHING (a selection is not
+    //    a click) — the other half of "click and select both", proven on the pane the click just worked on.
+    const drag = await dragCenter(page, host);
+    assert.equal(drag.frames.length, 0,
+      `a drag also forwarded to the app (click won over selection): ${JSON.stringify(drag.frames)}`);
+    assert.ok(drag.selected, 'a plain drag did not select on an app pane (selection lost to the click)');
+
+    // 5) BARE SHELL (no app behind the pane): a click must NOT reach its stdin. Re-point the SAME page at
+    //    a shell session record so nothing about the relay or the browser is re-created for this half.
+    host.sendOutput(SESSION, '\x1b[2J\x1b[Hshell prompt $ ');
+    await page.evaluate(() => {
+      window._sessions = (window._sessions || []).map(s => s.name === 'click-gate-shell'
+        ? { name: s.name, alive: true, cols: s.cols, rows: s.rows, hasCommand: false, shellOnly: true, ready: true, owner: false, sessionId: '' }
+        : s);
+    });
+    await sleep(200);
+    const shellFrames = await clickCenter(page, host);
+    assert.equal(shellFrames.length, 0,
+      `a click on a bare shell leaked to its stdin: ${JSON.stringify(shellFrames)}`);
   } finally {
     if (context) await context.close();
     await harness.stop();

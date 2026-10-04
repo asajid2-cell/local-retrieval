@@ -2490,40 +2490,86 @@ try{ window.__muxForceSel = forceSel; }catch(e){}
 (function(){
   const host=$('#term');
   let ownerPress=null;
+  // CLICK AND SELECT, BOTH, WITHOUT A MODIFIER.
+  //
+  // The old shape was an either/or and it was decided at PRESS time, on one boolean: appOwnsScreen()
+  // (buffer type) for the forward, and xterm's own areMouseEventsActive for whether native selection
+  // worked. That meant a pane got exactly one gesture - forward the press and native selection was
+  // suppressed (you had to hold Shift to select), or leave selection native and the press went nowhere
+  // ("you can select but never click"). Shift was never the fix; it only proved the defect existed.
+  //
+  // The gesture is not really two things. A plain press that MOVES is a selection; a plain press that
+  // does not move is a click. Both are knowable at RELEASE, so the decision moves there:
+  //   * press        -> remember a candidate click. Forward nothing yet.
+  //   * drag (moved) -> run OUR selection from the press anchor, exactly like Shift does, so a drag
+  //                     selects even on a pane whose app armed the mouse (where xterm's own selection
+  //                     service is off). No report is sent: the gesture was a selection.
+  //   * release      -> if it moved, the selection already won (stop here). If it did not move, it was a
+  //                     click: forward the press+release to the app, and only when the app actually
+  //                     asked for the mouse (appTakesMouse). A bare shell never asks, so nothing is
+  //                     written into its stdin - the danger the old appOwnsScreen() gate protected
+  //                     against is covered by the arm state itself, without collapsing to an either/or.
   host.addEventListener('mousedown', e=>{
-    if(e.button!==0 || !forceSelectGesture(e)) return;
-    if(!forceSelStart(e.clientX, e.clientY)) return;
-    e.preventDefault(); e.stopPropagation();   // xterm must not turn a selection into a report to the app
-  }, true);
-  host.addEventListener('mousedown', e=>{
-    // The gate is the SCREEN the app owns, not whether the app happened to ARM mouse reporting. An app
-    // pane sits on the alternate screen and owns its own clicks; a bare shell sits on the normal buffer,
-    // so appOwnsScreen() is false there and the press still never reaches its stdin. Requiring
-    // appTakesMouse() here was the either/or: a session the app had not armed fell through to a null
-    // click (xterm's own reporting is off too), so you could select but never click - and an armed
-    // session suppressed native selection, so you could click but had to hold Shift to select. The
-    // screen discriminates the same danger the old gate protected against, and it does so in one arm
-    // state, so selection (Shift, or a plain drag on an unarmed app) and a click coexist.
-    if(e.button>2 || !appOwnsScreen() || forceSelectGesture(e)) return;
+    if(e.button>2) return;
+    if(forceSelectGesture(e)){                       // Shift / Sel toggle: the explicit selection gesture
+      if(forceSelStart(e.clientX,e.clientY)){ e.preventDefault(); e.stopPropagation(); }
+      return;
+    }
+    // A plain press is a candidate click OR the start of a drag - we do not know yet, so record it and
+    // let motion (below) and the release (below) decide. Nothing is forwarded here.
     const cell=bufferCellAt(e.clientX,e.clientY);
     if(!cell) return;
-    const button=[0,1,2][e.button];
-    const report=`\x1b[<${button};${cell[0]+1};${cell[1]-(term.buffer.active.viewportY|0)+1}M`;
-    ownerPress={button, cell, session:current};
-    sendMouseInput(report);
-    e.preventDefault(); e.stopPropagation();
+    const s=findSession(current);
+    // WHAT WANTS THE CLICK. Not the buffer type (a normal-buffer app pane lost every click) and not the
+    // arm state (an app that never armed the mouse lost every click too - that was the either/or). It is
+    // simply whether an APP is behind this pane at all: a session bound to an exact chat / carrying a
+    // command is an app pane and takes clicks; a bare shell is not and must never have a report written
+    // into its stdin, where it would echo as garbage. Both of the panes in the field report are this case.
+    const wantApp=!!(s && (s.hasCommand || (s.sessionId && !s.shellOnly)));
+    ownerPress={button:[0,1,2][e.button], cell, session:current,
+                x:e.clientX, y:e.clientY, moved:false, wantApp};
+    // When the app armed the mouse, xterm's own protocol would emit the press the instant it fires - and
+    // we would emit ours again at release, so the app sees two presses for one click. Keep xterm out of
+    // an armed pane's press; we are the only one that reports it. On an UNARMED pane we must NOT prevent
+    // it: xterm's own selection service is what makes a plain drag highlight, and swallowing the press
+    // would leave that pane unable to select.
+    if(appTakesMouse()){ e.preventDefault(); e.stopPropagation(); }
   }, true);
   document.addEventListener('mouseup', e=>{
     if(!ownerPress) return;
     const press=ownerPress;
     ownerPress=null;
     if(current!==press.session) return;
+    if(press.moved){
+      // The press turned into a selection mid-gesture (forceSel handled it). A selection is not a click
+      // and must not also reach the app - that double-delivery was half the either/or.
+      e.preventDefault(); e.stopPropagation();
+      return;
+    }
+    // Never moved: a click. Forward it only when there is an app behind this pane to receive it. The cell
+    // is recomputed at the release point so a click that drifted a few px still lands on what is under
+    // the cursor.
+    if(!press.wantApp) return;
     const cell=bufferCellAt(e.clientX,e.clientY) || press.cell;
-    sendMouseInput(`\x1b[<${press.button};${cell[0]+1};${cell[1]-(term.buffer.active.viewportY|0)+1}m`);
+    const at=c=>`\x1b[<${press.button};${c[0]+1};${c[1]-(term.buffer.active.viewportY|0)+1}`;
+    sendMouseInput(at(cell)+'M');
+    sendMouseInput(at(cell)+'m');
     e.preventDefault(); e.stopPropagation();
   }, true);
   // The drag and its release live on the document: the gesture is allowed to leave the terminal.
-  document.addEventListener('mousemove', e=>{ if(forceSel.active) forceSelTrack(e.clientX, e.clientY); }, true);
+  document.addEventListener('mousemove', e=>{
+    if(forceSel.active){ forceSelTrack(e.clientX, e.clientY); return; }
+    // Promote a plain press into a selection once it has actually moved. The threshold keeps a click with
+    // a pixel of jitter a click. anchor = the press cell, so the drag starts where the user pressed.
+    if(!ownerPress || ownerPress.moved) return;
+    if(Math.abs(e.clientX-ownerPress.x) < 4 && Math.abs(e.clientY-ownerPress.y) < 4) return;
+    ownerPress.moved=true;
+    // We are taking over the gesture. On an unarmed pane xterm started its OWN selection on the press
+    // (we did not prevent it, so a plain press could still be a click); drop that so the two selections
+    // do not fight over the same highlight - ours is the one that latches and copies.
+    try{ term.clearSelection(); }catch(_){}
+    if(forceSelStart(ownerPress.x, ownerPress.y)) forceSelTrack(e.clientX, e.clientY);
+  }, true);
   // The release must not reach xterm. Its element-level mouseup listener is installed by the mouse protocol
   // itself (not by the mousedown), so keeping the mousedown out is not enough: it would emit the release to
   // the app, and xterm's own onUserInput listener - which cannot tell a release report from a keystroke -
