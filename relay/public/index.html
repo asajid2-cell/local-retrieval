@@ -165,6 +165,17 @@
     background:var(--rose); color:#1a0a0e; font:600 13px/1 inherit; cursor:pointer; box-shadow:0 6px 20px rgba(0,0,0,.5);
   }
   #jumplive.show { display:inline-flex; }
+  /* PREDICTIVE ECHO. mosh-style local typeahead: the char you just typed is drawn here the moment you
+     send it, so on a slow link you see your text before the server echoes it. It is an OVERLAY, never
+     written into xterm's buffer - the terminal's own model stays authoritative and the prediction is
+     only pixels. We dim it (opacity) and place it at the cursor cell, then peel confirmed chars off the
+     front as the real echo lands. Off on the alternate screen, where the app owns every cell. */
+  #predict {
+    position:absolute; z-index:4; pointer-events:none; display:none;
+    font:inherit; white-space:pre; opacity:.45; color:var(--txt);
+    text-rendering:optimizeSpeed; will-change:transform;
+  }
+  #predict.show { display:block; }
   /* Scrollback is real history, so give it a real scrollbar: thin, themed, draggable with a mouse.
      Nothing here changes xterm's sizing internals - only the bar the browser already paints. */
   #term .xterm-viewport {
@@ -671,6 +682,7 @@
     </div>
     <button type="button" id="scrollstate" hidden><span id="scrolltext"></span></button>
     <button id="jumplive" aria-label="Jump to live"><span id="jlcount">new</span> ↓</button>
+    <div id="predict" aria-hidden="true"></div>
   </main>
 
   <div id="fleetList" aria-label="Fleet glance"></div>
@@ -1295,6 +1307,9 @@ function clearTermWriteQueue(){
 }
 function enqueueTermWrite(bytes){
   const src = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  // The server's echo is the authority on what we actually typed: peel confirmed chars off the local
+  // prediction before the bytes reach the grid, so the guess never lingers over the real glyph.
+  if(typeof predictReconcile==='function') predictReconcile(src);
   const epoch = termWriteEpoch;
   for(let off=0; off<src.length; off+=WRITE_SLICE){
     termWriteQueue.push({ epoch, chunk:src.subarray(off, Math.min(off+WRITE_SLICE, src.length)) });
@@ -1635,6 +1650,10 @@ const send = (t,d) => {
   else if (t==='i' && inputQueue) r=inputQueue.capture(d, { kind:'input', scope:current });
   else r='dropped';
   if (inputSendProbe.sink) inputSendProbe.sink.push(r);
+  // Local typeahead: draw the char we just handled, so a slow link does not read as a dead keyboard.
+  // Only a single printable char qualifies (a paste or a control key is not a self-echoing keystroke),
+  // and only on the normal screen - an app in alt-screen decides what a key means.
+  if (t==='i' && typeof predictAdd==='function' && predictEligible(d) && !predictIsAlt() && !selectMode) predictAdd(d);
   return r;
 };
 
@@ -2461,6 +2480,79 @@ function bufferCellAt(clientX, clientY){
   return [Math.min(cols-1, Math.max(0,col)), Math.min(rows-1, Math.max(0,row)) + (term.buffer.active.viewportY|0)];
 }
 const forceSel={ active:false, moved:false, anchor:null, last:null };
+// ---- PREDICTIVE ECHO (mosh-style local typeahead) --------------------------------------------------
+// The felt lag on WAN is ~86ms p50 between a keystroke leaving and its echo coming back, so a fast
+// typist watches the cursor trail their fingers. We close that gap the way mosh does: as soon as a
+// printable char is sent we draw it locally, dim, at the cursor cell, and peel it off as the server's
+// real echo lands. The prediction is PIXELS ONLY - it is never written into xterm's buffer, so the
+// terminal's own screen model stays the single source of truth and a dropped/reordered reconcile can
+// only ever leave stale paint, never corrupt the grid. (Per the review: off on the alternate screen,
+// where an app owns every cell and a guess is wrong as often as right.)
+const predict = { chars:[], cell:null, buf:'' };
+function predictIsAlt(){ try{ return term.buffer.active.type==='alternate'; }catch(e){ return true; } }
+function predictEligible(d){ return d.length===1 && d>=' ' && d!=='\x7f'; }   // one printable char, no paste/control
+function predictClear(){
+  if(!predict.chars.length) return;
+  predict.chars=[]; predict.cell=null; predict.buf='';
+  predictPaint();   // predictPaint syncs the DOM text and hides — no stale glyph left behind
+}
+// Where the cursor sits right now, as a viewport cell. The prediction rides the cursor, so it must be
+// recomputed on every keystroke rather than latched once.
+function predictCursorCell(){
+  try{
+    const b=term.buffer.active;
+    return [b.cursorX|0, (b.cursorY|0) - (b.viewportY|0)];
+  }catch(e){ return null; }
+}
+function predictAdd(d){
+  if(!predict.chars.length) predict.cell = predictCursorCell();
+  if(!predict.cell) return false;
+  // A wrapped/killed line makes the running string meaningless; restart the take at the live cursor.
+  const cell=predictCursorCell();
+  if(cell && (cell[1]!==predict.cell[1] || cell[0]!==predict.cell[0]+predict.chars.length)) predict.cell=cell;
+  predict.chars.push(d);
+  predictPaint();
+  return true;
+}
+// Reconcile incoming server output against the pending prediction. The echo is authoritative: whatever
+// prefix of our guess it confirms comes off; a control char / newline / divergence cancels the rest,
+// because from there the screen no longer matches what we drew.
+function predictReconcile(out){
+  if(!predict.chars.length) return;
+  const text = new TextDecoder('utf-8', { stream:false }).decode(out);
+  if(text.indexOf('\x1b')>=0 || /[\r\n\x08\x07]/.test(text)){ predictClear(); return; }
+  let consumed=0;
+  for(let i=0;i<text.length && i<predict.chars.length;i++){
+    if(text[i]!==predict.chars[i]) break;
+    consumed++;
+  }
+  if(consumed===0){ predictClear(); return; }   // the server said something else entirely
+  predict.chars.splice(0, consumed);
+  predictPaint();
+}
+function predictPaint(){
+  const el=$('#predict');
+  if(!el){ return; }
+  // Always keep the DOM text in step with the model, even on the hide paths — a hidden-but-stale
+  // "hi" left in the node is what a later read (or a font re-layout) would surface as a ghost.
+  const want = predict.chars.join('');
+  if(el.textContent !== want) el.textContent = want;
+  if(!predict.chars.length || predictIsAlt() || selectMode){ el.classList.remove('show'); return; }
+  const host=$('#term'), scr=host && host.querySelector('.xterm-screen');
+  if(!scr || !predict.cell){ el.classList.remove('show'); return; }
+  const cols=term.cols|0, rows=term.rows|0;
+  const r=scr.getBoundingClientRect(), hr=host.getBoundingClientRect();
+  if(!r.width || !cols || !rows){ el.classList.remove('show'); return; }
+  const cw=r.width/cols, chh=r.height/rows;
+  // xterm draws the cursor cell; our guess starts one cell past it as the char lands, so anchor on the
+  // cursor cell itself and let the glyph fill it (the cursor will move under the echo).
+  const left = (r.left - hr.left) + predict.cell[0]*cw;
+  const top  = (r.top  - hr.top)  + predict.cell[1]*chh;
+  el.style.transform = `translate(${left}px, ${top}px)`;
+  el.style.lineHeight = chh+'px';
+  el.style.height = chh+'px';
+  el.classList.add('show');
+}
 function forceSelApply(){
   if(!forceSel.anchor || !forceSel.last) return false;
   const a=forceSel.anchor, b=forceSel.last;
@@ -2664,6 +2756,9 @@ function applyScrollAffordance(){
   const key = (alt?'a:':'n:') + (panning?'p:':'f:') + label;
   if(key===lastAffordance) return label;
   lastAffordance = key;
+  // An alt-screen flip changes who owns the cells, so a pending prediction is stale either way: entering
+  // the app's screen makes a shell guess wrong, leaving it returns to a cursor our guess no longer sits on.
+  if(typeof predictClear==='function') predictClear();
   host.classList.toggle('altbuf', alt);
   chip.classList.toggle('app', alt);
   txt.textContent = label;
@@ -3758,6 +3853,7 @@ function copyFromTerm(){
 function toggleSelect(){
   selectMode=!selectMode;
   $('#term').classList.toggle('selecting', selectMode);
+  if(typeof predictClear==='function') predictClear();   // a frozen/refrozen screen has no live cursor to predict onto
   buildKeybar();
   if(selectMode){ flash('FROZEN — drag to select (hold Shift if the app grabs the mouse), then Copy'); }
   else {
