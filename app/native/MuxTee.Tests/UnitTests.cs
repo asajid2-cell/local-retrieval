@@ -81,6 +81,58 @@ public class UnitTests
         CollectionAssert.AreEqual(new byte[] { 3, 4, 5, 6 }, ring.Snapshot());
     }
 
+    // Invariant 2, at the one point that enforces it: many producers (T2 keys, the net task) push
+    // multi-byte sequences, and ONE consumer - the shape of T3 - writes them out. Every sequence must
+    // arrive whole and in its own contiguous run, never sliced by another producer's bytes. Break the
+    // "one consumer" half (drain with two threads) and the runs interleave, so this goes red.
+    [TestMethod]
+    public void InputQueue_OneConsumer_KeepsEachSequenceWhole()
+    {
+        var queue = new InputQueue(_ => { });
+        const int producers = 4, perProducer = 200, seqLen = 6;
+        // Each producer stamps a distinct byte value and a 0xAA terminator, so a torn run is visible.
+        var expectedWhole = producers * perProducer;
+
+        var writers = new List<System.Threading.Thread>();
+        for (int p = 0; p < producers; p++)
+        {
+            int id = p + 1;
+            writers.Add(new System.Threading.Thread(() =>
+            {
+                var seq = new byte[seqLen];
+                for (int i = 0; i < seqLen - 1; i++) seq[i] = (byte)id;
+                seq[seqLen - 1] = 0xAA;
+                for (int n = 0; n < perProducer; n++) queue.Enqueue(seq);
+            }) { IsBackground = true });
+        }
+
+        var outBuf = new List<byte>();
+        var drain = new System.Threading.Thread(() =>
+        {
+            while (queue.TryTake(out var chunk)) outBuf.AddRange(chunk);
+        }) { IsBackground = true };
+
+        drain.Start();
+        foreach (var w in writers) w.Start();
+        foreach (var w in writers) w.Join();
+        queue.Complete();
+        drain.Join(5000);
+
+        // Re-parse the flat stream into runs and check none is torn.
+        int runs = 0; bool torn = false;
+        for (int i = 0; i < outBuf.Count; )
+        {
+            byte id = outBuf[i];
+            if (id == 0 || id > producers) { torn = true; break; }
+            for (int j = 0; j < seqLen; j++)
+                if (outBuf[i + j] != (j == seqLen - 1 ? (byte)0xAA : id)) { torn = true; break; }
+            if (torn) break;
+            i += seqLen; runs++;
+        }
+        Assert.IsFalse(torn, "a sequence was torn: bytes from two producers interleaved");
+        Assert.AreEqual(expectedWhole, runs, "not every enqueued sequence came out whole");
+    }
+
     [TestMethod]
     public void QuoteArg_LeavesSimpleArgsAlone()
         => Assert.AreEqual("hello", ChildProcess.QuoteArg("hello"));
