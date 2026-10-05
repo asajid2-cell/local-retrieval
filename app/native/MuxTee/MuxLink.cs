@@ -22,14 +22,32 @@ namespace MuxTee;
 // Everything here is fire-and-forget off T1: the send queue is bounded and drops its OLDEST frame on
 // overflow, because this is a live screen, and the newest VT is the part that matters. T1 must never
 // block on the network (invariant 1), so Enqueue only ever touches the queue and a wake.
+//
+// One socket, both directions. A muxd restart closes the socket, and the tab has to come back on its
+// own: the receive half must survive a Close frame (it used to `return`, leaving the tab deaf), the send
+// half must not block forever on a frame that an unwatched tab will never produce, and a reconnect must
+// start from a clean slate. These are the whole of B1.
 internal sealed class MuxLink : IDisposable
 {
     private const byte KindIngest = 0x01;
     private const byte KindResync = 0x03;
 
+    // Bounds one connect handshake. A muxd that accepts the TCP socket but never finishes the websocket
+    // handshake must not wedge the send loop - the tab still has to re-register within a bounded time.
+    private static readonly TimeSpan ConnectTimeout = TimeSpan.FromSeconds(5);
+
+    // The send loop waits for a frame, but never longer than this. An UNWATCHED tab produces no frames
+    // at all (Enqueue skips the copy), so a bare wait would sleep straight through a muxd restart and the
+    // tab would never notice the socket had died. The timeout just re-runs the loop, which re-checks the
+    // socket state - that is how a dead socket is detected with no outbound frame to fail on.
+    private static readonly TimeSpan ReconnectPoll = TimeSpan.FromSeconds(1);
+
     private readonly string _name;
     private readonly string _ownerKey;
-    private readonly int _cols, _rows;
+    // Mutable: a reconnect must announce the tab's CURRENT size, not the one it was built with, so a tab
+    // resized while the link was down comes back at the right dimensions. (B2 wires the resize path that
+    // calls SetSize; today nothing changes it, so the reconnect hello equals the construction size.)
+    private int _cols, _rows;
     private readonly string _uri;
     private readonly InputQueue _input;
     private readonly Action<string> _log;
@@ -47,7 +65,8 @@ internal sealed class MuxLink : IDisposable
     // spec section 6.5: muxd tells us when a relay viewer is actually watching this tab. Until then -
     // and again once the last viewer leaves - we skip the frame copy entirely, because bytes nobody is
     // looking at are pure allocation on the path a local keystroke has to share. Starts false: a fresh
-    // link is unwatched until muxd says otherwise.
+    // link is unwatched until muxd says otherwise. A reconnect resets it, because a watch granted by the
+    // muxd we just lost means nothing to the one that replaced it.
     private volatile bool _watched;
 
     public bool Watched => _watched;
@@ -56,7 +75,8 @@ internal sealed class MuxLink : IDisposable
 
     // Fires on the transition into "registered at muxd", so the owner can push its ring as the initial
     // history. The child draws before muxd has accepted us, so those first frames are never enqueued -
-    // the ring snapshot closes that gap.
+    // the ring snapshot closes that gap. It also fires on every reconnect, so a tab that was watched
+    // before a muxd restart comes back whole.
     public event Action? RegisteredChanged;
 
     // Fires on the rising edge of watched (spec section 6.5). While unwatched we skip sending, so muxd's
@@ -77,6 +97,14 @@ internal sealed class MuxLink : IDisposable
 
     public static string DefaultUri()
         => "ws://127.0.0.1:" + (Environment.GetEnvironmentVariable("MUXTEE_LOCAL_PORT") ?? "7699");
+
+    // The size the next hello reports. A resize calls this so a later reconnect announces the current
+    // dimensions rather than the ones the link was constructed with.
+    public void SetSize(int cols, int rows)
+    {
+        _cols = cols;
+        _rows = rows;
+    }
 
     public void Start()
     {
@@ -103,6 +131,8 @@ internal sealed class MuxLink : IDisposable
     // Replace the ring wholesale (spec section 6.1, kind 0x03). Used when the local screen and the ring
     // have diverged - e.g. after a resize the ring never saw. Queued in order, so it lands after whatever
     // T1 already put ahead of it.
+    // NOTE (B3): unlike Enqueue, this does NOT apply the 1 MiB cap - a resync snapshot is one frame that
+    // has to land whole. B3 revisits whether a pathological ring size needs its own ceiling here.
     public void ReplaceHistory(byte[] snapshot)
     {
         var frame = new byte[snapshot.Length + 1];
@@ -119,23 +149,29 @@ internal sealed class MuxLink : IDisposable
         {
             try
             {
-                if (_ws is null || _ws.State != WebSocketState.Open)
+                var ws = _ws;
+                if (ws is null || ws.State != WebSocketState.Open)
                 {
                     await Connect();
-                    if (!_registered) { await Task.Delay(1000, _cts.Token); continue; }
+                    ws = _ws;
                 }
-                await _outWake.WaitAsync(_cts.Token);
-                while (_out.TryDequeue(out var frame))
+
+                // Wait for a frame, but never indefinitely (see ReconnectPoll). Timing out is not an
+                // error: it is the tick that lets an idle tab notice its socket is gone.
+                await _outWake.WaitAsync(ReconnectPoll, _cts.Token);
+                // Send on the socket captured for THIS iteration, never on _ws: the receive half can drop
+                // the link and null _ws mid-send, and dereferencing it here would be a needless NRE.
+                while (ws is not null && _out.TryDequeue(out var frame))
                 {
                     Interlocked.Add(ref _outBytes, -frame.Length);
-                    await _ws!.SendAsync(frame, WebSocketMessageType.Binary, true, _cts.Token);
+                    await ws.SendAsync(frame, WebSocketMessageType.Binary, true, _cts.Token);
                 }
             }
             catch (OperationCanceledException) { break; }
             catch (Exception ex)
             {
                 _log("mux link send loop: " + ex.Message);
-                _registered = false;
+                DropLink();
                 try { await Task.Delay(1000, _cts.Token); } catch { break; }
             }
         }
@@ -143,26 +179,70 @@ internal sealed class MuxLink : IDisposable
 
     private async Task Connect()
     {
-        var ws = new ClientWebSocket();
-        await ws.ConnectAsync(new Uri(_uri), _cts.Token);
-        // A stream owner reports itself as a plain shell with no resolvable command identity (section
-        // 6.3): muxtee relays a terminal that muxd may not relaunch, so it must not claim a writer slot.
-        var hello = new
+        // A socket that is present but not Open is a corpse: only DropLink disposes the live one, so a
+        // socket left half-open (say the receive half saw a Close first) would otherwise linger. Clear it
+        // before dialing its replacement.
+        var previous = _ws;
+        if (previous is not null)
         {
-            t = "owner",
-            s = _name,
-            ownerKey = _ownerKey,
-            cmd = "",
-            cols = _cols,
-            rows = _rows,
-            stream = true,
-        };
-        var bytes = JsonSerializer.SerializeToUtf8Bytes(hello);
-        await ws.SendAsync(bytes, WebSocketMessageType.Text, true, _cts.Token);
+            _ws = null;
+            try { previous.Dispose(); } catch { }
+        }
+
+        var ws = new ClientWebSocket();
+        // Bound the handshake only. Reusing this token for the established socket's I/O is the trap that
+        // makes a live tab go deaf: the deadline fires mid-session and every receive throws.
+        using var attempt = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
+        attempt.CancelAfter(ConnectTimeout);
+        try
+        {
+            await ws.ConnectAsync(new Uri(_uri), attempt.Token);
+
+            // A fresh muxd knows nothing about us: the gate starts closed, and frames queued for the link
+            // we just lost are stale screen, so drop them rather than replay them into the new ring.
+            _watched = false;
+            while (_out.TryDequeue(out var stale)) Interlocked.Add(ref _outBytes, -stale.Length);
+
+            // A stream owner reports itself as a plain shell with no resolvable command identity (section
+            // 6.3): muxtee relays a terminal that muxd may not relaunch, so it must not claim a writer
+            // slot. cols/rows are read NOW, so a reconnect announces the tab's current size, not the
+            // construction-time one.
+            var hello = new
+            {
+                t = "owner",
+                s = _name,
+                ownerKey = _ownerKey,
+                cmd = "",
+                cols = _cols,
+                rows = _rows,
+                stream = true,
+            };
+            var bytes = JsonSerializer.SerializeToUtf8Bytes(hello);
+            await ws.SendAsync(bytes, WebSocketMessageType.Text, true, attempt.Token);
+        }
+        catch
+        {
+            // The handshake or the hello never completed, so this socket is not the link: dispose it and
+            // let the send loop's handler back off and retry. Leaving it undisposed leaks the socket.
+            try { ws.Dispose(); } catch { }
+            throw;
+        }
+
         _ws = ws;
         _registered = true;
         _log("mux link registered stream owner " + _name + " at " + _uri);
         try { RegisteredChanged?.Invoke(); } catch (Exception ex) { _log("registered hook: " + ex.Message); }
+    }
+
+    // The one place a lost socket is recorded. Both loops call it, so whichever half sees the failure
+    // first leaves the same clean state for the other to reconnect from.
+    private void DropLink()
+    {
+        _registered = false;
+        _watched = false;
+        var ws = _ws;
+        _ws = null;
+        try { ws?.Dispose(); } catch { }
     }
 
     private async Task RecvLoop()
@@ -173,19 +253,25 @@ internal sealed class MuxLink : IDisposable
             var ws = _ws;
             if (ws is null || ws.State != WebSocketState.Open)
             {
-                try { await Task.Delay(500, _cts.Token); } catch { break; }
+                try { await Task.Delay(200, _cts.Token); } catch { break; }
                 continue;
             }
             try
             {
                 using var ms = new System.IO.MemoryStream();
                 WebSocketReceiveResult r;
+                var closed = false;
                 do
                 {
                     r = await ws.ReceiveAsync(buffer, _cts.Token);
-                    if (r.MessageType == WebSocketMessageType.Close) { _registered = false; return; }
+                    if (r.MessageType == WebSocketMessageType.Close) { closed = true; break; }
                     ms.Write(buffer, 0, r.Count);
                 } while (!r.EndOfMessage);
+
+                // A Close frame ends THIS socket, not the loop. Null the link and go round, so the send
+                // half dials a fresh one. `return` here is what used to leave a tab permanently deaf
+                // after muxd restarted.
+                if (closed) { DropLink(); continue; }
 
                 if (r.MessageType != WebSocketMessageType.Text) continue;
                 HandleText(ms.ToArray());
@@ -194,9 +280,8 @@ internal sealed class MuxLink : IDisposable
             catch (Exception ex)
             {
                 _log("mux link recv loop: " + ex.Message);
-                _registered = false;
-                _ws = null;
-                try { await Task.Delay(1000, _cts.Token); } catch { break; }
+                DropLink();
+                try { await Task.Delay(500, _cts.Token); } catch { break; }
             }
         }
     }
@@ -235,6 +320,7 @@ internal sealed class MuxLink : IDisposable
                     break;
                 case "redraw":
                     // muxd saw the screen and its ring disagree; the caller re-sends history.
+                    try { WatchChanged?.Invoke(); } catch (Exception ex) { _log("redraw hook: " + ex.Message); }
                     break;
                 case "kill":
                     // Remote kill of a local tab is not wired in P2; the local terminal owns its lifetime.
