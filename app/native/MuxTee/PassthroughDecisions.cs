@@ -31,6 +31,12 @@ internal static class PassthroughDecisions
         return LaunchMode.Tee;
     }
 
+    // B6: the passthrough Ctrl handler swallows ONLY Ctrl+C, so a ^C in the tab leaves muxtee (and the
+    // tab) alive while the child's foreground command still dies - the OS delivers the event to every
+    // process on the console, and the child has no handler. Break (1) and Close (2) pass through: there
+    // the tab really is going away and muxtee should go with it.
+    internal static bool SwallowsCtrl(uint ctrlType) => ctrlType == 0; // CTRL_C_EVENT only
+
     // "1", "true", "yes", "on" - anything else, including "" or unset, is off. Only truthy values turn
     // the escape hatch on, so a stray MUXTEE_DISABLE=0 in a shell does not silently disable the tee.
     internal static bool IsSet(string? value)

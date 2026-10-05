@@ -41,6 +41,16 @@ public class UnitTests
                 new Dictionary<string, string> { ["MUXTEE_DISABLE"] = "0" }.GetValueOrDefault));
     }
 
+    // B6: the passthrough handler must swallow Ctrl+C (0) so a ^C in the tab does not take muxtee with
+    // it, and must NOT swallow Break (1) or Close (2) - there the tab really is going away.
+    [TestMethod]
+    public void Passthrough_SwallowsOnlyCtrlC()
+    {
+        Assert.IsTrue(PassthroughDecisions.SwallowsCtrl(0), "Ctrl+C must be swallowed");
+        Assert.IsFalse(PassthroughDecisions.SwallowsCtrl(1), "Break must tear muxtee down");
+        Assert.IsFalse(PassthroughDecisions.SwallowsCtrl(2), "Close must tear muxtee down");
+    }
+
     [TestMethod]
     [DataRow("1", true)]
     [DataRow("true", true)]

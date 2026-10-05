@@ -134,6 +134,90 @@ public class TeeAcceptanceTests
             "Ctrl+C did not return control to the shell; saw: " + Snippet(h.Output));
     }
 
+    // B6 has no pty-based test on purpose. A passthrough Ctrl+C is a console CONTROL event, and a pty
+    // cannot produce one: the harness writes a raw ^C byte, and neither a raw pty write nor
+    // GenerateConsoleCtrlEvent can raise CTRL_C_EVENT (only CTRL_BREAK_EVENT is deliverable), so any such
+    // test would be asserting on a proxy that cannot fire. The two halves are proven elsewhere:
+    //   * the handler's decision (swallow Ctrl+C, pass break/close) - UnitTests.Passthrough_SwallowsOnlyCtrlC;
+    //   * a console control event reaching the real passthrough child and killing its foreground command -
+    //     the live isolated-console probe (muxtee-mode), plus PassthroughChild_DiesWhenTheTabCloses below.
+
+    // B6: closing a passthrough tab must not orphan the child. The tab IS muxtee's console, so closing it
+    // kills muxtee and the OS closes its handles - and the child only goes with it if muxtee put it in a
+    // kill-on-close job. Red before the fix: the child (a sleeping powershell) outlives muxtee.
+    [TestMethod]
+    public void PassthroughChild_DiesWhenTheTabCloses()
+    {
+        var pidFile = Path.Combine(Path.GetTempPath(), "muxtee-childpid-" + Guid.NewGuid().ToString("N") + ".txt");
+        try
+        {
+            // stdio is a pipe, not a console, so this is the passthrough path - the same RunPassthrough
+            // that MUXTEE_DISABLE=1 takes in a real tab.
+            var psi = new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = MuxteeExe,
+                RedirectStandardInput = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+            };
+            psi.ArgumentList.Add("--");
+            psi.ArgumentList.Add("powershell.exe");
+            psi.ArgumentList.Add("-NoProfile");
+            psi.ArgumentList.Add("-Command");
+            // The child reports its own pid, then sleeps well past the test's patience.
+            psi.ArgumentList.Add("$PID | Out-File -Encoding ascii '" + pidFile + "'; Start-Sleep 60");
+
+            var p = System.Diagnostics.Process.Start(psi)!;
+            var childPid = WaitForPid(pidFile, 20000);
+            Assert.IsTrue(childPid > 0, "the passthrough child never reported its pid");
+            Assert.IsTrue(IsAlive(childPid), "the passthrough child was not running to begin with");
+
+            // The tab closes: muxtee goes away. This is what the X does to the console's process.
+            p.Kill(entireProcessTree: false);
+            p.WaitForExit(10000);
+            Assert.IsTrue(p.HasExited, "muxtee did not exit when killed");
+
+            Assert.IsTrue(WaitForPidGone(childPid, 10000),
+                $"closing the tab orphaned the passthrough child (pid {childPid})");
+        }
+        finally { try { File.Delete(pidFile); } catch { } }
+    }
+
+    private static int WaitForPid(string pidFile, int timeoutMs)
+    {
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        while (sw.ElapsedMilliseconds < timeoutMs)
+        {
+            try
+            {
+                if (File.Exists(pidFile)
+                    && int.TryParse(File.ReadAllText(pidFile).Trim(), out var pid) && pid > 0)
+                    return pid;
+            }
+            catch { }
+            System.Threading.Thread.Sleep(100);
+        }
+        return 0;
+    }
+
+    private static bool IsAlive(int pid)
+    {
+        try { using var _ = System.Diagnostics.Process.GetProcessById(pid); return true; }
+        catch { return false; }
+    }
+
+    private static bool WaitForPidGone(int pid, int timeoutMs)
+    {
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        while (sw.ElapsedMilliseconds < timeoutMs)
+        {
+            if (!IsAlive(pid)) return true;
+            System.Threading.Thread.Sleep(100);
+        }
+        return !IsAlive(pid);
+    }
+
     // Nesting: `muxtee -- muxtee -- cmd` must spend ONE ConPTY layer, not two. The inner muxtee sees
     // MUXTEE_ACTIVE and passes through; the outer owns the only pty. Evidence: only one ConPTY-init
     // burst, and the child still works.

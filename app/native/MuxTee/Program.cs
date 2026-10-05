@@ -43,6 +43,15 @@ internal static class Program
 
     // ---- passthrough ----------------------------------------------------------------------------
 
+    // B6: a Ctrl+C typed in a passthrough tab must not kill muxtee. With no handler the default terminates
+    // us on ^C, and the tab closes with us; the child is a separate process on the SAME console and the OS
+    // already delivers the event to it, so swallowing it for ourselves is the whole fix. Break and Close
+    // still tear us down, because there the tab really is going away. Held in a static so the delegate
+    // stays alive while the OS holds the pointer.
+    private static readonly ConsoleApi.ConsoleCtrlDelegate PassthroughCtrl = OnPassthroughCtrl;
+
+    private static bool OnPassthroughCtrl(uint ctrlType) => PassthroughDecisions.SwallowsCtrl(ctrlType);
+
     private static int RunPassthrough(LaunchSpec spec)
     {
         // Straight exec with inherited handles, at the same cwd and environment we already have. This is
@@ -50,6 +59,7 @@ internal static class Program
         // be indistinguishable from not having muxtee in the chain.
         try
         {
+            ConsoleApi.SetConsoleCtrlHandler(PassthroughCtrl, true);
             var psi = new ProcessStartInfo(spec.Image)
             {
                 UseShellExecute = false,
@@ -59,6 +69,12 @@ internal static class Program
 
             using var child = Process.Start(psi)
                 ?? throw new InvalidOperationException("Process.Start returned null for " + spec.Image);
+            // B6: the tab IS muxtee's console, so when it closes muxtee dies and the OS closes its
+            // handles. A kill-on-close job is what makes that take the child with it; without one,
+            // closing a passthrough tab orphans the child (the tee path has always had this job).
+            using var job = new ChildJob();
+            try { job.Assign(child.SafeHandle); }
+            catch (Win32Exception ex) { Log.Write("passthrough job assign failed: " + ex.Message); }
             child.WaitForExit();
             return child.ExitCode;
         }
