@@ -10,4 +10,8 @@
     <InvariantGlobalization>true</InvariantGlobalization>
     <RootNamespace>MuxTee.Spikes</RootNamespace>
   </PropertyGroup>
+  <ItemGroup>
+    <!-- ctrlfire/ has its own project (the B6 Ctrl+C proof); keep its sources out of this one's glob. -->
+    <Compile Remove="ctrlfire/**/*.cs" />
+  </ItemGroup>
 </Project>
