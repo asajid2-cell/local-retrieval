@@ -106,6 +106,26 @@ class OwnerWatchGate(unittest.TestCase):
         self.assertTrue(records["tab"]["stream"])
 
 
+class OwnerNoLaunchClaim(unittest.TestCase):
+    """6.3: a stream owner claims no writer slot.
+
+    A teed PC tab registers with an empty command and no identity, so it must not reserve a launch
+    claim. CLAIM_ROOT exists to stop two muxd-driven writers racing into one agent session; a bare tab
+    has no muxd-side writer to race (muxtee is the tab's only child, and the tab is the only writer), and
+    taking a claim would also block a later agent binding inside the same tab. This pins the property the
+    stream branch rides on: an empty command yields no candidate ids, so acquire_launch_claim refuses to
+    write a claim file. Drop that guard and the duplicate-writer path starts claiming bare tabs.
+    """
+
+    def test_empty_command_yields_no_claim_candidate(self):
+        self.assertEqual(muxd.launch_candidate_ids("", []), [], "a bare tab has no identity to claim")
+
+    def test_acquire_launch_claim_for_an_empty_command_takes_no_claim(self):
+        claim, detail = muxd.acquire_launch_claim("", [])
+        self.assertIsNone(claim, "an empty-command tab must not acquire a launch claim")
+        self.assertEqual(detail, "")
+
+
 class RecordingWs:
     def __init__(self, owner):
         self.owner = owner

@@ -160,6 +160,42 @@ public class TeeAcceptanceTests
             $"{var} passthrough did not run the child; saw: " + Snippet(h.Output));
     }
 
+    // Spec §14.7 / §13: a Gateway leaf or background launch is detached with no console on stdin/stdout,
+    // and must hit the passthrough rule untouched - it must NOT be wrapped in a tee (which would steal a
+    // pty layer and a net link the leaf does not want). We launch muxtee exactly that way: stdio is a
+    // pipe, not a console, so the child is exec'd directly. The child's output must come back verbatim and
+    // muxtee must report passthrough - the marker only appears if the child really ran.
+    [TestMethod]
+    public void DetachedNoConsole_PassesThroughAndRunsChild()
+    {
+        var psi = new System.Diagnostics.ProcessStartInfo
+        {
+            FileName = MuxteeExe,
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+        };
+        psi.ArgumentList.Add("--");
+        psi.ArgumentList.Add("cmd.exe");
+        psi.ArgumentList.Add("/c");
+        psi.ArgumentList.Add("echo DETACHED-PASSTHROUGH-OK & exit 0");
+
+        var p = System.Diagnostics.Process.Start(psi)!;
+        var stdout = p.StandardOutput.ReadToEnd();
+        var stderr = p.StandardError.ReadToEnd();
+        p.WaitForExit(10000);
+
+        Assert.IsTrue(p.HasExited, "muxtee did not exit with its detached child");
+        Assert.AreEqual(0, p.ExitCode, "detached passthrough did not forward the child's exit code");
+        Assert.IsTrue(stdout.Contains("DETACHED-PASSTHROUGH-OK"),
+            "detached no-console launch was wrapped, not passed through; stdout=" + Snippet(stdout)
+            + " stderr=" + Snippet(stderr));
+        // A tee would have started an inner ConPTY and logged the tee line; passthrough never does.
+        Assert.IsFalse(stderr.Contains("bundledConpty="),
+            "a detached launch must not start the tee path; stderr=" + Snippet(stderr));
+    }
+
     private static string Snippet(string s)
         => s.Length <= 300 ? s : s[^300..];
 }
