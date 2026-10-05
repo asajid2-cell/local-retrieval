@@ -8,16 +8,38 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <AssemblyName>muxtee</AssemblyName>
     <RootNamespace>MuxTee</RootNamespace>
+    <!-- The ConPTY package keys its copy of OpenConsole.exe off PlatformTarget: unset, it copies
+         nothing, conpty.dll then finds no host of its own and quietly falls back to the inbox
+         conhost.exe - the one thing section 5 says we must not accept. The PC is x64, so say so and
+         get .\x64\OpenConsole.exe beside conpty.dll, which is where conpty.dll looks for it. -->
+    <PlatformTarget>x64</PlatformTarget>
+    <MuxTeeConPtyVersion>1.25.260930003</MuxTeeConPtyVersion>
     <!-- This helper only ever runs on the Windows PC, and it P/Invokes both the inbox console API and
          the bundled ConPTY, so the platform analyzer's hand-wringing does not apply. -->
     <NoWarn>$(NoWarn);CA1416</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>
-    <!-- Bundles conpty.dll + OpenConsole.exe beside muxtee.exe and sets ConptyNativePlatform, so the
-         same CreatePseudoConsole the current Windows Terminal uses is what our child gets. The inbox
-         kernel32 ConPTY varies by OS build in how much VT it passes through; the bundled one does not. -->
+    <!-- Bundles conpty.dll beside muxtee.exe, so the same CreatePseudoConsole the current Windows
+         Terminal uses is what our child gets. The inbox kernel32 ConPTY varies by OS build in how much
+         VT it passes through; the bundled one does not. -->
+    <!-- Note: conpty.dll is a plain reference copy; OpenConsole.exe needs the explicit stage below. -->
     <PackageReference Include="Microsoft.Windows.Console.ConPTY" Version="1.25.260930003" />
+  </ItemGroup>
+
+  <!-- The package ships OpenConsole.exe (the console host the bundled conpty.dll launches for each
+       pty) but only copies it for a ProjectReference consumer, and only into an arch subdir keyed off
+       PlatformTarget. We consume it as a plain PackageReference, so nothing puts it where conpty.dll
+       looks: conpty.dll scans its own directory for `x64\OpenConsole.exe`, then `\conhost.exe`, so
+       without this copy every pty would quietly fall back to the inbox host. Stage the x64 host
+       (the only arch this PC is) into both build and publish output. -->
+  <ItemGroup>
+    <None Include="$(NuGetPackageRoot)microsoft.windows.console.conpty\$(MuxTeeConPtyVersion)\build\native\runtimes\x64\OpenConsole.exe"
+          Condition="Exists('$(NuGetPackageRoot)microsoft.windows.console.conpty\$(MuxTeeConPtyVersion)\build\native\runtimes\x64\OpenConsole.exe')">
+      <Link>x64\OpenConsole.exe</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+    </None>
   </ItemGroup>
 
   <ItemGroup>

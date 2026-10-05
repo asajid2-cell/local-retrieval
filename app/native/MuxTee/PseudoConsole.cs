@@ -14,6 +14,12 @@ internal sealed class PseudoConsole : IDisposable
     public SafeFileHandle OutputRead { get; private set; }      // we read child output here
     public IntPtr Handle { get; private set; }
     public bool UsedBundledDll { get; private set; }
+    // conpty.dll launches a console host for each pty and picks it by scanning its own directory for
+    // `x64\OpenConsole.exe` (then `arm64\`, `x86\`, then the inbox `\conhost.exe`). UsedBundledDll is
+    // true even when that host is the inbox one, so it is NOT the answer to "are we on the bundled
+    // host". This records the host the pty actually got, so a host-less install shows up in the log
+    // instead of passing silently (spec section 5).
+    public string PtyHost { get; private set; } = "unknown";
 
     private readonly Action<string> _log;
 
@@ -45,6 +51,7 @@ internal sealed class PseudoConsole : IDisposable
                 throw new InvalidOperationException($"CreatePseudoConsole failed hr=0x{hr:X8}");
             Handle = hpc;
             UsedBundledDll = false;
+            PtyHost = "inbox kernel32 (bundled DLL did not load)";
         }
     }
 
@@ -57,6 +64,7 @@ internal sealed class PseudoConsole : IDisposable
             {
                 Handle = hpc;
                 UsedBundledDll = true;
+                PtyHost = ProbePtyHost();
             }
             return hr;
         }
@@ -69,6 +77,30 @@ internal sealed class PseudoConsole : IDisposable
         {
             _log("bundled conpty.dll missing ConptyCreatePseudoConsole: " + ex.Message);
             return unchecked((int)0x8007007F); // ERROR_PROC_NOT_FOUND as HRESULT
+        }
+    }
+
+    // Which console host conpty.dll will hand this pty. conpty.dll embeds the search it does - its own
+    // directory, then `x64\OpenConsole.exe`, `arm64\`, `x86\`, then the inbox `\conhost.exe` - so the
+    // best we can do is look where it looks and report. Paths are keyed to the loaded conpty.dll, which
+    // for us is the copy beside muxtee.exe; the DllImport search finds the exe directory first.
+    private string ProbePtyHost() => ProbePtyHost(AppContext.BaseDirectory);
+
+    // Split out so a test can point it at a staged directory instead of the running exe's own.
+    internal static string ProbePtyHost(string dir)
+    {
+        try
+        {
+            foreach (var arch in new[] { "x64", "arm64", "x86" })
+            {
+                if (File.Exists(Path.Combine(dir, arch, "OpenConsole.exe")))
+                    return $"OpenConsole.exe ({arch}, bundled)";
+            }
+            return "conhost.exe (inbox - no bundled OpenConsole.exe beside conpty.dll)";
+        }
+        catch (Exception ex)
+        {
+            return "unknown (" + ex.GetType().Name + ")";
         }
     }
 

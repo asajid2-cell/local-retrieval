@@ -126,7 +126,7 @@ internal static class Program
         }
         engine.Start();
         Log.Write($"tee: {spec.Image} cols={cols} rows={rows} bundledConpty={pc.UsedBundledDll} " +
-                  $"link={(engine.Link is null ? "off" : "on")}");
+                  $"ptyHost={pc.PtyHost} link={(engine.Link is null ? "off" : "on")}");
         engine.WaitForExit();
         return engine.ExitCode;
     }

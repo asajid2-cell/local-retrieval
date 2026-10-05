@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using MuxTee;
 
 namespace MuxTee.Tests;
@@ -113,5 +114,37 @@ public class UnitTests
         var spec = CommandLine.Parse(new[] { "--", "cmd.exe", "-c", "--weird" });
         Assert.AreEqual("cmd.exe", spec.Image);
         CollectionAssert.AreEqual(new[] { "-c", "--weird" }, (System.Collections.ICollection)spec.Args);
+    }
+
+    // P4 regression: the ptyHost diagnostic must report the bundled host only when conpty.dll can find
+    // its OpenConsole.exe, and must say "inbox" when it cannot. bundledConpty=True is true either way
+    // (the DLL's entry point resolved), so this is the flag that actually catches a host-less install.
+    [TestMethod]
+    public void PseudoConsole_ProbePtyHost_ReportsBundledWhenHostStaged()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "muxtee-probe-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(Path.Combine(root, "x64"));
+        try
+        {
+            File.WriteAllText(Path.Combine(root, "x64", "OpenConsole.exe"), "stub");
+            StringAssert.Contains(PseudoConsole.ProbePtyHost(root), "bundled");
+            StringAssert.Contains(PseudoConsole.ProbePtyHost(root), "x64");
+        }
+        finally { Directory.Delete(root, recursive: true); }
+    }
+
+    [TestMethod]
+    public void PseudoConsole_ProbePtyHost_ReportsInboxWhenHostMissing()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "muxtee-probe-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var reported = PseudoConsole.ProbePtyHost(root);
+            // The message does say "no bundled OpenConsole.exe", so assert on the host it names first,
+            // which is what the log reader keys on.
+            Assert.IsTrue(reported.StartsWith("conhost.exe (inbox"), "expected the inbox host first: " + reported);
+        }
+        finally { Directory.Delete(root, recursive: true); }
     }
 }
