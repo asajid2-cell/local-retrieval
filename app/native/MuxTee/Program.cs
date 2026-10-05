@@ -106,8 +106,27 @@ internal static class Program
         using var child = ChildProcess.Spawn(spec, pc.Handle, Environment.CurrentDirectory, Log.Write);
 
         using var engine = new TeeEngine(stdout, pc, input, child, modes, Log.Write);
+        // The net link only exists when we intend to be mirrored. MUXTEE_NOLINK gives the "no mux" escape
+        // a local-only tab, and is what the P1 acceptance suite runs under so it measures the tee alone.
+        if (!PassthroughDecisions.IsSet(Environment.GetEnvironmentVariable("MUXTEE_NOLINK")))
+        {
+            var link = new MuxLink(OwnerIdentity.SessionName(), OwnerIdentity.OwnerKey(),
+                cols, rows, MuxLink.DefaultUri(), input, Log.Write);
+            engine.Link = link;
+            // The child's first frames arrive before muxd has accepted the owner, so the link re-sends its
+            // ring as a replace_history once it registers. Hand it a snapshot at that point.
+            link.RegisteredChanged += () =>
+            {
+                if (link.Registered) link.ReplaceHistory(engine.Ring.Snapshot());
+            };
+            // While unwatched the link drops frames, so muxd's ring stopped at the last watched moment.
+            // Push a fresh snapshot the instant a viewer attaches, so the attach's `sb` reads our history
+            // and not a stale one (spec section 6.5).
+            link.WatchChanged += () => link.ReplaceHistory(engine.Ring.Snapshot());
+        }
         engine.Start();
-        Log.Write($"tee: {spec.Image} cols={cols} rows={rows} bundledConpty={pc.UsedBundledDll}");
+        Log.Write($"tee: {spec.Image} cols={cols} rows={rows} bundledConpty={pc.UsedBundledDll} " +
+                  $"link={(engine.Link is null ? "off" : "on")}");
         engine.WaitForExit();
         return engine.ExitCode;
     }

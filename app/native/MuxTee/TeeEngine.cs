@@ -30,6 +30,7 @@ internal sealed class TeeEngine : IDisposable
     // frames it would have queued. P1 never reads it; the field exists so P2's contract is unchanged.
     public bool NeedResync { get; private set; }
     public int ExitCode { get; private set; }
+    public MuxLink? Link { get; set; }
 
     private readonly ManualResetEventSlim _childExited = new(false);
     private Thread? _t1, _t2, _t3;
@@ -63,6 +64,7 @@ internal sealed class TeeEngine : IDisposable
         _t1.Start();
         _t2.Start();
         _t3.Start();
+        Link?.Start();
 
         var waiter = new Thread(WaitLoop) { IsBackground = true, Name = "muxtee-waiter" };
         waiter.Start();
@@ -94,11 +96,9 @@ internal sealed class TeeEngine : IDisposable
         }
     }
 
-    // P1: the net queue is deliberately a stub. P2 replaces the body with a bounded queue and a wake.
-    private void EnqueueNet(byte[] chunk)
-    {
-        _ = chunk;
-    }
+    // P2: hand the chunk to the link's bounded queue. The link drops its oldest frames under pressure and
+    // never blocks this thread, so invariant 1 still holds with a dead or absent muxd.
+    private void EnqueueNet(byte[] chunk) => Link?.Enqueue(chunk);
 
     // Keep writing until the whole buffer is out; a console write may take only part of it.
     internal static void WriteAll(SafeFileHandle handle, ReadOnlySpan<byte> data)
@@ -225,6 +225,7 @@ internal sealed class TeeEngine : IDisposable
         _input.Complete();
         _t1?.Join(3000);
         _pc.Dispose();
+        Link?.Dispose();
         _modes.Restore();
     }
 

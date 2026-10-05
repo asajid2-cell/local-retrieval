@@ -441,6 +441,30 @@ function sendHostInputRedraw(name) {
   }
   return sendHost({ t: 'redraw', s: name });
 }
+// §7.2: a stream owner only forwards bytes while a viewer is watching, so the relay fires `watch` on the
+// first attach and `unwatch` on the last detach. This is advisory - an old muxd ignores both frames and
+// forwards unconditionally, which is why it is gated on the cap rather than assumed. The per-session
+// flag makes the transition idempotent so two attaches do not double-fire a watch.
+function syncWatch(name, st, watched) {
+  if (!st) return;
+  const next = !!watched;
+  if (!!st.watchedHost === next) return;
+  st.watchedHost = next;
+  if (!hostSupportsCap('watch')) return;
+  const host = hostSessions.get(name);
+  if (!host || !host.owner) return;   // only a stream-owner session has a watchable link
+  sendHost({ t: next ? 'watch' : 'unwatch', s: name });
+}
+// A fresh host link is a fresh muxd whose stream owners all start unwatched, so every session the relay
+// still has viewers for must be re-watched even though its own flag did not change. Forgetting this is
+// exactly the bug where a reconnected tab silently stops mirroring.
+function resyncAllWatches() {
+  for (const [name, st] of sessions) {
+    if (!st.watchedHost) continue;
+    st.watchedHost = false;      // drop the flag so syncWatch re-fires against the new link
+    syncWatch(name, st, st.clients.size > 0);
+  }
+}
 // ---- Lever 4: binary host-link frames --------------------------------------------------------------
 // The `o` and unsigned `i` frames are the two hot paths between muxd and the relay. Both used to base64
 // the payload into a JSON dict only for the relay to decode it back out — a double conversion the relay
@@ -3704,6 +3728,7 @@ wssHost.on('connection', (ws, req) => {
       // The slot table is only meaningful when muxd advertised binaryFrames; the index must agree with
       // the `sessions` array muxd built it from, so it is derived from the same incoming set.
       hostBinarySlots = hostSupportsCap('binaryFrames') ? hostBinaryIndex([...incoming.keys()]) : null;
+      resyncAllWatches();   // §7.2: a new muxd link means every live stream owner must be re-watched
       console.log(`[host] hello from ${hostLabel} (${hostSessions.size} session(s), protocol ${hostProtocol.protocol})`);
       if (prior && prior !== ws) {
         try { prior.close(1000, 'replaced by validated host connection'); } catch {}
@@ -4089,6 +4114,7 @@ function removeViewer(name, st, client) {
   st.clients.delete(client.id);
   st.sbWaiters.delete(client.id);
   clearPinForDisconnectedDevice(name, st, client);
+  syncWatch(name, st, st.clients.size > 0);   // §7.2 last viewer leaving stops the feed
   deleteEmptySessionState(name, st);
 }
 function deleteSessionViewerState(name, reason) {
@@ -4190,6 +4216,14 @@ function commonFit(list) {
 }
 function targetSize(st, name) {
   const all = [...st.clients.values()].filter(c => c.vcols > 1 && c.vrows > 1);
+  // §7.1: a stream owner (a teed PC tab) owns its own size. The pin branch below would let a browser
+  // device pin outrank the tab, but the tab's PTY is the physical screen the user is sitting at, so the
+  // pin is skipped and the hosted size is returned unchanged - exactly like the localOwned branch, only
+  // checked first so a lingering pin cannot resize a tab out from under its user.
+  const owned = hostSessions.get(name);
+  if (owned && owned.owner && (owned.cols | 0) > 1 && (owned.rows | 0) > 1) {
+    return { cols: owned.cols | 0, rows: owned.rows | 0, pin: null, hostedSize: true };
+  }
   let pin = pins.get(name);
   if (pin) {
     const onDev = all.filter(c => (c.deviceId || ('sock-' + c.id)) === pin.deviceId);
@@ -4369,6 +4403,7 @@ wss.on('connection', async (ws, req) => {
     const st = sessionState(name);
     const client = { id, ws, term: null, hosted: true, vcols, vrows, sbWait: true, wentLive: false, sbTok: ++_cid, q: [], qBytes: 0, deviceId, label, visible: true, lastActive: Date.now(), connAt: Date.now() };
     st.clients.set(id, client);
+    syncWatch(name, st, true);                                            // §7.2 first viewer starts the feed
     if (!requestSessionScrollback(name, st, client)) {                   // one snapshot shared by every concurrent waiter
       removeViewer(name, st, client);
       try { ws.close(1013, 'PC mux host offline'); } catch {}

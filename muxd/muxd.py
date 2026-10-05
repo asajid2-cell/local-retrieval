@@ -1294,6 +1294,11 @@ else:
 LAN_RETURN_INTERVAL = max(10, int(ENV.get("LAN_RETURN_INTERVAL", "30")))
 RING_CAP = 800_000           # per-session scrollback bytes kept
 SB_SEND = 260_000            # bytes replayed to a newly-attached viewer
+# Binary owner-link frame kinds (spec section 6.1). Dispatch is on the FIRST byte, so these must stay
+# outside the printable range a JSON text frame would begin with.
+OWNER_FRAME_INGEST = 0x01    # append the payload to the ring
+OWNER_FRAME_RESYNC = 0x03    # replace the ring wholesale (clear, ingest, tell viewers to repaint)
+OWNER_FRAME_INPUT = 0x02     # remote keystrokes, already authorized on the relay path (spec section 6.4)
 LOCAL_SB_SEND = int(ENV.get("LOCAL_SB_SEND", "60000"))  # local muxctl attach should become live fast
 LOCAL_FIRST_TIMEOUT = float(ENV.get("LOCAL_FIRST_TIMEOUT", "3"))
 LOOP_WATCHDOG_WARN = float(ENV.get("LOOP_WATCHDOG_WARN", "30"))
@@ -1426,7 +1431,7 @@ CUSTODY_GC_INTERVAL_SECONDS = max(
 )
 CLAIM_SWEEP_SECONDS = max(15, int(ENV.get("LAUNCH_CLAIM_SWEEP_SECONDS", "60")))
 PROTOCOL = 4
-CAPS = ["ls", "info", "create", "createAck", "bind", "input", "open", "attach", "kill", "killFence", "relayKillFence", "rename", "heal", "tail", "scrollback", "resize", "owner", "relaunch", "agentTruth", "resync", "inputDurable", "inputFence", "resumeOnly", "principalRegister", "binaryFrames"]
+CAPS = ["ls", "info", "create", "createAck", "bind", "input", "open", "attach", "kill", "killFence", "relayKillFence", "rename", "heal", "tail", "scrollback", "resize", "owner", "relaunch", "agentTruth", "resync", "inputDurable", "inputFence", "resumeOnly", "principalRegister", "binaryFrames", "watch"]
 
 # Lever 4. The `o` and unsigned `i` frames are the two hot paths over the host link, and both used to
 # pay base64 twice: muxd base64'd the payload into a JSON dict, and the relay decoded it back out. On a
@@ -3135,7 +3140,7 @@ class OwnerSession:
     # snapshots to the VPS and forwards remote keystrokes back into the owner sidecar.
     def __init__(self, name, cmd, cwd, cols, rows, loop, outq, owner_ws, heal=False,
                  ids=None, session_id="", aliases=None, owner_key="", session_uuid="",
-                 adopted=False):
+                 adopted=False, stream=False):
         self.name, self.cmd, self.cwd = name, cmd or "", cwd or DEFAULT_CWD
         self.session_id, self.aliases, self.ids = resolve_session_identity(
             self.cmd, session_id, aliases, ids
@@ -3163,6 +3168,14 @@ class OwnerSession:
         self.owner = True
         self.expected_owner = True
         self.owner_key = str(owner_key or "")
+        # A stream owner (spec section 6.2) is a teed local tab: muxd holds its raw VT in the ring and
+        # reports kind "local-tab". It has no command muxd may relaunch, so it is never auto-healed.
+        self.stream = bool(stream)
+        self.heal = False if self.stream else self.heal
+        # spec section 6.5: a stream owner's output is only forwarded while a relay viewer is watching,
+        # and the owner is told so it can skip frames entirely on an unwatched tab. Non-stream owners
+        # default watched=True so their forwarding is unchanged.
+        self.watched = not self.stream
         self.identity_pending = False
         self.lifecycle = "active"
         self.last_alive_utc = ""
@@ -3280,6 +3293,48 @@ class OwnerSession:
         self.user_killed = by_user
         self.owner_stop_error = ""
         self._send_owner({"t": "kill"})
+
+    def set_watched(self, watched: bool):
+        # spec section 6.5: the relay tells us when a viewer attaches or leaves. We forward that to the
+        # owner so muxtee can stop enqueueing entirely on an unwatched tab, and we gate our own `o`
+        # forwarding on it. Idempotent - a repeated watch from a second viewer is a no-op.
+        watched = bool(watched)
+        if watched == self.watched:
+            return
+        self.watched = watched
+        self._send_owner({"t": "watch" if watched else "unwatch"})
+
+    def replace_history(self, data: bytes):
+        # spec section 6.1, kind 0x03: the owner's screen and our ring have diverged, so the ring is
+        # replaced wholesale rather than appended to. The same resync-the-viewers machinery the overflow
+        # path uses does the second half (relay paints CLEAR + scrollback), so there is one repaint path.
+        with self._ring_lock:
+            self.ring.clear()
+            self.ring.append(data)
+            self.ring_len = len(data)
+        self.replay_state = TerminalReplayState()
+        if data:
+            self.replay_state.ingest(data)
+        with self.plock:
+            self.pending = bytearray()
+        self.last_out = time.time()
+        self.outq.put_nowait(("resync", self.name, b""))
+        self.wake_pump()
+
+async def handle_owner_binary(owner, frame: bytes):
+    # The owner link's binary path (spec section 6.1). First byte is the kind, the rest is raw VT.
+    kind, payload = frame[0], frame[1:]
+    if kind == OWNER_FRAME_INGEST:
+        owner.ingest(payload)
+    elif kind == OWNER_FRAME_RESYNC:
+        owner.replace_history(payload)
+    elif kind == OWNER_FRAME_INPUT:
+        # Remote input to a stream owner (spec section 6.4). Authorization happens on the relay-facing
+        # input path before anything reaches the owner link, so this only carries bytes a lease already
+        # approved - the same contract the text `t:"i"` path holds. write_confirmed is used so a failed
+        # remote write is visible rather than silently dropped.
+        if payload:
+            await owner.write_confirmed(payload)
 
 sessions = {}          # name -> Session
 intent_records = {}    # scope:type:intentId -> durable request/outcome tombstone
@@ -3488,7 +3543,10 @@ def restore_manifest_sessions(records, target=None, loop=None, outq=None, now=No
             restored.owner_key = str(m.get("ownerKey", "") or "")
             restored.adopted = bool(m.get("adopted", False))
             restored.external_owner = bool(m.get("externalOwner", restored.adopted))
-            if restored.adopted:
+            # A stream owner is a teed local tab. It has no command muxd may relaunch, so it is never
+            # healed - a restored one is a dormant row the owner re-registers against (spec section 6.2).
+            restored.stream = bool(m.get("stream", False))
+            if restored.adopted or restored.stream:
                 restored.heal = False
             restored.identity_pending = bool(m.get("identityPending"))
             restored.lifecycle = str(m.get("lifecycle", "active") or "active")
@@ -3538,6 +3596,7 @@ def session_records_payload(source=None):
             "ownerKey": str(getattr(s, "owner_key", "") or ""),
             "adopted": bool(getattr(s, "adopted", False)),
             "externalOwner": bool(getattr(s, "external_owner", False)),
+            "stream": bool(getattr(s, "stream", False)),
             "identityPending": bool(getattr(s, "identity_pending", False)),
             "lifecycle": str(getattr(s, "lifecycle", "active") or "active"),
             "childPid": int(getattr(s, "child_pid", 0) or 0),
@@ -3656,6 +3715,7 @@ _PERSISTED_SESSION_FIELDS = (
     "owner_key",
     "adopted",
     "external_owner",
+    "stream",
     "identity_pending",
     "lifecycle",
     "child_pid",
@@ -3900,9 +3960,20 @@ def session_payload(name, sess):
     owner = bool(getattr(sess, "owner", False))
     adopted = bool(getattr(sess, "adopted", False))
     external_owner = bool(getattr(sess, "external_owner", False))
-    kind = "adopted-local" if adopted and alive else ("command" if has_cmd else ("shell" if alive else "dormant"))
+    stream = bool(getattr(sess, "stream", False))
+    # A stream owner reports "local-tab" (spec section 6.2): a teed local terminal the relay badges and
+    # whose size follows the PC tab. Everything else keeps the existing ladder.
+    if stream and alive:
+        kind = "local-tab"
+    else:
+        kind = "adopted-local" if adopted and alive else ("command" if has_cmd else ("shell" if alive else "dormant"))
     tail = sess.tail_text()
     agent = session_agent_status(sess, alive=alive, tail=tail)
+    # spec section 6.5: a local-tab with no bound agent identity carries no useful tail - the PC tab is
+    # the screen of record and a stale text tail only invites the relay to paint behind it. Omit it so
+    # the 5s list stays small; a stream owner that IS bound to an agent keeps its tail.
+    if kind == "local-tab" and not has_cmd:
+        tail = ""
     # Process truth is advisory and additive: it reports what the OS says about the
     # session's own process tree. It never overrides the heuristic ladder above - when
     # the probe is stale or failed, agentStateSource says 'heuristic' and agentState
@@ -4529,6 +4600,11 @@ async def main():
         if len(owner_key) < 24:
             return None, "visible owner registration requires a reconnect key"
         adopted = bool(first.get("adopted") or first.get("externalOwner"))
+        # A stream owner (spec section 6.2) is a teed local tab with a plain shell and no command muxd
+        # may relaunch. It registers with an empty cmd and no identity, and must NOT take a duplicate-writer
+        # launch claim: there is no writer race to arbitrate, because muxtee is the tab's only child and the
+        # tab is the only writer. A claim would also block a later agent binding in the same tab.
+        stream = bool(first.get("stream"))
         child_pid = int(first.get("childPid", 0) or 0)
         if adopted and child_pid <= 0:
             return None, "adopted owner registration requires a target pid"
@@ -4595,9 +4671,14 @@ async def main():
                 if not owned_ok:
                     return None, owned_detail or "could not verify reconnecting visible owner"
 
-            claim, preserve_existing_claim, claim_detail = await reserve_launch_claim(
-                name, cmd, candidate_ids, prev, ignored_live_override=ignored_live_override
-            )
+            if stream and not candidate_ids:
+                # No command identity yet: skip the launch claim entirely (see the stream comment above).
+                # `prev` keeps any claim it already holds, so binding an agent later can still take one.
+                claim, preserve_existing_claim, claim_detail = None, True, ""
+            else:
+                claim, preserve_existing_claim, claim_detail = await reserve_launch_claim(
+                    name, cmd, candidate_ids, prev, ignored_live_override=ignored_live_override
+                )
             existing_claim = getattr(prev, "_launch_claim", None) if prev else None
             if candidate_ids and claim is None:
                 return None, claim_detail or "could not reserve visible owner"
@@ -4656,6 +4737,7 @@ async def main():
                 aliases=identity_aliases,
                 owner_key=owner_key,
                 adopted=adopted,
+                stream=stream,
             )
             owner._launch_claim = claim
             owner.claim_paths = list(claim.paths) if claim is not None else []
@@ -5290,7 +5372,11 @@ async def main():
                 if s.wake is None: s.wake = wake
                 chunk = s.drain()
                 if chunk:
-                    outq.put_nowait(("o", s.name, chunk))
+                    # spec section 6.5: an unwatched stream owner still drains (the ring and replay state
+                    # must stay current for the next attach), but its bytes do not cross the relay. A
+                    # normal session has no watcher concept and is always forwarded.
+                    if getattr(s, "watched", True):
+                        outq.put_nowait(("o", s.name, chunk))
                     fanout_local_output(s, chunk)
     start_supervised_background(background_tasks, "output-flush", flush_out)
 
@@ -5399,6 +5485,13 @@ async def main():
                     outq.put_nowait(("dead", name, ""))  # force relay session-list refresh
                     try:
                         async for raw in ws:
+                            # Binary frames are the muxtee path (spec section 6.1) and dispatch on the first
+                            # byte before any JSON is attempted. Text frames stay exactly as they were, so
+                            # muxrun and the sidecar keep working unchanged.
+                            if isinstance(raw, (bytes, bytearray, memoryview)) and len(raw) and raw[0] in (
+                                    OWNER_FRAME_INGEST, OWNER_FRAME_RESYNC, OWNER_FRAME_INPUT):
+                                await handle_owner_binary(owner, bytes(raw))
+                                continue
                             try:
                                 m = json.loads(raw if isinstance(raw, str) else raw.decode("utf-8", "replace"))
                             except Exception:
@@ -5784,6 +5877,18 @@ async def main():
                                         "list": sess_list(),
                                         "notice": "auto-resume policy was not persisted",
                                     }))
+                            elif t == "watch" and name in sessions:
+                                session = sessions[name]
+                                if isinstance(session, OwnerSession):
+                                    session.set_watched(True)
+                                    if session.stream:
+                                        log(f"[{name}] watched: forwarding owner output")
+                            elif t == "unwatch" and name in sessions:
+                                session = sessions[name]
+                                if isinstance(session, OwnerSession):
+                                    session.set_watched(False)
+                                    if session.stream:
+                                        log(f"[{name}] unwatched: owner output parked in the ring")
                             elif t == "i" and name in sessions:
                                 # A refusal returns before any write, so a frame without an
                                 # accepted proof performs zero PTY writes.
