@@ -72,6 +72,11 @@ internal static class Program
             // B6: the tab IS muxtee's console, so when it closes muxtee dies and the OS closes its
             // handles. A kill-on-close job is what makes that take the child with it; without one,
             // closing a passthrough tab orphans the child (the tee path has always had this job).
+            //
+            // The child is assigned AFTER Process.Start, so anything the child itself spawns in the
+            // window before assignment is not in the job and would escape it. Closing that window would
+            // mean spawning suspended and resuming after Assign; that is not worth it for a passthrough
+            // shell, so the gap is left and recorded here.
             using var job = new ChildJob();
             try { job.Assign(child.SafeHandle); }
             catch (Win32Exception ex) { Log.Write("passthrough job assign failed: " + ex.Message); }
