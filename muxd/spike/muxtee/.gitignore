@@ -1,2 +1,5 @@
 bin/
 obj/
+# S5 writes its run output here; the P0 spikes kept their results outside the tree and the numbers are
+# recorded in the spec's section 10.6, so this is regenerated output, not source.
+s5-results.json

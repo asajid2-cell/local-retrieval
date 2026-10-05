@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <AssemblyName>muxtee</AssemblyName>
+    <RootNamespace>MuxTee</RootNamespace>
+    <!-- This helper only ever runs on the Windows PC, and it P/Invokes both the inbox console API and
+         the bundled ConPTY, so the platform analyzer's hand-wringing does not apply. -->
+    <NoWarn>$(NoWarn);CA1416</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Bundles conpty.dll + OpenConsole.exe beside muxtee.exe and sets ConptyNativePlatform, so the
+         same CreatePseudoConsole the current Windows Terminal uses is what our child gets. The inbox
+         kernel32 ConPTY varies by OS build in how much VT it passes through; the bundled one does not. -->
+    <PackageReference Include="Microsoft.Windows.Console.ConPTY" Version="1.25.260930003" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="MuxTee.Tests" />
+  </ItemGroup>
+
+</Project>
