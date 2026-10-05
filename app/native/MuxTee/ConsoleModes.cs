@@ -17,7 +17,8 @@ internal sealed class ConsoleModes
     private uint _inOriginal, _inChanged, _outOriginal, _outChanged;
     private bool _haveIn, _haveOut, _restored;
 
-    // Code pages are process-global, not per-handle, so these are saved and restored alongside the modes.
+    // A code page belongs to the CONSOLE, not a handle and not a process: every process attached to
+    // this tab shares the one setting, so our save and restore are talking about the tab, not ourselves.
     private uint _outCpOriginal, _inCpOriginal;
     private bool _haveOutCp, _haveInCp;
 
