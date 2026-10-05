@@ -238,7 +238,11 @@ class DisposableMuxd:
     def __init__(self, relay_port=1):
         self.root = Path(tempfile.mkdtemp(prefix="muxd-it-"))
         self.port = free_port()
-        mux_home = self.root / "muxd"
+        # The production profile derives its state root and env file from HOME/muxd-runtime, so that is
+        # where muxd.env has to sit for this fixture to isolate anything. It used to write HOME/muxd,
+        # which the profile never looks at: muxd then started with no relay URLs and exited 1, erroring
+        # every integration test at setUpClass.
+        mux_home = self.root / "muxd-runtime"
         mux_home.mkdir(parents=True, exist_ok=True)
         (mux_home / "muxd.env").write_text(
             "\n".join(
@@ -308,7 +312,7 @@ class DisposableMuxd:
         raise AssertionError(self.diagnostics(f"muxd local server was not ready: {last_error}"))
 
     def diagnostics(self, reason):
-        log_path = self.root / "muxd" / "muxd.log"
+        log_path = self.root / "muxd-runtime" / "muxd.log"
         log_tail = ""
         if log_path.exists():
             log_tail = "\n".join(log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-40:])
@@ -611,7 +615,7 @@ class MuxdLocalIntegrationTests(unittest.TestCase):
         name = "it-abandoned-intent"
         self.kill(name)
         self.muxd.stop_process()
-        manifest_path = self.muxd.root / "muxd" / "sessions.json"
+        manifest_path = self.muxd.root / "muxd-runtime" / "sessions.json"
         backup_path = Path(str(manifest_path) + ".bak")
         if backup_path.exists():
             backup_path.unlink()
@@ -1117,7 +1121,7 @@ while k.ReadConsoleInputW(hin,records,16,ctypes.byref(count)):
             self.assertIsNotNone(before)
             self.assertTrue(before.get("owner"), before)
 
-            manifest = json.loads((self.muxd.root / "muxd" / "sessions.json").read_text(encoding="utf-8"))
+            manifest = json.loads((self.muxd.root / "muxd-runtime" / "sessions.json").read_text(encoding="utf-8"))
             self.assertTrue(manifest["sessions"][name]["owner"])
             self.assertGreaterEqual(len(manifest["sessions"][name]["ownerKey"]), 24)
 
@@ -1361,7 +1365,7 @@ while k.ReadConsoleInputW(hin,records,16,ctypes.byref(count)):
         name = "it-user-killed-boot"
         self.kill(name)
         self.muxd.stop_process()
-        manifest_path = self.muxd.root / "muxd" / "sessions.json"
+        manifest_path = self.muxd.root / "muxd-runtime" / "sessions.json"
         manifest_path.write_text(
             json.dumps({
                 name: {
@@ -1396,7 +1400,7 @@ while k.ReadConsoleInputW(hin,records,16,ctypes.byref(count)):
         name = "it-replace-boot"
         self.kill(name)
         self.muxd.stop_process()
-        manifest_path = self.muxd.root / "muxd" / "sessions.json"
+        manifest_path = self.muxd.root / "muxd-runtime" / "sessions.json"
         manifest_path.write_text(
             json.dumps({
                 name: {
@@ -1433,7 +1437,7 @@ while k.ReadConsoleInputW(hin,records,16,ctypes.byref(count)):
         name = "it-active-boot"
         self.kill(name)
         self.muxd.stop_process()
-        manifest_path = self.muxd.root / "muxd" / "sessions.json"
+        manifest_path = self.muxd.root / "muxd-runtime" / "sessions.json"
         manifest_path.write_text(
             json.dumps({
                 name: {
@@ -1478,7 +1482,7 @@ while k.ReadConsoleInputW(hin,records,16,ctypes.byref(count)):
         self.kill(removed_name)
         self.kill(preserved_name)
         self.muxd.stop_process()
-        manifest_path = self.muxd.root / "muxd" / "sessions.json"
+        manifest_path = self.muxd.root / "muxd-runtime" / "sessions.json"
 
         def record(cmd, lifecycle, *, user_killed=False, stop_disposition=""):
             return {
@@ -1528,7 +1532,7 @@ while k.ReadConsoleInputW(hin,records,16,ctypes.byref(count)):
         )
         try:
             self.muxd.stop_process()
-            manifest_path = self.muxd.root / "muxd" / "sessions.json"
+            manifest_path = self.muxd.root / "muxd-runtime" / "sessions.json"
             manifest_path.write_text(
                 json.dumps({
                     name: {
@@ -1585,7 +1589,7 @@ while k.ReadConsoleInputW(hin,records,16,ctypes.byref(count)):
         )
         try:
             self.muxd.stop_process()
-            manifest_path = self.muxd.root / "muxd" / "sessions.json"
+            manifest_path = self.muxd.root / "muxd-runtime" / "sessions.json"
             manifest_path.write_text(
                 json.dumps({
                     name: {
@@ -1701,7 +1705,7 @@ while k.ReadConsoleInputW(hin,records,16,ctypes.byref(count)):
             )
             self.assertTrue(first.get("created"))
             pending = self.wait_for_tail(name, marker)
-            projection_path = self.muxd.root / "muxd" / "live-tabs.json"
+            projection_path = self.muxd.root / "muxd-runtime" / "live-tabs.json"
             deadline = time.monotonic() + 12
             projected = None
             while time.monotonic() < deadline:
