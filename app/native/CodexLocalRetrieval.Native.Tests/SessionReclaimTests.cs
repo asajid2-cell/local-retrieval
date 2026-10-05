@@ -3,6 +3,7 @@ using System.Text;
 using System.Text.Json;
 using CodexLocalRetrieval.Core.Models;
 using CodexLocalRetrieval.Core.Remote;
+using CodexLocalRetrieval.Core.Services;
 
 namespace CodexLocalRetrieval.Native.Tests;
 
@@ -812,6 +813,52 @@ public class SessionReclaimTests
         Assert.IsTrue(File.Exists(otherClaim.Path), "a different chat's launch reservation must remain untouched");
         Assert.AreEqual(1, report.Claims.Count, "reclaim must only read the candidate chat's reservations");
         Assert.AreEqual(targetSid, report.Claims.Single().SessionId);
+    }
+
+    [TestMethod]
+    public async Task Reclaim_RetriesPartialUnrelatedRegistryWrite_AndLeavesItsLiveOwnerUntouched()
+    {
+        RequireWindows();
+        var (unrelatedSid, unrelated) = StartChildHoldingTranscript();
+        var unrelatedStart = unrelated.StartTime.ToUniversalTime();
+        var registryFile = Path.Combine(TempDir(), unrelated.Id + ".json");
+        File.WriteAllText(registryFile, "{\"pid\":");
+
+        var writer = Task.Run(async () =>
+        {
+            await Task.Delay(200);
+            File.WriteAllText(registryFile, JsonSerializer.Serialize(new
+            {
+                pid = unrelated.Id,
+                sessionId = unrelatedSid,
+            }));
+        });
+
+        var targetSid = Guid.NewGuid().ToString();
+        var report = await SessionReclaim.ExecuteAsync(new ReclaimOptions
+        {
+            CandidateIds = new[] { targetSid },
+            RecordOptions = RecordOptions(TempDir()),
+            Kill = ids => RunningSessions.Kill(
+                ids,
+                pid: 0,
+                expectedStartedUtc: null,
+                signals: new RunningSessions.KillSignals(
+                    Scan: () => (true, new List<ArchiveService.RunningSessionInfo>(), ""),
+                    ClaudeRegistry: () =>
+                    {
+                        var ok = RunningSessions.TryReadClaudeRegistryFiles(
+                            new[] { registryFile }, null, out var map, out var unverifiable, out var detail);
+                        return (ok, map, unverifiable, detail);
+                    },
+                    OwnerRecords: RecordOptions(TempDir())))
+        });
+        await writer.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.IsTrue(report.KillOk, "the unrelated partial registry write should resolve on retry: " + report.KillDetail);
+        Assert.IsFalse(report.Relaunched);
+        Assert.IsFalse(unrelated.HasExited, "reclaim must not kill an unrelated registry owner");
+        Assert.IsFalse(RunningSessions.HasExitedByIdentity(unrelated.Id, unrelatedStart));
     }
 
     // ---- the reclaim-strand repro: a clear that FAILS must be reported, not swallowed ----------------

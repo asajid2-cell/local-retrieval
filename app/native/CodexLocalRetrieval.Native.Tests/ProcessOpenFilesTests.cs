@@ -194,6 +194,32 @@ public class ProcessOpenFilesTests
         Assert.AreEqual(4242, pid);
     }
 
+    [TestMethod]
+    public void RegistryFilePartiallyWrittenThenCompleted_IsReadOnRetry()
+    {
+        RequireWindows();
+        var dir = TempRegistryDir();
+        var live = StartSleeper();
+        var sid = Guid.NewGuid().ToString();
+        var file = Path.Combine(dir, live.Id + ".json");
+        File.WriteAllText(file, "{\"pid\":");
+
+        var writer = Task.Run(() =>
+        {
+            Thread.Sleep(200);
+            File.WriteAllText(file, $"{{\"pid\":{live.Id},\"sessionId\":\"{sid}\"}}");
+        });
+
+        var ok = RunningSessions.TryReadClaudeRegistryFiles(
+            new[] { file }, null, out var map, out var unverifiable, out var detail);
+        writer.Wait(10_000);
+
+        Assert.IsTrue(ok, "a partial registry write must be retried before treating its live pid as unverifiable: " + detail);
+        Assert.IsEmpty(unverifiable);
+        Assert.IsTrue(map.TryGetValue(sid, out var pid));
+        Assert.AreEqual(live.Id, pid);
+    }
+
     // Persistently unreadable + the file's pid is ALIVE: it may be hiding an idle claude that is visible
     // NOWHERE else, so this is uncertainty and Start-class fails closed.
     [TestMethod]
