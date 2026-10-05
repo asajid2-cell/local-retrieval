@@ -4061,6 +4061,13 @@ def finalize_confirmed_owner_exit(session):
 async def reconcile_owner_disconnect(sessions, name, owner, save_manifest):
     if sessions.get(name) is not owner:
         return
+    if bool(getattr(owner, "stream", False)):
+        # A teed local tab (spec section 6.2) leaves nothing worth keeping once its link closes: muxtee
+        # re-registers itself on reconnect, so a parked row would only ever be a dead tab the user cannot
+        # clear. Remove it here rather than let the manifest accumulate ghosts a boot must then sweep.
+        sessions.pop(name, None)
+        await save_manifest(sessions)
+        return
     target_alive = True
     if not str(getattr(owner, "owner_stop_error", "") or ""):
         target_alive = await asyncio.get_running_loop().run_in_executor(
@@ -4102,7 +4109,21 @@ async def terminate_session_off_loop(s, by_user=True, timeout=12, release_claim_
         if target_alive:
             return True, "adopted mirror removed; the local terminal and its agent are still running"
         return True, "adopted terminal already exited; mirror record removed"
+    if isinstance(s, OwnerSession) and not alive:
+        # No live owner socket: the tab was closed, or its link dropped and this row is a stale mirror.
+        # There is no one to ask and nothing to wait for - the local terminal owns its own lifetime - so
+        # drop the mirror at once. stop_input_writer() belongs to the PTY-owned Session, and reaching for
+        # it on an owner is what used to throw out of the relay handler and take the whole link with it.
+        s.dead = True
+        s.owner_exit_confirmed = True
+        if release_claim_on_success:
+            release_session_claim(s)
+        return True, "owner socket was gone; mirror record removed"
     if bool(getattr(s, "owner", False)):
+        if bool(getattr(s, "stream", False)):
+            # A teed local tab is the user's own terminal: the web may not close it, and muxtee ignores a
+            # kill frame anyway, so asking and waiting the full timeout would only stall the caller.
+            return False, "the local terminal owns this tab's lifetime"
         try:
             s.kill(by_user=by_user)
         except Exception as e:
@@ -5236,6 +5257,14 @@ async def main():
         if restored is None:
             continue
         m = boot_manifest[name]
+        if bool(m.get("stream")) or bool(getattr(restored, "stream", False)):
+            # A stream row that survived a restart is by definition a tab that is not connected - muxtee
+            # registers itself on connect - so it is a ghost the user cannot clear. Drop it here, through
+            # the same lifecycle the live disconnect path uses, rather than leave it for the relay to list.
+            sessions.pop(name, None)
+            await manifest_save_async(sessions)
+            log(f"[boot] dropped persisted stream tab: {name}")
+            continue
         heal = bool(m.get("heal"))
         ids = m.get("ids") if isinstance(m.get("ids"), list) else []
         try:
@@ -5737,258 +5766,268 @@ async def main():
                         tasks.append(asyncio.create_task(lan_return()))
                     try:
                         async for raw in ws:
-                            # A binary frame is ours by construction: JSON frames always arrive as text,
-                            # so an opcode byte is unambiguous. It carries kind+slot+payload; anything
-                            # malformed is dropped rather than guessed at, exactly like a bad JSON frame.
-                            if isinstance(raw, (bytes, bytearray, memoryview)):
-                                decoded = decode_host_binary(raw, len(session_at), session_at)
-                                if decoded is None:
-                                    continue
-                                bkind, bname, bpayload = decoded
-                                if bkind == "i":
-                                    # muxd is a conduit for input too: a binary `i` may only carry bytes
-                                    # for a session that has a live signed-input path. Unsigned input is
-                                    # refused unless the legacy `d` proof path (enforce-mode) allows it, so
-                                    # a binary frame here is treated exactly as a JSON `i` whose body is
-                                    # the raw payload and whose proof it does not carry -- authorize_relay_input
-                                    # decides, and in enforce mode it refuses.
-                                    bm = {"t": "i", "s": bname, "d": base64.b64encode(bpayload).decode()}
-                                    bsession = sessions.get(bname)
-                                    if bsession is None:
+                            try:
+                                # One bad command must cost that command and nothing else. This link is
+                                # the ONLY path from this box to the web UI, so an exception escaping
+                                # the dispatch below is not one lost reply - it is every tab going dark
+                                # until muxd reconnects. Keep the failure local to the frame that caused
+                                # it; CancelledError is a BaseException and still propagates for shutdown.
+                                # A binary frame is ours by construction: JSON frames always arrive as text,
+                                # so an opcode byte is unambiguous. It carries kind+slot+payload; anything
+                                # malformed is dropped rather than guessed at, exactly like a bad JSON frame.
+                                if isinstance(raw, (bytes, bytearray, memoryview)):
+                                    decoded = decode_host_binary(raw, len(session_at), session_at)
+                                    if decoded is None:
                                         continue
-                                    bprincipal, bbody, brefusal = authorize_relay_input(bm, bsession)
-                                    if brefusal is not None:
-                                        refused = brefusal.frame(bname)
-                                        await ws.send(json.dumps(refused))
-                                    else:
-                                        boutcome = await execute_input_intent(bm, bsession, bbody, principal=bprincipal)
-                                        if boutcome.get("t") == "err":
-                                            await ws.send(json.dumps(relay_input_error_frame(boutcome, bname, bm, bprincipal)))
+                                    bkind, bname, bpayload = decoded
+                                    if bkind == "i":
+                                        # muxd is a conduit for input too: a binary `i` may only carry bytes
+                                        # for a session that has a live signed-input path. Unsigned input is
+                                        # refused unless the legacy `d` proof path (enforce-mode) allows it, so
+                                        # a binary frame here is treated exactly as a JSON `i` whose body is
+                                        # the raw payload and whose proof it does not carry -- authorize_relay_input
+                                        # decides, and in enforce mode it refuses.
+                                        bm = {"t": "i", "s": bname, "d": base64.b64encode(bpayload).decode()}
+                                        bsession = sessions.get(bname)
+                                        if bsession is None:
+                                            continue
+                                        bprincipal, bbody, brefusal = authorize_relay_input(bm, bsession)
+                                        if brefusal is not None:
+                                            refused = brefusal.frame(bname)
+                                            await ws.send(json.dumps(refused))
+                                        else:
+                                            boutcome = await execute_input_intent(bm, bsession, bbody, principal=bprincipal)
+                                            if boutcome.get("t") == "err":
+                                                await ws.send(json.dumps(relay_input_error_frame(boutcome, bname, bm, bprincipal)))
+                                        continue
+                                    if bkind == "r" and bname in sessions:
+                                        rsession = sessions[bname]
+                                        if isinstance(rsession, OwnerSession):
+                                            rsession._send_owner({"t": "redraw"})
+                                        else:
+                                            await asyncio.get_running_loop().run_in_executor(None, redraw_nudge, rsession)
+                                        continue
                                     continue
-                                if bkind == "r" and bname in sessions:
-                                    rsession = sessions[bname]
-                                    if isinstance(rsession, OwnerSession):
-                                        rsession._send_owner({"t": "redraw"})
-                                    else:
-                                        await asyncio.get_running_loop().run_in_executor(None, redraw_nudge, rsession)
-                                    continue
-                                continue
-                            try: m = json.loads(raw)
-                            except Exception: continue
-                            t = m.get("t")
-                            name = strict_mux_name(m.get("s", ""))
-                            if t == "create":
-                                violation = remote_create_violation(m)
-                                if violation:
-                                    log(f"[relay] rejected create protocol frame: {violation}")
-                                    await ws.close(code=1008, reason="create frame violated protocol")
-                                    break
-                                request_id = str(m.get("rid", "") or "")
-                                result = await coordinate_create_intent(
-                                    m, "relay", True, leave_unarmed_dormant=True
-                                )
-                                if not result.get("ok"):
-                                    log(f"[{name}] create REFUSED: {result.get('detail', 'create failed')}")
-                                    await ws.send(json.dumps({
-                                        "t": "createResult",
-                                        "rid": request_id,
-                                        "s": name,
-                                        "ok": False,
-                                        "created": False,
-                                        "detail": result.get("detail", "muxd refused the create request"),
-                                        "retryable": bool(result.get("retryable")),
-                                    }))
-                                else:
-                                    await ws.send(json.dumps({
-                                        "t": "createResult",
-                                        "rid": request_id,
-                                        "s": name,
-                                        "ok": True,
-                                        "created": bool(result.get("created")),
-                                        "detail": "",
-                                        "retryable": False,
-                                        "session": result.get("session") or {},
-                                    }))
-                                    # The session now exists; say so on the list channel too, rather than
-                                    # waiting for the next pump_status tick (up to 5 s). The relay's
-                                    # create path queues the start over the app-command bridge and then
-                                    # confirms with waitForHostState against ITS OWN hostSessions, which
-                                    # only pump_status refreshes -- so a create that had already
-                                    # succeeded still read as "not visible on muxd" for as long as the
-                                    # timer had left to run. Pushing here makes the confirmation
-                                    # immediate. Sent only on the success branch: a refusal has no new
-                                    # list to announce.
-                                    await ws.send(json.dumps({"t": "sessions", "list": sess_list()}))
-                                continue
-                            elif t == "principal":
-                                # Principal registration (§3.4). muxd owns the registry, its ACL
-                                # revision and its lease epoch; the relay only carries the request
-                                # here and the granted tuple back. The registration mutates the
-                                # endpoint muxd is already serving -- not a fresh load from disk --
-                                # so the instanceId `hello` advertised is the one persisted; see
-                                # host_input_intent.register_principal_pem.
-                                request_id = str(m.get("rid", "") or "")
-                                principal_session = sessions.get(name)
-                                if str(m.get("op", "")) != "register":
-                                    await ws.send(json.dumps({
-                                        "t": "principalResult", "rid": request_id, "s": name,
-                                        "ok": False, "code": "principal-invalid",
-                                        "detail": "unsupported principal operation",
-                                    }))
-                                elif principal_session is None:
-                                    await ws.send(json.dumps({
-                                        "t": "principalResult", "rid": request_id, "s": name,
-                                        "ok": False, "code": "principal-unknown-session",
-                                        "detail": "no such session",
-                                    }))
-                                else:
-                                    try:
-                                        grant = await asyncio.get_running_loop().run_in_executor(
-                                            None,
-                                            lambda current=principal_session, frame=m: host_input_intent.register_principal_pem(
-                                                frame.get("publicKeyPem"), frame.get("principalId"),
-                                                frame.get("keyId"), host_input_intent.session_uuid_of(current),
-                                                PRINCIPAL_ENDPOINT, _principal_registry_path(),
-                                                roles=frame.get("roles"),
-                                            ),
-                                        )
-                                    except Exception as error:
-                                        code = getattr(error, "code", "principal-registration-failed")
-                                        log(f"[{name}] principal registration refused: {code}: {error}")
+                                try: m = json.loads(raw)
+                                except Exception: continue
+                                t = m.get("t")
+                                name = strict_mux_name(m.get("s", ""))
+                                if t == "create":
+                                    violation = remote_create_violation(m)
+                                    if violation:
+                                        log(f"[relay] rejected create protocol frame: {violation}")
+                                        await ws.close(code=1008, reason="create frame violated protocol")
+                                        break
+                                    request_id = str(m.get("rid", "") or "")
+                                    result = await coordinate_create_intent(
+                                        m, "relay", True, leave_unarmed_dormant=True
+                                    )
+                                    if not result.get("ok"):
+                                        log(f"[{name}] create REFUSED: {result.get('detail', 'create failed')}")
                                         await ws.send(json.dumps({
-                                            "t": "principalResult", "rid": request_id, "s": name,
-                                            "ok": False, "code": code, "detail": str(error),
+                                            "t": "createResult",
+                                            "rid": request_id,
+                                            "s": name,
+                                            "ok": False,
+                                            "created": False,
+                                            "detail": result.get("detail", "muxd refused the create request"),
+                                            "retryable": bool(result.get("retryable")),
                                         }))
                                     else:
-                                        log(f"[{name}] principal registered: {grant.get('principalId')}")
+                                        await ws.send(json.dumps({
+                                            "t": "createResult",
+                                            "rid": request_id,
+                                            "s": name,
+                                            "ok": True,
+                                            "created": bool(result.get("created")),
+                                            "detail": "",
+                                            "retryable": False,
+                                            "session": result.get("session") or {},
+                                        }))
+                                        # The session now exists; say so on the list channel too, rather than
+                                        # waiting for the next pump_status tick (up to 5 s). The relay's
+                                        # create path queues the start over the app-command bridge and then
+                                        # confirms with waitForHostState against ITS OWN hostSessions, which
+                                        # only pump_status refreshes -- so a create that had already
+                                        # succeeded still read as "not visible on muxd" for as long as the
+                                        # timer had left to run. Pushing here makes the confirmation
+                                        # immediate. Sent only on the success branch: a refusal has no new
+                                        # list to announce.
+                                        await ws.send(json.dumps({"t": "sessions", "list": sess_list()}))
+                                    continue
+                                elif t == "principal":
+                                    # Principal registration (§3.4). muxd owns the registry, its ACL
+                                    # revision and its lease epoch; the relay only carries the request
+                                    # here and the granted tuple back. The registration mutates the
+                                    # endpoint muxd is already serving -- not a fresh load from disk --
+                                    # so the instanceId `hello` advertised is the one persisted; see
+                                    # host_input_intent.register_principal_pem.
+                                    request_id = str(m.get("rid", "") or "")
+                                    principal_session = sessions.get(name)
+                                    if str(m.get("op", "")) != "register":
                                         await ws.send(json.dumps({
                                             "t": "principalResult", "rid": request_id, "s": name,
-                                            "ok": True, **grant,
+                                            "ok": False, "code": "principal-invalid",
+                                            "detail": "unsupported principal operation",
                                         }))
-                                continue
-                            elif t == "heal" and name in sessions:
-                                healed, detail = await set_session_heal(name, bool(m.get("on")))
-                                if not healed and detail == "fresh identity is pending":
-                                    log(f"[{name}] refused auto-resume while fresh identity is pending")
-                                elif not healed:
-                                    log(f"[{name}] heal persistence failed: {detail}")
-                                    await ws.send(json.dumps({
-                                        "t": "sessions",
-                                        "list": sess_list(),
-                                        "notice": "auto-resume policy was not persisted",
-                                    }))
-                            elif t == "watch" and name in sessions:
-                                session = sessions[name]
-                                if isinstance(session, OwnerSession):
-                                    session.set_watched(True)
-                                    if session.stream:
-                                        log(f"[{name}] watched: forwarding owner output")
-                            elif t == "unwatch" and name in sessions:
-                                session = sessions[name]
-                                if isinstance(session, OwnerSession):
-                                    session.set_watched(False)
-                                    if session.stream:
-                                        log(f"[{name}] unwatched: owner output parked in the ring")
-                            elif t == "i" and name in sessions:
-                                # A refusal returns before any write, so a frame without an
-                                # accepted proof performs zero PTY writes.
-                                input_session = sessions[name]
-                                principal, body, refusal = authorize_relay_input(m, input_session)
-                                if refusal is not None:
-                                    log(f"[{name}] input refused: {refusal.code}: {refusal.detail}")
-                                    refused = refusal.frame(name)
-                                    refused["channelId"] = str(
-                                        m.get("channelId")
-                                        or ((m.get("auth") or {}).get("channelId") if isinstance(m.get("auth"), dict) else "")
-                                        or ""
-                                    )
-                                    await ws.send(json.dumps(refused))
-                                else:
-                                    outcome = await execute_input_intent(
-                                        m, input_session, body, principal=principal
-                                    )
-                                    if outcome.get("t") == "err":
-                                        await ws.send(json.dumps(relay_input_error_frame(
-                                            outcome, name, m, principal
-                                        )))
-                            elif t == "resize" and name in sessions:
-                                apply_remote_session_size(sessions[name], m)
-                            elif t == "redraw" and name in sessions:
-                                session = sessions[name]
-                                if isinstance(session, OwnerSession):
-                                    session._send_owner({"t": "redraw"})
-                                else:
-                                    await asyncio.get_running_loop().run_in_executor(None, redraw_nudge, session)
-                            elif t == "sb" and name in sessions:
-                                session = sessions[name]
-                                scrollback_limit = m.get("max", SB_SEND)
-                                scrollback_request_id = str(m.get("rid", "") or "")
-                                encoded = await asyncio.get_running_loop().run_in_executor(
-                                    None,
-                                    lambda current=session, limit=scrollback_limit: base64.b64encode(
-                                        current.scrollback(limit)
-                                    ).decode(),
-                                )
-                                await ws.send(json.dumps({
-                                    "t": "sb",
-                                    "s": name,
-                                    "rid": scrollback_request_id,
-                                    "d": encoded,
-                                }))
-                                # Byte replay can't rebuild a full-screen TUI on its own; nudge the app to
-                                # emit an authoritative full frame right after the replay.
-                                await asyncio.get_running_loop().run_in_executor(None, redraw_nudge, session)
-                            elif t == "rename" and name in sessions:
-                                to = strict_mux_name(m.get("to", ""))
-                                if to and to not in sessions:
-                                    renamed, detail = await rename_session(name, to)
-                                    if not renamed:
-                                        log(f"[{name}] rename persistence failed: {detail}")
+                                    elif principal_session is None:
+                                        await ws.send(json.dumps({
+                                            "t": "principalResult", "rid": request_id, "s": name,
+                                            "ok": False, "code": "principal-unknown-session",
+                                            "detail": "no such session",
+                                        }))
+                                    else:
+                                        try:
+                                            grant = await asyncio.get_running_loop().run_in_executor(
+                                                None,
+                                                lambda current=principal_session, frame=m: host_input_intent.register_principal_pem(
+                                                    frame.get("publicKeyPem"), frame.get("principalId"),
+                                                    frame.get("keyId"), host_input_intent.session_uuid_of(current),
+                                                    PRINCIPAL_ENDPOINT, _principal_registry_path(),
+                                                    roles=frame.get("roles"),
+                                                ),
+                                            )
+                                        except Exception as error:
+                                            code = getattr(error, "code", "principal-registration-failed")
+                                            log(f"[{name}] principal registration refused: {code}: {error}")
+                                            await ws.send(json.dumps({
+                                                "t": "principalResult", "rid": request_id, "s": name,
+                                                "ok": False, "code": code, "detail": str(error),
+                                            }))
+                                        else:
+                                            log(f"[{name}] principal registered: {grant.get('principalId')}")
+                                            await ws.send(json.dumps({
+                                                "t": "principalResult", "rid": request_id, "s": name,
+                                                "ok": True, **grant,
+                                            }))
+                                    continue
+                                elif t == "heal" and name in sessions:
+                                    healed, detail = await set_session_heal(name, bool(m.get("on")))
+                                    if not healed and detail == "fresh identity is pending":
+                                        log(f"[{name}] refused auto-resume while fresh identity is pending")
+                                    elif not healed:
+                                        log(f"[{name}] heal persistence failed: {detail}")
                                         await ws.send(json.dumps({
                                             "t": "sessions",
                                             "list": sess_list(),
-                                            "notice": "session rename durability is unconfirmed",
+                                            "notice": "auto-resume policy was not persisted",
                                         }))
+                                elif t == "watch" and name in sessions:
+                                    session = sessions[name]
+                                    if isinstance(session, OwnerSession):
+                                        session.set_watched(True)
+                                        if session.stream:
+                                            log(f"[{name}] watched: forwarding owner output")
+                                elif t == "unwatch" and name in sessions:
+                                    session = sessions[name]
+                                    if isinstance(session, OwnerSession):
+                                        session.set_watched(False)
+                                        if session.stream:
+                                            log(f"[{name}] unwatched: owner output parked in the ring")
+                                elif t == "i" and name in sessions:
+                                    # A refusal returns before any write, so a frame without an
+                                    # accepted proof performs zero PTY writes.
+                                    input_session = sessions[name]
+                                    principal, body, refusal = authorize_relay_input(m, input_session)
+                                    if refusal is not None:
+                                        log(f"[{name}] input refused: {refusal.code}: {refusal.detail}")
+                                        refused = refusal.frame(name)
+                                        refused["channelId"] = str(
+                                            m.get("channelId")
+                                            or ((m.get("auth") or {}).get("channelId") if isinstance(m.get("auth"), dict) else "")
+                                            or ""
+                                        )
+                                        await ws.send(json.dumps(refused))
+                                    else:
+                                        outcome = await execute_input_intent(
+                                            m, input_session, body, principal=principal
+                                        )
+                                        if outcome.get("t") == "err":
+                                            await ws.send(json.dumps(relay_input_error_frame(
+                                                outcome, name, m, principal
+                                            )))
+                                elif t == "resize" and name in sessions:
+                                    apply_remote_session_size(sessions[name], m)
+                                elif t == "redraw" and name in sessions:
+                                    session = sessions[name]
+                                    if isinstance(session, OwnerSession):
+                                        session._send_owner({"t": "redraw"})
+                                    else:
+                                        await asyncio.get_running_loop().run_in_executor(None, redraw_nudge, session)
+                                elif t == "sb" and name in sessions:
+                                    session = sessions[name]
+                                    scrollback_limit = m.get("max", SB_SEND)
+                                    scrollback_request_id = str(m.get("rid", "") or "")
+                                    encoded = await asyncio.get_running_loop().run_in_executor(
+                                        None,
+                                        lambda current=session, limit=scrollback_limit: base64.b64encode(
+                                            current.scrollback(limit)
+                                        ).decode(),
+                                    )
+                                    await ws.send(json.dumps({
+                                        "t": "sb",
+                                        "s": name,
+                                        "rid": scrollback_request_id,
+                                        "d": encoded,
+                                    }))
+                                    # Byte replay can't rebuild a full-screen TUI on its own; nudge the app to
+                                    # emit an authoritative full frame right after the replay.
+                                    await asyncio.get_running_loop().run_in_executor(None, redraw_nudge, session)
+                                elif t == "rename" and name in sessions:
+                                    to = strict_mux_name(m.get("to", ""))
+                                    if to and to not in sessions:
+                                        renamed, detail = await rename_session(name, to)
+                                        if not renamed:
+                                            log(f"[{name}] rename persistence failed: {detail}")
+                                            await ws.send(json.dumps({
+                                                "t": "sessions",
+                                                "list": sess_list(),
+                                                "notice": "session rename durability is unconfirmed",
+                                            }))
+                                            continue
+                                        await ws.send(json.dumps({"t": "sessions", "list": sess_list()}))
+                                elif t == "tail" and name in sessions:
+                                    session = sessions[name]
+                                    lines = int(m.get("lines") or 40)
+                                    tail = await asyncio.get_running_loop().run_in_executor(
+                                        None,
+                                        lambda current=session, count=lines: current.tail_text(
+                                            nbytes=200000,
+                                            lines=count,
+                                        ),
+                                    )
+                                    await ws.send(json.dumps({"t": "tailr", "rid": m.get("rid", ""), "text": tail}))
+                                elif t == "kill":
+                                    session_id = m.get("sessionId")
+                                    generation_id = m.get("generationId")
+                                    reply = {"s": name, "rid": m.get("rid", ""),
+                                             "sessionId": session_id, "generationId": generation_id}
+                                    if (not isinstance(session_id, str) or _safe_identity(session_id) != session_id
+                                            or not isinstance(generation_id, str) or not generation_id
+                                            or _safe_identity(generation_id) != generation_id or not m.get("rid")):
+                                        await ws.send(json.dumps({**reply, "t": "killResult", "ok": False,
+                                                                 "detail": "exact sessionId, generationId and rid required"}))
                                         continue
+                                    ok, detail = await remove_session(name, by_user=True,
+                                        expected_session_id=session_id, expected_generation_id=generation_id)
+                                    if not ok:
+                                        log(f"[{name}] remote stop failed: {detail}")
+                                        await ws.send(json.dumps({**reply, "t": "killResult", "ok": False,
+                                                                 "uncertain": True, "detail": detail}))
+                                    else:
+                                        await ws.send(json.dumps({**reply, "t": "killed"}))
+                                    # Announce the new list IMMEDIATELY, not on the next pump_status tick.
+                                    # pump_status is a fixed 5 s cadence, so without this the relay's
+                                    # hostSessions still held the killed session when this very handler
+                                    # returned, and the relay's confirmation poll (waitForHostState, 100 ms
+                                    # interval) could not observe the removal for up to 5 s. That is the
+                                    # "erasing a terminal takes a handful of seconds" delay: the removal had
+                                    # already happened, and only its announcement was waiting on a timer.
                                     await ws.send(json.dumps({"t": "sessions", "list": sess_list()}))
-                            elif t == "tail" and name in sessions:
-                                session = sessions[name]
-                                lines = int(m.get("lines") or 40)
-                                tail = await asyncio.get_running_loop().run_in_executor(
-                                    None,
-                                    lambda current=session, count=lines: current.tail_text(
-                                        nbytes=200000,
-                                        lines=count,
-                                    ),
-                                )
-                                await ws.send(json.dumps({"t": "tailr", "rid": m.get("rid", ""), "text": tail}))
-                            elif t == "kill":
-                                session_id = m.get("sessionId")
-                                generation_id = m.get("generationId")
-                                reply = {"s": name, "rid": m.get("rid", ""),
-                                         "sessionId": session_id, "generationId": generation_id}
-                                if (not isinstance(session_id, str) or _safe_identity(session_id) != session_id
-                                        or not isinstance(generation_id, str) or not generation_id
-                                        or _safe_identity(generation_id) != generation_id or not m.get("rid")):
-                                    await ws.send(json.dumps({**reply, "t": "killResult", "ok": False,
-                                                             "detail": "exact sessionId, generationId and rid required"}))
-                                    continue
-                                ok, detail = await remove_session(name, by_user=True,
-                                    expected_session_id=session_id, expected_generation_id=generation_id)
-                                if not ok:
-                                    log(f"[{name}] remote stop failed: {detail}")
-                                    await ws.send(json.dumps({**reply, "t": "killResult", "ok": False,
-                                                             "uncertain": True, "detail": detail}))
-                                else:
-                                    await ws.send(json.dumps({**reply, "t": "killed"}))
-                                # Announce the new list IMMEDIATELY, not on the next pump_status tick.
-                                # pump_status is a fixed 5 s cadence, so without this the relay's
-                                # hostSessions still held the killed session when this very handler
-                                # returned, and the relay's confirmation poll (waitForHostState, 100 ms
-                                # interval) could not observe the removal for up to 5 s. That is the
-                                # "erasing a terminal takes a handful of seconds" delay: the removal had
-                                # already happened, and only its announcement was waiting on a timer.
-                                await ws.send(json.dumps({"t": "sessions", "list": sess_list()}))
+                            except asyncio.CancelledError:
+                                raise
+                            except Exception as dispatch_error:
+                                log(f"[relay] command dispatch raised, link kept up: {dispatch_error!r}")
                     finally:
                         for tk in tasks: tk.cancel()
                         clear_remote_size_ownership()

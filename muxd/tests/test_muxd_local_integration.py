@@ -338,6 +338,140 @@ class DisposableMuxd:
 
 @unittest.skipIf(websockets is None, "websockets package is required for muxd integration tests")
 @unittest.skipIf(os.name != "nt", "muxd ConPTY integration tests require Windows")
+class RelayLinkSurvivalTests(unittest.TestCase):
+    """S2(b): a per-command failure must cost that command and nothing else.
+
+    The relay host link is the ONLY path from this box to the web UI, so an exception escaping the
+    relay dispatch is not one lost reply - it is every tab going dark until muxd reconnects. This
+    class launches its OWN private-profile muxd (MUXD_PROFILE + MUXD_RUNTIME_ROOT + MUXD_ENV_FILE,
+    the repo's profile contract) so it does not depend on the shared DisposableMuxd fixture, which
+    predates the profile contract and cannot host a relay link.
+    """
+
+    def test_relay_kill_of_a_dead_owner_mirror_keeps_the_link_up(self):
+        # A visible owner that closed leaves a persisted mirror with owner=False
+        # (finalize_confirmed_owner_exit). The old kill path skipped the owner branch because owner was
+        # already False, fell through to the PTY branch, and called stop_input_writer() on an
+        # OwnerSession - only Session defines it - so the AttributeError escaped the relay dispatch and
+        # took the WHOLE link down. The kill must now answer on the SAME socket.
+        async def scenario():
+            connected = asyncio.get_running_loop().create_future()
+            finished = asyncio.Event()
+
+            async def relay(ws):
+                hello = json.loads(await ws.recv())
+                if not connected.done():
+                    connected.set_result((ws, hello))
+                await finished.wait()
+
+            async with websockets.serve(relay, '127.0.0.1', 0) as listener:
+                root = Path(tempfile.mkdtemp(prefix='muxd-deadowner-'))
+                profile_root = root / 'profile'
+                profile_root.mkdir()
+                state = profile_root / 'state'
+                state.mkdir()
+                control_port = free_port()
+                env_file = profile_root / 'profile.env'
+                env_file.write_text("\n".join(f"{k}={v}" for k, v in {
+                    'MUXD_STATE_ROOT': state,
+                    'MUXD_CONTROL_PORT': control_port,
+                    'MUXD_MUTEX_NAME': f'Local\\MuxDeadOwner-{control_port}',
+                    'MUXD_PRINCIPAL_REGISTRY': profile_root / 'principal.dpapi',
+                    'MUXD_PRINCIPAL_INSTANCE_ID': f'dead-owner-principal-{control_port}',
+                    'MUXD_HOST_IDENTITY': f'dead-owner-host-{control_port}',
+                    'MUXD_RELAY_URLS': f'ws://127.0.0.1:{listener.sockets[0].getsockname()[1]}/host',
+                    'MUXD_TOKEN_SOURCE': 'env:MUX_HOST_TOKEN',
+                    'MUXD_LAUNCH_CLAIM_ROOT': profile_root / 'claims',
+                    'MUXD_TASK_NAME': f'MuxDeadOwner-{control_port}',
+                    'MUXD_RESTART_TASK_NAME': f'MuxDeadOwnerRestart-{control_port}',
+                    'MUXD_WATCHDOG_TASK_NAME': f'MuxDeadOwnerWatchdog-{control_port}',
+                    'MUXD_GUARDIAN_DISABLED': '1',
+                    'DEFAULT_CWD': root,
+                }.items()), encoding='utf-8')
+                env = dict(os.environ)
+                env.update(MUXD_PROFILE='dead-owner-it', MUXD_RUNTIME_ROOT=str(profile_root / 'runtime'),
+                           MUXD_ENV_FILE=str(env_file), MUX_HOST_TOKEN='test-token', MUXCTL_AUTOSTART='0')
+                proc = subprocess.Popen([sys.executable, str(MUXD), '--profile', 'dead-owner-it'],
+                                        cwd=str(REPO), env=env, stdout=subprocess.DEVNULL,
+                                        stderr=subprocess.DEVNULL, creationflags=CREATE_NO_WINDOW)
+                try:
+                    deadline = time.monotonic() + 20
+                    while time.monotonic() < deadline:
+                        if proc.poll() is not None:
+                            self.fail(f'isolated muxd exited: {proc.returncode}')
+                        try:
+                            if (await request_json(control_port, {'t': 'info'}, timeout=1)).get('t') == 'info':
+                                break
+                        except Exception:
+                            await asyncio.sleep(0.1)
+                    else:
+                        self.fail('isolated muxd did not start')
+
+                    ws, _hello = await asyncio.wait_for(connected, 20)
+                    name = 'it-relay-dead-owner'
+                    # Register a visible (non-stream) owner, then close its socket. muxd parks the row
+                    # dormant with owner=False and no live target - exactly the persisted mirror that a
+                    # real terminal close leaves behind.
+                    owner = await websockets.connect(f'ws://127.0.0.1:{control_port}', ping_interval=None)
+                    await owner.send(json.dumps({'t': 'owner', 's': name,
+                                                 'cmd': 'codex resume it-dead-owner',
+                                                 'ownerKey': 'd' * 32}))
+                    ack = json.loads(await asyncio.wait_for(owner.recv(), 10))
+                    self.assertEqual('owner-ok', ack.get('t'), ack)
+                    await owner.close()
+
+                    async def wait_dormant():
+                        wait_deadline = time.time() + 15
+                        while time.time() < wait_deadline:
+                            rows = (await request_json(control_port, {'t': 'ls'})).get('list', [])
+                            row = next((r for r in rows if r['name'] == name), None)
+                            if row is not None and not row.get('alive'):
+                                return row
+                            await asyncio.sleep(0.1)
+                        self.fail('the closed owner row never went dormant')
+
+                    row = await wait_dormant()
+                    self.assertFalse(row.get('owner'), row)
+
+                    rid = 'dead-owner-stop'
+                    await ws.send(json.dumps({'t': 'kill', 's': name, 'rid': rid,
+                                              'sessionId': row.get('sessionId', ''),
+                                              'generationId': row['generationId']}))
+
+                    async def reply():
+                        while True:
+                            # If the handler raised, muxd drops the link and this recv() raises
+                            # ConnectionClosed instead of ever seeing the reply.
+                            frame = json.loads(await ws.recv())
+                            if frame.get('rid') == rid or frame.get('t') == 'killed':
+                                return frame
+
+                    got = await asyncio.wait_for(reply(), 15)
+                    self.assertEqual('killed', got.get('t'), got)
+                    self.assertNotIn(name, [r['name'] for r in
+                                            (await request_json(control_port, {'t': 'ls'}))['list']])
+                    # The window the link-was-dropped symptom would show up in: a raising command must
+                    # leave ZERO "relay link dropped" lines behind.
+                    log_path = profile_root / 'state' / 'muxd.log'
+                    log_text = log_path.read_text(encoding='utf-8', errors='replace') if log_path.exists() else ''
+                    self.assertNotIn('relay link dropped', log_text,
+                                     'the kill dropped the host link: ' + log_text[-500:])
+                finally:
+                    finished.set()
+                    if proc.poll() is None:
+                        proc.terminate()
+                        try:
+                            proc.wait(timeout=6)
+                        except subprocess.TimeoutExpired:
+                            proc.kill()
+                            proc.wait(timeout=6)
+                    shutil.rmtree(root, ignore_errors=True)
+
+        asyncio.run(scenario())
+
+
+@unittest.skipIf(websockets is None, "websockets package is required for muxd integration tests")
+@unittest.skipIf(os.name != "nt", "muxd ConPTY integration tests require Windows")
 class MuxdLocalIntegrationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

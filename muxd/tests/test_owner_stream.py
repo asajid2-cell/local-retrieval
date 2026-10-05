@@ -11,6 +11,7 @@ socket, no PTY -- so a regression in the framing or the watch gate fails here.
 import asyncio
 import base64
 import json
+import time
 import unittest
 
 import muxd
@@ -124,6 +125,59 @@ class OwnerNoLaunchClaim(unittest.TestCase):
         claim, detail = muxd.acquire_launch_claim("", [])
         self.assertIsNone(claim, "an empty-command tab must not acquire a launch claim")
         self.assertEqual(detail, "")
+
+
+class OwnerTabLifecycle(unittest.IsolatedAsyncioTestCase):
+    """S2: a teed tab's row follows its socket, and one bad command never takes the relay link down.
+
+    A WT tab closing leaves muxtee's socket gone. On the old path a kill of that row fell through to
+    the PTY branch, called stop_input_writer on an OwnerSession (only Session defines it), and threw -
+    out of the relay dispatch and off the whole link. These pin the three behaviours the fix rests on:
+    a gone tab is dropped at once, a live tab is the user's to close, and a closed stream socket
+    removes its row instead of parking it.
+    """
+
+    async def test_a_kill_of_a_tab_with_no_live_socket_removes_it_without_waiting(self):
+        s = make_stream_session()
+        s.dead = True          # the socket is gone...
+        s.owner = False        # ...and reconcile_finalize cleared the owner claim
+        s.lifecycle = "dormant"
+        started = time.perf_counter()
+        ok, detail = await muxd.terminate_session_off_loop(s, by_user=True)
+        self.assertTrue(ok, detail)
+        self.assertLess(time.perf_counter() - started, 1.0, "a gone tab must not be waited on")
+        self.assertIn("mirror", detail)
+
+    async def test_a_kill_of_a_live_stream_tab_is_refused(self):
+        s = make_stream_session()   # dead defaults to False, so the tab reads as live
+        ok, detail = await muxd.terminate_session_off_loop(s, by_user=True)
+        self.assertFalse(ok)
+        self.assertIn("local terminal owns", detail)
+
+    async def test_a_closed_stream_socket_removes_the_row_instead_of_parking_it(self):
+        s = make_stream_session()
+        sessions = {"tab": s}
+        saved = []
+
+        async def save(source):
+            saved.append(dict(source))
+
+        await muxd.reconcile_owner_disconnect(sessions, "tab", s, save)
+        self.assertNotIn("tab", sessions, "a closed stream socket must remove the row, not park it")
+        self.assertTrue(saved, "the removal must be persisted")
+
+    async def test_a_closed_regular_owner_socket_keeps_its_row_dormant(self):
+        # A non-stream owner is muxrun/adopted: its row is a resumable mirror, so a dropped link parks
+        # it dormant rather than deleting it. Only a stream tab is dropped outright.
+        s = make_regular_session()
+        sessions = {"shell": s}
+
+        async def save(source):
+            return None
+
+        await muxd.reconcile_owner_disconnect(sessions, "shell", s, save)
+        self.assertIn("shell", sessions)
+        self.assertEqual(s.lifecycle, "dormant")
 
 
 class RecordingWs:
