@@ -100,6 +100,26 @@ internal static class ConsoleApi
     [return: MarshalAs(UnmanagedType.Bool)]
     public static extern bool GetConsoleScreenBufferInfo(SafeFileHandle h, out CONSOLE_SCREEN_BUFFER_INFO info);
 
+    // ---- code page ------------------------------------------------------------------------------
+    // The outer console here IS the user's tab, and T1 writes the inner ConPTY's bytes through verbatim.
+    // Unless this console decodes UTF-8, multibyte glyphs land as CP437 mojibake: a bullet becomes two
+    // cells, so the scarce-width footer and rules wrap (measured ●─✓→é -> ΓùÅΓöÇΓ£ôΓåÆ├⌐).
+    public const uint CP_UTF8 = 65001;
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern uint GetConsoleOutputCP();
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool SetConsoleOutputCP(uint cp);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern uint GetConsoleCP();
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool SetConsoleCP(uint cp);
+
     [DllImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     public static extern bool ReadConsoleInputW(

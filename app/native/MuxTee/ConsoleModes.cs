@@ -17,6 +17,10 @@ internal sealed class ConsoleModes
     private uint _inOriginal, _inChanged, _outOriginal, _outChanged;
     private bool _haveIn, _haveOut, _restored;
 
+    // Code pages are process-global, not per-handle, so these are saved and restored alongside the modes.
+    private uint _outCpOriginal, _inCpOriginal;
+    private bool _haveOutCp, _haveInCp;
+
     public ConsoleModes(SafeFileHandle stdin, SafeFileHandle stdout)
     {
         Stdin = stdin;
@@ -53,6 +57,16 @@ internal sealed class ConsoleModes
             ConsoleApi.SetConsoleMode(Stdin, next);
             _inChanged = _inOriginal ^ next;
         }
+
+        // The tab is our outer console and we pass the inner pty's bytes through verbatim, so the console
+        // has to be UTF-8 for a bullet to stay one cell. A zero reading means there is no console to set.
+        _outCpOriginal = ConsoleApi.GetConsoleOutputCP();
+        if (_outCpOriginal != 0 && _outCpOriginal != ConsoleApi.CP_UTF8)
+            _haveOutCp = ConsoleApi.SetConsoleOutputCP(ConsoleApi.CP_UTF8);
+
+        _inCpOriginal = ConsoleApi.GetConsoleCP();
+        if (_inCpOriginal != 0 && _inCpOriginal != ConsoleApi.CP_UTF8)
+            _haveInCp = ConsoleApi.SetConsoleCP(ConsoleApi.CP_UTF8);
     }
 
     // Swap back only the bits we changed, so atexit machinery another process installed meanwhile is not
@@ -68,6 +82,11 @@ internal sealed class ConsoleModes
                 ConsoleApi.SetConsoleMode(Stdout, (curOut & ~_outChanged) | (_outOriginal & _outChanged));
             if (_haveIn && ConsoleApi.GetConsoleMode(Stdin, out var curIn))
                 ConsoleApi.SetConsoleMode(Stdin, (curIn & ~_inChanged) | (_inOriginal & _inChanged));
+
+            // Only the code pages we actually moved are put back, so a page another process set meanwhile
+            // is left alone - the same discipline the mode restore above uses.
+            if (_haveOutCp) ConsoleApi.SetConsoleOutputCP(_outCpOriginal);
+            if (_haveInCp) ConsoleApi.SetConsoleCP(_inCpOriginal);
         }
         catch
         {

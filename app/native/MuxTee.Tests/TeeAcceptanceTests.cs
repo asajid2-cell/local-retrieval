@@ -160,6 +160,25 @@ public class TeeAcceptanceTests
             $"{var} passthrough did not run the child; saw: " + Snippet(h.Output));
     }
 
+    // Spec §4 invariant 1 ("local first"): T1 writes to the local terminal before it touches anything
+    // network-related and never waits on muxd, so a dead, slow or absent muxd changes nothing on screen.
+    // We force the P2 link ON but point it at a port with nothing listening (an absent muxd), then assert
+    // the child's output still reaches the tab. If the net path could ever block or preempt the local
+    // write, the prompt would not appear and this would fail.
+    [TestMethod]
+    public void DeadMuxd_DoesNotAffectTheLocalScreen()
+    {
+        using var h = ConsoleHarness.Start(MuxteeExe, new[] { "--", "cmd.exe", "/c", "echo LOCAL-FIRST-OK & exit" },
+            rows: 24, cols: 80,
+            extraEnv: new Dictionary<string, string>
+            {
+                // No muxd is listening on this port, so the link can never connect.
+                ["MUXTEE_LOCAL_PORT"] = "7611",
+            });
+        Assert.IsTrue(h.WaitForOutput(o => o.Contains("LOCAL-FIRST-OK"), 10000),
+            "output did not reach the local screen with an absent muxd; saw: " + Snippet(h.Output));
+    }
+
     // Spec §14.7 / §13: a Gateway leaf or background launch is detached with no console on stdin/stdout,
     // and must hit the passthrough rule untouched - it must NOT be wrapped in a tee (which would steal a
     // pty layer and a net link the leaf does not want). We launch muxtee exactly that way: stdio is a
@@ -194,6 +213,26 @@ public class TeeAcceptanceTests
         // A tee would have started an inner ConPTY and logged the tee line; passthrough never does.
         Assert.IsFalse(stderr.Contains("bundledConpty="),
             "a detached launch must not start the tee path; stderr=" + Snippet(stderr));
+    }
+
+    // Spec §5.1 step 2: the tab IS our outer console, and T1 writes the inner pty's UTF-8 through
+    // verbatim - so muxtee has to put that console into UTF-8. Left at the console default (437 here)
+    // every multibyte glyph decodes byte-for-byte into mojibake and takes two or three cells, which is
+    // what wraps the footer and garbles the title. The child prints the glyphs and the harness reads the
+    // console back, so this is red before Capture sets the code page and green after.
+    [TestMethod]
+    public void MultibyteGlyphs_RenderAtTheirOwnWidth()
+    {
+        const string glyphs = "●─✓→é";
+        using var h = ConsoleHarness.Start(MuxteeExe,
+            new[] { "--", "powershell.exe", "-NoExit", "-Command",
+                    "[Console]::OutputEncoding=[Text.Encoding]::UTF8; Write-Host 'GLYPH " + glyphs + "'; Start-Sleep 4" },
+            rows: 24, cols: 80);
+        // "GLYPH" itself is ASCII, so it renders either way; the glyphs after it are the whole point.
+        Assert.IsTrue(h.WaitForOutput(o => o.Contains("GLYPH"), 15000),
+            "the child's glyph line never rendered; saw: " + Snippet(h.Output));
+        Assert.IsTrue(h.Output.Contains("GLYPH " + glyphs),
+            "multibyte glyphs came back mangled - the outer console is not UTF-8; saw: " + Snippet(h.Output));
     }
 
     private static string Snippet(string s)
