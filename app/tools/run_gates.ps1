@@ -279,7 +279,7 @@ function Test-ForbiddenPath {
     # acceptance input; the targets are where runtime copies live, never source authority.
     $forbiddenTokens = @(
         'multiplex-app-patch',
-        'C:/Users/Ahmed/muxd'
+        'C:/Users/Ahmed/muxd-runtime'
     )
     foreach ($token in $forbiddenTokens) {
         if ($normalized.Contains($token.ToLowerInvariant())) {

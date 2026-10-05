@@ -387,7 +387,7 @@ Write-Output 'preflight verified'
         with tempfile.TemporaryDirectory(prefix="muxd-overlap-profile-") as temp:
             root = Path(temp)
             env, _ = profile_env(root)
-            production_runtime = Path.home() / "muxd"
+            production_runtime = Path.home() / "muxd-runtime"
             cases = (
                 ("MUXD_RUNTIME_ROOT", production_runtime.parent),
                 ("MUXD_RUNTIME_ROOT", production_runtime / "test"),
@@ -441,7 +441,7 @@ Write-Output 'preflight verified'
             env, _ = profile_env(root)
             profile_file = Path(env["MUXD_ENV_FILE"])
             lines = [
-                f"DEFAULT_CWD={Path.home() / 'muxd' / 'workspace'}"
+                f"DEFAULT_CWD={Path.home() / 'muxd-runtime' / 'workspace'}"
                 if line.startswith("DEFAULT_CWD=") else line
                 for line in profile_file.read_text(encoding="utf-8").splitlines()
             ]

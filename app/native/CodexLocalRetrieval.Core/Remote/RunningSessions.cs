@@ -487,6 +487,7 @@ public static class RunningSessions
                 using var rfs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
                 using var rsr = new StreamReader(rfs);
                 json = rsr.ReadToEnd();
+                using var doc = JsonDocument.Parse(json);
                 return true;
             }
             catch (FileNotFoundException) { error = "file disappeared"; return false; }   // claude cleaned up; not a retry case
@@ -600,7 +601,7 @@ public static class RunningSessions
         detail = "";
         var liveTabs = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            "muxd",
+            "muxd-runtime",
             "live-tabs.json");
         int shellPid;
         try

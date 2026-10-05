@@ -58,7 +58,8 @@ MAX_BODY_BYTES = 64 * 1024
 _ID_RE = re.compile(r"\A[A-Za-z0-9._-]{1,128}\Z")
 _HEX32_RE = re.compile(r"\A[0-9a-f]{64}\Z")
 REGISTRY_VERSION = 1
-DEFAULT_REGISTRY = Path.home() / "muxd" / "principal-registry.dpapi"
+# Mirrors the production profile's principal registry under the live runtime root, muxd-runtime.
+DEFAULT_REGISTRY = Path.home() / "muxd-runtime" / "principal-registry.dpapi"
 
 # Staged rollout knob owned by the trust migration leaf. This module's endpoint always refuses a
 # proofless frame; the mode only decides whether muxd's call site is still allowed to fall back

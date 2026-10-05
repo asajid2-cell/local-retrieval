@@ -12,7 +12,7 @@ public sealed class AdoptedMuxLauncherTests
           <Actions>
             <Exec>
               <Command>C:\Python311\pythonw.exe</Command>
-              <Arguments>"C:\Users\Ahmed\muxd\muxd.py"</Arguments>
+              <Arguments>"C:\Users\Ahmed\muxd-runtime\muxd.py"</Arguments>
             </Exec>
           </Actions>
         </Task>
@@ -41,7 +41,7 @@ public sealed class AdoptedMuxLauncherTests
         Assert.IsTrue(result.Ok, result.Detail);
         Assert.IsNotNull(started);
         Assert.AreEqual(@"C:\Python311\pythonw.exe", started.FileName);
-        CollectionAssert.Contains(started.ArgumentList.ToArray(), @"C:\Users\Ahmed\muxd\muxrun.py");
+        CollectionAssert.Contains(started.ArgumentList.ToArray(), @"C:\Users\Ahmed\muxd-runtime\muxrun.py");
         CollectionAssert.Contains(started.ArgumentList.ToArray(), "--attach-pid");
         CollectionAssert.Contains(started.ArgumentList.ToArray(), request.Pid.ToString());
         CollectionAssert.Contains(started.ArgumentList.ToArray(), "--cmd-b64");
@@ -110,7 +110,7 @@ public sealed class AdoptedMuxLauncherTests
             () => Task.FromResult((true, TaskXml, "")),
             start,
             _ => Task.CompletedTask,
-            path => path is @"C:\Python311\pythonw.exe" or @"C:\Users\Ahmed\muxd\muxrun.py",
+            path => path is @"C:\Python311\pythonw.exe" or @"C:\Users\Ahmed\muxd-runtime\muxrun.py",
             _ => null,
             _ => true);
 

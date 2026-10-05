@@ -3,7 +3,7 @@
 param(
   [ValidateSet('audit','enforce')]
   [string]$AuthzMode,
-  [string]$RuntimeDir = 'C:\Users\Ahmed\muxd'
+  [string]$RuntimeDir = 'C:\Users\Ahmed\muxd-runtime'
 )
 
 $ErrorActionPreference = 'Stop'

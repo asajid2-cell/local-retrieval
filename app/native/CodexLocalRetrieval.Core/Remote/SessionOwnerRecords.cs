@@ -158,7 +158,7 @@ public static class SessionOwnerRecords
         {
             var liveTabs = Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-                "muxd",
+                "muxd-runtime",
                 "live-tabs.json");
             if (!File.Exists(liveTabs)) return 0;
             using var doc = JsonDocument.Parse(File.ReadAllText(liveTabs));

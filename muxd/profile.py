@@ -196,7 +196,9 @@ def load_profile(source: Mapping[str, str] | None = None) -> MuxdProfile:
         raise ProfileError("MUXD_PROFILE has invalid characters")
 
     home = Path.home()
-    production_runtime = str(home / "muxd")
+    # The live runtime directory is muxd-runtime: the old name "muxd" was indistinguishable from the
+    # muxd/ source subtree in the monorepo and from the legacy asajid2-cell/muxd checkout it replaced.
+    production_runtime = str(home / "muxd-runtime")
     production_env = str(Path(production_runtime) / "muxd.env")
     file_hint = process.get("MUXD_ENV_FILE", "")
     if name == PRODUCTION:

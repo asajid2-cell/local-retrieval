@@ -13,7 +13,7 @@ public class MuxdTaskLaunchTests
               <Actions>
                 <Exec>
                   <Command>C:\Python311\python.exe</Command>
-                  <Arguments>C:\Users\Ahmed\muxd\muxd.py</Arguments>
+                  <Arguments>C:\Users\Ahmed\muxd-runtime\muxd.py</Arguments>
                 </Exec>
               </Actions>
             </Task>
@@ -23,7 +23,7 @@ public class MuxdTaskLaunchTests
 
         Assert.IsTrue(ok);
         Assert.AreEqual(@"C:\Python311\pythonw.exe", exe);
-        Assert.AreEqual(@"C:\Users\Ahmed\muxd\muxd.py", args);
+        Assert.AreEqual(@"C:\Users\Ahmed\muxd-runtime\muxd.py", args);
     }
 
     [TestMethod]
@@ -34,7 +34,7 @@ public class MuxdTaskLaunchTests
               <Actions>
                 <Exec>
                   <Command>C:\Python311\pythonw.exe</Command>
-                  <Arguments>C:\Users\Ahmed\muxd\muxd.py</Arguments>
+                  <Arguments>C:\Users\Ahmed\muxd-runtime\muxd.py</Arguments>
                 </Exec>
               </Actions>
             </Task>
@@ -72,7 +72,7 @@ public class MuxdTaskLaunchTests
               <Actions>
                 <Exec>
                   <Command>C:\Python311\python.exe</Command>
-                  <Arguments>C:\Users\Ahmed\muxd\muxd.py</Arguments>
+                  <Arguments>C:\Users\Ahmed\muxd-runtime\muxd.py</Arguments>
                 </Exec>
               </Actions>
             </Task>
@@ -91,7 +91,7 @@ public class MuxdTaskLaunchTests
               <Actions>
                 <Exec>
                   <Command>C:\Python311\python.exe</Command>
-                  <Arguments>-u "C:\Users\Ahmed\muxd\muxd.py"</Arguments>
+                  <Arguments>-u "C:\Users\Ahmed\muxd-runtime\muxd.py"</Arguments>
                 </Exec>
               </Actions>
             </Task>
@@ -99,13 +99,13 @@ public class MuxdTaskLaunchTests
 
         var ok = MuxdTaskLaunch.TryGetAdopterAction(
             xml,
-            path => path is @"C:\Python311\pythonw.exe" or @"C:\Users\Ahmed\muxd\muxrun.py",
+            path => path is @"C:\Python311\pythonw.exe" or @"C:\Users\Ahmed\muxd-runtime\muxrun.py",
             out var action);
 
         Assert.IsTrue(ok);
         Assert.IsNotNull(action);
         Assert.AreEqual(@"C:\Python311\pythonw.exe", action.PythonwExe);
-        Assert.AreEqual(@"C:\Users\Ahmed\muxd\muxrun.py", action.MuxrunPath);
+        Assert.AreEqual(@"C:\Users\Ahmed\muxd-runtime\muxrun.py", action.MuxrunPath);
     }
 
     [TestMethod]
@@ -116,7 +116,7 @@ public class MuxdTaskLaunchTests
               <Actions>
                 <Exec>
                   <Command>C:\Python311\pythonw.exe</Command>
-                  <Arguments>C:\Users\Ahmed\muxd\muxd.py</Arguments>
+                  <Arguments>C:\Users\Ahmed\muxd-runtime\muxd.py</Arguments>
                 </Exec>
               </Actions>
             </Task>
@@ -136,32 +136,32 @@ public class MuxdTaskLaunchTests
               <Actions>
                 <Exec>
                   <Command>C:\Windows\System32\wscript.exe</Command>
-                  <Arguments>//B //NoLogo "C:\Users\Ahmed\muxd\ops\launch_muxd.vbs"</Arguments>
+                  <Arguments>//B //NoLogo "C:\Users\Ahmed\muxd-runtime\ops\launch_muxd.vbs"</Arguments>
                 </Exec>
               </Actions>
             </Task>
             """;
         const string vbs = """"
-            command = """C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"" -File ""C:\Users\Ahmed\muxd\ops\launch_muxd.ps1"""
+            command = """C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"" -File ""C:\Users\Ahmed\muxd-runtime\ops\launch_muxd.ps1"""
             """";
         const string ps1 = """
-            $child = "Start-Process -Wait -FilePath 'C:\Python311\pythonw.exe' -ArgumentList 'C:\Users\Ahmed\muxd\muxd.py'"
+            $child = "Start-Process -Wait -FilePath 'C:\Python311\pythonw.exe' -ArgumentList 'C:\Users\Ahmed\muxd-runtime\muxd.py'"
             """;
 
         var ok = MuxdTaskLaunch.TryGetAdopterAction(
             xml,
             path => path is
-                @"C:\Users\Ahmed\muxd\ops\launch_muxd.vbs" or
-                @"C:\Users\Ahmed\muxd\ops\launch_muxd.ps1" or
+                @"C:\Users\Ahmed\muxd-runtime\ops\launch_muxd.vbs" or
+                @"C:\Users\Ahmed\muxd-runtime\ops\launch_muxd.ps1" or
                 @"C:\Python311\pythonw.exe" or
-                @"C:\Users\Ahmed\muxd\muxrun.py",
+                @"C:\Users\Ahmed\muxd-runtime\muxrun.py",
             path => path.EndsWith(".vbs", StringComparison.OrdinalIgnoreCase) ? vbs : ps1,
             out var action);
 
         Assert.IsTrue(ok);
         Assert.IsNotNull(action);
         Assert.AreEqual(@"C:\Python311\pythonw.exe", action.PythonwExe);
-        Assert.AreEqual(@"C:\Users\Ahmed\muxd\muxrun.py", action.MuxrunPath);
+        Assert.AreEqual(@"C:\Users\Ahmed\muxd-runtime\muxrun.py", action.MuxrunPath);
     }
 
     [TestMethod]
@@ -172,7 +172,7 @@ public class MuxdTaskLaunchTests
               <Actions>
                 <Exec>
                   <Command>C:\Windows\System32\wscript.exe</Command>
-                  <Arguments>"C:\Users\Ahmed\muxd\ops\launch_muxd.vbs"</Arguments>
+                  <Arguments>"C:\Users\Ahmed\muxd-runtime\ops\launch_muxd.vbs"</Arguments>
                 </Exec>
               </Actions>
             </Task>
