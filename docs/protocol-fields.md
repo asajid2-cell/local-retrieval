@@ -213,7 +213,11 @@ Produced by `session_payload()` (`muxd/muxd.py:2266`), consumed by `normalizeHos
 muxd additionally emits `lifecycle`, `childPid`, `needsAttention`, and `lastOutAgeMs`, which the relay
 does not forward. It also emits `agentTruth` and `agentStateSource`, which the relay *does* keep: they
 survive `normalizeHostSession()` and drive the state dot and the `healEligible` recovery gate on
-`/api/sessions` (see below). `kind` is one of `command` / `shell` / `dormant`.
+`/api/sessions` (see below). `kind` is one of `command` / `shell` / `dormant` / `local-tab` (a
+muxtee-teed PC tab, a stream owner) / `adopted-local` (a mirrored local session muxd did not start).
+The relay keeps `kind` verbatim and derives `localTab` from it for the client; it also sends `tabOwned`
+on the viewer size frame when a stream owner's own geometry is in force, so the UI can lock the pin
+(§7.1/§7.3). `localTab` and `tabOwned` are relay-computed and never appear on the muxd↔relay wire.
 
 #### Process truth (`agentTruth` capability)
 

@@ -172,6 +172,7 @@ test('size chip names auto, own pin, and another device exactly', () => {
     sizePinned: false,
     sizeMine: false,
     sizeLocal: false,
+    sizeTabOwned: false,
     sizePinLabel: '',
     $: sel => sel === '#term' ? host : null,
     sizeButtonPresentation: null,
@@ -196,6 +197,15 @@ test('size chip names auto, own pin, and another device exactly', () => {
   assert.match(mirrored.title, /mirroring Phone/i);
   assert.match(mirrored.title, /tap to pin/i);
   assert.match(mirrored.title, /horizontal scrollbar/i);
+
+  // §7.3: a teed PC tab's grid is the physical screen - the chip says so and the pin is locked off.
+  sandbox.sizePinned = false; sandbox.sizePinLabel = ''; host.classList.remove('pan');
+  sandbox.sizeTabOwned = true;
+  const tabOwned = sandbox.sizeButtonPresentation();
+  assert.match(tabOwned.text, /follows PC tab/);
+  assert.equal(tabOwned.disabled, true, 'a tab-owned grid must not offer a pin');
+  assert.match(tabOwned.title, /cannot be pinned/i);
+  sandbox.sizeTabOwned = false;
 
   assert.match(source, /<button type="button" class="meta" id="statusmeta"/);
   assert.match(source, /\$\('#statusmeta'\)\.addEventListener\('click', cycleSize\)/);

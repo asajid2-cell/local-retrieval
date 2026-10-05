@@ -129,6 +129,9 @@
   .runrow .rmeta .realname[hidden] { display:none; }
   .runrow .rmeta .sub { display:block; font-size:11.5px; color:var(--faint); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .runrow.killing { opacity:.6; }
+  /* PC tabs (§7.3): a teed local terminal, not a mux session - tint the row and tag it apart from agents. */
+  .runrow.pctabrow .tool { background:rgba(110,168,254,.14); color:#6ea8fe; }
+  .crow.pctabs .cname { color:#6ea8fe; }
   .ractions { flex:0 0 auto; display:flex; gap:var(--sp2); }
   .openbtn, .mirrorbtn, .killbtn, .renbtn { flex:0 0 auto; height:36px; padding:0 var(--sp3); border-radius:var(--r-s); font:600 12.5px/1 inherit; cursor:pointer; }
   .openbtn { border:1px solid var(--line); background:var(--panel-2); color:var(--txt); }
@@ -267,7 +270,7 @@
 const $ = s => document.querySelector(s);
 const LS = { get:(k,d)=>{ try{ return JSON.parse(localStorage.getItem(k)) ?? d; }catch(e){ return d; } }, set:(k,v)=>{ try{ localStorage.setItem(k, JSON.stringify(v)); }catch(e){} } };
 const esc = s => String(s).replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-let data={collections:[]}, sessions=[], built=false, sig=null, curDetail=null, detailOrigin=null;
+let data={collections:[]}, sessions=[], built=false, sig=null, curDetail=null, detailOrigin=null, showAllPcTabs=false;
 let initialLoadFailed=false;
 const rows=[];           // master rows: [{id,name,crow,crun,total,coll}]
 const visibleChats=[];   // currently-rendered detail/search chat rows: [{key,ch,btn}]
@@ -310,11 +313,14 @@ function archiveChats(){ return Array.isArray(data && data.allChats) ? data.allC
 // Signature of everything VISIBLE/structural except `running` (which changes constantly and is
 // applied in place). A rename / new chat / changed command flips this -> we show the refresh pill
 // rather than mutating the live list (a fresh page is the only guaranteed-clean repaint).
-function structSig(d){
+function structSig(d, sess){
   const cols=(d&&d.collections)||[];
   const all=(d&&d.allChats)||[];
   const chatSig=ch=>chatKey(ch)+'~'+(ch.title||'')+'~'+(ch.tool||'')+'~'+(ch.muxName||'')+'~'+(ch.collection||'');
-  return cols.map(c=> (c.id||'')+':'+(c.name||'')+'#'+(c.chats||[]).map(chatSig).join(',')).join('|')+'||all#'+all.map(chatSig).join(',');
+  // §7.3: PC-tab membership is structural - a tab appearing or leaving adds/removes a whole group row, so
+  // it belongs in the signature and forces the same freeze-then-refresh path a new chat does.
+  const tabSig=(sess||sessions||[]).filter(s=>s&&s.localTab).map(s=>s.name+':'+(s.alive!==false?'1':'0')).sort().join(',');
+  return cols.map(c=> (c.id||'')+':'+(c.name||'')+'#'+(c.chats||[]).map(chatSig).join(',')).join('|')+'||all#'+all.map(chatSig).join(',')+'||tabs#'+tabSig;
 }
 function indexChats(){ const m={}; archiveChats().forEach(ch=>{ m[chatKey(ch)]=ch; }); (data.collections||[]).forEach(c=>(c.chats||[]).forEach(ch=>{ m[chatKey(ch)]=ch; })); return m; }
 const goSvg = '<svg class="cgo" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M9 6l6 6-6 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
@@ -368,6 +374,21 @@ function canRelaunchMuxName(name){
 }
 function blockerDetail(s){ return (s && (s.detail || s.legacyDetail || s.hostProtocolDetail)) || 'mux session is blocked by stale protocol or legacy tmux state'; }
 
+// §7.3: a "PC tabs" group. These are muxtee-teed LOCAL terminals (kind 'local-tab'), not mux sessions -
+// the relay mirrors a terminal the user is already sitting at. A tab with an agent bound to it is worth
+// showing; a bare shell is noise, so it stays hidden unless the user expands the group.
+function pcTabs(){ return (sessions||[]).filter(s => s && s.localTab && s.alive!==false); }
+function pcTabHasAgent(s){
+  if(!s) return false;
+  if(s.hasCommand) return true;
+  if(s.sessionId && !s.shellOnly) return true;
+  const st=String(s.agentState||'');
+  return !!st && st!=='neutral';
+}
+function pcTabHidden(s){ return !pcTabHasAgent(s); }
+function pcTabVisibleCount(){ const t=pcTabs(); return showAllPcTabs ? t.length : t.filter(s=>!pcTabHidden(s)).length; }
+
+
 // Resume button state. inMux=already a running multiplex (Attach); localRun=running locally,
 // not in mux (Mirror); missing name/command and not in mux => nothing to resume (Unavailable).
 function setBtnState(btn, ch, muxNames, runIds){
@@ -406,11 +427,25 @@ function buildList(loadError){
   const cols=(data&&data.collections)||[];
   const allArchive=archiveChats();
   const withChats=cols.filter(c=>(c.chats||[]).length);
-  if(!withChats.length && !allArchive.length){
+  const tabs=pcTabs();
+  if(!withChats.length && !allArchive.length && !tabs.length){
     const msg = cols.length
       ? 'Your synced projects don’t have any resumable chats yet.<br>Start a chat in the desktop app — it’ll show up here to resume remotely.'
       : 'No projects synced yet.<br>Open the desktop app — it pushes your collections &amp; chats here so you can resume them remotely.';
     el.innerHTML=`<div class="projempty">${msg}</div>`; built=true; queueMarkRows(); return;
+  }
+  if(tabs.length){
+    // §7.3: teed PC tabs are LOCAL terminals the relay happens to mirror - they are not relaunchable mux
+    // sessions, so they get their own group instead of sitting among the synced chats as if they were.
+    const crow=document.createElement('button'); crow.type='button'; crow.className='crow pctabs';
+    crow.innerHTML=`<span class="cname"></span><span class="ccount"></span>${goSvg}`;
+    crow.querySelector('.cname').textContent='PC tabs';
+    const vis=pcTabVisibleCount();
+    crow.querySelector('.ccount').textContent=`${vis} of ${tabs.length} shown`;
+    crow.setAttribute('aria-label', `PC tabs, ${tabs.length} local terminal${tabs.length!==1?'s':''} mirrored`);
+    crow.onclick=()=>openPcTabs(crow);
+    el.appendChild(crow);
+    rows.push({ id:'__pctabs__', name:'pc tabs local terminals mirrored', crow, crun:null, total:tabs.length, pcTabsRow:crow });
   }
   if(allArchive.length){
     const c={id:'__all__', name:'All chats', chats:allArchive};
@@ -447,6 +482,13 @@ function applyRunning(){
   const byId={}; (data.collections||[]).forEach(c=>{ byId[c.id]=c; });
   if(archiveChats().length) byId.__all__={id:'__all__', name:'All chats', chats:archiveChats()};
   rows.forEach(r=>{
+    if(r.pcTabsRow){                          // §7.3 group: live count, no per-chat running semantics
+      const all=pcTabs();
+      r.crun=r.crun; r.total=all.length;
+      const cnt=r.pcTabsRow.querySelector('.ccount');
+      if(cnt) cnt.textContent=`${pcTabVisibleCount()} of ${all.length} shown`;
+      return;
+    }
     const c=byId[r.id]||r.coll; r.coll=c;
     const anyRun=(c.chats||[]).some(ch=> chatLive(ch, runIds) || (ch.muxName && muxNames.has(ch.muxName)));
     r.crun.hidden=!anyRun;
@@ -686,6 +728,51 @@ function updateRunningCertainty(){
     : 'Latest scan: '+list.length+' agents. Rows below are the snapshot selected when this view opened; reopen Running to refresh them.';
   const empty=el.querySelector('.projempty');
   if(empty && !shown) empty.textContent=unverified ? 'Cannot determine whether agents are running.' : list.length ? 'New agents detected. Reopen Running to view them.' : 'No agents running right now.';
+}
+// §7.3: one row per teed PC tab. It is the local terminal, mirrored - attach to watch, or open it as a
+// transcript if it has a bound chat. There is nothing to relaunch: the tab lives on the PC.
+function pcTabRow(s){
+  const row=document.createElement('div'); row.className='runrow pctabrow';
+  row.innerHTML=`<span class="tool">PC</span><span class="rmeta"><span class="t"></span><span class="realname" hidden></span><span class="sub"></span></span><div class="ractions"><button class="openbtn" type="button">Attach</button></div>`;
+  row.querySelector('.t').textContent=s.name;
+  const bits=[];
+  if(s.cols && s.rows) bits.push(s.cols+'×'+s.rows);
+  const agent=pcTabHasAgent(s);
+  bits.push(agent ? (s.agentLabel || s.agentState || 'agent') : 'plain shell');
+  if(s.localViewers) bits.push(s.localViewers+' local viewer'+(s.localViewers!==1?'s':''));
+  row.querySelector('.sub').textContent=bits.join(' · ');
+  const openBtn=row.querySelector('.openbtn');
+  openBtn.onclick=()=>{ location.href='./?s='+encodeURIComponent(s.name); };
+  return row;
+}
+function openPcTabs(origin){
+  curDetail='__pctabs__'; detailOrigin=origin||null;
+  const el=$('#viewDetail'); el.innerHTML='';
+  const tabs=pcTabs();
+  const head=document.createElement('div'); head.className='dhead';
+  head.innerHTML=`<span class="dname"></span><span class="dcount"></span>`;
+  head.querySelector('.dname').textContent='PC tabs';
+  const shown=showAllPcTabs ? tabs : tabs.filter(s=>!pcTabHidden(s));
+  const hidden=tabs.length-shown.length;
+  head.querySelector('.dcount').textContent=`${shown.length} of ${tabs.length}`;
+  el.appendChild(head);
+  const note=document.createElement('div'); note.className='reslabel';
+  note.textContent='Local terminals on your PC, mirrored by the relay. Their size is the PC screen, so it cannot be pinned from here.';
+  el.appendChild(note);
+  if(!tabs.length){ const e2=document.createElement('div'); e2.className='projempty'; e2.textContent='No PC tabs right now.'; el.appendChild(e2); }
+  else if(!shown.length){ const e2=document.createElement('div'); e2.className='projempty'; e2.textContent='No PC tab has an agent bound. Expand to show the plain shells.'; el.appendChild(e2); }
+  else shown.forEach(s=> el.appendChild(pcTabRow(s)));
+  if(hidden>0 || showAllPcTabs){
+    const tgl=document.createElement('button'); tgl.type='button'; tgl.className='killbtn'; tgl.style.margin='var(--sp3)';
+    tgl.textContent=showAllPcTabs ? 'Hide plain shells' : ('Show '+hidden+' plain shell'+(hidden!==1?'s':''));
+    tgl.onclick=()=>{ showAllPcTabs=!showAllPcTabs; openPcTabs(origin); };
+    el.appendChild(tgl);
+  }
+  $('#viewList').hidden=true; $('#projsearch').hidden=true;
+  el.hidden=false; el.scrollTop=0;
+  $('#backproj').hidden=false; $('#brandword').textContent='pc tabs';
+  $('#backproj').focus();
+  queueMarkRows();
 }
 function openRunning(){
   const list=(data && Array.isArray(data.runningSessions)) ? data.runningSessions : [];
@@ -1161,7 +1248,7 @@ async function load(){
   try{ nd = await (await fetch('api/projects',{headers:{'Content-Type':'application/json'}})).json(); }catch(e){ projectsFailed=true; }
   try{ nsess = await (await fetch('api/sessions',{headers:{'Content-Type':'application/json'}})).json(); }catch(e){}
   if(!built){
-    data = nd||{collections:[]}; sessions = nsess||[]; sig=structSig(data); renderSync(data);
+    data = nd||{collections:[]}; sessions = nsess||[]; sig=structSig(data, sessions); renderSync(data);
     if(projectsFailed){
       initialLoadFailed=true;
       $('#syncbar').classList.add('stale');
@@ -1171,10 +1258,10 @@ async function load(){
   }
   if(nd===null && nsess===null) return;                    // both fetches failed — keep showing what we have
   if(nd && initialLoadFailed){
-    data=nd; sessions=nsess||[]; sig=structSig(data); initialLoadFailed=false;
+    data=nd; sessions=nsess||[]; sig=structSig(data, sessions); initialLoadFailed=false;
     renderSync(data); buildList(); updateRunPill(); return;
   }
-  const newSig = structSig(nd||data);
+  const newSig = structSig(nd||data, nsess||sessions);
   if(nd && newSig!==sig){                                  // content/structure drift -> freeze the list (don't mutate it),
     data.runningSessions=nd.runningSessions; data.runningVerified=nd.runningVerified; data.runningVerificationDetail=nd.runningVerificationDetail; data.live=nd.live; data.appLive=nd.appLive; data.bridgeLive=nd.bridgeLive;
     data.syncedAt=nd.syncedAt; data.appSyncedAt=nd.appSyncedAt; data.runningSyncedAt=nd.runningSyncedAt; data.host=nd.host;  // but keep the running info fresh
@@ -1184,7 +1271,8 @@ async function load(){
   renderSync(data);
   updateRunPill();
   applyRunning();                                          // master crun dots, in place
-  if(curDetail!==null && curDetail!=='__running__') applyRunningVisible();   // visible detail/search resume buttons, in place
+  if(curDetail==='__pctabs__') openPcTabs(detailOrigin);   // §7.3: keep the open PC-tabs detail in step
+  else if(curDetail!==null && curDetail!=='__running__') applyRunningVisible();   // visible detail/search resume buttons, in place
   queueMarkRows();
 }
 load();

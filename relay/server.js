@@ -555,6 +555,9 @@ function normalizeHostSession(s) {
     localFirst: !!s.localFirst, localViewers: s.localViewers || 0,
     hasCommand, shellOnly, ready: Object.prototype.hasOwnProperty.call(s, 'ready') ? !!s.ready : alive,
     kind: String(s.kind || (alive ? (shellOnly ? 'shell' : 'command') : 'dormant')),
+    // A teed PC tab (muxtee) IS the local terminal, mirrored - not a relaunchable mux session. The UI
+    // badges it and groups it apart from plain shells (§7.3).
+    localTab: String(s.kind || '') === 'local-tab',
     sessionId, aliases, identityPending: !!s.identityPending,
     generationId: commandIntentId(s.generationId),
     tool: ['claude', 'codex'].includes(s.tool) ? s.tool : '',
@@ -1143,6 +1146,10 @@ function listSessions() {
                   owner: !!h.owner, adopted: !!h.adopted, externalOwner: !!h.externalOwner,
                   hasCommand: !!h.hasCommand, shellOnly: !!h.shellOnly, ready: !!h.ready,
                   kind: h.kind || (dormant ? 'dormant' : (h.shellOnly ? 'shell' : 'command')),
+                  // §7.3: a teed PC tab is a local terminal the relay mirrors, not a mux session. The badge
+                  // and the PC-tabs group key on this flag, so it is derived here rather than inferred from
+                  // the kind string at the call site.
+                  localTab: (h.kind || '') === 'local-tab',
                   sessionId: String(chat && chat.id || h.sessionId || ''), aliases: Array.isArray(h.aliases) ? h.aliases : [],
                   identityPending: !!h.identityPending,
                   generationId: String(h.generationId || ''),
@@ -4222,7 +4229,9 @@ function targetSize(st, name) {
   // checked first so a lingering pin cannot resize a tab out from under its user.
   const owned = hostSessions.get(name);
   if (owned && owned.owner && (owned.cols | 0) > 1 && (owned.rows | 0) > 1) {
-    return { cols: owned.cols | 0, rows: owned.rows | 0, pin: null, hostedSize: true };
+    // tabOwned marks the STRONGER case: a stream owner's geometry is not merely the local terminal's, it
+    // is the PC's physical screen, so the UI must say so and refuse a pin outright (§7.3).
+    return { cols: owned.cols | 0, rows: owned.rows | 0, pin: null, hostedSize: true, tabOwned: true };
   }
   let pin = pins.get(name);
   if (pin) {
@@ -4278,7 +4287,10 @@ function recompute(name) {
     const mine = pinned && sz.pin.deviceId === (c.deviceId || ('sock-' + c.id));
     const mode = pinned ? 'pinned' : 'auto';
     const modeLabel = pinned ? `ðŸ“Œ ${mine ? 'this device' : pinLabel} Â· ${cols}Ã—${rows}` : `auto Â· ${cols}Ã—${rows}`;
-    sendViewer(name, st, c, 'd' + JSON.stringify({ cols, rows, mode, local: !!sz.hostedSize, pinLabel, mine, modeLabel, me: c.id, clients }));
+    // tabOwned: the size is the teed PC tab's PHYSICAL screen (§7.1/§7.3). The client renders a distinct
+    // label and disables pinning, because a pin would resize the tab out from under the user sitting there.
+    const tabOwned = !!sz.tabOwned;
+    sendViewer(name, st, c, 'd' + JSON.stringify({ cols, rows, mode, local: !!sz.hostedSize, tabOwned, pinLabel, mine, modeLabel, me: c.id, clients }));
   }
 }
 function pinToDevice(name, client, on) {

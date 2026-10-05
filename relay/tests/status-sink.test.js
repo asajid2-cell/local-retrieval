@@ -186,7 +186,9 @@ test('setStatus applies state as a class without touching markup', () => {
 
 test('the other innerHTML templates keep their dynamic parts escaped', () => {
   const tabChips = source.slice(source.indexOf('const chips ='), source.indexOf("t.querySelector('.nm').textContent"));
-  assert.doesNotMatch(tabChips.split('t.innerHTML')[0], /\$\{(?!s\.hosted|s\.legacyTwin|s\.legacyBlocked)/,
+  // §7.3: s.localTab joins the allowlist under the same rule as hosted/legacyTwin/legacyBlocked - a
+  // BOOLEAN selects one of two literal spans, so no session-controlled string reaches markup.
+  assert.doesNotMatch(tabChips.split('t.innerHTML')[0], /\$\{(?!s\.hosted|s\.legacyTwin|s\.legacyBlocked|s\.localTab)/,
     'tab chips must stay literal-only');
   assert.match(source, /t\.querySelector\('\.nm'\)\.textContent = s\.name/, 'the tab name is set as text');
   assert.match(source, /m\.querySelector\('\.mtitle'\)\.textContent = s\.name/, 'the menu title is set as text');

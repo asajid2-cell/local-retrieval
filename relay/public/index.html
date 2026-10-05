@@ -101,6 +101,7 @@
   .tab .pcchip.stale { color:var(--warn); border-color:rgba(251,191,36,.45); }
   .tab .pcchip.legacy { color:var(--rose); border-color:rgba(251,113,133,.5); }
   .tab .pcchip.remote { color:#e879f9; border-color:rgba(232,121,249,.5); }   /* resumed-remote (from /tomux) */
+  .tab .pcchip.localtab { color:var(--accent,#6ea8fe); border-color:rgba(110,168,254,.5); }   /* a teed PC tab (muxtee) - the local terminal, mirrored */
   /* Needs-attention chip: the dot is a hint, this is the word. Own class (not .pcchip) so the STALE
      rewrite below keeps targeting the PC chip no matter what order the chips render in. */
   .tab .attnchip { font-size:8px; font-weight:700; letter-spacing:.04em; color:var(--warn); border:1px solid rgba(251,191,36,.55); background:rgba(251,191,36,.10); border-radius:4px; padding:0 3px; line-height:1.5; flex:0 0 auto; }
@@ -268,6 +269,9 @@
   .key.active { background:var(--rose); color:#1a0a0e; border-color:var(--rose); }   /* Sel toggle when ON */
   .key.accent { background:var(--raised); border-color:var(--line); }
   .key.core { min-width:44px; }
+  /* size chip when the grid is the PC tab's own screen (§7.3): shown, not tappable - there is no pin. */
+  .key.locked { cursor:default; opacity:.7; }
+  .key.locked:active { background:var(--panel); }
   #term.selecting { cursor:text; }
   #term.selecting .xterm-screen { cursor:text; }
 
@@ -1706,7 +1710,7 @@ const send = (t,d) => {
 let viewportFit = null;            // {cols,rows} our screen can show at the current font
 let winSize = null;                // {cols,rows} the shared window the server told us to render
 let sizeModeLabel = '';            // e.g. "auto · 100×30" / "📌 Phone · 40×80"
-let sizePinned = false, sizeMine = false, sizeLocal = false, sizePinLabel = '', sizeClients = [];   // from the 'd' control frame
+let sizePinned = false, sizeMine = false, sizeLocal = false, sizeTabOwned = false, sizePinLabel = '', sizeClients = [];   // from the 'd' control frame
 // Persistent DEVICE identity so a pin follows the DEVICE across reconnects/relay restarts (not the socket).
 const deviceId = (()=>{ let d=LS.get('mux_devid',''); if(!d){ d='d'+Math.random().toString(36).slice(2,10)+Date.now().toString(36).slice(-4); LS.set('mux_devid',d); } return d; })();
 function defaultDeviceLabel(){ const ua=navigator.userAgent||''; const mob=/Mobi|Android|iPhone|iPad/i.test(ua);
@@ -1810,7 +1814,7 @@ function onControl(s){
   if(s[0]!=='d') return;
   let m; try{ m=JSON.parse(s.slice(1)); }catch(e){ return; }
   winSize={cols:m.cols, rows:m.rows}; sizeModeLabel=m.modeLabel||'';
-  sizePinned = m.mode==='pinned'; sizeMine = !!m.mine; sizeLocal = !!m.local; sizePinLabel = m.pinLabel||''; sizeClients = m.clients||[];
+  sizePinned = m.mode==='pinned'; sizeMine = !!m.mine; sizeLocal = !!m.local; sizeTabOwned = !!m.tabOwned; sizePinLabel = m.pinLabel||''; sizeClients = m.clients||[];
   if(term.cols!==m.cols || term.rows!==m.rows){ try{ preserveTermViewport(()=>term.resize(m.cols, m.rows)); hardenHelperTextarea(); installMobileInputDelta(); }catch(e){} }
   // Heal on EVERY size frame, not only on a grid change. A 'd' that re-asserts the size we already have is
   // exactly the frame that used to be a no-op: it proves the relay and this surface disagree about the
@@ -1821,7 +1825,7 @@ function onControl(s){
 }
 // TAP the size chip = pin the shared window to THIS device (everyone mirrors/pans it) — last-pinner-wins.
 // Tap again when it's already yours = back to auto. Long-press = pin another connected device.
-function cycleSize(){ send('P', (sizePinned && sizeMine) ? '0' : ''); }
+function cycleSize(){ if(sizeTabOwned && !sizePinned){ flash('This tab follows the PC terminal; its size cannot be pinned.'); return; } send('P', (sizePinned && sizeMine) ? '0' : ''); }
 function pinToOtherDevice(){
   const others = (sizeClients||[]).filter(c=> (c.dev||('sock-'+c.id)) !== deviceId);
   if(!others.length){ flash('No other device connected to pin'); return; }
@@ -1832,6 +1836,13 @@ function pinToOtherDevice(){
 function sizeButtonPresentation(){
   const dims = winSize ? (' '+winSize.cols+'×'+winSize.rows) : '';
   const host=$('#term'), panning=!!(host && host.classList.contains('pan'));
+  // A teed PC tab (§7.3): the grid IS the PC's physical screen, so there is nothing to pin - a pin would
+  // resize the tab under the person sitting at it. Say so, and make the chip non-interactive.
+  if(sizeTabOwned && !sizePinned){
+    let title='This tab follows the PC terminal at'+dims+'; its size is the physical screen and cannot be pinned.';
+    if(panning) title += ' This terminal is wider than your viewport; drag the horizontal scrollbar to pan.';
+    return { text:'🖥 follows PC tab ·'+dims, title, disabled:true };
+  }
   const text = sizePinned
     ? ('📌 '+(sizeMine?'this device':(sizePinLabel||'other device'))+' ·'+dims)
     : ('auto ·'+dims);
@@ -1841,12 +1852,13 @@ function sizeButtonPresentation(){
     : (sizeLocal ? 'Auto is following the attached PC terminal at'+dims+'. Tap to pin the shared terminal to this device.'
                  : 'Auto size uses the smallest active screen so every viewer can see the complete terminal. Tap to pin this device.');
   if(panning) title += ' This terminal is wider than your viewport; drag the horizontal scrollbar to pan.';
-  return { text, title };
+  return { text, title, disabled:false };
 }
 function updateSizeBtn(){ const b=$('#sizebtn'); if(!b) return;
   const view=sizeButtonPresentation();
   b.textContent = view.text;
   b.classList.toggle('on', sizePinned && sizeMine);
+  b.classList.toggle('locked', !!view.disabled);
   b.title = view.title;
 }
 let _altScrollAt=0;
@@ -3049,6 +3061,7 @@ function renderTabs(){
     const conf = s.agentConfidence ? ' · '+s.agentConfidence+' confidence' : '';
     t.title = s.name + (st?' · '+st:'') + detail + conf;
     const chips = `${s.hosted?'<span class="pcchip" title="Runs on your PC — survives network/VPS failures">PC</span>':''}`+
+      `${s.localTab?'<span class="pcchip localtab" title="A teed PC tab (muxtee) — this is a local terminal on your PC, mirrored here. It is not a mux session and cannot be relaunched from the web.">PC-TAB</span>':''}`+
       `${s.legacyTwin?'<span class="pcchip legacy" title="Legacy tmux session with the same name exists on the VPS">TWIN</span>':''}`+
       `${s.legacyBlocked?'<span class="pcchip legacy" title="Legacy tmux diagnostic only — relay refuses to attach/manage it">LEGACY</span>':''}`+
       MuxAttentionUi.attentionChipHtml(s);   // last: keeps '.pcchip' first for the STALE rewrite below

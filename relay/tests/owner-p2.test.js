@@ -107,3 +107,49 @@ test('§7.1: a browser pin cannot resize a stream owner', async t => {
   assert.equal(d.cols, 120, 'pin must not shrink a teed PC tab');
   assert.equal(d.rows, 40, 'pin must not shrink a teed PC tab');
 });
+
+// §7.3: the UI reads two facts off the wire - the 'd' frame's tabOwned (the chip says "follows PC tab"
+// and pinning is disabled) and the session payload's localTab (the badge and the PC-tabs group). Both
+// are relay truth, not client guesswork, so they are asserted at the protocol boundary.
+test('§7.3: the size frame marks a stream owner tabOwned', async t => {
+  const h = new RelayHarness({ ALLOWED_WS_ORIGINS: ORIGIN });
+  await h.start();
+  t.after(() => h.stop());
+  const host = await h.connectHost([streamOwner('tabowned', 120, 40)], { caps: WATCH_CAPS });
+  t.after(() => host.close());
+
+  const A = await openViewer(h.port, 'tabowned', 'devA', 120, 40);
+  t.after(() => A.ws.terminate());
+  const d = await lastDims(A, x => x.tabOwned === true, 'tabOwned on the size frame');
+  assert.equal(d.tabOwned, true, 'a teed PC tab must be flagged so the UI can lock the pin');
+  assert.equal(d.mode, 'auto', 'a tab-owned size is not a pin');
+});
+
+test('§7.3: a hosted non-owner session is NOT marked tabOwned', async t => {
+  const h = new RelayHarness({ ALLOWED_WS_ORIGINS: ORIGIN });
+  await h.start();
+  t.after(() => h.stop());
+  // A plain hosted owner:false tab is a mux session with local viewers, not a teed PC tab.
+  const plain = { ...streamOwner('plainhost', 120, 40), kind: 'command', owner: false, hasCommand: true, shellOnly: false, localViewers: 1 };
+  const host = await h.connectHost([plain], { caps: WATCH_CAPS });
+  t.after(() => host.close());
+
+  const A = await openViewer(h.port, 'plainhost', 'devA', 120, 40);
+  t.after(() => A.ws.terminate());
+  const d = await lastDims(A, x => typeof x.tabOwned === 'boolean', 'size frame arrives');
+  assert.equal(d.tabOwned, false, 'only a stream owner locks the pin');
+});
+
+test('§7.3: the session list flags a teed PC tab with localTab', async t => {
+  const h = new RelayHarness({ ALLOWED_WS_ORIGINS: ORIGIN });
+  await h.start();
+  t.after(() => h.stop());
+  const host = await h.connectHost([streamOwner('listedtab')], { caps: WATCH_CAPS });
+  t.after(() => host.close());
+
+  const list = await h.json('GET', '/api/sessions');
+  const row = list.find(s => s.name === 'listedtab');
+  assert.ok(row, 'the teed tab appears in the session list');
+  assert.equal(row.localTab, true, 'a local-tab kind must carry localTab for the badge + group');
+  assert.equal(row.kind, 'local-tab', 'kind stays authoritative');
+});
