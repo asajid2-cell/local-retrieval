@@ -320,6 +320,65 @@ public sealed class TranscriptSearchIndexTests
         Assert.AreEqual(before, after, "a cycle with no changes must not write the index");
     }
 
+    // The gate for the in-memory file-state map: the `files` table (~9.4k rows, ~3 MB live) must be read
+    // once per process, not on every sync. A dirty-set pass in steady state may read no row of it.
+    [TestMethod]
+    public async Task IncrementalSync_DoesNotReloadTheFileTable()
+    {
+        using var fixture = new SearchFixture();
+        const int count = 64;
+        var sessions = new List<ArchiveSession>();
+        for (var i = 0; i < count; i++)
+        {
+            var id = $"bulk-{i:D2}";
+            var path = fixture.WriteCodex(
+                id,
+                "{\"timestamp\":\"2026-08-03T00:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"" + id + "\"}}\n"
+                + "{\"timestamp\":\"2026-08-03T00:00:01Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"baseline sentinel " + id + "\"}}");
+            sessions.Add(fixture.Session(id, path));
+        }
+
+        await fixture.Index.SyncAsync(sessions, fixture.Sources("codex"));
+
+        // A fresh instance over the populated db models a process restart: the table is read once, at
+        // startup, and every later pass works from the map.
+        using var warm = new TranscriptSearchIndex(fixture.Index.DatabasePath);
+        await warm.SyncAsync(sessions, fixture.Sources("codex"));
+        Assert.AreEqual(count, warm.FileRowsRead, "the file table is materialised exactly once");
+
+        var target = sessions[0].SourcePath!;
+        await File.AppendAllTextAsync(
+            target,
+            """
+            {"timestamp":"2026-08-03T00:00:02Z","type":"event_msg","payload":{"type":"agent_message","message":"appended sentinel"}}
+
+            """);
+        File.SetLastWriteTimeUtc(target, DateTime.UtcNow.AddSeconds(1));
+
+        var rowsBefore = warm.FileRowsRead;
+        var bytesBefore = warm.FileStateBytesRead;
+        var sync = await warm.SyncAsync(
+            sessions,
+            fixture.Sources("codex"),
+            changedPaths: new[] { target });
+
+        Assert.AreEqual(1, sync.AppendedFiles, "the dirty-set pass must do real work");
+        Assert.AreEqual(rowsBefore, warm.FileRowsRead, "an incremental pass must not reload the file table");
+        Assert.AreEqual(bytesBefore, warm.FileStateBytesRead, "an incremental pass must read no file rows");
+        Assert.AreEqual(count, warm.Status.TotalFiles, "the running file count must stay correct");
+        Assert.AreEqual(
+            sessions.Sum(session => new FileInfo(session.SourcePath!).Length),
+            warm.Status.TotalBytes,
+            "the running byte total must stay correct");
+
+        // A full pass reconciles: a removed file leaves the count, still without reading the table.
+        File.Delete(sessions[1].SourcePath!);
+        var remaining = sessions.Where((_, index) => index != 1).ToList();
+        await warm.SyncAsync(remaining, fixture.Sources("codex"));
+        Assert.AreEqual(count - 1, warm.Status.TotalFiles);
+        Assert.AreEqual(rowsBefore, warm.FileRowsRead, "a reconciliation pass reads no file rows once warm");
+    }
+
     private sealed class SearchFixture : IDisposable
     {
         private readonly string _root = Path.Combine(

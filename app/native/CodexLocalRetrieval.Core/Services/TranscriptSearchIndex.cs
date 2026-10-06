@@ -20,6 +20,21 @@ internal sealed partial class TranscriptSearchIndex : IDisposable
     private readonly string _dbPath;
     private readonly SemaphoreSlim _syncGate = new(1, 1);
     private readonly object _statusGate = new();
+
+    // The `files` table is the index's memory of what it has already read: ~9.4k rows and ~3 MB of
+    // payload live. Reading it whole on every sync was a per-cycle read burst, so the states are held
+    // here instead -- materialised once per process and then kept in step by every write below (register,
+    // remove, upsert). _totalFiles/_totalBytes are the coverage totals that a per-pass COUNT/SUM used to
+    // scan for; they move with the same writes and are reconciled from the map on a full pass. Both are
+    // guarded by _syncGate, which SyncAsync holds for the whole body.
+    private Dictionary<string, FileState>? _fileStates;
+    private int _totalFiles;
+    private long _totalBytes;
+
+    // Test seams: the rows (and payload bytes) a sync materialised from `files`. Only the one-time load
+    // reads; an incremental pass in steady state must leave both untouched.
+    internal int FileRowsRead;
+    internal long FileStateBytesRead;
     private TranscriptSearchIndexStatus _status = new(
         false,
         false,
@@ -92,11 +107,12 @@ internal sealed partial class TranscriptSearchIndex : IDisposable
             var enumMs = enumWatch.ElapsedMilliseconds;
 
             var statesWatch = Stopwatch.StartNew();
-            var states = LoadFileStates(connection);
+            EnsureFileStates(connection);
+            var states = _fileStates!;
             var statesMs = statesWatch.ElapsedMilliseconds;
 
-            // A full pass knows the totals from its walk; an incremental pass reads the row counts so the
-            // coverage it reports still describes the whole index rather than only the files it touched.
+            // A full pass reports its walk; an incremental pass reports the running totals the register/
+            // remove/upsert writes below keep current.
             int totalFiles;
             long totalBytes;
             if (full)
@@ -106,7 +122,8 @@ internal sealed partial class TranscriptSearchIndex : IDisposable
             }
             else
             {
-                (totalFiles, totalBytes) = ReadIndexTotals(connection);
+                totalFiles = _totalFiles;
+                totalBytes = _totalBytes;
             }
             SetStatus(new TranscriptSearchIndexStatus(
                 true,
@@ -168,6 +185,7 @@ internal sealed partial class TranscriptSearchIndex : IDisposable
                     connection,
                     batch,
                     file,
+                    states,
                     startOffset,
                     rebuild: !append,
                     cancellationToken);
@@ -184,14 +202,23 @@ internal sealed partial class TranscriptSearchIndex : IDisposable
             // its bound, so a burst of writes cannot leave a multi-hundred-MB WAL behind.
             TryCheckpoint(connection);
 
+            // A full pass is the reconciliation beat: it saw every file, so the totals are recomputed from
+            // the (now complete) map rather than accumulated -- the same count/sum the old per-pass scan
+            // produced, with no read of the table.
+            if (full)
+            {
+                _totalFiles = states.Count;
+                _totalBytes = states.Values.Sum(state => state.ObservedLength);
+            }
+
             var complete = indexedFiles == files.Count;
             var finalStatus = new TranscriptSearchIndexStatus(
                 false,
                 complete,
                 indexedFiles,
-                totalFiles,
+                _totalFiles,
                 indexedBytes,
-                totalBytes,
+                _totalBytes,
                 "",
                 "",
                 DateTimeOffset.UtcNow);
@@ -545,6 +572,7 @@ internal sealed partial class TranscriptSearchIndex : IDisposable
         SqliteConnection connection,
         SqliteTransaction? batch,
         TranscriptFile file,
+        Dictionary<string, FileState> states,
         long startOffset,
         bool rebuild,
         CancellationToken cancellationToken)
@@ -605,6 +633,7 @@ internal sealed partial class TranscriptSearchIndex : IDisposable
                 connection,
                 transaction,
                 file,
+                states,
                 sessionId,
                 title,
                 lastCompleteOffset,
@@ -1061,10 +1090,13 @@ internal sealed partial class TranscriptSearchIndex : IDisposable
 
     private static bool CanAppend(TranscriptFile file, FileState? state)
     {
+        // An append needs an indexed prefix to extend. A row that has never been indexed carries
+        // indexed_length 0 and tail_hash ''; ComputeTailHash returns "" for offset 0, which would falsely
+        // "match" that empty hash. Zero is therefore a rebuild, not an append.
         if (state is null
             || state.IndexVersion != SchemaVersion
-            || file.Length <= state.IndexedLength
-            || state.IndexedLength < 0)
+            || state.IndexedLength <= 0
+            || file.Length <= state.IndexedLength)
             return false;
         try
         {
@@ -1276,14 +1308,15 @@ internal sealed partial class TranscriptSearchIndex : IDisposable
         catch { return 0; }
     }
 
-    private static (int Files, long Bytes) ReadIndexTotals(SqliteConnection connection)
+    // Materialise the `files` table once per process. Every later pass works from the in-memory map, so
+    // this whole-table read happens once rather than on every cycle.
+    private void EnsureFileStates(SqliteConnection connection)
     {
-        using var command = connection.CreateCommand();
-        command.CommandText = "SELECT COUNT(*), COALESCE(SUM(observed_length), 0) FROM files;";
-        using var reader = command.ExecuteReader();
-        return reader.Read()
-            ? ((int)reader.GetInt64(0), reader.GetInt64(1))
-            : (0, 0L);
+        if (_fileStates is not null) return;
+        var states = LoadFileStates(connection);
+        _fileStates = states;
+        _totalFiles = states.Count;
+        _totalBytes = states.Values.Sum(state => state.ObservedLength);
     }
 
     private static void Initialize(SqliteConnection connection)
@@ -1343,7 +1376,7 @@ internal sealed partial class TranscriptSearchIndex : IDisposable
         command.ExecuteNonQuery();
     }
 
-    private static Dictionary<string, FileState> LoadFileStates(SqliteConnection connection)
+    private Dictionary<string, FileState> LoadFileStates(SqliteConnection connection)
     {
         var states = new Dictionary<string, FileState>(StringComparer.OrdinalIgnoreCase);
         using var command = connection.CreateCommand();
@@ -1366,27 +1399,36 @@ internal sealed partial class TranscriptSearchIndex : IDisposable
         using var reader = command.ExecuteReader();
         while (reader.Read())
         {
-            states[reader.GetString(0)] = new FileState(
-                reader.GetString(1),
-                reader.GetString(2),
-                reader.GetString(3),
-                reader.GetString(4),
+            var path = reader.GetString(0);
+            var sessionId = reader.GetString(1);
+            var title = reader.GetString(2);
+            var tool = reader.GetString(3);
+            var updatedAt = reader.GetString(4);
+            var tailHash = reader.GetString(9);
+            states[path] = new FileState(
+                sessionId,
+                title,
+                tool,
+                updatedAt,
                 reader.GetInt64(5),
                 reader.GetInt64(6),
                 reader.GetInt64(7),
                 reader.GetInt64(8),
-                reader.GetString(9),
+                tailHash,
                 reader.GetInt32(10),
                 reader.GetInt32(11) != 0);
+            FileRowsRead++;
+            FileStateBytesRead += path.Length + sessionId.Length + title.Length + tool.Length
+                + updatedAt.Length + tailHash.Length + 24;
         }
         return states;
     }
 
-    private static void RegisterPendingFiles(
+    private void RegisterPendingFiles(
         SqliteConnection connection,
         SqliteTransaction? batch,
         IReadOnlyList<TranscriptFile> files,
-        IReadOnlyDictionary<string, FileState> states)
+        Dictionary<string, FileState> states)
     {
         var owns = batch is null;
         var transaction = batch ?? connection.BeginTransaction();
@@ -1423,6 +1465,16 @@ internal sealed partial class TranscriptSearchIndex : IDisposable
                         """;
                     BindFile(update, file);
                     update.ExecuteNonQuery();
+                    _totalBytes += file.Length - state.ObservedLength;
+                    states[file.Path] = state with
+                    {
+                        SessionId = file.SessionId,
+                        Title = file.Title,
+                        Tool = file.Tool,
+                        UpdatedAt = file.UpdatedAt,
+                        ObservedLastWriteTicks = file.LastWriteTicks,
+                        ObservedLength = file.Length,
+                    };
                     continue;
                 }
                 using var insert = connection.CreateCommand();
@@ -1458,6 +1510,20 @@ internal sealed partial class TranscriptSearchIndex : IDisposable
                 BindFile(insert, file);
                 insert.Parameters.AddWithValue("$version", SchemaVersion);
                 insert.ExecuteNonQuery();
+                states[file.Path] = new FileState(
+                    file.SessionId,
+                    file.Title,
+                    file.Tool,
+                    file.UpdatedAt,
+                    0,
+                    file.LastWriteTicks,
+                    0,
+                    file.Length,
+                    "",
+                    SchemaVersion,
+                    false);
+                _totalFiles++;
+                _totalBytes += file.Length;
             }
             if (owns) transaction.Commit();
         }
@@ -1467,14 +1533,15 @@ internal sealed partial class TranscriptSearchIndex : IDisposable
         }
     }
 
-    private static void RemoveMissingFiles(
+    private void RemoveMissingFiles(
         SqliteConnection connection,
         IReadOnlyList<TranscriptFile> files,
-        IReadOnlyDictionary<string, FileState> states)
+        Dictionary<string, FileState> states)
     {
         var current = files.Select(file => file.Path).ToHashSet(StringComparer.OrdinalIgnoreCase);
         foreach (var path in states.Keys.Where(path => !current.Contains(path)).ToList())
         {
+            var removed = states[path];
             using var transaction = connection.BeginTransaction();
             DeleteFileTurns(connection, transaction, path);
             using var command = connection.CreateCommand();
@@ -1483,6 +1550,9 @@ internal sealed partial class TranscriptSearchIndex : IDisposable
             command.Parameters.AddWithValue("$path", path);
             command.ExecuteNonQuery();
             transaction.Commit();
+            states.Remove(path);
+            _totalFiles--;
+            _totalBytes -= removed.ObservedLength;
         }
     }
 
@@ -1525,10 +1595,11 @@ internal sealed partial class TranscriptSearchIndex : IDisposable
         return Convert.ToInt32(command.ExecuteScalar(), CultureInfo.InvariantCulture);
     }
 
-    private static void UpsertFileState(
+    private void UpsertFileState(
         SqliteConnection connection,
         SqliteTransaction transaction,
         TranscriptFile file,
+        Dictionary<string, FileState> states,
         string sessionId,
         string title,
         long indexedLength,
@@ -1566,6 +1637,23 @@ internal sealed partial class TranscriptSearchIndex : IDisposable
         command.Parameters.AddWithValue("$version", SchemaVersion);
         command.Parameters.AddWithValue("$complete", complete ? 1 : 0);
         command.ExecuteNonQuery();
+        // RegisterPendingFiles ran for this file in the same pass, so its entry is always present.
+        var previous = states[file.Path];
+        _totalBytes += observedLength - previous.ObservedLength;
+        states[file.Path] = previous with
+        {
+            SessionId = sessionId,
+            Title = title,
+            Tool = file.Tool,
+            UpdatedAt = file.UpdatedAt,
+            LastWriteTicks = file.LastWriteTicks,
+            ObservedLastWriteTicks = file.LastWriteTicks,
+            IndexedLength = indexedLength,
+            ObservedLength = observedLength,
+            TailHash = tailHash,
+            IndexVersion = SchemaVersion,
+            Complete = complete,
+        };
     }
 
     private static void BindFile(SqliteCommand command, TranscriptFile file)
