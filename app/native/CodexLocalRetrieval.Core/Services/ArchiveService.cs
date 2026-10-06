@@ -58,6 +58,11 @@ public sealed partial class ArchiveService
     // routes those files through the same capped path (tail window + frozen forward values), so a cold
     // parse costs about this budget plus the tail window and every later cycle costs only the append.
     private const int ClaudeForwardReadBudgetBytes = 8 * 1024 * 1024;
+    // The same byte arm for Codex rollouts. Codex's core parse stopped on the line cap alone, so a large
+    // rollout holding fewer than MaxLinesPerSession lines - the exact shape a live Codex session produces -
+    // was re-read in full on every cycle and never entered a forward cache. Stopping on bytes too routes it
+    // through the same capped path, so only the appended bytes are read after the first cold parse.
+    private const int CodexForwardReadBudgetBytes = 8 * 1024 * 1024;
     // Above this prefix length the periodic whole-prefix re-hash is skipped and the cheap boundary hash
     // at the prefix edge is the only guard. Re-hashing a 600 MB prefix every 30 hits was a multi-MB/s
     // read on its own; the boundary hash still catches the append-time rewrite this cache must reject.
@@ -6926,6 +6931,36 @@ public sealed partial class ArchiveService
         updated = info.LastWriteTimeUtc.ToString("O");
         ArchiveMessage? lastTool = null;   // the function_call awaiting its function_call_output
 
+        // C1: reuse the frozen head result of an already-capped rollout when its capped prefix is provably
+        // unchanged, so a growing rollout costs only its tail read. Same guard as Claude's S1 path - a
+        // boundary hash at the prefix edge, with the whole prefix re-hashed every FullForwardVerifyEvery
+        // cycles to bound how long a middle-of-prefix edit could hide.
+        if (_codexForwardCache.TryGetValue(filePath, out var cachedForward)
+            && cachedForward.CreationUtc == info.CreationTimeUtc
+            && info.Length >= cachedForward.ReadBytes)
+        {
+            var verifyDue = cachedForward.VerifyCountdown <= 0;
+            var verifyFull = verifyDue && cachedForward.ReadBytes <= FullForwardVerifyMaxBytes;
+            var guardOk = verifyFull
+                ? PrefixMatches(filePath, cachedForward.ReadBytes, cachedForward.PrefixHash)
+                : BoundaryMatches(filePath, cachedForward.ReadBytes, cachedForward.BoundaryHash);
+            if (guardOk)
+            {
+                var reused = FinishCappedCodex(filePath, info, cachedForward);
+                if (reused is not null)
+                {
+                    CodexForwardCacheHits++;
+                    _codexForwardCache[filePath] = cachedForward with
+                    {
+                        VerifyCountdown = verifyDue
+                            ? FullForwardVerifyEvery
+                            : cachedForward.VerifyCountdown - 1,
+                    };
+                    return reused;
+                }
+            }
+        }
+
         using var stream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
         using var streamReader = new StreamReader(stream, Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
         var reader = new BoundedTextLineReader(
@@ -6936,7 +6971,15 @@ public sealed partial class ArchiveService
         var hitLineCap = false;
         while (true)
         {
-            if (++lineCount > MaxLinesPerSession) { hitLineCap = true; break; }
+            // Stop on lines OR bytes, exactly like the Claude forward pass: a live Codex rollout can hold
+            // fewer than MaxLinesPerSession lines and still be tens of MB, and such a file was re-read in
+            // full on every cycle because it never tripped the line cap. stream.Position is the underlying
+            // file position (a few KB ahead of the decoded line, immaterial against a multi-MB budget).
+            if (++lineCount > MaxLinesPerSession || stream.Position > CodexForwardReadBudgetBytes)
+            {
+                hitLineCap = true;
+                break;
+            }
             string? line;
             try { line = await reader.ReadLineAsync(); }
             catch (InvalidDataException) { continue; }
@@ -7047,6 +7090,13 @@ public sealed partial class ArchiveService
         var firstUser = FirstUserText(messages);
         var totalMessages = messages.Count;
 
+        // Forward-pass snapshot for the C1 cache, taken BEFORE the tail read overrides cwd/updated - the
+        // cache stores the values frozen once the rollout is capped.
+        var fwdCreated = created;
+        var fwdCwd = cwd;
+        var fwdUpdated = updated;
+        var forwardReadBytes = stream.Position;
+
         // A huge rollout was truncated at the head cap — the reader would then show the OLDEST turns, not
         // the recent ones (the "transcript stale from 3 days ago" bug). Re-read the FILE TAIL and swap in
         // the recent messages, exactly like the Claude parser does. Head-derived meta/title stay put.
@@ -7059,6 +7109,13 @@ public sealed partial class ArchiveService
                 codeBlocks = tail.codeBlocks;
                 if (string.IsNullOrWhiteSpace(cwd) && !string.IsNullOrWhiteSpace(tail.cwd)) cwd = tail.cwd;
                 if (!string.IsNullOrWhiteSpace(tail.updated)) updated = tail.updated;
+                _codexForwardCache[filePath] = new CodexCappedForward(
+                    id, fwdCreated, fwdCwd, fwdUpdated,
+                    new HashSet<string>(aliases, StringComparer.OrdinalIgnoreCase),
+                    totalMessages, firstUser, titleSeed,
+                    info.CreationTimeUtc, forwardReadBytes, HashPrefix(filePath, forwardReadBytes),
+                    HashBoundary(filePath, forwardReadBytes), FullForwardVerifyEvery);
+                CodexForwardCacheStores++;
             }
         }
 
@@ -7157,6 +7214,17 @@ public sealed partial class ArchiveService
 
     private readonly ConcurrentDictionary<string, ClaudeCappedForward> _claudeForwardCache =
         new(StringComparer.OrdinalIgnoreCase);
+    // The Codex equivalent. Its frozen values are the head-derived identity: the canonical id and its
+    // aliases (from session_meta), cwd, created, the head message count, the first user prompt and the
+    // title seed. The tail swap only ever replaces the message window and (when the head found none) cwd
+    // and updated, so everything else is captured before the swap and reused verbatim.
+    private sealed record CodexCappedForward(
+        string Id, string Created, string Cwd, string Updated, HashSet<string> Aliases,
+        int Total, string FirstUser, string? TitleSeed,
+        DateTime CreationUtc, long ReadBytes, byte[] PrefixHash, byte[] BoundaryHash, int VerifyCountdown);
+
+    private readonly ConcurrentDictionary<string, CodexCappedForward> _codexForwardCache =
+        new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, TailWindowCache> _tailWindowCache =
         new(StringComparer.OrdinalIgnoreCase);
 
@@ -7164,6 +7232,8 @@ public sealed partial class ArchiveService
     // the incremental path actually ran (and that the guard rejected a rewritten file).
     internal int ClaudeForwardCacheHits;
     internal int ClaudeForwardCacheStores;
+    internal int CodexForwardCacheHits;
+    internal int CodexForwardCacheStores;
     // Bytes the tail window reader actually pulled off disk, and how often a previous window was reused.
     // Test seams so a test can prove a small append costs a small read.
     internal static long TailBytesRead;
@@ -7242,6 +7312,26 @@ public sealed partial class ArchiveService
         return new ParsedTranscript(tail.messages, tail.codeBlocks,
             Path.GetFileNameWithoutExtension(filePath), CleanTitle(titleSource), created, updated, cwd,
             new HashSet<string>(StringComparer.OrdinalIgnoreCase), cached.Total, "claude", cached.FirstUser);
+    }
+
+    // The Codex counterpart of FinishCappedClaude. Rebuilds the transcript from the frozen head values
+    // plus a fresh tail read, mirroring the tail branch of ParseCodexCoreAsync exactly - so a reused
+    // forward result is byte-for-byte what a cold full parse would have produced. Null when the tail is
+    // unreadable this cycle, so the caller falls back to a full parse rather than lose the session.
+    private ParsedTranscript? FinishCappedCodex(string filePath, FileInfo info, CodexCappedForward cached)
+    {
+        var tail = ParseCodexTail(filePath, info);
+        if (tail.messages.Count == 0) return null;
+
+        var cwd = cached.Cwd;
+        var updated = cached.Updated;
+        if (string.IsNullOrWhiteSpace(cwd) && !string.IsNullOrWhiteSpace(tail.cwd)) cwd = tail.cwd;
+        if (!string.IsNullOrWhiteSpace(tail.updated)) updated = tail.updated;
+
+        var created = string.IsNullOrWhiteSpace(cached.Created) ? info.CreationTimeUtc.ToString("O") : cached.Created;
+        var title = CleanFallbackTitle(cached.TitleSeed ?? Path.GetFileNameWithoutExtension(filePath));
+        return new ParsedTranscript(tail.messages, tail.codeBlocks, cached.Id, title, created, updated, cwd,
+            cached.Aliases, cached.Total, "codex", cached.FirstUser);
     }
 
     // Claude Code transcript: one JSON object per line with sessionId/cwd/timestamp and a

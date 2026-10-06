@@ -4773,4 +4773,164 @@ public sealed class ArchiveServiceTests
         }
         finally { try { Directory.Delete(root, true); } catch { } }
     }
+
+    // C1 drift guard, Codex half: an already-capped rollout that only grows must produce EXACTLY what a
+    // cold, full parse of the same file produces - and it must take the incremental path, not silently
+    // fall back. Mirrors CappedTranscript_TailAppend_ReusesFrozenForwardResultIdentically.
+    [TestMethod]
+    public async Task CappedCodexRollout_TailAppend_ReusesFrozenForwardResultIdentically()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "clr-c1-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        var path = Path.Combine(root, "rollout-c1-drift.jsonl");
+        var source = new SessionSource { Tool = "codex", Root = root };
+        try
+        {
+            // More than MaxLinesPerSession (6000) lines, so the forward pass caps and its result freezes.
+            var head = new StringBuilder();
+            head.Append("{\"timestamp\":\"2026-01-01T00:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"c1-drift\",\"cwd\":\"z:/proj\"}}\n");
+            for (var i = 0; i < 6500; i++)
+            {
+                var pType = i % 2 == 0 ? "user_message" : "agent_message";
+                head.Append("{\"timestamp\":\"2026-01-01T00:").Append((i / 60 % 60).ToString("D2")).Append(':')
+                    .Append((i % 60).ToString("D2")).Append("Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"")
+                    .Append(pType).Append("\",\"message\":\"message ").Append(i).Append("\"}}\n");
+            }
+            File.WriteAllText(path, head.ToString());
+
+            var warm = new ArchiveService(storePath: Path.Combine(root, "warm.json"), sourceOverride: new[] { source });
+            var first = await warm.ScanDiskAsync();
+            Assert.AreEqual(1, first.Disk.Count);
+            Assert.AreEqual(1, warm.CodexForwardCacheStores, "a capped rollout must populate the forward cache");
+
+            // Grow the file the way a live Codex rollout does - new tail lines only.
+            var tail = new StringBuilder();
+            for (var i = 6500; i < 6525; i++)
+            {
+                var pType = i % 2 == 0 ? "user_message" : "agent_message";
+                tail.Append("{\"timestamp\":\"2026-01-02T00:00:").Append((i % 60).ToString("D2"))
+                    .Append("Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"").Append(pType)
+                    .Append("\",\"message\":\"appended ").Append(i).Append("\"}}\n");
+            }
+            File.AppendAllText(path, tail.ToString());
+
+            var incremental = (await warm.ScanDiskAsync()).Disk.Single();
+            Assert.IsTrue(warm.CodexForwardCacheHits >= 1, "the second scan must take the incremental path");
+
+            // Cold reference: a fresh service re-parses the same (appended) file from scratch.
+            var cold = new ArchiveService(storePath: Path.Combine(root, "cold.json"), sourceOverride: new[] { source });
+            var reference = (await cold.ScanDiskAsync()).Disk.Single();
+            Assert.AreEqual(0, cold.CodexForwardCacheHits);
+
+            Assert.AreEqual(reference.Id, incremental.Id);
+            Assert.AreEqual(reference.Title, incremental.Title);
+            Assert.AreEqual(reference.CreatedAt, incremental.CreatedAt);
+            Assert.AreEqual(reference.UpdatedAt, incremental.UpdatedAt);
+            Assert.AreEqual(reference.Workspace, incremental.Workspace);
+            Assert.AreEqual(reference.MessageCount, incremental.MessageCount);
+            Assert.AreEqual(reference.FirstUserMessage, incremental.FirstUserMessage);
+            Assert.AreEqual(reference.LastUserMessage, incremental.LastUserMessage);
+            Assert.AreEqual(reference.UserMessageCount, incremental.UserMessageCount);
+            CollectionAssert.AreEqual(
+                reference.Messages.Select(m => m.Text).ToList(),
+                incremental.Messages.Select(m => m.Text).ToList(),
+                "the reused forward result must not change the message window");
+        }
+        finally { try { Directory.Delete(root, true); } catch { } }
+    }
+
+    // The guard must reject a rollout whose capped prefix changed, so a rewrite is always re-parsed in
+    // full rather than served from a stale frozen result.
+    [TestMethod]
+    public async Task CappedCodexRollout_RewrittenPrefix_FallsBackToFullParse()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "clr-c1-rewrite-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        var path = Path.Combine(root, "rollout-c1-rewrite.jsonl");
+        var source = new SessionSource { Tool = "codex", Root = root };
+        try
+        {
+            string Build(string tag)
+            {
+                var sb = new StringBuilder();
+                sb.Append("{\"timestamp\":\"2026-01-01T00:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"c1-rewrite\",\"cwd\":\"z:/").Append(tag).Append("\"}}\n");
+                for (var i = 0; i < 6500; i++)
+                {
+                    var pType = i % 2 == 0 ? "user_message" : "agent_message";
+                    sb.Append("{\"timestamp\":\"2026-01-01T00:00:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"")
+                      .Append(pType).Append("\",\"message\":\"").Append(tag).Append(' ').Append(i).Append("\"}}\n");
+                }
+                return sb.ToString();
+            }
+
+            File.WriteAllText(path, Build("original"));
+            var service = new ArchiveService(storePath: Path.Combine(root, "store.json"), sourceOverride: new[] { source });
+            await service.ScanDiskAsync();
+            Assert.AreEqual(1, service.CodexForwardCacheStores);
+
+            // Rewrite the head (same length, same file) - the cached prefix hash no longer matches.
+            File.WriteAllText(path, Build("rewritten"));
+            var rescanned = (await service.ScanDiskAsync()).Disk.Single();
+
+            Assert.AreEqual(0, service.CodexForwardCacheHits, "a changed prefix must not hit the cache");
+            Assert.AreEqual("z:/rewritten", rescanned.Workspace, "the full re-parse must reflect the new prefix");
+        }
+        finally { try { Directory.Delete(root, true); } catch { } }
+    }
+
+    // C1 gate, size arm: a Codex rollout under the line cap but past the forward byte budget must still be
+    // frozen, and a small append must then cost a small read. Before this the codex parse stopped on lines
+    // alone, so such a rollout was re-read IN FULL every cycle and never entered the forward cache.
+    [TestMethod]
+    public async Task LargeUncappedCodexRollout_SmallAppend_ReadsOnlyTheAppend()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "clr-c1-large-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        var path = Path.Combine(root, "rollout-c1-large.jsonl");
+        var source = new SessionSource { Tool = "codex", Root = root };
+        try
+        {
+            // ~15 MB across 2,500 lines: past the forward byte budget, well under the 6,000-line cap.
+            var filler = new string('y', 6000);
+            var sb = new StringBuilder();
+            sb.Append("{\"timestamp\":\"2026-01-01T00:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"c1-large\",\"cwd\":\"z:/proj\"}}\n");
+            for (var i = 0; i < 2500; i++)
+            {
+                var pType = i % 2 == 0 ? "user_message" : "agent_message";
+                sb.Append("{\"timestamp\":\"2026-01-01T00:00:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"")
+                  .Append(pType).Append("\",\"message\":\"")
+                  .Append(i == 0 ? "opening prompt sentinel" : "message " + i + " " + filler)
+                  .Append("\"}}\n");
+            }
+            File.WriteAllText(path, sb.ToString());
+            Assert.IsTrue(new FileInfo(path).Length > 8 * 1024 * 1024,
+                "the fixture must exceed the forward byte budget");
+
+            var warm = new ArchiveService(storePath: Path.Combine(root, "warm.json"), sourceOverride: new[] { source });
+            var cold = (await warm.ScanDiskAsync()).Disk.Single();
+            Assert.AreEqual(1, warm.CodexForwardCacheStores,
+                "a large rollout under the line cap must still be frozen into the forward cache");
+            StringAssert.Contains(cold.FirstUserMessage, "opening prompt sentinel",
+                "capping on bytes must not lose the head facts the reader shows");
+            Assert.IsTrue(cold.MessageCount > 0);
+
+            var before = PerfCounters.Snapshot()["transcriptBytesRead"];
+            var tailBefore = ArchiveService.TailBytesRead;
+            var padding = new string('x', 1000);
+            File.AppendAllText(path,
+                "{\"timestamp\":\"2026-01-02T00:00:00Z\",\"type\":\"event_msg\",\"payload\":"
+                + "{\"type\":\"agent_message\",\"message\":\"" + padding + "\"}}\n");
+
+            await warm.ScanDiskAsync();
+
+            var read = PerfCounters.Snapshot()["transcriptBytesRead"] - before;
+            var tailRead = ArchiveService.TailBytesRead - tailBefore;
+            Assert.IsTrue(warm.CodexForwardCacheHits >= 1, "the append must take the incremental path");
+            Assert.IsTrue(tailRead < 64 * 1024,
+                $"a 1 KB append must cost a few KB of tail read (read {tailRead} bytes)");
+            Assert.IsTrue(read < 256 * 1024,
+                $"the whole cycle must read a few KB, not the 15 MB rollout (read {read} bytes)");
+        }
+        finally { try { Directory.Delete(root, true); } catch { } }
+    }
 }
