@@ -4507,6 +4507,84 @@ public sealed class ArchiveServiceTests
             restrictTranscriptSources: true));
     }
 
+    // ---- frozen backup index files -------------------------------------------------------------------
+
+    private static string IndexLine(string id, string name) =>
+        "{\"id\":\"" + id + "\",\"thread_name\":\"" + name + "\",\"updated_at\":\"2026-05-21T00:00:00Z\"}";
+
+    private static (ArchiveService Service, string Root, string BackupOne, string BackupTwo) BackupIndexArchive()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "clr-titles-" + Guid.NewGuid().ToString("N"));
+        var backupOne = Path.Combine(root, "repair-backups", "old-1", "session_index.jsonl");
+        var backupTwo = Path.Combine(root, "repair-backups", "old-2", "session_index.jsonl");
+        Directory.CreateDirectory(Path.GetDirectoryName(backupOne)!);
+        Directory.CreateDirectory(Path.GetDirectoryName(backupTwo)!);
+        File.WriteAllText(Path.Combine(root, "session_index.jsonl"), IndexLine("live-id", "Live Title"));
+        File.WriteAllText(backupOne, IndexLine("backup-one", "Backup One"));
+        File.WriteAllText(backupTwo, IndexLine("backup-two", "Backup Two"));
+        var service = new ArchiveService(
+            storePath: Path.Combine(root, "app-store.json"),
+            enableTranscriptSearchIndex: false,
+            codexStateDbPath: Path.Combine(root, "state_5.sqlite"));
+        return (service, root, backupOne, backupTwo);
+    }
+
+    // A merge cycle that imports ids re-reads the title sources every cycle. The repair-backup index
+    // files are frozen history, so each must be parsed once per process, not once per cycle.
+    [TestMethod]
+    public void MergeTitleLoad_ParsesEachBackupIndexOnce()
+    {
+        var (service, root, _, _) = BackupIndexArchive();
+        try
+        {
+            for (var cycle = 0; cycle < 5; cycle++)
+            {
+                Assert.AreEqual("Live Title", service.TitleForTesting("live-id"));
+                Assert.AreEqual("Backup One", service.TitleForTesting("backup-one"));
+                Assert.AreEqual("Backup Two", service.TitleForTesting("backup-two"));
+            }
+
+            Assert.AreEqual(
+                2,
+                service.BackupIndexFilesRead,
+                "each frozen backup index is parsed once per process, not once per merge cycle");
+        }
+        finally
+        {
+            if (Directory.Exists(root)) Directory.Delete(root, true);
+        }
+    }
+
+    [TestMethod]
+    public void MergeTitleLoad_ReReadsABackupIndexThatChanged()
+    {
+        var (service, root, backupOne, backupTwo) = BackupIndexArchive();
+        try
+        {
+            Assert.AreEqual("Backup One", service.TitleForTesting("backup-one"));
+            Assert.AreEqual(2, service.BackupIndexFilesRead);
+
+            // A size change: the file is re-parsed and both its old and new ids resolve.
+            File.WriteAllText(
+                backupOne,
+                IndexLine("backup-one", "Backup One Renamed") + "\n" + IndexLine("backup-three", "Backup Three"));
+            File.SetLastWriteTimeUtc(backupOne, DateTime.UtcNow.AddSeconds(5));
+            Assert.AreEqual("Backup One Renamed", service.TitleForTesting("backup-one"));
+            Assert.AreEqual("Backup Three", service.TitleForTesting("backup-three"));
+            Assert.AreEqual(3, service.BackupIndexFilesRead, "only the changed backup is re-parsed");
+
+            // An mtime-only change (same bytes) must still be re-read rather than served stale.
+            var before = service.BackupIndexFilesRead;
+            File.SetLastWriteTimeUtc(backupTwo, DateTime.UtcNow.AddSeconds(9));
+            Assert.AreEqual("Backup Two", service.TitleForTesting("backup-two"));
+            Assert.AreEqual(before + 1, service.BackupIndexFilesRead, "an mtime-only change is re-read");
+        }
+        finally
+        {
+            if (Directory.Exists(root)) Directory.Delete(root, true);
+        }
+    }
+
     [TestMethod]
     public async Task RestrictedMode_IgnoresPersistedSourcesAndNeverAbsorbsBundledHistory()
     {

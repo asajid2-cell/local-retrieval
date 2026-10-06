@@ -7248,6 +7248,9 @@ public sealed partial class ArchiveService
     // it whole on every merge was a ~45 MB read burst every ~14 s.)
     internal int ThreadTitleRowsRead;
     internal long ThreadTitleBytesRead;
+    // Test seam: how many frozen repair-backup index files a title load actually parsed. They are
+    // immutable, so this must stay flat across merge cycles rather than grow with them.
+    internal int BackupIndexFilesRead;
 
     private static byte[] HashRange(string path, long start, int count)
     {
@@ -8562,6 +8565,13 @@ public sealed partial class ArchiveService
     // imported: a codex thread's name is derived from its first prompt and its updated_at only moves when
     // the thread appends, so every title change that can occur after startup belongs to a session the
     // merge imported. A null/omitted set is the full load (startup enrichment, tests).
+    // The repair-backup index files are frozen history (last written months ago). Parsing them once per
+    // process -- and re-reading only the live index, which codex keeps rewriting -- is what keeps a merge
+    // cycle from re-reading several MB that cannot have changed. Keyed by path + size + mtime, so a backup
+    // that does change is re-read rather than silently going stale.
+    private readonly Dictionary<string, BackupIndexCache> _backupIndexCache = new(StringComparer.OrdinalIgnoreCase);
+    private readonly object _backupIndexCacheGate = new();
+
     private Dictionary<string, ThreadTitle> LoadThreadTitles(IReadOnlyCollection<string>? onlyIds = null)
     {
         HashSet<string>? filter = null;
@@ -8572,22 +8582,18 @@ public sealed partial class ArchiveService
         }
 
         var result = new Dictionary<string, ThreadTitle>(StringComparer.OrdinalIgnoreCase);
+        var live = LiveIndexPath();
         foreach (var file in CandidateSessionIndexFiles())
         {
             try
             {
-                foreach (var line in SafeReadLines(file))   // shared read: codex writes session_index live
+                var entries = string.Equals(file, live, StringComparison.OrdinalIgnoreCase)
+                    ? ReadIndexEntries(file)      // live: codex rewrites it, so always re-read
+                    : CachedBackupEntries(file);  // frozen history: parse once per process
+                foreach (var entry in entries)
                 {
-                    if (string.IsNullOrWhiteSpace(line)) continue;
-                    using var doc = JsonDocument.Parse(line);
-                    var root = doc.RootElement;
-                    if (!root.TryGetProperty("id", out var idProp)) continue;
-                    var id = idProp.GetString();
-                    if (string.IsNullOrWhiteSpace(id)) continue;
-                    if (filter is not null && !filter.Contains(id)) continue;
-                    var name = root.TryGetProperty("thread_name", out var nameProp) ? nameProp.GetString() ?? "" : "";
-                    var updated = root.TryGetProperty("updated_at", out var updatedProp) ? updatedProp.GetString() ?? "" : "";
-                    PutTitle(result, id, name, updated);
+                    if (filter is not null && !filter.Contains(entry.Id)) continue;
+                    PutTitle(result, entry.Id, entry.Name, entry.Updated);
                 }
             }
             catch
@@ -8600,10 +8606,61 @@ public sealed partial class ArchiveService
         return result;
     }
 
+    // Test seam: load one title the way a merge does (through the frozen-backup cache) without a full
+    // scan. See LoadThreadTitles.
+    internal string? TitleForTesting(string id)
+    {
+        var titles = LoadThreadTitles(new[] { id });
+        return titles.TryGetValue(id, out var title) ? title.Name : null;
+    }
+
+    private static List<IndexEntry> ReadIndexEntries(string path)
+    {
+        var entries = new List<IndexEntry>();
+        foreach (var line in SafeReadLines(path))   // shared read: codex writes session_index live
+        {
+            if (string.IsNullOrWhiteSpace(line)) continue;
+            using var doc = JsonDocument.Parse(line);
+            var root = doc.RootElement;
+            if (!root.TryGetProperty("id", out var idProp)) continue;
+            var id = idProp.GetString();
+            if (string.IsNullOrWhiteSpace(id)) continue;
+            var name = root.TryGetProperty("thread_name", out var nameProp) ? nameProp.GetString() ?? "" : "";
+            var updated = root.TryGetProperty("updated_at", out var updatedProp) ? updatedProp.GetString() ?? "" : "";
+            entries.Add(new IndexEntry(id, name, updated));
+        }
+        return entries;
+    }
+
+    private List<IndexEntry> CachedBackupEntries(string path)
+    {
+        var info = new FileInfo(path);
+        var size = info.Exists ? info.Length : 0;
+        var ticks = info.Exists ? info.LastWriteTimeUtc.Ticks : 0;
+        lock (_backupIndexCacheGate)
+        {
+            if (_backupIndexCache.TryGetValue(path, out var cached)
+                && cached.Size == size && cached.LastWriteTicks == ticks)
+            {
+                return cached.Entries;
+            }
+        }
+        var entries = ReadIndexEntries(path);
+        lock (_backupIndexCacheGate)
+        {
+            _backupIndexCache[path] = new BackupIndexCache(size, ticks, entries);
+            BackupIndexFilesRead++;
+        }
+        return entries;
+    }
+
+    private string LiveIndexPath() =>
+        Path.Combine(Path.GetDirectoryName(_codexStateDbPath)!, "session_index.jsonl");
+
     private IEnumerable<string> CandidateSessionIndexFiles()
     {
         var root = Path.GetDirectoryName(_codexStateDbPath)!;
-        var live = Path.Combine(root, "session_index.jsonl");
+        var live = LiveIndexPath();
         if (_restrictTranscriptSources) ValidateRestrictedPath(live, root);
         if (File.Exists(live)) yield return live;
         if (_restrictTranscriptSources) yield break;
@@ -8714,6 +8771,9 @@ public sealed partial class ArchiveService
     }
 
     private sealed record ThreadTitle(string Name, string UpdatedAt);
+
+    private sealed record IndexEntry(string Id, string Name, string Updated);
+    private sealed record BackupIndexCache(long Size, long LastWriteTicks, List<IndexEntry> Entries);
 
     private static string FindProjectRoot()
     {
