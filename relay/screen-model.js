@@ -20,9 +20,11 @@ let Terminal = null;
 let SerializeAddon = null;
 let loadError = null;
 try {
-  // Optional: the relay runs in production on the plain `express`+`ws` dependency set. These two live in
-  // devDependencies because until now only the harness used them; a deployment without them simply keeps
-  // the byte-replay path. That is the compatibility guarantee — the model is an accelerator, not a gate.
+  // Runtime dependencies: the model runs on the relay's reattach path in production, so these two are
+  // declared under `dependencies` (a `--omit=dev` install must still provide them - they used to be
+  // devDependencies and a production install left the model silently inert). The guard stays anyway: an
+  // install that is missing them keeps the byte-replay path, and `available()` / /api/health's `screenModel`
+  // report which path a deployment is on. The model is an accelerator, not a gate.
   ({ Terminal } = require('@xterm/headless'));
   ({ SerializeAddon } = require('@xterm/addon-serialize'));
 } catch (error) {

@@ -2287,6 +2287,10 @@ function healthSnapshot() {
     ? (!hostUp() || !hostProtocolOk() || hostFrameStale || legacyNames.length > 0 || !!persistenceFailure || renameIntents.length > 0 || uploadRecoveryWarnings.length > 0 || stateRecoveryFailures.length > 0)
     : (!hostUp() || !hostProtocolOk() || hostFrameStale || _pcHealth.reachable === false || _pcArchive.ok === false || gaveUp > 0 || hostedArmedDown > 0 || legacyNames.length > 0 || !projects.bridgeLive || !!persistenceFailure || renameIntents.length > 0 || uploadRecoveryWarnings.length > 0 || stateRecoveryFailures.length > 0);
   const snapshot = { ok: !degraded, degraded, uptimeSec: Math.round(process.uptime()), tmuxAvailable, sessions: hostSessions.size,
+           // Whether the reattach screen model is actually running in THIS deployment. `inert` means the
+           // two xterm deps did not load (a production install without them), so reattach falls back to the
+           // byte replay - correct, but slower, and until now invisible. A live field is the point.
+           screenModel: screenModel.available() ? 'live' : 'inert',
            // `archive` rides inside `pc` because it is the same question asked properly: `reachable` is
            // "the PC's sshd answers", `archive.ok` is "the mount /multiplex/pc proxies to actually
            // serves chat discovery". They diverge exactly when the PC-side server has died.
