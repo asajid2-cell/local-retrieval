@@ -82,6 +82,48 @@ public sealed class FileWatchTests
     }
 
     [TestMethod]
+    public void HealthyTreeWatch_DoesNotWalkTheTreeOnTheActiveFallbackCadence()
+    {
+        var dir = NewTempDir();
+        try
+        {
+            File.WriteAllText(Path.Combine(dir, "a.jsonl"), "{\"seed\":1}\n");
+            var clock = new ManualFileWatchClock();
+            using var service = new FileWatchService(new FileWatchOptions
+            {
+                ManualPump = true,
+                Clock = clock,
+                ActiveFallbackInterval = TimeSpan.FromSeconds(5),
+                IdleFallbackInterval = TimeSpan.FromSeconds(60),
+            });
+
+            var callbacks = 0;
+            using var reg = service.WatchDirectory(dir, "*.jsonl", recurse: true, () => Interlocked.Increment(ref callbacks));
+            Assert.IsTrue(service.AllWatchersHealthy, "the test needs a live OS watcher to exercise the healthy path");
+
+            // 10 simulated seconds: the active cadence would have walked the tree twice. A tree probe is
+            // coarse, so while the OS watcher is healthy the safety net must stay on the idle cadence.
+            for (var second = 0; second < 10; second++)
+            {
+                clock.Advance(TimeSpan.FromSeconds(1));
+                service.Pump();
+            }
+            Assert.AreEqual(0, service.Stats.FallbackPolls,
+                "a healthy tree watch walked the tree on the 5 s active cadence; polls=" + service.Stats.FallbackPolls);
+
+            // The safety net is still there: at the idle cadence it does run, once.
+            for (var second = 0; second < 55; second++)
+            {
+                clock.Advance(TimeSpan.FromSeconds(1));
+                service.Pump();
+            }
+            Assert.AreEqual(1, service.Stats.FallbackPolls, "the coarse safety-net poll must still run at the idle cadence");
+            Assert.AreEqual(0, Volatile.Read(ref callbacks), "an untouched tree must not produce callbacks");
+        }
+        finally { Cleanup(dir); }
+    }
+
+    [TestMethod]
     public void LargeInboxAtCursorEnd_ReadsOnlyTheAppendedBytes()
     {
         var dir = NewTempDir();

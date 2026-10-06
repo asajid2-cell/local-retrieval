@@ -2338,6 +2338,53 @@ public sealed class ArchiveServiceTests
         finally { Directory.Delete(dir, true); }
     }
 
+    // S2: the watcher names the files it saw change, so a refresh scans only those instead of walking
+    // every source tree (~16k transcripts on the live box). This pins the narrow scan's correctness:
+    // it finds the changed file, it does NOT stamp the files it never looked at, and the merge keeps the
+    // file it skipped -- so the next full walk still skips both.
+    [TestMethod]
+    public async Task ScanPaths_ParsesOnlyTheNamedFiles_AndLeavesOtherStampsAlone()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "clr-scanpaths-" + Guid.NewGuid().ToString("N"));
+        var pathA = WriteRollout(dir, "rollout-a.jsonl", "a-1", "2026-06-14T00:00:00Z", "first chat");
+        var pathB = WriteRollout(dir, "rollout-b.jsonl", "b-1", "2026-06-14T00:00:01Z", "second chat");
+        try
+        {
+            var service = new ArchiveService(
+                storePath: Path.Combine(dir, "store.json"),
+                codexAccountsRoot: Path.Combine(dir, "no-accounts"),
+                sourceOverride: new[] { new SessionSource { Tool = "codex", Root = dir } });
+            service.Store.Settings.BundledHistoryAbsorbed = true;
+
+            var first = await service.ScanDiskAsync();
+            await service.MergeScanAsync(first, refreshList: false);
+            Assert.AreEqual(2, service.Store.Sessions.Count, "both chats are indexed by the full walk");
+
+            // Append to A only, then scan just A the way the watcher's dirty set does.
+            File.AppendAllLines(pathA, new[]
+            {
+                "{\"timestamp\":\"2026-06-14T00:00:02Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"second question\"}}",
+            });
+            var narrow = await service.ScanPathsAsync(new[] { pathA });
+            Assert.AreEqual(1, narrow.Disk.Count, "only the named file is parsed");
+            Assert.AreEqual(pathA, narrow.Disk[0].SourcePath, "the named file's session is the one returned");
+            Assert.IsTrue(narrow.Stamps.ContainsKey(pathA), "the changed file is stamped");
+            Assert.IsFalse(narrow.Stamps.ContainsKey(pathB), "an unnamed file must not be stamped by a narrow scan");
+
+            await service.MergeScanAsync(narrow, refreshList: false);
+            Assert.AreEqual(2, service.Store.Sessions.Count, "the narrow scan must not drop the file it did not look at");
+
+            // A path outside every configured root is not ours: skipped, not a crash.
+            var outside = Path.Combine(Path.GetTempPath(), "clr-outside-" + Guid.NewGuid().ToString("N") + ".jsonl");
+            var ignored = await service.ScanPathsAsync(new[] { outside });
+            Assert.AreEqual(0, ignored.Disk.Count, "a path under no configured root is ignored");
+
+            var full = await service.ScanDiskAsync();
+            Assert.AreEqual(0, full.Disk.Count, "both files are unchanged after the narrow merge");
+        }
+        finally { Directory.Delete(dir, true); }
+    }
+
     // L1 correctness (tandem review HIGH): a re-sync refreshes disk content but must NOT wipe the
     // user's organization (pin / archive / rename / review / tags).
     [TestMethod]
@@ -4471,5 +4518,111 @@ public sealed class ArchiveServiceTests
             await Assert.ThrowsExactlyAsync<InvalidDataException>(() => service.LoadStoreStateAsync());
         }
         finally { try { Directory.Delete(root, recursive: true); } catch { } }
+    }
+
+    // S1 drift guard: an already-capped transcript that only grows must produce EXACTLY what a cold,
+    // full parse of the same file produces - and it must actually take the incremental path (cache
+    // hit), not silently fall back. Compares the two parses field-by-field.
+    [TestMethod]
+    public async Task CappedTranscript_TailAppend_ReusesFrozenForwardResultIdentically()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "clr-s1-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        var path = Path.Combine(root, "capped.jsonl");
+        var source = new SessionSource { Tool = "claude", Root = root };
+        try
+        {
+            // More than MaxLinesPerSession (6000) lines, so the forward pass caps and its result freezes.
+            var head = new StringBuilder();
+            for (var i = 0; i < 6500; i++)
+            {
+                var role = i % 2 == 0 ? "user" : "assistant";
+                head.Append("{\"type\":\"").Append(role).Append("\",\"cwd\":\"/work/").Append(i % 5)
+                    .Append("\",\"timestamp\":\"2026-01-01T00:").Append((i / 60 % 60).ToString("D2")).Append(':')
+                    .Append((i % 60).ToString("D2")).Append("Z\",\"message\":{\"role\":\"").Append(role)
+                    .Append("\",\"content\":[{\"type\":\"text\",\"text\":\"message ").Append(i).Append("\"}]}}\n");
+            }
+            File.WriteAllText(path, head.ToString());
+
+            var warm = new ArchiveService(storePath: Path.Combine(root, "warm.json"), sourceOverride: new[] { source });
+            var first = await warm.ScanDiskAsync();          // full parse; caches the frozen forward result
+            Assert.AreEqual(1, first.Disk.Count);
+            Assert.AreEqual(1, warm.ClaudeForwardCacheStores, "a capped transcript must populate the forward cache");
+
+            // Grow the file the way a live gateway session does - new tail lines only.
+            var tail = new StringBuilder();
+            for (var i = 6500; i < 6525; i++)
+            {
+                var role = i % 2 == 0 ? "user" : "assistant";
+                tail.Append("{\"type\":\"").Append(role).Append("\",\"customTitle\":\"Renamed at ").Append(i)
+                    .Append("\",\"timestamp\":\"2026-01-02T00:00:").Append((i % 60).ToString("D2"))
+                    .Append("Z\",\"message\":{\"role\":\"").Append(role)
+                    .Append("\",\"content\":[{\"type\":\"text\",\"text\":\"appended ").Append(i).Append("\"}]}}\n");
+            }
+            File.AppendAllText(path, tail.ToString());
+
+            var incremental = (await warm.ScanDiskAsync()).Disk.Single();
+            Assert.IsTrue(warm.ClaudeForwardCacheHits >= 1, "the second scan must take the incremental path");
+
+            // Cold reference: a fresh service re-parses the same (appended) file from scratch.
+            var cold = new ArchiveService(storePath: Path.Combine(root, "cold.json"), sourceOverride: new[] { source });
+            var reference = (await cold.ScanDiskAsync()).Disk.Single();
+            Assert.AreEqual(0, cold.ClaudeForwardCacheHits);
+
+            Assert.AreEqual(reference.Id, incremental.Id);
+            Assert.AreEqual(reference.Title, incremental.Title);
+            Assert.AreEqual(reference.CreatedAt, incremental.CreatedAt);
+            Assert.AreEqual(reference.UpdatedAt, incremental.UpdatedAt);
+            Assert.AreEqual(reference.Workspace, incremental.Workspace);
+            Assert.AreEqual(reference.MessageCount, incremental.MessageCount);
+            Assert.AreEqual(reference.FirstUserMessage, incremental.FirstUserMessage);
+            Assert.AreEqual(reference.LastUserMessage, incremental.LastUserMessage);
+            Assert.AreEqual(reference.UserMessageCount, incremental.UserMessageCount);
+            CollectionAssert.AreEqual(
+                reference.Messages.Select(m => m.Text).ToList(),
+                incremental.Messages.Select(m => m.Text).ToList(),
+                "the reused forward result must not change the message window");
+        }
+        finally { try { Directory.Delete(root, true); } catch { } }
+    }
+
+    // The guard must reject a file whose capped prefix changed, so a rewrite is always re-parsed in full
+    // rather than served from a stale frozen result.
+    [TestMethod]
+    public async Task CappedTranscript_RewrittenPrefix_FallsBackToFullParse()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "clr-s1-rewrite-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        var path = Path.Combine(root, "capped.jsonl");
+        var source = new SessionSource { Tool = "claude", Root = root };
+        try
+        {
+            string Build(string tag)
+            {
+                var sb = new StringBuilder();
+                for (var i = 0; i < 6500; i++)
+                {
+                    var role = i % 2 == 0 ? "user" : "assistant";
+                    sb.Append("{\"type\":\"").Append(role).Append("\",\"cwd\":\"/").Append(tag)
+                      .Append("\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"message\":{\"role\":\"").Append(role)
+                      .Append("\",\"content\":[{\"type\":\"text\",\"text\":\"").Append(tag).Append(' ').Append(i)
+                      .Append("\"}]}}\n");
+                }
+                return sb.ToString();
+            }
+
+            File.WriteAllText(path, Build("original"));
+            var service = new ArchiveService(storePath: Path.Combine(root, "store.json"), sourceOverride: new[] { source });
+            await service.ScanDiskAsync();
+            Assert.AreEqual(1, service.ClaudeForwardCacheStores);
+
+            // Rewrite the head (same length, same file) - the cached prefix hash no longer matches.
+            File.WriteAllText(path, Build("rewritten"));
+            var rescanned = (await service.ScanDiskAsync()).Disk.Single();
+
+            Assert.AreEqual(0, service.ClaudeForwardCacheHits, "a changed prefix must not hit the cache");
+            Assert.AreEqual("/rewritten", rescanned.Workspace, "the full re-parse must reflect the new prefix");
+        }
+        finally { try { Directory.Delete(root, true); } catch { } }
     }
 }

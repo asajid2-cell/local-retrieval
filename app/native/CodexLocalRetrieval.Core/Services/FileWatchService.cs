@@ -95,7 +95,11 @@ public sealed class FileWatchService : IDisposable
     }
 
     /// Watch a single file. The callback fires on append/overwrite/create/delete.
-    public IFileWatchRegistration WatchFile(string path, Action onChanged)
+    public IFileWatchRegistration WatchFile(string path, Action onChanged) => WatchFile(path, _ => onChanged());
+
+    /// Path-aware form: the callback receives the changed file's full path (an event-path delivery), or
+    /// null when the change was discovered by the safety-net poll, where the changed file is unknown.
+    public IFileWatchRegistration WatchFile(string path, Action<IReadOnlyList<string>?> onChanged)
     {
         var full = Path.GetFullPath(path);
         var dir = Path.GetDirectoryName(full) ?? throw new ArgumentException("File path has no directory: " + path, nameof(path));
@@ -104,28 +108,53 @@ public sealed class FileWatchService : IDisposable
             probe: () => FileStamp(full), onChanged);
     }
 
-    /// Watch a directory tree for files matching a simple `*.ext` style pattern.
+    /// Watch a directory tree for files matching a simple `*.ext` style pattern. A tree probe is the
+    /// whole recursive walk, so it is marked coarse: while the OS watcher is healthy the safety net runs
+    /// at the idle cadence instead of walking the tree every few seconds for an answer the event path
+    /// already delivered. It drops to the active cadence only when there is no watcher or it errored.
     public IFileWatchRegistration WatchDirectory(string directory, string pattern, bool recurse, Action onChanged)
+        => WatchDirectory(directory, pattern, recurse, _ => onChanged());
+
+    /// Path-aware form: the callback receives every file path that changed inside the debounce window
+    /// (so a burst under one tree is reported whole), or null when the safety-net poll found the change
+    /// and the individual file is unknown -- the caller must then treat it as "everything changed".
+    public IFileWatchRegistration WatchDirectory(string directory, string pattern, bool recurse, Action<IReadOnlyList<string>?> onChanged)
     {
         var dir = Path.GetFullPath(directory);
         return Register(dir, recurse,
             matches: changed => MatchesPattern(Path.GetFileName(changed), pattern),
-            probe: () => DirectoryStamp(dir, pattern, recurse), onChanged);
+            probe: () => DirectoryStamp(dir, pattern, recurse), onChanged, coarseFallback: true);
     }
 
-    private IFileWatchRegistration Register(string directory, bool recurse, Func<string, bool> matches, Func<string> probe, Action onChanged)
+    private IFileWatchRegistration Register(string directory, bool recurse, Func<string, bool> matches, Func<string> probe, Action<IReadOnlyList<string>?> onChanged, bool coarseFallback = false)
     {
-        var reg = new Registration(this, directory, recurse, matches, probe, onChanged);
+        var reg = new Registration(this, directory, recurse, matches, probe, onChanged, coarseFallback);
         lock (_gate)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
             reg.LastStamp = SafeProbe(probe);
-            reg.NextFallbackAt = _options.Clock.UtcNow + _options.ActiveFallbackInterval;
-            reg.FallbackInterval = _options.ActiveFallbackInterval;
-            _registrations.Add(reg);
             EnsureWatcherLocked(directory, recurse);
+            reg.Watcher = _watchers.TryGetValue(directory, out var watcher) ? watcher : null;
+            reg.FallbackInterval = FallbackIntervalFor(reg);
+            reg.NextFallbackAt = _options.Clock.UtcNow + reg.FallbackInterval;
+            _registrations.Add(reg);
         }
         return reg;
+    }
+
+    // The cadence of the safety-net poll. A cheap single-file probe stays at the active cadence, so a
+    // dropped event on a single watched file is noticed in seconds. A coarse tree probe is only walked
+    // when the event path is not there to carry the change.
+    private TimeSpan FallbackIntervalFor(Registration reg) =>
+        reg.CoarseFallback && (reg.Watcher?.Healthy ?? false)
+            ? _options.IdleFallbackInterval
+            : _options.ActiveFallbackInterval;
+
+    // Diagnostics: whether the OS watchers backing the registrations are carrying events or whether the
+    // registrations are living on the fallback poll. Lets the server's trace say which mode it is in.
+    public bool AllWatchersHealthy
+    {
+        get { lock (_gate) return _watchers.Values.All(w => w.Healthy); }
     }
 
     /// Evaluate every registration's debounce and fallback deadlines against the clock. Callbacks are
@@ -133,7 +162,7 @@ public sealed class FileWatchService : IDisposable
     public void Pump()
     {
         var now = _options.Clock.UtcNow;
-        List<Registration>? fire = null;
+        List<(Registration Reg, IReadOnlyList<string>? Paths)>? fire = null;
         lock (_gate)
         {
             if (_disposed) return;
@@ -146,7 +175,7 @@ public sealed class FileWatchService : IDisposable
                     if (now - since < _options.Debounce) continue;
                     reg.PendingSince = null;
                     Promote(reg, now);
-                    (fire ??= new()).Add(reg);
+                    (fire ??= new()).Add((reg, SnapshotPaths(reg)));
                     continue;
                 }
 
@@ -158,33 +187,48 @@ public sealed class FileWatchService : IDisposable
                 if (reg.LastStamp is null || !string.Equals(stamp, reg.LastStamp, StringComparison.Ordinal))
                 {
                     Promote(reg, now);
-                    (fire ??= new()).Add(reg);
+                    // A poll found the change, so which file moved is unknown: null means "assume all".
+                    (fire ??= new()).Add((reg, null));
                 }
                 else
                 {
                     // Quiet. One no-change poll is enough to demote to the slow cadence; the FSW event
-                    // is what makes activity visible immediately, this is only the safety net.
-                    reg.FallbackInterval = _options.IdleFallbackInterval;
+                    // is what makes activity visible immediately, this is only the safety net. A coarse
+                    // registration whose watcher is not carrying events never demotes -- the poll IS its
+                    // only signal then, so it must keep the active cadence.
+                    reg.FallbackInterval = reg.CoarseFallback && !(reg.Watcher?.Healthy ?? false)
+                        ? _options.ActiveFallbackInterval
+                        : _options.IdleFallbackInterval;
                     reg.NextFallbackAt = now + reg.FallbackInterval;
                 }
             }
             // Refresh remembered stamps under the lock so a concurrent event cannot race a stale value in.
             if (fire is not null)
-                foreach (var reg in fire) reg.LastStamp = SafeProbe(reg.Probe);
+                foreach (var (reg, _) in fire) reg.LastStamp = SafeProbe(reg.Probe);
         }
 
         if (fire is null) return;
-        foreach (var reg in fire)
+        foreach (var (reg, paths) in fire)
         {
             if (reg.Disposed) continue;
             Interlocked.Increment(ref Stats._callbacks);
-            try { reg.OnChanged(); } catch { /* a consumer's failure must not kill the pump */ }
+            try { reg.OnChanged(paths); } catch { /* a consumer's failure must not kill the pump */ }
         }
+    }
+
+    // Drain and return the paths accumulated during a debounce window, so a burst under one tree is
+    // delivered whole instead of collapsing to whichever file happened to be written last.
+    private static IReadOnlyList<string>? SnapshotPaths(Registration reg)
+    {
+        if (reg.PendingPaths is not { Count: > 0 } set) return null;
+        var snapshot = set.ToArray();
+        set.Clear();
+        return snapshot;
     }
 
     private void Promote(Registration reg, DateTimeOffset now)
     {
-        reg.FallbackInterval = _options.ActiveFallbackInterval;
+        reg.FallbackInterval = FallbackIntervalFor(reg);
         reg.NextFallbackAt = now + reg.FallbackInterval;
     }
 
@@ -194,7 +238,7 @@ public sealed class FileWatchService : IDisposable
         {
             if (_disposed || reg.Disposed) return;
             reg.LastStamp = null;                       // unknown ⇒ the next poll always re-fires
-            reg.FallbackInterval = _options.ActiveFallbackInterval;
+            reg.FallbackInterval = FallbackIntervalFor(reg);
             reg.NextFallbackAt = _options.Clock.UtcNow + reg.FallbackInterval;
         }
     }
@@ -209,10 +253,14 @@ public sealed class FileWatchService : IDisposable
             if (_disposed) return;
             foreach (var reg in _registrations)
             {
-                if (reg.Disposed || reg.PendingSince is not null) continue;
+                if (reg.Disposed) continue;
                 bool hit;
                 try { hit = reg.Matches(fullPath); } catch { hit = false; }
-                if (hit) reg.PendingSince = now;
+                if (!hit) continue;
+                // Keep every path seen in this debounce window, not just the first: the caller scans the
+                // whole set, and collapsing to one path would silently skip the rest of the burst.
+                (reg.PendingPaths ??= new HashSet<string>(StringComparer.OrdinalIgnoreCase)).Add(fullPath);
+                reg.PendingSince ??= now;
             }
         }
     }
@@ -327,19 +375,24 @@ public sealed class FileWatchService : IDisposable
         internal readonly bool Recurse;
         internal readonly Func<string, bool> Matches;
         internal readonly Func<string> Probe;
-        internal readonly Action OnChanged;
+        internal readonly Action<IReadOnlyList<string>?> OnChanged;
+        // A recursive tree probe is expensive, so it only runs at the active cadence when the OS watcher
+        // is not carrying the events (missing or errored). A single-file probe is cheap and is not coarse.
+        internal readonly bool CoarseFallback;
+        internal DirectoryWatcher? Watcher;
 
         internal string? LastStamp;
         internal DateTimeOffset? PendingSince;
+        internal HashSet<string>? PendingPaths;
         internal DateTimeOffset NextFallbackAt;
         internal TimeSpan FallbackInterval;
         internal bool Disposed;
 
         internal Registration(FileWatchService owner, string directory, bool recurse,
-            Func<string, bool> matches, Func<string> probe, Action onChanged)
+            Func<string, bool> matches, Func<string> probe, Action<IReadOnlyList<string>?> onChanged, bool coarseFallback)
         {
             _owner = owner; Directory = directory; Recurse = recurse;
-            Matches = matches; Probe = probe; OnChanged = onChanged;
+            Matches = matches; Probe = probe; OnChanged = onChanged; CoarseFallback = coarseFallback;
         }
 
         public void Rearm() => _owner.OnRearm(this);
@@ -360,8 +413,12 @@ public sealed class FileWatchService : IDisposable
     {
         private readonly FileSystemWatcher? _fsw;
         private readonly Action _onError;
+        private bool _errored;
         internal int RefCount;
         internal bool Recursive { get; private set; }
+        // Healthy = the OS watcher exists and has not reported an overflow/teardown. A coarse registration
+        // only falls back to the cheap cadence while this is true.
+        internal bool Healthy => _fsw is not null && !_errored;
 
         internal DirectoryWatcher(string directory, bool recurse, Action<string> onEvent, Action onError)
         {
@@ -386,7 +443,9 @@ public sealed class FileWatchService : IDisposable
                 _fsw.Error += (_, _) =>
                 {
                     // Overflow or the directory going away. The paired fallback poll is what keeps the
-                    // registration correct, so there is nothing to recover here beyond the count.
+                    // registration correct, so the mode drops back to the active cadence (see Healthy)
+                    // and there is nothing else to recover here beyond the count.
+                    _errored = true;
                     try { _onError(); } catch { }
                 };
                 _fsw.EnableRaisingEvents = true;

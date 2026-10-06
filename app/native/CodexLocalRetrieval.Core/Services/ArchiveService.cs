@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Collections.ObjectModel;
 using System.Runtime.CompilerServices;
 using System.Security.Cryptography;
@@ -279,6 +280,19 @@ public sealed partial class ArchiveService
     private readonly ConditionalWeakTable<ArchiveSession, SemaphoreSlim> _contentLoadGates = new();
     private readonly Func<string, string, Task<ArchiveSession?>>? _parseSessionOverride;
     private long _loadedGeneration;
+    // Coalescing for the BACKGROUND merge save. The watcher-driven sync runs every few seconds while
+    // live transcripts are appended, and each merge used to rewrite the whole store (59 MB here) plus
+    // its committed snapshot -- ~120 MB and ~1.6 s of CPU per cycle for metadata the transcripts can
+    // always re-derive. The store is a cache, not the source of truth, and the file stamps live in the
+    // SAME atomic payload as the session data they describe, so a dropped save costs only a re-parse of
+    // the files whose stamps reverted -- never a stamp that claims data the store does not hold.
+    // User-driven operations still call SaveAsync directly and stay immediate.
+    private static readonly TimeSpan DeferredSaveInterval = TimeSpan.FromMinutes(2);
+    // Anchored at construction: the process start read (or will read) the store, so the first background
+    // merge inside the window has nothing new to persist that the load did not just see. A zero anchor
+    // would make that first merge write immediately, which is the per-cycle rewrite this exists to stop.
+    private long _lastDeferredSaveUtcTicks = DateTime.UtcNow.Ticks;
+    private int _deferredSaveDirty;
     private readonly TranscriptSearchIndex? _transcriptSearchIndex;
     private readonly bool _transcriptSearchEnabled;
     private readonly object _transcriptSearchTaskGate = new();
@@ -1114,6 +1128,32 @@ public sealed partial class ArchiveService
         using (var json = new Utf8JsonWriter(writer))
             JsonSerializer.Serialize(json, Store, StorePayloadJsonOptions);
         return writer.WrittenMemory;
+    }
+
+    // A merge's result, saved unless a recent background save already covered it. `deferred` is set only
+    // by the watcher-driven refresh; every user-driven merge passes false and commits immediately.
+    private async Task SaveMergeResultAsync(bool deferred, CancellationToken cancellationToken)
+    {
+        if (!deferred) { await SaveAsync(cancellationToken); return; }
+        Volatile.Write(ref _deferredSaveDirty, 1);
+        var now = DateTime.UtcNow.Ticks;
+        if (now - Interlocked.Read(ref _lastDeferredSaveUtcTicks) < DeferredSaveInterval.Ticks) return;
+        await SaveAsync(cancellationToken);
+        Interlocked.Exchange(ref _lastDeferredSaveUtcTicks, DateTime.UtcNow.Ticks);
+        Volatile.Write(ref _deferredSaveDirty, 0);
+    }
+
+    // Whether a deferred merge save is still pending -- the store on disk is behind the in-memory store.
+    public bool HasDeferredSave => Volatile.Read(ref _deferredSaveDirty) == 1;
+
+    // Commit a pending deferred save now. Called before the runtime unloads the store and on shutdown, so
+    // a graceful exit never discards the last merge window (a crash only costs a re-parse).
+    public async Task FlushDeferredSaveAsync(CancellationToken cancellationToken = default)
+    {
+        if (Volatile.Read(ref _deferredSaveDirty) != 1) return;
+        await SaveAsync(cancellationToken);
+        Interlocked.Exchange(ref _lastDeferredSaveUtcTicks, DateTime.UtcNow.Ticks);
+        Volatile.Write(ref _deferredSaveDirty, 0);
     }
 
     public async Task SaveAsync(CancellationToken cancellationToken = default)
@@ -4933,6 +4973,91 @@ public sealed partial class ArchiveService
         return new DiskScan(disk, bundled) { Stamps = stamps, FullRescan = fullRescan };
     }
 
+    // OFF-THREAD SAFE: the same scan as ScanDiskAsync, but over an explicit set of paths the watcher
+    // reported instead of a walk of every source tree. It applies the identical stamp skip, sidechain
+    // exclusion and incomplete-tail rule, so an unchanged or half-written file behaves exactly as it
+    // would in a full walk; only the enumeration is skipped. Callers must treat the result as a PARTIAL
+    // view: it carries no bundled history and no stamps for files it did not look at, and the merge
+    // already merges stamps rather than replacing them, so untouched files keep their entries.
+    public async Task<DiskScan> ScanPathsAsync(IReadOnlyCollection<string> paths, CancellationToken cancellationToken = default)
+    {
+        var scanWatch = System.Diagnostics.Stopwatch.StartNew();
+        var bytesAtScanStart = PerfCounters.Snapshot()["transcriptBytesRead"];
+        var sources = EffectiveSources()
+            .Select(source => new SessionSource { Tool = source.Tool, Root = source.Root, Enabled = source.Enabled })
+            .ToList();
+        var fullRescan = Store.Settings.IndexVersion != CurrentIndexVersion;
+        var known = fullRescan
+            ? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            : new Dictionary<string, string>(Store.FileStamps, StringComparer.OrdinalIgnoreCase);
+        var disk = new List<ArchiveSession>();
+        var stamps = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var scanned = 0;
+        foreach (var path in paths.Distinct(StringComparer.OrdinalIgnoreCase))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var src = SourceForPath(sources, path);
+            if (src is null) continue;   // not under any configured root: not ours to index
+            FileInfo file;
+            try { file = new FileInfo(path); } catch { continue; }
+            if (!file.Exists) continue;  // a delete: the full walk drops it the same way (stamp carried out of the set only by a rescan)
+            scanned++;
+            try
+            {
+                var stamp = file.LastWriteTimeUtc.Ticks + ":" + file.Length;
+                if (src.Tool == "claude" && (file.Name == "journal.jsonl"
+                    || file.FullName.Contains("\\subagents\\", StringComparison.OrdinalIgnoreCase)))
+                {
+                    stamps[file.FullName] = stamp;
+                    continue;
+                }
+                if (known.TryGetValue(file.FullName, out var old) && old == stamp)
+                {
+                    stamps[file.FullName] = stamp; // unchanged between the event and the scan
+                    continue;
+                }
+                var session = await ParseSessionAsync(file.FullName, src.Tool);
+                var complete = session is null || FinalRecordIsComplete(file.FullName);
+                if (session is not null)
+                {
+                    ReleaseIndexedContent(session);
+                    disk.Add(session);
+                }
+                if (complete) stamps[file.FullName] = stamp;
+                // An incomplete tail is deliberately NOT stamped, exactly as in the full walk: the file is
+                // mid-append, so the next event on it retries rather than freezing a half turn.
+            }
+            catch (Exception ex)
+            {
+                PerfCounters.Trace?.Invoke($"scan path skipped {Path.GetFileName(path)}: {ex.Message}");
+            }
+        }
+        var bytesRead = PerfCounters.Snapshot()["transcriptBytesRead"] - bytesAtScanStart;
+        PerfCounters.Trace?.Invoke(
+            $"scan paths={paths.Count} scanned={scanned} parsed={disk.Count}"
+            + $" transcriptMB={bytesRead / 1048576.0:F0} ms={scanWatch.ElapsedMilliseconds}");
+        return new DiskScan(disk, new List<ArchiveSession>()) { Stamps = stamps, FullRescan = fullRescan };
+    }
+
+    // Longest-root match, so a nested source (an account sessions dir inside the codex home) wins over
+    // its parent and the file is parsed with the tool that owns it.
+    private static SessionSource? SourceForPath(IReadOnlyList<SessionSource> sources, string path)
+    {
+        SessionSource? best = null;
+        var bestLength = -1;
+        foreach (var source in sources)
+        {
+            if (!source.Enabled || string.IsNullOrWhiteSpace(source.Root)) continue;
+            var root = source.Root.TrimEnd('\\', '/');
+            if (root.Length == 0 || path.Length <= root.Length || bestLength >= root.Length) continue;
+            if (path[root.Length] is not ('\\' or '/')) continue;
+            if (!path.StartsWith(root, StringComparison.OrdinalIgnoreCase)) continue;
+            best = source;
+            bestLength = root.Length;
+        }
+        return best;
+    }
+
     // Enumerate one source, skip unchanged files (incremental), parse the rest by tool.
     private async Task<(List<ArchiveSession> Parsed, Dictionary<string, string> Stamps)> ParseSourceAsync(
         SessionSource src, IReadOnlyDictionary<string, string> known, IProgress<string>? progress,
@@ -5300,12 +5425,13 @@ public sealed partial class ArchiveService
         DiskScan scan,
         bool refreshList = true,
         CancellationToken cancellationToken = default,
-        bool buildSearchIndex = true)
+        bool buildSearchIndex = true,
+        bool deferSave = false)
     {
         for (var attempt = 0; ; attempt++)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            try { return await MergeScanOnceAsync(scan, refreshList, cancellationToken, buildSearchIndex); }
+            try { return await MergeScanOnceAsync(scan, refreshList, cancellationToken, buildSearchIndex, deferSave); }
             catch (StoreGenerationConflictException) when (attempt < 2)
             {
                 LastMergeLoadRetries = attempt + 1;
@@ -5318,7 +5444,8 @@ public sealed partial class ArchiveService
         DiskScan scan,
         bool refreshList,
         CancellationToken cancellationToken,
-        bool buildSearchIndex)
+        bool buildSearchIndex,
+        bool deferSave)
     {
         cancellationToken.ThrowIfCancellationRequested();
         // Before the no-change short circuit, so a family that moved - a patriarch that left while no
@@ -5395,7 +5522,7 @@ public sealed partial class ArchiveService
         }
         Store.Settings.IndexVersion = CurrentIndexVersion;
         RefreshTemplateSnapshotCounts();
-        await SaveAsync(cancellationToken);
+        await SaveMergeResultAsync(deferSave, cancellationToken);
         if (refreshList) ReapplyList();
         if (buildSearchIndex) StartTranscriptSearchIndexBuild(cancellationToken);
         LastMergeSearchIndexQueued = buildSearchIndex && _transcriptSearchIndex is not null;
@@ -6865,6 +6992,84 @@ public sealed partial class ArchiveService
         return !string.IsNullOrWhiteSpace(metaId) ? metaId : sessionId;
     }
 
+    // Incremental tail parse for a capped Claude transcript. A live gateway transcript grows to
+    // hundreds of MB but the forward pass stops after MaxLinesPerSession lines, and those first lines
+    // never change under append - so its whole result (created/cwd/summary/titles/count/first prompt)
+    // is frozen. We cache that snapshot and, while the capped prefix is provably byte-identical, pay
+    // only for the cheap 8MB tail read instead of re-parsing tens of MB of JSON every sync cycle.
+    // The guard is exactly the region the values depend on: same creation time, not truncated below
+    // the bytes we read, and the same SHA-256 over those bytes.
+    private sealed record ClaudeCappedForward(
+        string Created, string Cwd, string Summary, string Updated,
+        string ForwardCustom, string ForwardAi,
+        int Total, string FirstUser, string? TitleSeed,
+        DateTime CreationUtc, long ReadBytes, byte[] PrefixHash);
+
+    private readonly ConcurrentDictionary<string, ClaudeCappedForward> _claudeForwardCache =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    // Test seams: how often the S1 fast path was taken vs a capped result stored, so a test can prove
+    // the incremental path actually ran (and that the guard rejected a rewritten file).
+    internal int ClaudeForwardCacheHits;
+    internal int ClaudeForwardCacheStores;
+
+    private static byte[] HashPrefix(string path, long bytes)
+    {
+        using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        var n = (int)Math.Min(bytes, fs.Length);
+        using var sha = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        var buffer = ArrayPool<byte>.Shared.Rent(1 << 20);
+        try
+        {
+            var remaining = n;
+            while (remaining > 0)
+            {
+                var got = fs.Read(buffer, 0, Math.Min(buffer.Length, remaining));
+                if (got <= 0) break;
+                sha.AppendData(buffer, 0, got);
+                remaining -= got;
+            }
+        }
+        finally { ArrayPool<byte>.Shared.Return(buffer); }
+        return sha.GetHashAndReset();
+    }
+
+    private static bool PrefixMatches(string path, long bytes, byte[] expected)
+    {
+        try { return HashPrefix(path, bytes).AsSpan().SequenceEqual(expected); }
+        catch { return false; }
+    }
+
+    // Rebuild the ParsedTranscript from cached forward values plus a fresh tail read, mirroring the
+    // tail branch of ParseClaudeCoreAsync exactly. Null when the tail is unreadable this cycle, so the
+    // caller falls back to a full parse rather than publish a message-less session.
+    private static ParsedTranscript? FinishCappedClaude(string filePath, FileInfo info, ClaudeCappedForward cached)
+    {
+        var tail = ParseClaudeTail(filePath, info);
+        if (tail.messages.Count == 0) return null;
+
+        var cwd = cached.Cwd;
+        var summary = cached.Summary;
+        var updated = cached.Updated;
+        if (!string.IsNullOrWhiteSpace(tail.cwd)) cwd = tail.cwd;
+        if (!string.IsNullOrWhiteSpace(tail.summary)) summary = tail.summary;
+        if (!string.IsNullOrWhiteSpace(tail.updated)) updated = tail.updated;
+
+        var created = string.IsNullOrWhiteSpace(cached.Created) ? info.CreationTimeUtc.ToString("O") : cached.Created;
+        var titleSeed = FirstMeaningfulUserText(tail.messages);
+        var (tailCustom, tailAi) = ClaudeTailTitle(filePath);
+        var customName = !string.IsNullOrWhiteSpace(tailCustom) ? tailCustom : cached.ForwardCustom;
+        var aiName = UsableTitle(tailAi) ? tailAi! : cached.ForwardAi;
+        var titleSource =
+            !string.IsNullOrWhiteSpace(customName) ? customName! :
+            UsableTitle(aiName) ? aiName :
+            UsableTitle(summary) ? summary :
+            cached.TitleSeed ?? titleSeed ?? Path.GetFileNameWithoutExtension(filePath);
+        return new ParsedTranscript(tail.messages, tail.codeBlocks,
+            Path.GetFileNameWithoutExtension(filePath), CleanTitle(titleSource), created, updated, cwd,
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase), cached.Total, "claude", cached.FirstUser);
+    }
+
     // Claude Code transcript: one JSON object per line with sessionId/cwd/timestamp and a
     // message{role,content[]}. content is an array of {type:"text",text} blocks (plus tool_use/
     // tool_result we skip for the reader). Mirrors ParseJsonlAsync but for Claude's shape.
@@ -6887,6 +7092,17 @@ public sealed partial class ArchiveService
         var toolUseById = new Dictionary<string, ArchiveMessage>(StringComparer.Ordinal);  // tool_use id -> step (output attached from the later tool_result)
         var info = new FileInfo(filePath);
         var updated = info.LastWriteTimeUtc.ToString("O");
+
+        // S1: reuse the frozen forward-pass result of an already-capped transcript when its capped
+        // prefix is provably unchanged, so a growing file costs only its tail read.
+        if (_claudeForwardCache.TryGetValue(filePath, out var cachedForward)
+            && cachedForward.CreationUtc == info.CreationTimeUtc
+            && info.Length >= cachedForward.ReadBytes
+            && PrefixMatches(filePath, cachedForward.ReadBytes, cachedForward.PrefixHash))
+        {
+            var reused = FinishCappedClaude(filePath, info, cachedForward);
+            if (reused is not null) { ClaudeForwardCacheHits++; return reused; }
+        }
 
         using var stream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
         using var streamReader = new StreamReader(stream, Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
@@ -6953,6 +7169,13 @@ public sealed partial class ArchiveService
         var titleSeed = FirstMeaningfulUserText(messages);
         var firstUserClaude = FirstUserText(messages);   // from the HEAD, before any tail swap
         var totalClaude = messages.Count;
+        // Forward-pass snapshot for the S1 cache, taken BEFORE the tail read overrides cwd/summary/
+        // updated - the cache stores the forward values (the ones frozen once the file is capped).
+        var fwdCreated = created;
+        var fwdCwd = cwd;
+        var fwdSummary = summary;
+        var fwdUpdated = updated;
+        var forwardReadBytes = stream.Position;
         if (hitLineCap)
         {
             var tail = ParseClaudeTail(filePath, info);
@@ -6963,6 +7186,11 @@ public sealed partial class ArchiveService
                 if (!string.IsNullOrWhiteSpace(tail.cwd)) cwd = tail.cwd;
                 if (!string.IsNullOrWhiteSpace(tail.summary)) summary = tail.summary;
                 if (!string.IsNullOrWhiteSpace(tail.updated)) updated = tail.updated;
+                _claudeForwardCache[filePath] = new ClaudeCappedForward(
+                    fwdCreated, fwdCwd, fwdSummary, fwdUpdated, forwardCustom, forwardAi,
+                    totalClaude, firstUserClaude, titleSeed,
+                    info.CreationTimeUtc, forwardReadBytes, HashPrefix(filePath, forwardReadBytes));
+                ClaudeForwardCacheStores++;
             }
         }
 

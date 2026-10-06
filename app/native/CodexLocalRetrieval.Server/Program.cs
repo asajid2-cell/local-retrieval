@@ -568,6 +568,16 @@ try
 }
 finally
 {
+    // Commit any deferred background merge before the process exits, so a graceful stop never discards
+    // the last merge window (a hard kill only costs a re-parse of the changed files).
+    try
+    {
+        await archive.FlushDeferredSaveAsync();
+    }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine("deferred save flush on shutdown failed: " + ex);
+    }
     archiveRuntime.Dispose();
     try
     {

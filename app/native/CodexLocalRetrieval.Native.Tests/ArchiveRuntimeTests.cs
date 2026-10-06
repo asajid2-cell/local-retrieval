@@ -27,6 +27,58 @@ public sealed class ArchiveRuntimeTests
     }
 
     [TestMethod]
+    public async Task DeferredMergeSave_StaysOffDiskUntilFlush()
+    {
+        using var fixture = new RuntimeFixture();
+        await fixture.Runtime.UseAsync((archive, _) => Task.FromResult(archive.Store.Sessions.Count));
+        await fixture.Archive.FlushDeferredSaveAsync();
+
+        fixture.WriteRollout("rollout-deferred.jsonl", "deferred-1", "deferred work");
+        // Wait on the dirty flag, not the session: the merge publishes the session into memory before it
+        // reaches its save step, so a session-only wait can read HasDeferredSave before the merge sets it.
+        await WaitUntilAsync(() => fixture.Archive.HasDeferredSave);
+
+        Assert.IsTrue(fixture.Archive.Store.Sessions.ContainsKey("deferred-1"));
+        Assert.IsFalse(File.ReadAllText(fixture.StorePath).Contains("deferred-1"),
+            "the background merge must not rewrite the store inside the coalesce window");
+
+        await fixture.Archive.FlushDeferredSaveAsync();
+        Assert.IsFalse(fixture.Archive.HasDeferredSave);
+        Assert.IsTrue(File.ReadAllText(fixture.StorePath).Contains("deferred-1"),
+            "flush must commit the deferred merge");
+    }
+
+    // The crash gate: a hard kill between appends drops the deferred save, and the restart must recover
+    // the content by re-parsing the changed file (the stamps revert with the data they describe).
+    [TestMethod]
+    public async Task DeferredSaveDroppedOnKill_IsRecoveredByReparse()
+    {
+        using var fixture = new RuntimeFixture();
+        await fixture.Runtime.UseAsync((archive, _) => Task.FromResult(archive.Store.Sessions.Count));
+        await fixture.Archive.FlushDeferredSaveAsync();
+        fixture.WriteRollout("rollout-killed.jsonl", "killed-1", "appended then killed");
+        // Wait for the merge to finish its save step, so the assertion below is about a completed merge.
+        await WaitUntilAsync(() => fixture.Archive.HasDeferredSave);
+
+        // No FlushDeferredSaveAsync: this is the state a hard kill leaves -- memory ahead of disk.
+        Assert.IsTrue(fixture.Archive.Store.Sessions.ContainsKey("killed-1"));
+        Assert.IsFalse(File.ReadAllText(fixture.StorePath).Contains("killed-1"));
+
+        var restarted = new ArchiveService(
+            storePath: fixture.StorePath,
+            codexSessionsRoot: fixture.Root,
+            sourceOverride: new[]
+            {
+                new CodexLocalRetrieval.Core.Models.SessionSource { Tool = "codex", Root = fixture.Root },
+            });
+        await restarted.LoadAsync();
+        var scan = await restarted.ScanDiskAsync();
+        await restarted.MergeScanAsync(scan);
+        Assert.IsTrue(restarted.Store.Sessions.ContainsKey("killed-1"),
+            "a dropped deferred save must be recovered by re-parsing the changed file");
+    }
+
+    [TestMethod]
     public async Task WatcherRefresh_DoesNotStampPartialRollout_AndConvergesAfterCompletion()
     {
         using var fixture = new RuntimeFixture();

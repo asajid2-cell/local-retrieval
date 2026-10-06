@@ -26,6 +26,15 @@ public sealed class ArchiveRuntime
     private int _loaded;
     private int _sessionCount = -1;
     private long _lastAccessUtcTicks = DateTime.UtcNow.Ticks;
+    // The watcher reports the exact files it saw change, so a refresh that has them scans only those
+    // instead of walking every source tree (~16k transcripts here). Anything that makes the set
+    // untrustworthy -- a poll that found the change without a path, a burst past the cap, an index-version
+    // migration -- forces the full walk. The shortcut can therefore only ever NARROW a scan, never drop a
+    // change: the safety net still ends in a full walk.
+    private const int DirtyPathCap = 512;
+    private readonly HashSet<string> _dirtyPaths = new(StringComparer.OrdinalIgnoreCase);
+    private readonly object _dirtyGate = new();
+    private int _fullScanNeeded = 1;
 
     // How often an already-loaded runtime may re-check the on-disk store for a newer generation. The check
     // itself is cheap (a bounded header probe), but when it DOES find a newer generation the runtime
@@ -60,11 +69,45 @@ public sealed class ArchiveRuntime
 
     // A source watcher calls this without touching ArchiveService. The next archive operation performs
     // one coalesced scan while holding the same gate as every other server reader/writer.
-    public void MarkRefreshPending()
+    public void MarkRefreshPending() => MarkRefreshPending(null);
+
+    // Path-aware form. `changedPaths` is the set of transcript files the watcher actually saw change
+    // (null when the safety-net poll found the change and the file is unknown): a known set lets the
+    // refresh scan just those files, an unknown set or an oversized burst falls back to the full walk.
+    public void MarkRefreshPending(IReadOnlyList<string>? changedPaths)
     {
         if (Volatile.Read(ref _disposed) != 0) return;
+        if (changedPaths is null || changedPaths.Count == 0 || changedPaths.Count > DirtyPathCap)
+        {
+            Interlocked.Exchange(ref _fullScanNeeded, 1);
+        }
+        else
+        {
+            lock (_dirtyGate)
+            {
+                foreach (var path in changedPaths) _dirtyPaths.Add(path);
+                if (_dirtyPaths.Count > DirtyPathCap) Interlocked.Exchange(ref _fullScanNeeded, 1);
+            }
+        }
         Interlocked.Exchange(ref _refreshPending, 1);
         if (_syncOnLoad && IsLoaded) SchedulePendingRefresh();
+    }
+
+    // Drain the pending change set for one refresh. Always clears, so a full walk consumes the paths it
+    // subsumes rather than leaving them to trigger a second, narrower scan right after.
+    private (IReadOnlyList<string>? Paths, bool Full) TakePendingChanges()
+    {
+        var full = Interlocked.Exchange(ref _fullScanNeeded, 0) == 1;
+        List<string>? paths = null;
+        lock (_dirtyGate)
+        {
+            if (_dirtyPaths.Count > 0)
+            {
+                paths = _dirtyPaths.ToList();
+                _dirtyPaths.Clear();
+            }
+        }
+        return (paths, full);
     }
 
     private void EnsureSourceWatches()
@@ -87,7 +130,7 @@ public sealed class ArchiveRuntime
             {
                 try
                 {
-                    var registration = _watchService.WatchDirectory(root, "*.jsonl", recurse: true, MarkRefreshPending);
+                    var registration = _watchService.WatchDirectory(root, "*.jsonl", recurse: true, paths => MarkRefreshPending(paths));
                     _sourceWatches.Add(new SourceWatch(root, registration));
                 }
                 catch (Exception ex) { _log?.Invoke("archive watch warning: " + ex.Message); }
@@ -109,7 +152,7 @@ public sealed class ArchiveRuntime
             while (Interlocked.Exchange(ref _refreshPending, 0) == 1)
             {
                 if (!IsLoaded) break;
-                try { await RefreshAsync(CancellationToken.None); }
+                try { await RefreshAsync(preferFullScan: false, CancellationToken.None); }
                 catch (Exception ex) { _log?.Invoke("archive watcher sync warning: " + ex.Message); }
                 // A sync costs seconds and holds the gate a remote read needs, while the sources are being
                 // written continuously -- a live session appends to its transcript every few seconds. With
@@ -194,7 +237,7 @@ public sealed class ArchiveRuntime
                 // failure is the caller's failure.
                 Interlocked.Exchange(ref _refreshPending, 0);
                 var refreshStart = watch.ElapsedMilliseconds;
-                await RefreshAsync(cancellationToken);
+                await RefreshAsync(preferFullScan: true, cancellationToken);
                 refreshMs = watch.ElapsedMilliseconds - refreshStart;
             }
             else if (Interlocked.Exchange(ref _refreshPending, 0) == 1)
@@ -240,6 +283,9 @@ public sealed class ArchiveRuntime
         try
         {
             if (!IsLoaded || IdleDuration() < idleFor) return false;
+            // Commit any deferred background merge before the store leaves memory, so a graceful unload
+            // never discards the last merge window.
+            await _archive.FlushDeferredSaveAsync(cancellationToken);
             _archive.Unload();
             Volatile.Write(ref _sessionCount, -1);
             Volatile.Write(ref _loaded, 0);
@@ -290,20 +336,28 @@ public sealed class ArchiveRuntime
     // worker, MergeScanAsync on the UI thread). Running the WHOLE sync under the gate is what produced
     // the 22-23s `gate=` waits in the traces: every remote read queued behind a walk it did not need
     // to wait for. So walk first, gate only the merge. The merge is the part that touches the store.
-    private async Task RefreshAsync(CancellationToken cancellationToken)
+    private async Task RefreshAsync(bool preferFullScan, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
         await _syncGate.WaitAsync(cancellationToken);
         try
         {
-            var scan = await _archive.ScanDiskAsync(cancellationToken: cancellationToken);
+            // A user-facing refresh ("show me the current list now") always walks everything. Only the
+            // watcher's background refresh may narrow to the files it actually saw change.
+            var (paths, full) = TakePendingChanges();
+            var scan = preferFullScan || full || paths is null
+                ? await _archive.ScanDiskAsync(cancellationToken: cancellationToken)
+                : await _archive.ScanPathsAsync(paths, cancellationToken);
             if (SyncScanHook is { } hook) await hook(cancellationToken);
             cancellationToken.ThrowIfCancellationRequested();
             await _gate.WaitAsync(cancellationToken);
             var mergeWatch = Stopwatch.StartNew();
             try
             {
-                Touch();
+                // Deliberately NO Touch() here. This refresh is background work: the sources are appended
+                // to continuously, so stamping the idle clock on every merge would keep _lastAccessUtcTicks
+                // fresh forever and the idle unload could never fire -- the archive would stay resident and
+                // never hand its ~200 MB back. Only a real remote read/write stamps access (UseAsync).
                 // Re-check under the gate: the scan above ran while the runtime could have been unloaded
                 // and reloaded, and merging one store's disk walk into another's is the one thing the
                 // split makes possible that the old whole-sync-under-gate could not do. A generation
@@ -311,7 +365,7 @@ public sealed class ArchiveRuntime
                 // recovery already covers a second writer, and refusing on a moved generation would drop
                 // real work.
                 if (!IsLoaded) return;
-                await _archive.MergeScanAsync(scan, refreshList: false, cancellationToken: cancellationToken);
+                await _archive.MergeScanAsync(scan, refreshList: false, cancellationToken: cancellationToken, deferSave: true);
                 cancellationToken.ThrowIfCancellationRequested();
                 Volatile.Write(ref _sessionCount, _archive.Store.Sessions.Count);
                 // Attributed because the merge is the last thing holding the gate a remote read needs, and
@@ -319,7 +373,10 @@ public sealed class ArchiveRuntime
                 // the background search-index rebuild have completely different fixes.
                 PerfCounters.Trace?.Invoke(
                     $"sync merged files={scan.Disk.Count} mergeMs={mergeWatch.ElapsedMilliseconds}"
-                    + $" loadRetries={_archive.LastMergeLoadRetries} searchIndexQueued={_archive.LastMergeSearchIndexQueued}");
+                    + $" loadRetries={_archive.LastMergeLoadRetries} searchIndexQueued={_archive.LastMergeSearchIndexQueued}"
+                    + $" watchHealthy={_watchService.AllWatchersHealthy}"
+                    + $" watchEvents={_watchService.Stats.Events} watchFallbackPolls={_watchService.Stats.FallbackPolls}"
+                    + $" watchErrors={_watchService.Stats.WatcherErrors}");
             }
             finally { _gate.Release(); }
         }
