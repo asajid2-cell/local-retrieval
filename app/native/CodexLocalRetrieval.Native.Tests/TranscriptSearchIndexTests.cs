@@ -179,6 +179,147 @@ public sealed class TranscriptSearchIndexTests
         Assert.IsTrue(new FileInfo(path).Length > extra.Length);
     }
 
+    [TestMethod]
+    public async Task DirtySetSync_IndexesOnlyReportedFile()
+    {
+        using var fixture = new SearchFixture();
+        var reported = fixture.WriteCodex(
+            "reported",
+            """
+            {"timestamp":"2026-08-03T00:00:00Z","type":"session_meta","payload":{"id":"reported"}}
+            {"timestamp":"2026-08-03T00:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"reported baseline sentinel"}}
+            """);
+        var missed = fixture.WriteCodex(
+            "missed",
+            """
+            {"timestamp":"2026-08-03T00:00:00Z","type":"session_meta","payload":{"id":"missed"}}
+            {"timestamp":"2026-08-03T00:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"missed baseline sentinel"}}
+            """);
+        var sessions = new[] { fixture.Session("reported", reported), fixture.Session("missed", missed) };
+        await fixture.Index.SyncAsync(sessions, fixture.Sources("codex"));
+
+        // Only the missed file changes, but the dirty set names the reported file: the walk is skipped and
+        // the changed file is not touched.
+        await File.AppendAllTextAsync(
+            missed,
+            """
+            {"timestamp":"2026-08-03T00:00:02Z","type":"event_msg","payload":{"type":"agent_message","message":"unreported delta sentinel"}}
+
+            """);
+        File.SetLastWriteTimeUtc(missed, DateTime.UtcNow.AddSeconds(1));
+        var sync = await fixture.Index.SyncAsync(
+            sessions,
+            fixture.Sources("codex"),
+            changedPaths: new[] { reported });
+
+        Assert.AreEqual(0, sync.AppendedFiles);
+        Assert.AreEqual(0, sync.RebuiltFiles);
+        var absent = await fixture.Index.SearchAsync(
+            "unreported delta sentinel",
+            10,
+            id => sessions.FirstOrDefault(session => session.Id == id));
+        Assert.AreEqual(0, absent.Hits.Count, "a file outside the dirty set must not be indexed");
+    }
+
+    [TestMethod]
+    public async Task DirtySetSync_MakesAppendedTextSearchable()
+    {
+        using var fixture = new SearchFixture();
+        var path = fixture.WriteCodex(
+            "dirty-append",
+            """
+            {"timestamp":"2026-08-03T00:00:00Z","type":"session_meta","payload":{"id":"dirty-append"}}
+            {"timestamp":"2026-08-03T00:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"dirty baseline sentinel"}}
+            """);
+        var session = fixture.Session("dirty-append", path);
+        await fixture.Index.SyncAsync(new[] { session }, fixture.Sources("codex"));
+
+        await File.AppendAllTextAsync(
+            path,
+            """
+            {"timestamp":"2026-08-03T00:00:02Z","type":"event_msg","payload":{"type":"agent_message","message":"dirty appended sentinel"}}
+
+            """);
+        File.SetLastWriteTimeUtc(path, DateTime.UtcNow.AddSeconds(1));
+        var sync = await fixture.Index.SyncAsync(
+            new[] { session },
+            fixture.Sources("codex"),
+            changedPaths: new[] { path });
+
+        Assert.AreEqual(1, sync.AppendedFiles);
+        var result = await fixture.Index.SearchAsync(
+            "dirty appended sentinel",
+            10,
+            id => id == session.Id ? session : null);
+        Assert.AreEqual("dirty-append", result.Hits.Single().Session.Id);
+    }
+
+    [TestMethod]
+    public async Task FullSync_PicksUpFileTheDirtySetMissed()
+    {
+        using var fixture = new SearchFixture();
+        var known = fixture.WriteCodex(
+            "known",
+            """
+            {"timestamp":"2026-08-03T00:00:00Z","type":"session_meta","payload":{"id":"known"}}
+            {"timestamp":"2026-08-03T00:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"known baseline sentinel"}}
+            """);
+        var session = fixture.Session("known", known);
+        await fixture.Index.SyncAsync(new[] { session }, fixture.Sources("codex"));
+
+        // A file the watcher never reported: only the reconciliation walk can find it.
+        var late = fixture.WriteCodex(
+            "late",
+            """
+            {"timestamp":"2026-08-03T00:00:00Z","type":"session_meta","payload":{"id":"late"}}
+            {"timestamp":"2026-08-03T00:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"late arrival sentinel"}}
+            """);
+        var lateSession = fixture.Session("late", late);
+        await fixture.Index.SyncAsync(
+            new[] { session, lateSession },
+            fixture.Sources("codex"),
+            changedPaths: new[] { known });
+        var beforeWalk = await fixture.Index.SearchAsync(
+            "late arrival sentinel",
+            10,
+            id => id == lateSession.Id ? lateSession : null);
+        Assert.AreEqual(0, beforeWalk.Hits.Count);
+
+        await fixture.Index.SyncAsync(new[] { session, lateSession }, fixture.Sources("codex"));
+        var afterWalk = await fixture.Index.SearchAsync(
+            "late arrival sentinel",
+            10,
+            id => id == lateSession.Id ? lateSession : null);
+        Assert.AreEqual("late", afterWalk.Hits.Single().Session.Id);
+    }
+
+    [TestMethod]
+    public async Task EmptyDirtySet_WritesNothing()
+    {
+        using var fixture = new SearchFixture();
+        var path = fixture.WriteCodex(
+            "quiet",
+            """
+            {"timestamp":"2026-08-03T00:00:00Z","type":"session_meta","payload":{"id":"quiet"}}
+            {"timestamp":"2026-08-03T00:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"quiet sentinel"}}
+            """);
+        var session = fixture.Session("quiet", path);
+        await fixture.Index.SyncAsync(new[] { session }, fixture.Sources("codex"));
+
+        var dbPath = fixture.Index.DatabasePath;
+        var before = File.GetLastWriteTimeUtc(dbPath);
+        var sync = await fixture.Index.SyncAsync(
+            new[] { session },
+            fixture.Sources("codex"),
+            changedPaths: Array.Empty<string>());
+        var after = File.GetLastWriteTimeUtc(dbPath);
+
+        Assert.AreEqual(0, sync.IndexedFiles);
+        Assert.AreEqual(0, sync.RebuiltFiles);
+        Assert.AreEqual(0, sync.AppendedFiles);
+        Assert.AreEqual(before, after, "a cycle with no changes must not write the index");
+    }
+
     private sealed class SearchFixture : IDisposable
     {
         private readonly string _root = Path.Combine(

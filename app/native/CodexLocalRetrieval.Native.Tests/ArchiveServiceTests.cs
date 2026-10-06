@@ -4625,4 +4625,51 @@ public sealed class ArchiveServiceTests
         }
         finally { try { Directory.Delete(root, true); } catch { } }
     }
+
+    // T1 gate: a live transcript that grows by a small append must cost a small read. Before this the tail
+    // parser re-read a fixed 8 MB window every cycle no matter how little had been appended; now it reads
+    // only the bytes past the previous window, plus a couple of KB of boundary guard.
+    [TestMethod]
+    public async Task CappedTranscript_SmallAppend_ReadsOnlyTheAppend()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "clr-t1-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        var path = Path.Combine(root, "capped.jsonl");
+        var source = new SessionSource { Tool = "claude", Root = root };
+        try
+        {
+            var head = new StringBuilder();
+            for (var i = 0; i < 6500; i++)
+            {
+                var role = i % 2 == 0 ? "user" : "assistant";
+                head.Append("{\"type\":\"").Append(role).Append("\",\"cwd\":\"/work\",\"timestamp\":\"2026-01-01T00:00:00Z\",")
+                    .Append("\"message\":{\"role\":\"").Append(role).Append("\",\"content\":[{\"type\":\"text\",\"text\":\"message ")
+                    .Append(i).Append("\"}]}}\n");
+            }
+            File.WriteAllText(path, head.ToString());
+
+            var warm = new ArchiveService(storePath: Path.Combine(root, "warm.json"), sourceOverride: new[] { source });
+            await warm.ScanDiskAsync();          // cold: reads the prefix + a full tail window
+
+            var before = PerfCounters.Snapshot()["transcriptBytesRead"];
+            var tailBefore = ArchiveService.TailBytesRead;
+
+            // A ~1 KB append, the size of a real new turn.
+            var padding = new string('x', 1000);
+            File.AppendAllText(path,
+                "{\"type\":\"assistant\",\"cwd\":\"/work\",\"timestamp\":\"2026-01-02T00:00:00Z\",\"message\":"
+                + "{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"" + padding + "\"}]}}\n");
+
+            await warm.ScanDiskAsync();
+
+            var read = PerfCounters.Snapshot()["transcriptBytesRead"] - before;
+            var tailRead = ArchiveService.TailBytesRead - tailBefore;
+            Assert.IsTrue(warm.ClaudeForwardCacheHits >= 1, "the append must take the incremental path");
+            Assert.IsTrue(tailRead < 16 * 1024,
+                $"a 1 KB append must cost a few KB of tail read, not the old 8 MB window (read {tailRead} bytes)");
+            Assert.IsTrue(read < 16 * 1024,
+                $"the whole cycle must read a few KB, not the old 8 MB window (read {read} bytes)");
+        }
+        finally { try { Directory.Delete(root, true); } catch { } }
+    }
 }

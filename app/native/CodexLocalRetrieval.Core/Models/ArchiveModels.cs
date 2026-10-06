@@ -1047,6 +1047,10 @@ public sealed record DiskScan(List<ArchiveSession> Disk, List<ArchiveSession> Bu
     // True when the incremental cache was ignored (parser-version migration) and every file was
     // re-parsed — the only safe time to prune orphaned sessions whose id scheme changed.
     public bool FullRescan { get; init; }
+
+    // The exact paths a dirty-set scan looked at, or null for a full walk. Consumers that must follow the
+    // same narrowing (the search index) read it so they never re-enumerate the tree to chase the watcher.
+    public IReadOnlyList<string>? ChangedPaths { get; init; }
 }
 
 public sealed class ArchiveSearchHit

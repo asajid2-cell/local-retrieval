@@ -45,7 +45,10 @@ public sealed partial class ArchiveService
     private const long MaxTitleHeadBytes = 32 * 1024 * 1024;
     // Final-record probe window. The last line is the only thing that check needs, and a live transcript
     // can be hundreds of MB, so the whole file is no longer re-read to find its own tail.
-    private const int FinalRecordProbeBytes = 1024 * 1024;
+    private const int FinalRecordProbeBytes = 64 * 1024;
+    // Ceiling on the backward scan the probe falls back to when the final line is at or past the probe
+    // window. Bounded so a hundreds-of-MB live transcript is never drained to examine its own last line.
+    private const int FinalRecordSlowBudgetBytes = 1024 * 1024;
     private const int ClaudeTailBytes = 8 * 1024 * 1024;
     private const int CodexTailBytes = 8 * 1024 * 1024;
     private const int SearchTextCap = 6_000; // capped, in-memory searchable text per session (full content lazy-loads)
@@ -297,6 +300,14 @@ public sealed partial class ArchiveService
     private readonly bool _transcriptSearchEnabled;
     private readonly object _transcriptSearchTaskGate = new();
     private Task<TranscriptSearchSyncResult>? _transcriptSearchBuildTask;
+    // The index's own dirty set, fed by the scans that already know which files changed. A full walk is
+    // needed only to discover files and prune ones that vanished, so it is reserved for the startup build,
+    // a burst past the cap, and the runtime's reconciliation beat; every ordinary sync indexes just the
+    // paths the watcher reported.
+    private readonly object _indexDirtyGate = new();
+    private readonly HashSet<string> _pendingIndexPaths = new(StringComparer.OrdinalIgnoreCase);
+    private bool _indexFullNeeded = true;
+    private const int PendingIndexPathCap = 2048;
     private SearchCoverage _lastSearchCoverage = new(
         false,
         0,
@@ -548,7 +559,9 @@ public sealed partial class ArchiveService
         // leaves flash back". Before the page wires the callback (startup) ReapplyList is the flat paint, and
         // that is what binds the list for the first time.
         ReapplyList();
-        StartTranscriptSearchIndexBuild(cancellationToken);
+        // Startup: the one guaranteed full walk, so files added or removed while the process was down are
+        // seen and orphaned rows pruned. Everything after this indexes only what the scans report.
+        QueueTranscriptSearchIndexBuild(changedPaths: null, cancellationToken);
     }
 
     // Startup cache phase: read the last durable snapshot without waiting on the writer lock or performing
@@ -610,12 +623,45 @@ public sealed partial class ArchiveService
             return _transcriptSearchBuildTask!;
     }
 
+    // The index build's one entrance. A null set means "walk everything" (the startup build); a set is the
+    // files the scan saw change. An oversized set collapses to a full walk rather than an unbounded scan.
+    private void QueueTranscriptSearchIndexBuild(
+        IReadOnlyCollection<string>? changedPaths,
+        CancellationToken cancellationToken = default)
+    {
+        if (_transcriptSearchIndex is null) return;
+        lock (_indexDirtyGate)
+        {
+            if (changedPaths is null)
+            {
+                _indexFullNeeded = true;
+            }
+            else
+            {
+                foreach (var path in changedPaths) _pendingIndexPaths.Add(path);
+                if (_pendingIndexPaths.Count > PendingIndexPathCap) _indexFullNeeded = true;
+            }
+        }
+        StartTranscriptSearchIndexBuild(cancellationToken);
+    }
+
     public async Task<TranscriptSearchSyncResult> SyncTranscriptSearchIndexAsync(
         IProgress<TranscriptSearchIndexStatus>? progress = null,
         CancellationToken cancellationToken = default)
     {
         if (_transcriptSearchIndex is null)
             return new TranscriptSearchSyncResult(0, 0, 0, 0, 0, TimeSpan.Zero);
+        IReadOnlyCollection<string>? changedPaths;
+        bool full;
+        lock (_indexDirtyGate)
+        {
+            full = _indexFullNeeded;
+            changedPaths = full || _pendingIndexPaths.Count == 0
+                ? Array.Empty<string>()
+                : _pendingIndexPaths.ToList();
+            _pendingIndexPaths.Clear();
+            _indexFullNeeded = false;
+        }
         var sessions = Store.Sessions.Values.ToList();
         var sources = EffectiveSources().Select(source => new SessionSource
         {
@@ -627,7 +673,9 @@ public sealed partial class ArchiveService
             sessions,
             sources,
             progress,
-            cancellationToken).ConfigureAwait(false);
+            cancellationToken,
+            changedPaths: full ? null : changedPaths,
+            forceFullScan: full).ConfigureAwait(false);
     }
 
     private void StartTranscriptSearchIndexBuild(
@@ -646,9 +694,15 @@ public sealed partial class ArchiveService
                 task =>
                 {
                     _ = task.Exception;
+                    // A change that landed while this build was running was added to the pending set after
+                    // the build had already snapshotted it. Run once more rather than wait for the next
+                    // watcher event, which may never come.
+                    bool more;
+                    lock (_indexDirtyGate) more = _indexFullNeeded || _pendingIndexPaths.Count > 0;
+                    if (more) StartTranscriptSearchIndexBuild(CancellationToken.None);
                 },
                 CancellationToken.None,
-                TaskContinuationOptions.OnlyOnFaulted,
+                TaskContinuationOptions.None,
                 TaskScheduler.Default);
         }
     }
@@ -3821,7 +3875,7 @@ public sealed partial class ArchiveService
                     retainCustody(claim!, fs);
                     custodyTransferred = true;
                 }
-                var nativeTitle = ClaudeTailTitle(path);
+                var nativeTitle = ClaudeTailTitle(path, null);
                 if (intentId is not null)
                 {
                     string? custom = null, ai = null;
@@ -4993,7 +5047,8 @@ public sealed partial class ArchiveService
         var disk = new List<ArchiveSession>();
         var stamps = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         var scanned = 0;
-        foreach (var path in paths.Distinct(StringComparer.OrdinalIgnoreCase))
+        var changedPaths = paths.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+        foreach (var path in changedPaths)
         {
             cancellationToken.ThrowIfCancellationRequested();
             var src = SourceForPath(sources, path);
@@ -5036,7 +5091,12 @@ public sealed partial class ArchiveService
         PerfCounters.Trace?.Invoke(
             $"scan paths={paths.Count} scanned={scanned} parsed={disk.Count}"
             + $" transcriptMB={bytesRead / 1048576.0:F0} ms={scanWatch.ElapsedMilliseconds}");
-        return new DiskScan(disk, new List<ArchiveSession>()) { Stamps = stamps, FullRescan = fullRescan };
+        return new DiskScan(disk, new List<ArchiveSession>())
+        {
+            Stamps = stamps,
+            FullRescan = fullRescan,
+            ChangedPaths = changedPaths,
+        };
     }
 
     // Longest-root match, so a nested source (an account sessions dir inside the codex home) wins over
@@ -5152,10 +5212,22 @@ public sealed partial class ArchiveService
     // next scan rather than stamped forever from a half-written turn. Only the tail can answer this: the
     // previous implementation drained the whole enumeration for its last element, which re-read every byte
     // of a live transcript (hundreds of MB here) on each scan purely to examine its own last line.
-    private static bool FinalRecordIsComplete(string path)
+    private bool FinalRecordIsComplete(string path)
     {
         try
         {
+            // The parse that just ran may already hold the file's tail in memory (the capped-transcript
+            // path reads and caches it). When that cached window ends exactly at the file's current
+            // length, the final record can be judged from bytes already counted against the read budget,
+            // with no second read at all.
+            if (_tailWindowCache.TryGetValue(path, out var cached)
+                && cached.Window.Length > 0
+                && cached.EndOffset == new FileInfo(path).Length)
+            {
+                var cachedLast = LastNonEmptyLine(Encoding.UTF8.GetString(cached.Window));
+                return cachedLast is null || IsCompleteJsonRecord(cachedLast);
+            }
+
             using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
             var length = fs.Length;
             var window = (int)Math.Min(length, FinalRecordProbeBytes);
@@ -5197,11 +5269,72 @@ public sealed partial class ArchiveService
     {
         try
         {
-            try { PerfCounters.TranscriptBytesRead(new FileInfo(path).Length); } catch { }
-            var last = SafeReadLines(path).LastOrDefault(line => !string.IsNullOrWhiteSpace(line));
+            var last = LastNonEmptyLineBounded(path, FinalRecordSlowBudgetBytes);
             return last is null || IsCompleteJsonRecord(last);
         }
         catch { return false; }
+    }
+
+    // The last non-whitespace line of a block of text. The text is expected to end at the file's end, so
+    // only its first line can be a fragment; every line from the second onward is whole.
+    private static string? LastNonEmptyLine(string text)
+    {
+        var end = text.Length;
+        while (end > 0)
+        {
+            var nl = text.LastIndexOf('\n', end - 1);
+            if (nl < 0)
+            {
+                var head = text[..end].Trim();
+                return head.Length == 0 ? null : head;
+            }
+            var trimmed = text[(nl + 1)..end].Trim();
+            if (trimmed.Length > 0) return trimmed;
+            end = nl;
+        }
+        return null;
+    }
+
+    // The last non-whitespace line of a file, read backward within a bounded budget so a live transcript
+    // is never drained just to inspect its own final line. Returns null when the file holds no non-empty
+    // line, or when the final line alone runs past the budget (an oversized record the streaming reader
+    // drops anyway), in which case there is nothing testable at the tail.
+    private static string? LastNonEmptyLineBounded(string path, int budgetBytes)
+    {
+        using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        var length = fs.Length;
+        if (length == 0) return null;
+        var budget = (int)Math.Min(length, budgetBytes);
+        var start = length - budget;
+        var buf = new byte[budget];
+        fs.Seek(start, SeekOrigin.Begin);
+        var read = 0;
+        while (read < budget)
+        {
+            var n = fs.Read(buf, read, budget - read);
+            if (n <= 0) break;
+            read += n;
+        }
+        PerfCounters.TranscriptBytesRead(read);
+        if (read == 0) return null;
+        var text = Encoding.UTF8.GetString(buf, 0, read);
+        var end = text.Length;
+        while (end > 0)
+        {
+            var nl = text.LastIndexOf('\n', end - 1);
+            if (nl < 0)
+            {
+                // No newline in the window. Only a window that reached the file's start can test its
+                // leading line; a window that began mid-line holds a fragment whose true end is unknown.
+                if (start > 0) return null;
+                var head = text[..end].Trim();
+                return head.Length == 0 ? null : head;
+            }
+            var trimmed = text[(nl + 1)..end].Trim();
+            if (trimmed.Length > 0) return trimmed;
+            end = nl;
+        }
+        return null;
     }
 
     private static bool IsValidJsonRecord(string line)
@@ -5524,7 +5657,9 @@ public sealed partial class ArchiveService
         RefreshTemplateSnapshotCounts();
         await SaveMergeResultAsync(deferSave, cancellationToken);
         if (refreshList) ReapplyList();
-        if (buildSearchIndex) StartTranscriptSearchIndexBuild(cancellationToken);
+        // A full-walk scan (ChangedPaths null) hands the index a full pass; a dirty-set scan hands it the
+        // exact files it looked at, so the index never re-enumerates the tree to follow the watcher.
+        if (buildSearchIndex) QueueTranscriptSearchIndexBuild(scan.ChangedPaths, cancellationToken);
         LastMergeSearchIndexQueued = buildSearchIndex && _transcriptSearchIndex is not null;
         return scan.Disk.Count + recovered;
     }
@@ -6992,46 +7127,72 @@ public sealed partial class ArchiveService
         return !string.IsNullOrWhiteSpace(metaId) ? metaId : sessionId;
     }
 
-    // Incremental tail parse for a capped Claude transcript. A live gateway transcript grows to
-    // hundreds of MB but the forward pass stops after MaxLinesPerSession lines, and those first lines
-    // never change under append - so its whole result (created/cwd/summary/titles/count/first prompt)
-    // is frozen. We cache that snapshot and, while the capped prefix is provably byte-identical, pay
-    // only for the cheap 8MB tail read instead of re-parsing tens of MB of JSON every sync cycle.
-    // The guard is exactly the region the values depend on: same creation time, not truncated below
-    // the bytes we read, and the same SHA-256 over those bytes.
+    // Incremental parse for a capped Claude transcript. A live gateway transcript grows to hundreds of
+    // MB, but the forward pass stops after MaxLinesPerSession lines and the tail read only ever needs the
+    // newest lines - and those first lines never change under append. So we cache the forward result and
+    // the tail window and, while the regions they depend on are provably unchanged, pay only for the
+    // bytes appended since the last cycle instead of re-reading tens of MB per sync.
+    //
+    // The guard is a boundary hash at each cached region's edge (a few KB), plus an unchanged creation time
+    // and a length that never shrank. The forward prefix is hashed in full once, at cold; a boundary hash
+    // cannot see a surgical edit to the middle of an already-verified region, so every
+    // FullForwardVerifyEvery cycles the whole prefix is re-hashed to bound how long such an edit hides.
+    private const int BoundaryHashBytes = 2 * 1024;
+    private const int FullForwardVerifyEvery = 30;
+
     private sealed record ClaudeCappedForward(
         string Created, string Cwd, string Summary, string Updated,
         string ForwardCustom, string ForwardAi,
         int Total, string FirstUser, string? TitleSeed,
-        DateTime CreationUtc, long ReadBytes, byte[] PrefixHash);
+        DateTime CreationUtc, long ReadBytes, byte[] PrefixHash, byte[] BoundaryHash, int VerifyCountdown);
+
+    private sealed record TailWindowCache(DateTime CreationUtc, long EndOffset, byte[] Window, byte[] Boundary);
 
     private readonly ConcurrentDictionary<string, ClaudeCappedForward> _claudeForwardCache =
+        new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, TailWindowCache> _tailWindowCache =
         new(StringComparer.OrdinalIgnoreCase);
 
     // Test seams: how often the S1 fast path was taken vs a capped result stored, so a test can prove
     // the incremental path actually ran (and that the guard rejected a rewritten file).
     internal int ClaudeForwardCacheHits;
     internal int ClaudeForwardCacheStores;
+    // Bytes the tail window reader actually pulled off disk, and how often a previous window was reused.
+    // Test seams so a test can prove a small append costs a small read.
+    internal static long TailBytesRead;
+    internal static long TailWindowCacheHits;
 
-    private static byte[] HashPrefix(string path, long bytes)
+    private static byte[] HashRange(string path, long start, int count)
     {
         using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-        var n = (int)Math.Min(bytes, fs.Length);
         using var sha = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
         var buffer = ArrayPool<byte>.Shared.Rent(1 << 20);
         try
         {
-            var remaining = n;
+            fs.Seek(Math.Max(0, start), SeekOrigin.Begin);
+            var remaining = count;
+            var total = 0;
             while (remaining > 0)
             {
                 var got = fs.Read(buffer, 0, Math.Min(buffer.Length, remaining));
                 if (got <= 0) break;
                 sha.AppendData(buffer, 0, got);
                 remaining -= got;
+                total += got;
             }
+            PerfCounters.TranscriptBytesRead(total);
         }
         finally { ArrayPool<byte>.Shared.Return(buffer); }
         return sha.GetHashAndReset();
+    }
+
+    private static byte[] HashPrefix(string path, long bytes) =>
+        HashRange(path, 0, (int)Math.Min(Math.Max(0, bytes), int.MaxValue));
+
+    private static byte[] HashBoundary(string path, long endOffset)
+    {
+        var start = Math.Max(0, endOffset - BoundaryHashBytes);
+        return HashRange(path, start, (int)Math.Min(endOffset - start, BoundaryHashBytes));
     }
 
     private static bool PrefixMatches(string path, long bytes, byte[] expected)
@@ -7040,10 +7201,16 @@ public sealed partial class ArchiveService
         catch { return false; }
     }
 
+    private static bool BoundaryMatches(string path, long endOffset, byte[] expected)
+    {
+        try { return HashBoundary(path, endOffset).AsSpan().SequenceEqual(expected); }
+        catch { return false; }
+    }
+
     // Rebuild the ParsedTranscript from cached forward values plus a fresh tail read, mirroring the
     // tail branch of ParseClaudeCoreAsync exactly. Null when the tail is unreadable this cycle, so the
     // caller falls back to a full parse rather than publish a message-less session.
-    private static ParsedTranscript? FinishCappedClaude(string filePath, FileInfo info, ClaudeCappedForward cached)
+    private ParsedTranscript? FinishCappedClaude(string filePath, FileInfo info, ClaudeCappedForward cached)
     {
         var tail = ParseClaudeTail(filePath, info);
         if (tail.messages.Count == 0) return null;
@@ -7057,7 +7224,7 @@ public sealed partial class ArchiveService
 
         var created = string.IsNullOrWhiteSpace(cached.Created) ? info.CreationTimeUtc.ToString("O") : cached.Created;
         var titleSeed = FirstMeaningfulUserText(tail.messages);
-        var (tailCustom, tailAi) = ClaudeTailTitle(filePath);
+        var (tailCustom, tailAi) = ClaudeTailTitle(filePath, tail.window);
         var customName = !string.IsNullOrWhiteSpace(tailCustom) ? tailCustom : cached.ForwardCustom;
         var aiName = UsableTitle(tailAi) ? tailAi! : cached.ForwardAi;
         var titleSource =
@@ -7094,14 +7261,32 @@ public sealed partial class ArchiveService
         var updated = info.LastWriteTimeUtc.ToString("O");
 
         // S1: reuse the frozen forward-pass result of an already-capped transcript when its capped
-        // prefix is provably unchanged, so a growing file costs only its tail read.
+        // prefix is provably unchanged, so a growing file costs only its tail read. The cheap guard is a
+        // boundary hash at the prefix's edge; the whole prefix is re-hashed every FullForwardVerifyEvery
+        // cycles to bound how long an edit to the middle of the prefix could go unnoticed.
         if (_claudeForwardCache.TryGetValue(filePath, out var cachedForward)
             && cachedForward.CreationUtc == info.CreationTimeUtc
-            && info.Length >= cachedForward.ReadBytes
-            && PrefixMatches(filePath, cachedForward.ReadBytes, cachedForward.PrefixHash))
+            && info.Length >= cachedForward.ReadBytes)
         {
-            var reused = FinishCappedClaude(filePath, info, cachedForward);
-            if (reused is not null) { ClaudeForwardCacheHits++; return reused; }
+            var verifyFull = cachedForward.VerifyCountdown <= 0;
+            var guardOk = verifyFull
+                ? PrefixMatches(filePath, cachedForward.ReadBytes, cachedForward.PrefixHash)
+                : BoundaryMatches(filePath, cachedForward.ReadBytes, cachedForward.BoundaryHash);
+            if (guardOk)
+            {
+                var reused = FinishCappedClaude(filePath, info, cachedForward);
+                if (reused is not null)
+                {
+                    ClaudeForwardCacheHits++;
+                    _claudeForwardCache[filePath] = cachedForward with
+                    {
+                        VerifyCountdown = verifyFull
+                            ? FullForwardVerifyEvery
+                            : cachedForward.VerifyCountdown - 1,
+                    };
+                    return reused;
+                }
+            }
         }
 
         using var stream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
@@ -7176,6 +7361,7 @@ public sealed partial class ArchiveService
         var fwdSummary = summary;
         var fwdUpdated = updated;
         var forwardReadBytes = stream.Position;
+        var tailWindow = Array.Empty<byte>();
         if (hitLineCap)
         {
             var tail = ParseClaudeTail(filePath, info);
@@ -7183,13 +7369,15 @@ public sealed partial class ArchiveService
             {
                 messages = tail.messages;
                 codeBlocks = tail.codeBlocks;
+                tailWindow = tail.window;
                 if (!string.IsNullOrWhiteSpace(tail.cwd)) cwd = tail.cwd;
                 if (!string.IsNullOrWhiteSpace(tail.summary)) summary = tail.summary;
                 if (!string.IsNullOrWhiteSpace(tail.updated)) updated = tail.updated;
                 _claudeForwardCache[filePath] = new ClaudeCappedForward(
                     fwdCreated, fwdCwd, fwdSummary, fwdUpdated, forwardCustom, forwardAi,
                     totalClaude, firstUserClaude, titleSeed,
-                    info.CreationTimeUtc, forwardReadBytes, HashPrefix(filePath, forwardReadBytes));
+                    info.CreationTimeUtc, forwardReadBytes, HashPrefix(filePath, forwardReadBytes),
+                    HashBoundary(filePath, forwardReadBytes), FullForwardVerifyEvery);
                 ClaudeForwardCacheStores++;
             }
         }
@@ -7200,7 +7388,7 @@ public sealed partial class ArchiveService
         // end of the file, so its record is the latest one when it finds anything; what the forward pass
         // saw is the fallback for a name the tail window has scrolled past, which is what a chat renamed
         // while it was still running looks like.
-        var (tailCustom, tailAi) = ClaudeTailTitle(filePath);
+        var (tailCustom, tailAi) = ClaudeTailTitle(filePath, tailWindow);
         var customName = !string.IsNullOrWhiteSpace(tailCustom) ? tailCustom : forwardCustom;
         var aiName = UsableTitle(tailAi) ? tailAi! : forwardAi;
         var titleSource =
@@ -7242,58 +7430,133 @@ public sealed partial class ArchiveService
         };
     }
 
-    // Recent-message window for a Codex rollout that overflowed the head line-cap: read the FILE TAIL and
-    // rebuild the latest messages (event_msg turns + response_item tool steps), mirroring ParseClaudeTail.
-    // Meta (id/cwd/created/title) is still taken from the head pass; this only supplies the recent messages.
-    // Read only the last `maxBytes` of a transcript and return its complete lines, keeping at most the
-    // last `maxLines`. Both tail parsers used to do this as `byte[]` -> one whole-window `GetString` ->
-    // another whole-window `Replace("\r\n", "\n")` -> `Split('\n')` -> `Skip().ToList()`. On an 8 MB tail
-    // that is ~32 MB of large-object-heap garbage per parse, several times per sync cycle, when the only
-    // strings the parser actually needs are the individual lines. Splitting on the byte span allocates
-    // just the line strings - small, short-lived - plus one pooled buffer.
-    private static List<string> ReadTailLines(string path, int maxBytes, int maxLines)
+    // Recent-message window for a transcript that overflowed the head line-cap. Returns the last
+    // `maxLines` complete lines (capped to `maxBytes`), the raw bytes of that window, and the file offset
+    // just past it. A live transcript is appended to between cycles, so the caller passes the previous
+    // cycle's window back in and only the bytes appended since it ended are read - the tail cost is the
+    // append, not a fixed 8 MB. The window is kept on complete lines only, so a half-written final line is
+    // left for the next cycle rather than parsed as a truncated record. Splitting on the raw bytes (rather
+    // than a whole-window GetString + Replace + Split) is safe because '\n' is a single byte that can never
+    // appear inside a multi-byte UTF-8 sequence.
+    private static (List<string> Lines, byte[] Window, long EndOffset) ReadTailWindow(
+        string path,
+        byte[]? priorWindow,
+        long priorEnd,
+        int maxBytes,
+        int maxLines)
     {
-        var lines = new List<string>();
         using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-        var n = (int)Math.Min(fs.Length, maxBytes);
-        if (n <= 0) return lines;
-        var offset = fs.Length - n;
-        fs.Seek(offset, SeekOrigin.Begin);
-        var buffer = ArrayPool<byte>.Shared.Rent(n);
-        try
+        var length = fs.Length;
+        var hasPrior = priorWindow is not null && priorEnd >= 0 && priorEnd <= length;
+        var readStart = hasPrior ? priorEnd : Math.Max(0, length - maxBytes);
+        var toRead = (int)Math.Min(int.MaxValue, length - readStart);
+        byte[] delta;
+        if (toRead <= 0)
         {
+            delta = Array.Empty<byte>();
+        }
+        else
+        {
+            delta = new byte[toRead];
+            fs.Seek(readStart, SeekOrigin.Begin);
             var read = 0;
-            while (read < n)
+            while (read < toRead)
             {
-                var got = fs.Read(buffer, read, n - read);
+                var got = fs.Read(delta, read, toRead - read);
                 if (got <= 0) break;
                 read += got;
             }
-            PerfCounters.TranscriptBytesRead(read);
-            var span = buffer.AsSpan(0, read);
-            var start = 0;
-            for (var index = 0; index <= span.Length; index++)
+            if (read < toRead) Array.Resize(ref delta, read);
+        }
+        PerfCounters.TranscriptBytesRead(delta.Length);
+        Interlocked.Add(ref TailBytesRead, delta.Length);
+
+        long combinedStart;
+        byte[] combined;
+        if (hasPrior)
+        {
+            combinedStart = priorEnd - priorWindow!.Length;
+            combined = new byte[priorWindow.Length + delta.Length];
+            Buffer.BlockCopy(priorWindow, 0, combined, 0, priorWindow.Length);
+            Buffer.BlockCopy(delta, 0, combined, priorWindow.Length, delta.Length);
+        }
+        else
+        {
+            combinedStart = readStart;
+            combined = delta;
+        }
+
+        // Keep only complete lines, then the last maxLines (and maxBytes) of them.
+        var completeLength = Array.LastIndexOf(combined, (byte)'\n') + 1;
+        var start = 0;
+        // A cold window that began mid-file starts with a partial line; drop it before counting.
+        if (!hasPrior && readStart > 0)
+        {
+            var firstNewline = Array.IndexOf(combined, (byte)'\n');
+            if (firstNewline >= 0) start = firstNewline + 1;
+        }
+        if (completeLength > start)
+        {
+            var lineCount = 0;
+            for (var i = start; i < completeLength; i++)
+                if (combined[i] == (byte)'\n') lineCount++;
+            var drop = lineCount > maxLines ? lineCount - maxLines : 0;
+            for (var i = start; i < completeLength && drop > 0; i++)
             {
-                // '\n' is a single byte and can never be part of a multi-byte UTF-8 sequence, so splitting
-                // on the raw bytes is safe; the trailing '\r' of CRLF is trimmed off the decoded line.
-                if (index != span.Length && span[index] != (byte)'\n') continue;
-                var length = index - start;
-                if (length > 0 && span[start + length - 1] == (byte)'\r') length--;
-                lines.Add(Encoding.UTF8.GetString(span.Slice(start, length)));
-                start = index + 1;
+                if (combined[i] != (byte)'\n') continue;
+                start = i + 1;
+                drop--;
+            }
+            if (completeLength - start > maxBytes) start = completeLength - maxBytes;
+            // A byte cap can land mid-line; move the start to the next line boundary so the window never
+            // begins with a partial record.
+            if (start > 0 && combined[start - 1] != (byte)'\n')
+            {
+                while (start < completeLength && combined[start] != (byte)'\n') start++;
+                if (start < completeLength) start++;
             }
         }
-        finally
+        var windowLength = Math.Max(0, completeLength - start);
+        var window = new byte[windowLength];
+        Buffer.BlockCopy(combined, start, window, 0, windowLength);
+
+        var lines = new List<string>();
+        var lineStart = 0;
+        for (var index = 0; index < window.Length; index++)
         {
-            ArrayPool<byte>.Shared.Return(buffer);
+            if (window[index] != (byte)'\n') continue;
+            var lineLength = index - lineStart;
+            if (lineLength > 0 && window[lineStart + lineLength - 1] == (byte)'\r') lineLength--;
+            lines.Add(Encoding.UTF8.GetString(window, lineStart, lineLength));
+            lineStart = index + 1;
         }
-        // The first line is partial when the window began mid-file.
-        if (offset > 0 && lines.Count > 0) lines.RemoveAt(0);
-        if (lines.Count > maxLines) lines.RemoveRange(0, lines.Count - maxLines);
-        return lines;
+        return (lines, window, combinedStart + completeLength);
     }
 
-    private static (ObservableCollection<ArchiveMessage> messages, ObservableCollection<CodeBlock> codeBlocks, string cwd, string updated)
+    // Read a tail window, reusing the previous cycle's window when the file only grew (same creation time,
+    // length not shrunk, and the bytes at the window's edge unchanged). That turns the per-cycle tail cost
+    // from a fixed 8 MB into just the appended bytes.
+    private (List<string> Lines, byte[] Window, long EndOffset) ReadCachedTailWindow(
+        string path, FileInfo info, int maxBytes)
+    {
+        byte[]? prior = null;
+        var priorEnd = -1L;
+        if (_tailWindowCache.TryGetValue(path, out var cached)
+            && cached.CreationUtc == info.CreationTimeUtc
+            && info.Length >= cached.EndOffset
+            && BoundaryMatches(path, cached.EndOffset, cached.Boundary))
+        {
+            prior = cached.Window;
+            priorEnd = cached.EndOffset;
+            Interlocked.Increment(ref TailWindowCacheHits);
+        }
+        var result = ReadTailWindow(path, prior, priorEnd, maxBytes, MaxLinesPerSession);
+        _tailWindowCache[path] = new TailWindowCache(
+            info.CreationTimeUtc, result.EndOffset, result.Window, HashBoundary(path, result.EndOffset));
+        return result;
+    }
+
+    private (ObservableCollection<ArchiveMessage> messages, ObservableCollection<CodeBlock> codeBlocks, string cwd, string updated)
         ParseCodexTail(string path, FileInfo info)
     {
         var messages = new ObservableCollection<ArchiveMessage>();
@@ -7309,7 +7572,7 @@ public sealed partial class ArchiveService
 
         try
         {
-            var usable = ReadTailLines(path, CodexTailBytes, MaxLinesPerSession);
+            var (usable, _, _) = ReadCachedTailWindow(path, info, CodexTailBytes);
 
             foreach (var line in usable)
             {
@@ -7380,7 +7643,7 @@ public sealed partial class ArchiveService
         return (messages, codeBlocks, cwd, updated);
     }
 
-    private static (ObservableCollection<ArchiveMessage> messages, ObservableCollection<CodeBlock> codeBlocks, string cwd, string summary, string updated)
+    private (ObservableCollection<ArchiveMessage> messages, ObservableCollection<CodeBlock> codeBlocks, string cwd, string summary, string updated, byte[] window)
         ParseClaudeTail(string path, FileInfo info)
     {
         var messages = new ObservableCollection<ArchiveMessage>();
@@ -7390,10 +7653,12 @@ public sealed partial class ArchiveService
         var cwd = "";
         var summary = "";
         var updated = info.LastWriteTimeUtc.ToString("O");
+        var window = Array.Empty<byte>();
 
         try
         {
-            var usable = ReadTailLines(path, ClaudeTailBytes, MaxLinesPerSession);
+            var (usable, readWindow, _) = ReadCachedTailWindow(path, info, ClaudeTailBytes);
+            window = readWindow;
 
             foreach (var line in usable)
             {
@@ -7433,7 +7698,7 @@ public sealed partial class ArchiveService
             // Tail parsing is best-effort; the head parse remains usable if this fails.
         }
 
-        return (messages, codeBlocks, cwd, summary, updated);
+        return (messages, codeBlocks, cwd, summary, updated, window);
     }
 
     // Claude message.content is usually an array of typed blocks; keep the readable text ones.
@@ -7616,21 +7881,32 @@ public sealed partial class ArchiveService
                 new ObservableCollection<CodeBlock>(keep.SelectMany(m => m.CodeBlocks)));
     }
 
-    // Read the last 96KB of a Claude transcript for the latest custom-title / ai-title record. Renames
-    // are appended at the file TAIL (often far past the message window), so the forward parse misses
-    // them; this is how the reader and list show the real session name instead of the first prompt.
-    private static (string? custom, string? ai) ClaudeTailTitle(string path)
+    // The latest custom-title / ai-title record in a Claude transcript. Renames are appended at the file
+    // TAIL (often far past the message window), so the forward parse misses them; this is how the reader
+    // and list show the real session name instead of the first prompt. When the tail window is already in
+    // hand it is scanned directly - it reaches further back than the old fixed 96KB read and costs no I/O;
+    // only a caller without a window falls back to reading the last 96KB.
+    private static (string? custom, string? ai) ClaudeTailTitle(string path, byte[]? window)
     {
         try
         {
-            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-            var n = (int)Math.Min(fs.Length, 96 * 1024);
-            if (n <= 0) return (null, null);
-            fs.Seek(-n, SeekOrigin.End);
-            var buf = new byte[n];
-            var read = fs.Read(buf, 0, n);
+            byte[] buf;
+            if (window is { Length: > 0 })
+            {
+                buf = window;
+            }
+            else
+            {
+                using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+                var n = (int)Math.Min(fs.Length, 96 * 1024);
+                if (n <= 0) return (null, null);
+                fs.Seek(-n, SeekOrigin.End);
+                buf = new byte[n];
+                var read = fs.Read(buf, 0, n);
+                if (read < n) Array.Resize(ref buf, read);
+            }
             string? custom = null, ai = null;
-            foreach (var line in Encoding.UTF8.GetString(buf, 0, read).Split('\n'))
+            foreach (var line in Encoding.UTF8.GetString(buf).Split('\n'))
             {
                 if (line.IndexOf("Title", StringComparison.Ordinal) < 0) continue;
                 try

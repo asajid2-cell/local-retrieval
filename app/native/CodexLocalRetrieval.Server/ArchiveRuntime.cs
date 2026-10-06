@@ -51,6 +51,18 @@ public sealed class ArchiveRuntime
     // behind it almost permanently. A remote list reader tolerates a few seconds of staleness.
     private static readonly TimeSpan RefreshCoalesceWindow = TimeSpan.FromSeconds(10);
 
+    // Reconciliation beat. Every ordinary sync now narrows to the paths the watcher reported, so a file the
+    // watcher missed (a rename it did not observe, a root that went briefly unreachable, a delete during a
+    // gap) would otherwise never be picked up. This forces one full walk on a slow cadence; the walk's own
+    // stamp skip means it re-parses nothing that did not change.
+    private static readonly TimeSpan ReconcileInterval = TimeSpan.FromMinutes(30);
+    private Timer? _reconcileTimer;
+    private int _reconcileStarted;
+
+    // Test seam: the reconciliation cadence is 30 minutes in production, far too long for a test to wait
+    // on. Set before the first load; the timer is created once, from this value.
+    internal TimeSpan ReconcileIntervalOverride { get; set; } = ReconcileInterval;
+
     // Test seam, same shape as ArchiveService.SavePhaseMeasured. It exists so a test can park a sync
     // mid-walk and assert that a concurrent read is NOT queued behind it -- the exact regression that
     // put a 22-second disk walk inside the gate every remote read needs.
@@ -139,6 +151,18 @@ public sealed class ArchiveRuntime
         }
     }
 
+    // Start the reconciliation beat once, on the first successful load. It only ever marks a full refresh
+    // pending, which is the same cheap flag the watcher sets, so it can never itself hold the gate.
+    private void EnsureReconcileTimer()
+    {
+        if (Interlocked.CompareExchange(ref _reconcileStarted, 1, 0) != 0) return;
+        _reconcileTimer = new Timer(
+            _ => MarkRefreshPending(),
+            null,
+            ReconcileIntervalOverride,
+            ReconcileIntervalOverride);
+    }
+
     private void SchedulePendingRefresh()
     {
         if (Interlocked.CompareExchange(ref _refreshWorkerActive, 1, 0) != 0) return;
@@ -176,6 +200,7 @@ public sealed class ArchiveRuntime
     public void Dispose()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+        _reconcileTimer?.Dispose();
         lock (_watchGate)
         {
             foreach (var watch in _sourceWatches) watch.Registration.Dispose();
@@ -311,6 +336,7 @@ public sealed class ArchiveRuntime
             await _archive.LoadCachedAsync(cancellationToken);
             Volatile.Write(ref _loaded, 1);
             Volatile.Write(ref _sessionCount, _archive.Store.Sessions.Count);
+            EnsureReconcileTimer();
             _log?.Invoke($"archive loaded from cache on demand: {_archive.Store.Sessions.Count} chats");
             if (_syncOnLoad)
             {
@@ -326,6 +352,7 @@ public sealed class ArchiveRuntime
         await _archive.LoadAsync(cancellationToken);
         Volatile.Write(ref _loaded, 1);
         Volatile.Write(ref _sessionCount, _archive.Store.Sessions.Count);
+        EnsureReconcileTimer();
         _log?.Invoke($"archive loaded on demand: {_archive.Store.Sessions.Count} chats");
         return _syncOnLoad;
     }

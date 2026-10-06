@@ -50,12 +50,24 @@ internal sealed partial class TranscriptSearchIndex : IDisposable
         IReadOnlyCollection<ArchiveSession> sessions,
         IReadOnlyList<SessionSource> sources,
         IProgress<TranscriptSearchIndexStatus>? progress = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        IReadOnlyCollection<string>? changedPaths = null,
+        bool forceFullScan = false)
     {
         await _syncGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         var stopwatch = Stopwatch.StartNew();
         try
         {
+            // A null path set means "walk everything" (startup, overflow, the reconciliation beat). A
+            // non-null set is the watcher's dirty list: only those files are looked at, so the full
+            // EnumerateTranscriptFiles walk -- every source tree -- runs on the full passes alone.
+            var full = forceFullScan || changedPaths is null;
+            if (!full && changedPaths!.Count == 0)
+            {
+                // No change reported: no enumeration, no transaction, no write at all.
+                return new TranscriptSearchSyncResult(0, 0, 0, 0, 0, stopwatch.Elapsed);
+            }
+
             Directory.CreateDirectory(Path.GetDirectoryName(_dbPath)!);
             using var connection = OpenConnection();
             Initialize(connection);
@@ -69,31 +81,67 @@ internal sealed partial class TranscriptSearchIndex : IDisposable
                     group => group.Key,
                     group => group.First(),
                     StringComparer.OrdinalIgnoreCase);
-            var files = EnumerateTranscriptFiles(sources, known)
+
+            var enumWatch = Stopwatch.StartNew();
+            var files = (full
+                    ? EnumerateTranscriptFiles(sources, known)
+                    : BuildTranscriptFiles(changedPaths!, sources, known))
                 .OrderByDescending(file => file.LastWriteTicks)
                 .ThenBy(file => file.Path, StringComparer.OrdinalIgnoreCase)
                 .ToList();
-            var totalBytes = files.Sum(file => file.Length);
+            var enumMs = enumWatch.ElapsedMilliseconds;
+
+            var statesWatch = Stopwatch.StartNew();
+            var states = LoadFileStates(connection);
+            var statesMs = statesWatch.ElapsedMilliseconds;
+
+            // A full pass knows the totals from its walk; an incremental pass reads the row counts so the
+            // coverage it reports still describes the whole index rather than only the files it touched.
+            int totalFiles;
+            long totalBytes;
+            if (full)
+            {
+                totalFiles = files.Count;
+                totalBytes = files.Sum(file => file.Length);
+            }
+            else
+            {
+                (totalFiles, totalBytes) = ReadIndexTotals(connection);
+            }
             SetStatus(new TranscriptSearchIndexStatus(
                 true,
                 false,
                 0,
-                files.Count,
+                totalFiles,
                 0,
                 totalBytes,
                 "",
                 "",
                 DateTimeOffset.UtcNow), progress);
 
-            var states = LoadFileStates(connection);
-            RegisterPendingFiles(connection, files, states);
-            RemoveMissingFiles(connection, files, states);
+            // ONE transaction for a dirty-set pass: the metadata rows and every appended turn commit
+            // together, so a cycle costs one WAL flush instead of one per file. A full pass leaves it null
+            // so each file commits on its own (see IndexFile) and no single transaction spans the whole index.
+            using var batch = full ? null : connection.BeginTransaction();
+
+            var registerWatch = Stopwatch.StartNew();
+            RegisterPendingFiles(connection, batch, files, states);
+            var registerMs = registerWatch.ElapsedMilliseconds;
+
+            var removeMs = 0L;
+            if (full)
+            {
+                var removeWatch = Stopwatch.StartNew();
+                RemoveMissingFiles(connection, files, states);
+                removeMs = removeWatch.ElapsedMilliseconds;
+            }
 
             var indexedFiles = 0;
             var indexedBytes = 0L;
             var rebuilt = 0;
             var appended = 0;
             var unchanged = 0;
+            var indexWatch = Stopwatch.StartNew();
             foreach (var file in files)
             {
                 cancellationToken.ThrowIfCancellationRequested();
@@ -118,6 +166,7 @@ internal sealed partial class TranscriptSearchIndex : IDisposable
                 var startOffset = append ? state!.IndexedLength : 0;
                 var outcome = IndexFile(
                     connection,
+                    batch,
                     file,
                     startOffset,
                     rebuild: !append,
@@ -127,13 +176,20 @@ internal sealed partial class TranscriptSearchIndex : IDisposable
                 indexedFiles++;
                 indexedBytes += outcome.IndexedLength;
             }
+            batch?.Commit();
+            var indexMs = indexWatch.ElapsedMilliseconds;
+
+            // WAL housekeeping after the write, never inside it: a PASSIVE checkpoint folds what it can
+            // into the main DB and returns at once, and journal_size_limit truncates the log file back to
+            // its bound, so a burst of writes cannot leave a multi-hundred-MB WAL behind.
+            TryCheckpoint(connection);
 
             var complete = indexedFiles == files.Count;
             var finalStatus = new TranscriptSearchIndexStatus(
                 false,
                 complete,
                 indexedFiles,
-                files.Count,
+                totalFiles,
                 indexedBytes,
                 totalBytes,
                 "",
@@ -141,6 +197,11 @@ internal sealed partial class TranscriptSearchIndex : IDisposable
                 DateTimeOffset.UtcNow);
             SetStatus(finalStatus, progress);
             stopwatch.Stop();
+            PerfCounters.Trace?.Invoke(
+                $"index sync full={full} files={files.Count} appended={appended} rebuilt={rebuilt}"
+                + $" unchanged={unchanged} enumMs={enumMs} statesMs={statesMs} registerMs={registerMs}"
+                + $" removeMs={removeMs} indexMs={indexMs} totalMs={stopwatch.ElapsedMilliseconds}"
+                + $" wal={WalBytes():F0}MB");
             return new TranscriptSearchSyncResult(
                 indexedFiles,
                 rebuilt,
@@ -482,69 +543,81 @@ internal sealed partial class TranscriptSearchIndex : IDisposable
 
     private FileIndexOutcome IndexFile(
         SqliteConnection connection,
+        SqliteTransaction? batch,
         TranscriptFile file,
         long startOffset,
         bool rebuild,
         CancellationToken cancellationToken)
     {
-        using var transaction = connection.BeginTransaction();
-        if (rebuild) DeleteFileTurns(connection, transaction, file.Path);
-        var nextOrdinal = rebuild ? 0 : NextTurnOrdinal(connection, transaction, file.Path);
-        var sessionId = file.SessionId;
-        var title = file.Title;
-        var lastCompleteOffset = startOffset;
-        var inserted = 0;
-        using var stream = OpenTranscript(file.Path);
-        var snapshotLength = stream.Length;
-        var includeFinalLine = DateTime.UtcNow - new DateTime(file.LastWriteTicks, DateTimeKind.Utc)
-            > LiveFileWindow;
-        foreach (var line in ReadLines(
-                     stream,
-                     startOffset,
-                     snapshotLength,
-                     includeFinalLine))
+        // The append path passes one transaction for the whole cycle (one commit, one WAL flush). A full
+        // rebuild -- which can touch every transcript -- passes null so each file commits on its own and a
+        // single transaction never grows to the size of the entire index.
+        var owns = batch is null;
+        var transaction = batch ?? connection.BeginTransaction();
+        try
         {
-            cancellationToken.ThrowIfCancellationRequested();
-            var metadata = ExtractMetadata(line.Bytes, file.Tool);
-            if (!string.IsNullOrWhiteSpace(metadata.SessionId)) sessionId = metadata.SessionId;
-            if (title == file.DefaultTitle
-                && !string.IsNullOrWhiteSpace(metadata.Title))
-                title = metadata.Title;
-            var turns = ExtractTurns(line.Bytes, file.Tool);
-            for (var blockOrdinal = 0; blockOrdinal < turns.Count; blockOrdinal++)
+            if (rebuild) DeleteFileTurns(connection, transaction, file.Path);
+            var nextOrdinal = rebuild ? 0 : NextTurnOrdinal(connection, transaction, file.Path);
+            var sessionId = file.SessionId;
+            var title = file.Title;
+            var lastCompleteOffset = startOffset;
+            var inserted = 0;
+            using var stream = OpenTranscript(file.Path);
+            var snapshotLength = stream.Length;
+            var includeFinalLine = DateTime.UtcNow - new DateTime(file.LastWriteTicks, DateTimeKind.Utc)
+                > LiveFileWindow;
+            foreach (var line in ReadLines(
+                         stream,
+                         startOffset,
+                         snapshotLength,
+                         includeFinalLine))
             {
-                var turn = turns[blockOrdinal];
-                if (string.IsNullOrWhiteSpace(turn.Text)) continue;
-                InsertTurn(
-                    connection,
-                    transaction,
-                    sessionId,
-                    file.Path,
-                    line.Start,
-                    line.ContentLength,
-                    blockOrdinal,
-                    nextOrdinal++,
-                    turn);
-                inserted++;
-                if (title == file.DefaultTitle && turn.Role == "user")
-                    title = TitleFromText(turn.Text, file.DefaultTitle);
+                cancellationToken.ThrowIfCancellationRequested();
+                var metadata = ExtractMetadata(line.Bytes, file.Tool);
+                if (!string.IsNullOrWhiteSpace(metadata.SessionId)) sessionId = metadata.SessionId;
+                if (title == file.DefaultTitle
+                    && !string.IsNullOrWhiteSpace(metadata.Title))
+                    title = metadata.Title;
+                var turns = ExtractTurns(line.Bytes, file.Tool);
+                for (var blockOrdinal = 0; blockOrdinal < turns.Count; blockOrdinal++)
+                {
+                    var turn = turns[blockOrdinal];
+                    if (string.IsNullOrWhiteSpace(turn.Text)) continue;
+                    InsertTurn(
+                        connection,
+                        transaction,
+                        sessionId,
+                        file.Path,
+                        line.Start,
+                        line.ContentLength,
+                        blockOrdinal,
+                        nextOrdinal++,
+                        turn);
+                    inserted++;
+                    if (title == file.DefaultTitle && turn.Role == "user")
+                        title = TitleFromText(turn.Text, file.DefaultTitle);
+                }
+                if (line.Complete) lastCompleteOffset = line.End;
             }
-            if (line.Complete) lastCompleteOffset = line.End;
-        }
 
-        var tailHash = ComputeTailHash(file.Path, lastCompleteOffset);
-        UpsertFileState(
-            connection,
-            transaction,
-            file,
-            sessionId,
-            title,
-            lastCompleteOffset,
-            snapshotLength,
-            tailHash,
-            complete: lastCompleteOffset >= snapshotLength);
-        transaction.Commit();
-        return new FileIndexOutcome(lastCompleteOffset, inserted);
+            var tailHash = ComputeTailHash(file.Path, lastCompleteOffset);
+            UpsertFileState(
+                connection,
+                transaction,
+                file,
+                sessionId,
+                title,
+                lastCompleteOffset,
+                snapshotLength,
+                tailHash,
+                complete: lastCompleteOffset >= snapshotLength);
+            if (owns) transaction.Commit();
+            return new FileIndexOutcome(lastCompleteOffset, inserted);
+        }
+        finally
+        {
+            if (owns) transaction.Dispose();
+        }
     }
 
     private static void InsertTurn(
@@ -1043,30 +1116,8 @@ internal sealed partial class TranscriptSearchIndex : IDisposable
                 try
                 {
                     var full = FullPath(path);
-                    if (full.Contains(
-                            $"{Path.DirectorySeparatorChar}subagents{Path.DirectorySeparatorChar}",
-                            StringComparison.OrdinalIgnoreCase)
-                        || string.Equals(
-                            Path.GetFileName(full),
-                            "journal.jsonl",
-                            StringComparison.OrdinalIgnoreCase))
-                        continue;
-                    var info = new FileInfo(full);
-                    known.TryGetValue(full, out var session);
-                    var tool = session?.Tool;
-                    if (string.IsNullOrWhiteSpace(tool)) tool = source.Tool;
-                    if (string.IsNullOrWhiteSpace(tool) || tool == "auto")
-                        tool = ToolFromPath(full);
-                    var defaultTitle = Path.GetFileNameWithoutExtension(full);
-                    files[full] = new TranscriptFile(
-                        full,
-                        session?.Id ?? IdFromPath(full, tool),
-                        session?.DisplayTitle ?? defaultTitle,
-                        defaultTitle,
-                        tool.ToLowerInvariant(),
-                        info.Length,
-                        info.LastWriteTimeUtc.Ticks,
-                        info.LastWriteTimeUtc.ToString("O"));
+                    var file = BuildTranscriptFile(full, source, known);
+                    if (file is not null) files[full] = file;
                 }
                 catch
                 {
@@ -1074,6 +1125,84 @@ internal sealed partial class TranscriptSearchIndex : IDisposable
             }
         }
         return files.Values.ToList();
+    }
+
+    // The same file construction the full walk uses, for one explicit path. Returns null for the Claude
+    // workflow/subagent journals that collide on the filename "journal" and are not chats.
+    private static TranscriptFile? BuildTranscriptFile(
+        string full,
+        SessionSource source,
+        IReadOnlyDictionary<string, ArchiveSession> known)
+    {
+        if (full.Contains(
+                $"{Path.DirectorySeparatorChar}subagents{Path.DirectorySeparatorChar}",
+                StringComparison.OrdinalIgnoreCase)
+            || string.Equals(
+                Path.GetFileName(full),
+                "journal.jsonl",
+                StringComparison.OrdinalIgnoreCase))
+            return null;
+        var info = new FileInfo(full);
+        known.TryGetValue(full, out var session);
+        var tool = session?.Tool;
+        if (string.IsNullOrWhiteSpace(tool)) tool = source.Tool;
+        if (string.IsNullOrWhiteSpace(tool) || tool == "auto")
+            tool = ToolFromPath(full);
+        var defaultTitle = Path.GetFileNameWithoutExtension(full);
+        return new TranscriptFile(
+            full,
+            session?.Id ?? IdFromPath(full, tool),
+            session?.DisplayTitle ?? defaultTitle,
+            defaultTitle,
+            tool.ToLowerInvariant(),
+            info.Length,
+            info.LastWriteTimeUtc.Ticks,
+            info.LastWriteTimeUtc.ToString("O"));
+    }
+
+    // The dirty-set entry point: build the file list from the paths the watcher reported instead of a
+    // directory walk. The tool is resolved from the owning source (longest-root match), exactly as the
+    // walk would, so an explicit path indexes identically to one found by enumeration.
+    private static IReadOnlyList<TranscriptFile> BuildTranscriptFiles(
+        IReadOnlyCollection<string> paths,
+        IReadOnlyList<SessionSource> sources,
+        IReadOnlyDictionary<string, ArchiveSession> known)
+    {
+        var files = new Dictionary<string, TranscriptFile>(StringComparer.OrdinalIgnoreCase);
+        foreach (var path in paths)
+        {
+            try
+            {
+                var full = FullPath(path);
+                var source = SourceForPath(sources, full);
+                if (source is null) continue;
+                var file = BuildTranscriptFile(full, source, known);
+                if (file is not null) files[full] = file;
+            }
+            catch
+            {
+            }
+        }
+        return files.Values.ToList();
+    }
+
+    // Longest-root match, so a nested source (an account sessions dir inside the codex home) wins over its
+    // parent and the file is indexed with the tool that owns it.
+    private static SessionSource? SourceForPath(IReadOnlyList<SessionSource> sources, string path)
+    {
+        SessionSource? best = null;
+        var bestLength = -1;
+        foreach (var source in sources)
+        {
+            if (!source.Enabled || string.IsNullOrWhiteSpace(source.Root)) continue;
+            var root = source.Root.TrimEnd('\\', '/');
+            if (root.Length == 0 || path.Length <= root.Length || bestLength >= root.Length) continue;
+            if (path[root.Length] is not ('\\' or '/')) continue;
+            if (!path.StartsWith(root, StringComparison.OrdinalIgnoreCase)) continue;
+            best = source;
+            bestLength = root.Length;
+        }
+        return best;
     }
 
     private static string IdFromPath(string path, string tool)
@@ -1119,8 +1248,42 @@ internal sealed partial class TranscriptSearchIndex : IDisposable
             Execute(connection, "PRAGMA temp_store=MEMORY;");
             Execute(connection, "PRAGMA cache_size=-65536;");
             Execute(connection, "PRAGMA mmap_size=268435456;");
+            // Keep the write-ahead log bounded: auto-checkpoint every ~4 MB of frames, and cap the log
+            // file at 64 MB so a checkpoint truncates it back rather than leaving it at its high-water mark.
+            Execute(connection, "PRAGMA wal_autocheckpoint=1000;");
+            Execute(connection, "PRAGMA journal_size_limit=67108864;");
         }
         return connection;
+    }
+
+    // Fold the WAL back into the main DB without ever blocking: PASSIVE checkpoints whatever is not held
+    // by a reader and returns immediately, and journal_size_limit then truncates the log file. Run after
+    // a write pass, off the request path.
+    private static void TryCheckpoint(SqliteConnection connection)
+    {
+        try { Execute(connection, "PRAGMA wal_checkpoint(PASSIVE);"); }
+        catch { }
+    }
+
+    // Size of the write-ahead log file, for the sync trace. Zero when it has been folded and removed.
+    private double WalBytes()
+    {
+        try
+        {
+            var info = new FileInfo(_dbPath + "-wal");
+            return info.Exists ? info.Length / 1048576.0 : 0;
+        }
+        catch { return 0; }
+    }
+
+    private static (int Files, long Bytes) ReadIndexTotals(SqliteConnection connection)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = "SELECT COUNT(*), COALESCE(SUM(observed_length), 0) FROM files;";
+        using var reader = command.ExecuteReader();
+        return reader.Read()
+            ? ((int)reader.GetInt64(0), reader.GetInt64(1))
+            : (0, 0L);
     }
 
     private static void Initialize(SqliteConnection connection)
@@ -1168,10 +1331,13 @@ internal sealed partial class TranscriptSearchIndex : IDisposable
             );
             """);
         using var command = connection.CreateCommand();
+        // Conditional upsert: on every sync but the first the version already matches, and the WHERE keeps
+        // the statement from writing a row (and so a WAL frame) just because the sync ran.
         command.CommandText = """
             INSERT INTO meta(key, value)
             VALUES('schema_version', $version)
-            ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            WHERE meta.value <> excluded.value;
             """;
         command.Parameters.AddWithValue("$version", SchemaVersion.ToString(CultureInfo.InvariantCulture));
         command.ExecuteNonQuery();
@@ -1184,7 +1350,12 @@ internal sealed partial class TranscriptSearchIndex : IDisposable
         command.CommandText = """
             SELECT
                 source_path,
+                session_id,
+                title,
+                tool,
+                updated_at,
                 last_write_ticks,
+                observed_last_write_ticks,
                 indexed_length,
                 observed_length,
                 tail_hash,
@@ -1196,78 +1367,104 @@ internal sealed partial class TranscriptSearchIndex : IDisposable
         while (reader.Read())
         {
             states[reader.GetString(0)] = new FileState(
-                reader.GetInt64(1),
-                reader.GetInt64(2),
-                reader.GetInt64(3),
+                reader.GetString(1),
+                reader.GetString(2),
+                reader.GetString(3),
                 reader.GetString(4),
-                reader.GetInt32(5),
-                reader.GetInt32(6) != 0);
+                reader.GetInt64(5),
+                reader.GetInt64(6),
+                reader.GetInt64(7),
+                reader.GetInt64(8),
+                reader.GetString(9),
+                reader.GetInt32(10),
+                reader.GetInt32(11) != 0);
         }
         return states;
     }
 
     private static void RegisterPendingFiles(
         SqliteConnection connection,
+        SqliteTransaction? batch,
         IReadOnlyList<TranscriptFile> files,
         IReadOnlyDictionary<string, FileState> states)
     {
-        using var transaction = connection.BeginTransaction();
-        foreach (var file in files)
+        var owns = batch is null;
+        var transaction = batch ?? connection.BeginTransaction();
+        try
         {
-            if (states.ContainsKey(file.Path))
+            foreach (var file in files)
             {
-                using var update = connection.CreateCommand();
-                update.Transaction = transaction;
-                update.CommandText = """
-                    UPDATE files
-                    SET
-                        session_id = $session,
-                        title = $title,
-                        tool = $tool,
-                        updated_at = $updated,
-                        observed_last_write_ticks = $ticks,
-                        observed_length = $length
-                    WHERE source_path = $path;
+                if (states.TryGetValue(file.Path, out var state))
+                {
+                    // The observed stamp and the display metadata are the only things this pass can change,
+                    // and a file that did not move has neither. Skipping the write is what keeps the DB's
+                    // mtime (and the WAL) still on a cycle where nothing changed.
+                    if (state.ObservedLastWriteTicks == file.LastWriteTicks
+                        && state.ObservedLength == file.Length
+                        && string.Equals(state.SessionId, file.SessionId, StringComparison.Ordinal)
+                        && string.Equals(state.Title, file.Title, StringComparison.Ordinal)
+                        && string.Equals(state.Tool, file.Tool, StringComparison.Ordinal)
+                        && string.Equals(state.UpdatedAt, file.UpdatedAt, StringComparison.Ordinal))
+                    {
+                        continue;
+                    }
+                    using var update = connection.CreateCommand();
+                    update.Transaction = transaction;
+                    update.CommandText = """
+                        UPDATE files
+                        SET
+                            session_id = $session,
+                            title = $title,
+                            tool = $tool,
+                            updated_at = $updated,
+                            observed_last_write_ticks = $ticks,
+                            observed_length = $length
+                        WHERE source_path = $path;
+                        """;
+                    BindFile(update, file);
+                    update.ExecuteNonQuery();
+                    continue;
+                }
+                using var insert = connection.CreateCommand();
+                insert.Transaction = transaction;
+                insert.CommandText = """
+                    INSERT INTO files(
+                        source_path,
+                        session_id,
+                        title,
+                        tool,
+                        updated_at,
+                        last_write_ticks,
+                        observed_last_write_ticks,
+                        indexed_length,
+                        observed_length,
+                        tail_hash,
+                        index_version,
+                        complete)
+                    VALUES(
+                        $path,
+                        $session,
+                        $title,
+                        $tool,
+                        $updated,
+                        0,
+                        $ticks,
+                        0,
+                        $length,
+                        '',
+                        $version,
+                        0);
                     """;
-                BindFile(update, file);
-                update.ExecuteNonQuery();
-                continue;
+                BindFile(insert, file);
+                insert.Parameters.AddWithValue("$version", SchemaVersion);
+                insert.ExecuteNonQuery();
             }
-            using var insert = connection.CreateCommand();
-            insert.Transaction = transaction;
-            insert.CommandText = """
-                INSERT INTO files(
-                    source_path,
-                    session_id,
-                    title,
-                    tool,
-                    updated_at,
-                    last_write_ticks,
-                    observed_last_write_ticks,
-                    indexed_length,
-                    observed_length,
-                    tail_hash,
-                    index_version,
-                    complete)
-                VALUES(
-                    $path,
-                    $session,
-                    $title,
-                    $tool,
-                    $updated,
-                    0,
-                    $ticks,
-                    0,
-                    $length,
-                    '',
-                    $version,
-                    0);
-                """;
-            BindFile(insert, file);
-            insert.Parameters.AddWithValue("$version", SchemaVersion);
-            insert.ExecuteNonQuery();
+            if (owns) transaction.Commit();
         }
-        transaction.Commit();
+        finally
+        {
+            if (owns) transaction.Dispose();
+        }
     }
 
     private static void RemoveMissingFiles(
@@ -1432,7 +1629,12 @@ internal sealed partial class TranscriptSearchIndex : IDisposable
         string UpdatedAt);
 
     private sealed record FileState(
+        string SessionId,
+        string Title,
+        string Tool,
+        string UpdatedAt,
         long LastWriteTicks,
+        long ObservedLastWriteTicks,
         long IndexedLength,
         long ObservedLength,
         string TailHash,

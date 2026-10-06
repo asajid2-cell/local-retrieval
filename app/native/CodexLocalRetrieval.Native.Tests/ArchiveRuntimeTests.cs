@@ -259,6 +259,37 @@ public sealed class ArchiveRuntimeTests
     }
 
     [TestMethod]
+    public async Task ReconciliationBeat_ForcesAFullScanWithoutAWatcherEvent()
+    {
+        // The watcher's dirty set narrows every ordinary sync, so a file it never reported would only be
+        // found by the reconciliation walk. This proves that beat actually fires and drives a scan on its
+        // own -- the interval is a test override; production uses 30 minutes.
+        using var fixture = new RuntimeFixture();
+        var runtime = new ArchiveRuntime(fixture.Archive, syncOnLoad: true)
+        {
+            ReconcileIntervalOverride = TimeSpan.FromMilliseconds(200),
+        };
+        var scanSeen = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        try
+        {
+            // Warm first: the cold load runs its own refresh before the hook is installed, so the scan
+            // below can only be the timer's.
+            await runtime.UseAsync((archive, _) => Task.FromResult(archive.Store.Sessions.Count));
+            runtime.SyncScanHook = _ =>
+            {
+                scanSeen.TrySetResult();
+                return Task.CompletedTask;
+            };
+
+            await scanSeen.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        }
+        finally
+        {
+            runtime.Dispose();
+        }
+    }
+
+    [TestMethod]
     public async Task TryUnloadIfIdleAsync_WaitsForActiveArchiveOperation()
     {
         using var store = new TempStore();
