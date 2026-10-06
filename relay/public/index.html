@@ -2652,12 +2652,14 @@ term.onData(d => {
     sendMouseInput(d);
     return;
   }
-  // R7: the app's own focus reports (?1004). Forward them on the app-input seam, but NOT through the typing
-  // path below — a blur report during a drag must never read as a keystroke. When ?1004 is off, xterm emits
-  // none; if one still appears it falls through to the terminal-report strip and is dropped as before.
+  // R7: the app's own focus reports (?1004). Forward them on the signed input seam, but NOT through the
+  // typing path below — a blur report during a drag must never read as a keystroke. When ?1004 is off,
+  // xterm emits none; if one still appears it falls through to the terminal-report strip and is dropped
+  // as before. A focus report is terminal-generated app-bound input, the same class as a click report, so
+  // it leaves through sendMouseInput like they do.
   if(mouseGuard.focusReporting()){
     const f = extractFocusReports(d);
-    if(f.focus){ markActive(); send('i', f.focus); }
+    if(f.focus){ markActive(); sendMouseInput(f.focus); }
     d = f.rest;
     if(!d) return;
   }
