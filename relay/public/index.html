@@ -1542,7 +1542,7 @@ function reloadTerminal(quiet){
   connect(name, true);   // re-attach: CLEAR + scrollback replay + live, all client state reset
 }
 document.addEventListener('keydown', e=>{ if(e.ctrlKey && e.altKey && (e.key==='r'||e.key==='R')){ e.preventDefault(); e.stopPropagation(); reloadTerminal(); } }, true);
-window.__muxBuild='2026-10-05-webgl-paint-detector-and-paused-overlay';   // bump per web deploy so a loaded version is verifiable
+window.__muxBuild='2026-10-05-focus-report-passthrough';   // bump per web deploy so a loaded version is verifiable
 try{ console.info('multiplex build', window.__muxBuild); }catch(e){}
 const helper = $('#term').querySelector('.xterm-helper-textarea');
 function hardenHelperTextarea(){
@@ -2312,6 +2312,23 @@ function takeTerminalReport(s, at){
   }
   return 0;
 }
+// R7: focus in/out reports (CSI I / CSI O). xterm emits these through onData ONLY when the app enabled
+// DECSET 1004 (its sendFocus flag) — so their very presence means the app asked for them, and they are the
+// app's, not ours to swallow. They leave on the app-input seam (see term.onData), never through the typing
+// path: a blur report fires during a mouse drag and reading it as a keystroke is what used to wipe every
+// fresh selection. Returns the focus reports found and the string with them removed.
+function extractFocusReports(s){
+  if(!s || s.indexOf('\x1b') < 0) return { focus:'', rest:s || '' };
+  let focus = '', rest = '', i = 0;
+  while(i < s.length){
+    const esc = s.indexOf('\x1b', i);
+    if(esc < 0){ rest += s.slice(i); break; }
+    if(esc > i) rest += s.slice(i, esc);
+    if(s[esc+1] === '[' && (s[esc+2] === 'I' || s[esc+2] === 'O')){ focus += s.slice(esc, esc+3); i = esc+3; }
+    else { rest += s[esc]; i = esc+1; }
+  }
+  return { focus, rest };
+}
 function stripTerminalGeneratedReports(s){
   if(!s) return { out:s||'', dropped:false };
   let esc = s.indexOf('\x1b');
@@ -2468,6 +2485,10 @@ function createMouseGuard(){
   // nothing — while the wheel keeps working. That divergence ("scroll works, selection won't at all") is
   // why the forced-selection gesture gates on this and not on inputAllowed().
   let xtermModes = Object.create(null);
+  // DECSET 1004 (focus reporting) is its own channel, not mouse tracking: the app asks for ESC[I / ESC[O
+  // and only an app that asked should receive them. Kept apart from `modes` so the mouse leak-latch (which
+  // wipes `modes` to force a re-arm) can never silently switch focus reporting off.
+  let focusOn = false;
 
   const tracking = () => TRACK.some(m => modes[m]);
   const mouseActive = () => TRACK.some(m => xtermModes[m]);
@@ -2506,6 +2527,7 @@ function createMouseGuard(){
       if(end < 0) continue;                             // truncated (the tail carries it) or junk
       const enable = at(end) === 0x68;
       for(const mode of seen){
+        if(mode === 1004){ focusOn = enable; continue; }   // focus reporting, tracked but not mouse tracking
         if(mode !== 1006 && TRACK.indexOf(mode) < 0) continue;
         if(enable){
           if(!modes[mode]) blocked = false;             // a genuine off→on DECSET is the ONLY re-arm
@@ -2563,11 +2585,12 @@ function createMouseGuard(){
   // really is echoing our reports re-blocks within the echo window.
   function reset(keepModes){
     tail = []; blocked = false; pending = [];
-    if(!keepModes){ modes = Object.create(null); xtermModes = Object.create(null); }
+    if(!keepModes){ modes = Object.create(null); xtermModes = Object.create(null); focusOn = false; }
   }
   return {
     ingestOutput, noteForwarded, reset,
     inputAllowed: () => !blocked && tracking(),
+    focusReporting: () => focusOn,
     mouseActive,
     stats: () => ({ tracking:tracking(), mouseActive:mouseActive(), blocked, leaks, pending:pending.length, modes:Object.keys(modes).map(Number) }),
   };
@@ -2614,6 +2637,15 @@ term.onData(d => {
     markActive();
     sendMouseInput(d);
     return;
+  }
+  // R7: the app's own focus reports (?1004). Forward them on the app-input seam, but NOT through the typing
+  // path below — a blur report during a drag must never read as a keystroke. When ?1004 is off, xterm emits
+  // none; if one still appears it falls through to the terminal-report strip and is dropped as before.
+  if(mouseGuard.focusReporting()){
+    const f = extractFocusReports(d);
+    if(f.focus){ markActive(); send('i', f.focus); }
+    d = f.rest;
+    if(!d) return;
   }
   const filtered = stripTerminalGeneratedReports(d);
   if(filtered.dropped){

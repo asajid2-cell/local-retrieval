@@ -188,13 +188,16 @@ test('a shift-drag on a focus-tracking pane keeps a visible, copyable selection'
     assert.ok(visible.webgl ? visible.webglCanvas : visible.visualRects > 0,
       `the selection has no visible highlight (webgl=${visible.webgl} rects=${visible.visualRects} canvas=${visible.webglCanvas})`);
 
-    // the blur report must not have leaked to the pty as an input frame either
-    const leaked = host.messages
+    // R7 reversed this: with ?1004 on, a focus report is the APP's and is forwarded, not dropped (a shell
+    // without ?1004 still receives nothing - pinned by focus-passthrough.test.js). What must NOT happen is
+    // the report reading as a keystroke; the surviving selection above is that proof. Here we pin that the
+    // report actually went out (RED before R7: nothing was forwarded at all).
+    const forwarded = host.messages
       .filter(m => m.t === 'i')
       .map(m => Buffer.from(m.d, 'base64').toString('latin1'))
       .filter(s => s === '\x1b[O' || s === '\x1b[I');
-    assert.equal(leaked.length, 0,
-      `a focus report leaked into the pty as input: ${JSON.stringify(leaked)}`);
+    assert.ok(forwarded.length >= 1,
+      `the app enabled ?1004 but no focus report was forwarded to it: ${JSON.stringify(forwarded)}`);
   } finally {
     await context.close();
     await harness.stop();
