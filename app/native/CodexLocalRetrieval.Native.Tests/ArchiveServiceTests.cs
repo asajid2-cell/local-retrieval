@@ -5021,6 +5021,18 @@ public sealed class ArchiveServiceTests
                 $"an append cycle must read only the imported row, not all 2,000 (rows {rows})");
             Assert.IsTrue(transcriptBytes + titleBytes < 1024 * 1024,
                 $"a cycle with one small append must read under 1 MB (transcript {transcriptBytes} + titles {titleBytes})");
+
+            // The gate, verbatim: a cycle with no appends and no client requests reads less than 1 MB.
+            var idleTranscriptBefore = PerfCounters.Snapshot()["transcriptBytesRead"];
+            var idleRowsBefore = service.ThreadTitleRowsRead;
+            var idleTitleBytesBefore = service.ThreadTitleBytesRead;
+            await service.MergeScanAsync(
+                new DiskScan(new List<ArchiveSession>(), new List<ArchiveSession>()), refreshList: false);
+            var idleBytes = PerfCounters.Snapshot()["transcriptBytesRead"] - idleTranscriptBefore
+                + service.ThreadTitleBytesRead - idleTitleBytesBefore;
+            Assert.IsTrue(idleBytes < 1024 * 1024,
+                $"an idle cycle must read under 1 MB (read {idleBytes} bytes)");
+            Assert.AreEqual(idleRowsBefore, service.ThreadTitleRowsRead, "an idle cycle must read no title rows");
         }
         finally { SqliteConnection.ClearAllPools(); try { Directory.Delete(root, true); } catch { } }
     }
