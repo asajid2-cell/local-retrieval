@@ -4933,4 +4933,95 @@ public sealed class ArchiveServiceTests
         }
         finally { try { Directory.Delete(root, true); } catch { } }
     }
+
+    // Read gate (title load): a merge must not re-read the codex state db's whole `threads` table. In
+    // production that table is ~63 MB across ~3,600 rows because every row carries the thread's first
+    // prompt in title/preview/first_user_message, so the full scan cost ~45 MB of read every ~14 s while a
+    // live session appended - the burst this lane was told to attribute and remove. A merge imports a
+    // handful of ids, so it must materialise only those rows.
+    [TestMethod]
+    public async Task MergeCycle_ReadsOnlyTheImportedThreadsTitleRow()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "clr-titlegate-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        var dbPath = Path.Combine(root, "state_5.sqlite");
+        const string id = "019f0d3e-1111-2222-3333-444455556666";
+        var rollout = Path.Combine(root, "rollout-2026-01-01T00-00-00-" + id + ".jsonl");
+        try
+        {
+            // A fat `threads` table: the one real thread plus thousands of unrelated rows, each carrying the
+            // prompt-sized payload production rows carry.
+            var fat = new string('T', 7000);
+            using (var conn = new SqliteConnection(new SqliteConnectionStringBuilder { DataSource = dbPath }.ToString()))
+            {
+                conn.Open();
+                using (var create = conn.CreateCommand())
+                {
+                    create.CommandText =
+                        "create table threads (id text primary key, title text, updated_at_ms integer,"
+                        + " updated_at integer, preview text, first_user_message text);";
+                    create.ExecuteNonQuery();
+                }
+                using var insert = conn.CreateCommand();
+                insert.CommandText = "insert into threads values ($id, $title, $ms, $s, $preview, $first);";
+                var pId = insert.Parameters.Add("$id", SqliteType.Text);
+                var pTitle = insert.Parameters.Add("$title", SqliteType.Text);
+                var pMs = insert.Parameters.Add("$ms", SqliteType.Integer);
+                var pS = insert.Parameters.Add("$s", SqliteType.Integer);
+                var pPreview = insert.Parameters.Add("$preview", SqliteType.Text);
+                var pFirst = insert.Parameters.Add("$first", SqliteType.Text);
+                for (var i = 0; i < 2000; i++)
+                {
+                    pId.Value = i == 0 ? id : "019f0d3e-0000-0000-0000-" + i.ToString("D12");
+                    pTitle.Value = i == 0 ? "title from the state db" : "unrelated thread " + i + " " + fat;
+                    pMs.Value = 1_700_000_000_000L + i;
+                    pS.Value = 1_700_000_000L + i;
+                    pPreview.Value = fat;
+                    pFirst.Value = fat;
+                    insert.ExecuteNonQuery();
+                }
+            }
+            Assert.IsTrue(new FileInfo(dbPath).Length > 8 * 1024 * 1024,
+                "the fixture state db must be large enough that a full scan is unmistakable");
+
+            var sb = new StringBuilder();
+            sb.Append("{\"timestamp\":\"2026-01-01T00:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"")
+              .Append(id).Append("\",\"cwd\":\"z:/proj\"}}\n");
+            sb.Append("{\"timestamp\":\"2026-01-01T00:00:01Z\",\"type\":\"event_msg\",\"payload\":"
+                + "{\"type\":\"user_message\",\"message\":\"opening prompt\"}}\n");
+            File.WriteAllText(rollout, sb.ToString());
+
+            var service = new ArchiveService(
+                storePath: Path.Combine(root, "app-store.json"),
+                enableTranscriptSearchIndex: false,
+                sourceOverride: new[] { new SessionSource { Tool = "codex", Root = root } },
+                codexStateDbPath: dbPath);
+
+            await service.SyncFromDiskAsync();   // cold: import the rollout and apply its title
+
+            Assert.AreEqual("title from the state db", service.Store.Sessions[id].Title,
+                "the state db title must still be applied to the imported session");
+            Assert.IsTrue(service.ThreadTitleRowsRead <= 8,
+                $"a cold merge must read only the imported row, not the whole table (rows {service.ThreadTitleRowsRead})");
+
+            var rowsBefore = service.ThreadTitleRowsRead;
+            var titleBytesBefore = service.ThreadTitleBytesRead;
+            var transcriptBefore = PerfCounters.Snapshot()["transcriptBytesRead"];
+
+            // One ~1 KB append - the shape of a live session's next turn.
+            File.AppendAllText(rollout,
+                "{\"timestamp\":\"2026-01-01T00:00:02Z\",\"type\":\"event_msg\",\"payload\":"
+                + "{\"type\":\"agent_message\",\"message\":\"" + new string('x', 1000) + "\"}}\n");
+            await service.SyncFromDiskAsync();   // the cycle that used to re-scan the whole table
+
+            var rows = service.ThreadTitleRowsRead - rowsBefore;
+            var titleBytes = service.ThreadTitleBytesRead - titleBytesBefore;
+            var transcriptBytes = PerfCounters.Snapshot()["transcriptBytesRead"] - transcriptBefore;
+            Assert.IsTrue(rows <= 8,
+                $"an append cycle must read only the imported row, not all 2,000 (rows {rows})");
+            Assert.IsTrue(transcriptBytes + titleBytes < 1024 * 1024,
+                $"a cycle with one small append must read under 1 MB (transcript {transcriptBytes} + titles {titleBytes})");
+        }
+        finally { SqliteConnection.ClearAllPools(); try { Directory.Delete(root, true); } catch { } }
+    }
 }

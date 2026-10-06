@@ -1181,7 +1181,7 @@ public sealed partial class ArchiveService
         // Read the (potentially slow) sqlite/jsonl off-thread, but APPLY the changes on the caller
         // (UI) thread — mutating bound sessions raises INotifyPropertyChanged, which must not fire
         // from a worker.
-        var titles = await Task.Run(LoadThreadTitles, cancellationToken);
+        var titles = await Task.Run(() => LoadThreadTitles(), cancellationToken);
         cancellationToken.ThrowIfCancellationRequested();
         var changed = ApplyThreadTitles(titles);
         if (changed) ReapplyList();
@@ -5639,13 +5639,17 @@ public sealed partial class ArchiveService
             // INotifyPropertyChanged raised by ApplyThreadTitles never fires from a worker. The final
             // RefreshSessions below repaints the list, so we don't refresh here.
             var titleWatch = System.Diagnostics.Stopwatch.StartNew();
-            var titles = await Task.Run(LoadThreadTitles, cancellationToken);
+            var rowsBefore = ThreadTitleRowsRead;
+            // Only the imported ids: a merge must not re-read the whole `threads` table (see
+            // LoadSqliteThreadTitles). Title/updated_at changes for a codex thread only accompany an
+            // append, and an appended thread is imported here.
+            var titles = await Task.Run(() => LoadThreadTitles(imported), cancellationToken);
             cancellationToken.ThrowIfCancellationRequested();
             var loadTitlesMs = titleWatch.ElapsedMilliseconds;
             ApplyThreadTitles(titles);
             PerfCounters.Trace?.Invoke(
                 $"merge titles loadMs={loadTitlesMs} applyMs={titleWatch.ElapsedMilliseconds - loadTitlesMs}"
-                + $" count={titles.Count}");
+                + $" count={titles.Count} rows={ThreadTitleRowsRead - rowsBefore}");
         }
         // On a parser-version migration every file was re-parsed: prune sessions whose file WAS
         // scanned but no longer yields that id (old id scheme, or the file is now a skipped sidechain).
@@ -7238,6 +7242,12 @@ public sealed partial class ArchiveService
     // Test seams so a test can prove a small append costs a small read.
     internal static long TailBytesRead;
     internal static long TailWindowCacheHits;
+    // How many rows, and how much title payload, a title load materialised from the codex state db's
+    // `threads` table. A merge only needs the titles of the sessions it imported, so both must stay
+    // proportional to that set - not to the table. (The live table is ~63 MB across ~3,600 rows; reading
+    // it whole on every merge was a ~45 MB read burst every ~14 s.)
+    internal int ThreadTitleRowsRead;
+    internal long ThreadTitleBytesRead;
 
     private static byte[] HashRange(string path, long start, int count)
     {
@@ -8548,8 +8558,19 @@ public sealed partial class ArchiveService
         return changed;
     }
 
-    private Dictionary<string, ThreadTitle> LoadThreadTitles()
+    // `onlyIds` restricts the load to the given session ids. The merge path passes the sessions it just
+    // imported: a codex thread's name is derived from its first prompt and its updated_at only moves when
+    // the thread appends, so every title change that can occur after startup belongs to a session the
+    // merge imported. A null/omitted set is the full load (startup enrichment, tests).
+    private Dictionary<string, ThreadTitle> LoadThreadTitles(IReadOnlyCollection<string>? onlyIds = null)
     {
+        HashSet<string>? filter = null;
+        if (onlyIds is not null)
+        {
+            filter = new HashSet<string>(onlyIds, StringComparer.OrdinalIgnoreCase);
+            if (filter.Count == 0) return new Dictionary<string, ThreadTitle>(StringComparer.OrdinalIgnoreCase);
+        }
+
         var result = new Dictionary<string, ThreadTitle>(StringComparer.OrdinalIgnoreCase);
         foreach (var file in CandidateSessionIndexFiles())
         {
@@ -8563,6 +8584,7 @@ public sealed partial class ArchiveService
                     if (!root.TryGetProperty("id", out var idProp)) continue;
                     var id = idProp.GetString();
                     if (string.IsNullOrWhiteSpace(id)) continue;
+                    if (filter is not null && !filter.Contains(id)) continue;
                     var name = root.TryGetProperty("thread_name", out var nameProp) ? nameProp.GetString() ?? "" : "";
                     var updated = root.TryGetProperty("updated_at", out var updatedProp) ? updatedProp.GetString() ?? "" : "";
                     PutTitle(result, id, name, updated);
@@ -8574,7 +8596,7 @@ public sealed partial class ArchiveService
             }
         }
 
-        LoadSqliteThreadTitles(result);
+        LoadSqliteThreadTitles(result, filter);
         return result;
     }
 
@@ -8593,37 +8615,78 @@ public sealed partial class ArchiveService
         }
     }
 
-    private void LoadSqliteThreadTitles(Dictionary<string, ThreadTitle> result)
+    private void LoadSqliteThreadTitles(Dictionary<string, ThreadTitle> result, HashSet<string>? filter)
     {
         var path = _codexStateDbPath;
         if (_restrictTranscriptSources) ValidateRestrictedPath(path, Path.GetDirectoryName(path)!);
         if (!File.Exists(path)) return;
+        if (filter is not null && filter.Count == 0) return;
 
         try
         {
             var builder = new SqliteConnectionStringBuilder { DataSource = path, Mode = SqliteOpenMode.ReadOnly };
             using var connection = new SqliteConnection(builder.ToString());
             connection.Open();
-            using var command = connection.CreateCommand();
-            command.CommandText = "select id, title, updated_at_ms, updated_at from threads";
-            using var reader = command.ExecuteReader();
-            while (reader.Read())
+            if (filter is null)
             {
-                var id = reader.GetString(0);
-                var name = reader.GetString(1);
-                var updatedMs = reader.IsDBNull(2) ? 0 : reader.GetInt64(2);
-                var updatedSeconds = reader.IsDBNull(3) ? 0 : reader.GetInt64(3);
-                var updated = updatedMs > 0
-                    ? DateTimeOffset.FromUnixTimeMilliseconds(updatedMs).UtcDateTime.ToString("O")
-                    : updatedSeconds > 0
-                        ? DateTimeOffset.FromUnixTimeSeconds(updatedSeconds).UtcDateTime.ToString("O")
-                        : "";
-                PutTitle(result, id, name, updated);
+                using var command = connection.CreateCommand();
+                command.CommandText = "select id, title, updated_at_ms, updated_at from threads";
+                ReadThreadTitles(command, result);
+                return;
+            }
+
+            // Targeted read: `threads` rows carry the whole first prompt in `title`/`preview`/
+            // `first_user_message`, so a full scan materialises tens of MB of payload. A merge needs only
+            // the imported ids, so ask for exactly those. Batched to stay well inside SQLite's parameter
+            // limit.
+            foreach (var chunk in ChunkIds(filter, 400))
+            {
+                using var command = connection.CreateCommand();
+                var names = new string[chunk.Count];
+                for (var i = 0; i < chunk.Count; i++)
+                {
+                    names[i] = $"$id{i}";
+                    command.Parameters.AddWithValue(names[i], chunk[i]);
+                }
+                command.CommandText = "select id, title, updated_at_ms, updated_at from threads where id in ("
+                    + string.Join(",", names) + ")";
+                ReadThreadTitles(command, result);
             }
         }
         catch
         {
             // SQLite may be locked or absent on older installs. JSONL titles remain enough for those cases.
+        }
+    }
+
+    private static IEnumerable<IReadOnlyList<string>> ChunkIds(IReadOnlyCollection<string> ids, int size)
+    {
+        var chunk = new List<string>(size);
+        foreach (var id in ids)
+        {
+            chunk.Add(id);
+            if (chunk.Count == size) { yield return chunk; chunk = new List<string>(size); }
+        }
+        if (chunk.Count > 0) yield return chunk;
+    }
+
+    private void ReadThreadTitles(SqliteCommand command, Dictionary<string, ThreadTitle> result)
+    {
+        using var reader = command.ExecuteReader();
+        while (reader.Read())
+        {
+            var id = reader.GetString(0);
+            var name = reader.GetString(1);
+            var updatedMs = reader.IsDBNull(2) ? 0 : reader.GetInt64(2);
+            var updatedSeconds = reader.IsDBNull(3) ? 0 : reader.GetInt64(3);
+            var updated = updatedMs > 0
+                ? DateTimeOffset.FromUnixTimeMilliseconds(updatedMs).UtcDateTime.ToString("O")
+                : updatedSeconds > 0
+                    ? DateTimeOffset.FromUnixTimeSeconds(updatedSeconds).UtcDateTime.ToString("O")
+                    : "";
+            ThreadTitleRowsRead++;
+            ThreadTitleBytesRead += id.Length + name.Length + 16;
+            PutTitle(result, id, name, updated);
         }
     }
 
