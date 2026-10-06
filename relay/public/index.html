@@ -209,6 +209,18 @@
   }
   #scrollstate[hidden] { display:none; }
   #scrollstate.app { border-color:var(--warn); color:var(--warn); }
+  /* PAUSED overlay. autoFreeze/selectMode freeze the terminal so a highlight survives, but the freeze is
+     invisible: output silently buffers into _frozenBuf and the tab reads as stuck. This is the one visible
+     affordance that says the terminal is paused and how to go live again — the same escape the "Sel" toggle
+     and the ↓ pill already perform, made discoverable. */
+  #paused {
+    position:absolute; left:50%; top:12px; transform:translateX(-50%); z-index:6;
+    display:inline-flex; align-items:center; gap:6px; height:30px; padding:0 var(--sp3);
+    border-radius:999px; border:1px solid var(--warn); background:var(--panel-2); color:var(--warn);
+    font:600 12.5px/1 inherit; cursor:pointer; box-shadow:0 6px 20px rgba(0,0,0,.5); white-space:nowrap;
+  }
+  #paused[hidden] { display:none; }
+  #paused:hover { border-color:var(--rose); color:var(--txt); }
 
   /* ---- workbench status strip ---- */
   #status {
@@ -687,6 +699,7 @@
     <button type="button" id="scrollstate" hidden><span id="scrolltext"></span></button>
     <button id="jumplive" aria-label="Jump to live"><span id="jlcount">new</span> ↓</button>
     <div id="predict" aria-hidden="true"></div>
+    <button type="button" id="paused" hidden>paused &mdash; click to resume</button>
   </main>
 
   <div id="fleetList" aria-label="Fleet glance"></div>
@@ -1523,12 +1536,13 @@ function reloadTerminal(quiet){
   autoFreeze=false; selectMode=false; _frozenBuf=[]; _frozenBytes=0; _frozenLost=false; _wedgeStrikes=0;
   $('#term').classList.remove('selecting');
   try{ term.clearSelection(); }catch(e){}
+  syncPausedOverlay();
   try{ term.write('\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l\x1b[?2004l\x1b[?1049l\x1b[?25h'); }catch(e){}
   if(!quiet) flash('Reloading terminal…');
   connect(name, true);   // re-attach: CLEAR + scrollback replay + live, all client state reset
 }
 document.addEventListener('keydown', e=>{ if(e.ctrlKey && e.altKey && (e.key==='r'||e.key==='R')){ e.preventDefault(); e.stopPropagation(); reloadTerminal(); } }, true);
-window.__muxBuild='2026-10-01-gateway-seam-xtversion-and-mouse-modes';   // bump per web deploy so a loaded version is verifiable
+window.__muxBuild='2026-10-05-webgl-paint-detector-and-paused-overlay';   // bump per web deploy so a loaded version is verifiable
 try{ console.info('multiplex build', window.__muxBuild); }catch(e){}
 const helper = $('#term').querySelector('.xterm-helper-textarea');
 function hardenHelperTextarea(){
@@ -1584,7 +1598,7 @@ function taFlushDelta(h){
   }
   if(!out) return;
   markActive();
-  if(autoFreeze && !selectMode){ autoFreeze=false; try{ term.clearSelection(); }catch(e){} flushFrozen(); }
+  if(autoFreeze && !selectMode){ autoFreeze=false; try{ term.clearSelection(); }catch(e){} flushFrozen(); syncPausedOverlay(); }
   logMobileInputEvent('delta-send', { data: out, v, prev });
   send('i', out);
 }
@@ -1693,7 +1707,8 @@ function copySelectionNow(){
   const scr = $('#term');
   // freeze as soon as the mouse goes down, so the drag-select can't be repainted away mid-gesture
   scr.addEventListener('mousedown', e=>{
-    if(e.button===0 && !selectMode && (!isVisibleOwner() || forceSelectGesture(e))) autoFreeze=true;
+    if(e.target && e.target.closest && e.target.closest('#paused')) return;   // the overlay's own click must not re-latch the freeze
+    if(e.button===0 && !selectMode && (!isVisibleOwner() || forceSelectGesture(e))){ autoFreeze=true; syncPausedOverlay(); }
   }, true);
   // a click that makes no selection (just focusing) goes live again + replays whatever was buffered;
   // a drag that DID select stays frozen and, if auto-copy is armed, copies itself on release
@@ -1705,6 +1720,49 @@ function copySelectionNow(){
   // one gesture users expect to work on a live selection — calling
   // preventDefault to put a custom menu there is exactly what makes a web terminal feel un-native.
 })();
+
+// ---- PAUSED affordance: a frozen terminal says so, and offers one obvious way back ----
+// A freeze is CORRECT (a live repaint would wipe a highlight) but silent: output buffers into _frozenBuf and
+// the tab reads as stuck. This overlay is the visible half. It appears only once a freeze has held past a
+// click — a plain mousedown/mouseup latches autoFreeze for a single frame, and an overlay that blinks on
+// every click is worse than none — and hides immediately when the terminal goes live. Clicking it performs
+// exactly the unfreeze the "Sel" toggle and the ↓ pill already do, so it is an affordance, not a new path.
+let _pausedSince = 0;
+function pausedShouldShow(){
+  try { return isFrozen() && !!current && $('#empty').style.display === 'none'; }
+  catch(e){ return false; }
+}
+function syncPausedOverlay(){
+  const el = $('#paused');
+  if(!el) return;
+  if(!pausedShouldShow()){ _pausedSince = 0; el.hidden = true; return; }
+  if(!el.hidden) return;                       // already up
+  const now = Date.now();
+  if(!_pausedSince) _pausedSince = now;        // freeze just began: start the clock, don't reveal yet
+  if(now - _pausedSince >= 350) el.hidden = false;
+}
+function resumeFromPause(){
+  if(!isFrozen()){ syncPausedOverlay(); return; }
+  selectMode = false; autoFreeze = false;
+  $('#term').classList.remove('selecting');
+  try{ term.clearSelection(); }catch(e){}
+  if(typeof predictClear === 'function') predictClear();
+  buildKeybar();
+  if(!flushFrozen()){ syncPausedOverlay(); return; }   // overflowed buffer re-attaches; overlay re-syncs after
+  try{ term.scrollToBottom(); }catch(e){}
+  term.focus();
+  flash('Resumed');
+  syncPausedOverlay();
+}
+(function(){
+  const el = $('#paused');
+  if(!el) return;
+  el.addEventListener('click', e=>{ e.preventDefault(); e.stopPropagation(); resumeFromPause(); });
+})();
+// The latch functions (maybeUnfreezeSelection / selectionFreezeSync) stay pure state logic — a drag-select
+// has no DOM hook to hang an overlay on — so the overlay keeps itself honest off a light poll rather than
+// being called from inside them. Four boolean reads a second buys a freeze the user can actually see.
+setInterval(syncPausedOverlay, 250);
 
 // ---- IMAGE PASTE: a terminal can't take inline image bytes (codex/claude then say "no image found, try
 // scp"). So intercept a pasted image, upload it, transfer it to the PC, and drop its real FILE PATH into the
@@ -2564,7 +2622,7 @@ term.onData(d => {
   }
   if(!d) return;
   markActive();
-  if (autoFreeze && !selectMode) { autoFreeze=false; try{ term.clearSelection(); }catch(e){} flushFrozen(); }   // typing = you're done selecting → go live
+  if (autoFreeze && !selectMode) { autoFreeze=false; try{ term.clearSelection(); }catch(e){} flushFrozen(); syncPausedOverlay(); }   // typing = you're done selecting → go live
   // a sticky modifier (tapped on the keybar) applies to the next char you type on the phone keyboard
   if ((mods.ctrl||mods.alt||mods.shift) && d.length===1) { d = applyModsToChar(d); clearMods(); }
   send('i', d);
@@ -2734,6 +2792,7 @@ function forceSelEnd(){
   }
   const had=termHasSelection();
   if(had){ if(!selectMode) autoFreeze=true; if(autoCopyOnSelect) copySelectionNow(); }
+  syncPausedOverlay();
   return had;
 }
 try{ window.__muxForceSel = forceSel; }catch(e){}
@@ -2946,6 +3005,7 @@ $('#scrollstate').addEventListener('click', explainScrollAffordance);
 // even while a write is settling. Bound to the ↓ keybar button, the desktop header ⤓ icon, and the pill.
 function forceJumpBottom(){
   if(autoFreeze || selectMode){ autoFreeze=false; selectMode=false; $('#term').classList.remove('selecting'); try{ term.clearSelection(); }catch(e){} if(!flushFrozen()) return; }
+  syncPausedOverlay();
   userScrolledAt=0;   // don't let the viewport-restore logic treat this as a recent manual scroll-up
   const go=()=>{
     try{ viewportRestoreApplying=true; term.scrollToBottom(); }catch(e){} finally{ viewportRestoreApplying=false; }
@@ -3023,6 +3083,7 @@ function connect(name, isRetry){
   autoFreeze=false; selectMode=false; _frozenBuf=[]; _frozenBytes=0; _frozenLost=false;
   $('#term').classList.remove('selecting');
   try{ term.clearSelection(); }catch(e){}
+  syncPausedOverlay();
   buildKeybar();
   resetTaDelta(true);                // start the mobile input-delta buffer fresh on a session switch
   newLines=0; showJump();
@@ -4010,10 +4071,11 @@ function toggleSelect(){
   if(selectMode){ flash('FROZEN — drag to select (hold Shift if the app grabs the mouse), then Copy'); }
   else {
     autoFreeze=false;                          // unfreeze: replay intact output or reattach after overflow
-    if(!flushFrozen()) return;
+    if(!flushFrozen()){ syncPausedOverlay(); return; }
     try{ term.scrollToBottom(); }catch(e){}
     term.focus(); flash('Live again');
   }
+  syncPausedOverlay();
 }
 function kdivEl(){ const d=document.createElement('span'); d.className='kdiv'; return d; }
 
