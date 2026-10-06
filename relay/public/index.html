@@ -672,6 +672,9 @@
       <button class="icon" id="refresh" title="Refresh sessions" aria-label="Refresh sessions">
         <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M20 11a8 8 0 10-.6 4M20 5v6h-6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
       </button>
+      <button class="icon" id="repaint" title="Repaint: ask the app to redraw its screen" aria-label="Repaint">
+        <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><rect x="3" y="4" width="18" height="12" rx="1.6" stroke="currentColor" stroke-width="1.6"/><path d="M9 20h6M12 16v4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><path d="M8.5 10a3.5 3.5 0 115.4 3.7" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><path d="M8.5 7v3h3" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </button>
       <button class="icon" id="copybtn" title="Select &amp; copy terminal text" aria-label="Select and copy terminal text">
         <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><rect x="8" y="8" width="12" height="13" rx="2" stroke="currentColor" stroke-width="1.7"/><path d="M15 5.5A1.5 1.5 0 0013.5 4h-8A1.5 1.5 0 004 5.5v9A1.5 1.5 0 005.5 16" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
       </button>
@@ -1187,12 +1190,22 @@ function staleFrameWidth(){
   if(short/judged<0.9 || cols-maxW<4) return null;
   return { cols, rows:term.rows, judged, short, maxW };
 }
-// A repaint fixes DOM loss; a stale app frame needs the PC's TUI to redraw its own screen.
-// Reporting the same viewport size again does not resize the PTY and cannot repair that frame.
+// R6: ask the SERVER to repaint, not just the local renderer. A local heal re-renders whatever the
+// client's buffer already holds - enough for a dropped DOM frame, but useless when the buffer itself is
+// wrong (a screen corrupted in the client, or an app frame drawn for another size). Only the app can
+// rebuild its own block, so both the paint-fault detector and the toolbar's Repaint take this path:
+// ws 'R' -> relay -> muxd repaint_viewer (FOCUS_IN for a main-screen ?1004 app, the size wiggle for an
+// alt TUI). The relay rate-limits it, so a repeated fault cannot storm the host.
+function requestServerRepaint(reason){
+  try{ window.__muxLastRepaintRequest={ at:Date.now(), reason:reason||'manual' }; }catch(e){}
+  send('R', '');
+}
+// A local repaint fixes DOM loss; a stale app frame - or a buffer corrupted in the client - needs the
+// app to redraw its own screen, so the fault also requests a server repaint (see requestServerRepaint).
 function healDetectedPaintFault(reason, kind){
   recoverTerminalPaint((reason||'paint-check')+':'+kind);
   scheduleViewportFit(0);
-  if(kind==='stale-width') send('R', '');
+  requestServerRepaint((reason||'paint-check')+':'+kind);
 }
 // WebGL is healed differently from the DOM: recoverTerminalPaint() clears the glyph texture atlas and calls
 // term.refresh, which re-marks rows dirty and the addon re-renders on its next rAF - enough for the transient
@@ -1210,6 +1223,7 @@ function fallbackToDomRenderer(reason){
 }
 function healWebglBlank(reason){
   recoverTerminalPaint((reason||'paint-check')+':webgl-blank');
+  requestServerRepaint((reason||'paint-check')+':webgl-blank');
   requestAnimationFrame(()=>{ requestAnimationFrame(()=>{
     try{ if(terminalPaintLooksBlank()) fallbackToDomRenderer(reason||'paint-check'); }catch(e){}
   }); });
@@ -1542,7 +1556,7 @@ function reloadTerminal(quiet){
   connect(name, true);   // re-attach: CLEAR + scrollback replay + live, all client state reset
 }
 document.addEventListener('keydown', e=>{ if(e.ctrlKey && e.altKey && (e.key==='r'||e.key==='R')){ e.preventDefault(); e.stopPropagation(); reloadTerminal(); } }, true);
-window.__muxBuild='2026-10-05-focus-report-passthrough';   // bump per web deploy so a loaded version is verifiable
+window.__muxBuild='2026-10-05-repaint-request';   // bump per web deploy so a loaded version is verifiable
 try{ console.info('multiplex build', window.__muxBuild); }catch(e){}
 const helper = $('#term').querySelector('.xterm-helper-textarea');
 function hardenHelperTextarea(){
@@ -4268,6 +4282,10 @@ $('#fontdown').onclick=()=>setFont(fontSize-1);
 $('#fontup').onclick=()=>setFont(fontSize+1);
 $('#refresh').onclick=()=>{ loadSessions(); if(current) reloadTerminal(true); };   // also re-attach the open terminal (unfreeze) — muxd replays scrollback
 $('#refresh').title='Refresh sessions + reload the open terminal (unfreeze)';
+// R6: the manual Repaint. Same path as the detector's server repaint - the app redraws its own screen -
+// so a surface the local renderer cannot repair (a client-corrupted buffer, a stale app frame) recovers
+// without a reload or a re-attach.
+$('#repaint').onclick=()=>{ if(current) requestServerRepaint('button'); };
 $('#jumpbottom').onclick=()=>{ if(current) forceJumpBottom(); };
 // desktop keybar toggle: force-show the touch keybar (all the mobile buttons) on desktop; re-fit after
 function applyKeybarPref(){ const on=LS.get('mux_keybar',false); $('#app').classList.toggle('kb-on',on); const b=$('#kbtoggle'); if(b) b.classList.toggle('on',on); setTimeout(()=>{ applyViewport(); healTerminalSurface('keybar'); },60); }
