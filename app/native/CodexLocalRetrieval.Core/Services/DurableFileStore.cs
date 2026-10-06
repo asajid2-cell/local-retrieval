@@ -40,6 +40,7 @@ internal static class DurableFileStore
 {
     private const uint MoveFileReplaceExisting = 0x1;
     private const uint MoveFileWriteThrough = 0x8;
+    private const uint ReplaceFileWriteThrough = 0x1;
     private const int ErrorAccessDenied = 5;
     private const int ErrorSharingViolation = 32;
     private const int CopyBufferBytes = 256 * 1024;
@@ -54,10 +55,25 @@ internal static class DurableFileStore
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool MoveFileEx(string existingFileName, string newFileName, uint flags);
 
+    // Installs `replacementFileName` at `replacedFileName` and, when `backupFileName` is given, moves the
+    // bytes it displaced there as part of the same atomic operation. That is what lets a save preserve the
+    // previous generation with a RENAME instead of copying the whole file aside first.
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool ReplaceFile(
+        string replacedFileName,
+        string replacementFileName,
+        string? backupFileName,
+        uint flags,
+        IntPtr exclude,
+        IntPtr reserved);
+
     /// `contents` is a ReadOnlyMemory rather than a byte[] so the caller can hand over a slice of a
-    /// reusable serialization buffer. The store is tens of MB and it is written twice per save (primary
-    /// plus the redundant committed snapshot), so a `ToArray()` to satisfy a byte[] parameter was a whole
-    /// extra store-sized allocation and copy per save, on the large object heap.
+    /// reusable serialization buffer. The store is tens of MB, and a save writes it ONCE: the previous
+    /// generation is not copied aside beforehand but RENAMED into the backup slot by the same atomic swap
+    /// that installs the new bytes (ReplaceFile's backup argument), so preserving it costs neither a
+    /// second serialize nor a second store-sized write. A `ToArray()` to satisfy a byte[] parameter would
+    /// still be a whole extra store-sized allocation and copy per save, on the large object heap.
     public static async Task WriteAtomicAsync(
         string destination,
         ReadOnlyMemory<byte> contents,
@@ -68,40 +84,26 @@ internal static class DurableFileStore
             ?? throw new ArgumentException("Destination must have a parent directory.", nameof(destination));
         Directory.CreateDirectory(directory);
 
-        // The backup IS the rollback source. Keeping a byte[] of the previous generation in memory served
-        // only to be written back on a mismatch, and the file we just wrote holds exactly those bytes - so
-        // the copy is both the backup and the thing a rollback restores from, with no store-sized buffer
-        // held across the whole operation.
         var hadPrevious = File.Exists(destination);
-        if (hadPrevious)
-        {
-            if (string.IsNullOrWhiteSpace(backupPath))
-                throw new IOException("Replacing a durable file requires a backup path.");
-            try
-            {
-                await CommitFileCopyAsync(destination, backupPath, fault: null);
-            }
-            catch (DestinationRefusedException refused)
-            {
-                throw new IOException(
-                    "The previous generation could not be snapshotted; the durable file was left untouched: "
-                    + backupPath,
-                    refused);
-            }
-        }
+        if (hadPrevious && string.IsNullOrWhiteSpace(backupPath))
+            throw new IOException("Replacing a durable file requires a backup path.");
 
+        // The swap's backup argument is what preserves the previous generation, so it is only handed to the
+        // replace when there IS one; a first-time write has nothing to back up and uses a plain replace.
+        var swapBackup = hadPrevious ? backupPath : null;
+        var swapped = false;
         try
         {
-            await CommitBytesAsync(destination, contents, fault);
+            await CommitBytesAsync(destination, contents, swapBackup, fault, () => swapped = true);
         }
         catch (DestinationRefusedException refused)
         {
-            // Nothing was swapped, so the destination still holds the previous generation AND the backup
-            // written above holds those same bytes. Taking the shared failure path below would re-read the
-            // destination, find the old bytes, and roll back by re-issuing the identical refused replace -
-            // a second full-store rewrite plus a second retry budget, for a write that cannot succeed.
-            // Against a store held open by another process that ran on every sync attempt, which is where
-            // the sustained burn came from. The previous generation is provably intact, so say so.
+            // Nothing was swapped, so the destination still holds the previous generation and the backup
+            // was never created. Taking the shared failure path below would re-read the destination, find
+            // the old bytes, and roll back by re-issuing the identical refused replace - a second
+            // full-store rewrite plus a second retry budget, for a write that cannot succeed. Against a
+            // store held open by another process that ran on every sync attempt, which is where the
+            // sustained burn came from. The previous generation is provably intact, so say so.
             throw new DurableWriteException(
                 "The durable file replacement was refused; the previous generation is unchanged: " + destination,
                 refused,
@@ -110,12 +112,29 @@ internal static class DurableFileStore
         }
         catch (Exception error) when (error is not DurableWriteException)
         {
+            if (!swapped)
+            {
+                // The replace never ran, so the destination was never touched: there is nothing to compare
+                // or restore, and the previous generation is intact for the same reason it used to be
+                // restored to. (The pre-swap copy this replaced had already rewritten those bytes into the
+                // backup, which is why a pre-replace fault used to report `recovered` via a rollback.)
+                throw new DurableWriteException(
+                    hadPrevious
+                        ? "The durable file commit failed before the swap; the previous generation is unchanged: " + destination
+                        : "The durable file commit failed before the swap and no file was created: " + destination,
+                    error,
+                    committed: false,
+                    recovered: hadPrevious);
+            }
+
             var comparison = await CompareFileAsync(destination, contents, fault);
             if (comparison == DurableFileComparison.Match)
             {
                 try
                 {
-                    await CommitBytesAsync(destination, contents, fault: null);
+                    // The swap already moved the previous generation into the backup, so the retry must not
+                    // re-point the replace at it (that would overwrite the backup with the retried bytes).
+                    await CommitBytesAsync(destination, contents, backupPath: null, fault: null);
                     return;
                 }
                 catch (Exception retryError)
@@ -164,7 +183,9 @@ internal static class DurableFileStore
     private static async Task CommitBytesAsync(
         string destination,
         ReadOnlyMemory<byte> contents,
-        Action<DurableWriteStage>? fault)
+        string? backupPath,
+        Action<DurableWriteStage>? fault,
+        Action? onSwapped = null)
     {
         var tmp = TempPathFor(destination);
         try
@@ -185,7 +206,10 @@ internal static class DurableFileStore
             }
 
             fault?.Invoke(DurableWriteStage.BeforeReplace);
-            await ReplaceFileWithRetryAsync(tmp, destination);
+            await ReplaceFileWithRetryAsync(tmp, destination, backupPath);
+            // Reported before the post-swap stages run: a fault injected at one of those leaves the new
+            // bytes committed, and the caller must not read that as "the destination was never touched".
+            onSwapped?.Invoke();
 
             fault?.Invoke(DurableWriteStage.BeforeDirectoryFlush);
             FlushDirectory(Path.GetDirectoryName(destination)!);
@@ -200,8 +224,8 @@ internal static class DurableFileStore
     }
 
     // Byte-identical replacement of `destination` with the current contents of `source`, through the same
-    // temp + atomic-replace + verify machinery as CommitBytesAsync. Used for the pre-replace snapshot and
-    // for rolling back to it, so neither has to exist in memory first.
+    // temp + atomic-replace + verify machinery as CommitBytesAsync. Used to roll a mismatched primary back
+    // to the previous generation, which the swap preserved - so it never has to exist in memory first.
     //
     // The copy is bounded to the source length read up front and verified against that same prefix BEFORE
     // the replace. A transcript is append-only and may be growing while we copy it, so "copy then compare
@@ -255,7 +279,7 @@ internal static class DurableFileStore
                 throw new IOException("The durable file copy did not match its source: " + source);
 
             fault?.Invoke(DurableWriteStage.BeforeReplace);
-            await ReplaceFileWithRetryAsync(tmp, destination);
+            await ReplaceFileWithRetryAsync(tmp, destination, backupPath: null);
 
             fault?.Invoke(DurableWriteStage.BeforeDirectoryFlush);
             FlushDirectory(Path.GetDirectoryName(destination)!);
@@ -371,7 +395,11 @@ internal static class DurableFileStore
             CopyBufferBytes,
             FileOptions.Asynchronous | FileOptions.SequentialScan);
 
-    private static async Task ReplaceFileWithRetryAsync(string source, string destination)
+    // When `backupPath` is given the swap is ReplaceFile, which installs `source` at `destination` and
+    // RENAMES the bytes it displaced into `backupPath` in the same atomic operation - the previous
+    // generation is preserved without a second write. A plain replace is used when there is nothing to
+    // preserve: a first-time write, or a rollback that is itself overwriting a bad generation.
+    private static async Task ReplaceFileWithRetryAsync(string source, string destination, string? backupPath)
     {
         Exception? last = null;
         var refused = false;
@@ -381,19 +409,32 @@ internal static class DurableFileStore
             {
                 if (OperatingSystem.IsWindows())
                 {
-                    if (!MoveFileEx(
+                    var replaced = backupPath is null
+                        ? MoveFileEx(
                             source,
                             destination,
-                            MoveFileReplaceExisting | MoveFileWriteThrough))
+                            MoveFileReplaceExisting | MoveFileWriteThrough)
+                        : ReplaceFile(
+                            destination,
+                            source,
+                            backupPath,
+                            ReplaceFileWriteThrough,
+                            IntPtr.Zero,
+                            IntPtr.Zero);
+                    if (!replaced)
                     {
                         var code = Marshal.GetLastWin32Error();
                         refused = code is ErrorAccessDenied or ErrorSharingViolation;
                         throw new Win32Exception(code);
                     }
                 }
-                else
+                else if (backupPath is null)
                 {
                     File.Move(source, destination, overwrite: true);
+                }
+                else
+                {
+                    File.Replace(source, destination, backupPath);
                 }
                 return;
             }

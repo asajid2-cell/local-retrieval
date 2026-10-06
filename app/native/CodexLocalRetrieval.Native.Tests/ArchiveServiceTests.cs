@@ -69,12 +69,12 @@ public sealed class ArchiveServiceTests
             Assert.AreEqual(0, verificationReads, "no rollback verification read on a refused replacement");
             CollectionAssert.AreEqual(bytesBefore, await File.ReadAllBytesAsync(store), "the store is untouched");
 
-            // Retention must hold whether or not the commit succeeds. Pruning used to run only after a
-            // successful commit, so a store that stopped committing grew by a whole-store snapshot per
-            // attempt without bound - 5.8 GB in under an hour live. Thirteen snapshot writes happened;
-            // only the bounded prefix survives.
-            Assert.AreEqual(8, Directory.GetFiles(service.StoreBackupsDir, "*.json").Length,
-                "snapshots stay bounded while the store cannot be committed");
+            // Retention has nothing left to bound here: the previous generation is preserved by the rename
+            // the swap itself would have performed, so a refused swap writes no snapshot at all. Repeated
+            // failures leave the directory exactly as the last success left it - which is a stronger
+            // guarantee than the bounded growth this used to assert (5.8 GB in under an hour live).
+            Assert.AreEqual(0, Directory.GetFiles(service.StoreBackupsDir, "*.json").Length,
+                "a refused swap writes no snapshot; nothing accumulates while the store cannot be committed");
         }
         finally { try { Directory.Delete(dir, true); } catch { } }
     }
@@ -93,7 +93,7 @@ public sealed class ArchiveServiceTests
 
             var storeDir = Path.GetDirectoryName(Path.Combine(dir, "app-store.json"))!;
             var abandonedStore = Path.Combine(storeDir, "app-store.json.0000000000000000000000000000000.tmp");
-            var abandonedSnapshot = Path.Combine(service.StoreBackupsDir, "app-store-x-committed.json.0000000000000000000000000000000.tmp");
+            var abandonedSnapshot = Path.Combine(service.StoreBackupsDir, "app-store-x-previous.json.0000000000000000000000000000000.tmp");
             var inFlight = Path.Combine(service.StoreBackupsDir, "app-store-y-previous.json.1111111111111111111111111111111.tmp");
             foreach (var path in new[] { abandonedStore, abandonedSnapshot, inFlight })
                 await File.WriteAllTextAsync(path, "candidate");
@@ -121,13 +121,14 @@ public sealed class ArchiveServiceTests
         try
         {
             var service = new ArchiveService(storePath: Path.Combine(dir, "app-store.json"));
-            for (var save = 0; save < 6; save++)
+            for (var save = 0; save < 12; save++)
             {
                 service.Store.Sessions["s" + save] = new ArchiveSession { Id = "s" + save, Tool = "codex", Title = "t" };
                 await service.SaveAsync();
             }
 
-            // Two snapshots per accepted save, so six saves leave twelve files for an unbounded pruner.
+            // One snapshot per accepted save (the previous generation the swap displaced), so twelve saves
+            // leave eleven files for an unbounded pruner; the count cap keeps the newest eight.
             Assert.AreEqual(8, Directory.GetFiles(service.StoreBackupsDir, "*.json").Length);
             var newest = Directory.GetFiles(service.StoreBackupsDir, "*.json").OrderByDescending(File.GetLastWriteTimeUtc).First();
             Assert.IsTrue(File.Exists(newest), "the newest snapshot - the recovery candidate - is always kept");
@@ -156,8 +157,8 @@ public sealed class ArchiveServiceTests
             // Nothing enumerates these for recovery, so without an explicit sweep they live forever. They
             // also carry their own budget rather than competing with the recoverable generations.
             Assert.AreEqual(2, Directory.GetFiles(service.StoreBackupsDir, "superseded-*.json").Length);
-            Assert.AreEqual(3, Directory.GetFiles(service.StoreBackupsDir, "app-store-*.json").Length,
-                "both saves' recoverable generations are untouched by the superseded sweep");
+            Assert.AreEqual(1, Directory.GetFiles(service.StoreBackupsDir, "app-store-*.json").Length,
+                "the recoverable previous generation is untouched by the superseded sweep");
         }
         finally { try { Directory.Delete(dir, true); } catch { } }
     }
@@ -721,36 +722,60 @@ public sealed class ArchiveServiceTests
             Assert.IsTrue(File.Exists(store), "current store exists after save");
             Assert.AreEqual(0, Directory.GetFiles(dir, "*.tmp").Length, "temp files are cleaned after commit");
             var backups = Directory.GetFiles(service.StoreBackupsDir, "*.json");
-            Assert.AreEqual(3, backups.Length, "each accepted generation has a committed snapshot and replacement keeps the previous bytes");
+            Assert.AreEqual(1, backups.Length, "a save keeps exactly the previous generation the swap displaced");
 
             using var current = JsonDocument.Parse(File.ReadAllText(store));
             Assert.IsTrue(current.RootElement.GetProperty("sessions").TryGetProperty("s2", out _), "current store has the latest session");
 
-            var snapshots = backups.Select(path => JsonDocument.Parse(File.ReadAllText(path))).ToArray();
-            try
-            {
-                Assert.AreEqual(2, snapshots.Count(snapshot => snapshot.RootElement.GetProperty("generation").GetInt64() == 1));
-                Assert.AreEqual(1, snapshots.Count(snapshot => snapshot.RootElement.GetProperty("generation").GetInt64() == 2));
-                var committed = snapshots.Single(snapshot => snapshot.RootElement.GetProperty("generation").GetInt64() == 2);
-                Assert.IsTrue(
-                    committed.RootElement.GetProperty("sessions").TryGetProperty("s2", out _),
-                    "the newest acknowledged generation has a redundant recovery snapshot");
-            }
-            finally
-            {
-                foreach (var snapshot in snapshots) snapshot.Dispose();
-            }
-
-            using var previous = JsonDocument.Parse(File.ReadAllText(
-                backups.First(path =>
-                {
-                    using var snapshot = JsonDocument.Parse(File.ReadAllText(path));
-                    return snapshot.RootElement.GetProperty("generation").GetInt64() == 1;
-                })));
+            using var previous = JsonDocument.Parse(File.ReadAllText(backups.Single()));
+            Assert.AreEqual(1, previous.RootElement.GetProperty("generation").GetInt64());
             var backupSessions = previous.RootElement.GetProperty("sessions");
             Assert.IsTrue(backupSessions.TryGetProperty("s1", out var backedUpFirst), "backup keeps the previous session");
             Assert.IsFalse(backupSessions.TryGetProperty("s2", out _), "previous-generation backup does not invent later state");
             Assert.AreEqual("petunia", backedUpFirst.GetProperty("specialPhrases")[0].GetString());
+        }
+        finally { Directory.Delete(dir, true); }
+    }
+
+    // W1 gate: a replacement save writes about ONE store size, not three. The store is padded so a
+    // store-sized write is unambiguous against directory noise, then a save is measured by how much the
+    // backups directory grows. Preserving the previous generation by a RENAME adds about one store; the
+    // pre-W1 behaviour - a byte copy of the previous generation plus a redundant `-committed.json` copy of
+    // the new one - added about two, on top of the primary write itself.
+    [TestMethod]
+    public async Task SaveAsync_GrowsTheBackupSetByAboutOneStoreSize()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "clr-store-onewrite-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            var store = Path.Combine(dir, "app-store.json");
+            var service = new ArchiveService(storePath: store);
+            service.Store.Sessions["s1"] = new ArchiveSession
+                { Id = "s1", Tool = "codex", Title = "first", Text = new string('t', 1_000_000) };
+            await service.SaveAsync();   // first save: nothing to preserve, so no previous generation
+
+            var storeBytes = new FileInfo(store).Length;
+            Assert.IsTrue(storeBytes > 1_000_000, "the fixture must be store-sized, not noise-sized");
+            long BackupsBytes() => Directory.GetFiles(service.StoreBackupsDir, "*.json")
+                .Sum(path => new FileInfo(path).Length);
+
+            var before = BackupsBytes();
+            service.Store.Sessions["s2"] = new ArchiveSession
+                { Id = "s2", Tool = "codex", Title = "second", Text = new string('u', 1_000_000) };
+            await service.SaveAsync();
+            var grown = BackupsBytes() - before;
+
+            Assert.IsTrue(grown <= storeBytes * 3 / 2,
+                $"one save must add about one store size to the backups (added {grown} for a {storeBytes} byte store)");
+            var backups = Directory.GetFiles(service.StoreBackupsDir, "*.json");
+            Assert.AreEqual(1, backups.Length, "the swap leaves exactly the previous generation behind");
+            Assert.IsFalse(backups.Any(path => path.Contains("committed", StringComparison.OrdinalIgnoreCase)),
+                "the newest generation is no longer duplicated on disk");
+            // The displaced generation is the bytes the primary held, moved rather than copied.
+            using var previous = JsonDocument.Parse(File.ReadAllText(backups.Single()));
+            Assert.AreEqual(1, previous.RootElement.GetProperty("generation").GetInt64());
+            Assert.IsTrue(previous.RootElement.GetProperty("sessions").TryGetProperty("s1", out _));
         }
         finally { Directory.Delete(dir, true); }
     }
@@ -898,10 +923,15 @@ public sealed class ArchiveServiceTests
             writer.Store.Sessions["preserved"] = new ArchiveSession
                 { Id = "preserved", Tool = "codex", Title = "preserved" };
             await writer.SaveAsync();
+            writer.Store.Sessions["middle"] = new ArchiveSession
+                { Id = "middle", Tool = "claude", Title = "middle" };
+            await writer.SaveAsync();
             writer.Store.Sessions["latest"] = new ArchiveSession
                 { Id = "latest", Tool = "claude", Title = "latest" };
             await writer.SaveAsync();
 
+            // Two recoverable generations are on disk (the previous generations of saves two and three).
+            // Give the OLDER one the newer timestamp: recovery must rank by persisted generation, not mtime.
             foreach (var backup in Directory.GetFiles(writer.StoreBackupsDir, "*.json"))
             {
                 using var snapshot = JsonDocument.Parse(File.ReadAllText(backup));
@@ -917,17 +947,24 @@ public sealed class ArchiveServiceTests
             await reader.LoadAsync();
 
             Assert.IsTrue(reader.Store.Sessions.ContainsKey("preserved"));
-            Assert.IsTrue(reader.Store.Sessions.ContainsKey("latest"), "recovery chooses the highest valid generation, not the newest timestamp");
+            Assert.IsTrue(reader.Store.Sessions.ContainsKey("middle"), "recovery chooses the highest valid generation, not the newest timestamp");
+            Assert.IsFalse(reader.Store.Sessions.ContainsKey("latest"),
+                "the newest generation lives only in the primary; a corrupt primary falls back to the previous generation");
             Assert.AreEqual(7999, reader.ReadSettingsOnly().MultiplexApiPort);
             using var restored = JsonDocument.Parse(File.ReadAllText(store));
             Assert.IsTrue(restored.RootElement.GetProperty("sessions").TryGetProperty("preserved", out _));
-            Assert.IsTrue(restored.RootElement.GetProperty("sessions").TryGetProperty("latest", out _));
+            Assert.IsTrue(restored.RootElement.GetProperty("sessions").TryGetProperty("middle", out _));
         }
         finally { Directory.Delete(dir, true); }
     }
 
+    // A readable primary is authoritative: the backups are the fallback for a primary that cannot be read
+    // at all, not a second opinion that can out-vote a valid one. The newest generation used to be
+    // duplicated into a `-committed.json` snapshot, which is what made a stale primary recoverable to
+    // generation two; that third whole-store write per save is gone, so the newest generation now lives
+    // only in the primary and a backup can only ever hold an OLDER generation.
     [TestMethod]
-    public async Task LoadAsync_ReplacesValidStalePrimaryWithNewerCommittedGeneration()
+    public async Task LoadAsync_KeepsValidPrimaryWhenNoBackupHoldsANewerGeneration()
     {
         var dir = Path.Combine(Path.GetTempPath(), "clr-recover-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(dir);
@@ -954,11 +991,12 @@ public sealed class ArchiveServiceTests
             var reader = new ArchiveService(storePath: store);
             await reader.LoadAsync();
 
-            Assert.AreEqual(2, reader.Store.Generation);
+            Assert.AreEqual(1, reader.Store.Generation);
             Assert.IsTrue(reader.Store.Sessions.ContainsKey("generation-one"));
-            Assert.IsTrue(reader.Store.Sessions.ContainsKey("generation-two"));
+            Assert.IsFalse(reader.Store.Sessions.ContainsKey("generation-two"),
+                "no backup holds generation two, so the valid generation-one primary is what loads");
             using var restored = JsonDocument.Parse(File.ReadAllText(store));
-            Assert.AreEqual(2, restored.RootElement.GetProperty("generation").GetInt64());
+            Assert.AreEqual(1, restored.RootElement.GetProperty("generation").GetInt64());
         }
         finally { Directory.Delete(dir, true); }
     }
@@ -975,6 +1013,11 @@ public sealed class ArchiveServiceTests
             var first = new ArchiveService(storePath: firstPath);
             first.Store.Sessions["first-only"] = new ArchiveSession
                 { Id = "first-only", Tool = "codex", Title = "first" };
+            await first.SaveAsync();
+            // A second save so `first` has a recoverable previous generation of its own to be recovered
+            // from; the point of the test is that it must not borrow `second`'s.
+            first.Store.Sessions["first-again"] = new ArchiveSession
+                { Id = "first-again", Tool = "codex", Title = "again" };
             await first.SaveAsync();
 
             var second = new ArchiveService(storePath: secondPath);
@@ -1034,7 +1077,8 @@ public sealed class ArchiveServiceTests
             await reader.LoadAsync();
 
             Assert.IsTrue(reader.Store.Sessions.ContainsKey("preserved"));
-            Assert.IsTrue(reader.Store.Sessions.ContainsKey("newest"));
+            Assert.IsFalse(reader.Store.Sessions.ContainsKey("newest"),
+                "the backup holds the previous generation; the newest one lived only in the primary that was overwritten");
         }
         finally { Directory.Delete(dir, true); }
     }
@@ -1061,7 +1105,8 @@ public sealed class ArchiveServiceTests
             await reader.LoadAsync();
 
             Assert.IsTrue(reader.Store.Sessions.ContainsKey("preserved"));
-            Assert.IsTrue(reader.Store.Sessions.ContainsKey("newest"));
+            Assert.IsFalse(reader.Store.Sessions.ContainsKey("newest"),
+                "the newest valid backup is the previous generation; the deleted primary held the newest one");
             Assert.AreEqual(8123, reader.ReadSettingsOnly().MultiplexApiPort);
             Assert.IsTrue(File.Exists(store));
         }

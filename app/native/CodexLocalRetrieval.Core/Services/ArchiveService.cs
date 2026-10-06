@@ -61,6 +61,12 @@ public sealed partial class ArchiveService
     // Above this prefix length the periodic whole-prefix re-hash is skipped and the cheap boundary hash
     // at the prefix edge is the only guard. Re-hashing a 600 MB prefix every 30 hits was a multi-MB/s
     // read on its own; the boundary hash still catches the append-time rewrite this cache must reject.
+    // The trade-off is explicit: for a prefix above this length, an edit that rewrites bytes in the
+    // MIDDLE of the prefix - leaving the seam and the file length intact - is NOT caught by the periodic
+    // re-hash (it never runs) and NOT caught by the boundary hash (the seam is unchanged), so the frozen
+    // forward values would survive it. This is accepted because it requires a same-length, seam-preserving
+    // in-place rewrite of a multi-MB transcript, which no writer in this system performs: transcripts are
+    // append-only, and the two rewriters (branch/entrypoint) replace the file rather than edit it in place.
     private const long FullForwardVerifyMaxBytes = 8 * 1024 * 1024;
     private const int SearchTextCap = 6_000; // capped, in-memory searchable text per session (full content lazy-loads)
     private const int MaxDiskSearchParallelism = 4;
@@ -301,7 +307,7 @@ public sealed partial class ArchiveService
     // SAME atomic payload as the session data they describe, so a dropped save costs only a re-parse of
     // the files whose stamps reverted -- never a stamp that claims data the store does not hold.
     // User-driven operations still call SaveAsync directly and stay immediate.
-    private static readonly TimeSpan DeferredSaveInterval = TimeSpan.FromMinutes(2);
+    private static readonly TimeSpan DeferredSaveInterval = TimeSpan.FromMinutes(5);
     // Anchored at construction: the process start read (or will read) the store, so the first background
     // merge inside the window has nothing new to persist that the load did not just see. A zero anchor
     // would make that first merge write immediately, which is the per-cycle rewrite this exists to stop.
@@ -1285,29 +1291,19 @@ public sealed partial class ArchiveService
                         // this task, and the buffer is only reused by a later save, so the alias is safe
                         // for exactly as long as it is needed.
                         var commitWatch = System.Diagnostics.Stopwatch.StartNew();
+                        // One data write per save. The swap itself renames the previous primary into
+                        // `previousBackup` as ReplaceFile's backup argument, so the old generation is kept
+                        // without a second serialize. There used to be a third write here - a
+                        // `-committed.json` copy of the bytes just written - which was a whole extra store
+                        // per cycle for a generation the primary already held. Recovery ranks the backup
+                        // files by generation and the primary is never torn, so the previous generation is
+                        // the fallback the gate asks for ("old or new, never torn"); the newest generation
+                        // is no longer duplicated on disk.
                         await DurableFileStore.WriteAtomicAsync(
                             _storePath, bytes, previousBackup, StoreWriteFault);
-                        var primaryMs = commitWatch.ElapsedMilliseconds;
-                        var committedBackup = Path.Combine(
-                            StoreBackupsDir,
-                            StoreBackupPrefix + stamp + "-committed.json");
-                        try
-                        {
-                            await DurableFileStore.WriteAtomicAsync(committedBackup, bytes);
-                            PerfCounters.Trace?.Invoke(
-                                $"save commit primaryMs={primaryMs} snapshotMs={commitWatch.ElapsedMilliseconds - primaryMs}"
-                                + $" storeMB={bytes.Length / 1048576.0:F0}");
-                        }
-                        catch (Exception backupError)
-                        {
-                            throw new DurableWriteException(
-                                "The app store committed, but its redundant committed-generation snapshot failed.",
-                                backupError,
-                                committed: true,
-                                recovered: false,
-                                verificationUnknown: backupError is DurableWriteException durable
-                                                     && durable.VerificationUnknown);
-                        }
+                        PerfCounters.Trace?.Invoke(
+                            $"save commit primaryMs={commitWatch.ElapsedMilliseconds}"
+                            + $" storeMB={bytes.Length / 1048576.0:F0}");
                     });
                 }
                 finally
@@ -2720,11 +2716,11 @@ public sealed partial class ArchiveService
 
     private const int MaxAutoBackups = 30;
 
-    // Store-snapshot retention. Every accepted save writes TWO whole-store snapshots (the pre-replace
-    // bytes, plus a redundant copy of the committed bytes), so a count cap is really a disk cap: keeping
-    // 30 of them for one 57 MB store is 1.7 GB of snapshots sitting beside a 57 MB store. Bound the count
-    // AND the bytes. Recovery ranks the newest generations first, so older ones are worth their disk only
-    // as far as the floor; nothing beyond that is worth a gigabyte.
+    // Store-snapshot retention. Every accepted save leaves ONE whole-store snapshot - the previous
+    // generation, renamed into place by the atomic swap - so a count cap is really a disk cap: keeping 30
+    // of them for one 57 MB store is 1.7 GB of snapshots sitting beside a 57 MB store. Bound the count AND
+    // the bytes. Recovery ranks the newest generations first, so older ones are worth their disk only as
+    // far as the floor; nothing beyond that is worth a gigabyte.
     private const int MaxStoreBackups = 8;
     private const int MinStoreBackups = 3;
     private const long MaxStoreBackupBytes = 512L * 1024 * 1024;
