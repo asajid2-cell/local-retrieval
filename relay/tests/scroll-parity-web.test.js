@@ -101,7 +101,11 @@ test("normal screen is the host's: the router scrolls xterm's scrollback and swa
   const iAltBranch = router.indexOf('Alternate buffer');
   assert.notEqual(iAltBranch, -1, 'wheel router lost its alternate-buffer branch');
 
-  const iScroll = router.indexOf('term.scrollLines(');
+  // The bare-normal branch is the `let alt=… if(!alt){ … }` block; it must scroll locally and swallow the
+  // event. (The app branch and the SHIFT escape sit earlier in the router, so anchor on `let alt=`.)
+  const iBare = router.indexOf('let alt=');
+  assert.notEqual(iBare, -1, 'normal-buffer branch (let alt=) is gone');
+  const iScroll = router.indexOf('term.scrollLines(', iBare);
   assert.notEqual(iScroll, -1, 'normal-buffer branch no longer calls term.scrollLines()');
   const iPrevent = router.indexOf('preventDefault()', iScroll);
   assert.notEqual(iPrevent, -1, 'normal-buffer branch no longer calls preventDefault()');
@@ -123,19 +127,30 @@ test('the bare-alternate divergence from muxctl is recorded and accepted', () =>
   assert.equal(rec.accepted, true, 'the divergence must be an accepted decision, not a latent bug');
 });
 
-test('the capture-phase divergence on a tracked NORMAL buffer is recorded and accepted', () => {
-  // tracking-wins holds wherever the app sees the wheel at all. On the web normal buffer the capture-phase
-  // router deliberately takes the notch first (a leaked DECSET 1000 would otherwise freeze the scrollback
-  // forever), so those cells are host_scrollback — which is only honest because it is a recorded divergence.
+test('a tracked NORMAL buffer sends the wheel report — the reversal of the old capture-phase divergence', () => {
+  // tracking-wins holds wherever the app sees the wheel at all, on BOTH surfaces. The router now gates its app
+  // branch on appTakesMouse() — the app's mouse INTENT — not on the buffer. The CC gateway paints its transcript
+  // in place on the NORMAL buffer, so its history lives in the app: a local scroll walked an ~8-row stub while
+  // the real history was unreachable.
   for(const c of web.filter(c => c.screen === 'normal' && c.tracking === true)){
-    assert.equal(c.mechanism, 'host_scrollback', key(c) + ' must be host_scrollback: the capture-phase guard wins');
+    assert.equal(c.mechanism, 'wheel_report', key(c) + ' must be wheel_report: mouse intent outranks the buffer');
   }
 
+  const router = extractWheelRouterSource();
+  assert.match(router, /if\(appTakesMouse\(\)\)/, 'the app branch no longer gates on appTakesMouse()');
+  assert.doesNotMatch(router, /appOwnsScreen\(\)\s*&&\s*appTakesMouse\(\)/,
+    'the buffer still gates the app branch — the reversal did not land');
+  // SHIFT+wheel is the deliberate local-scrollback escape, checked FIRST so a tracked app cannot swallow it.
+  const iShift = router.indexOf('e.shiftKey');
+  const iApp = router.indexOf('if(appTakesMouse())');
+  assert.notEqual(iShift, -1, 'shift+wheel local-scrollback escape is gone');
+  assert.ok(iShift < iApp, 'shift+wheel must be checked before the app branch, or a tracked app swallows it');
+
   const rec = (vectors.divergences || []).find(d => /^web\/normal\/tracking=true/.test(d.cell || ''));
-  assert.ok(rec, 'no divergence record for web/normal/tracking=true — the exception would be silent');
+  assert.ok(rec, 'the reversal must be recorded, not silently deleted');
+  assert.equal(rec.reversed, true, 'the old divergence must be recorded as reversed');
   assert.equal(rec.muxctl, 'wheel_report');
-  assert.equal(rec.web, 'host_scrollback');
-  assert.equal(rec.accepted, true, 'the divergence must be an accepted decision, not a latent bug');
+  assert.equal(rec.web, 'wheel_report', 'the two surfaces now agree on a tracked normal buffer');
 });
 
 test('every web anchor points at real lines of ' + HTML_PATH, () => {

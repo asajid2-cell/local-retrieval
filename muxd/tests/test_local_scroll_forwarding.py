@@ -234,9 +234,17 @@ class ScrollParityVectorTests(unittest.TestCase):
         recorded = set()
         for d in VECTOR["divergences"]:
             _, screen, tracking, alt = d["cell"].split("/")
-            for a in ((True, False) if alt == "*" else (alt.endswith("true"),)):
-                recorded.add((screen, tracking.endswith("true"), a))
+            states = [(screen, tracking.endswith("true"), a)
+                      for a in ((True, False) if alt == "*" else (alt.endswith("true"),))]
             self.assertTrue(d["accepted"])
+            if d.get("reversed"):
+                # A reversed entry is a historical record, not a live divergence: the surfaces must now AGREE
+                # on those states (so they never appear in `disagree`) and the record must say so.
+                self.assertEqual(d["muxctl"], d["web"], d)
+                for st in states:
+                    self.assertNotIn(st, disagree, d)
+                continue
+            recorded.update(states)
         self.assertEqual(disagree, recorded)
 
     # ---- muxctl behavior ------------------------------------------------------------------

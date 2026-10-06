@@ -1991,17 +1991,15 @@ window.addEventListener('orientationchange', ()=>setTimeout(applyViewport,250));
 })();
 
 function isVisibleOwner(){ return !!(current && findSession(current)?.owner); }
-// WHOSE SCREEN IS THIS? The alternate screen is the APP's: it has no scrollback and the app is the only
-// thing that can move its own content. The normal buffer is the HOST's: the mirror holds that session's
-// whole output, so the wheel scrolls it instantly with no round trip and a plain drag selects. That
-// normal-buffer rule is the deliberate, recorded divergence in docs/scroll-parity.json
-// (web/normal/tracking=true/*) -- a TUI that leaked DECSET 1000 and died would otherwise freeze the
-// scrollback forever, with no local console to fall back on. Getting this wrong is what made a shell's wheel
-// look dead: the reports were forwarded into the shell's stdin as escape bytes while the mirror's own
-// scrollback sat unused.
-function appOwnsScreen(){
-  try{ return term.buffer.active.type==='alternate'; }catch(e){ return false; }
-}
+// WHOSE WHEEL IS THIS? Not the buffer's -- the app's MOUSE INTENT decides. This used to key on the buffer
+// (appOwnsScreen(): forward only on the alternate screen), and that rule is what the CC gateway broke: it
+// paints its transcript in place in its own ScrollBox on the NORMAL buffer, so xterm's base stays at the top
+// and a local scroll walked an ~8-row stub ("top - 8 up") while the real history sat unreachable in the app.
+// A real terminal does not ask which buffer it is on; it sends wheel reports whenever ?1000/1002/1003 is set.
+// So the app branch gates on appTakesMouse() alone, and the old normal-buffer host_scrollback divergence
+// (web/normal/tracking=true/* in docs/scroll-parity.json) is REVERSED -- recorded there, not deleted. A bare
+// shell is still protected: it never armed the mouse, so appTakesMouse() is false and nothing is forwarded.
+// SHIFT+wheel is the deliberate escape back to the local scrollback (see the wheel router).
 // Did the app actually ASK for the mouse? mouseGuard reads the DECSET/DECRST stream out of the session's own
 // output, so a bare shell -- or a pager that never enabled reporting -- answers no and the gesture stays the
 // client's. inputAllowed(), not mouseActive(): the former is what we are willing to forward. Without this a
@@ -2031,12 +2029,15 @@ function wheelAdvance(px, step){
   return units;
 }
 function sendOwnerWheel(px, clientX, clientY, discrete){
-  // The gate is the SCREEN and the app's mouse intent, never the session's owner flag: a session created
-  // from the web is owner:false, so an owner gate here silently killed the wheel for every browser-launched
-  // full-screen app - the same trap the shift gesture already documents (see the FORCE_SEL comment). A bare
-  // shell is still protected: it sits on the NORMAL buffer, so appOwnsScreen() is false and this returns
-  // before anything can be forwarded into its stdin.
-  if(!appOwnsScreen() || !appTakesMouse() || !px) return false;
+  // The gate is the app's mouse INTENT, never the buffer and never the session's owner flag. Buffer type
+  // is the wrong question: a real terminal (WT/xterm) sends wheel reports whenever ?1000/1002/1003 is set,
+  // so an app that armed the mouse on the NORMAL buffer must get the notch too - the CC gateway paints its
+  // transcript in place in its own ScrollBox, so xterm's base stays at the top and a local scroll only
+  // walks a stub. Ownership is the wrong question too: a web-created session is owner:false, so an owner
+  // gate here silently killed the wheel for every browser-launched full-screen app (the same trap the
+  // FORCE_SEL comment documents). A bare shell is still protected: it never armed the mouse, so
+  // appTakesMouse() is false and nothing can be forwarded into its stdin.
+  if(!appTakesMouse() || !px) return false;
   const cell=bufferCellAt(clientX, clientY);
   if(!cell) return false;
   const button=px<0 ? 64 : 65;
@@ -2054,8 +2055,8 @@ function sendOwnerWheel(px, clientX, clientY, discrete){
   sendMouseInput(report.repeat(n));
   return true;
 }
-// A wheel record goes to the app only when the app owns the screen (see appOwnsScreen); on a shell the
-// mirror scrolls its own scrollback, which is instant. The app path is the same record the app already
+// A wheel record goes to the app whenever it has ARMED the mouse (appTakesMouse), on either buffer; a bare
+// shell scrolls the mirror's own scrollback, which is instant. The app path is the same record the app already
 // understands, so nothing about a full-screen TUI changes here.
 $('#term').addEventListener('wheel', e=>{
   if(!e.isTrusted) return;   // synthetic forwarding must reach xterm, not recurse through this capture handler
@@ -2063,14 +2064,26 @@ $('#term').addEventListener('wheel', e=>{
   noteUserScroll();
   const host=$('#term'), xt=host.querySelector('.xterm');
   const px = wheelPx(e, (cellMetrics().h)||18);
-  // The app's screen and its mouse intent decide, NOT the session's owner flag: a browser-created session
-  // is owner:false, so an owner gate here meant the app branch never ran and an alt-screen wheel fell
-  // through to a viewport that has no scrollback (the dead wheel). When the app owns the screen AND asked
-  // for the mouse, the wheel is the app's, even for an event that does not yet complete a notch. Falling
-  // through to the local scrollback here scrolled the mirror behind the app's back AND spent the
-  // accumulator twice at two different steps, so no notch ever completed and a trackpad flick produced no
-  // report at all.
-  if(appOwnsScreen() && appTakesMouse()){
+  // SHIFT keeps the wheel local (xterm/WT scroll their own viewport under Shift), and it is the escape
+  // when an app armed the mouse but can no longer move its own content - a leaked DECSET 1000 from a TUI
+  // that died. Checked FIRST so a tracked app can never swallow it.
+  if(e.shiftKey){
+    const ch=(cellMetrics().h)||18;
+    const lines = wheelDiscrete(e, px, ch)
+      ? (Math.trunc(px/ch) || (px>0?1:(px<0?-1:0)))
+      : wheelAdvance(px, ch);
+    if(lines){ try{ term.scrollLines(lines); }catch(_){} }
+    e.preventDefault(); e.stopPropagation();
+    return;
+  }
+  // The app takes the wheel whenever it has ASKED for the mouse, on ANY buffer - not only the alternate
+  // screen. A real terminal sends wheel reports whenever ?1000/1002/1003 is set, and the CC gateway is
+  // exactly the case the old alternate-screen gate got wrong: it paints its transcript in place in its own
+  // ScrollBox on the NORMAL buffer, so xterm's base stays at the top and scrolling locally only walked an
+  // 8-row stub ("top - 8 up") with the real history unreachable. Mouse intent is the question; the buffer
+  // is not. Falling through to the local scrollback here also spent the accumulator at a second step, so
+  // no notch ever completed and a trackpad flick produced no report at all.
+  if(appTakesMouse()){
     sendOwnerWheel(px, e.clientX, e.clientY, wheelDiscrete(e, px, WHEEL_NOTCH_PX));
     e.preventDefault(); e.stopPropagation();
     return;
@@ -2804,10 +2817,15 @@ function applyScrollAffordance(){
   const panning = host.classList.contains('pan');
   const cols = winSize && winSize.cols ? winSize.cols : term.cols;
   const position = buf ? scrollPositionLabel(buf.viewportY, buf.baseY, term.rows) : 'no scrollback';
+  // A normal-buffer app that ARMED the mouse owns the wheel (see the wheel router), so the local scrollback is
+  // reachable only under SHIFT. Say so where the readout is read: the CC gateway shows "top · 8 up" with no
+  // clue the wheel belongs to the app, which is exactly the dead-end the field report hit.
+  const tracked = !alt && appTakesMouse();
+  const hint = tracked ? ' · shift+wheel: local history' : '';
   const label = alt
     ? ('app scroll'+(panning ? ' · pan '+cols+' cols' : ''))
-    : (panning ? ((position==='live · bottom' || position==='no scrollback' ? '' : position+' · ')+'pan '+cols+' cols') : position);
-  const key = (alt?'a:':'n:') + (panning?'p:':'f:') + label;
+    : ((panning ? ((position==='live · bottom' || position==='no scrollback' ? '' : position+' · ')+'pan '+cols+' cols') : position) + hint);
+  const key = (alt?'a:':'n:') + (panning?'p:':'f:') + (tracked?'t:':'u:') + label;
   if(key===lastAffordance) return label;
   lastAffordance = key;
   // An alt-screen flip changes who owns the cells, so a pending prediction is stale either way: entering
@@ -2821,7 +2839,8 @@ function applyScrollAffordance(){
                : 'This full-screen app handles vertical scrolling itself. Tap for details.')
     : (panning ? 'Drag the horizontal scrollbar to pan the shared terminal.' : label);
   // At the live bottom (or with no history at all) the chip is noise — the pill already covers "go live".
-  chip.hidden = !panning && !alt && (label==='live · bottom' || label==='no scrollback');
+  // A tracked normal buffer is the exception: the hint is the only clue that SHIFT+wheel still works.
+  chip.hidden = !panning && !alt && !tracked && (position==='live · bottom' || position==='no scrollback');
   return label;
 }
 function explainScrollAffordance(){
