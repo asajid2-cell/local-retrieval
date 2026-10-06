@@ -1558,7 +1558,13 @@ DSR_QUERY_RE = re.compile(br"\x1b\[\??6n")
 # or its wheel input falls back to arrow keys / dies entirely (the "can't scroll a TUI" bug).
 # DECCKM (?1) rides along so viewers pick the right arrow encoding (SS3 vs CSI) for that fallback
 # and for real cursor keys; readline treats both forms as arrows, so a dead TUI can't wedge input.
-REPLAY_PRIVATE_MODES = frozenset((1, 47, 1047, 1049, 2004, 9, 1000, 1002, 1003, 1005, 1006, 1007, 1015))
+# DECSET 1004 (focus reporting) is tracked for the same reason as the rest: it is state the app set
+# that a mid-session attach must restore. It is also the gate for R5's FOCUS_IN repaint injection
+# (repaint_viewer) - an app that asked for focus reports redraws its inline block when it gets one.
+REPLAY_PRIVATE_MODES = frozenset((1, 47, 1047, 1049, 2004, 9, 1000, 1002, 1003, 1005, 1006, 1007, 1015, 1004))
+# What a terminal sends the app on window focus (CSI I). A gateway that enabled ?1004 repaints its
+# whole inline block on it (its requestViewerRepaint blanks the frame buffers -> a total diff).
+FOCUS_IN = b"\x1b[I"
 
 
 def strip_replay_dsr(data):
@@ -2654,6 +2660,34 @@ def redraw_nudge(session):
         pty.setwinsize(rows, cols)
     except Exception:
         pass
+
+def repaint_viewer(session):
+    """R5: make a newly-attached / re-attached / resynced viewer of an INLINE app get a fresh frame.
+
+    redraw_nudge is alt-screen-only (a size wiggle needs a full-screen TUI to answer it), so a gateway
+    rendering inline on the MAIN screen never repainted for a new viewer - the viewer saw whatever cells
+    were already in the ring. The app's own frame is the authoritative screen and only the app can redraw
+    it, so an app that enabled focus reporting (DECSET 1004) is asked to: FOCUS_IN makes the gateway blank
+    its frame buffers and re-emit the whole block (requestViewerRepaint), no resize needed. Gated on 1004
+    so a shell that never asked receives nothing, rate-limited 1/s to match the alt wiggle and the app's
+    own VIEWER_REPAINT_INTERVAL_MS. Alt screens keep the existing size wiggle."""
+    try:
+        modes = set(getattr(getattr(session, "replay_state", None), "private_modes", None) or ())
+    except Exception:
+        modes = set()
+    if modes & {47, 1047, 1049}:
+        redraw_nudge(session)                      # alt screen: the SIGWINCH wiggle owns it
+        return
+    if 1004 not in modes:
+        return                                     # no focus reporting -> the app cannot be asked
+    now = time.time()
+    if now - getattr(session, "_last_focus_inject", 0.0) < 1.0:
+        return
+    session._last_focus_inject = now
+    try:
+        session.write(FOCUS_IN)
+    except Exception as e:
+        log(f"[{session.name}] focus-in repaint injection failed: {e}")
 
 class AsyncRLock:
     def __init__(self):
@@ -5620,7 +5654,7 @@ async def main():
                     if isinstance(s, OwnerSession):
                         s._send_owner({"t": "redraw"})
                     else:
-                        await asyncio.get_running_loop().run_in_executor(None, redraw_nudge, s)
+                        await asyncio.get_running_loop().run_in_executor(None, repaint_viewer, s)
                     pt = asyncio.create_task(pump_local_viewer(ws, s, lq))
                     try:
                         async for raw in ws:
@@ -5805,7 +5839,7 @@ async def main():
                                         if isinstance(rsession, OwnerSession):
                                             rsession._send_owner({"t": "redraw"})
                                         else:
-                                            await asyncio.get_running_loop().run_in_executor(None, redraw_nudge, rsession)
+                                            await asyncio.get_running_loop().run_in_executor(None, repaint_viewer, rsession)
                                         continue
                                     continue
                                 try: m = json.loads(raw)
@@ -5918,6 +5952,11 @@ async def main():
                                         session.set_watched(True)
                                         if session.stream:
                                             log(f"[{name}] watched: forwarding owner output")
+                                    else:
+                                        # R5: a viewer just attached to a headless session. An alt-screen
+                                        # TUI answers the size wiggle; an inline app that enabled ?1004 is
+                                        # asked to repaint with FOCUS_IN (redraw_nudge alone leaves it stale).
+                                        await asyncio.get_running_loop().run_in_executor(None, repaint_viewer, session)
                                 elif t == "unwatch" and name in sessions:
                                     session = sessions[name]
                                     if isinstance(session, OwnerSession):
@@ -5953,7 +5992,7 @@ async def main():
                                     if isinstance(session, OwnerSession):
                                         session._send_owner({"t": "redraw"})
                                     else:
-                                        await asyncio.get_running_loop().run_in_executor(None, redraw_nudge, session)
+                                        await asyncio.get_running_loop().run_in_executor(None, repaint_viewer, session)
                                 elif t == "sb" and name in sessions:
                                     session = sessions[name]
                                     scrollback_limit = m.get("max", SB_SEND)
@@ -5972,7 +6011,7 @@ async def main():
                                     }))
                                     # Byte replay can't rebuild a full-screen TUI on its own; nudge the app to
                                     # emit an authoritative full frame right after the replay.
-                                    await asyncio.get_running_loop().run_in_executor(None, redraw_nudge, session)
+                                    await asyncio.get_running_loop().run_in_executor(None, repaint_viewer, session)
                                 elif t == "rename" and name in sessions:
                                     to = strict_mux_name(m.get("to", ""))
                                     if to and to not in sessions:
