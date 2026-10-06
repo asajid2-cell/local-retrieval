@@ -51,6 +51,17 @@ public sealed partial class ArchiveService
     private const int FinalRecordSlowBudgetBytes = 1024 * 1024;
     private const int ClaudeTailBytes = 8 * 1024 * 1024;
     private const int CodexTailBytes = 8 * 1024 * 1024;
+    // Byte budget for the Claude forward pass. The line cap alone does not bound the read: a transcript
+    // can hold fewer than MaxLinesPerSession lines and still be tens or hundreds of MB (measured live:
+    // 48 MB across 5,831 lines), and such a file used to be re-parsed IN FULL on every cycle because it
+    // never tripped the line cap and so never entered the S1 forward cache. Stopping on bytes as well
+    // routes those files through the same capped path (tail window + frozen forward values), so a cold
+    // parse costs about this budget plus the tail window and every later cycle costs only the append.
+    private const int ClaudeForwardReadBudgetBytes = 8 * 1024 * 1024;
+    // Above this prefix length the periodic whole-prefix re-hash is skipped and the cheap boundary hash
+    // at the prefix edge is the only guard. Re-hashing a 600 MB prefix every 30 hits was a multi-MB/s
+    // read on its own; the boundary hash still catches the append-time rewrite this cache must reject.
+    private const long FullForwardVerifyMaxBytes = 8 * 1024 * 1024;
     private const int SearchTextCap = 6_000; // capped, in-memory searchable text per session (full content lazy-loads)
     private const int MaxDiskSearchParallelism = 4;
     private const long MaxDiskSearchBytesPerFile = 128L * 1024 * 1024;
@@ -7268,7 +7279,8 @@ public sealed partial class ArchiveService
             && cachedForward.CreationUtc == info.CreationTimeUtc
             && info.Length >= cachedForward.ReadBytes)
         {
-            var verifyFull = cachedForward.VerifyCountdown <= 0;
+            var verifyDue = cachedForward.VerifyCountdown <= 0;
+            var verifyFull = verifyDue && cachedForward.ReadBytes <= FullForwardVerifyMaxBytes;
             var guardOk = verifyFull
                 ? PrefixMatches(filePath, cachedForward.ReadBytes, cachedForward.PrefixHash)
                 : BoundaryMatches(filePath, cachedForward.ReadBytes, cachedForward.BoundaryHash);
@@ -7280,7 +7292,7 @@ public sealed partial class ArchiveService
                     ClaudeForwardCacheHits++;
                     _claudeForwardCache[filePath] = cachedForward with
                     {
-                        VerifyCountdown = verifyFull
+                        VerifyCountdown = verifyDue
                             ? FullForwardVerifyEvery
                             : cachedForward.VerifyCountdown - 1,
                     };
@@ -7296,10 +7308,19 @@ public sealed partial class ArchiveService
             MaxLineChars,
             discardOversizedLine: true);
         var lineCount = 0;
-        var hitLineCap = false;
+        var capped = false;
         while (true)
         {
-            if (++lineCount > MaxLinesPerSession) { hitLineCap = true; break; }
+            // Stop on lines OR bytes. The line cap alone never bounded the read: a transcript can hold
+            // fewer than MaxLinesPerSession lines and still be tens of MB, and such a file used to be
+            // re-parsed in full on every cycle because it never entered the S1 forward cache. stream.Position
+            // is the underlying file position, which the reader buffer keeps a few KB ahead of the line
+            // being decoded - immaterial against a multi-MB budget.
+            if (++lineCount > MaxLinesPerSession || stream.Position > ClaudeForwardReadBudgetBytes)
+            {
+                capped = true;
+                break;
+            }
             string? line;
             try { line = await reader.ReadLineAsync(); }
             catch (InvalidDataException) { continue; }
@@ -7362,7 +7383,7 @@ public sealed partial class ArchiveService
         var fwdUpdated = updated;
         var forwardReadBytes = stream.Position;
         var tailWindow = Array.Empty<byte>();
-        if (hitLineCap)
+        if (capped)
         {
             var tail = ParseClaudeTail(filePath, info);
             if (tail.messages.Count > 0)

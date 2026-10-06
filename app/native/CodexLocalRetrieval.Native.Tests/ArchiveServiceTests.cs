@@ -4672,4 +4672,60 @@ public sealed class ArchiveServiceTests
         }
         finally { try { Directory.Delete(root, true); } catch { } }
     }
+
+    // T1 gate for the size arm. The line cap alone did not bound the read: live, two transcripts of 48 MB
+    // and 44 MB held only ~5,000 lines each, so they never tripped MaxLinesPerSession and were re-parsed
+    // IN FULL on every cycle - 93 MB per cycle for two files. A large transcript under the line cap must
+    // take the same capped path, so the append is the only per-cycle cost.
+    [TestMethod]
+    public async Task LargeUncappedTranscript_SmallAppend_ReadsOnlyTheAppend()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "clr-t1-large-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        var path = Path.Combine(root, "large.jsonl");
+        var source = new SessionSource { Tool = "claude", Root = root };
+        try
+        {
+            // ~15 MB across 2,500 lines: past the forward byte budget, well under the 6,000-line cap.
+            var filler = new string('y', 6000);
+            var sb = new StringBuilder();
+            for (var i = 0; i < 2500; i++)
+            {
+                var role = i % 2 == 0 ? "user" : "assistant";
+                sb.Append("{\"type\":\"").Append(role).Append("\",\"cwd\":\"/work\",\"timestamp\":\"2026-01-01T00:00:00Z\",")
+                  .Append("\"message\":{\"role\":\"").Append(role).Append("\",\"content\":[{\"type\":\"text\",\"text\":\"")
+                  .Append(i == 0 ? "opening prompt sentinel" : "message " + i + " " + filler)
+                  .Append("\"}]}}\n");
+            }
+            File.WriteAllText(path, sb.ToString());
+            Assert.IsTrue(new FileInfo(path).Length > 8 * 1024 * 1024,
+                "the fixture must exceed the forward byte budget");
+
+            var warm = new ArchiveService(storePath: Path.Combine(root, "warm.json"), sourceOverride: new[] { source });
+            var cold = (await warm.ScanDiskAsync()).Disk.Single();
+            Assert.AreEqual(1, warm.ClaudeForwardCacheStores,
+                "a large transcript under the line cap must still be frozen into the forward cache");
+            StringAssert.Contains(cold.FirstUserMessage, "opening prompt sentinel",
+                "capping on bytes must not lose the head facts the reader shows");
+            Assert.IsTrue(cold.MessageCount > 0);
+
+            var before = PerfCounters.Snapshot()["transcriptBytesRead"];
+            var tailBefore = ArchiveService.TailBytesRead;
+            var padding = new string('x', 1000);
+            File.AppendAllText(path,
+                "{\"type\":\"assistant\",\"cwd\":\"/work\",\"timestamp\":\"2026-01-02T00:00:00Z\",\"message\":"
+                + "{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"" + padding + "\"}]}}\n");
+
+            await warm.ScanDiskAsync();
+
+            var read = PerfCounters.Snapshot()["transcriptBytesRead"] - before;
+            var tailRead = ArchiveService.TailBytesRead - tailBefore;
+            Assert.IsTrue(warm.ClaudeForwardCacheHits >= 1, "the append must take the incremental path");
+            Assert.IsTrue(tailRead < 64 * 1024,
+                $"a 1 KB append must cost a few KB of tail read (read {tailRead} bytes)");
+            Assert.IsTrue(read < 256 * 1024,
+                $"the whole cycle must read a few KB, not the 15 MB transcript (read {read} bytes)");
+        }
+        finally { try { Directory.Delete(root, true); } catch { } }
+    }
 }
