@@ -935,7 +935,11 @@ function loadWebglRenderer(){
   if(webglForcedOff()){ rendererKind='dom'; return false; }
   if(!window.WebglAddon || !window.WebglAddon.WebglAddon){ rendererKind='dom'; return false; }
   try{
-    const addon=new window.WebglAddon.WebglAddon();
+    // preserveDrawingBuffer:true so the drawing buffer survives compositing and the canvas can be READ back
+    // (the blank detector below copies it to a 2d canvas). With the default (false) a read after the frame
+    // returns black even while the screen is painted, which would report a healthy surface blank. This build
+    // takes the flag directly (the ctor assigns its argument straight to _preserveDrawingBuffer).
+    const addon=new window.WebglAddon.WebglAddon(true);
     // A lost context (GPU reset, tab backgrounded on mobile) silently blanks the canvas if nobody listens.
     // Dispose the addon and re-seat the DOM renderer so the screen comes back rather than going black.
     addon.onContextLoss(()=>{ try{ addon.dispose(); }catch(e){} webglAddon=null; rendererKind='dom'; healTerminalPaint(); });
@@ -956,6 +960,7 @@ let userScrolledAt=0, userScrollSerial=0;
 let viewportRestoreRaf=0, viewportRestoreGeneration=0, viewportRestoreApplying=false;
 let viewportRestoreOwner='', viewportRestoreCarriesWriteState=false;
 let lastPaintRecoverAt=0;
+let lastWebglBlankCheckAt=0;   // the WebGL blank check copies the whole canvas; throttle it (see verifyTerminalPaint)
 function healTerminalPaint(){
   try{
     if(term && term.rows) term.refresh(0, Math.max(0, term.rows-1));
@@ -964,27 +969,67 @@ function healTerminalPaint(){
 function visibleBufferHasText(){
   try{ return /\S/.test(termVisibleText()); }catch(e){ return false; }
 }
-function canvasHasVisiblePixels(canvas, hostRect){
+// Grid-sample the part of `canvas` that lies inside the host, reading through `ctx` - which is the canvas's
+// own 2d context, or a scratch canvas the caller copied a WebGL canvas into (see webglCanvasHasVisiblePixels).
+// Coordinates are computed in the canvas's own pixel space, so a scratch MUST be the same pixel size as the
+// canvas it copied. Returns true if any sampled pixel is visibly lit, false if every sampled pixel is dark,
+// null if the region cannot be judged.
+function sampleCanvasGrid(ctx, canvas, hostRect){
   const r=canvas.getBoundingClientRect();
   const left=Math.max(r.left, hostRect.left), top=Math.max(r.top, hostRect.top);
   const right=Math.min(r.right, hostRect.right), bottom=Math.min(r.bottom, hostRect.bottom);
   if(right-left<4 || bottom-top<4 || !canvas.width || !canvas.height) return null;
-  let ctx; try{ ctx=canvas.getContext('2d', { willReadFrequently:true }); }catch(e){ return null; }
-  if(!ctx) return null;
   const sx=canvas.width/Math.max(1,r.width), sy=canvas.height/Math.max(1,r.height);
-  let samples=0, visible=0;
+  let samples=0;
   const cols=18, rows=14;
   for(let y=0;y<rows;y++){
     for(let x=0;x<cols;x++){
       const px=Math.max(0, Math.min(canvas.width-1, Math.floor((left-r.left + (x+0.5)*(right-left)/cols) * sx)));
       const py=Math.max(0, Math.min(canvas.height-1, Math.floor((top-r.top + (y+0.5)*(bottom-top)/rows) * sy)));
-      let d; try{ d=ctx.getImageData(px, py, 1, 1).data; }catch(e){ return null; }
+      // A 3x3 block per grid point: a single pixel can fall between glyph strokes on a sparse screen and
+      // read a painted surface as blank. Out-of-bounds pixels come back transparent and are simply skipped.
+      let d; try{ d=ctx.getImageData(px, py, 3, 3).data; }catch(e){ return null; }
       samples++;
-      if(d[3] > 0 && (d[0] > 35 || d[1] > 35 || d[2] > 35)) visible++;
-      if(visible) return true;
+      for(let k=0; k<d.length; k+=4){ if(d[k+3] > 0 && (d[k] > 35 || d[k+1] > 35 || d[k+2] > 35)) return true; }
     }
   }
   return samples ? false : null;
+}
+function canvasHasVisiblePixels(canvas, hostRect){
+  let ctx; try{ ctx=canvas.getContext('2d', { willReadFrequently:true }); }catch(e){ return null; }
+  if(!ctx) return null;
+  return sampleCanvasGrid(ctx, canvas, hostRect);
+}
+// The WebGL renderer's canvas: the only canvas in the host with a webgl/webgl2 context. getContext returns
+// an already-created context (or null for a different type), so probing identifies it without addon internals;
+// xterm's selection canvas is 2d and is skipped.
+function webglCanvas(){
+  try{
+    for(const c of $('#term').querySelectorAll('canvas')){
+      try{ if(c.getContext('webgl2') || c.getContext('webgl')) return c; }catch(e){}
+    }
+  }catch(e){}
+  return null;
+}
+let webglSampleCanvas=null, webglSampleCtx=null;
+// A WebGL canvas has no 2d context, so getImageData cannot read it directly. Copy it 1:1 into a scratch 2d
+// canvas and sample THAT. The copy sees a frame only because the addon is constructed with
+// preserveDrawingBuffer:true - with the default the drawing buffer is cleared at composite and the copy is
+// black even while the screen is painted.
+function webglCanvasHasVisiblePixels(canvas, hostRect){
+  const w=canvas.width|0, h=canvas.height|0;
+  if(w<4 || h<4) return null;
+  if(!webglSampleCanvas){
+    webglSampleCanvas=document.createElement('canvas');
+    webglSampleCtx=webglSampleCanvas.getContext('2d', { willReadFrequently:true });
+  }
+  if(!webglSampleCtx) return null;
+  if(webglSampleCanvas.width!==w || webglSampleCanvas.height!==h){ webglSampleCanvas.width=w; webglSampleCanvas.height=h; }
+  try{
+    webglSampleCtx.clearRect(0, 0, w, h);
+    webglSampleCtx.drawImage(canvas, 0, 0);
+  }catch(e){ return null; }
+  return sampleCanvasGrid(webglSampleCtx, canvas, hostRect);
 }
 function domRowsHaveVisibleText(host, hostRect){
   if(usingWebglRenderer()) return null;               // no DOM rows to read under WebGL; not "blank", just unjudgeable
@@ -1043,12 +1088,16 @@ function terminalPaintLostRows(){
 }
 function terminalPaintLooksBlank(){
   if(!current || $('#empty').style.display!=='none' || !visibleBufferHasText()) return false;
-  // Under the WebGL renderer neither surface check below is trustworthy: there are no DOM rows to read, and
-  // the 2d pixel sampler cannot read a WebGL canvas (getContext('2d') on it returns null) - while xterm's own
-  // transparent selection canvas reads as blank. Both paths would call a healthy WebGL screen blank. The
-  // WebGL addon owns its own recovery via onContextLoss, so stand the detector down here rather than
-  // repaint-loop against the renderer that just went in.
-  if(usingWebglRenderer()) return false;
+  // Under WebGL there are no DOM rows to read, so the check samples the WebGL canvas instead. The 2d pixel
+  // sampler cannot read a WebGL canvas directly (getContext('2d') on it returns null), so it is copied to a
+  // scratch canvas first (webglCanvasHasVisiblePixels). If that cannot judge (null), the surface is NOT
+  // called blank - the same "cannot judge" contract the DOM-row checks use.
+  if(usingWebglRenderer()){
+    const host=$('#term'), hostRect=host.getBoundingClientRect();
+    const canvas=webglCanvas();
+    if(!canvas) return false;
+    return webglCanvasHasVisiblePixels(canvas, hostRect)===false;
+  }
   const host=$('#term'), hostRect=host.getBoundingClientRect();
   const domSeen=domRowsHaveVisibleText(host, hostRect);
   if(domSeen===true) return false;
@@ -1132,10 +1181,39 @@ function healDetectedPaintFault(reason, kind){
   scheduleViewportFit(0);
   if(kind==='stale-width') send('R', '');
 }
+// WebGL is healed differently from the DOM: recoverTerminalPaint() clears the glyph texture atlas and calls
+// term.refresh, which re-marks rows dirty and the addon re-renders on its next rAF - enough for the transient
+// blank (a dropped frame). If a repaint of the SAME buffer still leaves the canvas blank, the surface is not
+// recoverable in place: dispose the addon and re-seat the DOM renderer, which is the floor the whole renderer
+// stack is built on. Either way the user ends up with a painted terminal rather than a black canvas.
+function fallbackToDomRenderer(reason){
+  if(!usingWebglRenderer()) return false;
+  try{ if(webglAddon) webglAddon.dispose(); }catch(e){}
+  webglAddon=null; rendererKind='dom';
+  try{ window.__muxWebglFallback = { at:Date.now(), reason:reason||'webgl-fault' }; }catch(e){}
+  healTerminalPaint();
+  schedulePaintHeal(60);
+  return true;
+}
+function healWebglBlank(reason){
+  recoverTerminalPaint((reason||'paint-check')+':webgl-blank');
+  requestAnimationFrame(()=>{ requestAnimationFrame(()=>{
+    try{ if(terminalPaintLooksBlank()) fallbackToDomRenderer(reason||'paint-check'); }catch(e){}
+  }); });
+}
 let staleWidthLastActedAt=0, staleWidthLastKey='';
 function verifyTerminalPaint(reason){
   try{
-    if(terminalPaintLooksBlank()){ healDetectedPaintFault(reason, 'blank'); return; }
+    if(usingWebglRenderer()){
+      // The WebGL blank check copies the whole canvas to read it; run it at most once a second so a fast
+      // typing burst does not pay a full-canvas readback on every post-write verify. The 2s watchdog and
+      // every state transition still reach it.
+      const now=Date.now();
+      if(now-lastWebglBlankCheckAt>=1000){
+        lastWebglBlankCheckAt=now;
+        if(terminalPaintLooksBlank()){ healWebglBlank(reason); return; }
+      }
+    } else if(terminalPaintLooksBlank()){ healDetectedPaintFault(reason, 'blank'); return; }
     // Partial loss: the surface is not blank, but some rows the buffer holds never got painted. That is the
     // "half render" the reports show, and it used to be invisible here by construction.
     const m=terminalPaintLostRows();

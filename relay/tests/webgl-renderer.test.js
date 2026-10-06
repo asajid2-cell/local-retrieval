@@ -147,10 +147,11 @@ test('the fallback renderer still paints when WebGL is forced off', async t => {
   });
 });
 
-test('the paint-integrity stack stands down under WebGL instead of crying blank', async t => {
+test('the paint-integrity stack samples the WebGL canvas instead of standing down', async t => {
   if (skipWithoutChromium(t)) return;
   // Under WebGL there are no `.xterm-rows` divs, so the row-based integrity checks must report "cannot
-  // judge" (null) - not "blank" (true), which would repaint forever and fight the renderer.
+  // judge" (null) - not "blank" (true). But the blank check itself must NOT stand down: it samples the
+  // WebGL canvas, and a HEALTHY painted surface must read as not blank.
   await withBrowserRelay({ name: SESSION_NAME, alive: true, shellOnly: true, cols: 80, rows: 24 }, null, async ({ page }) => {
     const verdict = await page.evaluate(() => {
       const host = document.querySelector('#term');
@@ -158,12 +159,65 @@ test('the paint-integrity stack stands down under WebGL instead of crying blank'
       const out = { kind: rendererKind };
       try { out.haveVisibleText = domRowsHaveVisibleText(host, rect); } catch (e) { out.haveVisibleText = 'THREW'; }
       try { out.lostRows = domRowsLosingBufferText(host, rect); } catch (e) { out.lostRows = 'THREW'; }
+      try { out.sampled = webglCanvasHasVisiblePixels(webglCanvas(), rect); } catch (e) { out.sampled = 'THREW'; }
       try { out.looksBlank = terminalPaintLooksBlank(); } catch (e) { out.looksBlank = 'THREW'; }
       return out;
     });
     assert.equal(verdict.kind, 'webgl', 'this test is about the WebGL path');
     assert.equal(verdict.haveVisibleText, null, 'the DOM-row check must not claim a blank WebGL surface');
     assert.equal(verdict.lostRows, null, 'the lost-row check must not judge a WebGL surface');
-    assert.equal(verdict.looksBlank, false, 'the terminal must never be reported blank while WebGL is painting it');
+    assert.equal(verdict.sampled, true, 'the WebGL canvas must be samplable and read as painted');
+    assert.equal(verdict.looksBlank, false, 'a healthy WebGL surface must never be reported blank');
+  });
+});
+
+// Blanks the WebGL drawing buffer in the SAME task the verdict is taken, so xterm's own rAF cannot repaint
+// in between: a deterministic "the canvas is blank while the buffer holds text" fault. The canvas is found
+// inline (not via the page's webglCanvas()) so the verdict depends only on terminalPaintLooksBlank(), which
+// exists on HEAD too - the red direction is a behavioural one, not a missing-symbol one.
+function blankWebglThenCheck() {
+  const canvas = [...document.querySelectorAll('#term canvas')].find(c => {
+    try { return !!(c.getContext('webgl2') || c.getContext('webgl')); } catch (e) { return false; }
+  });
+  const gl = canvas && (canvas.getContext('webgl2') || canvas.getContext('webgl'));
+  if (gl) { gl.clearColor(0, 0, 0, 1); gl.clear(gl.COLOR_BUFFER_BIT); }
+  return { found: !!gl, looksBlank: terminalPaintLooksBlank() };
+}
+
+test('a blanked WebGL canvas is reported blank', async t => {
+  if (skipWithoutChromium(t)) return;
+  // The detector's whole reason to exist: pixels gone while the buffer has text. On HEAD the WebGL path
+  // stood down (returned false) and this read as healthy, so this is the red direction of the fix.
+  await withBrowserRelay({ name: SESSION_NAME, alive: true, shellOnly: true, cols: 80, rows: 24 }, null, async ({ page }) => {
+    const r = await page.evaluate(blankWebglThenCheck);
+    assert.equal(r.found, true, 'the WebGL canvas must exist to blank it');
+    assert.equal(r.looksBlank, true,
+      'a WebGL canvas with no visible pixels while the buffer holds text must be reported blank - returning '
+      + 'false here is the inert stand-down the detector replaces');
+  });
+});
+
+test('a detected WebGL blank is healed, and the heal is recorded', async t => {
+  if (skipWithoutChromium(t)) return;
+  await withBrowserRelay({ name: SESSION_NAME, alive: true, shellOnly: true, cols: 80, rows: 24 }, null, async ({ page }) => {
+    await page.evaluate(() => {
+      window.__muxLastPaintRecovery = null;
+      window.__muxWebglFallback = null;
+      try { lastWebglBlankCheckAt = 0; } catch (e) {}             // clear the once-a-second throttle (exists post-fix)
+      const canvas = [...document.querySelectorAll('#term canvas')].find(c => {
+        try { return !!(c.getContext('webgl2') || c.getContext('webgl')); } catch (e) { return false; }
+      });
+      const gl = canvas.getContext('webgl2') || canvas.getContext('webgl');
+      gl.clearColor(0, 0, 0, 1); gl.clear(gl.COLOR_BUFFER_BIT);
+      verifyTerminalPaint('test');                                // must detect the blank and heal it
+    });
+    // The heal is either a repaint (async, next rAF) or a DOM fallback; poll for the surface to come back.
+    await page.waitForFunction(() => !terminalPaintLooksBlank(), null, { timeout: 3000 });
+    const healed = await page.evaluate(() => ({
+      recovered: window.__muxLastPaintRecovery || null,
+      fallback: window.__muxWebglFallback || null,
+    }));
+    assert.ok(healed.recovered || healed.fallback,
+      'a blanked WebGL surface must trigger a heal (a paint recovery or a DOM fallback), not sit blank');
   });
 });
