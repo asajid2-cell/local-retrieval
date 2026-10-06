@@ -1,6 +1,7 @@
 using System.Text;
 using CodexLocalRetrieval.Core.Models;
 using CodexLocalRetrieval.Core.Services;
+using Microsoft.Data.Sqlite;
 
 namespace CodexLocalRetrieval.Native.Tests;
 
@@ -377,6 +378,135 @@ public sealed class TranscriptSearchIndexTests
         await warm.SyncAsync(remaining, fixture.Sources("codex"));
         Assert.AreEqual(count - 1, warm.Status.TotalFiles);
         Assert.AreEqual(rowsBefore, warm.FileRowsRead, "a reconciliation pass reads no file rows once warm");
+    }
+
+    // The gate for the cached next-turn ordinal: repeated appends to one file must run the `turns`
+    // ordinal query once (the first append seeds the cache), not once per append.
+    [TestMethod]
+    public async Task RepeatedAppends_RunTheOrdinalQueryOnce()
+    {
+        using var fixture = new SearchFixture();
+        var path = fixture.WriteCodex(
+            "ordinal",
+            """
+            {"timestamp":"2026-08-03T00:00:00Z","type":"session_meta","payload":{"id":"ordinal"}}
+            {"timestamp":"2026-08-03T00:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"ordinal baseline sentinel"}}
+            """);
+        var session = fixture.Session("ordinal", path);
+        await fixture.Index.SyncAsync(new[] { session }, fixture.Sources("codex"));
+
+        // A fresh instance over the populated db models a process restart: the file state it loads has no
+        // cached ordinal, so the first append seeds it and every later append reads the cache.
+        using var warm = new TranscriptSearchIndex(fixture.Index.DatabasePath);
+        await warm.SyncAsync(new[] { session }, fixture.Sources("codex"));
+        Assert.AreEqual(0, warm.OrdinalQueries, "a pass with no appends runs no ordinal query");
+
+        const int appends = 6;
+        for (var i = 0; i < appends; i++)
+        {
+            await File.AppendAllTextAsync(
+                path,
+                "{\"timestamp\":\"2026-08-03T00:00:0" + (i + 2)
+                + "Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"ordinal append "
+                + i + "\"}}\n\n");
+            File.SetLastWriteTimeUtc(path, DateTime.UtcNow.AddSeconds(i + 1));
+            var sync = await warm.SyncAsync(
+                new[] { session },
+                fixture.Sources("codex"),
+                changedPaths: new[] { path });
+            Assert.AreEqual(1, sync.AppendedFiles, $"append {i} must append");
+        }
+
+        Assert.AreEqual(
+            1,
+            warm.OrdinalQueries,
+            "the ordinal query runs once per file per process, not once per append");
+    }
+
+    // The cached ordinal must survive the real index transitions: appends keep the ordinals contiguous,
+    // and a rebuild restarts them at 0 so the next append continues from the rebuilt count, not the stale
+    // cache.
+    [TestMethod]
+    public async Task TurnOrdinals_StayContiguous_AcrossAppendAndRebuild()
+    {
+        using var fixture = new SearchFixture();
+        var path = fixture.WriteCodex(
+            "contiguous",
+            """
+            {"timestamp":"2026-08-03T00:00:00Z","type":"session_meta","payload":{"id":"contiguous"}}
+            {"timestamp":"2026-08-03T00:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"baseline sentinel"}}
+            """);
+        var session = fixture.Session("contiguous", path);
+        await fixture.Index.SyncAsync(new[] { session }, fixture.Sources("codex"));
+
+        await File.AppendAllTextAsync(
+            path,
+            "{\"timestamp\":\"2026-08-03T00:00:02Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"beta append one\"}}\n\n");
+        File.SetLastWriteTimeUtc(path, DateTime.UtcNow.AddSeconds(1));
+        await fixture.Index.SyncAsync(
+            new[] { session },
+            fixture.Sources("codex"),
+            changedPaths: new[] { path });
+        await File.AppendAllTextAsync(
+            path,
+            "{\"timestamp\":\"2026-08-03T00:00:03Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"gamma append two\"}}\n\n");
+        File.SetLastWriteTimeUtc(path, DateTime.UtcNow.AddSeconds(2));
+        await fixture.Index.SyncAsync(
+            new[] { session },
+            fixture.Sources("codex"),
+            changedPaths: new[] { path });
+
+        var afterAppends = Ordinals(fixture.Index.DatabasePath, path);
+        CollectionAssert.AreEqual(
+            Enumerable.Range(0, afterAppends.Count).ToArray(),
+            afterAppends,
+            "appends must leave the ordinals contiguous");
+
+        // A same-size mutation in the tail is not an append: the file rebuilds, its ordinals restart at 0,
+        // and the cached next ordinal must be refreshed rather than reused.
+        var original = await File.ReadAllTextAsync(path);
+        var changed = original.Replace("gamma", "gammx", StringComparison.Ordinal);
+        Assert.AreEqual(original.Length, changed.Length);
+        await File.WriteAllTextAsync(path, changed);
+        File.SetLastWriteTimeUtc(path, DateTime.UtcNow.AddSeconds(3));
+        var sync = await fixture.Index.SyncAsync(new[] { session }, fixture.Sources("codex"));
+        Assert.AreEqual(1, sync.RebuiltFiles);
+
+        var afterRebuild = Ordinals(fixture.Index.DatabasePath, path);
+        CollectionAssert.AreEqual(
+            Enumerable.Range(0, afterRebuild.Count).ToArray(),
+            afterRebuild,
+            "a rebuild must restart the ordinals at 0, contiguous");
+
+        await File.AppendAllTextAsync(
+            path,
+            "{\"timestamp\":\"2026-08-03T00:00:04Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"delta append three\"}}\n\n");
+        File.SetLastWriteTimeUtc(path, DateTime.UtcNow.AddSeconds(4));
+        await fixture.Index.SyncAsync(
+            new[] { session },
+            fixture.Sources("codex"),
+            changedPaths: new[] { path });
+
+        var afterRebuildAppend = Ordinals(fixture.Index.DatabasePath, path);
+        CollectionAssert.AreEqual(
+            Enumerable.Range(0, afterRebuildAppend.Count).ToArray(),
+            afterRebuildAppend,
+            "an append after a rebuild must continue from the rebuilt count");
+        Assert.AreEqual(afterRebuild.Count + 1, afterRebuildAppend.Count);
+    }
+
+    private static List<int> Ordinals(string dbPath, string sourcePath)
+    {
+        using var connection = new SqliteConnection($"Data Source={dbPath}");
+        connection.Open();
+        using var command = connection.CreateCommand();
+        command.CommandText =
+            "SELECT turn_ordinal FROM turns WHERE source_path = $path ORDER BY turn_ordinal;";
+        command.Parameters.AddWithValue("$path", sourcePath);
+        using var reader = command.ExecuteReader();
+        var ordinals = new List<int>();
+        while (reader.Read()) ordinals.Add(reader.GetInt32(0));
+        return ordinals;
     }
 
     private sealed class SearchFixture : IDisposable

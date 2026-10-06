@@ -35,6 +35,9 @@ internal sealed partial class TranscriptSearchIndex : IDisposable
     // reads; an incremental pass in steady state must leave both untouched.
     internal int FileRowsRead;
     internal long FileStateBytesRead;
+    // Test seam: how many times the `turns` table was asked for a file's next ordinal. The ordinal is
+    // cached on the file state, so repeated appends to one file seed it once and then read the cache.
+    internal int OrdinalQueries;
     private TranscriptSearchIndexStatus _status = new(
         false,
         false,
@@ -585,7 +588,12 @@ internal sealed partial class TranscriptSearchIndex : IDisposable
         try
         {
             if (rebuild) DeleteFileTurns(connection, transaction, file.Path);
-            var nextOrdinal = rebuild ? 0 : NextTurnOrdinal(connection, transaction, file.Path);
+            // The next ordinal is stable between appends to one file, so it is cached on the file state
+            // (see FileState.NextTurnOrdinal): the first append in a process pays one query, later appends
+            // read the cache. A rebuild starts over at 0 and stores the fresh count below.
+            var nextOrdinal = rebuild
+                ? 0
+                : states[file.Path].NextTurnOrdinal ?? NextTurnOrdinal(connection, transaction, file.Path);
             var sessionId = file.SessionId;
             var title = file.Title;
             var lastCompleteOffset = startOffset;
@@ -639,6 +647,7 @@ internal sealed partial class TranscriptSearchIndex : IDisposable
                 lastCompleteOffset,
                 snapshotLength,
                 tailHash,
+                nextTurnOrdinal: nextOrdinal,
                 complete: lastCompleteOffset >= snapshotLength);
             if (owns) transaction.Commit();
             return new FileIndexOutcome(lastCompleteOffset, inserted);
@@ -1579,11 +1588,12 @@ internal sealed partial class TranscriptSearchIndex : IDisposable
         rows.ExecuteNonQuery();
     }
 
-    private static int NextTurnOrdinal(
+    private int NextTurnOrdinal(
         SqliteConnection connection,
         SqliteTransaction transaction,
         string path)
     {
+        OrdinalQueries++;
         using var command = connection.CreateCommand();
         command.Transaction = transaction;
         command.CommandText = """
@@ -1605,6 +1615,7 @@ internal sealed partial class TranscriptSearchIndex : IDisposable
         long indexedLength,
         long observedLength,
         string tailHash,
+        int nextTurnOrdinal,
         bool complete)
     {
         using var command = connection.CreateCommand();
@@ -1653,6 +1664,7 @@ internal sealed partial class TranscriptSearchIndex : IDisposable
             TailHash = tailHash,
             IndexVersion = SchemaVersion,
             Complete = complete,
+            NextTurnOrdinal = nextTurnOrdinal,
         };
     }
 
@@ -1727,7 +1739,11 @@ internal sealed partial class TranscriptSearchIndex : IDisposable
         long ObservedLength,
         string TailHash,
         int IndexVersion,
-        bool Complete);
+        bool Complete,
+        // The ordinal the next appended turn takes. Null means "not seeded in this process": the next
+        // append runs one NextTurnOrdinal query and caches the answer here, and every later append uses
+        // the cache. A rebuild or a removal drops the cache, so the next append re-seeds.
+        int? NextTurnOrdinal = null);
 
     private sealed record IndexedTurn(string Role, string Text, string Timestamp);
     private sealed record FileIndexOutcome(long IndexedLength, int InsertedTurns);
