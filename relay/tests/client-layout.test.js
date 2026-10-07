@@ -50,6 +50,9 @@ function loadScrollAffordance(fakeTerm, els) {
     $: sel => els[sel] || null,
     winSize: null,
     flash: () => {},
+    // applyScrollAffordance consults appTakesMouse() (332e4b2, "Send wheel to a tracked normal buffer");
+    // a bare shell never armed the mouse, so the stub is the unarmed case these assertions are written for.
+    appTakesMouse: () => false,
     scrollPositionLabel: null,
     applyScrollAffordance: null,
   };
@@ -257,6 +260,25 @@ test('tab switches drain old parser work and reject stale write callbacks', () =
     connect.indexOf('afterTerminalParserDrain(generation') < connect.indexOf('const sock = ws = new WebSocket'),
     'the new socket must open only after the prior parser generation drains'
   );
+});
+
+// The connect-time geometry is what sizes the shared PTY before our first 'v' report lands. On a fresh
+// attach viewportFit is still null (the settle measure has not run) and term was just reset to xterm's
+// 80x24 default, so seeding the ws URL from term.cols/rows opened EVERY attach at 80x24 and dragged the
+// shared PTY through it (197x47 -> 80x24 -> 197x47 on the wire, verified) until the real measure landed.
+// The URL must measure synchronously - the same call the settle path uses - so the first size the relay
+// sees is already the real one.
+test('a fresh attach seeds the connect-time geometry from a real measure, never xterm\'s 80x24 default', () => {
+  const connect = section('const proto = location.protocol', 'sock.binaryType');
+  assert.match(connect, /fit\.proposeDimensions\(\)/,
+    'the ws URL must measure the real viewport synchronously - a fresh attach has no viewportFit and term is a reset 80x24');
+  assert.match(connect, /seed/, 'the measured geometry must be carried as a seed for the ws URL');
+  assert.ok(
+    connect.indexOf('fit.proposeDimensions()') < connect.indexOf('||term.cols'),
+    'the real measure must be tried before falling back to the reset terminal geometry'
+  );
+  // And the guard mirrors runViewportMeasure's: a nonsense propose (hidden/zero) still falls back.
+  assert.match(connect, /d\.cols>=10 && d\.rows>=3/);
 });
 
 // SCOPE, measured: this is a source-level guard ON PURPOSE. The defect it protects against is a frame the

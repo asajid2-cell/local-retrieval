@@ -3171,8 +3171,16 @@ function connect(name, isRetry){
     lastViewportReportSocket=null;
     scheduleViewportFit(0);
     const proto = location.protocol==='https:'?'wss:':'ws:';
+    // The ws URL carries our geometry so the relay can size the shared PTY before our first 'v' report.
+    // On a fresh attach viewportFit is still null (the settle measure at 2077 has not run yet) and term
+    // was just reset to xterm's 80x24 default, so seeding from term.cols/rows made EVERY attach open at
+    // 80x24 and drag the shared PTY through it (197x47 -> 80x24 -> 197x47) until the real measure landed.
+    // Measure synchronously here with the same call the settle path uses, so the first size the relay
+    // sees is already the real one - no transient default hop.
+    let seed = viewportFit;
+    if(!seed){ try{ const d=fit.proposeDimensions(); if(d && d.cols>=10 && d.rows>=3) seed={cols:d.cols, rows:d.rows}; }catch(e){} }
     // per-socket token: a stale socket from a rapid switch/reconnect must never write or set status
-    const sock = ws = new WebSocket(`${proto}//${location.host}${base}/ws?session=${encodeURIComponent(name)}&cols=${(viewportFit&&viewportFit.cols)||term.cols}&rows=${(viewportFit&&viewportFit.rows)||term.rows}&dev=${encodeURIComponent(deviceId)}&label=${encodeURIComponent(deviceLabel)}`);
+    const sock = ws = new WebSocket(`${proto}//${location.host}${base}/ws?session=${encodeURIComponent(name)}&cols=${(seed&&seed.cols)||term.cols}&rows=${(seed&&seed.rows)||term.rows}&dev=${encodeURIComponent(deviceId)}&label=${encodeURIComponent(deviceLabel)}`);
     sock.binaryType='arraybuffer';
     const fresh = ()=> generation===attachGeneration && ws===sock && current===name;
     // setStatusHtml, not setStatus: r.3.8 was written against the pre-rename helper, and setStatus sets
