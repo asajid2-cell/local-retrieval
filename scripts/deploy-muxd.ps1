@@ -157,7 +157,12 @@ if (-not (Test-Path -LiteralPath $restartScript)) {
   Write-Error "muxd restart preflight is missing: $restartScript"
   exit 1
 }
-& powershell -NoProfile -ExecutionPolicy Bypass -File $restartScript -CheckOnly -StaleLocalRows $StaleLocalRows
+# Pass -StaleLocalRows ONLY when it names rows: PowerShell drops an empty string argument, which made
+# the nested script fail with "Missing an argument for parameter 'StaleLocalRows'" and aborted the
+# deploy before any file was copied - even on the ordinary no-argument call.
+$preflightArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $restartScript, '-CheckOnly')
+if ($StaleLocalRows) { $preflightArgs += @('-StaleLocalRows', $StaleLocalRows) }
+& powershell @preflightArgs
 if ($LASTEXITCODE -ne 0) {
   Write-Error 'active muxd sessions or an unhealthy live runtime blocked deployment before any files were copied'
   exit 1
