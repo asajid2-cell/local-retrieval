@@ -210,5 +210,86 @@ class OwnerBinaryInput(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(base64.b64decode(sent["d"]), b"ls\r")
 
 
+class HandshakeDies:
+    """A socket that dies the instant muxd tries to acknowledge registration.
+
+    The leak this stands in for: `coordinate_owner_registration` has already committed the row to the
+    manifest, and then the `owner-ok` reply raises on the closed socket. On the old handler the reap
+    only wrapped the read loop, so the row was left behind forever - a local tab no path could clear.
+    """
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        await asyncio.Future()      # no frames; the socket is gone before the loop is ever entered
+
+    async def send(self, frame):
+        if '"owner-ok"' in frame:
+            raise ConnectionError("socket closed before the acknowledgement")
+
+
+class OwnerConnectionReap(unittest.IsolatedAsyncioTestCase):
+    """#20: a local-owned row is reaped on EVERY exit path, not just the read loop."""
+
+    async def test_a_socket_that_dies_on_the_owner_ok_reply_still_reaps_the_row(self):
+        sessions = {}
+        outq = muxd.RelayFanout()
+        saved = []
+
+        async def save(source):
+            saved.append(dict(source))
+
+        async def register(first, ws):
+            s = make_stream_session(name=first["s"], loop=asyncio.get_running_loop(), outq=outq)
+            s.owner_ws = ws
+            sessions[first["s"]] = s
+            return s, ""
+
+        with self.assertRaises(ConnectionError):
+            await muxd.serve_owner_connection(
+                HandshakeDies(), {"t": "owner", "s": "tab"}, sessions, outq, save, register
+            )
+        self.assertNotIn("tab", sessions, "a socket that dies before the read loop must still reap its row")
+        self.assertTrue(saved, "the reap must be persisted, not just held in memory")
+
+    async def test_owner_connected_is_true_only_while_the_socket_is_live(self):
+        sessions = {}
+        outq = muxd.RelayFanout()
+        observed = {}
+
+        async def save(source):
+            return None
+
+        async def register(first, ws):
+            s = make_regular_session(name=first["s"], loop=asyncio.get_running_loop(), outq=outq)
+            s.owner_ws = ws
+            sessions[first["s"]] = s
+            return s, ""
+
+        class Probe:
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                raise StopAsyncIteration
+
+            async def send(self, frame):
+                observed["connected_at_ack"] = sessions["shell"].owner_connected
+
+        await muxd.serve_owner_connection(
+            Probe(), {"t": "owner", "s": "shell"}, sessions, outq, save, register
+        )
+        self.assertTrue(observed["connected_at_ack"], "ownerConnected must be true once acknowledged")
+        self.assertFalse(sessions["shell"].owner_connected, "and cleared once the connection ends")
+
+    def test_owner_connected_is_reported_in_the_ls_row(self):
+        s = make_stream_session()
+        s.alive = lambda: True
+        self.assertFalse(muxd.session_payload("tab", s)["ownerConnected"])
+        s.owner_connected = True
+        self.assertTrue(muxd.session_payload("tab", s)["ownerConnected"])
+
+
 if __name__ == "__main__":
     unittest.main()

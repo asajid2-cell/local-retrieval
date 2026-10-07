@@ -3201,6 +3201,9 @@ class OwnerSession:
         self.owner_ws = owner_ws
         self.owner = True
         self.expected_owner = True
+        # True only while the owner's websocket is live. The connection handler sets it on registration
+        # and clears it in its teardown, so `ls` can tell a connected tab from a row whose socket is gone.
+        self.owner_connected = False
         self.owner_key = str(owner_key or "")
         # A stream owner (spec section 6.2) is a teed local tab: muxd holds its raw VT in the ring and
         # reports kind "local-tab". It has no command muxd may relaunch, so it is never auto-healed.
@@ -4020,6 +4023,7 @@ def session_payload(name, sess):
             "lastOut": int(sess.last_out * 1000), "cols": sess.cols, "rows": sess.rows,
             "tail": tail, "heal": sess.heal, "localViewers": len(sess.local),
             "localFirst": owner or len(sess.local) > 0, "owner": owner,
+            "ownerConnected": bool(getattr(sess, "owner_connected", False)),
             "adopted": adopted, "externalOwner": external_owner,
             "hasCommand": has_cmd, "shellOnly": alive and not has_cmd,
             "sessionUuid": str(getattr(sess, "session_uuid", "") or ""),
@@ -4116,6 +4120,88 @@ async def reconcile_owner_disconnect(sessions, name, owner, save_manifest):
     else:
         owner.dead = True
         owner.lifecycle = "dormant"
+
+
+async def finalize_owner_connection(sessions, name, owner, save_manifest, outq):
+    """Tear down a registered owner connection on EVERY exit path.
+
+    The owner branch used to enter its try/finally only AFTER the registration handshake, so an owner
+    whose socket dropped in the window between `coordinate_owner_registration` committing the row and
+    the first `async for` read - e.g. the `owner-ok` reply raising on an already-closed socket - left
+    its row behind with no one left to reap it: a local tab the user cannot clear and a boot cannot
+    even name. This is that reap, reached from a finally that wraps the whole owner lifetime, so the
+    row follows its socket no matter where the connection ends.
+    """
+    owner.owner_connected = False
+    for waiter in list(owner.input_waiters.values()):
+        if not waiter.done():
+            waiter.set_result((False, "visible owner disconnected during input"))
+    if sessions.get(name) is owner:
+        await reconcile_owner_disconnect(sessions, name, owner, save_manifest)
+        outq.put_nowait(("dead", name, ""))
+
+
+async def serve_owner_connection(ws, first, sessions, outq, save_manifest, register_owner):
+    """Own the whole visible-owner connection: register, handshake, pump, and reap on any exit.
+
+    Kept at module scope (rather than inline in the local handler) so the exit-path reap is drivable
+    from a test with a fake socket - the leak this replaces was only visible in the gap between the
+    handshake and the read loop, which no constructed-session test could reach.
+    """
+    name = SAFE(first.get("s", ""))
+    owner = None
+    try:
+        owner, detail = await register_owner(first, ws)
+        if owner is None:
+            await ws.send(json.dumps({"t": "err", "m": detail})); return
+        owner.owner_connected = True
+        await ws.send(json.dumps({"t": "owner-ok", "s": name, "alive": True}))
+        outq.put_nowait(("dead", name, ""))  # force relay session-list refresh
+        async for raw in ws:
+            # Binary frames are the muxtee path (spec section 6.1) and dispatch on the first
+            # byte before any JSON is attempted. Text frames stay exactly as they were, so
+            # muxrun and the sidecar keep working unchanged.
+            if isinstance(raw, (bytes, bytearray, memoryview)) and len(raw) and raw[0] in (
+                    OWNER_FRAME_INGEST, OWNER_FRAME_RESYNC, OWNER_FRAME_INPUT):
+                await handle_owner_binary(owner, bytes(raw))
+                continue
+            try:
+                m = json.loads(raw if isinstance(raw, str) else raw.decode("utf-8", "replace"))
+            except Exception:
+                continue
+            mt = m.get("t")
+            if mt == "o":
+                owner.ingest(base64.b64decode(m.get("d", "")))
+            elif mt == "size":
+                owner.cols = max(20, int(m.get("cols") or owner.cols))
+                owner.rows = max(8, int(m.get("rows") or owner.rows))
+            elif mt == "child":
+                child_pid = int(m.get("pid", 0) or 0)
+                if child_pid <= 0:
+                    continue
+                owner.child_pid = child_pid
+                owner.child_start_token = _process_start_token(child_pid)
+                await save_manifest(sessions)
+            elif mt == "inputResult":
+                waiter = owner.input_waiters.get(str(m.get("rid", "")))
+                if waiter is not None and not waiter.done():
+                    waiter.set_result((
+                        bool(m.get("ok")),
+                        "" if m.get("ok") else "visible terminal rejected input",
+                    ))
+            elif mt == "killResult" and not bool(m.get("ok")):
+                owner.owner_stop_error = str(
+                    m.get("m") or "process-tree termination was not confirmed"
+                )[:500]
+            elif mt == "dead":
+                finalize_confirmed_owner_exit(owner)
+                if owner.adopted:
+                    sessions.pop(name, None)
+                await save_manifest(sessions)
+                break
+    finally:
+        if owner is not None:
+            await finalize_owner_connection(sessions, name, owner, save_manifest, outq)
 
 
 async def terminate_session_off_loop(s, by_user=True, timeout=12, release_claim_on_success=True):
@@ -5540,67 +5626,9 @@ async def main():
                         await ws.send(json.dumps({"t": "err", "m": detail})); return
                     await ws.send(json.dumps({"t": "killed", "s": name})); return
                 if first.get("t") == "owner":
-                    name = SAFE(first.get("s", ""))
-                    owner, detail = await coordinate_owner_registration(first, ws)
-                    if owner is None:
-                        await ws.send(json.dumps({"t": "err", "m": detail})); return
-                    await ws.send(json.dumps({"t": "owner-ok", "s": name, "alive": True}))
-                    outq.put_nowait(("dead", name, ""))  # force relay session-list refresh
-                    try:
-                        async for raw in ws:
-                            # Binary frames are the muxtee path (spec section 6.1) and dispatch on the first
-                            # byte before any JSON is attempted. Text frames stay exactly as they were, so
-                            # muxrun and the sidecar keep working unchanged.
-                            if isinstance(raw, (bytes, bytearray, memoryview)) and len(raw) and raw[0] in (
-                                    OWNER_FRAME_INGEST, OWNER_FRAME_RESYNC, OWNER_FRAME_INPUT):
-                                await handle_owner_binary(owner, bytes(raw))
-                                continue
-                            try:
-                                m = json.loads(raw if isinstance(raw, str) else raw.decode("utf-8", "replace"))
-                            except Exception:
-                                continue
-                            mt = m.get("t")
-                            if mt == "o":
-                                owner.ingest(base64.b64decode(m.get("d", "")))
-                            elif mt == "size":
-                                owner.cols = max(20, int(m.get("cols") or owner.cols))
-                                owner.rows = max(8, int(m.get("rows") or owner.rows))
-                            elif mt == "child":
-                                child_pid = int(m.get("pid", 0) or 0)
-                                if child_pid <= 0:
-                                    continue
-                                owner.child_pid = child_pid
-                                owner.child_start_token = _process_start_token(child_pid)
-                                await manifest_save_async(sessions)
-                            elif mt == "inputResult":
-                                waiter = owner.input_waiters.get(str(m.get("rid", "")))
-                                if waiter is not None and not waiter.done():
-                                    waiter.set_result((
-                                        bool(m.get("ok")),
-                                        "" if m.get("ok") else "visible terminal rejected input",
-                                    ))
-                            elif mt == "killResult" and not bool(m.get("ok")):
-                                owner.owner_stop_error = str(
-                                    m.get("m") or "process-tree termination was not confirmed"
-                                )[:500]
-                            elif mt == "dead":
-                                finalize_confirmed_owner_exit(owner)
-                                if owner.adopted:
-                                    sessions.pop(name, None)
-                                await manifest_save_async(sessions)
-                                break
-                    finally:
-                        for waiter in list(owner.input_waiters.values()):
-                            if not waiter.done():
-                                waiter.set_result((False, "visible owner disconnected during input"))
-                        if sessions.get(name) is owner:
-                            await reconcile_owner_disconnect(
-                                sessions,
-                                name,
-                                owner,
-                                manifest_save_async,
-                            )
-                            outq.put_nowait(("dead", name, ""))
+                    await serve_owner_connection(
+                        ws, first, sessions, outq, manifest_save_async, coordinate_owner_registration
+                    )
                     return
                 if first.get("t") == "bind":
                     s, detail = await bind_session_identity(first)
