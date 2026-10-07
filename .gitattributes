@@ -16,3 +16,10 @@ scripts/* text eol=lf
 *.sh text eol=lf
 *.service text eol=lf
 *.timer text eol=lf
+
+# The browser assets are served as-is and are not exec'd, so CRLF is harmless
+# at runtime - but `git archive` on a Windows checkout with core.autocrlf=true
+# hands the release tarball CRLF for any unpinned path, so the deployed file no
+# longer byte-matches its blob and md5-vs-blob provenance checks need a CR strip.
+# Pin them to LF so the shipped bytes equal the committed blob exactly.
+relay/public/* text eol=lf
