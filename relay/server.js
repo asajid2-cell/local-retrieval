@@ -4362,10 +4362,14 @@ function handleClientMsg(name, client, s) {
   }
   if (t === 'h') { try { applyActivity(client, JSON.parse(s.slice(1))); } catch {} return true; }
   if (s === 'R' && client.hosted) {
-    const st = sessions.get(name);
+    // Per VIEWER, not per session: a repaint is session-wide, but a viewer that needs one must not be
+    // starved for up to 10s because ANOTHER viewer spent the budget - that is the black-until-something
+    // -happens symptom, and it is the damaged viewer, not the healthy one, that waits. The cost to the app
+    // stays bounded without the shared budget: muxd rate-limits the actual redraw (the size wiggle or the
+    // FOCUS_IN) to 1/s per session, so a burst of viewers coalesces there, not here.
     const now = Date.now();
-    if (st && (!st.lastRedrawAt || now - st.lastRedrawAt >= 10000)) {
-      if (sendHostInputRedraw(name)) st.lastRedrawAt = now;
+    if (!client.lastRedrawAt || now - client.lastRedrawAt >= 10000) {
+      if (sendHostInputRedraw(name)) client.lastRedrawAt = now;
     }
     return true;
   }

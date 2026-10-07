@@ -16,9 +16,11 @@ const assert = require('node:assert/strict');
 const childProcess = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
+const { once } = require('node:events');
 const { test } = require('node:test');
 
 const { RelayHarness, REPO, freePort, launchBrowser, waitFor, sleep } = require('./harness');
+const { WebSocket } = require('ws');
 
 const source = fs.readFileSync(path.join(__dirname, '..', 'public', 'index.html'), 'utf8');
 
@@ -221,4 +223,58 @@ test('the Repaint button asks the app to redraw and the screen is restored witho
       return hit && !junk;
     }, null, { timeout: TEST_TIMEOUT_MS });
   });
+});
+
+// ---- the repaint budget belongs to the VIEWER, not the session ---------------------------------------
+//
+// A repaint is session-wide: muxd answers with one size wiggle (alt screen) or one FOCUS_IN (inline ?1004
+// app) and the app re-emits a frame every viewer then receives. That is why the first cut throttled it per
+// SESSION. But a session-wide budget means a viewer whose own mirror is damaged and asks to heal within 10s
+// of another viewer's heal is simply REFUSED - the black-until-something-happens symptom, and the viewer
+// that pays is the one that is already wrong. The budget belongs to the viewer; muxd still rate-limits the
+// real redraw to 1/s per session, so a burst of viewers coalesces there and the app's cost is unchanged.
+//
+// Red on HEAD (per-session st.lastRedrawAt): A's 'R' lands, B's 'R' right after is swallowed, so the
+// `=== 2` wait below times out. Green once the budget is per-viewer.
+const viewerRedraws = host => host.messages.filter(m => m.t === 'redraw' && m.s === SESSION).length;
+
+async function openRawViewer(port, session) {
+  const ws = new WebSocket(`ws://127.0.0.1:${port}/ws?session=${session}&cols=80&rows=24`);
+  await once(ws, 'open');
+  ws.on('message', () => {});          // drain frames; this test only drives 'R'
+  return ws;
+}
+
+test('the repaint throttle is per viewer, so one viewer cannot starve another', async () => {
+  const harness = new RelayHarness();
+  let host = null, a = null, b = null;
+  try {
+    harness.start = () => startBrowserRelay(harness);
+    await harness.start();
+    host = await harness.connectHost([{ name: SESSION, alive: true, shellOnly: true, cols: 80, rows: 24 }]);
+
+    a = await openRawViewer(harness.port, SESSION);
+    const sbA = await host.waitFor(m => m.t === 'sb' && m.s === SESSION, 'viewer A scrollback request');
+    host.sendScrollback(SESSION, 'boot\n', sbA);
+    await sleep(60);
+    b = await openRawViewer(harness.port, SESSION);
+    await sleep(150);                                 // B is a connected hosted viewer; its repaint is what we test
+    host.messages.length = 0;
+
+    a.send('R');                                      // A heals: lands
+    await waitFor(() => viewerRedraws(host) === 1, 'viewer A repaint lands', 3000);
+
+    b.send('R');                                      // B heals within 10s of A: must ALSO land
+    await waitFor(() => viewerRedraws(host) === 2,
+      'viewer B repaint lands within A\'s window (per-viewer budget)', 3000);
+
+    b.send('R');                                      // B again within 10s: its OWN window, still throttled
+    await sleep(400);
+    assert.equal(viewerRedraws(host), 2,
+      'a viewer\'s own second repaint request within 10s is still throttled');
+  } finally {
+    for (const w of [a, b]) { try { if (w) w.close(); } catch {} }
+    if (host) host.close();
+    await harness.stop();
+  }
 });

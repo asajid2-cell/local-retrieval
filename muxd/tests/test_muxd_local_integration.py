@@ -1081,24 +1081,14 @@ while k.ReadConsoleInputW(hin,records,16,ctypes.byref(count)):
                     # repair has to restore those - VISIBLE FOOTER is gone from the app too.
                     page.evaluate("() => new Promise(resolve => term.write('\\x1b[2J\\x1b[H', resolve))")
                     page.wait_for_function("() => ![...document.querySelectorAll('.xterm-rows > div')].some(r => r.textContent.includes('BOTTOM FOOTER'))")
-                    # The relay rate-limits a viewer's repaint request to one per 10 seconds, and that
-                    # budget is per SESSION, not per viewer: the phone attached above fires the client's
-                    # blank-frame detector on its narrow viewport (window.__muxLastRepaintRequest reason
-                    # 'scheduled:blank') and spends it. So a single request from this desktop tab is
-                    # throttled away and the damaged mirror never heals. Ask, and if the request was
-                    # dropped, ask again once the window has passed - the retry is what the user's
-                    # Repaint button does too.
-                    restored = False
-                    for _attempt in range(4):
-                        page.evaluate("() => send('R', '')")
-                        page.evaluate("() => forceJumpBottom()")
-                        try:
-                            page.wait_for_function("() => [...document.querySelectorAll('.xterm-rows > div')].some(r => r.textContent.includes('BOTTOM FOOTER'))", timeout=11000)
-                            restored = True
-                            break
-                        except Exception:
-                            pass
-                    self.assertTrue(restored, 'a server repaint must restore the app content after the mirror is damaged')
+                    # The repaint budget belongs to THIS viewer, not the session: the phone above fired
+                    # the client's blank-frame detector on its narrow viewport and spent its OWN window,
+                    # which must not starve this desktop tab. So ONE request heals the damaged mirror -
+                    # the wait_for_function raising on timeout is the assertion that it did. A shared
+                    # budget would drop this single request and this line would time out.
+                    page.evaluate("() => send('R', '')")
+                    page.evaluate("() => forceJumpBottom()")
+                    page.wait_for_function("() => [...document.querySelectorAll('.xterm-rows > div')].some(r => r.textContent.includes('BOTTOM FOOTER'))", timeout=12000)
                     self.assertIn("WHEEL=", page.locator(".xterm-rows").inner_text())
                 finally:
                     browser.close()
