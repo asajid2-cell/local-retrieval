@@ -373,3 +373,71 @@ test('state transitions still repaint unconditionally — only the write path ch
   // The watch interval still verifies autonomously (the backstop the write path now relies on).
   assert.match(source, /setInterval\(\(\)=>\{[\s\S]{0,700}verifyTerminalPaint\('watchdog'\)/, 'the watchdog verify must remain');
 });
+
+// The first measurement after a socket opens can be a transient - fonts and layout have not settled yet
+// (measured on attach: 48 rows for two frames, then the real 47). Reporting it resizes the shared PTY,
+// which re-arms the Gateway inline mouse mid-settle with an origin read from the client's cursor while it
+// is still at the bottom-left; the bottom bar then stays dead until a later resize. So a measurement must
+// be HELD for a settle window before it is reported, while a deliberate user resize still goes out.
+//
+// The seam is pulled straight out of the shipped page and driven with a scripted geometry and clock, so
+// the test exercises the real settle logic rather than a copy that can drift from it.
+function loadViewportMeasure(getDims, clock) {
+  const code = section('let viewportTimer=0, layoutRaf=0, layoutGeneration=0;', 'function doFit()');
+  const reports = [], scheduled = [];
+  // The section declares its own `let layoutGeneration=0` (a lexical binding, not a global property), so
+  // the measure is driven with that same value; the generation guard is exercised but always fresh here.
+  // `terminalSurfaceVisible` is a real function declaration in the section, so it is not stubbed — it is
+  // given a visible host so the shipped visibility gate passes for real.
+  const host = { isConnected: true, offsetParent: {}, getBoundingClientRect: () => ({ width: 400, height: 300 }) };
+  const sandbox = {
+    fit: { proposeDimensions: () => getDims() },
+    scheduleViewportFit: () => {},
+    ws: { readyState: 1 },
+    current: 's',
+    viewportFit: null,
+    document: { visibilityState: 'visible' },
+    actFlag: () => false,
+    send: (t, d) => { if (t === 'v') reports.push(JSON.parse(d)); },
+    applyPan: () => {}, updateMeta: () => {}, updateSizeBtn: () => {}, applyScrollAffordance: () => {},
+    $: () => host,
+    getComputedStyle: () => ({ display: 'block', visibility: 'visible' }),
+    setTimeout: () => 0, clearTimeout: () => {}, requestAnimationFrame: () => 0, cancelAnimationFrame: () => {},
+    Date: { now: () => clock.t },
+    runViewportMeasure: null,
+  };
+  vm.createContext(sandbox);
+  vm.runInContext(code + '\nthis.runViewportMeasure=runViewportMeasure;', sandbox);
+  // scheduleViewportFit just records the requested delay; the test advances the clock and re-measures.
+  sandbox.scheduleViewportFit = d => scheduled.push(d);
+  return { reports, scheduled, measure: () => sandbox.runViewportMeasure(0) };
+}
+
+test('an attach-time transient measurement never reaches the wire; only the settled size is reported', () => {
+  const clock = { t: 1000 };
+  let cur = { cols: 197, rows: 48 };
+  const { reports, measure } = loadViewportMeasure(() => cur, clock);
+  measure();                                              // 48 first seen
+  clock.t += 16; measure();                               // 48 again - the transient held two frames
+  clock.t += 16; cur = { cols: 197, rows: 47 }; measure();// 47 - geometry changed, hold again
+  clock.t += 60; measure();                               // 47 stable, but only held 60ms
+  assert.equal(reports.length, 0, 'nothing may be reported before the geometry settles');
+  clock.t += 100; measure();                              // 47 held 160ms >= the settle window
+  assert.equal(reports.length, 1, 'one settle must produce exactly one report');
+  assert.equal(reports[0].cols, 197);
+  assert.equal(reports[0].rows, 47, 'the reported size is the settled one, never the transient 48');
+});
+
+test('a deliberate user resize is still reported once, within one settle window', () => {
+  const clock = { t: 5000 };
+  let cur = { cols: 197, rows: 47 };
+  const { reports, measure } = loadViewportMeasure(() => cur, clock);
+  measure(); clock.t += 20; measure(); clock.t += 20; measure(); clock.t += 160; measure();
+  assert.equal(reports.length, 1, 'the initial size settles to a single report');
+  assert.equal(reports[0].rows, 47);
+  clock.t += 10; cur = { cols: 197, rows: 60 }; measure(); // the user resizes
+  assert.equal(reports.length, 1, 'the new size waits out the settle window before it is sent');
+  clock.t += 150; measure();
+  assert.equal(reports.length, 2, 'the user resize still goes out, exactly once');
+  assert.equal(reports[1].rows, 60, 'and it carries the new size');
+});

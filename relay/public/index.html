@@ -2023,7 +2023,14 @@ function scrollAlternate(deltaY){
 // Measurements are accepted only after the terminal is visible and the same geometry survives two frames.
 // This prevents display:none mobile views and half-laid-out tab switches from shrinking the shared PTY.
 let viewportTimer=0, layoutRaf=0, layoutGeneration=0;
-let pendingViewportKey='', pendingViewportCount=0, lastViewportReport='', lastViewportReportSocket=null;
+// The first measurement after a socket opens can be a transient: fonts and layout have not settled yet
+// (measured on attach: 48 rows for two frames, then the real 47). Reporting it resizes the shared PTY,
+// which re-arms the Gateway inline mouse mid-settle - the app reads the client's cursor row while it is
+// still at the bottom-left and arms a wrong origin, leaving the bottom bar dead until a later resize.
+// Hold the SAME geometry for this window before reporting; a deliberate user resize still goes out in
+// one window, so it stays responsive.
+const VIEWPORT_SETTLE_MS=150;
+let pendingViewportKey='', pendingViewportCount=0, pendingViewportKeyAt=0, lastViewportReport='', lastViewportReportSocket=null;
 let _lastViewportResizeAt=0;
 // Keyboard animation can emit viewport events every frame; repeat geometry would otherwise thrash the grid.
 let _lastViewportGeometry='';
@@ -2056,11 +2063,17 @@ function runViewportMeasure(generation){
   if(key!==pendingViewportKey){
     pendingViewportKey=key;
     pendingViewportCount=1;
+    pendingViewportKeyAt=Date.now();
     scheduleViewportFit(0);
     return;
   }
   pendingViewportCount++;
   if(pendingViewportCount<2){ scheduleViewportFit(0); return; }
+  // Same geometry across two frames is not enough on attach: the first measurement is still settling
+  // (fonts, layout, the tab's first paint). Hold it for the settle window before it is reported, so a
+  // transient never resizes the shared PTY.
+  const held=Date.now()-pendingViewportKeyAt;
+  if(held<VIEWPORT_SETTLE_MS){ scheduleViewportFit(VIEWPORT_SETTLE_MS-held); return; }
   reportViewport({cols:dim.cols, rows:dim.rows});
 }
 function scheduleViewportFit(delay=80){
