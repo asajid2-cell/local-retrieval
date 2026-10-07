@@ -240,6 +240,12 @@
   }
   #status .meta:hover, #status .meta.on { color:var(--rose); }
   #status .meta:disabled { cursor:default; opacity:.6; }
+  /* The size chip is empty until the first 'd' decision lands, then fills with "auto · NNN×NN". An empty
+     button has no line box (its height is just the 4px padding), so the status strip grows ~4px the moment
+     the size arrives - which shrinks #term by exactly one row and forces a real SIGWINCH on every fresh
+     attach (197x48 -> 197x47). Keep a line box in the empty state so the strip's height never depends on
+     whether the chip has text yet; the connect-time size then equals the settled size by construction. */
+  #status #statusmeta:empty::before { content:"\00a0"; }
 
   /* ---- moded touch keybar ---- */
   #keybar {
@@ -3172,17 +3178,23 @@ function connect(name, isRetry){
     scheduleViewportFit(0);
     const proto = location.protocol==='https:'?'wss:':'ws:';
     // The ws URL carries our geometry so the relay can size the shared PTY before our first 'v' report.
-    // On a fresh attach viewportFit is still null (the settle measure at 2077 has not run yet) and term
-    // was just reset to xterm's 80x24 default, so seeding from term.cols/rows made EVERY attach open at
-    // 80x24 and drag the shared PTY through it (197x47 -> 80x24 -> 197x47) until the real measure landed.
-    // Measure synchronously here with the same call the settle path uses, so the first size the relay
-    // sees is already the real one - no transient default hop.
+    // On a fresh attach viewportFit is still null and term was just reset to xterm's 80x24 default, so
+    // seeding from term.cols/rows made EVERY attach open at 80x24 and drag the shared PTY through it
+    // (197x47 -> 80x24 -> 197x47). The seed must therefore be measured. It is the SETTLED size: the first
+    // 'v' reports the settled grid, and if the URL disagreed the relay would take a real SIGWINCH hop on
+    // every attach (a probe in flight answered at the old size, the rows=48 rejects). Nothing reflows
+    // between this measure and the settle report - the status strip's height is invariant now (the size
+    // chip keeps a line box while empty; see #statusmeta:empty in the stylesheet), which is what used to
+    // move the grid by a row the moment the first 'd' filled the chip.
     let seed = viewportFit;
     if(!seed){ try{ const d=fit.proposeDimensions(); if(d && d.cols>=10 && d.rows>=3) seed={cols:d.cols, rows:d.rows}; }catch(e){} }
-    // per-socket token: a stale socket from a rapid switch/reconnect must never write or set status
     const sock = ws = new WebSocket(`${proto}//${location.host}${base}/ws?session=${encodeURIComponent(name)}&cols=${(seed&&seed.cols)||term.cols}&rows=${(seed&&seed.rows)||term.rows}&dev=${encodeURIComponent(deviceId)}&label=${encodeURIComponent(deviceLabel)}`);
     sock.binaryType='arraybuffer';
     const fresh = ()=> generation===attachGeneration && ws===sock && current===name;
+    // The URL already told the relay this exact size, so the settle measure's first 'v' for the SAME
+    // geometry would only make the relay recompute and re-send an identical decision. Mark it reported;
+    // a genuinely different size (a real resize) still goes out because its key differs.
+    if(seed){ lastViewportReport=seed.cols+'x'+seed.rows; lastViewportReportSocket=sock; }
     // setStatusHtml, not setStatus: r.3.8 was written against the pre-rename helper, and setStatus sets
     // textContent — it would render this markup as literal text. Its inputQueue.reconnect() is kept.
     sock.onopen = () => { if(!fresh()) return; reconnectDelay=1000; setStatusHtml('live', `<span class="name">${esc(name)}</span> &middot; live`); scheduleViewportFit(0); term.focus();

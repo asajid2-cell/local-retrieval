@@ -463,3 +463,25 @@ test('a deliberate user resize is still reported once, within one settle window'
   assert.equal(reports.length, 2, 'the user resize still goes out, exactly once');
   assert.equal(reports[1].rows, 60, 'and it carries the new size');
 });
+
+// The r1 reject burst: a fresh attach opened at 197x48 and the settled grid was 197x47, so the shared PTY
+// took a real SIGWINCH hop on every attach and a probe in flight was answered at the pre-resize geometry.
+// The connect measurement was never wrong - the status strip's size chip (#statusmeta) was empty until the
+// first 'd' decision filled it, and an empty button has no line box, so the strip grew ~4px at that moment
+// and shrank #term by exactly one row. Keeping a line box in the empty state makes the strip's height
+// independent of whether the chip has text yet, so the connect-time size equals the settled size.
+test('the status size chip keeps its line box while empty, so the strip never reflows when a size lands', () => {
+  assert.ok(source.includes('#status #statusmeta:empty::before'), 'the empty size chip must keep a line box');
+  assert.ok(/#status #statusmeta:empty::before \{[^}]*content:"/.test(source), 'and that line box must come from content');
+});
+
+test('the connect seed is the settled size and is marked reported, so one attach makes one size decision', () => {
+  const connect = section('const proto = location.protocol', 'sock.onerror = () => {};');
+  // seed is the held settled fit (re-attach) or a measured dim - never xterm's post-reset 80x24 default
+  assert.match(connect, /let seed = viewportFit;/);
+  assert.match(connect, /proposeDimensions\(\)/);
+  // the size already in the URL is recorded as reported for THIS socket, so the settle measure's identical
+  // 'v' is suppressed and the relay never recomputes a second, identical decision
+  assert.match(connect, /lastViewportReport=seed\.cols\+'x'\+seed\.rows; lastViewportReportSocket=sock;/);
+  assert.match(source, /lastViewportReport!==key \|\| lastViewportReportSocket!==ws/);
+});
