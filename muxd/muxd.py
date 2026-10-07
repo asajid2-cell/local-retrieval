@@ -1550,9 +1550,37 @@ ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)
 STALE_CSI_RE = re.compile(r"\[[0-?]*[ -/]*[@-~]")
 CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 PRIVATE_MODE_RE = re.compile(br"\x1b\[\?([0-9;]+)([hl])")
-# Cursor-position queries: CSI ?6n (DECXCPR) and its plain CSI 6n twin. These are REQUESTS the app
-# writes to its own pty, never output that renders anything, so they are stripped from replay.
-DSR_QUERY_RE = re.compile(br"\x1b\[\??6n")
+# Terminal QUERIES: requests an app writes to its pty that a terminal is expected to ANSWER. They
+# render nothing, but a replay carries them forward to a viewer that attaches later, which answers
+# them on behalf of a terminal that is long gone - and the answers land on whatever app is running
+# NOW. The sharpest case is DA1 (CSI c): the Gateway fences an abandoned probe's tombstone with a DA1
+# reply, so a replayed OLD DA1 clears the tombstone early and the real in-flight reply then lands on
+# the newest probe - the stale-reply bug, on the attach path. Every query form is dropped from replay;
+# every mode set is kept (a mode set is state a viewer must still learn).
+#   CPR        CSI ?6n (DECXCPR) / CSI 6n (DSR)      cursor-position request
+#   DA1        CSI c / CSI 0c                        primary device attributes
+#   DA2        CSI >c / CSI >0c                      secondary device attributes
+#   XTVERSION  CSI >q / CSI >0q                      terminal name/version request
+#   DECRQM     CSI ?Ps$p / CSI Ps$p                  request DEC private mode status
+#   kitty      CSI ?u                                request Kitty keyboard flags
+#   OSC colour OSC 10|11|12 ; ? / OSC 4 [;idx] ; ?   fg/bg/cursor/palette colour request
+REPLAY_QUERY_RE = re.compile(
+    br"\x1b\[(?:\??6n"                       # CPR: CSI ?6n / CSI 6n
+    br"|0?c"                                  # DA1: CSI c / CSI 0c
+    br"|>0?c"                                 # DA2: CSI >c / CSI >0c
+    br"|>0?q"                                 # XTVERSION: CSI >q / CSI >0q
+    br"|\?[0-9;]*\$p"                         # DECRQM (private): CSI ?Ps$p
+    br"|[0-9;]*\$p"                           # DECRQM: CSI Ps$p
+    br"|\?u)"                                 # kitty keyboard query: CSI ?u
+    br"|\x1b\](?:1[012]|4(?:;[0-9]+)?);\?(?:\x07|\x1b\\)"   # OSC colour query, BEL or ST terminated
+)
+# Cheap prefilter: a literal head that can begin any stripped query. A false positive only costs a
+# regex pass, never a wrong strip - so a shell prompt containing "$p" is harmless here.
+_REPLAY_QUERY_MARKERS = (
+    b"\x1b[?6n", b"\x1b[6n", b"\x1b[c", b"\x1b[0c", b"\x1b[>c", b"\x1b[>0c",
+    b"\x1b[>q", b"\x1b[>0q", b"\x1b[?u", b"$p",
+    b"\x1b]10;?", b"\x1b]11;?", b"\x1b]12;?", b"\x1b]4;?",
+)
 # Alt-screen/bracketed-paste PLUS the mouse-tracking family: a viewer that attaches after the
 # app's ?1000h/?1006h scrolled out of the ring must still learn that the app owns the wheel,
 # or its wheel input falls back to arrow keys / dies entirely (the "can't scroll a TUI" bug).
@@ -1568,18 +1596,20 @@ FOCUS_IN = b"\x1b[I"
 
 
 def strip_replay_dsr(data):
-    """Drop historical cursor-position queries from a replay payload.
+    """Drop historical terminal queries from a replay payload.
 
-    A TUI that probes its pty with CSI ?6n leaves those requests in the ring forever. A viewer
-    attaching later replays them and answers a BURST of stale cursor-position reports, which is
-    what stops the Gateway inline renderer settling its mouse arm (measured: 5946 replayed
-    probes vs 2 on an already-settled session). The queries are requests, not output - removing
-    them from replay changes nothing that renders - and the DECSET/DECRST reassertion in
-    TerminalReplayState.prefix() is emitted separately and is left untouched.
+    A TUI that probes its pty leaves the requests in the ring forever. A viewer attaching later
+    replays them and answers a BURST of stale replies that belong to an app no longer asking -
+    measured at 5946 replayed cursor-position probes vs 2 on an already-settled session, which is
+    what stops the Gateway inline renderer settling its mouse arm. DA1 is worse than noise: the
+    Gateway fences an abandoned probe's tombstone with a DA1 reply, so a replayed OLD DA1 clears
+    the tombstone early and the real in-flight reply then lands on the newest probe. Queries are
+    requests, not output - removing them changes nothing that renders - and the DECSET/DECRST
+    reassertion in TerminalReplayState.prefix() is emitted separately and left untouched.
     """
-    if b"\x1b[?6n" not in data and b"\x1b[6n" not in data:
+    if not any(marker in data for marker in _REPLAY_QUERY_MARKERS):
         return data
-    return DSR_QUERY_RE.sub(b"", data)
+    return REPLAY_QUERY_RE.sub(b"", data)
 
 
 def launch_candidate_ids(cmd="", ids=None):

@@ -240,13 +240,18 @@ class MuxdStateTests(unittest.TestCase):
         finally:
             loop.close()
 
-    def test_strip_replay_dsr_removes_cursor_position_queries_only(self):
-        # Both query forms go; everything else in the stream survives byte-for-byte.
+    def test_strip_replay_dsr_removes_every_query_form_only(self):
+        # Every query form goes; everything else in the stream survives byte-for-byte. The finals that
+        # look like queries but are not - ?16n, ?6;1n - and kitty PUSH flags (>1u, a MODE SET) stay.
         mixed = (b"\x1b[?6n" b"\x1b[6n" b"keep" b"\x1b[2J"
-                 b"\x1b[?1049h" b"\x1b[?16n" b"\x1b[?6;1n" b"\x1b[>0q")
+                 b"\x1b[?1049h" b"\x1b[?16n" b"\x1b[?6;1n" b"\x1b[>0q"
+                 b"\x1b[c" b"\x1b[0c" b"\x1b[>c" b"\x1b[>0c" b"\x1b[>q"
+                 b"\x1b[?2026$p" b"\x1b[2026$p" b"\x1b[?u"
+                 b"\x1b]11;?\x07" b"\x1b]10;?\x1b\\" b"\x1b]12;?\x07" b"\x1b]4;?\x07"
+                 b"\x1b[>1u")
         self.assertEqual(
             muxd.strip_replay_dsr(mixed),
-            b"keep\x1b[2J\x1b[?1049h\x1b[?16n\x1b[?6;1n\x1b[>0q",
+            b"keep\x1b[2J\x1b[?1049h\x1b[?16n\x1b[?6;1n\x1b[>1u",
         )
         # The common case (no query) is returned as the identical object, not a copy.
         plain = b"no probes here\x1b[?1000h"
@@ -280,6 +285,53 @@ class MuxdStateTests(unittest.TestCase):
             self.assertIn(b"CURRENT_TUI_FRAME", replay, "the strip must not eat real output")
         finally:
             loop.close()
+
+    def test_scrollback_carries_no_query_form_between_its_output(self):
+        # Every query form the Gateway (or any app) can leave in the ring, interleaved with output. The
+        # replay must carry none of them, and the output and mode sets must be byte-identical otherwise.
+        queries = [
+            b"\x1b[?6n", b"\x1b[6n",                  # CPR: DECXCPR / DSR
+            b"\x1b[c", b"\x1b[0c",                    # DA1
+            b"\x1b[>c", b"\x1b[>0c",                  # DA2
+            b"\x1b[>q", b"\x1b[>0q",                  # XTVERSION
+            b"\x1b[?2026$p", b"\x1b[2026$p",          # DECRQM (private / plain)
+            b"\x1b[?u",                               # kitty keyboard query
+            b"\x1b]11;?\x07", b"\x1b]10;?\x1b\\",     # OSC colour queries (BEL / ST)
+            b"\x1b]12;?\x07", b"\x1b]4;?\x07",
+        ]
+        modes = b"\x1b[?1049h\x1b[?1000h\x1b[?1006h\x1b[>1u"   # >1u is kitty PUSH flags: a mode set
+        parts, expected = [modes], [modes]
+        for i, q in enumerate(queries):
+            line = f"line {i}\r\n".encode()
+            parts += [line, q]
+            expected.append(line)
+        parts.append(b"tail\r\n")
+        expected.append(b"tail\r\n")
+        payload = b"".join(parts)
+
+        loop = asyncio.new_event_loop()
+        try:
+            session = muxd.Session(
+                "query-strip-session",
+                "",
+                r"Z:\tmp",
+                100,
+                30,
+                loop,
+                asyncio.Queue(),
+                spawn_now=False,
+            )
+            session.replay_state.ingest(payload)
+            session._append_ring(payload)
+            prefix = session.replay_state.prefix()
+            replay = session.scrollback()
+        finally:
+            loop.close()
+
+        for q in queries:
+            self.assertNotIn(q, replay, f"{q!r} survived into the replay")
+        self.assertEqual(replay, prefix + b"".join(expected),
+                         "the strip altered output or mode sets")
 
     def test_owner_scrollback_drops_historical_probe_queries_but_keeps_modes_and_text(self):
         owner = muxd.OwnerSession(
