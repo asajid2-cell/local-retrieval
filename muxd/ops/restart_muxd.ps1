@@ -3,6 +3,10 @@ param(
     [switch]$CheckOnly,
     [switch]$Recovery,
     [string]$RecoveryToken,
+    # A comma-separated list of local-tab rows the caller believes are ownerless ghosts. Each one is
+    # re-verified against live state below before it is allowed to be skipped; this is not a general
+    # force. Any row not named here still counts as active.
+    [string]$StaleLocalRows = "",
     [int]$TimeoutSeconds = 30,
     [string]$Profile = $(if ($env:MUXD_PROFILE) { $env:MUXD_PROFILE } else { "production" }),
     [string]$RuntimeRoot = ""
@@ -89,6 +93,33 @@ function Wait-ForCondition([scriptblock]$Condition, [string]$Failure) {
     throw $Failure
 }
 
+function Test-StaleLocalRow([object]$Row, [int]$Port) {
+    # Returns $null only when the row is a VERIFIED ownerless local tab that may be skipped, else a
+    # reason it must still count as active. Every check runs here at restart time against live state:
+    # the caller names a suspicion, this function decides. A missing or failing check is a refusal,
+    # never a silent skip - the whole point of the parameter is to keep the fence honest.
+    if (-not ($Row.owner -eq $true)) { return "not a local-owned row (owner=$($Row.owner))" }
+    if ($Row.kind -ne "local-tab") { return "kind is '$($Row.kind)', not local-tab" }
+    if ([int]$Row.childPid -ne 0) { return "still reports a child process (childPid=$($Row.childPid))" }
+    if ($Row.hasCommand) { return "still reports a running command (hasCommand=true)" }
+    try {
+        $connections = @(Get-NetTCPConnection -LocalPort $Port -State Established -ErrorAction Stop)
+    }
+    catch {
+        # An empty result is reported as a CIM "no matching objects" error, not an empty array. That
+        # specific message means zero connections; anything else (missing cmdlet, denied query) is a
+        # failure to verify and therefore a refusal.
+        if ($_.Exception.Message -notmatch "No matching MSFT_NetTCPConnection objects found") {
+            return "could not enumerate connections on port ${Port}: $($_.Exception.Message)"
+        }
+        $connections = @()
+    }
+    if ($connections.Count -gt 0) {
+        return "$($connections.Count) established connection(s) on port $Port - a live socket may own this row"
+    }
+    return $null
+}
+
 $existingProcesses = @(Get-MuxdProcesses)
 $skipPreflight = $false
 if ($Recovery) {
@@ -107,7 +138,30 @@ if ($Recovery) {
 }
 if (-not $skipPreflight) {
     $sessions = @(Get-HostedSessions)
-    $active = @($sessions | Where-Object { @($_.alive) -contains $true })
+    $staleNames = @()
+    if ($StaleLocalRows) {
+        $staleNames = @($StaleLocalRows -split "," | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    }
+    $controlPort = [int]$profileJson.ControlPort
+    $active = @()
+    foreach ($session in $sessions) {
+        if (-not (@($session.alive) -contains $true)) { continue }
+        if ($staleNames -contains $session.name) {
+            $reason = Test-StaleLocalRow -Row $session -Port $controlPort
+            if ($reason) {
+                throw "refusing muxd restart: -StaleLocalRows '$($session.name)' is not a verified ownerless local tab: $reason"
+            }
+            Write-RestartLog ("skipping verified ownerless local tab '{0}' (owner={1} kind={2} childPid={3} hasCommand={4} establishedOnPort{5}=0)" -f `
+                $session.name, $session.owner, $session.kind, $session.childPid, $session.hasCommand, $controlPort)
+            continue
+        }
+        $active += $session
+    }
+    # A named row that is not present is a no-op, not an error: if it already reaped itself there is
+    # nothing to skip, and refusing would only make the caller re-run to discover the good news.
+    foreach ($missing in @($staleNames | Where-Object { $_ -notin @($sessions | ForEach-Object { $_.name }) })) {
+        Write-RestartLog "stale-local-rows named '$missing' but no such session is listed; nothing to skip"
+    }
     if ($active.Count -gt 0) {
         $names = ($active | ForEach-Object { $_.name }) -join ", "
         throw "refusing muxd restart while active sessions exist: $names"

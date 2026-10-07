@@ -3,6 +3,9 @@
 param(
   [ValidateSet('audit','enforce')]
   [string]$AuthzMode,
+  # Comma-separated local-tab rows the preflight may skip IF it re-verifies them as ownerless ghosts.
+  # Empty by default: an ordinary deploy still refuses while any session is alive.
+  [string]$StaleLocalRows = '',
   [string]$RuntimeDir = 'C:\Users\Ahmed\muxd-runtime'
 )
 
@@ -119,6 +122,14 @@ function Invoke-RestartAndVerify([switch]$Recovery, [string]$RecoveryToken = '')
     if ($LASTEXITCODE -ne 0) {
       throw "rollback recovery restart failed with exit $LASTEXITCODE"
     }
+  } elseif ($StaleLocalRows) {
+    # The scheduled restart task runs the same script with no arguments, so a named-skip restart has to
+    # invoke it directly - exactly as the recovery branch already does - to hand the preflight its list.
+    # The preflight still re-verifies every named row; this only gets it past the scheduler's fixed args.
+    & powershell -NoProfile -ExecutionPolicy Bypass -File $restartScript -StaleLocalRows $StaleLocalRows
+    if ($LASTEXITCODE -ne 0) {
+      throw "restart with -StaleLocalRows failed with exit $LASTEXITCODE"
+    }
   } else {
     Start-ScheduledTask -TaskName $restartTask
   }
@@ -146,7 +157,7 @@ if (-not (Test-Path -LiteralPath $restartScript)) {
   Write-Error "muxd restart preflight is missing: $restartScript"
   exit 1
 }
-& powershell -NoProfile -ExecutionPolicy Bypass -File $restartScript -CheckOnly
+& powershell -NoProfile -ExecutionPolicy Bypass -File $restartScript -CheckOnly -StaleLocalRows $StaleLocalRows
 if ($LASTEXITCODE -ne 0) {
   Write-Error 'active muxd sessions or an unhealthy live runtime blocked deployment before any files were copied'
   exit 1

@@ -378,5 +378,136 @@ class TestDeployManifest(unittest.TestCase):
         )
 
 
+FAKE_PROFILE_PY = (
+    "import json, sys\n"
+    "if sys.argv[1:] == ['--json']:\n"
+    "    print(json.dumps(%r))\n"
+    "elif sys.argv[1:] == ['--matching-pids']:\n"
+    "    sys.stdin.read()\n"
+    "    print('[]')\n"
+    "else:\n"
+    "    raise SystemExit('usage')\n"
+)
+
+FAKE_MUXCTL_PY = (
+    "ROWS = %r\n"
+    "async def fetch_info():\n"
+    "    return {'t': 'info'}\n"
+    "async def request_json(frame):\n"
+    "    return {'t': 'ls', 'list': ROWS}\n"
+)
+
+
+def ghost_row(name):
+    # The exact shape of an ownerless local tab: alive, local-owned, no command, no child process.
+    return {"name": name, "alive": True, "owner": True, "kind": "local-tab",
+            "childPid": 0, "hasCommand": False}
+
+
+class TestStaleLocalRowsPreflight(unittest.TestCase):
+    """restart_muxd.ps1 -StaleLocalRows must re-verify at run time, never blanket-force.
+
+    These drive the REAL restart_muxd.ps1 against a fake runtime root: a stub profile.py and a stub
+    muxctl.py stand in for the live host, so the preflight's decision - not a text match on the
+    script - is what is asserted.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = self._tmp.name
+        os.mkdir(os.path.join(self.root, "ops"))
+        shutil.copyfile(
+            os.path.join(MUXD_DIR, "ops", "restart_muxd.ps1"),
+            os.path.join(self.root, "ops", "restart_muxd.ps1"),
+        )
+        self._listener = None
+        self._client = None
+        self._accepted = None
+
+    def tearDown(self):
+        for sock in (self._client, self._accepted, self._listener):
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+        self._tmp.cleanup()
+
+    def _write_fakes(self, rows, port):
+        profile = {"Name": "production", "RuntimeRoot": self.root, "StateRoot": self.root,
+                   "ControlPort": port, "TaskName": "MuxFakeTask"}
+        with open(os.path.join(self.root, "profile.py"), "w", encoding="utf-8") as fh:
+            fh.write(FAKE_PROFILE_PY % profile)
+        with open(os.path.join(self.root, "muxctl.py"), "w", encoding="utf-8") as fh:
+            fh.write(FAKE_MUXCTL_PY % rows)
+
+    def _open_established(self, port):
+        import socket
+        self._listener = socket.socket()
+        self._listener.bind(("127.0.0.1", port))
+        self._listener.listen(1)
+        self._client = socket.create_connection(("127.0.0.1", port), timeout=5)
+        self._accepted, _ = self._listener.accept()
+
+    def _free_port(self):
+        import socket
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            return int(s.getsockname()[1])
+
+    def _run(self, stale):
+        cmd = ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+               os.path.join(self.root, "ops", "restart_muxd.ps1"),
+               "-CheckOnly", "-Profile", "production", "-RuntimeRoot", self.root]
+        if stale is not None:
+            cmd += ["-StaleLocalRows", stale]
+        return subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True, timeout=90)
+
+    @unittest.skipIf(os.name != "nt", "PowerShell preflight requires Windows")
+    def test_a_named_ownerless_ghost_passes(self):
+        port = self._free_port()
+        self._write_fakes([ghost_row("tab-6a64")], port)
+        result = self._run("tab-6a64")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        log = read(os.path.join(self.root, "muxd-restart.log"))
+        self.assertIn("skipping verified ownerless local tab 'tab-6a64'", log)
+
+    @unittest.skipIf(os.name != "nt", "PowerShell preflight requires Windows")
+    def test_a_named_row_with_a_live_socket_on_the_control_port_is_refused(self):
+        port = self._free_port()
+        self._write_fakes([ghost_row("tab-6a64")], port)
+        self._open_established(port)
+        result = self._run("tab-6a64")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("established connection", result.stdout + result.stderr)
+
+    @unittest.skipIf(os.name != "nt", "PowerShell preflight requires Windows")
+    def test_a_named_row_that_still_has_a_command_is_refused(self):
+        port = self._free_port()
+        row = ghost_row("tab-6a64")
+        row["hasCommand"] = True
+        self._write_fakes([row], port)
+        result = self._run("tab-6a64")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("still reports a running command", result.stdout + result.stderr)
+
+    @unittest.skipIf(os.name != "nt", "PowerShell preflight requires Windows")
+    def test_an_unnamed_row_still_blocks_the_restart(self):
+        port = self._free_port()
+        self._write_fakes([ghost_row("tab-6a64"), ghost_row("tab-8304")], port)
+        result = self._run("tab-6a64")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("active sessions exist", result.stdout + result.stderr)
+        self.assertIn("tab-8304", result.stdout + result.stderr)
+
+    @unittest.skipIf(os.name != "nt", "PowerShell preflight requires Windows")
+    def test_no_stale_names_refuses_every_live_row(self):
+        port = self._free_port()
+        self._write_fakes([ghost_row("tab-6a64")], port)
+        result = self._run(None)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("active sessions exist", result.stdout + result.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()
