@@ -2903,7 +2903,15 @@ try{ window.__muxForceSel = forceSel; }catch(e){}
     // an armed pane's press; we are the only one that reports it. On an UNARMED pane we must NOT prevent
     // it: xterm's own selection service is what makes a plain drag highlight, and swallowing the press
     // would leave that pane unable to select.
-    if(appTakesMouse()){ e.preventDefault(); e.stopPropagation(); }
+    if(appTakesMouse()){
+      // Swallowing the press ALSO keeps xterm's selection service from dropping the old highlight - and a
+      // live highlight holds the output freeze. A click after a drag-select then forwarded its report, but
+      // the app's reply stayed buffered behind the freeze and never painted, so the click looked dead until
+      // the highlight was cleared some other way. Clear it ourselves here, exactly like the drag path below
+      // does on the first move, so a new press goes live again; a drag re-selects from its own anchor.
+      if(termHasSelection()){ try{ term.clearSelection(); }catch(_){} }
+      e.preventDefault(); e.stopPropagation();
+    }
   }, true);
   document.addEventListener('mouseup', e=>{
     if(!ownerPress) return;

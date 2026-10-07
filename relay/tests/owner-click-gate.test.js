@@ -232,3 +232,30 @@ test('a click on an APP pane forwards press+release in EITHER arm state; a bare 
     await harness.stop();
   }
 });
+
+// The click-after-a-drag defect (Ahmed, 2026-10-06): "after I select, my next click on Led does nothing."
+// On an ARMED pane we swallow the press so xterm's protocol cannot double-report it - but that also keeps
+// xterm's selection service from dropping the old highlight, and a standing highlight latches the output
+// freeze. The app DID get the click report and DID reply (the LedMenu), but the reply stayed buffered
+// behind the freeze and never painted, so the click looked dead. Isolation proved it: forcing
+// term.clearSelection() from the page flushed the withheld paint.
+//
+// The fix is one line inside the armed branch of the press handler: clear the standing selection itself.
+// It is pinned as a SOURCE gate, not a behavioural one, because the loopback harness cannot reproduce the
+// live armed condition - it forwards the click through a real pty either way, so a behavioural assertion
+// here is FALSE-GREEN (it passes with the fix disabled). The behaviour was proven against the real client
+// instead: a document-capture mousedown that mimics the fix made the chooser open where the control left it
+// dead (muxdiag/dragoff-fix-proof.js: control clickOpenedChooser=false, fixed=true).
+test('an armed press clears a standing selection itself, because we swallow the press that xterm would use', () => {
+  const handler = ownerPressMousedownSource();
+  const armedAt = handler.indexOf('appTakesMouse()');
+  assert.notEqual(armedAt, -1, 'the armed-press branch is gone - the press is no longer kept out of xterm');
+  const armed = handler.slice(armedAt);
+  const clearAt = armed.indexOf('term.clearSelection()');
+  const preventAt = armed.indexOf('e.preventDefault()');
+  assert.notEqual(clearAt, -1,
+    'an armed press no longer clears a standing selection: a click after a drag-select leaves the highlight up, the freeze latched, and the app reply unpainted - the click reads as dead');
+  assert.notEqual(preventAt, -1, 'the armed press no longer swallows the event');
+  assert.ok(clearAt < preventAt,
+    'the selection is cleared after the press is swallowed; it must be cleared as part of taking the press');
+});
