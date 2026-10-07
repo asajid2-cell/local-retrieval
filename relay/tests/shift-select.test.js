@@ -27,7 +27,9 @@ const source = fs.readFileSync(path.join(__dirname, '..', 'public', 'index.html'
 // The force-select mousedown handler is the one that calls forceSelStart(). Pull just that listener out
 // of the shipped file (it is anonymous, so it is asserted against its source, not executed).
 function forceSelectMousedownSource(){
-  const call = source.indexOf('forceSelStart(e.clientX, e.clientY)');
+  // b017f69 dropped the space after the comma (`forceSelStart(e.clientX,e.clientY)`), so match on the
+  // call shape rather than one exact spacing - the assertion is about the handler's gate, not its style.
+  const call = source.search(/forceSelStart\(e\.clientX,\s*e\.clientY\)/);
   assert.notEqual(call, -1, 'no mousedown handler calls forceSelStart() — the shift gesture is gone');
   const start = source.lastIndexOf("addEventListener('mousedown'", call);
   assert.notEqual(start, -1, 'forceSelStart() is no longer reached from a mousedown listener');
@@ -39,9 +41,17 @@ function forceSelectMousedownSource(){
 test('the shift-select mousedown gate does not depend on the app taking the mouse or owning the session', () => {
   const handler = forceSelectMousedownSource();
   assert.match(handler, /forceSelectGesture\(e\)/, 'the handler no longer checks the shift gesture at all');
+  // The shift gesture is the FIRST branch and returns before the plain-press path below, which legitimately
+  // consults appTakesMouse() to decide whether to swallow xterm's own press. Scan only up to that early
+  // return: b017f69 moved the app-state check below the shift branch, where it no longer touches selection,
+  // and a whole-handler scan mistook it for a gate on the shift gesture.
+  const gateAt = handler.indexOf('forceSelectGesture(e)');
+  const gateEnd = handler.indexOf('return;', gateAt);
+  assert.notEqual(gateEnd, -1, 'the shift gesture branch no longer returns early');
+  const gate = handler.slice(0, gateEnd);
   for(const forbidden of ['isVisibleOwner', 'appOwnsMouse', 'appTakesMouse', 'mouseActive', 'inputAllowed']){
     assert.doesNotMatch(
-      handler, new RegExp(forbidden),
+      gate, new RegExp(forbidden),
       `the shift gesture is gated on ${forbidden}() again — a plain non-owner shell would lose shift-select`,
     );
   }

@@ -2936,8 +2936,14 @@ try{ window.__muxForceSel = forceSel; }catch(e){}
     if(!press.wantApp) return;
     const cell=bufferCellAt(e.clientX,e.clientY) || press.cell;
     const at=c=>`\x1b[<${press.button};${c[0]+1};${c[1]-(term.buffer.active.viewportY|0)+1}`;
-    sendMouseInput(at(cell)+'M');
-    sendMouseInput(at(cell)+'m');
+    const click=at(cell)+'M', release=at(cell)+'m';
+    // Register our own forward with the leak detector, exactly as xterm's own click path does (term.onData
+    // -> noteForwarded). On an armed pane the press never reaches xterm - we swallow it above - so this
+    // handler is the ONLY place that pane's click report is produced, and a session that echoes it straight
+    // back would go unnoticed, leaving the detector blind to every click on an armed pane.
+    mouseGuard.noteForwarded(click+release, Date.now());
+    sendMouseInput(click);
+    sendMouseInput(release);
     e.preventDefault(); e.stopPropagation();
   }, true);
   // The drag and its release live on the document: the gesture is allowed to leave the terminal.

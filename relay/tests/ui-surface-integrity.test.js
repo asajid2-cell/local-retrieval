@@ -201,7 +201,9 @@ test('the terminal surface stays reachable across every transition', async t => 
 // on a phone), a scroll that reaches the app, and the bottom bar.
 test('a full-screen TUI can still be scrolled, selected and driven from the nav', async t => {
   if (skipWithoutChromium(t)) return;
-  const session = { name: SESSION_NAME, alive: true, shellOnly: true, sessionId: 'tui-sid', generationId: 'tui-generation' };
+  // An APP pane (hasCommand) behind the alt screen: a click is what legitimately leaves the page here, which
+  // is what step 6 needs to echo to trip the leak latch. A drag is a selection (step 3) and forwards nothing.
+  const session = { name: SESSION_NAME, alive: true, shellOnly: true, hasCommand: true, sessionId: 'tui-sid', generationId: 'tui-generation' };
   await withSurfacePage(session, async ({ harness, host, page }) => {
     await page.goto(`http://127.0.0.1:${harness.port}/`);
     await waitFor(() => page.evaluate(() => typeof connect === 'function'), 'page boot');
@@ -258,13 +260,19 @@ test('a full-screen TUI can still be scrolled, selected and driven from the nav'
     assert.ok(toggled.text.trim().length > 0, 'the Sel toggle must select real text');
     await reset();
 
-    // 3. A plain drag is NOT a selection: the app asked for the mouse and must still get it. This is the
-    // guard against "fixing" selection by switching mouse reporting off for everything.
+    // 3. A plain drag is a SELECTION, not an app gesture. b017f69 (Ahmed's 2026-10-03 "either/or" report:
+    // "we can never click ... instead of letting us click and select both as needed") decides the gesture at
+    // RELEASE: a press that MOVED is a selection we run ourselves, so it works on a pane whose app armed the
+    // mouse (where xterm's own selection service is off), and only a press that did NOT move is a click. The
+    // app-pane click half is pinned end-to-end by owner-click-gate.test.js; the mouse-tracking half is here.
     const beforePlain = forwarded().length;
     await drag();
-    assert.ok(/^\x1b\[<[0-9]+;[0-9]+;[0-9]+[Mm]/m.test(forwarded().slice(beforePlain)),
-      'a plain drag in a mouse-tracking TUI must still be forwarded to the app');
-    assert.equal((await selection()).has, false, 'a plain drag must not steal the gesture from the app');
+    assert.equal(forwarded().slice(beforePlain), '',
+      'a plain drag in a mouse-tracking TUI was forwarded to the app: the gesture was a selection, not a click');
+    const plainSel = await selection();
+    assert.ok(plainSel.has && plainSel.text.trim().length > 0,
+      `a plain drag in a mouse-tracking TUI must select real text (got ${JSON.stringify(plainSel)})`);
+    await reset();
 
     // 4. The wheel must reach the app. The alternate buffer has no scrollback of its own, so the app owns
     // scrolling: what has to leave the page is the wheel mouse REPORT (SGR button 64/65), not a local
@@ -291,10 +299,15 @@ test('a full-screen TUI can still be scrolled, selected and driven from the nav'
     // selection service stays disabled while the wheel keeps working. That divergence is "scroll works,
     // selection won't at all", and the forced-selection gesture has to survive it: it is gated on xterm's
     // state, not on our forwarding policy.
+    // The report to echo is a CLICK's: a drag is a selection now (step 3) and forwards nothing, and the
+    // guard deliberately does not register wheel reports against themselves.
     const beforeLeak = forwarded().length;
-    await drag();
+    await page.mouse.move(centre.x, centre.y);
+    await page.mouse.down();
+    await page.mouse.up();
+    await sleep(200);
     const echoed = forwarded().slice(beforeLeak);
-    assert.ok(/\x1b\[<[0-9]+;[0-9]+;[0-9]+[Mm]/.test(echoed), 'an armed guard must forward a plain drag');
+    assert.ok(/\x1b\[<[0-9]+;[0-9]+;[0-9]+[Mm]/.test(echoed), 'an app pane must forward a click to echo');
     host.sendOutput(SESSION_NAME, echoed);
     await waitFor(async () => await page.evaluate(() => window.__muxMouseGuard.stats().blocked), 'leak detector tripped');
     assert.equal(await page.evaluate(() => window.__muxMouseGuard.stats().mouseActive), true,
