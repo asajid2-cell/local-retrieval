@@ -951,15 +951,20 @@ while k.ReadConsoleInputW(hin,records,16,ctypes.byref(count)):
                 browser = playwright.chromium.launch(headless=False, args=["--no-proxy-server"])
                 try:
                     page = browser.new_page(viewport={"width": 1440, "height": 900})
-                    page.goto(f"http://127.0.0.1:{relay_port}/", timeout=30000)
+                    # The DOM renderer, explicitly: this test reads cell text out of `.xterm-rows`, and the
+                    # WebGL default paints to a canvas with no such rows.
+                    page.goto(f"http://127.0.0.1:{relay_port}/?mux_render=dom", timeout=30000)
                     page.evaluate("name => connect(name)", name)
                     page.wait_for_function("() => [...document.querySelectorAll('.xterm-rows > div')].some(r => r.textContent.includes('VISIBLE FOOTER'))", timeout=20000)
                     self.assertIn("VISIBLE FOOTER", page.locator(".xterm-rows").inner_text())
-                    # The browser never saw the app's pre-attach DECSET, but session ownership
-                    # remains explicit; real pointer gestures must reach the visible console.
+                    # An ADOPTED console's VT modes are structurally unknowable: muxrun reads the CELL GRID,
+                    # so the app's DECSET never reaches muxd or the relay and the guard stays unarmed. The
+                    # browser still sees an owner-bound pane, so clicks and keystrokes (which need no arm)
+                    # land on the visible console - but the WHEEL has no arm to answer to and stays local.
                     page.wait_for_function("() => isVisibleOwner()")
                     self.assertEqual(page.evaluate("() => term.buffer.active.type"), "normal")
-                    self.assertFalse(page.evaluate("() => window.__muxMouseGuard.mouseActive()"))
+                    self.assertFalse(page.evaluate("() => window.__muxMouseGuard.mouseActive()"),
+                                     'an adopted console never delivers its DECSET, so the guard must stay unarmed')
                     centre = page.locator('#term .xterm-screen').bounding_box()
                     self.assertIsNotNone(centre)
                     x = centre['x'] + centre['width'] / 2
@@ -972,10 +977,14 @@ while k.ReadConsoleInputW(hin,records,16,ctypes.byref(count)):
                     page.mouse.down()
                     page.mouse.move(x + 70, y + 15, steps=5)
                     page.mouse.up()
-                    self.assertFalse(page.evaluate('() => term.hasSelection()'), 'a plain owner drag belongs to the app')
-                    self.assertFalse(page.evaluate('() => isFrozen()'), 'a plain owner drag must not freeze live output')
+                    # b017f69: a plain press that MOVES is our own selection, not a click the app gets to
+                    # see. It also latches the freeze, which typing (below) releases by resuming live output.
+                    self.assertTrue(page.evaluate('() => term.hasSelection()'), 'a plain owner drag is our own selection')
+                    self.assertTrue(page.evaluate('() => isFrozen()'), 'a drag-select latches the freeze until typing resumes live output')
                     page.keyboard.press('k')
-                    page.wait_for_function("() => [...document.querySelectorAll('.xterm-rows > div')].some(r => /WHEEL=[1-9]/.test(r.textContent) && /CLICK=[1-9]/.test(r.textContent) && /KEY=[1-9]/.test(r.textContent))", timeout=10000)
+                    page.wait_for_function("() => [...document.querySelectorAll('.xterm-rows > div')].some(r => /CLICK=[1-9]/.test(r.textContent) && /KEY=[1-9]/.test(r.textContent))", timeout=10000)
+                    self.assertIn("WHEEL=0", page.locator(".xterm-rows").inner_text(),
+                                  'an unarmed adopted console keeps the wheel local')
                     # Pointer fidelity at the LEFT EDGE of the grid: the cell the app receives must be
                     # the cell that was clicked. A clamped or off-by-one report would silently put every
                     # click on the wrong cell of a TUI - and a dropped release would leave it stuck in a
@@ -989,7 +998,9 @@ while k.ReadConsoleInputW(hin,records,16,ctypes.byref(count)):
                     self.assertEqual(reported, [1, 8], f'owner click reported the wrong cell: {reported}')
                     counters = page.evaluate("() => document.querySelector('.xterm-rows').textContent.match(/WHEEL=(\\d+) CLICK=(\\d+) KEY=(\\d+) REL=(\\d+)/).slice(1).map(Number)")
                     self.assertEqual(counters[3], counters[1], f'every owner press must be released: {counters}')
-                    self.assertGreaterEqual(counters[1], 3, counters)
+                    # Two forwarded clicks: the plain click above and the fidelity click. The plain drag
+                    # between them is our selection now, so it no longer adds a click (b017f69).
+                    self.assertGreaterEqual(counters[1], 2, counters)
                     footer = page.locator('.xterm-rows > div').filter(has_text='VISIBLE FOOTER').first
                     footer_box = footer.bounding_box()
                     self.assertIsNotNone(footer_box)
@@ -1007,9 +1018,9 @@ while k.ReadConsoleInputW(hin,records,16,ctypes.byref(count)):
                         'selection': page.evaluate("() => term.hasSelection() && !!term.getSelection().trim()"),
                     }
                     phone = browser.new_page(viewport={'width': 390, 'height': 700}, is_mobile=True, has_touch=True)
-                    phone.goto(f'http://127.0.0.1:{relay_port}/', timeout=30000)
+                    phone.goto(f'http://127.0.0.1:{relay_port}/?mux_render=dom', timeout=30000)
                     phone.evaluate('name => connect(name)', name)
-                    phone.wait_for_function("() => [...document.querySelectorAll('.xterm-rows > div')].some(r => /WHEEL=[1-9]/.test(r.textContent))", timeout=20000)
+                    phone.wait_for_function("() => [...document.querySelectorAll('.xterm-rows > div')].some(r => r.textContent.includes('VISIBLE FOOTER'))", timeout=20000)
                     phone.get_by_role('button', name='Sessions', exact=True).click()
                     self.assertTrue(phone.evaluate("() => document.querySelector('#app').classList.contains('mobile-view-sessions')"))
                     phone.get_by_role('button', name='Terminal', exact=True).click()
@@ -1038,13 +1049,20 @@ while k.ReadConsoleInputW(hin,records,16,ctypes.byref(count)):
                     touch.send('Input.dispatchTouchEvent', {'type': 'touchStart', 'touchPoints': [{'x': 90, 'y': 330, 'id': 1}]})
                     touch.send('Input.dispatchTouchEvent', {'type': 'touchMove', 'touchPoints': [{'x': 90, 'y': 250, 'id': 1}]})
                     touch.send('Input.dispatchTouchEvent', {'type': 'touchEnd', 'touchPoints': []})
-                    phone.wait_for_function("() => [...document.querySelectorAll('.xterm-rows > div')].some(r => /WHEEL=[5-9]/.test(r.textContent))", timeout=10000)
-                    observed['touch_scroll'] = True
+                    phone.wait_for_timeout(600)
+                    # The same limit as the desktop wheel: no arm reached this adopted console, so the
+                    # touch drag scrolls the phone's own mirror and the app's counter never moves.
+                    self.assertIn("WHEEL=0", phone.locator(".xterm-rows").inner_text(),
+                                  'an unarmed adopted console keeps the phone touch-scroll local')
+                    observed['touch_scroll'] = phone.evaluate("() => [...document.querySelectorAll('.xterm-rows > div')].some(r => /WHEEL=[1-9]/.test(r.textContent))")
                     print(f'owner browser gesture outcome: {observed}; mobile={mobile_surface}; screenshots={screenshot}, {mobile_screenshot}', flush=True)
                     self.assertTrue(observed['nav'], observed)
                     self.assertTrue(observed['selection'], observed)
                     self.assertTrue(observed['key'], observed)
-                    self.assertTrue(observed['wheel'], observed)
+                    # The wheel is the ONE gesture an adopted console cannot answer: no arm ever reached
+                    # the client, so it stays local on both the desktop and the phone.
+                    self.assertFalse(observed['wheel'], observed)
+                    self.assertFalse(observed['touch_scroll'], observed)
                     self.assertTrue(observed['click'], observed)
                     # The app then redraws its actual footer at row 51. The phone must
                     # follow content that moved after attach, without the user reloading.
@@ -1063,9 +1081,24 @@ while k.ReadConsoleInputW(hin,records,16,ctypes.byref(count)):
                     # repair has to restore those - VISIBLE FOOTER is gone from the app too.
                     page.evaluate("() => new Promise(resolve => term.write('\\x1b[2J\\x1b[H', resolve))")
                     page.wait_for_function("() => ![...document.querySelectorAll('.xterm-rows > div')].some(r => r.textContent.includes('BOTTOM FOOTER'))")
-                    page.evaluate("() => send('R', '')")
-                    page.evaluate("() => forceJumpBottom()")
-                    page.wait_for_function("() => [...document.querySelectorAll('.xterm-rows > div')].some(r => r.textContent.includes('BOTTOM FOOTER'))", timeout=20000)
+                    # The relay rate-limits a viewer's repaint request to one per 10 seconds, and that
+                    # budget is per SESSION, not per viewer: the phone attached above fires the client's
+                    # blank-frame detector on its narrow viewport (window.__muxLastRepaintRequest reason
+                    # 'scheduled:blank') and spends it. So a single request from this desktop tab is
+                    # throttled away and the damaged mirror never heals. Ask, and if the request was
+                    # dropped, ask again once the window has passed - the retry is what the user's
+                    # Repaint button does too.
+                    restored = False
+                    for _attempt in range(4):
+                        page.evaluate("() => send('R', '')")
+                        page.evaluate("() => forceJumpBottom()")
+                        try:
+                            page.wait_for_function("() => [...document.querySelectorAll('.xterm-rows > div')].some(r => r.textContent.includes('BOTTOM FOOTER'))", timeout=11000)
+                            restored = True
+                            break
+                        except Exception:
+                            pass
+                    self.assertTrue(restored, 'a server repaint must restore the app content after the mirror is damaged')
                     self.assertIn("WHEEL=", page.locator(".xterm-rows").inner_text())
                 finally:
                     browser.close()
