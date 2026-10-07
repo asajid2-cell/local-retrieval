@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Text;
 using CodexLocalRetrieval.Core.Services;
 
@@ -19,6 +20,111 @@ public sealed class FileWatchTests
     private static void Cleanup(string dir)
     {
         try { Directory.Delete(dir, recursive: true); } catch { }
+    }
+
+    private static void InterlockedMax(ref int target, int value)
+    {
+        int current;
+        while (value > (current = Volatile.Read(ref target)))
+            if (Interlocked.CompareExchange(ref target, value, current) == current) return;
+    }
+
+    // The stall this guards against: a 250 ms pump whose body is stuck in a recursive filesystem walk
+    // (measured ~1.1 s over the 12k-transcript .claude/projects tree) held _gate for the whole walk, so
+    // every overlapping tick and every FileSystemWatcher callback parked a thread-pool thread behind it
+    // until the pool starved and the server's /healthz stopped answering. A probe parked mid-walk must
+    // leave every other entry point responsive and must not let a second probe start.
+    [TestMethod]
+    public void BlockedProbe_DoesNotHoldTheService_AndDoesNotPileUpTicks()
+    {
+        var dir = NewTempDir();
+        try
+        {
+            using var service = new FileWatchService(new FileWatchOptions
+            {
+                ManualPump = true,
+                ActiveFallbackInterval = TimeSpan.Zero,   // the fallback is due on the next pump
+                IdleFallbackInterval = TimeSpan.Zero,
+            });
+
+            var entered = new ManualResetEventSlim(false);
+            var release = new ManualResetEventSlim(false);
+            var concurrent = 0;
+            var maxConcurrent = 0;
+            var block = false;                            // flipped after registration; captured by the probe
+
+            using var reg = service.WatchDirectoryForTest(dir, () =>
+            {
+                if (block)
+                {
+                    InterlockedMax(ref maxConcurrent, Interlocked.Increment(ref concurrent));
+                    entered.Set();
+                    release.Wait(TimeSpan.FromSeconds(3));
+                    Interlocked.Decrement(ref concurrent);
+                }
+                return "stamp";
+            }, _ => { });
+
+            block = true;
+
+            // Park one pump inside the probe. On the unfixed service this holds _gate for the whole wait.
+            var stuck = Task.Run(() => service.Pump());
+            Assert.IsTrue(entered.Wait(TimeSpan.FromSeconds(2)), "the probe never ran");
+
+            // Every other entry point must stay responsive while a probe is parked, and no second probe
+            // may run: an overlapping tick must return immediately, not queue behind the walk.
+            var sw = Stopwatch.StartNew();
+            service.Pump();
+            _ = service.AllWatchersHealthy;
+            using var reg2 = service.WatchDirectoryForTest(dir, () => "other", _ => { });
+            sw.Stop();
+
+            Assert.IsTrue(sw.Elapsed < TimeSpan.FromSeconds(1),
+                "a parked probe held the service for " + sw.ElapsedMilliseconds +
+                " ms; callers must not wait behind a filesystem walk");
+            Assert.AreEqual(1, Volatile.Read(ref maxConcurrent), "two probes ran at once; the tick is not single-flight");
+
+            release.Set();
+            Assert.IsTrue(stuck.Wait(TimeSpan.FromSeconds(5)), "the parked pump did not finish after release");
+        }
+        finally { Cleanup(dir); }
+    }
+
+    // The restructured pump moves the probe off the lock; a change that only the safety-net poll can see
+    // (a synthetic probe raises no OS event) must still fire, and must report unknown paths.
+    [TestMethod]
+    public void FallbackPoll_DetectsChange_AndFiresWithUnknownPaths()
+    {
+        var dir = NewTempDir();
+        try
+        {
+            var clock = new ManualFileWatchClock();
+            using var service = new FileWatchService(new FileWatchOptions
+            {
+                ManualPump = true,
+                Clock = clock,
+                ActiveFallbackInterval = TimeSpan.FromSeconds(5),
+                IdleFallbackInterval = TimeSpan.FromSeconds(60),
+            });
+
+            var stamp = "0";
+            var deliveries = new List<IReadOnlyList<string>?>();
+            using var reg = service.WatchDirectoryForTest(dir, () => stamp, paths => { lock (deliveries) deliveries.Add(paths); });
+
+            clock.Advance(TimeSpan.FromSeconds(60));
+            service.Pump();                          // due: unchanged stamp -> demote, no fire
+            Assert.AreEqual(0, deliveries.Count, "an unchanged stamp must not fire");
+
+            stamp = "1";
+            clock.Advance(TimeSpan.FromSeconds(60));
+            service.Pump();                          // due: changed -> fire with unknown paths
+            lock (deliveries)
+            {
+                Assert.AreEqual(1, deliveries.Count, "the fallback poll did not deliver the change");
+                Assert.IsNull(deliveries[0], "a poll-found change must report unknown paths (null)");
+            }
+        }
+        finally { Cleanup(dir); }
     }
 
     [TestMethod]

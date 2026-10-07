@@ -83,6 +83,7 @@ public sealed class FileWatchService : IDisposable
     private readonly List<Registration> _registrations = new();
     private readonly Dictionary<string, DirectoryWatcher> _watchers = new(StringComparer.OrdinalIgnoreCase);
     private readonly Timer? _pump;
+    private int _pumping;
     private bool _disposed;
 
     public FileWatchStats Stats { get; } = new();
@@ -126,6 +127,11 @@ public sealed class FileWatchService : IDisposable
             probe: () => DirectoryStamp(dir, pattern, recurse), onChanged, coarseFallback: true);
     }
 
+    // Test seam: register with an injected probe so a test can drive a synthetic or deliberately slow
+    // stamp without a real tree. Production registrations always use WatchFile/WatchDirectory.
+    internal IFileWatchRegistration WatchDirectoryForTest(string directory, Func<string> probe, Action<IReadOnlyList<string>?> onChanged)
+        => Register(Path.GetFullPath(directory), recurse: true, matches: _ => true, probe, onChanged, coarseFallback: true);
+
     private IFileWatchRegistration Register(string directory, bool recurse, Func<string, bool> matches, Func<string> probe, Action<IReadOnlyList<string>?> onChanged, bool coarseFallback = false)
     {
         var reg = new Registration(this, directory, recurse, matches, probe, onChanged, coarseFallback);
@@ -157,12 +163,30 @@ public sealed class FileWatchService : IDisposable
         get { lock (_gate) return _watchers.Values.All(w => w.Healthy); }
     }
 
-    /// Evaluate every registration's debounce and fallback deadlines against the clock. Callbacks are
-    /// invoked OUTSIDE the lock so a slow consumer cannot stall registration or disposal.
+    /// Evaluate every registration's debounce and fallback deadlines against the clock. Non-reentrant:
+    /// a tick that overlaps one still in flight returns immediately instead of queueing a second body.
     public void Pump()
+    {
+        // A 250 ms tick whose body is stuck in a filesystem walk would otherwise queue a fresh callback
+        // every interval, and every queued callback parks a thread-pool thread until the walk finishes --
+        // enough of them starve unrelated work (the server's /healthz). One body at a time is enough: a
+        // registration's deadlines are only advanced by a pump that actually ran.
+        if (Interlocked.CompareExchange(ref _pumping, 1, 0) != 0) return;
+        try { PumpCore(); }
+        finally { Interlocked.Exchange(ref _pumping, 0); }
+    }
+
+    /// The pump body. Probes (the recursive tree walk) run OUTSIDE <see cref="_gate"/>: holding the lock
+    /// across a walk of ~16k transcripts (~1.1 s measured here) is what let a fallback poll park every
+    /// other thread that needed the service -- including the timer's own overlapping ticks -- behind it.
+    /// Callbacks are likewise invoked outside the lock so a slow consumer cannot stall registration.
+    private void PumpCore()
     {
         var now = _options.Clock.UtcNow;
         List<(Registration Reg, IReadOnlyList<string>? Paths)>? fire = null;
+        List<Registration>? fallbackDue = null;   // need a probe + stamp comparison
+        List<Registration>? refreshStamp = null;  // already fired on the event path; just refresh the stamp
+
         lock (_gate)
         {
             if (_disposed) return;
@@ -176,6 +200,9 @@ public sealed class FileWatchService : IDisposable
                     reg.PendingSince = null;
                     Promote(reg, now);
                     (fire ??= new()).Add((reg, SnapshotPaths(reg)));
+                    // Refresh the remembered stamp so the next poll does not re-fire the change the event
+                    // already delivered. Probing it is the expensive half, so it happens off the lock below.
+                    (refreshStamp ??= new()).Add(reg);
                     continue;
                 }
 
@@ -183,28 +210,49 @@ public sealed class FileWatchService : IDisposable
 
                 Interlocked.Increment(ref Stats._fallbackPolls);
                 PerfCounters.FileWatchFallbackPoll();
-                var stamp = SafeProbe(reg.Probe);
-                if (reg.LastStamp is null || !string.Equals(stamp, reg.LastStamp, StringComparison.Ordinal))
-                {
-                    Promote(reg, now);
-                    // A poll found the change, so which file moved is unknown: null means "assume all".
-                    (fire ??= new()).Add((reg, null));
-                }
-                else
-                {
-                    // Quiet. One no-change poll is enough to demote to the slow cadence; the FSW event
-                    // is what makes activity visible immediately, this is only the safety net. A coarse
-                    // registration whose watcher is not carrying events never demotes -- the poll IS its
-                    // only signal then, so it must keep the active cadence.
-                    reg.FallbackInterval = reg.CoarseFallback && !(reg.Watcher?.Healthy ?? false)
-                        ? _options.ActiveFallbackInterval
-                        : _options.IdleFallbackInterval;
-                    reg.NextFallbackAt = now + reg.FallbackInterval;
-                }
+                (fallbackDue ??= new()).Add(reg);
             }
-            // Refresh remembered stamps under the lock so a concurrent event cannot race a stale value in.
-            if (fire is not null)
-                foreach (var (reg, _) in fire) reg.LastStamp = SafeProbe(reg.Probe);
+        }
+
+        var stamps = new Dictionary<Registration, string>();
+        if (fallbackDue is not null) foreach (var reg in fallbackDue) stamps[reg] = SafeProbe(reg.Probe);
+        if (refreshStamp is not null) foreach (var reg in refreshStamp) stamps[reg] = SafeProbe(reg.Probe);
+
+        if (stamps.Count > 0)
+        {
+            lock (_gate)
+            {
+                if (_disposed) return;
+                if (refreshStamp is not null)
+                    foreach (var reg in refreshStamp)
+                        if (!reg.Disposed) reg.LastStamp = stamps[reg];
+
+                if (fallbackDue is not null)
+                    foreach (var reg in fallbackDue)
+                    {
+                        if (reg.Disposed) continue;
+                        var stamp = stamps[reg];
+                        var changed = reg.LastStamp is null || !string.Equals(stamp, reg.LastStamp, StringComparison.Ordinal);
+                        reg.LastStamp = stamp;
+                        if (changed)
+                        {
+                            Promote(reg, now);
+                            // A poll found the change, so which file moved is unknown: null means "assume all".
+                            (fire ??= new()).Add((reg, null));
+                        }
+                        else
+                        {
+                            // Quiet. One no-change poll is enough to demote to the slow cadence; the FSW
+                            // event is what makes activity visible immediately, this is only the safety
+                            // net. A coarse registration whose watcher is not carrying events never
+                            // demotes -- the poll IS its only signal then, so it keeps the active cadence.
+                            reg.FallbackInterval = reg.CoarseFallback && !(reg.Watcher?.Healthy ?? false)
+                                ? _options.ActiveFallbackInterval
+                                : _options.IdleFallbackInterval;
+                            reg.NextFallbackAt = now + reg.FallbackInterval;
+                        }
+                    }
+            }
         }
 
         if (fire is null) return;
