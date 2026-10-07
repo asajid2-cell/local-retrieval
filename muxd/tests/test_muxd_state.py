@@ -1485,6 +1485,16 @@ class MuxdStateTests(unittest.TestCase):
                 muxd.CLAIM_ROOT = old_root
                 muxd._CLAIM_SWEEP_LAST = old_last
 
+    def test_strict_mux_name_rejects_a_flag_shaped_name(self):
+        # A leading "-" is a command-line flag, not a session name: the `mux` shim forwards its
+        # arguments to `muxctl open`, so `mux --help` would otherwise create a session "--help".
+        self.assertEqual("", muxd.strict_mux_name("--help"))
+        self.assertEqual("", muxd.strict_mux_name("-x"))
+        self.assertEqual("", muxd.strict_mux_name(""))
+        self.assertEqual("b2fix", muxd.strict_mux_name("b2fix"))
+        # an internal hyphen is still a legitimate name character
+        self.assertEqual("flap-2", muxd.strict_mux_name("flap-2"))
+
     def test_single_instance_mutex_refuses_duplicate_muxd(self):
         class FakeCall:
             def __init__(self, result):

@@ -814,6 +814,13 @@ async def do_attach(name, create=False):
 
 def main():
     a = _consume_profile_arg(sys.argv[1:])
+    # A session name is a positional argument, never a flag. The `mux`/`multiplex` shims forward
+    # their arguments straight to `open`, so `mux --help` must print usage rather than create a
+    # session literally named "--help".
+    if len(a) >= 2 and a[0] in ("create", "new", "kill", "rm", "delete", "attach", "a", "open", "o") \
+            and str(a[1]).startswith("-"):
+        sys.stderr.write("[muxctl] session name must not start with '-': %s\n" % a[1])
+        raise SystemExit(2)
     try:
         if not a or a[0] in ("ls", "list"):
             asyncio.run(do_ls())

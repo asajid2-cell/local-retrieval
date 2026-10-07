@@ -514,6 +514,15 @@ class MuxdLocalIntegrationTests(unittest.TestCase):
         info = run_request(self.muxd.port, {"t": "info"})
         self.assertEqual("info", info.get("t"))
 
+    def test_flag_shaped_session_name_is_refused(self):
+        # The `mux`/`multiplex` shims forward their arguments to `open`, so `mux --help` used to
+        # create a session literally named "--help". A name that starts with "-" is a flag, not a
+        # session, and must be refused on both the create and the open path rather than spawned.
+        for frame in ({"t": "create", "s": "--help"}, {"t": "open", "s": "--help"}):
+            refused = run_request(self.muxd.port, frame, timeout=6)
+            self.assertEqual("err", refused.get("t"), frame)
+        self.assertIsNone(self.session("--help"))
+
     def test_shell_only_session_relaunches_when_command_arrives(self):
         name = "it-shell-relaunch"
         marker = f"MUXD_IT_RELAUNCH_{int(time.time() * 1000)}"

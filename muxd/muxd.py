@@ -3873,7 +3873,9 @@ SAFE = lambda s: re.sub(r"[^A-Za-z0-9_.-]", "", str(s or ""))[:48]
 
 def strict_mux_name(value):
     raw = str(value or "").strip()
-    return raw if raw and SAFE(raw) == raw else ""
+    # A leading "-" is a command-line flag, never a session name: the `mux` shim forwards its
+    # arguments to `muxctl open`, so `mux --help` would otherwise create a session named "--help".
+    return raw if raw and not raw.startswith("-") and SAFE(raw) == raw else ""
 
 REMOTE_CREATE_FIELDS = {"t", "s", "rid", "cols", "rows", "relaunch", "heal"}
 _RELAY_TLS_CONTEXT = None
@@ -4946,6 +4948,8 @@ async def main():
         name = SAFE(first.get("s", ""))
         if not name:
             return None, "session name required", False
+        if name.startswith("-"):
+            return None, "session name must not start with '-'", False
         async with launch_lock(name):
             prev = sessions.get(name)
             requested_cmd = (first.get("cmd", "") or "").strip()
