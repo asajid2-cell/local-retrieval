@@ -933,6 +933,15 @@ function initMobileViews(){
 let fontSize = Math.min(20, Math.max(11, LS.get('mux_font', 14)));
 const term = new Terminal({
   cursorBlink:true, fontSize, scrollback:60000, allowProposedApi:true,
+  // Option is the Mac's Alt key, and a terminal must send it as META (ESC+key), not as a third-level
+  // shift that composes a literal char. Left at xterm's default (false), a Mac browser turns Option+P
+  // into 'π' (Option+O 'ø', Option+T '†') and hands the app the char instead of the chord - so the
+  // app's Alt+P shortcut (Claude Code / Gateway's model picker) never fires, and the app inserts the
+  // glyph. The app inside a session runs on the WINDOWS host and reads Alt from the ESC prefix (its own
+  // Option-char mapping is gated on the HOST's platform, which is never macOS here), so ESC+key is the
+  // only form that works. Windows/Linux clients are unaffected: xterm's third-level-shift test is
+  // Mac-only, so this flag is inert there.
+  macOptionIsMeta:true,
   fontFamily:'ui-monospace,SFMono-Regular,Menlo,Consolas,"Roboto Mono",monospace',
   theme:{ background:'#000000', foreground:'#ededf0', cursor:'#fb7185', cursorAccent:'#000000',
           selectionBackground:'#3a2b30', black:'#15151a', red:'#fb7185', green:'#34d399',
@@ -1562,7 +1571,7 @@ function reloadTerminal(quiet){
   connect(name, true);   // re-attach: CLEAR + scrollback replay + live, all client state reset
 }
 document.addEventListener('keydown', e=>{ if(e.ctrlKey && e.altKey && (e.key==='r'||e.key==='R')){ e.preventDefault(); e.stopPropagation(); reloadTerminal(); } }, true);
-window.__muxBuild='2026-10-05-repaint-request';   // bump per web deploy so a loaded version is verifiable
+window.__muxBuild='2026-10-07-option-as-meta';   // bump per web deploy so a loaded version is verifiable
 try{ console.info('multiplex build', window.__muxBuild); }catch(e){}
 const helper = $('#term').querySelector('.xterm-helper-textarea');
 function hardenHelperTextarea(){
