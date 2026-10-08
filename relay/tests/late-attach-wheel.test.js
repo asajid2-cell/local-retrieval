@@ -18,6 +18,13 @@
 //     the console CELL GRID and re-synthesizes its frames, so the app's DECSET never reaches muxd or the
 //     relay and the arm is structurally unknowable. Its clicks and keys still land (they need no arm); the
 //     wheel does not.
+//
+//     We also checked whether the console INPUT mode could recover the arm - GetConsoleMode(hin) bit 0x10
+//     (ENABLE_MOUSE_INPUT) or 0x200 (ENABLE_VIRTUAL_TERMINAL_INPUT) - and REJECTED it (measured 2026-10-07).
+//     Neither bit moves with the arm state; the bits track the RUNTIME, not the arm (a plain shell or an
+//     ncurses/python TUI stays 0x01F7; a VT-input runtime such as bun/cc or nvim is 0x0208), and cc never
+//     calls SetConsoleMode, so its console mode is arm-invariant by construction. Do not retry it.
+//     Evidence: muxdiag/gcm.ps1, gcm2.ps1, gcm-attach.ps1, gcmtui.py, gcm-tui-*.json, nvim-probe*.txt.
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const childProcess = require('node:child_process');
