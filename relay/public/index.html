@@ -1571,7 +1571,7 @@ function reloadTerminal(quiet){
   connect(name, true);   // re-attach: CLEAR + scrollback replay + live, all client state reset
 }
 document.addEventListener('keydown', e=>{ if(e.ctrlKey && e.altKey && (e.key==='r'||e.key==='R')){ e.preventDefault(); e.stopPropagation(); reloadTerminal(); } }, true);
-window.__muxBuild='2026-10-07-option-as-meta';   // bump per web deploy so a loaded version is verifiable
+window.__muxBuild='2026-10-08-mobile-delta-sole-forwarder';   // bump per web deploy so a loaded version is verifiable
 try{ console.info('multiplex build', window.__muxBuild); }catch(e){}
 const helper = $('#term').querySelector('.xterm-helper-textarea');
 function hardenHelperTextarea(){
@@ -1604,8 +1604,17 @@ hardenHelperTextarea();
 // textarea and fire an input event carrying the FULL text on every keystroke/autocorrect, so xterm forwards
 // the whole sentence again and again. We take the textarea over on mobile and forward only what CHANGED vs
 // the last value — backspaces (\x7f) for removed chars + the new tail — so typing, backspace, AND autocorrect
-// -replace all send the minimal correct edit. Capture-phase + stopImmediatePropagation keeps xterm from ALSO
-// forwarding the full buffer. Desktop is untouched (xterm's normal path). Opt out with ?legacyinput=1.
+// -replace all send the minimal correct edit.
+//
+// It has to be a SOLE forwarder, or every edit goes twice: xterm also forwards text from the same textarea
+// (its keydown/keypress/_inputEvent/CompositionHelper pipeline). That pipeline is registered on the helper
+// textarea, in the CAPTURE phase, inside Terminal.open() — i.e. BEFORE our listeners — so a listener on the
+// textarea can never stop it: stopImmediatePropagation there only stops listeners registered after ours, and
+// xterm's already ran. The one place that runs earlier is a capture listener on DOCUMENT (the capture phase
+// descends window→document→…→target), so that is where we live: for a text edit we forward the delta and
+// stopPropagation, and xterm never sees the event at all. Special keys (Enter/Escape/Tab/arrows/Ctrl chords)
+// are left to xterm untouched — we only own plain text and the Android keyCode-229 "Unidentified" soft-key
+// events. Desktop is untouched (on() is false, nothing is stopped). Opt out with ?legacyinput=1.
 let _taLast='', _taComposing=false, _taCommittedValue='', _taCommittedAt=0;
 let mobileDeltaInstalled=false;
 const _mobileDeltaOn = !/[?&]legacyinput=1/.test(location.search);
@@ -1631,46 +1640,55 @@ function taFlushDelta(h){
   logMobileInputEvent('delta-send', { data: out, v, prev });
   send('i', out);
 }
+// Keys xterm must keep handling itself on mobile — they carry no textarea text. Anything else (printable
+// chars, the space bar, and Android's keyCode-229 "Unidentified" soft-key events) is ours to forward.
+const MUX_SPECIAL_KEYS = new Set(['Enter','Escape','Tab','Backspace','Delete','Insert','ArrowUp','ArrowDown',
+  'ArrowLeft','ArrowRight','Home','End','PageUp','PageDown','Shift','Control','Alt','Meta','CapsLock','ContextMenu',
+  'F1','F2','F3','F4','F5','F6','F7','F8','F9','F10','F11','F12']);
 function installMobileInputDelta(){
   const h=$('#term').querySelector('.xterm-helper-textarea'); if(!h || h.dataset.muxDelta) return;
   h.dataset.muxDelta='1';
   mobileDeltaInstalled=_mobileDeltaOn;
   const on=()=>isMobile() && _mobileDeltaOn;
-  h.addEventListener('compositionstart', ev=>{
-    if(!on()) return;
-    _taComposing=true;
-    ev.stopImmediatePropagation();
-  }, true);
-  h.addEventListener('compositionupdate', ev=>{ if(on()) ev.stopImmediatePropagation(); }, true);
-  h.addEventListener('compositionend', ev=>{
-    if(!on()) return;
+  const mine=ev=>on() && ev.target===h;
+  const letXterm=ev=>MUX_SPECIAL_KEYS.has(ev.key) || ev.ctrlKey || ev.altKey || ev.metaKey;
+  document.addEventListener('compositionstart', ev=>{ if(!mine(ev)) return; _taComposing=true; ev.stopPropagation(); }, true);
+  document.addEventListener('compositionupdate', ev=>{ if(mine(ev)) ev.stopPropagation(); }, true);
+  document.addEventListener('compositionend', ev=>{
+    if(!mine(ev)) return;
     _taComposing=false;
     taFlushDelta(h);
     _taCommittedValue=h.value||'';
     _taCommittedAt=Date.now();
-    ev.stopImmediatePropagation();
+    ev.stopPropagation();
   }, true);
-  h.addEventListener('input', ev=>{
-    if(!on()) return;
-    if(_taComposing || ev.isComposing){
-      ev.stopImmediatePropagation();
-      return;
-    }
+  document.addEventListener('input', ev=>{
+    if(!mine(ev)) return;
+    // Paste/drop is xterm's to forward (its own paste listener already sent the text); the browser's default
+    // insert still lands in the textarea, so resync rather than forward it a second time.
+    if(/^insertFrom/.test(ev.inputType||'')){ resetTaDelta(true); ev.stopPropagation(); return; }
+    if(_taComposing || ev.isComposing){ ev.stopPropagation(); return; }
     const v=h.value||'';
     if(v===_taCommittedValue && Date.now()-_taCommittedAt<250){
       _taCommittedValue='';
-      ev.stopImmediatePropagation();
+      ev.stopPropagation();
       return;
     }
     _taCommittedValue='';
     taFlushDelta(h);
-    ev.stopImmediatePropagation();
+    ev.stopPropagation();
   }, true);
-  h.addEventListener('keydown', ev=>{
-    if(on() && ev.key && ev.key.length===1 && !ev.ctrlKey && !ev.altKey && !ev.metaKey) ev.stopImmediatePropagation();
+  document.addEventListener('keydown', ev=>{
+    if(!mine(ev)) return;
+    if(letXterm(ev)){
+      // xterm handles this key, and some of them clear the helper textarea (Enter/CR, Ctrl+C/ETX). Resync our
+      // diff baseline to the fresh, empty line so the next typed char is a clean insert, not a run of deletes.
+      setTimeout(()=>resetTaDelta(true), 0);
+      return;
+    }
+    ev.stopPropagation();   // the input event below forwards the resulting text as a delta
   }, true);
-  // Enter/Escape go through xterm's keydown (we don't block those); resync our buffer to the fresh line after.
-  h.addEventListener('keydown', ev=>{ if(on() && (ev.key==='Enter'||ev.key==='Escape')) setTimeout(()=>resetTaDelta(true), 0); }, true);
+  document.addEventListener('keypress', ev=>{ if(mine(ev) && !letXterm(ev)) ev.stopPropagation(); }, true);
   h.addEventListener('blur', ()=>{ if(on()) resetTaDelta(true); }, true);
 }
 installMobileInputDelta();
@@ -2667,8 +2685,10 @@ function noteSessionOutput(bytes){
 }
 term.onData(d => {
   logMobileInputEvent('onData', { data:d });
-  // If our mobile delta handler just forwarded this keystroke, xterm's own echo of the full buffer that
-  // lands in the same tick is the duplicate — drop it. (Real pastes never coincide with a delta-send.)
+  // On mobile this carries only what the delta handler does NOT own — special keys, paste, mouse/focus
+  // reports. xterm's text echo never reaches here: the delta handler stops those events at document
+  // capture, before xterm's own textarea listeners run (see installMobileInputDelta). Desktop is xterm's
+  // normal path, unchanged.
   d = stripMouseReports(d, mouseGuard.inputAllowed());
   if(!d) return;
   if(isClickReport(d)){
