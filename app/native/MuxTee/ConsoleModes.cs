@@ -45,11 +45,14 @@ internal sealed class ConsoleModes
         {
             _haveIn = true;
             // VT input mode is what carries win32-input-mode sequences (Shift+Enter and friends) intact.
-            // Clear LINE/ECHO/PROCESSED/QUICK_EDIT: the child owns line editing, and QuickEdit would
-            // freeze us on a stray click in the tab.
+            // MOUSE_INPUT is what lets the terminal hand us the mouse reports it resolved for a tracking
+            // child; without it those reports are consumed by the console and never reach T2, so a TUI
+            // gets no wheel and no click in a mux tab. Clear LINE/ECHO/PROCESSED/QUICK_EDIT: the child
+            // owns line editing, and QuickEdit would freeze us on a stray click in the tab.
             var next = (_inOriginal
                         | ConsoleApi.ENABLE_VIRTUAL_TERMINAL_INPUT
                         | ConsoleApi.ENABLE_WINDOW_INPUT
+                        | ConsoleApi.ENABLE_MOUSE_INPUT
                         | ConsoleApi.ENABLE_EXTENDED_FLAGS)
                        & ~(ConsoleApi.ENABLE_LINE_INPUT
                            | ConsoleApi.ENABLE_ECHO_INPUT

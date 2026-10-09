@@ -234,8 +234,43 @@ public class UnitTests
         Assert.AreEqual("\t", KeyTranslator.ForKeyDown(0x09, '\t', 0));
         // Ctrl+C arrives as ETX in the character field, not as a navigation key.
         Assert.AreEqual("\x03", KeyTranslator.ForKeyDown(0x43, '\x03', KeyTranslator.LEFT_CTRL_PRESSED));
-        // An unmapped key must contribute nothing - never an invented byte.
-        Assert.AreEqual(string.Empty, KeyTranslator.ForKeyDown(0x70, '\0', 0), "F1 unmapped");
+        // A key with no mapping at all must contribute nothing - never an invented byte.
+        Assert.AreEqual(string.Empty, KeyTranslator.ForKeyDown(0xFF, '\0', 0), "unmapped VK");
+    }
+
+    // A terminal sends DEL for Backspace and BS for Ctrl+Backspace; the console hands us BS for both, so
+    // the distinction has to be rebuilt here or Backspace deletes a whole word in a TUI.
+    [TestMethod]
+    public void KeyTranslator_BackspaceMatchesATerminal()
+    {
+        Assert.AreEqual("\x7f", KeyTranslator.ForKeyDown(0x08, '\x08', 0), "Backspace = DEL");
+        Assert.AreEqual("\x7f", KeyTranslator.ForKeyDown(0x08, '\x08', KeyTranslator.SHIFT_PRESSED), "Shift+Backspace = DEL");
+        Assert.AreEqual("\x08", KeyTranslator.ForKeyDown(0x08, '\x08', KeyTranslator.LEFT_CTRL_PRESSED), "Ctrl+Backspace = BS");
+        Assert.AreEqual("\x7f", KeyTranslator.ForKeyDown(0x08, '\x08',
+            KeyTranslator.LEFT_CTRL_PRESSED | KeyTranslator.SHIFT_PRESSED), "Ctrl+Shift+Backspace = DEL");
+    }
+
+    [TestMethod]
+    public void KeyTranslator_MapsFunctionKeys()
+    {
+        Assert.AreEqual("\x1bOP", KeyTranslator.ForKeyDown(0x70, '\0', 0), "F1 (SS3)");
+        Assert.AreEqual("\x1b[15~", KeyTranslator.ForKeyDown(0x74, '\0', 0), "F5");
+        Assert.AreEqual("\x1b[24~", KeyTranslator.ForKeyDown(0x7B, '\0', 0), "F12");
+        Assert.AreEqual("\x1b[15;5~", KeyTranslator.ForKeyDown(0x74, '\0', KeyTranslator.LEFT_CTRL_PRESSED), "Ctrl+F5");
+    }
+
+    // Ctrl+Arrow is word motion and Shift+Arrow is a selection in PSReadLine; sending the bare CSI form
+    // would silently drop the modifier and move/select by one cell instead.
+    [TestMethod]
+    public void KeyTranslator_ModifiedNavigationKeys()
+    {
+        Assert.AreEqual("\x1b[1;5A", KeyTranslator.ForKeyDown(0x26, '\0', KeyTranslator.LEFT_CTRL_PRESSED), "Ctrl+Up");
+        Assert.AreEqual("\x1b[1;2D", KeyTranslator.ForKeyDown(0x25, '\0', KeyTranslator.SHIFT_PRESSED), "Shift+Left");
+        Assert.AreEqual("\x1b[1;6C", KeyTranslator.ForKeyDown(0x27, '\0',
+            KeyTranslator.LEFT_CTRL_PRESSED | KeyTranslator.SHIFT_PRESSED), "Ctrl+Shift+Right");
+        Assert.AreEqual("\x1b[1;3A", KeyTranslator.ForKeyDown(0x26, '\0', KeyTranslator.LEFT_ALT_PRESSED), "Alt+Up");
+        Assert.AreEqual("\x1b[1;5H", KeyTranslator.ForKeyDown(0x24, '\0', KeyTranslator.LEFT_CTRL_PRESSED), "Ctrl+Home");
+        Assert.AreEqual("\x1b[3;5~", KeyTranslator.ForKeyDown(0x2E, '\0', KeyTranslator.LEFT_CTRL_PRESSED), "Ctrl+Delete");
     }
 
     [TestMethod]
@@ -258,5 +293,75 @@ public class UnitTests
         Assert.AreEqual("é", KeyTranslator.ForAltNumpadKeyUp(KeyTranslator.VK_MENU, 'é'));
         Assert.AreEqual(string.Empty, KeyTranslator.ForAltNumpadKeyUp(0x41, 'a'), "a normal key-up is a release");
         Assert.AreEqual(string.Empty, KeyTranslator.ForAltNumpadKeyUp(KeyTranslator.VK_MENU, '\0'));
+    }
+
+    // The tracker is the gate: only a child that turned mouse tracking on should have reports forwarded,
+    // and the encoding mode decides the report's shape.
+    [TestMethod]
+    public void ScreenMode_TracksMouseModesFromChildOutput()
+    {
+        var t = new ScreenModeTracker();
+        t.Feed(System.Text.Encoding.ASCII.GetBytes("\x1b[?1000h\x1b[?1006h"));
+        Assert.IsTrue(t.MouseTracking, "1000h turns tracking on");
+        Assert.IsTrue(t.Sgr, "1006h selects SGR");
+
+        t.Feed(System.Text.Encoding.ASCII.GetBytes("\x1b[?1000l"));
+        Assert.IsFalse(t.MouseTracking, "1000l turns tracking off");
+        Assert.IsTrue(t.Sgr, "1006 is untouched by the 1000 reset");
+    }
+
+    [TestMethod]
+    public void ScreenMode_HandlesMultiParamAndSplitSequences()
+    {
+        var t = new ScreenModeTracker();
+        t.Feed(System.Text.Encoding.ASCII.GetBytes("\x1b[?1002;1006;1049h"));
+        Assert.IsTrue(t.MouseTracking, "1002 is a tracking mode");
+        Assert.IsTrue(t.Sgr);
+        Assert.IsTrue(t.AlternateScreen, "1049 is the alternate screen");
+
+        var split = new ScreenModeTracker();
+        split.Feed(System.Text.Encoding.ASCII.GetBytes("\x1b[?10"));
+        split.Feed(System.Text.Encoding.ASCII.GetBytes("15h"));
+        Assert.IsTrue(split.Urxvt, "a sequence cut across two reads still lands");
+    }
+
+    [TestMethod]
+    public void ScreenMode_IgnoresNonModeSequences()
+    {
+        var t = new ScreenModeTracker();
+        t.Feed(System.Text.Encoding.ASCII.GetBytes("\x1b[31m\x1b[2J\x1b]0;title\x07\x1b[H"));
+        Assert.IsFalse(t.MouseTracking);
+        Assert.IsFalse(t.Sgr);
+        Assert.IsFalse(t.AlternateScreen);
+    }
+
+    [TestMethod]
+    public void MouseInput_EncodesSgrPressAndRelease()
+    {
+        // Left button (console bit 0x1) at (5,7) -> button 0, 'M' for press, 'm' for release.
+        var press = MouseInput.Encode(0x0001, 0, 0, 5, 7, sgr: true, urxvt: false);
+        CollectionAssert.AreEqual(System.Text.Encoding.ASCII.GetBytes("\x1b[<0;5;7M"), press);
+        var release = MouseInput.Encode(0x0000, 0, 0, 5, 7, sgr: true, urxvt: false);
+        CollectionAssert.AreEqual(System.Text.Encoding.ASCII.GetBytes("\x1b[<3;5;7m"), release);
+    }
+
+    [TestMethod]
+    public void MouseInput_EncodesWheelDirection()
+    {
+        var up = MouseInput.Encode((uint)1 << 16, 0, ConsoleApi.MOUSE_WHEELED, 10, 4, sgr: true, urxvt: false);
+        CollectionAssert.AreEqual(System.Text.Encoding.ASCII.GetBytes("\x1b[<64;10;4M"), up);
+        var down = MouseInput.Encode(0xFFFF0000, 0, ConsoleApi.MOUSE_WHEELED, 10, 4, sgr: true, urxvt: false);
+        CollectionAssert.AreEqual(System.Text.Encoding.ASCII.GetBytes("\x1b[<65;10;4M"), down);
+    }
+
+    [TestMethod]
+    public void MouseInput_EncodesUrxvtAndX10()
+    {
+        var urxvt = MouseInput.Encode(0x0001, 0, 0, 5, 7, sgr: false, urxvt: true);
+        CollectionAssert.AreEqual(System.Text.Encoding.ASCII.GetBytes("\x1b[32;5;7M"), urxvt);
+
+        // X10 coordinate bytes are raw (32+c) and must not be UTF-8 doubled even past 0x7f.
+        var x10 = MouseInput.Encode(0x0001, 0, 0, 200, 200, sgr: false, urxvt: false);
+        CollectionAssert.AreEqual(new byte[] { 0x1b, (byte)'[', (byte)'M', 32, 232, 232 }, x10);
     }
 }

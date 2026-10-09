@@ -48,18 +48,42 @@ internal struct WINDOW_BUFFER_SIZE_RECORD
     public COORD dwSize;
 }
 
+[StructLayout(LayoutKind.Sequential)]
+internal struct MOUSE_EVENT_RECORD
+{
+    public COORD dwMousePosition;
+    public uint dwButtonState;
+    public uint dwControlKeyState;
+    public uint dwEventFlags;
+}
+
 [StructLayout(LayoutKind.Explicit)]
 internal struct INPUT_RECORD
 {
     [FieldOffset(0)] public ushort EventType;
     [FieldOffset(4)] public KEY_EVENT_RECORD KeyEvent;
+    [FieldOffset(4)] public MOUSE_EVENT_RECORD MouseEvent;
     [FieldOffset(4)] public WINDOW_BUFFER_SIZE_RECORD WindowBufferSizeEvent;
 }
 
 internal static class ConsoleApi
 {
     public const ushort KEY_EVENT = 0x0001;
+    public const ushort MOUSE_EVENT = 0x0002;
     public const ushort WINDOW_BUFFER_SIZE_EVENT = 0x0004;
+
+    // MOUSE_EVENT_RECORD.dwEventFlags
+    public const uint MOUSE_MOVED = 0x0001;
+    public const uint DOUBLE_CLICK = 0x0002;
+    public const uint MOUSE_WHEELED = 0x0004;
+    public const uint MOUSE_HWHEELED = 0x0008;
+
+    // MOUSE_EVENT_RECORD.dwButtonState bits
+    public const uint FROM_LEFT_1ST_BUTTON_PRESSED = 0x0001;
+    public const uint RIGHTMOST_BUTTON_PRESSED = 0x0002;
+    public const uint FROM_LEFT_2ND_BUTTON_PRESSED = 0x0004;
+    public const uint FROM_LEFT_3RD_BUTTON_PRESSED = 0x0008;
+    public const uint FROM_LEFT_4TH_BUTTON_PRESSED = 0x0010;
 
     public const int STD_INPUT_HANDLE = -10;
     public const int STD_OUTPUT_HANDLE = -11;

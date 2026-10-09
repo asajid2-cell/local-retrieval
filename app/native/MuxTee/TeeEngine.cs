@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Threading;
 using Microsoft.Win32.SafeHandles;
 
@@ -23,6 +24,10 @@ internal sealed class TeeEngine : IDisposable
     private readonly ChildProcess _child;
     private readonly ConsoleModes _modes;
     private readonly Action<string> _log;
+
+    // Watches the child's output for the DEC private modes that govern the mouse, so T2 can re-encode a
+    // MOUSE_EVENT in the encoding the child negotiated. Fed from T1; read from T2.
+    private readonly ScreenModeTracker _screen = new();
 
     public RingBuffer Ring { get; } = new(2 * 1024 * 1024);
 
@@ -88,6 +93,10 @@ internal sealed class TeeEngine : IDisposable
                 // Then the ring, for a reconnect replay, and only then the (P1: inert) net queue.
                 Ring.Append(chunk);
                 EnqueueNet(chunk);
+
+                // Track the child's mouse modes for T2. The child's output is the only place the app says
+                // which mouse encoding it wants, and T1 is the one thread that sees every byte of it.
+                _screen.Feed(chunk);
             }
         }
         catch (Exception ex)
@@ -130,6 +139,9 @@ internal sealed class TeeEngine : IDisposable
     {
         var records = new INPUT_RECORD[128];
         var pending = new System.Text.StringBuilder(256);
+        // Keys become UTF-8 text; a mouse report is raw bytes (X10 coordinates can exceed 0x7f, so they
+        // must not go through UTF-8). Both land here in record order and leave as one write.
+        var raw = new List<byte>(256);
         short lastCols = -1, lastRows = -1;
         long lastSizeCheck = Environment.TickCount64;
 
@@ -145,6 +157,7 @@ internal sealed class TeeEngine : IDisposable
                 }
 
                 pending.Clear();
+                raw.Clear();
                 for (int i = 0; i < count; i++)
                 {
                     if (records[i].EventType == ConsoleApi.KEY_EVENT)
@@ -166,6 +179,17 @@ internal sealed class TeeEngine : IDisposable
                         int repeat = Math.Max(1, (int)k.wRepeatCount);
                         for (int r = 0; r < repeat; r++) pending.Append(text);
                     }
+                    else if (records[i].EventType == ConsoleApi.MOUSE_EVENT)
+                    {
+                        // WT only hands us a mouse report when the child asked to track the mouse, and the
+                        // report's encoding is the child's. Flush the pending text first so key and mouse
+                        // bytes keep their order in the pipe.
+                        if (!_screen.MouseTracking) continue;
+                        var m = records[i].MouseEvent;
+                        AppendText(raw, pending);
+                        raw.AddRange(MouseInput.Encode(m.dwButtonState, m.dwControlKeyState, m.dwEventFlags,
+                            m.dwMousePosition.X + 1, m.dwMousePosition.Y + 1, _screen.Sgr, _screen.Urxvt));
+                    }
                     else if (records[i].EventType == ConsoleApi.WINDOW_BUFFER_SIZE_EVENT)
                     {
                         if (TryResize(ref lastCols, ref lastRows))
@@ -173,8 +197,9 @@ internal sealed class TeeEngine : IDisposable
                     }
                 }
 
-                if (pending.Length > 0)
-                    _input.Enqueue(Utf.EncodeChunk(pending.ToString()));
+                AppendText(raw, pending);
+                if (raw.Count > 0)
+                    _input.Enqueue(raw.ToArray());
 
                 // Backstop (§5.2): WT does not always deliver WINDOW_BUFFER_SIZE_EVENT, so re-read the
                 // viewport on a slow timer as well.
@@ -189,6 +214,15 @@ internal sealed class TeeEngine : IDisposable
         {
             _log("T2 input loop ended: " + ex.Message);
         }
+    }
+
+    // Turn the accumulated key text into UTF-8 bytes and fold it into the pending byte run, so a surrogate
+    // pair split across two records still re-joins before it is encoded (never two lone halves).
+    private static void AppendText(List<byte> raw, System.Text.StringBuilder pending)
+    {
+        if (pending.Length == 0) return;
+        raw.AddRange(Utf.EncodeChunk(pending.ToString()));
+        pending.Clear();
     }
 
     private bool TryResize(ref short lastCols, ref short lastRows)
