@@ -150,9 +150,21 @@ internal sealed class TeeEngine : IDisposable
                     if (records[i].EventType == ConsoleApi.KEY_EVENT)
                     {
                         var k = records[i].KeyEvent;
-                        // Only key-down carries the payload; key-up would double every character.
-                        if (k.bKeyDown == 0) continue;
-                        pending.Append(k.UnicodeChar);
+                        if (k.bKeyDown == 0)
+                        {
+                            // A key-up is a release and carries nothing - except Alt+numpad, whose
+                            // composed character is delivered on VK_MENU's key-up record.
+                            pending.Append(KeyTranslator.ForAltNumpadKeyUp(k.wVirtualKeyCode, k.UnicodeChar));
+                            continue;
+                        }
+                        // Translate the record the way a stock terminal would. Forwarding UnicodeChar
+                        // alone dropped every key with no character (arrows, Home/End, Insert/Delete,
+                        // PageUp/PageDown, Shift+Tab) - up-arrow never reached the child, so command
+                        // history was unreachable.
+                        var text = KeyTranslator.ForKeyDown(k.wVirtualKeyCode, k.UnicodeChar, k.dwControlKeyState);
+                        if (text.Length == 0) continue;
+                        int repeat = Math.Max(1, (int)k.wRepeatCount);
+                        for (int r = 0; r < repeat; r++) pending.Append(text);
                     }
                     else if (records[i].EventType == ConsoleApi.WINDOW_BUFFER_SIZE_EVENT)
                     {

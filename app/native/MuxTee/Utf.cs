@@ -5,8 +5,9 @@ namespace MuxTee;
 
 internal static class Utf
 {
-    // T2 receives INPUT_RECORDs from a win32-input-mode console, so the uChars are the already-encoded VT
-    // or win32-input sequence as UTF-16 units. We transcode to bytes once here; the pipe takes bytes.
+    // T2 builds the child's input from the console KEY_EVENTs: ordinary characters come straight from
+    // uChar, and the navigation/modifier keys are mapped to their VT sequences by KeyTranslator. We
+    // transcode the whole batch to bytes once here; the pipe takes bytes.
     //
     // A read call's records are concatenated into ONE chunk so a sequence split across records (a
     // surrogate pair, or a CSI that arrived in pieces) still lands in the pipe as one write.

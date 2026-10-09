@@ -319,6 +319,42 @@ public class TeeAcceptanceTests
             "multibyte glyphs came back mangled - the outer console is not UTF-8; saw: " + Snippet(h.Output));
     }
 
+    // The reported divergence: up-arrow at a prompt did NOTHING, so command history was unreachable.
+    // T2 forwarded only k.UnicodeChar, and an arrow key carries no character - it was dropped before it
+    // ever reached the child. cmd.exe recalls its own history on Up, so seeing the command run a second
+    // time is the user-visible proof the arrow arrived.
+    [TestMethod]
+    public void ArrowUp_RecallsThePreviousCommand()
+    {
+        const string marker = "MUXTEE-ARROW-OK";
+        using var h = ConsoleHarness.Start(MuxteeExe, new[] { "--", "cmd.exe", "/k" }, rows: 24, cols: 80);
+        Assert.IsTrue(h.WaitForOutput(o => o.Contains(">"), 8000), "no prompt through the tee");
+
+        h.Write("echo " + marker + "\r\n");
+        // Two sightings even on the first run: cmd echoes the typed line, then prints its output.
+        Assert.IsTrue(h.WaitForOutput(o => CountOf(o, marker) >= 2, 8000),
+            "the first command did not run; saw: " + Snippet(h.Output));
+        var before = CountOf(h.Output, marker);
+
+        System.Threading.Thread.Sleep(400);   // let the fresh prompt settle so the arrow lands on the line
+        h.Write("\x1b[A");                     // Up-arrow: recall the previous command
+        System.Threading.Thread.Sleep(400);
+        h.Write("\r\n");                       // run the recalled line
+
+        // Recall re-echoes the command and reprints its output - two more sightings.
+        Assert.IsTrue(h.WaitForOutput(o => CountOf(o, marker) >= before + 2, 8000),
+            "up-arrow did not recall the command; saw: " + Snippet(h.Output));
+    }
+
+    private static int CountOf(string haystack, string needle)
+    {
+        int count = 0;
+        for (int i = haystack.IndexOf(needle, StringComparison.Ordinal); i >= 0;
+             i = haystack.IndexOf(needle, i + needle.Length, StringComparison.Ordinal))
+            count++;
+        return count;
+    }
+
     private static string Snippet(string s)
         => s.Length <= 300 ? s : s[^300..];
 }

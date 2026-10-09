@@ -209,4 +209,54 @@ public class UnitTests
         }
         finally { Directory.Delete(root, recursive: true); }
     }
+
+    // The regression behind "up-arrow does nothing": T2 forwarded only UnicodeChar, so a key with no
+    // character vanished. These pin the stock-terminal encoding for each key a terminal must send.
+    [TestMethod]
+    public void KeyTranslator_MapsNavigationKeysToVtSequences()
+    {
+        Assert.AreEqual("\x1b[A", KeyTranslator.ForKeyDown(0x26, '\0', 0), "Up (command history)");
+        Assert.AreEqual("\x1b[B", KeyTranslator.ForKeyDown(0x28, '\0', 0), "Down");
+        Assert.AreEqual("\x1b[C", KeyTranslator.ForKeyDown(0x27, '\0', 0), "Right");
+        Assert.AreEqual("\x1b[D", KeyTranslator.ForKeyDown(0x25, '\0', 0), "Left");
+        Assert.AreEqual("\x1b[H", KeyTranslator.ForKeyDown(0x24, '\0', 0), "Home");
+        Assert.AreEqual("\x1b[F", KeyTranslator.ForKeyDown(0x23, '\0', 0), "End");
+        Assert.AreEqual("\x1b[5~", KeyTranslator.ForKeyDown(0x21, '\0', 0), "PageUp");
+        Assert.AreEqual("\x1b[6~", KeyTranslator.ForKeyDown(0x22, '\0', 0), "PageDown");
+        Assert.AreEqual("\x1b[3~", KeyTranslator.ForKeyDown(0x2E, '\0', 0), "Delete");
+        Assert.AreEqual("\x1b[2~", KeyTranslator.ForKeyDown(0x2D, '\0', 0), "Insert");
+    }
+
+    [TestMethod]
+    public void KeyTranslator_CharacterKeysPassThrough()
+    {
+        Assert.AreEqual("a", KeyTranslator.ForKeyDown(0x41, 'a', 0));
+        Assert.AreEqual("\t", KeyTranslator.ForKeyDown(0x09, '\t', 0));
+        // Ctrl+C arrives as ETX in the character field, not as a navigation key.
+        Assert.AreEqual("\x03", KeyTranslator.ForKeyDown(0x43, '\x03', KeyTranslator.LEFT_CTRL_PRESSED));
+        // An unmapped key must contribute nothing - never an invented byte.
+        Assert.AreEqual(string.Empty, KeyTranslator.ForKeyDown(0x70, '\0', 0), "F1 unmapped");
+    }
+
+    [TestMethod]
+    public void KeyTranslator_ShiftTabIsBackTab()
+        => Assert.AreEqual("\x1b[Z", KeyTranslator.ForKeyDown(0x09, '\t', KeyTranslator.SHIFT_PRESSED));
+
+    [TestMethod]
+    public void KeyTranslator_AltPrintableGetsEscapePrefix()
+    {
+        Assert.AreEqual("\x1b" + "a", KeyTranslator.ForKeyDown(0x41, 'a', KeyTranslator.LEFT_ALT_PRESSED));
+        // AltGr is Ctrl+Alt and must stay a bare character, not an ESC-prefixed one.
+        Assert.AreEqual("a", KeyTranslator.ForKeyDown(0x41, 'a',
+            KeyTranslator.LEFT_ALT_PRESSED | KeyTranslator.LEFT_CTRL_PRESSED));
+    }
+
+    // Alt+numpad composition only: the composed character rides the ALT key-UP record.
+    [TestMethod]
+    public void KeyTranslator_AltNumpadKeyUpCarriesTheCharacter()
+    {
+        Assert.AreEqual("é", KeyTranslator.ForAltNumpadKeyUp(KeyTranslator.VK_MENU, 'é'));
+        Assert.AreEqual(string.Empty, KeyTranslator.ForAltNumpadKeyUp(0x41, 'a'), "a normal key-up is a release");
+        Assert.AreEqual(string.Empty, KeyTranslator.ForAltNumpadKeyUp(KeyTranslator.VK_MENU, '\0'));
+    }
 }
