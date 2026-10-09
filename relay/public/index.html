@@ -554,18 +554,35 @@
       grid-template-areas:"topbar" "term" "status" "mobileNav";
     }
     #mobileNav {
-      grid-area:mobileNav; display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:var(--sp1);
+      /* SIX destinations (Sessions/Terminal/Fleet/Projects/Chats/Keys). Five columns wrapped "Keys"
+         alone onto a second row -- a ~60px band of dead chrome on every phone. */
+      grid-area:mobileNav; display:grid; grid-template-columns:repeat(6,minmax(0,1fr)); gap:var(--sp1);
       padding:var(--sp1) var(--sp2); padding-bottom:max(var(--sp1),env(safe-area-inset-bottom));
       background:var(--panel); border-top:1px solid var(--line); min-width:0;
     }
-    #topbar { min-height:52px; }
-    .top-actions { gap:0; }
+    #mobileNav button, #mobileNav a { min-height:44px; padding:4px 2px; gap:3px; font-size:10.5px; }
+    #mobileNav span { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:100%; }
+    #mobileNav svg { width:17px; height:17px; }
+    /* ONE header row. The wordmark spent ~78px and pushed the last two actions onto a second row (a
+       ~105px header on a 390px phone). The glyph plus a single horizontally-scrollable action row keeps
+       every action reachable and the header at one row; 40px icons fit all seven visible actions. */
+    #topbar { min-height:46px; padding-block:var(--sp1); }
+    .brand .wordmark { display:none; }
+    .top-actions { gap:0; flex-wrap:nowrap; overflow-x:auto; scrollbar-width:none; }
+    .top-actions::-webkit-scrollbar { display:none; }
+    .top-actions .icon { height:40px; min-width:40px; flex:0 0 auto; }
+    .top-actions .icon svg { width:16px; height:16px; }
     #projbtn, #zen, #fontdown, #fontup, #kbtoggle { display:none; }
-    #refresh, #copybtn { height:44px; min-width:44px; }
     #tabwrap, #keybar { display:none; }
     #term { padding:var(--sp1); }
-    #status { min-height:30px; padding:5px var(--sp3); }
+    #status { min-height:26px; padding:3px var(--sp3); }
     #status #statustext { font-size:12px; }
+    /* KEYBOARD-UP: while the soft keyboard is open the phone has no room for chrome. Hide the bottom
+       nav and the status strip so every reclaimable pixel goes to the terminal -- the nav alone is
+       ~60px, and with the keyboard up the terminal was collapsing to ~8 rows. `html.kb-open` is set
+       from the visualViewport inset in applyViewport() below (a class toggle, not a resize hook). */
+    html.kb-open #mobileNav, html.kb-open #status { display:none; }
+    html.kb-open #topbar { min-height:40px; }
 
     #app.mobile-view-sessions {
       grid-template-rows:auto minmax(0,1fr) auto auto;
@@ -1571,7 +1588,7 @@ function reloadTerminal(quiet){
   connect(name, true);   // re-attach: CLEAR + scrollback replay + live, all client state reset
 }
 document.addEventListener('keydown', e=>{ if(e.ctrlKey && e.altKey && (e.key==='r'||e.key==='R')){ e.preventDefault(); e.stopPropagation(); reloadTerminal(); } }, true);
-window.__muxBuild='2026-10-08-mobile-delta-sole-forwarder';   // bump per web deploy so a loaded version is verifiable
+window.__muxBuild='2026-10-09-mobile-layout-chrome';   // bump per web deploy so a loaded version is verifiable (supersedes 2026-10-08 mobile-delta-sole-forwarder, which is still in this tree)
 try{ console.info('multiplex build', window.__muxBuild); }catch(e){}
 const helper = $('#term').querySelector('.xterm-helper-textarea');
 function hardenHelperTextarea(){
@@ -2122,7 +2139,21 @@ function scheduleViewportFit(delay=80){
   }, Math.max(0, delay));
 }
 function doFit(){ scheduleViewportFit(0); }
+// Is the soft keyboard up? Compare the LAYOUT viewport to the VISUAL viewport: iOS shrinks only the
+// visual viewport for the keyboard (the layout viewport and 100dvh do not move), so the gap between them
+// is the keyboard. Only a LARGE gap counts -- Safari's collapsing URL bar also shrinks the visual
+// viewport by ~60px, and treating that as a keyboard would hide chrome during an ordinary scroll. The
+// class is toggled only on change, so it cannot oscillate; the layout change it causes is the legitimate
+// terminal growth, which the ResizeObserver below already turns into one settled PTY resize.
+function updateKeyboardInset(){
+  const vv=window.visualViewport; if(!vv) return;
+  const inset=Math.max(0, Math.round((window.innerHeight||0) - (vv.height + (vv.offsetTop||0))));
+  const open=inset>140;
+  const root=document.documentElement;
+  if(root.classList.contains('kb-open')!==open) root.classList.toggle('kb-open', open);
+}
 function applyViewport(){
+  updateKeyboardInset();
   _lastViewportResizeAt=Date.now();
   const vv=window.visualViewport, app=$('#app');
   if(vv && vv.height>0){

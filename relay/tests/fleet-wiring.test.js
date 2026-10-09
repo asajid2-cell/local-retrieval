@@ -96,8 +96,17 @@ test("mobile-view-fleet hides term, keybar, and tabwrap", () => {
   assert.match(mq, /#app\.mobile-view-fleet\s+#tabwrap.*display:\s*none/);
 });
 
-test("nav grid uses repeat(5) to accommodate the fleet button", () => {
-  assert.match(source, /grid-template-columns:\s*repeat\(5,\s*minmax\(0,\s*1fr\)\)/);
+test("nav grid gives every destination its own column so none wraps to a second row", () => {
+  const nav = section('<nav id="mobileNav"', "</nav>");
+  const destinations = (nav.match(/data-mobile-view=|class="projects"/g) || []).length;
+  assert.ok(destinations >= 4, "nav destinations not found");
+  const mqStart = source.indexOf("@media (max-width:59.99rem)");
+  const mqEnd = source.indexOf("@media (max-width:23rem)", mqStart);
+  const mq = source.slice(mqStart, mqEnd);
+  const m = mq.match(/#mobileNav\s*\{[\s\S]*?grid-template-columns:\s*repeat\((\d+),\s*minmax\(0,\s*1fr\)\)/);
+  assert.ok(m, "mobile nav grid-template-columns not found");
+  assert.equal(+m[1], destinations,
+    `the nav has ${destinations} destinations; the grid must give each one a column or the last wraps`);
 });
 
 test("--info custom property exists in :root", () => {
