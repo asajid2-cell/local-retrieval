@@ -373,9 +373,26 @@ class KeyTranslationTests(unittest.TestCase):
         altgr = muxctl.LEFT_ALT_PRESSED | muxctl.LEFT_CTRL_PRESSED
         self.assertEqual(muxctl.translate_key_event(0x32, "@", altgr), b"@")
 
+    def test_function_keys_map_to_their_vt_sequences(self):
+        # F1-F4 are SS3; F5-F12 are CSI n~. Same table as the tee's KeyTranslator.
+        self.assertEqual(muxctl.translate_key_event(0x70, "", 0), b"\x1bOP")
+        self.assertEqual(muxctl.translate_key_event(0x74, "", 0), b"\x1b[15~")
+        self.assertEqual(muxctl.translate_key_event(0x7B, "", 0), b"\x1b[24~")
+        self.assertEqual(muxctl.translate_key_event(0x74, "", muxctl.LEFT_CTRL_PRESSED), b"\x1b[15;5~")
+
+    def test_modified_navigation_keys_carry_the_modifier(self):
+        self.assertEqual(muxctl.translate_key_event(0x26, "", muxctl.LEFT_CTRL_PRESSED), b"\x1b[1;5A")
+        self.assertEqual(muxctl.translate_key_event(0x25, "", muxctl.SHIFT_PRESSED), b"\x1b[1;2D")
+        self.assertEqual(muxctl.translate_key_event(0x2E, "", muxctl.LEFT_CTRL_PRESSED), b"\x1b[3;5~")
+
+    def test_backspace_is_del_and_ctrl_backspace_is_bs(self):
+        self.assertEqual(muxctl.translate_key_event(0x08, "\x08", 0), b"\x7f")
+        self.assertEqual(muxctl.translate_key_event(0x08, "\x08", muxctl.SHIFT_PRESSED), b"\x7f")
+        self.assertEqual(muxctl.translate_key_event(0x08, "\x08", muxctl.LEFT_CTRL_PRESSED), b"\x08")
+
     def test_unmapped_keys_produce_nothing(self):
         self.assertIsNone(muxctl.translate_key_event(0x10, "", muxctl.SHIFT_PRESSED))  # bare shift
-        self.assertIsNone(muxctl.translate_key_event(0x70, "", 0))                     # F1
+        self.assertIsNone(muxctl.translate_key_event(0xFF, "", 0))                     # unmapped VK
 
 
 def _key_record(vk, ch, ctrl=0, repeat=1, down=1):

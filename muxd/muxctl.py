@@ -38,11 +38,36 @@ LOCAL_SCROLLBACK = max(0, int(os.environ.get("MUXCTL_SCROLLBACK", "60000")))
 def env_truthy(name):
     return os.environ.get(name, "").lower() in ("1", "true", "yes", "on")
 
-# navigation keys (KEY_EVENT virtual-key codes) -> VT sequences (same bytes the old
-# msvcrt/scan-code table produced, so hosted-app key handling is unchanged)
-VK_TO_VT = {0x26: b'\x1b[A', 0x28: b'\x1b[B', 0x27: b'\x1b[C', 0x25: b'\x1b[D',
-            0x24: b'\x1b[H', 0x23: b'\x1b[F', 0x21: b'\x1b[5~', 0x22: b'\x1b[6~',
-            0x2E: b'\x1b[3~', 0x2D: b'\x1b[2~'}
+# Navigation and function keys (KEY_EVENT virtual-key code) -> (unmodified bytes, modified template).
+# The plain forms are the same bytes the old msvcrt/scan-code table produced, so hosted-app key handling
+# is unchanged; the template's {0} is xterm's modifier parameter, 1 + shift(1) + alt(2) + ctrl(4), so
+# Ctrl/Shift/Alt+Arrow and the function keys arrive as the real sequence instead of being dropped. Kept
+# identical to the tee's KeyTranslator table, so a local mux tab and a remote attach send the same bytes.
+VK_TO_VT = {
+    0x26: (b'\x1b[A', "\x1b[1;{0}A"),       # Up
+    0x28: (b'\x1b[B', "\x1b[1;{0}B"),       # Down
+    0x27: (b'\x1b[C', "\x1b[1;{0}C"),       # Right
+    0x25: (b'\x1b[D', "\x1b[1;{0}D"),       # Left
+    0x24: (b'\x1b[H', "\x1b[1;{0}H"),       # Home
+    0x23: (b'\x1b[F', "\x1b[1;{0}F"),       # End
+    0x21: (b'\x1b[5~', "\x1b[5;{0}~"),      # PageUp
+    0x22: (b'\x1b[6~', "\x1b[6;{0}~"),      # PageDown
+    0x2E: (b'\x1b[3~', "\x1b[3;{0}~"),      # Delete
+    0x2D: (b'\x1b[2~', "\x1b[2;{0}~"),      # Insert
+    0x70: (b'\x1bOP', "\x1b[1;{0}P"),       # F1
+    0x71: (b'\x1bOQ', "\x1b[1;{0}Q"),       # F2
+    0x72: (b'\x1bOR', "\x1b[1;{0}R"),       # F3
+    0x73: (b'\x1bOS', "\x1b[1;{0}S"),       # F4
+    0x74: (b'\x1b[15~', "\x1b[15;{0}~"),    # F5
+    0x75: (b'\x1b[17~', "\x1b[17;{0}~"),    # F6
+    0x76: (b'\x1b[18~', "\x1b[18;{0}~"),    # F7
+    0x77: (b'\x1b[19~', "\x1b[19;{0}~"),    # F8
+    0x78: (b'\x1b[20~', "\x1b[20;{0}~"),    # F9
+    0x79: (b'\x1b[21~', "\x1b[21;{0}~"),    # F10
+    0x7A: (b'\x1b[23~', "\x1b[23;{0}~"),    # F11
+    0x7B: (b'\x1b[24~', "\x1b[24;{0}~"),    # F12
+}
+VK_BACK = 0x08
 VK_TAB = 0x09
 SHIFT_PRESSED = 0x0010
 LEFT_ALT_PRESSED = 0x0002
@@ -302,19 +327,33 @@ def wheel_input_sequences(tracker, notches, cell_x=1, cell_y=1, alt_scroll=DEFAU
 def translate_key_event(vk, ch, ctrl_state):
     """KEY_EVENT (key-down) -> bytes for the hosted pty, or None for keys with no mapping.
     muxd decodes session input as UTF-8 (Session.write), so characters are UTF-8 encoded."""
+    shift = ctrl_state & SHIFT_PRESSED
+    alt = ctrl_state & (LEFT_ALT_PRESSED | RIGHT_ALT_PRESSED)
+    ctrl = ctrl_state & (LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED)
+
+    # Backspace: a terminal sends DEL (0x7f); Ctrl+Backspace sends BS (0x08). The console hands us BS for
+    # both, so rebuild the distinction here rather than pass 0x08 through (a TUI reads that as
+    # delete-word). Ctrl+Shift+Backspace stays DEL, matching WT.
+    if vk == VK_BACK:
+        return b'\x08' if (ctrl and not shift) else b'\x7f'
+
     if ch:
-        if vk == VK_TAB and (ctrl_state & SHIFT_PRESSED):
+        if vk == VK_TAB and shift:
             return b"\x1b[Z"
         try:
             data = ch.encode("utf-8")
         except UnicodeEncodeError:
             return None
-        alt = ctrl_state & (LEFT_ALT_PRESSED | RIGHT_ALT_PRESSED)
-        ctrl = ctrl_state & (LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED)
         if alt and not ctrl and ch >= " " and ch != "\x7f":
             return b"\x1b" + data          # plain Alt+printable; AltGr (ctrl+alt) stays a bare char
         return data
-    return VK_TO_VT.get(vk)
+
+    entry = VK_TO_VT.get(vk)
+    if entry is None:
+        return None
+    plain, template = entry
+    mod = 1 + (1 if shift else 0) + (2 if alt else 0) + (4 if ctrl else 0)
+    return plain if mod == 1 else template.format(mod).encode("ascii")
 
 
 class KEY_EVENT_RECORD(ctypes.Structure):
