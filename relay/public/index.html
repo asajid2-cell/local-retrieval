@@ -554,14 +554,19 @@
       grid-template-areas:"topbar" "term" "status" "mobileNav";
     }
     #mobileNav {
-      /* SIX destinations (Sessions/Terminal/Fleet/Projects/Chats/Keys). Five columns wrapped "Keys"
-         alone onto a second row -- a ~60px band of dead chrome on every phone. */
-      grid-area:mobileNav; display:grid; grid-template-columns:repeat(6,minmax(0,1fr)); gap:var(--sp1);
+      /* SIX destinations (Sessions/Terminal/Fleet/Projects/Chats/Keys). A fixed multi-column grid either
+         wrapped the last one onto a second row (~60px of dead chrome per phone) or, cramped into one row,
+         crushed every label. A single horizontally-scrollable row keeps each label at its natural width
+         and costs exactly one row of height; the row pans sideways when it overflows. */
+      grid-area:mobileNav; display:flex; flex-wrap:nowrap; align-items:stretch; gap:var(--sp1);
       padding:var(--sp1) var(--sp2); padding-bottom:max(var(--sp1),env(safe-area-inset-bottom));
       background:var(--panel); border-top:1px solid var(--line); min-width:0;
+      overflow-x:auto; overflow-y:hidden; -webkit-overflow-scrolling:touch;
+      overscroll-behavior-x:contain; scrollbar-width:none;
     }
-    #mobileNav button, #mobileNav a { min-height:44px; padding:4px 2px; gap:3px; font-size:10.5px; }
-    #mobileNav span { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:100%; }
+    #mobileNav::-webkit-scrollbar { display:none; }
+    #mobileNav button, #mobileNav a { flex:0 0 auto; min-width:62px; min-height:44px; padding:4px 10px; gap:3px; font-size:11px; }
+    #mobileNav span { white-space:nowrap; }
     #mobileNav svg { width:17px; height:17px; }
     /* ONE header row. The wordmark spent ~78px and pushed the last two actions onto a second row (a
        ~105px header on a 390px phone). The glyph plus a single horizontally-scrollable action row keeps
@@ -1588,7 +1593,7 @@ function reloadTerminal(quiet){
   connect(name, true);   // re-attach: CLEAR + scrollback replay + live, all client state reset
 }
 document.addEventListener('keydown', e=>{ if(e.ctrlKey && e.altKey && (e.key==='r'||e.key==='R')){ e.preventDefault(); e.stopPropagation(); reloadTerminal(); } }, true);
-window.__muxBuild='2026-10-09-mobile-layout-chrome';   // bump per web deploy so a loaded version is verifiable (supersedes 2026-10-08 mobile-delta-sole-forwarder, which is still in this tree)
+window.__muxBuild='2026-10-09-mobile-tap-focus-nav-scroll';   // bump per web deploy so a loaded version is verifiable (supersedes 2026-10-08 mobile-delta-sole-forwarder, which is still in this tree)
 try{ console.info('multiplex build', window.__muxBuild); }catch(e){}
 const helper = $('#term').querySelector('.xterm-helper-textarea');
 function hardenHelperTextarea(){
@@ -2187,6 +2192,17 @@ window.addEventListener('orientationchange', ()=>setTimeout(applyViewport,250));
 // preventDefault so it doesn't get mis-read as a selection or page scroll).
 (function(){
   const host=$('#term'); let active=false,lastX=0,lastY=0,moved=false,accY=0;
+  // iOS only opens the soft keyboard for a focus() that runs INSIDE a touch gesture. A stationary tap on
+  // an app pane never gets the browser's default focus: the client swallows the press with preventDefault
+  // (so xterm does not double-report the click), which also cancels the browser's own focus-the-textarea
+  // default. Relying on that default is why tapping the prompt did nothing and no keyboard ever appeared.
+  // Do it ourselves at touchend -- the gesture's last moment -- so the phone can type. A drag is a scroll
+  // (moved) and a selection gesture (selectMode) wants no keyboard, so both are left alone.
+  function focusForTyping(){
+    try{ term.focus(); }catch(e){}
+    const h=host.querySelector('.xterm-helper-textarea');
+    if(h && document.activeElement!==h){ try{ h.focus({preventScroll:true}); }catch(e){ try{ h.focus(); }catch(_){} } }
+  }
   host.addEventListener('touchstart', e=>{ markActive(); if(e.touches.length!==1){ active=false; return; } active=true; moved=false; accY=0; lastX=e.touches[0].clientX; lastY=e.touches[0].clientY; }, {passive:true});
   host.addEventListener('touchmove', e=>{
     if(!active || e.touches.length!==1) return;
@@ -2214,7 +2230,11 @@ window.addEventListener('orientationchange', ()=>setTimeout(applyViewport,250));
     } else if(host.classList.contains('pan')){ noteUserScroll(); host.scrollLeft-=dx; e.preventDefault(); }
     lastX=t.clientX; lastY=t.clientY;
   }, {passive:false});
-  host.addEventListener('touchend', ()=>{ active=false; }, {passive:true});
+  host.addEventListener('touchend', e=>{
+    const wasTap = active && !moved && !selectMode && e.touches.length===0;
+    active=false;
+    if(wasTap){ markActive(); focusForTyping(); }
+  }, {passive:true});
 })();
 
 function isVisibleOwner(){ return !!(current && findSession(current)?.owner); }

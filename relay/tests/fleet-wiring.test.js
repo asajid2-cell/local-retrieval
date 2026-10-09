@@ -96,17 +96,24 @@ test("mobile-view-fleet hides term, keybar, and tabwrap", () => {
   assert.match(mq, /#app\.mobile-view-fleet\s+#tabwrap.*display:\s*none/);
 });
 
-test("nav grid gives every destination its own column so none wraps to a second row", () => {
+test("mobile nav is one non-wrapping horizontally-scrolling row so no destination wraps to a second row", () => {
+  // Six destinations (Sessions/Terminal/Fleet/Projects/Chats/Keys). A wrapping grid stacked the last one
+  // onto a second row (a ~60px band of dead chrome on every phone); a fixed-column grid crushed the
+  // labels. The nav must be a single flex row that scrolls sideways instead.
   const nav = section('<nav id="mobileNav"', "</nav>");
   const destinations = (nav.match(/data-mobile-view=|class="projects"/g) || []).length;
   assert.ok(destinations >= 4, "nav destinations not found");
   const mqStart = source.indexOf("@media (max-width:59.99rem)");
   const mqEnd = source.indexOf("@media (max-width:23rem)", mqStart);
   const mq = source.slice(mqStart, mqEnd);
-  const m = mq.match(/#mobileNav\s*\{[\s\S]*?grid-template-columns:\s*repeat\((\d+),\s*minmax\(0,\s*1fr\)\)/);
-  assert.ok(m, "mobile nav grid-template-columns not found");
-  assert.equal(+m[1], destinations,
-    `the nav has ${destinations} destinations; the grid must give each one a column or the last wraps`);
+  const m = mq.match(/#mobileNav\s*\{[\s\S]*?\}/);
+  assert.ok(m, "#mobileNav rule not found in the mobile media query");
+  const rule = m[0];
+  assert.match(rule, /display:\s*flex/, "#mobileNav must be a flex row");
+  assert.match(rule, /flex-wrap:\s*nowrap/, "#mobileNav must never wrap to a second row");
+  assert.match(rule, /overflow-x:\s*auto/, "#mobileNav must scroll horizontally on overflow");
+  assert.equal(rule.indexOf("grid-template-columns"), -1,
+    "#mobileNav must not go back to a fixed grid");
 });
 
 test("--info custom property exists in :root", () => {

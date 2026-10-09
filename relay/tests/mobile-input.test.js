@@ -337,3 +337,35 @@ test('every keybar button is created as a non-submitting button', () => {
     );
   }
 });
+
+test('a stationary tap on the terminal focuses the helper textarea so the iOS keyboard can open', () => {
+  const impact = 'tapping the prompt does nothing and no keyboard appears, so the phone cannot type at all';
+  // The focus must actually land on the helper textarea — the one focusable node xterm routes typing
+  // through — not merely on some ancestor.
+  const focuser = functionSection('focusForTyping', impact);
+  assert.match(focuser, /\.xterm-helper-textarea/, `${impact}: the tap focus does not target the helper textarea`);
+  assert.match(focuser, /\.focus\s*\(/, `${impact}: the helper textarea is never focused`);
+
+  // It must run from touchend — the gesture's last moment, the only point iOS honors a programmatic
+  // focus that opens the keyboard.
+  const termTouches = containerListeners(source, '#term', 'touchend');
+  assert.ok(termTouches.length > 0, `${impact}: the terminal has no touchend listener`);
+  const tap = termTouches.find(call => /focusForTyping\s*\(/.test(call.source));
+  assert.ok(tap, `${impact}: no touchend handler focuses the terminal`);
+  // Guarded: a real drag scrolls and the Sel toggle selects — neither wants a keyboard.
+  assert.match(tap.source, /\bmoved\b/, `${impact}: the tap focus is not guarded against a drag`);
+  assert.match(tap.source, /\bselectMode\b/, `${impact}: the tap focus is not guarded against the Sel toggle`);
+});
+
+test('the terminal touchstart listener does not preventDefault, so iOS can still open the keyboard', () => {
+  const impact = 'preventing the touchstart default blocks the keyboard and text selection on the phone';
+  const termTouches = containerListeners(source, '#term', 'touchstart');
+  assert.ok(termTouches.length > 0, `${impact}: the terminal has no touchstart listener`);
+  const scrolling = termTouches.filter(call => /passive\s*:\s*true/.test(call.source));
+  for (const call of scrolling) {
+    assert.ok(
+      !/preventDefault\s*\(\s*\)/.test(call.source),
+      `${impact}: a passive terminal touchstart calls preventDefault`
+    );
+  }
+});
