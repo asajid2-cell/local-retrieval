@@ -29,6 +29,9 @@ internal sealed class TeeEngine : IDisposable
     // MOUSE_EVENT in the encoding the child negotiated. Fed from T1; read from T2.
     private readonly ScreenModeTracker _screen = new();
 
+    // Whether the tab's console is currently capturing the mouse (toggled by T1 to match _screen).
+    private bool _mouseCapture;
+
     public RingBuffer Ring { get; } = new(2 * 1024 * 1024);
 
     // Set when the child appeared to be resized behind our back and the net tier should not trust the
@@ -97,6 +100,17 @@ internal sealed class TeeEngine : IDisposable
                 // Track the child's mouse modes for T2. The child's output is the only place the app says
                 // which mouse encoding it wants, and T1 is the one thread that sees every byte of it.
                 _screen.Feed(chunk);
+
+                // Mirror the child's mouse intent onto the tab's console: capture only while the child
+                // actually tracks the mouse, so a plain shell keeps native drag-select and scrollback
+                // (muxctl does the same - wants_mouse_capture). Mode changes are rare, so this stays off
+                // the hot path in practice.
+                if (_screen.MouseTracking != _mouseCapture)
+                {
+                    _mouseCapture = _screen.MouseTracking;
+                    _modes.SetMouseCapture(_mouseCapture);
+                    _log($"mouse capture {(_mouseCapture ? "on" : "off")}");
+                }
             }
         }
         catch (Exception ex)
@@ -182,10 +196,14 @@ internal sealed class TeeEngine : IDisposable
                     else if (records[i].EventType == ConsoleApi.MOUSE_EVENT)
                     {
                         // WT only hands us a mouse report when the child asked to track the mouse, and the
-                        // report's encoding is the child's. Flush the pending text first so key and mouse
-                        // bytes keep their order in the pipe.
+                        // report's encoding is the child's. But only the WHEEL is forwarded: click and
+                        // motion are dropped, because a flooded motion/click stream is what leaked mouse
+                        // bytes into a shell that never asked (the 2026-10-13 ssh bug), exactly as muxctl
+                        // and the web client avoid (muxd/muxctl.py translates the wheel alone). Flush the
+                        // pending text first so key and wheel bytes keep their order in the pipe.
                         if (!_screen.MouseTracking) continue;
                         var m = records[i].MouseEvent;
+                        if (!MouseInput.IsWheel(m.dwEventFlags)) continue;
                         AppendText(raw, pending);
                         raw.AddRange(MouseInput.Encode(m.dwButtonState, m.dwControlKeyState, m.dwEventFlags,
                             m.dwMousePosition.X + 1, m.dwMousePosition.Y + 1, _screen.Sgr, _screen.Urxvt));

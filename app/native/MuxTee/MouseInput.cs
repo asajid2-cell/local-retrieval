@@ -13,8 +13,13 @@ namespace MuxTee;
 // decision is identical with and without muxtee in the chain.
 //
 // What breaks is the last hop. WT delivers that report to us as a MOUSE_EVENT record; T2 used to drop it,
-// so a tracking TUI (htop, vim, claude) got no wheel, no click and no drag in a mux tab. We now re-encode
-// the record into the VT mouse report the inner app actually asked for and write it into the inner pty.
+// so a tracking TUI (htop, vim, claude) got no wheel in a mux tab. We re-encode the record into the VT
+// mouse report the inner app asked for and write it into the inner pty.
+//
+// Only the WHEEL is translated. Click and motion are dropped: a flooded click/motion stream is what leaked
+// mouse bytes into a shell that never asked for them (each event echoed as text like `35;194;1M`, while the
+// captured mouse blocked drag-select). The muxd attach path (muxd/muxctl.py) and the web client
+// (relay/public/index.html stripMouseReports) keep the wheel and strip click/motion for exactly this reason.
 //
 // The encoding has to be the one the app negotiated (SGR/urxvt/X10), so the tracker below watches the
 // child's own DECSET/DECRST output for those modes and for mouse tracking itself.
@@ -113,6 +118,12 @@ internal static class MouseInput
     // X10 coordinate bytes are raw 32+c, and can run past 0x7f; muxctl clamps to 222 for the same reason
     // (kept identical so the tee and the local attach emit byte-identical reports).
     private const int MaxCoord = 222;
+
+    // The attach path's rule, verbatim (muxd/muxctl.py): a wheel notch is the only event worth
+    // translating. Click and motion are dropped - they flood, and a shell that never asked for mouse
+    // reports echoes each one as literal bytes (the 2026-10-13 ssh injection bug).
+    public static bool IsWheel(uint eventFlags)
+        => (eventFlags & (ConsoleApi.MOUSE_WHEELED | ConsoleApi.MOUSE_HWHEELED)) != 0;
 
     public static byte[] Encode(uint buttonState, uint ctrlState, uint eventFlags, int x, int y,
         bool sgr, bool urxvt)

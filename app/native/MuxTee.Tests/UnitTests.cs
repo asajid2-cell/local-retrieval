@@ -354,6 +354,22 @@ public class UnitTests
         CollectionAssert.AreEqual(System.Text.Encoding.ASCII.GetBytes("\x1b[<65;10;4M"), down);
     }
 
+    // The gate that keeps a shell clean: only a wheel notch is ever forwarded. A click (flags 0) or a
+    // motion report is what a shell that never asked for mouse reports echoes as literal bytes like
+    // `35;194;1M` - the ssh injection bug. If this ever admits a motion/click flag, the flood is back.
+    [TestMethod]
+    public void MouseInput_IsWheel_AdmitsOnlyTheWheel()
+    {
+        Assert.IsTrue(MouseInput.IsWheel(ConsoleApi.MOUSE_WHEELED), "vertical wheel");
+        Assert.IsTrue(MouseInput.IsWheel(ConsoleApi.MOUSE_HWHEELED), "horizontal wheel");
+        Assert.IsFalse(MouseInput.IsWheel(0), "a press/release has no event flags");
+        Assert.IsFalse(MouseInput.IsWheel(ConsoleApi.MOUSE_MOVED), "a motion report must be dropped");
+        Assert.IsFalse(MouseInput.IsWheel(ConsoleApi.MOUSE_MOVED | ConsoleApi.MOUSE_WHEELED & 0),
+            "motion with no wheel bit must be dropped");
+        // A wheel notch that also carries the motion bit is still a wheel and must pass.
+        Assert.IsTrue(MouseInput.IsWheel(ConsoleApi.MOUSE_WHEELED | ConsoleApi.MOUSE_MOVED), "wheel+motion");
+    }
+
     [TestMethod]
     public void MouseInput_EncodesUrxvtAndX10()
     {
