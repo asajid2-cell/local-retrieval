@@ -380,4 +380,26 @@ public class UnitTests
         var x10 = MouseInput.Encode(0x0001, 0, 0, 200, 200, sgr: false, urxvt: false);
         CollectionAssert.AreEqual(new byte[] { 0x1b, (byte)'[', (byte)'M', 32, 232, 232 }, x10);
     }
+
+    // The child job must carry BOTH flags, read back from the OS rather than trusted. KILL_ON_JOB_CLOSE
+    // is invariant 6: closing the tab drops our last handle and reaps the whole descendant tree.
+    // BREAKAWAY_OK is additive and is what keeps the gateway's breakaway leaf launcher working - a leaf
+    // created with CREATE_BREAKAWAY_FROM_JOB may leave the job; without the flag the launcher is refused
+    // (Win32 err 5) or the child stays trapped, and the fail-closed launcher then kills the suspended
+    // leaf so it "just disappears". This mirrors owned-gateway-process.ps1's SetInformationJobObject
+    // readback (:314-:323), which asserts the same pair rather than trusting the set call.
+    [TestMethod]
+    public void ChildJob_HasKillOnCloseAndBreakawayOk()
+    {
+        const uint KillOnJobClose = 0x00002000;
+        const uint BreakawayOk = 0x00000800;
+
+        using var job = new ChildJob();
+        var flags = job.QueryLimitFlags();
+
+        Assert.IsTrue((flags & KillOnJobClose) != 0,
+            $"KILL_ON_JOB_CLOSE must remain set (invariant 6); got 0x{flags:X8}");
+        Assert.IsTrue((flags & BreakawayOk) != 0,
+            $"BREAKAWAY_OK must be set or a breakaway gateway leaf is refused/trapped; got 0x{flags:X8}");
+    }
 }

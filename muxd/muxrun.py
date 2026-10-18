@@ -59,6 +59,7 @@ ENABLE_QUICK_EDIT_MODE = 0x0040
 ENABLE_EXTENDED_FLAGS = 0x0080
 ENABLE_PROCESSED_INPUT = 0x0001
 JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+JOB_OBJECT_LIMIT_BREAKAWAY_OK = 0x00000800
 JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
 TH32CS_SNAPPROCESS = 0x00000002
 INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
@@ -203,7 +204,13 @@ class ChildJob:
         if not handle:
             raise ctypes.WinError()
         info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
-        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        # KILL_ON_JOB_CLOSE is invariant 6 (closing the tab reaps the whole descendant tree).
+        # BREAKAWAY_OK is additive: it only *permits* a gateway leaf spawned with
+        # CREATE_BREAKAWAY_FROM_JOB to leave the job instead of being refused (Win32 err 5)
+        # or trapped, which is what makes the leaf "just disappear".
+        info.BasicLimitInformation.LimitFlags = (
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK
+        )
         if not k.SetInformationJobObject(
             handle,
             JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
