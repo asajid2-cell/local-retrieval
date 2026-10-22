@@ -104,25 +104,33 @@ function cookieVal(req, name) {
   const m = (req.headers.cookie || '').match(new RegExp('(?:^|;\\s*)' + name + '=([^;]+)'));
   return m ? decodeURIComponent(m[1]) : null;
 }
-async function isOwner(token) {
+async function isOwner(token, req) {
   if (!token) return false;
+  const realIp = req && req.headers ? req.headers['x-real-ip'] : null;
+  const userAgent = req && req.headers ? req.headers['user-agent'] : null;
+  // The verdict now depends on what the client presented, so the cache key must too:
+  // a token cached as owner from one address must not answer for another.
+  const cacheKey = token + '\n' + (realIp || '') + '\n' + (userAgent || '');
   const now = Date.now();
   for (const [cachedToken, entry] of _authCache) {
     if (entry.exp <= now) _authCache.delete(cachedToken);
   }
-  const hit = _authCache.get(token);
+  const hit = _authCache.get(cacheKey);
   if (hit) {
-    _authCache.delete(token);
-    _authCache.set(token, hit);
+    _authCache.delete(cacheKey);
+    _authCache.set(cacheKey, hit);
     return hit.owner;
   }
   try {
-    const r = await fetch(HLAUTH_BASE + '/internal/verify', { headers: { 'x-internal-key': HL_KEY, 'x-session-token': token } });
+    const _verifyHeaders = { 'x-internal-key': HL_KEY, 'x-session-token': token };
+    if (realIp) _verifyHeaders['x-forwarded-for'] = realIp;
+    if (userAgent) _verifyHeaders['user-agent'] = userAgent;
+    const r = await fetch(HLAUTH_BASE + '/internal/verify', { headers: _verifyHeaders });
     const j = await r.json();
     const owner = !!(j.authenticated && j.user && j.user.isOwner);
-    _authCache.delete(token);
+    _authCache.delete(cacheKey);
     while (_authCache.size >= AUTH_CACHE_MAX) _authCache.delete(_authCache.keys().next().value);
-    _authCache.set(token, { exp: Date.now() + AUTH_CACHE_TTL_MS, owner });
+    _authCache.set(cacheKey, { exp: Date.now() + AUTH_CACHE_TTL_MS, owner });
     return owner;
   } catch { return false; }
 }
@@ -256,7 +264,7 @@ app.use(async (req, res, next) => {
   // the unchanged testMode/cookie logic below, so no existing request changes behaviour. A browser
   // sends no Authorization header and is untouched; a wrong Bearer simply meets the owner cookie gate.
   if (nativeViewerTokenOk(bearerViewerToken(req))) return next();
-  if (await isOwner(cookieVal(req, HL_COOKIE))) return next();
+  if (await isOwner(cookieVal(req, HL_COOKIE), req)) return next();
   const tok = cookieVal(req, HL_COOKIE);
   if (!tok) {
     const prefix = req.headers['x-forwarded-prefix'] || process.env.PUBLIC_RETURN || '/multiplex';
@@ -2136,7 +2144,7 @@ app.post('/api/archive-index', (req, res) => {
   res.json({ ok: true, count: chats.length, updatedAt: candidate.updatedAt });
 });
 app.get('/api/archive-index', async (req, res) => {
-  if (!(await isOwner(cookieVal(req, HL_COOKIE)))) return res.status(403).json({ error: 'owner only' });
+  if (!(await isOwner(cookieVal(req, HL_COOKIE), req))) return res.status(403).json({ error: 'owner only' });
   const updatedAt = _archiveIndex.updatedAt || 0;
   res.json({
     schemaVersion: ARCHIVE_INDEX_SCHEMA_VERSION,
@@ -4387,7 +4395,7 @@ wss.on('connection', async (ws, req) => {
   // browser path is bit-identical.
   const nativeBearer = bearerViewerToken(req);
   const nativeViewer = nativeBearer !== null && nativeViewerTokenOk(nativeBearer);
-  if (!nativeViewer && !testModeLocalTrust(req) && !(await isOwner(cookieVal(req, HL_COOKIE)))) { try { ws.close(1008, 'unauthorized'); } catch {} return; }
+  if (!nativeViewer && !testModeLocalTrust(req) && !(await isOwner(cookieVal(req, HL_COOKIE), req))) { try { ws.close(1008, 'unauthorized'); } catch {} return; }
   try { req.socket.setNoDelay(true); } catch {}                       // low-latency keystrokes: no Nagle on the viewer link
   const u = new URL(req.url, 'http://x');
   const name = strictMuxName(u.searchParams.get('session'));
