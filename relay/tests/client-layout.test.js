@@ -422,6 +422,7 @@ function loadViewportMeasure(getDims, clock) {
     actFlag: () => false,
     send: (t, d) => { if (t === 'v') reports.push(JSON.parse(d)); },
     applyPan: () => {}, updateMeta: () => {}, updateSizeBtn: () => {}, applyScrollAffordance: () => {},
+    fitTabOwnedGrid: () => {},
     $: () => host,
     getComputedStyle: () => ({ display: 'block', visibility: 'visible' }),
     setTimeout: () => 0, clearTimeout: () => {}, requestAnimationFrame: () => 0, cancelAnimationFrame: () => {},
@@ -484,4 +485,103 @@ test('the connect seed is the settled size and is marked reported, so one attach
   // 'v' is suppressed and the relay never recomputes a second, identical decision
   assert.match(connect, /lastViewportReport=seed\.cols\+'x'\+seed\.rows; lastViewportReportSocket=sock;/);
   assert.match(source, /lastViewportReport!==key \|\| lastViewportReportSocket!==ws/);
+});
+
+// A tab-owned grid is the PC terminal's physical screen: its cols x rows are fixed and the relay never
+// resizes it for this viewer. A real terminal resolves its cell size from the window WIDTH - as wide a
+// font as the width allows - and scrolls when the result is taller than the view. The shipped fit does
+// the same. The numbers used here were measured live: 209x51 with a 7.7x17px cell (0.55px of cell width
+// per px of font) in a 1842x792 pane. The old fit was height-bound, chose 12, and left 588px of width
+// empty - the "shrunk down" look this replaces.
+function loadTabFit(opts){
+  const code = section('function cellMetrics', 'function applyPan');
+  const classes = new Set();
+  const host = {
+    clientWidth: opts.hostW, clientHeight: opts.hostH,
+    classList: {
+      toggle(n,on){ if(on) classes.add(n); else classes.delete(n); },
+      add(n){ classes.add(n); }, remove(n){ classes.delete(n); }, contains(n){ return classes.has(n); },
+    },
+  };
+  const sandbox = {
+    fontSize: opts.preference,
+    sizeTabOwned: opts.tabOwned !== false,
+    sizePinned: !!opts.pinned,
+    term: opts.term,
+    LS: { get: (k, d) => (k === 'mux_tab_font' && opts.tabScale !== undefined ? opts.tabScale : d), set(){} },
+    $: sel => sel === '#term' ? host : null,
+    getComputedStyle: () => ({ paddingLeft:'0px', paddingTop:'0px', paddingRight:'0px', paddingBottom:'0px' }),
+    healTerminalSurface(){}, doFit(){},
+  };
+  vm.createContext(sandbox);
+  vm.runInContext(code + '\nthis.fitTabOwnedGrid=fitTabOwnedGrid; this.appliedFont=()=>appliedFont;', sandbox);
+  return { fit: sandbox.fitTabOwnedGrid, applied: sandbox.appliedFont, classes: () => Array.from(classes).sort(), sandbox };
+}
+function gridTerm(cols,rows,cellW,cellH){
+  return { cols, rows, options:{ fontSize:14 }, _core:{ _renderService:{ dimensions:{ css:{ cell:{ width:cellW, height:cellH } } } } } };
+}
+function setCell(term,cellW,cellH){
+  const cell=term._core._renderService.dimensions.css.cell;
+  cell.width=cellW; cell.height=cellH;
+}
+
+test('a tab-owned grid takes its cell size from the pane width, the way a terminal does', () => {
+  const term = gridTerm(209,51,7.7,17);
+  const fit = loadTabFit({ term, preference:14, hostW:1842, hostH:792 });
+  fit.fit();
+  assert.equal(term.options.fontSize, 16, '1842 / (209 x 0.55) = 16.02 -> 16px, so the grid spans the pane');
+  assert.equal(fit.applied(), 16);
+  assert.deepEqual(fit.classes(), ['tabfit'], 'the fitted grid is centred, not pinned to the left edge');
+});
+
+test('pane height never caps the font - the rows overflow and the row pan follows the footer', () => {
+  // 51 rows at 16px is ~870px in a 400px pane. Shrinking to fit the height is exactly the hand-tuned
+  // behaviour this replaces; a terminal would keep the width-derived cell size and scroll instead.
+  const term = gridTerm(209,51,7.7,17);
+  loadTabFit({ term, preference:14, hostW:1842, hostH:400 }).fit();
+  assert.equal(term.options.fontSize, 16, 'the fit is width-driven, never height-driven');
+});
+
+test('a grid already spanning the pane is a fixed point, so two sizes cannot chase each other', () => {
+  const term = gridTerm(209,51,7.7,17);
+  const fit = loadTabFit({ term, preference:14, hostW:Math.round(209*7.7), hostH:792 });
+  fit.fit();
+  assert.equal(term.options.fontSize, 14, 'a painted width within 2px of the pane is left alone');
+});
+
+test('quantised cell metrics cannot make two font sizes chase each other', () => {
+  // Measured live: at font 17 the cell is 9px wide, so 209 cols paint 1881px into an 1827px pane and the
+  // pan class comes on; at 16 the cell is 8px and 1672px leaves a margin. The estimate flips between the
+  // two, so the fit must step back once and then refuse to re-enter the size that overflowed.
+  const term = gridTerm(209,51,9,20);
+  const fit = loadTabFit({ term, preference:17, hostW:1827, hostH:792 });
+  fit.fit();
+  assert.equal(term.options.fontSize, 16, 'an overflowing size steps back');
+  setCell(term, 8, 19);                       // the renderer re-measures at the smaller size
+  fit.fit(); fit.fit();
+  assert.equal(term.options.fontSize, 16, 'the estimate still asks for 17, but 17 is latched out');
+  assert.equal(fit.applied(), 16);
+});
+
+test('A+/A- on a tab-owned grid zooms the width fit instead of overwriting it', () => {
+  const term = gridTerm(209,51,7.7,17);
+  loadTabFit({ term, preference:14, hostW:1842, hostH:792, tabScale:1.25 }).fit();
+  assert.equal(term.options.fontSize, 20, 'floor(16.02 x 1.25) = 20 - the zoom rides on top of the fit');
+});
+
+test('leaving a tab-owned session restores the stored preference and drops the fit class', () => {
+  const term = gridTerm(209,51,7.7,17);
+  const fit = loadTabFit({ term, preference:14, hostW:1842, hostH:792 });
+  fit.fit();
+  assert.equal(term.options.fontSize, 16);
+  fit.sandbox.sizeTabOwned = false;
+  fit.fit();
+  assert.equal(term.options.fontSize, 14, 'the preference is restored, never overwritten by a derived size');
+  assert.deepEqual(fit.classes(), []);
+});
+
+test('the fit runs on every size frame and every re-measure, not only on a grid change', () => {
+  assert.match(section('function onControl', 'function cycleSize'), /fitTabOwnedGrid\(\)/);
+  assert.match(section('function reportViewport', 'function runViewportMeasure'), /fitTabOwnedGrid\(\)/);
+  assert.match(source, /#term\.tabfit:not\(\.pan\) \.xterm \{ width:max-content !important; margin-left:auto; margin-right:auto; \}/);
 });

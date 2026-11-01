@@ -137,6 +137,10 @@
     scrollbar-width:thin; scrollbar-color:var(--rose) var(--panel-2);
   }
   #term.pan .xterm { width:max-content !important; min-width:100%; }
+  /* A tab-owned grid is the PC terminal's physical screen: the relay never resizes it for this viewer, so
+     the font is fitted until the whole cols x rows grid is inside the pane (fitTabOwnedGrid). Once it fits,
+     the grid is centred instead of hugging the left edge and leaving a dead margin. */
+  #term.tabfit:not(.pan) .xterm { width:max-content !important; margin-left:auto; margin-right:auto; }
   @media (hover:hover) and (pointer:fine) {
     #term.pan::-webkit-scrollbar { height:10px; background:var(--panel-2); }
     #term.pan::-webkit-scrollbar-thumb { background:var(--rose); border-radius:999px; }
@@ -1948,7 +1952,65 @@ function bufferFrozenOutput(out){
 }
 function cellMetrics(){
   try { const d = term._core._renderService.dimensions.css.cell; if (d && d.height) return { w:d.width, h:d.height }; } catch(e){}
-  return { w: fontSize*0.6, h: fontSize*1.2 };
+  return { w: appliedFont*0.6, h: appliedFont*1.2 };
+}
+// ---- SIZE A PC TAB'S SCREEN THE WAY A TERMINAL WOULD ----
+// A tab-owned grid (a teed PC tab) is that terminal's physical screen: its cols x rows are fixed and the
+// relay will not resize it for this viewer. A real terminal resolves its cell size from the window it is
+// given - as large a font as the width allows - and scrolls when the result is taller than the view. So
+// do the same here: take the largest font whose painted grid still fits the pane WIDTH, and let the
+// bottom-anchored row pan (`.rowpan` / alignTerminalSurface) keep a TUI's status bar and leaf line in
+// view. Changing only the font also keeps the cell aspect ratio, so the mirror looks like the local tab;
+// the hand-tuned shrink-to-fit this replaces sized on HEIGHT and left the grid small and short of the
+// right edge at desktop widths.
+//
+// Largest-that-fits is a search, not a division, because cell metrics are quantised: measured live, 16px
+// gives an 8px cell and 17px a 9px cell, so one size leaves ~150px unused while the next overflows. A
+// solver that trusted its estimate alone would hop between those two sizes forever (and the pan class
+// with it), so a size that overflowed is latched and not re-entered until the pane or the zoom changes.
+let appliedFont = fontSize;        // what the renderer actually uses; `fontSize` stays the stored preference
+let tabFontScale = (()=>{          // A+/A- on a tab-owned grid becomes a zoom on top of the width fit
+  const v = Number(LS.get('mux_tab_font', 1));
+  return (isFinite(v) && v>0) ? Math.min(2.5, Math.max(0.5, v)) : 1;
+})();
+let tabFitRejected = 0, tabFitPaneW = -1, tabFitPaneScale = 0;
+function fitTabOwnedGrid(){
+  const host=$('#term');
+  if(!host) return;
+  const owned = !!(sizeTabOwned && !sizePinned);
+  host.classList.toggle('tabfit', owned);
+  if(!owned){
+    tabFitRejected=0; tabFitPaneW=-1;
+    if(appliedFont!==fontSize){ appliedFont=fontSize; try{ term.options.fontSize=fontSize; }catch(e){} }
+    return;
+  }
+  if(!term.cols || !term.rows || !(appliedFont>0)) return;
+  const cs=getComputedStyle(host);
+  const availW=host.clientWidth-(parseFloat(cs.paddingLeft)||0)-(parseFloat(cs.paddingRight)||0);
+  if(availW<80) return;
+  if(availW!==tabFitPaneW || tabFontScale!==tabFitPaneScale){
+    tabFitPaneW=availW; tabFitPaneScale=tabFontScale; tabFitRejected=0;
+  }
+  const cell=cellMetrics();
+  if(!(cell.w>0)) return;
+  const gridW=term.cols*cell.w, targetW=availW*tabFontScale;
+  const fitFont = availW/(term.cols*(cell.w/appliedFont));   // font size that spans the pane width
+  if(!isFinite(fitFont) || fitFont<=0) return;
+  let want = Math.max(8, Math.min(22, Math.floor(fitFont*tabFontScale)));
+  if(gridW > availW+1){          // painted wider than the pane - the last step was too big, go back
+    tabFitRejected = appliedFont;
+    if(want >= appliedFont) want = appliedFont-1;   // the measurement decides, not a stale estimate
+  } else if(targetW - gridW > 1 && want > appliedFont){
+    if(want === tabFitRejected) return;   // that size already overflowed at this pane width
+  } else {
+    return;                      // already at (or inside) the target: this is the fixed point
+  }
+  want=Math.max(8, want);
+  if(want===appliedFont || want===tabFitRejected) return;
+  appliedFont=want;
+  try{ term.options.fontSize=want; }catch(e){}
+  healTerminalSurface('tabfit');
+  if(typeof doFit==='function') doFit();
 }
 function applyPan(){
   const host=$('#term');
@@ -1973,7 +2035,10 @@ let wasRowOverflow=false, alignedContentRow=-1, alignedScrollTop=0;
 function alignTerminalSurface(){
   const host=$('#term'), xt=host.querySelector('.xterm');
   if(!xt) return;
-  const rowOverflow = !!(isMobile() && winSize && viewportFit && winSize.rows > viewportFit.rows+1);
+  // Vertical overflow is not a phone-only case: a tab-owned grid fitted down to the smallest legible font
+  // can still be taller than the pane on a short desktop window. Clipping the bottom rows is never right,
+  // so the same anchored scroll is the floor there too. (fitTabOwnedGrid handles the normal case.)
+  const rowOverflow = !!(winSize && viewportFit && winSize.rows > viewportFit.rows+1);
   host.classList.toggle('rowpan', rowOverflow);
   if(!rowOverflow){
     xt.style.transform='';
@@ -2026,6 +2091,7 @@ function onControl(s){
   // past (a reconnect, a re-measure, a lease handover), and the rows xterm drew under the old belief are
   // still on screen. Repainting costs one refresh of the visible rows.
   schedulePaintHeal(20);
+  fitTabOwnedGrid();
   applyPan(); updateMeta(); updateSizeBtn();
 }
 // TAP the size chip = pin the shared window to THIS device (everyone mirrors/pans it) — last-pinner-wins.
@@ -2107,6 +2173,7 @@ function reportViewport(dim){
       act:actFlag()
     }));
   }
+  fitTabOwnedGrid();
   applyPan();
   updateMeta(); updateSizeBtn(); applyScrollAffordance();
 }
@@ -2359,7 +2426,23 @@ $('#term').addEventListener('wheel', e=>{
   }catch(_){}
 }, {passive:false, capture:true});
 
-function setFont(px){ fontSize=Math.min(20,Math.max(11,px)); term.options.fontSize=fontSize; LS.set('mux_font',fontSize); doFit(); healTerminalSurface('font'); }
+// A tab-owned grid takes its cell size from the pane (see fitTabOwnedGrid), so A+/A- is a zoom on that
+// fit rather than a font size the fit would overwrite on the next size frame.
+function setFont(px){
+  if(sizeTabOwned && !sizePinned){
+    const dir = px > fontSize ? 0.1 : -0.1;
+    tabFontScale = Math.min(2.5, Math.max(0.5, Math.round((tabFontScale+dir)*100)/100));
+    LS.set('mux_tab_font', tabFontScale);
+    fitTabOwnedGrid();
+    if(typeof doFit==='function') doFit();
+    healTerminalSurface('zoom');
+    return;
+  }
+  fontSize=Math.min(20,Math.max(11,px)); appliedFont=fontSize;
+  term.options.fontSize=appliedFont; LS.set('mux_font',fontSize);
+  fitTabOwnedGrid();            // a tab-owned grid may need to stay smaller than the preference
+  doFit(); healTerminalSurface('font');
+}
 function updateMeta(){
   const b=$('#statusmeta'); if(!b) return;
   const view=sizeButtonPresentation();
