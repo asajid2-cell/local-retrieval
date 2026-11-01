@@ -509,6 +509,43 @@ class MuxdLocalIntegrationTests(unittest.TestCase):
         except Exception:
             pass
 
+    def test_a_full_ring_snapshot_fits_the_attach_server(self):
+        """muxtee re-sends its whole ring as ONE 0x03 frame on every register and every watch.
+
+        With websockets' 1 MiB default the server answered 1009 and closed the link, the tab
+        reconnected and sent the identical frame, and the loop repeated about once a second - the tab
+        never held a mirror at all. Asserted here against a real server, not just the constant: the
+        follow-up frame only lands if the big one was accepted.
+        """
+        if websockets is None:
+            self.skipTest("websockets not installed")
+        name = f"it-big-ring-{int(time.time() * 1000)}"
+        ring = b"A" * (2 * 1024 * 1024)          # TeeEngine.Ring, byte for byte
+        outcome = {}
+
+        async def scenario():
+            ws = await websockets.connect(f"ws://127.0.0.1:{self.muxd.port}",
+                                          max_size=None, ping_interval=None)
+            try:
+                await ws.send(json.dumps({"t": "owner", "s": name, "cmd": "",
+                                          "ownerKey": "e" * 32, "stream": True}))
+                ack = json.loads(await asyncio.wait_for(ws.recv(), 10))
+                outcome["ack"] = ack.get("t")
+                await ws.send(bytes([0x03]) + ring)
+                await asyncio.sleep(0.4)          # a 1009 would have closed the socket by now
+                await ws.send(json.dumps({"t": "size", "cols": 133, "rows": 44}))
+                await asyncio.sleep(0.2)
+                rows = (await request_json(self.muxd.port, {"t": "ls"}, timeout=10)).get("list", [])
+                outcome["row"] = next((r for r in rows if r.get("name") == name), None)
+            finally:
+                await ws.close()
+
+        asyncio.run(scenario())
+        self.assertEqual("owner-ok", outcome["ack"])
+        self.assertIsNotNone(outcome["row"], "the owner row is gone: the snapshot killed the link")
+        self.assertEqual((133, 44), (outcome["row"].get("cols"), outcome["row"].get("rows")),
+                         "the frame after the snapshot never arrived - the link was closed")
+
     def test_local_control_rejects_browser_origin_before_first_frame(self):
         self.assertEqual(1008, asyncio.run(browser_origin_close_code(self.muxd.port)))
         info = run_request(self.muxd.port, {"t": "info"})
