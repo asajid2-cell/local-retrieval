@@ -1294,6 +1294,11 @@ else:
 LAN_RETURN_INTERVAL = max(10, int(ENV.get("LAN_RETURN_INTERVAL", "30")))
 RING_CAP = 800_000           # per-session scrollback bytes kept
 SB_SEND = 260_000            # bytes replayed to a newly-attached viewer
+# One frame on the loopback attach socket carries a whole owner snapshot (kind 0x03), which is bounded
+# by muxtee's ring. The websockets default is 1 MiB and muxtee's ring is larger than that, so the default
+# turned every tab with a full ring into a 1009 close loop: the client re-sent the same snapshot on each
+# reconnect and was refused every time. Sized like the relay host link, which carries the same payloads.
+LOCAL_MAX_MESSAGE = int(ENV.get("LOCAL_MAX_MESSAGE", "8000000"))
 # Binary owner-link frame kinds (spec section 6.1). Dispatch is on the FIRST byte, so these must stay
 # outside the printable range a JSON text frame would begin with.
 OWNER_FRAME_INGEST = 0x01    # append the payload to the ring
@@ -3404,6 +3409,13 @@ async def handle_owner_binary(owner, frame: bytes):
             await owner.write_confirmed(payload)
 
 sessions = {}          # name -> Session
+# The relay's last stated viewer interest, keyed by session name. It has to outlive the session object:
+# reconcile_owner_disconnect POPS a stream owner's row, so a muxtee reconnect is a brand-new OwnerSession
+# that starts unwatched. The relay states its interest only on a transition (`syncWatch` early-returns
+# when its own flag already matches), so without this the relay still believes the tab is watched while
+# the new owner has never been told - the tab reconnects, the screen freezes, and nothing ever re-arms it.
+DESIRED_WATCH = {}     # name -> (watched: bool, stated_at: epoch seconds)
+DESIRED_WATCH_MAX = 512
 intent_records = {}    # scope:type:intentId -> durable request/outcome tombstone
 INTENT_TERMINAL_RETENTION_SECONDS = 180 * 24 * 60 * 60
 INTENT_TERMINAL_LIMIT = 20000
@@ -3417,6 +3429,18 @@ def live_session_names():
         except Exception:
             pass
     return names
+
+
+def remember_desired_watch(name, watched):
+    """Record what the relay last said it wants, so a rebuilt owner can be re-armed from it."""
+    now = time.time()
+    DESIRED_WATCH[name] = (bool(watched), now)
+    if len(DESIRED_WATCH) > DESIRED_WATCH_MAX:
+        # Nothing can consult an entry for a name that has no session and has not been restated in an
+        # hour; pruning only those keeps a long-lived muxd from accumulating one row per tab ever seen.
+        for key in [k for k, (_w, at) in DESIRED_WATCH.items()
+                    if k not in sessions and now - at > 3600]:
+            DESIRED_WATCH.pop(key, None)
 
 
 def restore_local_session_size(session):
@@ -4189,6 +4213,12 @@ async def serve_owner_connection(ws, first, sessions, outq, save_manifest, regis
         owner.owner_connected = True
         await ws.send(json.dumps({"t": "owner-ok", "s": name, "alive": True}))
         outq.put_nowait(("dead", name, ""))  # force relay session-list refresh
+        # A stream owner starts unwatched (section 6.5) and a reconnect rebuilds it from scratch, while
+        # the relay only re-states its interest on a transition. Re-arm from the last stated interest or
+        # every reconnect silently ends the mirror.
+        wanted = DESIRED_WATCH.get(name)
+        if owner.stream and wanted and wanted[0]:
+            owner.set_watched(True)
         async for raw in ws:
             # Binary frames are the muxtee path (spec section 6.1) and dispatch on the first
             # byte before any JSON is attempted. Text frames stay exactly as they were, so
@@ -5760,7 +5790,8 @@ async def main():
         while True:
             try:
                 async with _ws.serve(handler, "127.0.0.1", LOCAL_PORT, ping_interval=20,
-                                     ping_timeout=10, close_timeout=2, max_queue=32):
+                                     ping_timeout=10, close_timeout=2, max_queue=32,
+                                     max_size=LOCAL_MAX_MESSAGE):
                     log(f"local attach server listening on 127.0.0.1:{LOCAL_PORT}")
                     await asyncio.Future()
             except Exception as e:
@@ -6008,23 +6039,26 @@ async def main():
                                             "list": sess_list(),
                                             "notice": "auto-resume policy was not persisted",
                                         }))
-                                elif t == "watch" and name in sessions:
-                                    session = sessions[name]
+                                elif t in ("watch", "unwatch"):
+                                    # Recorded even with no live session: a stream owner row is popped the
+                                    # moment its link drops, so the relay's attach can land in exactly the
+                                    # window where the tab is between reconnects. Dropping the statement
+                                    # there is what used to leave a rebuilt owner permanently unwatched.
+                                    wanted = t == "watch"
+                                    if name:
+                                        remember_desired_watch(name, wanted)
+                                    session = sessions.get(name)
                                     if isinstance(session, OwnerSession):
-                                        session.set_watched(True)
+                                        session.set_watched(wanted)
                                         if session.stream:
-                                            log(f"[{name}] watched: forwarding owner output")
-                                    else:
+                                            log(f"[{name}] " + (
+                                                "watched: forwarding owner output" if wanted
+                                                else "unwatched: owner output parked in the ring"))
+                                    elif wanted and session is not None:
                                         # R5: a viewer just attached to a headless session. An alt-screen
                                         # TUI answers the size wiggle; an inline app that enabled ?1004 is
                                         # asked to repaint with FOCUS_IN (redraw_nudge alone leaves it stale).
                                         await asyncio.get_running_loop().run_in_executor(None, repaint_viewer, session)
-                                elif t == "unwatch" and name in sessions:
-                                    session = sessions[name]
-                                    if isinstance(session, OwnerSession):
-                                        session.set_watched(False)
-                                        if session.stream:
-                                            log(f"[{name}] unwatched: owner output parked in the ring")
                                 elif t == "i" and name in sessions:
                                     # A refusal returns before any write, so a frame without an
                                     # accepted proof performs zero PTY writes.
