@@ -1976,14 +1976,28 @@ let tabFontScale = (()=>{          // A+/A- on a tab-owned grid becomes a zoom o
   const v = Number(LS.get('mux_tab_font', 1));
   return (isFinite(v) && v>0) ? Math.min(2.5, Math.max(0.4, v)) : 1;
 })();
-let tabFitRejected = 0, tabFitPaneW = -1, tabFitPaneH = -1, tabFitPaneScale = 0;
+// How a fixed grid meets a pane whose aspect it does not match. 'fill' uses every pixel of width and
+// scrolls vertically (a real terminal window's behaviour when its font is bigger than the screen);
+// 'fit' shows every row and takes the margins. The choice is per device and remembered, because a
+// desktop and a phone want opposite answers.
+let tabFitMode = (LS.get('mux_tab_fit') === 'fit') ? 'fit' : 'fill';
+let tabFitRejected = 0, tabFitPaneW = -1, tabFitPaneH = -1, tabFitPaneScale = 0, tabFitPaneMode = '';
+let tabFitFollowup = 0;
+// Cell metrics only change after the renderer repaints, so the estimate that drove one step was read at
+// the PREVIOUS font size. Re-running the fit once on the next frame is what makes the search converge in
+// one repaint instead of settling at a size that was never measured (seen live: 12 where 13 fits, and a
+// fill landing on 17 with a 49px horizontal overflow). The latch makes each re-entry terminate.
+function scheduleTabFitFollowup(){
+  if(tabFitFollowup) return;
+  tabFitFollowup = requestAnimationFrame(()=>{ tabFitFollowup = 0; fitTabOwnedGrid(); });
+}
 function fitTabOwnedGrid(){
   const host=$('#term');
   if(!host) return;
   const owned = !!(sizeTabOwned && !sizePinned);
   host.classList.toggle('tabfit', owned);
   if(!owned){
-    tabFitRejected=0; tabFitPaneW=-1; tabFitPaneH=-1;
+    tabFitRejected=0; tabFitPaneW=-1; tabFitPaneH=-1; tabFitPaneMode='';
     if(appliedFont!==fontSize){ appliedFont=fontSize; try{ term.options.fontSize=fontSize; }catch(e){} }
     return;
   }
@@ -1992,17 +2006,25 @@ function fitTabOwnedGrid(){
   const availW=host.clientWidth-(parseFloat(cs.paddingLeft)||0)-(parseFloat(cs.paddingRight)||0);
   const availH=host.clientHeight-(parseFloat(cs.paddingTop)||0)-(parseFloat(cs.paddingBottom)||0);
   if(availW<80 || availH<60) return;
-  if(availW!==tabFitPaneW || availH!==tabFitPaneH || tabFontScale!==tabFitPaneScale){
-    tabFitPaneW=availW; tabFitPaneH=availH; tabFitPaneScale=tabFontScale; tabFitRejected=0;
+  // A real window resize re-opens the search. A scrollbar appearing does not: pan/rowpan are toggled by
+  // this very fit, and a 15px clientWidth change would otherwise clear the latch on every step and send
+  // the font back up to the size that just overflowed (seen live: fill bouncing to 17 with a pan bar).
+  const paneMoved = Math.abs(availW-tabFitPaneW) > 24 || Math.abs(availH-tabFitPaneH) > 24;
+  if(tabFitPaneW<0 || paneMoved || tabFontScale!==tabFitPaneScale || tabFitMode!==tabFitPaneMode){
+    tabFitPaneScale=tabFontScale; tabFitPaneMode=tabFitMode; tabFitRejected=0;
   }
+  tabFitPaneW=availW; tabFitPaneH=availH;
   const cell=cellMetrics();
   if(!(cell.w>0) || !(cell.h>0)) return;
-  // Font size that exactly spans the pane on each axis; the smaller one is the fit. Cell metrics are read
-  // from the size now in use, so dividing by appliedFont makes both estimates font-size independent.
+  // Font size that exactly spans the pane on each axis. Cell metrics are read from the size now in use,
+  // so dividing by appliedFont makes both estimates font-size independent.
   const fitW = availW/(term.cols*(cell.w/appliedFont));
   const fitH = availH/(term.rows*(cell.h/appliedFont));
   if(!isFinite(fitW) || !isFinite(fitH) || fitW<=0 || fitH<=0) return;
-  const fitFont = Math.min(fitW, fitH);
+  const fill = tabFitMode !== 'fit';
+  // 'fill' takes the width estimate and lets the height overflow (alignTerminalSurface keeps the bottom
+  // rows - the status bar and leaf line - pinned in view). 'fit' takes the smaller estimate.
+  const fitFont = fill ? fitW : Math.min(fitW, fitH);
 
   if(tabFontScale !== 1){
     // A zoomed view is the viewer's own choice: apply it exactly (fractionally, so every press of A+/A-
@@ -2011,12 +2033,16 @@ function fitTabOwnedGrid(){
     if(Math.abs(want-appliedFont) < 0.05) return;
     appliedFont=want;
     try{ term.options.fontSize=want; }catch(e){}
-    applyPan(); scheduleTerminalSurfaceAlign();
+    applyPan(); scheduleTerminalSurfaceAlign(); scheduleTabFitFollowup();
     healTerminalSurface('tabfit');
     return;
   }
 
-  const overflow = (term.cols*cell.w > availW+1) || (term.rows*cell.h > availH+1);
+  // The latch watches only the axis this mode is fitting: in 'fill' a tall grid is expected and the
+  // row pan handles it, so height must not be read as an overflow.
+  const overflow = fill
+    ? (term.cols*cell.w > availW+1)
+    : ((term.cols*cell.w > availW+1) || (term.rows*cell.h > availH+1));
   let want = Math.max(8, Math.min(32, Math.floor(fitFont)));
   if(overflow){                  // painted bigger than the pane - the last step was too big, go back
     tabFitRejected = appliedFont;
@@ -2031,6 +2057,7 @@ function fitTabOwnedGrid(){
   try{ term.options.fontSize=want; }catch(e){}
   applyPan();                    // the pan/rowpan classes follow the new painted size, not a stale measure
   scheduleTerminalSurfaceAlign();
+  scheduleTabFitFollowup();      // and the next frame re-measures the cell at this font and settles
   healTerminalSurface('tabfit');
   if(typeof doFit==='function') doFit();
 }
@@ -2137,7 +2164,18 @@ function onControl(s){
 }
 // TAP the size chip = pin the shared window to THIS device (everyone mirrors/pans it) — last-pinner-wins.
 // Tap again when it's already yours = back to auto. Long-press = pin another connected device.
-function cycleSize(){ if(sizeTabOwned && !sizePinned){ flash('This tab follows the PC terminal; its size cannot be pinned.'); return; } send('P', (sizePinned && sizeMine) ? '0' : ''); }
+// On a tab-owned grid there is no pin to offer (the PTY is the PC's screen), so the tap switches how this
+// device renders that fixed grid instead: fill the width, or fit every row.
+function cycleSize(){
+  if(sizeTabOwned && !sizePinned){
+    tabFitMode = (tabFitMode==='fill') ? 'fit' : 'fill';
+    LS.set('mux_tab_fit', tabFitMode);
+    fitTabOwnedGrid(); applyPan(); scheduleTerminalSurfaceAlign(); updateMeta(); updateSizeBtn();
+    flash(tabFitMode==='fill' ? 'Filling the width; scroll for the rows above' : 'Fitting every row; side margins fill the rest');
+    return;
+  }
+  send('P', (sizePinned && sizeMine) ? '0' : '');
+}
 function pinToOtherDevice(){
   const others = (sizeClients||[]).filter(c=> (c.dev||('sock-'+c.id)) !== deviceId);
   if(!others.length){ flash('No other device connected to pin'); return; }
@@ -2149,11 +2187,16 @@ function sizeButtonPresentation(){
   const dims = winSize ? (' '+winSize.cols+'×'+winSize.rows) : '';
   const host=$('#term'), panning=!!(host && host.classList.contains('pan'));
   // A teed PC tab (§7.3): the grid IS the PC's physical screen, so there is nothing to pin - a pin would
-  // resize the tab under the person sitting at it. Say so, and make the chip non-interactive.
+  // resize the tab under the person sitting at it. The chip still works, but it switches the rendering
+  // of that fixed grid for this device instead of changing the size.
   if(sizeTabOwned && !sizePinned){
-    let title='This tab follows the PC terminal at'+dims+'; its size is the physical screen and cannot be pinned.';
+    const fill = tabFitMode !== 'fit';
+    let title = 'This tab follows PC tab at'+dims+' - the PC terminal\'s physical screen, so its size cannot be pinned. '
+      + (fill ? 'Scaling fills the width and scrolls vertically for the rows above.'
+              : 'Every row is shown; the margins fill the rest of this screen.')
+      + ' Tap to ' + (fill ? 'fit every row instead.' : 'fill the width instead.');
     if(panning) title += ' This terminal is wider than your viewport; drag the horizontal scrollbar to pan.';
-    return { text:'🖥 follows PC tab ·'+dims, title, disabled:true };
+    return { text:(fill?'🖥 fills width ·':'🖥 fits rows ·')+dims, title, disabled:false };
   }
   const text = sizePinned
     ? ('📌 '+(sizeMine?'this device':(sizePinLabel||'other device'))+' ·'+dims)
