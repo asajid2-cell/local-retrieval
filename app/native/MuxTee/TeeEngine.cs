@@ -259,6 +259,11 @@ internal sealed class TeeEngine : IDisposable
         lastCols = cols;
         lastRows = rows;
         _pc.Resize(cols, rows);
+        // The mirror must follow the window the user is actually looking at. The relay cannot resize a
+        // stream owner from the web, so the tab is the only source of its geometry and it has to say so
+        // on every change - silence here means viewers keep rendering at the size the tab happened to be
+        // at when muxtee started.
+        Link?.SetSize(cols, rows);
         _log($"resize inner pty to {cols}x{rows}");
         return true;
     }

@@ -119,7 +119,7 @@ public class UnitTests
         var outBuf = new List<byte>();
         var drain = new System.Threading.Thread(() =>
         {
-            while (queue.TryTake(out var chunk)) outBuf.AddRange(chunk);
+            while (queue.TryTake(out var item)) outBuf.AddRange(item.Data);
         }) { IsBackground = true };
 
         drain.Start();

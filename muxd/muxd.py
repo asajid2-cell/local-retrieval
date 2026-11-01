@@ -4235,8 +4235,14 @@ async def serve_owner_connection(ws, first, sessions, outq, save_manifest, regis
             if mt == "o":
                 owner.ingest(base64.b64decode(m.get("d", "")))
             elif mt == "size":
-                owner.cols = max(20, int(m.get("cols") or owner.cols))
-                owner.rows = max(8, int(m.get("rows") or owner.rows))
+                cols = max(20, int(m.get("cols") or owner.cols))
+                rows = max(8, int(m.get("rows") or owner.rows))
+                if (cols, rows) != (owner.cols, owner.rows):
+                    owner.cols, owner.rows = cols, rows
+                    # Every viewer of a stream owner renders at this size (§7.1), and the relay learns
+                    # sizes only from the session list, which otherwise trickles out on the 5 s status
+                    # pump. Nudge it so a resize reaches the mirror immediately.
+                    outq.put_nowait(("dead", name, ""))
             elif mt == "child":
                 child_pid = int(m.get("pid", 0) or 0)
                 if child_pid <= 0:

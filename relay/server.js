@@ -3782,6 +3782,15 @@ wssHost.on('connection', (ws, req) => {
       // link instead, so counting it as liveness would let a malformed loop keep the age fresh while the
       // relay refuses every update.
       hostFrame.sessionsAt = Date.now();
+      // A stream owner's geometry is authoritative (§7.1) and changes every time the user resizes the
+      // local window, but this list used to be read for identity only: viewers kept rendering - and the
+      // pan chip kept naming - the size the tab had when its link first registered. Recompute exactly
+      // the sessions whose reported geometry moved.
+      const resized = [];
+      for (const [n, v] of incoming) {
+        const prev = hostSessions.get(n);
+        if (!prev || (prev.cols | 0) !== (v.cols | 0) || (prev.rows | 0) !== (v.rows | 0)) resized.push(n);
+      }
       hostSessions.clear();
       for (const [n, v] of incoming) hostSessions.set(n, v);
       for (const [n, st] of sessions) {
@@ -3793,6 +3802,7 @@ wssHost.on('connection', (ws, req) => {
       }
       reconcileRenameIntentsFromHost();
       sweepAttentionEpisodes();
+      for (const n of resized) recompute(n);
     } else if (m.t === 'createResult') {
       const rid = String(m.rid || '');
       const pending = pendingHostCreates.get(rid);

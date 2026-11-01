@@ -195,6 +195,67 @@ class RecordingWs:
             waiter.set_result(True)
 
 
+class OwnerSizeReporting(unittest.IsolatedAsyncioTestCase):
+    """§7.1: a tab owns its geometry, so every viewer renders at the size the tab last reported.
+
+    The hello carries the size once, at connect. Without the `size` frame a tab resized afterwards kept
+    mirroring at its launch width for the life of the link - and the relay cannot fix it, because it is
+    forbidden to resize a stream owner from the web.
+    """
+
+    async def _feed(self, frames):
+        sessions, sent, owners = {}, [], []
+        outq = muxd.RelayFanout()
+
+        async def save(source):
+            return None
+
+        async def register(first, ws):
+            s = make_stream_session(first["s"], asyncio.get_running_loop(), outq)
+            s._send_owner = lambda frame: sent.append(frame)
+            sessions[first["s"]] = s
+            owners.append(s)
+            return s, ""
+
+        class OneShot:
+            def __init__(self, payloads):
+                self._payloads = list(payloads)
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                if not self._payloads:
+                    raise StopAsyncIteration
+                return self._payloads.pop(0)
+
+            async def send(self, frame):
+                return None
+
+        await muxd.serve_owner_connection(
+            OneShot([json.dumps(f) for f in frames]), {"t": "owner", "s": "tab"},
+            sessions, outq, save, register,
+        )
+        nudges = 0
+        while not outq.empty():
+            if outq.get_nowait() == ("dead", "tab", ""):
+                nudges += 1
+        return owners[0], nudges
+
+    async def test_a_size_frame_moves_the_owned_geometry(self):
+        owner, _ = await self._feed([{"t": "size", "cols": 209, "rows": 51}])
+        self.assertEqual((owner.cols, owner.rows), (209, 51))
+
+    async def test_a_size_change_nudges_the_relay_so_viewers_repaint_at_once(self):
+        # One nudge is the registration refresh, one is the reap; the third is the size change itself.
+        _owner, nudges = await self._feed([{"t": "size", "cols": 209, "rows": 51}])
+        self.assertEqual(nudges, 3)
+
+    async def test_an_unchanged_size_does_not_nudge(self):
+        _owner, nudges = await self._feed([{"t": "size", "cols": 120, "rows": 30}])
+        self.assertEqual(nudges, 2, "a redundant size frame must not wake the relay")
+
+
 class OwnerBinaryInput(unittest.IsolatedAsyncioTestCase):
     """6.4: remote input reaches the owner as a confirmed write."""
 

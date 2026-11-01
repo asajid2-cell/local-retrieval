@@ -115,12 +115,22 @@ internal sealed class MuxLink : IDisposable
     public static string DefaultUri()
         => "ws://127.0.0.1:" + (Environment.GetEnvironmentVariable("MUXTEE_LOCAL_PORT") ?? "7699");
 
-    // The size the next hello reports. A resize calls this so a later reconnect announces the current
-    // dimensions rather than the ones the link was constructed with.
+    // The size the next hello reports, and - while connected - a live `size` frame. A stream owner's
+    // geometry IS the tab's physical screen: the relay renders every viewer at whatever the owner last
+    // reported and refuses to resize it from the web (§7.1). The hello carries this only at connect, so
+    // without the frame a tab resized after launch kept mirroring at its launch width for the whole life
+    // of the link: text wrapped at the old column count and the pan chip named a size nobody was at.
     public void SetSize(int cols, int rows)
     {
+        if (cols <= 0 || rows <= 0) return;
+        if (cols == _cols && rows == _rows) return;
         _cols = cols;
         _rows = rows;
+        // Off-link the next hello carries it, and the queue is purged on connect anyway.
+        var ws = _ws;
+        if (ws is null || ws.State != WebSocketState.Open) return;
+        _outText.Enqueue("{\"t\":\"size\",\"cols\":" + cols + ",\"rows\":" + rows + "}");
+        try { _outWake.Release(); } catch (SemaphoreFullException) { }
     }
 
     public void Start()

@@ -140,6 +140,28 @@ test('§7.3: a hosted non-owner session is NOT marked tabOwned', async t => {
   assert.equal(d.tabOwned, false, 'only a stream owner locks the pin');
 });
 
+// §7.1: the tab is the only source of its geometry, and the user resizes it. muxtee reports the change
+// on the owner link, muxd relays it on the session list, and the relay recomputes the attached viewers.
+// Before this the list was read for identity only, so a tab resized after its link came up kept
+// mirroring - and kept naming in the pan chip - the width it had at registration.
+test('§7.1: a listed size change moves attached viewers and never resizes the tab', async t => {
+  const h = new RelayHarness({ ALLOWED_WS_ORIGINS: ORIGIN });
+  await h.start();
+  t.after(() => h.stop());
+  const host = await h.connectHost([streamOwner('resizetab', 120, 40)], { caps: WATCH_CAPS });
+  t.after(() => host.close());
+
+  const A = await openViewer(h.port, 'resizetab', 'devA', 120, 40);
+  t.after(() => A.ws.terminate());
+  await lastDims(A, x => x.cols === 120 && x.tabOwned === true, 'initial tab size');
+
+  host.sendSessions([streamOwner('resizetab', 209, 51)]);
+  const d = await lastDims(A, x => x.cols === 209 && x.rows === 51, 'viewer follows the tab resize');
+  assert.equal(d.tabOwned, true, 'the tab still owns its geometry');
+  assert.equal(host.messages.some(m => m.t === 'resize' && m.s === 'resizetab'), false,
+    'a tab-owned geometry must never be resized back from the web');
+});
+
 test('§7.3: the session list flags a teed PC tab with localTab', async t => {
   const h = new RelayHarness({ ALLOWED_WS_ORIGINS: ORIGIN });
   await h.start();
