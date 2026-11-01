@@ -54,6 +54,10 @@ internal sealed class MuxLink : IDisposable
 
     // Bounded so a slow or absent muxd cannot grow T1's memory. 1 MiB, matching the spec's net queue.
     private readonly ConcurrentQueue<byte[]> _out = new();
+    // Acks for remote input. Text frames, so they cannot share the binary queue, and they must not be
+    // dropped under pressure: a lost ack costs muxd its whole write_confirmed timeout and reports a
+    // failure that did not happen.
+    private readonly ConcurrentQueue<string> _outText = new();
     private readonly SemaphoreSlim _outWake = new(0);
     private long _outBytes;
     private readonly long _outCap = 1024 * 1024;
@@ -93,6 +97,19 @@ internal sealed class MuxLink : IDisposable
         _uri = uri;
         _input = input;
         _log = log;
+        // T3 reports a remote write once it has actually reached the child. Until this was wired, muxd's
+        // write_confirmed waited its full 8s timeout for every remote keystroke and then reported
+        // "visible terminal input failed" - a failure that never happened, while the host link sat
+        // blocked the whole time.
+        _input.Written += OnRemoteInputWritten;
+    }
+
+    private void OnRemoteInputWritten(string rid, bool ok)
+    {
+        var frame = "{\"t\":\"inputResult\",\"rid\":" + JsonSerializer.Serialize(rid) +
+                    ",\"ok\":" + (ok ? "true" : "false") + "}";
+        _outText.Enqueue(frame);
+        try { _outWake.Release(); } catch (SemaphoreFullException) { }
     }
 
     public static string DefaultUri()
@@ -161,6 +178,8 @@ internal sealed class MuxLink : IDisposable
                 await _outWake.WaitAsync(ReconnectPoll, _cts.Token);
                 // Send on the socket captured for THIS iteration, never on _ws: the receive half can drop
                 // the link and null _ws mid-send, and dereferencing it here would be a needless NRE.
+                while (ws is not null && _outText.TryDequeue(out var text))
+                    await ws.SendAsync(Encoding.UTF8.GetBytes(text), WebSocketMessageType.Text, true, _cts.Token);
                 while (ws is not null && _out.TryDequeue(out var frame))
                 {
                     Interlocked.Add(ref _outBytes, -frame.Length);
@@ -202,6 +221,9 @@ internal sealed class MuxLink : IDisposable
             // we just lost are stale screen, so drop them rather than replay them into the new ring.
             _watched = false;
             while (_out.TryDequeue(out var stale)) Interlocked.Add(ref _outBytes, -stale.Length);
+            // An ack for a frame from the link we just lost means nothing to the new one, and the old
+            // muxd already timed the write out.
+            while (_outText.TryDequeue(out _)) { }
 
             // A stream owner reports itself as a plain shell with no resolvable command identity (section
             // 6.3): muxtee relays a terminal that muxd may not relaunch, so it must not claim a writer
@@ -299,7 +321,15 @@ internal sealed class MuxLink : IDisposable
                     if (root.TryGetProperty("d", out var d) && d.ValueKind == JsonValueKind.String)
                     {
                         var data = Convert.FromBase64String(d.GetString()!);
-                        if (data.Length > 0) _input.Enqueue(data);
+                        if (data.Length > 0)
+                        {
+                            // rid is present when muxd is holding a durable write open on this frame
+                            // (write_confirmed); T3 answers it after the child has taken the bytes.
+                            var rid = root.TryGetProperty("rid", out var r) && r.ValueKind == JsonValueKind.String
+                                ? r.GetString()
+                                : null;
+                            _input.Enqueue(data, rid);
+                        }
                     }
                     break;
                 case "watch":
@@ -336,6 +366,7 @@ internal sealed class MuxLink : IDisposable
 
     public void Dispose()
     {
+        try { _input.Written -= OnRemoteInputWritten; } catch { }
         try { _cts.Cancel(); } catch { }
         try { _ws?.Dispose(); } catch { }
         // A local write must never be delayed by the link going away, so this does not wait on the tasks.

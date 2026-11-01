@@ -32,6 +32,9 @@ internal sealed class TeeEngine : IDisposable
     // Whether the tab's console is currently capturing the mouse (toggled by T1 to match _screen).
     private bool _mouseCapture;
 
+    // A reconnect/watch snapshot is sent as ONE websocket message, so this capacity must stay under the
+    // local attach server's max message size (muxd LOCAL_MAX_MESSAGE, 8 MB) or the link is closed 1009 on
+    // every register - which is a permanent reconnect loop, not a degraded mirror.
     public RingBuffer Ring { get; } = new(2 * 1024 * 1024);
 
     // Set when the child appeared to be resized behind our back and the net tier should not trust the
@@ -266,8 +269,22 @@ internal sealed class TeeEngine : IDisposable
     {
         try
         {
-            while (_input.TryTake(out var chunk))
-                WriteAll(_innerWrite, chunk);
+            while (_input.TryTake(out var item))
+            {
+                bool ok = false;
+                try
+                {
+                    WriteAll(_innerWrite, item.Data);
+                    ok = true;
+                }
+                finally
+                {
+                    // The ack means "these bytes reached the child", which is the only claim muxd's
+                    // write_confirmed can honestly make. Answering at enqueue time would let a remote
+                    // sender believe a keystroke landed when the child had already gone away.
+                    _input.NotifyWritten(item.Rid, ok);
+                }
+            }
         }
         catch (Exception ex)
         {
