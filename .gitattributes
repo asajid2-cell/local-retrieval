@@ -23,3 +23,9 @@ scripts/* text eol=lf
 # longer byte-matches its blob and md5-vs-blob provenance checks need a CR strip.
 # Pin them to LF so the shipped bytes equal the committed blob exactly.
 relay/public/* text eol=lf
+
+# The element-map contract is mirrored byte-for-byte from the gateway repo and
+# its vectors are identified by sha256 in docs/protocol-fields.md. A CRLF
+# checkout would change the bytes and break that equality.
+docs/terminal-element-map.md text eol=lf
+docs/element-map-vectors.json text eol=lf
