@@ -1996,7 +1996,7 @@ function fitTabOwnedGrid(){
   const gridW=term.cols*cell.w, targetW=availW*tabFontScale;
   const fitFont = availW/(term.cols*(cell.w/appliedFont));   // font size that spans the pane width
   if(!isFinite(fitFont) || fitFont<=0) return;
-  let want = Math.max(8, Math.min(22, Math.floor(fitFont*tabFontScale)));
+  let want = Math.max(8, Math.min(32, Math.floor(fitFont*tabFontScale)));
   if(gridW > availW+1){          // painted wider than the pane - the last step was too big, go back
     tabFitRejected = appliedFont;
     if(want >= appliedFont) want = appliedFont-1;   // the measurement decides, not a stale estimate
