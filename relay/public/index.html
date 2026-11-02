@@ -1613,7 +1613,7 @@ function reloadTerminal(quiet){
   connect(name, true);   // re-attach: CLEAR + scrollback replay + live, all client state reset
 }
 document.addEventListener('keydown', e=>{ if(e.ctrlKey && e.altKey && (e.key==='r'||e.key==='R')){ e.preventDefault(); e.stopPropagation(); reloadTerminal(); } }, true);
-window.__muxBuild='2026-10-09-mobile-tap-focus-nav-scroll';   // bump per web deploy so a loaded version is verifiable (supersedes 2026-10-08 mobile-delta-sole-forwarder, which is still in this tree)
+window.__muxBuild='2026-11-02-element-map-viewer';   // bump per web deploy so a loaded version is verifiable (supersedes 2026-10-09-mobile-tap-focus-nav-scroll)
 try{ console.info('multiplex build', window.__muxBuild); }catch(e){}
 const helper = $('#term').querySelector('.xterm-helper-textarea');
 function hardenHelperTextarea(){
