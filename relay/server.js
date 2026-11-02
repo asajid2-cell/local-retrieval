@@ -15,6 +15,9 @@ const { createRetention, pruneTranscripts: pruneTranscriptRetention } = require(
 // Every acknowledged state mutation commits through durable-state.js before it is published in memory.
 const { createLeaseConduit } = require('./lease-conduit');
 const screenModel = require('./screen-model');
+// OSC 21338: the renderer's semantic element map. The relay strips the sequence from the byte
+// stream (a browser must never see it) and forwards the decoded map as its own viewer frame.
+const elementMap = require('./element-map');
 // The write lease lives in muxd. This relay holds no lease key and makes no lease decision; the
 // conduit forwards client-signed frames byte-for-byte and caches muxd's notices as UI hints only.
 const leaseConduit = createLeaseConduit();
@@ -3863,7 +3866,13 @@ wssHost.on('connection', (ws, req) => {
     } else if (m.t === 'sb') {
       const n = strictMuxName(m.s); const st = sessions.get(n); if (!st) return;
       if (!st.sbInFlight || String(m.rid || '') !== st.sbRid) return;
-      const buf = Buffer.from(m.d || '', 'base64');
+      // This path bypasses deliverHostOutput, so the element map is stripped here too. The replay is
+      // an independent stream, not a continuation of the live one: a fresh state, no carry forward.
+      // A replay that begins mid-body has no introducer, so the fragment passes through as text
+      // (contract 2a) - the fix for that is at the ring, not here.
+      const clean = elementMap.stripElementMap(Buffer.from(m.d || '', 'base64'), elementMap.createStripState());
+      const buf = clean.text;
+      if (clean.frames.length) publishElementMap(n, st, clean.frames[clean.frames.length - 1], true);
       // Seed/refresh the screen model from muxd's replay so the next attach can serialize a few KB of
       // screen instead of shipping this whole byte log again. The replay is the authoritative bytes, so
       // feeding them to the model is safe even when the model was empty; the geometry is the shared one.
@@ -4101,6 +4110,9 @@ function sessionState(name) {
     st = {
       clients: new Map(), cur: null, unpinnedLocalSize: null, sbInFlight: false, sbRid: '',
       sbWaiters: new Set(), sbRequestTimer: null,
+      // One element-map state per session, never per viewer: the strip is applied once, before
+      // fan-out, so the screen model and every viewer see the same text.
+      emap: { strip: elementMap.createStripState(), map: null, gen: null },
     };
     sessions.set(name, st);
   }
@@ -4175,12 +4187,35 @@ function sendViewer(name, st, client, data, replayBurst = false) {
     return false;
   }
 }
+// The element map is a control frame, not terminal output: it goes straight to each viewer, never
+// through sendViewer (which may coalesce or drop it into a burst queue). Dedupe is on `gen` alone,
+// exactly as the contract says, so the 10 s heartbeat costs nothing after the first copy. A frame
+// from a scrollback replay is only used when no live map has been published yet, because the replay
+// is older than anything already on the wire.
+function publishElementMap(name, st, frame, fromReplay) {
+  if (!st.emap) return;
+  const current = elementMap.clipFrame(frame);
+  if (!current) return;
+  if (st.emap.map && (fromReplay || current.gen === st.emap.gen)) return;
+  st.emap.map = current;
+  st.emap.gen = current.gen;
+  const msg = elementMap.encodeViewerFrame(current);
+  for (const c of st.clients.values()) {
+    if (!c || !c.ws || c.ws.readyState !== 1) continue;
+    try { c.ws.send(msg); } catch {}
+  }
+}
 // The single output fan-out. Both the JSON `o` frame and the binary one land here with the raw bytes
 // already in hand, so the buffering, the go-live clear and the per-viewer send live in exactly one place
 // and the two transports cannot drift apart.
 function deliverHostOutput(name, buf) {
   const h = hostSessions.get(name); if (h) h.lastOut = Date.now();
   const st = sessions.get(name); if (!st) return;
+  // Remove the element map before anything else touches these bytes: a viewer must never receive the
+  // sequence, and the screen model must feed on the same text the viewers get.
+  const stripped = elementMap.stripElementMap(buf, st.emap.strip);
+  buf = stripped.text;
+  if (stripped.frames.length) publishElementMap(name, st, stripped.frames[stripped.frames.length - 1], false);
   // Keep the screen model current with the same bytes the viewers get, at the shared geometry the
   // viewers will render at. Off-geometry feeds are refused inside the model, so a resize simply makes
   // the model unavailable until it is rebuilt rather than letting it drift out of step with the stream.
@@ -4464,6 +4499,9 @@ wss.on('connection', async (ws, req) => {
       }
     }, HOST_SB_WAIT_MS);
     recompute(name);
+    // After the size frame, give a newly attached viewer the map that is already current, so widgets
+    // paint now instead of waiting up to one heartbeat. Nothing held means nothing is said.
+    if (st.emap && st.emap.map) { try { ws.send(elementMap.encodeViewerFrame(st.emap.map)); } catch {} }
     // A viewer that attaches mid-lease must not be told "you may type" by silence. Replay muxd's
     // last notice verbatim; if the relay has none, it says nothing rather than inventing a state.
     {
