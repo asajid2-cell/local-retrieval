@@ -1617,6 +1617,131 @@ def strip_replay_dsr(data):
     return REPLAY_QUERY_RE.sub(b"", data)
 
 
+# OSC 21338 is the gateway's terminal element map: a full, base64url JSON map re-sent every 10 s with
+# the same `gen` while the screen is unchanged. It is a control channel, not screen content. The live
+# path must keep it - the relay decodes it and hands browsers the map as its own frame - but history
+# must not: at ~4.2 KB per frame the 800 KB ring would hold ~32 minutes of base64 that nothing renders.
+# So one input chunk has two outputs: `pending` (live ws) keeps the bytes verbatim, the ring gets the
+# stripped text. This is a ring-side stripper only; strip at or upstream of the net branch and the
+# relay would never see a map at all (and every relay test would still pass, because they feed the
+# relay directly).
+ELEMENT_MAP_ESC = b"\x1b]21338;"     # ESC ] 21338 ;
+ELEMENT_MAP_C1 = b"\x9d21338;"       # 0x9D 21338 ;
+ELEMENT_MAP_CARRY_MAX = 65536        # same bounded carry as the relay consumer (contract 2a)
+_EM_BEL, _EM_CAN, _EM_SUB = 0x07, 0x18, 0x1A
+_EM_ESC, _EM_ST, _EM_BS, _EM_C1 = 0x1B, 0x9C, 0x5C, 0x9D
+
+
+def _element_map_introducer(buf, at):
+    """Length of a complete legal introducer, 0 for a proper prefix (hold it), -1 for text."""
+    first = buf[at]
+    if first == _EM_ESC:
+        template = ELEMENT_MAP_ESC
+    elif first == _EM_C1:
+        template = ELEMENT_MAP_C1
+    else:
+        return -1
+    avail = min(len(template), len(buf) - at)
+    if bytes(buf[at:at + avail]) != template[:avail]:
+        return -1
+    return len(template) if avail == len(template) else 0
+
+
+def _find_element_map_introducer(buf, start):
+    """First legal introducer (or a trailing partial one) at or after `start`, else -1."""
+    for at in range(start, len(buf)):
+        if buf[at] != _EM_ESC and buf[at] != _EM_C1:
+            continue
+        if _element_map_introducer(buf, at) >= 0:
+            return at
+    return -1
+
+
+class ElementMapStrip:
+    """Ring-side OSC 21338 stripper with the contract's per-session bounded carry.
+
+    One instance per session, mutated only by the thread that appends to that session's ring. The body
+    is never decoded here: an introducer makes the sequence ours by command number, and history drops
+    it either way, so validation belongs to the relay, not the ring.
+    """
+
+    def __init__(self):
+        self.carry = b""
+        self.dropped = 0
+
+    def _hold(self, buf, text_from, at, parts):
+        if at > text_from:
+            parts.append(bytes(buf[text_from:at]))
+        held = buf[at:]
+        # A runaway body past the cap is abandoned; scanning resumes at the next legal introducer so a
+        # well-formed frame behind the garbage is not lost with it.
+        while len(held) > ELEMENT_MAP_CARRY_MAX:
+            self.dropped += 1
+            nxt = _find_element_map_introducer(held, 1)
+            held = held[nxt:] if nxt >= 0 else b""
+        self.carry = bytes(held)
+
+    def strip(self, data: bytes) -> bytes:
+        if not data and not self.carry:
+            return b""
+        buf = (self.carry + bytes(data or b"")) if self.carry else bytes(data or b"")
+        parts = []
+        text_from = 0
+        i = 0
+        n = len(buf)
+
+        while i < n:
+            start = -1
+            for at in range(i, n):
+                if buf[at] == _EM_ESC or buf[at] == _EM_C1:
+                    start = at
+                    break
+            if start < 0:
+                break
+
+            m = _element_map_introducer(buf, start)
+            if m == 0:
+                self._hold(buf, text_from, start, parts)
+                return b"".join(parts)
+            if m < 0:
+                i = start + 1                  # not ours: this byte stays text, keep scanning
+                continue
+
+            # The body runs to the first terminator or abort. No body byte can be a terminator
+            # (base64url excludes all of them), so the boundary cannot be spoofed from a payload.
+            k, end, nxt = start + m, -1, -1
+            while k < n:
+                c = buf[k]
+                if c == _EM_BEL or c == _EM_ST:      # terminator, consumed
+                    end, nxt = k, k + 1
+                    break
+                if c == _EM_CAN or c == _EM_SUB:     # abort, consumed
+                    end, nxt = k, k + 1
+                    break
+                if c == _EM_ESC:
+                    if k + 1 >= n:                   # could still be ST
+                        break
+                    if buf[k + 1] == _EM_BS:         # ST, consumed
+                        end, nxt = k, k + 2
+                    else:                            # abort: ESC survives as text
+                        end, nxt = k, k
+                    break
+                k += 1
+            if end < 0:
+                self._hold(buf, text_from, start, parts)
+                return b"".join(parts)
+
+            if start > text_from:
+                parts.append(bytes(buf[text_from:start]))
+            text_from = nxt
+            i = nxt
+
+        if text_from < n:
+            parts.append(bytes(buf[text_from:]))
+        self.carry = b""
+        return b"".join(parts)
+
+
 def launch_candidate_ids(cmd="", ids=None):
     candidates = _candidate_resume_ids(cmd, ids)
     unique = {}
@@ -2889,6 +3014,7 @@ class Session:
         self.created = time.time(); self.last_out = time.time()
         self.ring = collections.deque(); self.ring_len = 0
         self._ring_lock = threading.RLock()
+        self.emap_strip = ElementMapStrip()     # ring-only: `pending` keeps the OSC verbatim
         self.replay_state = TerminalReplayState()
         self.dead = False; self.user_killed = False
         self.deaths = []
@@ -3026,6 +3152,14 @@ class Session:
 
     def _append_ring(self, data):
         with self._ring_lock:
+            # Ring-only element-map strip (see ElementMapStrip): history must never hold an OSC 21338
+            # sequence, while the live `pending` copy of these same bytes is forwarded untouched. The
+            # per-session carry holds a fragment a chunk boundary split, so base64 never leaks into a
+            # replay. A stream that carries no frame is unchanged byte for byte.
+            data = self.emap_strip.strip(data)
+            if not data:
+                self.last_out = time.time()
+                return
             if len(data) >= RING_CAP:
                 retained = data[-RING_CAP:]
                 self.ring.clear()
@@ -3224,6 +3358,7 @@ class OwnerSession:
         self.created = time.time(); self.last_out = time.time()
         self.ring = collections.deque(); self.ring_len = 0
         self._ring_lock = threading.RLock()
+        self.emap_strip = ElementMapStrip()     # ring-only: `pending` keeps the OSC verbatim
         self.replay_state = TerminalReplayState()
         self.dead = False; self.user_killed = False
         self.deaths = []
@@ -3291,6 +3426,14 @@ class OwnerSession:
 
     def _append_ring(self, data):
         with self._ring_lock:
+            # Ring-only element-map strip (see ElementMapStrip): history must never hold an OSC 21338
+            # sequence, while the live `pending` copy of these same bytes is forwarded untouched. The
+            # per-session carry holds a fragment a chunk boundary split, so base64 never leaks into a
+            # replay. A stream that carries no frame is unchanged byte for byte.
+            data = self.emap_strip.strip(data)
+            if not data:
+                self.last_out = time.time()
+                return
             if len(data) >= RING_CAP:
                 retained = data[-RING_CAP:]
                 self.ring.clear()
@@ -3380,10 +3523,15 @@ class OwnerSession:
         # spec section 6.1, kind 0x03: the owner's screen and our ring have diverged, so the ring is
         # replaced wholesale rather than appended to. The same resync-the-viewers machinery the overflow
         # path uses does the second half (relay paints CLEAR + scrollback), so there is one repaint path.
+        # A resync is a new stream: any fragment the previous stream left in the strip carry belongs to
+        # bytes that are now gone, so the stripper starts fresh and only the ring copy is stripped (the
+        # DECSET tracker must still see the raw bytes, exactly as it does on a live ingest).
+        self.emap_strip = ElementMapStrip()
+        history = self.emap_strip.strip(data)
         with self._ring_lock:
             self.ring.clear()
-            self.ring.append(data)
-            self.ring_len = len(data)
+            self.ring.append(history)
+            self.ring_len = len(history)
         self.replay_state = TerminalReplayState()
         if data:
             self.replay_state.ingest(data)
