@@ -1632,6 +1632,38 @@ _EM_BEL, _EM_CAN, _EM_SUB = 0x07, 0x18, 0x1A
 _EM_ESC, _EM_ST, _EM_BS, _EM_C1 = 0x1B, 0x9C, 0x5C, 0x9D
 
 
+_EM_B64_RUN = re.compile(rb"[A-Za-z0-9_=-]{128,}")
+_EM_TAIL_CLOSERS = (b"\x1b\\", b"\x9c", b"\x07", b"\x18", b"\x1a")
+
+
+def drop_leading_element_map_tail(data: bytes) -> bytes:
+    """Drop a mid-body OSC 21338 fragment sitting at the head of a RESYNC snapshot.
+
+    muxtee's ring evicts from the FRONT at byte granularity (`RingBuffer.Append`), so its snapshot can
+    begin inside a body, with no introducer in front of it. Contract 2a is right that a stream starting
+    mid-body is text - the stripper cannot invent an introducer - but for a snapshot that tail is a
+    known artefact of the eviction, and left alone it is replayed to every viewer as tens of KB of
+    base64. So it is removed where the snapshot is produced.
+
+    Only the head is examined, and only an unbroken run of base64url characters at offset 0 that is
+    closed by a terminator can be such a tail. Terminal output does contain long runs of one character
+    (a `-----` rule, a row of `=`), so the run must also be high-entropy: base64 of JSON uses many
+    distinct byte values, a rule uses one. Anything else is returned byte for byte.
+    """
+    if not data:
+        return data
+    m = _EM_B64_RUN.match(data)
+    if not m:
+        return data
+    if len(set(m.group(0))) < 12:
+        return data
+    end = m.end()
+    for closer in _EM_TAIL_CLOSERS:
+        if data.startswith(closer, end):
+            return data[end + len(closer):]
+    return data
+
+
 def _element_map_introducer(buf, at):
     """Length of a complete legal introducer, 0 for a proper prefix (hold it), -1 for text."""
     first = buf[at]
@@ -3527,7 +3559,10 @@ class OwnerSession:
         # bytes that are now gone, so the stripper starts fresh and only the ring copy is stripped (the
         # DECSET tracker must still see the raw bytes, exactly as it does on a live ingest).
         self.emap_strip = ElementMapStrip()
-        history = self.emap_strip.strip(data)
+        # A snapshot from an evicting ring can start inside a body. That tail has no introducer, so the
+        # stripper would honour 2a and keep it as text; drop it here, where the snapshot is known to be
+        # one, before it becomes part of the ring.
+        history = self.emap_strip.strip(drop_leading_element_map_tail(data))
         with self._ring_lock:
             self.ring.clear()
             self.ring.append(history)

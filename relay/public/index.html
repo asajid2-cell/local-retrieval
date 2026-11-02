@@ -141,6 +141,9 @@
      the font is fitted until the whole cols x rows grid is inside the pane (fitTabOwnedGrid). Once it fits,
      the grid is centred instead of hugging the left edge and leaving a dead margin. */
   #term.tabfit:not(.pan) .xterm { width:max-content !important; margin-left:auto; margin-right:auto; }
+  /* flex/fill stretch the SCREEN to the pane edge; a centred .xterm would shift that stretch by the
+     leftover margin and overflow on one side, so a stretched grid is flush left. */
+  #term.tabfit.stretch .xterm { margin-left:0 !important; margin-right:0 !important; }
   @media (hover:hover) and (pointer:fine) {
     #term.pan::-webkit-scrollbar { height:10px; background:var(--panel-2); }
     #term.pan::-webkit-scrollbar-thumb { background:var(--rose); border-radius:999px; }
@@ -1613,7 +1616,7 @@ function reloadTerminal(quiet){
   connect(name, true);   // re-attach: CLEAR + scrollback replay + live, all client state reset
 }
 document.addEventListener('keydown', e=>{ if(e.ctrlKey && e.altKey && (e.key==='r'||e.key==='R')){ e.preventDefault(); e.stopPropagation(); reloadTerminal(); } }, true);
-window.__muxBuild='2026-11-02-element-map-viewer';   // bump per web deploy so a loaded version is verifiable (supersedes 2026-10-09-mobile-tap-focus-nav-scroll)
+window.__muxBuild='2026-11-02-emap-inline-geometry-flex-fit';   // bump per web deploy so a loaded version is verifiable (supersedes 2026-10-09-mobile-tap-focus-nav-scroll)
 try{ console.info('multiplex build', window.__muxBuild); }catch(e){}
 const helper = $('#term').querySelector('.xterm-helper-textarea');
 function hardenHelperTextarea(){
@@ -2024,24 +2027,41 @@ function emapBuild(){
     if(!want.has(id)){ n.remove(); emapNodes.delete(id); }
   }
 }
+// Rows between the terminal's first row and the app block's row 0. On the alternate screen the app owns
+// the grid, so it is 0. An inline app paints its block part-way down the PTY and publishes that offset
+// as `oy` - the same number the app subtracts from every mouse row (ink.tsx getMouseRowOffset). A normal
+// screen with no `oy` is a frame from before the probe answered: its rows cannot be placed, so 0 boxes.
+function emapRowOffset(){
+  let altScreen = true;
+  try{ altScreen = term.buffer.active.type === 'alternate'; }catch(e){ altScreen = false; }
+  if(altScreen) return 0;
+  return (emap && Number.isFinite(emap.oy) && emap.oy >= 0) ? emap.oy : null;
+}
 // Place every box on the cells the app drew. The offset recipe is the one #predict already uses: the
 // screen rect is the origin and the cells divide it, so pan/rowpan/font changes need no separate maths.
 function emapPlace(){
   if(!emapLayer || !emap) return;
   const host = $('#term');
   if(!host || !emapShown){ emapLayer.style.display = 'none'; return; }
-  if(emap.cols !== (term.cols|0) || emap.rows !== (term.rows|0)){ emapLayer.style.display = 'none'; return; }
-  // FULLSCREEN ONLY. The map's rows are app-space, and on the alternate screen the app's row 0 IS the
-  // terminal's row 0, so a box lands on the cell the app painted. An INLINE app paints its block part-way
-  // down the PTY and subtracts that block origin from every mouse row (ink.tsx:176): the origin is
-  // neither published nor derivable here, so a box would be off by that many rows - worse than no box.
+  // Columns must always line up or every box lands on the wrong cell. Rows are different: on the
+  // alternate screen the app owns the whole grid, but an INLINE app paints a block that is usually
+  // SHORTER than the PTY (a form, a picker) and publishes only those rows. Requiring equality hid every
+  // inline map - which is the common case - and the boxes simply never appeared.
   let altScreen = true;
   try{ altScreen = term.buffer.active.type === 'alternate'; }catch(e){ altScreen = false; }
-  if(!altScreen){ emapLayer.style.display = 'none'; return; }
+  if(emap.cols !== (term.cols|0)){ emapLayer.style.display = 'none'; return; }
+  if(altScreen && emap.rows !== (term.rows|0)){ emapLayer.style.display = 'none'; return; }
+  const rowOrigin = emapRowOffset();
+  if(rowOrigin === null){ emapLayer.style.display = 'none'; return; }
   const scr = host.querySelector('.xterm-screen');
   if(!scr){ emapLayer.style.display = 'none'; return; }
   const r = scr.getBoundingClientRect(), hr = host.getBoundingClientRect();
-  const cw = r.width / emap.cols, ch = r.height / emap.rows;
+  // The screen element spans the TERMINAL's grid (term.cols x term.rows), never the app block's, so
+  // cell size comes from the terminal's counts. Dividing by emap.rows stretched every inline box by
+  // term.rows/emap.rows.
+  const trows = term.rows|0, tcols = term.cols|0;
+  if(!(trows > 0) || !(tcols > 0)){ emapLayer.style.display = 'none'; return; }
+  const cw = r.width / tcols, ch = r.height / trows;
   if(!(cw > 0) || !(ch > 0)){ emapLayer.style.display = 'none'; return; }
   // ox/oy add back #term's own scroll offset: the boxes are laid out inside that scroller, so a bare
   // rect difference would undo the scroll once in the translate and again in the scroller itself.
@@ -2050,8 +2070,8 @@ function emapPlace(){
   emapLayer.style.display = '';
   for(const el of emap.els){
     const n = emapNodes.get(el.id); if(!n) continue;
-    const y = el.r[1] - vy;
-    if(y + el.r[3] <= 0 || y >= emap.rows){ n.style.display = 'none'; continue; }
+    const y = rowOrigin + el.r[1] - vy;
+    if(y + el.r[3] <= 0 || y >= rowOrigin + emap.rows){ n.style.display = 'none'; continue; }
     n.style.display = '';
     n.style.transform = `translate(${Math.round(ox + el.r[0]*cw)}px, ${Math.round(oy + y*ch)}px)`;
     n.style.width = Math.max(4, Math.round(el.r[2]*cw)) + 'px';
@@ -2072,8 +2092,13 @@ function emapTap(id){
   // an even-width control, and a control 118 cells wide does not mean the same thing at cell 60 as at 61.
   const cx = Number.isInteger(el.act.x) ? el.act.x : el.r[0] + Math.floor(el.r[2] / 2);
   const cy = Number.isInteger(el.act.y) ? el.act.y : el.r[1] + Math.floor(el.r[3] / 2);
+  // The press goes out in terminal space, and the app's (x,y) are app-space: add the same block origin
+  // the boxes were placed with. A box is only drawn when that origin is known, so this cannot be null
+  // for a visible control.
+  const rowOrigin = emapRowOffset();
+  if(rowOrigin === null){ flash('This app has not published where its screen starts'); return; }
   const b = Math.min(2, Math.max(0, el.act.b|0));
-  const at = `\x1b[<${b};${cx+1};${cy-(term.buffer.active.viewportY|0)+1}`;
+  const at = `\x1b[<${b};${cx+1};${rowOrigin+cy-(term.buffer.active.viewportY|0)+1}`;
   const click = at + 'M', release = at + 'm';
   mouseGuard.noteForwarded(click + release, Date.now());
   sendMouseInput(click);
@@ -2112,11 +2137,67 @@ let tabFontScale = (()=>{          // A+/A- on a tab-owned grid becomes a zoom o
 })();
 // How a fixed grid meets a pane whose aspect it does not match. 'fill' uses every pixel of width and
 // scrolls vertically (a real terminal window's behaviour when its font is bigger than the screen);
-// 'fit' shows every row and takes the margins. The choice is per device and remembered, because a
-// desktop and a phone want opposite answers.
-let tabFitMode = (LS.get('mux_tab_fit') === 'fit') ? 'fit' : 'fill';
+// 'fit' shows every row and takes the margins; 'flex' fills the width like 'fill' and then squeezes the
+// line box (xterm's lineHeight) until every row also fits - no scrolling and no side margins, at the
+// cost of tighter leading. The choice is per device and remembered, because a desktop and a phone want
+// opposite answers.
+let tabFitMode = (()=>{ const v=LS.get('mux_tab_fit'); return (v==='fit'||v==='flex') ? v : 'fill'; })();
 let tabFitRejected = 0, tabFitPaneW = -1, tabFitPaneH = -1, tabFitPaneScale = 0, tabFitPaneMode = '';
 let tabFitFollowup = 0;
+// xterm's own `lineHeight` option refuses anything below 1 ("lineHeight cannot be less than 1"), so the
+// row height cannot be squeezed there. 'flex' instead paints the grid at the width-filling font and
+// applies a vertical SCALE to the rendered screen: every column lands on the pane edge, every row lands
+// inside it, and the glyphs are compressed instead of the grid being scrolled or letterboxed.
+let tabFlexSx = 1, tabFlexSy = 1;
+// Below this the glyphs stop being readable; 'flex' then settles here and scrolls like 'fill'.
+const FLEX_SCALE_FLOOR = 0.72;
+// Font sizes are whole pixels, so the largest font that fits a pane can be up to one cell short of it
+// (~9% of an 11px cell). A small horizontal stretch closes that gap instead of leaving a dead margin.
+const FLEX_STRETCH_MAX = 1.12;
+// The vertical scale that puts `rows` rows of `cellH` px inside `availH` px. Pure arithmetic so the
+// fit's only non-obvious decision is testable without a renderer. One pixel is left for xterm's
+// per-cell floor() so the analytic answer cannot land one row outside the pane.
+function flexScaleTarget(availH, rows, cellH){
+  if(!(availH > 1) || !(rows > 0) || !(cellH > 0)) return 1;
+  const ratio = (availH - 1) / (rows * cellH);
+  if(!(ratio > 0)) return 1;
+  return Math.max(FLEX_SCALE_FLOOR, Math.min(1, ratio));
+}
+// The horizontal scale that makes `cols` cells of `cellW` px span `availW` px exactly. Only ever
+// stretches (never squeezes); `fit` does not use it because its side margins are the point.
+function flexStretchTarget(availW, cols, cellW){
+  if(!(availW > 1) || !(cols > 0) || !(cellW > 0)) return 1;
+  const ratio = availW / (cols * cellW);
+  if(!(ratio > 1)) return 1;
+  return Math.min(FLEX_STRETCH_MAX, ratio);
+}
+// Put (or remove) the transform on xterm's screen element. Only that element: the viewport scroller and
+// the host keep their real size, so scrolling, `#term` clipping and the pan classes all behave as they
+// do in the other two modes. Every hit test in this page divides the SCREEN RECT by the grid counts
+// (bufferCellAt, emapPlace), so a transformed screen stays exact for taps, drag-select and widget boxes.
+function applyFlexTransform(sx, sy){
+  const wx = Math.max(1, Math.min(FLEX_STRETCH_MAX, Number(sx) || 1));
+  const wy = Math.max(FLEX_SCALE_FLOOR, Math.min(1, Number(sy) || 1));
+  const host = $('#term');
+  // The fit can run before xterm has put its screen element in the host (first layout, a tab switch), so
+  // there is nothing to scale yet; the next fit pass applies it.
+  const scr = host && host.querySelector ? host.querySelector('.xterm-screen') : null;
+  if(!scr){ tabFlexSx = 1; tabFlexSy = 1; return; }
+  const on = wx > 1.001 || wy < 0.999;
+  if(Math.abs(wx - tabFlexSx) < 0.002 && Math.abs(wy - tabFlexSy) < 0.002 && (scr.style.transform !== '') === on) return;
+  tabFlexSx = wx; tabFlexSy = wy;
+  if(on){
+    // Flush-left when stretched: with the default auto margins the .xterm box is centred and a scale from
+    // its left edge would overflow the pane on the right and leave a gap on the left.
+    host.classList.add('stretch');
+    scr.style.transformOrigin = '0 0';
+    scr.style.transform = 'scale(' + Math.round(wx * 1000) / 1000 + ',' + Math.round(wy * 1000) / 1000 + ')';
+  } else {
+    host.classList.remove('stretch');
+    scr.style.transform = '';
+    scr.style.transformOrigin = '';
+  }
+}
 // Cell metrics only change after the renderer repaints, so the estimate that drove one step was read at
 // the PREVIOUS font size. Re-running the fit once on the next frame is what makes the search converge in
 // one repaint instead of settling at a size that was never measured (seen live: 12 where 13 fits, and a
@@ -2132,6 +2213,8 @@ function fitTabOwnedGrid(){
   host.classList.toggle('tabfit', owned);
   if(!owned){
     tabFitRejected=0; tabFitPaneW=-1; tabFitPaneH=-1; tabFitPaneMode='';
+    // A grid we no longer own must not keep the transform of a mode we left.
+    applyFlexTransform(1, 1);
     if(appliedFont!==fontSize){ appliedFont=fontSize; try{ term.options.fontSize=fontSize; }catch(e){} }
     return;
   }
@@ -2146,18 +2229,34 @@ function fitTabOwnedGrid(){
   const paneMoved = Math.abs(availW-tabFitPaneW) > 24 || Math.abs(availH-tabFitPaneH) > 24;
   if(tabFitPaneW<0 || paneMoved || tabFontScale!==tabFitPaneScale || tabFitMode!==tabFitPaneMode){
     tabFitPaneScale=tabFontScale; tabFitPaneMode=tabFitMode; tabFitRejected=0;
+    // Any mode that is not 'flex' shows the grid at its natural height; the reset also clears a scale
+    // left behind, so switching away cannot leave a transformed screen.
+    if(tabFitMode!=='flex') applyFlexTransform(1, 1);
   }
   tabFitPaneW=availW; tabFitPaneH=availH;
   const cell=cellMetrics();
   if(!(cell.w>0) || !(cell.h>0)) return;
+  // -- the transform that makes the mode's promise literal -------------------------------------------
+  // A whole-pixel font can leave up to a cell of dead space on either axis. 'fill' and 'fit' keep their
+  // own answers (and are left exactly as they shipped); 'flex' closes both gaps with one transform -
+  // stretched up to the pane edge horizontally and squashed down so all rows land inside vertically.
+  // Layout metrics do not change under a transform, so this is one analytic step per pass.
+  const sx = tabFitMode==='flex' ? flexStretchTarget(availW, term.cols, cell.w) : 1;
+  const sy = tabFitMode==='flex' ? flexScaleTarget(availH, term.rows, cell.h) : 1;
+  if(Math.abs(sx - tabFlexSx) > 0.002 || Math.abs(sy - tabFlexSy) > 0.002){
+    applyFlexTransform(sx, sy);
+    scheduleTerminalSurfaceAlign();
+  }
   // Font size that exactly spans the pane on each axis. Cell metrics are read from the size now in use,
   // so dividing by appliedFont makes both estimates font-size independent.
   const fitW = availW/(term.cols*(cell.w/appliedFont));
   const fitH = availH/(term.rows*(cell.h/appliedFont));
   if(!isFinite(fitW) || !isFinite(fitH) || fitW<=0 || fitH<=0) return;
   const fill = tabFitMode !== 'fit';
-  // 'fill' takes the width estimate and lets the height overflow (alignTerminalSurface keeps the bottom
-  // rows - the status bar and leaf line - pinned in view). 'fit' takes the smaller estimate.
+  // 'fill' and 'flex' both take the width estimate. 'fill' lets the height overflow
+  // (alignTerminalSurface keeps the bottom rows - the status bar and leaf line - pinned in view, and the
+  // rest is a row scroll). 'flex' closes the last of both gaps with the screen transform above, so the
+  // width is exact and every row is visible. 'fit' takes the smaller estimate and lives with the margins.
   const fitFont = fill ? fitW : Math.min(fitW, fitH);
 
   if(tabFontScale !== 1){
@@ -2232,8 +2331,11 @@ function alignTerminalSurface(){
   const padY=(parseFloat(cs.paddingTop)||0)+(parseFloat(cs.paddingBottom)||0);
   const visibleH=Math.max(0, host.clientHeight-padY);
   const owned = !!(sizeTabOwned && !sizePinned);
+  // 'flex' paints the grid at its natural cell height and then scales the SCREEN down, so what has to
+  // fit the pane is the scaled height; using the unscaled one would keep the rowpan scrollbar alive.
+  const rowScale = (owned && tabFitMode==='flex') ? tabFlexSy : 1;
   const rowOverflow = owned
-    ? (!!term.rows && term.rows*cellMetrics().h > visibleH+1)
+    ? (!!term.rows && term.rows*cellMetrics().h*rowScale > visibleH+1)
     : !!(winSize && viewportFit && winSize.rows > viewportFit.rows+1);
   host.classList.toggle('rowpan', rowOverflow);
   if(!rowOverflow){
@@ -2244,7 +2346,7 @@ function alignTerminalSurface(){
     // A fitted grid is narrower than the pane, so it is also shorter: place it like a terminal window
     // sitting on a larger desktop (centred) instead of pinning it to the top edge.
     if(owned){
-      const gridH=(term.rows||0)*cellMetrics().h;
+      const gridH=(term.rows||0)*cellMetrics().h*rowScale;
       const slack=visibleH-gridH;
       if(slack>2) xt.style.marginTop=Math.round(slack/2)+'px';
     }
@@ -2304,13 +2406,15 @@ function onControl(s){
 // TAP the size chip = pin the shared window to THIS device (everyone mirrors/pans it) — last-pinner-wins.
 // Tap again when it's already yours = back to auto. Long-press = pin another connected device.
 // On a tab-owned grid there is no pin to offer (the PTY is the PC's screen), so the tap switches how this
-// device renders that fixed grid instead: fill the width, or fit every row.
+// device renders that fixed grid instead: fill the width, fit every row, or both at once.
 function cycleSize(){
   if(sizeTabOwned && !sizePinned){
-    tabFitMode = (tabFitMode==='fill') ? 'fit' : 'fill';
+    tabFitMode = (tabFitMode==='fill') ? 'fit' : (tabFitMode==='fit') ? 'flex' : 'fill';
     LS.set('mux_tab_fit', tabFitMode);
     fitTabOwnedGrid(); applyPan(); scheduleTerminalSurfaceAlign(); updateMeta(); updateSizeBtn();
-    flash(tabFitMode==='fill' ? 'Filling the width; scroll for the rows above' : 'Fitting every row; side margins fill the rest');
+    flash(tabFitMode==='fill' ? 'Filling the width; scroll for the rows above'
+        : tabFitMode==='fit' ? 'Fitting every row; side margins fill the rest'
+        : 'Filling the width and squeezing the row height until every row fits');
     return;
   }
   send('P', (sizePinned && sizeMine) ? '0' : '');
@@ -2329,13 +2433,20 @@ function sizeButtonPresentation(){
   // resize the tab under the person sitting at it. The chip still works, but it switches the rendering
   // of that fixed grid for this device instead of changing the size.
   if(sizeTabOwned && !sizePinned){
-    const fill = tabFitMode !== 'fit';
+    const mode = (tabFitMode==='fit'||tabFitMode==='flex') ? tabFitMode : 'fill';
+    const text = mode==='fill' ? '🖥 fills width ·' : mode==='fit' ? '🖥 fits rows ·' : '🖥 flex fit ·';
+    const how = mode==='fill'
+      ? 'Scaling fills the width and scrolls vertically for the rows above.'
+      : mode==='fit'
+        ? 'Every row is shown at full size; the margins fill the rest of this screen.'
+        : 'Scaling fills the width and squeezes the row height until every row fits.';
+    const next = mode==='fill' ? 'fit every row instead'
+               : mode==='fit'  ? 'fill the width and flex the row height instead'
+               : 'fill the width and scroll instead';
     let title = 'This tab follows PC tab at'+dims+' - the PC terminal\'s physical screen, so its size cannot be pinned. '
-      + (fill ? 'Scaling fills the width and scrolls vertically for the rows above.'
-              : 'Every row is shown; the margins fill the rest of this screen.')
-      + ' Tap to ' + (fill ? 'fit every row instead.' : 'fill the width instead.');
+      + how + ' Tap to ' + next + '.';
     if(panning) title += ' This terminal is wider than your viewport; drag the horizontal scrollbar to pan.';
-    return { text:(fill?'🖥 fills width ·':'🖥 fits rows ·')+dims, title, disabled:false };
+    return { text:text+dims, title, disabled:false };
   }
   const text = sizePinned
     ? ('📌 '+(sizeMine?'this device':(sizePinLabel||'other device'))+' ·'+dims)

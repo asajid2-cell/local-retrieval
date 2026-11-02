@@ -122,6 +122,14 @@ test('clipFrame keeps rects inside the grid and drops the rest', () => {
   assert.equal(clipFrame({ ...frame, v: 2 }), null);
 });
 
+test('clipFrame carries the app-block origin an inline viewer places boxes with', () => {
+  const frame = { v: 1, gen: 1, cols: 10, rows: 4, oy: 2, els: [{ id: 'a', role: 'box', r: [0, 0, 4, 1] }] };
+  assert.equal(clipFrame(frame).oy, 2);
+  // Absent stays absent: the viewer must not read a guessed 0 as a measured origin.
+  const noOrig = { v: 1, gen: 1, cols: 10, rows: 4, els: [] };
+  assert.equal('oy' in clipFrame(noOrig), false);
+});
+
 test('clipFrame tolerates a map wider than the grid it was computed against', () => {
   const frame = { v: 1, gen: 1, cols: 80, rows: 24, els: [{ id: 'e', role: 'text', r: [0, 0, 200, 1] }] };
   assert.deepEqual(clipFrame(frame).els, [{ id: 'e', role: 'text', r: [0, 0, 80, 1] }]);
@@ -135,6 +143,10 @@ test('isFrame rejects the shapes the fixture calls corrupt', () => {
   assert.equal(isFrame({ v: 1, gen: 1, cols: 1, rows: 1, els: [{ id: 'x', role: 'text', r: [0, 0, 1, 1], act: {} }] }), false);
   assert.equal(isFrame({ v: 1, gen: 1, cols: 1, rows: 1, els: [{ id: 'x', role: 'text', r: [0, 0, 1, 1], act: { t: 'key' } }] }), false);
   assert.equal(isFrame({ v: 1, gen: 1, cols: 1, rows: 1, els: [{ id: 'x', role: 'text', r: [0, 0, 1, 1], act: { t: 'focus' } }] }), true);
+  assert.equal(isFrame({ v: 1, gen: 1, cols: 1, rows: 1, oy: 0, els: [] }), true);
+  assert.equal(isFrame({ v: 1, gen: 1, cols: 1, rows: 1, oy: 3, els: [] }), true);
+  assert.equal(isFrame({ v: 1, gen: 1, cols: 1, rows: 1, oy: -1, els: [] }), false);
+  assert.equal(isFrame({ v: 1, gen: 1, cols: 1, rows: 1, oy: 1.5, els: [] }), false);
   assert.equal(isFrame({ v: 1, gen: 1, cols: 1, rows: 1, els: [{ id: 'x', role: 'text', r: [0, 0, 1, 1], act: { t: 'none' } }] }), true);
   assert.equal(isFrame({ v: 1, gen: 1, cols: 1, rows: 1, els: [{ id: 'x', role: 'text', r: [0, 0, 1, 1] }] }), true);
 });

@@ -81,6 +81,9 @@ function isFrame(o) {
   if (!isInt(o.gen) || o.gen < 0) return false;
   if (!isInt(o.cols) || o.cols < 0) return false;
   if (!isInt(o.rows) || o.rows < 0) return false;
+  // Optional app-block origin (terminal rows above the app's row 0). Absent is
+  // legal - the emitter leaves it out until the inline probe answers.
+  if (o.oy !== undefined && (!isInt(o.oy) || o.oy < 0)) return false;
   if (!Array.isArray(o.els)) return false;
   return o.els.every(isElement);
 }
@@ -182,7 +185,11 @@ function clipFrame(frame) {
     byId.delete(el.id);
     byId.set(el.id, { ...el, r: [x0, y0, x1 - x0, y1 - y0] });
   }
-  return { v: frame.v, gen: frame.gen, cols, rows, els: [...byId.values()] };
+  // Rebuilt field by field, so an unknown top-level field would be dropped
+  // here. `oy` is known and load-bearing for inline apps, and is copied.
+  const out = { v: frame.v, gen: frame.gen, cols, rows, els: [...byId.values()] };
+  if (frame.oy !== undefined) out.oy = frame.oy;
+  return out;
 }
 
 // Prefix for a map frame on the viewer socket. Deliberately one character that no terminal

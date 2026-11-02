@@ -106,6 +106,33 @@ class StripUnit(unittest.TestCase):
         self.assertEqual(self.strip_all(orphan)[0], orphan)
         self.assertEqual(self.strip_all(orphan)[1].dropped, 0)
 
+    def test_a_resync_snapshot_tail_is_dropped_where_it_is_known_to_be_a_tail(self):
+        # muxtee's ring evicts by byte, so a snapshot can begin inside a body. The stripper must keep a
+        # mid-body stream as text (2a), so the snapshot path removes the tail before it is stripped.
+        tail = BODY_B[:900] + b"\x1b\\"
+        self.assertEqual(muxd.drop_leading_element_map_tail(tail + b"after"), b"after")
+        self.assertEqual(muxd.drop_leading_element_map_tail(BODY_B[:900] + b"\x9c" + b"after"), b"after")
+        self.assertEqual(muxd.drop_leading_element_map_tail(BODY_B[:900] + b"\x07" + b"after"), b"after")
+
+    def test_a_snapshot_that_is_real_text_is_not_touched(self):
+        for data in (b"", b"prompt$ ls\r\n", b"SCREEN-LINE-000001 " + b"." * 40, b"-" * 200 + b"\x07"):
+            self.assertEqual(muxd.drop_leading_element_map_tail(data), data)
+
+    def test_a_short_or_unterminated_leading_run_is_left_alone(self):
+        # Too short to be a body, and a long run with no terminator behind it is indistinguishable from
+        # text - guessing there would eat real output, so it is kept.
+        self.assertEqual(muxd.drop_leading_element_map_tail(b"abc" + b"\x1b\\" + b"tail"), b"abc\x1b\\tail")
+        self.assertEqual(muxd.drop_leading_element_map_tail(BODY_B[:900]), BODY_B[:900])
+
+    def test_a_low_entropy_run_is_a_rule_not_a_body(self):
+        # Terminal output does produce long runs of one glyph, and a snapshot may well begin in one.
+        for rule in (b"-" * 200, b"=" * 200, b"A" * 300):
+            self.assertEqual(muxd.drop_leading_element_map_tail(rule + b"\x07next"), rule + b"\x07next")
+
+    def test_an_intact_frame_at_the_head_is_still_stripped_normally(self):
+        # The tail remover must not claim a snapshot that starts with its own introducer.
+        self.assertEqual(muxd.drop_leading_element_map_tail(ESC_SEQ + b"tail"), ESC_SEQ + b"tail")
+
     def test_carry_overflow_discards_and_resumes_at_the_next_introducer(self):
         # A runaway ESC-form body past the cap is abandoned. Its bytes are base64url text, so the only
         # introducer that can hide inside it is the 8-bit form - and the strict reading keeps the frame
@@ -203,6 +230,16 @@ class RingOnlySplit(unittest.TestCase):
         s.replace_history(b"fresh" + ESC_SEQ + b"screen")
         self.assertEqual(b"".join(s._ring_snapshot()), b"freshscreen")
         self.assertEqual(s.emap_strip.carry, b"")
+
+    def test_a_resync_that_starts_mid_body_does_not_replay_base64(self):
+        # The live shape: muxtee's ring evicted into the middle of a 34 KB body, so the snapshot head is
+        # body bytes with no introducer. Replayed, that is what a viewer paints on screen.
+        s = make_stream()
+        s.replace_history(BODY_B[:900] + b"\x1b\\" + b"prompt$ ")
+        ring = b"".join(s._ring_snapshot())
+        self.assertEqual(ring, b"prompt$ ")
+        self.assertNotIn(BODY_SLICE[:40], ring)
+        self.assertEqual(s.scrollback(), b"prompt$ ")
 
 
 class RingEvictionAndReplay(unittest.IsolatedAsyncioTestCase):

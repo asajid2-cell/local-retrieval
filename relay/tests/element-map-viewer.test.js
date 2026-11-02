@@ -175,8 +175,63 @@ test('no box is placed unless the frame geometry matches the terminal in front o
 });
 
 test('no box is placed over the normal buffer: the map rows are app rows, not screen rows', () => {
+  // The gateway renders inline on the normal buffer, and the frame carries no
+  // origin until its probe answers. Guessing 0 would put every box `oy` rows
+  // too high, so the map waits instead of drawing a wrong box.
   const h = harness({ store: { mux_widgets: '1' }, bufferType: 'normal' });
   h.sandbox.emapApply(frame([{ id: 'a', role: 'box', r: [2, 3, 10, 1], act: { t: 'ptr', x: 6, y: 3, b: 0 } }]));
+  assert.equal(h.sandbox.emapLayerNode().style.display, 'none');
+});
+
+test('a normal-buffer map is placed by the origin the app publishes', () => {
+  // The gateway inline probe measured the app block starting two rows down.
+  // App row 0 is terminal row 2, so a rect at app row 3 lands on terminal row 5.
+  const h = harness({ cols: 80, rows: 24, store: { mux_widgets: '1' }, bufferType: 'normal' });
+  h.sandbox.emapApply({ v: 1, gen: 1, cols: 80, rows: 24, oy: 2, els: [{ id: 'a', role: 'box', r: [2, 3, 10, 1], act: { t: 'ptr', x: 6, y: 3, b: 0 } }] });
+  const n = h.sandbox.emapLayerNode().children[0];
+  assert.equal(n.style.transform, 'translate(28px, 114px)');   // 8+2*10 , 4+(2+3)*22
+  assert.equal(n.style.display, '');
+
+  // And a tap goes out in terminal space: app row 3 + origin 2 + 1 = SGR row 6.
+  h.sandbox.emapTap('a');
+  assert.deepEqual(h.sent, ['\x1b[<0;7;6M', '\x1b[<0;7;6m']);
+});
+
+test('an inline block shorter than the PTY still places every box', () => {
+  // The common live shape: a 40-row PTY with the app block occupying 30 rows from row 1. The screen
+  // element still spans all 40 PTY rows, so cells are 10 x 13.2 - not 10 x 17.6 (528/30), which used to
+  // stretch every box by a third and hide the layer entirely when rows differed.
+  const h = harness({
+    cols: 80, rows: 40, bufferType: 'normal', store: { mux_widgets: '1' },
+    screenRect: { left: 8, top: 4, width: 800, height: 528 },
+  });
+  h.sandbox.emapApply({ v: 1, gen: 1, cols: 80, rows: 30, oy: 1, els: [{ id: 'a', role: 'box', r: [2, 3, 10, 1], act: { t: 'ptr', x: 6, y: 3, b: 0 } }] });
+  const n = h.sandbox.emapLayerNode().children[0];
+  assert.equal(n.style.display, '');
+  assert.equal(n.style.transform, 'translate(28px, 57px)');   // 8+2*10 , 4+(1+3)*13.2
+  assert.equal(n.style.width, '100px');
+  assert.equal(n.style.height, '13px');
+});
+
+test('an inline box below its own block is hidden even though the PTY has rows left', () => {
+  // Row 30 is past the published block, so nothing was painted there and no box may sit on it.
+  const h = harness({
+    cols: 80, rows: 40, bufferType: 'normal', store: { mux_widgets: '1' },
+    screenRect: { left: 8, top: 4, width: 800, height: 528 },
+  });
+  h.sandbox.emapApply({ v: 1, gen: 1, cols: 80, rows: 30, oy: 1, els: [{ id: 'a', role: 'box', r: [0, 30, 4, 1], act: { t: 'ptr', x: 0, y: 30, b: 0 } }] });
+  assert.equal(h.sandbox.emapLayerNode().children[0].style.display, 'none');
+});
+
+test('on the alternate screen the app owns the grid, so a row count that differs is still refused', () => {
+  const h = harness({ cols: 80, rows: 40, bufferType: 'alternate', store: { mux_widgets: '1' } });
+  h.sandbox.emapApply({ v: 1, gen: 1, cols: 80, rows: 30, els: [{ id: 'a', role: 'box', r: [2, 3, 10, 1], act: { t: 'ptr', x: 6, y: 3, b: 0 } }] });
+  assert.equal(h.sandbox.emapLayerNode().style.display, 'none');
+});
+
+test('a column count that differs always hides the layer: boxes would sit on the wrong cells', () => {
+  const h = harness({ cols: 100, rows: 40, bufferType: 'normal', store: { mux_widgets: '1' } });
+  h.sandbox.emapApply({ v: 1, gen: 1, cols: 80, rows: 30, oy: 1, els: [{ id: 'a', role: 'box', r: [2, 3, 10, 1], act: { t: 'ptr', x: 6, y: 3, b: 0 } }] });
   assert.equal(h.sandbox.emapLayerNode().style.display, 'none');
 });
 
