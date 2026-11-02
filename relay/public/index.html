@@ -184,22 +184,6 @@
     text-rendering:optimizeSpeed; will-change:transform;
   }
   #predict.show { display:block; }
-  /* ELEMENT MAP BOXES. Exact hit targets over the cells an app painted, from the semantic map the app
-     publishes on the VT stream (docs/terminal-element-map.md). Off unless the widgets chip is on: a box
-     that swallows a press would also swallow drag-select, so the plain terminal stays the default. */
-  #emap {
-    position:absolute; inset:0; z-index:3; display:none; pointer-events:none; overflow:hidden;
-  }
-  #emap.on { display:block; }
-  #emap .emap-el {
-    position:absolute; left:0; top:0; display:none; box-sizing:border-box; margin:0; padding:0;
-    border-radius:4px; border:1px solid rgba(232,120,150,.45); background:rgba(232,120,150,.05);
-    cursor:pointer; pointer-events:auto; -webkit-user-select:none; user-select:none; touch-action:manipulation;
-  }
-  #emap.on .emap-el { display:block; }
-  #emap .emap-el:hover, #emap .emap-el:focus-visible {
-    border-color:var(--rose); background:rgba(232,120,150,.18);
-  }
   /* Scrollback is real history, so give it a real scrollbar: thin, themed, draggable with a mouse.
      Nothing here changes xterm's sizing internals - only the bar the browser already paints. */
   #term .xterm-viewport {
@@ -1616,7 +1600,7 @@ function reloadTerminal(quiet){
   connect(name, true);   // re-attach: CLEAR + scrollback replay + live, all client state reset
 }
 document.addEventListener('keydown', e=>{ if(e.ctrlKey && e.altKey && (e.key==='r'||e.key==='R')){ e.preventDefault(); e.stopPropagation(); reloadTerminal(); } }, true);
-window.__muxBuild='2026-11-02-emap-inline-geometry-flex-fit';   // bump per web deploy so a loaded version is verifiable (supersedes 2026-10-09-mobile-tap-focus-nav-scroll)
+window.__muxBuild='2026-11-02-emap-overlay-removed-flex-fit';   // bump per web deploy so a loaded version is verifiable (supersedes 2026-11-02-emap-inline-geometry-flex-fit)
 try{ console.info('multiplex build', window.__muxBuild); }catch(e){}
 const helper = $('#term').querySelector('.xterm-helper-textarea');
 function hardenHelperTextarea(){
@@ -1973,146 +1957,13 @@ function cellMetrics(){
   try { const d = term._core._renderService.dimensions.css.cell; if (d && d.height) return { w:d.width, h:d.height }; } catch(e){}
   return { w: appliedFont*0.6, h: appliedFont*1.2 };
 }
-// ---- TERMINAL ELEMENT MAP (OSC 21338) ---------------------------------------------------------------
-// An app that draws its own UI can also publish a semantic map of what it just painted: each element's
-// rect in ITS OWN cell space, a label, and what a tap on it means (docs/terminal-element-map.md). The
-// relay strips that sequence out of the byte stream and hands it over as an `E` control frame, so nothing
-// here touches the VT path: the terminal still draws every cell, and this layer only adds hit boxes that
-// sit on exactly those cells. Off by default - a box that swallows a press also swallows drag-select.
-let emap = null;                                    // {v, gen, cols, rows, els}
-let emapLayer = null;                               // container over the screen, created on first frame
-const emapNodes = new Map();                        // element id -> node
-let emapShown = LS.get('mux_widgets', '') === '1';  // the widgets chip, per device
-function emapActionable(el){ const a = el && el.act; return !!a && (a.t === 'ptr' || a.t === 'focus'); }
-function emapApply(m){
-  if(!m || m.v !== 1 || !Array.isArray(m.els)) return;   // an unknown version is dropped whole
-  if(emap && m.gen === emap.gen) return;                 // dedupe on gen alone: heartbeat re-sends it
-  emap = m;
-  emapBuild(); emapPlace();
-}
-function emapClear(){
-  emap = null;
-  emapNodes.clear();
-  if(emapLayer) emapLayer.textContent = '';
-}
-function emapBuild(){
-  const host = $('#term'); if(!host) return;
-  if(!emapLayer){
-    emapLayer = document.createElement('div');
-    emapLayer.id = 'emap';
-    host.appendChild(emapLayer);
-  }
-  emapLayer.classList.toggle('on', emapShown);
-  const want = new Set();
-  for(const el of (emap && emap.els) || []){
-    if(!emapActionable(el)) continue;
-    want.add(el.id);
-    let n = emapNodes.get(el.id);
-    if(!n){
-      n = document.createElement('button');
-      n.type = 'button';
-      n.className = 'emap-el';
-      n.dataset.id = el.id;
-      n.tabIndex = -1;
-      emapLayer.appendChild(n);
-      emapNodes.set(el.id, n);
-    }
-    const label = el.label || el.role || 'control';
-    n.setAttribute('aria-label', label);
-    n.title = el.label ? (el.label + ' · ' + el.role) : el.role;
-    n.dataset.role = el.role;
-    n.dataset.act = el.act ? el.act.t : '';
-  }
-  for(const [id, n] of emapNodes){
-    if(!want.has(id)){ n.remove(); emapNodes.delete(id); }
-  }
-}
-// Rows between the terminal's first row and the app block's row 0. On the alternate screen the app owns
-// the grid, so it is 0. An inline app paints its block part-way down the PTY and publishes that offset
-// as `oy` - the same number the app subtracts from every mouse row (ink.tsx getMouseRowOffset). A normal
-// screen with no `oy` is a frame from before the probe answered: its rows cannot be placed, so 0 boxes.
-function emapRowOffset(){
-  let altScreen = true;
-  try{ altScreen = term.buffer.active.type === 'alternate'; }catch(e){ altScreen = false; }
-  if(altScreen) return 0;
-  return (emap && Number.isFinite(emap.oy) && emap.oy >= 0) ? emap.oy : null;
-}
-// Place every box on the cells the app drew. The offset recipe is the one #predict already uses: the
-// screen rect is the origin and the cells divide it, so pan/rowpan/font changes need no separate maths.
-function emapPlace(){
-  if(!emapLayer || !emap) return;
-  const host = $('#term');
-  if(!host || !emapShown){ emapLayer.style.display = 'none'; return; }
-  // Columns must always line up or every box lands on the wrong cell. Rows are different: on the
-  // alternate screen the app owns the whole grid, but an INLINE app paints a block that is usually
-  // SHORTER than the PTY (a form, a picker) and publishes only those rows. Requiring equality hid every
-  // inline map - which is the common case - and the boxes simply never appeared.
-  let altScreen = true;
-  try{ altScreen = term.buffer.active.type === 'alternate'; }catch(e){ altScreen = false; }
-  if(emap.cols !== (term.cols|0)){ emapLayer.style.display = 'none'; return; }
-  if(altScreen && emap.rows !== (term.rows|0)){ emapLayer.style.display = 'none'; return; }
-  const rowOrigin = emapRowOffset();
-  if(rowOrigin === null){ emapLayer.style.display = 'none'; return; }
-  const scr = host.querySelector('.xterm-screen');
-  if(!scr){ emapLayer.style.display = 'none'; return; }
-  const r = scr.getBoundingClientRect(), hr = host.getBoundingClientRect();
-  // The screen element spans the TERMINAL's grid (term.cols x term.rows), never the app block's, so
-  // cell size comes from the terminal's counts. Dividing by emap.rows stretched every inline box by
-  // term.rows/emap.rows.
-  const trows = term.rows|0, tcols = term.cols|0;
-  if(!(trows > 0) || !(tcols > 0)){ emapLayer.style.display = 'none'; return; }
-  const cw = r.width / tcols, ch = r.height / trows;
-  if(!(cw > 0) || !(ch > 0)){ emapLayer.style.display = 'none'; return; }
-  // ox/oy add back #term's own scroll offset: the boxes are laid out inside that scroller, so a bare
-  // rect difference would undo the scroll once in the translate and again in the scroller itself.
-  const vy = term.buffer.active.viewportY|0;
-  const ox = (r.left - hr.left) + host.scrollLeft, oy = (r.top - hr.top) + host.scrollTop;
-  emapLayer.style.display = '';
-  for(const el of emap.els){
-    const n = emapNodes.get(el.id); if(!n) continue;
-    const y = rowOrigin + el.r[1] - vy;
-    if(y + el.r[3] <= 0 || y >= rowOrigin + emap.rows){ n.style.display = 'none'; continue; }
-    n.style.display = '';
-    n.style.transform = `translate(${Math.round(ox + el.r[0]*cw)}px, ${Math.round(oy + y*ch)}px)`;
-    n.style.width = Math.max(4, Math.round(el.r[2]*cw)) + 'px';
-    n.style.height = Math.max(4, Math.round(el.r[3]*ch)) + 'px';
-  }
-}
-// A tap on a box has to travel the same bytes a click on that cell already travels, or the app sees a
-// different event depending on whether the box was drawn. Centre cell, floored - the cell the app's own
-// half-open hit test lands on - then the exact press/release pair the host mouseup path builds.
-function emapTap(id){
-  const el = emap && emap.els.find(e => e.id === id);
-  if(!emapActionable(el)) return;
-  if(el.act.t === 'focus'){ try{ term.focus(); }catch(e){} flash('Typing goes to the app'); return; }
-  const s = findSession(current);
-  const wantApp = !!(s && (s.hasCommand || (s.sessionId && !s.shellOnly)));
-  if(!wantApp){ flash('Nothing behind this pane to tap'); return; }
-  // The app publishes the cell it wants pressed. Use it: a rect centre I derive is a different cell for
-  // an even-width control, and a control 118 cells wide does not mean the same thing at cell 60 as at 61.
-  const cx = Number.isInteger(el.act.x) ? el.act.x : el.r[0] + Math.floor(el.r[2] / 2);
-  const cy = Number.isInteger(el.act.y) ? el.act.y : el.r[1] + Math.floor(el.r[3] / 2);
-  // The press goes out in terminal space, and the app's (x,y) are app-space: add the same block origin
-  // the boxes were placed with. A box is only drawn when that origin is known, so this cannot be null
-  // for a visible control.
-  const rowOrigin = emapRowOffset();
-  if(rowOrigin === null){ flash('This app has not published where its screen starts'); return; }
-  const b = Math.min(2, Math.max(0, el.act.b|0));
-  const at = `\x1b[<${b};${cx+1};${rowOrigin+cy-(term.buffer.active.viewportY|0)+1}`;
-  const click = at + 'M', release = at + 'm';
-  mouseGuard.noteForwarded(click + release, Date.now());
-  sendMouseInput(click);
-  sendMouseInput(release);
-}
-function cycleEmap(){
-  emapShown = !emapShown;
-  LS.set('mux_widgets', emapShown ? '1' : '');
-  emapBuild(); emapPlace();
-  const b = $('#widgetsbtn'); if(b) b.classList.toggle('on', emapShown);
-  flash(emapShown
-    ? (emap ? 'Widget boxes on · taps land on the app cell' : 'Widget boxes on · waiting for this app to publish a map')
-    : 'Widget boxes off');
-}
+// ---- ELEMENT MAP (OSC 21338) REMOVED ---------------------------------------------------------------
+// The app can still publish a semantic map on the VT stream, and the relay still hands it over as an `E`
+// control frame, but this viewer no longer consumes it. The overlay's hit boxes were a second, independent
+// pointer-to-cell mapping (its own row origin, its own scale) sitting over the terminal's; a tap must
+// travel exactly the bytes the app's own mouse mode produces for the cell under the pointer, nothing else.
+// The stored preference is retired with the code, so no device keeps a capability this build lacks.
+try{ localStorage.removeItem('mux_widgets'); }catch(e){}
 // ---- SIZE A PC TAB'S SCREEN THE WAY A TERMINAL WOULD ----
 // A tab-owned grid (a teed PC tab) is that terminal's physical screen: its cols x rows are fixed and the
 // relay will not resize it for this viewer. So the whole grid is fitted into the pane the way a terminal
@@ -2174,7 +2025,7 @@ function flexStretchTarget(availW, cols, cellW){
 // Put (or remove) the transform on xterm's screen element. Only that element: the viewport scroller and
 // the host keep their real size, so scrolling, `#term` clipping and the pan classes all behave as they
 // do in the other two modes. Every hit test in this page divides the SCREEN RECT by the grid counts
-// (bufferCellAt, emapPlace), so a transformed screen stays exact for taps, drag-select and widget boxes.
+// (bufferCellAt), so a transformed screen stays exact for forced selection and forwarded taps.
 function applyFlexTransform(sx, sy){
   const wx = Math.max(1, Math.min(FLEX_STRETCH_MAX, Number(sx) || 1));
   const wy = Math.max(FLEX_SCALE_FLOOR, Math.min(1, Number(sy) || 1));
@@ -2318,7 +2169,7 @@ function applyPan(){
 let surfaceAlignRaf=0;
 function scheduleTerminalSurfaceAlign(){
   if(surfaceAlignRaf) cancelAnimationFrame(surfaceAlignRaf);
-  surfaceAlignRaf=requestAnimationFrame(()=>{ surfaceAlignRaf=0; alignTerminalSurface(); emapPlace(); });
+  surfaceAlignRaf=requestAnimationFrame(()=>{ surfaceAlignRaf=0; alignTerminalSurface(); });
 }
 let wasRowOverflow=false, alignedContentRow=-1, alignedScrollTop=0;
 function alignTerminalSurface(){
@@ -2385,11 +2236,9 @@ function alignTerminalSurface(){
   wasRowOverflow=true;
 }
 function onControl(s){
-  if(s[0]==='E'){                     // element map: full replacement, last-wins, no name needed (one socket per session)
-    let em; try{ em=JSON.parse(s.slice(1)); }catch(e){ return; }
-    emapApply(em);
-    return;
-  }
+  // 'E' was the element-map channel (OSC 21338). The overlay it fed is gone, so the frame is ignored
+  // whole: nothing is parsed, and a late or hostile `E` cannot reach any state in this page. The relay
+  // still emits it; removing the emission is the other end's change, not this one's.
   if(s[0]!=='d') return;
   let m; try{ m=JSON.parse(s.slice(1)); }catch(e){ return; }
   winSize={cols:m.cols, rows:m.rows}; sizeModeLabel=m.modeLabel||'';
@@ -3393,15 +3242,6 @@ try{ window.__muxForceSel = forceSel; }catch(e){}
     e.preventDefault(); e.stopPropagation();
     forceSelEnd();
   }, true);
-  // An element-map box claims its press at the DOCUMENT capture stage: #term's own press handler also
-  // listens in capture (top-down), so a press left to propagate would forward a second click for one tap.
-  // Boxes exist only while the widgets chip is on, so the plain terminal gesture is untouched when it is off.
-  document.addEventListener('pointerdown', e=>{
-    const t=e.target, n=(t && t.closest) ? t.closest('.emap-el') : null;
-    if(!n) return;
-    e.preventDefault(); e.stopPropagation();
-    emapTap(n.dataset.id);
-  }, true);
   // The phone's Sel toggle is the same gesture with a finger. While the app owns the mouse a touch drag
   // cannot fall through to xterm - this build has no touch selection at all - so it comes here instead.
   host.addEventListener('touchstart', e=>{
@@ -3611,8 +3451,6 @@ function connect(name, isRetry){
     resetTerminalSurface();
     mouseGuard.reset(prevName === name);   // same session keeps the modes its app already armed; a
                                            // different session starts clean (see reset() for why)
-    emapClear();                           // a map belongs to the app on the other end of THIS attach
-    if(prevName !== name) emapBuild();
     lastViewportReport='';
     lastViewportReportSocket=null;
     scheduleViewportFit(0);
@@ -4720,8 +4558,6 @@ function buildKeybar(){
     sb.addEventListener('touchstart', start, {passive:true}); sb.addEventListener('touchend', cancel); sb.addEventListener('touchmove', cancel);
     sb.addEventListener('mousedown', start); sb.addEventListener('mouseup', cancel); sb.addEventListener('mouseleave', cancel);
     sb.addEventListener('contextmenu', e=>{ e.preventDefault(); pinToOtherDevice(); }); }
-  { const wb=mk('◫','accent', cycleEmap); wb.id='widgetsbtn'; wb.classList.toggle('on', emapShown);   // the app's own controls as tappable boxes
-    wb.title='Show this app\u2019s own controls as tap targets'; kb.appendChild(wb); }
   updateSizeBtn();
   kb.appendChild(kdivEl());
   // sticky modifiers (combine; apply to the next key OR typed char)

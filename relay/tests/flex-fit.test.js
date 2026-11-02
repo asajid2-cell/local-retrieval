@@ -1,7 +1,8 @@
 // The third sizing mode for a teed PC tab: 'flex'. It keeps the width fill of 'fill' and squashes the
 // rendered screen vertically so every row is on screen without side margins. xterm's own lineHeight
-// option refuses values below 1, so the squeeze is a CSS scale on .xterm-screen - which also leaves every
-// hit test intact, because this page derives cells from the screen RECT (bufferCellAt, emapPlace).
+// option refuses values below 1, so the squeeze is a CSS scale on .xterm-screen. This page's own hit
+// tests stay exact (bufferCellAt divides the screen RECT); xterm's native ones do not, which is the open
+// I-1 defect. This file only checks the scale arithmetic, not the mapping under it.
 //
 // The arithmetic is lifted out of the shipped page and run here, so the only non-obvious decision - how
 // far to squash - is checked without a renderer.
