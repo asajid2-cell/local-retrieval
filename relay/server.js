@@ -3745,11 +3745,26 @@ wssHost.on('connection', (ws, req) => {
       // would be measured from the process start until the first 5s pump, and a host that had just
       // connected would read as stale.
       hostFrame = { helloAt: Date.now(), sessionsAt: Date.now() };
+      const priorSessions = new Map(hostSessions);
       hostSessions.clear();
       for (const [name, value] of incoming) hostSessions.set(name, value);
       // The slot table is only meaningful when muxd advertised binaryFrames; the index must agree with
       // the `sessions` array muxd built it from, so it is derived from the same incoming set.
       hostBinarySlots = hostSupportsCap('binaryFrames') ? hostBinaryIndex([...incoming.keys()]) : null;
+      // A replaced link is a new byte stream for every session. A hello on the SAME link is a
+      // heartbeat unless this name's identity changed, so only a changed (sessionId, generationId),
+      // a new name, a vanished name or `prior !== ws` starts the stripper fresh - otherwise a body
+      // split across a heartbeat would be painted as text.
+      const linkReplaced = prior !== ws;
+      for (const name of new Set([...priorSessions.keys(), ...hostSessions.keys()])) {
+        const before = priorSessions.get(name);
+        const after = hostSessions.get(name);
+        if (linkReplaced || !before || !after
+          || before.sessionId !== after.sessionId || before.generationId !== after.generationId) {
+          const st = sessions.get(name);
+          if (st) resetElementMapBoundary(st);
+        }
+      }
       resyncAllWatches();   // §7.2: a new muxd link means every live stream owner must be re-watched
       console.log(`[host] hello from ${hostLabel} (${hostSessions.size} session(s), protocol ${hostProtocol.protocol})`);
       if (prior && prior !== ws) {
@@ -3921,6 +3936,9 @@ wssHost.on('connection', (ws, req) => {
       // boundary. The gap is unrecoverable from the stream, so repaint from truth: CLEAR +
       // scrollback replay for this session's viewers only — no other session lost a byte.
       const n = strictMuxName(m.s); const st = sessions.get(n); if (!st) return;
+      // The resync is a new stream at H2 (muxd replaced its ring and starts a fresh stripper), so the
+      // live stripper here starts fresh before any post-gap output is delivered.
+      resetElementMapBoundary(st);
       clearScrollbackRequest(st);                 // supersede any in-flight (pre-gap) request
       let asked = false;
       for (const c of st.clients.values()) {
@@ -4204,6 +4222,18 @@ function publishElementMap(name, st, frame, fromReplay) {
     if (!c || !c.ws || c.ws.readyState !== 1) continue;
     try { c.ws.send(msg); } catch {}
   }
+}
+// Every stream boundary - a resync replay, or a hello that replaces the muxd link or changes a
+// session's (sessionId, generationId) - replaces that session's byte stream.
+// A partial OSC carried from before the boundary can never be completed by bytes that arrive after it
+// (muxd starts a fresh stripper at its own boundary), so the live state starts fresh too, and the
+// cached element map belongs to the screen that is gone. Leaving either in place is what let a
+// 342-byte carry swallow the head of the next stream (I-2) and re-sent a stale map (I-10).
+function resetElementMapBoundary(st) {
+  if (!st || !st.emap) return;
+  st.emap.strip = elementMap.createStripState();
+  st.emap.map = null;
+  st.emap.gen = null;
 }
 // The single output fan-out. Both the JSON `o` frame and the binary one land here with the raw bytes
 // already in hand, so the buffering, the go-live clear and the per-viewer send live in exactly one place
