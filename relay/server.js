@@ -1543,7 +1543,7 @@ app.patch('/api/sessions/:name', withMutationIntent('session.rename', req => ({
     } catch (error) {
       return failPersistence(res, error);
     }
-    const st = sessions.get(name); if (st) { for (const c of st.clients.values()) { try { c.ws.close(4001, 'renamed'); } catch {} } screenModel.dispose(name); sessions.delete(name); }  // viewers reconnect under the new name
+    const st = sessions.get(name); if (st) { for (const c of st.clients.values()) { try { c.ws.close(4001, 'renamed'); } catch {} } bumpBoundaryEpoch(name); clearSeedTimer(st); st.seedHold = null; screenModel.dispose(name); sessions.delete(name); }  // viewers reconnect under the new name
     return res.json({ ok: true, name: to, hosted: true });
   }
   if (tmuxHas(name)) return failLegacy(res, name);
@@ -3783,7 +3783,17 @@ wssHost.on('connection', (ws, req) => {
         if (!boundaryNames.has(name)) continue;
         st.cur = null;
         clearScrollbackRequest(st);
-        const waiter = [...st.sbWaiters].map(id => st.clients.get(id)).find(Boolean);
+        // A viewer still waiting for the old stream's ring is owed a paint from the NEW stream's ring, so
+        // the request must be re-issued. Re-armed from the clients themselves, not only from sbWaiters:
+        // sbWait is the authoritative "still waiting" flag, and the boundary must not depend on the set
+        // having been kept in step by the reply handler. Every other hosted sbWait client is put back so
+        // the next paintAll finds it too.
+        let waiter = null;
+        for (const c of st.clients.values()) {
+          if (!c.hosted || c.ws.readyState !== 1 || !c.sbWait) continue;
+          st.sbWaiters.add(c.id);
+          if (!waiter) waiter = c;
+        }
         if (waiter && hostSessions.has(name)) requestSessionScrollback(name, st, waiter);
       }
       for (const name of hostSessions.keys()) recompute(name);
@@ -3902,7 +3912,12 @@ wssHost.on('connection', (ws, req) => {
       // the session's start. It is never sent to a viewer. A viewer gets a serialized screen (State S/R)
       // or a defined banner (State L) - never a byte log, whose tail can begin mid-escape-sequence.
       const waiters = [...st.sbWaiters];
-      st.sbWaiters.clear();
+      // NOT cleared here. Every painting path (paintSnapshot / paintStateL) and the live fan-out
+      // (deliverHostOutput) removes a viewer from this set when it is no longer waiting, so membership is
+      // exactly "still owed a first paint". Clearing it here used to empty it while the viewers were still
+      // sbWait, and a boundary or a failed seed then had no waiter to re-request the ring for - the viewer
+      // was left buffering with its watchdog cancelled. Keeping the set populated is what lets
+      // resetSessionBoundary's caller find a waiter and ask muxd for the new ring.
       clearScrollbackRequest(st);
       // Hold live bytes out of the model for the duration of the seed (see the reply cut above).
       // paintAll() releases it after every waiting viewer has been painted and flushed.
@@ -3981,12 +3996,59 @@ wssHost.on('connection', (ws, req) => {
         }
       };
       const seedAndPaint = (gz, retry) => {
+        // The ring below belongs to the stream the session had when this reply arrived. It is captured
+        // with that instant's epoch so the callback can tell whether it is still the same stream: a
+        // hello boundary, a resync, or the state object being replaced all bump the epoch, and a seed
+        // that started before the bump must abandon its ring rather than paint a screen for a stream
+        // that has ended.
+        const epoch = boundaryEpochOf(n);
+        const seq = ++st.seedSeq;   // only the newest seed for this state may paint or retry
+        clearSeedTimer(st);
+        // Watchdog: HOST_SB_WAIT_MS also bounds a viewer's first paint, and the two are the same wait.
+        // If the ring never finishes parsing, live bytes stay out of the model for ever and sbWaiters
+        // never drains. Take the defined banner state, drop the model (its bytes are a suffix of a
+        // stream nobody will finish reading) and ask for the ring again, so the retry path can recover.
+        st.seedTimer = setTimeout(() => {
+          if (sessions.get(n) !== st || st.seedSeq !== seq || boundaryEpochOf(n) !== epoch) return;
+          st.seedSeq++;
+          st.seedTimer = null;
+          st.seedHold = null;              // the held bytes belong to a ring that will not be painted
+          clearScrollbackRequest(st);      // a stalled seed is a stalled request; let a new one go out
+          screenModel.dispose(n);
+          for (const c of st.clients.values()) {
+            if (!c.hosted || c.ws.readyState !== 1 || !c.sbWait) continue;
+            paintStateL(n, st, c);
+          }
+          const waiter = [...st.clients.values()].find(c => c.hosted && c.ws.readyState === 1);
+          if (waiter && hostSessions.has(n)) requestSessionScrollback(n, st, waiter);
+        }, HOST_SB_WAIT_MS);
+        // Settle exactly once: the first of {seed callback, drain callback, watchdog} to run owns this
+        // seed, and every later one is a stale report about a ring that is no longer current.
+        const settle = () => {
+          if (st.seedSeq !== seq) return false;
+          st.seedSeq++;
+          clearSeedTimer(st);
+          return true;
+        };
+        const after = () => {
+          if (!settle()) return false;
+          if (boundaryEpochOf(n) !== epoch) {
+            // ABANDONED. The stream this ring was read from ended while it parsed. Painting it would be
+            // a screen from the old stream; retrying would re-read the old ring; feeding the hold would
+            // append the old stream's continuation to a model that no longer belongs to it. Do none of
+            // the three, and leave the hold empty for the new stream's own seed to fill.
+            st.seedHold = null;
+            return false;
+          }
+          return true;
+        };
         // done() runs after the ring has parsed, and live bytes are held out of the model until then,
         // so the snapshot it triggers is exactly the ring; the held bytes are flushed verbatim after it.
         const status = screenModel.seed(n, gz.cols, gz.rows, buf, ok => {
+          if (!after()) return;
           if (ok) { paintAll(); return; }
-          // One retry from the same ring: a boundary reset or a geometry change may have replaced the
-          // model between the request and this reply. A second failure is State L, not a third try.
+          // One retry from the same ring: a geometry change may have replaced the model between the
+          // request and this reply. A second failure is State L, not a third try.
           if (retry) {
             const g2 = modelGeom(st, n);
             if (g2) { seedAndPaint(g2, false); return; }
@@ -3995,8 +4057,8 @@ wssHost.on('connection', (ws, req) => {
         });
         // 'seeding' paints from the callback. 'warm' already holds this ring, but writes may still be
         // queued, so the snapshot must wait for them the way a seed's does. 'failed' has no model.
-        if (status === 'warm') screenModel.drain(n, () => paintAll());
-        else if (status !== 'seeding') paintAll();
+        if (status === 'warm') screenModel.drain(n, () => { if (after()) paintAll(); });
+        else if (status !== 'seeding') { if (after()) paintAll(); }
       };
       const geom = modelGeom(st, n);
       if (geom) seedAndPaint(geom, true); else paintAll();
@@ -4224,6 +4286,9 @@ function sessionState(name) {
     st = {
       clients: new Map(), cur: null, unpinnedLocalSize: null, sbInFlight: false, sbRid: '',
       sbWaiters: new Set(), sbRequestTimer: null, seedHold: null,
+      // The seed watchdog: a ring whose parse never reports back must not hold live bytes out of the
+      // model for ever, and a seed that belongs to a stream which has already ended must not paint.
+      seedTimer: null, seedSeq: 0,
       // One element-map state per session, never per viewer: the strip is applied once, before
       // fan-out, so the screen model and every viewer see the same text.
       emap: { strip: elementMap.createStripState(), map: null, gen: null },
@@ -4232,8 +4297,26 @@ function sessionState(name) {
   }
   return st;
 }
+// A seed parses the ring asynchronously, so its callback can land after the stream it was reading has
+// ended. The session state object cannot carry that fact: deleteEmptySessionState removes `st` from the
+// map, and a later attach builds a NEW object for the same name while the old seed closure still holds
+// the old one - so a version counter on `st` would be replaced along with it and the stale callback would
+// look current. The epoch is keyed by session NAME and lives outside the state, so every event that
+// replaces the stream or the state object can invalidate seeds that started before it. It is bumped at
+// every place the screen model is dropped or the state object is replaced: resetSessionBoundary (hello
+// boundary and resync), deleteEmptySessionState, and the rename disposal.
+const boundaryEpochs = new Map();   // name -> integer, monotonic for the process
+function bumpBoundaryEpoch(name) { boundaryEpochs.set(name, (boundaryEpochs.get(name) || 0) + 1); }
+function boundaryEpochOf(name) { return boundaryEpochs.get(name) || 0; }
+function clearSeedTimer(st) {
+  if (!st || !st.seedTimer) return;
+  clearTimeout(st.seedTimer);
+  st.seedTimer = null;
+}
 function deleteEmptySessionState(name, st) {
   if (st.clients.size === 0 && sessions.get(name) === st) {
+    bumpBoundaryEpoch(name);   // a seed still holding this state must not paint a dead session's screen
+    clearSeedTimer(st);
     clearScrollbackRequest(st);
     screenModel.dispose(name);   // the session is gone; its screen model has no stream to stay in step with
     sessions.delete(name);
@@ -4280,7 +4363,11 @@ function deleteSessionViewerState(name, reason) {
     try { client.ws.close(1013, reason); } catch {}
   }
   // removeViewer disposes through deleteEmptySessionState when it removes the last one; state with no
-  // clients at entry (a session that ended with nobody watching) would otherwise never reach it.
+  // clients at entry (a session that ended with nobody watching) would otherwise never reach it, and
+  // that path is a state replacement too - a seed still parsing the old ring must not paint here.
+  bumpBoundaryEpoch(name);
+  clearSeedTimer(st);
+  st.seedHold = null;
   screenModel.dispose(name);
   sessions.delete(name);
 }
@@ -4370,7 +4457,15 @@ function resetElementMapBoundary(st) {
 // the old stream answer an attach. It is rebuilt - and reseeded from the new ring - on demand.
 function resetSessionBoundary(name, st) {
   resetElementMapBoundary(st);
-  if (st) st.seedHold = null;   // held bytes belong to the stream that just ended, not the new one
+  // The epoch is what makes an in-flight seed abandon its ring rather than paint it into a stream that
+  // has ended: bumping here reaches a seed whose callback holds a state object this function may not
+  // even be looking at (deleteEmptySessionState + reattach), which a counter on `st` cannot.
+  bumpBoundaryEpoch(name);
+  if (st) {
+    st.seedHold = null;   // held bytes belong to the stream that just ended, not the new one
+    st.seedSeq++;         // any seed started before this boundary is stale, timer included
+    clearSeedTimer(st);
+  }
   screenModel.dispose(name);
 }
 // The geometry the session's byte stream was drawn at - not the geometry of whichever viewer happens
