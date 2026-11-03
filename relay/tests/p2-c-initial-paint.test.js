@@ -330,7 +330,10 @@ test('a same-identity hello during a seed does not cancel it (heartbeat-mid-seed
     'the heartbeat left the seeded model in place: a warm attach asks for nothing');
 });
 
-test('an identity-changing hello during a seed abandons the old ring (boundary-epoch)', async t => {
+// This row proves ABANDONMENT and the re-request, not the name-keyed epoch: the boundary also bumps
+// st.seedSeq on the same state object, which alone rejects the old seed's callback. The epoch's unique
+// arm is the replaced-state row below, where the closure holds a state object that no counter can reach.
+test('an identity-changing hello during a seed abandons the old ring and re-requests', async t => {
   const name = 'boundary-epoch';
   const { h, host } = await boot(t, [session(name)]);
   const before = sbRequests(host, name).length;
@@ -390,9 +393,10 @@ function stalledRing() {
 
 test('a seed that outlives HOST_SB_WAIT_MS releases the hold, drops the model and asks again', async t => {
   const name = 'seed-watchdog';
-  // A 2 ms budget forces the watchdog to win deterministically rather than race the parser: it is armed
-  // before screenModel.seed() queues the parse, and both `setTimeout`s clamp to the same millisecond, so
-  // the watchdog is first in the timer list. A larger budget would race how fast this box parses 194KB.
+  // A 2 ms budget, against a ring this large, forces the watchdog to fire before the parser can finish:
+  // it is armed before screenModel.seed() queues the parse, and 194KB cannot parse in 2ms. The seed's
+  // completion is an xterm write callback, not a second timer, so the argument here is parse volume
+  // against the budget, not timer ordering. A larger budget would race how fast this box parses the ring.
   // The mechanism it proves is the one that saves a session whose parser never catches up: a hold that
   // outlives the ring keeps live bytes out of the model and the viewer on a buffer for ever.
   const { h, host } = await boot(t, [session(name)], { MUX_HOST_SB_WAIT_MS: '2' });
@@ -411,13 +415,32 @@ test('a seed that outlives HOST_SB_WAIT_MS releases the hold, drops the model an
   assert.ok(text.includes(BANNER), 'the viewer is left in the defined state, not on a bare buffer');
   assert.ok(text.startsWith(CLEAR), 'the defined state is CLEAR-bounded');
 
-  // Not wedged: the same reply that the watchdog asked for is answered, and a stalled parse produces
-  // another request rather than silence - the retry loop survives the abandoned seed.
+  // The retry loop is not one-shot: answering the re-request with another stalled ring produces a further
+  // request rather than silence. Same mechanism as above, so it is equally deterministic.
   const afterFirst = sbRequests(host, name).length;
-  host.sendScrollback(name, 'RECOVERED_SCREEN\r\n');
+  host.sendScrollback(name, stalledRing());
   await waitFor(() => sbRequests(host, name).length > afterFirst,
-    'a still-stalled parse asks again instead of going silent', 4000);
+    'a second stalled parse asks again instead of going silent', 4000);
+  assert.ok(!got.text().includes('STALE_RING_MARKER'), 'the second abandoned ring never paints');
+
+  // Not wedged: the re-request is answered with a real (small) ring. At a 2 ms budget that seed may either
+  // complete and paint, or lose the race and produce another request; both are a defined state, so accept
+  // either and answer once more if asked. The property pinned is "defined state, never wedged", not the
+  // exact request count on a reply that is designed to finish.
+  let outcome = null;
+  for (let round = 0; round < 3; round++) {
+    const mark = sbRequests(host, name).length;
+    host.sendScrollback(name, 'RECOVERED_SCREEN\r\n');
+    await waitFor(() => got.text().includes('RECOVERED_SCREEN') || sbRequests(host, name).length > mark,
+      `the small ring paints or asks again (round ${round + 1})`, 4000);
+    outcome = got.text().includes('RECOVERED_SCREEN') ? 'painted' : 'requested';
+    if (outcome === 'painted') break;
+  }
+  assert.ok(outcome === 'painted' || outcome === 'requested',
+    'an answered re-request either paints or is answered again - never silence');
   assert.ok(!got.text().includes('STALE_RING_MARKER'), 'the abandoned ring never paints');
+  assert.ok(got.text().includes(BANNER) || got.text().includes('RECOVERED_SCREEN'),
+    'the viewer is in a defined state, not a bare buffer');
 });
 
 test('a seed whose state object was replaced cannot warm the model (name-keyed epoch)', async t => {
