@@ -3167,21 +3167,21 @@ try{ window.__muxForceSel = forceSel; }catch(e){}
     // let motion (below) and the release (below) decide. Nothing is forwarded here.
     const cell=bufferCellAt(e.clientX,e.clientY);
     if(!cell) return;
-    const s=findSession(current);
-    // WHAT WANTS THE CLICK. Not the buffer type (a normal-buffer app pane lost every click) and not the
-    // arm state (an app that never armed the mouse lost every click too - that was the either/or). It is
-    // simply whether an APP is behind this pane at all: a session bound to an exact chat / carrying a
-    // command is an app pane and takes clicks; a bare shell is not and must never have a report written
-    // into its stdin, where it would echo as garbage. Both of the panes in the field report are this case.
-    const wantApp=!!(s && (s.hasCommand || (s.sessionId && !s.shellOnly)));
+    // WHAT WANTS THE CLICK: the app's own arm state, and nothing else. A bare shell never arms the mouse,
+    // so it can never have a report written into its stdin. Session metadata is the wrong question: a
+    // hosted/mirror row has no command of its own yet the app behind it is armed and expects the click.
+    // This ONE value decides both halves of the gesture - the press swallow below and the release forward.
+    // They were two different expressions once (appTakesMouse at press, session metadata at release) and
+    // drifted apart, so an armed pane swallowed the press and then forwarded nothing.
+    const forward=appTakesMouse();
     ownerPress={button:[0,1,2][e.button], cell, session:current,
-                x:e.clientX, y:e.clientY, moved:false, wantApp};
+                x:e.clientX, y:e.clientY, moved:false, forward};
     // When the app armed the mouse, xterm's own protocol would emit the press the instant it fires - and
     // we would emit ours again at release, so the app sees two presses for one click. Keep xterm out of
     // an armed pane's press; we are the only one that reports it. On an UNARMED pane we must NOT prevent
     // it: xterm's own selection service is what makes a plain drag highlight, and swallowing the press
     // would leave that pane unable to select.
-    if(appTakesMouse()){
+    if(forward){
       // Swallowing the press ALSO keeps xterm's selection service from dropping the old highlight - and a
       // live highlight holds the output freeze. A click after a drag-select then forwarded its report, but
       // the app's reply stayed buffered behind the freeze and never painted, so the click looked dead until
@@ -3202,10 +3202,11 @@ try{ window.__muxForceSel = forceSel; }catch(e){}
       e.preventDefault(); e.stopPropagation();
       return;
     }
-    // Never moved: a click. Forward it only when there is an app behind this pane to receive it. The cell
-    // is recomputed at the release point so a click that drifted a few px still lands on what is under
-    // the cursor.
-    if(!press.wantApp) return;
+    // Never moved: a click. Forward it only when the app had armed the mouse at press time - the SAME
+    // value that decided the press swallow, not a second expression that can drift from it. The cell is
+    // recomputed at the release point so a click that drifted a few px still lands on what is under the
+    // cursor.
+    if(!press.forward) return;
     const cell=bufferCellAt(e.clientX,e.clientY) || press.cell;
     const at=c=>`\x1b[<${press.button};${c[0]+1};${c[1]-(term.buffer.active.viewportY|0)+1}`;
     const click=at(cell)+'M', release=at(cell)+'m';
