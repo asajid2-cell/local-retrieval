@@ -3298,6 +3298,52 @@ try{ window.__muxForceSel = forceSel; }catch(e){}
     forceSelEnd();
   }, {capture:true, passive:false});
   host.addEventListener('touchcancel', ()=>{ if(forceSel.active) forceSelEnd(); }, {capture:true, passive:false});
+  // ---- FLEX POINTER MAPPING (I-1) ------------------------------------------------------------------
+  // xterm builds a cell from `clientX - rect.left`, measuring the .xterm-screen box but dividing by the
+  // UNSCALED cell size: getCoordsRelativeToElement in the vendored bundle reads the rect and never the
+  // scale. Under 'flex' that box carries a CSS scale on both axes, so the rect is the visual (scaled)
+  // box while the divisor is CSS pixels, and every report xterm composes is wrong by that scale - at
+  // 1.12 it lands a few columns to the right of the pointer, at 0.8 it falls behind it. The page's own
+  // hit test (bufferCellAt) is not affected and must not be pre-divided here: it measures the same
+  // visual rect and divides by the visual cell size, so it is already in the correct phase. This
+  // rewrite is for xterm's native protocol only (motion and button reports).
+  //
+  // A capture listener on #term rewrites the event's client coordinates into CSS pixels of the
+  // untransformed grid; xterm then subtracts the rect and divides by the cell size exactly as it does
+  // at scale 1, so the report for a given cell is byte-identical at every scale. It is registered after
+  // the handlers above (same element, same phase), so this page's own gesture code still reads the true
+  // viewport point; the page's wheel router is a capture listener up at #term too, and it was registered
+  // long before this block, so the owner wheel report is composed from the untouched point and this
+  // rewrite only feeds the native wheel path underneath it. It runs only for targets inside #term - the
+  // toolbar and dialogs are untouched. When both scales are exactly 1 it returns before defining
+  // anything: an unscaled pane takes the path it always did, with the event object left as the browser
+  // made it. 'wheel' is here because xterm reports the pointer cell for it as well: the page's own
+  // router hands an armed pane's wheel to the app, but a re-dispatched wheel (padding, alt buffer) and
+  // any wheel xterm sees directly carry the same unscaled-cell divisor.
+  const POINTER_XY = ['mousedown','mousemove','mouseup','click','auxclick','dblclick','contextmenu','wheel'];
+  function pointerScale(){
+    const scr=$('#term') && $('#term').querySelector('.xterm-screen');
+    if(!scr || !scr.offsetWidth || !scr.offsetHeight) return null;
+    const r=scr.getBoundingClientRect();
+    const sx=r.width/scr.offsetWidth, sy=r.height/scr.offsetHeight;
+    if(!(sx>0) || !(sy>0)) return null;
+    return (sx===1 && sy===1) ? null : {sx, sy, left:r.left, top:r.top};
+  }
+  function unscalePointer(e){
+    const h=$('#term');
+    if(!h || !e.target || !h.contains(e.target)) return;   // #term targets only
+    const g=pointerScale();
+    if(!g) return;                                          // unscaled: identity, leave the event alone
+    // x and y are divided by their own scale: 'flex' applies scale(sx,sy) and the two axes differ.
+    const x=g.left + (e.clientX - g.left)/g.sx;
+    const y=g.top  + (e.clientY - g.top )/g.sy;
+    try{
+      // Own data properties shadow MouseEvent's prototype getters; xterm reads e.clientX / e.clientY.
+      Object.defineProperty(e,'clientX',{value:x,configurable:true});
+      Object.defineProperty(e,'clientY',{value:y,configurable:true});
+    }catch(_){}
+  }
+  for(const type of POINTER_XY) host.addEventListener(type, unscalePointer, true);
 })();
 
 // ---- status ----
