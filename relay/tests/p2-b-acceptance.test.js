@@ -3,7 +3,9 @@
 //
 // Contract: ISSUES-tab-8648.md, "P2-B fence contract" (2026-11-03).
 // Base: leaf17/p2-b-positional-cut off 81b1f60.
-// LANDED-ON: (implementation head sha recorded when this file is rebased onto it)
+// LANDED-ON: 8cf91619264f903376318344c0bc694808b7564b (leaf17/p2-b-positional-cut, parent 81b1f60,
+// verified against origin; muxd/muxd.py blob d481fbc605bf43bd0bef9562e8f2b0cf23fe834a,
+// relay/server.js blob a49f16969aaa29923153d7d0f30e593e047df14c).
 //
 // Baseline on 81b1f60 (P2-C only, 2026-11-02): 8 pass / 9 fail.
 //   GREEN (the P2-C fallback rows must stay green through the change): 04c, 06, 07, 08, 10, 12, 13, 15.
