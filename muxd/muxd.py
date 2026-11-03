@@ -1774,6 +1774,113 @@ class ElementMapStrip:
         return b"".join(parts)
 
 
+class VtBoundaryTracker:
+    """Absolute offsets at which a VT parser is in ground state.
+
+    The positional replay cut may only fall where no escape sequence is open, so `pos` and `start`
+    are snapped to offsets this tracker recorded over the same forwarded raw bytes the ring is fed.
+    Recognition is byte-level and UTF-8 aware: a byte 0x80-0xBF that continues a multi-byte
+    character is data, so ordinary text cannot open a sequence. The 8-bit C1 introducers are still
+    honoured inside UTF-8 text because the relay-side strip state honours them too - a boundary the
+    strip cannot reproduce must never be reported, and missing a boundary only costs a larger live
+    flush, never a mis-cut.
+    """
+
+    _C1 = (0x90, 0x9B, 0x9C, 0x9D)
+
+    def __init__(self):
+        self.reset(0)
+
+    def reset(self, at=0):
+        self.state = "ground"
+        self.utf8_need = 0
+        self.last_ground = int(at)
+
+    def _consume(self, b):
+        st = self.state
+        if st == "ground":
+            if b == 0x1B:
+                self.state = "esc"
+            elif b == 0x9B:
+                self.state = "csi"
+            elif b == 0x9D:
+                self.state = "osc"
+            elif b == 0x90:
+                self.state = "str"
+            # a lone ST in ground is a no-op
+        elif st == "esc":
+            if b == 0x5B:
+                self.state = "csi"
+            elif b == 0x5D:
+                self.state = "osc"
+            elif b in (0x50, 0x58, 0x5E, 0x5F):
+                self.state = "str"
+            elif 0x20 <= b <= 0x2F:
+                self.state = "esc_int"
+            else:
+                self.state = "ground"      # two-character escape (or aborted)
+        elif st == "esc_int":
+            if b in (0x18, 0x1A) or not (0x20 <= b <= 0x2F):
+                self.state = "ground"
+        elif st == "csi":
+            if b in (0x18, 0x1A) or 0x40 <= b <= 0x7E:
+                self.state = "ground"
+            # params/intermediates and ignored controls keep CSI open
+        elif st == "osc":
+            if b in (0x07, 0x18, 0x1A, 0x9C):
+                self.state = "ground"
+            elif b == 0x1B:
+                self.state = "str_esc"
+        elif st == "str":
+            if b in (0x18, 0x1A, 0x9C):
+                self.state = "ground"
+            elif b == 0x1B:
+                self.state = "str_esc"
+        elif st == "str_esc":
+            if b == 0x5C:
+                self.state = "ground"
+            elif b != 0x1B:
+                self.state = "str"         # not ST: resume the string body
+
+    def feed(self, data, base):
+        """Feed bytes covering [base, base+len(data)); return the first and last ground offsets in
+        that closed range, or (None, None) when the chunk contains none."""
+        first = last = None
+
+        def note(p):
+            nonlocal first, last
+            if first is None:
+                first = p
+            last = p
+
+        if self.state == "ground" and not self.utf8_need:
+            note(base)
+        i, n = 0, len(data)
+        while i < n:
+            b = data[i]
+            if self.utf8_need and 0x80 <= b <= 0xBF:
+                self.utf8_need -= 1        # continuation of a character: data, never a control
+            else:
+                self.utf8_need = 0
+                if b in self._C1:
+                    self._consume(b)
+                elif 0xC2 <= b <= 0xDF:
+                    self.utf8_need = 1
+                elif 0xE0 <= b <= 0xEF:
+                    self.utf8_need = 2
+                elif 0xF0 <= b <= 0xF4:
+                    self.utf8_need = 3
+                else:
+                    self._consume(b)
+            i += 1
+            # A boundary must never fall inside a multi-byte character: the cut splits raw bytes,
+            # and a mid-character cut would hand the relay a broken sequence.
+            if not self.utf8_need and self.state == "ground":
+                self.last_ground = base + i
+                note(base + i)
+        return first, last
+
+
 def launch_candidate_ids(cmd="", ids=None):
     candidates = _candidate_resume_ids(cmd, ids)
     unique = {}
@@ -3045,9 +3152,17 @@ class Session:
         self.cols, self.rows = max(20, cols or 140), max(8, rows or 40)
         self.created = time.time(); self.last_out = time.time()
         self.ring = collections.deque(); self.ring_len = 0
+        self.ring_meta = collections.deque()    # per-chunk (raw_start, raw_end, first_ground, last_ground)
         self._ring_lock = threading.RLock()
         self.emap_strip = ElementMapStrip()     # ring-only: `pending` keeps the OSC verbatim
         self.replay_state = TerminalReplayState()
+        # Positional replay coordinate: `stream_bytes` counts the raw bytes handed to the forward
+        # queue (the same bytes the relay receives), and every ring chunk records the raw span it was
+        # taken from. `stream_dirty` is set when the queue drops a prefix, which leaves a hole the
+        # relay can never receive; positional replies are refused until a resync re-bases the stream.
+        self.stream_bytes = 0
+        self.stream_dirty = False
+        self.ground = VtBoundaryTracker()
         self.dead = False; self.user_killed = False
         self.deaths = []
         self.loop, self.outq = loop, outq
@@ -3161,11 +3276,15 @@ class Session:
             if pty is not self.pty: return          # superseded by a respawn
             b = data.encode("utf-8", "replace")
             self.replay_state.ingest(b)
-            self._append_ring(b)
             with self.plock:                           # coalesced; the pump flushes immediately then merges a burst
+                raw_start = self.stream_bytes           # the ring span and the forward counter move together
+                self.stream_bytes += len(b)
+                raw_end = self.stream_bytes
                 self.pending += b                       # backpressure: if a flood outruns a slow link, keep the
                 if len(self.pending) > 512_000:         # last ~512KB unsent (the ring still holds history for reattach)
                     del self.pending[:len(self.pending) - 512_000]
+                    self.stream_dirty = True            # a dropped prefix is a hole the relay never receives
+            self._append_ring(b, raw_start, raw_end)
             self.wake_pump()
 
     def drain(self):
@@ -3182,8 +3301,16 @@ class Session:
         try: self.loop.call_soon_threadsafe(ev.set)
         except Exception: pass
 
-    def _append_ring(self, data):
+    def _append_ring(self, data, raw_start=None, raw_end=None):
+        if raw_start is None:                      # direct call (tests): derive the span and advance
+            raw_start = self.stream_bytes
+            raw_end = raw_start + len(data)
+            self.stream_bytes = raw_end
         with self._ring_lock:
+            # The boundary scan and the append are one critical section: a reply taken between them
+            # could name a `pos` in a chunk the snapshot does not yet hold, which is the one way a
+            # positional cut could leave a gap.
+            first_ground, last_ground = self.ground.feed(data, raw_start)
             # Ring-only element-map strip (see ElementMapStrip): history must never hold an OSC 21338
             # sequence, while the live `pending` copy of these same bytes is forwarded untouched. The
             # per-session carry holds a fragment a chunk boundary split, so base64 never leaks into a
@@ -3194,16 +3321,22 @@ class Session:
                 return
             if len(data) >= RING_CAP:
                 retained = data[-RING_CAP:]
-                self.ring.clear()
+                self.ring.clear(); self.ring_meta.clear()
+                # The retained tail of a post-strip slice has no exact raw start (bytes were stripped
+                # out of it), so it reports no first boundary: `start` falls through to the next chunk
+                # that has one. Its end and last boundary are exact.
                 self.ring.append(retained)
+                self.ring_meta.append((max(raw_start, raw_end - len(retained)), raw_end, None, last_ground))
                 self.ring_len = len(retained)
                 self.last_out = time.time()
                 return
             self.ring.append(data)
+            self.ring_meta.append((raw_start, raw_end, first_ground, last_ground))
             self.ring_len += len(data)
             self.last_out = time.time()
             while self.ring_len > RING_CAP:
                 old = self.ring.popleft()
+                self.ring_meta.popleft()
                 self.ring_len -= len(old)
 
     def _ring_snapshot(self):
@@ -3338,6 +3471,50 @@ class Session:
             if n >= limit: break
         return self.replay_state.prefix() + strip_replay_dsr(b"".join(reversed(out)))
 
+    def scrollback_view(self, limit=SB_SEND):
+        """The replay plus its positional cut: `pos`/`start` in the forwarded-raw coordinate.
+
+        `pos` is the last ground-state boundary at or before the ring tail, so every raw byte below
+        it is represented by the snapshot body (a chunk that straddles `pos` contributes only its
+        prefix) and every byte from `pos` on is not. `start` is the first ground boundary at or after
+        the raw start of the oldest chunk actually in this reply. A dirty stream (the forward queue
+        dropped a prefix) reports `pos: null`, which the relay routes to the time cut exactly like an
+        old muxd that sends no position at all.
+        """
+        try: limit = max(0, min(RING_CAP, int(limit)))
+        except Exception: limit = SB_SEND
+        with self._ring_lock:
+            picked, n = [], 0
+            for chunk, meta in reversed(list(zip(self.ring, self.ring_meta))):
+                picked.append((chunk, meta)); n += len(chunk)
+                if n >= limit: break
+            picked.reverse()
+            if getattr(self, "resync_pending", False):
+                self.resync_pending = False
+                body = getattr(self, "resync_body", b"")
+                pos = start = 0
+                resync = True
+            else:
+                body = b"".join(chunk for chunk, _ in picked)
+                resync = False
+                if self.stream_dirty:
+                    pos = start = None
+                else:
+                    pos = 0
+                    for _, meta in reversed(list(zip(self.ring, self.ring_meta))):
+                        if meta[3] is not None:
+                            pos = meta[3]
+                            break
+                    start = None
+                    for _, meta in picked:
+                        if meta[2] is not None:
+                            start = meta[2]
+                            break
+                    if start is None or start > pos:
+                        start = pos
+        return {"d": self.replay_state.prefix() + strip_replay_dsr(body),
+                "pos": pos, "start": start, "resync": resync}
+
     def tail_text(self, nbytes=1600, lines=0):
         raw = bytearray()
         for b in reversed(self._ring_snapshot()):
@@ -3389,9 +3566,17 @@ class OwnerSession:
         self.cols, self.rows = max(20, int(cols or 140)), max(8, int(rows or 40))
         self.created = time.time(); self.last_out = time.time()
         self.ring = collections.deque(); self.ring_len = 0
+        self.ring_meta = collections.deque()    # per-chunk (raw_start, raw_end, first_ground, last_ground)
         self._ring_lock = threading.RLock()
         self.emap_strip = ElementMapStrip()     # ring-only: `pending` keeps the OSC verbatim
         self.replay_state = TerminalReplayState()
+        # Positional replay coordinate: `stream_bytes` counts the raw bytes handed to the forward
+        # queue (the same bytes the relay receives), and every ring chunk records the raw span it was
+        # taken from. `stream_dirty` is set when the queue drops a prefix, which leaves a hole the
+        # relay can never receive; positional replies are refused until a resync re-bases the stream.
+        self.stream_bytes = 0
+        self.stream_dirty = False
+        self.ground = VtBoundaryTracker()
         self.dead = False; self.user_killed = False
         self.deaths = []
         self.loop, self.outq = loop, outq
@@ -3415,6 +3600,12 @@ class OwnerSession:
         # and the owner is told so it can skip frames entirely on an unwatched tab. Non-stream owners
         # default watched=True so their forwarding is unchanged.
         self.watched = not self.stream
+        # Bytes parked in the ring while unwatched never cross the relay, so the forwarded stream has
+        # a hole the coordinate cannot describe; the first watch after one marks the stream dirty.
+        self._parked_since_watch = 0
+        # A resync is a truth snapshot handed out exactly once: history body, pos = start = base.
+        self.resync_pending = False
+        self.resync_body = b""
         self.identity_pending = False
         self.lifecycle = "active"
         self.last_alive_utc = ""
@@ -3435,11 +3626,15 @@ class OwnerSession:
     def ingest(self, data: bytes):
         if not data: return
         self.replay_state.ingest(data)
-        self._append_ring(data)
         with self.plock:
+            raw_start = self.stream_bytes
+            self.stream_bytes += len(data)
+            raw_end = self.stream_bytes
             self.pending += data
             if len(self.pending) > 512_000:
                 del self.pending[:len(self.pending) - 512_000]
+                self.stream_dirty = True
+        self._append_ring(data, raw_start, raw_end)
         self.wake_pump()
 
     def drain(self):
@@ -3456,8 +3651,16 @@ class OwnerSession:
         try: self.loop.call_soon_threadsafe(ev.set)
         except Exception: pass
 
-    def _append_ring(self, data):
+    def _append_ring(self, data, raw_start=None, raw_end=None):
+        if raw_start is None:                      # direct call (tests): derive the span and advance
+            raw_start = self.stream_bytes
+            raw_end = raw_start + len(data)
+            self.stream_bytes = raw_end
         with self._ring_lock:
+            # The boundary scan and the append are one critical section: a reply taken between them
+            # could name a `pos` in a chunk the snapshot does not yet hold, which is the one way a
+            # positional cut could leave a gap.
+            first_ground, last_ground = self.ground.feed(data, raw_start)
             # Ring-only element-map strip (see ElementMapStrip): history must never hold an OSC 21338
             # sequence, while the live `pending` copy of these same bytes is forwarded untouched. The
             # per-session carry holds a fragment a chunk boundary split, so base64 never leaks into a
@@ -3468,16 +3671,22 @@ class OwnerSession:
                 return
             if len(data) >= RING_CAP:
                 retained = data[-RING_CAP:]
-                self.ring.clear()
+                self.ring.clear(); self.ring_meta.clear()
+                # The retained tail of a post-strip slice has no exact raw start (bytes were stripped
+                # out of it), so it reports no first boundary: `start` falls through to the next chunk
+                # that has one. Its end and last boundary are exact.
                 self.ring.append(retained)
+                self.ring_meta.append((max(raw_start, raw_end - len(retained)), raw_end, None, last_ground))
                 self.ring_len = len(retained)
                 self.last_out = time.time()
                 return
             self.ring.append(data)
+            self.ring_meta.append((raw_start, raw_end, first_ground, last_ground))
             self.ring_len += len(data)
             self.last_out = time.time()
             while self.ring_len > RING_CAP:
                 old = self.ring.popleft()
+                self.ring_meta.popleft()
                 self.ring_len -= len(old)
 
     def _ring_snapshot(self):
@@ -3524,6 +3733,50 @@ class OwnerSession:
             if n >= limit: break
         return self.replay_state.prefix() + strip_replay_dsr(b"".join(reversed(out)))
 
+    def scrollback_view(self, limit=SB_SEND):
+        """The replay plus its positional cut: `pos`/`start` in the forwarded-raw coordinate.
+
+        `pos` is the last ground-state boundary at or before the ring tail, so every raw byte below
+        it is represented by the snapshot body (a chunk that straddles `pos` contributes only its
+        prefix) and every byte from `pos` on is not. `start` is the first ground boundary at or after
+        the raw start of the oldest chunk actually in this reply. A dirty stream (the forward queue
+        dropped a prefix) reports `pos: null`, which the relay routes to the time cut exactly like an
+        old muxd that sends no position at all.
+        """
+        try: limit = max(0, min(RING_CAP, int(limit)))
+        except Exception: limit = SB_SEND
+        with self._ring_lock:
+            picked, n = [], 0
+            for chunk, meta in reversed(list(zip(self.ring, self.ring_meta))):
+                picked.append((chunk, meta)); n += len(chunk)
+                if n >= limit: break
+            picked.reverse()
+            if getattr(self, "resync_pending", False):
+                self.resync_pending = False
+                body = getattr(self, "resync_body", b"")
+                pos = start = 0
+                resync = True
+            else:
+                body = b"".join(chunk for chunk, _ in picked)
+                resync = False
+                if self.stream_dirty:
+                    pos = start = None
+                else:
+                    pos = 0
+                    for _, meta in reversed(list(zip(self.ring, self.ring_meta))):
+                        if meta[3] is not None:
+                            pos = meta[3]
+                            break
+                    start = None
+                    for _, meta in picked:
+                        if meta[2] is not None:
+                            start = meta[2]
+                            break
+                    if start is None or start > pos:
+                        start = pos
+        return {"d": self.replay_state.prefix() + strip_replay_dsr(body),
+                "pos": pos, "start": start, "resync": resync}
+
     def tail_text(self, nbytes=1600, lines=0):
         raw = bytearray()
         for b in reversed(self._ring_snapshot()):
@@ -3549,7 +3802,16 @@ class OwnerSession:
         if watched == self.watched:
             return
         self.watched = watched
+        if watched and self._parked_since_watch:
+            # Those bytes are in the ring but never crossed the relay, so the forwarded coordinate no
+            # longer describes what the relay received. A resync (replace_history) re-bases and clears it.
+            self.stream_dirty = True
+            self._parked_since_watch = 0
         self._send_owner({"t": "watch" if watched else "unwatch"})
+
+    def note_parked(self, count: int):
+        if count > 0:
+            self._parked_since_watch += count
 
     def replace_history(self, data: bytes):
         # spec section 6.1, kind 0x03: the owner's screen and our ring have diverged, so the ring is
@@ -3563,15 +3825,25 @@ class OwnerSession:
         # stripper would honour 2a and keep it as text; drop it here, where the snapshot is known to be
         # one, before it becomes part of the ring.
         history = self.emap_strip.strip(drop_leading_element_map_tail(data))
+        with self.plock:
+            # Re-base and drop the forward queue in one step. The resync frame below is queued after
+            # this, so no post-resync byte can reach the relay before it re-bases its own counter.
+            self.pending = bytearray()
+            self.stream_bytes = 0
+            self.stream_dirty = False
         with self._ring_lock:
-            self.ring.clear()
+            # The history snapshot is below the new base: it carries a zero-width span so the live
+            # coordinate starts at 0 and the body still paints the whole screen.
+            self.ground.reset(0)
+            self.ring.clear(); self.ring_meta.clear()
             self.ring.append(history)
+            self.ring_meta.append((0, 0, 0, 0))
             self.ring_len = len(history)
+            self.resync_body = history
+            self.resync_pending = True
         self.replay_state = TerminalReplayState()
         if data:
             self.replay_state.ingest(data)
-        with self.plock:
-            self.pending = bytearray()
         self.last_out = time.time()
         self.outq.put_nowait(("resync", self.name, b""))
         self.wake_pump()
@@ -4269,6 +4541,9 @@ def session_payload(name, sess):
             "ready": alive, "kind": kind,
             "sessionId": getattr(sess, "session_id", "") or "",
             "generationId": str(getattr(sess, "generation_id", "") or ""),
+            # Forwarded-raw coordinate. The relay anchors its own counter on it at hello, so an
+            # additive field: an old relay ignores it and keeps the time cut.
+            "streamBytes": int(getattr(sess, "stream_bytes", 0) or 0),
             "aliases": list(getattr(sess, "aliases", []) or []),
             "identityPending": bool(getattr(sess, "identity_pending", False)),
             "lifecycle": str(getattr(sess, "lifecycle", "active") or "active"),
@@ -5779,6 +6054,10 @@ async def main():
                     # normal session has no watcher concept and is always forwarded.
                     if getattr(s, "watched", True):
                         outq.put_nowait(("o", s.name, chunk))
+                    else:
+                        note_parked = getattr(s, "note_parked", None)
+                        if note_parked:
+                            note_parked(len(chunk))
                     fanout_local_output(s, chunk)
     start_supervised_background(background_tasks, "output-flush", flush_out)
 
@@ -6282,17 +6561,22 @@ async def main():
                                     session = sessions[name]
                                     scrollback_limit = m.get("max", SB_SEND)
                                     scrollback_request_id = str(m.get("rid", "") or "")
-                                    encoded = await asyncio.get_running_loop().run_in_executor(
+                                    view = await asyncio.get_running_loop().run_in_executor(
                                         None,
-                                        lambda current=session, limit=scrollback_limit: base64.b64encode(
-                                            current.scrollback(limit)
-                                        ).decode(),
+                                        lambda current=session, limit=scrollback_limit: current.scrollback_view(limit),
                                     )
+                                    # The positional cut rides the same reply, additive: the body is
+                                    # everything below `pos`, and `pos: null` (dirty) is distinct from
+                                    # an old muxd that omits the key entirely.
                                     await ws.send(json.dumps({
                                         "t": "sb",
                                         "s": name,
                                         "rid": scrollback_request_id,
-                                        "d": encoded,
+                                        "d": base64.b64encode(view["d"]).decode(),
+                                        "pos": view["pos"],
+                                        "start": view["start"],
+                                        "generationId": str(getattr(session, "generation_id", "") or ""),
+                                        "resync": bool(view["resync"]),
                                     }))
                                     # Byte replay can't rebuild a full-screen TUI on its own; nudge the app to
                                     # emit an authoritative full frame right after the replay.
