@@ -4020,11 +4020,12 @@ wssHost.on('connection', (ws, req) => {
         if (c.sbTimer) { clearTimeout(c.sbTimer); c.sbTimer = null; }
       }
       const paintAll = () => {
-        // The reply that reached paintAll was a successful seed (or a warm model already holding it),
-        // so any stale-run strikes accumulated against this generation are over.
-        st.strikes = 0;
         const g = modelGeom(st, n);
         const snap = g ? screenModel.snapshot(n, g.cols, g.rows) : null;
+        // Only a reply that actually yields a screen ends a stale run: a reply with no snapshot leaves
+        // every viewer on the banner, so the next stale must still count toward the permanent State L
+        // rather than resetting the strikes against a cold model.
+        if (snap) st.strikes = 0;
         // The held bytes are the continuation the snapshot cannot carry (it shows cells, not the
         // sequences that made them). Every viewer painted from this snapshot was buffering across the
         // reply, so every one of them gets the hold verbatim right after CLEAR + snapshot - including a
@@ -4731,8 +4732,14 @@ function deliverHostOutput(name, buf) {
       const covered = Math.max(0, c.dropUntil - rawStart);
       c.dropUntil = null;
       if (c.dropTimer) { clearTimeout(c.dropTimer); c.dropTimer = null; }
-      // Ground `pos` means the tail can be re-stripped from a fresh state exactly like a replay cut.
-      const tail = elementMap.stripElementMap(raw.subarray(covered), elementMap.createStripState()).text;
+      // A chunk that begins at or after the cut has nothing to drop, and it may start INSIDE an
+      // element-map sequence whose introducer was in a dropped chunk - re-stripping it from a fresh
+      // state would hand the viewer the sequence body as text, so use the carried strip the whole
+      // chunk already went through. Only a genuine straddler is re-stripped, from a fresh state,
+      // which is exact because `pos` is a ground-state boundary.
+      const tail = covered > 0
+        ? elementMap.stripElementMap(raw.subarray(covered), elementMap.createStripState()).text
+        : buf;
       c.wentLive = true; st.sbWaiters.delete(c.id);
       if (tail.length && !sendViewer(name, st, c, tail)) continue;
       c.painted = rawEnd;

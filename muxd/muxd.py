@@ -3500,10 +3500,16 @@ class Session:
                 if self.stream_dirty:
                     pos = start = None
                 else:
-                    pos = 0
+                    # The tracker has fed every forwarded byte, including a chunk stripped to nothing
+                    # (a pure element-map chunk never enters the ring, so scanning `ring_meta` alone
+                    # would leave `pos` behind a tail the relay already received - a cold attach would
+                    # then be judged STALE and show the banner). Bytes between the ring tail and this
+                    # boundary were element-map only: they produce no screen output, so the snapshot
+                    # still represents everything below `pos`.
+                    pos = self.ground.last_ground
                     for _, meta in reversed(list(zip(self.ring, self.ring_meta))):
                         if meta[3] is not None:
-                            pos = meta[3]
+                            pos = max(pos, meta[3])
                             break
                     start = None
                     for _, meta in picked:
@@ -3762,10 +3768,16 @@ class OwnerSession:
                 if self.stream_dirty:
                     pos = start = None
                 else:
-                    pos = 0
+                    # The tracker has fed every forwarded byte, including a chunk stripped to nothing
+                    # (a pure element-map chunk never enters the ring, so scanning `ring_meta` alone
+                    # would leave `pos` behind a tail the relay already received - a cold attach would
+                    # then be judged STALE and show the banner). Bytes between the ring tail and this
+                    # boundary were element-map only: they produce no screen output, so the snapshot
+                    # still represents everything below `pos`.
+                    pos = self.ground.last_ground
                     for _, meta in reversed(list(zip(self.ring, self.ring_meta))):
                         if meta[3] is not None:
-                            pos = meta[3]
+                            pos = max(pos, meta[3])
                             break
                     start = None
                     for _, meta in picked:

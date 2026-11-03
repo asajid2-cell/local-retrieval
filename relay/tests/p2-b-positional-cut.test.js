@@ -431,6 +431,58 @@ test('shape (i): a positional replay publishes no map, the live chunk publishes 
 });
 
 // ------------------------------------------------------------------------------------------------
+// Two follow-up defects found by review, each with its own row.
+// ------------------------------------------------------------------------------------------------
+test('a chunk split mid-OSC across the drop window never puts the body on the wire', async t => {
+  const name = 'osc-drop-split';
+  const { h, host } = await boot(t, [session(name)]);
+  const { got } = await attach(t, h, name);
+  await waitFor(() => host.sbReqs(name).length > 0, 'scrollback request');
+
+  const covered = 'COVERED-10';
+  assert.equal(Buffer.byteLength(covered), 10);
+  const opener = '\x1b]21338;';                  // 8 bytes: introducer only, no body and no terminator
+  host.sendOut(name, covered + opener);          // buffered chunk that ends INSIDE the sequence
+  host.replySb(name, { d: covered, pos: 10, start: 0, generationId: GEN });
+  await waitFor(() => got.text().includes(covered), 'the snapshot is painted');
+  const mark = got.mark();
+
+  // The body and terminator arrive in one live chunk that begins at or after the cut, so there is
+  // nothing to drop. Re-stripping it from a fresh state would treat the body as ordinary text; the
+  // chunk must keep the carried strip state the whole session is on.
+  host.sendOut(name, 'QUJD\x1b\\VISIBLE!');
+  await waitFor(() => got.text().includes('VISIBLE!'), 'the post-OSC tail is flushed');
+  await sleep(120);
+
+  const wire = got.bytesSince(mark).toString('latin1');
+  assert.equal(wire.includes('VISIBLE!'), true, 'the live tail is delivered');
+  assert.equal(wire.includes('QUJD'), false, 'the element-map body is never sent to a viewer');
+  assert.equal(wire.includes('\x1b]21338;'), false, 'nor the introducer');
+  assert.equal(count(got.text(), BANNER), 0);
+});
+
+test('a cold attach after a pure element-map tail paints a screen, not State L', async t => {
+  const name = 'emap-tail-cold';
+  const { h, host } = await boot(t, [session(name)]);
+  host.sendOut(name, 'TAIL-TEXT\r\n');
+  host.sendOut(name, seqFor(2));                 // strips to nothing, but the bytes WERE forwarded
+  const recv = host.forwarded.get(name);         // what the host now reports as `streamBytes`/`pos`
+  await sleep(80);
+  const { got } = await attach(t, h, name);
+  await waitFor(() => host.sbReqs(name).length > 0, 'scrollback request');
+
+  // The cut reaches the stripped tail (the muxd half of this fix), so pos == recv and the reply is
+  // not stale. The companion muxd test is the red arm: it fails where scrollback_view derives `pos`
+  // from the ring alone.
+  host.replySb(name, { d: 'TAIL-TEXT\r\n', pos: recv, start: 0, generationId: GEN });
+  await waitFor(() => got.text().includes('TAIL-TEXT'), 'the ring is painted over the stripped tail');
+  await sleep(200);
+
+  assert.equal(count(got.text(), BANNER), 0, 'a reply at the forwarded coordinate is a screen, not a banner');
+  assert.equal(host.sbReqs(name).length, 1, 'no re-request means the stale strike never reaches 2');
+});
+
+// ------------------------------------------------------------------------------------------------
 // I-15 partition invariant over random cuts: covered once, flushed once, no gap, no banner. The seed
 // is derived from a name rather than written as a literal so the fixture never looks like a key.
 // ------------------------------------------------------------------------------------------------

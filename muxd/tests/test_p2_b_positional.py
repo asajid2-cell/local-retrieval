@@ -72,6 +72,40 @@ class ForwardedCoordinateTest(unittest.TestCase):
         s.ingest(b"abcdef")
         self.assertEqual(muxd.session_payload("x", s)["streamBytes"], 6)
 
+    def test_a_pure_element_map_tail_is_covered_by_the_position(self):
+        # A chunk that strips to nothing never enters the ring, but its bytes WERE forwarded, so the
+        # cut has to reach them: otherwise a cold attach, whose `recv` already includes them, reads a
+        # `pos` behind the relaid stream and the reply is judged STALE (banner, then State L).
+        osc = b"\x1b]21338;" + b"QUJD" + b"\x1b\\"
+        owner = make_owner()
+        owner.ingest(b"HELLO")
+        owner.ingest(osc)
+        view = owner.scrollback_view()
+        self.assertEqual(owner.stream_bytes, 5 + len(osc))
+        self.assertEqual([m[:2] for m in owner.ring_meta], [(0, 5)],
+                         "the element-map chunk contributes no ring entry")
+        self.assertEqual(view["pos"], owner.stream_bytes,
+                         "the cut covers bytes that were stripped before the ring saw them")
+        self.assertEqual(view["start"], 0)
+        self.assertEqual(view["d"], b"HELLO")
+
+        hosted = make_hosted()
+        hosted._append_ring(b"HELLO")
+        hosted._append_ring(osc)
+        hview = hosted.scrollback_view()
+        self.assertEqual(hview["pos"], hosted.stream_bytes, "the hosted path keeps the same coordinate")
+
+    def test_an_unterminated_element_map_tail_does_not_advance_the_cut(self):
+        # The tracker is the source of truth, not the raw end: a tail still inside an OSC has no
+        # boundary there, and the bytes after it could carry screen output, so the cut stays put.
+        s = make_owner()
+        s.ingest(b"HELLO")
+        s.ingest(b"\x1b]21338;")          # introducer only: the sequence is open, nothing stripped yet
+        self.assertEqual(s.scrollback_view()["pos"], 5, "an open sequence is not a boundary")
+        s.ingest(b"QUJD\x1b\\")           # body + terminator: the sequence closes, ground resumes
+        self.assertEqual(s.scrollback_view()["pos"], 5 + 8 + 6,
+                         "the cut follows the close of the sequence")
+
 
 class GroundBoundaryTest(unittest.TestCase):
     def pos(self, s):
