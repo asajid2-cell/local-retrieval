@@ -2,10 +2,10 @@
 //
 // These lock in the shape of the viewer flow-control fix so it cannot silently regress:
 //   1. A viewer that stops reading is TERMINATED, never fed a gapped stream (server.js sendViewer).
-//   2. Output arriving while a scrollback request is still pending is queued and then replayed
-//      behind a single CLEAR, in arrival order (server.js host 'o' / 'sb' handlers).
-//   3. Replay sends get exactly one extra allowance of VIEWER_REPLAY_BURST_BYTES over the
-//      steady-state high-water mark -- no more, no less.
+//   2. Output arriving while a scrollback request is still pending is queued and then dropped when the
+//      ring defines the screen: a first paint is a screen snapshot, never the byte log (server.js 'sb').
+//   3. A first paint is a replay send, so it gets the replay burst allowance over the steady-state
+//      high-water mark instead of being mistaken for a stalled viewer (server.js sendViewer).
 //
 // Tests only: nothing here may require a server.js change to pass.
 
@@ -345,9 +345,10 @@ test('flood past the viewer high-water mark terminates the stalled viewer and ke
 });
 
 // ---------------------------------------------------------------------------------------------
-// (b) Burst arriving while scrollback is still pending: queue flush emits CLEAR + full replay, in order.
+// (b) Burst arriving while scrollback is still pending: the ring defines the screen; the buffered burst
+//     is NOT replayed as a byte log after it.
 // ---------------------------------------------------------------------------------------------
-test('output bursting while scrollback is pending is replayed behind one CLEAR in arrival order', async t => {
+test('output bursting while scrollback is pending is not replayed as a byte log after the snapshot', async t => {
   // Long sbWait so the burst is still queued (not force-flushed by the timeout) when sb lands.
   const h = new RelayHarness({ MUX_HOST_SB_WAIT_MS: '6000' });
   await h.start();
@@ -373,87 +374,82 @@ test('output bursting while scrollback is pending is replayed behind one CLEAR i
   await sleep(200);
   assert.equal(viewer.bytes, 0, 'nothing may reach the viewer while scrollback is still pending');
 
-  const snapshot = Buffer.from('QUEUED_SNAPSHOT_BODY');
-  await host.sendScrollback('queuecase', snapshot);
+  const ring = Buffer.from('QUEUED_SNAPSHOT_BODY\r\n');
+  await host.sendScrollback('queuecase', ring);
 
-  // The replay BODY is no longer muxd's bytes verbatim: the relay keeps a screen model and serves its
-  // compact snapshot on reattach instead of the byte log (that is the reattach fix). The burst we just
-  // sent warmed the model, so what lands here is that screen snapshot - not `snapshot`. What this test
-  // is FOR is the ordering and the single CLEAR, so assert those and let the replay body be whatever the
-  // relay chose: it must still come before the buffered burst and after exactly one CLEAR.
-  const bodyFloor = CLEAR_SCREEN.length + snapshot.length + burstBuf.length;
-  await waitFor(() => viewer.bytes >= bodyFloor, 'queued replay delivered', 15000);
+  // A viewer's first paint is a screen, never the byte log. The burst arrived while the request was in
+  // flight, so its bytes are a suffix of unknown start; muxd serialized its ring at reply time, so the
+  // ring already contains them. The relay seeds a model from the ring and paints that screen - and the
+  // buffered burst must not also be replayed after it (the old path painted those lines twice).
+  await waitFor(() => viewer.bytes > 0, 'the seeded screen is painted', 15000);
   await sleep(150);
 
-  assert.equal(viewer.closed, false, 'the queued replay must not trip backpressure');
+  assert.equal(viewer.closed, false, 'the seeded screen must not trip backpressure');
   const got = viewer.received();
   assert.ok(got.subarray(0, CLEAR_SCREEN.length).equals(CLEAR_SCREEN),
-    'the replay must open with one CLEAR');
+    'the first paint must open with one CLEAR');
   assert.equal(got.indexOf(CLEAR_SCREEN, 1), -1, 'there must be exactly one CLEAR');
-  const burstAt = got.indexOf(burstBuf);
-  assert.ok(burstAt >= CLEAR_SCREEN.length,
-    'the buffered burst must arrive after the CLEAR, in arrival order');
-  assert.ok(got.subarray(burstAt).equals(burstBuf),
-    'the queued burst itself must be replayed verbatim and last');
+  assert.ok(got.includes('QUEUED_SNAPSHOT_BODY'), 'the ring screen is on the viewer');
+  // A one-line screen cannot carry a 512KiB log: anything near the burst size would mean the byte log
+  // reached the viewer. The burst's fill bytes are 0x61..0x68 and a real screen has no such run.
+  assert.ok(got.length < burstBuf.length / 8,
+    `the burst must not be painted as a log (paint=${got.length}, burst=${burstBuf.length})`);
+  assert.equal(got.includes(Buffer.alloc(4096, 97)), false,
+    'no run of the burst payload may reach the viewer');
+
+  // Live output after the paint still follows the screen, in order.
+  await host.sendOutput('queuecase', 'LIVE_AFTER_SCREEN\r\n');
+  await waitFor(() => viewer.received().includes('LIVE_AFTER_SCREEN'), 'live output after the paint');
+  const text = viewer.received().toString('latin1');
+  assert.ok(text.indexOf('LIVE_AFTER_SCREEN') > text.indexOf('QUEUED_SNAPSHOT_BODY'),
+    'live output follows the snapshot');
 });
 
 // ---------------------------------------------------------------------------------------------
-// (c) Replay allowance boundary: VIEWER_REPLAY_BURST_BYTES over the high-water mark, and not a byte more.
+// (c) The first paint is a replay send: the replay allowance, not the steady-state high-water mark.
 // ---------------------------------------------------------------------------------------------
-test('replay sends are allowed exactly one VIEWER_REPLAY_BURST_BYTES over the high-water mark', async t => {
+// Under P2-C a replay is a bounded screen snapshot (at most 500 scrollback lines at the viewer's grid),
+// so the 2MB upper boundary the old byte-log path could reach is unreachable by construction. What still
+// has to hold is the lower direction: a snapshot larger than the plain high-water mark is a first paint
+// and must be delivered, not mistaken for a stalled viewer and terminated. sendViewer measures the whole
+// frame at call time, so without the replayBurst allowance this test's viewer dies immediately.
+test('a first paint larger than the steady-state high-water mark is delivered under the replay allowance', async t => {
   const HIGH_WATER = 1024;          // server clamps to a 1024 floor
-  const HOST_SB_BYTES = 1024;
   const h = new RelayHarness({
     MUX_HOST_SB_WAIT_MS: '6000',
     MUX_VIEWER_HIGH_WATER_BYTES: String(HIGH_WATER),
-    MUX_HOST_SB_BYTES: String(HOST_SB_BYTES),
   });
   await h.start();
   t.after(() => h.stop());
-  const host = await h.connectHost([shellSession('undercase'), shellSession('overcase')]);
+  const name = 'replaycase';
+  const host = await h.connectHost([shellSession(name)]);
   t.after(() => host.close());
 
-  // server.js: VIEWER_REPLAY_BURST_BYTES = HOST_SB_BYTES + 2000000 + CLEAR_SCREEN.length
-  //            replay limit = VIEWER_HIGH_WATER_BYTES + VIEWER_REPLAY_BURST_BYTES
-  const REPLAY_BURST = HOST_SB_BYTES + 2000000 + CLEAR_SCREEN.length;
-  const LIMIT = HIGH_WATER + REPLAY_BURST;
-  // CLEAR_SCREEN goes out first, so the snapshot is measured against a socket already holding it.
-  // The margin absorbs whether that 77-byte frame (plus the small 'd' sizing frame) has drained yet.
-  const MARGIN = 512;
+  const viewer = attachViewer(h.port, name, { dev: 'replaydev' });
+  await viewer.open;
+  await host.waitFor(m => m.t === 'sb' && m.s === name, 'scrollback request');
+  await sleep(150);                                   // let the 'd' sizing frame drain first
 
-  const cases = [
-    { session: 'undercase', size: LIMIT - CLEAR_SCREEN.length - MARGIN, survives: true },
-    { session: 'overcase', size: LIMIT + MARGIN, survives: false },
-  ];
+  // 2,000 distinct lines: the ring is ~170KB, the snapshot is bounded to the last 500 lines (~40KB).
+  // Both dwarf the 1KB high-water mark, so only the replay allowance can explain the delivery.
+  let ring = '';
+  for (let i = 0; i < 2000; i++) ring += `REPLAY LINE ${String(i).padStart(4, '0')} ${'x'.repeat(55)}\r\n`;
+  await host.sendScrollback(name, Buffer.from(ring));
 
-  for (const c of cases) {
-    // Both payloads dwarf the steady-state high-water mark: only the replay-burst allowance can
-    // explain the under-case surviving, so this really does pin VIEWER_REPLAY_BURST_BYTES.
-    assert.ok(c.size > HIGH_WATER * 100, 'boundary payload must be far past the plain high-water mark');
+  await waitFor(() => viewer.bytes > HIGH_WATER, 'first paint past the plain high-water mark', 20000);
+  await sleep(200);
+  assert.equal(viewer.closed, false, 'a first paint past the plain high-water mark must not terminate the viewer');
 
-    const viewer = attachViewer(h.port, c.session, { dev: `bd-${c.session}` });
-    await viewer.open;
-    await host.waitFor(m => m.t === 'sb' && m.s === c.session, `scrollback request for ${c.session}`);
-    await sleep(150);                                   // let the 'd' sizing frame drain first
+  const got = viewer.received();
+  assert.ok(got.subarray(0, CLEAR_SCREEN.length).equals(CLEAR_SCREEN), 'the paint opens with one CLEAR');
+  assert.equal(got.indexOf(CLEAR_SCREEN, 1), -1, 'there must be exactly one CLEAR');
+  const text = got.toString('latin1');
+  assert.ok(text.includes('REPLAY LINE 1999'), 'the screen reaches the last ring line');
+  assert.ok(got.length < Buffer.byteLength(ring) / 2,
+    `the paint must be the bounded screen, not the ring (paint=${got.length}, ring=${Buffer.byteLength(ring)})`);
 
-    const snapshot = Buffer.alloc(c.size, 0x2e);
-    await host.sendScrollback(c.session, snapshot);
-
-    if (c.survives) {
-      const expected = Buffer.concat([CLEAR_SCREEN, snapshot]);
-      await waitFor(() => viewer.bytes >= expected.length, `${c.session} replay delivered`, 20000);
-      await sleep(150);
-      assert.equal(viewer.closed, false, `${c.session}: replay just under the burst allowance must survive`);
-      assert.equal(viewer.bytes, expected.length, `${c.session} replay byte count`);
-      assert.ok(viewer.received().equals(expected), `${c.session}: under-limit replay must be byte-complete`);
-    } else {
-      await waitFor(() => viewer.closed, `${c.session} viewer terminated`, 20000);
-      assert.equal(viewer.closed, true, `${c.session}: replay past the burst allowance must terminate the viewer`);
-      assert.ok(
-        viewer.bytes <= CLEAR_SCREEN.length,
-        `${c.session}: the oversized snapshot must never be delivered, got ${viewer.bytes} bytes`,
-      );
-    }
-    try { viewer.ws.terminate(); } catch {}
-  }
+  // The viewer stays usable: a live chunk after the first paint arrives whole.
+  await host.sendOutput(name, 'LIVE_AFTER_REPLAY\r\n');
+  await waitFor(() => viewer.received().includes('LIVE_AFTER_REPLAY'), 'live output after the paint');
+  try { viewer.ws.terminate(); } catch {}
 });

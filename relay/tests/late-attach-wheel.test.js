@@ -1,11 +1,11 @@
 // Regression: a late attach to a SPAWNED (muxd-hosted) session must still get the app's mouse arm, on
-// BOTH reattach paths, and the wheel must reach the app as a decoded SGR cell.
+// BOTH attach paths, and the wheel must reach the app as a decoded SGR cell.
 //
-// The relay has two reattach paths for a hosted session, chosen by whether its screen model is warm:
-//   COLD - the model is not parsed yet, so the viewer gets CLEAR_SCREEN + muxd's BYTE REPLAY (buf), which
-//          still carries the app's DECSET verbatim;
-//   WARM - the model is parsed, so the viewer gets CLEAR_SCREEN + the serialized SNAPSHOT, which emits the
-//          mouseTrackingMode (1000/1002/1003) but DROPS the SGR-encoding flag (1006).
+// A viewer is never sent a byte log. Its first paint is one of the defined states, and both of them end in
+// CLEAR_SCREEN + a serialized SCREEN:
+//   COLD (State R) - the model is seeded from muxd's ring, then serialized; the serialized screen emits the
+//                    mouseTrackingMode (1000/1002/1003) but DROPS the SGR-encoding flag (1006);
+//   WARM (State S) - the model is already parsed, so the same snapshot answers with no ring request at all.
 // Both must leave the client's mouse guard ARMED, because inputAllowed() reads tracking (1000), not the
 // encoding flag. The failure this pins: a late attach that arrives unarmed silently scrolls the mirror
 // locally and the app's own wheel handler never sees the notch. The spawned path is the one that carries
@@ -83,8 +83,9 @@ async function startBrowserRelay(harness) {
 }
 
 // The SPAWNED shape: muxd launches the child and owns the PTY, real bytes flow through it, and no local
-// console owns the size (owner:false). That last part matters: the relay only runs its screen model for a
-// session whose geometry IT decides - a tab-owned (owner:true) console is served the byte replay always.
+// console owns the size (owner:false). Geometry matters either way: the relay models the stream at the
+// PTY's size (st.cur after a relay resize) or, for a tab-owned (owner:true) console, at the PC tab's
+// physical screen - never at a viewer's own size.
 function hostedSession(name, owner = false) {
   return {
     name, alive: true, created: Date.now(), lastOut: Date.now(), cols: COLS, rows: ROWS,
@@ -141,9 +142,9 @@ async function wheelAndDecode(host, page) {
   return { reports, expected };
 }
 
-// ---- COLD late attach: the FIRST viewer gets the byte replay, and it still arms the wheel -----------
+// ---- COLD late attach: the FIRST viewer is seeded and painted, and the arm still reaches it ---------
 
-test('a cold attach to a spawned session arms the wheel from the byte replay', async t => {
+test('a cold attach to a spawned session arms the wheel from the seeded screen', async t => {
   if (!browser) return t.skip(`Chromium unavailable.\n${INSTALL}\n${browserError && browserError.message}`);
 
   const harness = new RelayHarness();
@@ -158,7 +159,7 @@ test('a cold attach to a spawned session arms the wheel from the byte replay', a
     const { page, wire } = await openViewer(context, harness.port, 'late-cold');
     const sb = await host.waitFor(m => m.t === 'sb' && m.s === 'late-cold', 'scrollback request');
     host.sendScrollback('late-cold', APP_LOG, sb);
-    await waitFor(() => armed(page), 'the cold attach armed the guard from the byte replay', TEST_TIMEOUT_MS);
+    await waitFor(() => armed(page), 'the cold attach armed the guard from the seeded screen', TEST_TIMEOUT_MS);
 
     const { reports, expected } = await wheelAndDecode(host, page);
     const up = reports.find(r => r.button === 64);
@@ -187,7 +188,7 @@ test('a warm late attach arms the wheel from the serialized snapshot, not the by
     context = await browser.newContext({ viewport: { width: 1000, height: 700 } });
     context.setDefaultTimeout(TEST_TIMEOUT_MS);
 
-    // First viewer: cold, pays the byte replay, and warms the relay's screen model as a side effect.
+    // First viewer: cold, seeded from the ring, and it warms the relay's screen model as a side effect.
     const firstViewer = await openViewer(context, harness.port, 'late-warm');
     const first = firstViewer.page, firstWire = firstViewer.wire;
     const sbOne = await host.waitFor(m => m.t === 'sb' && m.s === 'late-warm', 'first scrollback request');
@@ -195,14 +196,14 @@ test('a warm late attach arms the wheel from the serialized snapshot, not the by
     await waitFor(() => armed(first), 'the first viewer armed', TEST_TIMEOUT_MS);
     await sleep(200);   // let xterm-headless finish parsing before the late attach reads the model
 
-    // Late attach while the first is still open, so the warm model survives.
+    // Late attach while the first is still open, so the warm model survives. A warm model answers a
+    // reattach outright - State S - so no ring is requested at all and muxd sees no second `sb`.
+    const sbBefore = host.messages.filter(m => m.t === 'sb' && m.s === 'late-warm').length;
     const secondViewer = await openViewer(context, harness.port, 'late-warm');
     const second = secondViewer.page, secondWire = secondViewer.wire;
-    await waitFor(() => host.messages.filter(m => m.t === 'sb' && m.s === 'late-warm').length === 2,
-      'second scrollback request', TEST_TIMEOUT_MS);
-    const sbTwo = [...host.messages].reverse().find(m => m.t === 'sb' && m.s === 'late-warm');
-    host.sendScrollback('late-warm', APP_LOG, sbTwo);
     await waitFor(() => armed(second), 'the warm late attach armed the guard from the snapshot', TEST_TIMEOUT_MS);
+    assert.equal(host.messages.filter(m => m.t === 'sb' && m.s === 'late-warm').length, sbBefore,
+      'a warm model must answer the late attach without asking muxd for the ring');
 
     const { reports, expected } = await wheelAndDecode(host, second);
     const up = reports.find(r => r.button === 64);
@@ -210,21 +211,24 @@ test('a warm late attach arms the wheel from the serialized snapshot, not the by
     assert.deepEqual([up.col, up.row], [expected[0] + 1, expected[1] + 1],
       `the late attach must report the cell under the pointer (got ${JSON.stringify([up.col, up.row])})`);
 
-    // The late attach took the compact snapshot, not the whole log again: the second viewer's wire is a
-    // small screen, the first viewer paid the 3000-line replay.
+    // Neither viewer is served the log: the first was seeded and painted as a bounded screen too, so both
+    // wires are a compact snapshot rather than 3,000 lines.
     assert.ok(secondWire.bytes > 0, 'the late attach received bytes');
-    assert.ok(secondWire.bytes < firstWire.bytes / 2,
-      `the warm late attach must serve the snapshot, not the log: second=${secondWire.bytes}, first=${firstWire.bytes}`);
+    assert.ok(secondWire.bytes < Buffer.byteLength(APP_LOG) / 3,
+      `the late attach must serve the snapshot, not the log: second=${secondWire.bytes}, log=${Buffer.byteLength(APP_LOG)}`);
+    assert.ok(!firstWire.text.includes('APP line 0000'),
+      'the first paint is a bounded screen, not the head of the log');
 
     // Say WHY the snapshot still arms the wheel, on the wire itself: it carries the alternate screen and the
-    // mouse TRACKING mode the app armed, and drops the SGR-encoding flag (1006). The first viewer's wire is
-    // the control: the byte log DOES carry 1006, so the second's absence is a real difference between the two
-    // paths and not a claim about a string nothing on the wire ever emits.
-    assert.match(firstWire.text, /\x1b\[\?1006h/, 'the byte log carries the SGR encoding flag (the control)');
-    assert.match(secondWire.text, /\x1b\[\?1049h/, 'the snapshot must carry the app\'s alternate screen');
-    assert.match(secondWire.text, /\x1b\[\?1000h/, 'the snapshot must carry the mouse tracking mode the app armed');
-    assert.doesNotMatch(secondWire.text, /\x1b\[\?1006h/,
-      'the snapshot drops the SGR encoding flag - its absence proves this is the serialized screen, not the byte log');
+    // mouse TRACKING mode the app armed, and drops the SGR-encoding flag (1006). Both viewer paths are
+    // snapshots now, so the same three claims hold for both - and neither wire is a byte log, which would
+    // have carried 1006 verbatim.
+    for (const [label, wire] of [['first', firstWire], ['late', secondWire]]) {
+      assert.match(wire.text, /\x1b\[\?1049h/, `${label}: the snapshot must carry the app's alternate screen`);
+      assert.match(wire.text, /\x1b\[\?1000h/, `${label}: the snapshot must carry the mouse tracking mode the app armed`);
+      assert.doesNotMatch(wire.text, /\x1b\[\?1006h/,
+        `${label}: the snapshot drops the SGR encoding flag - its absence proves this is the serialized screen, not the byte log`);
+    }
   } finally {
     if (context) await context.close();
     if (host) host.close();

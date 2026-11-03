@@ -378,6 +378,10 @@ const CLEAR_SCREEN = Buffer.from(
   '\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l\x1b[?2004l' +
   '\x1b[?1049l\x1b[?25h\x1b[0m\x1b[3J\x1b[2J\x1b[H'
 );
+// State L: no trustworthy screen. The viewer is given a defined starting state instead of a blank
+// terminal or a stale screen with live bytes appended. Sent once, before any live byte, and never
+// assumed to be erased - the app's next full frame is the repair.
+const STATE_BANNER = Buffer.from('[scrollback unavailable - showing live output]\r\n');
 // Hosted sessions are PC-local first. Web attach must become live quickly; scrollback is a bounded
 // convenience replay, not something allowed to stall live terminal bytes for multiple seconds.
 const HOST_SB_BYTES = +process.env.MUX_HOST_SB_BYTES || 800000;
@@ -1539,7 +1543,7 @@ app.patch('/api/sessions/:name', withMutationIntent('session.rename', req => ({
     } catch (error) {
       return failPersistence(res, error);
     }
-    const st = sessions.get(name); if (st) { for (const c of st.clients.values()) { try { c.ws.close(4001, 'renamed'); } catch {} } sessions.delete(name); }  // viewers reconnect under the new name
+    const st = sessions.get(name); if (st) { for (const c of st.clients.values()) { try { c.ws.close(4001, 'renamed'); } catch {} } screenModel.dispose(name); sessions.delete(name); }  // viewers reconnect under the new name
     return res.json({ ok: true, name: to, hosted: true });
   }
   if (tmuxHas(name)) return failLegacy(res, name);
@@ -3756,13 +3760,15 @@ wssHost.on('connection', (ws, req) => {
       // a new name, a vanished name or `prior !== ws` starts the stripper fresh - otherwise a body
       // split across a heartbeat would be painted as text.
       const linkReplaced = prior !== ws;
+      const boundaryNames = new Set();
       for (const name of new Set([...priorSessions.keys(), ...hostSessions.keys()])) {
         const before = priorSessions.get(name);
         const after = hostSessions.get(name);
         if (linkReplaced || !before || !after
           || before.sessionId !== after.sessionId || before.generationId !== after.generationId) {
+          boundaryNames.add(name);
           const st = sessions.get(name);
-          if (st) resetElementMapBoundary(st);
+          if (st) resetSessionBoundary(name, st);
         }
       }
       resyncAllWatches();   // §7.2: a new muxd link means every live stream owner must be re-watched
@@ -3770,7 +3776,11 @@ wssHost.on('connection', (ws, req) => {
       if (prior && prior !== ws) {
         try { prior.close(1000, 'replaced by validated host connection'); } catch {}
       }
+      // Only a BOUNDARY invalidates the in-flight request, the relay's resize and the model. A 5 s
+      // same-identity heartbeat reaches this handler too, and clearing here would orphan a seed that is
+      // mid-parse (the sb reply would be dropped on its rid) and undo a resize that is still in force.
       for (const [name, st] of sessions) {
+        if (!boundaryNames.has(name)) continue;
         st.cur = null;
         clearScrollbackRequest(st);
         const waiter = [...st.sbWaiters].map(id => st.clients.get(id)).find(Boolean);
@@ -3888,31 +3898,74 @@ wssHost.on('connection', (ws, req) => {
       const clean = elementMap.stripElementMap(Buffer.from(m.d || '', 'base64'), elementMap.createStripState());
       const buf = clean.text;
       if (clean.frames.length) publishElementMap(n, st, clean.frames[clean.frames.length - 1], true);
-      // Seed/refresh the screen model from muxd's replay so the next attach can serialize a few KB of
-      // screen instead of shipping this whole byte log again. The replay is the authoritative bytes, so
-      // feeding them to the model is safe even when the model was empty; the geometry is the shared one.
-      if (st.cur) screenModel.noteScrollback(n, st.cur.cols, st.cur.rows, buf);
+      // The replay is the ONE stream that may still enter the model: it is the only one that begins at
+      // the session's start. It is never sent to a viewer. A viewer gets a serialized screen (State S/R)
+      // or a defined banner (State L) - never a byte log, whose tail can begin mid-escape-sequence.
       const waiters = [...st.sbWaiters];
       st.sbWaiters.clear();
       clearScrollbackRequest(st);
+      // The reply is the cut between "in muxd's ring" and "live". Chunks already buffered arrived before
+      // the reply, so the ring contains them; the snapshot will show them, and qMark keeps them out of
+      // the post-snapshot flush. A viewer on the banner is re-armed as repairPending so bytes that arrive
+      // while the ring parses are buffered the same way instead of being painted and then wiped by the
+      // repair's CLEAR. Its watchdog is cancelled: the reply this client waited for has arrived.
       for (const id of waiters) {
         const c = st.clients.get(id);
-        // Deliver the replay unless live output has already painted (wentLive). Crucially this
-        // fires EVEN IF the sbWait timeout already elapsed: the timeout no longer blanks the
-        // screen, so a late sb is the only thing that paints an idle session. Dropping it here
-        // (the old `!c.sbWait` guard) is exactly what left an idle terminal black.
-        if (!c || !c.hosted || c.wentLive) continue;
-        c.sbWait = false; c.wentLive = true;
-        // Prefer the screen model: CLEAR + a compact serialized screen (a few KB) instead of the
-        // up-to-800KB byte replay. Falls back to `buf` when the model is unavailable (missing deps,
-        // just resized, never fed) — the replay is always correct, the model is only cheaper.
-        const snap = st.cur ? screenModel.snapshot(n, st.cur.cols, st.cur.rows) : null;
-        const replay = snap ? Buffer.from(snap, 'utf8') : buf;
-        if (sendViewer(n, st, c, CLEAR_SCREEN, true) && sendViewer(n, st, c, replay, true)) {
-          for (const q of (c.q || [])) if (!sendViewer(n, st, c, q, true)) break;
-        }
-        c.q = []; c.qBytes = 0;
+        if (!c) continue;
+        c.qMark = (c.q || []).length;
+        if (c.sbTimer) { clearTimeout(c.sbTimer); c.sbTimer = null; }
       }
+      for (const c of st.clients.values()) {
+        if (!c.hosted || c.ws.readyState !== 1 || !c.stateL) continue;
+        c.repairPending = true; c.qMark = (c.q || []).length;
+        if (c.sbTimer) { clearTimeout(c.sbTimer); c.sbTimer = null; }
+      }
+      const paintAll = () => {
+        const g = modelGeom(st, n);
+        const snap = g ? screenModel.snapshot(n, g.cols, g.rows) : null;
+        for (const id of waiters) {
+          const c = st.clients.get(id);
+          // A client already painted or gone is left alone. The sbWait guard is also what stops a seed
+          // callback that arrived after the sbWait watchdog already took the client to State L.
+          if (!c || !c.hosted || !c.sbWait || c.wentLive) continue;
+          if (snap) paintSnapshot(n, st, c, snap); else paintStateL(n, st, c);
+        }
+        // A viewer that timed out into State L is showing a banner, not a screen. When this reply finally
+        // gives the model a trustworthy screen, repaint it too - the snapshot covers the ring plus every
+        // live byte fed since, so the replacement is complete and nothing shown after the banner is lost.
+        // Nothing is sent while the model is cold: the banner stays, which is the defined state, and the
+        // bytes held for the repair are live output that belongs after the banner.
+        for (const c of st.clients.values()) {
+          if (!c.hosted || c.ws.readyState !== 1) continue;
+          if (snap && (c.repairPending || c.stateL)) { paintSnapshot(n, st, c, snap); continue; }
+          if (!snap && c.repairPending) {
+            c.repairPending = false;
+            const pending = (c.q || []).slice(c.qMark || 0);
+            c.q = []; c.qBytes = 0; c.qMark = 0;
+            for (const b of pending) {
+              if (!sendViewer(n, st, c, b, true)) break;
+            }
+          }
+        }
+      };
+      const seedAndPaint = (gz, retry) => {
+        const status = screenModel.seed(n, gz.cols, gz.rows, buf, ok => {
+          if (ok) { paintAll(); return; }
+          // One retry from the same ring: a boundary reset or a geometry change may have replaced the
+          // model between the request and this reply. A second failure is State L, not a third try.
+          if (retry) {
+            const g2 = modelGeom(st, n);
+            if (g2) { seedAndPaint(g2, false); return; }
+          }
+          paintAll();
+        });
+        // 'seeding' paints from the callback. 'warm' already holds this ring, but writes may still be
+        // queued, so the snapshot must wait for them the way a seed's does. 'failed' has no model.
+        if (status === 'warm') screenModel.drain(n, () => paintAll());
+        else if (status !== 'seeding') paintAll();
+      };
+      const geom = modelGeom(st, n);
+      if (geom) seedAndPaint(geom, true); else paintAll();
     } else if (m.t === 'lease') {
       // muxd decided; the relay only mirrors. The frame is cached and fanned out verbatim so every
       // viewer re-verifies muxd's signature itself — a relay that edits this string just breaks it.
@@ -3937,17 +3990,26 @@ wssHost.on('connection', (ws, req) => {
       // scrollback replay for this session's viewers only — no other session lost a byte.
       const n = strictMuxName(m.s); const st = sessions.get(n); if (!st) return;
       // The resync is a new stream at H2 (muxd replaced its ring and starts a fresh stripper), so the
-      // live stripper here starts fresh before any post-gap output is delivered.
-      resetElementMapBoundary(st);
+      // live stripper starts fresh AND the screen model is dropped - a screen built from the old ring
+      // must not answer an attach - before any post-gap output is delivered.
+      resetSessionBoundary(n, st);
       clearScrollbackRequest(st);                 // supersede any in-flight (pre-gap) request
       let asked = false;
       for (const c of st.clients.values()) {
         if (!c.hosted || c.ws.readyState !== 1) continue;
-        c.sbWait = true; c.wentLive = false; c.q = []; c.qBytes = 0;
+        c.sbWait = true; c.wentLive = false; c.stateL = false; c.repairPending = false;
+        c.q = []; c.qBytes = 0; c.qMark = 0;
         asked = requestSessionScrollback(n, st, c) || asked;
+        // Watchdog for the reply above: if the seed or the reply never lands, the viewer still reaches
+        // a defined state instead of buffering forever.
+        if (asked) {
+          if (c.sbTimer) clearTimeout(c.sbTimer);
+          c.sbTimer = setTimeout(() => { if (c.sbWait) paintStateL(n, st, c); }, HOST_SB_WAIT_MS);
+        }
       }
-      // Host unreachable: never strand viewers buffering forever — go live and let output repaint.
-      if (!asked) for (const c of st.clients.values()) { c.sbWait = false; c.wentLive = true; }
+      // Host unreachable: never strand viewers buffering forever - State L now, not a stale screen
+      // with live bytes appended.
+      if (!asked) for (const c of st.clients.values()) { if (c.hosted && c.ws.readyState === 1) paintStateL(n, st, c); }
     } else if (m.t === 'tailr') { const f = pendingTails.get(m.rid); if (f) { pendingTails.delete(m.rid); f(String(m.text || ''), String(m.sig || '')); }
     } else if (m.t === 'killed' || m.t === 'killResult') {
       const n = strictMuxName(m.s);
@@ -4183,6 +4245,9 @@ function deleteSessionViewerState(name, reason) {
     removeViewer(name, st, client);
     try { client.ws.close(1013, reason); } catch {}
   }
+  // removeViewer disposes through deleteEmptySessionState when it removes the last one; state with no
+  // clients at entry (a session that ended with nobody watching) would otherwise never reach it.
+  screenModel.dispose(name);
   sessions.delete(name);
 }
 function viewerBytes(data) {
@@ -4204,6 +4269,44 @@ function sendViewer(name, st, client, data, replayBurst = false) {
     try { client.ws.terminate(); } catch {}
     return false;
   }
+}
+// State S/R: one CLEAR followed by the serialized screen. The snapshot already contains every byte the
+// client buffered while it waited (the model is fed before the buffer at 4255), so the buffer is
+// dropped rather than replayed - replaying it would paint those lines twice.
+function paintSnapshot(name, st, client, snap) {
+  // sbWait selects a first paint; stateL/repairPending select a repair of a viewer on the banner.
+  if (!client || client.removed || client.ws.readyState !== 1) return false;
+  if (!client.sbWait && !client.stateL && !client.repairPending) return false;
+  if (!sendViewer(name, st, client, CLEAR_SCREEN, true)) return false;
+  if (!sendViewer(name, st, client, Buffer.from(snap, 'utf8'), true)) return false;
+  client.sbWait = false; client.wentLive = true; client.stateL = false; client.repairPending = false;
+  if (client.sbTimer) { clearTimeout(client.sbTimer); client.sbTimer = null; }
+  st.sbWaiters.delete(client.id);
+  // qMark is the cut between two kinds of buffered byte. Everything before it arrived before muxd's
+  // ring reply, so it is inside that ring and the snapshot - replaying it would paint it twice. What
+  // follows it arrived after the reply, so it is too new for the ring and the snapshot; it is the live
+  // stream that continues the screen, and dropping it would lose output.
+  const pending = (client.q || []).slice(client.qMark || 0);
+  client.q = []; client.qBytes = 0; client.qMark = 0;
+  for (const b of pending) {
+    if (!sendViewer(name, st, client, b, true)) break;
+  }
+  return true;
+}
+// State L: no trustworthy screen (no model, a cold model that could not be seeded, an sb timeout, or a
+// host that never answers). CLEAR returns any half-read sequence in the viewer to ground, then one
+// banner defines the state. Anything buffered while waiting is a suffix that can begin mid-sequence, so
+// it is dropped; the live stream that follows is the viewer's content. The redraw is best effort - for
+// an inline app without focus reporting it produces no bytes at all - so it is never relied on.
+function paintStateL(name, st, client) {
+  if (!client || client.removed || client.ws.readyState !== 1) return false;
+  client.sbWait = false; client.wentLive = true; client.stateL = true; client.repairPending = false;
+  st.sbWaiters.delete(client.id);
+  const ok = sendViewer(name, st, client, CLEAR_SCREEN, true)
+    && sendViewer(name, st, client, STATE_BANNER, true);
+  sendHostInputRedraw(name);
+  client.q = []; client.qBytes = 0; client.qMark = 0;
+  return ok;
 }
 // The element map is a control frame, not terminal output: it goes straight to each viewer, never
 // through sendViewer (which may coalesce or drop it into a burst queue). Dedupe is on `gen` alone,
@@ -4235,6 +4338,25 @@ function resetElementMapBoundary(st) {
   st.emap.map = null;
   st.emap.gen = null;
 }
+// A stream boundary is more than the stripper: the screen model is a cache of one stream, so a new
+// stream (resync / link replacement / identity change) must make it cold rather than let a screen from
+// the old stream answer an attach. It is rebuilt - and reseeded from the new ring - on demand.
+function resetSessionBoundary(name, st) {
+  resetElementMapBoundary(st);
+  screenModel.dispose(name);
+}
+// The geometry the session's byte stream was drawn at - not the geometry of whichever viewer happens
+// to ask. After a relay-initiated resize that is st.cur (recompute, 4368); otherwise it is the PTY's own
+// size from the hello, which for a tab-owned session is the PC tab's physical screen. A stream owner is
+// never resized by the relay, so its hello geometry is the only correct one.
+function modelGeom(st, name) {
+  if (st && st.cur && (st.cur.cols | 0) > 1 && (st.cur.rows | 0) > 1) {
+    return { cols: st.cur.cols | 0, rows: st.cur.rows | 0 };
+  }
+  const h = hostSessions.get(name);
+  if (h && (h.cols | 0) > 1 && (h.rows | 0) > 1) return { cols: h.cols | 0, rows: h.rows | 0 };
+  return null;
+}
 // The single output fan-out. Both the JSON `o` frame and the binary one land here with the raw bytes
 // already in hand, so the buffering, the go-live clear and the per-viewer send live in exactly one place
 // and the two transports cannot drift apart.
@@ -4246,25 +4368,22 @@ function deliverHostOutput(name, buf) {
   const stripped = elementMap.stripElementMap(buf, st.emap.strip);
   buf = stripped.text;
   if (stripped.frames.length) publishElementMap(name, st, stripped.frames[stripped.frames.length - 1], false);
-  // Keep the screen model current with the same bytes the viewers get, at the shared geometry the
-  // viewers will render at. Off-geometry feeds are refused inside the model, so a resize simply makes
-  // the model unavailable until it is rebuilt rather than letting it drift out of step with the stream.
-  if (st.cur && screenModel.available()) screenModel.feed(name, st.cur.cols, st.cur.rows, buf);
+  // Keep the screen model current with the same bytes the viewers get, at the geometry the stream was
+  // drawn at. Off-geometry feeds are refused inside the model, so a resize simply makes the model cold
+  // until it is rebuilt rather than letting it drift out of step with the stream.
+  const geom = modelGeom(st, name);
+  if (geom && screenModel.available()) screenModel.feed(name, geom.cols, geom.rows, buf);
   for (const c of st.clients.values()) {
     if (!c.hosted || c.ws.readyState !== 1) continue;
-    if (c.sbWait) {
+    if (c.sbWait || c.repairPending) {
       (c.q = c.q || []).push(buf); c.qBytes = (c.qBytes || 0) + buf.length;
-      // Flood while still waiting for scrollback: relieve memory, but NEVER blank-and-drop.
-      // The live stream itself repaints a TUI, so go live now — clear once (a fresh attach
-      // starts clean) and replay what we buffered. wentLive means a late sb is dropped, but
-      // only because real output is already painting the screen (never leaves it black).
+      // Flood while still waiting for scrollback: relieve memory as a defined state. What was buffered
+      // is a suffix, not a screen, so it is dropped; the banner says so and the live stream paints.
+      // A viewer already on the banner (repairPending) keeps it - a flood is not a reason to say it twice.
       if (c.qBytes > 2000000 || c.q.length > 4000) {
-        c.sbWait = false; c.wentLive = true;
-        st.sbWaiters.delete(c.id);
-        if (sendViewer(name, st, c, CLEAR_SCREEN, true)) {
-          for (const q of c.q) if (!sendViewer(name, st, c, q, true)) break;
-        }
-        c.q = []; c.qBytes = 0;
+        if (c.repairPending) { c.repairPending = false; c.q = []; c.qBytes = 0; c.qMark = 0; }
+        else paintStateL(name, st, c);
+        sendViewer(name, st, c, buf);     // this chunk is the first live byte, not part of the suffix
       }
       continue;
     }
@@ -4289,7 +4408,11 @@ function requestSessionScrollback(name, st, client) {
     st.sbRequestTimer = setTimeout(() => {
       if (sessions.get(name) !== st || !st.sbInFlight || st.sbRid !== rid) return;
       clearScrollbackRequest(st);
-      const waiter = [...st.sbWaiters].map(id => st.clients.get(id)).find(Boolean);
+      // A viewer that timed out into State L has left sbWaiters, but the ring is still the only way to
+      // give the session a trustworthy screen (and to repair that viewer), so retry while anyone is
+      // hosted rather than only while a first-paint waiter remains.
+      const waiter = [...st.sbWaiters].map(id => st.clients.get(id)).find(Boolean)
+        || [...st.clients.values()].find(c => c.hosted && c.ws.readyState === 1);
       if (waiter && hostSessions.has(name)) requestSessionScrollback(name, st, waiter);
     }, HOST_SB_REQUEST_TIMEOUT_MS);
     return true;
@@ -4512,31 +4635,38 @@ wss.on('connection', async (ws, req) => {
     }
     const id = 'c' + (++_cid);
     const st = sessionState(name);
-    const client = { id, ws, term: null, hosted: true, vcols, vrows, sbWait: true, wentLive: false, sbTok: ++_cid, q: [], qBytes: 0, deviceId, label, visible: true, lastActive: Date.now(), connAt: Date.now() };
+    const client = { id, ws, term: null, hosted: true, vcols, vrows, sbWait: true, wentLive: false, sbTok: ++_cid, q: [], qBytes: 0, qMark: 0, repairPending: false, deviceId, label, visible: true, lastActive: Date.now(), connAt: Date.now() };
     st.clients.set(id, client);
     syncWatch(name, st, true);                                            // §7.2 first viewer starts the feed
-    if (!requestSessionScrollback(name, st, client)) {                   // one snapshot shared by every concurrent waiter
+    // A9 stays a refusal even when a warm model could answer the attach: a warm model proves the link
+    // was live at the last hello, not that it is live now. A viewer must never be shown a frozen screen
+    // it cannot type into.
+    const hostReady = hostUp() && hostSessions.has(name) && hostSessions.get(name).alive !== false;
+    if (!hostReady) {
       removeViewer(name, st, client);
       try { ws.close(1013, 'PC mux host offline'); } catch {}
       return;
     }
-    // Scrollback slow/large: relieve the wait WITHOUT blanking the screen. If live output was
-    // buffered, flow it now (a TUI repaints). If the session is idle (nothing buffered), leave the
-    // screen as-is and keep waiting â€” wentLive stays false so the sb reply (or the next live byte)
-    // still paints it. Blanking here and then dropping the late sb was the black-screen bug.
-    client.sbTimer = setTimeout(() => {
-      if (!client.sbWait) return;
-      client.sbWait = false;
-      if (client.q && client.q.length) {
-        client.wentLive = true;
-        st.sbWaiters.delete(client.id);
-        if (sendViewer(name, st, client, CLEAR_SCREEN, true)) {
-          for (const q of client.q) if (!sendViewer(name, st, client, q, true)) break;
-        }
-        client.q = []; client.qBytes = 0;
-      }
-    }, HOST_SB_WAIT_MS);
+    // Size first: the `d` frame sizes the viewer's xterm, and the snapshot is serialized at exactly
+    // that grid, so the screen must be defined before the cells are written into it.
     recompute(name);
+    const geom = modelGeom(st, name);
+    const warmSnap = geom ? screenModel.snapshot(name, geom.cols, geom.rows) : null;
+    if (warmSnap) {
+      // State S: the model already holds the whole stream; no scrollback request is sent at all.
+      if (!paintSnapshot(name, st, client, warmSnap)) return;
+    } else if (!requestSessionScrollback(name, st, client)) {             // one snapshot shared by every concurrent waiter
+      removeViewer(name, st, client);
+      try { ws.close(1013, 'PC mux host offline'); } catch {}
+      return;
+    } else {
+      // State R pending. If neither the reply nor the seed lands, the watchdog takes this viewer to
+      // State L - a banner, never a blank terminal and never a stale screen with live bytes appended.
+      client.sbTimer = setTimeout(() => {
+        if (!client.sbWait) return;
+        paintStateL(name, st, client);
+      }, HOST_SB_WAIT_MS);
+    }
     // After the size frame, give a newly attached viewer the map that is already current, so widgets
     // paint now instead of waiting up to one heartbeat. Nothing held means nothing is said.
     if (st.emap && st.emap.map) { try { ws.send(elementMap.encodeViewerFrame(st.emap.map)); } catch {} }

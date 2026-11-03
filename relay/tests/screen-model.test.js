@@ -46,6 +46,13 @@ const ESC = '\x1b';
 // will serialize. A macrotask hop past the parser's own timer is what settles it.
 const flushTurn = () => new Promise(resolve => setTimeout(resolve, 20));
 
+// Seed from "the session's start" the way the relay does with muxd's ring, and resolve when the parser
+// has consumed it. A model is COLD - and refuses to serialize - until this has happened.
+const seedAsync = (name, cols, rows, bytes) => new Promise(resolve => {
+  const status = screenModel.seed(name, cols, rows, bytes, ok => resolve(ok));
+  if (status !== 'seeding') resolve(status === 'warm');
+});
+
 test('a snapshot of a fed stream re-renders the same screen as the full byte replay', async () => {
   assert.equal(screenModel.available(), true, 'xterm-headless must be installed for this lever to run');
   // A stream with the things a real screen has: plain lines, colour, a cursor move, a partial line.
@@ -57,9 +64,8 @@ test('a snapshot of a fed stream re-renders the same screen as the full byte rep
     `no-newline-tail`;
   const bytes = Buffer.from(stream, 'utf8');
 
-  const full = await render(bytes);                         // what the OLD path (byte replay) shows
-  screenModel.feed('sm-render', COLS, ROWS, bytes);
-  await flushTurn();
+  const full = await render(bytes);                         // what a viewer fed the stream shows
+  assert.equal(await seedAsync('sm-render', COLS, ROWS, bytes), true, 'the ring seeds the model');
   const snap = screenModel.snapshot('sm-render', COLS, ROWS);
   assert.ok(snap, 'a fed, correctly-sized model must produce a snapshot');
   const fromSnap = await render(Buffer.from(snap, 'utf8')); // what the NEW path shows
@@ -76,8 +82,7 @@ test('the snapshot is a small screen, not a copy of the byte log', async () => {
   stream += `the only line that stays on screen`;
   const bytes = Buffer.from(stream, 'utf8');
 
-  screenModel.feed('sm-size', COLS, ROWS, bytes);
-  await flushTurn();
+  await seedAsync('sm-size', COLS, ROWS, bytes);
   const snap = screenModel.snapshot('sm-size', COLS, ROWS);
   assert.ok(snap);
   // The whole point: the snapshot is a bounded screen plus a bounded slice of history (~30KB at 500
@@ -95,32 +100,59 @@ test('the snapshot is a small screen, not a copy of the byte log', async () => {
 });
 
 test('a model at the wrong geometry refuses to serialize instead of lying', async () => {
-  screenModel.feed('sm-geom', 100, 30, Buffer.from('hello', 'utf8'));
-  await flushTurn();
+  assert.equal(await seedAsync('sm-geom', 100, 30, Buffer.from('hello', 'utf8')), true);
   assert.ok(screenModel.snapshot('sm-geom', 100, 30), 'the matching geometry serializes');
   assert.equal(screenModel.snapshot('sm-geom', 80, 24), null,
-    'a request at a different geometry must be refused — the caller falls back to the byte replay');
+    'a request at a different geometry is refused - the caller serves a defined banner instead');
   screenModel.dispose('sm-geom');
 });
 
-test('an empty or never-fed model produces no snapshot', () => {
+test('an unseeded model is cold: bytes alone are a suffix, not a screen', async () => {
   assert.equal(screenModel.snapshot('sm-never', COLS, ROWS), null, 'a session with no bytes has no screen to serve');
-  assert.ok(screenModel.feed('sm-empty', COLS, ROWS, Buffer.alloc(0)) === true, 'feeding zero bytes is fine');
-  assert.equal(screenModel.snapshot('sm-empty', COLS, ROWS), null, 'but it is still nothing to serve');
-  screenModel.dispose('sm-empty');
+  assert.equal(screenModel.feed('sm-cold', COLS, ROWS, Buffer.from('mid-stream bytes', 'utf8')), true,
+    'live bytes are accepted by a cold model');
+  await flushTurn();
+  assert.equal(screenModel.snapshot('sm-cold', COLS, ROWS), null,
+    'but they begin mid-stream, so the model must not serve them as a screen');
+  screenModel.dispose('sm-cold');
+  assert.equal(screenModel.snapshot('sm-empty', COLS, ROWS), null, 'a disposed model has nothing to serve');
 });
 
-test('a resize drops the stale model so the next feed rebuilds at the new geometry', async () => {
-  screenModel.feed('sm-resize', 80, 24, Buffer.from('old grid\r\n', 'utf8'));
+test('seeding a cold-but-non-empty model replaces the suffix instead of appending to it', async () => {
+  screenModel.feed('sm-suffix', COLS, ROWS, Buffer.from('MIDSTREAM_GARBAGE\r\n', 'utf8'));
   await flushTurn();
+  assert.equal(await seedAsync('sm-suffix', COLS, ROWS, Buffer.from('WHOLE_STREAM_START\r\n', 'utf8')), true);
+  const snap = screenModel.snapshot('sm-suffix', COLS, ROWS);
+  assert.ok(snap, 'the seeded model serves');
+  const shown = await render(Buffer.from(snap, 'utf8'));
+  assert.ok(shown.rows.some(r => r.includes('WHOLE_STREAM_START')), 'the ring is on the screen');
+  assert.ok(!shown.rows.some(r => r.includes('MIDSTREAM_GARBAGE')),
+    'the mid-stream suffix the model had accumulated is gone, not appended');
+  screenModel.dispose('sm-suffix');
+});
+
+test('seeding a warm model is a no-op: history must not be duplicated', async () => {
+  const ring = Buffer.from('ONLY_ONCE\r\n', 'utf8');
+  assert.equal(await seedAsync('sm-warm', COLS, ROWS, ring), true);
+  const first = screenModel.snapshot('sm-warm', COLS, ROWS);
+  assert.equal(screenModel.seed('sm-warm', COLS, ROWS, ring), 'warm', 'a warm model ignores the ring');
+  assert.equal(screenModel.snapshot('sm-warm', COLS, ROWS), first,
+    'a second seed leaves the serialized screen byte-identical');
+  screenModel.dispose('sm-warm');
+});
+
+test('a resize makes the model cold; the next seed rebuilds at the new geometry', async () => {
+  assert.equal(await seedAsync('sm-resize', 80, 24, Buffer.from('old grid\r\n', 'utf8')), true);
   assert.ok(screenModel.snapshot('sm-resize', 80, 24));
-  // Feed at a new size: the old cells are for the wrong grid, so the model must not serve them.
+  // A feed at a new size rebuilds the cells for the wrong-grid model, so it may not serve them.
   screenModel.feed('sm-resize', 40, 10, Buffer.from('new grid', 'utf8'));
   await flushTurn();
   assert.equal(screenModel.snapshot('sm-resize', 80, 24), null, 'the old-geometry screen must not be served');
-  assert.ok(screenModel.snapshot('sm-resize', 40, 10), 'the rebuilt model serves at the new geometry');
+  assert.equal(screenModel.snapshot('sm-resize', 40, 10), null,
+    'the rebuilt model is cold: one post-resize chunk is a suffix, not a screen');
+  assert.equal(await seedAsync('sm-resize', 40, 10, Buffer.from('new grid seeded\r\n', 'utf8')), true);
   const model = await render(Buffer.from(screenModel.snapshot('sm-resize', 40, 10), 'utf8'));
-  assert.ok(model.rows[0].includes('new grid'));
+  assert.ok(model.rows.some(r => r.includes('new grid seeded')), 'the reseeded screen is the ring at the new size');
   screenModel.dispose('sm-resize');
 });
 
@@ -153,21 +185,18 @@ test('reattach paints a compact snapshot, not the byte log, over the real host l
   await new Promise(r => setTimeout(r, 80)); // let xterm-headless finish parsing before the second attach
 
   // Second attach while the first is still open, so the session state (and its warm model) survives.
+  // State S: the warm model answers outright, so NO second scrollback request is sent at all.
+  const sbBefore = host.messages.filter(m => m.t === 'sb' && m.s === 'sm-live').length;
   const second = new WebSocket(`ws://127.0.0.1:${h.port}/ws?session=sm-live&cols=${COLS}&rows=${ROWS}`);
-  await once(second, 'open');
-  await waitFor(
-    () => host.messages.filter(m => m.t === 'sb' && m.s === 'sm-live').length === 2,
-    'second scrollback request',
-  );
-  const reqTwo = [...host.messages].reverse().find(m => m.t === 'sb' && m.s === 'sm-live');
-
   let wire = 0;
   const onSecond = raw => { wire += Buffer.byteLength(raw.toString(), 'utf8'); };
   second.on('message', onSecond);
   const secondPainted = waitForWsText(second, /THE_VISIBLE_SCREEN_LINE/, 'second viewer painted from the snapshot');
-  host.sendScrollback('sm-live', log, reqTwo);
+  await once(second, 'open');
   assert.match(await secondPainted, /THE_VISIBLE_SCREEN_LINE/);
   second.off('message', onSecond);
+  assert.equal(host.messages.filter(m => m.t === 'sb' && m.s === 'sm-live').length, sbBefore,
+    'a warm model must not ask muxd for the ring again');
 
   // The screen came through, and it cost a fraction of the log. Generous bound: the snapshot carries a
   // bounded slice of history, so require well under half the log rather than a single screen's worth.

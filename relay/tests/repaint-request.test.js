@@ -116,16 +116,37 @@ async function withBrowserRelay(renderMode, callback) {
     await page.evaluate(() => connect('repaint'));
     await page.waitForFunction(() => !!document.querySelector('.xterm'));
     await waitFor(() => host.messages.some(m => m.t === 'sb' && m.s === SESSION), 'scrollback request', TEST_TIMEOUT_MS);
-    host.sendScrollback(SESSION, 'boot\n');
-    await page.waitForFunction(() => term.buffer.active.length > 0);
-    host.sendOutput(SESSION, AUTHORITATIVE);
-    await page.waitForFunction(() => {
-      const b = term.buffer.active;
-      for (let y = 0; y < b.length; y++) { const l = b.getLine(y); if (l && /REPAINT authoritative line/.test(l.translateToString(true))) return true; }
-      return false;
-    }, null, { timeout: TEST_TIMEOUT_MS });
-    await sleep(400);   // let the write burst settle so the detector judges a settled surface
-    await callback({ harness, host, page });
+    // `ring` is the screen the host would hand a re-attaching viewer - the boot line, then the
+    // authoritative frame once it has been emitted - and it is what every later sb request is answered
+    // with. The page can attach more than once: its wedge watchdog re-attaches after a write it believes
+    // has stalled, and the relay drops a session's model when its last viewer leaves, so the new viewer
+    // is cold and asks for its own ring. Answering only the first request leaves that viewer on the
+    // State-L banner, which then CLEARs the authoritative frame away. A pump keeps every request answered.
+    const answered = new Set();
+    let ring = 'boot\n';
+    const answerRings = () => {
+      for (const m of host.messages) {
+        if (m.t !== 'sb' || m.s !== SESSION || answered.has(m.rid)) continue;
+        answered.add(m.rid);
+        host.sendScrollback(SESSION, ring, m);
+      }
+    };
+    const pump = setInterval(answerRings, 20);
+    try {
+      answerRings();
+      await page.waitForFunction(() => term.buffer.active.length > 0);
+      ring += AUTHORITATIVE;
+      host.sendOutput(SESSION, AUTHORITATIVE);
+      await page.waitForFunction(() => {
+        const b = term.buffer.active;
+        for (let y = 0; y < b.length; y++) { const l = b.getLine(y); if (l && /REPAINT authoritative line/.test(l.translateToString(true))) return true; }
+        return false;
+      }, null, { timeout: TEST_TIMEOUT_MS });
+      await sleep(400);   // let the write burst settle so the detector judges a settled surface
+      await callback({ harness, host, page });
+    } finally {
+      clearInterval(pump);
+    }
   } finally {
     if (context) await context.close();
     if (host) host.close();

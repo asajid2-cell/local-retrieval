@@ -105,8 +105,10 @@ function collect(viewer) {
 }
 const maps = got => got.texts().filter(s => s[0] === 'E').map(s => JSON.parse(s.slice(1)));
 
+// A scrollback reply must beat the State-L watchdog for these to exercise State R. The harness default
+// is 40ms so suites do not wait on it; these tests script a reply and need it to win the race.
 async function boot(t, sessions = [session]) {
-  const h = new RelayHarness();
+  const h = new RelayHarness({ MUX_HOST_SB_WAIT_MS: '6000' });
   await h.start();
   t.after(async () => h.stop());
   const host = new FakeHost(h.port);
@@ -119,15 +121,18 @@ async function boot(t, sessions = [session]) {
 function sbRequests(host) { return host.messages.filter(m => m.t === 'sb' && m.s === NAME); }
 
 // Attach a viewer and answer its scrollback request. `reply` is ordinary screen text, so the client
-// goes live and later host output is delivered directly.
-async function attach(t, h, host, reply = '') {
+// goes live and later host output is delivered directly. A warm model answers outright (State S), so
+// `expectSb: false` is for the attach-after-a-boundary case where no request must be sent at all.
+async function attach(t, h, host, reply = '', { expectSb = true } = {}) {
   const before = sbRequests(host).length;
   const viewer = new WebSocket(`ws://127.0.0.1:${h.port}/ws?session=${NAME}`);
   const got = collect(viewer);
   await once(viewer, 'open');
   t.after(() => viewer.close());
-  await waitFor(() => sbRequests(host).length > before, 'scrollback request');
-  host.sendScrollback(NAME, reply, sbRequests(host).at(-1));
+  if (expectSb) {
+    await waitFor(() => sbRequests(host).length > before, 'scrollback request');
+    host.sendScrollback(NAME, reply, sbRequests(host).at(-1));
+  }
   await sleep(80);
   return { viewer, got };
 }
@@ -167,16 +172,20 @@ test('a resync resets the live strip and drops the cached map', async t => {
   host.sendOutput(NAME, AFTER_RESYNC.toString('latin1'));
   await sleep(120);
 
-  // The repaint may be the raw 34-byte replay or the screen model's serialized screen, depending on
-  // whether the model is available; both are the fresh-state path. The discriminator is the NEXT
-  // chunk, which the stale carry used to eat.
+  // The repaint is the post-boundary ring, serialized from a model that was dropped at the boundary.
+  // It must show the replay and must NOT stack the pre-gap screen underneath it - the old noteScrollback
+  // appended the replay to a model that still held the old screen, which is the state P2-C removes.
   const after = got.bytes().subarray(beforeResync).toString('latin1');
-  assert.ok(after.includes('prompt$ '), 'the repaint arrives');
+  assert.ok(after.includes('PROMPT> ls'), 'the post-gap ring is on the screen');
+  assert.ok(!after.includes('prompt$ '), 'the pre-gap screen is gone, not stacked under the repaint');
   assert.ok(after.endsWith(AFTER_RESYNC.toString('latin1')),
     'the next live chunk arrives whole; before P2-A the stale carry swallowed it');
 
-  // A viewer that attaches after the boundary must not receive the pre-boundary map.
-  const second = await attach(t, h, host);
+  // A viewer that attaches after the boundary must not receive the pre-boundary map. The reseeded model
+  // is warm, so it answers outright and muxd is not asked for the ring again.
+  const sbBeforeSecond = sbRequests(host).length;
+  const second = await attach(t, h, host, '', { expectSb: false });
+  assert.equal(sbRequests(host).length, sbBeforeSecond, 'a warm model serves the boundary repaint');
   assert.deepEqual(maps(second.got), [], 'no cached map after the boundary');
   assert.ok(second.got.texts().some(s => s[0] === 'd'), 'the size frame still arrives');
 });
