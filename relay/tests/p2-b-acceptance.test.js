@@ -27,7 +27,7 @@
 //   01 covered-once (incl. amendment (a): a stripped OSC inside the straddler)
 //   02 ring-window loss closed
 //   03 below-pos arrivals dropped
-//   04 ahead: 04a catch-up flush, 04b never-catch-up State L, 04c beyond the 512 KiB bound
+//   04 ahead: 04a catch-up flush, 04b never-catch-up State L, 04c beyond the 512_000-byte cap
 //   05 stale end (banner/re-request, second stale -> permanent State L)
 //   06 generation mismatch -> time cut
 //   07 epoch bump (host resync) between request and reply -> positional refused
@@ -120,6 +120,7 @@ class PosHost extends FakeHost {
     if (generationId !== undefined) msg.generationId = generationId;
     if (resync !== undefined) msg.resync = resync;
     this.ws.send(JSON.stringify(msg));
+    this.lastReply = msg;   // the exact reply object, so a row can assert its wire shape
     return req.rid;
   }
 }
@@ -261,11 +262,13 @@ test('03/04a ahead: below-pos arrivals are dropped, the chunk reaching pos flush
 
 // ---------------------------------------------------------------------------------------------
 // 04b - never catch up: a dropUntil timer of HOST_SB_WAIT_MS bounds the window.
+// The request timeout is set far out so the ONLY thing that can produce a re-request is the drop-window
+// expiry. That makes "exactly one re-request" deterministic instead of racing the retry timer.
 // ---------------------------------------------------------------------------------------------
 test('04b ahead-never-catch-up: the drop window expires into State L and one re-request', async t => {
   const name = 'ahead-stall';
   const { h, host } = await boot(t, [session(name)], {
-    MUX_HOST_SB_WAIT_MS: '200', MUX_HOST_SB_REQUEST_TIMEOUT_MS: '350',
+    MUX_HOST_SB_WAIT_MS: '200', MUX_HOST_SB_REQUEST_TIMEOUT_MS: '60000',
   });
   const { ws, got } = await attach(t, h, name);
   await waitFor(() => host.sbReqs(name).length > 0, 'scrollback request');
@@ -275,18 +278,22 @@ test('04b ahead-never-catch-up: the drop window expires into State L and one re-
 
   await waitFor(() => got.text().includes(BANNER), 'State L after the bounded drop window', 3000);
   await waitFor(() => host.sbReqs(name).length > 1, 're-request after the bounded window', 3000);
+  await sleep(400);                                  // longer than the wait, well inside the 60 s retry
   assert.equal(count(got.text(), BANNER), 1, 'exactly one banner');
+  assert.equal(host.sbReqs(name).length, 2, 'exactly one re-request: a stall costs one request, not a loop');
   assert.equal(ws.readyState, 1, 'the viewer is still attached, not silently dropped');
 });
 
-// 04c - beyond the 512 KiB bound the reply degrades to the time cut: no drop, no banner.
-test('04c ahead-beyond-bound: pos - recv > 512 KiB degrades to the time cut', async t => {
+// 04c - beyond the 512_000-byte pending cap the reply degrades to the time cut: no drop, no banner.
+test('04c ahead-beyond-bound: pos - recv > 512000 degrades to the time cut', async t => {
   const name = 'ahead-bound';
   const { h, host } = await boot(t, [session(name)]);
   const { got } = await attach(t, h, name);
   await waitFor(() => host.sbReqs(name).length > 0, 'scrollback request');
 
-  host.replySb(name, { d: 'BOUND-RING', pos: (512 * 1024) + 1, start: 0, generationId: THE_GEN });
+  // The positional bound is muxd's pending cap: 512_000 bytes, not 512*1024. 512_000 ahead is the
+  // largest legal gap; 512_001 is the smallest impossible one, so this row sits exactly on the edge.
+  host.replySb(name, { d: 'BOUND-RING', pos: 512001, start: 0, generationId: THE_GEN });
   await waitFor(() => got.text().includes('BOUND-RING'), 'snapshot painted');
   host.sendOut(name, 'BOUND-GUARD');
   await waitFor(() => got.text().includes('BOUND-GUARD'), 'positional mode was refused, so bytes flush');
@@ -373,6 +380,11 @@ test('08 dirty: an explicit pos:null reply is a time cut, never positional again
   await waitFor(() => host.sbReqs(name).length > 0, 'scrollback request');
 
   host.replySb(name, { d: 'DIRTY-RING', pos: null, start: null, generationId: THE_GEN });
+  // The wire shape is the point of this row: `pos` is PRESENT and null, not absent. Row 13 sends the
+  // absent-key form. Both route to the time cut, but they must stay distinguishable - an implementation
+  // that only tests `pos === undefined` would treat this reply as positional against zero.
+  assert.ok(Object.prototype.hasOwnProperty.call(host.lastReply, 'pos'), 'pos must be present');
+  assert.equal(host.lastReply.pos, null, 'and explicitly null');
   await waitFor(() => got.text().includes('DIRTY-RING'), 'the ring is painted by the time cut');
   host.sendOut(name, 'DIRTY-LIVE');
   await waitFor(() => got.text().includes('DIRTY-LIVE'), 'live bytes flow');
@@ -491,6 +503,9 @@ test('13 absent pos: a legacy reply keeps the P2-C time cut', async t => {
   await waitFor(() => host.sbReqs(name).length > 0, 'scrollback request');
 
   host.replySb(name, { d: 'LEGACY-RING\r\n' });     // no pos, no start, no generationId
+  // The complement of row 8: the key is ABSENT, which is the old-muxd form. `pos: null` here would be
+  // a different wire shape and the two tests would stop proving the two distinct fallbacks.
+  assert.equal(Object.prototype.hasOwnProperty.call(host.lastReply, 'pos'), false, 'pos must be absent');
   await waitFor(() => got.text().includes('LEGACY-RING'), 'the ring is painted');
   host.sendOut(name, 'LEGACY-LIVE');
   await waitFor(() => got.text().includes('LEGACY-LIVE'), 'live bytes flow');
