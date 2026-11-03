@@ -148,6 +148,24 @@ test('output that arrives while the ring parses is in the snapshot, not lost', a
   assert.equal(count(got.text(), 'RACED_WITH_THE_SEED'), 1, 'the raced line is painted exactly once');
 });
 
+test('a client-addressed query that arrives while the ring parses reaches the viewer', async t => {
+  const name = 'seed-race-query';
+  const { h, host } = await boot(t, [session(name)]);
+  const before = sbRequests(host, name).length;
+  const { got } = await attach(t, h, name);
+  await waitFor(() => sbRequests(host, name).length > before, 'scrollback request');
+
+  // XTVERSION is a query, not a cell: a headless model absorbs it and a serialized screen cannot
+  // reproduce it. If the relay fed it to the model while the ring parsed and then trusted its snapshot
+  // to carry it, the viewer's xterm would never see it - and never answer it. It must arrive verbatim,
+  // exactly once, after the snapshot.
+  host.sendScrollback(name, longRing());
+  host.sendOutput(name, '\x1b[>0q');
+
+  await waitFor(() => got.text().includes('THE_ONLY_VISIBLE_LINE'), 'the seed completed');
+  assert.equal(count(got.text(), '\x1b[>0q'), 1, 'the query reaches the viewer exactly once');
+});
+
 test('a warm attach is answered by the model with no host request and no duplication', async t => {
   const name = 'warm-attach';
   const { h, host } = await boot(t, [session(name)]);

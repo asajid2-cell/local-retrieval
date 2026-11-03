@@ -110,11 +110,12 @@ function feed(name, cols, rows, buf, done) {
 // mid-stream. Appending the ring to that suffix is exactly the undefined screen this change removes, so
 // the model is dropped and rebuilt before the ring is fed.
 //
-// `cut` (optional) is called at the exact instant the drain marker is enqueued. Everything fed to the
-// model by then is inside the snapshot that follows; anything fed after it is not. The caller uses that
-// boundary to decide which of its own buffered bytes the snapshot already shows - it cannot infer it
-// from the reply alone, because live bytes keep arriving while the ring parses.
-function seed(name, cols, rows, bytes, done, cut) {
+// While the ring parses, the caller holds live bytes OUT of the model (server.js's seed hold): a byte fed
+// during the seed would be inside the snapshot, and a snapshot reproduces screen CELLS, not the control
+// sequences that produced them - a client-addressed query (XTVERSION, DA1) would be absorbed here and
+// never reach a viewer. So the snapshot taken at done() is exactly the ring, and the caller delivers the
+// held bytes itself, verbatim, after it.
+function seed(name, cols, rows, bytes, done) {
   let model = modelFor(name, cols, rows);
   if (!model) return 'failed';
   if (!model.cold) return 'warm';
@@ -126,16 +127,13 @@ function seed(name, cols, rows, bytes, done, cut) {
   const gen = model.gen;
   try {
     model.term.write(bytes, () => {
-      // A write callback fires when ITS chunk is parsed, before the next queued chunk - and live bytes
-      // that arrived while the ring parsed are queued behind it. A snapshot taken in this callback would
-      // miss them, and the caller drops its per-viewer buffer once it paints, so they would be lost.
-      // The marker write lands behind every write already queued, and its callback fires only after all
-      // of them have parsed. `drain` documents the same rule for the warm path.
-      // The model may have been disposed (boundary reset, last viewer removed) or rebuilt at another
-      // geometry while the parser worked. This seed then belongs to a screen nobody will render.
+      // While a seed is held the ring is the only write queued behind this callback, but writes from
+      // before the reply may still be parsing, so the drain marker still proves the parser has caught
+      // up - the same rule the warm path relies on. The model may have been disposed (boundary reset,
+      // last viewer removed) or rebuilt at another geometry while the parser worked. This seed then
+      // belongs to a screen nobody will render.
       const now = MODELS.get(name);
       const live = !!now && now === model && now.gen === gen && now.cold;
-      if (live && typeof cut === 'function') cut();
       drain(name, alive => {
         const ok = live && alive;
         const cur = MODELS.get(name);

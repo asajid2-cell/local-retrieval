@@ -3904,14 +3904,17 @@ wssHost.on('connection', (ws, req) => {
       const waiters = [...st.sbWaiters];
       st.sbWaiters.clear();
       clearScrollbackRequest(st);
-      // Two cuts, because a snapshot can only show what the parser reached before it was taken.
-      //   qMark - taken here, at the reply: everything already buffered arrived before the reply, so it
-      //           is inside muxd's ring. It is the cut for the no-snapshot fallback, where nothing is
-      //           repainted and every byte buffered during the wait must follow the banner.
-      //   qCut  - taken at the DRAIN marker (markDrainCut), i.e. after the seed's parse: everything fed
-      //           before that marker is inside the snapshot, so only what was fed after it may be
-      //           flushed afterwards. Using qMark here instead would replay the post-reply bytes the
-      //           snapshot already shows, painting them twice.
+      // Hold live bytes out of the model for the duration of the seed (see the reply cut above).
+      // paintAll() releases it after every waiting viewer has been painted and flushed.
+      st.seedHold = [];
+      // The reply is the cut between "in muxd's ring" and "live", and it is the cut for every flush:
+      //   - bytes already buffered arrived before the reply, so the ring contains them; the snapshot
+      //     shows them, and qMark keeps them out of the post-snapshot flush.
+      //   - bytes arriving after this point are held out of the model (st.seedHold) while the ring
+      //     parses, so the snapshot is exactly the ring and every one of them is flushed verbatim after
+      //     it. Holding them out keeps a screen both faithful and complete: a byte fed to the model is
+      //     absorbed into cells (a client-addressed XTVERSION/DA1 query produces none), so the snapshot
+      //     could not reproduce it - while flushing it too would paint it twice.
       // A viewer on the banner is re-armed as repairPending so bytes that arrive while the ring parses
       // are buffered the same way instead of being painted and then wiped by the repair's CLEAR. Its
       // watchdog is cancelled: the reply this client waited for has arrived.
@@ -3929,34 +3932,57 @@ wssHost.on('connection', (ws, req) => {
       const paintAll = () => {
         const g = modelGeom(st, n);
         const snap = g ? screenModel.snapshot(n, g.cols, g.rows) : null;
-        for (const id of waiters) {
+        // The held bytes are the continuation the snapshot cannot carry (it shows cells, not the
+        // sequences that made them). Every viewer painted from this snapshot was buffering across the
+        // reply, so every one of them gets the hold verbatim right after CLEAR + snapshot - including a
+        // viewer that attached while the seed parsed, whose own buffer is therefore empty.
+        const held = st.seedHold || [];
+        const flushHeld = c => {
+          for (const b of held) { if (!sendViewer(n, st, c, b, true)) return; }
+        };
+        // A viewer that attached while the seed parsed joined sbWaiters after the reply; it is painted
+        // from this same snapshot rather than being left to its own watchdog.
+        const ids = new Set(waiters.concat([...st.sbWaiters]));
+        for (const id of ids) {
           const c = st.clients.get(id);
           // A client already painted or gone is left alone. The sbWait guard is also what stops a seed
           // callback that arrived after the sbWait watchdog already took the client to State L.
           if (!c || !c.hosted || !c.sbWait || c.wentLive) continue;
-          if (snap) paintSnapshot(n, st, c, snap); else paintStateL(n, st, c);
+          if (snap) { if (paintSnapshot(n, st, c, snap)) flushHeld(c); }
+          else paintStateL(n, st, c);
         }
         // A viewer that timed out into State L is showing a banner, not a screen. When this reply finally
-        // gives the model a trustworthy screen, repaint it too - the snapshot covers the ring plus every
-        // live byte fed since, so the replacement is complete and nothing shown after the banner is lost.
+        // gives the model a trustworthy screen, repaint it too - the snapshot covers the ring, and the
+        // hold covers every byte sent since the banner, so the replacement loses nothing.
         // Nothing is sent while the model is cold: the banner stays, which is the defined state, and the
         // bytes held for the repair are live output that belongs after the banner.
         for (const c of st.clients.values()) {
           if (!c.hosted || c.ws.readyState !== 1) continue;
-          if (snap && (c.repairPending || c.stateL)) { paintSnapshot(n, st, c, snap); continue; }
+          if (snap && (c.repairPending || c.stateL)) {
+            if (paintSnapshot(n, st, c, snap)) flushHeld(c);
+            continue;
+          }
           if (!snap && c.repairPending) {
             c.repairPending = false;
             const pending = (c.q || []).slice(c.qMark || 0);
-            c.q = []; c.qBytes = 0; c.qMark = 0; c.qCut = null;
+            c.q = []; c.qBytes = 0; c.qMark = 0;
             for (const b of pending) {
               if (!sendViewer(n, st, c, b, true)) break;
             }
           }
         }
+        // The hold is over: from here on live bytes go to the model and to the viewers in arrival order.
+        // The held bytes are fed once, after the snapshot that deliberately excluded them, so the model
+        // ends up holding the same stream the viewers have seen.
+        st.seedHold = null;
+        const after = held.length ? modelGeom(st, n) : null;
+        if (after && screenModel.available()) {
+          for (const b of held) screenModel.feed(n, after.cols, after.rows, b);
+        }
       };
       const seedAndPaint = (gz, retry) => {
-        // done() runs after every byte queued before the drain marker has parsed, so the snapshot it
-        // triggers is complete; `cut` records exactly where that parse boundary was.
+        // done() runs after the ring has parsed, and live bytes are held out of the model until then,
+        // so the snapshot it triggers is exactly the ring; the held bytes are flushed verbatim after it.
         const status = screenModel.seed(n, gz.cols, gz.rows, buf, ok => {
           if (ok) { paintAll(); return; }
           // One retry from the same ring: a boundary reset or a geometry change may have replaced the
@@ -3966,10 +3992,10 @@ wssHost.on('connection', (ws, req) => {
             if (g2) { seedAndPaint(g2, false); return; }
           }
           paintAll();
-        }, () => markDrainCut(st));
+        });
         // 'seeding' paints from the callback. 'warm' already holds this ring, but writes may still be
         // queued, so the snapshot must wait for them the way a seed's does. 'failed' has no model.
-        if (status === 'warm') { markDrainCut(st); screenModel.drain(n, () => paintAll()); }
+        if (status === 'warm') screenModel.drain(n, () => paintAll());
         else if (status !== 'seeding') paintAll();
       };
       const geom = modelGeom(st, n);
@@ -4006,7 +4032,7 @@ wssHost.on('connection', (ws, req) => {
       for (const c of st.clients.values()) {
         if (!c.hosted || c.ws.readyState !== 1) continue;
         c.sbWait = true; c.wentLive = false; c.stateL = false; c.repairPending = false;
-        c.q = []; c.qBytes = 0; c.qMark = 0; c.qCut = null;
+        c.q = []; c.qBytes = 0; c.qMark = 0;
         asked = requestSessionScrollback(n, st, c) || asked;
         // Watchdog for the reply above: if the seed or the reply never lands, the viewer still reaches
         // a defined state instead of buffering forever.
@@ -4197,7 +4223,7 @@ function sessionState(name) {
   if (!st) {
     st = {
       clients: new Map(), cur: null, unpinnedLocalSize: null, sbInFlight: false, sbRid: '',
-      sbWaiters: new Set(), sbRequestTimer: null,
+      sbWaiters: new Set(), sbRequestTimer: null, seedHold: null,
       // One element-map state per session, never per viewer: the strip is applied once, before
       // fan-out, so the screen model and every viewer see the same text.
       emap: { strip: elementMap.createStripState(), map: null, gen: null },
@@ -4278,20 +4304,10 @@ function sendViewer(name, st, client, data, replayBurst = false) {
     return false;
   }
 }
-// The drain cut: bytes fed to the model before drain() enqueues its marker are parsed into the snapshot;
-// bytes fed after it are not. Call this synchronously just before drain(), so q.length at that instant is
-// exactly the boundary. Every byte in q was fed to the model first (deliverHostOutput feeds, then queues);
-// what is in q by now is therefore in the snapshot the marker's callback will take.
-function markDrainCut(st) {
-  for (const c of st.clients.values()) {
-    if (!c.hosted || c.ws.readyState !== 1) continue;
-    if (!c.sbWait && !c.repairPending && !c.stateL) continue;
-    c.qCut = (c.q || []).length;
-  }
-}
-// State S/R: one CLEAR followed by the serialized screen. The snapshot already contains every byte the
-// client buffered while it waited (the model is fed before the buffer at 4255), so the buffer is
-// dropped rather than replayed - replaying it would paint those lines twice.
+// State S/R: one CLEAR followed by the serialized screen. The snapshot contains every byte the client
+// buffered before the reply (muxd's ring holds them), so that part of the buffer is dropped rather than
+// replayed. Bytes that arrived after the reply are held out of the model, so the caller flushes them
+// verbatim immediately after this paint.
 function paintSnapshot(name, st, client, snap) {
   // sbWait selects a first paint; stateL/repairPending select a repair of a viewer on the banner.
   if (!client || client.removed || client.ws.readyState !== 1) return false;
@@ -4301,16 +4317,7 @@ function paintSnapshot(name, st, client, snap) {
   client.sbWait = false; client.wentLive = true; client.stateL = false; client.repairPending = false;
   if (client.sbTimer) { clearTimeout(client.sbTimer); client.sbTimer = null; }
   st.sbWaiters.delete(client.id);
-  // qCut is the cut the snapshot was actually taken at: everything before it was parsed into the screen
-  // (replaying it would paint it twice), and what follows it was fed after the drain marker, so it is
-  // the live stream that continues the screen - dropping it would lose output. A State S attach has no
-  // reply and therefore no cut; its buffer is empty anyway.
-  const cut = client.qCut == null ? (client.qMark || 0) : client.qCut;
-  const pending = (client.q || []).slice(cut);
-  client.q = []; client.qBytes = 0; client.qMark = 0; client.qCut = null;
-  for (const b of pending) {
-    if (!sendViewer(name, st, client, b, true)) break;
-  }
+  client.q = []; client.qBytes = 0; client.qMark = 0;
   return true;
 }
 // State L: no trustworthy screen (no model, a cold model that could not be seeded, an sb timeout, or a
@@ -4325,7 +4332,7 @@ function paintStateL(name, st, client) {
   const ok = sendViewer(name, st, client, CLEAR_SCREEN, true)
     && sendViewer(name, st, client, STATE_BANNER, true);
   sendHostInputRedraw(name);
-  client.q = []; client.qBytes = 0; client.qMark = 0; client.qCut = null;
+  client.q = []; client.qBytes = 0; client.qMark = 0;
   return ok;
 }
 // The element map is a control frame, not terminal output: it goes straight to each viewer, never
@@ -4363,6 +4370,7 @@ function resetElementMapBoundary(st) {
 // the old stream answer an attach. It is rebuilt - and reseeded from the new ring - on demand.
 function resetSessionBoundary(name, st) {
   resetElementMapBoundary(st);
+  if (st) st.seedHold = null;   // held bytes belong to the stream that just ended, not the new one
   screenModel.dispose(name);
 }
 // The geometry the session's byte stream was drawn at - not the geometry of whichever viewer happens
@@ -4392,7 +4400,15 @@ function deliverHostOutput(name, buf) {
   // drawn at. Off-geometry feeds are refused inside the model, so a resize simply makes the model cold
   // until it is rebuilt rather than letting it drift out of step with the stream.
   const geom = modelGeom(st, name);
-  if (geom && screenModel.available()) screenModel.feed(name, geom.cols, geom.rows, buf);
+  if (st.seedHold) {
+    // A seed is parsing this session's ring right now. A byte fed now would land inside the snapshot the
+    // seed is about to take, and a snapshot reproduces cells, not control sequences - a client-addressed
+    // query in this chunk would never reach a viewer. Hold it: paintAll flushes it verbatim after the
+    // snapshot, then feeds it to the model once.
+    st.seedHold.push(buf);
+  } else if (geom && screenModel.available()) {
+    screenModel.feed(name, geom.cols, geom.rows, buf);
+  }
   for (const c of st.clients.values()) {
     if (!c.hosted || c.ws.readyState !== 1) continue;
     if (c.sbWait || c.repairPending) {
@@ -4401,7 +4417,7 @@ function deliverHostOutput(name, buf) {
       // is a suffix, not a screen, so it is dropped; the banner says so and the live stream paints.
       // A viewer already on the banner (repairPending) keeps it - a flood is not a reason to say it twice.
       if (c.qBytes > 2000000 || c.q.length > 4000) {
-        if (c.repairPending) { c.repairPending = false; c.q = []; c.qBytes = 0; c.qMark = 0; c.qCut = null; }
+        if (c.repairPending) { c.repairPending = false; c.q = []; c.qBytes = 0; c.qMark = 0; }
         else paintStateL(name, st, c);
         sendViewer(name, st, c, buf);     // this chunk is the first live byte, not part of the suffix
       }
@@ -4420,7 +4436,9 @@ function clearScrollbackRequest(st) {
 }
 function requestSessionScrollback(name, st, client) {
   st.sbWaiters.add(client.id);
-  if (st.sbInFlight) return true;
+  // A seed already parsing the ring is a request in flight: this viewer joins it and is painted from the
+  // same snapshot, with the held bytes flushed after it. Asking muxd again would race two seeds.
+  if (st.sbInFlight || st.seedHold) return true;
   st.sbInFlight = true;
   st.sbRid = 'sb' + Date.now().toString(36) + '-' + (++_scrollbackRequestSeq).toString(36);
   const rid = st.sbRid;
@@ -4655,7 +4673,7 @@ wss.on('connection', async (ws, req) => {
     }
     const id = 'c' + (++_cid);
     const st = sessionState(name);
-    const client = { id, ws, term: null, hosted: true, vcols, vrows, sbWait: true, wentLive: false, sbTok: ++_cid, q: [], qBytes: 0, qMark: 0, qCut: null, repairPending: false, deviceId, label, visible: true, lastActive: Date.now(), connAt: Date.now() };
+    const client = { id, ws, term: null, hosted: true, vcols, vrows, sbWait: true, wentLive: false, sbTok: ++_cid, q: [], qBytes: 0, qMark: 0, repairPending: false, deviceId, label, visible: true, lastActive: Date.now(), connAt: Date.now() };
     st.clients.set(id, client);
     syncWatch(name, st, true);                                            // §7.2 first viewer starts the feed
     // A9 stays a refusal even when a warm model could answer the attach: a warm model proves the link
@@ -4666,7 +4684,10 @@ wss.on('connection', async (ws, req) => {
     // that grid, so the screen must be defined before the cells are written into it.
     recompute(name);
     const geom = modelGeom(st, name);
-    const warmSnap = geom ? screenModel.snapshot(name, geom.cols, geom.rows) : null;
+    // While a seed is parsing, the model is missing the bytes held for the viewers already waiting, so it
+    // cannot answer this attach: the viewer joins that seed instead (requestSessionScrollback below) and
+    // is painted from the same snapshot with the hold flushed after it.
+    const warmSnap = (geom && !st.seedHold) ? screenModel.snapshot(name, geom.cols, geom.rows) : null;
     if (warmSnap) {
       // State S: the model already holds the whole stream; no scrollback request is sent at all.
       if (!paintSnapshot(name, st, client, warmSnap)) return;
