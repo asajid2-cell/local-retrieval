@@ -3321,6 +3321,12 @@ try{ window.__muxForceSel = forceSel; }catch(e){}
   // router hands an armed pane's wheel to the app, but a re-dispatched wheel (padding, alt buffer) and
   // any wheel xterm sees directly carry the same unscaled-cell divisor.
   const POINTER_XY = ['mousedown','mousemove','mouseup','click','auxclick','dblclick','contextmenu','wheel'];
+  // RECORDED, NOT FIXED - the scale probe has one coupling. rect/offsetWidth is exactly 1 for an unscaled
+  // pane only because xterm sizes .xterm-screen to Math.round(css.canvas.width) integer px and this page
+  // never overrides that width. If either changes, an unscaled pane stops taking the exact identity path
+  // and would be rewritten by a sub-pixel amount. The authoritative scale is the computed transform
+  // matrix, or the page's own tabFlexSx/tabFlexSy above (applyFlexTransform writes those); the ratio is
+  // used here because it also tracks a transform set outside the flex fit (a test, a future mode).
   function pointerScale(){
     const scr=$('#term') && $('#term').querySelector('.xterm-screen');
     if(!scr || !scr.offsetWidth || !scr.offsetHeight) return null;
@@ -3329,6 +3335,14 @@ try{ window.__muxForceSel = forceSel; }catch(e){}
     if(!(sx>0) || !(sy>0)) return null;
     return (sx===1 && sy===1) ? null : {sx, sy, left:r.left, top:r.top};
   }
+  // RECORDED, NOT FIXED - there is no isTrusted check here. The page's own alt-buffer wheel re-dispatch
+  // (see the "Alternate buffer: hand the wheel to the app" path above) builds a synthetic WheelEvent with
+  // no clientX/clientY, i.e. 0,0; under a scale this rewrite turns that into a negative grid point before
+  // xterm reads it. Harmless today only because that dispatch runs on unarmed panes, where bindMouse is not
+  // bound and no pointer cell is read. The check is deliberately absent so synthetic events in the
+  // regression can exercise the rewrite. If that re-dispatch ever runs on an armed pane, add
+  // `if(!e.isTrusted) return;` (or give the re-dispatch the original coordinates) - otherwise it feeds
+  // xterm a bogus cell.
   function unscalePointer(e){
     const h=$('#term');
     if(!h || !e.target || !h.contains(e.target)) return;   // #term targets only

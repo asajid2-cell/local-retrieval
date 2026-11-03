@@ -25,10 +25,15 @@
 // which is where the cell is chosen), and the WIRE assertion uses the one native report class the guard
 // forwards - the wheel (Cb bit 6) - comparing its bytes across scales.
 //
-// The regression reproduces the red direction by DROPPING the fix: at k=1.12 the control's cell (10,5)
-// is reported as (11,5), so the comparisons below fail with the report shifted one column. I-14 (sub-1.0
-// flex instability) is marked: 0.8 is exercised because the same divisor error runs the other way
-// there, and the fix must be symmetric.
+// RED PROOF, EXECUTED (2026-11-03, at 7f60495 with relay/public/index.html reverted to 19692ed and this
+// file unchanged). All three rows go red:
+//   * source gate: 'the flex pointer mapping block is gone from the shipped page';
+//   * native motion row: at 1.12 the report chose {col:11,row:6} where scale 1 chooses {col:10,row:5} -
+//     both axes move, because the scale multiplies the point before the unscaled-cell divisor;
+//   * selection row: at 1.12 a double-click at cell (10,5) selected the neighbouring word on the NEXT
+//     ROW - {"text":"JKL",start(12,6),end(15,6)} - instead of {"text":"abc",start(8,5),end(11,5)}.
+// I-14 (sub-1.0 flex instability) is marked: 0.8 is exercised because the same divisor error runs the
+// other way there, and the fix must be symmetric.
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -321,6 +326,92 @@ test('native mouse reports name the same cell at every flex scale, and the page\
     });
     assert.deepEqual(outside.seen, outside.made,
       'a pointer event outside #term was rewritten while the pane was scaled');
+  } finally {
+    if (context) await context.close();
+    if (host) host.close();
+    await harness.stop();
+  }
+});
+
+// ---- SELECTION: the native reader a user actually sees ------------------------------------------------
+//
+// Every native pointer REPORT is either page-composed (the armed click and wheel, already exact) or
+// stripped from the wire (motion, Cb bit 5, dropped unconditionally). The one native reader whose effect
+// a user sees is xterm's SelectionService: double-click word select, triple-click line select, and the
+// click-in-selection clear all call getCoords against the same scaled screen rect and divide by the
+// unscaled cell size. On an UNARMED pane the page deliberately does not swallow the press, so the
+// selection service owns it; this arm measures the selection a user gets there, not a wire frame.
+
+// Double-click at the VISUAL centre of (col,row). The selected range is read back from xterm itself.
+async function doubleClickWord(page, col, row) {
+  return page.evaluate(({ col, row }) => {
+    const scr = document.querySelector('#term .xterm-screen');
+    const r = scr.getBoundingClientRect();
+    const cols = term.cols | 0, rows = term.rows | 0;
+    const x = r.left + r.width * (col + 0.5) / cols;
+    const y = r.top + r.height * (row + 0.5) / rows;
+    try { term.clearSelection(); } catch (e) {}
+    const mk = type => new MouseEvent(type, {
+      bubbles: true, cancelable: true, clientX: x, clientY: y,
+      button: 0, buttons: 0, detail: 2, view: window,
+    });
+    scr.dispatchEvent(mk('mousedown'));
+    document.dispatchEvent(mk('mouseup'));          // release xterm's drag listeners and drag-scroll timer
+    return {
+      text: term.getSelection ? term.getSelection() : '',
+      pos: term.getSelectionPosition ? term.getSelectionPosition() : null,
+    };
+  }, { col, row });
+}
+
+test('a flex-scaled double-click selects the word under the pointer (unarmed pane)', async t => {
+  if (!browser) return t.skip(`Chromium unavailable.\n${INSTALL}\n${browserError && browserError.message}`);
+
+  const harness = new RelayHarness();
+  let host = null, context = null;
+  try {
+    harness.fixedPort = await freePort();
+    harness.env.ALLOWED_WS_ORIGINS = `http://127.0.0.1:${harness.fixedPort}`;
+    await harness.start();
+    host = await harness.connectHost([{ name: SESSION, alive: true, shellOnly: true, cols: 80, rows: 24 }]);
+
+    context = await browser.newContext({ viewport: { width: 1000, height: 700 } });
+    context.setDefaultTimeout(TEST_TIMEOUT_MS);
+    context.setDefaultNavigationTimeout(30000);
+    const page = await context.newPage();
+    await page.goto(`http://127.0.0.1:${harness.port}/?s=${SESSION}`, { waitUntil: 'domcontentloaded' });
+    await page.locator('#term').waitFor({ state: 'visible' });
+    await waitFor(() => host.messages.some(m => m.t === 'sb' && m.s === SESSION), 'scrollback request', TEST_TIMEOUT_MS);
+    host.sendScrollback(SESSION, 'boot\n');
+    await waitFor(async () => {
+      const text = await page.locator('#status').innerText();
+      return text.includes(SESSION) && text.includes('live') ? true : null;
+    }, 'live terminal status', TEST_TIMEOUT_MS);
+
+    // UNARMED on purpose: no tracking sequence is sent, so xterm's selection service owns the double
+    // click and the page must not swallow the press. Two identical rows, so a scaled ROW shift still
+    // lands in text rather than blank space and the comparison is about the word, not the blank.
+    const row = (a, b) => ' '.repeat(8) + a + ' ' + b;    // a at cols 8-10, separator at 11, b at 12-14
+    host.sendOutput(SESSION, '\x1b[2J\x1b[H' + '\r\n'.repeat(5) +
+      row('abc', 'DEF') + '\r\n' + row('ghi', 'JKL') + '\r\n');
+    await sleep(300);
+    assert.equal(await page.evaluate(() => term.buffer.active.viewportY | 0), 0,
+      'the fixture must not be scrolled for the row to be viewport row ROW');
+
+    await setScale(page, 'scale(1)');
+    const control = await doubleClickWord(page, COL, ROW);
+    assert.equal(control.text, 'abc', `the scale-1 control selected ${JSON.stringify(control.text)}`);
+    assert.deepEqual(control.pos, { start: { x: 8, y: ROW }, end: { x: 11, y: ROW } },
+      `the scale-1 control selected the wrong range: ${JSON.stringify(control.pos)}`);
+
+    await setScale(page, 'scale(1.12)');
+    const scaled = await doubleClickWord(page, COL, ROW);
+    assert.deepEqual(scaled, control,
+      `at 1.12 the double-click selected ${JSON.stringify(scaled)} instead of the word under the pointer ` +
+      `${JSON.stringify(control)} - selection reads the same scaled rect as the native report path`);
+
+    assert.equal(host.messages.filter(m => m.t === 'i').length, 0,
+      'an unarmed selection must not reach the PTY as input');
   } finally {
     if (context) await context.close();
     if (host) host.close();
