@@ -128,6 +128,26 @@ test('bytes buffered while waiting are not painted a second time after the snaps
     'the buffered copy is discarded after the snapshot; the old code replayed it and doubled the line');
 });
 
+test('output that arrives while the ring parses is in the snapshot, not lost', async t => {
+  const name = 'seed-race';
+  const { h, host } = await boot(t, [session(name)]);
+  const before = sbRequests(host, name).length;
+  const { got } = await attach(t, h, name);
+  await waitFor(() => sbRequests(host, name).length > before, 'scrollback request');
+
+  // The reply and the next live line leave the host in one tick. The relay starts seeding on the reply,
+  // the line is fed to the model while the large ring is still parsing, and the ring's own write callback
+  // fires BEFORE that line parses. A snapshot taken there would miss it and the per-viewer buffer is cut
+  // at the reply, so it could not be replayed either - the line would simply be gone. seed()'s drain
+  // marker is enqueued behind every pending write, so the snapshot waits for it.
+  host.sendScrollback(name, longRing());
+  host.sendOutput(name, 'RACED_WITH_THE_SEED\r\n');
+
+  await waitFor(() => got.text().includes('THE_ONLY_VISIBLE_LINE'), 'the seed completed');
+  await waitFor(() => got.text().includes('RACED_WITH_THE_SEED'), 'the raced line is painted');
+  assert.equal(count(got.text(), 'RACED_WITH_THE_SEED'), 1, 'the raced line is painted exactly once');
+});
+
 test('a warm attach is answered by the model with no host request and no duplication', async t => {
   const name = 'warm-attach';
   const { h, host } = await boot(t, [session(name)]);
