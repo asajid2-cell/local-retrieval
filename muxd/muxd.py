@@ -3474,12 +3474,15 @@ class Session:
     def scrollback_view(self, limit=SB_SEND):
         """The replay plus its positional cut: `pos`/`start` in the forwarded-raw coordinate.
 
-        `pos` is the last ground-state boundary at or before the ring tail, so every raw byte below
-        it is represented by the snapshot body (a chunk that straddles `pos` contributes only its
-        prefix) and every byte from `pos` on is not. `start` is the first ground boundary at or after
-        the raw start of the oldest chunk actually in this reply. A dirty stream (the forward queue
-        dropped a prefix) reports `pos: null`, which the relay routes to the time cut exactly like an
-        old muxd that sends no position at all.
+        `pos` is the last ground-state boundary the forwarded stream has reached, so every raw byte
+        below it is accounted for by the snapshot: the retained-ring body is painted, and a tail that
+        was fully stripped (an element-map chunk that never entered the ring) produced no screen
+        output. The body runs to the ring tail, not to `pos`, so a chunk that straddles `pos` is
+        replayed whole; the relay paints the snapshot over [start,pos) and re-sends the post-`pos`
+        interior live, which is exact because `pos` is a ground boundary. `start` is the first ground
+        boundary at or after the raw start of the oldest chunk actually in this reply. A dirty stream
+        (the forward queue dropped a prefix) reports `pos: null`, which the relay routes to the time
+        cut exactly like an old muxd that sends no position at all.
         """
         try: limit = max(0, min(RING_CAP, int(limit)))
         except Exception: limit = SB_SEND
@@ -3742,12 +3745,15 @@ class OwnerSession:
     def scrollback_view(self, limit=SB_SEND):
         """The replay plus its positional cut: `pos`/`start` in the forwarded-raw coordinate.
 
-        `pos` is the last ground-state boundary at or before the ring tail, so every raw byte below
-        it is represented by the snapshot body (a chunk that straddles `pos` contributes only its
-        prefix) and every byte from `pos` on is not. `start` is the first ground boundary at or after
-        the raw start of the oldest chunk actually in this reply. A dirty stream (the forward queue
-        dropped a prefix) reports `pos: null`, which the relay routes to the time cut exactly like an
-        old muxd that sends no position at all.
+        `pos` is the last ground-state boundary the forwarded stream has reached, so every raw byte
+        below it is accounted for by the snapshot: the retained-ring body is painted, and a tail that
+        was fully stripped (an element-map chunk that never entered the ring) produced no screen
+        output. The body runs to the ring tail, not to `pos`, so a chunk that straddles `pos` is
+        replayed whole; the relay paints the snapshot over [start,pos) and re-sends the post-`pos`
+        interior live, which is exact because `pos` is a ground boundary. `start` is the first ground
+        boundary at or after the raw start of the oldest chunk actually in this reply. A dirty stream
+        (the forward queue dropped a prefix) reports `pos: null`, which the relay routes to the time
+        cut exactly like an old muxd that sends no position at all.
         """
         try: limit = max(0, min(RING_CAP, int(limit)))
         except Exception: limit = SB_SEND

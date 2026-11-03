@@ -5002,8 +5002,11 @@ wss.on('connection', async (ws, req) => {
     const st = sessionState(name);
     // `painted` is the raw coordinate of the last byte handed to this viewer (snapshot or live), which
     // is what makes the positional cut per-viewer: a reply whose `pos` is behind it is a rewind hazard,
-    // not an information gap. A fresh viewer starts at the relay's received-bytes offset.
-    const client = { id, ws, term: null, hosted: true, vcols, vrows, sbWait: true, wentLive: false, sbTok: ++_cid, q: [], qBytes: 0, qMark: 0, repairPending: false, painted: hostRecvOf(name) ?? 0, dropUntil: null, dropTimer: null, deviceId, label, visible: true, lastActive: Date.now(), connAt: Date.now() };
+    // not an information gap. A fresh viewer has been handed nothing, so it starts at 0 and advances
+    // only on an actual send. Crediting it with the relay's received-bytes offset made a reply that
+    // covers [pos,recv) look like a rewind for a viewer that never saw those bytes - exactly the case
+    // where `recv` has outrun `pos` inside an open escape sequence - and left it on the banner.
+    const client = { id, ws, term: null, hosted: true, vcols, vrows, sbWait: true, wentLive: false, sbTok: ++_cid, q: [], qBytes: 0, qMark: 0, repairPending: false, painted: 0, dropUntil: null, dropTimer: null, deviceId, label, visible: true, lastActive: Date.now(), connAt: Date.now() };
     st.clients.set(id, client);
     syncWatch(name, st, true);                                            // §7.2 first viewer starts the feed
     // A9 stays a refusal even when a warm model could answer the attach: a warm model proves the link

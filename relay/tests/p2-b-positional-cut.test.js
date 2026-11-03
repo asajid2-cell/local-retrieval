@@ -482,6 +482,29 @@ test('a cold attach after a pure element-map tail paints a screen, not State L',
   assert.equal(host.sbReqs(name).length, 1, 'no re-request means the stale strike never reaches 2');
 });
 
+test('a viewer joining an in-flight request after an unterminated tail still paints', async t => {
+  const name = 'inflight-open-seq';
+  const { h, host } = await boot(t, [session(name)]);
+  const first = await attach(t, h, name);            // attaches at recv 0 and issues the request
+  await waitFor(() => host.sbReqs(name).length > 0, 'scrollback request');
+  const rid = host.sbReqs(name)[0].rid;
+
+  const text = 'TAIL-TEXT';                          // 9 bytes
+  host.sendOut(name, text + '\x1b[');                // recv 11, last ground 9: an open CSI
+  const second = await attach(t, h, name);           // joins the seed in flight, handed nothing
+  assert.equal(host.sbReqs(name).length, 1, 'the late joiner does not issue its own request');
+
+  // pos 9 is behind recv 11 but ahead of the request's reqPos 0, so it is positional for the session.
+  // The late joiner has been sent nothing, so pos < painted must not read as a rewind for it.
+  host.replySb(name, { rid, d: text, pos: 9, start: 0, generationId: GEN });
+
+  await waitFor(() => first.got.text().includes(text), 'the requesting viewer paints');
+  await waitFor(() => second.got.text().includes(text), 'the late joiner paints too');
+  await sleep(200);
+  assert.equal(count(second.got.text(), BANNER), 0, 'an unwatched tail is not a rewind for a fresh viewer');
+  assert.equal(host.sbReqs(name).length, 1, 'no rewind re-request, so no second strike');
+});
+
 // ------------------------------------------------------------------------------------------------
 // I-15 partition invariant over random cuts: covered once, flushed once, no gap, no banner. The seed
 // is derived from a name rather than written as a literal so the fixture never looks like a key.
