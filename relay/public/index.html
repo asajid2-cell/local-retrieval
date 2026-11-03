@@ -1923,6 +1923,11 @@ let viewportFit = null;            // {cols,rows} our screen can show at the cur
 let winSize = null;                // {cols,rows} the shared window the server told us to render
 let sizeModeLabel = '';            // e.g. "auto · 100×30" / "📌 Phone · 40×80"
 let sizePinned = false, sizeMine = false, sizeLocal = false, sizeTabOwned = false, sizePinLabel = '', sizeClients = [];   // from the 'd' control frame
+// Is this viewer the ONLY terminal on the app's one PTY? Terminal-generated replies (DA/CPR/DSR/DECRQM/
+// DCS/XTVERSION and focus) can only be forwarded from the sole terminal; with a PC terminal attached too
+// the app would receive two answers and mis-parse the second as a command. `known` is false until the
+// first 'd' of this attach arrives, during which the old classifier (drop) applies.
+let soleTerminal = true, soleTerminalKnown = false;
 // Persistent DEVICE identity so a pin follows the DEVICE across reconnects/relay restarts (not the socket).
 const deviceId = (()=>{ let d=LS.get('mux_devid',''); if(!d){ d='d'+Math.random().toString(36).slice(2,10)+Date.now().toString(36).slice(-4); LS.set('mux_devid',d); } return d; })();
 function defaultDeviceLabel(){ const ua=navigator.userAgent||''; const mob=/Mobi|Android|iPhone|iPad/i.test(ua);
@@ -2243,6 +2248,10 @@ function onControl(s){
   let m; try{ m=JSON.parse(s.slice(1)); }catch(e){ return; }
   winSize={cols:m.cols, rows:m.rows}; sizeModeLabel=m.modeLabel||'';
   sizePinned = m.mode==='pinned'; sizeMine = !!m.mine; sizeLocal = !!m.local; sizeTabOwned = !!m.tabOwned; sizePinLabel = m.pinLabel||''; sizeClients = m.clients||[];
+  // Presence, not truthiness: an old relay omits the field entirely, and that is the only case that falls
+  // back to today's size-based classifier. A relay that sends it has told us the answer even when false.
+  soleTerminal = Object.prototype.hasOwnProperty.call(m,'attachedLocal') ? !m.attachedLocal : !(sizeLocal || sizeTabOwned);
+  soleTerminalKnown = true;
   if(term.cols!==m.cols || term.rows!==m.rows){ try{ preserveTermViewport(()=>term.resize(m.cols, m.rows)); hardenHelperTextarea(); installMobileInputDelta(); }catch(e){} }
   // Heal on EVERY size frame, not only on a grid change. A 'd' that re-asserts the size we already have is
   // exactly the frame that used to be a no-op: it proves the relay and this surface disagree about the
@@ -2652,6 +2661,9 @@ function takeTerminalReport(s, at){
       let k = i+3, ch;
       while(k < len && ((ch=s.charCodeAt(k)) === 0x3b || (ch >= 0x30 && ch <= 0x39))) k++;
       if(s[k] === 'c') return k+1-i;
+      // DECRQM reply, private form: CSI ? Ps ; Pm $ y (xterm answers ?2026 here). The parser generates it
+      // in reply to an app query, so it is bytes ABOUT this terminal, never typing.
+      if(s[k] === '$' && s[k+1] === 'y') return k+2-i;
     }
     // Focus reports: CSI I (gained focus) / CSI O (lost focus). xterm emits these through onData when the
     // app enabled focus tracking (DECSET 1004), and it emits CSI O on every helper-textarea blur — which
@@ -2661,6 +2673,7 @@ function takeTerminalReport(s, at){
     let k = i+2, ch;
     while(k < len && ((ch=s.charCodeAt(k)) === 0x3b || (ch >= 0x30 && ch <= 0x39))) k++;
     if(s[k] === 'R') return k+1-i;                  // cursor-position report
+    if(s[k] === '$' && s[k+1] === 'y') return k+2-i; // DECRQM reply, ANSI form: CSI Ps ; Pm $ y
     k = i+2;
     while(k < len && ((ch=s.charCodeAt(k)) === 0x3b || ch === 0x3f || (ch >= 0x30 && ch <= 0x39))) k++;
     if(s[k] === 'n') return k+1-i;                  // device/status report
@@ -2687,6 +2700,17 @@ function takeTerminalReport(s, at){
     }
     return 0;
   }
+  if(c === 'P'){
+    // DCS reply (XTVERSION `ESC P > | xterm.js ESC \`, DECRQSS `ESC P 1 $ r 0 m ESC \`): a device-control
+    // string the parser emitted in reply to a query. Its payload cannot contain ESC, so the first ESC
+    // decides: ST ends it, anything else is not a report we recognise.
+    let k = i+2;
+    while(k < len){
+      if(s.charCodeAt(k) === 0x1b) return s[k+1] === '\\' ? k+2-i : 0;
+      k++;
+    }
+    return 0;
+  }
   return 0;
 }
 // R7: focus in/out reports (CSI I / CSI O). xterm emits these through onData ONLY when the app enabled
@@ -2707,19 +2731,19 @@ function extractFocusReports(s){
   return { focus, rest };
 }
 function stripTerminalGeneratedReports(s){
-  if(!s) return { out:s||'', dropped:false };
+  if(!s) return { out:s||'', dropped:false, reports:'' };
   let esc = s.indexOf('\x1b');
-  if(esc < 0) return { out:s, dropped:false };      // the common case: no report can start, so don't scan
-  let out='', dropped=false, i=0;
+  if(esc < 0) return { out:s, dropped:false, reports:'' };   // the common case: no report can start, so don't scan
+  let out='', reports='', dropped=false, i=0;
   while(i < s.length){
     if(esc < 0){ out += s.slice(i); break; }        // no ESC left — take the whole tail in one go
     if(esc > i){ out += s.slice(i, esc); i = esc; }
     const n = takeTerminalReport(s, i);
-    if(n){ dropped = true; i += n; }
+    if(n){ dropped = true; reports += s.slice(i, i+n); i += n; }   // keep the exact bytes for forwarding
     else { out += s[i]; i++; }
     esc = s.indexOf('\x1b', i);
   }
-  return { out, dropped };
+  return { out, dropped, reports };
 }
 const debugInputEnabled = /(?:[?&]debuginput=1(?:&|$))/.test(location.search);
 window.__muxInputLog = window.__muxInputLog || [];
@@ -2950,12 +2974,20 @@ term.onData(d => {
   // it leaves through sendMouseInput like they do.
   if(mouseGuard.focusReporting()){
     const f = extractFocusReports(d);
-    if(f.focus){ markActive(); sendMouseInput(f.focus); }
+    // Focus in/out describes THIS terminal. With a PC terminal also attached, the app's one view of the
+    // world is not "this tab lost focus" - forwarding it would tell the app it went away. Forward only
+    // from the sole terminal; otherwise consume it.
+    if(f.focus && !(soleTerminalKnown && !soleTerminal)){ markActive(); sendMouseInput(f.focus); }
     d = f.rest;
     if(!d) return;
   }
   const filtered = stripTerminalGeneratedReports(d);
   if(filtered.dropped){
+    // DA/CPR/DSR/DECRQM/DCS replies are answers to queries the app sent down the ONE pty. If a PC
+    // terminal is attached it answers too, and two answers make the app read the second as a command. So
+    // forward the terminal-generated bytes only from the sole terminal, and only when we actually know we
+    // are sole; unknown stays on the old behaviour (drop).
+    if(soleTerminalKnown && soleTerminal && filtered.reports){ markActive(); sendMouseInput(filtered.reports); }
     d = filtered.out;
     if(!d) return;
   }
@@ -2976,6 +3008,9 @@ term.onData(d => {
 // exposes no version constant, so we answer the name alone - which is all the identification needs.
 try{
   term.parser.registerCsiHandler({prefix:'>', final:'q'}, () => {
+    // With a PC terminal attached, IT answers this query; a second reply through the same pty corrupts the
+    // app's next read. Consume the query and stay silent unless we are the sole terminal.
+    if(soleTerminalKnown && !soleTerminal) return true;
     send('i', '\x1bP>|xterm.js\x1b\\');
     return true;
   });
@@ -3452,6 +3487,7 @@ function connect(name, isRetry){
     resetTerminalSurface();
     mouseGuard.reset(prevName === name);   // same session keeps the modes its app already armed; a
                                            // different session starts clean (see reset() for why)
+    soleTerminal = true; soleTerminalKnown = false;   // unknown until this attach's first 'd'
     lastViewportReport='';
     lastViewportReportSocket=null;
     scheduleViewportFit(0);

@@ -4339,6 +4339,14 @@ function recompute(name) {
   }
   const clients = [...st.clients.values()].map(c => ({ id: c.id, w: c.vcols, h: c.vrows, label: c.label || '', dev: c.deviceId || '', active: isActive(c) }));
   const pinned = !!sz.pin, pinLabel = pinned ? (sz.pin.label || 'a device') : '';
+  // attachedLocal: a PC terminal is attached to the app's PTY right now. This is NOT the size decision -
+  // a pin can win the size while a local terminal is still attached, and then `local` (hostedSize) is
+  // false even though a report-forwarding terminal is present. It is emitted on EVERY 'd' (never omitted)
+  // so a client can tell "no local terminal" from "this relay is too old to say"; absence is the only
+  // unknown.
+  const hostedNow = hostSessions.get(name);
+  const attachedLocal = !!(hostedNow && hostedNow.alive !== false
+    && (((hostedNow.localViewers | 0) > 0) || !!hostedNow.owner));
   for (const c of st.clients.values()) {
     if (c.ws.readyState !== 1) continue;
     const mine = pinned && sz.pin.deviceId === (c.deviceId || ('sock-' + c.id));
@@ -4347,7 +4355,7 @@ function recompute(name) {
     // tabOwned: the size is the teed PC tab's PHYSICAL screen (§7.1/§7.3). The client renders a distinct
     // label and disables pinning, because a pin would resize the tab out from under the user sitting there.
     const tabOwned = !!sz.tabOwned;
-    sendViewer(name, st, c, 'd' + JSON.stringify({ cols, rows, mode, local: !!sz.hostedSize, tabOwned, pinLabel, mine, modeLabel, me: c.id, clients }));
+    sendViewer(name, st, c, 'd' + JSON.stringify({ cols, rows, mode, local: !!sz.hostedSize, tabOwned, attachedLocal, pinLabel, mine, modeLabel, me: c.id, clients }));
   }
 }
 function pinToDevice(name, client, on) {
