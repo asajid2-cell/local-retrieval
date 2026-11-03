@@ -434,16 +434,21 @@ test('10 ground start: pre-start bytes never paint and the tail still flows', as
   const { got } = await attach(t, h, name);
   await waitFor(() => host.sbReqs(name).length > 0, 'scrollback request');
 
-  // 'PRE-START' (9 bytes) is forwarded but the ring was trimmed: [0,9) is unavailable. The ring
-  // covers [9,13) and pos is 13, so only bytes at/after pos may reach a viewer.
+  // Forward all 13 bytes BEFORE the reply: [0,9) is the unavailable prefix, [9,13) is the span the ring
+  // covers. Because recv == pos == 13 at the reply, this is a ground start, not the ahead case (with
+  // only 9 bytes forwarded, pos - recv would be 4 and the next chunk would flush partially, which is
+  // row 4/04a's contract and not this row's).
   host.sendOut(name, 'PRE-START');
+  host.sendOut(name, 'RING');                       // the covered span, represented by 'UNAV'
   host.replySb(name, { d: 'UNAV', pos: 13, start: 9, generationId: THE_GEN });
   await waitFor(() => got.text().includes('UNAV'), 'the covered ring is painted');
   host.sendOut(name, 'FLUSH10!');
-  await waitFor(() => got.text().includes('FLUSH10!'), 'bytes at pos still flush');
+  await waitFor(() => got.text().includes('FLUSH10!'), 'bytes at pos flush whole');
   await sleep(120);
   assert.equal(count(got.text(), 'PRE-START'), 0,
     'a byte below start is unavailable and must never be flushed');
+  assert.equal(count(got.text(), 'RING'), 0,
+    'the covered span is represented by the snapshot; its raw bytes must not be painted again');
 });
 
 // ---------------------------------------------------------------------------------------------
