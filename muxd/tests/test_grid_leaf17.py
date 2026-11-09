@@ -101,6 +101,21 @@ class AckTest(unittest.TestCase):
         self.assertIn('"ok": false', reports[-1])
         self.assertIn('"epoch": 2', reports[-1])
 
+    def test_a_local_reclaim_answers_the_device_request_it_supersedes(self):
+        # Typing at the PC while a device take (or a viewport re-measure) is in flight must win, but the
+        # superseded epoch has to be answered: the relay is waiting on it, and an unanswered epoch left
+        # its pending record stuck forever, silently dropping every later request for the session.
+        s = make_stream()
+        commit(s, 100, 40, 1)
+        self.assertTrue(muxd.owner_request_grid(s, 90, 30, 2, "devB"))
+        self.assertTrue(muxd.owner_reclaim_local(s, reason="activity"))
+        reports = [f for kind, _n, f in s.frames.items if kind == "gridAck"]
+        superseded = [f for f in reports if '"epoch": 2' in f and '"ok": false' in f]
+        self.assertEqual(len(superseded), 1, "the superseded request is refused, not forgotten")
+        self.assertIn('superseded by local reclaim', superseded[0])
+        self.assertEqual(s.grid_pending.get("epoch"), 3, "the reclaim itself is now what is in flight")
+        self.assertTrue(s.grid_pending.get("local"))
+
     def test_t4_an_unanswered_request_times_out_without_moving_the_grid(self):
         s = make_stream()
         self.assertTrue(muxd.owner_request_grid(s, 100, 40, 1, "devA"))

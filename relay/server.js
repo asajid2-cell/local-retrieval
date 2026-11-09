@@ -3947,7 +3947,11 @@ wssHost.on('connection', (ws, req) => {
       const req = st.gridReq;
       if (!req || Number(m.epoch) !== req.epoch) return;
       st.gridReq = null;
-      if (m.ok === false && !req.retried) {
+      // A request the local terminal superseded (the user typed at the PC while a device take or
+      // viewport re-measure was in flight) is terminal: retrying it would fight the person at the PC,
+      // who has already won. It is answered so the pending record resolves; no retry, drop the pin.
+      const superseded = /^superseded/.test(String(m.reason || ''));
+      if (m.ok === false && !req.retried && !superseded) {
         const host = hostSessions.get(n);
         // muxd reports its current epoch with the refusal; the session list may be older than that.
         const hostEpoch = Number.isSafeInteger(Number(m.gridEpoch)) ? Number(m.gridEpoch) : 0;

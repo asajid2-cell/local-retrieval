@@ -127,6 +127,32 @@ test('a refused epoch retries exactly once at muxd\'s current epoch + 1', async 
   assert.equal(resizeFrames(host).length, 2, 'a second refusal is final, not a retry loop');
 });
 
+test('a request the local terminal superseded is answered and never retried', async t => {
+  const name = 'grid-superseded';
+  const { h, host } = await boot(t, [tabSession(name, { gridEpoch: 10 })]);
+  const { ws } = await attach(t, h, name, 100, 30);
+  ws.send('P');
+  await waitFor(() => resizeFrames(host).length === 1, 'take the grid');
+  assert.equal(resizeFrames(host)[0].epoch, 11);
+
+  // The user typed at the PC while the take was in flight. The local terminal wins; the superseded
+  // epoch is still answered so the relay's pending record resolves - and it must NOT be retried,
+  // because a retry would take the grid straight back from the person who just typed.
+  host.ws.send(JSON.stringify({ t: 'gridAck', s: name, epoch: 11, ok: false, reason: 'superseded by local reclaim', gridEpoch: 11 }));
+  await sleep(250);
+  assert.equal(resizeFrames(host).length, 1, 'a superseded request is not retried');
+
+  // The pin is gone with it: the next tap is a fresh take, not a release of a grid this device never held.
+  ws.send('P');
+  await waitFor(() => resizeFrames(host).length === 2, 'a fresh take goes out');
+  const fresh = resizeFrames(host)[1];
+  assert.ok(fresh.owner && fresh.owner !== 'local', 'the chip is not stuck believing it owns the grid');
+  // The relay only knows the committed epoch from its session list (10), so the fresh take is 11. If
+  // muxd has already reserved 11 for the reclaim it refuses with its current epoch and the one-retry
+  // path moves it to 12 - that path is covered by the stale-epoch test.
+  assert.ok(Number(fresh.epoch) >= 11, 'the next request moves past the committed epoch');
+});
+
 test('T13 the pinning device disconnecting releases the grid to local', async t => {
   const name = 'grid-disconnect';
   const { h, host } = await boot(t, [tabSession(name, { gridEpoch: 10 })]);

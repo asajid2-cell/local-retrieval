@@ -4034,6 +4034,13 @@ def owner_reclaim_local(owner, reason="activity"):
     pending = getattr(owner, "grid_pending", None)
     if pending and pending.get("local"):
         return False                       # a reclaim is already in flight
+    if pending:
+        # A DEVICE request (a take, or a viewport re-measure) is in flight and this local activity wins.
+        # The superseded request still has to be ANSWERED: its epoch is what the relay is waiting on, and
+        # an unanswered epoch left the relay's pending record stuck forever, silently dropping every
+        # later request for that session. Refuse it with a reason the relay must not retry.
+        _grid_report(owner, pending.get("epoch", 0), False, "superseded by local reclaim")
+        log(f"[{owner.name}] superseded device request epoch={pending.get('epoch')} reason={reason}")
     size = (int(owner.pane_cols), int(owner.pane_rows))
     epoch = _grid_next_epoch(owner)
     owner.grid_pending = {"epoch": epoch, "cols": size[0], "rows": size[1],
