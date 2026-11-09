@@ -26,8 +26,10 @@ test('§7.3: the size chip says "follows PC tab" and locks the pin', () => {
   assert.match(indexSource, /sizeTabOwned/);
   assert.match(indexSource, /follows PC tab/);
   assert.match(indexSource, /sizeTabOwned && !sizePinned/);
-  // cycleSize must refuse the pin, not just paint a different label.
-  assert.match(indexSource, /function cycleSize\(\)\{\s*if\(sizeTabOwned && !sizePinned\)/);
+  // cycleSize must refuse the pin, not just paint a different label, and a tap while a grid request is
+  // in flight must not be read as a second request (the pending guard is the first statement it runs).
+  assert.match(indexSource, /function cycleSize\(\)\{[\s\S]{0,400}?if\(_gridBusy\) return;/);
+  assert.match(indexSource, /function cycleSize\(\)\{[\s\S]{0,700}?if\(sizeTabOwned && !sizePinned\)/);
   assert.match(indexSource, /cannot be pinned/);
 });
 

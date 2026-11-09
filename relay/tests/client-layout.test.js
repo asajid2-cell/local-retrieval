@@ -180,6 +180,7 @@ test('size chip names auto, own pin, and another device exactly', () => {
     sizeTabOwned: false,
     sizePinLabel: '',
     tabFitMode: 'fill',
+    _gridBusy: null,
     $: sel => sel === '#term' ? host : null,
     sizeButtonPresentation: null,
     updateSizeBtn: null,

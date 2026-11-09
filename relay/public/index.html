@@ -2237,7 +2237,16 @@ function onControl(s){
   const ownChanged = prevOwner!==sizeGridOwner || prevPinned!==sizePinned || prevTabOwned!==sizeTabOwned;
   const firstFrame = !_paintReady;
   if(firstFrame) _paintReady = true;
-  if(geomChanged || ownChanged || firstFrame){
+  if(firstFrame){
+    // A cold attach can land before the renderer has painted, so repaint the LOCAL surface - but do not
+    // run the fault detector on this frame. Its escalation is a SERVER repaint ('R') and the relay
+    // rate-limits that to one per 10s per session, so a request spent at attach starves the manual
+    // Repaint button and the app's own next redraw: repaint-request.test.js's button click was swallowed.
+    healTerminalPaint();
+    requestAnimationFrame(()=>{ healTerminalPaint(); });
+    fitTabOwnedGrid();
+    applyPan();
+  } else if(geomChanged || ownChanged){
     schedulePaintHeal(20);
     fitTabOwnedGrid();
     applyPan();
