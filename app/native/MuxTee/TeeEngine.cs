@@ -64,6 +64,17 @@ internal sealed class TeeEngine : IDisposable
     // restores the pane locally - the PTY, not just muxd's record - because TryResize compares the pane
     // against its own last seen size and would never fire after a remote resize.
     private bool _remoteOwned;
+    // The pane as it was when the device took the grid, and the grid it took. ConPTY reports the
+    // pseudoconsole's new size through the tee's own console after a remote resize, so a pane read that
+    // merely echoes _remoteGrid is not the user's pane moving - it is our own resize coming back.
+    private (int Cols, int Rows) _paneBeforeRemote;
+    private (int Cols, int Rows) _remoteGrid;
+    private readonly List<byte> _localCarry = new();
+    // conhost echoes a pseudoconsole resize back through the tee's own console a few milliseconds
+    // later, and two device resizes in a row queue two echoes. For a short window after any resize the
+    // pane read is not trustworthy, so it is not acted on; the next 250 ms backstop picks up a real
+    // user resize once the stream has settled.
+    private long _settleUntilTicks;
     private long _lastActivityAt;
     private readonly object _resizeLock = new();
 
@@ -118,7 +129,11 @@ internal sealed class TeeEngine : IDisposable
 
                 // INVARIANT 1: the local terminal is served first, unconditionally, before anything that
                 // could touch the network. T1 never waits on muxd and never sees its absence.
-                WriteAll(_stdout, chunk);
+                // A resize of OUR pseudoconsole makes conhost emit a window-resize request
+                // (CSI 8 ; rows ; cols t) into the pty stream. Forwarded to the tab it makes the USER'S
+                // pane adopt the phone's grid, so it is dropped from the LOCAL write only; the mirror
+                // still receives the pty's bytes unchanged.
+                WriteAll(_stdout, StripWindowResize(chunk));
 
                 // Then the ring, for a reconnect replay, and only then the (P1: inert) net queue.
                 Ring.Append(chunk);
@@ -275,6 +290,48 @@ internal sealed class TeeEngine : IDisposable
         pending.Clear();
     }
 
+    // Drops `ESC [ 8 ; <digits> ; <digits> t` (conhost's window-resize request) from the local write,
+    // carrying a partial sequence into the next chunk. Nothing else is touched.
+    private byte[] StripWindowResize(byte[] chunk)
+    {
+        _localCarry.AddRange(chunk);
+        var src = _localCarry.ToArray();
+        var keep = new List<byte>(src.Length);
+        int i = 0, pending = -1;
+        while (i < src.Length)
+        {
+            if (src[i] == 0x1B)
+            {
+                int j = i + 1;
+                if (j < src.Length && src[j] == (byte)'[')
+                {
+                    j++;
+                    int digits1 = 0;
+                    while (j < src.Length && src[j] >= (byte)'0' && src[j] <= (byte)'9') { j++; digits1++; }
+                    if (j >= src.Length) { pending = i; break; }
+                    if (digits1 > 0 && src[j] == (byte)';')
+                    {
+                        j++;
+                        int digits2 = 0;
+                        while (j < src.Length && src[j] >= (byte)'0' && src[j] <= (byte)'9') { j++; digits2++; }
+                        if (j >= src.Length) { pending = i; break; }
+                        if (digits1 == 1 && src[i + 2] == (byte)'8'
+                            && digits2 > 0 && src[j] == (byte)'t')
+                        {
+                            i = j + 1;          // drop the whole request
+                            continue;
+                        }
+                    }
+                }
+            }
+            keep.Add(src[i]);
+            i++;
+        }
+        _localCarry.Clear();
+        if (pending >= 0) _localCarry.AddRange(src[pending..]);
+        return keep.ToArray();
+    }
+
     // The WT viewport, read srWindow (NOT dwSize - under a ConPTY the buffer is viewport-sized and
     // dwSize is the maximum window, which is not the size the user sees).
     private bool TryReadPaneSize(out short cols, out short rows)
@@ -294,12 +351,24 @@ internal sealed class TeeEngine : IDisposable
         // The local pane owns the grid by default. While a remote device owns it this still runs (the
         // window may be dragged underneath), and the pane's new size is simply reported as a local
         // statement - which is what reclaims the grid.
-        if (!TryReadPaneSize(out var cols, out var rows)) return false;
-        if (cols == lastCols && rows == lastRows) return false;
+        short cols, rows;
+        // The read and the decision are serialized with ApplyRemoteResize: a remote resize wakes this
+        // loop (the pane stays put, but the console buffer reports the pseudoconsole) and the two must
+        // not interleave, or this fires on the remote grid a millisecond after it landed.
+        lock (_resizeLock)
+        {
+            if (!TryReadPaneSize(out cols, out rows)) return false;
+            // Echo guard: while a device owns the grid, a read equal to the grid we applied is ConPTY
+            // reporting our own pseudoconsole resize, not the local pane changing. Firing here would
+            // send a `size` and reclaim the grid the device just took (contract G2/G5).
+            if (_remoteOwned && (int)cols == _remoteGrid.Cols && (int)rows == _remoteGrid.Rows) return false;
+            if (Environment.TickCount64 < _settleUntilTicks) return false;
+            if (cols == lastCols && rows == lastRows) return false;
+            _pc.Resize(cols, rows);
+            _remoteOwned = false;
+        }
         lastCols = cols;
         lastRows = rows;
-        lock (_resizeLock) { _pc.Resize(cols, rows); }
-        _remoteOwned = false;
         // The mirror must follow the window the user is actually looking at. The tab is the default
         // source of its geometry and it has to say so on every change - silence here means viewers keep
         // rendering at the size the tab happened to be at when muxtee started.
@@ -311,20 +380,32 @@ internal sealed class TeeEngine : IDisposable
     // Contract 5a: the local pane reclaims the grid. Called from the receive half when muxd asks.
     private (bool Ok, int Cols, int Rows, int PaneCols, int PaneRows) ApplyRemoteResize(int cols, int rows, long epoch)
     {
-        var pane = ReadPaneSizeTuple();
+        (int Cols, int Rows) pane;
         try
         {
-            lock (_resizeLock) { _pc.Resize((short)cols, (short)rows); }
+            // Claim the grid BEFORE the resize so a pane-read racing this call sees _remoteOwned with the
+            // applied grid already recorded and treats its own echo as our resize, not the user's.
+            lock (_resizeLock)
+            {
+                pane = ReadPaneSizeTuple();
+                // Only the local -> remote transition records the pane. On a device -> device change
+                // the console is still echoing the previous device grid, so a fresh read would record
+                // the phone's size as "the pane" and every later restore would land on it.
+                if (!_remoteOwned && pane.Cols > 0 && pane.Rows > 0) _paneBeforeRemote = pane;
+                _remoteGrid = (cols, rows);
+                _remoteOwned = true;
+                _settleUntilTicks = Environment.TickCount64 + 400;
+                _pc.Resize((short)cols, (short)rows);
+            }
         }
         catch (Exception ex)
         {
             _log("remote resize failed: " + ex.Message);
-            return (false, 0, 0, pane.Cols, pane.Rows);
+            return (false, 0, 0, 0, 0);
         }
         // A remote resize never touches lastCols/lastRows: those track the pane, and moving them would
         // make the 250 ms backstop immediately undo the phone's grid. It does mean TryResize cannot
         // notice the pane changing back; _remoteOwned drives the restore instead (NoteLocalInput).
-        _remoteOwned = true;
         // The ring's bytes are at the old width and cannot be honestly replayed: clear it, and the app
         // repaints itself at the new grid.
         Link?.ReplaceHistory(Array.Empty<byte>());
@@ -336,10 +417,25 @@ internal sealed class TeeEngine : IDisposable
     // explicit muxd release, which is why the release frame carries no geometry at all.
     private (bool Ok, int Cols, int Rows, int PaneCols, int PaneRows) RestorePaneLocal(long epoch)
     {
-        if (!TryReadPaneSize(out var cols, out var rows))
+        // Use the pane read when the grid was taken, not a fresh one: ConPTY is currently echoing the
+        // remote grid through the tee's own console, so a live read would "restore" to the phone's size.
+        short cols, rows;
+        if (_paneBeforeRemote.Cols > 0 && _paneBeforeRemote.Rows > 0)
+        {
+            cols = (short)_paneBeforeRemote.Cols;
+            rows = (short)_paneBeforeRemote.Rows;
+        }
+        else if (!TryReadPaneSize(out cols, out rows))
             return (false, 0, 0, 0, 0);
-        _remoteOwned = false;
-        try { lock (_resizeLock) { _pc.Resize(cols, rows); } }
+        try
+        {
+            lock (_resizeLock)
+            {
+                _remoteOwned = false;
+                _settleUntilTicks = Environment.TickCount64 + 800;
+                _pc.Resize(cols, rows);
+            }
+        }
         catch (Exception ex)
         {
             _log("pane restore resize failed: " + ex.Message);
