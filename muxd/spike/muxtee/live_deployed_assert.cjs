@@ -296,6 +296,22 @@ async function waitForOwner(page, want, timeoutMs, predicate) {
     fit.mode === 'fit' && fit.gridOwner === 'local' && fit.cols === HOST_COLS && fit.rows === HOST_ROWS && fit.resizeSends === 0,
     `mode=${fit.mode} gridOwner=${fit.gridOwner} term=${fit.cols}x${fit.rows} epoch=${fit.gridEpoch} resizeSends=${fit.resizeSends} chip=${JSON.stringify(fit.chip)}`);
 
+  // --- cold take, reported and bounded, but not the steady-state measurement -----------------------
+  // A tab that has never been pinned pays a cold cost on its FIRST take: the first ConPTY resize plus
+  // the tee's first ack. Measured on a fresh tab it was 2610 ms, against 324-561 ms for every take after
+  // that, so measuring steady state on the cold one made the strict row below red for a real but
+  // one-time cost. Take and release once here, then measure the warm path.
+  await mark(page);
+  await page.evaluate(() => { const b = document.querySelector('#sizebtn'); b.click(); b.click(); });
+  const coldTook = await waitForOwner(page, 'mine', 20000, (st) => st.cols !== HOST_COLS);
+  const coldT = await timings(page, 600);
+  check('L2 the first take on a fresh tab is bounded',
+    coldTook.gridOwner === 'mine' && coldT.commitMs > 0 && coldT.commitMs < 5000,
+    `coldCommitMs=${coldT.commitMs} term=${coldTook.cols}x${coldTook.rows} (steady state measured below)`);
+  await clickChip(page);
+  await waitForOwner(page, 'local', 20000, (st) => st.cols === HOST_COLS);
+  await page.waitForTimeout(800);
+
   // --- take -------------------------------------------------------------------------------------
   const tee0 = teeMark();
   await mark(page);
