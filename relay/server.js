@@ -580,6 +580,12 @@ function normalizeHostSession(s) {
     // host simply keeps the time cut.
     streamBytes: Number.isSafeInteger(Number(s.streamBytes)) && Number(s.streamBytes) >= 0
       ? Number(s.streamBytes) : null,
+    // Grid ownership (GRID-OWNERSHIP-CONTRACT.md). `owner` above stays the historical bool; these are
+    // the committed grid authority. An old muxd omits them and every session reads as local, which is
+    // exactly today's behaviour.
+    gridOwner: String(s.gridOwner || '') === 'pin' ? 'pin' : 'local',
+    gridOwnerLabel: String(s.gridOwnerLabel || '').slice(0, 64),
+    gridEpoch: Number.isSafeInteger(Number(s.gridEpoch)) && Number(s.gridEpoch) >= 0 ? Number(s.gridEpoch) : 0,
     tool: ['claude', 'codex'].includes(s.tool) ? s.tool : '',
     childPid: Number.isSafeInteger(Number(s.childPid)) && Number(s.childPid) > 0 ? Number(s.childPid) : 0,
     agentState: String(s.agentState || ''), agentLabel: String(s.agentLabel || ''),
@@ -3840,7 +3846,11 @@ wssHost.on('connection', (ws, req) => {
       const resized = [];
       for (const [n, v] of incoming) {
         const prev = hostSessions.get(n);
-        if (!prev || (prev.cols | 0) !== (v.cols | 0) || (prev.rows | 0) !== (v.rows | 0)) resized.push(n);
+        // Ownership and its epoch republish even when the geometry does not move: a release back to the
+        // pane at the same size still has to reach every viewer, or the chip keeps showing the old owner.
+        if (!prev
+          || (prev.cols | 0) !== (v.cols | 0) || (prev.rows | 0) !== (v.rows | 0)
+          || prev.gridOwner !== v.gridOwner || (prev.gridEpoch | 0) !== (v.gridEpoch | 0)) resized.push(n);
       }
       hostSessions.clear();
       for (const [n, v] of incoming) hostSessions.set(n, v);
@@ -3918,6 +3928,22 @@ wssHost.on('connection', (ws, req) => {
       });
     } else if (m.t === 'o') {
       deliverHostOutput(strictMuxName(m.s), Buffer.from(m.d || '', 'base64'));
+    } else if (m.t === 'gridAck') {
+      // A grid request muxd refused (or a stale epoch it declined). A pin record survives a relay
+      // restart while muxd's epoch moves on, so re-issue exactly one retry at the CURRENT epoch + 1;
+      // without it a surviving pin silently does nothing forever.
+      const n = strictMuxName(m.s); const st = sessions.get(n); if (!st) return;
+      const req = st.gridReq;
+      if (!req || Number(m.epoch) !== req.epoch) return;
+      st.gridReq = null;
+      if (m.ok === false && !req.retried) {
+        const host = hostSessions.get(n);
+        const epoch = ((host && host.gridEpoch) | 0) + 1;
+        const retry = { ...req, epoch, retried: true };
+        st.gridReq = retry;
+        if (retry.owner === 'local') sendHost({ t: 'resize', s: n, epoch, owner: 'local' });
+        else sendHost({ t: 'resize', s: n, cols: retry.cols, rows: retry.rows, epoch, owner: retry.owner, label: retry.label });
+      }
     } else if (m.t === 'sb') {
       const n = strictMuxName(m.s); const st = sessions.get(n); if (!st) return;
       if (!st.sbInFlight || String(m.rid || '') !== st.sbRid) return;
@@ -4804,9 +4830,14 @@ function targetSize(st, name) {
   // checked first so a lingering pin cannot resize a tab out from under its user.
   const owned = hostSessions.get(name);
   if (owned && owned.owner && (owned.cols | 0) > 1 && (owned.rows | 0) > 1) {
-    // tabOwned marks the STRONGER case: a stream owner's geometry is not merely the local terminal's, it
-    // is the PC's physical screen, so the UI must say so and refuse a pin outright (§7.3).
-    return { cols: owned.cols | 0, rows: owned.rows | 0, pin: null, hostedSize: true, tabOwned: true };
+    // Grid ownership: a teed tab's committed geometry is the ONLY thing painted. A pin does not move
+    // this; it asks muxd, and muxd publishes the new committed size once the tee has applied it (G2).
+    // `grid` carries the authority so recompute can label the owner and gate on the epoch.
+    return {
+      cols: owned.cols | 0, rows: owned.rows | 0, pin: null, hostedSize: true,
+      // tabOwned is the "you cannot pin this" lock, and only while LOCAL ownership holds (contract §4).
+      tabOwned: owned.gridOwner !== 'pin', grid: owned,
+    };
   }
   let pin = pins.get(name);
   if (pin) {
@@ -4865,6 +4896,7 @@ function recompute(name) {
   const hostedNow = hostSessions.get(name);
   const attachedLocal = !!(hostedNow && hostedNow.alive !== false
     && (((hostedNow.localViewers | 0) > 0) || !!hostedNow.owner));
+  const grid = sz.grid || null;
   for (const c of st.clients.values()) {
     if (c.ws.readyState !== 1) continue;
     const mine = pinned && sz.pin.deviceId === (c.deviceId || ('sock-' + c.id));
@@ -4873,8 +4905,40 @@ function recompute(name) {
     // tabOwned: the size is the teed PC tab's PHYSICAL screen (§7.1/§7.3). The client renders a distinct
     // label and disables pinning, because a pin would resize the tab out from under the user sitting there.
     const tabOwned = !!sz.tabOwned;
-    sendViewer(name, st, c, 'd' + JSON.stringify({ cols, rows, mode, local: !!sz.hostedSize, tabOwned, attachedLocal, pinLabel, mine, modeLabel, me: c.id, clients }));
+    // Committed grid ownership, relative to this viewer. `mine`/`other` is decided from the relay's own
+    // pin record (muxd publishes a label, not a device id), while the geometry above is always the
+    // committed one from muxd - a request that has not been acked paints nothing.
+    let gridOwner = 'local', gridEpoch = 0, gridOwnerLabel = '';
+    if (grid) {
+      gridEpoch = grid.gridEpoch | 0;
+      if (grid.gridOwner === 'pin') {
+        const rec = pins.get(name);
+        const dev = rec ? rec.deviceId : '';
+        gridOwner = dev && dev === (c.deviceId || ('sock-' + c.id)) ? 'mine' : 'other';
+        gridOwnerLabel = grid.gridOwnerLabel || (rec && rec.label) || '';
+      }
+    }
+    sendViewer(name, st, c, 'd' + JSON.stringify({ cols, rows, mode, local: !!sz.hostedSize, tabOwned, attachedLocal, pinLabel, mine, modeLabel, me: c.id, clients, gridOwner, gridEpoch, gridOwnerLabel }));
   }
+}
+// A teed tab's grid is not the relay's to paint: a pin is a REQUEST to muxd, which asks the tee and
+// publishes the committed geometry only after the tee's ack. Until then every viewer keeps the old grid.
+function requestTabGrid(name, st, client, on) {
+  const host = hostSessions.get(name);
+  if (!st || !host || !host.owner) return false;
+  const epoch = ((host.gridEpoch | 0) + 1);
+  if (on) {
+    const deviceId = client.deviceId || ('sock-' + client.id);
+    const cols = clampTermDimension(client.vcols, st.cur ? st.cur.cols : 2, MAX_TERM_COLS);
+    const rows = clampTermDimension(client.vrows, st.cur ? st.cur.rows : 2, MAX_TERM_ROWS);
+    st.gridReq = { epoch, cols, rows, owner: deviceId, label: String(client.label || '').slice(0, 64), retried: false };
+    sendHost({ t: 'resize', s: name, cols, rows, epoch, owner: deviceId, label: String(client.label || '').slice(0, 64) });
+  } else {
+    // Release carries no geometry: the tee reads the pane (contract section 4).
+    st.gridReq = { epoch, cols: 0, rows: 0, owner: 'local', label: '', retried: false };
+    sendHost({ t: 'resize', s: name, epoch, owner: 'local' });
+  }
+  return true;
 }
 function pinToDevice(name, client, on) {
   const candidate = new Map(pins);
@@ -4894,9 +4958,15 @@ function pinToDevice(name, client, on) {
   }
   const st = sessions.get(name);
   if (st) {
-    st.unpinnedLocalSize = !on && previous
-      ? { cols: previous.cols | 0, rows: previous.rows | 0, until: Date.now() + PIN_HOST_SYNC_GRACE_MS }
-      : null;
+    const gridHost = hostSessions.get(name);
+    if (gridHost && gridHost.owner) {
+      // The committed geometry comes back through the session list; nothing repaints on the request.
+      requestTabGrid(name, st, client, on);
+    } else {
+      st.unpinnedLocalSize = !on && previous
+        ? { cols: previous.cols | 0, rows: previous.rows | 0, until: Date.now() + PIN_HOST_SYNC_GRACE_MS }
+        : null;
+    }
   }
   recompute(name);
   return true;
@@ -4936,6 +5006,18 @@ function handleClientMsg(name, client, s) {
       if (o.rows != null) client.vrows = clampTermDimension(o.rows, client.vrows, MAX_TERM_ROWS);
       applyActivity(client, o);
     } catch {}
+    // The device that owns a teed tab's grid re-pins when its viewport changes (contract section 6):
+    // it cannot scale, so a new viewport is a new request. Only while its pin is committed and the
+    // request's own viewport differs from the committed grid.
+    const st = sessions.get(name), host = hostSessions.get(name);
+    if (st && host && host.owner && host.gridOwner === 'pin') {
+      const rec = pins.get(name);
+      const dev = client.deviceId || ('sock-' + client.id);
+      if (rec && rec.deviceId === dev && !st.gridReq
+          && (client.vcols !== (host.cols | 0) || client.vrows !== (host.rows | 0))) {
+        requestTabGrid(name, st, client, true);
+      }
+    }
     recompute(name);
     return true;
   }
