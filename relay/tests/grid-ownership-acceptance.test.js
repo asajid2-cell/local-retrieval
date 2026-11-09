@@ -5,7 +5,7 @@
 // LANDED-ON: (implementation head sha recorded when #17's grid-ownership commits land)
 //
 // Rows are numbered with the contract so a fence amendment maps onto a test name:
-//   G3/T12  owner=local: fill and fit emit zero resize frames, and d.owner is local
+//   G3/T12  owner=local: fill and fit emit zero resize frames, and d.gridOwner is local
 //   G2/T9   a pin request carries a superseding epoch; nothing paints until muxd publishes
 //   G4      a stale epoch cannot roll the committed geometry back
 //   G5/T10  last of two pins wins; the second tap releases; disconnect returns to local;
@@ -17,15 +17,14 @@
 // Every row drives the real relay over HTTP/ws with a fake host. Nothing reads relay internals:
 // the host declares the committed record, the viewer asserts on the `d` frame it receives.
 //
-// Two wire choices the contract leaves open, made explicitly here:
-//  1. The frame set gives the session list `owner` = "local"|"pin". That NAME already exists on the
-//     relay's host record as a BOOLEAN (watchable-link / local-owner tests). A truthy string cannot
-//     distinguish local from pin, so these rows send the contract's string and require the relay to
-//     keep the two meanings apart. If the implementer keeps the boolean, the field must be renamed on
-//     one side; the rows only require that d.owner carries the contract value.
-//  2. A pin/release is driven with the existing control frames: 'P' toggles, 'v' reports geometry.
-//     The contract names the behaviour, not the byte, so a different control frame would move these
-//     rows rather than invalidate them.
+// Settled field names (contract §4 ruling, 2026-11-09): the session list and the `d` frame carry
+// `gridOwner` ("local"|"pin" on the list, "local"|"mine"|"other" on d), `gridEpoch` and
+// `gridOwnerLabel`. The existing boolean `owner` is the stream-owner/link gate and is NOT this value;
+// these rows never accept a truthy string on `owner`.
+//
+// A pin is driven with the existing control frames: 'P' toggles, 'v' reports geometry. The pin
+// request is {"t":"resize",s,cols,rows,epoch,owner:"<deviceId>"}. Release is
+// {"t":"resize",s,epoch,owner:"local"} with cols/rows OMITTED (the tee knows the pane and acks it).
 //
 // `winSize` is accepted as {cols,rows} or [cols,rows]; a renderer cannot paint without a pair.
 const test = require('node:test');
@@ -41,13 +40,14 @@ const PANE = { cols: 209, rows: 51 };
 const DEVICE = { cols: 100, rows: 30 };
 
 // A teed PC tab as muxd reports it. `kind:local-tab` is what makes the relay treat the pane as the
-// stream's physical screen. `owner`/`ownerEpoch`/`ownerLabel` are the contract's new list fields.
+// stream's physical screen. `gridOwner`/`gridEpoch`/`gridOwnerLabel` are the contract's new list
+// fields; cols/rows are the committed geometry.
 function session(name, over = {}) {
   return {
     name, alive: true, created: 1, lastOut: 1, cols: PANE.cols, rows: PANE.rows,
     hasCommand: true, shellOnly: false, ready: true, kind: 'local-tab',
     sessionId: name + '-id', generationId: GEN, aliases: [], streamBytes: 0,
-    owner: 'local', ownerEpoch: 1, ownerLabel: 'PC',
+    gridOwner: 'local', gridEpoch: 1, gridOwnerLabel: 'PC',
     ...over,
   };
 }
@@ -116,8 +116,8 @@ test('T12a owner=local fill: zero resize frames, committed geometry, owner local
   const { ws, got } = await attach(t, h, name);
 
   const d0 = got.lastD();
-  assert.equal(d0.owner, 'local', 'the viewer must be told it renders under local ownership');
-  assert.equal(d0.ownerEpoch, 1, 'and the committed epoch');
+  assert.equal(d0.gridOwner, 'local', 'the viewer must be told it renders under local ownership');
+  assert.equal(d0.gridEpoch, 1, 'and the committed epoch');
   assert.deepEqual(winSize(d0), PANE, 'winSize is the committed pane geometry');
   assert.equal(d0.tabOwned, true, 'tabOwned stays true while the grid is local');
 
@@ -145,7 +145,7 @@ test('T12b owner=local fit: zero resize frames and byte-identical paint', async 
   await waitFor(() => got.text().includes('G3-BYTE-FIDELITY'), 'host bytes reach the viewer');
   assert.equal(got.bytesSince(mark).toString('latin1'), 'G3-BYTE-FIDELITY\r\n',
     'the stream is untouched: no reflow, no in-band metadata (G6)');
-  assert.equal(got.lastD().owner, 'local', 'and ownership did not change');
+  assert.equal(got.lastD().gridOwner, 'local', 'and ownership did not change');
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -165,10 +165,10 @@ test('T9a pin request carries a superseding epoch and the device viewport', asyn
   assert.equal(req.s, name);
   assert.equal(req.cols, DEVICE.cols, "the pin asks for this device's viewport, not a scaled grid");
   assert.equal(req.rows, DEVICE.rows);
-  assert.ok(Number.isInteger(req.epoch) && req.epoch > before.ownerEpoch,
+  assert.ok(Number.isInteger(req.epoch) && req.epoch > before.gridEpoch,
     'the request names the epoch it supersedes: ' + JSON.stringify(req));
-  assert.ok(typeof req.owner === 'string' && req.owner && req.owner !== 'local',
-    'and the requester, so muxd can enforce last-pin-wins: ' + JSON.stringify(req.owner));
+  assert.equal(req.owner, 'dev-a',
+    'and the requesting device id, so muxd can enforce last-pin-wins: ' + JSON.stringify(req.owner));
 
   await sleep(250);
   const painted = got.frames.slice(mark).filter(f => !f.binary).map(f => f.buf.toString())
@@ -192,12 +192,12 @@ test('T9b pin paints only after the commit, and tabOwned ends', async t => {
   assert.deepEqual(winSize(got.lastD()), PANE, 'still the pane while unacked');
 
   await publish(host, [session(name, {
-    owner: 'pin', ownerEpoch: 2, ownerLabel: 'dev-a', cols: DEVICE.cols, rows: DEVICE.rows,
+    gridOwner: 'pin', gridEpoch: 2, gridOwnerLabel: 'dev-a', cols: DEVICE.cols, rows: DEVICE.rows,
   })]);
 
   const d = got.lastD();
-  assert.equal(d.owner, 'mine', 'the owning device sees itself as the owner');
-  assert.equal(d.ownerEpoch, 2);
+  assert.equal(d.gridOwner, 'mine', 'the owning device sees itself as the owner');
+  assert.equal(d.gridEpoch, 2);
   assert.deepEqual(winSize(d), DEVICE, 'the acked geometry is what every renderer paints (G1/G2)');
   assert.equal(d.tabOwned, false, 'tabOwned must not outlive local ownership');
 });
@@ -210,17 +210,17 @@ test('T9b pin paints only after the commit, and tabOwned ends', async t => {
 test('G4 a stale epoch cannot roll the committed geometry back', async t => {
   const name = 'g4-stale';
   const pinned = session(name, {
-    owner: 'pin', ownerEpoch: 7, ownerLabel: 'dev-a', cols: 100, rows: 30,
+    gridOwner: 'pin', gridEpoch: 7, gridOwnerLabel: 'dev-a', cols: 100, rows: 30,
   });
   const { h, host } = await boot(t, [pinned]);
   const { got } = await attach(t, h, name, { dev: 'dev-a' });
   assert.deepEqual(winSize(got.lastD()), { cols: 100, rows: 30 }, 'starts at the committed pin');
 
-  await publish(host, [session(name, { owner: 'pin', ownerEpoch: 5, ownerLabel: 'dev-b', cols: 209, rows: 51 })]);
+  await publish(host, [session(name, { gridOwner: 'pin', gridEpoch: 5, gridOwnerLabel: 'dev-b', cols: 209, rows: 51 })]);
   await sleep(200);
   const d = got.lastD();
   assert.deepEqual(winSize(d), { cols: 100, rows: 30 }, 'a lower epoch must not move the geometry');
-  assert.equal(d.ownerEpoch, 7, 'nor regress the epoch');
+  assert.equal(d.gridEpoch, 7, 'nor regress the epoch');
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -235,18 +235,18 @@ test('G5 last of two pins wins and the first becomes other', async t => {
 
   a.ws.send('P');
   await waitFor(() => resizes(host)[0], 'A pin request', 4000);
-  await publish(host, [session(name, { owner: 'pin', ownerEpoch: 2, ownerLabel: 'dev-a', cols: 100, rows: 30 })]);
-  await waitFor(() => a.got.lastD().owner === 'mine', 'A sees itself as owner');
-  assert.equal(b.got.lastD().owner, 'other', 'B is other');
+  await publish(host, [session(name, { gridOwner: 'pin', gridEpoch: 2, gridOwnerLabel: 'dev-a', cols: 100, rows: 30 })]);
+  await waitFor(() => a.got.lastD().gridOwner === 'mine', 'A sees itself as owner');
+  assert.equal(b.got.lastD().gridOwner, 'other', 'B is other');
 
   b.ws.send('P');
   await waitFor(() => resizes(host).length > 1, 'B pin request', 4000);
   const reqB = resizes(host)[1];
   assert.ok(reqB.epoch > 2, 'B supersedes the epoch it observed');
-  await publish(host, [session(name, { owner: 'pin', ownerEpoch: 3, ownerLabel: 'dev-b', cols: 110, rows: 34 })]);
+  await publish(host, [session(name, { gridOwner: 'pin', gridEpoch: 3, gridOwnerLabel: 'dev-b', cols: 110, rows: 34 })]);
 
-  await waitFor(() => b.got.lastD().owner === 'mine', 'B now owns the grid');
-  assert.equal(a.got.lastD().owner, 'other', 'A is other, not an error');
+  await waitFor(() => b.got.lastD().gridOwner === 'mine', 'B now owns the grid');
+  assert.equal(a.got.lastD().gridOwner, 'other', 'A is other, not an error');
   assert.deepEqual(winSize(a.got.lastD()), { cols: 110, rows: 34 }, 'both paint one committed geometry (G1)');
   assert.deepEqual(winSize(b.got.lastD()), { cols: 110, rows: 34 });
 });
@@ -263,16 +263,18 @@ test('G5 owner disconnect returns the grid to local', async t => {
 
   a.ws.send('P');
   await waitFor(() => resizes(host)[0], 'A pin request', 4000);
-  await publish(host, [session(name, { owner: 'pin', ownerEpoch: 2, ownerLabel: 'dev-a', cols: 100, rows: 30 })]);
-  await waitFor(() => a.got.lastD().owner === 'mine', 'A owns the grid');
+  await publish(host, [session(name, { gridOwner: 'pin', gridEpoch: 2, gridOwnerLabel: 'dev-a', cols: 100, rows: 30 })]);
+  await waitFor(() => a.got.lastD().gridOwner === 'mine', 'A owns the grid');
 
   a.ws.close();
-  const release = await waitFor(() => resizes(host).find(m => m.epoch > 2), 'a release request', 4000);
-  assert.equal(release.cols, PANE.cols, 'the release asks for the pane geometry');
-  assert.equal(release.rows, PANE.rows);
+  // Release is the restore semantics: owner "local", cols/rows OMITTED (only the tee knows the pane).
+  const release = await waitFor(() => resizes(host).find(m => m.owner === 'local' && m.epoch > 2),
+    'a release request', 4000);
+  assert.equal(release.cols, undefined, 'the release must not invent a geometry (ruling: cols omitted)');
+  assert.equal(release.rows, undefined);
 
-  await publish(host, [session(name, { owner: 'local', ownerEpoch: 3, ownerLabel: 'PC' })]);
-  await waitFor(() => b.got.lastD().owner === 'local', 'B is local again');
+  await publish(host, [session(name, { gridOwner: 'local', gridEpoch: 3, gridOwnerLabel: 'PC' })]);
+  await waitFor(() => b.got.lastD().gridOwner === 'local', 'B is local again');
   assert.equal(b.got.lastD().tabOwned, true);
   assert.deepEqual(winSize(b.got.lastD()), PANE, 'and paints the pane geometry');
 });
@@ -283,16 +285,16 @@ test('G5 owner disconnect returns the grid to local', async t => {
 // ---------------------------------------------------------------------------------------------
 test('G5 a local activity reclaim is painted for every viewer', async t => {
   const name = 'g5-reclaim';
-  const pinned = session(name, { owner: 'pin', ownerEpoch: 4, ownerLabel: 'dev-a', cols: 100, rows: 30 });
+  const pinned = session(name, { gridOwner: 'pin', gridEpoch: 4, gridOwnerLabel: 'dev-a', cols: 100, rows: 30 });
   const { h, host } = await boot(t, [pinned]);
   const a = await attach(t, h, name, { dev: 'dev-a' });
   const b = await attach(t, h, name, { dev: 'dev-b' });
-  await waitFor(() => a.got.lastD().owner === 'mine' && b.got.lastD().owner === 'other', 'pinned paint');
+  await waitFor(() => a.got.lastD().gridOwner === 'mine' && b.got.lastD().gridOwner === 'other', 'pinned paint');
 
-  await publish(host, [session(name, { owner: 'local', ownerEpoch: 5, ownerLabel: 'PC' })]);
+  await publish(host, [session(name, { gridOwner: 'local', gridEpoch: 5, gridOwnerLabel: 'PC' })]);
 
   for (const v of [a, b]) {
-    await waitFor(() => v.got.lastD().owner === 'local', 'reclaimed to local');
+    await waitFor(() => v.got.lastD().gridOwner === 'local', 'reclaimed to local');
     assert.equal(v.got.lastD().mine, false, 'no viewer keeps the pin chip');
     assert.equal(v.got.lastD().tabOwned, true);
     assert.deepEqual(winSize(v.got.lastD()), PANE, 'every viewer paints the pane (G1)');
@@ -310,14 +312,16 @@ test('T10 a second tap releases the pin', async t => {
 
   v.ws.send('P');
   await waitFor(() => resizes(host)[0], 'the pin request', 4000);
-  await publish(host, [session(name, { owner: 'pin', ownerEpoch: 2, ownerLabel: 'dev-a', cols: 100, rows: 30 })]);
-  await waitFor(() => v.got.lastD().owner === 'mine', 'pinned');
+  await publish(host, [session(name, { gridOwner: 'pin', gridEpoch: 2, gridOwnerLabel: 'dev-a', cols: 100, rows: 30 })]);
+  await waitFor(() => v.got.lastD().gridOwner === 'mine', 'pinned');
 
   v.ws.send('P');
   const release = await waitFor(() => resizes(host)[1], 'the release request', 4000);
+  assert.equal(release.owner, 'local', 'a second tap releases with the restore semantics');
+  assert.equal(release.cols, undefined, 'and no invented geometry');
   assert.ok(release.epoch > 2, 'the release supersedes the pin epoch');
-  await publish(host, [session(name, { owner: 'local', ownerEpoch: 3, ownerLabel: 'PC' })]);
-  await waitFor(() => v.got.lastD().owner === 'local', 'released to local');
+  await publish(host, [session(name, { gridOwner: 'local', gridEpoch: 3, gridOwnerLabel: 'PC' })]);
+  await waitFor(() => v.got.lastD().gridOwner === 'local', 'released to local');
   assert.deepEqual(winSize(v.got.lastD()), PANE);
 });
 
@@ -341,13 +345,15 @@ test('T11 the viewer source has no sx/sy transform path', async () => {
 test('G1 one committed geometry and G6 byte fidelity under a pin', async t => {
   const name = 'g1-one-grid';
   const { h, host } = await boot(t, [session(name, {
-    owner: 'pin', ownerEpoch: 9, ownerLabel: 'dev-a', cols: 100, rows: 30,
+    gridOwner: 'pin', gridEpoch: 9, gridOwnerLabel: 'dev-a', cols: 100, rows: 30,
   })]);
   const a = await attach(t, h, name, { dev: 'dev-a', cols: 100, rows: 30 });
   const b = await attach(t, h, name, { dev: 'dev-b', cols: 209, rows: 51 });
   assert.deepEqual(winSize(a.got.lastD()), { cols: 100, rows: 30 });
   assert.deepEqual(winSize(b.got.lastD()), { cols: 100, rows: 30 },
     'a differently-sized viewer paints the same committed grid');
+  assert.equal(a.got.lastD().gridOwner, 'mine');
+  assert.equal(b.got.lastD().gridOwner, 'other');
 
   const ma = a.got.mark(), mb = b.got.mark();
   host.sendOutput(name, 'PIN-BYTES-UNCHANGED\r\n');
