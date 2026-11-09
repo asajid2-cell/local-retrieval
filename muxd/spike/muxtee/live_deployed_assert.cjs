@@ -110,6 +110,9 @@ async function readState(page) {
       hostW: host ? host.clientWidth : 0,
       screenW: sr ? Math.round(sr.width) : 0,
       pan: !!(host && host.classList.contains('pan')),
+      cellX: (() => { try { const c = term._core._renderService.dimensions.css.cell; return Math.round(c.width * 1000) / 1000; } catch (e) { return null; } })(),
+      cellM: (() => { try { const c = cellMetrics(); return Math.round(c.w * 1000) / 1000; } catch (e) { return null; } })(),
+      screenStyleW: (() => { try { return host.querySelector('.xterm-screen').style.width; } catch (e) { return null; } })(),
       focusedTerminal: !!(active && (active.classList.contains('xterm-helper-textarea') || (active.closest && active.closest('#term')))),
       build: window.__muxBuild || '',
       wsState: (() => { try { return typeof ws !== 'undefined' && ws ? ws.readyState : -1; } catch (e) { return -1; } })(),
@@ -345,7 +348,7 @@ async function waitForOwner(page, want, timeoutMs, predicate) {
     laid.gridOwner === 'mine' && Math.abs(laid.sx - 1) < 1e-6 && Math.abs(laid.sy - 1) < 1e-6
     && Math.abs(laid.eff - 1) < 0.005
     && span > 0.98 && span <= 1.02 && !laid.pan && Number.isInteger(laid.fontSize),
-    `gridOwner=${laid.gridOwner} transform=${laid.transform} effScale=${laid.eff.toFixed(3)} span=${span.toFixed(3)} screenW=${laid.screenW} hostW=${laid.hostW} pan=${laid.pan} font=${laid.fontSize} term=${laid.cols}x${laid.rows}`);
+    `gridOwner=${laid.gridOwner} transform=${laid.transform} effScale=${laid.eff.toFixed(3)} span=${span.toFixed(3)} screenW=${laid.screenW} hostW=${laid.hostW} screenStyleW=${laid.screenStyleW} cellX=${laid.cellX} cellM=${laid.cellM} pan=${laid.pan} font=${laid.fontSize} term=${laid.cols}x${laid.rows}`);
 
   // --- a viewport change while owning is a new grid ---------------------------------------------
   const tee1 = teeMark();

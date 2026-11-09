@@ -1600,7 +1600,7 @@ function reloadTerminal(quiet){
   connect(name, true);   // re-attach: CLEAR + scrollback replay + live, all client state reset
 }
 document.addEventListener('keydown', e=>{ if(e.ctrlKey && e.altKey && (e.key==='r'||e.key==='R')){ e.preventDefault(); e.stopPropagation(); reloadTerminal(); } }, true);
-window.__muxBuild='2026-11-09-grid-ownership';   // bump per web deploy so a loaded version is verifiable (supersedes 2026-11-02-emap-overlay-removed-flex-fit)
+window.__muxBuild='2026-11-09-grid-ownership-2';   // bump per web deploy so a loaded version is verifiable (supersedes 2026-11-02-emap-overlay-removed-flex-fit)
 try{ console.info('multiplex build', window.__muxBuild); }catch(e){}
 const helper = $('#term').querySelector('.xterm-helper-textarea');
 function hardenHelperTextarea(){
@@ -2742,6 +2742,31 @@ function isVisibleOwner(){ return !!(current && findSession(current)?.owner); }
 // press built here went straight to the app's stdin (sendMouseInput does NOT pass through stripMouseReports)
 // and a shell echoed it back as garbage, while the drag that should have selected text was eaten.
 function appTakesMouse(){ try{ return mouseGuard.inputAllowed(); }catch(e){ return false; } }
+// WHO GETS A CLICK? Two panes answer yes, and only one of them can ever be armed.
+//
+// The arm state is the app's intent and stays the first question. But an ADOPTED console - a session muxd
+// itself spawned (adopted-local) and this browser is viewing - never delivers its DECSET: muxd reads the
+// console as a CELL GRID, so the app's ?1000/1002/1003 is consumed by conhost and never appears in a byte
+// stream the guard can read. The guard therefore stays unarmed forever on exactly the panes that most need
+// clicking, and every click on them was composed nowhere (measured on the adopted-console browser row:
+// CLICK=0 KEY=1, while keystrokes landed).
+//
+// So a pane we KNOW is the visible owner, and that carries a command of its own (never a bare shell), is
+// allowed a click with no arm. A real terminal would report it; the app is the source of truth and its
+// DECSET is simply unobservable here. Being wrong is bounded, not silent: the report is registered with the
+// leak detector, and a shell that echoes our own report back within the window blocks forwarding until a
+// fresh DECSET re-arms it - the protection a mis-armed pane has always had. The WHEEL deliberately stays on
+// the arm alone (appTakesMouse): scrolling an app that wanted the mouse for selection moves something the
+// user did not point at, and there is no echo to correct it with.
+function ownerClickPane(){
+  try{
+    if(!current || !isVisibleOwner()) return false;   // the pane the browser is actually showing as owner
+    const s = findSession(current);
+    if(!s) return false;
+    return !!s.hasCommand && !s.shellOnly;            // an app behind it, never a bare shell's stdin
+  }catch(e){ return false; }
+}
+function clickForwardable(){ return appTakesMouse() || ownerClickPane(); }
 // One physical wheel notch is ~100-120 px in every engine, but a trackpad reports the same motion as dozens
 // of 2-8 px events. Rounding each event on its own turned one flick into ~30 scroll steps and ~30 round
 // trips (measured: 30 reports for a 30-event flick), so a continuous device accumulates and only advances
@@ -3441,13 +3466,12 @@ try{ window.__muxForceSel = forceSel; }catch(e){}
     // let motion (below) and the release (below) decide. Nothing is forwarded here.
     const cell=bufferCellAt(e.clientX,e.clientY);
     if(!cell) return;
-    // WHAT WANTS THE CLICK: the app's own arm state, and nothing else. A bare shell never arms the mouse,
-    // so it can never have a report written into its stdin. Session metadata is the wrong question: a
-    // hosted/mirror row has no command of its own yet the app behind it is armed and expects the click.
+    // WHAT WANTS THE CLICK: the app's own arm state first, then the one pane whose arm can never arrive.
+    // A bare shell neither arms nor is it an owner-backed app row, so nothing can be written into its stdin.
     // This ONE value decides both halves of the gesture - the press swallow below and the release forward.
     // They were two different expressions once (appTakesMouse at press, session metadata at release) and
     // drifted apart, so an armed pane swallowed the press and then forwarded nothing.
-    const forward=appTakesMouse();
+    const forward=clickForwardable();
     ownerPress={button:[0,1,2][e.button], cell, session:current,
                 x:e.clientX, y:e.clientY, moved:false, forward};
     // When the app armed the mouse, xterm's own protocol would emit the press the instant it fires - and
@@ -3476,8 +3500,8 @@ try{ window.__muxForceSel = forceSel; }catch(e){}
       e.preventDefault(); e.stopPropagation();
       return;
     }
-    // Never moved: a click. Forward it only when the app had armed the mouse at press time - the SAME
-    // value that decided the press swallow, not a second expression that can drift from it. The cell is
+    // Never moved: a click. Forward it only when the pane wanted the click at press time - the SAME value
+    // that decided the press swallow, not a second expression that can drift from it. The cell is
     // recomputed at the release point so a click that drifted a few px still lands on what is under the
     // cursor.
     if(!press.forward) return;

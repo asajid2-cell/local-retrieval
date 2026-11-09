@@ -49,20 +49,23 @@ test('the click gate is the app arm state alone, recorded once for both halves o
   // The gesture is decided at release, so the press handler records a candidate rather than forwarding.
   assert.match(handler, /moved:false/,
     'the press no longer records a click-or-drag candidate — the gesture is being decided at press time again');
-  // The arm state is the one question. It is computed once and stored on the candidate, so the press
-  // swallow and the release forward cannot use different expressions and drift apart (I-13).
-  assert.match(handler, /const forward=appTakesMouse\(\)/,
-    'the click gate no longer records the app arm state as one value for the whole gesture');
+  // The decision is ONE value for the whole gesture, computed at press and carried to the release, so the
+  // press swallow and the release forward cannot use different expressions and drift apart (I-13).
+  assert.match(handler, /const forward=clickForwardable\(\)/,
+    'the click gate no longer records the decision as one value for the whole gesture');
   assert.match(handler, /forward}/,
-    'the press candidate does not carry the arm-state decision to the release handler');
-  // Session metadata is not app intent: a hosted/mirror row (hasCommand:false, shellOnly:true,
-  // sessionId:"") is the pane the app is armed behind. The buffer type and owner flag are equally wrong.
-  assert.doesNotMatch(handler, /hasCommand|shellOnly|sessionId|findSession/,
-    'the click gate consults session metadata again — a hosted/mirror pane would lose every click');
+    'the press candidate does not carry the click decision to the release handler');
+  assert.doesNotMatch(handler, /hasCommand|shellOnly|sessionId|findSession|isVisibleOwner/,
+    'the press handler consults session metadata directly again — the two halves can drift apart; the predicate belongs in clickForwardable()');
   assert.doesNotMatch(handler, /appOwnsScreen\(\)/,
     'the click decision depends on the buffer type again — a normal-buffer app pane would lose every click');
-  assert.doesNotMatch(handler, /isVisibleOwner/,
-    'the click gate depends on the session being the visible owner again — a web-created pane would lose clicks');
+  // The predicate itself: the arm state stays FIRST (so an armed pane is never re-gated on metadata, the
+  // I-13 failure), and the second term is the one pane whose DECSET cannot reach us - a visible owner with
+  // an app behind it. A bare shell (shellOnly/no command) must still be refused.
+  assert.match(source, /function clickForwardable\(\)\{ return appTakesMouse\(\) \|\| ownerClickPane\(\); \}/,
+    'clickForwardable() no longer keeps the arm state first and adds the owner pane as a fallback');
+  assert.match(source, /return !!s\.hasCommand && !s\.shellOnly;/,
+    'the owner-pane fallback stopped refusing a bare shell — a click would be written into a shell stdin');
   // The release half must consume that same stored value, not recompute a second expression.
   assert.match(source, /if\(!press\.forward\) return;/,
     'the release handler no longer consumes the arm state recorded at press time');
@@ -218,6 +221,35 @@ test('a click forwards only on an ARMED pane; an unarmed pane and a bare shell f
       `a drag also forwarded to the app (click won over selection): ${JSON.stringify(drag.frames)}`);
     assert.ok(drag.selected, 'a plain drag did not select on an app pane (selection lost to the click)');
 
+    // 4b) OWNER-BACKED ADOPTED PANE, UNARMED: an adopted console (muxd spawns it and reads its CELL GRID)
+    //     never delivers its DECSET, so the arm can never arrive. A real terminal would still report the
+    //     click, and the pane is the visible owner with an app behind it - so the click forwards.
+    host.sendOutput(SESSION, '\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l');
+    await sleep(250);
+    await page.evaluate(() => {
+      window._sessions = (window._sessions || []).map(s => s.name === 'click-gate-shell'
+        ? { name: s.name, alive: true, cols: s.cols, rows: s.rows, hasCommand: true, shellOnly: false, ready: true, owner: true, sessionId: 'adopted-owner' }
+        : s);
+    });
+    await sleep(200);
+    const adoptedFrames = await clickCenter(page, host);
+    assert.equal(adoptedFrames.length, 2,
+      `an unarmed OWNER-BACKED app pane (adopted console, no DECSET) forwarded nothing: ${JSON.stringify(adoptedFrames)}`);
+    assert.ok(adoptedFrames.some(d => /M$/.test(d)) && adoptedFrames.some(d => /m$/.test(d)),
+      `the adopted-pane forward is not an SGR press+release pair: ${JSON.stringify(adoptedFrames)}`);
+
+    // 4c) OWNER-BACKED BARE SHELL: ownership is not enough. A row with no command is a shell's stdin, and
+    //     a report written there is echoed back as `[<0;x;yM` garbage - the mutation-flood class.
+    await page.evaluate(() => {
+      window._sessions = (window._sessions || []).map(s => s.name === 'click-gate-shell'
+        ? { name: s.name, alive: true, cols: s.cols, rows: s.rows, hasCommand: false, shellOnly: true, ready: true, owner: true, sessionId: '' }
+        : s);
+    });
+    await sleep(200);
+    const ownedShellFrames = await clickCenter(page, host);
+    assert.equal(ownedShellFrames.length, 0,
+      `a click on an owner-backed BARE SHELL leaked to its stdin: ${JSON.stringify(ownedShellFrames)}`);
+
     // 5) BARE SHELL (no app behind the pane): a click must NOT reach its stdin. The protection is the
     //    arm state itself - a shell never enables mouse tracking - so disarm first, exactly as the shell
     //    would leave it. Re-point the SAME page at a shell session record so nothing about the relay or
@@ -254,7 +286,7 @@ test('a click forwards only on an ARMED pane; an unarmed pane and a bare shell f
 // dead (muxdiag/dragoff-fix-proof.js: control clickOpenedChooser=false, fixed=true).
 test('an armed press clears a standing selection itself, because we swallow the press that xterm would use', () => {
   const handler = ownerPressMousedownSource();
-  const armedAt = handler.indexOf('appTakesMouse()');
+  const armedAt = handler.indexOf('clickForwardable()');
   assert.notEqual(armedAt, -1, 'the armed-press branch is gone - the press is no longer kept out of xterm');
   const armed = handler.slice(armedAt);
   const clearAt = armed.indexOf('term.clearSelection()');
