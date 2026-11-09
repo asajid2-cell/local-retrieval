@@ -54,6 +54,8 @@ class EpochTest(unittest.TestCase):
         self.assertEqual(len(reports), 1)
         self.assertIn('"epoch": 9', reports[0])
         self.assertIn('"ok": false', reports[0])
+        self.assertIn('"gridEpoch": 9', reports[0],
+                      "the report carries muxd's current epoch so the relay can retry one past it")
 
     def test_g4_a_late_ack_for_an_older_request_cannot_roll_the_grid_back(self):
         s = make_stream()

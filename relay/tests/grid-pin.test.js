@@ -107,6 +107,26 @@ test('T10 a second tap releases the grid with no geometry', async t => {
   await waitFor(() => got.all().some(f => f.gridOwner === 'local' && f.gridEpoch === 12), 'the pane grid returns');
 });
 
+test('a refused epoch retries exactly once at muxd\'s current epoch + 1', async t => {
+  const name = 'grid-retry';
+  const { h, host } = await boot(t, [tabSession(name, { gridEpoch: 10 })]);
+  const { ws } = await attach(t, h, name, 100, 30);
+  ws.send('P');
+  await waitFor(() => resizeFrames(host).length === 1, 'first request');
+  assert.equal(resizeFrames(host)[0].epoch, 11);
+
+  // muxd declines a stale epoch and tells us where it actually is; the relay's own record may predate
+  // a muxd restart, so guessing from the session list would retry the same stale epoch forever.
+  host.ws.send(JSON.stringify({ t: 'gridAck', s: name, epoch: 11, ok: false, reason: 'stale epoch', gridEpoch: 40 }));
+  await waitFor(() => resizeFrames(host).length === 2, 'one retry');
+  assert.equal(resizeFrames(host)[1].epoch, 41);
+  assert.equal(resizeFrames(host)[1].owner, resizeFrames(host)[0].owner);
+
+  host.ws.send(JSON.stringify({ t: 'gridAck', s: name, epoch: 41, ok: false, reason: 'stale epoch', gridEpoch: 40 }));
+  await sleep(200);
+  assert.equal(resizeFrames(host).length, 2, 'a second refusal is final, not a retry loop');
+});
+
 test('T11 no non-uniform screen transform remains in the viewer', () => {
   const html = fs.readFileSync(path.join(__dirname, '..', 'public', 'index.html'), 'utf8');
   assert.equal(/FLEX_SCALE_FLOOR|FLEX_STRETCH_MAX|applyFlexTransform|flexScaleTarget|flexStretchTarget/.test(html), false,

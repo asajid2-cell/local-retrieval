@@ -3938,7 +3938,9 @@ wssHost.on('connection', (ws, req) => {
       st.gridReq = null;
       if (m.ok === false && !req.retried) {
         const host = hostSessions.get(n);
-        const epoch = ((host && host.gridEpoch) | 0) + 1;
+        // muxd reports its current epoch with the refusal; the session list may be older than that.
+        const hostEpoch = Number.isSafeInteger(Number(m.gridEpoch)) ? Number(m.gridEpoch) : 0;
+        const epoch = Math.max(hostEpoch, (host && host.gridEpoch) | 0) + 1;
         const retry = { ...req, epoch, retried: true };
         st.gridReq = retry;
         if (retry.owner === 'local') sendHost({ t: 'resize', s: n, epoch, owner: 'local' });

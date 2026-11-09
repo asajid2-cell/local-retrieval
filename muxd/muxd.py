@@ -3980,6 +3980,9 @@ def _grid_refresh(owner):
 def _grid_report(owner, epoch, ok, reason=""):
     owner.outq.put_nowait(("gridAck", owner.name, json.dumps({
         "t": "gridAck", "s": owner.name, "epoch": int(epoch or 0), "ok": bool(ok),
+        # muxd's CURRENT epoch, so a relay whose pin record outlived a restart can retry one past it
+        # instead of guessing from a stale session list.
+        "gridEpoch": int(getattr(owner, "grid_epoch", 0) or 0),
         "reason": str(reason or "")[:200],
     })))
 
