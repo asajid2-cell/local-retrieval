@@ -1600,7 +1600,7 @@ function reloadTerminal(quiet){
   connect(name, true);   // re-attach: CLEAR + scrollback replay + live, all client state reset
 }
 document.addEventListener('keydown', e=>{ if(e.ctrlKey && e.altKey && (e.key==='r'||e.key==='R')){ e.preventDefault(); e.stopPropagation(); reloadTerminal(); } }, true);
-window.__muxBuild='2026-11-09-grid-ownership-2';   // bump per web deploy so a loaded version is verifiable (supersedes 2026-11-02-emap-overlay-removed-flex-fit)
+window.__muxBuild='2026-11-09-grid-ownership-3';   // bump per web deploy so a loaded version is verifiable (supersedes 2026-11-02-emap-overlay-removed-flex-fit)
 try{ console.info('multiplex build', window.__muxBuild); }catch(e){}
 const helper = $('#term').querySelector('.xterm-helper-textarea');
 function hardenHelperTextarea(){
@@ -3750,6 +3750,18 @@ function connect(name, isRetry){
     resetTerminalSurface();
     mouseGuard.reset(prevName === name);   // same session keeps the modes its app already armed; a
                                            // different session starts clean (see reset() for why)
+    if(prevName !== name){
+      _paintReady = false;
+      sizePinned=false; sizeMine=false; sizeTabOwned=false; sizeLocal=false;
+      sizeGridOwner='local'; sizeGridEpoch=0; sizeGridOwnerLabel=''; sizePinLabel=''; sizeClients=[];
+      _gridBusy=null; if(_takeTimer){ clearTimeout(_takeTimer); _takeTimer=null; }
+    }
+    // A SWITCH IS A NEW SCREEN. The per-session grid state and the "this surface is already painted"
+    // latch both belong to the session they were measured on. Carrying them over meant the new tab's
+    // first frame took the nothing-changed path - no heal, no fit - and painted the PREVIOUS tab's
+    // geometry: switching between two local grids and the viewer grid looked like the grid had stopped
+    // fitting at all, and the chip kept the old tab's pin. A re-attach of the SAME session keeps both:
+    // its grid and its painted surface really are still there.
     soleTerminal = true; soleTerminalKnown = false;   // unknown until this attach's first 'd'
     lastViewportReport='';
     lastViewportReportSocket=null;

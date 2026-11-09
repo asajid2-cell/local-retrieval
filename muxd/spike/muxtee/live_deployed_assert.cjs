@@ -39,6 +39,9 @@ const COOKIE = (process.env.MUX_COOKIE || '').trim();
 const UA = process.env.MUX_UA
   || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.7827.55 Safari/537.36';
 const BUILD = '2026-11-09-grid-ownership';
+// A later page under the same ownership work carries a -N suffix; the proof is about the family, not one
+// byte-identical string, so the loaded build must START with it (and is printed on every run).
+const buildOk = b => typeof b === 'string' && b.indexOf(BUILD) === 0;
 const TEE_LOG = process.env.MUX_TEE_LOG
   || path.join(process.env.LOCALAPPDATA || 'C:/Users/Ahmed/AppData/Local', 'muxtee', 'muxtee.log');
 const HEADFUL = process.argv.includes('--headful');
@@ -274,10 +277,10 @@ async function waitForOwner(page, want, timeoutMs, predicate) {
 
   let s = await readState(page);
   check('L0 the deployed page is the grid-ownership build and attaches',
-    resp && resp.status() === 200 && s.build === BUILD && s.cols > 10 && s.rows > 5 && errors.length === 0,
+    resp && resp.status() === 200 && buildOk(s.build) && s.cols > 10 && s.rows > 5 && errors.length === 0,
     `status=${resp && resp.status()} build=${s.build} term=${s.cols}x${s.rows} ws=${s.wsState} errors=${errors.length}`);
   if (!(s.cols > 10)) { await browser.close(); process.exit(1); }
-  if (s.build !== BUILD) check('L0 the loaded page is the build under proof', false, `build=${s.build} want=${BUILD}`);
+  if (!buildOk(s.build)) check('L0 the loaded page is the build under proof', false, `build=${s.build} want=${BUILD}*`);
 
   await mark(page);
   const quiet = await timings(page, 2000);
