@@ -13,7 +13,8 @@ Rows drive the production API directly - no aliases, no test-only seams:
 Contract rows:
     T3  a request whose epoch <= current is ignored; committed G does not move
     T4  muxd commits only after sizeAck; an unacked or failed resize leaves G unchanged
-    T5  the committed geometry and epoch persist; a restart returns the owner to local
+    T5  the committed geometry and epoch persist; a restart returns the owner to local by design
+        (authority is deliberately not persisted; the epoch restores at max(record, wall time))
     T6  a local `activity` reclaims a device-owned grid
     T7  two devices: last pin wins; the first becomes stale and is rejected
     T8  owner release (disconnect / TTL) returns to local and the pane geometry
@@ -194,7 +195,8 @@ class GridOwnershipTests(unittest.TestCase):
                          "the durable record carries the committed geometry")
         self.assertEqual(record.get("gridEpoch"), 5, "and the ordering token")
         self.assertNotIn("gridOwner", record,
-                         "the durable record must not resurrect a device pin: authority is local after restart")
+                         "by design (T5): geometry and epoch persist, authority does not - a restart "
+                         "returns local at max(record epoch, wall time), which is not a lost pin")
 
         relay_view = muxd.session_payload(s.name, s)
         self.assertEqual(relay_view["gridOwner"], "pin", "the live list names the owner")
@@ -308,10 +310,11 @@ class GridOwnershipTests(unittest.TestCase):
 
     # --- contract §4 compliance: the restore frame ------------------------------------------
     def test_contract_restore_frame_is_local_without_geometry(self):
-        """§4 ruling: release is {"t":"resize","epoch":E,"owner":"local"} with cols/rows OMITTED.
-
-        Only the tee knows the pane; muxd must not invent a geometry. 8379e13 sends the stored
-        pane_cols/pane_rows and omits `owner`, so this row is the compliance red for that gap.
+        """§4 ruling (confirmed 2026-11-09): release is {"t":"resize","epoch":E,"owner":"local"}
+        with cols/rows OMITTED. Only the tee knows the pane; muxd must not invent a geometry. This
+        is the same path as the activity reclaim (5a), so there is one restore implementation.
+        8379e13 predates the change (it sends stored pane cols/rows and no owner); this row is the
+        marker that turns green when the implementation lands.
         """
         s = FakeGridSession()
         muxd.owner_request_grid(s, 100, 30, 5, "dev-a", "laptop")
