@@ -52,6 +52,8 @@ async function readState(page) {
     }
     const g = (n) => { try { return eval(n); } catch (e) { return undefined; } };
     const d = (window.__d && window.__d.length) ? window.__d[window.__d.length - 1] : null;
+    const sr = scr ? scr.getBoundingClientRect() : null;
+    const active = document.activeElement;
     return {
       cols: g('term.cols'), rows: g('term.rows'), fontSize: g('term.options.fontSize'),
       transform: tf, sx, sy,
@@ -61,6 +63,11 @@ async function readState(page) {
       chip: (document.querySelector('#sizebtn') || {}).textContent || '',
       dFrames: (window.__d || []).length,
       resizeSends: (window.__sent || []).filter((f) => f && f.t === 'resize').length,
+      hostW: host ? host.clientWidth : 0,
+      screenW: sr ? Math.round(sr.width) : 0,
+      pan: !!(host && host.classList.contains('pan')),
+      // focus is part of the contract: after any chip tap the keyboard must be back on the terminal
+      focusedTerminal: !!(active && (active.classList.contains('xterm-helper-textarea') || (active.closest && active.closest('#term')))),
     };
   });
 }
@@ -189,6 +196,15 @@ async function waitForOwner(page, want, timeoutMs, predicate) {
       + `host=${HOST_COLS}x${HOST_ROWS} chip=${JSON.stringify(pinned.chip)}`);
     check('V3 no distortion while owned', pinned.gridOwner === 'mine' && Math.abs(pinned.sx - 1) < 1e-6 && Math.abs(pinned.sy - 1) < 1e-6,
       `gridOwner=${pinned.gridOwner} transform=${pinned.transform}`);
+    // The owning device must paint its grid ACROSS the viewport, not left-aligned with a bezel on the
+    // right: at 1:1 the painted screen spans the host on both axes, so the widths must agree closely.
+    await page.waitForTimeout(1200);
+    const laid = await readState(page);
+    const span = laid.hostW ? laid.screenW / laid.hostW : 0;
+    check('V3 the owned grid spans the viewport', laid.gridOwner === 'mine' && span > 0.98 && span <= 1.02 && !laid.pan,
+      `screenW=${laid.screenW} hostW=${laid.hostW} span=${span.toFixed(3)} pan=${laid.pan}`);
+    check('V3 the keyboard is still on the terminal', laid.focusedTerminal,
+      `focusedTerminal=${laid.focusedTerminal}`);
 
     await clickChip(page);
     const released = await waitForOwner(page, 'local', 15000);
@@ -196,6 +212,27 @@ async function waitForOwner(page, want, timeoutMs, predicate) {
       && released.cols === HOST_COLS && released.rows === HOST_ROWS,
       `gridOwner=${released.gridOwner} term=${released.cols}x${released.rows} `
       + `host=${HOST_COLS}x${HOST_ROWS} chip=${JSON.stringify(released.chip)}`);
+
+    // V6: switching is repeatable. A handover that works once and then leaves the chip confused is a
+    // worse product than one that never worked, so the cycle is driven three times and every landing is
+    // asserted, not just the first.
+    let cycles = 0;
+    const cycleFailures = [];
+    for (let i = 0; i < 3; i += 1) {
+      await clickChip(page);
+      const took = await waitForOwner(page, 'mine', 15000);
+      if (took.gridOwner !== 'mine') { cycleFailures.push(`take@${i}:${took.gridOwner}`); continue; }
+      await clickChip(page);
+      const back = await waitForOwner(page, 'local', 15000,
+        (st) => st.cols === HOST_COLS && st.rows === HOST_ROWS);
+      if (back.gridOwner !== 'local' || back.cols !== HOST_COLS) {
+        cycleFailures.push(`release@${i}:${back.gridOwner}@${back.cols}x${back.rows}`);
+        continue;
+      }
+      cycles += 1;
+    }
+    check('V6 take and release repeat', cycles === 3,
+      `cycles=${cycles}/3 failures=${cycleFailures.join(',') || 'none'}`);
 
     // V5: the owning device simply goes away. The relay must release the grid, not wait for muxd's TTL -
     // contract section 5's disconnect arm. A fresh context is a different device, so what it reads is
