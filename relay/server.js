@@ -4521,6 +4521,14 @@ function clearPinForDisconnectedDevice(name, st, client) {
     other => (other.deviceId || ('sock-' + other.id)) === deviceId,
   );
   if (stillConnected) return;
+  // The last viewer on the pinning device is gone: release the grid now. muxd's TTL is only the
+  // backstop for a relay that never got to say this (contract section 5, "last owner viewer gone").
+  // This runs from removeViewer BEFORE deleteEmptySessionState, so `st` still talks to the host.
+  const host = hostSessions.get(name);
+  // Teed tab, and this device held the pin record. The muxd side may still be committing the take, so
+  // the condition is not "committed as pin": a release is harmless while the grid is still local and
+  // necessary the moment it is not.
+  if (host && host.owner) requestTabGrid(name, st, client, false);
   const candidate = new Map(pins);
   candidate.delete(name);
   commitBestEffortPinCleanup(candidate, 'disconnected pin cleanup');

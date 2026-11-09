@@ -127,6 +127,26 @@ test('a refused epoch retries exactly once at muxd\'s current epoch + 1', async 
   assert.equal(resizeFrames(host).length, 2, 'a second refusal is final, not a retry loop');
 });
 
+test('T13 the pinning device disconnecting releases the grid to local', async t => {
+  const name = 'grid-disconnect';
+  const { h, host } = await boot(t, [tabSession(name, { gridEpoch: 10 })]);
+  const { ws } = await attach(t, h, name, 100, 30);
+
+  ws.send('P');                                    // this connection becomes the pin record's device
+  await waitFor(() => resizeFrames(host).length === 1, 'take the grid');
+  const take = resizeFrames(host)[0];
+
+  // Closing the last viewer of that device is the relay's immediate release; muxd's TTL is only the
+  // backstop for a relay that is gone.
+  ws.close();
+  await waitFor(() => resizeFrames(host).length === 2, 'a release goes out on disconnect', 4000);
+  const release = resizeFrames(host)[1];
+  assert.equal(release.owner, 'local');
+  assert.equal('cols' in release, false, 'a release must not dictate the pane size');
+  assert.equal('rows' in release, false);
+  assert.ok(Number(release.epoch) >= Number(take.epoch), 'the release never goes back in time');
+});
+
 test('T11 no non-uniform screen transform remains in the viewer', () => {
   const html = fs.readFileSync(path.join(__dirname, '..', 'public', 'index.html'), 'utf8');
   assert.equal(/FLEX_SCALE_FLOOR|FLEX_STRETCH_MAX|applyFlexTransform|flexScaleTarget|flexStretchTarget/.test(html), false,
