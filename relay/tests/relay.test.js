@@ -1740,6 +1740,18 @@ test('last viewer removal deletes session state so reconnect recomputes and re-r
   const firstClosed = once(first, 'close');
   first.close();
   await firstClosed;
+  // The property under test is what the SECOND attach does once the relay has dropped the state. A
+  // client-side 'close' only means this socket is gone; the server's close handler - and so the deletion -
+  // runs on its own tick, and an attach that wins that race is legitimately warm (it reuses the screen
+  // model) and sends no scrollback request at all. Wait for the cleanup to be OBSERVED rather than
+  // assumed, so the row tests the reconnect path instead of the scheduler.
+  await waitFor(async () => {
+    try {
+      const rows = await h.json('GET', '/api/sessions');
+      const row = (Array.isArray(rows) ? rows : rows.sessions || []).find(r => r.name === 'state-cleanup');
+      return !!row && row.attached === false;
+    } catch (e) { return false; }
+  }, 'the relay to drop the last viewer state');
 
   const second = new WebSocket(`ws://127.0.0.1:${h.port}/ws?session=state-cleanup&cols=81&rows=25`);
   await once(second, 'open');
