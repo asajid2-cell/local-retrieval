@@ -197,13 +197,34 @@ async function waitForOwner(page, want, timeoutMs) {
       `gridOwner=${released.gridOwner} term=${released.cols}x${released.rows} `
       + `host=${HOST_COLS}x${HOST_ROWS} chip=${JSON.stringify(released.chip)}`);
 
-    await page.screenshot({ path: path.join(__dirname, 'grid-viewer-proof.png'), fullPage: false });
+    // V5: the owning device simply goes away. The relay must release the grid, not wait for muxd's TTL -
+    // contract section 5's disconnect arm. A fresh context is a different device, so what it reads is
+    // what the relay published after the owner left.
+    await clickChip(page);                      // fit -> take again
+    const reowned = await waitForOwner(page, 'mine', 15000);
+    check('V5 the grid is taken once more', reowned.gridOwner === 'mine',
+      `gridOwner=${reowned.gridOwner} term=${reowned.cols}x${reowned.rows}`);
+    await ctx.close();
+    const ctx2 = await browser.newContext({ viewport: { width: 1440, height: 900 }, locale: 'en-US' });
+    const page2 = await ctx2.newPage();
+    page2.on('pageerror', (e) => errors.push(String((e && e.message) || e)));
+    await page2.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await installFrameTap(page2);
+    await page2.waitForFunction(() => { try { return typeof term !== 'undefined' && term.cols > 1; } catch (e) { return false; } }, null, { timeout: 30000 });
+    const away = await waitForOwner(page2, 'local', 15000);
+    check('V5 owner disconnect returns the grid to local', away.gridOwner === 'local'
+      && away.cols === HOST_COLS && away.rows === HOST_ROWS,
+      `gridOwner=${away.gridOwner} term=${away.cols}x${away.rows} host=${HOST_COLS}x${HOST_ROWS} `
+      + `chip=${JSON.stringify(away.chip)}`);
+
+    await page2.screenshot({ path: path.join(__dirname, 'grid-viewer-proof.png'), fullPage: false });
+    await ctx2.close();
     const failed = rows.filter((r) => !r.ok).map((r) => r.id);
     console.log(failed.length ? `VIEWER PROOF FAIL: ${failed.join(', ')}` : 'VIEWER PROOF PASS');
     process.exitCode = failed.length ? 1 : 0;
     return process.exitCode;
   } finally {
-    await ctx.close();
+    try { await ctx.close(); } catch (_) {}     // V5 may already have closed it on purpose
     await browser.close();
   }
 })().catch((e) => { console.error('ASSERT ERROR', e && (e.stack || e.message)); process.exit(2); });
