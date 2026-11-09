@@ -321,6 +321,22 @@ async function waitForOwner(page, want, timeoutMs, predicate) {
     check('V3 a stale zoom cannot make the owned paint fractional',
       zoomed.int && zoomed.owner === 'mine',
       `fontSize=${zoomed.font} integer=${zoomed.int} gridOwner=${zoomed.owner}`);
+
+    // A renderer reading that is not this font's must be replaced by the FACE's own metrics - never by
+    // the element-overflow measurement. Force a 3x3 cell at the current font and require a sane answer.
+    const faceCell = await page.evaluate(() => new Promise((resolve) => {
+      const orig = cellMetrics;
+      try { cellMetrics = () => ({ w: 3, h: 3 }); } catch (e) {}
+      withNativeCell((cell) => {
+        try { cellMetrics = orig; } catch (e) {}
+        resolve({ w: cell.w, h: cell.h, want: appliedFont });
+      });
+    }));
+    check('V3 a stale cell reading is replaced by the font face',
+      faceCell.want > 0 && faceCell.w / faceCell.want >= 0.45 && faceCell.w / faceCell.want <= 0.75
+      && faceCell.h / faceCell.want >= 0.9,
+      `cell=${faceCell.w.toFixed(2)}x${faceCell.h.toFixed(2)} font=${faceCell.want} `
+      + `em=${(faceCell.w / faceCell.want).toFixed(2)}`);
     await page.evaluate(() => { try { tabFontScale = 1; fitTabOwnedGrid(); } catch (e) {} });
     await page.waitForTimeout(400);
 

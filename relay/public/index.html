@@ -2277,20 +2277,47 @@ function nativeDims(cell){
 }
 // Cell metrics only refresh after the renderer repaints at the new font, and on a cold page the first
 // reads can still describe a fallback face (seen live: a 6px cell at a 14px font, which produced a
-// 235-column grid and then a font search that shrank the font to make it fit). A monospace cell is
-// ~0.5-0.7 em wide and 1.0-1.45 em tall; anything outside that is not this font yet, so wait a frame
-// (bounded). Sending a good grid late beats sending a wrong one fast.
+// 235-column grid and then a font search that shrank the font to make it fit). When the renderer's own
+// reading is not this font's, measure the FACE with a canvas - never `fit.proposeDimensions()`, which
+// measures the terminal element and proposes more columns for a narrower window (the bug this path
+// exists to avoid). The range is wide on purpose: a condensed or wide system monospace, or an OS
+// text-size scale that moves the line box, must still be accepted rather than falling back forever.
+function cellForFont(want){
+  try{
+    const c=document.createElement('canvas'), cx=c.getContext('2d');
+    const family=(term.options && term.options.fontFamily) || 'monospace';
+    cx.font = want+'px '+family;
+    const w = cx.measureText('M').width;
+    const lh = Number(term.options && term.options.lineHeight)>0 ? Number(term.options.lineHeight) : 1;
+    if(w>0) return { w, h: want*lh };
+  }catch(e){}
+  return { w: want*0.6, h: want*1.2 };
+}
 function withNativeCell(cb){
   const want = appliedFont>0 ? appliedFont : fontSize;
-  const t0 = performance.now();
-  const step = () => {
-    const cell = cellMetrics();
-    const em = cell.w/want, eh = cell.h/want;
-    const sane = cell.w>0 && cell.h>0 && em>=0.5 && em<=0.7 && eh>=1.0 && eh<=1.45;
-    if(sane || performance.now()-t0 > 700){ cb(sane ? cell : null); return; }
-    requestAnimationFrame(step);
+  const measure = () => {
+    const ref = cellForFont(want);            // the FACE's own metrics, available immediately
+    const t0 = performance.now();
+    let prev = null;
+    const step = () => {
+      const cell = cellMetrics();
+      // The renderer's WIDTH is the one that goes bad on a cold page (6px at a 14px font); its height
+      // is reported reliably. Accept the renderer's cell when its width agrees with the face and holds
+      // still for a frame; otherwise take the face's own width and height. Never the element measure.
+      const agreeW = cell.w > 0 && Math.abs(cell.w - ref.w) <= Math.max(1, ref.w * 0.15);
+      const stable = agreeW && prev === cell.w;
+      if(stable || performance.now() - t0 > 400){ cb(agreeW ? cell : ref); return; }
+      prev = agreeW ? cell.w : null;
+      requestAnimationFrame(step);
+    };
+    step();
   };
-  step();
+  // A webfont that has not painted yet measures as the fallback twice in a row, which would look
+  // stable. Wait for the document's fonts before judging.
+  try{
+    if(document.fonts && document.fonts.ready) document.fonts.ready.then(measure, measure);
+    else measure();
+  }catch(e){ measure(); }
 }
 function sendViewport(dim){
   viewportFit={cols:dim.cols, rows:dim.rows};
@@ -2323,9 +2350,7 @@ function takeGrid(){
     }
     withNativeCell((cell)=>{
     if(_gridBusy !== 'take') return;
-    let dim=null;
-    if(cell) dim=nativeDims(cell);
-    else { try{ dim=fit.proposeDimensions(); }catch(e){} }
+    const dim = nativeDims(cell);
     if(dim && dim.cols>10 && dim.rows>3) sendViewport(dim);
     if(send('P', '') === 'dropped'){
       // A reconnect ate the request. Do not leave the chip spinning for 8 s and then blame the muxtee.
@@ -2362,9 +2387,7 @@ function requestNativeRemeasure(){
     _reReqTimer = null;
     requestAnimationFrame(()=>withNativeCell((cell)=>{
       if(_gridBusy) return;
-      let dim=null;
-      if(cell) dim=nativeDims(cell);
-      else { try{ dim=fit.proposeDimensions(); }catch(e){} }
+      const dim = nativeDims(cell);
       if(dim) sendViewport(dim);
     }));
   }, 120);
