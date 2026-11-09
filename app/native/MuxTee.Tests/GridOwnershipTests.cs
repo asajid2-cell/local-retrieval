@@ -60,3 +60,28 @@ public class GridOwnershipTests
         Assert.IsFalse(MuxLink.IsRelease("", 60, 30));
     }
 }
+
+// The reclaim predicate itself (contract 5a): a local KEY or MOUSE event wins the grid back. A bare
+// pointer move is not a hand at the pane - counting it made a device's take revert on hover.
+[TestClass]
+public class LocalIntentTests
+{
+    private static MOUSE_EVENT_RECORD Mouse(uint buttons, uint flags) => new()
+    { dwButtonState = buttons, dwEventFlags = flags };
+
+    [TestMethod]
+    public void a_pointer_move_with_no_button_is_not_local_intent()
+    {
+        Assert.IsFalse(MouseInput.IsIntent(Mouse(0, ConsoleApi.MOUSE_MOVED)));
+    }
+
+    [TestMethod]
+    public void a_press_a_drag_and_a_wheel_are_local_intent()
+    {
+        Assert.IsTrue(MouseInput.IsIntent(Mouse(1, 0)), "button down");
+        Assert.IsTrue(MouseInput.IsIntent(Mouse(1, ConsoleApi.MOUSE_MOVED)), "drag");
+        Assert.IsTrue(MouseInput.IsIntent(Mouse(0, ConsoleApi.DOUBLE_CLICK)), "double click");
+        Assert.IsTrue(MouseInput.IsIntent(Mouse(0, ConsoleApi.MOUSE_WHEELED)), "wheel");
+        Assert.IsTrue(MouseInput.IsIntent(Mouse(0, ConsoleApi.MOUSE_HWHEELED)), "horizontal wheel");
+    }
+}

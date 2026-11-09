@@ -224,10 +224,12 @@ internal sealed class TeeEngine : IDisposable
                 raw.Clear();
                 for (int i = 0; i < count; i++)
                 {
-                    // Contract 5a: the physical hand at the pane always wins. Keys and mouse records both
-                    // count; the restore is once, the activity report is rate-limited inside.
+                    // Contract 5a: the physical hand at the pane always wins. Keys, a click/drag and a
+                    // wheel notch count; a bare pointer MOVE does not (MouseInput.IsIntent) - motion is
+                    // not intent, and WT emits it whenever the pointer crosses the window. The restore is
+                    // once, the activity report is rate-limited inside.
                     if (records[i].EventType == ConsoleApi.KEY_EVENT
-                        || records[i].EventType == ConsoleApi.MOUSE_EVENT)
+                        || (records[i].EventType == ConsoleApi.MOUSE_EVENT && MouseInput.IsIntent(records[i].MouseEvent)))
                         NoteLocalInput();
                     if (records[i].EventType == ConsoleApi.KEY_EVENT)
                     {
