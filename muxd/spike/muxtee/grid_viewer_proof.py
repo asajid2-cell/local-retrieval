@@ -76,6 +76,7 @@ class Relay:
             # A browser always sends Origin; the deployed allow-list is the real host, so the loopback
             # origin has to be added explicitly or every viewer attach answers 1008.
             "ALLOWED_WS_ORIGINS": f"http://127.0.0.1:{self.port}",
+            "MUX_GRID_DEBUG": "1",
         })
         self.proc = subprocess.Popen([os.environ.get("NODE_BIN", "node"), "server.js"],
                                      cwd=str(self.repo), env=env,

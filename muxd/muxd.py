@@ -4103,6 +4103,10 @@ def owner_size_ack(owner, message):
         pane = grid_clamp(message.get("paneCols"), message.get("paneRows"))
         if pane: owner.pane_cols, owner.pane_rows = pane
     log(f"[{owner.name}] resize ack epoch={epoch} cols={size[0]} rows={size[1]} ok=true")
+    # G4: the commit itself is acked with its epoch. Without this a relay could only learn about a
+    # success from the session list, which left its pending-request record set forever and silently
+    # dropped every later request for the session (a viewport change while owning looked like a no-op).
+    _grid_report(owner, epoch, True)
     _grid_refresh(owner)
     return True
 

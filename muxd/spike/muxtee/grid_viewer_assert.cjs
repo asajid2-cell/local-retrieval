@@ -110,6 +110,9 @@ async function installFrameTap(page) {
     wrap('fitTabOwnedGrid', '__fitCalls');
     wrap('alignTerminalSurface', '__alignCalls');
     wrap('schedulePaintHeal', '__healCalls');
+    window.__vpCalls = 0; window.__reportCalls = 0;
+    wrap('scheduleViewportFit', '__vpCalls');
+    wrap('reportViewport', '__reportCalls');
     // ONE listener per socket. The old version re-added on every 200 ms grab(), so a single 'd' frame
     // was counted once per accumulated listener - dFrames read 77 when the true number was a handful.
     // That made a quiet page look like a repaint storm. Guard the receive tap exactly like the send tap.
@@ -321,6 +324,31 @@ async function waitForOwner(page, want, timeoutMs, predicate) {
     await page.evaluate(() => { try { tabFontScale = 1; fitTabOwnedGrid(); } catch (e) {} });
     await page.waitForTimeout(400);
 
+    // A viewport change while owning is a new grid, not a stretched old one: rotate a phone or resize a
+    // window and muxd must commit a grid for the new viewport at the same native font.
+    const beforeResize = (await readState(page)).cols;
+    await page.setViewportSize({ width: 1100, height: 760 });
+    let reflowed = null;
+    const resizeEnd = Date.now() + 15000;
+    while (Date.now() < resizeEnd) {
+      const st = await readState(page);
+      if (st.gridOwner === 'mine' && st.cols !== beforeResize) { reflowed = st; break; }
+      await page.waitForTimeout(300);
+    }
+    const diagR = await page.evaluate(() => ({
+      hostW: document.querySelector('#term').clientWidth, innerW: window.innerWidth,
+      vp: window.__vpCalls, rep: window.__reportCalls, lvr: lastViewportReport, vf: viewportFit,
+      nd: (window.__ndLog || []).slice(-6), vl: (window.__vLog || []).slice(-6),
+      owner: sizeGridOwner, busy: _gridBusy,
+    }));
+    check('V3 a viewport change while owned commits a new native grid',
+      !!reflowed && Number.isInteger(reflowed.fontSize) && Math.abs(reflowed.sx - 1) < 1e-6,
+      `was=${beforeResize} now=${reflowed ? reflowed.cols + 'x' + reflowed.rows : 'none'} `
+      + `font=${reflowed ? reflowed.fontSize : '-'} gridOwner=${reflowed ? reflowed.gridOwner : '-'} `
+      + `diag=${JSON.stringify(diagR)}`);
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.waitForTimeout(1800);
+
     await mark(page);
     await clickChip(page);
     const released = await waitForOwner(page, 'local', 15000);
@@ -409,6 +437,24 @@ async function waitForOwner(page, want, timeoutMs, predicate) {
       && away.cols === HOST_COLS && away.rows === HOST_ROWS,
       `gridOwner=${away.gridOwner} term=${away.cols}x${away.rows} host=${HOST_COLS}x${HOST_ROWS} `
       + `chip=${JSON.stringify(away.chip)}`);
+
+    // R1 guard, deterministically: the take sends its viewport report BEFORE its request, and the relay
+    // broadcasts a 'd' for every report. A 'd' that merely re-announces `local` must NOT clear a take
+    // that is still in flight - that re-armed the chip mid-take and let a second tap issue a second
+    // request. Only the committed owner may clear it. This is state, not timing, so it cannot flake.
+    const guard = await page2.evaluate(() => {
+      _gridBusy = 'take';
+      const frame = (o) => 'd' + JSON.stringify(Object.assign(
+        { cols: term.cols, rows: term.rows, gridEpoch: 7, tabOwned: true, local: true }, o));
+      onControl(frame({ gridOwner: 'local' }));
+      const stillBusy = _gridBusy;
+      onControl(frame({ gridOwner: 'mine', tabOwned: false, local: false, mine: true }));
+      const cleared = _gridBusy;
+      return { stillBusy, cleared };
+    });
+    check('V2 a re-announced local grid cannot clear a pending take',
+      guard.stillBusy === 'take' && guard.cleared === null,
+      `afterLocal=${guard.stillBusy} afterMine=${guard.cleared}`);
 
     await page2.screenshot({ path: path.join(__dirname, 'grid-viewer-proof.png'), fullPage: false });
     await ctx2.close();

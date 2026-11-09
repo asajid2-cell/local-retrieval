@@ -3854,6 +3854,17 @@ wssHost.on('connection', (ws, req) => {
       }
       hostSessions.clear();
       for (const [n, v] of incoming) hostSessions.set(n, v);
+      // A committed grid is also an acknowledgement. muxd reports a refusal over its gridAck channel,
+      // but a success used to be visible only here, so a pending request never resolved and every
+      // later request for that session was mistaken for one still in flight.
+      for (const [n, v] of incoming) {
+        const st = sessions.get(n);
+        const req = st && st.gridReq;
+        if (!req) continue;
+        const committed = (v.gridEpoch | 0) === (req.epoch | 0)
+          && (req.owner === 'local' ? v.gridOwner !== 'pin' : v.gridOwner === 'pin');
+        if (committed) st.gridReq = null;
+      }
       // Anchor a new session, or one whose generation restarted, and forget vanished names. A
       // same-generation session keeps its running count: o frames for it may still be in flight.
       for (const [n, v] of incoming) {
@@ -5034,8 +5045,12 @@ function handleClientMsg(name, client, s) {
     if (st && host && host.owner && host.gridOwner === 'pin') {
       const rec = pins.get(name);
       const dev = client.deviceId || ('sock-' + client.id);
-      if (rec && rec.deviceId === dev && !st.gridReq
-          && (client.vcols !== (host.cols | 0) || client.vrows !== (host.rows | 0))) {
+      const wantReq = (client.vcols !== (host.cols | 0) || client.vrows !== (host.rows | 0));
+      if (process.env.MUX_GRID_DEBUG) {
+        console.log(`[grid] v ${name} dev=${dev} rec=${rec && rec.deviceId} req=${st.gridReq ? st.gridReq.epoch : '-'} `
+          + `v=${client.vcols}x${client.vrows} host=${host.cols | 0}x${host.rows | 0} want=${wantReq}`);
+      }
+      if (rec && rec.deviceId === dev && !st.gridReq && wantReq) {
         requestTabGrid(name, st, client, true);
       }
     }

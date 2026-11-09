@@ -2037,10 +2037,21 @@ function fitTabOwnedGrid(){
   // this very fit, and a 15px clientWidth change would otherwise clear the latch on every step and send
   // the font back up to the size that just overflowed (seen live: fill bouncing to 17 with a pan bar).
   // The owner never pans, so it has no such feedback loop and re-opens on any real move.
-  const paneMoved = Math.abs(availW-tabFitPaneW) > (weOwn ? 1 : 24)
-                 || Math.abs(availH-tabFitPaneH) > (weOwn ? 1 : 24);
+  const paneMoved = tabFitPaneW>=0
+    && (Math.abs(availW-tabFitPaneW) > (weOwn ? 1 : 24)
+     || Math.abs(availH-tabFitPaneH) > (weOwn ? 1 : 24));
   if(tabFitPaneW<0 || paneMoved || zoom!==tabFitPaneScale || modeKey!==tabFitPaneMode){
     tabFitPaneScale=zoom; tabFitPaneMode=modeKey; tabFitRejected=0;
+  }
+  if(weOwn && paneMoved){
+    // A viewport change while owning is a NEW GRID REQUEST, not a new font. Keep the native font and
+    // re-report the host's own dimensions so muxd commits a grid for it; stretching the old grid here is
+    // what made a rotation or a window resize look non-native. RETURN: letting the font search run on
+    // the old grid first shrinks the font to fit it (seen live: font 10 at a 1084px pane), and then the
+    // re-measure inherits that shrink and requests a grid of 216 columns of 5px cells.
+    tabFitPaneW=availW; tabFitPaneH=availH;
+    try{ requestNativeRemeasure(); }catch(e){}
+    return;
   }
   tabFitPaneW=availW; tabFitPaneH=availH;
   const cell=cellMetrics();
@@ -2200,7 +2211,15 @@ function onControl(s){
   const committedGrid = Object.prototype.hasOwnProperty.call(m, 'gridOwner');
   sizePinned = committedGrid ? gridHeld : (m.mode === 'pinned');
   sizeMine = committedGrid ? (sizeGridOwner === 'mine') : (sizePinned && !!m.mine);
-  if(_gridBusy && (sizePinned || sizeGridOwner === 'local')){ _gridBusy = null; clearTimeout(_takeTimer); _takeTimer = null; }
+  // Clear the pending state ONLY when the request it stands for has actually landed. Every 'v' makes the
+  // relay recompute and broadcast a 'd', and the take sends its 'v' before its 'P' - so a blanket
+  // "owner is local -> not busy" cleared the chip mid-flight, re-armed it, and let a second tap issue a
+  // second request. That is the same glitch one layer deeper, so key the clear to the act, not to 'local'.
+  if(_gridBusy === 'take' && sizeGridOwner === 'mine'){
+    _gridBusy = null; clearTimeout(_takeTimer); _takeTimer = null;
+  } else if(_gridBusy === 'release' && sizeGridOwner === 'local' && !sizePinned){
+    _gridBusy = null; clearTimeout(_takeTimer); _takeTimer = null;
+  }
   sizeLocal = !!m.local; sizeTabOwned = !!m.tabOwned; sizePinLabel = m.pinLabel || sizeGridOwnerLabel; sizeClients = m.clients||[];
   // Presence, not truthiness: an old relay omits the field entirely, and that is the only case that falls
   // back to today's size-based classifier. A relay that sends it has told us the answer even when false.
@@ -2235,16 +2254,34 @@ function onControl(s){
 // instead of the terminal. Every branch below hands the keyboard back.
 function refocusTerminal(){ try{ term.focus({preventScroll:true}); }catch(e){ try{ term.focus(); }catch(_){} } }
 let _takeTimer = null;
+let _reReqTimer = null;
 let _gridBusy = null;          // 'take' | 'release' while a request is in flight
 let _paintReady = false;       // first 'd' after attach always repaints; after that only real changes do
 // The grid this device takes is THIS viewport's, at a WHOLE-PIXEL font. Deriving it from the font we
 // were using to mirror someone else's grid, then fitting the font back into that grid, is two roundings
 // that never agree: the owned view lands fractionally scaled with a bezel. Choose the font first and let
 // cols/rows follow it, once - that is what makes the owned grid native.
+//
+// Measured from the HOST box, not `fit.proposeDimensions()`: while this device owns the grid the xterm
+// element is exactly the committed grid's width, which can be wider than the pane, and the fit addon
+// measures the element - so it proposes MORE columns for a NARROWER window (seen live: 203 columns at
+// 1440px, 217 proposed at 1100px). The host box is the viewport; that is what the grid must come from.
+function nativeDims(){
+  const host=$('#term'); if(!host) return null;
+  const cs=getComputedStyle(host);
+  const availW=host.clientWidth-(parseFloat(cs.paddingLeft)||0)-(parseFloat(cs.paddingRight)||0);
+  const availH=host.clientHeight-(parseFloat(cs.paddingTop)||0)-(parseFloat(cs.paddingBottom)||0);
+  const cell=cellMetrics();
+  if(!(cell.w>0) || !(cell.h>0) || availW<80 || availH<60) return null;
+  const dim={ cols: Math.max(10, Math.floor(availW/cell.w)), rows: Math.max(3, Math.floor(availH/cell.h)) };
+  try{ (window.__ndLog=window.__ndLog||[]).push({t:Math.round(performance.now()),w:Math.round(availW),h:Math.round(availH),cw:Math.round(cell.w*100)/100,ch:Math.round(cell.h*100)/100,cols:dim.cols,rows:dim.rows}); if(window.__ndLog.length>40) window.__ndLog.shift(); }catch(e){}
+  return dim;
+}
 function sendViewport(dim){
   viewportFit={cols:dim.cols, rows:dim.rows};
   lastViewportReport=dim.cols+'x'+dim.rows;
   lastViewportReportSocket=ws;
+  try{ (window.__vLog=window.__vLog||[]).push({t:Math.round(performance.now()),c:dim.cols,r:dim.rows,ready:ws?ws.readyState:-1,cur:!!current}); if(window.__vLog.length>40) window.__vLog.shift(); }catch(e){}
   if(ws && ws.readyState===1 && current){
     send('v', JSON.stringify({
       cols:dim.cols, rows:dim.rows,
@@ -2260,7 +2297,7 @@ function takeGrid(){
   flash('Taking this screen\'s grid');
   window.__muxGridTiming = { clickAt: Math.round(performance.now()), ackAt: 0 };
   clearTimeout(_takeTimer);
-  // Set the whole-pixel font now, let the renderer measure it (one frame), then report the grid that
+  // Set the whole-pixel font now, let the renderer measure it (two frames), then report the grid that
   // font yields and request exactly that. Two frames of local latency buys a grid that paints 1:1.
   requestAnimationFrame(()=>requestAnimationFrame(()=>{
     if(_gridBusy !== 'take') return;
@@ -2270,25 +2307,47 @@ function takeGrid(){
         appliedFont = want;
         try{ term.options.fontSize = want; }catch(e){}
       }
-      let dim=null; try{ dim=fit.proposeDimensions(); }catch(e){}
-      if(dim && dim.cols>10 && dim.rows>3) sendViewport(dim);
+      const dim=nativeDims();
+      if(dim) sendViewport(dim);
     }catch(e){}
-    send('P', '');
-  }));
-  // A terminal whose muxtee predates grid ownership ignores the resize, so nothing ever acks. Say that
-  // plainly instead of leaving the chip spinning and the viewer stuck in a squashed fit mode.
-  _takeTimer = setTimeout(function(){
-    _takeTimer = null;
-    if(_gridBusy === 'take') _gridBusy = null;
-    if(sizeGridOwner === 'mine' || sizePinned) return;
-    flash('This tab\'s terminal cannot take the grid yet - open a new tab (its muxtee needs the update), then tap again');
-    if(tabFitMode !== 'fill'){
-      tabFitMode = 'fill'; LS.set('mux_tab_fit', tabFitMode);
-      try{ fitTabOwnedGrid(); applyPan(); updateSizeBtn(); }catch(e){}
+    if(send('P', '') === 'dropped'){
+      // A reconnect ate the request. Do not leave the chip spinning for 8 s and then blame the muxtee.
+      _gridBusy = null; _takeTimer = null;
+      flash('Reconnecting - tap again in a moment');
+      updateSizeBtn();
+      return;
     }
-    updateSizeBtn();
-    refocusTerminal();
-  }, 8000);
+    // A terminal whose muxtee predates grid ownership ignores the resize, so nothing ever acks. Say that
+    // plainly instead of leaving the chip spinning and the viewer stuck in a squashed fit mode.
+    _takeTimer = setTimeout(function(){
+      _takeTimer = null;
+      if(_gridBusy === 'take') _gridBusy = null;
+      if(sizeGridOwner === 'mine' || sizePinned) return;
+      flash('This tab\'s terminal cannot take the grid yet - open a new tab (its muxtee needs the update), then tap again');
+      if(tabFitMode !== 'fill'){
+        tabFitMode = 'fill'; LS.set('mux_tab_fit', tabFitMode);
+        try{ fitTabOwnedGrid(); applyPan(); updateSizeBtn(); }catch(e){}
+      }
+      updateSizeBtn();
+      refocusTerminal();
+    }, 8000);
+  }));
+}
+// A viewport change (or a zoom) while this device owns the grid is a NEW GRID, not a stretched old one.
+// Re-measure the host at the native font and report it; the relay re-pins the owner on a changed viewport
+// (server.js `'v'` branch), so no second 'P' is needed and the chip stays live throughout.
+function requestNativeRemeasure(){
+  if(_gridBusy || _reReqTimer) return;
+  const want = Math.max(8, Math.min(48, Math.round(fontSize*(tabFontScale||1))));
+  if(appliedFont !== want){ appliedFont=want; try{ term.options.fontSize=want; }catch(e){} }
+  _reReqTimer = setTimeout(()=>{
+    _reReqTimer = null;
+    requestAnimationFrame(()=>requestAnimationFrame(()=>{
+      if(_gridBusy) return;
+      const dim=nativeDims();
+      if(dim) sendViewport(dim);
+    }));
+  }, 120);
 }
 function cycleSize(){
   // A tap while a request is in flight is not a second request. Without this guard the ladder re-read
@@ -2671,6 +2730,17 @@ $('#term').addEventListener('wheel', e=>{
 // A tab-owned grid takes its cell size from the pane (see fitTabOwnedGrid), so A+/A- is a zoom on that
 // fit rather than a font size the fit would overwrite on the next size frame.
 function setFont(px){
+  if(sizePinned && sizeMine){
+    // This device OWNS the grid, so the grid is its viewport at a native font: A+/A- is a new grid at a
+    // new whole-pixel font, not a dead button and not a CSS zoom. Re-measure and re-request.
+    fontSize = Math.min(20, Math.max(11, px));
+    LS.set('mux_font', fontSize);
+    appliedFont = fontSize;
+    try{ term.options.fontSize = appliedFont; }catch(e){}
+    requestNativeRemeasure();
+    healTerminalSurface('font');
+    return;
+  }
   if(sizeTabOwned && !sizePinned){
     const dir = px > fontSize ? 0.1 : -0.1;
     tabFontScale = Math.min(2.5, Math.max(0.5, Math.round((tabFontScale+dir)*100)/100));

@@ -82,6 +82,10 @@ class AckTest(unittest.TestCase):
         self.assertEqual((s.cols, s.rows), (100, 40))
         self.assertEqual(s.grid_owner, "devA")
         self.assertEqual(s.grid_epoch, 1)
+        # G4: the commit itself is acked with its epoch, so a relay never has to infer success.
+        reports = [f for kind, _name, f in s.frames.items if kind == "gridAck"]
+        self.assertTrue(any('"ok": true' in f and '"epoch": 1' in f for f in reports),
+                        "the committed geometry is acked")
 
     def test_t4_a_refusal_leaves_the_grid_and_reports_failure(self):
         s = make_stream()
@@ -92,8 +96,10 @@ class AckTest(unittest.TestCase):
         self.assertEqual(s.grid_owner, "devA", "and the previous owner keeps the grid")
         self.assertEqual(s.grid_epoch, 1, "a refused request never burns the epoch")
         reports = [f for kind, _name, f in s.frames.items if kind == "gridAck"]
-        self.assertEqual(len(reports), 1)
-        self.assertIn('"ok": false', reports[0])
+        failures = [f for f in reports if '"ok": false' in f]
+        self.assertEqual(len(failures), 1, "exactly one report says the request was refused")
+        self.assertIn('"ok": false', reports[-1])
+        self.assertIn('"epoch": 2', reports[-1])
 
     def test_t4_an_unanswered_request_times_out_without_moving_the_grid(self):
         s = make_stream()
