@@ -74,19 +74,64 @@ async function readState(page) {
 
 async function installFrameTap(page) {
   await page.evaluate(() => {
-    window.__d = [];
+    window.__d = []; window.__dTimes = []; window.__dMark = 0;
     // What this viewer ASKS muxd for. Local ownership means no resize request, whatever the render
     // mode: a mode that reaches the wire has already taken the grid.
     window.__sent = [];
+    // Timing and churn: a switch is only good if it LANDS FAST and SETTLES. State-only assertions let a
+    // 4-second, font-thrashing handover pass, so the harness records when the commit arrived, when the
+    // grid was painted, and how many times the page changed its font on the way.
+    window.__t0 = 0; window.__commitAt = 0; window.__paintAt = 0;
+    window.__fontLog = []; window.__fitCalls = 0; window.__alignCalls = 0; window.__healCalls = 0;
+    window.__mark = () => {
+      window.__t0 = performance.now(); window.__commitAt = 0; window.__paintAt = 0;
+      window.__fontLog = []; window.__fitCalls = 0; window.__alignCalls = 0; window.__healCalls = 0;
+      window.__dMark = window.__d.length;
+    };
+    let lastFont = null;
+    setInterval(() => {
+      try {
+        const f = term && term.options ? term.options.fontSize : null;
+        if (f !== lastFont) { lastFont = f; window.__fontLog.push({ t: Math.round(performance.now() - (window.__t0 || performance.now())), f }); }
+        if (window.__commitAt && !window.__paintAt && term && term.cols === window.__commitCols) {
+          window.__paintAt = Math.round(performance.now() - window.__t0);
+        }
+      } catch (_) {}
+    }, 25);
+    const wrap = (name, counter) => {
+      try {
+        const orig = window[name];
+        if (typeof orig !== 'function' || orig.__wrapped) return;
+        const w = function (...a) { window[counter] = (window[counter] || 0) + 1; return orig.apply(this, a); };
+        w.__wrapped = true; window[name] = w;
+      } catch (_) {}
+    };
+    wrap('fitTabOwnedGrid', '__fitCalls');
+    wrap('alignTerminalSurface', '__alignCalls');
+    wrap('schedulePaintHeal', '__healCalls');
+    // ONE listener per socket. The old version re-added on every 200 ms grab(), so a single 'd' frame
+    // was counted once per accumulated listener - dFrames read 77 when the true number was a handful.
+    // That made a quiet page look like a repaint storm. Guard the receive tap exactly like the send tap.
     const grab = () => {
       try {
         if (typeof ws === 'undefined' || !ws) return false;
-        ws.addEventListener('message', (e) => {
-          const s = typeof e.data === 'string' ? e.data : '';
-          if (s && s[0] === 'd') {
-            try { window.__d.push(JSON.parse(s.slice(1))); } catch (_) {}
-          }
-        });
+        if (!ws.__tapRecv) {
+          ws.__tapRecv = true;
+          ws.addEventListener('message', (e) => {
+            const s = typeof e.data === 'string' ? e.data : '';
+            if (s && s[0] === 'd') {
+              let m = null; try { m = JSON.parse(s.slice(1)); } catch (_) {}
+              if (m) {
+                window.__d.push(m);
+                window.__dTimes.push(Math.round(performance.now()));
+                if (m.gridOwner === 'mine' && window.__t0 && !window.__commitAt) {
+                  window.__commitAt = Math.round(performance.now() - window.__t0);
+                  window.__commitCols = m.cols;
+                }
+              }
+            }
+          });
+        }
         if (!ws.__tapSend) {
           const send = ws.send.bind(ws);
           ws.__tapSend = true;
@@ -102,6 +147,31 @@ async function installFrameTap(page) {
     };
     grab();
     window.__tap = setInterval(grab, 200);
+  });
+}
+
+async function mark(page) { await page.evaluate(() => window.__mark && window.__mark()); }
+
+async function timings(page, settleMs = 1500) {
+  await page.waitForTimeout(settleMs);
+  return page.evaluate(() => {
+    const from = window.__dMark || 0;
+    const times = (window.__dTimes || []).slice(from);
+    // Per-window churn: dFrames is the delta since mark(), fps is that over the window, and maxGap
+    // catches a page that answers a burst then goes silent for a long beat (the "sticky" feel).
+    let maxGap = 0;
+    for (let i = 1; i < times.length; i += 1) maxGap = Math.max(maxGap, times[i] - times[i - 1]);
+    const span = times.length > 1 ? times[times.length - 1] - times[0] : 0;
+    return {
+      commitMs: window.__commitAt, paintMs: window.__paintAt,
+      fonts: (window.__fontLog || []).length, fontSizes: (window.__fontLog || []).map((x) => x.f),
+      fitCalls: window.__fitCalls, alignCalls: window.__alignCalls, healCalls: window.__healCalls,
+      dFrames: times.length,
+      fps: span > 0 ? Math.round((times.length - 1) * 1000 / span) : 0,
+      maxGap,
+      vSends: (window.__sent || []).filter((f) => f && f.t === 'v').length,
+      resizeSends: (window.__sent || []).filter((f) => f && f.t === 'resize').length,
+    };
   });
 }
 
@@ -163,6 +233,13 @@ async function waitForOwner(page, want, timeoutMs, predicate) {
       console.log('NO-D-FRAME DIAG ' + JSON.stringify(diag));
     }
 
+    // A quiet window is the baseline: any steady stream of 'd' frames means the page is repainting for
+    // no reason, and a steady stream of 'v' sends means the page and the relay are resizing each other.
+    await mark(page);
+    const quiet = await timings(page, 1500);
+    check('V0 quiet window is quiet', quiet.dFrames <= 2 && quiet.vSends === 0,
+      `dFrames=${quiet.dFrames} vSends=${quiet.vSends} fitCalls=${quiet.fitCalls} healCalls=${quiet.healCalls}`);
+
     const localOwner = (s.gridOwner === 'local') || (s.gridOwner === undefined && s.tabOwned === true);
     check('V1 local ownership', localOwner && Math.abs(s.sx - 1) < 1e-6 && Math.abs(s.sy - 1) < 1e-6,
       `gridOwner=${s.gridOwner} tabOwned=${s.tabOwned} transform=${s.transform} term=${s.cols}x${s.rows} host=${HOST_COLS}x${HOST_ROWS}`);
@@ -189,16 +266,22 @@ async function waitForOwner(page, want, timeoutMs, predicate) {
 
     // The next tap is the handover, not a rendering mode. Wait for the ack-published owner: the page may
     // not paint the new grid before muxd commits it (contract G2).
+    await mark(page);
     await clickChip(page);
     const pinned = await waitForOwner(page, 'mine', 15000);
+    const takeT = await timings(page, 1200);
     check('V2 the chip takes the grid', pinned.gridOwner === 'mine' && pinned.cols !== s.cols,
       `gridOwner=${pinned.gridOwner} mine=${pinned.mine} term=${pinned.cols}x${pinned.rows} `
       + `host=${HOST_COLS}x${HOST_ROWS} chip=${JSON.stringify(pinned.chip)}`);
+    check('V2 the take lands quickly', takeT.commitMs > 0 && takeT.commitMs < 1500,
+      `commitMs=${takeT.commitMs} paintMs=${takeT.paintMs} dFrames=${takeT.dFrames} vSends=${takeT.vSends}`);
+    check('V2 the take settles without font thrash', takeT.fonts <= 3,
+      `fonts=${takeT.fonts} sizes=${JSON.stringify(takeT.fontSizes)} fitCalls=${takeT.fitCalls} `
+      + `healCalls=${takeT.healCalls}`);
     check('V3 no distortion while owned', pinned.gridOwner === 'mine' && Math.abs(pinned.sx - 1) < 1e-6 && Math.abs(pinned.sy - 1) < 1e-6,
       `gridOwner=${pinned.gridOwner} transform=${pinned.transform}`);
     // The owning device must paint its grid ACROSS the viewport, not left-aligned with a bezel on the
     // right: at 1:1 the painted screen spans the host on both axes, so the widths must agree closely.
-    await page.waitForTimeout(1200);
     const laid = await readState(page);
     const span = laid.hostW ? laid.screenW / laid.hostW : 0;
     check('V3 the owned grid spans the viewport', laid.gridOwner === 'mine' && span > 0.98 && span <= 1.02 && !laid.pan,
@@ -206,12 +289,17 @@ async function waitForOwner(page, want, timeoutMs, predicate) {
     check('V3 the keyboard is still on the terminal', laid.focusedTerminal,
       `focusedTerminal=${laid.focusedTerminal}`);
 
+    await mark(page);
     await clickChip(page);
     const released = await waitForOwner(page, 'local', 15000);
+    const relT = await timings(page, 800);
     check('V4 release returns to local', released.gridOwner === 'local'
       && released.cols === HOST_COLS && released.rows === HOST_ROWS,
       `gridOwner=${released.gridOwner} term=${released.cols}x${released.rows} `
       + `host=${HOST_COLS}x${HOST_ROWS} chip=${JSON.stringify(released.chip)}`);
+    check('V4 the release stays quick and quiet', relT.fonts <= 3,
+      `commitMs=${relT.commitMs} paintMs=${relT.paintMs} fonts=${relT.fonts} `
+      + `sizes=${JSON.stringify(relT.fontSizes)} fitCalls=${relT.fitCalls}`);
 
     // V6: switching is repeatable. A handover that works once and then leaves the chip confused is a
     // worse product than one that never worked, so the cycle is driven three times and every landing is
