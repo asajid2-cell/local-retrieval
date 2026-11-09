@@ -106,11 +106,11 @@ async function clickChip(page) {
   await page.waitForTimeout(700);
 }
 
-async function waitForOwner(page, want, timeoutMs) {
+async function waitForOwner(page, want, timeoutMs, predicate) {
   const end = Date.now() + timeoutMs;
   let s = await readState(page);
   while (Date.now() < end) {
-    if (s.gridOwner === want) return s;
+    if (s.gridOwner === want && (!predicate || predicate(s))) return s;
     await page.waitForTimeout(250);
     s = await readState(page);
   }
@@ -211,7 +211,11 @@ async function waitForOwner(page, want, timeoutMs) {
     await page2.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
     await installFrameTap(page2);
     await page2.waitForFunction(() => { try { return typeof term !== 'undefined' && term.cols > 1; } catch (e) { return false; } }, null, { timeout: 30000 });
-    const away = await waitForOwner(page2, 'local', 15000);
+    // Ownership and geometry are two commits on two frames: the relay drops the pin at once (local, old
+    // grid) and muxd publishes the pane geometry when the tee acks the restore. The row is about the
+    // grid coming back, so it waits for both.
+    const away = await waitForOwner(page2, 'local', 15000,
+      (st) => st.cols === HOST_COLS && st.rows === HOST_ROWS);
     check('V5 owner disconnect returns the grid to local', away.gridOwner === 'local'
       && away.cols === HOST_COLS && away.rows === HOST_ROWS,
       `gridOwner=${away.gridOwner} term=${away.cols}x${away.rows} host=${HOST_COLS}x${HOST_ROWS} `
