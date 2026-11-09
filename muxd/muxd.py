@@ -3631,6 +3631,16 @@ class OwnerSession:
         self.owner_stop_error = ""
         self.input_waiters = {}
         self.input_seq = 0
+        # Grid ownership (GRID-OWNERSHIP-CONTRACT.md). `grid_owner` is "" while the local pane holds the
+        # grid and a device id while a remote pin does; `grid_epoch` is the last epoch accepted, so a
+        # request or ack at or behind it can never move the grid. `pane_cols/rows` is the last geometry
+        # the tee reported for the physical pane, used to reclaim when a pin releases.
+        self.grid_owner = ""
+        self.grid_owner_label = ""
+        self.grid_epoch = 0
+        self.grid_pending = None          # {epoch, cols, rows, device, label, local, at}
+        self.pane_cols, self.pane_rows = self.cols, self.rows
+        self.grid_last_at = 0.0           # last device-request/ack time, for the pin TTL
 
     def ingest(self, data: bytes):
         if not data: return
@@ -3948,6 +3958,169 @@ def clear_remote_size_ownership():
         restore_local_session_size(session)
 
 
+# ---- grid ownership (GRID-OWNERSHIP-CONTRACT.md) ------------------------------------------------
+# A teed local tab has one committed geometry. The local pane holds it by default; a device may take
+# it with an epoch, and the tee's sizeAck is what commits. These helpers are pure state machines over
+# an OwnerSession so a test can drive them without a socket.
+GRID_MAX_COLS, GRID_MAX_ROWS = 1000, 300
+GRID_PIN_TTL_S = 300.0        # a device pin with no traffic releases the grid back to the pane
+GRID_ACK_TIMEOUT_S = 5.0      # a request the tee has not applied is refused, never left pending
+
+def grid_clamp(cols, rows):
+    try:
+        c, r = int(cols), int(rows)
+    except Exception:
+        return None
+    return max(20, min(GRID_MAX_COLS, c)), max(8, min(GRID_MAX_ROWS, r))
+
+def _grid_refresh(owner):
+    # The relay learns geometry from the session list, which otherwise trickles out on the 5 s pump.
+    owner.outq.put_nowait(("dead", owner.name, ""))
+
+def _grid_report(owner, epoch, ok, reason=""):
+    owner.outq.put_nowait(("gridAck", owner.name, json.dumps({
+        "t": "gridAck", "s": owner.name, "epoch": int(epoch or 0), "ok": bool(ok),
+        # muxd's CURRENT epoch, so a relay whose pin record outlived a restart can retry one past it
+        # instead of guessing from a stale session list.
+        "gridEpoch": int(getattr(owner, "grid_epoch", 0) or 0),
+        "reason": str(reason or "")[:200],
+    })))
+
+def _grid_next_epoch(owner):
+    """The epoch a new commit would take: one past the committed epoch and any in-flight reservation."""
+    cur = int(getattr(owner, "grid_epoch", 0) or 0)
+    pending = getattr(owner, "grid_pending", None)
+    if pending:
+        cur = max(cur, int(pending.get("epoch", 0) or 0))
+    return cur + 1
+
+def owner_touch(owner):
+    """Any traffic from the owning device keeps its pin alive; the TTL is for a GONE device."""
+    if getattr(owner, "grid_owner", ""):
+        owner.grid_last_at = time.time()
+
+def owner_local_size(owner, cols, rows):
+    """A tee `size` frame: the local pane is (again) the authority, applied before it is reported."""
+    size = grid_clamp(cols, rows)
+    if size is None:
+        return False
+    was_pinned = bool(getattr(owner, "grid_owner", ""))
+    owner.pane_cols, owner.pane_rows = size
+    # A redundant announcement (the connect-time one, or an unchanged pane) is not a commit: it must
+    # not bump the epoch and must not wake the relay.
+    if not was_pinned and size == (owner.cols, owner.rows):
+        return False
+    epoch = _grid_next_epoch(owner)
+    owner.grid_owner = ""
+    owner.grid_owner_label = ""
+    owner.grid_pending = None
+    owner.grid_epoch = epoch
+    owner.grid_last_at = 0.0
+    owner.cols, owner.rows = size
+    if was_pinned:
+        log(f"[{owner.name}] owner=local reason=size")
+    _grid_refresh(owner)
+    return True
+
+def owner_reclaim_local(owner, reason="activity"):
+    """Local activity or an explicit release: ask the tee to restore the pane, commit on its ack.
+
+    Nothing moves here except the reservation: until the tee has actually resized the child PTY, the
+    committed grid is still the device's, and advertising it as local would have viewers paint a
+    remote grid under a local label.
+    """
+    if not getattr(owner, "grid_owner", ""):
+        return False
+    pending = getattr(owner, "grid_pending", None)
+    if pending and pending.get("local"):
+        return False                       # a reclaim is already in flight
+    size = (int(owner.pane_cols), int(owner.pane_rows))
+    epoch = _grid_next_epoch(owner)
+    owner.grid_pending = {"epoch": epoch, "cols": size[0], "rows": size[1],
+                          "device": "", "label": "", "local": True, "at": time.time()}
+    # Release carries no geometry: only the tee can read the pane, and this is the same restore path as
+    # the first-local-key reclaim (contract section 5a). The ack brings the pane geometry back.
+    owner._send_owner({"t": "resize", "epoch": epoch, "owner": "local"})
+    # The transition itself is the rate limit: once the reclaim is in flight a typing burst is a
+    # no-op and logs nothing, so this line appears at most once per reclaim.
+    log(f"[{owner.name}] owner=local reason={reason}")
+    return True
+
+def owner_request_grid(owner, cols, rows, epoch, device, label=""):
+    """A device takes the grid. G and the epoch do not move until the tee's sizeAck commits them."""
+    size = grid_clamp(cols, rows)
+    device = str(device or "").strip()[:64]
+    if size is None or not device:
+        return False
+    try:
+        want = int(epoch)
+    except Exception:
+        want = _grid_next_epoch(owner)
+    # G4/T3: an epoch at or behind the last COMMITTED one, or behind an in-flight reservation, can
+    # never move the grid.
+    current = int(getattr(owner, "grid_epoch", 0) or 0)
+    pending = getattr(owner, "grid_pending", None)
+    if pending:
+        current = max(current, int(pending.get("epoch", 0) or 0))
+    if want <= current:
+        return False
+    owner.grid_pending = {"epoch": want, "cols": size[0], "rows": size[1],
+                          "device": device, "label": str(label or "")[:64],
+                          "local": False, "at": time.time()}
+    owner._send_owner({"t": "resize", "epoch": want, "cols": size[0], "rows": size[1]})
+    log(f"[{owner.name}] resize req epoch={want} cols={size[0]} rows={size[1]} owner={device}")
+    return True
+
+def owner_size_ack(owner, message):
+    """Commit a resize the tee actually applied. Returns True only when G moved."""
+    try:
+        epoch = int(message.get("epoch"))
+    except Exception:
+        return False
+    pending = getattr(owner, "grid_pending", None)
+    if not pending or epoch != int(pending.get("epoch", -1)):
+        return False                       # G4: an ack for a superseded request never rolls G back
+    owner.grid_pending = None
+    ok = bool(message.get("ok"))
+    if not ok:
+        log(f"[{owner.name}] resize ack epoch={epoch} cols={pending['cols']} rows={pending['rows']} ok=false")
+        _grid_report(owner, epoch, False, message.get("reason", "the tee could not apply the resize"))
+        return False                       # a refusal leaves G, the epoch and the owner exactly as they were
+    size = grid_clamp(message.get("cols", pending["cols"]), message.get("rows", pending["rows"]))
+    if size is None:
+        size = (int(pending["cols"]), int(pending["rows"]))
+    owner.cols, owner.rows = size
+    owner.grid_epoch = epoch
+    if pending.get("local"):
+        owner.grid_owner = ""
+        owner.grid_owner_label = ""
+    else:
+        owner.grid_owner = str(pending.get("device") or "")
+        owner.grid_owner_label = str(pending.get("label") or "")
+        owner.grid_last_at = time.time()
+    # The ack is the tee's own report of the pane, so it can re-anchor a later reclaim.
+    if message.get("paneCols") and message.get("paneRows"):
+        pane = grid_clamp(message.get("paneCols"), message.get("paneRows"))
+        if pane: owner.pane_cols, owner.pane_rows = pane
+    log(f"[{owner.name}] resize ack epoch={epoch} cols={size[0]} rows={size[1]} ok=true")
+    _grid_refresh(owner)
+    return True
+
+def owner_grid_tick(owner, now=None):
+    """Timeout an unapplied request, and release a pin whose device has gone quiet (G5 TTL)."""
+    now = time.time() if now is None else now
+    changed = False
+    pending = getattr(owner, "grid_pending", None)
+    if pending and now - float(pending.get("at") or now) > GRID_ACK_TIMEOUT_S:
+        # Pure report: the request never moved G, the epoch or the owner, so there is nothing to undo.
+        owner.grid_pending = None
+        _grid_report(owner, pending.get("epoch", 0), False, "the tee did not acknowledge the resize")
+        changed = True
+    if getattr(owner, "grid_owner", "") and owner.grid_last_at and now - owner.grid_last_at > GRID_PIN_TTL_S:
+        changed = owner_reclaim_local(owner, reason="disconnect") or changed
+    return changed
+
+
 def dump_thread_stacks(reason):
     try:
         frames = sys._current_frames()
@@ -4123,6 +4296,15 @@ def restore_manifest_sessions(records, target=None, loop=None, outq=None, now=No
                 restored.stop_disposition = ""
             restored.user_killed = bool(m.get("userKilled", False))
             restored.generation_id = str(m.get("generationId", "") or restored.generation_id)
+            # A restored epoch must stay monotonic across the restart: if the record cannot supply one
+            # ahead of wall time, wall time does, so a relay holding a pre-restart epoch cannot win.
+            restored.grid_epoch = max(
+                int(m.get("gridEpoch", 0) or 0) if str(m.get("gridEpoch", "")).lstrip("-").isdigit() else 0,
+                int(time.time()),
+            )
+            restored.grid_owner = ""
+            restored.grid_owner_label = ""
+            restored.grid_pending = None
             restored.operation_key = str(m.get("operationKey", "") or "")
             restored.operation_fingerprint = str(m.get("operationFingerprint", "") or "")
             restored.operation_created = bool(m.get("operationCreated", False))
@@ -4152,6 +4334,9 @@ def session_records_payload(source=None):
     source = sessions if source is None else source
     return {
         n: {"cmd": s.cmd, "cwd": s.cwd, "cols": s.cols, "rows": s.rows, "heal": s.heal,
+            # The grid epoch rides with the geometry: a relay carrying an epoch from before a restart
+            # must never win, so the two are written in the same record and restored together.
+            "gridEpoch": int(getattr(s, "grid_epoch", 0) or 0),
             "sessionId": getattr(s, "session_id", "") or "",
             "sessionUuid": getattr(s, "session_uuid", "") or "",
             "aliases": list(getattr(s, "aliases", []) or []),
@@ -4550,6 +4735,13 @@ def session_payload(name, sess):
         agent_truth, agent_source = dict(AGENT_TRUTH_UNKNOWN), "heuristic"
     return {"name": name, "alive": alive, "created": int(sess.created * 1000),
             "lastOut": int(sess.last_out * 1000), "cols": sess.cols, "rows": sess.rows,
+            # Grid ownership. `owner` above is the historical bool ("this row is owner-backed"), so the
+            # committed grid authority is ADDITIVE under distinct names: the relay reads these and a
+            # reader that does not know them sees exactly today's record.
+            "gridOwner": ("pin" if getattr(sess, "grid_owner", "") else "local"),
+            "gridOwnerLabel": str(getattr(sess, "grid_owner_label", "") or ""),
+            "gridEpoch": int(getattr(sess, "grid_epoch", 0) or 0),
+            "gridPending": bool(getattr(sess, "grid_pending", None)),
             "tail": tail, "heal": sess.heal, "localViewers": len(sess.local),
             "localFirst": owner or len(sess.local) > 0, "owner": owner,
             "ownerConnected": bool(getattr(sess, "owner_connected", False)),
@@ -4583,6 +4775,12 @@ def needs_relaunch_for_command(prev, requested_cmd):
     return command_sig(getattr(prev, "cmd", "")) != command_sig(requested)
 
 def sess_list(now=None):
+    # A pin whose device has gone quiet, or a request the tee never applied, is resolved here: this is
+    # the one cadence that touches every session, and the list is what the relay reads to paint.
+    for s in list(sessions.values()):
+        if isinstance(s, OwnerSession):
+            try: owner_grid_tick(s, time.time())
+            except Exception as e: log(f"[{getattr(s, 'name', '?')}] grid tick failed: {e}")
     # Custody-expired records are dropped outright: the relay keeps showing every UNexpired dormant
     # row for relaunch, and never a row muxd has already written off.
     return [session_payload(n, s) for n, s in sessions.items() if not custody_reclaimable(s, now)]
@@ -4711,14 +4909,18 @@ async def serve_owner_connection(ws, first, sessions, outq, save_manifest, regis
             if mt == "o":
                 owner.ingest(base64.b64decode(m.get("d", "")))
             elif mt == "size":
-                cols = max(20, int(m.get("cols") or owner.cols))
-                rows = max(8, int(m.get("rows") or owner.rows))
-                if (cols, rows) != (owner.cols, owner.rows):
-                    owner.cols, owner.rows = cols, rows
-                    # Every viewer of a stream owner renders at this size (§7.1), and the relay learns
-                    # sizes only from the session list, which otherwise trickles out on the 5 s status
-                    # pump. Nudge it so a resize reaches the mirror immediately.
-                    outq.put_nowait(("dead", name, ""))
+                # The pane changed (or this is the connect-time announcement): a local-ownership
+                # statement. It always bumps the epoch, so a late ack for a device pin cannot win.
+                if owner_local_size(owner, m.get("cols"), m.get("rows")):
+                    await save_manifest(sessions)
+            elif mt == "sizeAck":
+                # Only an ack can commit a device pin; a refusal leaves G and the owner untouched.
+                if owner_size_ack(owner, m):
+                    await save_manifest(sessions)
+            elif mt == "activity":
+                # A local key or mouse event. The physical keyboard always wins, silently (contract §9).
+                if owner_reclaim_local(owner):
+                    await save_manifest(sessions)
             elif mt == "child":
                 child_pid = int(m.get("pid", 0) or 0)
                 if child_pid <= 0:
@@ -5426,6 +5628,13 @@ async def main():
             )
             owner._launch_claim = claim
             owner.claim_paths = list(claim.paths) if claim is not None else []
+            # A reconnect inherits the epoch its row carried, and never goes below wall time, so a relay
+            # request minted before a muxd restart can never outrank this process's commits.
+            owner.grid_epoch = max(
+                int(getattr(prev, "grid_epoch", 0) or 0) if prev is not None else 0,
+                int(time.time()),
+            )
+            owner.pane_cols, owner.pane_rows = owner.cols, owner.rows
             owner.child_pid = child_pid
             owner.child_start_token = _process_start_token(owner.child_pid)
             candidate = dict(sessions)
@@ -6348,6 +6557,9 @@ async def main():
                                 await ws.send(json.dumps({"t": "resync", "s": name}))
                             elif kind == "dead":
                                 await ws.send(json.dumps({"t": "sessions", "list": sess_list()}))
+                            elif kind == "gridAck":
+                                # A grid request the tee refused or never answered. `data` is the frame.
+                                await ws.send(data)
 
                     async def pump_status():
                         while True:
@@ -6549,6 +6761,9 @@ async def main():
                                     # A refusal returns before any write, so a frame without an
                                     # accepted proof performs zero PTY writes.
                                     input_session = sessions[name]
+                                    # Remote input is proof the owning device is still there: refresh the
+                                    # pin TTL so an idle hands-on viewer does not lose the grid.
+                                    owner_touch(input_session)
                                     principal, body, refusal = authorize_relay_input(m, input_session)
                                     if refusal is not None:
                                         log(f"[{name}] input refused: {refusal.code}: {refusal.detail}")
@@ -6568,7 +6783,31 @@ async def main():
                                                 outcome, name, m, principal
                                             )))
                                 elif t == "resize" and name in sessions:
-                                    apply_remote_session_size(sessions[name], m)
+                                    session = sessions[name]
+                                    if isinstance(session, OwnerSession) and getattr(session, "stream", False):
+                                        # A teed local tab: the device either takes the grid (request
+                                        # with an epoch) or releases it back to the pane.
+                                        requester = str(m.get("owner") or "").strip()
+                                        if m.get("active") is False or requester in ("", "local"):
+                                            if owner_reclaim_local(session, reason="release"):
+                                                # This dispatch runs inside main(), where the manifest
+                                                # callable is manifest_save_async; save_manifest only
+                                                # exists in serve_owner_connection's parameters.
+                                                await manifest_save_async(sessions)
+                                        else:
+                                            # A viewport report from the owning device is also liveness.
+                                            owner_touch(session)
+                                            if owner_request_grid(
+                                                session, m.get("cols"), m.get("rows"),
+                                                m.get("epoch"), requester, m.get("label", ""),
+                                            ):
+                                                await manifest_save_async(sessions)
+                                            else:
+                                                # Tell the relay so it can retry once at the current
+                                                # epoch + 1: its pin record outlives a relay restart.
+                                                _grid_report(session, m.get("epoch"), False, "stale epoch")
+                                    else:
+                                        apply_remote_session_size(session, m)
                                 elif t == "redraw" and name in sessions:
                                     session = sessions[name]
                                     if isinstance(session, OwnerSession):

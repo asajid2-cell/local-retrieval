@@ -218,13 +218,9 @@ test('size chip names auto, own pin, and another device exactly', () => {
   const tabFit = sandbox.sizeButtonPresentation();
   assert.match(tabFit.text, /fits rows/);
   assert.match(tabFit.title, /every row/i);
-  assert.match(tabFit.title, /fill the width and flex the row height instead/i);
-  // A third mode sits between the two: width like 'fill', every row like 'fit'.
-  sandbox.tabFitMode = 'flex';
-  const tabFlex = sandbox.sizeButtonPresentation();
-  assert.match(tabFlex.text, /flex fit/);
-  assert.match(tabFlex.title, /every row fits/i);
-  assert.match(tabFlex.title, /fill the width and scroll instead/i);
+  // The old third mode scaled the screen non-uniformly; it is gone (GRID-OWNERSHIP-CONTRACT §6). The
+  // second tap from 'fit' takes this device's grid instead, which is a request, not a transform.
+  assert.match(tabFit.title, /take this screen's grid instead/i);
   sandbox.sizeTabOwned = false; sandbox.tabFitMode = 'fill';
 
   assert.match(source, /<button type="button" class="meta" id="statusmeta"/);
