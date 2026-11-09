@@ -94,7 +94,26 @@ class SizeTab:
         return bytes(self.buf)
 
     def saw(self, needle):
+        """Historical: did this string EVER appear. Not proof of the current geometry - see now_size."""
         return needle.encode() in self.output()
+
+    def now_size(self):
+        """The last SIZE the child printed: the pty's size NOW, not the best size it ever had.
+
+        A monotonic `in buffer` check is how a restore that lands on the wrong size still passes - the
+        old SIZE=120x30 from startup is still in the scrollback. The proof must read the tail.
+        """
+        import re
+        hits = re.findall(rb"SIZE=(\d+)x(\d+)", self.output())
+        return (int(hits[-1][0]), int(hits[-1][1])) if hits else None
+
+    def pane_size(self):
+        """The harness terminal's own dimensions, to separate "the pty moved" from "the pane moved"."""
+        try:
+            dims = self.p.getwinsize()          # pywinpty: (rows, cols)
+            return (int(dims[1]), int(dims[0]))
+        except Exception:
+            return None
 
     def write(self, s):
         try:
@@ -158,6 +177,13 @@ async def main():
     print(f"exe={exe}\nrepo={repo}")
 
     rows = Rows()
+    # The tee logs to %LOCALAPPDATA%\muxtee\muxtee.log, shared by every run on this box. Truncate it so
+    # the tail below is THIS run's evidence and not a paragraph from yesterday.
+    tee_log = Path(os.environ.get("LOCALAPPDATA", "")) / "muxtee" / "muxtee.log"
+    try:
+        tee_log.write_text("")
+    except Exception:
+        pass
     relay = await b1.FakeRelay().start()
     mux = b1.DisposableMuxd(relay_port=relay.port)
     port = mux.port
@@ -205,11 +231,31 @@ async def main():
                        if isinstance(p, dict) and p.get("t") == "resync")
         resync_before = resyncs()
 
+        async def epoch_now():
+            r = await b1.owner_snapshot(port, "grid-proof")
+            return int((r or {}).get("gridEpoch") or 0)
+
+        # A request must speak the relay's language: it names the device taking the grid and asks for an
+        # epoch past the one committed. A hard-coded epoch is either stale (a rejection that looks like
+        # a product fault) or skips the ordering the contract is proving.
+        async def pin(cols, rows, device="device-a", label="Phone A"):
+            e = await epoch_now()
+            await relay.send({"t": "resize", "s": "grid-proof", "cols": cols, "rows": rows,
+                              "epoch": e + 1, "owner": device, "label": label})
+            return e + 1
+
         # T2: the relay asks for a device-owned grid.
-        await relay.send({"t": "resize", "s": "grid-proof", "cols": 60, "rows": 20, "epoch": 1})
-        moved = await wait_for(lambda: tab.saw("SIZE=60x20"), 12)
+        await pin(60, 20)
+        moved = await wait_for(lambda: tab.now_size() == (60, 20), 12)
         rows.check("T2 pty follows the remote resize", moved,
-                   "child reports 60x20" if moved else "child never reported 60x20")
+                   f"child now reports {tab.now_size()}")
+        # The mirror must take the phone's grid WITHOUT the local pane reclaiming it. The tee's own
+        # backstop is what would do that, so the assertion is on the tee's statements, not on the
+        # harness window (pywinpty reports the size it set, not the host's live console).
+        await asyncio.sleep(1.0)
+        no_reclaim = "owner=local reason=size" not in mux_log(mux)
+        rows.check("T2 no local size reclaim while pinned", no_reclaim,
+                   "no 'owner=local reason=size' in muxd.log")
 
         end = time.time() + 8
         committed = False
@@ -222,31 +268,51 @@ async def main():
             await asyncio.sleep(0.3)
         rows.check("T2 muxd commits 60x20", committed,
                    f"gridOwner={row.get('gridOwner') if row else None} epoch={row.get('gridEpoch') if row else None}")
+        # Geometry alone does not prove the handover: a `size` frame from the tee would set the same
+        # numbers while leaving the pane as the owner, which is the divergence this contract exists to
+        # end. The committed owner must be the device that asked.
+        rows.check("T2 muxd commits the device as owner",
+                   bool(row) and row.get("gridOwner") == "pin"
+                   and row.get("gridOwnerLabel") == "Phone A",
+                   f"gridOwner={row.get('gridOwner') if row else None} "
+                   f"label={row.get('gridOwnerLabel') if row else None}")
 
         # T2b: the ring was cleared, so a resync went out to viewers *because of this commit*.
         got_resync = resyncs() > resync_before
         rows.check("T2b resync after commit", got_resync,
                    f"{resync_before} -> {resyncs()} resync frame(s)")
 
-        # T3: a stale epoch must not move anything.
-        await relay.send({"t": "resize", "s": "grid-proof", "cols": 90, "rows": 25, "epoch": 1})
+        # T3: re-asserting the epoch that just committed must not move anything.
+        committed_epoch = await epoch_now()
+        await relay.send({"t": "resize", "s": "grid-proof", "cols": 90, "rows": 25,
+                          "epoch": committed_epoch, "owner": "device-b"})
         await asyncio.sleep(2.0)
         r = await b1.owner_snapshot(port, "grid-proof")
-        stale_ok = (r.get("cols"), r.get("rows")) == (60, 20) and tab.saw("SIZE=60x20")
-        rows.check("T3 stale epoch rejected", stale_ok,
-                   f"still {r.get('cols')}x{r.get('rows')}" if r else "no row")
+        stale_ok = ((r.get("cols"), r.get("rows")) == (60, 20)
+                    and int(r.get("gridEpoch") or 0) == committed_epoch)
+        rows.check("T3 stale epoch rejected", stale_ok and tab.now_size() == (60, 20),
+                   f"still {r.get('cols')}x{r.get('rows')} epoch={r.get('gridEpoch')} "
+                   f"pty={tab.now_size()}" if r else "no row")
 
         # T7: a newer epoch from another device wins.
-        await relay.send({"t": "resize", "s": "grid-proof", "cols": 100, "rows": 28, "epoch": 2})
+        await pin(100, 28, device="device-b", label="Phone B")
         rows.check("T7 newer epoch commits",
-                   await wait_for(lambda: tab.saw("SIZE=100x28"), 12),
-                   "child reports 100x28")
+                   await wait_for(lambda: tab.now_size() == (100, 28), 12),
+                   f"child now reports {tab.now_size()}")
+        r = await b1.owner_snapshot(port, "grid-proof")
+        rows.check("T7 last pin wins ownership",
+                   bool(r) and r.get("gridOwner") == "pin"
+                   and r.get("gridOwnerLabel") == "Phone B"
+                   and (r.get("cols"), r.get("rows")) == (100, 28),
+                   f"gridOwner={r.get('gridOwner') if r else None} "
+                   f"label={r.get('gridOwnerLabel') if r else None} "
+                   f"{r.get('cols') if r else None}x{r.get('rows') if r else None}")
 
         # T6: a local keystroke reclaims the pane's grid.
         tab.write("x")
-        reclaimed = await wait_for(lambda: tab.saw("SIZE=120x30"), 12)
+        reclaimed = await wait_for(lambda: tab.now_size() == (120, 30), 12)
         rows.check("T6 local key restores the pane", reclaimed,
-                   "child back at 120x30" if reclaimed else "child stuck off-pane")
+                   f"child now reports {tab.now_size()} pane={tab.pane_size()}")
         end = time.time() + 8
         owner_local = False
         while time.time() < end:
@@ -256,7 +322,31 @@ async def main():
                 break
             await asyncio.sleep(0.3)
         rows.check("T6 muxd reports local ownership", owner_local,
-                   f"gridOwner={r.get('gridOwner') if r else None}")
+                   f"gridOwner={r.get('gridOwner') if r else None} "
+                   f"{r.get('cols') if r else None}x{r.get('rows') if r else None}")
+        rows.check("T6 committed grid is the pane again",
+                   bool(r) and (r.get("cols"), r.get("rows")) == (120, 30),
+                   f"{r.get('cols') if r else None}x{r.get('rows') if r else None}")
+
+        grid_lines = [ln for ln in mux_log(mux).splitlines()
+                      if any(k in ln for k in ("owner=", "resize", "grid", "size"))]
+        print("\n--- muxd grid log ---")
+        print("\n".join(grid_lines[-25:]) or "(no grid lines)")
+        try:
+            tee_text = tee_log.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            tee_text = ""
+        tee_lines = [ln for ln in tee_text.splitlines()
+                     if any(k in ln for k in ("resize", "size", "activity", "remote", "pane"))]
+        print("--- muxtee grid log ---")
+        print("\n".join(tee_lines[-20:]) or "(no grid lines)")
+        # ConPTY answers a pseudoconsole resize by asking the TERMINAL to resize (CSI 8 ; rows ; cols t).
+        # A host that honours it moves the user's own pane, which would make "the pane is a view" a lie,
+        # so the sequence is evidence either way and is reported rather than assumed.
+        import re as _re
+        wreq = _re.findall(rb"\x1b\[8;(\d+);(\d+)t", tab.output())
+        print("--- upstream window-resize requests ---")
+        print([(int(a), int(b)) for a, b in wreq[-6:]] or "(none)")
 
         if rows.failed:
             print("\n--- muxd log ---\n" + mux_log(mux)[-3000:])
