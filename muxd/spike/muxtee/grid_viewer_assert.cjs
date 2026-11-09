@@ -98,16 +98,23 @@ async function installFrameTap(page) {
   });
 }
 
-// Cycle the size chip until the page reports the wanted mode, so a row never assumes the click order.
-async function setMode(page, mode) {
-  for (let i = 0; i < 4; i += 1) {
-    const s = await page.evaluate(() => { try { return tabFitMode; } catch (e) { return undefined; } });
-    if (s === mode) return true;
-    await page.evaluate(() => document.querySelector('#sizebtn').click());
-    await page.waitForTimeout(600);
+// The chip is a one-way ladder while the pane owns the grid: fill -> fit -> TAKE THE GRID. There is no
+// 'flex' mode any more (the transform is deleted), so the proof must not click in a loop - each extra
+// click is a pin or a release, and a loop turns the ownership it is trying to prove into a flap.
+async function clickChip(page) {
+  await page.evaluate(() => document.querySelector('#sizebtn').click());
+  await page.waitForTimeout(700);
+}
+
+async function waitForOwner(page, want, timeoutMs) {
+  const end = Date.now() + timeoutMs;
+  let s = await readState(page);
+  while (Date.now() < end) {
+    if (s.gridOwner === want) return s;
+    await page.waitForTimeout(250);
+    s = await readState(page);
   }
-  const s = await page.evaluate(() => { try { return tabFitMode; } catch (e) { return undefined; } });
-  return s === mode;
+  return s;
 }
 
 (async () => {
@@ -154,34 +161,41 @@ async function setMode(page, mode) {
       `gridOwner=${s.gridOwner} tabOwned=${s.tabOwned} transform=${s.transform} term=${s.cols}x${s.rows} host=${HOST_COLS}x${HOST_ROWS}`);
 
     // Local ownership must survive a mode change: fill and fit are pure rendering, so neither may put a
-    // resize on the wire nor move the grid off the pane's.
-    for (const mode of ['fill', 'fit']) {
-      const reached = await setMode(page, mode);
+    // resize on the wire nor move the grid off the pane's. The ladder is one-way (fill -> fit -> take),
+    // so only step to fit from fill.
+    const modeRow = async (mode, at) => {
       await page.waitForTimeout(1200);
       const m = await readState(page);
       check(`V1 ${mode} renders without taking the grid`,
-        reached && m.gridOwner === 'local' && m.cols === HOST_COLS && m.rows === HOST_ROWS
+        at === mode && m.gridOwner === 'local' && m.cols === HOST_COLS && m.rows === HOST_ROWS
         && m.resizeSends === 0 && Math.abs(m.sx - 1) < 1e-6 && Math.abs(m.sy - 1) < 1e-6,
-        `mode=${m.mode} reached=${reached} gridOwner=${m.gridOwner} term=${m.cols}x${m.rows} `
+        `mode=${m.mode} gridOwner=${m.gridOwner} term=${m.cols}x${m.rows} `
         + `host=${HOST_COLS}x${HOST_ROWS} resizeSends=${m.resizeSends} transform=${m.transform}`);
+    };
+    let mode = s.mode;
+    if (mode === 'fill') {
+      await modeRow('fill', mode);
+      await clickChip(page);
+      mode = (await readState(page)).mode;
     }
+    await modeRow('fit', mode);
 
-    check('V2 flex tap reaches the wire', await setMode(page, 'flex'),
-      `mode=${(await readState(page)).mode}`);
-    await page.waitForTimeout(3000);
-    const pinned = await readState(page);
-    const took = pinned.gridOwner === 'mine';
-    check('V2 flex takes the grid', took && pinned.cols !== s.cols,
-      `gridOwner=${pinned.gridOwner} mine=${pinned.mine} term=${pinned.cols}x${pinned.rows} chip=${JSON.stringify(pinned.chip)}`);
+    // The next tap is the handover, not a rendering mode. Wait for the ack-published owner: the page may
+    // not paint the new grid before muxd commits it (contract G2).
+    await clickChip(page);
+    const pinned = await waitForOwner(page, 'mine', 15000);
+    check('V2 the chip takes the grid', pinned.gridOwner === 'mine' && pinned.cols !== s.cols,
+      `gridOwner=${pinned.gridOwner} mine=${pinned.mine} term=${pinned.cols}x${pinned.rows} `
+      + `host=${HOST_COLS}x${HOST_ROWS} chip=${JSON.stringify(pinned.chip)}`);
     check('V3 no distortion while owned', pinned.gridOwner === 'mine' && Math.abs(pinned.sx - 1) < 1e-6 && Math.abs(pinned.sy - 1) < 1e-6,
       `gridOwner=${pinned.gridOwner} transform=${pinned.transform}`);
 
-    await page.evaluate(() => document.querySelector('#sizebtn').click());
-    await page.waitForTimeout(3000);
-    const released = await readState(page);
-    const back = released.gridOwner === 'local';
-    check('V4 release returns to local', back && released.cols === s.cols,
-      `gridOwner=${released.gridOwner} term=${released.cols}x${released.rows} chip=${JSON.stringify(released.chip)}`);
+    await clickChip(page);
+    const released = await waitForOwner(page, 'local', 15000);
+    check('V4 release returns to local', released.gridOwner === 'local'
+      && released.cols === HOST_COLS && released.rows === HOST_ROWS,
+      `gridOwner=${released.gridOwner} term=${released.cols}x${released.rows} `
+      + `host=${HOST_COLS}x${HOST_ROWS} chip=${JSON.stringify(released.chip)}`);
 
     await page.screenshot({ path: path.join(__dirname, 'grid-viewer-proof.png'), fullPage: false });
     const failed = rows.filter((r) => !r.ok).map((r) => r.id);
