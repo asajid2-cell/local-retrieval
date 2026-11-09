@@ -69,6 +69,11 @@ internal sealed class TeeEngine : IDisposable
     // merely echoes _remoteGrid is not the user's pane moving - it is our own resize coming back.
     private (int Cols, int Rows) _paneBeforeRemote;
     private (int Cols, int Rows) _remoteGrid;
+    // The last pane size read at a moment we could trust: a backstop fire, a completed restore, or the
+    // startup read. A device can take the grid again seconds after a release, while the console is still
+    // echoing; taking the pane from that read records the OLD DEVICE GRID as "the pane", and the next
+    // restore drags the user's pty back to it. This is the only source ApplyRemoteResize may use.
+    private (int Cols, int Rows) _paneTrusted;
     private readonly List<byte> _localCarry = new();
     // conhost echoes a pseudoconsole resize back through the tee's own console a few milliseconds
     // later, and two device resizes in a row queue two echoes. For a short window after any resize the
@@ -101,6 +106,9 @@ internal sealed class TeeEngine : IDisposable
 
     public void Start()
     {
+        // Seed the trusted pane size before any device can take the grid: at launch the pty IS the pane,
+        // so this read is the only one that is guaranteed to be the user's window and not an echo.
+        _paneTrusted = ReadPaneSizeTuple();
         // Threads first, then the child sees input - spec §5.1: INHERIT_CURSOR makes ConPTY ask the
         // OUTER terminal for the cursor via ESC[6n, and that reply arrives on our stdin, so T2/T3 must
         // already be running when the child draws its first frame.
@@ -366,6 +374,9 @@ internal sealed class TeeEngine : IDisposable
             if (cols == lastCols && rows == lastRows) return false;
             _pc.Resize(cols, rows);
             _remoteOwned = false;
+            // A backstop fire is the one moment the pane read is proven genuine: it differs from the
+            // applied grid, from the last seen size, and it arrives outside the settle window.
+            _paneTrusted = (cols, rows);
         }
         lastCols = cols;
         lastRows = rows;
@@ -388,10 +399,16 @@ internal sealed class TeeEngine : IDisposable
             lock (_resizeLock)
             {
                 pane = ReadPaneSizeTuple();
-                // Only the local -> remote transition records the pane. On a device -> device change
-                // the console is still echoing the previous device grid, so a fresh read would record
-                // the phone's size as "the pane" and every later restore would land on it.
-                if (!_remoteOwned && pane.Cols > 0 && pane.Rows > 0) _paneBeforeRemote = pane;
+                // Only the local -> remote transition records the pane, and only from the trusted size:
+                // a device can take the grid again while the console still echoes the last grid, so a
+                // fresh read here can be the previous device grid, not the pane. Recording that would
+                // make every later restore drag the user's pty back to a phone's size.
+                if (!_remoteOwned && _paneTrusted.Cols > 0 && _paneTrusted.Rows > 0)
+                    _paneBeforeRemote = _paneTrusted;
+                else if (!_remoteOwned && pane.Cols > 0 && pane.Rows > 0
+                         && !(pane.Cols == _remoteGrid.Cols && pane.Rows == _remoteGrid.Rows)
+                         && Environment.TickCount64 >= _settleUntilTicks)
+                    _paneBeforeRemote = pane;
                 _remoteGrid = (cols, rows);
                 _remoteOwned = true;
                 _settleUntilTicks = Environment.TickCount64 + 400;
@@ -434,6 +451,7 @@ internal sealed class TeeEngine : IDisposable
                 _remoteOwned = false;
                 _settleUntilTicks = Environment.TickCount64 + 800;
                 _pc.Resize(cols, rows);
+                _paneTrusted = (cols, rows);
             }
         }
         catch (Exception ex)
