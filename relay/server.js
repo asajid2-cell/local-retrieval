@@ -3945,6 +3945,17 @@ wssHost.on('connection', (ws, req) => {
         st.gridReq = retry;
         if (retry.owner === 'local') sendHost({ t: 'resize', s: n, epoch, owner: 'local' });
         else sendHost({ t: 'resize', s: n, cols: retry.cols, rows: retry.rows, epoch, owner: retry.owner, label: retry.label });
+      } else if (m.ok === false) {
+        // The retry was refused as well: this tab's tee cannot apply a grid (a muxtee that predates the
+        // handover ignores the resize and never acks, so every request times out). Drop the pin so the
+        // chip stops advertising a handover that will not happen and nothing keeps re-targeting a size
+        // the terminal cannot reach. The grid itself never moved - a refusal is not a commit.
+        if (req.owner !== 'local') {
+          const candidate = new Map(pins);
+          candidate.delete(n);
+          commitBestEffortPinCleanup(candidate, 'grid request refused');
+        }
+        recompute(n);
       }
     } else if (m.t === 'sb') {
       const n = strictMuxName(m.s); const st = sessions.get(n); if (!st) return;

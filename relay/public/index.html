@@ -2011,7 +2011,11 @@ function scheduleTabFitFollowup(){
 function fitTabOwnedGrid(){
   const host=$('#term');
   if(!host) return;
-  const owned = !!(sizeTabOwned && !sizePinned);
+  // Two ways the grid can be ours to lay out: the pane owns it (fill/fit are pure rendering), or THIS
+  // device owns it (then its grid IS its viewport, and the view must be 1:1 - no fill/fit, no scale).
+  const paneOwns = !!(sizeTabOwned && !sizePinned);
+  const weOwn = !!(sizePinned && sizeMine);
+  const owned = paneOwns || weOwn;
   host.classList.toggle('tabfit', owned);
   if(!owned){
     tabFitRejected=0; tabFitPaneW=-1; tabFitPaneH=-1; tabFitPaneMode='';
@@ -2023,12 +2027,15 @@ function fitTabOwnedGrid(){
   const availW=host.clientWidth-(parseFloat(cs.paddingLeft)||0)-(parseFloat(cs.paddingRight)||0);
   const availH=host.clientHeight-(parseFloat(cs.paddingTop)||0)-(parseFloat(cs.paddingBottom)||0);
   if(availW<80 || availH<60) return;
+  // The owning device ignores the fill/fit choice: its committed grid must span the viewport on BOTH
+  // axes, so the latch is keyed on its own mode and never on a mode the user picked while local.
+  const modeKey = weOwn ? 'own' : tabFitMode;
   // A real window resize re-opens the search. A scrollbar appearing does not: pan/rowpan are toggled by
   // this very fit, and a 15px clientWidth change would otherwise clear the latch on every step and send
   // the font back up to the size that just overflowed (seen live: fill bouncing to 17 with a pan bar).
   const paneMoved = Math.abs(availW-tabFitPaneW) > 24 || Math.abs(availH-tabFitPaneH) > 24;
-  if(tabFitPaneW<0 || paneMoved || tabFontScale!==tabFitPaneScale || tabFitMode!==tabFitPaneMode){
-    tabFitPaneScale=tabFontScale; tabFitPaneMode=tabFitMode; tabFitRejected=0;
+  if(tabFitPaneW<0 || paneMoved || tabFontScale!==tabFitPaneScale || modeKey!==tabFitPaneMode){
+    tabFitPaneScale=tabFontScale; tabFitPaneMode=modeKey; tabFitRejected=0;
   }
   tabFitPaneW=availW; tabFitPaneH=availH;
   const cell=cellMetrics();
@@ -2038,7 +2045,9 @@ function fitTabOwnedGrid(){
   const fitW = availW/(term.cols*(cell.w/appliedFont));
   const fitH = availH/(term.rows*(cell.h/appliedFont));
   if(!isFinite(fitW) || !isFinite(fitH) || fitW<=0 || fitH<=0) return;
-  const fill = tabFitMode !== 'fit';
+  // The owning device paints 1:1, so it fits BOTH axes whatever mode it had while local; that is what
+  // makes its grid span the screen instead of sitting left-aligned with a bezel on the right.
+  const fill = weOwn ? false : (tabFitMode !== 'fit');
   // 'fill' takes the width estimate and lets the height overflow (alignTerminalSurface keeps the bottom
   // rows - the status bar and leaf line - pinned in view, and the rest is a row scroll). 'fit' takes the
   // smaller estimate and lives with the margins.
@@ -2092,7 +2101,9 @@ function applyPan(){
   // .xterm element to the pane while the screen inside stays narrow - the "offset to the left" look.
   const cs=getComputedStyle(host);
   const innerW=host.clientWidth-(parseFloat(cs.paddingLeft)||0)-(parseFloat(cs.paddingRight)||0);
-  const panning = (sizeTabOwned && !sizePinned && term.cols)
+  // The owning device never pans: its committed grid is its own viewport, so there is nothing outside.
+  const weOwn = !!(sizePinned && sizeMine);
+  const panning = weOwn ? false : (sizeTabOwned && !sizePinned && term.cols)
     ? (term.cols*cellMetrics().w > innerW+1)
     : (winSize.cols > viewportFit.cols+1);
   host.classList.toggle('pan', panning);
@@ -2174,9 +2185,15 @@ function onControl(s){
   let m; try{ m=JSON.parse(s.slice(1)); }catch(e){ return; }
   winSize={cols:m.cols, rows:m.rows}; sizeModeLabel=m.modeLabel||'';
   sizeGridOwner = m.gridOwner || 'local'; sizeGridEpoch = Number.isInteger(m.gridEpoch) ? m.gridEpoch : 0; sizeGridOwnerLabel = m.gridOwnerLabel || '';
+  if(sizeGridOwner === 'mine' && _takeTimer){ clearTimeout(_takeTimer); _takeTimer = null; }
   const gridHeld = sizeGridOwner === 'mine' || sizeGridOwner === 'other';
-  sizePinned = m.mode==='pinned' || gridHeld;
-  sizeMine = sizePinned && (!!m.mine || sizeGridOwner === 'mine');
+  // Ownership is the COMMITTED grid, not the relay's pin record: a take is a request, and until muxd
+  // acks it the grid is still the pane's. Trusting the pin record made the chip claim a handover that
+  // had not happened, so the ladder stopped offering fill/fit and the next tap looked like a no-op.
+  const committedGrid = Object.prototype.hasOwnProperty.call(m, 'gridOwner');
+  sizePinned = committedGrid ? gridHeld : (m.mode === 'pinned');
+  sizeMine = committedGrid ? (sizeGridOwner === 'mine') : (sizePinned && !!m.mine);
+  if(_gridBusy && (sizePinned || sizeGridOwner === 'local')){ _gridBusy = null; clearTimeout(_takeTimer); _takeTimer = null; }
   sizeLocal = !!m.local; sizeTabOwned = !!m.tabOwned; sizePinLabel = m.pinLabel || sizeGridOwnerLabel; sizeClients = m.clients||[];
   // Presence, not truthiness: an old relay omits the field entirely, and that is the only case that falls
   // back to today's size-based classifier. A relay that sends it has told us the answer even when false.
@@ -2195,6 +2212,31 @@ function onControl(s){
 // Tap again when it's already yours = back to auto. Long-press = pin another connected device.
 // On a tab-owned grid there is no pin to offer (the PTY is the PC's screen), so the tap switches how this
 // device renders that fixed grid instead: fill the width, fit every row, or both at once.
+// The chip is a button: clicking it leaves focus ON it, and then the keyboard goes to the button
+// instead of the terminal. Every branch below hands the keyboard back.
+function refocusTerminal(){ try{ term.focus({preventScroll:true}); }catch(e){ try{ term.focus(); }catch(_){} } }
+let _takeTimer = null;
+let _gridBusy = null;          // 'take' | 'release' while a request is in flight
+function takeGrid(){
+  if(_gridBusy) return;
+  _gridBusy = 'take';
+  send('P', '');
+  flash('Taking this screen\'s grid');
+  clearTimeout(_takeTimer);
+  // A terminal whose muxtee predates grid ownership ignores the resize, so nothing ever acks. Say that
+  // plainly instead of leaving the chip spinning and the viewer stuck in a squashed fit mode.
+  _takeTimer = setTimeout(function(){
+    _takeTimer = null;
+    if(_gridBusy === 'take') _gridBusy = null;
+    if(sizeGridOwner === 'mine' || sizePinned) return;
+    flash('This tab\'s terminal cannot take the grid yet - open a new tab (its muxtee needs the update), then tap again');
+    if(tabFitMode !== 'fill'){
+      tabFitMode = 'fill'; LS.set('mux_tab_fit', tabFitMode);
+      try{ fitTabOwnedGrid(); applyPan(); updateSizeBtn(); }catch(e){}
+    }
+    refocusTerminal();
+  }, 8000);
+}
 function cycleSize(){
   if(sizeTabOwned && !sizePinned){
     // fill <-> fit change only how THIS device paints the pane's grid. The third tap TAKES the grid:
@@ -2204,13 +2246,26 @@ function cycleSize(){
       tabFitMode='fit'; LS.set('mux_tab_fit', tabFitMode);
       fitTabOwnedGrid(); applyPan(); scheduleTerminalSurfaceAlign(); updateMeta(); updateSizeBtn();
       flash('Fitting every row; side margins fill the rest');
+      refocusTerminal();
       return;
     }
-    send('P', '');
-    flash('Taking this screen\'s grid');
+    takeGrid();
+    refocusTerminal();
     return;
   }
-  send('P', (sizePinned && sizeMine) ? '0' : '');
+  if(_gridBusy) return;
+  const releasing = !!(sizePinned && sizeMine);
+  _gridBusy = releasing ? 'release' : 'take';
+  send('P', releasing ? '0' : '');
+  clearTimeout(_takeTimer); _takeTimer = null;
+  _takeTimer = setTimeout(function(){
+    _takeTimer = null;
+    if(_gridBusy) _gridBusy = null;
+    if(releasing && sizePinned && sizeMine){
+      flash('The PC has not given the grid back yet - tap again, or press a key on the PC');
+    }
+  }, 8000);
+  refocusTerminal();
 }
 function pinToOtherDevice(){
   const others = (sizeClients||[]).filter(c=> (c.dev||('sock-'+c.id)) !== deviceId);
