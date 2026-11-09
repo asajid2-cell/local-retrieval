@@ -6796,6 +6796,10 @@ async def main():
                                                 m.get("epoch"), requester, m.get("label", ""),
                                             ):
                                                 await save_manifest(sessions)
+                                            else:
+                                                # Tell the relay so it can retry once at the current
+                                                # epoch + 1: its pin record outlives a relay restart.
+                                                _grid_report(session, m.get("epoch"), False, "stale epoch")
                                     else:
                                         apply_remote_session_size(session, m)
                                 elif t == "redraw" and name in sessions:

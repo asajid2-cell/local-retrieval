@@ -43,6 +43,18 @@ class EpochTest(unittest.TestCase):
         self.assertEqual(s.sent, [], "a rejected request sends nothing to the tee")
         self.assertTrue(muxd.owner_request_grid(s, 100, 40, 5, "devA"))
 
+    def test_a_stale_request_is_reported_so_the_relay_can_retry(self):
+        # The relay's pin record persists across its own restart; muxd's epoch has moved. Without the
+        # report the relay never learns its request lost, and the pin looks like a dead button.
+        s = make_stream()
+        s.grid_epoch = 9
+        self.assertFalse(muxd.owner_request_grid(s, 100, 40, 9, "devA"))
+        muxd._grid_report(s, 9, False, "stale epoch")
+        reports = [f for kind, _n, f in s.frames.items if kind == "gridAck"]
+        self.assertEqual(len(reports), 1)
+        self.assertIn('"epoch": 9', reports[0])
+        self.assertIn('"ok": false', reports[0])
+
     def test_g4_a_late_ack_for_an_older_request_cannot_roll_the_grid_back(self):
         s = make_stream()
         commit(s, 100, 40, 2)
