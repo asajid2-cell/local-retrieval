@@ -1,7 +1,7 @@
 """Grid ownership acceptance: the muxd state machine of GRID-OWNERSHIP-CONTRACT.md (2026-11-09).
 
-Base: 39d5efa (leaf17/p2-b-positional-cut, frozen). Implementation under test: 8379e13, the muxd
-layer of leaf17/grid-ownership. LANDED-ON: 8379e1365cbe002d9705ee2072edde252a0cf8dd.
+Base: leaf17/grid-ownership 07616ad (all three layers; P2-B 39d5efa is an ancestor).
+LANDED-ON: 07616ad (implementation head recorded at landing).
 
 Rows drive the production API directly - no aliases, no test-only seams:
     owner_request_grid(owner, cols, rows, epoch, device, label)
