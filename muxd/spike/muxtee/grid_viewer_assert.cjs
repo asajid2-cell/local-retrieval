@@ -56,10 +56,11 @@ async function readState(page) {
       cols: g('term.cols'), rows: g('term.rows'), fontSize: g('term.options.fontSize'),
       transform: tf, sx, sy,
       winSize: g('winSize'), tabOwned: g('sizeTabOwned'), pinned: g('sizePinned'),
-      mine: g('sizeMine'), modeLabel: g('sizeModeLabel'),
+      mine: g('sizeMine'), modeLabel: g('sizeModeLabel'), mode: g('tabFitMode'),
       gridOwner: d && d.gridOwner, gridEpoch: d && d.gridEpoch,
       chip: (document.querySelector('#sizebtn') || {}).textContent || '',
       dFrames: (window.__d || []).length,
+      resizeSends: (window.__sent || []).filter((f) => f && f.t === 'resize').length,
     };
   });
 }
@@ -67,6 +68,9 @@ async function readState(page) {
 async function installFrameTap(page) {
   await page.evaluate(() => {
     window.__d = [];
+    // What this viewer ASKS muxd for. Local ownership means no resize request, whatever the render
+    // mode: a mode that reaches the wire has already taken the grid.
+    window.__sent = [];
     const grab = () => {
       try {
         if (typeof ws === 'undefined' || !ws) return false;
@@ -76,12 +80,34 @@ async function installFrameTap(page) {
             try { window.__d.push(JSON.parse(s.slice(1))); } catch (_) {}
           }
         });
+        if (!ws.__tapSend) {
+          const send = ws.send.bind(ws);
+          ws.__tapSend = true;
+          ws.send = (payload) => {
+            try {
+              if (typeof payload === 'string' && payload[0] === '{') window.__sent.push(JSON.parse(payload));
+            } catch (_) {}
+            return send(payload);
+          };
+        }
         return true;
       } catch (_) { return false; }
     };
     grab();
     window.__tap = setInterval(grab, 200);
   });
+}
+
+// Cycle the size chip until the page reports the wanted mode, so a row never assumes the click order.
+async function setMode(page, mode) {
+  for (let i = 0; i < 4; i += 1) {
+    const s = await page.evaluate(() => { try { return tabFitMode; } catch (e) { return undefined; } });
+    if (s === mode) return true;
+    await page.evaluate(() => document.querySelector('#sizebtn').click());
+    await page.waitForTimeout(600);
+  }
+  const s = await page.evaluate(() => { try { return tabFitMode; } catch (e) { return undefined; } });
+  return s === mode;
 }
 
 (async () => {
@@ -127,7 +153,21 @@ async function installFrameTap(page) {
     check('V1 local ownership', localOwner && Math.abs(s.sx - 1) < 1e-6 && Math.abs(s.sy - 1) < 1e-6,
       `gridOwner=${s.gridOwner} tabOwned=${s.tabOwned} transform=${s.transform} term=${s.cols}x${s.rows} host=${HOST_COLS}x${HOST_ROWS}`);
 
-    await page.evaluate(() => document.querySelector('#sizebtn').click());
+    // Local ownership must survive a mode change: fill and fit are pure rendering, so neither may put a
+    // resize on the wire nor move the grid off the pane's.
+    for (const mode of ['fill', 'fit']) {
+      const reached = await setMode(page, mode);
+      await page.waitForTimeout(1200);
+      const m = await readState(page);
+      check(`V1 ${mode} renders without taking the grid`,
+        reached && m.gridOwner === 'local' && m.cols === HOST_COLS && m.rows === HOST_ROWS
+        && m.resizeSends === 0 && Math.abs(m.sx - 1) < 1e-6 && Math.abs(m.sy - 1) < 1e-6,
+        `mode=${m.mode} reached=${reached} gridOwner=${m.gridOwner} term=${m.cols}x${m.rows} `
+        + `host=${HOST_COLS}x${HOST_ROWS} resizeSends=${m.resizeSends} transform=${m.transform}`);
+    }
+
+    check('V2 flex tap reaches the wire', await setMode(page, 'flex'),
+      `mode=${(await readState(page)).mode}`);
     await page.waitForTimeout(3000);
     const pinned = await readState(page);
     const took = pinned.gridOwner === 'mine';
