@@ -41,7 +41,31 @@ internal sealed class TeeEngine : IDisposable
     // frames it would have queued. P1 never reads it; the field exists so P2's contract is unchanged.
     public bool NeedResync { get; private set; }
     public int ExitCode { get; private set; }
-    public MuxLink? Link { get; set; }
+
+    private MuxLink? _link;
+    // Setting the link wires it to this pty: a remote resize is applied HERE (the link has no pty), and
+    // the pane's geometry is read live so every size frame and ack carries it.
+    public MuxLink? Link
+    {
+        get => _link;
+        set
+        {
+            _link = value;
+            if (value is not null)
+            {
+                value.ApplyResize = ApplyRemoteResize;
+                value.RestorePane = RestorePaneLocal;
+                value.PaneSize = ReadPaneSizeTuple;
+            }
+        }
+    }
+
+    // Contract section 5a: true while a remote device owns the grid. The first local key or mouse event
+    // restores the pane locally - the PTY, not just muxd's record - because TryResize compares the pane
+    // against its own last seen size and would never fire after a remote resize.
+    private bool _remoteOwned;
+    private long _lastActivityAt;
+    private readonly object _resizeLock = new();
 
     private readonly ManualResetEventSlim _childExited = new(false);
     private Thread? _t1, _t2, _t3;
@@ -177,6 +201,11 @@ internal sealed class TeeEngine : IDisposable
                 raw.Clear();
                 for (int i = 0; i < count; i++)
                 {
+                    // Contract 5a: the physical hand at the pane always wins. Keys and mouse records both
+                    // count; the restore is once, the activity report is rate-limited inside.
+                    if (records[i].EventType == ConsoleApi.KEY_EVENT
+                        || records[i].EventType == ConsoleApi.MOUSE_EVENT)
+                        NoteLocalInput();
                     if (records[i].EventType == ConsoleApi.KEY_EVENT)
                     {
                         var k = records[i].KeyEvent;
@@ -246,26 +275,92 @@ internal sealed class TeeEngine : IDisposable
         pending.Clear();
     }
 
+    // The WT viewport, read srWindow (NOT dwSize - under a ConPTY the buffer is viewport-sized and
+    // dwSize is the maximum window, which is not the size the user sees).
+    private bool TryReadPaneSize(out short cols, out short rows)
+    {
+        cols = rows = 0;
+        if (!ConsoleApi.GetConsoleScreenBufferInfo(_modes.Stdout, out var info)) return false;
+        cols = (short)(info.srWindow.Right - info.srWindow.Left + 1);
+        rows = (short)(info.srWindow.Bottom - info.srWindow.Top + 1);
+        return cols > 0 && rows > 0;
+    }
+
+    private (int Cols, int Rows) ReadPaneSizeTuple()
+        => TryReadPaneSize(out var c, out var r) ? (c, r) : (0, 0);
+
     private bool TryResize(ref short lastCols, ref short lastRows)
     {
-        // Invariant 3: the local terminal owns size; the inner pty always matches the WT viewport. No
-        // remote path may call this. Read srWindow, NOT dwSize - under a ConPTY the buffer is
-        // viewport-sized and dwSize is the maximum window, which is not the size the user sees.
-        if (!ConsoleApi.GetConsoleScreenBufferInfo(_modes.Stdout, out var info)) return false;
-        var cols = (short)(info.srWindow.Right - info.srWindow.Left + 1);
-        var rows = (short)(info.srWindow.Bottom - info.srWindow.Top + 1);
-        if (cols <= 0 || rows <= 0) return false;
+        // The local pane owns the grid by default. While a remote device owns it this still runs (the
+        // window may be dragged underneath), and the pane's new size is simply reported as a local
+        // statement - which is what reclaims the grid.
+        if (!TryReadPaneSize(out var cols, out var rows)) return false;
         if (cols == lastCols && rows == lastRows) return false;
         lastCols = cols;
         lastRows = rows;
-        _pc.Resize(cols, rows);
-        // The mirror must follow the window the user is actually looking at. The relay cannot resize a
-        // stream owner from the web, so the tab is the only source of its geometry and it has to say so
-        // on every change - silence here means viewers keep rendering at the size the tab happened to be
-        // at when muxtee started.
+        lock (_resizeLock) { _pc.Resize(cols, rows); }
+        _remoteOwned = false;
+        // The mirror must follow the window the user is actually looking at. The tab is the default
+        // source of its geometry and it has to say so on every change - silence here means viewers keep
+        // rendering at the size the tab happened to be at when muxtee started.
         Link?.SetSize(cols, rows);
         _log($"resize inner pty to {cols}x{rows}");
         return true;
+    }
+
+    // Contract 5a: the local pane reclaims the grid. Called from the receive half when muxd asks.
+    private (bool Ok, int Cols, int Rows, int PaneCols, int PaneRows) ApplyRemoteResize(int cols, int rows, long epoch)
+    {
+        var pane = ReadPaneSizeTuple();
+        try
+        {
+            lock (_resizeLock) { _pc.Resize((short)cols, (short)rows); }
+        }
+        catch (Exception ex)
+        {
+            _log("remote resize failed: " + ex.Message);
+            return (false, 0, 0, pane.Cols, pane.Rows);
+        }
+        // A remote resize never touches lastCols/lastRows: those track the pane, and moving them would
+        // make the 250 ms backstop immediately undo the phone's grid. It does mean TryResize cannot
+        // notice the pane changing back; _remoteOwned drives the restore instead (NoteLocalInput).
+        _remoteOwned = true;
+        // The ring's bytes are at the old width and cannot be honestly replayed: clear it, and the app
+        // repaints itself at the new grid.
+        Link?.ReplaceHistory(Array.Empty<byte>());
+        _log($"remote resize pty to {cols}x{rows} epoch={epoch}");
+        return (true, cols, rows, pane.Cols, pane.Rows);
+    }
+
+    // Contract 5a: restore the pane's pty and report it. Shared by the first local key and by an
+    // explicit muxd release, which is why the release frame carries no geometry at all.
+    private (bool Ok, int Cols, int Rows, int PaneCols, int PaneRows) RestorePaneLocal(long epoch)
+    {
+        if (!TryReadPaneSize(out var cols, out var rows))
+            return (false, 0, 0, 0, 0);
+        _remoteOwned = false;
+        try { lock (_resizeLock) { _pc.Resize(cols, rows); } }
+        catch (Exception ex)
+        {
+            _log("pane restore resize failed: " + ex.Message);
+            return (false, 0, 0, cols, rows);
+        }
+        Link?.SetSize(cols, rows);
+        // The ring's bytes are at the remote width: clear it and let the app repaint at the pane grid.
+        Link?.ReplaceHistory(Array.Empty<byte>());
+        _log($"pane restored to {cols}x{rows} epoch={epoch}");
+        return (true, cols, rows, cols, rows);
+    }
+
+    // A local key or mouse event. The first one after a remote resize restores the pane's PTY locally;
+    // every one at most once a second tells muxd the physical hand is here (it reclaims ownership).
+    private void NoteLocalInput()
+    {
+        if (_remoteOwned) RestorePaneLocal(0);
+        long now = Environment.TickCount64;
+        if (now - _lastActivityAt < 1000) return;      // rate-limited: a typing burst is one signal
+        _lastActivityAt = now;
+        Link?.SendActivity();
     }
 
     // ---- T3 -------------------------------------------------------------------------------------

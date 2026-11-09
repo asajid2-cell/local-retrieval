@@ -133,6 +133,94 @@ internal sealed class MuxLink : IDisposable
         try { _outWake.Release(); } catch (SemaphoreFullException) { }
     }
 
+    // Grid ownership (GRID-OWNERSHIP-CONTRACT.md). The engine owns the pty, so the link asks it to apply
+    // a remote resize and echoes exactly what landed. The tuple is (ok, applied cols, applied rows,
+    // pane cols, pane rows); a null delegate (no pty, or a unit test) answers ok:false.
+    public Func<int, int, long, (bool Ok, int Cols, int Rows, int PaneCols, int PaneRows)>? ApplyResize;
+
+    // muxd -> tee: a release ("owner":"local", no geometry). Only the tee can read the pane, so it
+    // restores it and reports the size it landed on; this is the same path as the first-local-key
+    // reclaim (contract section 5a).
+    public Func<long, (bool Ok, int Cols, int Rows, int PaneCols, int PaneRows)>? RestorePane;
+
+    internal static string ResizeOwner(JsonElement root)
+        => root.TryGetProperty("owner", out var o) && o.ValueKind == JsonValueKind.String
+            ? (o.GetString() ?? "")
+            : "";
+
+    // A release is owner:"local" (contract section 4) or a frame with no geometry at all. A frame that
+    // names geometry without an owner applies, so an older sender cannot be mistaken for a release.
+    internal static bool IsRelease(string owner, int cols, int rows)
+        => owner == "local" || (owner.Length == 0 && (cols <= 0 || rows <= 0));
+
+    // The local pane's geometry, read live. Sent with every size frame and ack so muxd can publish a
+    // committed geometry on a release even if the tee is momentarily silent.
+    public Func<(int Cols, int Rows)>? PaneSize;
+
+    // muxd -> tee: the owning device asked for a geometry. The engine applies it, then this answers
+    // sizeAck and clears the ring (kind 0x03, empty) - pre-resize bytes are at another width and
+    // cannot be honestly replayed. Never blocks T1: this runs on the receive half.
+    private void HandleResize(JsonElement root)
+    {
+        int cols = root.TryGetProperty("cols", out var c) && c.TryGetInt32(out var ci) ? ci : 0;
+        int rows = root.TryGetProperty("rows", out var r) && r.TryGetInt32(out var ri) ? ri : 0;
+        long epoch = root.TryGetProperty("epoch", out var e) && e.TryGetInt64(out var el) ? el : 0;
+        var pane = PaneSize?.Invoke() ?? (0, 0);
+        (bool Ok, int Cols, int Rows, int PaneCols, int PaneRows) result =
+            (false, cols, rows, pane.Item1, pane.Item2);
+        if (IsRelease(ResizeOwner(root), cols, rows))
+        {
+            // Release: restore the pane. The echoed geometry is the pane, not a requested size.
+            if (RestorePane is not null)
+            {
+                try { result = RestorePane(epoch); }
+                catch (Exception ex) { _log("mux link restore failed: " + ex.Message); }
+            }
+        }
+        else if (cols > 0 && rows > 0 && ApplyResize is not null)
+        {
+            try { result = ApplyResize(cols, rows, epoch); }
+            catch (Exception ex) { _log("mux link resize failed: " + ex.Message); }
+        }
+        var ack = SizeAckFrame(epoch, result.Ok, result.Cols, result.Rows, result.PaneCols, result.PaneRows);
+        _outText.Enqueue(ack);
+        try { _outWake.Release(); } catch (SemaphoreFullException) { }
+    }
+
+    // The wire shapes are the contract; split out so a unit test can pin them without a socket.
+    internal static string SizeFrame(int cols, int rows)
+        => "{\"t\":\"size\",\"cols\":" + cols + ",\"rows\":" + rows + "}";
+
+    internal static string ActivityFrame() => "{\"t\":\"activity\"}";
+
+    internal static string SizeAckFrame(long epoch, bool ok, int cols, int rows, int paneCols, int paneRows)
+        => "{\"t\":\"sizeAck\",\"epoch\":" + epoch +
+           ",\"cols\":" + cols + ",\"rows\":" + rows +
+           ",\"ok\":" + (ok ? "true" : "false") +
+           ",\"paneCols\":" + paneCols + ",\"paneRows\":" + paneRows + "}";
+
+    // The local pane is authoritative again (or has just changed): announce it even when the size is
+    // unchanged relative to the last hello, because a remote resize never moved _cols/_rows.
+    public void SendSize(int cols, int rows)
+    {
+        if (cols <= 0 || rows <= 0) return;
+        _cols = cols;
+        _rows = rows;
+        var ws = _ws;
+        if (ws is null || ws.State != WebSocketState.Open) return;
+        _outText.Enqueue(SizeFrame(cols, rows));
+        try { _outWake.Release(); } catch (SemaphoreFullException) { }
+    }
+
+    // A local key or mouse event was seen. Text, so it cannot be dropped behind the binary ingest queue.
+    public void SendActivity()
+    {
+        var ws = _ws;
+        if (ws is null || ws.State != WebSocketState.Open) return;
+        _outText.Enqueue(ActivityFrame());
+        try { _outWake.Release(); } catch (SemaphoreFullException) { }
+    }
+
     public void Start()
     {
         _send = Task.Run(SendLoop);
@@ -361,6 +449,11 @@ internal sealed class MuxLink : IDisposable
                 case "redraw":
                     // muxd saw the screen and its ring disagree; the caller re-sends history.
                     try { WatchChanged?.Invoke(); } catch (Exception ex) { _log("redraw hook: " + ex.Message); }
+                    break;
+                case "resize":
+                    // The device that owns the grid changed size (or reclaimed it). Only muxd issues
+                    // this; the engine applies it and the ack echoes the epoch it satisfies.
+                    HandleResize(root);
                     break;
                 case "kill":
                     // Remote kill of a local tab is not wired in P2; the local terminal owns its lifetime.

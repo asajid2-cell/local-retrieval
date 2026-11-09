@@ -4035,7 +4035,9 @@ def owner_reclaim_local(owner, reason="activity"):
     epoch = _grid_next_epoch(owner)
     owner.grid_pending = {"epoch": epoch, "cols": size[0], "rows": size[1],
                           "device": "", "label": "", "local": True, "at": time.time()}
-    owner._send_owner({"t": "resize", "epoch": epoch, "cols": size[0], "rows": size[1]})
+    # Release carries no geometry: only the tee can read the pane, and this is the same restore path as
+    # the first-local-key reclaim (contract section 5a). The ack brings the pane geometry back.
+    owner._send_owner({"t": "resize", "epoch": epoch, "owner": "local"})
     # The transition itself is the rate limit: once the reclaim is in flight a typing burst is a
     # no-op and logs nothing, so this line appears at most once per reclaim.
     log(f"[{owner.name}] owner=local reason={reason}")

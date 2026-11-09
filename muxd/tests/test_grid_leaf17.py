@@ -129,12 +129,24 @@ class ReclaimTest(unittest.TestCase):
         self.assertEqual(s.grid_owner, "devA")
         self.assertEqual((s.cols, s.rows), (100, 40))
         self.assertEqual(s.grid_epoch, 1, "a reclaim does not burn an epoch before the ack")
-        self.assertEqual(s.sent[-1], {"t": "resize", "epoch": 2, "cols": 120, "rows": 30})
+        # A release carries no geometry: only the tee can read the pane (contract section 4).
+        self.assertEqual(s.sent[-1], {"t": "resize", "epoch": 2, "owner": "local"})
 
         self.assertTrue(muxd.owner_size_ack(s, {"epoch": 2, "cols": 120, "rows": 30, "ok": True}))
         self.assertEqual(s.grid_owner, "")
         self.assertEqual((s.cols, s.rows), (120, 30))
         self.assertEqual(s.grid_epoch, 2)
+
+    def test_t6_the_restore_frame_is_local_and_carries_no_geometry(self):
+        s = make_stream()
+        s.pane_cols, s.pane_rows = 120, 30
+        commit(s, 100, 40, 1, "devA")
+        self.assertTrue(muxd.owner_reclaim_local(s, reason="release"))
+        frame = s.sent[-1]
+        self.assertEqual(frame, {"t": "resize", "epoch": 2, "owner": "local"},
+                         "a release must not dictate the pane size; only the tee knows it")
+        self.assertNotIn("cols", frame)
+        self.assertNotIn("rows", frame)
 
     def test_t6_a_second_activity_before_the_ack_is_a_no_op(self):
         s = make_stream()
