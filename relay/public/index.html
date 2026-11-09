@@ -2027,31 +2027,32 @@ function fitTabOwnedGrid(){
   const availW=host.clientWidth-(parseFloat(cs.paddingLeft)||0)-(parseFloat(cs.paddingRight)||0);
   const availH=host.clientHeight-(parseFloat(cs.paddingTop)||0)-(parseFloat(cs.paddingBottom)||0);
   if(availW<80 || availH<60) return;
-  // The owning device ignores the fill/fit choice: its committed grid must span the viewport on BOTH
-  // axes, so the latch is keyed on its own mode and never on a mode the user picked while local. It
-  // also ignores the persisted zoom: a native paint is a whole-pixel font, so a stale `mux_tab_font`
-  // cannot leave the owned view fractionally scaled (and it must not, once the grid was chosen for it).
-  const zoom = weOwn ? 1 : tabFontScale;
-  const modeKey = weOwn ? 'own' : tabFitMode;
+  // OWNING DEVICE. It is 1:1 at a whole-pixel font THIS device chose, and the grid was derived from
+  // that font - so the font is authoritative and is never re-fitted against the committed grid. A pane
+  // change is a new grid REQUEST, not a new font. Letting the search shrink the font to fit the old grid
+  // (seen live: font 10 at a 1084px pane) then made the re-measure ask for a grid of 5px cells.
+  if(weOwn){
+    const nativeFont = Math.max(8, Math.min(48, Math.round(fontSize)));
+    if(appliedFont !== nativeFont){
+      appliedFont = nativeFont;
+      try{ term.options.fontSize = nativeFont; }catch(e){}
+    }
+    const moved = tabFitPaneW>=0
+      && (Math.abs(availW-tabFitPaneW) > 1 || Math.abs(availH-tabFitPaneH) > 1);
+    tabFitPaneW=availW; tabFitPaneH=availH;
+    tabFitPaneMode='own'; tabFitPaneScale=1; tabFitRejected=0;
+    if(moved){ try{ requestNativeRemeasure(); }catch(e){} }
+    return;
+  }
+  // PANE-OWNED. fill/fit only change how this fixed grid is painted.
+  const modeKey = tabFitMode;
   // A real window resize re-opens the search. A scrollbar appearing does not: pan/rowpan are toggled by
   // this very fit, and a 15px clientWidth change would otherwise clear the latch on every step and send
   // the font back up to the size that just overflowed (seen live: fill bouncing to 17 with a pan bar).
-  // The owner never pans, so it has no such feedback loop and re-opens on any real move.
   const paneMoved = tabFitPaneW>=0
-    && (Math.abs(availW-tabFitPaneW) > (weOwn ? 1 : 24)
-     || Math.abs(availH-tabFitPaneH) > (weOwn ? 1 : 24));
-  if(tabFitPaneW<0 || paneMoved || zoom!==tabFitPaneScale || modeKey!==tabFitPaneMode){
-    tabFitPaneScale=zoom; tabFitPaneMode=modeKey; tabFitRejected=0;
-  }
-  if(weOwn && paneMoved){
-    // A viewport change while owning is a NEW GRID REQUEST, not a new font. Keep the native font and
-    // re-report the host's own dimensions so muxd commits a grid for it; stretching the old grid here is
-    // what made a rotation or a window resize look non-native. RETURN: letting the font search run on
-    // the old grid first shrinks the font to fit it (seen live: font 10 at a 1084px pane), and then the
-    // re-measure inherits that shrink and requests a grid of 216 columns of 5px cells.
-    tabFitPaneW=availW; tabFitPaneH=availH;
-    try{ requestNativeRemeasure(); }catch(e){}
-    return;
+    && (Math.abs(availW-tabFitPaneW) > 24 || Math.abs(availH-tabFitPaneH) > 24);
+  if(tabFitPaneW<0 || paneMoved || tabFontScale!==tabFitPaneScale || modeKey!==tabFitPaneMode){
+    tabFitPaneScale=tabFontScale; tabFitPaneMode=modeKey; tabFitRejected=0;
   }
   tabFitPaneW=availW; tabFitPaneH=availH;
   const cell=cellMetrics();
@@ -2061,19 +2062,16 @@ function fitTabOwnedGrid(){
   const fitW = availW/(term.cols*(cell.w/appliedFont));
   const fitH = availH/(term.rows*(cell.h/appliedFont));
   if(!isFinite(fitW) || !isFinite(fitH) || fitW<=0 || fitH<=0) return;
-  // The owning device paints 1:1, so it fits BOTH axes whatever mode it had while local; that is what
-  // makes its grid span the screen instead of sitting left-aligned with a bezel on the right.
-  const fill = weOwn ? false : (tabFitMode !== 'fit');
+  const fill = (tabFitMode !== 'fit');
   // 'fill' takes the width estimate and lets the height overflow (alignTerminalSurface keeps the bottom
   // rows - the status bar and leaf line - pinned in view, and the rest is a row scroll). 'fit' takes the
   // smaller estimate and lives with the margins.
   const fitFont = fill ? fitW : Math.min(fitW, fitH);
 
-  if(zoom !== 1){
+  if(tabFontScale !== 1){
     // A zoomed view is the viewer's own choice: apply it exactly (fractionally, so every press of A+/A-
     // is visible instead of being rounded back to the size it already had) and let pan/rowpan follow.
-    // The owning device never reaches this branch (zoom is pinned to 1 there): its paint is native.
-    const want = Math.max(4, Math.min(48, Math.round(fitFont*zoom*10)/10));
+    const want = Math.max(4, Math.min(48, Math.round(fitFont*tabFontScale*10)/10));
     if(Math.abs(want-appliedFont) < 0.05) return;
     appliedFont=want;
     try{ term.options.fontSize=want; }catch(e){}
@@ -2266,16 +2264,33 @@ let _paintReady = false;       // first 'd' after attach always repaints; after 
 // element is exactly the committed grid's width, which can be wider than the pane, and the fit addon
 // measures the element - so it proposes MORE columns for a NARROWER window (seen live: 203 columns at
 // 1440px, 217 proposed at 1100px). The host box is the viewport; that is what the grid must come from.
-function nativeDims(){
+function nativeDims(cell){
   const host=$('#term'); if(!host) return null;
   const cs=getComputedStyle(host);
   const availW=host.clientWidth-(parseFloat(cs.paddingLeft)||0)-(parseFloat(cs.paddingRight)||0);
   const availH=host.clientHeight-(parseFloat(cs.paddingTop)||0)-(parseFloat(cs.paddingBottom)||0);
-  const cell=cellMetrics();
+  cell = cell || cellMetrics();
   if(!(cell.w>0) || !(cell.h>0) || availW<80 || availH<60) return null;
   const dim={ cols: Math.max(10, Math.floor(availW/cell.w)), rows: Math.max(3, Math.floor(availH/cell.h)) };
   try{ (window.__ndLog=window.__ndLog||[]).push({t:Math.round(performance.now()),w:Math.round(availW),h:Math.round(availH),cw:Math.round(cell.w*100)/100,ch:Math.round(cell.h*100)/100,cols:dim.cols,rows:dim.rows}); if(window.__ndLog.length>40) window.__ndLog.shift(); }catch(e){}
   return dim;
+}
+// Cell metrics only refresh after the renderer repaints at the new font, and on a cold page the first
+// reads can still describe a fallback face (seen live: a 6px cell at a 14px font, which produced a
+// 235-column grid and then a font search that shrank the font to make it fit). A monospace cell is
+// ~0.5-0.7 em wide and 1.0-1.45 em tall; anything outside that is not this font yet, so wait a frame
+// (bounded). Sending a good grid late beats sending a wrong one fast.
+function withNativeCell(cb){
+  const want = appliedFont>0 ? appliedFont : fontSize;
+  const t0 = performance.now();
+  const step = () => {
+    const cell = cellMetrics();
+    const em = cell.w/want, eh = cell.h/want;
+    const sane = cell.w>0 && cell.h>0 && em>=0.5 && em<=0.7 && eh>=1.0 && eh<=1.45;
+    if(sane || performance.now()-t0 > 700){ cb(sane ? cell : null); return; }
+    requestAnimationFrame(step);
+  };
+  step();
 }
 function sendViewport(dim){
   viewportFit={cols:dim.cols, rows:dim.rows};
@@ -2297,19 +2312,21 @@ function takeGrid(){
   flash('Taking this screen\'s grid');
   window.__muxGridTiming = { clickAt: Math.round(performance.now()), ackAt: 0 };
   clearTimeout(_takeTimer);
-  // Set the whole-pixel font now, let the renderer measure it (two frames), then report the grid that
-  // font yields and request exactly that. Two frames of local latency buys a grid that paints 1:1.
-  requestAnimationFrame(()=>requestAnimationFrame(()=>{
+  // Set the whole-pixel font, wait for the renderer to actually measure THAT font, then report the
+  // grid it yields and request exactly that. A few frames of local latency buys a grid that paints 1:1.
+  requestAnimationFrame(()=>{
     if(_gridBusy !== 'take') return;
-    try{
-      const want = Math.max(8, Math.min(48, Math.round(fontSize*(tabFontScale||1))));
-      if(Number.isFinite(want) && Math.abs(appliedFont-want) > 0.01){
-        appliedFont = want;
-        try{ term.options.fontSize = want; }catch(e){}
-      }
-      const dim=nativeDims();
-      if(dim) sendViewport(dim);
-    }catch(e){}
+    const want = Math.max(8, Math.min(48, Math.round(fontSize)));
+    if(Number.isFinite(want) && Math.abs(appliedFont-want) > 0.01){
+      appliedFont = want;
+      try{ term.options.fontSize = want; }catch(e){}
+    }
+    withNativeCell((cell)=>{
+    if(_gridBusy !== 'take') return;
+    let dim=null;
+    if(cell) dim=nativeDims(cell);
+    else { try{ dim=fit.proposeDimensions(); }catch(e){} }
+    if(dim && dim.cols>10 && dim.rows>3) sendViewport(dim);
     if(send('P', '') === 'dropped'){
       // A reconnect ate the request. Do not leave the chip spinning for 8 s and then blame the muxtee.
       _gridBusy = null; _takeTimer = null;
@@ -2331,20 +2348,23 @@ function takeGrid(){
       updateSizeBtn();
       refocusTerminal();
     }, 8000);
-  }));
+    });
+  });
 }
 // A viewport change (or a zoom) while this device owns the grid is a NEW GRID, not a stretched old one.
 // Re-measure the host at the native font and report it; the relay re-pins the owner on a changed viewport
 // (server.js `'v'` branch), so no second 'P' is needed and the chip stays live throughout.
 function requestNativeRemeasure(){
   if(_gridBusy || _reReqTimer) return;
-  const want = Math.max(8, Math.min(48, Math.round(fontSize*(tabFontScale||1))));
+  const want = Math.max(8, Math.min(48, Math.round(fontSize)));
   if(appliedFont !== want){ appliedFont=want; try{ term.options.fontSize=want; }catch(e){} }
   _reReqTimer = setTimeout(()=>{
     _reReqTimer = null;
-    requestAnimationFrame(()=>requestAnimationFrame(()=>{
+    requestAnimationFrame(()=>withNativeCell((cell)=>{
       if(_gridBusy) return;
-      const dim=nativeDims();
+      let dim=null;
+      if(cell) dim=nativeDims(cell);
+      else { try{ dim=fit.proposeDimensions(); }catch(e){} }
       if(dim) sendViewport(dim);
     }));
   }, 120);

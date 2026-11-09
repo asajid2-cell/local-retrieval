@@ -349,6 +349,25 @@ async function waitForOwner(page, want, timeoutMs, predicate) {
     await page.setViewportSize({ width: 1440, height: 900 });
     await page.waitForTimeout(1800);
 
+    // A+/A- while owning the grid is a new native grid at a bigger whole-pixel font, not a dead button
+    // (the old code let fitTabOwnedGrid overwrite the font in the same call, so the press did nothing).
+    const beforeZoom = await readState(page);
+    const beforeFont = beforeZoom.fontSize, beforeCols = beforeZoom.cols;
+    await page.evaluate(() => { try { setFont(term.options.fontSize + 2); } catch (e) {} });
+    let zoomGrid = null;
+    const zoomEnd = Date.now() + 12000;
+    while (Date.now() < zoomEnd) {
+      const st = await readState(page);
+      // The grid itself must move: a font change alone would be the old dead-button symptom.
+      if (st.gridOwner === 'mine' && st.fontSize > beforeFont && st.cols !== beforeCols) { zoomGrid = st; break; }
+      await page.waitForTimeout(300);
+    }
+    check('V3 A+/A- while owned requests a new native grid',
+      !!zoomGrid && Number.isInteger(zoomGrid.fontSize),
+      `before=${beforeFont} after=${zoomGrid ? zoomGrid.fontSize : '-'} `
+      + `term=${zoomGrid ? zoomGrid.cols + 'x' + zoomGrid.rows : '-'} `
+      + `owner=${zoomGrid ? zoomGrid.gridOwner : '-'}`);
+
     await mark(page);
     await clickChip(page);
     const released = await waitForOwner(page, 'local', 15000);
