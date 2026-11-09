@@ -17,8 +17,11 @@ Rows proven here (each prints PASS/FAIL; the process exits non-zero if any row f
 Usage:
   python muxd/spike/muxtee/grid_ownership_proof.py [--exe PATH] [--repo PATH]
 
-RED today: the installed tee has no inbound resize case and muxd's OwnerSession.resize is a no-op,
-so T2 fails at "the child still reports 120x30". That is the intended red before the campaign lands.
+GREEN (2026-11-09) against the in-repo muxd and the fixed tee build
+(`%USERPROFILE%\muxtee-grid\muxtee.exe`, dll `5932d517...`): 15/15 rows, T2/T2b/T3/T6/T7 included -
+the pty follows the ack, the ring is cleared on the commit, a stale epoch cannot move it, the last pin
+wins, and a local keystroke restores the pane. The same file ran RED (T2/T2b/T3/T7/T6) against the old
+installed tee (dll `47e278db...`) and muxd `39d5efa`, which is the red this campaign set out to clear.
 """
 import argparse
 import asyncio
