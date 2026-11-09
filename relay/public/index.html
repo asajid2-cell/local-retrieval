@@ -2028,14 +2028,19 @@ function fitTabOwnedGrid(){
   const availH=host.clientHeight-(parseFloat(cs.paddingTop)||0)-(parseFloat(cs.paddingBottom)||0);
   if(availW<80 || availH<60) return;
   // The owning device ignores the fill/fit choice: its committed grid must span the viewport on BOTH
-  // axes, so the latch is keyed on its own mode and never on a mode the user picked while local.
+  // axes, so the latch is keyed on its own mode and never on a mode the user picked while local. It
+  // also ignores the persisted zoom: a native paint is a whole-pixel font, so a stale `mux_tab_font`
+  // cannot leave the owned view fractionally scaled (and it must not, once the grid was chosen for it).
+  const zoom = weOwn ? 1 : tabFontScale;
   const modeKey = weOwn ? 'own' : tabFitMode;
   // A real window resize re-opens the search. A scrollbar appearing does not: pan/rowpan are toggled by
   // this very fit, and a 15px clientWidth change would otherwise clear the latch on every step and send
   // the font back up to the size that just overflowed (seen live: fill bouncing to 17 with a pan bar).
-  const paneMoved = Math.abs(availW-tabFitPaneW) > 24 || Math.abs(availH-tabFitPaneH) > 24;
-  if(tabFitPaneW<0 || paneMoved || tabFontScale!==tabFitPaneScale || modeKey!==tabFitPaneMode){
-    tabFitPaneScale=tabFontScale; tabFitPaneMode=modeKey; tabFitRejected=0;
+  // The owner never pans, so it has no such feedback loop and re-opens on any real move.
+  const paneMoved = Math.abs(availW-tabFitPaneW) > (weOwn ? 1 : 24)
+                 || Math.abs(availH-tabFitPaneH) > (weOwn ? 1 : 24);
+  if(tabFitPaneW<0 || paneMoved || zoom!==tabFitPaneScale || modeKey!==tabFitPaneMode){
+    tabFitPaneScale=zoom; tabFitPaneMode=modeKey; tabFitRejected=0;
   }
   tabFitPaneW=availW; tabFitPaneH=availH;
   const cell=cellMetrics();
@@ -2053,10 +2058,11 @@ function fitTabOwnedGrid(){
   // smaller estimate and lives with the margins.
   const fitFont = fill ? fitW : Math.min(fitW, fitH);
 
-  if(tabFontScale !== 1){
+  if(zoom !== 1){
     // A zoomed view is the viewer's own choice: apply it exactly (fractionally, so every press of A+/A-
     // is visible instead of being rounded back to the size it already had) and let pan/rowpan follow.
-    const want = Math.max(4, Math.min(48, Math.round(fitFont*tabFontScale*10)/10));
+    // The owning device never reaches this branch (zoom is pinned to 1 there): its paint is native.
+    const want = Math.max(4, Math.min(48, Math.round(fitFont*zoom*10)/10));
     if(Math.abs(want-appliedFont) < 0.05) return;
     appliedFont=want;
     try{ term.options.fontSize=want; }catch(e){}
@@ -2183,6 +2189,7 @@ function onControl(s){
   // still emits it; removing the emission is the other end's change, not this one's.
   if(s[0]!=='d') return;
   let m; try{ m=JSON.parse(s.slice(1)); }catch(e){ return; }
+  const prevOwner=sizeGridOwner, prevPinned=sizePinned, prevTabOwned=sizeTabOwned;
   winSize={cols:m.cols, rows:m.rows}; sizeModeLabel=m.modeLabel||'';
   sizeGridOwner = m.gridOwner || 'local'; sizeGridEpoch = Number.isInteger(m.gridEpoch) ? m.gridEpoch : 0; sizeGridOwnerLabel = m.gridOwnerLabel || '';
   if(sizeGridOwner === 'mine' && _takeTimer){ clearTimeout(_takeTimer); _takeTimer = null; }
@@ -2200,13 +2207,25 @@ function onControl(s){
   soleTerminal = Object.prototype.hasOwnProperty.call(m,'attachedLocal') ? !m.attachedLocal : !(sizeLocal || sizeTabOwned);
   soleTerminalKnown = true;
   if(term.cols!==m.cols || term.rows!==m.rows){ try{ preserveTermViewport(()=>term.resize(m.cols, m.rows)); hardenHelperTextarea(); installMobileInputDelta(); }catch(e){} }
-  // Heal on EVERY size frame, not only on a grid change. A 'd' that re-asserts the size we already have is
-  // exactly the frame that used to be a no-op: it proves the relay and this surface disagree about the
-  // past (a reconnect, a re-measure, a lease handover), and the rows xterm drew under the old belief are
-  // still on screen. Repainting costs one refresh of the visible rows.
-  schedulePaintHeal(20);
-  fitTabOwnedGrid();
-  applyPan(); updateMeta(); updateSizeBtn();
+  // A take is committed only when muxd says so. Record when that landed, so the round trip can be
+  // measured on the live page instead of being assumed fast.
+  if(sizeGridOwner === 'mine' && window.__muxGridTiming && !window.__muxGridTiming.ackAt){
+    window.__muxGridTiming.ackAt = Math.round(performance.now());
+  }
+  // Repaint only when this frame tells the surface something it does not already show: the grid moved,
+  // or ownership moved (a take/release changes who paints whom). Re-asserting the same grid used to run
+  // two full refreshes plus a forced-layout fit for EVERY connected viewer on EVERY 'd', so a second
+  // device felt the first device's geometry churn. A no-op frame now costs nothing.
+  const geomChanged = term.cols!==m.cols || term.rows!==m.rows;
+  const ownChanged = prevOwner!==sizeGridOwner || prevPinned!==sizePinned || prevTabOwned!==sizeTabOwned;
+  const firstFrame = !_paintReady;
+  if(firstFrame) _paintReady = true;
+  if(geomChanged || ownChanged || firstFrame){
+    schedulePaintHeal(20);
+    fitTabOwnedGrid();
+    applyPan();
+  }
+  updateMeta(); updateSizeBtn();
 }
 // TAP the size chip = pin the shared window to THIS device (everyone mirrors/pans it) — last-pinner-wins.
 // Tap again when it's already yours = back to auto. Long-press = pin another connected device.
@@ -2217,12 +2236,45 @@ function onControl(s){
 function refocusTerminal(){ try{ term.focus({preventScroll:true}); }catch(e){ try{ term.focus(); }catch(_){} } }
 let _takeTimer = null;
 let _gridBusy = null;          // 'take' | 'release' while a request is in flight
+let _paintReady = false;       // first 'd' after attach always repaints; after that only real changes do
+// The grid this device takes is THIS viewport's, at a WHOLE-PIXEL font. Deriving it from the font we
+// were using to mirror someone else's grid, then fitting the font back into that grid, is two roundings
+// that never agree: the owned view lands fractionally scaled with a bezel. Choose the font first and let
+// cols/rows follow it, once - that is what makes the owned grid native.
+function sendViewport(dim){
+  viewportFit={cols:dim.cols, rows:dim.rows};
+  lastViewportReport=dim.cols+'x'+dim.rows;
+  lastViewportReportSocket=ws;
+  if(ws && ws.readyState===1 && current){
+    send('v', JSON.stringify({
+      cols:dim.cols, rows:dim.rows,
+      vis:document.visibilityState==='visible' && terminalSurfaceVisible(),
+      act:actFlag()
+    }));
+  }
+}
 function takeGrid(){
   if(_gridBusy) return;
   _gridBusy = 'take';
-  send('P', '');
+  updateSizeBtn();
   flash('Taking this screen\'s grid');
+  window.__muxGridTiming = { clickAt: Math.round(performance.now()), ackAt: 0 };
   clearTimeout(_takeTimer);
+  // Set the whole-pixel font now, let the renderer measure it (one frame), then report the grid that
+  // font yields and request exactly that. Two frames of local latency buys a grid that paints 1:1.
+  requestAnimationFrame(()=>requestAnimationFrame(()=>{
+    if(_gridBusy !== 'take') return;
+    try{
+      const want = Math.max(8, Math.min(48, Math.round(fontSize*(tabFontScale||1))));
+      if(Number.isFinite(want) && Math.abs(appliedFont-want) > 0.01){
+        appliedFont = want;
+        try{ term.options.fontSize = want; }catch(e){}
+      }
+      let dim=null; try{ dim=fit.proposeDimensions(); }catch(e){}
+      if(dim && dim.cols>10 && dim.rows>3) sendViewport(dim);
+    }catch(e){}
+    send('P', '');
+  }));
   // A terminal whose muxtee predates grid ownership ignores the resize, so nothing ever acks. Say that
   // plainly instead of leaving the chip spinning and the viewer stuck in a squashed fit mode.
   _takeTimer = setTimeout(function(){
@@ -2234,10 +2286,15 @@ function takeGrid(){
       tabFitMode = 'fill'; LS.set('mux_tab_fit', tabFitMode);
       try{ fitTabOwnedGrid(); applyPan(); updateSizeBtn(); }catch(e){}
     }
+    updateSizeBtn();
     refocusTerminal();
   }, 8000);
 }
 function cycleSize(){
+  // A tap while a request is in flight is not a second request. Without this guard the ladder re-read
+  // the pre-ack flags and toggled fill<->fit, which is exactly the "it mostly just does 2 and glitches
+  // between them" report: every tap inside the round trip looked like a rendering toggle.
+  if(_gridBusy) return;
   if(sizeTabOwned && !sizePinned){
     // fill <-> fit change only how THIS device paints the pane's grid. The third tap TAKES the grid:
     // it asks muxd to pin this device's viewport, which the tee applies to the child pty. There is no
@@ -2256,6 +2313,7 @@ function cycleSize(){
   if(_gridBusy) return;
   const releasing = !!(sizePinned && sizeMine);
   _gridBusy = releasing ? 'release' : 'take';
+  updateSizeBtn();
   send('P', releasing ? '0' : '');
   clearTimeout(_takeTimer); _takeTimer = null;
   _takeTimer = setTimeout(function(){
@@ -2264,6 +2322,7 @@ function cycleSize(){
     if(releasing && sizePinned && sizeMine){
       flash('The PC has not given the grid back yet - tap again, or press a key on the PC');
     }
+    updateSizeBtn();
   }, 8000);
   refocusTerminal();
 }
@@ -2276,6 +2335,11 @@ function pinToOtherDevice(){
 }
 function sizeButtonPresentation(){
   const dims = winSize ? (' '+winSize.cols+'×'+winSize.rows) : '';
+  if(_gridBusy){
+    // The request is a round trip, not an instant. Say so, and take no further taps until it lands.
+    const text = (_gridBusy === 'release' ? '↩ giving the grid back…' : '⏳ taking the grid…') + dims;
+    return { text, title: 'Waiting for the PC terminal to confirm the new grid.', disabled: true };
+  }
   const host=$('#term'), panning=!!(host && host.classList.contains('pan'));
   // A teed PC tab (§7.3): the grid IS the PC's physical screen, so there is nothing to pin - a pin would
   // resize the tab under the person sitting at it. The chip still works, but it switches the rendering

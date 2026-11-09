@@ -76,8 +76,9 @@ async function installFrameTap(page) {
   await page.evaluate(() => {
     window.__d = []; window.__dTimes = []; window.__dMark = 0;
     // What this viewer ASKS muxd for. Local ownership means no resize request, whatever the render
-    // mode: a mode that reaches the wire has already taken the grid.
-    window.__sent = [];
+    // mode: a mode that reaches the wire has already taken the grid. JSON frames and raw protocol
+    // frames ('P', 'i', ...) are both recorded: the grid request is a raw 'P', not JSON.
+    window.__sent = []; window.__sentRaw = [];
     // Timing and churn: a switch is only good if it LANDS FAST and SETTLES. State-only assertions let a
     // 4-second, font-thrashing handover pass, so the harness records when the commit arrived, when the
     // grid was painted, and how many times the page changed its font on the way.
@@ -137,7 +138,10 @@ async function installFrameTap(page) {
           ws.__tapSend = true;
           ws.send = (payload) => {
             try {
-              if (typeof payload === 'string' && payload[0] === '{') window.__sent.push(JSON.parse(payload));
+              if (typeof payload === 'string') {
+                if (payload[0] === '{') window.__sent.push(JSON.parse(payload));
+                else window.__sentRaw.push(payload.slice(0, 64));
+              }
             } catch (_) {}
             return send(payload);
           };
@@ -179,8 +183,16 @@ async function timings(page, settleMs = 1500) {
 // 'flex' mode any more (the transform is deleted), so the proof must not click in a loop - each extra
 // click is a pin or a release, and a loop turns the ownership it is trying to prove into a flap.
 async function clickChip(page) {
+  // Tap only when the chip is ready, as a person must: a request in flight disables it. If it never
+  // becomes ready that is itself a failure, so the wait is bounded and its expiry is visible below.
+  let idle = true;
+  try {
+    await page.waitForFunction(() => { try { return !_gridBusy; } catch (e) { return true; } },
+      null, { timeout: 10000 });
+  } catch (e) { idle = false; }
   await page.evaluate(() => document.querySelector('#sizebtn').click());
   await page.waitForTimeout(700);
+  return idle;
 }
 
 async function waitForOwner(page, want, timeoutMs, predicate) {
@@ -266,13 +278,20 @@ async function waitForOwner(page, want, timeoutMs, predicate) {
 
     // The next tap is the handover, not a rendering mode. Wait for the ack-published owner: the page may
     // not paint the new grid before muxd commits it (contract G2).
+    //
+    // A DOUBLE tap, in one task, is the race a human hits on a slow link: the second tap arrives before
+    // the ack, when the page still believes it is local. It must not become a second request and must not
+    // toggle the fill/fit ladder - exactly the "mostly just does 2 and glitches between them" report.
     await mark(page);
-    await clickChip(page);
+    await page.evaluate(() => { const b = document.querySelector('#sizebtn'); b.click(); b.click(); });
     const pinned = await waitForOwner(page, 'mine', 15000);
     const takeT = await timings(page, 1200);
+    const pSends = await page.evaluate(() => (window.__sentRaw || []).filter((s) => s && s[0] === 'P').length);
     check('V2 the chip takes the grid', pinned.gridOwner === 'mine' && pinned.cols !== s.cols,
       `gridOwner=${pinned.gridOwner} mine=${pinned.mine} term=${pinned.cols}x${pinned.rows} `
       + `host=${HOST_COLS}x${HOST_ROWS} chip=${JSON.stringify(pinned.chip)}`);
+    check('V2 a tap in flight is not a second request', pSends === 1,
+      `pSends=${pSends} (a double tap must produce exactly one grid request)`);
     check('V2 the take lands quickly', takeT.commitMs > 0 && takeT.commitMs < 1500,
       `commitMs=${takeT.commitMs} paintMs=${takeT.paintMs} dFrames=${takeT.dFrames} vSends=${takeT.vSends}`);
     check('V2 the take settles without font thrash', takeT.fonts <= 3,
@@ -288,6 +307,19 @@ async function waitForOwner(page, want, timeoutMs, predicate) {
       `screenW=${laid.screenW} hostW=${laid.hostW} span=${span.toFixed(3)} pan=${laid.pan}`);
     check('V3 the keyboard is still on the terminal', laid.focusedTerminal,
       `focusedTerminal=${laid.focusedTerminal}`);
+
+    // A persisted zoom (A+/A- on any earlier tab) must not leave the owned view fractionally scaled.
+    // The owner pins zoom to 1 and derives the grid at a whole-pixel font, so the font stays integer.
+    await page.evaluate(() => { try { tabFontScale = 1.3; fitTabOwnedGrid(); } catch (e) {} });
+    await page.waitForTimeout(700);
+    const zoomed = await page.evaluate(() => ({
+      font: term.options.fontSize, int: Number.isInteger(term.options.fontSize), owner: sizeGridOwner,
+    }));
+    check('V3 a stale zoom cannot make the owned paint fractional',
+      zoomed.int && zoomed.owner === 'mine',
+      `fontSize=${zoomed.font} integer=${zoomed.int} gridOwner=${zoomed.owner}`);
+    await page.evaluate(() => { try { tabFontScale = 1; fitTabOwnedGrid(); } catch (e) {} });
+    await page.waitForTimeout(400);
 
     await mark(page);
     await clickChip(page);
@@ -322,13 +354,45 @@ async function waitForOwner(page, want, timeoutMs, predicate) {
     check('V6 take and release repeat', cycles === 3,
       `cycles=${cycles}/3 failures=${cycleFailures.join(',') || 'none'}`);
 
+    // V7: a second device is watching. When the first takes the grid, the follower must resize once and
+    // settle - it may not repaint on a loop, change its font repeatedly, or issue a request of its own.
+    // This is the cost a second phone pays for someone else's handover, which the single-viewer proof
+    // could not see at all.
+    const ctxB = await browser.newContext({ viewport: { width: 1280, height: 800 }, locale: 'en-US' });
+    const pageB = await ctxB.newPage();
+    pageB.on('pageerror', (e) => errors.push(String((e && e.message) || e)));
+    await pageB.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await installFrameTap(pageB);
+    await pageB.waitForFunction(() => { try { return typeof term !== 'undefined' && term.cols > 1; } catch (e) { return false; } }, null, { timeout: 30000 });
+    await pageB.waitForTimeout(1500);
+    await pageB.evaluate(() => window.__mark && window.__mark());
+    await clickChip(page);
+    const took2 = await waitForOwner(page, 'mine', 15000);
+    const bt = await timings(pageB, 1600);
+    const bs = await readState(pageB);
+    check('V7 another viewer follows once and settles',
+      took2.gridOwner === 'mine' && bs.gridOwner === 'other' && bt.healCalls <= 2 && bt.fonts <= 2
+      && bt.resizeSends === 0,
+      `owner=${bs.gridOwner} healCalls=${bt.healCalls} fonts=${bt.fonts} `
+      + `dFrames=${bt.dFrames} vSends=${bt.vSends} resizeSends=${bt.resizeSends}`);
+    check('V7 the follower paints without distortion',
+      Math.abs(bs.sx - 1) < 1e-6 && Math.abs(bs.sy - 1) < 1e-6,
+      `transform=${bs.transform} gridOwner=${bs.gridOwner}`);
+    await clickChip(page);
+    await waitForOwner(page, 'local', 15000, (st) => st.cols === HOST_COLS && st.rows === HOST_ROWS);
+    await ctxB.close();
+
     // V5: the owning device simply goes away. The relay must release the grid, not wait for muxd's TTL -
     // contract section 5's disconnect arm. A fresh context is a different device, so what it reads is
     // what the relay published after the owner left.
+    const preTake = await page.evaluate(() => ({
+      busy: _gridBusy, mode: tabFitMode, owned: sizeTabOwned, pinned: sizePinned,
+      mine: sizeMine, owner: sizeGridOwner,
+    }));
     await clickChip(page);                      // fit -> take again
     const reowned = await waitForOwner(page, 'mine', 15000);
     check('V5 the grid is taken once more', reowned.gridOwner === 'mine',
-      `gridOwner=${reowned.gridOwner} term=${reowned.cols}x${reowned.rows}`);
+      `gridOwner=${reowned.gridOwner} term=${reowned.cols}x${reowned.rows} pre=${JSON.stringify(preTake)}`);
     await ctx.close();
     const ctx2 = await browser.newContext({ viewport: { width: 1440, height: 900 }, locale: 'en-US' });
     const page2 = await ctx2.newPage();
