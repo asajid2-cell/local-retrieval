@@ -1400,6 +1400,9 @@ function terminalSurfaceIntegrityFault(){
 let integrityHealAt=0;
 function watchTerminalSurface(){
   try{
+    // An owned grid whose cell grew after the take must be re-requested even when no 'd' arrives: the
+    // font can settle seconds later, and nothing else in this page samples the painted width.
+    try{ checkOwnedCellDrift(); }catch(e){}
     const fault=terminalSurfaceIntegrityFault();
     if(!fault) return;
     const now=Date.now();
@@ -2042,6 +2045,7 @@ function fitTabOwnedGrid(){
     tabFitPaneW=availW; tabFitPaneH=availH;
     tabFitPaneMode='own'; tabFitPaneScale=1; tabFitRejected=0;
     if(moved){ try{ requestNativeRemeasure(); }catch(e){} }
+    checkOwnedCellDrift();
     return;
   }
   // PANE-OWNED. fill/fit only change how this fixed grid is painted.
@@ -2264,6 +2268,7 @@ let _takeTimer = null;
 let _reReqTimer = null;
 let _gridBusy = null;          // 'take' | 'release' while a request is in flight
 let _paintReady = false;       // first 'd' after attach always repaints; after that only real changes do
+let _ownedRefitAt = 0;         // last time an owned grid was re-requested because its cell had changed
 // The grid this device takes is THIS viewport's, at a WHOLE-PIXEL font. Deriving it from the font we
 // were using to mirror someone else's grid, then fitting the font back into that grid, is two roundings
 // that never agree: the owned view lands fractionally scaled with a bezel. Choose the font first and let
@@ -2388,6 +2393,25 @@ function takeGrid(){
 // A viewport change (or a zoom) while this device owns the grid is a NEW GRID, not a stretched old one.
 // Re-measure the host at the native font and report it; the relay re-pins the owner on a changed viewport
 // (server.js `'v'` branch), so no second 'P' is needed and the chip stays live throughout.
+// The CELL can change under a committed grid - a webfont that lands after the take, or a renderer that
+// re-measures once fonts settle. The grid was derived from the cell we measured, so a painted screen
+// wider than the pane means this grid is stale and would be clipped: live, 203 columns taken at cell 7.0
+// and then painted at 7.7 is 1563 px of screen in a 1440 px pane - the intermittent "does not fit or
+// draw native" report. Ask again from the cell we have now, at most once every 2 s so a font that keeps
+// flipping cannot flap the pty. Under-fill is not this: fill mode deliberately leaves the side margin.
+function checkOwnedCellDrift(){
+  if(!(sizePinned && sizeMine)) return;
+  const host=$('#term'); if(!host) return;
+  const scr=host.querySelector('.xterm-screen'); if(!scr) return;
+  const cs=getComputedStyle(host);
+  const availW=host.clientWidth-(parseFloat(cs.paddingLeft)||0)-(parseFloat(cs.paddingRight)||0);
+  if(!(availW>0)) return;
+  const over=scr.getBoundingClientRect().width-availW;
+  if(over>Math.max(2, availW*0.015) && Date.now()-(_ownedRefitAt||0)>2000){
+    _ownedRefitAt=Date.now();
+    try{ requestNativeRemeasure(); }catch(e){}
+  }
+}
 function requestNativeRemeasure(){
   if(_gridBusy || _reReqTimer) return;
   const want = Math.max(8, Math.min(48, Math.round(fontSize)));
@@ -2401,11 +2425,51 @@ function requestNativeRemeasure(){
     }));
   }, 120);
 }
+// A TEED TAB is a real PC terminal the relay mirrors - a property of the SESSION, not of who holds the
+// grid. `sizeTabOwned` is the relay's "the pane owns the grid" flag and it goes false the moment ANY
+// device pins, so branching on it dropped the chip into the generic shared-window path as soon as a pin
+// existed. That path sends 'P' with NO viewport, so the pin committed this device's last reported FIT
+// viewport (1024px at font 9 = 252x61) while the owned paint ran at font 14: a 1.72x wide screen in a 1x
+// window - the "viewer grid does not fit or draw native" report, and the reason switching away from
+// another device's pin felt broken.
+function isTeedTab(){ try{ const s=findSession(current); return !!(s && s.owner); }catch(e){ return false; } }
+function releaseGrid(){
+  _gridBusy = 'release';
+  updateSizeBtn();
+  if(send('P', '0') === 'dropped'){
+    _gridBusy = null; updateSizeBtn();
+    flash('Reconnecting - tap again in a moment');
+    return;
+  }
+  clearTimeout(_takeTimer); _takeTimer = null;
+  _takeTimer = setTimeout(function(){
+    _takeTimer = null;
+    if(_gridBusy) _gridBusy = null;
+    if(sizePinned && sizeMine) flash('The PC has not given the grid back yet - tap again, or press a key on the PC');
+    updateSizeBtn();
+  }, 8000);
+}
 function cycleSize(){
   // A tap while a request is in flight is not a second request. Without this guard the ladder re-read
   // the pre-ack flags and toggled fill<->fit, which is exactly the "it mostly just does 2 and glitches
   // between them" report: every tap inside the round trip looked like a rendering toggle.
   if(_gridBusy) return;
+  if(isTeedTab()){
+    // Teed tab ladder: mine -> give it back; another device's -> take it over (MEASURED, so the committed
+    // grid is this viewport at this font); local -> fill, fit, then take.
+    if(sizePinned && sizeMine){ releaseGrid(); refocusTerminal(); return; }
+    if(sizePinned && !sizeMine){ takeGrid(); refocusTerminal(); return; }
+    if(tabFitMode==='fill'){
+      tabFitMode='fit'; LS.set('mux_tab_fit', tabFitMode);
+      fitTabOwnedGrid(); applyPan(); scheduleTerminalSurfaceAlign(); updateMeta(); updateSizeBtn();
+      flash('Fitting every row; side margins fill the rest');
+      refocusTerminal();
+      return;
+    }
+    takeGrid();
+    refocusTerminal();
+    return;
+  }
   if(sizeTabOwned && !sizePinned){
     // fill <-> fit change only how THIS device paints the pane's grid. The third tap TAKES the grid:
     // it asks muxd to pin this device's viewport, which the tee applies to the child pty. There is no
