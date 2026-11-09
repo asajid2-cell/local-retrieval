@@ -2373,7 +2373,12 @@ function cycleSize(){
   const releasing = !!(sizePinned && sizeMine);
   _gridBusy = releasing ? 'release' : 'take';
   updateSizeBtn();
-  send('P', releasing ? '0' : '');
+  if(send('P', releasing ? '0' : '') === 'dropped'){
+    _gridBusy = null; updateSizeBtn();
+    flash('Reconnecting - tap again in a moment');
+    refocusTerminal();
+    return;
+  }
   clearTimeout(_takeTimer); _takeTimer = null;
   _takeTimer = setTimeout(function(){
     _takeTimer = null;
@@ -2731,12 +2736,10 @@ $('#term').addEventListener('wheel', e=>{
 // fit rather than a font size the fit would overwrite on the next size frame.
 function setFont(px){
   if(sizePinned && sizeMine){
-    // This device OWNS the grid, so the grid is its viewport at a native font: A+/A- is a new grid at a
-    // new whole-pixel font, not a dead button and not a CSS zoom. Re-measure and re-request.
-    fontSize = Math.min(20, Math.max(11, px));
-    LS.set('mux_font', fontSize);
-    appliedFont = fontSize;
-    try{ term.options.fontSize = appliedFont; }catch(e){}
+    // Owning the grid: A+/A- is a NEW GRID at a new whole-pixel font, not a dead button or a CSS zoom.
+    const font = Math.min(20, Math.max(11, px));
+    term.options.fontSize = appliedFont = font;
+    LS.set('mux_font', fontSize = font);
     requestNativeRemeasure();
     healTerminalSurface('font');
     return;
