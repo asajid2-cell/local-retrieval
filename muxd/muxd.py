@@ -6787,7 +6787,10 @@ async def main():
                                         requester = str(m.get("owner") or "").strip()
                                         if m.get("active") is False or requester in ("", "local"):
                                             if owner_reclaim_local(session, reason="release"):
-                                                await save_manifest(sessions)
+                                                # This dispatch runs inside main(), where the manifest
+                                                # callable is manifest_save_async; save_manifest only
+                                                # exists in serve_owner_connection's parameters.
+                                                await manifest_save_async(sessions)
                                         else:
                                             # A viewport report from the owning device is also liveness.
                                             owner_touch(session)
@@ -6795,7 +6798,7 @@ async def main():
                                                 session, m.get("cols"), m.get("rows"),
                                                 m.get("epoch"), requester, m.get("label", ""),
                                             ):
-                                                await save_manifest(sessions)
+                                                await manifest_save_async(sessions)
                                             else:
                                                 # Tell the relay so it can retry once at the current
                                                 # epoch + 1: its pin record outlives a relay restart.
