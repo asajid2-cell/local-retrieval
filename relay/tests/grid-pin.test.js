@@ -173,6 +173,38 @@ test('T13 the pinning device disconnecting releases the grid to local', async t 
   assert.ok(Number(release.epoch) >= Number(take.epoch), 'the release never goes back in time');
 });
 
+test('T13b a persisted pin for a device that is gone is released when the last viewer leaves', async t => {
+  // PINS ARE PERSISTED, so the pin record can outlive the viewer list: a relay restart, or a viewer that
+  // closes while its take is still in flight, leaves a pin whose device matches no client. The id path then
+  // returns early and the pane stays committed to a device that is gone. The empty-viewer condition is the
+  // backstop, and this row seeds exactly that state on disk before the relay starts.
+  const name = 'grid-ghost-pin';
+  const h = new RelayHarness({});
+  fs.writeFileSync(path.join(h.tmp, 'pins.json'),
+    JSON.stringify([[name, { deviceId: 'ghost-device', label: 'gone', cols: 100, rows: 30, at: Date.now() }]]));
+  await h.start();
+  t.after(async () => h.stop());
+  const host = new FakeHost(h.port);
+  await host.connect();
+  host.sendHello([tabSession(name, { gridOwner: 'pin', gridOwnerLabel: 'gone', cols: 100, rows: 30 })], { caps: [...HOST_CAPS] });
+  await waitFor(async () => {
+    const health = await h.json('GET', '/api/health');
+    return health.host && health.host.connected && health.host.protocolOk ? health : null;
+  }, 'host accepted', 5000);
+  t.after(() => host.close());
+
+  const ws = new WebSocket(`ws://127.0.0.1:${h.port}/ws?session=${name}&cols=80&rows=24&dev=someone-else`);
+  t.after(() => { try { ws.close(); } catch {} });
+  await once(ws, 'open');
+  await sleep(250);
+  host.messages.length = 0;
+  ws.close();
+  await waitFor(() => resizeFrames(host).length === 1, 'the pane gets the grid back', 4000);
+  const release = resizeFrames(host)[0];
+  assert.equal(release.owner, 'local', 'a pinned tab with no viewers left must be released to the pane');
+  assert.equal('cols' in release, false, 'a release must not dictate the pane size');
+});
+
 test('T11 no non-uniform screen transform remains in the viewer', () => {
   const html = fs.readFileSync(path.join(__dirname, '..', 'public', 'index.html'), 'utf8');
   assert.equal(/FLEX_SCALE_FLOOR|FLEX_STRETCH_MAX|applyFlexTransform|flexScaleTarget|flexStretchTarget/.test(html), false,

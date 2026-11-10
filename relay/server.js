@@ -4539,14 +4539,16 @@ function deleteEmptySessionState(name, st) {
     sessions.delete(name);
   }
 }
+// Returns TRUE when it asked muxd to release the grid, so the caller's empty-session backstop does not
+// send a second release for the same departure.
 function clearPinForDisconnectedDevice(name, st, client) {
   const deviceId = client.deviceId || ('sock-' + client.id);
   let pin = pins.get(name);
-  if (!pin || pin.deviceId !== deviceId) return;
+  if (!pin || pin.deviceId !== deviceId) return false;
   const stillConnected = [...st.clients.values()].some(
     other => (other.deviceId || ('sock-' + other.id)) === deviceId,
   );
-  if (stillConnected) return;
+  if (stillConnected) return false;
   // The last viewer on the pinning device is gone: release the grid now. muxd's TTL is only the
   // backstop for a relay that never got to say this (contract section 5, "last owner viewer gone").
   // This runs from removeViewer BEFORE deleteEmptySessionState, so `st` still talks to the host.
@@ -4558,6 +4560,7 @@ function clearPinForDisconnectedDevice(name, st, client) {
   const candidate = new Map(pins);
   candidate.delete(name);
   commitBestEffortPinCleanup(candidate, 'disconnected pin cleanup');
+  return true;
 }
 function commitBestEffortPinCleanup(candidate, context) {
   try {
@@ -4577,7 +4580,18 @@ function removeViewer(name, st, client) {
   if (client.dropTimer) clearTimeout(client.dropTimer);
   st.clients.delete(client.id);
   st.sbWaiters.delete(client.id);
-  clearPinForDisconnectedDevice(name, st, client);
+  const releasedOnId = clearPinForDisconnectedDevice(name, st, client);
+  // NOBODY WATCHING MEANS NOBODY OWNS IT. The id path above is exact, and exact is the problem when the
+  // pin record is older than the viewer list: pins are PERSISTED, so a relay restart (or a viewer that
+  // closes while its take is still in flight) can leave a pin whose device is no longer among the clients.
+  // The matching viewer then closes, the id path returns early, and the pane stays committed to a device
+  // that is gone - seen once on the deployed page as a tab held at a viewer's 130x43 for minutes. This is
+  // the backstop for that case only: it fires when the session has NO viewers left and the tab is still
+  // committed as pinned, which no longer has an owner by definition.
+  if (!releasedOnId && st.clients.size === 0) {
+    const host = hostSessions.get(name);
+    if (host && host.owner && host.gridOwner === 'pin') requestTabGrid(name, st, null, false);
+  }
   syncWatch(name, st, st.clients.size > 0);   // §7.2 last viewer leaving stops the feed
   deleteEmptySessionState(name, st);
 }
