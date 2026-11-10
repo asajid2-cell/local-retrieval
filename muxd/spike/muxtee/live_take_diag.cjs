@@ -73,9 +73,13 @@ const screenText = () => { try { return termVisibleText(); } catch (e) { return 
   }
   // Converge watch.
   const t0 = Date.now();
-  for (let i = 0; i < 27; i += 1) {
+  const WATCH = Number(process.env.MUX_WATCH_MS || 8000);
+  let prevKey = '';
+  while (Date.now() - t0 < WATCH) {
     const s = await page.evaluate(STATE);
-    console.log(`t+${String(Date.now() - t0).padStart(4)}ms ` + JSON.stringify(s));
+    // Print on CHANGE only: the question is whether the committed grid moves again after the ack.
+    const key = `${s.owner}|${s.cols}x${s.rows}|${s.font}|${s.span}|${s.pan}`;
+    if (key !== prevKey) { prevKey = key; console.log(`t+${String(Date.now() - t0).padStart(5)}ms ` + JSON.stringify(s)); }
     await page.waitForTimeout(300);
   }
   // Type into the page as a real user would (click the visible grid first, then type).
