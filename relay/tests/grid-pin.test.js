@@ -182,6 +182,27 @@ test('T11 no non-uniform screen transform remains in the viewer', () => {
   assert.equal(/tabFlexSx|tabFlexSy/.test(html), false);
 });
 
+test('T11b a re-request needs a whole cell of overflow and a post-ack settle window', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'public', 'index.html'), 'utf8');
+  const at = html.indexOf('function checkOwnedCellDrift(){');
+  assert.notEqual(at, -1, 'the owned-cell drift check is gone');
+  const body = html.slice(at, html.indexOf('function requestNativeRemeasure(){', at));
+  // A re-request re-pins, resizes the child pty and clears the ring, so the app repaints its whole screen.
+  // The 2px/1.5% rule re-committed 247x50 -> 248x50 after a take; a whole cell is the floor now.
+  assert.match(body, /over>colW\+1/,
+    'the drift check is back to a sub-column threshold — a rounding difference would re-commit the grid');
+  assert.match(body, /__muxLastAckAt/,
+    'the drift check no longer waits for the renderer to settle after the ack');
+  // And the page must not report a viewport identical to the grid it already owns.
+  const vp = html.indexOf('function sendViewport(dim){');
+  assert.notEqual(vp, -1, 'sendViewport is gone');
+  assert.match(html.slice(vp, vp + 600), /dim\.cols===term\.cols && dim\.rows===term\.rows/,
+    'an owner now re-reports the grid it already holds, which re-pins and clears the ring for nothing');
+  // The ack timestamp has to be written somewhere, or the settle window never opens.
+  assert.match(html, /window\.__muxLastAckAt = Date\.now\(\)/,
+    'nothing stamps the ack time the settle window reads');
+});
+
 test('T12 local ownership emits zero resize frames and the bytes are untouched', async t => {
   const name = 'grid-local';
   const { h, host } = await boot(t, [tabSession(name)]);

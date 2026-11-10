@@ -1600,7 +1600,7 @@ function reloadTerminal(quiet){
   connect(name, true);   // re-attach: CLEAR + scrollback replay + live, all client state reset
 }
 document.addEventListener('keydown', e=>{ if(e.ctrlKey && e.altKey && (e.key==='r'||e.key==='R')){ e.preventDefault(); e.stopPropagation(); reloadTerminal(); } }, true);
-window.__muxBuild='2026-11-09-grid-ownership-3';   // bump per web deploy so a loaded version is verifiable (supersedes 2026-11-02-emap-overlay-removed-flex-fit)
+window.__muxBuild='2026-11-09-grid-ownership-4';   // bump per web deploy so a loaded version is verifiable (supersedes 2026-11-02-emap-overlay-removed-flex-fit)
 try{ console.info('multiplex build', window.__muxBuild); }catch(e){}
 const helper = $('#term').querySelector('.xterm-helper-textarea');
 function hardenHelperTextarea(){
@@ -2230,6 +2230,9 @@ function onControl(s){
   if(term.cols!==m.cols || term.rows!==m.rows){ try{ preserveTermViewport(()=>term.resize(m.cols, m.rows)); hardenHelperTextarea(); installMobileInputDelta(); }catch(e){} }
   // A take is committed only when muxd says so. Record when that landed, so the round trip can be
   // measured on the live page instead of being assumed fast.
+  // A commit landed for THIS device: stamp it. The owned-cell drift check refuses to re-request inside a
+  // settle window after this, so the renderer can finish re-measuring the face before it is judged.
+  if(sizeGridOwner === 'mine'){ window.__muxLastAckAt = Date.now(); }
   if(sizeGridOwner === 'mine' && window.__muxGridTiming && !window.__muxGridTiming.ackAt){
     window.__muxGridTiming.ackAt = Math.round(performance.now());
   }
@@ -2334,6 +2337,12 @@ function withNativeCell(cb){
   }catch(e){ measure(); }
 }
 function sendViewport(dim){
+  // While THIS device owns the grid, reporting the grid it already holds changes nothing upstream but
+  // costs a re-pin and a ring clear on the paths that reach here, and the app repaints for it. Say nothing.
+  if(sizePinned && sizeMine && dim && dim.cols===term.cols && dim.rows===term.rows){
+    viewportFit={cols:dim.cols, rows:dim.rows};
+    return;
+  }
   viewportFit={cols:dim.cols, rows:dim.rows};
   lastViewportReport=dim.cols+'x'+dim.rows;
   lastViewportReportSocket=ws;
@@ -2406,8 +2415,18 @@ function checkOwnedCellDrift(){
   const cs=getComputedStyle(host);
   const availW=host.clientWidth-(parseFloat(cs.paddingLeft)||0)-(parseFloat(cs.paddingRight)||0);
   if(!(availW>0)) return;
+  const cell=cellMetrics();
+  const colW=(cell && cell.w>0) ? cell.w : 8;
   const over=scr.getBoundingClientRect().width-availW;
-  if(over>Math.max(2, availW*0.015) && Date.now()-(_ownedRefitAt||0)>2000){
+  // TWO RATCHETS, because a re-request is not free: it re-pins, the tee resizes the child pty, and the
+  // ring is cleared so the app repaints its whole screen. Live, the old 2px/1.5% rule re-committed a grid
+  // one column apart (247x50 -> 248x50) eighteen seconds after a take, and again minutes later - each one
+  // repainting the app and reading as "taking the grid broke it, then it fixed itself".
+  //  · a whole CELL of overflow, not 2px: a measurement that lands a fraction of a column wide is not a
+  //    stale grid, it is rounding, and re-asking for it only changes the column count by one.
+  //  · a settle window after the ack: the renderer is still re-measuring the face it just switched to.
+  const settled=Date.now()-((window.__muxLastAckAt)||0)>3000;
+  if(over>colW+1 && settled && Date.now()-(_ownedRefitAt||0)>2500){
     _ownedRefitAt=Date.now();
     try{ requestNativeRemeasure(); }catch(e){}
   }
