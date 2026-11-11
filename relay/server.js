@@ -390,6 +390,9 @@ const HOST_SB_REQUEST_TIMEOUT_MS = Math.max(
   HOST_SB_WAIT_MS + 100,
   +process.env.MUX_HOST_SB_REQUEST_TIMEOUT_MS || 3000,
 );
+// How long an attach waits for the tee to say whether its watch actually produced a snapshot. Short: a
+// healthy tee answers inside one round trip, and the fallback (just ask for scrollback) is cheap and safe.
+const WATCH_ACK_WAIT_MS = Math.max(150, +process.env.MUX_WATCH_ACK_WAIT_MS || 400);
 const MAX_TERM_COLS = 1000;
 const MAX_TERM_ROWS = 300;
 function clampTermDimension(value, fallback, maximum) {
@@ -573,6 +576,8 @@ function normalizeHostSession(s) {
     adopted: !!s.adopted, externalOwner: !!s.externalOwner,
     localFirst: !!s.localFirst, localViewers: s.localViewers || 0,
     hasCommand, shellOnly, ready: Object.prototype.hasOwnProperty.call(s, 'ready') ? !!s.ready : alive,
+    // Per-session, from the tee's hello through muxd: this tab answers `watch` with a `watchAck`.
+    watchAck: !!s.watchAck,
     kind: String(s.kind || (alive ? (shellOnly ? 'shell' : 'command') : 'dormant')),
     // A teed PC tab (muxtee) IS the local terminal, mirrored - not a relaunchable mux session. The UI
     // badges it and groups it apart from plain shells (§7.3).
@@ -1180,6 +1185,10 @@ function listSessions() {
                   // and the PC-tabs group key on this flag, so it is derived here rather than inferred from
                   // the kind string at the call site.
                   localTab: (h.kind || '') === 'local-tab',
+                  // Whether THIS tab's tee answers `watch` with a `watchAck` (carried from its hello through
+                  // muxd). Exposed so the page and the probes can see the same per-session fact the attach
+                  // path gates its resync wait on - an old tee reads false and keeps the old paint path.
+                  watchAck: !!h.watchAck,
                   sessionId: String(chat && chat.id || h.sessionId || ''), aliases: Array.isArray(h.aliases) ? h.aliases : [],
                   identityPending: !!h.identityPending,
                   generationId: String(h.generationId || ''),
@@ -4279,6 +4288,36 @@ wssHost.on('connection', (ws, req) => {
         if (source && c.id !== source) continue;
         try { c.ws.close(1008, String(m.code) + ': ' + String(m.m || 'input refused').slice(0, 90)); } catch {}
       }
+    } else if (m.t === 'watchAck') {
+      // The tee answered a `watch`: did that watch produce a fresh ring snapshot? The attach path holds its
+      // scrollback request while it waits for this, because a snapshot makes the request redundant AND the
+      // reply would be taken from a ring the snapshot is about to replace. `snapshot:false` means the tee
+      // was already watching (muxd re-stated its interest), so nothing is coming and the request must go.
+      const n = strictMuxName(m.s); const st = sessions.get(n);
+      if (!st) return;
+      const waiters = st.watchWaiters;
+      if (!waiters || !waiters.size) return;
+      st.watchWaiters = new Map();
+      if (m.snapshot) {
+        // A resync follows and will paint these viewers. Drop the fallback timers; the sbTimer watchdog
+        // stays, so a snapshot that never arrives still ends on the defined banner.
+        for (const id of waiters.keys()) {
+          const c = st.clients.get(id);
+          if (c && c.watchAckTimer) { clearTimeout(c.watchAckTimer); c.watchAckTimer = null; }
+        }
+        return;
+      }
+      for (const id of waiters.keys()) {
+        const c = st.clients.get(id);
+        if (!c || st.clients.get(id) !== c) continue;
+        if (c.watchAckTimer) { clearTimeout(c.watchAckTimer); c.watchAckTimer = null; }
+        if (!c.sbWait) continue;
+        requestSessionScrollback(n, st, c);
+        // Same rule as the timeout path: the bounded State L watchdog starts when THIS viewer's request
+        // goes out, so State V never spends its fallback budget on the wait that preceded the ask.
+        if (c.sbTimer) clearTimeout(c.sbTimer);
+        c.sbTimer = setTimeout(() => { if (c.sbWait) paintStateL(n, st, c); }, HOST_SB_WAIT_MS);
+      }
     } else if (m.t === 'resync') {
       // muxd blew THIS session's ~1MiB egress budget and dropped its own backlog at a frame
       // boundary. The gap is unrecoverable from the stream, so repaint from truth: CLEAR +
@@ -4294,6 +4333,16 @@ wssHost.on('connection', (ws, req) => {
       resetSessionBoundary(n, st);
       st.resyncPending = true;
       clearScrollbackRequest(st);                 // supersede any in-flight (pre-gap) request
+      // A resync IS the answer to a watch wait: this is the tee's ring snapshot arriving. Settle those
+      // waiters here rather than letting their fallback timers fire a second, redundant scrollback request
+      // for a screen this loop is about to paint them from.
+      if (st.watchWaiters && st.watchWaiters.size) {
+        for (const id of st.watchWaiters.keys()) {
+          const c = st.clients.get(id);
+          if (c && c.watchAckTimer) { clearTimeout(c.watchAckTimer); c.watchAckTimer = null; }
+        }
+        st.watchWaiters.clear();
+      }
       let asked = false;
       for (const c of st.clients.values()) {
         if (!c.hosted || c.ws.readyState !== 1) continue;
@@ -4582,8 +4631,10 @@ function removeViewer(name, st, client) {
   if (client.ka) clearInterval(client.ka);
   if (client.sbTimer) clearTimeout(client.sbTimer);
   if (client.dropTimer) clearTimeout(client.dropTimer);
+  if (client.watchAckTimer) clearTimeout(client.watchAckTimer);
   st.clients.delete(client.id);
   st.sbWaiters.delete(client.id);
+  if (st.watchWaiters) st.watchWaiters.delete(client.id);
   const releasedOnId = clearPinForDisconnectedDevice(name, st, client);
   // NOBODY WATCHING MEANS NOBODY OWNS IT. The id path above is exact, and exact is the problem when the
   // pin record is older than the viewer list: pins are PERSISTED, so a relay restart (or a viewer that
@@ -5153,7 +5204,32 @@ wss.on('connection', async (ws, req) => {
     // second time (and the reply is taken from a ring the resync is about to replace), which is what made
     // a new viewer's first keystroke wait behind two replays. Wait for the resync instead: it is a fresh
     // screen by construction, and the bounded State L fallback below still covers a tee that never sends.
-    const watchFlip = syncWatch(name, st, true);                          // §7.2 first viewer starts the feed
+    //
+    // BUT a watch is not a promise of a snapshot. muxd re-states its interest whenever its own state was
+    // reset while the tee never stopped watching, and then there is no snapshot to wait for. That is what
+    // put the deployed page on the scrollback banner on 2026-11-11: a relay that assumed a snapshot was
+    // always coming sat in the waiting state forever.
+    //
+    // So the wait is BOUNDED, and that bound is what makes it safe: a resync, a watchAck, or
+    // WATCH_ACK_WAIT_MS, whichever comes first, decides. A tee that snapshots gets the fix - no scrollback
+    // request at all, so the same history never crosses the wire twice. A tee that is already watching (a
+    // relay restart re-states interest to an muxd whose own flag never cleared) sends nothing, so the
+    // bounded wait expires and the ordinary request goes out shortly after. That is the 2026-11-11 banner
+    // case, and it is precisely why this must NOT be an unbounded wait: a missing snapshot has to resolve
+    // to a request, never to silence.
+    //
+    // The wait is armed only for a tab whose OWN TEE said it answers `watch` (row field watchAck, carried
+    // from the tee's hello). That gate is load-bearing and deliberately per-session, not host-wide: an old
+    // tee in the same muxd never sends the ack, and because muxd's set_watched is idempotent it will not
+    // even forward a `watch` once its own flag is set - so nothing would arrive to settle the wait and that
+    // tab would pay the full timeout on every attach for no gain. Per-session means the user's existing
+    // tabs keep exactly their pre-watch-flip path (zero added latency) while a new tee gets the double
+    // replay removed from its first attach. The ack is a latency refinement over the timer, never the
+    // safety mechanism - the timer is what makes the wait bounded.
+    // `teeAcksWatch` is read from the session row THIS attach is for, never from the host-wide caps: the
+    // capability belongs to the owner binary, and a per-host answer would tax every old tab in the fleet.
+    const teeAcksWatch = !!((hostSessions.get(name) || {}).watchAck);
+    const watchFlip = syncWatch(name, st, true) && teeAcksWatch;   // §7.2 first viewer starts the feed
     // A9 stays a refusal even when a warm model could answer the attach: a warm model proves the link
     // was live at the last hello, not that it is live now, so a viewer must never be shown a frozen
     // screen it cannot type into. That refusal is the `hostUp()` gate above this branch (with the
@@ -5170,15 +5246,31 @@ wss.on('connection', async (ws, req) => {
       // State S: the model already holds the whole stream; no scrollback request is sent at all.
       if (!paintSnapshot(name, st, client, warmSnap)) return;
     } else if (watchFlip) {
-      // State V: this attach started the feed, so a resync carrying the tee's whole ring is already on its
-      // way and asking for scrollback too would duplicate it. Stay in the waiting state (live bytes are
-      // buffered, not appended to a stale screen) and let the resync paint: it bumps the boundary, drops
-      // this viewer's buffer and requests one reply from the NEW ring, which is a truth snapshot.
-      // The same bounded wait as State R applies, so a tee that never answers still reaches the banner.
-      client.sbTimer = setTimeout(() => {
-        if (!client.sbWait) return;
-        paintStateL(name, st, client);
-      }, HOST_SB_WAIT_MS);
+      // State V: this attach started the feed, so a resync carrying the tee's whole ring is on its way and
+      // asking for scrollback too would duplicate it. Stay in the waiting state (live bytes are buffered,
+      // not appended to a stale screen) and let the resync paint: it bumps the boundary, drops this
+      // viewer's buffer and requests one reply from the NEW ring, which is a truth snapshot.
+      //
+      // A watch is not a promise of a snapshot, though: the tee only snapshots on a REAL flip, and it says
+      // so in its watchAck. Wait for that ack, and if it reports no snapshot, take the ordinary scrollback
+      // path at once rather than idling into the banner.
+      (st.watchWaiters || (st.watchWaiters = new Map())).set(client.id, Date.now());
+      // The State L watchdog is armed when a request is actually ISSUED, not here. Arming it at attach made
+      // this state self-defeating: the 400 ms ack wait spent most of the 900 ms budget, so the banner fired
+      // before the request it was supposed to be a fallback for could answer (live, 2026-11-11: a healthy
+      // teed tab bannered at 908 ms with a resync in flight). A resync arms it from the resync path and an
+      // ask arms it from watchdogRequest below, so every path still has a defined end and each one gets the
+      // full window from the moment its own question goes out.
+      const ask = () => {
+        if (!client.sbWait || st.clients.get(client.id) !== client) return;
+        (st.watchWaiters || new Map()).delete(client.id);
+        if (client.sbWait) {
+          requestSessionScrollback(name, st, client);
+          if (client.sbTimer) clearTimeout(client.sbTimer);
+          client.sbTimer = setTimeout(() => { if (client.sbWait) paintStateL(name, st, client); }, HOST_SB_WAIT_MS);
+        }
+      };
+      client.watchAckTimer = setTimeout(ask, WATCH_ACK_WAIT_MS);
     } else if (!requestSessionScrollback(name, st, client)) {             // one snapshot shared by every concurrent waiter
       removeViewer(name, st, client);
       try { ws.close(1013, 'PC mux host offline'); } catch {}

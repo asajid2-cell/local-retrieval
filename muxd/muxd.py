@@ -1436,7 +1436,7 @@ CUSTODY_GC_INTERVAL_SECONDS = max(
 )
 CLAIM_SWEEP_SECONDS = max(15, int(ENV.get("LAUNCH_CLAIM_SWEEP_SECONDS", "60")))
 PROTOCOL = 4
-CAPS = ["ls", "info", "create", "createAck", "bind", "input", "open", "attach", "kill", "killFence", "relayKillFence", "rename", "heal", "tail", "scrollback", "resize", "owner", "relaunch", "agentTruth", "resync", "inputDurable", "inputFence", "resumeOnly", "principalRegister", "binaryFrames", "watch"]
+CAPS = ["ls", "info", "create", "createAck", "bind", "input", "open", "attach", "kill", "killFence", "relayKillFence", "rename", "heal", "tail", "scrollback", "resize", "owner", "relaunch", "agentTruth", "resync", "inputDurable", "inputFence", "resumeOnly", "principalRegister", "binaryFrames", "watch", "watchAck"]
 
 # Lever 4. The `o` and unsigned `i` frames are the two hot paths over the host link, and both used to
 # pay base64 twice: muxd base64'd the payload into a JSON dict, and the relay decoded it back out. On a
@@ -3561,7 +3561,7 @@ class OwnerSession:
     # snapshots to the VPS and forwards remote keystrokes back into the owner sidecar.
     def __init__(self, name, cmd, cwd, cols, rows, loop, outq, owner_ws, heal=False,
                  ids=None, session_id="", aliases=None, owner_key="", session_uuid="",
-                 adopted=False, stream=False):
+                 adopted=False, stream=False, watch_ack=None):
         self.name, self.cmd, self.cwd = name, cmd or "", cwd or DEFAULT_CWD
         self.session_id, self.aliases, self.ids = resolve_session_identity(
             self.cmd, session_id, aliases, ids
@@ -3604,6 +3604,11 @@ class OwnerSession:
         # A stream owner (spec section 6.2) is a teed local tab: muxd holds its raw VT in the ring and
         # reports kind "local-tab". It has no command muxd may relaunch, so it is never auto-healed.
         self.stream = bool(stream)
+        # The tee's own answer capability, advertised in its hello: it replies to every `watch` with a
+        # `watchAck` stating whether that watch sent a ring snapshot. Per-session because it describes THIS
+        # owner binary - new tees set it, older ones in the same muxd do not, and the relay must not wait on
+        # a snapshot from a tee that will never send one.
+        self.watch_ack = bool(watch_ack) if watch_ack is not None else False
         self.heal = False if self.stream else self.heal
         # spec section 6.5: a stream owner's output is only forwarded while a relay viewer is watching,
         # and the owner is told so it can skip frames entirely on an unwatched tab. Non-stream owners
@@ -3842,6 +3847,8 @@ class OwnerSession:
             self._parked_since_watch += count
 
     def replace_history(self, data: bytes):
+        import traceback as _tb
+        log(f"[dbg-replace] {getattr(self,'name','?')} len={len(data)} from=" + ' < '.join(f"{f.name}:{f.lineno}" for f in _tb.extract_stack()[-4:-1]))
         # spec section 6.1, kind 0x03: the owner's screen and our ring have diverged, so the ring is
         # replaced wholesale rather than appended to. The same resync-the-viewers machinery the overflow
         # path uses does the second half (relay paints CLEAR + scrollback), so there is one repaint path.
@@ -4294,6 +4301,7 @@ def restore_manifest_sessions(records, target=None, loop=None, outq=None, now=No
             # A stream owner is a teed local tab. It has no command muxd may relaunch, so it is never
             # healed - a restored one is a dormant row the owner re-registers against (spec section 6.2).
             restored.stream = bool(m.get("stream", False))
+            restored.watch_ack = bool(m.get("watchAck", False))
             if restored.adopted or restored.stream:
                 restored.heal = False
             restored.identity_pending = bool(m.get("identityPending"))
@@ -4357,6 +4365,10 @@ def session_records_payload(source=None):
             "adopted": bool(getattr(s, "adopted", False)),
             "externalOwner": bool(getattr(s, "external_owner", False)),
             "stream": bool(getattr(s, "stream", False)),
+            # The tee's answer capability, persisted with the row so a restored link keeps it. Without
+            # this, an muxd restart would forget which tabs can answer `watch` and fall back for all of
+            # them - the same silent downgrade this session was fixed for.
+            "watchAck": bool(getattr(s, "watch_ack", False)),
             "identityPending": bool(getattr(s, "identity_pending", False)),
             "lifecycle": str(getattr(s, "lifecycle", "active") or "active"),
             "childPid": int(getattr(s, "child_pid", 0) or 0),
@@ -4753,6 +4765,10 @@ def session_payload(name, sess):
             "gridOwnerLabel": str(getattr(sess, "grid_owner_label", "") or ""),
             "gridEpoch": int(getattr(sess, "grid_epoch", 0) or 0),
             "gridPending": bool(getattr(sess, "grid_pending", None)),
+            # Per-session, from the tee's own hello: this tab answers `watch` with a `watchAck`. The relay
+            # uses it to decide whether a new viewer's history request may wait for a resync, because only
+            # a tee that answers can tell it no snapshot is coming. Additive: an old relay ignores it.
+            "watchAck": bool(getattr(sess, "watch_ack", False)),
             "tail": tail, "heal": sess.heal, "localViewers": len(sess.local),
             "localFirst": owner or len(sess.local) > 0, "owner": owner,
             "ownerConnected": bool(getattr(sess, "owner_connected", False)),
@@ -4939,6 +4955,13 @@ async def serve_owner_connection(ws, first, sessions, outq, save_manifest, regis
                 owner.child_pid = child_pid
                 owner.child_start_token = _process_start_token(child_pid)
                 await save_manifest(sessions)
+            elif mt == "watchAck":
+                # The tee told us whether its `watch` produced a fresh ring snapshot. The relay holds an
+                # attach's scrollback request waiting on this answer, so forward it verbatim and promptly:
+                # `snapshot:true` means a resync is about to paint those viewers instead.
+                owner.outq.put_nowait(("watchAck", owner.name, json.dumps({
+                    "t": "watchAck", "s": owner.name, "snapshot": bool(m.get("snapshot")),
+                })))
             elif mt == "inputResult":
                 waiter = owner.input_waiters.get(str(m.get("rid", "")))
                 if waiter is not None and not waiter.done():
@@ -5636,6 +5659,7 @@ async def main():
                 owner_key=owner_key,
                 adopted=adopted,
                 stream=stream,
+                watch_ack=bool(first.get("watchAck", False)),
             )
             owner._launch_claim = claim
             owner.claim_paths = list(claim.paths) if claim is not None else []
@@ -6571,6 +6595,10 @@ async def main():
                             elif kind == "gridAck":
                                 # A grid request the tee refused or never answered. `data` is the frame.
                                 await ws.send(data)
+                            elif kind == "watchAck":
+                                # The tee's answer to a `watch`: did it send a ring snapshot? The relay holds
+                                # an attach's scrollback request on this, so it must not wait behind output.
+                                await ws.send(data)
 
                     async def pump_status():
                         while True:
@@ -6758,7 +6786,18 @@ async def main():
                                         remember_desired_watch(name, wanted)
                                     session = sessions.get(name)
                                     if isinstance(session, OwnerSession):
+                                        # muxd is the authority on whether a re-statement can produce a
+                                        # snapshot. set_watched is idempotent, so when the owner is ALREADY
+                                        # watching it forwards nothing - the tee never sees the frame and no
+                                        # snapshot or ack can ever come. Answering here is what keeps a
+                                        # relay that waits on this attach from idling into the banner.
+                                        was_watched = bool(session.watched)
                                         session.set_watched(wanted)
+                                        if (wanted and was_watched and session.stream
+                                                and getattr(session, "watch_ack", False)):
+                                            outq.put_nowait(("watchAck", name, json.dumps({
+                                                "t": "watchAck", "s": name, "snapshot": False,
+                                            })))
                                         if session.stream:
                                             log(f"[{name}] " + (
                                                 "watched: forwarding owner output" if wanted
@@ -6836,6 +6875,7 @@ async def main():
                                     # The positional cut rides the same reply, additive: the body is
                                     # everything below `pos`, and `pos: null` (dirty) is distinct from
                                     # an old muxd that omits the key entirely.
+                                    log(f"[dbg-sb] {name} resync={view['resync']} dlen={len(view['d'])} pending_before={getattr(session,'resync_pending',None)} ring_len={getattr(session,'ring_len',0)}")
                                     await ws.send(json.dumps({
                                         "t": "sb",
                                         "s": name,

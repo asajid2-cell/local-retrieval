@@ -221,6 +221,16 @@ internal sealed class MuxLink : IDisposable
         try { _outWake.Release(); } catch (SemaphoreFullException) { }
     }
 
+    // A protocol reply that carries no pty bytes (today: the watch ack). Text, and queued ahead of the
+    // binary ingest backlog, so a reply about the feed is never stuck behind the feed itself.
+    private void SendText(string frame)
+    {
+        var ws = _ws;
+        if (ws is null || ws.State != WebSocketState.Open) return;
+        _outText.Enqueue(frame);
+        try { _outWake.Release(); } catch (SemaphoreFullException) { }
+    }
+
     public void Start()
     {
         _send = Task.Run(SendLoop);
@@ -336,6 +346,12 @@ internal sealed class MuxLink : IDisposable
                 cols = _cols,
                 rows = _rows,
                 stream = true,
+                // This tee answers every `watch` with a `watchAck` saying whether that watch produced a
+                // fresh ring snapshot. Declared PER SESSION in the hello, not host-wide in muxd's CAPS:
+                // it is a property of this binary, and an older tee registered in the same muxd would
+                // never answer. A relay that waited on such a tee would pay the whole timeout for a
+                // snapshot that cannot arrive, so the relay arms that wait only where this flag is set.
+                watchAck = true,
             };
             var bytes = JsonSerializer.SerializeToUtf8Bytes(hello);
             await ws.SendAsync(bytes, WebSocketMessageType.Text, true, attempt.Token);
@@ -434,10 +450,22 @@ internal sealed class MuxLink : IDisposable
                     // muxd has a relay viewer attached (spec section 6.5); start feeding the frame queue.
                     // The ring went stale while we were skipping, so hand back a fresh snapshot for muxd to
                     // serve the attach's `sb` from.
+                    //
+                    // The SNAPSHOT ONLY HAPPENS ON A REAL FLIP. muxd also re-states its interest when its
+                    // own state was reset (a relay restart, a re-watch after a link replacement) while THIS
+                    // tee never stopped watching - and answering that with another full ring snapshot
+                    // would replace a ring that is already correct. So the ack says whether a snapshot was
+                    // actually sent, and the relay decides from that instead of assuming one is coming.
                     if (!_watched)
                     {
                         _watched = true;
-                        try { WatchChanged?.Invoke(); } catch (Exception ex) { _log("watch hook: " + ex.Message); }
+                        bool sent = false;
+                        try { WatchChanged?.Invoke(); sent = true; } catch (Exception ex) { _log("watch hook: " + ex.Message); }
+                        SendText("{\"t\":\"watchAck\",\"snapshot\":" + (sent ? "true" : "false") + "}");
+                    }
+                    else
+                    {
+                        SendText("{\"t\":\"watchAck\",\"snapshot\":false}");
                     }
                     break;
                 case "unwatch":
