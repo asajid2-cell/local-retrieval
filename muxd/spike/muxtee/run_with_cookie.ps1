@@ -9,5 +9,8 @@ if (-not $name) {
   exit 2
 }
 $env:MUX_COOKIE = $name
+# Two probes read the credential under a different name; both are the same keysafe secret, so set them
+# here rather than making the caller remember which probe wants which. Nothing is printed.
+$env:HLOWNER = $name
 node $Script
 exit $LASTEXITCODE

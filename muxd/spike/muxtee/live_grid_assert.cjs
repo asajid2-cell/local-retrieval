@@ -24,6 +24,8 @@ const { assertSession } = require('./probe_guard.cjs');
 const BASE = process.env.MUX_LIVE_URL || 'https://harmonizerlabs.cc/multiplex/';
 const SESSION = process.env.MUX_LIVE_SESSION || 'hl-owner-session';
 const TOKEN = process.env.HLOWNER || '';
+// hl-auth binds the session to the UA it was minted with; present exactly that one.
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.7827.55 Safari/537.36';
 const HEADFUL = process.argv.includes('--headful');
 
 const rows = [];
@@ -55,10 +57,16 @@ async function state(page) {
 
 (async () => {
   if (!TOKEN) { console.error('HLOWNER missing: run under keysafe'); process.exit(2); }
+  // The credential is the full Cookie HEADER (hl_session + CSRF), not a bare session value: hl-auth binds
+  // the session to the exact header the owner test credential was minted with. Every other live probe
+  // splits it into pairs the same way, so this one does too rather than inventing a second shape.
+  const pairs = TOKEN.split(';').map(x => x.trim()).filter(Boolean).map(x => {
+    const i = x.indexOf('='); return { name: x.slice(0, i), value: x.slice(i + 1) };
+  });
+  if (!pairs.length) { console.error('HLOWNER has no cookie pairs'); process.exit(2); }
   const browser = await chromium.launch({ headless: !HEADFUL, args: ['--no-proxy-server'] });
-  const ctx = await browser.newContext({ viewport: { width: 1440, height: 900 }, locale: 'en-US' });
-  const value = TOKEN.trim();
-  await ctx.addCookies([{ name: 'hl_session', value, url: 'https://harmonizerlabs.cc/multiplex/' }]);
+  const ctx = await browser.newContext({ viewport: { width: 1440, height: 900 }, locale: 'en-US', userAgent: UA });
+  await ctx.addCookies(pairs.map(c => ({ ...c, domain: 'harmonizerlabs.cc', path: '/', httpOnly: true, secure: true, sameSite: 'Lax' })));
   const page = await ctx.newPage();
   const errors = [];
   page.on('pageerror', (e) => errors.push(String((e && e.message) || e)));
@@ -82,8 +90,11 @@ async function state(page) {
       };
       grab(); setInterval(grab, 200);
     });
-    await page.waitForFunction(() => { try { return typeof term !== 'undefined' && term.cols > 1; } catch (e) { return false; } }, null, { timeout: 30000 });
-  await assertSession(page, S);   // fail closed: never type into a pane this probe was not given
+    // Wait for the session LIST, not just the terminal: the guard below reads window._sessions, and a
+    // terminal that exists before the list arrives attaches to nothing (current === null), which the
+    // guard would - correctly - refuse. The other live probes wait on `current` for the same reason.
+    await page.waitForFunction(() => { try { return typeof term !== 'undefined' && term.cols > 1 && current; } catch (e) { return false; } }, null, { timeout: 30000 });
+  await assertSession(page, SESSION);   // fail closed: never type into a pane this probe was not given
     await sleep(2500);
     let s = await state(page);
     check('L0 the deployed page attaches with the real session cookie',
@@ -95,6 +106,31 @@ async function state(page) {
     check('L1 local ownership is the default on the live page',
       localOwner && Math.abs(s.sx - 1) < 1e-6 && Math.abs(s.sy - 1) < 1e-6,
       `gridOwner=${s.gridOwner} transform=${s.transform} chip=${JSON.stringify(s.chip)} term=${s.cols}x${s.rows}`);
+
+    // The doneWhen row the ladder probe watches but never asserts: with LCAL ownership holding, the pane
+    // must stay put. Fill mode first (the default), then a 3 s window in which NO resize frame and no
+    // commit may appear - a fill mode that quietly resized the pty would show up here as a 'v' or an 'r'
+    // or a gridEpoch bump, and the term size must not move a cell.
+    await page.evaluate(() => { window.__localStart = { d: (window.__d || []).length, epoch: (window.__d || []).slice(-1)[0] && window.__d.slice(-1)[0].gridEpoch }; });
+    const before = await state(page);
+    await sleep(3000);
+    const after = await state(page);
+    const frames = await page.evaluate(() => {
+      const d = window.__d || [];
+      const start = window.__localStart ? window.__localStart.d : 0;
+      const fresh = d.slice(start);
+      return {
+        n: fresh.length,
+        kinds: fresh.map(f => String(f.t || f.kind || '?')),
+        epochStart: window.__localStart ? window.__localStart.epoch : null,
+        epochEnd: d.length ? d[d.length - 1].gridEpoch : null,
+      };
+    });
+    check('L1b local ownership sends NO resize traffic and never moves the pane',
+      before.mode === after.mode && before.cols === after.cols && before.rows === after.rows
+        && frames.n === 0,
+      `mode=${before.mode}->${after.mode} term=${before.cols}x${before.rows}->${after.cols}x${after.rows} `
+      + `frames=${frames.n} epoch=${frames.epochStart}->${frames.epochEnd}`);
 
     // Walk the ladder to "take". fill -> fit -> take; never loop (each extra tap is a pin/release).
     const tap = async () => {

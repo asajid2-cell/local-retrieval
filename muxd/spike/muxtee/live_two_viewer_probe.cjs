@@ -26,8 +26,9 @@ async function open(browser, w, h, label) {
   await ctx.addCookies(pairs.map(c => ({ ...c, domain: 'harmonizerlabs.cc', path: '/', httpOnly: true, secure: true, sameSite: 'Lax' })));
   const page = await ctx.newPage();
   await page.goto(`${BASE}/?s=${encodeURIComponent(SESSION)}&dev=${label}&label=${label}`, { waitUntil: 'domcontentloaded', timeout: 60000 });
-  await page.waitForFunction(() => { try { return typeof term !== 'undefined' && term.cols > 1; } catch (e) { return false; } }, null, { timeout: 30000 });
-  await assertSession(page, S);   // fail closed: never type into a pane this probe was not given
+  // Wait for the list too: the guard reads window._sessions and `current`, which arrive with it.
+  await page.waitForFunction(() => { try { return typeof term !== 'undefined' && term.cols > 1 && current; } catch (e) { return false; } }, null, { timeout: 30000 });
+  await assertSession(page, SESSION);   // fail closed: never type into a pane this probe was not given
   await page.waitForTimeout(2000);
   return { ctx, page, label };
 }
