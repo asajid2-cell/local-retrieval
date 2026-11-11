@@ -357,12 +357,17 @@ test('the integrity watch notices a bottom bar a pointer can no longer reach', a
       'a reachable bottom bar must not be healed');
     assert.ok(await page.evaluate(() => {
       const nav = document.querySelector('#mobileNav');
+      const box = nav.getBoundingClientRect();
       return [...nav.querySelectorAll('button,a')].every(b => {
         const r = b.getBoundingClientRect();
+        // The bar is a horizontally SCROLLING row by design, so a control panned past its right edge is
+        // reachable by panning, not broken. Only the ones inside the bar must answer the pointer - which is
+        // what the fault above (an overlay covering the whole visible bar) still trips.
+        if (r.left < box.left - 1 || r.right > box.right + 1) return true;
         const h = document.elementFromPoint(Math.round(r.left + r.width / 2), Math.round(r.top + r.height / 2));
         return h && (h === b || b.contains(h));
       });
-    }), 'every nav control must be the pointer target at its own centre');
+    }), 'every nav control inside the bar must be the pointer target at its own centre');
   });
 });
 

@@ -300,6 +300,57 @@
   /* ---- projects view (synced from the desktop app) ---- */
   #projects { grid-area:term; display:none; flex-direction:column; min-height:0; min-width:0; background:var(--bg); }
   #fleetList { grid-area:term; display:none; flex-direction:column; min-height:0; min-width:0; overflow:auto; background:var(--bg); }
+
+  /* ---- threads: the conversation render of the SAME session bytes ----
+     A phone is bad at a 209-column grid and good at a message list, so this view groups the live buffer
+     rows into messages (threads.js) and paints them as bubbles. Every row shown here came off the same
+     pty the terminal is mirroring; nothing is fetched, and the terminal view remains the authority. */
+  #threads {
+    grid-area:threads; display:none; flex-direction:column; min-height:0; min-width:0;
+    overflow-y:auto; overscroll-behavior:contain; background:var(--bg);
+    padding:var(--sp3) var(--sp3) var(--sp4); scroll-behavior:smooth;
+  }
+  .th-msg { display:flex; flex-direction:column; margin:0 0 var(--sp3); max-width:100%; }
+  .th-msg:last-child { margin-bottom:0; }
+  .th-who { font-size:11px; letter-spacing:.03em; text-transform:uppercase; color:var(--faint); margin:0 0 3px var(--sp1); }
+  .th-body {
+    border:1px solid var(--line); background:var(--panel); border-radius:var(--r-m);
+    padding:var(--sp2) var(--sp3); font-size:14px; line-height:1.5; color:var(--txt);
+    white-space:pre-wrap; word-break:break-word; overflow-wrap:anywhere;
+  }
+  /* The user's own turn reads as "me": accent edge, raised surface, right-aligned. */
+  .th-msg.user { align-items:flex-end; }
+  .th-msg.user .th-who { margin-right:var(--sp1); }
+  .th-msg.user .th-body { background:var(--rose-dim); border-color:rgba(251,113,133,.34); color:var(--txt); }
+  /* A tool result is subordinate: muted, smaller, and monospaced because it is machine output. */
+  .th-msg.tool .th-body {
+    background:var(--panel-2); color:var(--muted); font-size:12.5px; line-height:1.45;
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"Roboto Mono",monospace;
+  }
+  .th-msg.status .th-body { background:transparent; border-style:dashed; color:var(--muted); font-size:12.5px; }
+  #threads .th-empty { color:var(--faint); font-size:13px; padding:var(--sp4) 0; text-align:center; }
+  #threads .th-alt {
+    margin:var(--sp2) 0; padding:var(--sp3); border:1px solid var(--line); border-radius:var(--r-m);
+    background:var(--panel); color:var(--muted); font-size:13px; line-height:1.5;
+  }
+  #threads .th-alt button { margin-top:var(--sp2); min-height:40px; padding:0 var(--sp3); border-radius:var(--r-s);
+    border:1px solid var(--rose); background:var(--rose-dim); color:var(--rose); font-size:13.5px; font-weight:600; }
+  /* Composer: the phone's own input row, so typing into a thread never needs the grid or the keybar. */
+  #composer {
+    grid-area:composer; display:none; align-items:flex-end; gap:var(--sp2); padding:var(--sp2) var(--sp3);
+    border-top:1px solid var(--line); background:var(--panel); flex:0 0 auto;
+  }
+  #composer textarea {
+    flex:1 1 auto; min-height:40px; max-height:38vh; resize:none; padding:10px var(--sp3);
+    border-radius:var(--r-m); border:1px solid var(--line); background:var(--bg); color:var(--txt);
+    font:inherit; font-size:15px; line-height:1.35; outline:none;
+  }
+  #composer textarea:focus { border-color:var(--rose); }
+  #composer #sendthread {
+    flex:0 0 auto; min-width:52px; min-height:40px; padding:0 var(--sp3); border-radius:var(--r-m);
+    border:1px solid var(--rose); background:var(--rose); color:#12070a; font-size:14px; font-weight:700;
+  }
+  #composer #sendthread:disabled { opacity:.45; }
   #app.projects #term { display:none; }
   #app.projects #projects { display:flex; }
   #app.projects #tabwrap, #app.projects #status, #app.projects #keybar { display:none; }
@@ -638,6 +689,17 @@
     }
     #app.mobile-view-terminal #tabwrap, #app.mobile-view-terminal #keybar { display:none; }
 
+    /* THREADS: the same teemux output rendered as a conversation instead of a grid. Rows come from the
+       live buffer (threads.js segments them) - nothing here fetches, and nothing here knows about leaves. */
+    #app.mobile-view-threads {
+      grid-template-rows:auto minmax(0,1fr) auto auto auto;
+      grid-template-areas:"topbar" "threads" "composer" "status" "mobileNav";
+    }
+    #app.mobile-view-threads #term, #app.mobile-view-threads #keybar,
+    #app.mobile-view-threads #tabwrap { display:none; }
+    #app.mobile-view-threads #threads { display:flex; }
+    #app.mobile-view-threads #composer { display:flex; }
+
     #app.mobile-view-keys {
       grid-template-rows:auto minmax(4rem,1fr) auto auto auto;
       grid-template-areas:"topbar" "term" "status" "keys" "mobileNav";
@@ -739,12 +801,23 @@
 
   <div id="fleetList" aria-label="Fleet glance"></div>
 
+  <section id="threads" aria-label="Conversation view of this session"></section>
+  <form id="composer" autocomplete="off">
+    <textarea id="threadinput" rows="1" placeholder="Message this session&hellip;" aria-label="Message this session"></textarea>
+    <button type="submit" id="sendthread">Send</button>
+  </form>
+
+
   <div id="status"><span class="sdot"></span><span id="statustext">connecting&hellip;</span><button type="button" class="meta" id="statusmeta" aria-label="Shared terminal size"></button></div>
   <div id="keybar"></div>
   <nav id="mobileNav" aria-label="Mobile views">
     <button type="button" data-mobile-view="sessions" aria-label="Sessions" aria-pressed="false">
       <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 6h14M5 12h14M5 18h14" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
       <span>Sessions</span>
+    </button>
+    <button type="button" data-mobile-view="threads" aria-label="Threads" aria-pressed="false">
+      <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M4 6.5A2.5 2.5 0 016.5 4h11A2.5 2.5 0 0120 6.5v7a2.5 2.5 0 01-2.5 2.5H11l-4.6 3.4A.6.6 0 015.5 18.9V16H6.5A2.5 2.5 0 014 13.5v-7z" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/><path d="M8 8.5h8M8 11.5h5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+      <span>Threads</span>
     </button>
     <button type="button" data-mobile-view="terminal" aria-label="Terminal" aria-pressed="false">
       <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><rect x="3.5" y="5" width="17" height="14" rx="2" stroke="currentColor" stroke-width="1.7"/><path d="M7 10l3 2-3 2M12.5 15h4" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
@@ -890,13 +963,14 @@
 <script src="input-continuity.js"></script>
 <script src="picker.js"></script>
 <script src="fleet.js"></script>
+<script src="threads.js"></script>
 <script>
 const $ = s => document.querySelector(s);
 const base = location.pathname.replace(/\/[^/]*$/, '') || '';
 const api = p => fetch(base + '/api/' + p, { headers:{'Content-Type':'application/json'} });
 const LS = { get:(k,d)=>{ try{ return JSON.parse(localStorage.getItem(k)) ?? d; }catch(e){ return d; } }, set:(k,v)=>{ try{ localStorage.setItem(k, JSON.stringify(v)); }catch(e){} } };
 const mobileMQ = window.matchMedia ? window.matchMedia('(max-width: 59.99rem)') : {matches:false,addEventListener:()=>{},addListener:()=>{}};
-const MOBILE_VIEWS = ['sessions','fleet','terminal','keys'];
+const MOBILE_VIEWS = ['sessions','fleet','threads','terminal','keys'];
 let mobileView = LS.get('mux_mobile_view','terminal');
 if(!MOBILE_VIEWS.includes(mobileView)) mobileView='terminal';
 const isMobile = () => !!mobileMQ.matches;
@@ -930,6 +1004,7 @@ function setMobileView(view, persist=true){
   } else {
     if(fleetPollInterval){ clearInterval(fleetPollInterval); fleetPollInterval = null; }
   }
+  if(isMobile() && view==='threads') renderThreads(true);
   if(isMobile() && view!=='sessions' && view!=='fleet'){
     // applyViewport (not healTerminalSurface) does the height write, so it stays first; the heal is what
     // repaints the rows xterm drew while this view was display:none. Only when the terminal was actually
@@ -938,6 +1013,92 @@ function setMobileView(view, persist=true){
     setTimeout(()=>{ applyViewport(); if(heal) healTerminalSurface('mobile-view-'+view); try{ term.focus(); }catch(e){} }, 60);
   }
 }
+// ---- threads: the same session bytes, rendered as a conversation ---------------------------------------
+// A phone cannot use a 209-column grid, so this view groups the LIVE buffer rows into messages and paints
+// bubbles. The rows are the terminal's own - segments come from MuxThreads.segment(), whose rules are
+// pinned in relay/tests/threads.test.js against a real agent screen. No fetch, no new wire field, and the
+// terminal view is still the authority: this only reads what the pty already delivered.
+let threadsLastSig = '';
+function threadRowsFromBuffer(){
+  // Read the WHOLE buffer, not just the viewport: a message list that forgets everything scrolled past is
+  // not a conversation. Scrollback is already in memory (xterm keeps 60000 lines), so this is a walk.
+  const rows=[]; let b=null;
+  try{ b=term.buffer.active; }catch(e){ return { kind:'normal', rows:[] }; }
+  if(!b) return { kind:'normal', rows:[] };
+  const kind=(window.MuxThreads && MuxThreads.bufferKind) ? MuxThreads.bufferKind(b) : 'normal';
+  for(let i=0;i<b.length;i++){
+    const ln=b.getLine(i);
+    if(!ln) continue;
+    rows.push({ i, text: ln.translateToString(true), wrapped: !!ln.isWrapped });
+  }
+  return { kind, rows };
+}
+function renderThreads(force){
+  const host=$('#threads'); if(!host) return;
+  if(!isMobile() || mobileView!=='threads') return;
+  if(!current){ host.innerHTML='<div class="th-empty">No session open.</div>'; threadsLastSig=''; return; }
+  const buf=threadRowsFromBuffer();
+  // A full-screen TUI owns every cell, so its rows are a canvas, not a conversation. Say so plainly and
+  // offer the only honest action instead of inventing messages out of a TUI's box drawing.
+  if(buf.kind==='alternate'){
+    const sig='alt|'+current;
+    if(force || sig!==threadsLastSig){
+      threadsLastSig=sig;
+      host.innerHTML='';
+      const d=document.createElement('div'); d.className='th-alt';
+      d.textContent='This app is drawing a full-screen interface, so there is no conversation to group. '
+        +'Open the terminal to use it directly.';
+      const b=document.createElement('button'); b.type='button'; b.textContent='Open the terminal';
+      b.onclick=()=>setMobileView('terminal');
+      d.appendChild(b); host.appendChild(d);
+    }
+    return;
+  }
+  const msgs=(window.MuxThreads && MuxThreads.segment) ? MuxThreads.segment(buf.rows) : [];
+  const sig=current+'|'+msgs.map(m=>m.role+':'+m.text.length+':'+m.text.slice(-24)).join('\u0001');
+  if(!force && sig===threadsLastSig) return;      // nothing changed: do not rebuild the list under a finger
+  threadsLastSig=sig;
+  const WHO={user:'You',assistant:current,status:'status',tool:'result',text:''};
+  const stick = host.scrollHeight - host.scrollTop - host.clientHeight < 80;   // were we at the bottom?
+  host.innerHTML='';
+  if(!msgs.length){ host.innerHTML='<div class="th-empty">Nothing on this screen yet.</div>'; return; }
+  const frag=document.createDocumentFragment();
+  for(const m of msgs){
+    const wrap=document.createElement('div'); wrap.className='th-msg '+(m.role||'text');
+    const who=document.createElement('div'); who.className='th-who';
+    who.textContent=WHO[m.role]!==undefined?WHO[m.role]:m.role;
+    const body=document.createElement('div'); body.className='th-body';
+    // The glyph has already done its job (it is what grouped this message), and the label above says who
+    // it is - so it is stripped from the first line instead of being read out twice.
+    const said=m.text.replace(/^\s*[⏺●○⏎⎿└❯⏵›✻✳]\s?/, '');
+    // A row that was ONLY the glyph is the empty prompt line above the composer, not a message: showing it
+    // as an empty bubble reads as a broken message.
+    if(!said.trim()) continue;
+    body.textContent=said;
+    wrap.appendChild(who); wrap.appendChild(body); frag.appendChild(wrap);
+  }
+  host.appendChild(frag);
+  if(stick) host.scrollTop=host.scrollHeight;
+}
+function threadSafeToRender(){
+  try{ return isMobile() && mobileView==='threads'; }catch(e){ return false; }
+}
+// The composer is not a second input channel: it hands text to the SAME path the terminal uses (term.paste
+// -> onData -> send), so the lease checks, mouse-report stripping and signing all still apply. Sending is
+// text plus one CR, which is exactly what pressing Enter in the terminal does.
+function sendThreadMessage(){
+  const ta=$('#threadinput'); if(!ta) return;
+  const text=ta.value; if(!text.trim()) return;
+  if(!current){ flash('No session open'); return; }
+  ta.value=''; ta.style.height='auto';
+  try{ term.paste(text); }catch(e){ send('i', text); }
+  setTimeout(()=>{ try{ send('i','\r'); }catch(e){} }, 30);
+  markActive();
+  if(!isMobile() || mobileView!=='threads') return;
+  // The message the user just sent belongs on screen immediately, before the app echoes it back.
+  renderThreads(true);
+}
+
 function syncMobileView(){
   const app=$('#app'); if(!app) return;
   app.classList.toggle('mobile-device', isMobile());
@@ -950,6 +1111,17 @@ function syncMobileView(){
 }
 function initMobileViews(){
   document.querySelectorAll('[data-mobile-view]').forEach(b=> b.onclick=()=>setMobileView(b.dataset.mobileView));
+  const threadForm=$('#composer');
+  if(threadForm){
+    threadForm.addEventListener('submit', e=>{ e.preventDefault(); sendThreadMessage(); });
+    const ta=$('#threadinput');
+    if(ta){
+      // Grow with the text up to the CSS cap, and Enter sends while Shift+Enter (or a hardware fn key)
+      // still inserts a newline - the shape a phone message box has trained everyone to expect.
+      ta.addEventListener('input', ()=>{ ta.style.height='auto'; ta.style.height=Math.min(ta.scrollHeight, Math.round(window.innerHeight*0.38))+'px'; });
+      ta.addEventListener('keydown', e=>{ if(e.key==='Enter' && !e.shiftKey){ e.preventDefault(); sendThreadMessage(); } });
+    }
+  }
   if(window.MuxFleet) MuxFleet.attachFleet($("#fleetList"), function(name){ setMobileView("terminal"); connect(name, false); });
   if(mobileMQ.addEventListener) mobileMQ.addEventListener('change', syncMobileView);
   else if(mobileMQ.addListener) mobileMQ.addListener(syncMobileView);
@@ -1378,9 +1550,18 @@ function terminalSurfaceIntegrityFault(){
     // verbatim: the terminal works, the bottom bar is simply not there to press. Every control must be the
     // pointer's target at its OWN centre. A control that is off screen is the geometry fault above, so this
     // only judges the ones the user can actually see.
+    // The bar is a horizontally SCROLLING row by design (see #mobileNav), so a control past the right edge
+    // is reachable by panning - it is not the "invisible bar" fault this check exists for. Judge only the
+    // controls currently inside the bar's own box; one that is visible-but-unhit still faults.
+    const navBox=nav.getBoundingClientRect();
     for(const b of nav.querySelectorAll('button,a')){
       const br=b.getBoundingClientRect();
       if(!br.width || !br.height) continue;
+      // Clipped BY THE BAR (the row scrolls): not reachable until panned, which is the documented behaviour.
+      // Clipped by the VIEWPORT is different - that is a control the user can see and cannot press, and it
+      // still faults below.
+      const inBar = br.left >= navBox.left - 1 && br.right <= navBox.right + 1;
+      if(!inBar) continue;
       const cy=Math.round(br.top+br.height/2);
       if(cy<0 || cy>vh) continue;
       const nh=document.elementFromPoint(Math.round(br.left+br.width/2), cy);
@@ -3662,6 +3843,10 @@ function explainScrollAffordance(){
 }
 try{ term.buffer.onBufferChange(()=>applyScrollAffordance()); }catch(e){}
 try{ term.onRender(()=>applyScrollAffordance()); }catch(e){}
+// The thread view is a REPAINT of the same buffer, so it follows the terminal's own render cadence rather
+// than polling. It is a no-op unless the phone is actually on that view, and renderThreads() collapses a
+// rebuild by signature, so a burst of writes costs one DOM pass, not one per frame.
+try{ term.onRender(()=>{ if(threadSafeToRender()) renderThreads(false); }); }catch(e){}
 term.onScroll(()=>{
   if(!viewportRestoreApplying && (!terminalWriteActive || !atBottom())) noteUserScroll();
   if(atBottom()){ newLines=0; showJump(); }
