@@ -7,6 +7,7 @@ function loadPlaywright() {
   let last; for (const x of c) { try { return require(x); } catch (e) { last = e; } } throw last;
 }
 const { chromium } = loadPlaywright();
+const { assertSession } = require('./probe_guard.cjs');
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.7827.55 Safari/537.36';
 const BASE = process.env.MUX_BASE || 'https://harmonizerlabs.cc/multiplex';
 const SESSION = process.env.MUX_LIVE_SESSION || 'hl-owner-session';
@@ -26,6 +27,7 @@ async function open(browser, w, h, label) {
   const page = await ctx.newPage();
   await page.goto(`${BASE}/?s=${encodeURIComponent(SESSION)}&dev=${label}&label=${label}`, { waitUntil: 'domcontentloaded', timeout: 60000 });
   await page.waitForFunction(() => { try { return typeof term !== 'undefined' && term.cols > 1; } catch (e) { return false; } }, null, { timeout: 30000 });
+  await assertSession(page, S);   // fail closed: never type into a pane this probe was not given
   await page.waitForTimeout(2000);
   return { ctx, page, label };
 }

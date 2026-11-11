@@ -460,15 +460,19 @@ function sendHostInputRedraw(name) {
 // first attach and `unwatch` on the last detach. This is advisory - an old muxd ignores both frames and
 // forwards unconditionally, which is why it is gated on the cap rather than assumed. The per-session
 // flag makes the transition idempotent so two attaches do not double-fire a watch.
+// Returns true only when it actually TOLD a stream owner to start watching. That transition makes the tee
+// push a full ring snapshot (a resync), which is what lets the attach path below skip its own scrollback
+// request instead of paying for the same history twice.
 function syncWatch(name, st, watched) {
-  if (!st) return;
+  if (!st) return false;
   const next = !!watched;
-  if (!!st.watchedHost === next) return;
+  if (!!st.watchedHost === next) return false;
   st.watchedHost = next;
-  if (!hostSupportsCap('watch')) return;
+  if (!hostSupportsCap('watch')) return false;
   const host = hostSessions.get(name);
-  if (!host || !host.owner) return;   // only a stream-owner session has a watchable link
+  if (!host || !host.owner) return false;   // only a stream-owner session has a watchable link
   sendHost({ t: next ? 'watch' : 'unwatch', s: name });
+  return next;
 }
 // A fresh host link is a fresh muxd whose stream owners all start unwatched, so every session the relay
 // still has viewers for must be re-watched even though its own flag did not change. Forgetting this is
@@ -5144,7 +5148,12 @@ wss.on('connection', async (ws, req) => {
     // where `recv` has outrun `pos` inside an open escape sequence - and left it on the banner.
     const client = { id, ws, term: null, hosted: true, vcols, vrows, sbWait: true, wentLive: false, sbTok: ++_cid, q: [], qBytes: 0, qMark: 0, repairPending: false, painted: 0, dropUntil: null, dropTimer: null, deviceId, label, visible: true, lastActive: Date.now(), connAt: Date.now() };
     st.clients.set(id, client);
-    syncWatch(name, st, true);                                            // §7.2 first viewer starts the feed
+    // If THIS attach is what starts the feed for a stream owner, the tee answers the watch by pushing its
+    // whole ring as a resync. Asking muxd for scrollback on the same attach sends the same history a
+    // second time (and the reply is taken from a ring the resync is about to replace), which is what made
+    // a new viewer's first keystroke wait behind two replays. Wait for the resync instead: it is a fresh
+    // screen by construction, and the bounded State L fallback below still covers a tee that never sends.
+    const watchFlip = syncWatch(name, st, true);                          // §7.2 first viewer starts the feed
     // A9 stays a refusal even when a warm model could answer the attach: a warm model proves the link
     // was live at the last hello, not that it is live now, so a viewer must never be shown a frozen
     // screen it cannot type into. That refusal is the `hostUp()` gate above this branch (with the
@@ -5160,6 +5169,16 @@ wss.on('connection', async (ws, req) => {
     if (warmSnap) {
       // State S: the model already holds the whole stream; no scrollback request is sent at all.
       if (!paintSnapshot(name, st, client, warmSnap)) return;
+    } else if (watchFlip) {
+      // State V: this attach started the feed, so a resync carrying the tee's whole ring is already on its
+      // way and asking for scrollback too would duplicate it. Stay in the waiting state (live bytes are
+      // buffered, not appended to a stale screen) and let the resync paint: it bumps the boundary, drops
+      // this viewer's buffer and requests one reply from the NEW ring, which is a truth snapshot.
+      // The same bounded wait as State R applies, so a tee that never answers still reaches the banner.
+      client.sbTimer = setTimeout(() => {
+        if (!client.sbWait) return;
+        paintStateL(name, st, client);
+      }, HOST_SB_WAIT_MS);
     } else if (!requestSessionScrollback(name, st, client)) {             // one snapshot shared by every concurrent waiter
       removeViewer(name, st, client);
       try { ws.close(1013, 'PC mux host offline'); } catch {}

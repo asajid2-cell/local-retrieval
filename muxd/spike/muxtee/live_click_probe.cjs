@@ -3,6 +3,7 @@
 const path = require('path');
 function loadPlaywright() { const c = ['C:/Users/Ahmed/mux-track/wt-grid-proof/relay/node_modules/playwright', 'playwright']; let l; for (const x of c) { try { return require(x); } catch (e) { l = e; } } throw l; }
 const { chromium } = loadPlaywright();
+const { assertSession } = require('./probe_guard.cjs');
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.7827.55 Safari/537.36';
 const COOKIE = (process.env.MUX_COOKIE || '').trim();
 const pairs = COOKIE.split(';').map(p => p.trim()).filter(Boolean).map(p => { const i = p.indexOf('='); return { name: p.slice(0, i), value: p.slice(i + 1) }; });
@@ -13,6 +14,7 @@ const pairs = COOKIE.split(';').map(p => p.trim()).filter(Boolean).map(p => { co
   const page = await ctx.newPage();
   await page.goto('https://harmonizerlabs.cc/multiplex/?s=hl-owner-session', { waitUntil: 'domcontentloaded', timeout: 60000 });
   await page.waitForFunction(() => { try { return typeof term !== 'undefined' && term.cols > 1; } catch (e) { return false; } }, null, { timeout: 30000 });
+  await assertSession(page, S);   // fail closed: never type into a pane this probe was not given
   await page.waitForTimeout(2500);
   const pre = await page.evaluate(() => ({ armed: (() => { try { return mouseGuard.mouseActive(); } catch (e) { return null; } })(), allowed: (() => { try { return mouseGuard.inputAllowed(); } catch (e) { return null; } })(), solo: (() => { try { return soleTerminal; } catch (e) { return null; } })() }));
   await page.evaluate(() => { window.__out = []; try { const o = ws.send.bind(ws); ws.send = (p) => { window.__out.push(String(p).slice(0, 48)); return o(p); }; } catch (e) {} });

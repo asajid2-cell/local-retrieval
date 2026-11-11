@@ -6,6 +6,7 @@
 const path = require('path');
 function loadPlaywright() { const c = ['C:/Users/Ahmed/mux-track/wt-grid-proof/relay/node_modules/playwright', 'playwright']; let l; for (const x of c) { try { return require(x); } catch (e) { l = e; } } throw l; }
 const { chromium } = loadPlaywright();
+const { assertSession } = require('./probe_guard.cjs');
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.7827.55 Safari/537.36';
 const BASE = process.env.MUX_BASE || 'https://harmonizerlabs.cc/multiplex';
 const S = process.env.MUX_SESSION || 'hl-owner-session';
@@ -39,6 +40,7 @@ const screenText = () => { try { return termVisibleText(); } catch (e) { return 
   const errs = []; page.on('pageerror', e => errs.push(String(e && e.message || e)));
   await page.goto(`${BASE}/?s=${encodeURIComponent(S)}`, { waitUntil: 'domcontentloaded', timeout: 60000 });
   await page.waitForFunction(() => { try { return typeof term !== 'undefined' && term.cols > 1 && current; } catch (e) { return false; } }, null, { timeout: 30000 });
+  await assertSession(page, S);   // fail closed: never type into a pane this probe was not given
   await page.waitForTimeout(2500);
   await page.evaluate(() => {
     window.__sent = [];

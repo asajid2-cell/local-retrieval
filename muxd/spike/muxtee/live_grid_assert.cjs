@@ -19,6 +19,7 @@ function loadPlaywright() {
   throw last;
 }
 const { chromium } = loadPlaywright();
+const { assertSession } = require('./probe_guard.cjs');
 
 const BASE = process.env.MUX_LIVE_URL || 'https://harmonizerlabs.cc/multiplex/';
 const SESSION = process.env.MUX_LIVE_SESSION || 'hl-owner-session';
@@ -82,6 +83,7 @@ async function state(page) {
       grab(); setInterval(grab, 200);
     });
     await page.waitForFunction(() => { try { return typeof term !== 'undefined' && term.cols > 1; } catch (e) { return false; } }, null, { timeout: 30000 });
+  await assertSession(page, S);   // fail closed: never type into a pane this probe was not given
     await sleep(2500);
     let s = await state(page);
     check('L0 the deployed page attaches with the real session cookie',

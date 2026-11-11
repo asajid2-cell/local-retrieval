@@ -1,0 +1,145 @@
+'use strict';
+// The attach path must not pay for the same history twice.
+//
+// A teed PC tab only forwards bytes while the relay is watching it, and the tee answers the FIRST watch
+// by pushing its whole ring as a resync. The relay also used to ask muxd for scrollback on that same
+// attach, so a new viewer's history crossed the wire twice: once as the scrollback reply (taken from a
+// ring the resync was about to replace) and once as the resync snapshot itself. Both had to be parsed by
+// the page before the viewer's first keystroke echo could paint, which is the measured 0.5-1.8 s first-key
+// stall in GRID-OWNERSHIP-CONTRACT.md 10a; with a holder already watching, the same key echoes in 57 ms.
+//
+// The rule this suite pins: when THIS attach is the one that starts the feed, the relay waits for the
+// resync instead of requesting scrollback. Every other attach is unchanged, and a tee that never sends
+// the resync still reaches a defined state (banner) rather than hanging.
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const { once } = require('node:events');
+const WebSocket = require('ws');
+const { RelayHarness, HOST_CAPS, sleep, waitFor } = require('./harness');
+
+const BANNER = '[scrollback unavailable - showing live output]';
+
+function teed(name, over = {}) {
+  return {
+    name, alive: true, created: 1, lastOut: 1, cols: 100, rows: 30,
+    hasCommand: false, shellOnly: true, ready: true, kind: 'local-tab', owner: true,
+    sessionId: name + '-id', generationId: 'gen-' + name, aliases: [], streamBytes: 0,
+    ...over,
+  };
+}
+
+function sbRequests(host, name) {
+  return host.messages.filter(m => m.t === 'sb' && m.s === name);
+}
+
+function watchFrames(host) {
+  return host.messages.filter(m => m.t === 'watch' || m.t === 'unwatch');
+}
+
+function collect(ws) {
+  const chunks = [];
+  const texts = [];
+  ws.on('message', (data, isBinary) => {
+    if (isBinary) chunks.push(Buffer.from(data));
+    else texts.push(data.toString());
+  });
+  return { bytes: () => Buffer.concat(chunks), text: () => Buffer.concat(chunks).toString('latin1'), texts: () => texts.slice() };
+}
+
+async function boot(t, sessions, env = {}) {
+  // A long State L fallback: the point is that the resync arrives first, not that the banner races it.
+  const h = new RelayHarness({ MUX_HOST_SB_WAIT_MS: '6000', ...env });
+  await h.start();
+  t.after(async () => { await h.stop(); });
+  // `watch` is a muxd capability; without it in the hello the relay never tells the tee to start feeding.
+  const host = await h.connectHost(sessions, { caps: [...HOST_CAPS, 'watch'] });
+  t.after(() => host.close());
+  return { h, host };
+}
+
+async function attach(t, h, name) {
+  const ws = new WebSocket(`ws://127.0.0.1:${h.port}/ws?session=${name}&cols=100&rows=30`);
+  const got = collect(ws);
+  await once(ws, 'open');
+  t.after(() => { try { ws.close(); } catch {} });
+  await waitFor(() => got.texts().some(s => s[0] === 'd'), 'size frame');
+  return { ws, got };
+}
+
+// The resync reply shape muxd sends after replace_history: pos === start === 0 marks it a truth snapshot.
+function replyResync(host, name, screen) {
+  const req = sbRequests(host, name).at(-1);
+  if (!req || !req.rid) throw new Error('no scrollback request to answer');
+  host.ws.send(JSON.stringify({
+    t: 'sb', s: name, rid: req.rid, d: Buffer.from(screen, 'utf8').toString('base64'),
+    pos: 0, start: 0, resync: true,
+  }));
+}
+
+test('the attach that starts the feed waits for the resync instead of asking for scrollback', async t => {
+  const name = 'watch-flip-attach';
+  const { h, host } = await boot(t, [teed(name)]);
+  const { got } = await attach(t, h, name);
+
+  // The relay told the tee to start watching...
+  await waitFor(() => watchFrames(host).some(m => m.t === 'watch'), 'watch frame for the new viewer');
+  await sleep(200);
+  assert.equal(sbRequests(host, name).length, 0,
+    'a watch flip guarantees a resync carrying the ring; a scrollback request here duplicates that history');
+
+  // ...and the tee's resync then paints this viewer, from the new ring.
+  host.ws.send(JSON.stringify({ t: 'resync', s: name }));
+  await waitFor(() => sbRequests(host, name).length === 1, 'the resync requests exactly one reply');
+  replyResync(host, name, 'SCREEN-FROM-THE-TEE\r\n');
+  await waitFor(() => got.text().includes('SCREEN-FROM-THE-TEE'), 'the resync snapshot is painted');
+
+  // Live bytes after the boundary flow normally, and the whole history was sent once.
+  host.sendOutput(name, 'LIVE-AFTER-RESYNC\r\n');
+  await waitFor(() => got.text().includes('LIVE-AFTER-RESYNC'), 'live output after the resync');
+  assert.equal(sbRequests(host, name).length, 1, 'exactly one scrollback exchange for the whole attach');
+});
+
+test('an attach that does NOT start the feed keeps the ordinary paint path', async t => {
+  const name = 'watch-already-held';
+  const { h, host } = await boot(t, [teed(name)], { MUX_HOST_SB_WAIT_MS: '400' });
+  const first = await attach(t, h, name);
+  await waitFor(() => watchFrames(host).some(m => m.t === 'watch'), 'the first viewer starts the feed');
+  // The tee's resync bumps the boundary, which DISPOSES the model: a resync means the old screen is gone.
+  // Leave the reply unanswered so the model stays cold, which is the only state where the two attach
+  // paths differ (a warm model paints without asking anyone, on both paths).
+  host.ws.send(JSON.stringify({ t: 'resync', s: name }));
+  await waitFor(() => sbRequests(host, name).length === 1, 'the resync asks for the ring');
+  assert.equal(first.got.text().includes(BANNER), false, 'the first viewer must not have fallen to the banner yet');
+
+  // No watch flip this time - the feed is already running - so this attach must take the scrollback path
+  // rather than wait for a resync that was never requested.
+  const second = await attach(t, h, name);
+  await waitFor(() => sbRequests(host, name).length === 2, 'a plain attach still requests the ring');
+  host.sendScrollback(name, 'SECOND-VIEWER-SCREEN\r\n');
+  await waitFor(() => second.got.text().includes('SECOND-VIEWER-SCREEN'), 'second viewer painted');
+  assert.equal(watchFrames(host).filter(m => m.t === 'watch').length, 1,
+    'the feed is started once; a second attach must not re-fire it');
+});
+
+test('a tee that never sends the resync still reaches the banner, not a hang', async t => {
+  const name = 'watch-flip-silent';
+  const { h, host } = await boot(t, [teed(name)], { MUX_HOST_SB_WAIT_MS: '120' });
+  const { got } = await attach(t, h, name);
+  await waitFor(() => watchFrames(host).some(m => m.t === 'watch'), 'watch frame');
+  // The tee says nothing. The bounded wait must define the state rather than leave the viewer waiting.
+  await waitFor(() => got.text().includes(BANNER), 'State L banner from the bounded wait', 4000);
+});
+
+test('a non-owner session is untouched: it never flips a watch, so it always asks', async t => {
+  const name = 'plain-shell';
+  const { h, host } = await boot(t, [{
+    name, alive: true, created: 1, lastOut: 1, cols: 100, rows: 30,
+    hasCommand: true, shellOnly: false, ready: true, kind: 'command',
+    sessionId: name + '-id', aliases: [],
+  }]);
+  const { got } = await attach(t, h, name);
+  await waitFor(() => sbRequests(host, name).length === 1, 'a plain session attaches by scrollback as before');
+  host.sendScrollback(name, 'PLAIN-SCREEN\r\n');
+  await waitFor(() => got.text().includes('PLAIN-SCREEN'), 'painted');
+  assert.equal(watchFrames(host).length, 0, 'no watch frames for a session with no stream owner');
+});

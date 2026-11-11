@@ -32,6 +32,7 @@ function loadPlaywright() {
   throw last;
 }
 const { chromium } = loadPlaywright();
+const { assertSession } = require('./probe_guard.cjs');
 
 const BASE = process.env.MUX_BASE || 'https://harmonizerlabs.cc/multiplex';
 const SESSION = process.env.MUX_LIVE_SESSION || 'hl-owner-session';
@@ -263,6 +264,7 @@ async function waitForOwner(page, want, timeoutMs, predicate) {
   await installFrameTap(page);
   try {
     await page.waitForFunction(() => { try { return typeof term !== 'undefined' && term.cols > 1; } catch (e) { return false; } }, null, { timeout: 30000 });
+  await assertSession(page, S);   // fail closed: never type into a pane this probe was not given
   } catch (e) {
     const diag = await page.evaluate(() => ({
       href: location.href, title: document.title,
