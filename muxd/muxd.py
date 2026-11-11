@@ -3847,8 +3847,6 @@ class OwnerSession:
             self._parked_since_watch += count
 
     def replace_history(self, data: bytes):
-        import traceback as _tb
-        log(f"[dbg-replace] {getattr(self,'name','?')} len={len(data)} from=" + ' < '.join(f"{f.name}:{f.lineno}" for f in _tb.extract_stack()[-4:-1]))
         # spec section 6.1, kind 0x03: the owner's screen and our ring have diverged, so the ring is
         # replaced wholesale rather than appended to. The same resync-the-viewers machinery the overflow
         # path uses does the second half (relay paints CLEAR + scrollback), so there is one repaint path.
@@ -6875,7 +6873,6 @@ async def main():
                                     # The positional cut rides the same reply, additive: the body is
                                     # everything below `pos`, and `pos: null` (dirty) is distinct from
                                     # an old muxd that omits the key entirely.
-                                    log(f"[dbg-sb] {name} resync={view['resync']} dlen={len(view['d'])} pending_before={getattr(session,'resync_pending',None)} ring_len={getattr(session,'ring_len',0)}")
                                     await ws.send(json.dumps({
                                         "t": "sb",
                                         "s": name,
