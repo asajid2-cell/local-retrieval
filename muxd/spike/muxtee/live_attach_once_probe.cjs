@@ -112,5 +112,10 @@ const pct = (a, p) => { if (!a.length) return null; const s = a.slice().sort((x,
     viewportBanner: /scrollback unavailable/.test(viewport),
     viewportTail: viewport.split('\n').filter(l => l.trim()).slice(-6),
   }, null, 1));
+  // THE ASSERTION, not just a report: on a teed tab this fix must repaint from exactly ONE ring reply and
+  // must never leave the viewer on the banner. A duplicate replay shows up as two big rings in one attach.
+  const ok = !banner && big.length === 1;
+  console.log(JSON.stringify({ VERDICT: ok ? 'SINGLE-REPLAY' : 'FAILED', banner, ringReplies: big.length }));
   await ctx.close(); await browser.close();
+  process.exit(ok ? 0 : 1);
 })().catch(e => { console.error('PROBE ERROR', e && (e.stack || e.message)); process.exit(2); });

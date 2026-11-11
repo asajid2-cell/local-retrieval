@@ -4010,7 +4010,14 @@ wssHost.on('connection', (ws, req) => {
           && gen && curGen && gen === curGen
           && boundaryEpochOf(n) === st.sbReqEpoch) {
           const reqPos = Number.isSafeInteger(st.sbReqPos) ? st.sbReqPos : null;
-          truthSnapshot = m.resync === true && st.resyncPending === true;
+          // A resync reply is self-describing: `resync:true` with pos === start === 0 says "this body
+          // replaces the whole stream", so it does NOT need the announcement frame to have arrived first.
+          // Requiring st.resyncPending made a correct reply look stale whenever muxd's direct ws.send
+          // overtook the queued `{"t":"resync"}` frame - which is the normal case, since the announcement
+          // travels the async outq and the reply does not. The relay then bannered a healthy tab and
+          // asked for a redraw in a loop (live, 2026-11-11: `resync=True pos=0 pending_before=False`
+          // repeating, ring never painted). The pending flag is still cleared when a resync IS announced.
+          truthSnapshot = m.resync === true && pos === 0 && start === 0;
           if (truthSnapshot) {
             // The resync reply is a truth snapshot: pos = start = base, painted whole, flush nothing
             // that it represents. Bytes forwarded after the resync still flush from the new base.

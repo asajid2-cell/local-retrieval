@@ -217,3 +217,29 @@ test('an old tee that never acks is never waited on - its attach asks immediatel
   assert.equal(got.text().includes(BANNER), false, 'and it never idled into the banner');
   assert.ok(waited < 1200, `the request must not wait for an ack that cannot come (waited ${waited} ms)`);
 });
+
+test('a resync reply paints even when it arrives BEFORE the announcement frame', async t => {
+  // The live ordering (2026-11-11): muxd sends the `sb` reply with a direct ws.send while the
+  // {"t":"resync"} announcement travels its async out-queue, so the REPLY routinely lands first. The old
+  // check required st.resyncPending, which is set by the announcement - so a perfectly good truth snapshot
+  // was judged stale, the viewer bannered, and the relay asked for a redraw in a loop. The reply carries
+  // resync:true and pos===start===0, which is self-describing; the announcement must not be a precondition.
+  const name = 'resync-before-announce';
+  const { h, host } = await boot(t, [teed(name)]);
+  const { got } = await attach(t, h, name);
+  await waitFor(() => watchFrames(host).some(m => m.t === 'watch'), 'watch frame');
+  // The exact live ordering, byte for byte: the feed starts firing, so the relay has ALREADY received
+  // bytes (reqPos > 0) when it asks for scrollback. muxd answers that request from its freshly-replaced
+  // ring with pos=0 (a truth snapshot) but its direct ws.send overtakes the {"t":"resync"} announcement
+  // on the async out-queue, so the reply arrives with NO announcement in front of it. Under the old
+  // check (resync && st.resyncPending) a pos=0 < reqPos reply is STALE: the viewer bannered and the relay
+  // re-asked in a loop. A reply that says resync:true at pos===start===0 is self-describing and must paint.
+  host.sendOutput(name, 'LIVE-BYTES-BEFORE-THE-ASK');
+  await sleep(120);
+  await waitFor(() => sbRequests(host, name).length >= 1, 'a scrollback request exists to answer');
+  replyResync(host, name, 'REPLY-FIRST-SCREEN' + String.fromCharCode(13) + String.fromCharCode(10));
+  await waitFor(() => got.text().includes('REPLY-FIRST-SCREEN'),
+    'the truth snapshot paints without waiting for the announcement', 4000);
+  assert.equal(got.text().includes(BANNER), false,
+    'a correctly-shaped truth snapshot is never treated as stale');
+});

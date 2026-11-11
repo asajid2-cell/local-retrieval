@@ -22,6 +22,7 @@ Usage:
 """
 import argparse
 import asyncio
+import os
 import sys
 import time
 from pathlib import Path
@@ -33,6 +34,41 @@ from grid_ownership_proof import SizeTab  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[3]
 NAME = 'attach-once'
+
+# A full screen of output, then quiet ticks. A tee's ring must hold this, because it is exactly what the
+# relay paints a new viewer from; measuring with a nearly-empty ring (a few status lines) says nothing
+# about whether a screen can be painted at all.
+SCREEN_CHILD = (
+    "import sys,time\n"
+    "sys.stdout.write('\\x1b[2J\\x1b[H')\n"
+    "for i in range(120):\n"
+    "    sys.stdout.write('SCREENLINE %03d %s\\r\\n' % (i, '=' * 40))\n"
+    "sys.stdout.flush()\n"
+    "while True:\n"
+    "    time.sleep(0.5)\n"
+    "    sys.stdout.write('tick\\r\\n'); sys.stdout.flush()\n"
+)
+
+
+class ScreenTab(SizeTab):
+    """SizeTab, but its child paints a real full screen instead of repeating its own size."""
+
+    def __init__(self, exe, port, name, cols=120, rows=30):
+        import threading as _threading
+        import winpty as _winpty
+        env = os.environ.copy()
+        env.pop('MUXTEE_ACTIVE', None)
+        env.pop('MUXTEE_DISABLE', None)
+        env.update({'MUXTEE_LOCAL_PORT': str(port), 'MUXTEE_NAME': name,
+                    'MUXTEE_NOLINK': '', 'TERM': 'xterm-256color'})
+        self.name = name
+        self.buf = bytearray()
+        self._stop = _threading.Event()
+        self.p = _winpty.PtyProcess.spawn(
+            [exe, '--', sys.executable, '-u', '-c', SCREEN_CHILD],
+            dimensions=(rows, cols), env=env)
+        self._t = _threading.Thread(target=self._pump, daemon=True)
+        self._t.start()
 
 
 class Rows:
@@ -93,7 +129,7 @@ async def main():
             rows.check('harness', False, 'muxd never dialled the fake relay')
             return 1
 
-        tab = SizeTab(str(exe), mux.port, NAME, cols=120, rows=30)
+        tab = ScreenTab(str(exe), mux.port, NAME, cols=120, rows=30)
         row = None
 
         async def registered():
