@@ -159,3 +159,34 @@ test('the prediction stays off on the alternate screen', async t => {
     assert.equal((await readPrediction(page)).shown, false, 'no prediction may be drawn on the alternate screen');
   });
 });
+
+// The cause of the partial-peel failure (found 2026-11-12 while fixing the phone): the pending prediction
+// was cleared by applyScrollAffordance, which runs on EVERY render and EVERY label change. Its own comment
+// said it was clearing for an alt-screen flip, but the call was unconditional - so any ordinary output that
+// moved the scroll readout (or revealed the pan hint) dropped the characters the user had typed but the
+// server had not yet echoed. A fast typist lost typeahead whenever the affordance changed.
+test('an affordance label change does not eat the pending typeahead', async t => {
+  if (skipWithoutChromium(t)) return;
+  await withBrowserRelay({ name: SESSION_NAME, alive: true, shellOnly: true, cols: 80, rows: 24 }, async ({ host, page }) => {
+    await page.evaluate(() => { for (const ch of ['a', 'b', 'c']) send('i', ch); });
+    assert.equal((await readPrediction(page)).text, 'abc');
+    // Output that changes the scroll readout (a full line, so the position moves) but confirms only "ab".
+    host.sendOutput(SESSION_NAME, 'ab\r\nline two\r\n');
+    await new Promise(r => setTimeout(r, 500));
+    assert.equal((await readPrediction(page)).shown, false,
+      'a real echo that diverges cancels the guess, as before');
+
+    // Now the case that was broken: a partial echo, then output that moves the readout without confirming
+    // the rest. The pending tail must survive the affordance pass.
+    await page.evaluate(() => { for (const ch of ['x', 'y', 'z']) send('i', ch); });
+    assert.equal((await readPrediction(page)).text, 'xyz');
+    host.sendOutput(SESSION_NAME, 'x');
+    await waitFor(async () => (await readPrediction(page)).text === 'yz', 'partial peel to yz', 3000);
+    // Force the affordance to re-run with a CHANGED label while 'yz' is still pending - the state a fast
+    // typist is in when output moves the readout. Dropping the cached label is the page's own "this label
+    // differs" condition, so the pass reaches the line under test instead of returning early on a match.
+    await page.evaluate(() => { lastAffordance = null; applyScrollAffordance(); });
+    assert.equal((await readPrediction(page)).text, 'yz',
+      'the affordance pass must not clear a prediction it did not invalidate');
+  });
+});

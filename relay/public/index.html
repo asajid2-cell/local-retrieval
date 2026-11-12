@@ -1907,7 +1907,7 @@ function reloadTerminal(quiet){
   connect(name, true);   // re-attach: CLEAR + scrollback replay + live, all client state reset
 }
 document.addEventListener('keydown', e=>{ if(e.ctrlKey && e.altKey && (e.key==='r'||e.key==='R')){ e.preventDefault(); e.stopPropagation(); reloadTerminal(); } }, true);
-window.__muxBuild='2026-11-12-phone-threads-10';   // bump per web deploy so a loaded version is verifiable (supersedes 2026-11-11-phone-threads-1)
+window.__muxBuild='2026-11-12-phone-threads-11';   // bump per web deploy so a loaded version is verifiable (supersedes 2026-11-11-phone-threads-1)
 try{ console.info('multiplex build', window.__muxBuild); }catch(e){}
 const helper = $('#term').querySelector('.xterm-helper-textarea');
 function hardenHelperTextarea(){
@@ -4056,6 +4056,7 @@ function scrollPositionLabel(viewportY, baseY, rows){
 // onRender runs per frame, so the three nodes are resolved once and cached; they are static for the life of
 // the document. We only re-query while one is still missing (script can run before the node is parsed).
 let lastAffordance=null;
+let lastAffordanceAlt=null;   // the alt-screen state the last label described; a FLIP invalidates a guess
 let affHost=null, affChip=null, affText=null;
 function applyScrollAffordance(){
   if(!affHost || !affChip || !affText){
@@ -4079,9 +4080,15 @@ function applyScrollAffordance(){
   const key = (alt?'a:':'n:') + (panning?'p:':'f:') + (tracked?'t:':'u:') + label;
   if(key===lastAffordance) return label;
   lastAffordance = key;
-  // An alt-screen flip changes who owns the cells, so a pending prediction is stale either way: entering
+  // An alt-screen FLIP changes who owns the cells, so a pending prediction is stale either way: entering
   // the app's screen makes a shell guess wrong, leaving it returns to a cursor our guess no longer sits on.
-  if(typeof predictClear==='function') predictClear();
+  //
+  // Only a FLIP. This used to clear on every label change, and the label changes on ordinary output (the
+  // scroll position moves, the pan hint appears), so a fast typist lost pending characters whenever the
+  // readout updated - measured: with "abc" typed and only "ab" echoed, the peel left "c" pending and this
+  // line then wiped it, leaving the typeahead blank while the server had not yet confirmed the last char.
+  if(alt !== lastAffordanceAlt && typeof predictClear==='function') predictClear();
+  lastAffordanceAlt = alt;
   host.classList.toggle('altbuf', alt);
   chip.classList.toggle('app', alt);
   txt.textContent = label;

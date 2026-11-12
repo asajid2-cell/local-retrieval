@@ -7,7 +7,7 @@ SRC=/tmp/index.html.new
 SRCJS=/tmp/threads.js.new
 DST=/home/harmonizer/multiplex-app/public/index.html
 DSTJS=/home/harmonizer/multiplex-app/public/threads.js
-STAMP='2026-11-12-phone-threads-10'
+STAMP='2026-11-12-phone-threads-11'
 [ -s "$SRC" ] || { echo "staged page missing"; exit 3; }
 [ -s "$SRCJS" ] || { echo "staged threads.js missing"; exit 3; }
 grep -q "$STAMP" "$SRC" || { echo "staged page is not the threads build"; exit 4; }
