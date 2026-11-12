@@ -332,8 +332,41 @@
     font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"Roboto Mono",monospace;
   }
   .th-msg.status .th-body { background:transparent; border-style:dashed; color:var(--muted); font-size:12.5px; }
+  /* A box table keeps its own frame: monospace, NO wrapping, and a horizontal scroller so one row can be
+     read across by panning. Wrapping it was the defect - a 100-column git-log table became a column of
+     orphaned ─ characters. The bubble padding is trimmed so the scroll starts at the frame's own edge. */
+  .th-body.th-table { padding:0; overflow:hidden; }
+  .th-body.th-table .th-scroll {
+    margin:0; padding:var(--sp2) var(--sp3); overflow-x:auto; overflow-y:hidden;
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"Roboto Mono",monospace;
+    font-size:12px; line-height:1.35; white-space:pre; word-break:normal; overflow-wrap:normal;
+    -webkit-overflow-scrolling:touch; overscroll-behavior-x:contain;
+  }
   /* Screen context above the first real message: muted and unframed, so it reads as "where the screen was"
      rather than as a bubble with a sender. */
+  /* A phone cannot read a wide mirror. The notice says so plainly, offers the two surfaces that work at
+     this width, and sits as an OVERLAY on the pane rather than as a grid row: adding a row would change
+     the pane's client height, which is an input to the fit search, and a notice that resizes the thing it
+     is complaining about is a fit loop. */
+  #narrowgrid {
+    display:none; align-items:flex-start; gap:var(--sp2); flex-wrap:wrap;
+    /* Same grid cell as #term, above it: the pane's height never changes, so a notice can never be an
+       input to the fit search that produced it. */
+    grid-area:term; align-self:start; z-index:3; min-width:0;
+    padding:var(--sp2) var(--sp3); border-bottom:1px solid var(--line);
+    background:rgba(24,24,30,.95);
+    color:var(--muted); font-size:12.5px; line-height:1.4;
+  }
+  .mobile-view-terminal #narrowgrid { display:flex; }
+  #narrowgrid span.msg { flex:1 1 100%; }
+  #narrowgrid button {
+    min-height:34px; padding:0 var(--sp3); border-radius:var(--r-s);
+    border:1px solid var(--line); background:var(--raised); color:var(--txt);
+    font-size:12.5px; font-weight:600;
+  }
+  /* The action that actually fixes the width: taking the grid re-pins the tab to this screen. */
+  #narrowgrid button.take { border-color:var(--rose); background:var(--rose-dim); color:var(--rose); }
+  #narrowgrid button.x { min-width:34px; padding:0; border-color:transparent; background:transparent; color:var(--faint); font-size:16px; }
   .th-msg.th-ctx .th-body {
     background:transparent; border-color:transparent; color:var(--faint);
     font-size:13px; line-height:1.5; padding:0 var(--sp1);
@@ -1092,7 +1125,17 @@ function renderThreads(force){
     // A row that was ONLY the glyph is the empty prompt line above the composer, not a message: showing it
     // as an empty bubble reads as a broken message.
     if(!said.trim()) continue;
-    body.textContent=said;
+    // A BOX TABLE is panned, never wrapped: word-wrapping a grid of │-delimited cells turns it into a pile
+    // of orphaned rule characters (measured live). It gets its own scroller so the phone can move across
+    // one row at a time, exactly as it moves across the terminal. Prose and code still wrap.
+    if(m.kind==='table'){
+      body.classList.add('th-table');
+      const sc=document.createElement('pre'); sc.className='th-scroll';
+      sc.textContent=said;
+      body.appendChild(sc);
+    } else {
+      body.textContent=said;
+    }
     if(m.showWho!==false){
       const who=document.createElement('div'); who.className='th-who';
       who.textContent=WHO[m.role]!==undefined?WHO[m.role]:m.role;
@@ -1529,9 +1572,69 @@ function schedulePaintVerify(delay=40){
 // Re-measure AND repaint: the two are independent, and re-measuring alone resizes nothing when cols/rows
 // already match, which is why the manual workarounds (toggle fullscreen, hard refresh) were the only heals.
 function healTerminalSurface(reason){
+  syncRendererGeometry();
   scheduleViewportFit(0);
   schedulePaintHeal(60);
   try{ window.__muxLastSurfaceHeal = { at:Date.now(), reason:reason||'transition' }; }catch(e){}
+}
+// THE WEBGL RENDERER DOES NOT FOLLOW A GRID CHANGE ON ITS OWN.
+//
+// Measured on the phone (tab-26f4, 390x844, 2026-11-12): after this device TOOK the grid the model was
+// 49x41 and the render service already reported a 23px device cell, but the renderer kept painting at the
+// PREVIOUS scale - the pane filled with ~16 enormous clipped glyphs, with a correct paint of the same
+// buffer visible underneath. Asking the renderer for a resize at the grid it already holds repainted it
+// exactly right, at the same cols and font, with no model change and no wire traffic.
+//
+// So the renderer's geometry is a CACHE that a font/grid change must invalidate. The DOM renderer needs
+// nothing (its rows re-lay out); the WebGL one is handed its own resize, which re-derives the atlas and the
+// cell rects. Guarded to the shipped addon and a live renderer, and a no-op on the DOM fallback.
+let _rendererSyncAt = 0;
+function syncRendererGeometry(force){
+  if(!usingWebglRenderer()) return false;
+  const now = Date.now();
+  if(!force && now - _rendererSyncAt < 40) return false;   // a burst of heals is one resize
+  _rendererSyncAt = now;
+  try{
+    const r = webglAddon && webglAddon._renderer;
+    if(!r) return false;
+    if(!term.cols || !term.rows) return false;
+    const dims = term._core._renderService.dimensions;
+    // THE ONE WRITE THAT MATTERS: the addon's CANVAS BACKING STORE. The renderer resizes it inside
+    // handleResize from the dpr it cached at construction; when a grid change arrives while that cache is
+    // momentarily at 1 (or the change happens through a path that never calls handleResize), the bitmap is
+    // left at CSS size - 376 px for a 49-column grid whose every cell is 23 DEVICE px. The model and the
+    // render service are both already right; only the canvas is stale. Measured: repairing exactly this
+    // (backing store + CSS box + one redraw) repaints the screen correctly with no model change at all,
+    // and it is the cheapest of the three repairs tried (the other two are the same thing plus a full
+    // atlas re-warm).
+    const wantW = dims.device.canvas.width, wantH = dims.device.canvas.height;
+    const cv = r._canvas;
+    let wrote = false;
+    if(cv && wantW > 0 && wantH > 0 && (cv.width !== wantW || cv.height !== wantH)){
+      cv.width = wantW; cv.height = wantH;
+      cv.style.width = dims.css.canvas.width + 'px';
+      cv.style.height = dims.css.canvas.height + 'px';
+      wrote = true;
+    }
+    // A resized canvas is a CLEARED canvas (the spec resets the bitmap), so it must be redrawn in the same
+    // turn or the pane goes blank until the next output arrives.
+    if(wrote){ try{ r._requestRedrawViewport ? r._requestRedrawViewport() : term.refresh(0, term.rows-1); }catch(e){} }
+    // Keep the addon's own cached geometry honest for the paths that call handleResize later.
+    if(typeof r.handleResize === 'function'){ try{ r.handleResize(term.cols, term.rows); }catch(e){} }
+    return wrote;
+  }catch(e){ return false; }
+}
+// A GRID COMMIT LANDS IN PIECES. term.resize, the char-size re-measure and the renderer's own resize each
+// arrive on their own frame, and the LAST one wins - measured live, a repair issued in the commit frame was
+// overwritten by xterm's later resize, which sized the bitmap from a char width it had not re-measured yet
+// (376 px for a 49-column grid). So the commit path re-asserts on the next frame and once after a settle
+// window. Each call is idempotent: syncRendererGeometry writes only when the canvas is actually wrong.
+let _rendererRepairTimer = 0;
+function scheduleRendererRepair(){
+  if(!usingWebglRenderer()) return;
+  requestAnimationFrame(()=>{ syncRendererGeometry(true); });
+  if(_rendererRepairTimer) clearTimeout(_rendererRepairTimer);
+  _rendererRepairTimer = setTimeout(()=>{ _rendererRepairTimer = 0; syncRendererGeometry(true); }, 280);
 }
 // THE WATCH. healTerminalSurface covers the transitions we KNOW move the surface; this covers the ones
 // we cannot enumerate - a resize the ResizeObserver coalesced away, a viewport change while the tab was
@@ -1804,7 +1907,7 @@ function reloadTerminal(quiet){
   connect(name, true);   // re-attach: CLEAR + scrollback replay + live, all client state reset
 }
 document.addEventListener('keydown', e=>{ if(e.ctrlKey && e.altKey && (e.key==='r'||e.key==='R')){ e.preventDefault(); e.stopPropagation(); reloadTerminal(); } }, true);
-window.__muxBuild='2026-11-12-phone-threads-4';   // bump per web deploy so a loaded version is verifiable (supersedes 2026-11-11-phone-threads-1)
+window.__muxBuild='2026-11-12-phone-threads-10';   // bump per web deploy so a loaded version is verifiable (supersedes 2026-11-11-phone-threads-1)
 try{ console.info('multiplex build', window.__muxBuild); }catch(e){}
 const helper = $('#term').querySelector('.xterm-helper-textarea');
 function hardenHelperTextarea(){
@@ -2215,6 +2318,81 @@ function scheduleTabFitFollowup(){
   if(tabFitFollowup) return;
   tabFitFollowup = requestAnimationFrame(()=>{ tabFitFollowup = 0; fitTabOwnedGrid(); });
 }
+// Is this grid READABLE on this device, or is it a wide mirror that needs the conversation surface?
+//
+// Only asked on a phone-sized pane. The fit search can always make a wide grid "fit" by shrinking the
+// font, and it did: 209 columns in a 390 px pane settled at font 8 with the paint still 2.3x too wide -
+// unreadable AND clipped, while the chip claimed "fills width". The honest question is not "does it fit",
+// it is "would the font that fits be legible". Anything below MIN_READABLE_FONT_PX is not.
+//
+// Returns {readable, fitFont, hint}: `hint` names the surface to offer when it is not readable, so the
+// caller never has to invent the next step.
+function phoneGridVerdict(o){
+  const MIN_READABLE_FONT_PX = 10;
+  const paneW = Math.max(0, Number(o && o.paneW) || 0);
+  const cols = Math.max(1, Number(o && o.cols) || 1);
+  const cellW = Number(o && o.cellW) > 0 ? Number(o.cellW) : 0;
+  const font = Number(o && o.font) > 0 ? Number(o.font) : 14;
+  if(!paneW || !cellW) return { readable: true, fitFont: font, hint: '' };
+  // Cell width scales linearly with font size, so the font that spans the pane is a single division.
+  const perCol = cellW / font;
+  const fitFont = Math.round((paneW / (cols * perCol)) * 10) / 10;
+  const readable = fitFont >= MIN_READABLE_FONT_PX;
+  return { readable: readable, fitFont: fitFont, hint: readable ? '' : 'threads' };
+}
+// A phone cannot read a wide mirror, and pretending it can is worse than saying so. When the grid would
+// need an illegible font, the pane keeps a readable slice and this banner offers the two surfaces that
+// actually work at this width. Both are real: taking the grid is the designed ladder (the pin resizes the
+// child pty to THIS viewport, so the tab becomes ~50 columns and paints 1:1), and the conversation view is
+// the reading/replying surface. Neither is a fallback that fakes it.
+let _narrowNoticeFor='';
+let _narrowDismissed='';        // the geometry key the user dismissed; a different grid earns a new notice
+function showNarrowGridNotice(verdict){
+  const host=$('#term');
+  if(!host) return;
+  const key=current+'|'+(verdict&&verdict.fitFont);
+  if(_narrowDismissed===key) return;
+  if(_narrowNoticeFor===key && document.getElementById('narrowgrid')) return;
+  _narrowNoticeFor=key;
+  let el=document.getElementById('narrowgrid');
+  if(!el){
+    el=document.createElement('div');
+    el.id='narrowgrid';
+    el.className='narrowgrid';
+    host.parentNode.insertBefore(el, host);
+  }
+  el.innerHTML='';
+  const msg=document.createElement('span');
+  msg.className='msg';
+  msg.textContent='This PC tab is '+(term.cols||'many')+' columns wide - unreadable at full size here. ';
+  // TAKING THE GRID IS THE REAL FIX, and it is the ladder's own step, not a special case: the request
+  // re-pins the tab to this device's viewport, the tee resizes the child pty, and the app redraws at
+  // ~50 columns which then paints 1:1 at a legible font. Offering only "read the conversation" made the
+  // notice a one-way door, and on a phone the terminal is where you actually reply with keys.
+  const take=document.createElement('button');
+  take.type='button'; take.className='take';
+  take.textContent='Resize to this screen';
+  take.title='Pin the tab to this phone so the app redraws at this screen\'s width. The PC tab resizes; the size chip gives it back.';
+  take.onclick=()=>{ if(!_gridBusy) takeGrid(); };
+  const convo=document.createElement('button');
+  convo.type='button'; convo.textContent='Read the conversation';
+  convo.onclick=()=>{ setMobileView('threads'); };
+  // Dismissing is per-SESSION and lasts until the pane's geometry changes: the notice must never come
+  // back on the next repaint of the same grid, or it is a banner that fights the finger.
+  const x=document.createElement('button');
+  x.type='button'; x.className='x'; x.textContent='×'; x.setAttribute('aria-label','Dismiss');
+  x.onclick=()=>{ dismissNarrowGridNotice(); };
+  el.appendChild(msg); el.appendChild(take); el.appendChild(convo); el.appendChild(x);
+}
+function dismissNarrowGridNotice(){
+  _narrowDismissed=_narrowNoticeFor;
+  clearNarrowGridNotice();
+}
+function clearNarrowGridNotice(){
+  _narrowNoticeFor='';
+  const el=document.getElementById('narrowgrid');
+  if(el) el.remove();
+}
 function fitTabOwnedGrid(){
   const host=$('#term');
   if(!host) return;
@@ -2239,10 +2417,15 @@ function fitTabOwnedGrid(){
   // change is a new grid REQUEST, not a new font. Letting the search shrink the font to fit the old grid
   // (seen live: font 10 at a 1084px pane) then made the re-measure ask for a grid of 5px cells.
   if(weOwn){
+    // The grid is this device's now, so the "too wide to read" state and its notice are both over.
+    clearNarrowGridNotice();
     const nativeFont = Math.max(8, Math.min(48, Math.round(fontSize)));
     if(appliedFont !== nativeFont){
       appliedFont = nativeFont;
       try{ term.options.fontSize = nativeFont; }catch(e){}
+      // A font change is a new cell, so the renderer must be told. Without this the owned grid paints at the
+      // PREVIOUS scale - giant clipped glyphs over a correct paint (the phone defect, 2026-11-12).
+      syncRendererGeometry();
     }
     const moved = tabFitPaneW>=0
       && (Math.abs(availW-tabFitPaneW) > 1 || Math.abs(availH-tabFitPaneH) > 1);
@@ -2288,6 +2471,29 @@ function fitTabOwnedGrid(){
     return;
   }
 
+  // READABLE FLOOR, decided before any shrinking. On a phone-sized pane a wide mirror can always be made
+  // to "fit" by shrinking the font - live that settled at 8 px with the paint still 2.3x too wide, so the
+  // text was unreadable AND clipped while the chip claimed "fills width". Below the floor the font is not
+  // reduced further: the pane shows a readable slice with the pan bar, and the chip/notice points at the
+  // conversation surface, which is the one built for a narrow screen. This is a phone-only floor; a
+  // desktop pane that has room never reaches it.
+  const verdict = (isMobile() && !weOwn)
+    ? phoneGridVerdict({ paneW: availW, cols: term.cols, cellW: cell.w, font: appliedFont })
+    : { readable: true, fitFont: 0, hint: '' };
+  if(isMobile() && !verdict.readable){
+    const floor = 11;
+    if(appliedFont < floor || appliedFont > floor + 0.75){
+      appliedFont = floor;
+      try{ term.options.fontSize = floor; }catch(e){}
+    }
+    tabFitPaneW=availW; tabFitPaneH=availH; tabFitPaneMode='unreadable'; tabFitPaneScale=tabFontScale;
+    syncRendererGeometry();
+    applyPan();
+    scheduleTerminalSurfaceAlign();
+    showNarrowGridNotice(verdict);
+    return;
+  }
+  clearNarrowGridNotice();
   // The latch watches only the axis this mode is fitting: in 'fill' a tall grid is expected and the
   // row pan handles it, so height must not be read as an overflow.
   const overflow = fill
@@ -2305,6 +2511,7 @@ function fitTabOwnedGrid(){
   if(want===appliedFont || want===tabFitRejected) return;
   appliedFont=want;
   try{ term.options.fontSize=want; }catch(e){}
+  syncRendererGeometry();
   applyPan();                    // the pan/rowpan classes follow the new painted size, not a stale measure
   scheduleTerminalSurfaceAlign();
   scheduleTabFitFollowup();      // and the next frame re-measures the cell at this font and settles
@@ -2431,7 +2638,13 @@ function onControl(s){
   // back to today's size-based classifier. A relay that sends it has told us the answer even when false.
   soleTerminal = Object.prototype.hasOwnProperty.call(m,'attachedLocal') ? !m.attachedLocal : !(sizeLocal || sizeTabOwned);
   soleTerminalKnown = true;
-  if(term.cols!==m.cols || term.rows!==m.rows){ try{ preserveTermViewport(()=>term.resize(m.cols, m.rows)); hardenHelperTextarea(); installMobileInputDelta(); }catch(e){} }
+  if(term.cols!==m.cols || term.rows!==m.rows){
+    try{ preserveTermViewport(()=>term.resize(m.cols, m.rows)); hardenHelperTextarea(); installMobileInputDelta(); }catch(e){}
+    // term.resize re-derives the renderer at the new grid; ask it once more at the size it now holds, and
+    // again after the settle, so the renderer's own debounced resize cannot leave the bitmap at the old
+    // scale (measured: 376 px backing store for a 49-column grid after a take).
+    scheduleRendererRepair();
+  }
   // A take is committed only when muxd says so. Record when that landed, so the round trip can be
   // measured on the live page instead of being assumed fast.
   // A commit landed for THIS device: stamp it. The owned-cell drift check refuses to re-request inside a
@@ -2458,6 +2671,12 @@ function onControl(s){
     fitTabOwnedGrid();
     applyPan();
   } else if(geomChanged || ownChanged){
+    // The renderer's geometry is a cache keyed on the grid; a commit that changes it must invalidate that
+    // cache. This is the grid-ownership half of the phone defect (2026-11-12): the model took 49x41 while
+    // the WebGL canvas kept painting the previous scale, so the pane showed giant clipped glyphs.
+    // `scheduleRendererRepair` (not a bare sync) because the renderer's own resize lands a frame later and
+    // would otherwise undo a repair issued here.
+    scheduleRendererRepair();
     schedulePaintHeal(20);
     fitTabOwnedGrid();
     applyPan();
@@ -2682,6 +2901,9 @@ function cycleSize(){
     // grid is this viewport at this font); local -> fill, fit, then take.
     if(sizePinned && sizeMine){ releaseGrid(); refocusTerminal(); return; }
     if(sizePinned && !sizeMine){ takeGrid(); refocusTerminal(); return; }
+    // Unreadable and unpinned: fill and fit both leave a legible-font search with no answer, so the only
+    // tap that changes what the user can read is the take. Same rule as the branch below.
+    if(tabFitPaneMode==='unreadable'){ takeGrid(); refocusTerminal(); return; }
     if(tabFitMode==='fill'){
       tabFitMode='fit'; LS.set('mux_tab_fit', tabFitMode);
       fitTabOwnedGrid(); applyPan(); scheduleTerminalSurfaceAlign(); updateMeta(); updateSizeBtn();
@@ -2697,6 +2919,12 @@ function cycleSize(){
     // fill <-> fit change only how THIS device paints the pane's grid. The third tap TAKES the grid:
     // it asks muxd to pin this device's viewport, which the tee applies to the child pty. There is no
     // non-uniform scale any more (contract section 6); once the ack lands, every renderer paints 1:1.
+    //
+    // UNREADABLE SHORT-CIRCUITS THE LADDER. fill and fit are both wrong answers when neither can make
+    // the text legible, so a tap here must not spend a round on a rendering change the user cannot see -
+    // it must do the one thing that changes the COLUMN COUNT, which is taking the grid. The chip says
+    // "too wide" in this state and this is what that promise means.
+    if(tabFitPaneMode==='unreadable'){ takeGrid(); refocusTerminal(); return; }
     if(tabFitMode==='fill'){
       tabFitMode='fit'; LS.set('mux_tab_fit', tabFitMode);
       fitTabOwnedGrid(); applyPan(); scheduleTerminalSurfaceAlign(); updateMeta(); updateSizeBtn();
@@ -2744,6 +2972,17 @@ function sizeButtonPresentation(){
     return { text, title: 'Waiting for the PC terminal to confirm the new grid.', disabled: true };
   }
   const host=$('#term'), panning=!!(host && host.classList.contains('pan'));
+  // An unreadable pane must not be described by the mode it is pretending to be. Live, the chip read
+  // "fills width · 209×51" over an 8px clipped grid - the claim was true of the fit and false of what the
+  // user could read. Say the state instead, and say what the tap does about it.
+  if(tabFitPaneMode==='unreadable'){
+    return {
+      text: '⚠ too wide ·'+dims,
+      title: 'This PC tab is '+((term&&term.cols)||'many')+' columns - too wide to read on this screen. '
+        + 'Tap to resize the tab to this screen, so it redraws at this width and paints 1:1.',
+      disabled: false,
+    };
+  }
   // A teed PC tab (§7.3): the grid IS the PC's physical screen, so there is nothing to pin - a pin would
   // resize the tab under the person sitting at it. The chip still works, but it switches the rendering
   // of that fixed grid for this device instead of changing the size.

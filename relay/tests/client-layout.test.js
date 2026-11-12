@@ -180,6 +180,7 @@ test('size chip names auto, own pin, and another device exactly', () => {
     sizeTabOwned: false,
     sizePinLabel: '',
     tabFitMode: 'fill',
+    tabFitPaneMode: '',            // a desktop pane is never in the phone "too wide to read" state
     _gridBusy: null,
     $: sel => sel === '#term' ? host : null,
     sizeButtonPresentation: null,
@@ -530,6 +531,18 @@ function loadTabFit(opts){
       set(){},
     },
     $: sel => sel === '#term' ? host : null,
+    // The page asks isMobile() before applying the PHONE readable floor. These cases are desktop panes by
+    // construction (a 1842px host), so the answer is false - the phone rule is pinned separately in
+    // tests/phone-terminal.test.js and must not leak into the desktop fit arithmetic below.
+    isMobile: () => false,
+    // The phone notice is a DOM element. The fit touches it only to clear it (a desktop pane has none), so
+    // the stub document answers "not present" and the notice itself is pinned in
+    // tests/phone-terminal.test.js.
+    document: { getElementById: () => null, createElement: () => ({ style:{}, setAttribute(){}, appendChild(){}, onclick:null }) },
+    // The renderer-geometry sync is WebGL-only and the renderer here is the DOM default, so the page's own
+    // guard makes it a no-op; recording it keeps the desktop arithmetic independent of the phone paint fix
+    // (both are pinned in tests/phone-terminal.test.js).
+    syncRendererGeometry(){ return false; },
     getComputedStyle: () => ({ paddingLeft:'0px', paddingTop:'0px', paddingRight:'0px', paddingBottom:'0px' }),
     healTerminalSurface(){}, doFit(){}, applyPan(){}, scheduleTerminalSurfaceAlign(){},
     requestAnimationFrame(){ return ++rafCount; },   // tests drive fit() directly; the frame is counted

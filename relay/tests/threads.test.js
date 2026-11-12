@@ -220,3 +220,83 @@ test('text above the first recognised message is marked as context, not shown as
   assert.equal(msgs[1].context, false, 'the first real message is a message');
   assert.ok(/keyboard noise/.test(msgs[1].text), 'the real message is intact');
 });
+
+// ---- a phone must be able to READ a 209-column code line (live, tab-26f4, 2026-11-12) ------------------
+//
+// The screen is a 209-column terminal. An app that prints code aligns it at those columns, so a row arrives
+// as "135                   if (symbol == 'S') {" - the leading run is column alignment, not meaning. On a
+// 390px phone that run consumes most of the line and the code wraps around it, half a screen per token.
+test('long source-column indentation is collapsed so wrapped code uses the phone width', () => {
+  const T = load();
+  const msgs = T.grouped(T.segment([
+    row('⏺ Update(main.cpp)', false, 1),
+    row('  ⎿ Added 1 line, removed 1 line', false, 2),
+    row('    136                     ECSENGINE::SpawnComponent spawner{};', false, 3),
+  ]));
+  const code = msgs.find(m => m.role === 'tool');
+  assert.ok(code, 'the tool block exists');
+  const line = code.text.split('\n').find(l => /SpawnComponent/.test(l)) || '';
+  // The run between the leading indent and the code must be a small fixed gap, not the source columns.
+  assert.ok(!/ {8,}/.test(line), `no long internal run survives: ${JSON.stringify(line)}`);
+  assert.ok(/SpawnComponent/.test(line), 'the code itself is intact');
+});
+
+test('a row longer than the screen is wrapped, never truncated', () => {
+  const T = load();
+  const long = '  ' + 'x'.repeat(400);
+  const msgs = T.segment([row('⏺ note', false, 1), row(long, false, 2)]);
+  const text = msgs.map(m => m.text).join('\n');
+  assert.equal((text.match(/x/g) || []).length, 400, 'every character survives - the phone must not lose text');
+});
+
+// ---- two defects the DRIVEN phone run found (phone_drive.cjs, tab-26f4, 2026-11-12) -------------------
+//
+// A4 typed into the terminal and A6 read the conversation back. Both showed a defect that no amount of
+// reading the source had exposed.
+
+// 1. The spinner line joined the user's own turn. `echo phone-keypath-ok` came back as
+//    "echo phone-keypath-ok\n\n✢ Boogieing…" - the app's activity row was absorbed as body because ✢ was
+//    not in the glyph list and it is not at indent 0 with any known leader.
+test('the agent activity line is its own status message, never the tail of the last one', () => {
+  const T = load();
+  const msgs = T.grouped(T.segment([
+    row('❯ echo phone-keypath-ok', false, 1),
+    row('', false, 2),
+    row('✢ Boogieing…', false, 3),
+  ]));
+  const you = msgs.find(m => m.role === 'user');
+  assert.ok(you, 'the user turn exists');
+  assert.ok(!/Boogieing/.test(you.text), `the spinner must not be the user's text: ${JSON.stringify(you.text)}`);
+  const spin = msgs.find(m => /Boogieing/.test(m.text));
+  assert.ok(spin, 'the spinner is kept - the phone never shows less than the terminal');
+  assert.equal(spin.role, 'status', 'but it is a status message');
+  // The same row when the app draws it under a RESULT, which is where it usually lands.
+  const under = T.segment([row('⏺ Running the suite', false, 1), row('✽ Noodling…', false, 2)]);
+  assert.equal(under[under.length - 1].role, 'status', 'a spinner after a turn opens its own message');
+});
+
+// 2. A box table was word-wrapped into soup. A6 showed a git-log table rendered as orphaned ─ runs:
+//    the cells were there, the frame was destroyed. A table must keep its bytes and be PANNED.
+test('a box table keeps its exact bytes and is marked for panning, not wrapping', () => {
+  const T = load();
+  const screen = [
+    row('⏺ git log', false, 1),
+    row('  ┌─────────┬───────┬────────────────────┐', false, 2),
+    row('  │ Commit  │ Time  │ What               │', false, 3),
+    row('  ├─────────┼───────┼────────────────────┤', false, 4),
+    row('  │ a1b2c3d │ 09:12 │ fix the thing      │', false, 5),
+    row('  └─────────┴───────┴────────────────────┘', false, 6),
+  ];
+  const msgs = T.segment(screen);
+  const table = msgs.find(m => /┌/.test(m.text));
+  assert.ok(table, 'the table survives as one message');
+  assert.equal(table.kind, 'table', 'and is identified as a table');
+  // Every column gap is still there: the collapse rule must not touch a table.
+  assert.ok(/│ Commit  │ Time  │ What/.test(table.text),
+    `the cells keep their alignment: ${JSON.stringify(table.text.split('\n')[1])}`);
+  assert.ok(/a1b2c3d/.test(table.text), 'and the data is intact');
+  // Prose is unaffected: still 'text', still collapsed.
+  const prose = T.segment([row('⏺ a     long      run', false, 1)]);
+  assert.equal(prose[0].kind, 'text');
+  assert.ok(!/ {6,}/.test(prose[0].text), 'prose still collapses its runs');
+});
