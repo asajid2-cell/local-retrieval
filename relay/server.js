@@ -4057,6 +4057,33 @@ wssHost.on('connection', (ws, req) => {
       // The reply is the answer to the pending request: whatever it said about `resync`, the truth
       // snapshot it might have carried has now been consumed.
       st.resyncPending = false;
+      // AN EMPTY TRUTH SNAPSHOT IS NOT AN ANSWER. The tee clears its ring on every resize - a remote take
+      // AND a local restore - because its bytes are at the old width and cannot be honestly replayed
+      // (TeeEngine.TryResize / RestorePaneLocal both send an empty replace_history). It then expects the
+      // app to repaint itself at the new grid, which lands a few hundred ms later as a SECOND resync.
+      //
+      // Live (tab-26f4, 2026-11-12): the relay received exactly that pair -
+      //     resync=true pos=0 dlen=0        <- ring cleared by the take
+      //     resync=true pos=0 dlen=65428    <- the app's repaint, ~300 ms later
+      // - and it settled on the FIRST one. An empty body produces no snapshot, so every viewer was left
+      // unpainted while the watchdog counted down, and the banner was painted 325 ms AFTER a successful
+      // ack. That is the "taking the grid glitches into scrollback unavailable" report.
+      //
+      // So an empty resync reply is the START of the transition, not the end of it: keep the viewers
+      // waiting (their existing watchdog still bounds the wait) and let the repaint paint them. A ring that
+      // is cleared and never refilled therefore still reaches the defined banner - the watchdog, not this
+      // branch, is what guarantees an end.
+      if (m.resync === true && String(m.d || '').length === 0) {
+        // The repaint's own resync frame issues the next fetch - but the tee only repaints when the app
+        // reacts, and an idle app may not react at all. Asking for the redraw NOW is what makes the pair
+        // (empty ring, then a real one) complete inside the watchdog instead of after it: without this the
+        // 900 ms sbTimer fired first, the viewer was bannered, and the banner's own redraw is what finally
+        // produced the screen - which is exactly the "glitches into scrollback unavailable, then slowly
+        // fixes itself" the report describes. One nudge per empty reply, never a loop: the redraw either
+        // produces a real ring or the watchdog ends the wait on the banner.
+        sendHostInputRedraw(n);
+        return;
+      }
       // The replay is the ONE stream that may still enter the model: it is the only one that begins at
       // the session's start. It is never sent to a viewer. A viewer gets a serialized screen (State S/R)
       // or a defined banner (State L) - never a byte log, whose tail can begin mid-escape-sequence.
@@ -4082,6 +4109,7 @@ wssHost.on('connection', (ws, req) => {
       // A viewer on the banner is re-armed as repairPending so bytes that arrive while the ring parses
       // are buffered the same way instead of being painted and then wiped by the repair's CLEAR. Its
       // watchdog is cancelled: the reply this client waited for has arrived.
+
       for (const id of waiters) {
         const c = st.clients.get(id);
         if (!c) continue;
@@ -4326,6 +4354,7 @@ wssHost.on('connection', (ws, req) => {
         c.sbTimer = setTimeout(() => { if (c.sbWait) paintStateL(n, st, c); }, HOST_SB_WAIT_MS);
       }
     } else if (m.t === 'resync') {
+
       // muxd blew THIS session's ~1MiB egress budget and dropped its own backlog at a frame
       // boundary. The gap is unrecoverable from the stream, so repaint from truth: CLEAR +
       // scrollback replay for this session's viewers only — no other session lost a byte.
