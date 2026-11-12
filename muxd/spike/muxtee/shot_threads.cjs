@@ -26,11 +26,15 @@ const pairs = COOKIE.split(';').map(p => p.trim()).filter(Boolean).map(p => { co
   await page.locator('[data-mobile-view="threads"]').click();
   await page.locator('#threads').waitFor({ state: 'visible' });
   await page.waitForTimeout(900);
+  // Render the TOP of the thread: the first bubble is the screen context, which is what this shot is for.
+  if (process.env.MUX_TOP) { await page.evaluate(() => { const h = document.querySelector('#threads'); if (h) h.scrollTop = 0; }); await page.waitForTimeout(250); }
   const info = await page.evaluate(() => ({
     build: window.__muxBuild,
     msgs: [...document.querySelectorAll('#threads .th-msg')].map(m => ({
-      role: [...m.classList].find(c => c !== 'th-msg'),
-      who: m.querySelector('.th-who').textContent,
+      role: [...m.classList].find(c => c !== 'th-msg' && c !== 'th-cont'),
+      // A continuation of the same speaker's run deliberately has NO label - that is the fix under test,
+      // so its absence must be reported rather than crash the read.
+      who: (m.querySelector('.th-who') || {}).textContent || null,
       text: m.querySelector('.th-body').textContent.slice(0, 90),
     })),
     overflowX: document.documentElement.scrollWidth > window.innerWidth,

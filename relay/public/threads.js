@@ -55,10 +55,39 @@
     return { kind: 'body', indent: indent, lead: ch };
   }
 
+  // Where the agent app's COMPOSER starts, or rows.length when there is none.
+  //
+  // Measured on tab-5bec (2026-11-12): the app boxes its input between two rules with the prompt glyph
+  // between them, and paints its status line underneath:
+  //     ---------------
+  //     > (prompt glyph, alone)
+  //     ---------------
+  //       cd: ...   bypass permissions on - 3 shells - usage: 37% left
+  //       < Leaf 3: tv ... > All 3
+  // Every row from the pair's FIRST rule onward is CHROME: it is the app's own interface, not something the
+  // agent said. Left in, it becomes the tail of the last message - which is exactly the giant status-bar
+  // bubble the phone showed. Detected structurally (rule, then a prompt-only row, then a rule) so it does
+  // not depend on the wording of any one status line, and a screen with no such sandwich keeps every row.
+  function chromeStart(rows) {
+    for (var i = 0; i + 2 < rows.length; i++) {
+      var a = classify(rows[i].text), b = classify(rows[i + 1].text), c = classify(rows[i + 2].text);
+      if (a.kind !== 'rule') continue;
+      // The prompt row: the user leader glyph and nothing else on the line.
+      var promptOnly = b.kind === 'user' && /^[\s]*[\u276f\u23f5\u203a]\s*$/.test(rows[i + 1].text || '');
+      if (!promptOnly) continue;
+      if (c.kind !== 'rule') continue;
+      return i;
+    }
+    return rows.length;
+  }
+
   // Rows -> messages. `rows` is [{i, text, wrapped}]; wrapped rows are glued to the row above BEFORE
   // classification, so a paragraph that the pty wrapped at column 209 becomes one line and its continuation
   // does not masquerade as a message body.
   function segment(rows) {
+    // Drop the app's composer and status bar before anything is grouped: they sit at the END of the screen
+    // and would otherwise be absorbed into the last message as its body.
+    rows = rows.slice(0, chromeStart(rows));
     var joined = [];
     for (var i = 0; i < rows.length; i++) {
       var r = rows[i];
@@ -72,6 +101,8 @@
       var text = joined[j];
       var c = classify(text);
       if (c.kind === 'rule') { if (cur) { out.push(cur); cur = null; } continue; }
+      // A footer widget is never body: it would otherwise extend whichever message it lands under.
+      if (isFooter(text)) { if (cur) { out.push(cur); cur = null; } continue; }
       if (c.kind === 'blank') { if (cur) cur.lines.push(''); continue; }
       if (c.kind === 'body') {
         if (cur) { cur.lines.push(text); continue; }
@@ -94,6 +125,49 @@
     return out.filter(function (m) { return m.text !== ''; });
   }
 
+  // The agent app's own FOOTER widgets, painted over the bottom rows of the screen. Measured on tab-5bec
+  // (2026-11-12): a scroll hint, a task counter and a key hint appear under whatever the app last drew, so a
+  // long command's output appears to continue into them. They are the app's interface, not output.
+  var FOOTER = [
+    /^\s*Jump to bottom\b/i,
+    /^\s*[\u25b8\u25be>]\s*\d+\s+tasks?\s*\(\d+ done/i,
+    /^\s*\(ctrl\+[a-z]\)\s*$/i,
+    /^\s*Press .* for .*$/i,
+  ];
+
+  function isFooter(text) {
+    var t = String(text || '');
+    for (var i = 0; i < FOOTER.length; i++) if (FOOTER[i].test(t)) return true;
+    return false;
+  }
+
+  // Which messages get a SENDER LABEL. A messaging view labels a run of turns from one speaker once: the
+  // phone showed "TAB-5BEC" five times in a column, which is noise on the smallest screen. This returns the
+  // same message objects with `showWho` set, so the caller keeps one source of truth for order and content.
+  function grouped(msgs) {
+    var out = [], prev = null, seenReal = false;
+    for (var i = 0; i < msgs.length; i++) {
+      var m = msgs[i];
+      // Anything above the FIRST recognised message is the tail of a turn whose header scrolled off - often
+      // the agent's own reasoning. It is kept (the phone never shows less than the terminal) but it is
+      // CONTEXT, not a message the agent sent you, so the renderer styles it as such and never labels it.
+      var role0 = m.role || 'text';
+      var isContext = !seenReal && role0 === 'text';
+      if (role0 !== 'text') seenReal = true;
+      // A RUN is one speaker's turn. A tool result is part of the agent's turn - it is the agent running a
+      // command - so it neither starts a run nor carries the label; it stays visually subordinate in
+      // monospace. Without this, assistant -> tool -> assistant -> tool printed the session name on every
+      // bubble, which is what the phone showed.
+      var who = m.role || 'text';
+      var speaker = (who === 'tool') ? 'assistant' : who;
+      var showWho = who !== 'text' && speaker !== prev;
+      out.push({ role: m.role, lead: m.lead, text: m.text, lines: m.lines, index: m.index,
+                 showWho: showWho && !isContext, context: isContext });
+      if (who !== 'text') prev = speaker;
+    }
+    return out;
+  }
+
   // What kind of surface is this buffer? The alternate screen is a TUI (vim, an agent's full-screen mode):
   // its rows are a canvas, not a conversation, so the phone must fall back to the plain terminal.
   function bufferKind(buffer) {
@@ -111,6 +185,8 @@
     classify: classify,
     bufferKind: bufferKind,
     summarize: summarize,
+    chromeStart: chromeStart,
+    grouped: grouped,
     LEAD: LEAD,
   };
 })(window);

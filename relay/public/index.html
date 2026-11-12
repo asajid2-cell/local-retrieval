@@ -312,10 +312,14 @@
   }
   .th-msg { display:flex; flex-direction:column; margin:0 0 var(--sp3); max-width:100%; }
   .th-msg:last-child { margin-bottom:0; }
+  /* A continuation of the SAME speaker's run: no label, and only a hairline gap, so several short turns read
+     as one turn rather than as a stack of unrelated cards. */
+  .th-msg.th-cont { margin-top:calc(-1 * var(--sp3) + 4px); }
+  .th-msg.th-cont .th-body { border-top-left-radius:6px; border-top-right-radius:6px; }
   .th-who { font-size:11px; letter-spacing:.03em; text-transform:uppercase; color:var(--faint); margin:0 0 3px var(--sp1); }
   .th-body {
     border:1px solid var(--line); background:var(--panel); border-radius:var(--r-m);
-    padding:var(--sp2) var(--sp3); font-size:14px; line-height:1.5; color:var(--txt);
+    padding:var(--sp2) var(--sp3); font-size:15px; line-height:1.45; color:var(--txt);
     white-space:pre-wrap; word-break:break-word; overflow-wrap:anywhere;
   }
   /* The user's own turn reads as "me": accent edge, raised surface, right-aligned. */
@@ -328,6 +332,13 @@
     font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"Roboto Mono",monospace;
   }
   .th-msg.status .th-body { background:transparent; border-style:dashed; color:var(--muted); font-size:12.5px; }
+  /* Screen context above the first real message: muted and unframed, so it reads as "where the screen was"
+     rather than as a bubble with a sender. */
+  .th-msg.th-ctx .th-body {
+    background:transparent; border-color:transparent; color:var(--faint);
+    font-size:13px; line-height:1.5; padding:0 var(--sp1);
+    border-left:2px solid var(--line); border-radius:0;
+  }
   #threads .th-empty { color:var(--faint); font-size:13px; padding:var(--sp4) 0; text-align:center; }
   #threads .th-alt {
     margin:var(--sp2) 0; padding:var(--sp3); border:1px solid var(--line); border-radius:var(--r-m);
@@ -1054,7 +1065,10 @@ function renderThreads(force){
     }
     return;
   }
-  const msgs=(window.MuxThreads && MuxThreads.segment) ? MuxThreads.segment(buf.rows) : [];
+  const seg=(window.MuxThreads && MuxThreads.segment) ? MuxThreads.segment(buf.rows) : [];
+  // One label per RUN of turns from the same speaker, not one per bubble: five "TAB-5BEC" headers down a
+  // phone screen is noise, and in a message list the reader already knows whose turn it is.
+  const msgs=(window.MuxThreads && MuxThreads.grouped) ? MuxThreads.grouped(seg) : seg;
   const sig=current+'|'+msgs.map(m=>m.role+':'+m.text.length+':'+m.text.slice(-24)).join('\u0001');
   if(!force && sig===threadsLastSig) return;      // nothing changed: do not rebuild the list under a finger
   threadsLastSig=sig;
@@ -1065,8 +1079,12 @@ function renderThreads(force){
   const frag=document.createDocumentFragment();
   for(const m of msgs){
     const wrap=document.createElement('div'); wrap.className='th-msg '+(m.role||'text');
-    const who=document.createElement('div'); who.className='th-who';
-    who.textContent=WHO[m.role]!==undefined?WHO[m.role]:m.role;
+    // A run of same-speaker turns is visually one block: no gap above a continuation, so the bubbles stack.
+    if(m.showWho===false) wrap.classList.add('th-cont');
+    // Text above the first recognised message is the tail of a scrolled-off turn (often the agent's own
+    // reasoning). It stays visible - the phone never shows less than the terminal - but it is clearly
+    // secondary, so it never reads as something the agent said to you.
+    if(m.context) wrap.classList.add('th-ctx');
     const body=document.createElement('div'); body.className='th-body';
     // The glyph has already done its job (it is what grouped this message), and the label above says who
     // it is - so it is stripped from the first line instead of being read out twice.
@@ -1075,7 +1093,12 @@ function renderThreads(force){
     // as an empty bubble reads as a broken message.
     if(!said.trim()) continue;
     body.textContent=said;
-    wrap.appendChild(who); wrap.appendChild(body); frag.appendChild(wrap);
+    if(m.showWho!==false){
+      const who=document.createElement('div'); who.className='th-who';
+      who.textContent=WHO[m.role]!==undefined?WHO[m.role]:m.role;
+      wrap.appendChild(who);
+    }
+    wrap.appendChild(body); frag.appendChild(wrap);
   }
   host.appendChild(frag);
   if(stick) host.scrollTop=host.scrollHeight;
@@ -1781,7 +1804,7 @@ function reloadTerminal(quiet){
   connect(name, true);   // re-attach: CLEAR + scrollback replay + live, all client state reset
 }
 document.addEventListener('keydown', e=>{ if(e.ctrlKey && e.altKey && (e.key==='r'||e.key==='R')){ e.preventDefault(); e.stopPropagation(); reloadTerminal(); } }, true);
-window.__muxBuild='2026-11-11-phone-threads-1';   // bump per web deploy so a loaded version is verifiable (supersedes 2026-11-09-grid-ownership-4)
+window.__muxBuild='2026-11-12-phone-threads-4';   // bump per web deploy so a loaded version is verifiable (supersedes 2026-11-11-phone-threads-1)
 try{ console.info('multiplex build', window.__muxBuild); }catch(e){}
 const helper = $('#term').querySelector('.xterm-helper-textarea');
 function hardenHelperTextarea(){
