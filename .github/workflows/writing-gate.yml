@@ -1,13 +1,16 @@
 name: writing-gate
 
+# Scope: README.md only. The technical pages under docs/ predate this gate and
+# are deliberately out of scope, so a green badge covers the README, not docs/.
+
 on:
   pull_request:
     paths:
-      - "**/*.md"
-      - "**/*.mdx"
-      - "**/*.txt"
+      - "README.md"
   push:
     branches: [main, release]
+    paths:
+      - "README.md"
 
 permissions:
   contents: read
@@ -24,8 +27,12 @@ jobs:
 
       - name: Install Vale
         run: |
-          curl -fsSL https://github.com/vale-cli/vale/releases/download/v3.27.0/vale_3.27.0_Linux_64-bit.tar.gz \
-            | tar -xz -C /usr/local/bin vale
+          base=https://github.com/vale-cli/vale/releases/download/v3.27.0
+          cd /tmp
+          curl -fsSLO "$base/vale_3.27.0_checksums.txt"
+          curl -fsSLO "$base/vale_3.27.0_Linux_64-bit.tar.gz"
+          sha256sum -c vale_3.27.0_checksums.txt --ignore-missing
+          tar -xzf vale_3.27.0_Linux_64-bit.tar.gz -C /usr/local/bin vale
 
       - name: Lint prose
         run: vale README.md

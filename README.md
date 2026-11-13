@@ -14,7 +14,7 @@ MUX puts both agent-session stores into one searchable archive. It reopens any c
 | --- | --- |
 | Two session formats in one archive | Codex rollouts and Claude transcripts, parsed by `app/native/CodexLocalRetrieval.Core/Services/ArchiveService.cs` |
 | Three processes in one repo | `app/`, `muxd/`, `relay/` |
-| 1,800+ automated tests | `app/native/CodexLocalRetrieval.Native.Tests`, `relay/tests` |
+| 1,700+ automated tests | `app/native/CodexLocalRetrieval.Native.Tests`, `relay/tests` |
 | Zero inbound ports on the PC | `muxd/muxd.py` dials out to the relay |
 | One action to resume | `codex resume` or `claude --resume`, in the chat's original working directory |
 
