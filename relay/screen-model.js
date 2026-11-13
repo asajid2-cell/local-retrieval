@@ -92,7 +92,7 @@ function modelFor(name, cols, rows) {
     // COLD: the model holds only the bytes seen since it was created (or rebuilt), which begin in the
     // middle of the session's stream. Its screen is therefore a suffix, not a state, and it must not be
     // served until seed() has fed it muxd's ring from the beginning. Only seed() clears this.
-    model = { term, ser, cols, rows, bytes: 0, idleAt: 0, cold: true, gen: ++_modelGen };
+    model = { term, ser, cols, rows, bytes: 0, idleAt: 0, cold: true, settled: false, gen: ++_modelGen };
     MODELS.set(name, model);
   }
   return model;
@@ -154,7 +154,9 @@ function seed(name, cols, rows, bytes, done) {
       drain(name, alive => {
         const ok = live && alive;
         const cur = MODELS.get(name);
-        if (ok && cur) cur.cold = false;
+        // `settled` records that this model has parsed a stream from its start and is not mid-parse, so a
+        // snapshot that comes out EMPTY is the app's real screen rather than a race with the parser.
+        if (ok && cur) { cur.cold = false; cur.settled = true; }
         if (typeof done === 'function') done(ok);
       });
     });
@@ -187,10 +189,11 @@ function drain(name, cb) {
 // the geometry the viewer will render at; a model at any other size is refused (the caller rebuilds by
 // replaying bytes at that size instead). A COLD model is refused outright: its screen is a suffix of
 // the stream, and a suffix is not a state.
-function snapshot(name, cols, rows) {
+function snapshotWithReason(name, cols, rows) {
   const model = MODELS.get(name);
-  if (!model || model.cold || model.cols !== cols || model.rows !== rows) return null;
-  if (model.bytes === 0) return null;
+  if (!model || model.cols !== cols || model.rows !== rows) return { snap: null, reason: 'unknown' };
+  if (model.cold) return { snap: null, reason: 'cold' };
+  if (model.bytes === 0) return { snap: null, reason: 'empty-stream' };
   let out;
   try {
     // Serialize a bounded slice of scrollback, not the whole thing. The screen itself is 24 rows; the
@@ -206,16 +209,22 @@ function snapshot(name, cols, rows) {
     }
   } catch (error) {
     dispose(name);
-    return null;
+    return { snap: null, reason: 'failed' };
   }
-  // xterm-headless parses on a microtask, so a snapshot taken in the same tick as the last feed can be
-  // empty even though bytes were handed over. An empty screen after the caller's CLEAR is a BLACK
-  // terminal, so refuse it and let the byte replay (always correct) paint instead.
-  return out && out.length ? out : null;
+  if (out && out.length) return { snap: out, reason: 'screen' };
+  // A WARM model that serializes to nothing is not a parse race - it has been fed every byte of a live
+  // stream and its screen really is blank. That is a real app state, not a failure: a tab that emits only
+  // window-title escapes (measured: tab-7a38's whole 151 KB ring, 0 newlines, 0 cursor addresses) has an
+  // empty screen, and calling that "scrollback unavailable" blames a transport that is working. The
+  // distinction matters because the two need different words in front of the user.
+  return { snap: null, reason: model.settled ? 'blank' : 'parsing' };
+}
+function snapshot(name, cols, rows) {
+  return snapshotWithReason(name, cols, rows).snap;
 }
 
 function stats() {
   return { sessions: MODELS.size, available: available(), error: loadError ? String(loadError.message || loadError) : '' };
 }
 
-module.exports = { available, feed, seed, drain, snapshot, dispose, stats };
+module.exports = { available, feed, seed, drain, snapshot, snapshotWithReason, dispose, stats };

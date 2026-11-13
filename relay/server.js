@@ -4148,7 +4148,12 @@ wssHost.on('connection', (ws, req) => {
       }
       const paintAll = () => {
         const g = modelGeom(st, n);
-        const snap = g ? screenModel.snapshot(n, g.cols, g.rows) : null;
+        const model = g ? screenModel.snapshotWithReason(n, g.cols, g.rows) : { snap: null, reason: 'unknown' };
+        const snap = model.snap;
+        // A SEEDED model whose screen came out empty is a real state (the app has drawn nothing yet), so
+        // the viewer is painted blank and live rather than accused of an unavailable scrollback. The ring
+        // itself answered; only the cells are absent.
+        const blank = !snap && model.reason === 'blank';
         // Only a reply that actually yields a screen ends a stale run: a reply with no snapshot leaves
         // every viewer on the banner, so the next stale must still count toward the permanent State L
         // rather than resetting the strikes against a cold model.
@@ -4198,6 +4203,15 @@ wssHost.on('connection', (ws, req) => {
         };
         const paint = c => {
           const queued = (c.q || []).slice();
+          if (blank) {
+            // The screen is genuinely empty. CLEAR defines it and everything buffered is live output that
+            // belongs after the CLEAR - the same rule as a snapshot paint, with no cells to write.
+            if (!paintBlankScreen(n, st, c)) return;
+            flushText(c, queued);
+            c.q = []; c.qBytes = 0; c.qMark = 0;
+            armCut(c);
+            return;
+          }
           if (!snap) {
             // No trustworthy screen: the banner is the defined state, and what was buffered is a live
             // suffix that belongs after it, flushed as text - never a replay. `cut` is null here by
@@ -4770,6 +4784,9 @@ function paintSnapshot(name, st, client, snap) {
 // an inline app without focus reporting it produces no bytes at all - so it is never relied on.
 function paintStateL(name, st, client) {
   if (!client || client.removed || client.ws.readyState !== 1) return false;
+  // NOTE: this is the "no trustworthy screen" state, and its banner says so. It is NOT what a session
+  // whose screen is genuinely blank gets - that is paintBlankScreen below, precisely so the two causes are
+  // never confused in front of the user.
   client.sbWait = false; client.wentLive = true; client.stateL = true; client.repairPending = false;
   st.sbWaiters.delete(client.id);
   const ok = sendViewer(name, st, client, CLEAR_SCREEN, true)
@@ -4777,6 +4794,29 @@ function paintStateL(name, st, client) {
   sendHostInputRedraw(name);
   client.q = []; client.qBytes = 0; client.qMark = 0;
   return ok;
+}
+// State B: the model parsed this session's stream from its start and its screen is EMPTY. That is a real
+// app state - a tab whose output so far is nothing but window-title escapes - and it must not be described
+// with the "scrollback unavailable" banner, which blames a transport that answered perfectly. CLEAR defines
+// the screen (xterm is re-based so no half-read sequence survives) and the viewer goes live: the next byte
+// the app writes lands on a screen the user can trust, and until then it is blank, which is the truth.
+function paintBlankScreen(name, st, client) {
+  if (!client || client.removed || client.ws.readyState !== 1) return false;
+  client.sbWait = false; client.wentLive = true; client.stateL = false; client.repairPending = false;
+  if (client.sbTimer) { clearTimeout(client.sbTimer); client.sbTimer = null; }
+  if (client.watchAckTimer) { clearTimeout(client.watchAckTimer); client.watchAckTimer = null; }
+  st.sbWaiters.delete(client.id);
+  if (st.watchWaiters) st.watchWaiters.delete(client.id);
+  // CLEAR re-bases the screen, then whatever was buffered while waiting is live output this viewer is owed
+  // and is delivered verbatim, in order - it is not a replay, so nothing can begin mid-escape-sequence in
+  // it (muxd starts each frame at a boundary).
+  if (!sendViewer(name, st, client, CLEAR_SCREEN, true)) return false;
+  const queued = (client.q || []).slice();
+  for (const e of queued) {
+    if (e.text && e.text.length && !sendViewer(name, st, client, e.text, true)) return false;
+  }
+  client.q = []; client.qBytes = 0; client.qMark = 0;
+  return true;
 }
 // The ahead case: the snapshot represents [start,pos) but the relay has not yet received the bytes in
 // [recv,pos), so they must be dropped as they arrive (`dropUntil`). The wait is bounded like a first
@@ -5304,10 +5344,19 @@ wss.on('connection', async (ws, req) => {
     // While a seed is parsing, the model is missing the bytes held for the viewers already waiting, so it
     // cannot answer this attach: the viewer joins that seed instead (requestSessionScrollback below) and
     // is painted from the same snapshot with the hold flushed after it.
-    const warmSnap = (geom && !st.seedHold) ? screenModel.snapshot(name, geom.cols, geom.rows) : null;
+    const warm = (geom && !st.seedHold) ? screenModel.snapshotWithReason(name, geom.cols, geom.rows)
+      : { snap: null, reason: 'held' };
+    const warmSnap = warm.snap;
     if (warmSnap) {
       // State S: the model already holds the whole stream; no scrollback request is sent at all.
       if (!paintSnapshot(name, st, client, warmSnap)) return;
+    } else if (warm.reason === 'blank') {
+      // State B: the model has parsed this session's stream from its start and the app's screen is EMPTY -
+      // a tab that emits only window-title escapes (measured: tab-7a38's whole 151 KB ring, 0 newlines, 0
+      // cursor addresses). Painting the "scrollback unavailable" banner here is a false accusation: nothing
+      // was unavailable, the screen really is blank, and the next byte will paint. CLEAR defines the state
+      // and the viewer goes live, so what the user sees is the truth.
+      if (!paintBlankScreen(name, st, client)) return;
     } else if (watchFlip) {
       // State V: this attach started the feed, so a resync carrying the tee's whole ring is on its way and
       // asking for scrollback too would duplicate it. Stay in the waiting state (live bytes are buffered,
