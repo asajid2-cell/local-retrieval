@@ -652,6 +652,10 @@ public sealed class ArchiveSession : INotifyPropertyChanged
 
     // Capped, searchable text (user+assistant+tool text, truncated). Serialized so search works without
     // holding full transcripts in memory.
+    // A capped content preview. It is a RECENT-chat cache, not a corpus copy: the archive keeps it
+    // only for the newest few hundred chats (ArchiveService.PruneSessionText) because holding a
+    // 6,000-char preview for all ~10,000 chats cost ~84 MB of strings and 61 MB of a 64 MB store,
+    // while full-content search is served by the transcript index.
     private string _text = "";
     [JsonPropertyName("text")]
     public string Text { get => _text; set { _text = value; InvalidateSearchText(); } }

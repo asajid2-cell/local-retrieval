@@ -13,9 +13,19 @@ internal sealed partial class TranscriptSearchIndex : IDisposable
 {
     internal const int SchemaVersion = 1;
     private const int TailHashBytes = 64 * 1024;
-    private const int CandidateRowLimit = 2_000;
+    // FTS rows whose matched text is materialized from disk for scoring. Every row costs a seek plus a
+    // JSON parse of the matched transcript line, so this is the dominant cost of a search: 2,000 rows
+    // measured 8-13 s per query, entirely in this loop. Rows are now ordered by FTS rank, so the head of
+    // the list is the relevant end and a few hundred rows carry the same sessions a result list can show.
+    private const int CandidateRowLimit = 150;
     private static readonly TimeSpan LiveFileWindow = TimeSpan.FromMinutes(10);
-    private static readonly TimeSpan FallbackBudget = TimeSpan.FromSeconds(32);
+    // How long a search may spend scanning transcripts the index has not reached yet. This is the
+    // INTERACTIVE path: it runs after every debounced keystroke, so a 32-second budget meant a search
+    // could sit on a disk walk for half a minute whenever the index was still catching up (measured:
+    // 3.9 s for a 7-hit query). The indexed results are already in hand; this is a best-effort top-up,
+    // and a keystroke must feel attached to the keyboard. The explicit "deep search" path scans disk on
+    // its own terms and does not use this budget.
+    private static readonly TimeSpan FallbackBudget = TimeSpan.FromMilliseconds(750);
 
     private readonly string _dbPath;
     private readonly SemaphoreSlim _syncGate = new(1, 1);
@@ -379,46 +389,70 @@ internal sealed partial class TranscriptSearchIndex : IDisposable
             JOIN turns t ON t.id = turn_fts.rowid
             JOIN files f ON f.source_path = t.source_path
             WHERE turn_fts MATCH $query
-            ORDER BY
-                CASE t.role
-                    WHEN 'user' THEN 0
-                    WHEN 'assistant' THEN 1
-                    ELSE 2
-                END,
-                f.observed_last_write_ticks DESC
+            ORDER BY rank
             LIMIT $limit;
             """;
         command.Parameters.AddWithValue("$query", BuildFtsQuery(tokens));
         command.Parameters.AddWithValue("$limit", CandidateRowLimit);
+        // ExecuteReader is lazy: the ORDER BY over the joined match set is paid on the first Read, and the
+        // per-row transcript seeks are paid in the loop. Both are traced so a slow search can be attributed.
+        var queryWatch = System.Diagnostics.Stopwatch.StartNew();
         using var reader = command.ExecuteReader();
-        while (reader.Read())
+        long firstRowMs = -1;
+        var rowCount = 0;
+        // Rows arrive grouped by file (the ORDER BY is role then recency, and a chat's turns are
+        // adjacent), so one open handle per file serves a whole run of hits instead of one open per row.
+        // With up to 2,000 candidate rows that alone was hundreds of FileStream opens per keystroke.
+        string? openPath = null;
+        FileStream? openStream = null;
+        try
         {
-            cancellationToken.ThrowIfCancellationRequested();
-            var sessionId = reader.GetString(0);
-            var path = reader.GetString(1);
-            var byteStart = reader.GetInt64(2);
-            var byteLength = reader.GetInt64(3);
-            var blockOrdinal = reader.GetInt32(4);
-            var role = reader.GetString(5);
-            var tool = reader.GetString(6);
-            var text = ReadTurnText(
-                path,
-                byteStart,
-                byteLength,
-                blockOrdinal,
-                role,
-                tool);
-            if (string.IsNullOrWhiteSpace(text)) continue;
-            AddCandidate(
-                bySession,
-                sessionId,
-                path,
-                byteStart,
-                byteLength,
-                role,
-                text,
-                query,
-                tokens);
+            while (reader.Read())
+            {
+                if (firstRowMs < 0) firstRowMs = queryWatch.ElapsedMilliseconds;
+                rowCount++;
+                cancellationToken.ThrowIfCancellationRequested();
+                var sessionId = reader.GetString(0);
+                var path = reader.GetString(1);
+                var byteStart = reader.GetInt64(2);
+                var byteLength = reader.GetInt64(3);
+                var blockOrdinal = reader.GetInt32(4);
+                var role = reader.GetString(5);
+                var tool = reader.GetString(6);
+                if (openStream is null || !string.Equals(path, openPath, StringComparison.OrdinalIgnoreCase))
+                {
+                    openStream?.Dispose();
+                    openStream = null;
+                    openPath = null;
+                    try { openStream = OpenTranscript(path); openPath = path; }
+                    catch { continue; }
+                }
+                var text = ReadTurnText(
+                    openStream,
+                    byteStart,
+                    byteLength,
+                    blockOrdinal,
+                    role,
+                    tool);
+                if (string.IsNullOrWhiteSpace(text)) continue;
+                AddCandidate(
+                    bySession,
+                    sessionId,
+                    path,
+                    byteStart,
+                    byteLength,
+                    role,
+                    text,
+                    query,
+                    tokens);
+            }
+        }
+        finally
+        {
+            openStream?.Dispose();
+            PerfCounters.Trace?.Invoke(
+                $"fts query='{query}' rows={rowCount} firstRowMs={firstRowMs}"
+                + $" totalMs={queryWatch.ElapsedMilliseconds}");
         }
     }
 
@@ -717,7 +751,7 @@ internal sealed partial class TranscriptSearchIndex : IDisposable
     }
 
     private static string ReadTurnText(
-        string path,
+        FileStream stream,
         long byteStart,
         long byteLength,
         int blockOrdinal,
@@ -726,7 +760,6 @@ internal sealed partial class TranscriptSearchIndex : IDisposable
     {
         try
         {
-            using var stream = OpenTranscript(path);
             stream.Position = byteStart;
             var length = checked((int)Math.Min(byteLength, 256L * 1024 * 1024));
             var bytes = new byte[length];
@@ -1288,7 +1321,10 @@ internal sealed partial class TranscriptSearchIndex : IDisposable
             Execute(connection, "PRAGMA synchronous=NORMAL;");
             Execute(connection, "PRAGMA temp_store=MEMORY;");
             Execute(connection, "PRAGMA cache_size=-65536;");
-            Execute(connection, "PRAGMA mmap_size=268435456;");
+            // The index is ~18 GB; a 256 MB mapping put a quarter of a gigabyte of file pages into this
+            // process's working set for a cache whose hit rate on a corpus that size is marginal. 64 MB is
+            // the same order as the page cache above and keeps the mapped footprint bounded.
+            Execute(connection, "PRAGMA mmap_size=67108864;");
             // Keep the write-ahead log bounded: auto-checkpoint every ~4 MB of frames, and cap the log
             // file at 64 MB so a checkpoint truncates it back rather than leaving it at its high-water mark.
             Execute(connection, "PRAGMA wal_autocheckpoint=1000;");

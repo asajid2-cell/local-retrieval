@@ -74,12 +74,31 @@ public sealed partial class ArchiveService
     // append-only, and the two rewriters (branch/entrypoint) replace the file rather than edit it in place.
     private const long FullForwardVerifyMaxBytes = 8 * 1024 * 1024;
     private const int SearchTextCap = 6_000; // capped, in-memory searchable text per session (full content lazy-loads)
+    private static string CapText(string s) => string.IsNullOrEmpty(s) || s.Length <= SearchTextCap ? s : s[^SearchTextCap..];
+
+    // Keep the content preview only for the newest chats. The scan re-parses whatever changed, so
+    // without this the preview set grows back to the whole corpus within days of normal use.
+    private static void PruneSessionText(IEnumerable<ArchiveSession> sessions)
+    {
+        var holders = new List<ArchiveSession>();
+        foreach (var session in sessions)
+            if (!string.IsNullOrEmpty(session.Text)) holders.Add(session);
+        if (holders.Count <= RetainedSessionTextCount) return;
+        holders.Sort(static (left, right) => string.CompareOrdinal(right.UpdatedAt, left.UpdatedAt));
+        for (var index = RetainedSessionTextCount; index < holders.Count; index++)
+            holders[index].Text = "";
+    }
+
+    // How many of the newest chats keep their in-memory content preview. Measured live: ~10,000 chats
+    // holding a 6,000-char preview was ~84 MB of strings, and that same text made app-store.json 61 MB
+    // of a 64 MB payload rewritten on every sync. The preview exists to answer a filter pass and the
+    // recent-chat list without touching a transcript; content search over the rest of the corpus is
+    // the transcript index's job. Dropping a preview only costs one re-parse when a chat is opened.
+    private const int RetainedSessionTextCount = 300;
     private const int MaxDiskSearchParallelism = 4;
     private const long MaxDiskSearchBytesPerFile = 128L * 1024 * 1024;
     private const int StoreLockAttempts = 1200;
     private const int StoreLockRetryDelayMilliseconds = 25;
-
-    private static string CapText(string s) => string.IsNullOrEmpty(s) || s.Length <= SearchTextCap ? s : s[^SearchTextCap..];
 
     // The last / first USER message in a full transcript, collapsed to a single capped line — used as the row
     // title for the "last/first user message" sorts (computed at parse time, persisted on the session).
@@ -891,6 +910,7 @@ public sealed partial class ArchiveService
         var data = JsonSerializer.Deserialize<AppStoreData>(bytes, _jsonOptions)
             ?? throw new InvalidDataException("App store deserialized to null: " + source);
         NormalizeLoadedStore(data);
+        PruneSessionText(data.Sessions.Values);
         // In restricted mode every persisted transcript/snapshot path must still live inside the explicit
         // roots; a store written while unrestricted (or tampered with) must not widen the read surface.
         if (_restrictTranscriptSources)
@@ -923,22 +943,58 @@ public sealed partial class ArchiveService
                 throw new InvalidDataException("Isolated archive paths cannot traverse reparse points.");
     }
 
+    // Streaming, allocation-free shape check. `JsonDocument.Parse` answers the same question but rents a
+    // metadata array proportional to the document from ArrayPool<byte>.Shared - and .NET 8 KEEPS pooled
+    // arrays of any size in a thread-local slot. On a 32 MB store that parked a 32 MB array for the life
+    // of the process (verified in a heap dump and reproduced in isolation: a returned 32 MB rental comes
+    // straight back out of the pool). The reader below walks the same bytes without materializing anything.
     private static void ValidateStoreShape(ReadOnlyMemory<byte> bytes, string source)
     {
         PerfCounters.StoreJsonParse();
-        using var document = JsonDocument.Parse(bytes);
-        var root = document.RootElement;
-        if (root.ValueKind != JsonValueKind.Object
-            || !root.TryGetProperty("sessions", out var sessions)
-            || sessions.ValueKind != JsonValueKind.Object
-            || !root.TryGetProperty("settings", out var settings)
-            || settings.ValueKind != JsonValueKind.Object)
-            throw new InvalidDataException("App store is missing required sections: " + source);
-        if (root.TryGetProperty("storeSchemaVersion", out var schemaVersion)
-            && (schemaVersion.ValueKind != JsonValueKind.Number
-                || !schemaVersion.TryGetInt32(out var schema)
-                || schema != 1))
-            throw new InvalidDataException("App store uses an unsupported schema version: " + source);
+        try
+        {
+            var reader = new Utf8JsonReader(bytes.Span);
+            if (!reader.Read() || reader.TokenType != JsonTokenType.StartObject)
+                throw new InvalidDataException("App store is not a JSON object: " + source);
+            var hasSessions = false;
+            var hasSettings = false;
+            while (reader.Read())
+            {
+                if (reader.TokenType == JsonTokenType.EndObject) break;
+                if (reader.TokenType != JsonTokenType.PropertyName) continue;
+                var name = reader.GetString();
+                if (!reader.Read()) break;
+                if (name == "storeSchemaVersion")
+                {
+                    if (reader.TokenType != JsonTokenType.Number
+                        || !reader.TryGetInt32(out var schema)
+                        || schema != 1)
+                        throw new InvalidDataException("App store uses an unsupported schema version: " + source);
+                }
+                else if (name == "sessions")
+                {
+                    hasSessions = reader.TokenType == JsonTokenType.StartObject;
+                }
+                else if (name == "settings")
+                {
+                    hasSettings = reader.TokenType == JsonTokenType.StartObject;
+                }
+                if (reader.TokenType is not (JsonTokenType.StartObject or JsonTokenType.StartArray)) continue;
+                // Skip the subtree so the walk stays O(bytes) without holding it.
+                var depth = 0;
+                do
+                {
+                    if (reader.TokenType is JsonTokenType.StartObject or JsonTokenType.StartArray) depth++;
+                    else if (reader.TokenType is JsonTokenType.EndObject or JsonTokenType.EndArray) depth--;
+                } while (depth > 0 && reader.Read());
+            }
+            if (!hasSessions || !hasSettings)
+                throw new InvalidDataException("App store is missing required sections: " + source);
+        }
+        catch (JsonException error)
+        {
+            throw new InvalidDataException("App store is not valid JSON: " + source, error);
+        }
     }
 
     private static void NormalizeLoadedStore(AppStoreData data)
@@ -1196,14 +1252,25 @@ public sealed partial class ArchiveService
     // The returned span aliases this buffer, so it is valid only until the next save - which is exactly
     // the lifetime the caller needs, because the save gate is held for the whole operation.
     private ArrayBufferWriter<byte>? _serializationBuffer;
+    private int _serializationBufferHint = 1 << 20;
 
     private ReadOnlyMemory<byte> SerializeStore()
     {
-        var writer = _serializationBuffer ??= new ArrayBufferWriter<byte>(1 << 20);
+        // An eighth of headroom so a store that grew by a few bytes does not double the whole buffer.
+        var writer = _serializationBuffer ??= new ArrayBufferWriter<byte>(
+            Math.Max(1 << 16, _serializationBufferHint + (_serializationBufferHint >> 3)));
         writer.Clear();
         using (var json = new Utf8JsonWriter(writer))
             JsonSerializer.Serialize(json, Store, StorePayloadJsonOptions);
-        return writer.WrittenMemory;
+        var written = writer.WrittenMemory;
+        _serializationBufferHint = written.Length;
+        // Capacity must follow the payload, not its high-water mark. A retained buffer keeps working for
+        // the largest store it ever serialized, so once the store shrinks (it dropped from 61 MB to ~19 MB
+        // when the per-chat `text` field stopped being persisted) the old 64 MB capacity would never be
+        // handed back. Dropping it re-allocates at the current size on the next save instead.
+        if (writer.Capacity > written.Length + (written.Length >> 1))
+            _serializationBuffer = null;
+        return written;
     }
 
     // A merge's result, saved unless a recent background save already covered it. `deferred` is set only
@@ -1501,39 +1568,68 @@ public sealed partial class ArchiveService
         PerfCounters.SessionListOps(ObservableDiff.Apply(Sessions, desired, static s => s.Id));
     }
 
-    private IReadOnlyList<ArchiveSession> SearchIncludingArchived(string query)
+    // Archived and "all" scopes must still search CONTENT, which is no longer held per session in
+    // memory. The transcript index covers it (default-on); without the index the metadata leg
+    // (title/path/tags/codename) answers, which is what the in-memory preview could still do once it
+    // stopped carrying transcript text. Bracket-phrase lookup is a pure tag query either way.
+    private IReadOnlyList<ArchiveSession> SearchIncludingArchived(
+        string query, IReadOnlyList<ArchiveSession>? universe = null)
     {
         var q = (query ?? "").Trim();
         if (q.Length >= 3 && q[0] == '[' && q[^1] == ']')
         {
             var phrase = q[1..^1].Trim();
-            return Store.Sessions.Values
+            return (universe ?? (IEnumerable<ArchiveSession>)new List<ArchiveSession>(Store.Sessions.Values))
                 .Where(s => s.SpecialPhrases.Any(p => string.Equals(p, phrase, StringComparison.OrdinalIgnoreCase)))
                 .OrderByDescending(s => s.Pinned).ThenByDescending(s => s.UpdatedAt, StringComparer.Ordinal).ToList();
         }
-        var terms = q.ToLowerInvariant().Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-        return Store.Sessions.Values
-            .Where(session => terms.All(term => SearchText(session).Contains(term, StringComparison.OrdinalIgnoreCase)))
-            .OrderByDescending(session => Score(session, terms)).ThenByDescending(session => session.Pinned)
-            .ThenByDescending(session => session.UpdatedAt).ToList();
+        if (_transcriptSearchEnabled && q.Length > 0)
+        {
+            var previous = _searchUniverse;
+            _searchUniverse = universe;
+            try
+            {
+                return UnifiedSearchAsync(q, 1000).GetAwaiter().GetResult()
+                    .Hits.Select(hit => hit.Session).ToList();
+            }
+            finally { _searchUniverse = previous; }
+        }
+        return SearchLegacy(q, includeArchived: true, universe: universe);
     }
 
-    public IReadOnlyList<ArchiveSession> Search(string query)
+    // The snapshot a caller supplies when it wants the search OFF the UI thread. It rides a ThreadStatic
+    // rather than a parameter because UnifiedSearchAsync is public and its signature is not worth widening
+    // for one internal path; the value is read synchronously at method entry, before the first await can
+    // move the continuation to another thread.
+    [ThreadStatic] private static IReadOnlyList<ArchiveSession>? _searchUniverse;
+
+    // `universe` lets a caller hand in a stable snapshot of the store so the search can run OFF the UI
+    // thread: Store.Sessions is a plain Dictionary and may not be enumerated while the UI mutates it.
+    // Everything downstream only READS session fields.
+    public IReadOnlyList<ArchiveSession> Search(string query, IReadOnlyList<ArchiveSession>? universe = null)
     {
         if (!_transcriptSearchEnabled
             || string.IsNullOrWhiteSpace(query)
             || IsBracketPhraseQuery(query))
-            return SearchLegacy(query);
+            return SearchLegacy(query, universe: universe);
 
-        var result = UnifiedSearchAsync(query, 1000).GetAwaiter().GetResult();
-        return result.Hits.Select(hit => hit.Session).ToList();
+        var previous = _searchUniverse;
+        _searchUniverse = universe;
+        try
+        {
+            var result = UnifiedSearchAsync(query, 1000).GetAwaiter().GetResult();
+            return result.Hits.Select(hit => hit.Session).ToList();
+        }
+        finally { _searchUniverse = previous; }
     }
 
-    private IReadOnlyList<ArchiveSession> SearchLegacy(string query)
+    private IReadOnlyList<ArchiveSession> SearchLegacy(
+        string query, bool includeArchived = false, IReadOnlyList<ArchiveSession>? universe = null)
     {
+        var all = universe ?? (IReadOnlyList<ArchiveSession>)new List<ArchiveSession>(Store.Sessions.Values);
         if (string.IsNullOrWhiteSpace(query))
         {
-            return OrderedVisibleSessions(Store.Sessions.Values).ToList();
+            return OrderedVisibleSessions(all).ToList();
         }
 
         // [phrase] syntax — a fast, PRECISE codename lookup: return ONLY chats explicitly stamped with that
@@ -1544,16 +1640,17 @@ public sealed partial class ArchiveService
         {
             var phrase = q[1..^1].Trim();
             if (phrase.Length > 0)
-                return Store.Sessions.Values
-                    .Where(s => !s.Archived && s.SpecialPhrases.Any(p => string.Equals(p, phrase, StringComparison.OrdinalIgnoreCase)))
+                return all
+                    .Where(s => (includeArchived || !s.Archived)
+                        && s.SpecialPhrases.Any(p => string.Equals(p, phrase, StringComparison.OrdinalIgnoreCase)))
                     .OrderByDescending(s => s.Pinned)
                     .ThenByDescending(s => s.UpdatedAt, StringComparer.Ordinal)
                     .ToList();
         }
 
         var terms = query.ToLowerInvariant().Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-        return Store.Sessions.Values
-            .Where(session => !session.Archived)
+        return all
+            .Where(session => includeArchived || !session.Archived)
             .Where(session => terms.All(term => SearchText(session).Contains(term, StringComparison.OrdinalIgnoreCase)))
             .OrderByDescending(session => Score(session, terms))
             .ThenByDescending(session => session.Pinned)
@@ -1573,9 +1670,12 @@ public sealed partial class ArchiveService
         CancellationToken cancellationToken = default)
     {
         limit = Math.Clamp(limit, 1, 1000);
+        // A caller-supplied snapshot is the whole reason this can run off the UI thread.
+        var universe = _searchUniverse;
+        var all = universe ?? new List<ArchiveSession>(Store.Sessions.Values);
         if (string.IsNullOrWhiteSpace(query))
         {
-            var recent = OrderedVisibleSessions(Store.Sessions.Values)
+            var recent = OrderedVisibleSessions(all)
                 .Take(limit)
                 .Select(session => new ArchiveSearchHit
                 {
@@ -1583,7 +1683,9 @@ public sealed partial class ArchiveService
                     Message = session.Messages.LastOrDefault(),
                     SourceLabel = "recent chat",
                     Snippet = MakeSnippet(
-                        session.Messages.LastOrDefault()?.Text ?? session.Text,
+                        session.Messages.LastOrDefault()?.Text
+                        ?? session.Text
+                        ?? session.LastUserMessage,
                         []),
                     Score = session.Pinned ? 5 : 0,
                     Navigable = !string.IsNullOrWhiteSpace(session.SourcePath)
@@ -1592,12 +1694,12 @@ public sealed partial class ArchiveService
                 .ToList();
             var complete = new SearchCoverage(
                 true,
-                Store.Sessions.Count,
-                Store.Sessions.Count,
+                all.Count,
+                all.Count,
                 0,
                 0,
                 true,
-                $"Listed {Store.Sessions.Count:N0} known chats.");
+                $"Listed {all.Count:N0} known chats.");
             _lastSearchCoverage = complete;
             _lastSearchHits = recent.ToDictionary(
                 hit => hit.Session.Id,
@@ -1607,11 +1709,11 @@ public sealed partial class ArchiveService
 
         if (IsBracketPhraseQuery(query) || _transcriptSearchIndex is null)
         {
-            var legacy = DeepSearchLegacy(query, limit);
+            var legacy = DeepSearchLegacy(query, limit, all);
             var coverage = new SearchCoverage(
                 false,
                 0,
-                Store.Sessions.Count,
+                all.Count,
                 0,
                 0,
                 false,
@@ -1626,15 +1728,24 @@ public sealed partial class ArchiveService
         // Build the large transcript index lazily when search is actually requested. Starting it during
         // archive startup competes with the initial scan and creates a large transient memory/disk spike.
         StartTranscriptSearchIndexBuild(cancellationToken);
+        var byId = universe is null
+            ? null
+            : all.ToDictionary(session => session.Id, StringComparer.OrdinalIgnoreCase);
+        var indexWatch = System.Diagnostics.Stopwatch.StartNew();
         var indexed = await _transcriptSearchIndex.SearchAsync(
             query,
             Math.Max(limit, 100),
-            id => Store.Sessions.TryGetValue(id, out var session) ? session : null,
+            id => byId is not null
+                ? byId.TryGetValue(id, out var snapshotSession) ? snapshotSession : null
+                : Store.Sessions.TryGetValue(id, out var session) ? session : null,
             cancellationToken).ConfigureAwait(false);
+        PerfCounters.Trace?.Invoke(
+            $"search.index query='{query}' hits={indexed.Hits.Count} ms={indexWatch.ElapsedMilliseconds}");
+        var legacyWatch = System.Diagnostics.Stopwatch.StartNew();
         var bySession = indexed.Hits.ToDictionary(
             hit => hit.Session.Id,
             StringComparer.OrdinalIgnoreCase);
-        foreach (var metadataHit in DeepSearchLegacy(query, Math.Max(limit, 100)))
+        foreach (var metadataHit in DeepSearchLegacy(query, Math.Max(limit, 100), all))
         {
             if (bySession.TryGetValue(metadataHit.Session.Id, out var contentHit))
             {
@@ -1645,6 +1756,8 @@ public sealed partial class ArchiveService
             }
             bySession[metadataHit.Session.Id] = metadataHit;
         }
+        PerfCounters.Trace?.Invoke(
+            $"search.legacy query='{query}' candidates={bySession.Count} ms={legacyWatch.ElapsedMilliseconds}");
         var hits = bySession.Values
             .OrderByDescending(hit => hit.Score)
             .ThenByDescending(hit => hit.Session.Pinned)
@@ -2024,9 +2137,11 @@ public sealed partial class ArchiveService
         return DeepSearchLegacy(query, limit);
     }
 
-    private IReadOnlyList<ArchiveSearchHit> DeepSearchLegacy(string query, int limit = 80)
+    private IReadOnlyList<ArchiveSearchHit> DeepSearchLegacy(
+        string query, int limit = 80, IReadOnlyList<ArchiveSession>? universe = null)
     {
-        var visible = Store.Sessions.Values.Where(session => !session.Archived);
+        var visible = (universe ?? (IReadOnlyList<ArchiveSession>)new List<ArchiveSession>(Store.Sessions.Values))
+            .Where(session => !session.Archived);
         if (string.IsNullOrWhiteSpace(query))
         {
             return OrderedVisibleSessions(visible)
@@ -2036,7 +2151,11 @@ public sealed partial class ArchiveService
                     Session = session,
                     Message = session.Messages.LastOrDefault(),
                     SourceLabel = "recent chat",
-                    Snippet = MakeSnippet(session.Messages.LastOrDefault()?.Text ?? session.Text, []),
+                    Snippet = MakeSnippet(
+                        session.Messages.LastOrDefault()?.Text
+                        ?? session.Text
+                        ?? session.LastUserMessage,
+                        []),
                     Score = session.Pinned ? 5 : 0
                 })
                 .ToList();
@@ -4525,11 +4644,20 @@ public sealed partial class ArchiveService
         return (_cachedScopeCounts = (unvetted, active, archived)).Value;
     }
 
-    public IReadOnlyList<ArchiveSession> FilterChats(ChatFilter f)
+    // A stable copy of the store's sessions. The UI takes this on its own thread and hands it to
+    // FilterChats on a worker: Store.Sessions is a plain Dictionary and must not be enumerated while the
+    // UI thread is adding or replacing entries.
+    public IReadOnlyList<ArchiveSession> SnapshotSessions() => new List<ArchiveSession>(Store.Sessions.Values);
+
+    public IReadOnlyList<ArchiveSession> FilterChats(
+        ChatFilter f, IReadOnlyList<ArchiveSession>? universe = null)
     {
+        var all = universe ?? (IReadOnlyList<ArchiveSession>)new List<ArchiveSession>(Store.Sessions.Values);
         IEnumerable<ArchiveSession> baseSet = string.IsNullOrWhiteSpace(f.Query)
-            ? Store.Sessions.Values
-            : f.Archived is "archived" or "all" ? SearchIncludingArchived(f.Query) : Search(f.Query);
+            ? all
+            : f.Archived is "archived" or "all"
+                ? SearchIncludingArchived(f.Query, all)
+                : Search(f.Query, all);
 
         // Three DISJOINT tiers, one chat in exactly one of them: "unvetted" is the general populace (the
         // pile everything lands in), "active" is vetted and in play, "archived" is retired. "all" keeps
@@ -5671,6 +5799,7 @@ public sealed partial class ArchiveService
         }
         Store.Settings.IndexVersion = CurrentIndexVersion;
         RefreshTemplateSnapshotCounts();
+        PruneSessionText(Store.Sessions.Values);
         await SaveMergeResultAsync(deferSave, cancellationToken);
         if (refreshList) ReapplyList();
         // A full-walk scan (ChangedPaths null) hands the index a full pass; a dirty-set scan hands it the
@@ -7214,7 +7343,51 @@ public sealed partial class ArchiveService
         int Total, string FirstUser, string? TitleSeed,
         DateTime CreationUtc, long ReadBytes, byte[] PrefixHash, byte[] BoundaryHash, int VerifyCountdown);
 
-    private sealed record TailWindowCache(DateTime CreationUtc, long EndOffset, byte[] Window, byte[] Boundary);
+    private sealed record TailWindowCache(
+        DateTime CreationUtc, DateTime CachedUtc, long EndOffset, byte[] Window, byte[] Boundary);
+
+    // The tail-window cache lets a later cycle re-read only the bytes a transcript appended instead of
+    // its last several MB. That is a real win, but each entry holds up to 8 MB of raw window and the
+    // dictionary used to be unbounded - one entry per distinct file ever parsed, retained for the life
+    // of the process. Measured live: ~68 MB of windows for eight files, all of which had already stopped
+    // changing. It is a cache for files being written RIGHT NOW, so it is now bounded both by age (a
+    // changed-then-quiet file falls out after ten minutes) and by total bytes.
+    internal const long TailWindowCacheBudgetBytes = 32L * 1024 * 1024;
+    private const int TailWindowCacheMaxEntries = 48;
+    private static readonly TimeSpan TailWindowCacheTtl = TimeSpan.FromMinutes(10);
+    private readonly object _tailWindowGate = new();
+    private long _tailWindowBytes;
+
+    private static long TailWindowSize(TailWindowCache cache) => cache.Window.Length + cache.Boundary.Length;
+
+    private void RememberTailWindow(string path, TailWindowCache value)
+    {
+        var now = DateTime.UtcNow;
+        lock (_tailWindowGate)
+        {
+            if (_tailWindowCache.TryRemove(path, out var previous))
+                _tailWindowBytes -= TailWindowSize(previous);
+            _tailWindowCache[path] = value;
+            _tailWindowBytes += TailWindowSize(value);
+
+            var overBudget = _tailWindowCache.Count > TailWindowCacheMaxEntries
+                             || _tailWindowBytes > TailWindowCacheBudgetBytes;
+            if (!overBudget) return;
+
+            // Oldest first. Expired windows always go (they are for files that stopped being written);
+            // beyond that, evict until the byte and entry bounds hold again.
+            foreach (var entry in _tailWindowCache.ToArray().OrderBy(e => e.Value.CachedUtc))
+            {
+                overBudget = _tailWindowCache.Count > TailWindowCacheMaxEntries
+                             || _tailWindowBytes > TailWindowCacheBudgetBytes;
+                var expired = now - entry.Value.CachedUtc >= TailWindowCacheTtl;
+                if (!overBudget && !expired) continue;
+                if (_tailWindowCache.TryRemove(entry.Key, out var removed))
+                    _tailWindowBytes -= TailWindowSize(removed);
+            }
+            if (_tailWindowBytes < 0) _tailWindowBytes = 0;
+        }
+    }
 
     private readonly ConcurrentDictionary<string, ClaudeCappedForward> _claudeForwardCache =
         new(StringComparer.OrdinalIgnoreCase);
@@ -7662,6 +7835,7 @@ public sealed partial class ArchiveService
         byte[]? prior = null;
         var priorEnd = -1L;
         if (_tailWindowCache.TryGetValue(path, out var cached)
+            && DateTime.UtcNow - cached.CachedUtc < TailWindowCacheTtl
             && cached.CreationUtc == info.CreationTimeUtc
             && info.Length >= cached.EndOffset
             && BoundaryMatches(path, cached.EndOffset, cached.Boundary))
@@ -7671,8 +7845,9 @@ public sealed partial class ArchiveService
             Interlocked.Increment(ref TailWindowCacheHits);
         }
         var result = ReadTailWindow(path, prior, priorEnd, maxBytes, MaxLinesPerSession);
-        _tailWindowCache[path] = new TailWindowCache(
-            info.CreationTimeUtc, result.EndOffset, result.Window, HashBoundary(path, result.EndOffset));
+        RememberTailWindow(path, new TailWindowCache(
+            info.CreationTimeUtc, DateTime.UtcNow, result.EndOffset, result.Window,
+            HashBoundary(path, result.EndOffset)));
         return result;
     }
 

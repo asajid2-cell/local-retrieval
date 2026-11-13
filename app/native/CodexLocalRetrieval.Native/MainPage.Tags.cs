@@ -133,11 +133,46 @@ public sealed partial class MainPage
         TrailingDebouncer<string>.DefaultDelay,
         run => DispatcherQueue.TryEnqueue(() => run()));
 
+    private int _filterGeneration;
+
     private void ApplyFilters()
+    {
+        var filter = CurrentChatFilter();
+        var watch = System.Diagnostics.Stopwatch.StartNew();
+        if (string.IsNullOrWhiteSpace(filter.Query))
+        {
+            ApplyFilterResults(_archive.CollapseFamilies(_archive.FilterChats(filter), _groupFamilies));
+            return;
+        }
+
+        // A typed query hits the transcript index (a SQLite query over an 18 GB database) plus a metadata
+        // pass over every chat. Doing that on the UI thread froze the list for the whole query on every
+        // debounced keystroke. Compute it on a worker over a snapshot taken HERE (Store.Sessions is a plain
+        // Dictionary, so it may not be enumerated from another thread), then apply on the UI thread.
+        var generation = ++_filterGeneration;
+        var snapshot = _archive.SnapshotSessions();
+        var query = filter.Query;
+        _ = Task.Run(() => _archive.FilterChats(filter, snapshot))
+            .ContinueWith(completed => DispatcherQueue.TryEnqueue(() =>
+            {
+                if (generation != _filterGeneration) return;   // a newer keystroke superseded this pass
+                if (completed.IsFaulted)
+                {
+                    Diag.Log("Filter failed: " + completed.Exception?.GetBaseException().Message);
+                    return;
+                }
+                var apply = System.Diagnostics.Stopwatch.StartNew();
+                ApplyFilterResults(_archive.CollapseFamilies(completed.Result, _groupFamilies));
+                Diag.Log($"Filter '{query}' {completed.Result.Count} rows in {watch.ElapsedMilliseconds} ms"
+                    + $" (ui apply {apply.ElapsedMilliseconds} ms)");
+            }), TaskScheduler.Default);
+    }
+
+    // Applies an already-computed filter result. Always runs on the UI thread.
+    private void ApplyFilterResults(IReadOnlyList<ArchiveSession> results)
     {
         var previousId = _selected?.Id;
         var current = _selected;
-        var results = _archive.CollapseFamilies(_archive.FilterChats(CurrentChatFilter()), _groupFamilies);
         // The chat you had open may have been folded into its family's row by the collapse above, which takes
         // the chat itself out of the list. Following it to the row that stands for the family is "the family
         // goes wherever the current patriarch is" read backwards - the chat went where its family is - and it
