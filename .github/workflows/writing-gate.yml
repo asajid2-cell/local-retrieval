@@ -1,0 +1,34 @@
+name: writing-gate
+
+on:
+  pull_request:
+    paths:
+      - "**/*.md"
+      - "**/*.mdx"
+      - "**/*.txt"
+  push:
+    branches: [main, release]
+
+permissions:
+  contents: read
+
+jobs:
+  prose:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Vale
+        run: |
+          curl -fsSL https://github.com/vale-cli/vale/releases/download/v3.27.0/vale_3.27.0_Linux_64-bit.tar.gz \
+            | tar -xz -C /usr/local/bin vale
+
+      - name: Lint prose
+        run: vale README.md
+
+      - name: Check shape
+        run: node tools/check.mjs README.md

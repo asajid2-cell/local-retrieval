@@ -1,32 +1,36 @@
 # MUX
 
-**One archive for the Codex and Claude Code session files on one PC, and a browser terminal that reaches the live session.**
+**One searchable archive for the Codex and Claude Code sessions on a PC, with a browser terminal for the live ones.**
 
-MUX indexes the session files that Codex and Claude Code already write, so a chat from months ago resurfaces, reads cleanly, and reopens in the terminal where it started. A PC-side host (`muxd`) and a VPS relay carry those same terminals to a browser, and keep them alive when the network drops.
+MUX puts both agent-session stores into one searchable archive. It reopens any chat in the terminal where it started, and carries that terminal to a browser without opening a port on the PC. The repo holds the desktop app, the PC-side session host, and the VPS relay.
+
+[![writing gate](https://github.com/asajid2-cell/local-retrieval/actions/workflows/writing-gate.yml/badge.svg?branch=release)](https://github.com/asajid2-cell/local-retrieval/actions/workflows/writing-gate.yml)
 
 ![The MUX desktop app](app/docs/media/hero.gif)
 
-## What is in the repo
+## The result
 
-| Part | Job | Entry point |
-| --- | --- | --- |
-| `app/` | WinUI 3 desktop archive: index, read, organize, search, resume | `app/native/CodexLocalRetrieval.Native` |
-| `muxd/` | PC-side ConPTY host; owns the real terminals and dials out | `muxd/muxd.py` |
-| `relay/` | Express + WebSocket relay and browser terminal on a VPS | `relay/server.js` |
+| Result | Evidence |
+| --- | --- |
+| Two session formats in one archive | Codex rollouts and Claude transcripts, parsed by `app/native/CodexLocalRetrieval.Core/Services/ArchiveService.cs` |
+| Three processes in one repo | `app/`, `muxd/`, `relay/` |
+| 1,800+ automated tests | `app/native/CodexLocalRetrieval.Native.Tests`, `relay/tests` |
+| Zero inbound ports on the PC | `muxd/muxd.py` dials out to the relay |
+| One action to resume | `codex resume` or `claude --resume`, in the chat's original working directory |
 
-`app/` arrived by subtree from the local-retrieval repo, and `muxd/` and `relay/` from the multiplex repos, so each directory keeps its own history.
+## What I built
+
+I built the archive engine, the WinUI 3 client, the co-pilot tool loop, the ConPTY session host, and the relay. The hard part is the live file: the session you most want to resume is often still being written, in one of two formats, with subagent transcripts mixed in. The parser streams it, keys each chat on its resumable id, and an incremental stamp cache keeps a re-scan off files that did not change.
 
 ## How it works
 
-The app scans `~/.codex/sessions` and `~/.claude/projects` on launch, parses each format, and re-reads only files that changed. Claude chats key on the transcript filename, which is also the id `claude --resume` needs, and sidechain transcripts are skipped. Pins, projects, and renames live in an app-owned store, so a re-sync never rewrites your source `.jsonl` files.
+The app scans `~/.codex/sessions` and `~/.claude/projects` on launch and routes each file by format. Claude chats key on the transcript filename, which is also the id `claude --resume` needs, and sidechain transcripts are skipped. Pins, projects, and renames live in an app-owned store, so a re-sync never rewrites a source `.jsonl` file.
 
-`muxd` owns one ConPTY per session on the PC and dials out to the relay over a single WebSocket. The PC needs no inbound port, and a Wi-Fi drop or relay deploy only makes viewers reattach. The relay mirrors sessions, strips its own element-map escape sequence before the browser sees the stream, and keeps durable state for projects and pins. Write leases live in `muxd`, so the relay never decides who may type.
+`muxd` owns one ConPTY per session on the PC and dials out to the relay over a single WebSocket. The PC needs no inbound port, so a Wi-Fi drop or relay deploy only makes viewers reattach. The relay mirrors sessions and keeps durable state for projects and pins; write leases live in `muxd`, so the relay never decides who may type.
 
-The desktop app reads `live-tabs.json` and walks a process's ancestor pids to link a running `codex` or `claude` process to its real tab. That link is deterministic, so a shell-launched agent can join a collection or relaunch by its chat id without guessing from folder names.
+The obvious alternative is SSH plus tmux. That needs an inbound path or a permanent tunnel to the PC, and a Unix host. `muxd` dials out instead, and owns Windows ConPTY directly.
 
-The main limit is the platform: the desktop app and `muxd` target Windows, because both depend on WinUI 3 and ConPTY.
-
-## Run it
+## Try it
 
 ```powershell
 git clone https://github.com/asajid2-cell/local-retrieval.git
@@ -36,7 +40,7 @@ dotnet run -c Debug
 
 Requires Windows 10 or 11 and the .NET 8 SDK. On first launch the app indexes both default session stores; add another folder in Settings → Sources.
 
-## What you can do
+## What it does
 
 - **Resurface old chats.** Launch re-scans both stores, so a conversation from months ago is back in the list.
 - **Read it clean.** The reader strips IDE, environment, and system-reminder boilerplate.
@@ -45,7 +49,7 @@ Requires Windows 10 or 11 and the .NET 8 SDK. On first launch the app indexes bo
 - **Ask a co-pilot.** A DeepSeek-backed tool loop searches and organizes the archive, with a confirmation step before any change.
 - **Reach it from a phone.** The headless `CodexLocalRetrieval.Server` serves a bearer-authenticated web UI through your own reverse proxy.
 
-## Where to look
+## Where the substance is
 
 | Area | Path |
 | --- | --- |
@@ -59,10 +63,6 @@ Requires Windows 10 or 11 and the .NET 8 SDK. On first launch the app indexes bo
 
 Run the app suite with `dotnet test app/native/CodexLocalRetrieval.Native.Tests`, and the relay suite with `npm test` in `relay/`.
 
-## Deploy
-
-`scripts/deploy-muxd.ps1` copies `muxd/` to `%USERPROFILE%\muxd-runtime` and restarts the `MuxdSessionHost` task. `scripts/deploy-relay.sh` packages an exact commit for the VPS installer. The runtime directory is a deploy target and state root, never a checkout; edit `muxd/` here.
-
 ## Limitations
 
 - The desktop app and `muxd` run on Windows only, because both depend on WinUI 3 and ConPTY.
@@ -74,6 +74,6 @@ Run the app suite with `dotnet test app/native/CodexLocalRetrieval.Native.Tests`
 
 ## Status and license
 
-Active development on `main`; the desktop release notes track v0.2.0 in `app/RELEASE_NOTES.md`. The desktop app is MIT (`app/LICENSE`); the relay package declares ISC.
+Active development on `release`; the desktop release notes track v0.2.0 in `app/RELEASE_NOTES.md`. The desktop app is MIT (`app/LICENSE`); the relay package declares ISC.
 
 Read `app/CONTRIBUTING.md` and run both suites before a pull request.

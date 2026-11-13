@@ -1,0 +1,8 @@
+extends: existence
+message: "Heading '%s' says nothing. Name what is under it."
+description: "Empty structural headings. See WRITING-SYSTEM.md rule 2."
+level: error
+ignorecase: true
+scope: heading
+tokens:
+  - "^\\s*(?:introduction|overview|conclusion|summary|welcome|getting started|about this (?:guide|page|document))\\s*$"

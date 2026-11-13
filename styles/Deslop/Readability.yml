@@ -1,0 +1,6 @@
+extends: readability
+message: "Reading grade %s is too high. Target 9 or lower."
+description: "Plain-language practice: grade 8-9 for public content."
+level: warning
+grade: 9
+metrics: Flesch-Kincaid

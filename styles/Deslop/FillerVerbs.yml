@@ -1,0 +1,13 @@
+extends: existence
+message: "Filler verb '%s'. Use the real verb."
+description: "Verbs that hide the action. See SLOP-LIST.md section 8."
+level: error
+ignorecase: true
+tokens:
+  - "\\bis designed to\\b"
+  - "\\b(?:aims|seeks|strives) to\\b"
+  - "\\bis able to\\b"
+  - "\\ballows? you to\\b"
+  - "\\bhelps? you to\\b"
+  - "\\b(?:serves|stands|acts) as\\b"
+  - "\\brepresents\\b"

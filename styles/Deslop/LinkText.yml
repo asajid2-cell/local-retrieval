@@ -1,0 +1,10 @@
+extends: existence
+message: "Ambiguous link text '%s'. Describe the destination."
+description: "W3C WAI: link text must describe the target."
+level: error
+ignorecase: true
+scope: sentence
+tokens:
+  - "\\bclick here\\b"
+  - "\\bsee here\\b"
+  - "\\bthis link\\b"
