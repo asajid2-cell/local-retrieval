@@ -1,7 +1,0 @@
-extends: occurrence
-message: "Em dash count is %s. Use a period or a comma."
-description: "Em dash chains are a strong machine-register signal in our corpora."
-level: warning
-scope: text
-max: 3
-token: "—"
