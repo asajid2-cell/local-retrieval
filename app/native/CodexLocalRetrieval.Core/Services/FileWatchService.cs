@@ -1,3 +1,5 @@
+using System.IO.Enumeration;
+
 namespace CodexLocalRetrieval.Core.Services;
 
 /// Clock seam. Production uses the wall clock; tests drive <see cref="ManualFileWatchClock"/> so the
@@ -36,6 +38,12 @@ public sealed class FileWatchOptions
     /// Fallback cadence once a target has gone quiet. One no-change poll demotes to this rate, and any
     /// observed change promotes straight back to <see cref="ActiveFallbackInterval"/>.
     public TimeSpan IdleFallbackInterval { get; init; } = TimeSpan.FromSeconds(60);
+
+    /// First cadence for a COARSE (whole-tree) probe whose OS watcher is not carrying events. A tree probe
+    /// is a recursive walk of every transcript - ~20k files here - so the 5 s active cadence is only
+    /// tolerable for a single stat. It doubles from here up to <see cref="IdleFallbackInterval"/> while
+    /// polls keep finding no change, which bounds a dead watcher to one walk a minute instead of twelve.
+    public TimeSpan CoarseFallbackInterval { get; init; } = TimeSpan.FromSeconds(30);
 
     /// How often the internal pump wakes to evaluate debounce + fallback deadlines. Ignored when
     /// <see cref="ManualPump"/> is set.
@@ -149,12 +157,15 @@ public sealed class FileWatchService : IDisposable
     }
 
     // The cadence of the safety-net poll. A cheap single-file probe stays at the active cadence, so a
-    // dropped event on a single watched file is noticed in seconds. A coarse tree probe is only walked
-    // when the event path is not there to carry the change.
+    // dropped event on a single watched file is noticed in seconds. A coarse tree probe is a recursive
+    // walk, so it is slow when the event path carries the change and merely bounded (never per-tick) when
+    // it does not. The 30s floor is what keeps a dead watcher from walking every transcript on every tick.
     private TimeSpan FallbackIntervalFor(Registration reg) =>
-        reg.CoarseFallback && (reg.Watcher?.Healthy ?? false)
-            ? _options.IdleFallbackInterval
-            : _options.ActiveFallbackInterval;
+        !reg.CoarseFallback
+            ? _options.ActiveFallbackInterval
+            : (reg.Watcher?.Healthy ?? false)
+                ? _options.IdleFallbackInterval
+                : _options.CoarseFallbackInterval;
 
     // Diagnostics: whether the OS watchers backing the registrations are carrying events or whether the
     // registrations are living on the fallback poll. Lets the server's trace say which mode it is in.
@@ -199,6 +210,7 @@ public sealed class FileWatchService : IDisposable
                     if (now - since < _options.Debounce) continue;
                     reg.PendingSince = null;
                     Promote(reg, now);
+                    if (reg.CoarseFallback) reg.EventDeliveredSincePoll = true;
                     (fire ??= new()).Add((reg, SnapshotPaths(reg)));
                     // Refresh the remembered stamp so the next poll does not re-fire the change the event
                     // already delivered. Probing it is the expensive half, so it happens off the lock below.
@@ -216,7 +228,14 @@ public sealed class FileWatchService : IDisposable
 
         var stamps = new Dictionary<Registration, string>();
         if (fallbackDue is not null) foreach (var reg in fallbackDue) stamps[reg] = SafeProbe(reg.Probe);
-        if (refreshStamp is not null) foreach (var reg in refreshStamp) stamps[reg] = SafeProbe(reg.Probe);
+        // After an event-delivered change only a CHEAP probe is refreshed. For a coarse registration the
+        // probe is a recursive walk of the whole tree, and agents write constantly, so this refresh was
+        // walking every transcript on every debounce window (250 ms) - the largest remaining burn. Its
+        // stamp is left stale instead: the next scheduled fallback poll compares it, sees the change it
+        // already acted on, and re-baselines then, once per poll rather than four times a second.
+        if (refreshStamp is not null)
+            foreach (var reg in refreshStamp)
+                if (!reg.CoarseFallback) stamps[reg] = SafeProbe(reg.Probe);
 
         if (stamps.Count > 0)
         {
@@ -225,7 +244,8 @@ public sealed class FileWatchService : IDisposable
                 if (_disposed) return;
                 if (refreshStamp is not null)
                     foreach (var reg in refreshStamp)
-                        if (!reg.Disposed) reg.LastStamp = stamps[reg];
+                        if (!reg.Disposed && stamps.TryGetValue(reg, out var refreshed))
+                            reg.LastStamp = refreshed;
 
                 if (fallbackDue is not null)
                     foreach (var reg in fallbackDue)
@@ -236,18 +256,31 @@ public sealed class FileWatchService : IDisposable
                         reg.LastStamp = stamp;
                         if (changed)
                         {
+                            var alreadyDelivered = reg.CoarseFallback
+                                && reg.EventDeliveredSincePoll
+                                && (reg.Watcher?.Healthy ?? false);
+                            reg.EventDeliveredSincePoll = false;
                             Promote(reg, now);
-                            // A poll found the change, so which file moved is unknown: null means "assume all".
-                            (fire ??= new()).Add((reg, null));
+                            // Re-baseline without firing when the change this poll sees is the one the event
+                            // path already delivered: the stamp was left stale on purpose, and treating that
+                            // as news would rescan every transcript on every poll while an agent is writing.
+                            if (!alreadyDelivered)
+                                (fire ??= new()).Add((reg, null)); // which file moved is unknown: "assume all"
                         }
                         else
                         {
                             // Quiet. One no-change poll is enough to demote to the slow cadence; the FSW
                             // event is what makes activity visible immediately, this is only the safety
-                            // net. A coarse registration whose watcher is not carrying events never
-                            // demotes -- the poll IS its only signal then, so it keeps the active cadence.
+                            // net. A coarse registration whose watcher is not carrying events cannot
+                            // demote all the way, but it must BACK OFF: keeping it at the 5s active
+                            // cadence walked every transcript tree twelve times a minute, continuously,
+                            // for the rest of the process once a watcher had errored (measured: ~46% of
+                            // a core on one thread). Doubling from the coarse floor to the idle ceiling
+                            // bounds that to one walk a minute.
                             reg.FallbackInterval = reg.CoarseFallback && !(reg.Watcher?.Healthy ?? false)
-                                ? _options.ActiveFallbackInterval
+                                ? TimeSpan.FromTicks(Math.Min(
+                                    _options.IdleFallbackInterval.Ticks,
+                                    Math.Max(_options.CoarseFallbackInterval.Ticks, reg.FallbackInterval.Ticks * 2)))
                                 : _options.IdleFallbackInterval;
                             reg.NextFallbackAt = now + reg.FallbackInterval;
                         }
@@ -352,6 +385,10 @@ public sealed class FileWatchService : IDisposable
     /// notice "a new transcript appeared" without reading a byte of content. The traversal is iterative
     /// and does not follow reparse-point directories: recursive enumeration over a large or cyclic source
     /// tree can otherwise exhaust the process stack before the watcher can report a useful error.
+    ///
+    /// The write time comes out of the directory entry the enumeration already returned, so a walk is one
+    /// batched pass instead of a `GetFileAttributes`/stat syscall per file - the difference between ~20k
+    /// syscalls and ~20k struct reads for the same answer.
     public static string DirectoryStamp(string directory, string pattern, bool recurse)
     {
         if (!Directory.Exists(directory)) return "-";
@@ -361,37 +398,41 @@ public sealed class FileWatchService : IDisposable
         while (pending.Count > 0)
         {
             var current = pending.Pop();
-            IEnumerable<string> files;
-            try { files = Directory.EnumerateFiles(current, pattern, SearchOption.TopDirectoryOnly); }
-            catch (IOException) { continue; }
-            catch (UnauthorizedAccessException) { continue; }
-
-            foreach (var file in files)
+            try
             {
-                count++;
-                long ticks;
-                try { ticks = File.GetLastWriteTimeUtc(file).Ticks; } catch { continue; }
-                if (ticks > newest) newest = ticks;
-            }
-
-            if (!recurse) continue;
-            IEnumerable<string> directories;
-            try { directories = Directory.EnumerateDirectories(current, "*", SearchOption.TopDirectoryOnly); }
-            catch (IOException) { continue; }
-            catch (UnauthorizedAccessException) { continue; }
-            foreach (var child in directories)
-            {
-                try
+                var entries = new FileSystemEnumerable<(string Name, long Ticks, bool IsDirectory)>(
+                    current,
+                    static (ref FileSystemEntry entry) =>
+                        (entry.FileName.ToString(), entry.LastWriteTimeUtc.UtcTicks, entry.IsDirectory),
+                    StampWalkOptions);
+                foreach (var (name, ticks, isDirectory) in entries)
                 {
-                    if ((File.GetAttributes(child) & FileAttributes.ReparsePoint) == 0)
-                        pending.Push(child);
+                    if (isDirectory)
+                    {
+                        if (recurse) pending.Push(Path.Combine(current, name));
+                        continue;
+                    }
+                    if (!MatchesPattern(name, pattern)) continue;
+                    count++;
+                    if (ticks > newest) newest = ticks;
                 }
-                catch (IOException) { }
-                catch (UnauthorizedAccessException) { }
             }
+            catch (IOException) { continue; }
+            catch (UnauthorizedAccessException) { continue; }
         }
         return count.ToString() + ":" + newest.ToString();
     }
+
+    // Top-level entries only (the walk pushes subdirectories itself, iteratively, so a cyclic or deep
+    // tree cannot exhaust the stack) and reparse points skipped, matching the old traversal's rules.
+    private static readonly EnumerationOptions StampWalkOptions = new()
+    {
+        RecurseSubdirectories = false,
+        IgnoreInaccessible = true,
+        ReturnSpecialDirectories = false,
+        AttributesToSkip = FileAttributes.ReparsePoint,
+        MatchType = MatchType.Simple,
+    };
 
     private static bool MatchesPattern(string name, string pattern)
     {
@@ -435,6 +476,11 @@ public sealed class FileWatchService : IDisposable
         internal DateTimeOffset NextFallbackAt;
         internal TimeSpan FallbackInterval;
         internal bool Disposed;
+        // Set when a coarse registration already delivered a change on the event path. The tree stamp is
+        // deliberately left stale after such a delivery (probing it per debounce was the burn), so the
+        // next fallback poll is EXPECTED to see a difference -- re-baselining silently is what stops that
+        // difference from firing a whole-tree rescan on every poll for the rest of the session.
+        internal bool EventDeliveredSincePoll;
 
         internal Registration(FileWatchService owner, string directory, bool recurse,
             Func<string, bool> matches, Func<string> probe, Action<IReadOnlyList<string>?> onChanged, bool coarseFallback)
@@ -461,7 +507,7 @@ public sealed class FileWatchService : IDisposable
     {
         private readonly FileSystemWatcher? _fsw;
         private readonly Action _onError;
-        private bool _errored;
+        private volatile bool _errored;
         internal int RefCount;
         internal bool Recursive { get; private set; }
         // Healthy = the OS watcher exists and has not reported an overflow/teardown. A coarse registration
@@ -483,18 +529,33 @@ public sealed class FileWatchService : IDisposable
                     NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.Size | NotifyFilters.FileName | NotifyFilters.CreationTime,
                     Filter = "*",
                 };
-                void Handle(object _, FileSystemEventArgs e) { try { onEvent(e.FullPath); } catch { } }
+                // An event proves the channel is carrying again, so a past overflow stops demoting this
+                // watcher's registrations to the coarse poll. Errored flips back here rather than staying
+                // true for the life of the process.
+                void Handle(object _, FileSystemEventArgs e)
+                {
+                    _errored = false;
+                    try { onEvent(e.FullPath); } catch { }
+                }
                 _fsw.Changed += Handle;
                 _fsw.Created += Handle;
                 _fsw.Deleted += Handle;
-                _fsw.Renamed += (_, e) => { try { onEvent(e.FullPath); } catch { } };
+                _fsw.Renamed += (_, e) => { _errored = false; try { onEvent(e.FullPath); } catch { } };
                 _fsw.Error += (_, _) =>
                 {
-                    // Overflow or the directory going away. The paired fallback poll is what keeps the
-                    // registration correct, so the mode drops back to the active cadence (see Healthy)
-                    // and there is nothing else to recover here beyond the count.
+                    // Overflow or the directory going away. The paired fallback poll keeps the
+                    // registration correct; toggling the watcher drains the overflowed buffer and starts
+                    // a fresh one so the event path can resume. Without the toggle, ONE overflow left
+                    // this watcher "unhealthy" forever and every tree registration walked ~20k files on
+                    // the active cadence for the rest of the run.
                     _errored = true;
                     try { _onError(); } catch { }
+                    try
+                    {
+                        _fsw.EnableRaisingEvents = false;
+                        _fsw.EnableRaisingEvents = true;
+                    }
+                    catch { /* directory gone: stay on the fallback poll */ }
                 };
                 _fsw.EnableRaisingEvents = true;
             }
