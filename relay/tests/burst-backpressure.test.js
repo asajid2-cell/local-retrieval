@@ -445,8 +445,13 @@ test('a first paint larger than the steady-state high-water mark is delivered un
   assert.equal(got.indexOf(CLEAR_SCREEN, 1), -1, 'there must be exactly one CLEAR');
   const text = got.toString('latin1');
   assert.ok(text.includes('REPLAY LINE 1999'), 'the screen reaches the last ring line');
-  assert.ok(got.length < Buffer.byteLength(ring) / 2,
-    `the paint must be the bounded screen, not the ring (paint=${got.length}, ring=${Buffer.byteLength(ring)})`);
+  // The bound is in BYTES, not a fraction of whatever ring this test happens to build. A snapshot may
+  // carry most of a 2000-line ring - ~16 bytes a line against ~85 for the raw bytes that produced it - and
+  // that is the point: the viewer gets real history at a lower cost than the replay it replaces.
+  assert.ok(got.length <= 400 * 1024,
+    `the paint must stay inside the snapshot byte budget (paint=${got.length})`);
+  assert.ok(got.length < Buffer.byteLength(ring),
+    `the paint must cost less than the ring it replaces (paint=${got.length}, ring=${Buffer.byteLength(ring)})`);
 
   // The viewer stays usable: a live chunk after the first paint arrives whole.
   await host.sendOutput(name, 'LIVE_AFTER_REPLAY\r\n');

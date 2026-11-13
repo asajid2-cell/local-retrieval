@@ -70,6 +70,8 @@
   .icon svg { width:17px; height:17px; display:block; }
   .compose-desktop { display:none; }
   @media (hover:hover) and (pointer:fine) { .compose-desktop { display:inline-grid; } }
+  /* Phone-only: the bottom bar is already gone on desktop, so its toggle is too. */
+  #navtoggle { display:none; }
 
   /* ---- session tabs ---- */
   #tabwrap {
@@ -728,6 +730,7 @@
     .top-actions .icon { height:40px; min-width:40px; flex:0 0 auto; }
     .top-actions .icon svg { width:16px; height:16px; }
     #projbtn, #zen, #fontdown, #fontup, #kbtoggle { display:none; }
+    #navtoggle { display:inline-grid; }   /* phone only: the bottom bar exists only here */
     #tabwrap, #keybar { display:none; }
     #term { padding:var(--sp1); }
     #status { min-height:26px; padding:3px var(--sp3); }
@@ -812,6 +815,16 @@
     #app.mobile-view-keys .kdiv { display:none; }
     #app.zen #mobileNav, #app.zen #status, #app.zen #keybar { display:none; }
     #app.zen { grid-template-rows:auto minmax(0,1fr); grid-template-areas:"topbar" "term"; }
+
+    /* BOTTOM BAR HIDDEN (the #navtoggle button). Each view mode names the bar in its own row list, so the
+       row has to be dropped per mode or the grid keeps a 0-height track and the pane gains nothing. Every
+       rule here is the matching rule above with the "mobileNav" track and area removed. */
+    #app.nonav #mobileNav { display:none; }
+    #app.nonav { grid-template-rows:auto minmax(0,1fr) auto; grid-template-areas:"topbar" "term" "status"; }
+    #app.nonav.mobile-view-sessions { grid-template-rows:auto minmax(0,1fr) auto; grid-template-areas:"topbar" "tabs" "status"; }
+    #app.nonav.mobile-view-fleet, #app.nonav.mobile-view-terminal { grid-template-rows:auto minmax(0,1fr) auto; grid-template-areas:"topbar" "term" "status"; }
+    #app.nonav.mobile-view-threads { grid-template-rows:auto minmax(0,1fr) auto auto; grid-template-areas:"topbar" "threads" "composer" "status"; }
+    #app.nonav.mobile-view-keys { grid-template-rows:auto minmax(4rem,1fr) auto auto; grid-template-areas:"topbar" "term" "status" "keys"; }
     #empty { padding:var(--sp4) var(--sp3); }
     #empty .quick button { min-height:44px; }
   }
@@ -852,6 +865,14 @@
       </button>
       <button class="icon" id="zen" title="Zen / fullscreen (F11)" aria-label="Zen / fullscreen">
         <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M4 9V5a1 1 0 011-1h4M20 9V5a1 1 0 00-1-1h-4M4 15v4a1 1 0 001 1h4M20 15v4a1 1 0 01-1 1h-4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+      </button>
+      <!-- PHONE ONLY: hide the bottom bar. Those ~60px are four terminal rows, and on a phone the bar is
+           also exactly what covers the app's own bottom menus (the leaf switcher and its status line).
+           Zen does the same job but is desktop-only, so a phone had no way to reclaim the space. This is a
+           toggle with remembered state, not a mode: the button lives in the top bar, which stays, so the
+           bar can always be brought back. -->
+      <button class="icon" id="navtoggle" title="Hide the bottom bar" aria-label="Hide the bottom bar" aria-pressed="false">
+        <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M4 5h16M4 12h16M4 19h16" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><path d="M4 21L20 3" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
       </button>
       <button class="icon" id="fontdown" title="Smaller text" aria-label="Smaller text">A&minus;</button>
       <button class="icon" id="fontup" title="Larger text" aria-label="Larger text">A+</button>
@@ -1143,6 +1164,68 @@ function threadRowsFromBuffer(){
   }
   return { kind, rows };
 }
+// What the conversation has SHOWN, per session, kept across repaints of the screen.
+//
+// The screen is a canvas the app repaints in place, so it forgets as it redraws. A reader is not asking
+// for a canvas, though - they want the turns. So each observation of the screen is merged into a durable
+// list: a turn already seen is recognised by its opening line and updated in place (a streaming message
+// grows), and a turn that is new is appended. Nothing is ever dropped except by the byte cap below, which
+// is what keeps a long session from growing without bound.
+//
+// This is a RENDER, not a second source of truth: it holds only text the session actually showed, keyed by
+// what it said, so a repaint that changes nothing appends nothing.
+const THREADS_KEEP = 400;              // messages retained per session
+const THREADS_KEEP_CHARS = 400000;     // and a byte budget, so a wall of output cannot grow the page
+let threadAccum = {};                  // session name -> { msgs: [...], seen: Map(key -> index) }
+function threadsKey(m){
+  const t=String(m.text||'');
+  const nl=t.indexOf(String.fromCharCode(10));
+  return (m.role||'text')+'|'+(nl<0?t:t.slice(0,nl)).trim();
+}
+function accumulateThreads(live){
+  const name=current||'';
+  if(!name) return live;
+  const st=threadAccum[name] || (threadAccum[name]={ msgs:[] });
+  const rec=st.msgs;
+  // The screen shows a TAIL of the conversation, so the merge is an ALIGNMENT, not a lookup: find the
+  // longest run at the end of the record that is also the start of what is on screen. That is the overlap,
+  // and it is what makes a streaming reply (same first line, longer body) update in place instead of
+  // appending a second copy - and what keeps two turns that merely OPEN the same way distinct.
+  const key=m=>threadsKey(m);
+  let overlap=0;
+  for(let k=Math.min(rec.length, live.length); k>0; k--){
+    let ok=true;
+    for(let i=0;i<k;i++){
+      if(key(rec[rec.length-k+i])!==key(live[i])){ ok=false; break; }
+    }
+    if(ok){ overlap=k; break; }
+  }
+  // A live message that is new is appended; one that is part of the overlap refreshes the recorded copy,
+  // because the screen is the newer truth for a turn that is still being written.
+  for(let i=0;i<overlap;i++){
+    const r=rec[rec.length-overlap+i];
+    r.text=live[i].text;
+    r.kind=live[i].kind||r.kind;
+  }
+  for(let i=overlap;i<live.length;i++){
+    const m=live[i];
+    if(!m || !String(m.text||'').trim()) continue;
+    rec.push({ role:m.role, lead:m.lead, text:m.text, kind:m.kind||'text' });
+  }
+  // Trim from the front against a message count and a character budget, so a long session stays bounded.
+  let total=0;
+  for(const m of rec) total+=m.text.length;
+  let cut=0;
+  while(cut<rec.length && (rec.length-cut>THREADS_KEEP || total>THREADS_KEEP_CHARS)){
+    total-=rec[cut].text.length; cut++;
+  }
+  if(cut) st.msgs=rec.slice(cut);
+  if(!st.msgs.length) return live;
+  // The labels are recomputed over the WHOLE record, so a run that began before the screen scrolled still
+  // labels once and a continuation still reads as a continuation.
+  return (window.MuxThreads && MuxThreads.grouped) ? MuxThreads.grouped(st.msgs) : st.msgs;
+}
+
 function renderThreads(force){
   const host=$('#threads'); if(!host) return;
   if(!isMobile() || mobileView!=='threads') return;
@@ -1165,9 +1248,16 @@ function renderThreads(force){
     return;
   }
   const seg=(window.MuxThreads && MuxThreads.segment) ? MuxThreads.segment(buf.rows) : [];
-  // One label per RUN of turns from the same speaker, not one per bubble: five "TAB-5BEC" headers down a
-  // phone screen is noise, and in a message list the reader already knows whose turn it is.
-  const msgs=(window.MuxThreads && MuxThreads.grouped) ? MuxThreads.grouped(seg) : seg;
+  // THE CONVERSATION OUTLIVES THE SCREEN. Measured live (all six teed tabs, 2026-11-13): every viewer's
+  // buffer held bufLen === rows - ZERO scrollback - because an agent TUI repaints in place with absolute
+  // cursor addressing (494 CUP sequences, no scroll region, no newline scrolling). Feeding muxd's whole
+  // 240 KB ring into a headless xterm gives the same answer: 0 lines of history. The history does not exist
+  // in the byte stream at all, so no amount of replay depth can recover it - the mirror is faithful and the
+  // app simply never emits it. That is the "it stops pretty early, it doesn't let us view more than a
+  // couple of events back" report, and it can only be answered here: accumulate the turns as they are seen
+  // and render the accumulation. Nothing leaves the page; this is a render of what the session showed.
+  const live=(window.MuxThreads && MuxThreads.grouped) ? MuxThreads.grouped(seg) : seg;
+  const msgs=accumulateThreads(live);
   const sig=current+'|'+msgs.map(m=>m.role+':'+m.text.length+':'+m.text.slice(-24)).join('\u0001');
   if(!force && sig===threadsLastSig) return;      // nothing changed: do not rebuild the list under a finger
   threadsLastSig=sig;
@@ -2009,7 +2099,7 @@ function reloadTerminal(quiet){
   connect(name, true);   // re-attach: CLEAR + scrollback replay + live, all client state reset
 }
 document.addEventListener('keydown', e=>{ if(e.ctrlKey && e.altKey && (e.key==='r'||e.key==='R')){ e.preventDefault(); e.stopPropagation(); reloadTerminal(); } }, true);
-window.__muxBuild='2026-11-12-phone-typing-1';   // bump per web deploy so a loaded version is verifiable (supersedes 2026-11-11-phone-threads-1)
+window.__muxBuild='2026-11-13-attach-repair-1';   // bump per web deploy so a loaded version is verifiable (supersedes 2026-11-11-phone-threads-1)
 try{ console.info('multiplex build', window.__muxBuild); }catch(e){}
 const helper = $('#term').querySelector('.xterm-helper-textarea');
 function hardenHelperTextarea(){
@@ -4369,6 +4459,10 @@ function connect(name, isRetry){
       sizePinned=false; sizeMine=false; sizeTabOwned=false; sizeLocal=false;
       sizeGridOwner='local'; sizeGridEpoch=0; sizeGridOwnerLabel=''; sizePinLabel=''; sizeClients=[];
       _gridBusy=null; if(_takeTimer){ clearTimeout(_takeTimer); _takeTimer=null; }
+      // The accumulated conversation belongs to the session it was recorded from, so a switch starts a new
+      // one. A RE-attach of the SAME session keeps it: those turns really did happen, and the screen the
+      // re-attach paints is the same one that produced them.
+      if(threadAccum && threadAccum[name]) delete threadAccum[name];
     }
     // A SWITCH IS A NEW SCREEN. The per-session grid state and the "this surface is already painted"
     // latch both belong to the session they were measured on. Carrying them over meant the new tab's
@@ -5563,6 +5657,19 @@ $('#jumpbottom').onclick=()=>{ if(current) forceJumpBottom(); };
 function applyKeybarPref(){ const on=LS.get('mux_keybar',false); $('#app').classList.toggle('kb-on',on); const b=$('#kbtoggle'); if(b) b.classList.toggle('on',on); setTimeout(()=>{ applyViewport(); healTerminalSurface('keybar'); },60); }
 $('#kbtoggle').onclick=()=>{ LS.set('mux_keybar', !LS.get('mux_keybar',false)); applyKeybarPref(); };
 applyKeybarPref();
+// PHONE ONLY: hide the bottom bar. It is ~60px of a 390x844 screen and it is also what sits over the
+// app's own bottom menus, so this is the way to reach them. Nothing about it resizes the session: the pane
+// only changes size, and doFit re-fits the local grid to whatever it now is.
+function applyNavPref(){
+  const hidden = LS.get('mux_nav_hidden', false) === true;
+  $('#app').classList.toggle('nonav', hidden);
+  const b = $('#navtoggle'); if(b){ b.classList.toggle('on', hidden); b.setAttribute('aria-pressed', hidden ? 'true' : 'false');
+    b.title = hidden ? 'Show the bottom bar' : 'Hide the bottom bar';
+    b.setAttribute('aria-label', b.title); }
+  setTimeout(()=>{ applyViewport(); doFit(); healTerminalSurface('navtoggle'); }, 60);
+}
+$('#navtoggle').onclick=()=>{ LS.set('mux_nav_hidden', !(LS.get('mux_nav_hidden', false) === true)); applyNavPref(); };
+applyNavPref();
 function toggleZen(){ const z=$('#app').classList.toggle('zen'); $('#zen').classList.toggle('on',z);
   if(z && document.documentElement.requestFullscreen) document.documentElement.requestFullscreen().catch(()=>{});
   else if(!z && document.fullscreenElement) document.exitFullscreen().catch(()=>{});

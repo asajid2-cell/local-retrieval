@@ -35,10 +35,27 @@ try {
 
 function available() { return !!(Terminal && SerializeAddon); }
 
-// How much scrollback the snapshot carries. Bounded on purpose: the screen is 24 rows, so the useful
-// part of a reattach is the history above it, and a slice keeps the payload compact while still far
-// smaller than the byte log.
-const SNAPSHOT_SCROLLBACK = 500;
+// How much scrollback the snapshot carries, and how much the model is allowed to HOLD.
+//
+// These are the bound on what a viewer can read back at all: the phone's conversation view renders the
+// whole buffer, so a viewer painted from a 500-line snapshot simply has no more history to show. That was
+// the "it stops pretty early - it doesn't let us view more than a couple of events back" report, and it
+// was also an inconsistency: a COLD attach replays up to HOST_SB_BYTES (800 KB) of muxd's ring, which at
+// 209 columns is ~3800 lines, so the same session showed several times more history depending on which
+// path happened to paint it.
+//
+// The bound that actually matters is the PAYLOAD, not the line count: a snapshot must cost about what the
+// replay it replaces costs, or a warm attach becomes the slow one. So the line budget is generous and a
+// byte budget trims it - at a narrow phone grid the full slice fits easily, and at 209 columns it stops
+// at roughly the same byte total the replay would have spent.
+const SNAPSHOT_SCROLLBACK = Math.max(50, Number(process.env.MUX_SNAPSHOT_SCROLLBACK) || 2000);
+const MODEL_SCROLLBACK = Math.max(SNAPSHOT_SCROLLBACK, Number(process.env.MUX_MODEL_SCROLLBACK) || 10000);
+// A small fraction of the 800 KB replay it replaces, which is what keeps a warm attach the cheap path.
+// Measured: a serialized line costs ~16 bytes at 80 columns and ~190 at 209, so this is ~8000 lines on a
+// narrow grid (under the line cap) and ~650 on a wide one. The line cap alone is NOT enough - at 80 columns
+// 2000 lines of plain text serialize to about the same bytes as the log that produced them, and then a
+// warm attach costs MORE than the replay it exists to beat.
+const SNAPSHOT_MAX_BYTES = Math.max(16 * 1024, Number(process.env.MUX_SNAPSHOT_MAX_BYTES) || 128 * 1024);
 
 const MODELS = new Map();     // name -> { term, ser, cols, rows, bytes, idleAt, cold, gen }
 let _modelGen = 0;
@@ -65,7 +82,7 @@ function modelFor(name, cols, rows) {
   if (!model) {
     let term;
     try {
-      term = new Terminal({ cols, rows, allowProposedApi: true, scrollback: 1000 });
+      term = new Terminal({ cols, rows, allowProposedApi: true, scrollback: MODEL_SCROLLBACK });
     } catch (error) {
       if (!loadError) loadError = error;
       return null;
@@ -177,9 +194,16 @@ function snapshot(name, cols, rows) {
   let out;
   try {
     // Serialize a bounded slice of scrollback, not the whole thing. The screen itself is 24 rows; the
-    // history behind it is what a person scrolls up to. 500 lines is ~30KB - well under muxd's 800KB
-    // replay - and past that the marginal history costs more than the replay path it is replacing.
-    out = model.ser.serialize({ scrollback: SNAPSHOT_SCROLLBACK });
+    // history behind it is what a person scrolls up to, and the slice is chosen to carry about as much
+    // history as the byte replay it replaces (see SNAPSHOT_MAX_BYTES). If the line budget overruns the
+    // byte budget the slice is halved until it fits, so a very wide grid does not pay more than the
+    // replay would have; the final screen rows are always kept, so the result is still a real screen.
+    let lines = SNAPSHOT_SCROLLBACK;
+    for (;;) {
+      out = model.ser.serialize({ scrollback: lines });
+      if (!out || out.length <= SNAPSHOT_MAX_BYTES || lines <= model.rows) break;
+      lines = Math.max(model.rows, Math.floor(lines / 2));
+    }
   } catch (error) {
     dispose(name);
     return null;

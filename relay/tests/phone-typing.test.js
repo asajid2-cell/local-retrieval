@@ -196,3 +196,55 @@ test('quick keys send their sequences without opening the keyboard', async t => 
     assert.equal(focused, false, 'a quick key must not leave the keyboard up over the screen');
   });
 });
+
+// The bar is ~60px of a 390x844 screen and it is exactly what covers an app's own bottom menus, so the
+// phone needs a way to put it away. The toggle lives in the top bar (which stays) and must actually give
+// the pane the rows back - dropping the track, not just hiding the element - and it must be remembered.
+test('the bottom bar can be hidden from the top bar, and the pane gets the rows', async t => {
+  await withPhone(t, async ({ page }) => {
+    const before = await page.evaluate(() => {
+      const nav = document.querySelector('#mobileNav');
+      const b = document.querySelector('#navtoggle');
+      return {
+        shown: !!nav && getComputedStyle(nav).display !== 'none',
+        btnShown: !!b && getComputedStyle(b).display !== 'none',
+        paneH: document.querySelector('#term').getBoundingClientRect().height,
+        rows: term.rows,
+        pressed: b && b.getAttribute('aria-pressed'),
+      };
+    });
+    assert.equal(before.shown, true, 'the bar starts visible');
+    assert.equal(before.btnShown, true, 'and the phone has the button that hides it');
+    assert.equal(before.pressed, 'false');
+
+    await page.click('#navtoggle');
+    await page.waitForTimeout(400);
+    const after = await page.evaluate(() => {
+      const nav = document.querySelector('#mobileNav');
+      const b = document.querySelector('#navtoggle');
+      return {
+        shown: !!nav && getComputedStyle(nav).display !== 'none',
+        paneH: document.querySelector('#term').getBoundingClientRect().height,
+        rows: term.rows,
+        pressed: b && b.getAttribute('aria-pressed'),
+        title: b && b.title,
+        stored: localStorage.getItem('mux_nav_hidden'),
+      };
+    });
+    assert.equal(after.shown, false, 'the bar is gone');
+    assert.equal(after.pressed, 'true', 'and the button says so');
+    assert.match(after.title, /show/i, 'the title offers the way back');
+    assert.ok(after.paneH > before.paneH + 20, `the pane keeps the space: ${before.paneH} -> ${after.paneH}`);
+    assert.ok(after.rows >= before.rows, `and the grid re-fits into it: ${before.rows} -> ${after.rows}`);
+    assert.equal(JSON.parse(after.stored), true, 'the choice is remembered across loads');
+
+    await page.click('#navtoggle');
+    await page.waitForTimeout(400);
+    const back = await page.evaluate(() => ({
+      shown: getComputedStyle(document.querySelector('#mobileNav')).display !== 'none',
+      paneH: document.querySelector('#term').getBoundingClientRect().height,
+    }));
+    assert.equal(back.shown, true, 'and tapping again brings it back');
+    assert.ok(Math.abs(back.paneH - before.paneH) < 2, 'with the pane back where it started');
+  });
+});

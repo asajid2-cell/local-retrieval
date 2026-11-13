@@ -107,8 +107,10 @@ test("mobile nav lays every destination out as an equal column, all on screen", 
   const mqStart = source.indexOf("@media (max-width:59.99rem)");
   const mqEnd = source.indexOf("@media (max-width:23rem)", mqStart);
   const mq = source.slice(mqStart, mqEnd);
-  // The LAST #mobileNav block in the media query is the mobile rule (there is an earlier display:none base).
-  const blocks = [...mq.matchAll(/#mobileNav\s*\{[\s\S]*?\}/g)].map(m => m[0]);
+  // The LAYOUT rule, by selector - an earlier base `#mobileNav { display:none; }` and later state rules
+  // (`#app.nonav #mobileNav`, `html.kb-open #mobileNav`) also mention it, and none of those describe the row.
+  const blocks = [...mq.matchAll(/([^{}\n]*#mobileNav)\s*\{[\s\S]*?\}/g)]
+    .filter(m => m[1].trim() === '#mobileNav').map(m => m[0]);
   const rule = blocks[blocks.length - 1] || '';
   assert.match(rule, /display:\s*grid/, "#mobileNav must lay its items out as columns");
   assert.match(rule, /grid-auto-flow:\s*column/, "#mobileNav must flow its items in one row");

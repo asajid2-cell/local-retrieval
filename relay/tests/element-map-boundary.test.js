@@ -235,7 +235,12 @@ test('a hello that changes a session identity resets the live strip and drops th
       assert.equal(after, AFTER_HELLO.toString('latin1') + '\x07',
         'the first chunk after the boundary arrives whole, BEL included (the carry is empty)');
 
-      const second = await attach(t2, h, host);
+      // `expectSb: false` because the boundary already re-requested the ring on behalf of the FIRST
+      // viewer (it is on the banner - its attach was answered with an empty ring - and a boundary is
+      // exactly what repairs a banner). That request is still in flight, so this attach joins it rather
+      // than sending a second one. What this test is about is the cached map and the size frame, and
+      // both are asserted below either way.
+      const second = await attach(t2, h, host, '', { expectSb: false });
       assert.deepEqual(maps(second.got), [], 'no cached map after the identity change');
       assert.ok(second.got.texts().some(s => s[0] === 'd'), 'the size frame still arrives');
     });
@@ -260,6 +265,8 @@ test('a replacing link resets the live strip even when the session identity is u
   assert.equal(after, AFTER_HELLO.toString('latin1') + '\x07',
     'the new link starts fresh; a partial body from the old link is not carried across');
 
-  const second = await attach(t, h, host2);
+  // `expectSb: false` for the same reason as the identity-change case above: the boundary already asked
+  // for the ring on behalf of the bannered first viewer, so a second attach joins that request.
+  const second = await attach(t, h, host2, '', { expectSb: false });
   assert.deepEqual(maps(second.got), [], 'no cached map after the link replacement');
 });

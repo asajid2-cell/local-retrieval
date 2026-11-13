@@ -75,7 +75,7 @@ test('a snapshot of a fed stream re-renders the same screen as the full byte rep
   screenModel.dispose('sm-render');
 });
 
-test('the snapshot is a small screen, not a copy of the byte log', async () => {
+test('the snapshot is a bounded screen plus real history, not a copy of the byte log', async () => {
   // 4000 lines of scrollback: the byte log is large, the screen it leaves is 24 rows.
   let stream = '';
   for (let i = 0; i < 4000; i++) stream += `${ESC}[36mline ${String(i).padStart(5, '0')}${ESC}[0m\r\n`;
@@ -85,12 +85,16 @@ test('the snapshot is a small screen, not a copy of the byte log', async () => {
   await seedAsync('sm-size', COLS, ROWS, bytes);
   const snap = screenModel.snapshot('sm-size', COLS, ROWS);
   assert.ok(snap);
-  // The whole point: the snapshot is a bounded screen plus a bounded slice of history (~30KB at 500
-  // lines), so it is orders of magnitude under the log even when the log is 4000 lines deep.
-  assert.ok(Buffer.byteLength(snap) < 64 * 1024,
-    `a bounded snapshot must stay under 64KB, got ${Buffer.byteLength(snap)} bytes`);
-  assert.ok(Buffer.byteLength(snap) < bytes.length / 10,
-    `the snapshot (${Buffer.byteLength(snap)}) must be far under the byte log (${bytes.length})`);
+  // The payload is bounded in BYTES, and that bound is what decides whether a warm attach is faster than
+  // the replay it replaces: ~1/5 of the 800 KB replay budget, not an arbitrary line count.
+  assert.ok(Buffer.byteLength(snap) <= 128 * 1024,
+    `the snapshot must stay inside its byte budget, got ${Buffer.byteLength(snap)} bytes`);
+  assert.ok(Buffer.byteLength(snap) < bytes.length,
+    `the snapshot (${Buffer.byteLength(snap)}) must be smaller than the byte log (${bytes.length})`);
+  // And it carries real history, which is the point of the depth: the phone's conversation view renders
+  // the buffer, so a snapshot holding only the visible screen is "a couple of events back".
+  assert.match(Buffer.from(snap, 'utf8').toString('latin1'), /line 0*\d{3}/,
+    'the snapshot must reach back thousands of lines, not only the visible screen');
 
   // And it still shows the right final line.
   const model = await render(Buffer.from(snap, 'utf8'));

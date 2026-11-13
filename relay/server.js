@@ -3815,17 +3815,42 @@ wssHost.on('connection', (ws, req) => {
         if (!boundaryNames.has(name)) continue;
         st.cur = null;
         clearScrollbackRequest(st);
+        // A pending grid request belonged to the OLD link: its epoch was minted against the previous
+        // host's gridEpoch, so no reply on the new link can ever match it. Left in place it is a
+        // permanent "a request is in flight" marker - the viewport re-pin (handleClientMsg 'v') and the
+        // gridAck retry both require it to be gone - so one take that crossed the reconnect silently
+        // disabled every later viewport re-pin for that session. Live: "taking the grid sometimes does
+        // not work". A boundary means nobody is owed a reply, so the record goes.
+        st.gridReq = null;
         // A viewer still waiting for the old stream's ring is owed a paint from the NEW stream's ring, so
         // the request must be re-issued. Re-armed from the clients themselves, not only from sbWaiters:
         // sbWait is the authoritative "still waiting" flag, and the boundary must not depend on the set
         // having been kept in step by the reply handler. Every other hosted sbWait client is put back so
         // the next paintAll finds it too.
+        //
+        // A viewer already ON THE BANNER is owed the same paint, and it used to be skipped here - the
+        // single defect behind "it loads but never gives it to me". The PC link flaps (live: repeated
+        // `PC session host disconnected` / `hello from CRACKERBARREL` minutes apart), and every viewer
+        // that attached during a gap spent its HOST_SB_WAIT_MS and took State L, which is the DEFINED
+        // state for a host that never answers. But State L was only ever repaired by a reply, and this
+        // loop was the only place a reply gets asked for after a reconnect - and it only asked when
+        // somebody was still in sbWait. So the banner outlived the outage that caused it: the host came
+        // back, the ring held the whole screen, and the viewer was never painted again until a reload.
+        // `stateL` means "no trustworthy screen", exactly the condition a fresh boundary removes, so it
+        // is re-armed as a repair rather than left as a permanent verdict.
         let waiter = null;
         for (const c of st.clients.values()) {
-          if (!c.hosted || c.ws.readyState !== 1 || !c.sbWait) continue;
-          st.sbWaiters.add(c.id);
+          if (!c.hosted || c.ws.readyState !== 1) continue;
+          if (c.sbWait) st.sbWaiters.add(c.id);
+          // A banner viewer is NOT re-armed as waiting here: it is already live on the defined banner and
+          // must keep receiving live output while the repair is in flight. It needs no flag change -
+          // paintAll already repaints every `stateL` client from a snapshot that lands - so the only thing
+          // missing was the REQUEST, and the waiter below is what issues it.
+          else if (!c.stateL) continue;
           if (!waiter) waiter = c;
         }
+        // The request goes out on the strength of ANY viewer owed a paint - including one that only
+        // reached the banner - because the ring reply is what repairs a banner and there is no other.
         if (waiter && hostSessions.has(name)) requestSessionScrollback(name, st, waiter);
       }
       for (const name of hostSessions.keys()) recompute(name);
@@ -5068,17 +5093,19 @@ function requestTabGrid(name, st, client, on) {
   const host = hostSessions.get(name);
   if (!st || !host || !host.owner) return false;
   const epoch = ((host.gridEpoch | 0) + 1);
-  if (on) {
-    const deviceId = client.deviceId || ('sock-' + client.id);
-    const cols = clampTermDimension(client.vcols, st.cur ? st.cur.cols : 2, MAX_TERM_COLS);
-    const rows = clampTermDimension(client.vrows, st.cur ? st.cur.rows : 2, MAX_TERM_ROWS);
-    st.gridReq = { epoch, cols, rows, owner: deviceId, label: String(client.label || '').slice(0, 64), retried: false };
-    sendHost({ t: 'resize', s: name, cols, rows, epoch, owner: deviceId, label: String(client.label || '').slice(0, 64) });
-  } else {
+  const frame = on
+    ? { t: 'resize', s: name, epoch, owner: client.deviceId || ('sock-' + client.id), label: String(client.label || '').slice(0, 64),
+        cols: clampTermDimension(client.vcols, st.cur ? st.cur.cols : 2, MAX_TERM_COLS),
+        rows: clampTermDimension(client.vrows, st.cur ? st.cur.rows : 2, MAX_TERM_ROWS) }
     // Release carries no geometry: the tee reads the pane (contract section 4).
-    st.gridReq = { epoch, cols: 0, rows: 0, owner: 'local', label: '', retried: false };
-    sendHost({ t: 'resize', s: name, epoch, owner: 'local' });
-  }
+    : { t: 'resize', s: name, epoch, owner: 'local' };
+  // The pending record means "a request is in flight", so it is written only after the frame actually
+  // went out: a take that finds no socket has nothing in flight, and recording it anyway would leave a
+  // marker that gates this session's viewport re-pins until a commit that is never coming. The record is
+  // also dropped at every host boundary (see the reconnect hello), which is the same rule for a request
+  // that was sent and then stranded by the link.
+  if (!sendHost(frame)) return true;
+  st.gridReq = { epoch, cols: frame.cols | 0, rows: frame.rows | 0, owner: frame.owner, label: frame.label || '', retried: false };
   return true;
 }
 function pinToDevice(name, client, on) {
