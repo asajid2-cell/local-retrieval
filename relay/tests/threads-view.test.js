@@ -162,3 +162,64 @@ test('the composer sends through the session input path, byte for byte', async t
   assert.equal(sent, 'please check the logs\r',
     `the composer must deliver the text then exactly one CR, got ${JSON.stringify(sent)}`);
 });
+
+
+// ---- the conversation must follow OUTPUT, not a paint
+//
+// Live defect (2026-11-12): the list was refreshed only from term.onRender(), and xterm stops rendering while
+// its element is display:none - which is exactly what #term is on the threads view. Opening the conversation
+// therefore FROZE it: new turns landed in the buffer and never appeared, so a phone could not read anything
+// that arrived after it opened the view. Driven here in a real browser on a phone viewport.
+test('a turn that arrives while the conversation is open appears without touching the terminal', async t => {
+  if (!browser) return t.skip(`Chromium unavailable. ${INSTALL} ${browserError && browserError.message}`);
+  const { host, page } = await boot(t);
+  // Open the conversation FIRST: renderThreads is a no-op on any other view, so a turn sent while the
+  // terminal is showing lives only in the buffer until this view is opened.
+  await page.click('[data-mobile-view="threads"]');
+  await waitFor(async () => await page.evaluate(() => document.querySelectorAll('#threads .th-msg').length > 0), 'threads open', 4000);
+
+  // A new turn arrives while the terminal pane is hidden. Nothing repaints that pane, so only an
+  // output-driven refresh can put this on screen.
+  host.sendOutput(SESSION, '\x1b[0m\u23fa Turn two: arrived while reading.\r\n\r\n');
+  await waitFor(async () => /Turn two/.test(await page.evaluate(() => document.querySelector('#threads').textContent)),
+    'the new turn must appear while the terminal is hidden', 4000);
+});
+
+test('scrolling back through history keeps the reader where they were', async t => {
+  if (!browser) return t.skip(`Chromium unavailable. ${INSTALL} ${browserError && browserError.message}`);
+  const { host, page } = await boot(t);
+  await page.click('[data-mobile-view="threads"]');
+  let payload = '';
+  // Enough turns that the MIDDLE of the list is genuinely away from the bottom. With a short list, "middle"
+  // clamps to the newest message, where pinning to the bottom is the correct behaviour.
+  for (let i = 1; i <= 60; i++) payload += '\x1b[0m\u23fa Turn ' + i + ': message body number ' + i + '.\r\n\r\n';
+  host.sendOutput(SESSION, payload);
+  await waitFor(async () => await page.evaluate(() => document.querySelectorAll('#threads .th-msg').length >= 50), 'list built', 8000);
+
+  // Read from the middle of the history.
+  const mid = await page.evaluate(() => {
+    const h = document.querySelector('#threads');
+    h.scrollTop = Math.round(h.scrollHeight / 2);
+    const bodies = [...h.querySelectorAll('.th-body')];
+    const top = h.getBoundingClientRect().top;
+    const first = bodies.find(b => b.getBoundingClientRect().bottom > top + 1);
+    return { scrollTop: Math.round(h.scrollTop), anchor: first ? first.textContent.slice(0, 24) : null };
+  });
+  assert.ok(mid.scrollTop > 0, 'the list is scrollable, so there is history to read');
+
+  // New output arrives. The reader must stay on the message they were reading, and the new turn must show.
+  // A token that CANNOT already be in the list: the payload above is numbered 1..60, so waiting on "Turn 25"
+  // would pass instantly without any rebuild and the test would prove nothing.
+  host.sendOutput(SESSION, '\x1b[0m\u23fa FRESH-ARRIVAL: arrived while reading history.\r\n\r\n');
+  await waitFor(async () => /FRESH-ARRIVAL/.test(await page.evaluate(() => document.querySelector('#threads').textContent)), 'new turn shown', 4000);
+
+  const after = await page.evaluate(() => {
+    const h = document.querySelector('#threads');
+    const bodies = [...h.querySelectorAll('.th-body')];
+    const top = h.getBoundingClientRect().top;
+    const first = bodies.find(b => b.getBoundingClientRect().bottom > top + 1);
+    return { scrollTop: Math.round(h.scrollTop), anchor: first ? first.textContent.slice(0, 24) : null };
+  });
+  assert.equal(after.anchor, mid.anchor, 'the reader stays on the same message');
+  assert.ok(after.scrollTop > 0, 'and is not thrown to the top of the list');
+});

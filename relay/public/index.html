@@ -36,6 +36,8 @@
     grid-template-rows: auto auto minmax(0,1fr) auto auto;
     grid-template-areas: "topbar" "tabs" "term" "status" "keys";
     isolation:isolate;
+    /* No double-tap zoom anywhere in the app shell (see #term for why). Deliberate pinch still works. */
+    touch-action:manipulation;
   }
   #app.zen #tabwrap { display:none; }   /* zen hides the tab strip; the topbar (with the exit button) STAYS, so you can always get out */
 
@@ -128,8 +130,19 @@
   #term {
     grid-area:term; position:relative; z-index:0; min-height:0; min-width:0; background:#000;
     padding:var(--sp1) var(--sp2); overflow:hidden; isolation:isolate;
+    /* A DOUBLE TAP must not zoom the page. Nothing set touch-action, so the browser's default double-tap
+       zoom was live on the pane and on the chrome: tapping twice to place a cursor or to hit a small target
+       scaled the whole view, which reads as "it constantly zooms in and out". Pinch-zoom is still allowed -
+       that is a deliberate gesture - but double-tap zoom and tap-panning belong to us. */
+    touch-action:manipulation;
   }
   #term .xterm { isolation:isolate; }
+  /* iOS Safari AUTO-ZOOMS the page when a focused field's font-size is under 16px. The helper textarea is
+     xterm's hidden input and it measured 13.3px, so every tap into the terminal zoomed the page in - which
+     is half of "it constantly zooms in and out" (the other half was double-tap zoom). The field is
+     transparent and 1px wide, so its font size is invisible to the user; raising it to 16px changes nothing
+     on screen and removes the zoom. */
+  #term .xterm .xterm-helper-textarea { font-size:16px !important; }
   /* "pan" = the shared window is wider than this screen: let the user drag horizontally.
      Vertical history belongs to xterm's scrollback, never to a browser wrapper scrollbar. */
   #term.pan {
@@ -213,6 +226,35 @@
   }
   #scrollstate[hidden] { display:none; }
   #scrollstate.app { border-color:var(--warn); color:var(--warn); }
+  /* QUICK KEYS: a phone-only strip of the keys a soft keyboard does not have. Hidden on desktop, where the
+     real keyboard is right there. Sits at the bottom of the pane so it never covers a row of output, and it
+     is not focusable-by-tap into the terminal: a key button takes focus and BLURS on send, so tapping Esc
+     does not leave the keyboard up over the screen. */
+  #quickkeys { display:none; }
+  @media (max-width:59.99rem) {
+    #quickkeys {
+      display:flex; gap:5px; align-items:center; overflow-x:auto; overflow-y:hidden;
+      padding:4px var(--sp1); scrollbar-width:none; touch-action:pan-x;
+      overscroll-behavior-x:contain;
+    }
+    #quickkeys::-webkit-scrollbar { display:none; }
+    /* 34px tall, not 44: this strip shares the pane with the output, and every pixel it takes is a row of
+       terminal the user cannot see. 34px is still comfortably tappable at a phone's scale. */
+    #quickkeys button {
+      flex:0 0 auto; min-width:40px; min-height:34px; padding:0 8px; border-radius:var(--r-s);
+      border:1px solid var(--line); background:var(--raised); color:var(--txt);
+      font:600 12.5px/1 ui-monospace,monospace; touch-action:manipulation;
+    }
+    #quickkeys button:active { background:var(--panel-2); }
+    #quickkeys .qk-go { border-color:var(--rose); background:var(--rose-dim); color:var(--rose); min-width:46px; }
+    /* The way to the full keyboard is PINNED at the right edge: it is the escape hatch, so it must never be
+       the item that scrolled off the screen (which is exactly how the nav's Keys item went missing). */
+    #quickkeys .qk-more { margin-left:auto; position:sticky; right:0; border-color:var(--line); color:var(--muted); }
+  }
+    /* While the soft keyboard is UP the strip is the first thing to go: the phone has no room for chrome and
+       the user is typing, not pressing arrows. */
+    html.kb-open #quickkeys { display:none; }
+  }
   /* PAUSED overlay. autoFreeze/selectMode freeze the terminal so a highlight survives, but the freeze is
      invisible: output silently buffers into _frozenBuf and the tab reads as stuck. This is the one visible
      affordance that says the terminal is paused and how to go live again — the same escape the "Sel" toggle
@@ -308,7 +350,14 @@
   #threads {
     grid-area:threads; display:none; flex-direction:column; min-height:0; min-width:0;
     overflow-y:auto; overscroll-behavior:contain; background:var(--bg);
-    padding:var(--sp3) var(--sp3) var(--sp4); scroll-behavior:smooth;
+    padding:var(--sp3) var(--sp3) var(--sp4);
+    /* INSTANT, not smooth. Every rebuild restores the reader's position by assigning scrollTop, and with
+       `scroll-behavior:smooth` each output burst started a new animation from wherever the previous one
+       had reached - so a live session made the transcript slide under the reader's finger on every message,
+       which is one of the ways this view read as unstable and hard to read. History you are reading must
+       not move unless you move it. */
+    scroll-behavior:auto;
+    -webkit-overflow-scrolling:touch;
   }
   .th-msg { display:flex; flex-direction:column; margin:0 0 var(--sp3); max-width:100%; }
   .th-msg:last-child { margin-bottom:0; }
@@ -387,7 +436,9 @@
   #composer textarea {
     flex:1 1 auto; min-height:40px; max-height:38vh; resize:none; padding:10px var(--sp3);
     border-radius:var(--r-m); border:1px solid var(--line); background:var(--bg); color:var(--txt);
-    font:inherit; font-size:15px; line-height:1.35; outline:none;
+    /* 16px, not 15: iOS auto-zooms into any focused field under 16px, so the message box zoomed the page the
+       moment it was tapped. 1px is not a readable difference and it removes the zoom entirely. */
+    font:inherit; font-size:16px; line-height:1.35; outline:none;
   }
   #composer textarea:focus { border-color:var(--rose); }
   #composer #sendthread {
@@ -653,19 +704,19 @@
       grid-template-areas:"topbar" "term" "status" "mobileNav";
     }
     #mobileNav {
-      /* SIX destinations (Sessions/Terminal/Fleet/Projects/Chats/Keys). A fixed multi-column grid either
-         wrapped the last one onto a second row (~60px of dead chrome per phone) or, cramped into one row,
-         crushed every label. A single horizontally-scrollable row keeps each label at its natural width
-         and costs exactly one row of height; the row pans sideways when it overflows. */
-      grid-area:mobileNav; display:flex; flex-wrap:nowrap; align-items:stretch; gap:var(--sp1);
-      padding:var(--sp1) var(--sp2); padding-bottom:max(var(--sp1),env(safe-area-inset-bottom));
-      background:var(--panel); border-top:1px solid var(--line); min-width:0;
-      overflow-x:auto; overflow-y:hidden; -webkit-overflow-scrolling:touch;
-      overscroll-behavior-x:contain; scrollbar-width:none;
+      /* SEVEN destinations, ALL on screen. The row used to be a horizontally-scrolling strip of fixed 62px
+         items, which measured 477px at EVERY phone width - so the last two (Search chats, and the KEYS
+         button that reveals the extra keys and command chords) sat parked off the right edge with no hint
+         the row scrolled. "There is no keys button" was literally true: it began at x=407 on a 390px
+         screen. Equal columns mean every destination is reachable at any width, which is the whole point
+         of a bottom bar; labels ellipsize rather than pushing a neighbour out of reach. */
+      grid-area:mobileNav; display:grid; grid-auto-flow:column; grid-auto-columns:minmax(0,1fr);
+      align-items:stretch; gap:2px;
+      padding:var(--sp1) var(--sp1); padding-bottom:max(var(--sp1),env(safe-area-inset-bottom));
+      background:var(--panel); border-top:1px solid var(--line); min-width:0; overflow:hidden;
     }
-    #mobileNav::-webkit-scrollbar { display:none; }
-    #mobileNav button, #mobileNav a { flex:0 0 auto; min-width:62px; min-height:44px; padding:4px 10px; gap:3px; font-size:11px; }
-    #mobileNav span { white-space:nowrap; }
+    #mobileNav button, #mobileNav a { min-width:0; min-height:44px; padding:4px 2px; gap:3px; font-size:10.5px; }
+    #mobileNav span { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:100%; }
     #mobileNav svg { width:17px; height:17px; }
     /* ONE header row. The wordmark spent ~78px and pushed the last two actions onto a second row (a
        ~105px header on a 390px phone). The glyph plus a single horizontally-scrollable action row keeps
@@ -841,6 +892,21 @@
     <button id="jumplive" aria-label="Jump to live"><span id="jlcount">new</span> ↓</button>
     <div id="predict" aria-hidden="true"></div>
     <button type="button" id="paused" hidden>paused &mdash; click to resume</button>
+    <!-- PHONE QUICK KEYS. The full keyboard lives on the Keys view, but a phone user sending a prompt needs
+         Enter, Escape and the arrows WITHOUT leaving the terminal, and the soft keyboard has no Esc, no Tab
+         and no arrows. Before this strip the only route was the bottom nav (whose Keys item was scrolled off
+         screen) - i.e. "there is no keys button". These are the same sendKey() calls the Keys view uses, so
+         no new input path exists. The ↑ at the far left is the tab-drag handle: it scrolls the strip. -->
+    <div id="quickkeys" aria-label="Quick keys">
+      <button type="button" data-qk="esc" aria-label="Escape">Esc</button>
+      <button type="button" data-qk="tab" aria-label="Tab">Tab</button>
+      <button type="button" data-qk="up" aria-label="Arrow up">↑</button>
+      <button type="button" data-qk="down" aria-label="Arrow down">↓</button>
+      <button type="button" data-qk="left" aria-label="Arrow left">←</button>
+      <button type="button" data-qk="right" aria-label="Arrow right">→</button>
+      <button type="button" data-qk="enter" class="qk-go" aria-label="Enter">⏎</button>
+      <button type="button" id="qk-all" class="qk-more" aria-label="All keys">⌨ keys</button>
+    </div>
   </main>
 
   <div id="fleetList" aria-label="Fleet glance"></div>
@@ -1106,7 +1172,21 @@ function renderThreads(force){
   if(!force && sig===threadsLastSig) return;      // nothing changed: do not rebuild the list under a finger
   threadsLastSig=sig;
   const WHO={user:'You',assistant:current,status:'status',tool:'result',text:''};
+  // WHERE THE READER WAS. Two numbers restore the view across a rebuild: `anchor` is the first message whose
+  // bottom edge is still visible, and `offset` is how far that edge sits below the pane's top. Restoring the
+  // raw scrollTop is wrong here because the rebuild can change the height ABOVE the reader (a bubble re-wraps
+  // when a table stops being a table, a status line grows a duration), and then the same scrollTop shows
+  // different text - the reader's place silently slides.
   const stick = host.scrollHeight - host.scrollTop - host.clientHeight < 80;   // were we at the bottom?
+  const nodesBeat = [...host.querySelectorAll('.th-msg')];
+  let anchor=-1, anchorOffset=0;
+  if(!stick){
+    const top=host.getBoundingClientRect().top;
+    for(let i=0;i<nodesBeat.length;i++){
+      const r=nodesBeat[i].getBoundingClientRect();
+      if(r.bottom > top+1){ anchor=i; anchorOffset=r.bottom-top; break; }
+    }
+  }
   host.innerHTML='';
   if(!msgs.length){ host.innerHTML='<div class="th-empty">Nothing on this screen yet.</div>'; return; }
   const frag=document.createDocumentFragment();
@@ -1144,10 +1224,31 @@ function renderThreads(force){
     wrap.appendChild(body); frag.appendChild(wrap);
   }
   host.appendChild(frag);
-  if(stick) host.scrollTop=host.scrollHeight;
+  if(stick || anchor < 0){ host.scrollTop=host.scrollHeight; return; }
+  // Put the reader back on the message they were reading. If it no longer exists (the buffer was trimmed),
+  // fall back to the bottom rather than to an arbitrary offset.
+  const after=[...host.querySelectorAll('.th-msg')];
+  const node=after[anchor];
+  if(!node){ host.scrollTop=host.scrollHeight; return; }
+  const delta=node.getBoundingClientRect().bottom - host.getBoundingClientRect().top - anchorOffset;
+  host.scrollTop += delta;
 }
 function threadSafeToRender(){
   try{ return isMobile() && mobileView==='threads'; }catch(e){ return false; }
+}
+// The thread list must follow OUTPUT, not just a PAINT.
+//
+// Live defect (2026-11-12): the list was driven solely by term.onRender, and xterm stops rendering while its
+// element is display:none - which is exactly the state of #term on the threads view. So the moment the phone
+// opened the conversation the list FROZE: new turns arrived in the buffer and never appeared, and the reader
+// could not scroll to them. (Measured: the buffer held Turn 31 while the DOM still ended at Turn 30, and a
+// forced renderThreads(true) drew it correctly.) Output arrival is the real signal, so it schedules the
+// rebuild directly; the render hook stays as a second source for cursor/repaint-driven changes.
+let threadsRenderTimer=0;
+function scheduleThreadsRender(){
+  if(!threadSafeToRender()) return;
+  if(threadsRenderTimer) return;                 // a burst of output is one rebuild, not one per frame
+  threadsRenderTimer=setTimeout(()=>{ threadsRenderTimer=0; renderThreads(false); }, 120);
 }
 // The composer is not a second input channel: it hands text to the SAME path the terminal uses (term.paste
 // -> onData -> send), so the lease checks, mouse-report stripping and signing all still apply. Sending is
@@ -1177,6 +1278,7 @@ function syncMobileView(){
 }
 function initMobileViews(){
   document.querySelectorAll('[data-mobile-view]').forEach(b=> b.onclick=()=>setMobileView(b.dataset.mobileView));
+  wireQuickKeys();
   const threadForm=$('#composer');
   if(threadForm){
     threadForm.addEventListener('submit', e=>{ e.preventDefault(); sendThreadMessage(); });
@@ -1907,7 +2009,7 @@ function reloadTerminal(quiet){
   connect(name, true);   // re-attach: CLEAR + scrollback replay + live, all client state reset
 }
 document.addEventListener('keydown', e=>{ if(e.ctrlKey && e.altKey && (e.key==='r'||e.key==='R')){ e.preventDefault(); e.stopPropagation(); reloadTerminal(); } }, true);
-window.__muxBuild='2026-11-12-phone-threads-11';   // bump per web deploy so a loaded version is verifiable (supersedes 2026-11-11-phone-threads-1)
+window.__muxBuild='2026-11-12-phone-typing-1';   // bump per web deploy so a loaded version is verifiable (supersedes 2026-11-11-phone-threads-1)
 try{ console.info('multiplex build', window.__muxBuild); }catch(e){}
 const helper = $('#term').querySelector('.xterm-helper-textarea');
 function hardenHelperTextarea(){
@@ -1958,12 +2060,35 @@ function resetTaDelta(clear){
   _taLast=''; _taComposing=false; _taCommittedValue=''; _taCommittedAt=0;
   if(clear){ try{ const h=$('#term').querySelector('.xterm-helper-textarea'); if(h) h.value=''; }catch(e){} }
 }
-function taFlushDelta(h){
+// A delta is an EDIT, and the event says which edit it was. Diffing the field alone cannot tell a real
+// backspace from the field having been reset behind our back, and that ambiguity is what made phone typing
+// unusable: any reset turned the next keystroke - usually the space after a word - into a burst of DELs, so
+// the session deleted the word just typed and sentences arrived run together ("makesthesentencescomeout
+// likethis"). Measured on a real 390x844 viewport: an insert arriving with a stale baseline sent
+// "\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7fx" for the single character "x ".
+//
+// The rule: DELETES COME ONLY FROM A DELETE EVENT. For any insert-ish inputType the forwarder emits just the
+// inserted text and re-anchors the baseline; the only exception is a genuine replacement (autocorrect), where
+// the event's own replacementText says the earlier chars are being swapped rather than appended.
+const TA_DELETE_TYPES = /^delete(Content|Word|SoftLine|HardLine|ByCut|ByDrag)/;
+function taFlushDelta(h, ev){
   const v = h.value || '', prev = _taLast;
+  const inputType = (ev && ev.inputType) || '';
   let cp=0; const L=Math.min(v.length, prev.length);
   while(cp<L && v.charCodeAt(cp)===prev.charCodeAt(cp)) cp++;
-  const back = prev.length - cp;
+  let back = prev.length - cp;
   let add = v.slice(cp);
+  // An INSERT never deletes. If the field does not simply extend the baseline, the baseline was lost (a
+  // reset, an IME commit, a blur) - so re-anchor to what is really in the field and send only the new text.
+  // A true replacement is the one case where the earlier characters really are being swapped out.
+  if(!TA_DELETE_TYPES.test(inputType) && back > 0){
+    const replacing = inputType === 'insertReplacementText' || inputType === 'insertFromComposition';
+    if(!replacing){
+      logMobileInputEvent('delta-reanchor', { v, prev, inputType, dropped: back });
+      back = 0;
+      add = ev && typeof ev.data === 'string' && ev.data ? ev.data : v;
+    }
+  }
   _taLast = v;
   let out = back>0 ? '\x7f'.repeat(back) : '';
   if(add){
@@ -1973,7 +2098,7 @@ function taFlushDelta(h){
   if(!out) return;
   markActive();
   if(autoFreeze && !selectMode){ autoFreeze=false; try{ term.clearSelection(); }catch(e){} flushFrozen(); syncPausedOverlay(); }
-  logMobileInputEvent('delta-send', { data: out, v, prev });
+  logMobileInputEvent('delta-send', { data: out, v, prev, inputType });
   send('i', out);
 }
 // Keys xterm must keep handling itself on mobile — they carry no textarea text. Anything else (printable
@@ -1993,7 +2118,7 @@ function installMobileInputDelta(){
   document.addEventListener('compositionend', ev=>{
     if(!mine(ev)) return;
     _taComposing=false;
-    taFlushDelta(h);
+    taFlushDelta(h, ev);
     _taCommittedValue=h.value||'';
     _taCommittedAt=Date.now();
     ev.stopPropagation();
@@ -2011,7 +2136,7 @@ function installMobileInputDelta(){
       return;
     }
     _taCommittedValue='';
-    taFlushDelta(h);
+    taFlushDelta(h, ev);
     ev.stopPropagation();
   }, true);
   document.addEventListener('keydown', ev=>{
@@ -2689,7 +2814,23 @@ function onControl(s){
 // device renders that fixed grid instead: fill the width, fit every row, or both at once.
 // The chip is a button: clicking it leaves focus ON it, and then the keyboard goes to the button
 // instead of the terminal. Every branch below hands the keyboard back.
-function refocusTerminal(){ try{ term.focus({preventScroll:true}); }catch(e){ try{ term.focus(); }catch(_){} } }
+// The keyboard belongs to the TERMINAL, and only to it. On a desktop, focusing the terminal after a tap is
+// the right way to hand the keyboard back to the pane. On a PHONE the same call POPS THE SOFT KEYBOARD UP -
+// so tapping the size chip (a display-only control) opened the keyboard over the screen the user was trying
+// to look at. Measured: tapping #statusmeta left document.activeElement on the helper textarea, i.e. the
+// keyboard opened. A tap that only reads a readout must leave focus exactly where it was.
+function refocusTerminal(opt){
+  if(opt && opt.ownerTap && isMobile()){
+    // Give the tap back to the page: blur whatever the click landed on (buttons take focus on tap) without
+    // pulling focus into the terminal. If the pane was ALREADY focused, keep it - the user is typing.
+    const a=document.activeElement;
+    if(a && a!==document.body && !(a.tagName==='TEXTAREA' && a.classList.contains('xterm-helper-textarea'))){
+      try{ a.blur(); }catch(e){}
+    }
+    return;
+  }
+  try{ term.focus({preventScroll:true}); }catch(e){ try{ term.focus(); }catch(_){} }
+}
 let _takeTimer = null;
 let _reReqTimer = null;
 let _gridBusy = null;          // 'take' | 'release' while a request is in flight
@@ -2899,20 +3040,20 @@ function cycleSize(){
   if(isTeedTab()){
     // Teed tab ladder: mine -> give it back; another device's -> take it over (MEASURED, so the committed
     // grid is this viewport at this font); local -> fill, fit, then take.
-    if(sizePinned && sizeMine){ releaseGrid(); refocusTerminal(); return; }
-    if(sizePinned && !sizeMine){ takeGrid(); refocusTerminal(); return; }
+    if(sizePinned && sizeMine){ releaseGrid(); refocusTerminal({ownerTap:true}); return; }
+    if(sizePinned && !sizeMine){ takeGrid(); refocusTerminal({ownerTap:true}); return; }
     // Unreadable and unpinned: fill and fit both leave a legible-font search with no answer, so the only
     // tap that changes what the user can read is the take. Same rule as the branch below.
-    if(tabFitPaneMode==='unreadable'){ takeGrid(); refocusTerminal(); return; }
+    if(tabFitPaneMode==='unreadable'){ takeGrid(); refocusTerminal({ownerTap:true}); return; }
     if(tabFitMode==='fill'){
       tabFitMode='fit'; LS.set('mux_tab_fit', tabFitMode);
       fitTabOwnedGrid(); applyPan(); scheduleTerminalSurfaceAlign(); updateMeta(); updateSizeBtn();
       flash('Fitting every row; side margins fill the rest');
-      refocusTerminal();
+      refocusTerminal({ownerTap:true});
       return;
     }
     takeGrid();
-    refocusTerminal();
+    refocusTerminal({ownerTap:true});
     return;
   }
   if(sizeTabOwned && !sizePinned){
@@ -2924,16 +3065,16 @@ function cycleSize(){
     // the text legible, so a tap here must not spend a round on a rendering change the user cannot see -
     // it must do the one thing that changes the COLUMN COUNT, which is taking the grid. The chip says
     // "too wide" in this state and this is what that promise means.
-    if(tabFitPaneMode==='unreadable'){ takeGrid(); refocusTerminal(); return; }
+    if(tabFitPaneMode==='unreadable'){ takeGrid(); refocusTerminal({ownerTap:true}); return; }
     if(tabFitMode==='fill'){
       tabFitMode='fit'; LS.set('mux_tab_fit', tabFitMode);
       fitTabOwnedGrid(); applyPan(); scheduleTerminalSurfaceAlign(); updateMeta(); updateSizeBtn();
       flash('Fitting every row; side margins fill the rest');
-      refocusTerminal();
+      refocusTerminal({ownerTap:true});
       return;
     }
     takeGrid();
-    refocusTerminal();
+    refocusTerminal({ownerTap:true});
     return;
   }
   if(_gridBusy) return;
@@ -2943,7 +3084,7 @@ function cycleSize(){
   if(send('P', releasing ? '0' : '') === 'dropped'){
     _gridBusy = null; updateSizeBtn();
     flash('Reconnecting - tap again in a moment');
-    refocusTerminal();
+    refocusTerminal({ownerTap:true});
     return;
   }
   clearTimeout(_takeTimer); _takeTimer = null;
@@ -2955,7 +3096,7 @@ function cycleSize(){
     }
     updateSizeBtn();
   }, 8000);
-  refocusTerminal();
+  refocusTerminal({ownerTap:true});
 }
 function pinToOtherDevice(){
   const others = (sizeClients||[]).filter(c=> (c.dev||('sock-'+c.id)) !== deviceId);
@@ -4271,6 +4412,9 @@ function connect(name, isRetry){
       noteSessionOutput(out);   // mouse-mode tracking + leak detection, BEFORE the frozen path can swallow it
       if(isFrozen()){ bufferFrozenOutput(out); return; }   // FROZEN for selection: buffer output; a repaint would wipe the highlight
       const wasBottom=atBottom(); enqueueTermWrite(out); markReadLive();
+      // The conversation view reads the buffer, and xterm pauses painting while #term is hidden, so the
+      // onRender hook cannot be its only trigger (see scheduleThreadsRender).
+      if(typeof scheduleThreadsRender==='function') scheduleThreadsRender();
       if(!wasBottom){ newLines += 1; showJump(); } };
     sock.onclose = ev => {
       if(inputQueue) inputQueue.disconnect('socket closed');   // burn the channel; buffered plaintext stays here
@@ -5189,6 +5333,28 @@ function seqForKey(k){
 function sendKey(k){ const s=seqForKey(k); clearMods(); if(s) send('i',s); term.focus(); }
 function sendChar(ch){ const out=applyModsToChar(ch); clearMods(); send('i',out); term.focus(); }
 function sendRaw(seq){ clearMods(); send('i',seq); term.focus(); }   // a ctrl-shortcut that already IS the combo
+// A QUICK KEY is the same bytes as sendKey, but it must not summon the soft keyboard on a phone. Pressing Esc
+// or an arrow is a command, not an invitation to type: the user is reading the screen, and focus() would throw
+// the keyboard back over it. On desktop the focus is what lets them keep typing, so it is kept there.
+function sendQuickKey(k){
+  const s=seqForKey(k); clearMods();
+  if(s) send('i', s);
+  markActive();
+  if(!isMobile()) term.focus();
+}
+function wireQuickKeys(){
+  const strip=$('#quickkeys'); if(!strip || strip.dataset.wired) return;
+  strip.dataset.wired='1';
+  strip.addEventListener('click', ev=>{
+    const b=ev.target.closest('button'); if(!b) return;
+    ev.preventDefault();
+    if(b.id==='qk-all'){ setMobileView('keys'); return; }
+    const k=b.dataset.qk; if(k) sendQuickKey(k);
+  });
+  document.addEventListener('touchstart', ev=>{
+    if(ev.target.closest && ev.target.closest('#quickkeys')) markActive();
+  }, { passive:true, capture:true });
+}
 
 const KEYMODES = {
   ctl: { kind:'raw',  items:[['^C','\x03'],['^D','\x04'],['^R','\x12'],['^L','\x0c'],['^Z','\x1a'],['^A','\x01'],['^E','\x05'],['^U','\x15'],['^K','\x0b'],['^W','\x17'],['^P','\x10'],['^N','\x0e']] },

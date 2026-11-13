@@ -34,7 +34,9 @@ test('§7.3: the size chip says "follows PC tab" and locks the pin', () => {
   // tab-owned guard is still the fallback for a row the teed test cannot classify, and it still refuses
   // the pin with exactly this expression.
   assert.match(indexSource, /function cycleSize\(\)\{[\s\S]{0,400}?if\(isTeedTab\(\)\)\{/);
-  assert.match(indexSource, /function cycleSize\(\)\{[\s\S]{0,1400}?if\(sizeTabOwned && !sizePinned\)/);
+    // The window has to cover the teed ladder, the unreadable short-circuit and the pane-owned branch, which
+  // now sit between the guard and this fallback.
+  assert.match(indexSource, /function cycleSize\(\)\{[\s\S]{0,2200}?if\(sizeTabOwned && !sizePinned\)/);
   assert.match(indexSource, /cannot be pinned/);
 });
 

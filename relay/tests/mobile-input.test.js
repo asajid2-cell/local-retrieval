@@ -369,3 +369,87 @@ test('the terminal touchstart listener does not preventDefault, so iOS can still
     );
   }
 });
+
+// ---- the delta forwarder must not invent deletes ------------------------------------------------------
+//
+// Live defect (2026-11-12): a phone lost the space after every word and whole words "backspaced
+// themselves", so sentences arrived run together ("makesthesentencescomeoutlikethis"). The forwarder mailed
+// the delta between the textarea and its cached baseline, so ANY event that left the field shorter than the
+// baseline - a reset, a lost IME commit, a keyboard that re-creates the field - was sent as that many DEL
+// characters, which deleted the word the user had just typed. The event itself says which edit it was, so
+// the rule is: deletes come only from a delete event; an insert that does not extend the baseline re-anchors
+// instead of deleting.
+const taTypes = (() => {
+  // A module-level const, not part of the function body, so read it off the source.
+  const m = source.match(/const TA_DELETE_TYPES = (\/[^\n]+?\/);/);
+  return m ? m[1] : null;
+})();
+
+test('a stale baseline is re-anchored, never forwarded as backspaces', () => {
+  const impact = 'a stale textarea baseline must not be forwarded as backspaces';
+  assert.ok(taTypes, `${impact}: the forwarder has no delete-type rule`);
+  const isDelete = new RegExp(taTypes.replace(/^\/|\/$/g, ''));
+  assert.equal(isDelete.test('deleteContentBackward'), true, 'a real backspace is a delete');
+  assert.equal(isDelete.test('deleteWordBackward'), true, 'a word delete is a delete');
+  assert.equal(isDelete.test('deleteSoftLineBackward'), true, 'a soft-line delete is a delete');
+  for (const insert of ['insertText', 'insertCompositionText', 'insertReplacementText', 'insertLineBreak']) {
+    assert.equal(isDelete.test(insert), false, `${insert} must never delete`);
+  }
+  // And the forwarder only emits DELs when the event WAS a delete.
+  const block = functionSection('taFlushDelta', impact);
+  const guard = block.indexOf('!TA_DELETE_TYPES.test(inputType) && back > 0');
+  assert.notEqual(guard, -1, `${impact}: the re-anchor is not gated on the event being an insert`);
+  assert.ok(block.indexOf('back = 0') > guard, `${impact}: the insert path does not clear the delete count`);
+});
+
+test('the mobile helper textarea is 16px, so iOS does not zoom into the terminal', () => {
+  // iOS Safari auto-zooms when a focused field is under 16px. The helper textarea is xterm's hidden input
+  // and measured 13.3px, so every tap into the terminal zoomed the page.
+  assert.match(source, /\.xterm-helper-textarea\s*\{[^}]*font-size\s*:\s*16px/,
+    'the helper textarea must not be under 16px');
+  // The message composer had the same problem at 15px.
+  assert.match(source, /#composer textarea\s*\{[^}]*font-size\s*:\s*16px/s,
+    'the composer must not be under 16px');
+});
+
+test('the app shell disables double-tap zoom but keeps pinch', () => {
+  // Nothing set touch-action, so double-tapping the pane zoomed the whole view ("it constantly zooms in and
+  // out"). manipulation still allows a deliberate pinch.
+  assert.match(source, /#app\s*\{[^}]*touch-action\s*:\s*manipulation/s, 'the app shell must not double-tap zoom');
+  assert.match(source, /#term\s*\{[^}]*touch-action\s*:\s*manipulation/s, 'and neither must the pane');
+  assert.doesNotMatch(source, /touch-action\s*:\s*none/, 'pinch-zoom must stay possible');
+});
+
+test('every bottom-nav destination is on screen at phone widths', () => {
+  // The row was a scrolling strip of fixed 62px items (477px total), so Search chats and Keys sat past the
+  // right edge at every phone width - "there is no keys button" was literally true.
+  // The rule lives inside the phone media query, so take the LAST #mobileNav block (the mobile one).
+  const navBlocks = [...source.matchAll(/#mobileNav\s*\{[^}]*\}/gs)].map(m => m[0]);
+  const nav = navBlocks.find(b => /grid-auto-flow/.test(b)) || '';
+  assert.match(nav, /grid-auto-flow\s*:\s*column/, 'the nav must lay its items out as equal columns');
+  assert.match(nav, /grid-auto-columns\s*:\s*minmax\(0\s*,\s*1fr\)/, 'and those columns must share the width');
+  assert.doesNotMatch(nav, /overflow-x\s*:\s*auto/, 'a scrolling nav is what hid the Keys button');
+  assert.match(source, /#mobileNav button,\s*#mobileNav a\s*\{[^}]*min-width\s*:\s*0/s,
+    'items must be allowed to shrink into their column');
+});
+
+test('the terminal view has quick keys, and they do not summon the soft keyboard', () => {
+  assert.match(source, /id="quickkeys"/, 'the terminal needs a quick-key strip');
+  for (const key of ['esc', 'tab', 'up', 'down', 'left', 'right', 'enter']) {
+    assert.match(source, new RegExp(`data-qk="${key}"`), `the strip is missing ${key}`);
+  }
+  const send = functionSection('sendQuickKey', 'quick keys must not steal focus on a phone');
+  assert.match(send, /seqForKey\s*\(/, 'a quick key sends the same sequence the Keys view does');
+  assert.match(send, /!isMobile\(\)\),?\s*term\.focus\(\)|if\s*\(\s*!isMobile\(\)\s*\)\s*term\.focus\(\)/,
+    'focus is returned on desktop only - on a phone it would pop the keyboard');
+});
+
+test('a display-only control never pulls focus into the terminal on a phone', () => {
+  // Tapping the size chip opened the keyboard over the screen the user was reading.
+  const refocus = functionSection('refocusTerminal', 'a readout tap must not open the keyboard');
+  assert.match(refocus, /isMobile\s*\(\s*\)/, 'the phone case is handled explicitly');
+  assert.match(refocus, /ownerTap/, 'the caller says whether a tap owns the keyboard');
+  const ladder = functionSection('cycleSize', 'the size ladder must not open the keyboard');
+  assert.match(ladder, /refocusTerminal\(\s*\{\s*ownerTap\s*:\s*true\s*\}\s*\)/,
+    'the size chip must hand the tap back rather than focusing the terminal');
+});
