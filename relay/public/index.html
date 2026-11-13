@@ -36,6 +36,8 @@
     grid-template-rows: auto auto minmax(0,1fr) auto auto;
     grid-template-areas: "topbar" "tabs" "term" "status" "keys";
     isolation:isolate;
+    /* No double-tap zoom anywhere in the app shell (see #term for why). Deliberate pinch still works. */
+    touch-action:manipulation;
   }
   #app.zen #tabwrap { display:none; }   /* zen hides the tab strip; the topbar (with the exit button) STAYS, so you can always get out */
 
@@ -68,6 +70,8 @@
   .icon svg { width:17px; height:17px; display:block; }
   .compose-desktop { display:none; }
   @media (hover:hover) and (pointer:fine) { .compose-desktop { display:inline-grid; } }
+  /* Phone-only: the bottom bar is already gone on desktop, so its toggle is too. */
+  #navtoggle { display:none; }
 
   /* ---- session tabs ---- */
   #tabwrap {
@@ -128,8 +132,19 @@
   #term {
     grid-area:term; position:relative; z-index:0; min-height:0; min-width:0; background:#000;
     padding:var(--sp1) var(--sp2); overflow:hidden; isolation:isolate;
+    /* A DOUBLE TAP must not zoom the page. Nothing set touch-action, so the browser's default double-tap
+       zoom was live on the pane and on the chrome: tapping twice to place a cursor or to hit a small target
+       scaled the whole view, which reads as "it constantly zooms in and out". Pinch-zoom is still allowed -
+       that is a deliberate gesture - but double-tap zoom and tap-panning belong to us. */
+    touch-action:manipulation;
   }
   #term .xterm { isolation:isolate; }
+  /* iOS Safari AUTO-ZOOMS the page when a focused field's font-size is under 16px. The helper textarea is
+     xterm's hidden input and it measured 13.3px, so every tap into the terminal zoomed the page in - which
+     is half of "it constantly zooms in and out" (the other half was double-tap zoom). The field is
+     transparent and 1px wide, so its font size is invisible to the user; raising it to 16px changes nothing
+     on screen and removes the zoom. */
+  #term .xterm .xterm-helper-textarea { font-size:16px !important; }
   /* "pan" = the shared window is wider than this screen: let the user drag horizontally.
      Vertical history belongs to xterm's scrollback, never to a browser wrapper scrollbar. */
   #term.pan {
@@ -141,9 +156,6 @@
      the font is fitted until the whole cols x rows grid is inside the pane (fitTabOwnedGrid). Once it fits,
      the grid is centred instead of hugging the left edge and leaving a dead margin. */
   #term.tabfit:not(.pan) .xterm { width:max-content !important; margin-left:auto; margin-right:auto; }
-  /* flex/fill stretch the SCREEN to the pane edge; a centred .xterm would shift that stretch by the
-     leftover margin and overflow on one side, so a stretched grid is flush left. */
-  #term.tabfit.stretch .xterm { margin-left:0 !important; margin-right:0 !important; }
   @media (hover:hover) and (pointer:fine) {
     #term.pan::-webkit-scrollbar { height:10px; background:var(--panel-2); }
     #term.pan::-webkit-scrollbar-thumb { background:var(--rose); border-radius:999px; }
@@ -184,22 +196,6 @@
     text-rendering:optimizeSpeed; will-change:transform;
   }
   #predict.show { display:block; }
-  /* ELEMENT MAP BOXES. Exact hit targets over the cells an app painted, from the semantic map the app
-     publishes on the VT stream (docs/terminal-element-map.md). Off unless the widgets chip is on: a box
-     that swallows a press would also swallow drag-select, so the plain terminal stays the default. */
-  #emap {
-    position:absolute; inset:0; z-index:3; display:none; pointer-events:none; overflow:hidden;
-  }
-  #emap.on { display:block; }
-  #emap .emap-el {
-    position:absolute; left:0; top:0; display:none; box-sizing:border-box; margin:0; padding:0;
-    border-radius:4px; border:1px solid rgba(232,120,150,.45); background:rgba(232,120,150,.05);
-    cursor:pointer; pointer-events:auto; -webkit-user-select:none; user-select:none; touch-action:manipulation;
-  }
-  #emap.on .emap-el { display:block; }
-  #emap .emap-el:hover, #emap .emap-el:focus-visible {
-    border-color:var(--rose); background:rgba(232,120,150,.18);
-  }
   /* Scrollback is real history, so give it a real scrollbar: thin, themed, draggable with a mouse.
      Nothing here changes xterm's sizing internals - only the bar the browser already paints. */
   #term .xterm-viewport {
@@ -232,6 +228,35 @@
   }
   #scrollstate[hidden] { display:none; }
   #scrollstate.app { border-color:var(--warn); color:var(--warn); }
+  /* QUICK KEYS: a phone-only strip of the keys a soft keyboard does not have. Hidden on desktop, where the
+     real keyboard is right there. Sits at the bottom of the pane so it never covers a row of output, and it
+     is not focusable-by-tap into the terminal: a key button takes focus and BLURS on send, so tapping Esc
+     does not leave the keyboard up over the screen. */
+  #quickkeys { display:none; }
+  @media (max-width:59.99rem) {
+    #quickkeys {
+      display:flex; gap:5px; align-items:center; overflow-x:auto; overflow-y:hidden;
+      padding:4px var(--sp1); scrollbar-width:none; touch-action:pan-x;
+      overscroll-behavior-x:contain;
+    }
+    #quickkeys::-webkit-scrollbar { display:none; }
+    /* 34px tall, not 44: this strip shares the pane with the output, and every pixel it takes is a row of
+       terminal the user cannot see. 34px is still comfortably tappable at a phone's scale. */
+    #quickkeys button {
+      flex:0 0 auto; min-width:40px; min-height:34px; padding:0 8px; border-radius:var(--r-s);
+      border:1px solid var(--line); background:var(--raised); color:var(--txt);
+      font:600 12.5px/1 ui-monospace,monospace; touch-action:manipulation;
+    }
+    #quickkeys button:active { background:var(--panel-2); }
+    #quickkeys .qk-go { border-color:var(--rose); background:var(--rose-dim); color:var(--rose); min-width:46px; }
+    /* The way to the full keyboard is PINNED at the right edge: it is the escape hatch, so it must never be
+       the item that scrolled off the screen (which is exactly how the nav's Keys item went missing). */
+    #quickkeys .qk-more { margin-left:auto; position:sticky; right:0; border-color:var(--line); color:var(--muted); }
+  }
+    /* While the soft keyboard is UP the strip is the first thing to go: the phone has no room for chrome and
+       the user is typing, not pressing arrows. */
+    html.kb-open #quickkeys { display:none; }
+  }
   /* PAUSED overlay. autoFreeze/selectMode freeze the terminal so a highlight survives, but the freeze is
      invisible: output silently buffers into _frozenBuf and the tab reads as stuck. This is the one visible
      affordance that says the terminal is paused and how to go live again — the same escape the "Sel" toggle
@@ -319,6 +344,110 @@
   /* ---- projects view (synced from the desktop app) ---- */
   #projects { grid-area:term; display:none; flex-direction:column; min-height:0; min-width:0; background:var(--bg); }
   #fleetList { grid-area:term; display:none; flex-direction:column; min-height:0; min-width:0; overflow:auto; background:var(--bg); }
+
+  /* ---- threads: the conversation render of the SAME session bytes ----
+     A phone is bad at a 209-column grid and good at a message list, so this view groups the live buffer
+     rows into messages (threads.js) and paints them as bubbles. Every row shown here came off the same
+     pty the terminal is mirroring; nothing is fetched, and the terminal view remains the authority. */
+  #threads {
+    grid-area:threads; display:none; flex-direction:column; min-height:0; min-width:0;
+    overflow-y:auto; overscroll-behavior:contain; background:var(--bg);
+    padding:var(--sp3) var(--sp3) var(--sp4);
+    /* INSTANT, not smooth. Every rebuild restores the reader's position by assigning scrollTop, and with
+       `scroll-behavior:smooth` each output burst started a new animation from wherever the previous one
+       had reached - so a live session made the transcript slide under the reader's finger on every message,
+       which is one of the ways this view read as unstable and hard to read. History you are reading must
+       not move unless you move it. */
+    scroll-behavior:auto;
+    -webkit-overflow-scrolling:touch;
+  }
+  .th-msg { display:flex; flex-direction:column; margin:0 0 var(--sp3); max-width:100%; }
+  .th-msg:last-child { margin-bottom:0; }
+  /* A continuation of the SAME speaker's run: no label, and only a hairline gap, so several short turns read
+     as one turn rather than as a stack of unrelated cards. */
+  .th-msg.th-cont { margin-top:calc(-1 * var(--sp3) + 4px); }
+  .th-msg.th-cont .th-body { border-top-left-radius:6px; border-top-right-radius:6px; }
+  .th-who { font-size:11px; letter-spacing:.03em; text-transform:uppercase; color:var(--faint); margin:0 0 3px var(--sp1); }
+  .th-body {
+    border:1px solid var(--line); background:var(--panel); border-radius:var(--r-m);
+    padding:var(--sp2) var(--sp3); font-size:15px; line-height:1.45; color:var(--txt);
+    white-space:pre-wrap; word-break:break-word; overflow-wrap:anywhere;
+  }
+  /* The user's own turn reads as "me": accent edge, raised surface, right-aligned. */
+  .th-msg.user { align-items:flex-end; }
+  .th-msg.user .th-who { margin-right:var(--sp1); }
+  .th-msg.user .th-body { background:var(--rose-dim); border-color:rgba(251,113,133,.34); color:var(--txt); }
+  /* A tool result is subordinate: muted, smaller, and monospaced because it is machine output. */
+  .th-msg.tool .th-body {
+    background:var(--panel-2); color:var(--muted); font-size:12.5px; line-height:1.45;
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"Roboto Mono",monospace;
+  }
+  .th-msg.status .th-body { background:transparent; border-style:dashed; color:var(--muted); font-size:12.5px; }
+  /* A box table keeps its own frame: monospace, NO wrapping, and a horizontal scroller so one row can be
+     read across by panning. Wrapping it was the defect - a 100-column git-log table became a column of
+     orphaned ─ characters. The bubble padding is trimmed so the scroll starts at the frame's own edge. */
+  .th-body.th-table { padding:0; overflow:hidden; }
+  .th-body.th-table .th-scroll {
+    margin:0; padding:var(--sp2) var(--sp3); overflow-x:auto; overflow-y:hidden;
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"Roboto Mono",monospace;
+    font-size:12px; line-height:1.35; white-space:pre; word-break:normal; overflow-wrap:normal;
+    -webkit-overflow-scrolling:touch; overscroll-behavior-x:contain;
+  }
+  /* Screen context above the first real message: muted and unframed, so it reads as "where the screen was"
+     rather than as a bubble with a sender. */
+  /* A phone cannot read a wide mirror. The notice says so plainly, offers the two surfaces that work at
+     this width, and sits as an OVERLAY on the pane rather than as a grid row: adding a row would change
+     the pane's client height, which is an input to the fit search, and a notice that resizes the thing it
+     is complaining about is a fit loop. */
+  #narrowgrid {
+    display:none; align-items:flex-start; gap:var(--sp2); flex-wrap:wrap;
+    /* Same grid cell as #term, above it: the pane's height never changes, so a notice can never be an
+       input to the fit search that produced it. */
+    grid-area:term; align-self:start; z-index:3; min-width:0;
+    padding:var(--sp2) var(--sp3); border-bottom:1px solid var(--line);
+    background:rgba(24,24,30,.95);
+    color:var(--muted); font-size:12.5px; line-height:1.4;
+  }
+  .mobile-view-terminal #narrowgrid { display:flex; }
+  #narrowgrid span.msg { flex:1 1 100%; }
+  #narrowgrid button {
+    min-height:34px; padding:0 var(--sp3); border-radius:var(--r-s);
+    border:1px solid var(--line); background:var(--raised); color:var(--txt);
+    font-size:12.5px; font-weight:600;
+  }
+  /* The action that actually fixes the width: taking the grid re-pins the tab to this screen. */
+  #narrowgrid button.take { border-color:var(--rose); background:var(--rose-dim); color:var(--rose); }
+  #narrowgrid button.x { min-width:34px; padding:0; border-color:transparent; background:transparent; color:var(--faint); font-size:16px; }
+  .th-msg.th-ctx .th-body {
+    background:transparent; border-color:transparent; color:var(--faint);
+    font-size:13px; line-height:1.5; padding:0 var(--sp1);
+    border-left:2px solid var(--line); border-radius:0;
+  }
+  #threads .th-empty { color:var(--faint); font-size:13px; padding:var(--sp4) 0; text-align:center; }
+  #threads .th-alt {
+    margin:var(--sp2) 0; padding:var(--sp3); border:1px solid var(--line); border-radius:var(--r-m);
+    background:var(--panel); color:var(--muted); font-size:13px; line-height:1.5;
+  }
+  #threads .th-alt button { margin-top:var(--sp2); min-height:40px; padding:0 var(--sp3); border-radius:var(--r-s);
+    border:1px solid var(--rose); background:var(--rose-dim); color:var(--rose); font-size:13.5px; font-weight:600; }
+  /* Composer: the phone's own input row, so typing into a thread never needs the grid or the keybar. */
+  #composer {
+    grid-area:composer; display:none; align-items:flex-end; gap:var(--sp2); padding:var(--sp2) var(--sp3);
+    border-top:1px solid var(--line); background:var(--panel); flex:0 0 auto;
+  }
+  #composer textarea {
+    flex:1 1 auto; min-height:40px; max-height:38vh; resize:none; padding:10px var(--sp3);
+    border-radius:var(--r-m); border:1px solid var(--line); background:var(--bg); color:var(--txt);
+    /* 16px, not 15: iOS auto-zooms into any focused field under 16px, so the message box zoomed the page the
+       moment it was tapped. 1px is not a readable difference and it removes the zoom entirely. */
+    font:inherit; font-size:16px; line-height:1.35; outline:none;
+  }
+  #composer textarea:focus { border-color:var(--rose); }
+  #composer #sendthread {
+    flex:0 0 auto; min-width:52px; min-height:40px; padding:0 var(--sp3); border-radius:var(--r-m);
+    border:1px solid var(--rose); background:var(--rose); color:#12070a; font-size:14px; font-weight:700;
+  }
+  #composer #sendthread:disabled { opacity:.45; }
   #app.projects #term { display:none; }
   #app.projects #projects { display:flex; }
   #app.projects #tabwrap, #app.projects #status, #app.projects #keybar { display:none; }
@@ -577,19 +706,19 @@
       grid-template-areas:"topbar" "term" "status" "mobileNav";
     }
     #mobileNav {
-      /* SIX destinations (Sessions/Terminal/Fleet/Projects/Chats/Keys). A fixed multi-column grid either
-         wrapped the last one onto a second row (~60px of dead chrome per phone) or, cramped into one row,
-         crushed every label. A single horizontally-scrollable row keeps each label at its natural width
-         and costs exactly one row of height; the row pans sideways when it overflows. */
-      grid-area:mobileNav; display:flex; flex-wrap:nowrap; align-items:stretch; gap:var(--sp1);
-      padding:var(--sp1) var(--sp2); padding-bottom:max(var(--sp1),env(safe-area-inset-bottom));
-      background:var(--panel); border-top:1px solid var(--line); min-width:0;
-      overflow-x:auto; overflow-y:hidden; -webkit-overflow-scrolling:touch;
-      overscroll-behavior-x:contain; scrollbar-width:none;
+      /* SEVEN destinations, ALL on screen. The row used to be a horizontally-scrolling strip of fixed 62px
+         items, which measured 477px at EVERY phone width - so the last two (Search chats, and the KEYS
+         button that reveals the extra keys and command chords) sat parked off the right edge with no hint
+         the row scrolled. "There is no keys button" was literally true: it began at x=407 on a 390px
+         screen. Equal columns mean every destination is reachable at any width, which is the whole point
+         of a bottom bar; labels ellipsize rather than pushing a neighbour out of reach. */
+      grid-area:mobileNav; display:grid; grid-auto-flow:column; grid-auto-columns:minmax(0,1fr);
+      align-items:stretch; gap:2px;
+      padding:var(--sp1) var(--sp1); padding-bottom:max(var(--sp1),env(safe-area-inset-bottom));
+      background:var(--panel); border-top:1px solid var(--line); min-width:0; overflow:hidden;
     }
-    #mobileNav::-webkit-scrollbar { display:none; }
-    #mobileNav button, #mobileNav a { flex:0 0 auto; min-width:62px; min-height:44px; padding:4px 10px; gap:3px; font-size:11px; }
-    #mobileNav span { white-space:nowrap; }
+    #mobileNav button, #mobileNav a { min-width:0; min-height:44px; padding:4px 2px; gap:3px; font-size:10.5px; }
+    #mobileNav span { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:100%; }
     #mobileNav svg { width:17px; height:17px; }
     /* ONE header row. The wordmark spent ~78px and pushed the last two actions onto a second row (a
        ~105px header on a 390px phone). The glyph plus a single horizontally-scrollable action row keeps
@@ -601,6 +730,7 @@
     .top-actions .icon { height:40px; min-width:40px; flex:0 0 auto; }
     .top-actions .icon svg { width:16px; height:16px; }
     #projbtn, #zen, #fontdown, #fontup, #kbtoggle { display:none; }
+    #navtoggle { display:inline-grid; }   /* phone only: the bottom bar exists only here */
     #tabwrap, #keybar { display:none; }
     #term { padding:var(--sp1); }
     #status { min-height:26px; padding:3px var(--sp3); }
@@ -657,6 +787,17 @@
     }
     #app.mobile-view-terminal #tabwrap, #app.mobile-view-terminal #keybar { display:none; }
 
+    /* THREADS: the same teemux output rendered as a conversation instead of a grid. Rows come from the
+       live buffer (threads.js segments them) - nothing here fetches, and nothing here knows about leaves. */
+    #app.mobile-view-threads {
+      grid-template-rows:auto minmax(0,1fr) auto auto auto;
+      grid-template-areas:"topbar" "threads" "composer" "status" "mobileNav";
+    }
+    #app.mobile-view-threads #term, #app.mobile-view-threads #keybar,
+    #app.mobile-view-threads #tabwrap { display:none; }
+    #app.mobile-view-threads #threads { display:flex; }
+    #app.mobile-view-threads #composer { display:flex; }
+
     #app.mobile-view-keys {
       grid-template-rows:auto minmax(4rem,1fr) auto auto auto;
       grid-template-areas:"topbar" "term" "status" "keys" "mobileNav";
@@ -674,6 +815,16 @@
     #app.mobile-view-keys .kdiv { display:none; }
     #app.zen #mobileNav, #app.zen #status, #app.zen #keybar { display:none; }
     #app.zen { grid-template-rows:auto minmax(0,1fr); grid-template-areas:"topbar" "term"; }
+
+    /* BOTTOM BAR HIDDEN (the #navtoggle button). Each view mode names the bar in its own row list, so the
+       row has to be dropped per mode or the grid keeps a 0-height track and the pane gains nothing. Every
+       rule here is the matching rule above with the "mobileNav" track and area removed. */
+    #app.nonav #mobileNav { display:none; }
+    #app.nonav { grid-template-rows:auto minmax(0,1fr) auto; grid-template-areas:"topbar" "term" "status"; }
+    #app.nonav.mobile-view-sessions { grid-template-rows:auto minmax(0,1fr) auto; grid-template-areas:"topbar" "tabs" "status"; }
+    #app.nonav.mobile-view-fleet, #app.nonav.mobile-view-terminal { grid-template-rows:auto minmax(0,1fr) auto; grid-template-areas:"topbar" "term" "status"; }
+    #app.nonav.mobile-view-threads { grid-template-rows:auto minmax(0,1fr) auto auto; grid-template-areas:"topbar" "threads" "composer" "status"; }
+    #app.nonav.mobile-view-keys { grid-template-rows:auto minmax(4rem,1fr) auto auto; grid-template-areas:"topbar" "term" "status" "keys"; }
     #empty { padding:var(--sp4) var(--sp3); }
     #empty .quick button { min-height:44px; }
   }
@@ -715,6 +866,14 @@
       <button class="icon" id="zen" title="Zen / fullscreen (F11)" aria-label="Zen / fullscreen">
         <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M4 9V5a1 1 0 011-1h4M20 9V5a1 1 0 00-1-1h-4M4 15v4a1 1 0 001 1h4M20 15v4a1 1 0 01-1 1h-4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
       </button>
+      <!-- PHONE ONLY: hide the bottom bar. Those ~60px are four terminal rows, and on a phone the bar is
+           also exactly what covers the app's own bottom menus (the leaf switcher and its status line).
+           Zen does the same job but is desktop-only, so a phone had no way to reclaim the space. This is a
+           toggle with remembered state, not a mode: the button lives in the top bar, which stays, so the
+           bar can always be brought back. -->
+      <button class="icon" id="navtoggle" title="Hide the bottom bar" aria-label="Hide the bottom bar" aria-pressed="false">
+        <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M4 5h16M4 12h16M4 19h16" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><path d="M4 21L20 3" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+      </button>
       <button class="icon" id="fontdown" title="Smaller text" aria-label="Smaller text">A&minus;</button>
       <button class="icon" id="fontup" title="Larger text" aria-label="Larger text">A+</button>
       <button class="icon" id="jumpbottom" title="Jump to the live bottom" aria-label="Jump to the live bottom">
@@ -754,9 +913,31 @@
     <button id="jumplive" aria-label="Jump to live"><span id="jlcount">new</span> ↓</button>
     <div id="predict" aria-hidden="true"></div>
     <button type="button" id="paused" hidden>paused &mdash; click to resume</button>
+    <!-- PHONE QUICK KEYS. The full keyboard lives on the Keys view, but a phone user sending a prompt needs
+         Enter, Escape and the arrows WITHOUT leaving the terminal, and the soft keyboard has no Esc, no Tab
+         and no arrows. Before this strip the only route was the bottom nav (whose Keys item was scrolled off
+         screen) - i.e. "there is no keys button". These are the same sendKey() calls the Keys view uses, so
+         no new input path exists. The ↑ at the far left is the tab-drag handle: it scrolls the strip. -->
+    <div id="quickkeys" aria-label="Quick keys">
+      <button type="button" data-qk="esc" aria-label="Escape">Esc</button>
+      <button type="button" data-qk="tab" aria-label="Tab">Tab</button>
+      <button type="button" data-qk="up" aria-label="Arrow up">↑</button>
+      <button type="button" data-qk="down" aria-label="Arrow down">↓</button>
+      <button type="button" data-qk="left" aria-label="Arrow left">←</button>
+      <button type="button" data-qk="right" aria-label="Arrow right">→</button>
+      <button type="button" data-qk="enter" class="qk-go" aria-label="Enter">⏎</button>
+      <button type="button" id="qk-all" class="qk-more" aria-label="All keys">⌨ keys</button>
+    </div>
   </main>
 
   <div id="fleetList" aria-label="Fleet glance"></div>
+
+  <section id="threads" aria-label="Conversation view of this session"></section>
+  <form id="composer" autocomplete="off">
+    <textarea id="threadinput" rows="1" placeholder="Message this session&hellip;" aria-label="Message this session"></textarea>
+    <button type="submit" id="sendthread">Send</button>
+  </form>
+
 
   <div id="status"><span class="sdot"></span><span id="statustext">connecting&hellip;</span><button type="button" class="meta" id="statusmeta" aria-label="Shared terminal size"></button></div>
   <div id="keybar"></div>
@@ -764,6 +945,10 @@
     <button type="button" data-mobile-view="sessions" aria-label="Sessions" aria-pressed="false">
       <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 6h14M5 12h14M5 18h14" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
       <span>Sessions</span>
+    </button>
+    <button type="button" data-mobile-view="threads" aria-label="Threads" aria-pressed="false">
+      <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M4 6.5A2.5 2.5 0 016.5 4h11A2.5 2.5 0 0120 6.5v7a2.5 2.5 0 01-2.5 2.5H11l-4.6 3.4A.6.6 0 015.5 18.9V16H6.5A2.5 2.5 0 014 13.5v-7z" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/><path d="M8 8.5h8M8 11.5h5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+      <span>Threads</span>
     </button>
     <button type="button" data-mobile-view="terminal" aria-label="Terminal" aria-pressed="false">
       <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><rect x="3.5" y="5" width="17" height="14" rx="2" stroke="currentColor" stroke-width="1.7"/><path d="M7 10l3 2-3 2M12.5 15h4" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
@@ -909,13 +1094,14 @@
 <script src="input-continuity.js"></script>
 <script src="picker.js"></script>
 <script src="fleet.js"></script>
+<script src="threads.js"></script>
 <script>
 const $ = s => document.querySelector(s);
 const base = location.pathname.replace(/\/[^/]*$/, '') || '';
 const api = p => fetch(base + '/api/' + p, { headers:{'Content-Type':'application/json'} });
 const LS = { get:(k,d)=>{ try{ return JSON.parse(localStorage.getItem(k)) ?? d; }catch(e){ return d; } }, set:(k,v)=>{ try{ localStorage.setItem(k, JSON.stringify(v)); }catch(e){} } };
 const mobileMQ = window.matchMedia ? window.matchMedia('(max-width: 59.99rem)') : {matches:false,addEventListener:()=>{},addListener:()=>{}};
-const MOBILE_VIEWS = ['sessions','fleet','terminal','keys'];
+const MOBILE_VIEWS = ['sessions','fleet','threads','terminal','keys'];
 let mobileView = LS.get('mux_mobile_view','terminal');
 if(!MOBILE_VIEWS.includes(mobileView)) mobileView='terminal';
 const isMobile = () => !!mobileMQ.matches;
@@ -949,6 +1135,7 @@ function setMobileView(view, persist=true){
   } else {
     if(fleetPollInterval){ clearInterval(fleetPollInterval); fleetPollInterval = null; }
   }
+  if(isMobile() && view==='threads') renderThreads(true);
   if(isMobile() && view!=='sessions' && view!=='fleet'){
     // applyViewport (not healTerminalSurface) does the height write, so it stays first; the heal is what
     // repaints the rows xterm drew while this view was display:none. Only when the terminal was actually
@@ -957,6 +1144,218 @@ function setMobileView(view, persist=true){
     setTimeout(()=>{ applyViewport(); if(heal) healTerminalSurface('mobile-view-'+view); try{ term.focus(); }catch(e){} }, 60);
   }
 }
+// ---- threads: the same session bytes, rendered as a conversation ---------------------------------------
+// A phone cannot use a 209-column grid, so this view groups the LIVE buffer rows into messages and paints
+// bubbles. The rows are the terminal's own - segments come from MuxThreads.segment(), whose rules are
+// pinned in relay/tests/threads.test.js against a real agent screen. No fetch, no new wire field, and the
+// terminal view is still the authority: this only reads what the pty already delivered.
+let threadsLastSig = '';
+function threadRowsFromBuffer(){
+  // Read the WHOLE buffer, not just the viewport: a message list that forgets everything scrolled past is
+  // not a conversation. Scrollback is already in memory (xterm keeps 60000 lines), so this is a walk.
+  const rows=[]; let b=null;
+  try{ b=term.buffer.active; }catch(e){ return { kind:'normal', rows:[] }; }
+  if(!b) return { kind:'normal', rows:[] };
+  const kind=(window.MuxThreads && MuxThreads.bufferKind) ? MuxThreads.bufferKind(b) : 'normal';
+  for(let i=0;i<b.length;i++){
+    const ln=b.getLine(i);
+    if(!ln) continue;
+    rows.push({ i, text: ln.translateToString(true), wrapped: !!ln.isWrapped });
+  }
+  return { kind, rows };
+}
+// What the conversation has SHOWN, per session, kept across repaints of the screen.
+//
+// The screen is a canvas the app repaints in place, so it forgets as it redraws. A reader is not asking
+// for a canvas, though - they want the turns. So each observation of the screen is merged into a durable
+// list: a turn already seen is recognised by its opening line and updated in place (a streaming message
+// grows), and a turn that is new is appended. Nothing is ever dropped except by the byte cap below, which
+// is what keeps a long session from growing without bound.
+//
+// This is a RENDER, not a second source of truth: it holds only text the session actually showed, keyed by
+// what it said, so a repaint that changes nothing appends nothing.
+const THREADS_KEEP = 400;              // messages retained per session
+const THREADS_KEEP_CHARS = 400000;     // and a byte budget, so a wall of output cannot grow the page
+let threadAccum = {};                  // session name -> { msgs: [...], seen: Map(key -> index) }
+function threadsKey(m){
+  const t=String(m.text||'');
+  const nl=t.indexOf(String.fromCharCode(10));
+  return (m.role||'text')+'|'+(nl<0?t:t.slice(0,nl)).trim();
+}
+function accumulateThreads(live){
+  const name=current||'';
+  if(!name) return live;
+  const st=threadAccum[name] || (threadAccum[name]={ msgs:[] });
+  const rec=st.msgs;
+  // The screen shows a TAIL of the conversation, so the merge is an ALIGNMENT, not a lookup: find the
+  // longest run at the end of the record that is also the start of what is on screen. That is the overlap,
+  // and it is what makes a streaming reply (same first line, longer body) update in place instead of
+  // appending a second copy - and what keeps two turns that merely OPEN the same way distinct.
+  const key=m=>threadsKey(m);
+  let overlap=0;
+  for(let k=Math.min(rec.length, live.length); k>0; k--){
+    let ok=true;
+    for(let i=0;i<k;i++){
+      if(key(rec[rec.length-k+i])!==key(live[i])){ ok=false; break; }
+    }
+    if(ok){ overlap=k; break; }
+  }
+  // A live message that is new is appended; one that is part of the overlap refreshes the recorded copy,
+  // because the screen is the newer truth for a turn that is still being written.
+  for(let i=0;i<overlap;i++){
+    const r=rec[rec.length-overlap+i];
+    r.text=live[i].text;
+    r.kind=live[i].kind||r.kind;
+  }
+  for(let i=overlap;i<live.length;i++){
+    const m=live[i];
+    if(!m || !String(m.text||'').trim()) continue;
+    rec.push({ role:m.role, lead:m.lead, text:m.text, kind:m.kind||'text' });
+  }
+  // Trim from the front against a message count and a character budget, so a long session stays bounded.
+  let total=0;
+  for(const m of rec) total+=m.text.length;
+  let cut=0;
+  while(cut<rec.length && (rec.length-cut>THREADS_KEEP || total>THREADS_KEEP_CHARS)){
+    total-=rec[cut].text.length; cut++;
+  }
+  if(cut) st.msgs=rec.slice(cut);
+  if(!st.msgs.length) return live;
+  // The labels are recomputed over the WHOLE record, so a run that began before the screen scrolled still
+  // labels once and a continuation still reads as a continuation.
+  return (window.MuxThreads && MuxThreads.grouped) ? MuxThreads.grouped(st.msgs) : st.msgs;
+}
+
+function renderThreads(force){
+  const host=$('#threads'); if(!host) return;
+  if(!isMobile() || mobileView!=='threads') return;
+  if(!current){ host.innerHTML='<div class="th-empty">No session open.</div>'; threadsLastSig=''; return; }
+  const buf=threadRowsFromBuffer();
+  // A full-screen TUI owns every cell, so its rows are a canvas, not a conversation. Say so plainly and
+  // offer the only honest action instead of inventing messages out of a TUI's box drawing.
+  if(buf.kind==='alternate'){
+    const sig='alt|'+current;
+    if(force || sig!==threadsLastSig){
+      threadsLastSig=sig;
+      host.innerHTML='';
+      const d=document.createElement('div'); d.className='th-alt';
+      d.textContent='This app is drawing a full-screen interface, so there is no conversation to group. '
+        +'Open the terminal to use it directly.';
+      const b=document.createElement('button'); b.type='button'; b.textContent='Open the terminal';
+      b.onclick=()=>setMobileView('terminal');
+      d.appendChild(b); host.appendChild(d);
+    }
+    return;
+  }
+  const seg=(window.MuxThreads && MuxThreads.segment) ? MuxThreads.segment(buf.rows) : [];
+  // THE CONVERSATION OUTLIVES THE SCREEN. Measured live (all six teed tabs, 2026-11-13): every viewer's
+  // buffer held bufLen === rows - ZERO scrollback - because an agent TUI repaints in place with absolute
+  // cursor addressing (494 CUP sequences, no scroll region, no newline scrolling). Feeding muxd's whole
+  // 240 KB ring into a headless xterm gives the same answer: 0 lines of history. The history does not exist
+  // in the byte stream at all, so no amount of replay depth can recover it - the mirror is faithful and the
+  // app simply never emits it. That is the "it stops pretty early, it doesn't let us view more than a
+  // couple of events back" report, and it can only be answered here: accumulate the turns as they are seen
+  // and render the accumulation. Nothing leaves the page; this is a render of what the session showed.
+  const live=(window.MuxThreads && MuxThreads.grouped) ? MuxThreads.grouped(seg) : seg;
+  const msgs=accumulateThreads(live);
+  const sig=current+'|'+msgs.map(m=>m.role+':'+m.text.length+':'+m.text.slice(-24)).join('\u0001');
+  if(!force && sig===threadsLastSig) return;      // nothing changed: do not rebuild the list under a finger
+  threadsLastSig=sig;
+  const WHO={user:'You',assistant:current,status:'status',tool:'result',text:''};
+  // WHERE THE READER WAS. Two numbers restore the view across a rebuild: `anchor` is the first message whose
+  // bottom edge is still visible, and `offset` is how far that edge sits below the pane's top. Restoring the
+  // raw scrollTop is wrong here because the rebuild can change the height ABOVE the reader (a bubble re-wraps
+  // when a table stops being a table, a status line grows a duration), and then the same scrollTop shows
+  // different text - the reader's place silently slides.
+  const stick = host.scrollHeight - host.scrollTop - host.clientHeight < 80;   // were we at the bottom?
+  const nodesBeat = [...host.querySelectorAll('.th-msg')];
+  let anchor=-1, anchorOffset=0;
+  if(!stick){
+    const top=host.getBoundingClientRect().top;
+    for(let i=0;i<nodesBeat.length;i++){
+      const r=nodesBeat[i].getBoundingClientRect();
+      if(r.bottom > top+1){ anchor=i; anchorOffset=r.bottom-top; break; }
+    }
+  }
+  host.innerHTML='';
+  if(!msgs.length){ host.innerHTML='<div class="th-empty">Nothing on this screen yet.</div>'; return; }
+  const frag=document.createDocumentFragment();
+  for(const m of msgs){
+    const wrap=document.createElement('div'); wrap.className='th-msg '+(m.role||'text');
+    // A run of same-speaker turns is visually one block: no gap above a continuation, so the bubbles stack.
+    if(m.showWho===false) wrap.classList.add('th-cont');
+    // Text above the first recognised message is the tail of a scrolled-off turn (often the agent's own
+    // reasoning). It stays visible - the phone never shows less than the terminal - but it is clearly
+    // secondary, so it never reads as something the agent said to you.
+    if(m.context) wrap.classList.add('th-ctx');
+    const body=document.createElement('div'); body.className='th-body';
+    // The glyph has already done its job (it is what grouped this message), and the label above says who
+    // it is - so it is stripped from the first line instead of being read out twice.
+    const said=m.text.replace(/^\s*[⏺●○⏎⎿└❯⏵›✻✳]\s?/, '');
+    // A row that was ONLY the glyph is the empty prompt line above the composer, not a message: showing it
+    // as an empty bubble reads as a broken message.
+    if(!said.trim()) continue;
+    // A BOX TABLE is panned, never wrapped: word-wrapping a grid of │-delimited cells turns it into a pile
+    // of orphaned rule characters (measured live). It gets its own scroller so the phone can move across
+    // one row at a time, exactly as it moves across the terminal. Prose and code still wrap.
+    if(m.kind==='table'){
+      body.classList.add('th-table');
+      const sc=document.createElement('pre'); sc.className='th-scroll';
+      sc.textContent=said;
+      body.appendChild(sc);
+    } else {
+      body.textContent=said;
+    }
+    if(m.showWho!==false){
+      const who=document.createElement('div'); who.className='th-who';
+      who.textContent=WHO[m.role]!==undefined?WHO[m.role]:m.role;
+      wrap.appendChild(who);
+    }
+    wrap.appendChild(body); frag.appendChild(wrap);
+  }
+  host.appendChild(frag);
+  if(stick || anchor < 0){ host.scrollTop=host.scrollHeight; return; }
+  // Put the reader back on the message they were reading. If it no longer exists (the buffer was trimmed),
+  // fall back to the bottom rather than to an arbitrary offset.
+  const after=[...host.querySelectorAll('.th-msg')];
+  const node=after[anchor];
+  if(!node){ host.scrollTop=host.scrollHeight; return; }
+  const delta=node.getBoundingClientRect().bottom - host.getBoundingClientRect().top - anchorOffset;
+  host.scrollTop += delta;
+}
+function threadSafeToRender(){
+  try{ return isMobile() && mobileView==='threads'; }catch(e){ return false; }
+}
+// The thread list must follow OUTPUT, not just a PAINT.
+//
+// Live defect (2026-11-12): the list was driven solely by term.onRender, and xterm stops rendering while its
+// element is display:none - which is exactly the state of #term on the threads view. So the moment the phone
+// opened the conversation the list FROZE: new turns arrived in the buffer and never appeared, and the reader
+// could not scroll to them. (Measured: the buffer held Turn 31 while the DOM still ended at Turn 30, and a
+// forced renderThreads(true) drew it correctly.) Output arrival is the real signal, so it schedules the
+// rebuild directly; the render hook stays as a second source for cursor/repaint-driven changes.
+let threadsRenderTimer=0;
+function scheduleThreadsRender(){
+  if(!threadSafeToRender()) return;
+  if(threadsRenderTimer) return;                 // a burst of output is one rebuild, not one per frame
+  threadsRenderTimer=setTimeout(()=>{ threadsRenderTimer=0; renderThreads(false); }, 120);
+}
+// The composer is not a second input channel: it hands text to the SAME path the terminal uses (term.paste
+// -> onData -> send), so the lease checks, mouse-report stripping and signing all still apply. Sending is
+// text plus one CR, which is exactly what pressing Enter in the terminal does.
+function sendThreadMessage(){
+  const ta=$('#threadinput'); if(!ta) return;
+  const text=ta.value; if(!text.trim()) return;
+  if(!current){ flash('No session open'); return; }
+  ta.value=''; ta.style.height='auto';
+  try{ term.paste(text); }catch(e){ send('i', text); }
+  setTimeout(()=>{ try{ send('i','\r'); }catch(e){} }, 30);
+  markActive();
+  if(!isMobile() || mobileView!=='threads') return;
+  // The message the user just sent belongs on screen immediately, before the app echoes it back.
+  renderThreads(true);
+}
+
 function syncMobileView(){
   const app=$('#app'); if(!app) return;
   app.classList.toggle('mobile-device', isMobile());
@@ -969,6 +1368,18 @@ function syncMobileView(){
 }
 function initMobileViews(){
   document.querySelectorAll('[data-mobile-view]').forEach(b=> b.onclick=()=>setMobileView(b.dataset.mobileView));
+  wireQuickKeys();
+  const threadForm=$('#composer');
+  if(threadForm){
+    threadForm.addEventListener('submit', e=>{ e.preventDefault(); sendThreadMessage(); });
+    const ta=$('#threadinput');
+    if(ta){
+      // Grow with the text up to the CSS cap, and Enter sends while Shift+Enter (or a hardware fn key)
+      // still inserts a newline - the shape a phone message box has trained everyone to expect.
+      ta.addEventListener('input', ()=>{ ta.style.height='auto'; ta.style.height=Math.min(ta.scrollHeight, Math.round(window.innerHeight*0.38))+'px'; });
+      ta.addEventListener('keydown', e=>{ if(e.key==='Enter' && !e.shiftKey){ e.preventDefault(); sendThreadMessage(); } });
+    }
+  }
   if(window.MuxFleet) MuxFleet.attachFleet($("#fleetList"), function(name){ setMobileView("terminal"); connect(name, false); });
   if(mobileMQ.addEventListener) mobileMQ.addEventListener('change', syncMobileView);
   else if(mobileMQ.addListener) mobileMQ.addListener(syncMobileView);
@@ -1353,9 +1764,69 @@ function schedulePaintVerify(delay=40){
 // Re-measure AND repaint: the two are independent, and re-measuring alone resizes nothing when cols/rows
 // already match, which is why the manual workarounds (toggle fullscreen, hard refresh) were the only heals.
 function healTerminalSurface(reason){
+  syncRendererGeometry();
   scheduleViewportFit(0);
   schedulePaintHeal(60);
   try{ window.__muxLastSurfaceHeal = { at:Date.now(), reason:reason||'transition' }; }catch(e){}
+}
+// THE WEBGL RENDERER DOES NOT FOLLOW A GRID CHANGE ON ITS OWN.
+//
+// Measured on the phone (tab-26f4, 390x844, 2026-11-12): after this device TOOK the grid the model was
+// 49x41 and the render service already reported a 23px device cell, but the renderer kept painting at the
+// PREVIOUS scale - the pane filled with ~16 enormous clipped glyphs, with a correct paint of the same
+// buffer visible underneath. Asking the renderer for a resize at the grid it already holds repainted it
+// exactly right, at the same cols and font, with no model change and no wire traffic.
+//
+// So the renderer's geometry is a CACHE that a font/grid change must invalidate. The DOM renderer needs
+// nothing (its rows re-lay out); the WebGL one is handed its own resize, which re-derives the atlas and the
+// cell rects. Guarded to the shipped addon and a live renderer, and a no-op on the DOM fallback.
+let _rendererSyncAt = 0;
+function syncRendererGeometry(force){
+  if(!usingWebglRenderer()) return false;
+  const now = Date.now();
+  if(!force && now - _rendererSyncAt < 40) return false;   // a burst of heals is one resize
+  _rendererSyncAt = now;
+  try{
+    const r = webglAddon && webglAddon._renderer;
+    if(!r) return false;
+    if(!term.cols || !term.rows) return false;
+    const dims = term._core._renderService.dimensions;
+    // THE ONE WRITE THAT MATTERS: the addon's CANVAS BACKING STORE. The renderer resizes it inside
+    // handleResize from the dpr it cached at construction; when a grid change arrives while that cache is
+    // momentarily at 1 (or the change happens through a path that never calls handleResize), the bitmap is
+    // left at CSS size - 376 px for a 49-column grid whose every cell is 23 DEVICE px. The model and the
+    // render service are both already right; only the canvas is stale. Measured: repairing exactly this
+    // (backing store + CSS box + one redraw) repaints the screen correctly with no model change at all,
+    // and it is the cheapest of the three repairs tried (the other two are the same thing plus a full
+    // atlas re-warm).
+    const wantW = dims.device.canvas.width, wantH = dims.device.canvas.height;
+    const cv = r._canvas;
+    let wrote = false;
+    if(cv && wantW > 0 && wantH > 0 && (cv.width !== wantW || cv.height !== wantH)){
+      cv.width = wantW; cv.height = wantH;
+      cv.style.width = dims.css.canvas.width + 'px';
+      cv.style.height = dims.css.canvas.height + 'px';
+      wrote = true;
+    }
+    // A resized canvas is a CLEARED canvas (the spec resets the bitmap), so it must be redrawn in the same
+    // turn or the pane goes blank until the next output arrives.
+    if(wrote){ try{ r._requestRedrawViewport ? r._requestRedrawViewport() : term.refresh(0, term.rows-1); }catch(e){} }
+    // Keep the addon's own cached geometry honest for the paths that call handleResize later.
+    if(typeof r.handleResize === 'function'){ try{ r.handleResize(term.cols, term.rows); }catch(e){} }
+    return wrote;
+  }catch(e){ return false; }
+}
+// A GRID COMMIT LANDS IN PIECES. term.resize, the char-size re-measure and the renderer's own resize each
+// arrive on their own frame, and the LAST one wins - measured live, a repair issued in the commit frame was
+// overwritten by xterm's later resize, which sized the bitmap from a char width it had not re-measured yet
+// (376 px for a 49-column grid). So the commit path re-asserts on the next frame and once after a settle
+// window. Each call is idempotent: syncRendererGeometry writes only when the canvas is actually wrong.
+let _rendererRepairTimer = 0;
+function scheduleRendererRepair(){
+  if(!usingWebglRenderer()) return;
+  requestAnimationFrame(()=>{ syncRendererGeometry(true); });
+  if(_rendererRepairTimer) clearTimeout(_rendererRepairTimer);
+  _rendererRepairTimer = setTimeout(()=>{ _rendererRepairTimer = 0; syncRendererGeometry(true); }, 280);
 }
 // THE WATCH. healTerminalSurface covers the transitions we KNOW move the surface; this covers the ones
 // we cannot enumerate - a resize the ResizeObserver coalesced away, a viewport change while the tab was
@@ -1397,9 +1868,18 @@ function terminalSurfaceIntegrityFault(){
     // verbatim: the terminal works, the bottom bar is simply not there to press. Every control must be the
     // pointer's target at its OWN centre. A control that is off screen is the geometry fault above, so this
     // only judges the ones the user can actually see.
+    // The bar is a horizontally SCROLLING row by design (see #mobileNav), so a control past the right edge
+    // is reachable by panning - it is not the "invisible bar" fault this check exists for. Judge only the
+    // controls currently inside the bar's own box; one that is visible-but-unhit still faults.
+    const navBox=nav.getBoundingClientRect();
     for(const b of nav.querySelectorAll('button,a')){
       const br=b.getBoundingClientRect();
       if(!br.width || !br.height) continue;
+      // Clipped BY THE BAR (the row scrolls): not reachable until panned, which is the documented behaviour.
+      // Clipped by the VIEWPORT is different - that is a control the user can see and cannot press, and it
+      // still faults below.
+      const inBar = br.left >= navBox.left - 1 && br.right <= navBox.right + 1;
+      if(!inBar) continue;
       const cy=Math.round(br.top+br.height/2);
       if(cy<0 || cy>vh) continue;
       const nh=document.elementFromPoint(Math.round(br.left+br.width/2), cy);
@@ -1419,6 +1899,9 @@ function terminalSurfaceIntegrityFault(){
 let integrityHealAt=0;
 function watchTerminalSurface(){
   try{
+    // An owned grid whose cell grew after the take must be re-requested even when no 'd' arrives: the
+    // font can settle seconds later, and nothing else in this page samples the painted width.
+    try{ checkOwnedCellDrift(); }catch(e){}
     const fault=terminalSurfaceIntegrityFault();
     if(!fault) return;
     const now=Date.now();
@@ -1616,7 +2099,7 @@ function reloadTerminal(quiet){
   connect(name, true);   // re-attach: CLEAR + scrollback replay + live, all client state reset
 }
 document.addEventListener('keydown', e=>{ if(e.ctrlKey && e.altKey && (e.key==='r'||e.key==='R')){ e.preventDefault(); e.stopPropagation(); reloadTerminal(); } }, true);
-window.__muxBuild='2026-11-02-emap-inline-geometry-flex-fit';   // bump per web deploy so a loaded version is verifiable (supersedes 2026-10-09-mobile-tap-focus-nav-scroll)
+window.__muxBuild='2026-11-13-attach-repair-1';   // bump per web deploy so a loaded version is verifiable (supersedes 2026-11-11-phone-threads-1)
 try{ console.info('multiplex build', window.__muxBuild); }catch(e){}
 const helper = $('#term').querySelector('.xterm-helper-textarea');
 function hardenHelperTextarea(){
@@ -1667,12 +2150,35 @@ function resetTaDelta(clear){
   _taLast=''; _taComposing=false; _taCommittedValue=''; _taCommittedAt=0;
   if(clear){ try{ const h=$('#term').querySelector('.xterm-helper-textarea'); if(h) h.value=''; }catch(e){} }
 }
-function taFlushDelta(h){
+// A delta is an EDIT, and the event says which edit it was. Diffing the field alone cannot tell a real
+// backspace from the field having been reset behind our back, and that ambiguity is what made phone typing
+// unusable: any reset turned the next keystroke - usually the space after a word - into a burst of DELs, so
+// the session deleted the word just typed and sentences arrived run together ("makesthesentencescomeout
+// likethis"). Measured on a real 390x844 viewport: an insert arriving with a stale baseline sent
+// "\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7fx" for the single character "x ".
+//
+// The rule: DELETES COME ONLY FROM A DELETE EVENT. For any insert-ish inputType the forwarder emits just the
+// inserted text and re-anchors the baseline; the only exception is a genuine replacement (autocorrect), where
+// the event's own replacementText says the earlier chars are being swapped rather than appended.
+const TA_DELETE_TYPES = /^delete(Content|Word|SoftLine|HardLine|ByCut|ByDrag)/;
+function taFlushDelta(h, ev){
   const v = h.value || '', prev = _taLast;
+  const inputType = (ev && ev.inputType) || '';
   let cp=0; const L=Math.min(v.length, prev.length);
   while(cp<L && v.charCodeAt(cp)===prev.charCodeAt(cp)) cp++;
-  const back = prev.length - cp;
+  let back = prev.length - cp;
   let add = v.slice(cp);
+  // An INSERT never deletes. If the field does not simply extend the baseline, the baseline was lost (a
+  // reset, an IME commit, a blur) - so re-anchor to what is really in the field and send only the new text.
+  // A true replacement is the one case where the earlier characters really are being swapped out.
+  if(!TA_DELETE_TYPES.test(inputType) && back > 0){
+    const replacing = inputType === 'insertReplacementText' || inputType === 'insertFromComposition';
+    if(!replacing){
+      logMobileInputEvent('delta-reanchor', { v, prev, inputType, dropped: back });
+      back = 0;
+      add = ev && typeof ev.data === 'string' && ev.data ? ev.data : v;
+    }
+  }
   _taLast = v;
   let out = back>0 ? '\x7f'.repeat(back) : '';
   if(add){
@@ -1682,7 +2188,7 @@ function taFlushDelta(h){
   if(!out) return;
   markActive();
   if(autoFreeze && !selectMode){ autoFreeze=false; try{ term.clearSelection(); }catch(e){} flushFrozen(); syncPausedOverlay(); }
-  logMobileInputEvent('delta-send', { data: out, v, prev });
+  logMobileInputEvent('delta-send', { data: out, v, prev, inputType });
   send('i', out);
 }
 // Keys xterm must keep handling itself on mobile — they carry no textarea text. Anything else (printable
@@ -1702,7 +2208,7 @@ function installMobileInputDelta(){
   document.addEventListener('compositionend', ev=>{
     if(!mine(ev)) return;
     _taComposing=false;
-    taFlushDelta(h);
+    taFlushDelta(h, ev);
     _taCommittedValue=h.value||'';
     _taCommittedAt=Date.now();
     ev.stopPropagation();
@@ -1720,7 +2226,7 @@ function installMobileInputDelta(){
       return;
     }
     _taCommittedValue='';
-    taFlushDelta(h);
+    taFlushDelta(h, ev);
     ev.stopPropagation();
   }, true);
   document.addEventListener('keydown', ev=>{
@@ -1939,6 +2445,14 @@ let viewportFit = null;            // {cols,rows} our screen can show at the cur
 let winSize = null;                // {cols,rows} the shared window the server told us to render
 let sizeModeLabel = '';            // e.g. "auto · 100×30" / "📌 Phone · 40×80"
 let sizePinned = false, sizeMine = false, sizeLocal = false, sizeTabOwned = false, sizePinLabel = '', sizeClients = [];   // from the 'd' control frame
+// Grid ownership (GRID-OWNERSHIP-CONTRACT.md): who holds a teed tab's grid at the relay's committed
+// epoch. 'local' is the pane; 'mine'/'other' is a device that took the grid and had it acked.
+let sizeGridOwner = 'local', sizeGridEpoch = 0, sizeGridOwnerLabel = '';
+// Is this viewer the ONLY terminal on the app's one PTY? Terminal-generated replies (DA/CPR/DSR/DECRQM/
+// DCS/XTVERSION and focus) can only be forwarded from the sole terminal; with a PC terminal attached too
+// the app would receive two answers and mis-parse the second as a command. `known` is false until the
+// first 'd' of this attach arrives, during which the old classifier (drop) applies.
+let soleTerminal = true, soleTerminalKnown = false;
 // Persistent DEVICE identity so a pin follows the DEVICE across reconnects/relay restarts (not the socket).
 const deviceId = (()=>{ let d=LS.get('mux_devid',''); if(!d){ d='d'+Math.random().toString(36).slice(2,10)+Date.now().toString(36).slice(-4); LS.set('mux_devid',d); } return d; })();
 function defaultDeviceLabel(){ const ua=navigator.userAgent||''; const mob=/Mobi|Android|iPhone|iPad/i.test(ua);
@@ -1973,146 +2487,13 @@ function cellMetrics(){
   try { const d = term._core._renderService.dimensions.css.cell; if (d && d.height) return { w:d.width, h:d.height }; } catch(e){}
   return { w: appliedFont*0.6, h: appliedFont*1.2 };
 }
-// ---- TERMINAL ELEMENT MAP (OSC 21338) ---------------------------------------------------------------
-// An app that draws its own UI can also publish a semantic map of what it just painted: each element's
-// rect in ITS OWN cell space, a label, and what a tap on it means (docs/terminal-element-map.md). The
-// relay strips that sequence out of the byte stream and hands it over as an `E` control frame, so nothing
-// here touches the VT path: the terminal still draws every cell, and this layer only adds hit boxes that
-// sit on exactly those cells. Off by default - a box that swallows a press also swallows drag-select.
-let emap = null;                                    // {v, gen, cols, rows, els}
-let emapLayer = null;                               // container over the screen, created on first frame
-const emapNodes = new Map();                        // element id -> node
-let emapShown = LS.get('mux_widgets', '') === '1';  // the widgets chip, per device
-function emapActionable(el){ const a = el && el.act; return !!a && (a.t === 'ptr' || a.t === 'focus'); }
-function emapApply(m){
-  if(!m || m.v !== 1 || !Array.isArray(m.els)) return;   // an unknown version is dropped whole
-  if(emap && m.gen === emap.gen) return;                 // dedupe on gen alone: heartbeat re-sends it
-  emap = m;
-  emapBuild(); emapPlace();
-}
-function emapClear(){
-  emap = null;
-  emapNodes.clear();
-  if(emapLayer) emapLayer.textContent = '';
-}
-function emapBuild(){
-  const host = $('#term'); if(!host) return;
-  if(!emapLayer){
-    emapLayer = document.createElement('div');
-    emapLayer.id = 'emap';
-    host.appendChild(emapLayer);
-  }
-  emapLayer.classList.toggle('on', emapShown);
-  const want = new Set();
-  for(const el of (emap && emap.els) || []){
-    if(!emapActionable(el)) continue;
-    want.add(el.id);
-    let n = emapNodes.get(el.id);
-    if(!n){
-      n = document.createElement('button');
-      n.type = 'button';
-      n.className = 'emap-el';
-      n.dataset.id = el.id;
-      n.tabIndex = -1;
-      emapLayer.appendChild(n);
-      emapNodes.set(el.id, n);
-    }
-    const label = el.label || el.role || 'control';
-    n.setAttribute('aria-label', label);
-    n.title = el.label ? (el.label + ' · ' + el.role) : el.role;
-    n.dataset.role = el.role;
-    n.dataset.act = el.act ? el.act.t : '';
-  }
-  for(const [id, n] of emapNodes){
-    if(!want.has(id)){ n.remove(); emapNodes.delete(id); }
-  }
-}
-// Rows between the terminal's first row and the app block's row 0. On the alternate screen the app owns
-// the grid, so it is 0. An inline app paints its block part-way down the PTY and publishes that offset
-// as `oy` - the same number the app subtracts from every mouse row (ink.tsx getMouseRowOffset). A normal
-// screen with no `oy` is a frame from before the probe answered: its rows cannot be placed, so 0 boxes.
-function emapRowOffset(){
-  let altScreen = true;
-  try{ altScreen = term.buffer.active.type === 'alternate'; }catch(e){ altScreen = false; }
-  if(altScreen) return 0;
-  return (emap && Number.isFinite(emap.oy) && emap.oy >= 0) ? emap.oy : null;
-}
-// Place every box on the cells the app drew. The offset recipe is the one #predict already uses: the
-// screen rect is the origin and the cells divide it, so pan/rowpan/font changes need no separate maths.
-function emapPlace(){
-  if(!emapLayer || !emap) return;
-  const host = $('#term');
-  if(!host || !emapShown){ emapLayer.style.display = 'none'; return; }
-  // Columns must always line up or every box lands on the wrong cell. Rows are different: on the
-  // alternate screen the app owns the whole grid, but an INLINE app paints a block that is usually
-  // SHORTER than the PTY (a form, a picker) and publishes only those rows. Requiring equality hid every
-  // inline map - which is the common case - and the boxes simply never appeared.
-  let altScreen = true;
-  try{ altScreen = term.buffer.active.type === 'alternate'; }catch(e){ altScreen = false; }
-  if(emap.cols !== (term.cols|0)){ emapLayer.style.display = 'none'; return; }
-  if(altScreen && emap.rows !== (term.rows|0)){ emapLayer.style.display = 'none'; return; }
-  const rowOrigin = emapRowOffset();
-  if(rowOrigin === null){ emapLayer.style.display = 'none'; return; }
-  const scr = host.querySelector('.xterm-screen');
-  if(!scr){ emapLayer.style.display = 'none'; return; }
-  const r = scr.getBoundingClientRect(), hr = host.getBoundingClientRect();
-  // The screen element spans the TERMINAL's grid (term.cols x term.rows), never the app block's, so
-  // cell size comes from the terminal's counts. Dividing by emap.rows stretched every inline box by
-  // term.rows/emap.rows.
-  const trows = term.rows|0, tcols = term.cols|0;
-  if(!(trows > 0) || !(tcols > 0)){ emapLayer.style.display = 'none'; return; }
-  const cw = r.width / tcols, ch = r.height / trows;
-  if(!(cw > 0) || !(ch > 0)){ emapLayer.style.display = 'none'; return; }
-  // ox/oy add back #term's own scroll offset: the boxes are laid out inside that scroller, so a bare
-  // rect difference would undo the scroll once in the translate and again in the scroller itself.
-  const vy = term.buffer.active.viewportY|0;
-  const ox = (r.left - hr.left) + host.scrollLeft, oy = (r.top - hr.top) + host.scrollTop;
-  emapLayer.style.display = '';
-  for(const el of emap.els){
-    const n = emapNodes.get(el.id); if(!n) continue;
-    const y = rowOrigin + el.r[1] - vy;
-    if(y + el.r[3] <= 0 || y >= rowOrigin + emap.rows){ n.style.display = 'none'; continue; }
-    n.style.display = '';
-    n.style.transform = `translate(${Math.round(ox + el.r[0]*cw)}px, ${Math.round(oy + y*ch)}px)`;
-    n.style.width = Math.max(4, Math.round(el.r[2]*cw)) + 'px';
-    n.style.height = Math.max(4, Math.round(el.r[3]*ch)) + 'px';
-  }
-}
-// A tap on a box has to travel the same bytes a click on that cell already travels, or the app sees a
-// different event depending on whether the box was drawn. Centre cell, floored - the cell the app's own
-// half-open hit test lands on - then the exact press/release pair the host mouseup path builds.
-function emapTap(id){
-  const el = emap && emap.els.find(e => e.id === id);
-  if(!emapActionable(el)) return;
-  if(el.act.t === 'focus'){ try{ term.focus(); }catch(e){} flash('Typing goes to the app'); return; }
-  const s = findSession(current);
-  const wantApp = !!(s && (s.hasCommand || (s.sessionId && !s.shellOnly)));
-  if(!wantApp){ flash('Nothing behind this pane to tap'); return; }
-  // The app publishes the cell it wants pressed. Use it: a rect centre I derive is a different cell for
-  // an even-width control, and a control 118 cells wide does not mean the same thing at cell 60 as at 61.
-  const cx = Number.isInteger(el.act.x) ? el.act.x : el.r[0] + Math.floor(el.r[2] / 2);
-  const cy = Number.isInteger(el.act.y) ? el.act.y : el.r[1] + Math.floor(el.r[3] / 2);
-  // The press goes out in terminal space, and the app's (x,y) are app-space: add the same block origin
-  // the boxes were placed with. A box is only drawn when that origin is known, so this cannot be null
-  // for a visible control.
-  const rowOrigin = emapRowOffset();
-  if(rowOrigin === null){ flash('This app has not published where its screen starts'); return; }
-  const b = Math.min(2, Math.max(0, el.act.b|0));
-  const at = `\x1b[<${b};${cx+1};${rowOrigin+cy-(term.buffer.active.viewportY|0)+1}`;
-  const click = at + 'M', release = at + 'm';
-  mouseGuard.noteForwarded(click + release, Date.now());
-  sendMouseInput(click);
-  sendMouseInput(release);
-}
-function cycleEmap(){
-  emapShown = !emapShown;
-  LS.set('mux_widgets', emapShown ? '1' : '');
-  emapBuild(); emapPlace();
-  const b = $('#widgetsbtn'); if(b) b.classList.toggle('on', emapShown);
-  flash(emapShown
-    ? (emap ? 'Widget boxes on · taps land on the app cell' : 'Widget boxes on · waiting for this app to publish a map')
-    : 'Widget boxes off');
-}
+// ---- ELEMENT MAP (OSC 21338) REMOVED ---------------------------------------------------------------
+// The app can still publish a semantic map on the VT stream, and the relay still hands it over as an `E`
+// control frame, but this viewer no longer consumes it. The overlay's hit boxes were a second, independent
+// pointer-to-cell mapping (its own row origin, its own scale) sitting over the terminal's; a tap must
+// travel exactly the bytes the app's own mouse mode produces for the cell under the pointer, nothing else.
+// The stored preference is retired with the code, so no device keeps a capability this build lacks.
+try{ localStorage.removeItem('mux_widgets'); }catch(e){}
 // ---- SIZE A PC TAB'S SCREEN THE WAY A TERMINAL WOULD ----
 // A tab-owned grid (a teed PC tab) is that terminal's physical screen: its cols x rows are fixed and the
 // relay will not resize it for this viewer. So the whole grid is fitted into the pane the way a terminal
@@ -2137,67 +2518,13 @@ let tabFontScale = (()=>{          // A+/A- on a tab-owned grid becomes a zoom o
 })();
 // How a fixed grid meets a pane whose aspect it does not match. 'fill' uses every pixel of width and
 // scrolls vertically (a real terminal window's behaviour when its font is bigger than the screen);
-// 'fit' shows every row and takes the margins; 'flex' fills the width like 'fill' and then squeezes the
-// line box (xterm's lineHeight) until every row also fits - no scrolling and no side margins, at the
-// cost of tighter leading. The choice is per device and remembered, because a desktop and a phone want
-// opposite answers.
-let tabFitMode = (()=>{ const v=LS.get('mux_tab_fit'); return (v==='fit'||v==='flex') ? v : 'fill'; })();
+// 'fit' shows every row and takes the margins. The old third mode scaled the rendered screen
+// non-uniformly; it is gone (contract section 6) and a device that wants a different grid takes it
+// instead. The choice is per device and remembered, because a desktop and a phone want opposite
+// answers.
+let tabFitMode = (()=>{ const v=LS.get('mux_tab_fit'); return v==='fit' ? 'fit' : 'fill'; })();
 let tabFitRejected = 0, tabFitPaneW = -1, tabFitPaneH = -1, tabFitPaneScale = 0, tabFitPaneMode = '';
 let tabFitFollowup = 0;
-// xterm's own `lineHeight` option refuses anything below 1 ("lineHeight cannot be less than 1"), so the
-// row height cannot be squeezed there. 'flex' instead paints the grid at the width-filling font and
-// applies a vertical SCALE to the rendered screen: every column lands on the pane edge, every row lands
-// inside it, and the glyphs are compressed instead of the grid being scrolled or letterboxed.
-let tabFlexSx = 1, tabFlexSy = 1;
-// Below this the glyphs stop being readable; 'flex' then settles here and scrolls like 'fill'.
-const FLEX_SCALE_FLOOR = 0.72;
-// Font sizes are whole pixels, so the largest font that fits a pane can be up to one cell short of it
-// (~9% of an 11px cell). A small horizontal stretch closes that gap instead of leaving a dead margin.
-const FLEX_STRETCH_MAX = 1.12;
-// The vertical scale that puts `rows` rows of `cellH` px inside `availH` px. Pure arithmetic so the
-// fit's only non-obvious decision is testable without a renderer. One pixel is left for xterm's
-// per-cell floor() so the analytic answer cannot land one row outside the pane.
-function flexScaleTarget(availH, rows, cellH){
-  if(!(availH > 1) || !(rows > 0) || !(cellH > 0)) return 1;
-  const ratio = (availH - 1) / (rows * cellH);
-  if(!(ratio > 0)) return 1;
-  return Math.max(FLEX_SCALE_FLOOR, Math.min(1, ratio));
-}
-// The horizontal scale that makes `cols` cells of `cellW` px span `availW` px exactly. Only ever
-// stretches (never squeezes); `fit` does not use it because its side margins are the point.
-function flexStretchTarget(availW, cols, cellW){
-  if(!(availW > 1) || !(cols > 0) || !(cellW > 0)) return 1;
-  const ratio = availW / (cols * cellW);
-  if(!(ratio > 1)) return 1;
-  return Math.min(FLEX_STRETCH_MAX, ratio);
-}
-// Put (or remove) the transform on xterm's screen element. Only that element: the viewport scroller and
-// the host keep their real size, so scrolling, `#term` clipping and the pan classes all behave as they
-// do in the other two modes. Every hit test in this page divides the SCREEN RECT by the grid counts
-// (bufferCellAt, emapPlace), so a transformed screen stays exact for taps, drag-select and widget boxes.
-function applyFlexTransform(sx, sy){
-  const wx = Math.max(1, Math.min(FLEX_STRETCH_MAX, Number(sx) || 1));
-  const wy = Math.max(FLEX_SCALE_FLOOR, Math.min(1, Number(sy) || 1));
-  const host = $('#term');
-  // The fit can run before xterm has put its screen element in the host (first layout, a tab switch), so
-  // there is nothing to scale yet; the next fit pass applies it.
-  const scr = host && host.querySelector ? host.querySelector('.xterm-screen') : null;
-  if(!scr){ tabFlexSx = 1; tabFlexSy = 1; return; }
-  const on = wx > 1.001 || wy < 0.999;
-  if(Math.abs(wx - tabFlexSx) < 0.002 && Math.abs(wy - tabFlexSy) < 0.002 && (scr.style.transform !== '') === on) return;
-  tabFlexSx = wx; tabFlexSy = wy;
-  if(on){
-    // Flush-left when stretched: with the default auto margins the .xterm box is centred and a scale from
-    // its left edge would overflow the pane on the right and leave a gap on the left.
-    host.classList.add('stretch');
-    scr.style.transformOrigin = '0 0';
-    scr.style.transform = 'scale(' + Math.round(wx * 1000) / 1000 + ',' + Math.round(wy * 1000) / 1000 + ')';
-  } else {
-    host.classList.remove('stretch');
-    scr.style.transform = '';
-    scr.style.transformOrigin = '';
-  }
-}
 // Cell metrics only change after the renderer repaints, so the estimate that drove one step was read at
 // the PREVIOUS font size. Re-running the fit once on the next frame is what makes the search converge in
 // one repaint instead of settling at a size that was never measured (seen live: 12 where 13 fits, and a
@@ -2206,15 +2533,92 @@ function scheduleTabFitFollowup(){
   if(tabFitFollowup) return;
   tabFitFollowup = requestAnimationFrame(()=>{ tabFitFollowup = 0; fitTabOwnedGrid(); });
 }
+// Is this grid READABLE on this device, or is it a wide mirror that needs the conversation surface?
+//
+// Only asked on a phone-sized pane. The fit search can always make a wide grid "fit" by shrinking the
+// font, and it did: 209 columns in a 390 px pane settled at font 8 with the paint still 2.3x too wide -
+// unreadable AND clipped, while the chip claimed "fills width". The honest question is not "does it fit",
+// it is "would the font that fits be legible". Anything below MIN_READABLE_FONT_PX is not.
+//
+// Returns {readable, fitFont, hint}: `hint` names the surface to offer when it is not readable, so the
+// caller never has to invent the next step.
+function phoneGridVerdict(o){
+  const MIN_READABLE_FONT_PX = 10;
+  const paneW = Math.max(0, Number(o && o.paneW) || 0);
+  const cols = Math.max(1, Number(o && o.cols) || 1);
+  const cellW = Number(o && o.cellW) > 0 ? Number(o.cellW) : 0;
+  const font = Number(o && o.font) > 0 ? Number(o.font) : 14;
+  if(!paneW || !cellW) return { readable: true, fitFont: font, hint: '' };
+  // Cell width scales linearly with font size, so the font that spans the pane is a single division.
+  const perCol = cellW / font;
+  const fitFont = Math.round((paneW / (cols * perCol)) * 10) / 10;
+  const readable = fitFont >= MIN_READABLE_FONT_PX;
+  return { readable: readable, fitFont: fitFont, hint: readable ? '' : 'threads' };
+}
+// A phone cannot read a wide mirror, and pretending it can is worse than saying so. When the grid would
+// need an illegible font, the pane keeps a readable slice and this banner offers the two surfaces that
+// actually work at this width. Both are real: taking the grid is the designed ladder (the pin resizes the
+// child pty to THIS viewport, so the tab becomes ~50 columns and paints 1:1), and the conversation view is
+// the reading/replying surface. Neither is a fallback that fakes it.
+let _narrowNoticeFor='';
+let _narrowDismissed='';        // the geometry key the user dismissed; a different grid earns a new notice
+function showNarrowGridNotice(verdict){
+  const host=$('#term');
+  if(!host) return;
+  const key=current+'|'+(verdict&&verdict.fitFont);
+  if(_narrowDismissed===key) return;
+  if(_narrowNoticeFor===key && document.getElementById('narrowgrid')) return;
+  _narrowNoticeFor=key;
+  let el=document.getElementById('narrowgrid');
+  if(!el){
+    el=document.createElement('div');
+    el.id='narrowgrid';
+    el.className='narrowgrid';
+    host.parentNode.insertBefore(el, host);
+  }
+  el.innerHTML='';
+  const msg=document.createElement('span');
+  msg.className='msg';
+  msg.textContent='This PC tab is '+(term.cols||'many')+' columns wide - unreadable at full size here. ';
+  // TAKING THE GRID IS THE REAL FIX, and it is the ladder's own step, not a special case: the request
+  // re-pins the tab to this device's viewport, the tee resizes the child pty, and the app redraws at
+  // ~50 columns which then paints 1:1 at a legible font. Offering only "read the conversation" made the
+  // notice a one-way door, and on a phone the terminal is where you actually reply with keys.
+  const take=document.createElement('button');
+  take.type='button'; take.className='take';
+  take.textContent='Resize to this screen';
+  take.title='Pin the tab to this phone so the app redraws at this screen\'s width. The PC tab resizes; the size chip gives it back.';
+  take.onclick=()=>{ if(!_gridBusy) takeGrid(); };
+  const convo=document.createElement('button');
+  convo.type='button'; convo.textContent='Read the conversation';
+  convo.onclick=()=>{ setMobileView('threads'); };
+  // Dismissing is per-SESSION and lasts until the pane's geometry changes: the notice must never come
+  // back on the next repaint of the same grid, or it is a banner that fights the finger.
+  const x=document.createElement('button');
+  x.type='button'; x.className='x'; x.textContent='×'; x.setAttribute('aria-label','Dismiss');
+  x.onclick=()=>{ dismissNarrowGridNotice(); };
+  el.appendChild(msg); el.appendChild(take); el.appendChild(convo); el.appendChild(x);
+}
+function dismissNarrowGridNotice(){
+  _narrowDismissed=_narrowNoticeFor;
+  clearNarrowGridNotice();
+}
+function clearNarrowGridNotice(){
+  _narrowNoticeFor='';
+  const el=document.getElementById('narrowgrid');
+  if(el) el.remove();
+}
 function fitTabOwnedGrid(){
   const host=$('#term');
   if(!host) return;
-  const owned = !!(sizeTabOwned && !sizePinned);
+  // Two ways the grid can be ours to lay out: the pane owns it (fill/fit are pure rendering), or THIS
+  // device owns it (then its grid IS its viewport, and the view must be 1:1 - no fill/fit, no scale).
+  const paneOwns = !!(sizeTabOwned && !sizePinned);
+  const weOwn = !!(sizePinned && sizeMine);
+  const owned = paneOwns || weOwn;
   host.classList.toggle('tabfit', owned);
   if(!owned){
     tabFitRejected=0; tabFitPaneW=-1; tabFitPaneH=-1; tabFitPaneMode='';
-    // A grid we no longer own must not keep the transform of a mode we left.
-    applyFlexTransform(1, 1);
     if(appliedFont!==fontSize){ appliedFont=fontSize; try{ term.options.fontSize=fontSize; }catch(e){} }
     return;
   }
@@ -2223,40 +2627,51 @@ function fitTabOwnedGrid(){
   const availW=host.clientWidth-(parseFloat(cs.paddingLeft)||0)-(parseFloat(cs.paddingRight)||0);
   const availH=host.clientHeight-(parseFloat(cs.paddingTop)||0)-(parseFloat(cs.paddingBottom)||0);
   if(availW<80 || availH<60) return;
+  // OWNING DEVICE. It is 1:1 at a whole-pixel font THIS device chose, and the grid was derived from
+  // that font - so the font is authoritative and is never re-fitted against the committed grid. A pane
+  // change is a new grid REQUEST, not a new font. Letting the search shrink the font to fit the old grid
+  // (seen live: font 10 at a 1084px pane) then made the re-measure ask for a grid of 5px cells.
+  if(weOwn){
+    // The grid is this device's now, so the "too wide to read" state and its notice are both over.
+    clearNarrowGridNotice();
+    const nativeFont = Math.max(8, Math.min(48, Math.round(fontSize)));
+    if(appliedFont !== nativeFont){
+      appliedFont = nativeFont;
+      try{ term.options.fontSize = nativeFont; }catch(e){}
+      // A font change is a new cell, so the renderer must be told. Without this the owned grid paints at the
+      // PREVIOUS scale - giant clipped glyphs over a correct paint (the phone defect, 2026-11-12).
+      syncRendererGeometry();
+    }
+    const moved = tabFitPaneW>=0
+      && (Math.abs(availW-tabFitPaneW) > 1 || Math.abs(availH-tabFitPaneH) > 1);
+    tabFitPaneW=availW; tabFitPaneH=availH;
+    tabFitPaneMode='own'; tabFitPaneScale=1; tabFitRejected=0;
+    if(moved){ try{ requestNativeRemeasure(); }catch(e){} }
+    checkOwnedCellDrift();
+    return;
+  }
+  // PANE-OWNED. fill/fit only change how this fixed grid is painted.
+  const modeKey = tabFitMode;
   // A real window resize re-opens the search. A scrollbar appearing does not: pan/rowpan are toggled by
   // this very fit, and a 15px clientWidth change would otherwise clear the latch on every step and send
   // the font back up to the size that just overflowed (seen live: fill bouncing to 17 with a pan bar).
-  const paneMoved = Math.abs(availW-tabFitPaneW) > 24 || Math.abs(availH-tabFitPaneH) > 24;
-  if(tabFitPaneW<0 || paneMoved || tabFontScale!==tabFitPaneScale || tabFitMode!==tabFitPaneMode){
-    tabFitPaneScale=tabFontScale; tabFitPaneMode=tabFitMode; tabFitRejected=0;
-    // Any mode that is not 'flex' shows the grid at its natural height; the reset also clears a scale
-    // left behind, so switching away cannot leave a transformed screen.
-    if(tabFitMode!=='flex') applyFlexTransform(1, 1);
+  const paneMoved = tabFitPaneW>=0
+    && (Math.abs(availW-tabFitPaneW) > 24 || Math.abs(availH-tabFitPaneH) > 24);
+  if(tabFitPaneW<0 || paneMoved || tabFontScale!==tabFitPaneScale || modeKey!==tabFitPaneMode){
+    tabFitPaneScale=tabFontScale; tabFitPaneMode=modeKey; tabFitRejected=0;
   }
   tabFitPaneW=availW; tabFitPaneH=availH;
   const cell=cellMetrics();
   if(!(cell.w>0) || !(cell.h>0)) return;
-  // -- the transform that makes the mode's promise literal -------------------------------------------
-  // A whole-pixel font can leave up to a cell of dead space on either axis. 'fill' and 'fit' keep their
-  // own answers (and are left exactly as they shipped); 'flex' closes both gaps with one transform -
-  // stretched up to the pane edge horizontally and squashed down so all rows land inside vertically.
-  // Layout metrics do not change under a transform, so this is one analytic step per pass.
-  const sx = tabFitMode==='flex' ? flexStretchTarget(availW, term.cols, cell.w) : 1;
-  const sy = tabFitMode==='flex' ? flexScaleTarget(availH, term.rows, cell.h) : 1;
-  if(Math.abs(sx - tabFlexSx) > 0.002 || Math.abs(sy - tabFlexSy) > 0.002){
-    applyFlexTransform(sx, sy);
-    scheduleTerminalSurfaceAlign();
-  }
   // Font size that exactly spans the pane on each axis. Cell metrics are read from the size now in use,
   // so dividing by appliedFont makes both estimates font-size independent.
   const fitW = availW/(term.cols*(cell.w/appliedFont));
   const fitH = availH/(term.rows*(cell.h/appliedFont));
   if(!isFinite(fitW) || !isFinite(fitH) || fitW<=0 || fitH<=0) return;
-  const fill = tabFitMode !== 'fit';
-  // 'fill' and 'flex' both take the width estimate. 'fill' lets the height overflow
-  // (alignTerminalSurface keeps the bottom rows - the status bar and leaf line - pinned in view, and the
-  // rest is a row scroll). 'flex' closes the last of both gaps with the screen transform above, so the
-  // width is exact and every row is visible. 'fit' takes the smaller estimate and lives with the margins.
+  const fill = (tabFitMode !== 'fit');
+  // 'fill' takes the width estimate and lets the height overflow (alignTerminalSurface keeps the bottom
+  // rows - the status bar and leaf line - pinned in view, and the rest is a row scroll). 'fit' takes the
+  // smaller estimate and lives with the margins.
   const fitFont = fill ? fitW : Math.min(fitW, fitH);
 
   if(tabFontScale !== 1){
@@ -2271,6 +2686,29 @@ function fitTabOwnedGrid(){
     return;
   }
 
+  // READABLE FLOOR, decided before any shrinking. On a phone-sized pane a wide mirror can always be made
+  // to "fit" by shrinking the font - live that settled at 8 px with the paint still 2.3x too wide, so the
+  // text was unreadable AND clipped while the chip claimed "fills width". Below the floor the font is not
+  // reduced further: the pane shows a readable slice with the pan bar, and the chip/notice points at the
+  // conversation surface, which is the one built for a narrow screen. This is a phone-only floor; a
+  // desktop pane that has room never reaches it.
+  const verdict = (isMobile() && !weOwn)
+    ? phoneGridVerdict({ paneW: availW, cols: term.cols, cellW: cell.w, font: appliedFont })
+    : { readable: true, fitFont: 0, hint: '' };
+  if(isMobile() && !verdict.readable){
+    const floor = 11;
+    if(appliedFont < floor || appliedFont > floor + 0.75){
+      appliedFont = floor;
+      try{ term.options.fontSize = floor; }catch(e){}
+    }
+    tabFitPaneW=availW; tabFitPaneH=availH; tabFitPaneMode='unreadable'; tabFitPaneScale=tabFontScale;
+    syncRendererGeometry();
+    applyPan();
+    scheduleTerminalSurfaceAlign();
+    showNarrowGridNotice(verdict);
+    return;
+  }
+  clearNarrowGridNotice();
   // The latch watches only the axis this mode is fitting: in 'fill' a tall grid is expected and the
   // row pan handles it, so height must not be read as an overflow.
   const overflow = fill
@@ -2288,6 +2726,7 @@ function fitTabOwnedGrid(){
   if(want===appliedFont || want===tabFitRejected) return;
   appliedFont=want;
   try{ term.options.fontSize=want; }catch(e){}
+  syncRendererGeometry();
   applyPan();                    // the pan/rowpan classes follow the new painted size, not a stale measure
   scheduleTerminalSurfaceAlign();
   scheduleTabFitFollowup();      // and the next frame re-measures the cell at this font and settles
@@ -2307,7 +2746,9 @@ function applyPan(){
   // .xterm element to the pane while the screen inside stays narrow - the "offset to the left" look.
   const cs=getComputedStyle(host);
   const innerW=host.clientWidth-(parseFloat(cs.paddingLeft)||0)-(parseFloat(cs.paddingRight)||0);
-  const panning = (sizeTabOwned && !sizePinned && term.cols)
+  // The owning device never pans: its committed grid is its own viewport, so there is nothing outside.
+  const weOwn = !!(sizePinned && sizeMine);
+  const panning = weOwn ? false : (sizeTabOwned && !sizePinned && term.cols)
     ? (term.cols*cellMetrics().w > innerW+1)
     : (winSize.cols > viewportFit.cols+1);
   host.classList.toggle('pan', panning);
@@ -2318,7 +2759,7 @@ function applyPan(){
 let surfaceAlignRaf=0;
 function scheduleTerminalSurfaceAlign(){
   if(surfaceAlignRaf) cancelAnimationFrame(surfaceAlignRaf);
-  surfaceAlignRaf=requestAnimationFrame(()=>{ surfaceAlignRaf=0; alignTerminalSurface(); emapPlace(); });
+  surfaceAlignRaf=requestAnimationFrame(()=>{ surfaceAlignRaf=0; alignTerminalSurface(); });
 }
 let wasRowOverflow=false, alignedContentRow=-1, alignedScrollTop=0;
 function alignTerminalSurface(){
@@ -2331,11 +2772,8 @@ function alignTerminalSurface(){
   const padY=(parseFloat(cs.paddingTop)||0)+(parseFloat(cs.paddingBottom)||0);
   const visibleH=Math.max(0, host.clientHeight-padY);
   const owned = !!(sizeTabOwned && !sizePinned);
-  // 'flex' paints the grid at its natural cell height and then scales the SCREEN down, so what has to
-  // fit the pane is the scaled height; using the unscaled one would keep the rowpan scrollbar alive.
-  const rowScale = (owned && tabFitMode==='flex') ? tabFlexSy : 1;
   const rowOverflow = owned
-    ? (!!term.rows && term.rows*cellMetrics().h*rowScale > visibleH+1)
+    ? (!!term.rows && term.rows*cellMetrics().h > visibleH+1)
     : !!(winSize && viewportFit && winSize.rows > viewportFit.rows+1);
   host.classList.toggle('rowpan', rowOverflow);
   if(!rowOverflow){
@@ -2346,7 +2784,7 @@ function alignTerminalSurface(){
     // A fitted grid is narrower than the pane, so it is also shorter: place it like a terminal window
     // sitting on a larger desktop (centred) instead of pinning it to the top edge.
     if(owned){
-      const gridH=(term.rows||0)*cellMetrics().h*rowScale;
+      const gridH=(term.rows||0)*cellMetrics().h;
       const slack=visibleH-gridH;
       if(slack>2) xt.style.marginTop=Math.round(slack/2)+'px';
     }
@@ -2385,39 +2823,370 @@ function alignTerminalSurface(){
   wasRowOverflow=true;
 }
 function onControl(s){
-  if(s[0]==='E'){                     // element map: full replacement, last-wins, no name needed (one socket per session)
-    let em; try{ em=JSON.parse(s.slice(1)); }catch(e){ return; }
-    emapApply(em);
-    return;
-  }
+  // 'E' was the element-map channel (OSC 21338). The overlay it fed is gone, so the frame is ignored
+  // whole: nothing is parsed, and a late or hostile `E` cannot reach any state in this page. The relay
+  // still emits it; removing the emission is the other end's change, not this one's.
   if(s[0]!=='d') return;
   let m; try{ m=JSON.parse(s.slice(1)); }catch(e){ return; }
+  const prevOwner=sizeGridOwner, prevPinned=sizePinned, prevTabOwned=sizeTabOwned;
   winSize={cols:m.cols, rows:m.rows}; sizeModeLabel=m.modeLabel||'';
-  sizePinned = m.mode==='pinned'; sizeMine = !!m.mine; sizeLocal = !!m.local; sizeTabOwned = !!m.tabOwned; sizePinLabel = m.pinLabel||''; sizeClients = m.clients||[];
-  if(term.cols!==m.cols || term.rows!==m.rows){ try{ preserveTermViewport(()=>term.resize(m.cols, m.rows)); hardenHelperTextarea(); installMobileInputDelta(); }catch(e){} }
-  // Heal on EVERY size frame, not only on a grid change. A 'd' that re-asserts the size we already have is
-  // exactly the frame that used to be a no-op: it proves the relay and this surface disagree about the
-  // past (a reconnect, a re-measure, a lease handover), and the rows xterm drew under the old belief are
-  // still on screen. Repainting costs one refresh of the visible rows.
-  schedulePaintHeal(20);
-  fitTabOwnedGrid();
-  applyPan(); updateMeta(); updateSizeBtn();
+  sizeGridOwner = m.gridOwner || 'local'; sizeGridEpoch = Number.isInteger(m.gridEpoch) ? m.gridEpoch : 0; sizeGridOwnerLabel = m.gridOwnerLabel || '';
+  if(sizeGridOwner === 'mine' && _takeTimer){ clearTimeout(_takeTimer); _takeTimer = null; }
+  const gridHeld = sizeGridOwner === 'mine' || sizeGridOwner === 'other';
+  // Ownership is the COMMITTED grid, not the relay's pin record: a take is a request, and until muxd
+  // acks it the grid is still the pane's. Trusting the pin record made the chip claim a handover that
+  // had not happened, so the ladder stopped offering fill/fit and the next tap looked like a no-op.
+  const committedGrid = Object.prototype.hasOwnProperty.call(m, 'gridOwner');
+  sizePinned = committedGrid ? gridHeld : (m.mode === 'pinned');
+  sizeMine = committedGrid ? (sizeGridOwner === 'mine') : (sizePinned && !!m.mine);
+  // Clear the pending state ONLY when the request it stands for has actually landed. Every 'v' makes the
+  // relay recompute and broadcast a 'd', and the take sends its 'v' before its 'P' - so a blanket
+  // "owner is local -> not busy" cleared the chip mid-flight, re-armed it, and let a second tap issue a
+  // second request. That is the same glitch one layer deeper, so key the clear to the act, not to 'local'.
+  if(_gridBusy === 'take' && sizeGridOwner === 'mine'){
+    _gridBusy = null; clearTimeout(_takeTimer); _takeTimer = null;
+  } else if(_gridBusy === 'release' && sizeGridOwner === 'local' && !sizePinned){
+    _gridBusy = null; clearTimeout(_takeTimer); _takeTimer = null;
+  }
+  sizeLocal = !!m.local; sizeTabOwned = !!m.tabOwned; sizePinLabel = m.pinLabel || sizeGridOwnerLabel; sizeClients = m.clients||[];
+  // Presence, not truthiness: an old relay omits the field entirely, and that is the only case that falls
+  // back to today's size-based classifier. A relay that sends it has told us the answer even when false.
+  soleTerminal = Object.prototype.hasOwnProperty.call(m,'attachedLocal') ? !m.attachedLocal : !(sizeLocal || sizeTabOwned);
+  soleTerminalKnown = true;
+  if(term.cols!==m.cols || term.rows!==m.rows){
+    try{ preserveTermViewport(()=>term.resize(m.cols, m.rows)); hardenHelperTextarea(); installMobileInputDelta(); }catch(e){}
+    // term.resize re-derives the renderer at the new grid; ask it once more at the size it now holds, and
+    // again after the settle, so the renderer's own debounced resize cannot leave the bitmap at the old
+    // scale (measured: 376 px backing store for a 49-column grid after a take).
+    scheduleRendererRepair();
+  }
+  // A take is committed only when muxd says so. Record when that landed, so the round trip can be
+  // measured on the live page instead of being assumed fast.
+  // A commit landed for THIS device: stamp it. The owned-cell drift check refuses to re-request inside a
+  // settle window after this, so the renderer can finish re-measuring the face before it is judged.
+  if(sizeGridOwner === 'mine'){ window.__muxLastAckAt = Date.now(); }
+  if(sizeGridOwner === 'mine' && window.__muxGridTiming && !window.__muxGridTiming.ackAt){
+    window.__muxGridTiming.ackAt = Math.round(performance.now());
+  }
+  // Repaint only when this frame tells the surface something it does not already show: the grid moved,
+  // or ownership moved (a take/release changes who paints whom). Re-asserting the same grid used to run
+  // two full refreshes plus a forced-layout fit for EVERY connected viewer on EVERY 'd', so a second
+  // device felt the first device's geometry churn. A no-op frame now costs nothing.
+  const geomChanged = term.cols!==m.cols || term.rows!==m.rows;
+  const ownChanged = prevOwner!==sizeGridOwner || prevPinned!==sizePinned || prevTabOwned!==sizeTabOwned;
+  const firstFrame = !_paintReady;
+  if(firstFrame) _paintReady = true;
+  if(firstFrame){
+    // A cold attach can land before the renderer has painted, so repaint the LOCAL surface - but do not
+    // run the fault detector on this frame. Its escalation is a SERVER repaint ('R') and the relay
+    // rate-limits that to one per 10s per session, so a request spent at attach starves the manual
+    // Repaint button and the app's own next redraw: repaint-request.test.js's button click was swallowed.
+    healTerminalPaint();
+    requestAnimationFrame(()=>{ healTerminalPaint(); });
+    fitTabOwnedGrid();
+    applyPan();
+  } else if(geomChanged || ownChanged){
+    // The renderer's geometry is a cache keyed on the grid; a commit that changes it must invalidate that
+    // cache. This is the grid-ownership half of the phone defect (2026-11-12): the model took 49x41 while
+    // the WebGL canvas kept painting the previous scale, so the pane showed giant clipped glyphs.
+    // `scheduleRendererRepair` (not a bare sync) because the renderer's own resize lands a frame later and
+    // would otherwise undo a repair issued here.
+    scheduleRendererRepair();
+    schedulePaintHeal(20);
+    fitTabOwnedGrid();
+    applyPan();
+  }
+  updateMeta(); updateSizeBtn();
 }
 // TAP the size chip = pin the shared window to THIS device (everyone mirrors/pans it) — last-pinner-wins.
 // Tap again when it's already yours = back to auto. Long-press = pin another connected device.
 // On a tab-owned grid there is no pin to offer (the PTY is the PC's screen), so the tap switches how this
 // device renders that fixed grid instead: fill the width, fit every row, or both at once.
-function cycleSize(){
-  if(sizeTabOwned && !sizePinned){
-    tabFitMode = (tabFitMode==='fill') ? 'fit' : (tabFitMode==='fit') ? 'flex' : 'fill';
-    LS.set('mux_tab_fit', tabFitMode);
-    fitTabOwnedGrid(); applyPan(); scheduleTerminalSurfaceAlign(); updateMeta(); updateSizeBtn();
-    flash(tabFitMode==='fill' ? 'Filling the width; scroll for the rows above'
-        : tabFitMode==='fit' ? 'Fitting every row; side margins fill the rest'
-        : 'Filling the width and squeezing the row height until every row fits');
+// The chip is a button: clicking it leaves focus ON it, and then the keyboard goes to the button
+// instead of the terminal. Every branch below hands the keyboard back.
+// The keyboard belongs to the TERMINAL, and only to it. On a desktop, focusing the terminal after a tap is
+// the right way to hand the keyboard back to the pane. On a PHONE the same call POPS THE SOFT KEYBOARD UP -
+// so tapping the size chip (a display-only control) opened the keyboard over the screen the user was trying
+// to look at. Measured: tapping #statusmeta left document.activeElement on the helper textarea, i.e. the
+// keyboard opened. A tap that only reads a readout must leave focus exactly where it was.
+function refocusTerminal(opt){
+  if(opt && opt.ownerTap && isMobile()){
+    // Give the tap back to the page: blur whatever the click landed on (buttons take focus on tap) without
+    // pulling focus into the terminal. If the pane was ALREADY focused, keep it - the user is typing.
+    const a=document.activeElement;
+    if(a && a!==document.body && !(a.tagName==='TEXTAREA' && a.classList.contains('xterm-helper-textarea'))){
+      try{ a.blur(); }catch(e){}
+    }
     return;
   }
-  send('P', (sizePinned && sizeMine) ? '0' : '');
+  try{ term.focus({preventScroll:true}); }catch(e){ try{ term.focus(); }catch(_){} }
+}
+let _takeTimer = null;
+let _reReqTimer = null;
+let _gridBusy = null;          // 'take' | 'release' while a request is in flight
+let _paintReady = false;       // first 'd' after attach always repaints; after that only real changes do
+let _ownedRefitAt = 0;         // last time an owned grid was re-requested because its cell had changed
+// The grid this device takes is THIS viewport's, at a WHOLE-PIXEL font. Deriving it from the font we
+// were using to mirror someone else's grid, then fitting the font back into that grid, is two roundings
+// that never agree: the owned view lands fractionally scaled with a bezel. Choose the font first and let
+// cols/rows follow it, once - that is what makes the owned grid native.
+//
+// Measured from the HOST box, not `fit.proposeDimensions()`: while this device owns the grid the xterm
+// element is exactly the committed grid's width, which can be wider than the pane, and the fit addon
+// measures the element - so it proposes MORE columns for a NARROWER window (seen live: 203 columns at
+// 1440px, 217 proposed at 1100px). The host box is the viewport; that is what the grid must come from.
+function nativeDims(cell){
+  const host=$('#term'); if(!host) return null;
+  const cs=getComputedStyle(host);
+  const availW=host.clientWidth-(parseFloat(cs.paddingLeft)||0)-(parseFloat(cs.paddingRight)||0);
+  const availH=host.clientHeight-(parseFloat(cs.paddingTop)||0)-(parseFloat(cs.paddingBottom)||0);
+  cell = cell || cellMetrics();
+  if(!(cell.w>0) || !(cell.h>0) || availW<80 || availH<60) return null;
+  const dim={ cols: Math.max(10, Math.floor(availW/cell.w)), rows: Math.max(3, Math.floor(availH/cell.h)) };
+  try{ (window.__ndLog=window.__ndLog||[]).push({t:Math.round(performance.now()),w:Math.round(availW),h:Math.round(availH),cw:Math.round(cell.w*100)/100,ch:Math.round(cell.h*100)/100,cols:dim.cols,rows:dim.rows}); if(window.__ndLog.length>40) window.__ndLog.shift(); }catch(e){}
+  return dim;
+}
+// Cell metrics only refresh after the renderer repaints at the new font, and on a cold page the first
+// reads can still describe a fallback face (seen live: a 6px cell at a 14px font, which produced a
+// 235-column grid and then a font search that shrank the font to make it fit). When the renderer's own
+// reading is not this font's, measure the FACE with a canvas - never `fit.proposeDimensions()`, which
+// measures the terminal element and proposes more columns for a narrower window (the bug this path
+// exists to avoid). The range is wide on purpose: a condensed or wide system monospace, or an OS
+// text-size scale that moves the line box, must still be accepted rather than falling back forever.
+function cellForFont(want){
+  try{
+    const c=document.createElement('canvas'), cx=c.getContext('2d');
+    const family=(term.options && term.options.fontFamily) || 'monospace';
+    cx.font = want+'px '+family;
+    const w = cx.measureText('M').width;
+    const lh = Number(term.options && term.options.lineHeight)>0 ? Number(term.options.lineHeight) : 1;
+    if(w>0) return { w, h: want*lh };
+  }catch(e){}
+  return { w: want*0.6, h: want*1.2 };
+}
+function withNativeCell(cb){
+  const want = appliedFont>0 ? appliedFont : fontSize;
+  const measure = () => {
+    const ref = cellForFont(want);            // the FACE's own metrics, available immediately
+    const t0 = performance.now();
+    let prev = null;
+    const step = () => {
+      const cell = cellMetrics();
+      // The renderer's WIDTH is the one that goes bad on a cold page (6px at a 14px font); its height
+      // is reported reliably. Accept the renderer's cell when its width agrees with the face and holds
+      // still for a frame; otherwise take the face's own width and height. Never the element measure.
+      const agreeW = cell.w > 0 && Math.abs(cell.w - ref.w) <= Math.max(1, ref.w * 0.15);
+      const stable = agreeW && prev === cell.w;
+      if(stable || performance.now() - t0 > 400){ cb(agreeW ? cell : ref); return; }
+      prev = agreeW ? cell.w : null;
+      requestAnimationFrame(step);
+    };
+    step();
+  };
+  // A webfont that has not painted yet measures as the fallback twice in a row, which would look
+  // stable. Wait for the document's fonts before judging.
+  try{
+    if(document.fonts && document.fonts.ready) document.fonts.ready.then(measure, measure);
+    else measure();
+  }catch(e){ measure(); }
+}
+function sendViewport(dim){
+  // While THIS device owns the grid, reporting the grid it already holds changes nothing upstream but
+  // costs a re-pin and a ring clear on the paths that reach here, and the app repaints for it. Say nothing.
+  if(sizePinned && sizeMine && dim && dim.cols===term.cols && dim.rows===term.rows){
+    viewportFit={cols:dim.cols, rows:dim.rows};
+    return;
+  }
+  viewportFit={cols:dim.cols, rows:dim.rows};
+  lastViewportReport=dim.cols+'x'+dim.rows;
+  lastViewportReportSocket=ws;
+  try{ (window.__vLog=window.__vLog||[]).push({t:Math.round(performance.now()),c:dim.cols,r:dim.rows,ready:ws?ws.readyState:-1,cur:!!current}); if(window.__vLog.length>40) window.__vLog.shift(); }catch(e){}
+  if(ws && ws.readyState===1 && current){
+    send('v', JSON.stringify({
+      cols:dim.cols, rows:dim.rows,
+      vis:document.visibilityState==='visible' && terminalSurfaceVisible(),
+      act:actFlag()
+    }));
+  }
+}
+function takeGrid(){
+  if(_gridBusy) return;
+  _gridBusy = 'take';
+  updateSizeBtn();
+  flash('Taking this screen\'s grid');
+  window.__muxGridTiming = { clickAt: Math.round(performance.now()), ackAt: 0 };
+  clearTimeout(_takeTimer);
+  // Set the whole-pixel font, wait for the renderer to actually measure THAT font, then report the
+  // grid it yields and request exactly that. A few frames of local latency buys a grid that paints 1:1.
+  requestAnimationFrame(()=>{
+    if(_gridBusy !== 'take') return;
+    const want = Math.max(8, Math.min(48, Math.round(fontSize)));
+    if(Number.isFinite(want) && Math.abs(appliedFont-want) > 0.01){
+      appliedFont = want;
+      try{ term.options.fontSize = want; }catch(e){}
+    }
+    withNativeCell((cell)=>{
+    if(_gridBusy !== 'take') return;
+    const dim = nativeDims(cell);
+    if(dim && dim.cols>10 && dim.rows>3) sendViewport(dim);
+    if(send('P', '') === 'dropped'){
+      // A reconnect ate the request. Do not leave the chip spinning for 8 s and then blame the muxtee.
+      _gridBusy = null; _takeTimer = null;
+      flash('Reconnecting - tap again in a moment');
+      updateSizeBtn();
+      return;
+    }
+    // A terminal whose muxtee predates grid ownership ignores the resize, so nothing ever acks. Say that
+    // plainly instead of leaving the chip spinning and the viewer stuck in a squashed fit mode.
+    _takeTimer = setTimeout(function(){
+      _takeTimer = null;
+      if(_gridBusy === 'take') _gridBusy = null;
+      if(sizeGridOwner === 'mine' || sizePinned) return;
+      flash('This tab\'s terminal cannot take the grid yet - open a new tab (its muxtee needs the update), then tap again');
+      if(tabFitMode !== 'fill'){
+        tabFitMode = 'fill'; LS.set('mux_tab_fit', tabFitMode);
+        try{ fitTabOwnedGrid(); applyPan(); updateSizeBtn(); }catch(e){}
+      }
+      updateSizeBtn();
+      refocusTerminal();
+    }, 8000);
+    });
+  });
+}
+// A viewport change (or a zoom) while this device owns the grid is a NEW GRID, not a stretched old one.
+// Re-measure the host at the native font and report it; the relay re-pins the owner on a changed viewport
+// (server.js `'v'` branch), so no second 'P' is needed and the chip stays live throughout.
+// The CELL can change under a committed grid - a webfont that lands after the take, or a renderer that
+// re-measures once fonts settle. The grid was derived from the cell we measured, so a painted screen
+// wider than the pane means this grid is stale and would be clipped: live, 203 columns taken at cell 7.0
+// and then painted at 7.7 is 1563 px of screen in a 1440 px pane - the intermittent "does not fit or
+// draw native" report. Ask again from the cell we have now, at most once every 2 s so a font that keeps
+// flipping cannot flap the pty. Under-fill is not this: fill mode deliberately leaves the side margin.
+function checkOwnedCellDrift(){
+  if(!(sizePinned && sizeMine)) return;
+  const host=$('#term'); if(!host) return;
+  const scr=host.querySelector('.xterm-screen'); if(!scr) return;
+  const cs=getComputedStyle(host);
+  const availW=host.clientWidth-(parseFloat(cs.paddingLeft)||0)-(parseFloat(cs.paddingRight)||0);
+  if(!(availW>0)) return;
+  const cell=cellMetrics();
+  const colW=(cell && cell.w>0) ? cell.w : 8;
+  const over=scr.getBoundingClientRect().width-availW;
+  // TWO RATCHETS, because a re-request is not free: it re-pins, the tee resizes the child pty, and the
+  // ring is cleared so the app repaints its whole screen. Live, the old 2px/1.5% rule re-committed a grid
+  // one column apart (247x50 -> 248x50) eighteen seconds after a take, and again minutes later - each one
+  // repainting the app and reading as "taking the grid broke it, then it fixed itself".
+  //  · a whole CELL of overflow, not 2px: a measurement that lands a fraction of a column wide is not a
+  //    stale grid, it is rounding, and re-asking for it only changes the column count by one.
+  //  · a settle window after the ack: the renderer is still re-measuring the face it just switched to.
+  const settled=Date.now()-((window.__muxLastAckAt)||0)>3000;
+  if(over>colW+1 && settled && Date.now()-(_ownedRefitAt||0)>2500){
+    _ownedRefitAt=Date.now();
+    try{ requestNativeRemeasure(); }catch(e){}
+  }
+}
+function requestNativeRemeasure(){
+  if(_gridBusy || _reReqTimer) return;
+  const want = Math.max(8, Math.min(48, Math.round(fontSize)));
+  if(appliedFont !== want){ appliedFont=want; try{ term.options.fontSize=want; }catch(e){} }
+  _reReqTimer = setTimeout(()=>{
+    _reReqTimer = null;
+    requestAnimationFrame(()=>withNativeCell((cell)=>{
+      if(_gridBusy) return;
+      const dim = nativeDims(cell);
+      if(dim) sendViewport(dim);
+    }));
+  }, 120);
+}
+// A TEED TAB is a real PC terminal the relay mirrors - a property of the SESSION, not of who holds the
+// grid. `sizeTabOwned` is the relay's "the pane owns the grid" flag and it goes false the moment ANY
+// device pins, so branching on it dropped the chip into the generic shared-window path as soon as a pin
+// existed. That path sends 'P' with NO viewport, so the pin committed this device's last reported FIT
+// viewport (1024px at font 9 = 252x61) while the owned paint ran at font 14: a 1.72x wide screen in a 1x
+// window - the "viewer grid does not fit or draw native" report, and the reason switching away from
+// another device's pin felt broken.
+function isTeedTab(){ try{ const s=findSession(current); return !!(s && s.owner); }catch(e){ return false; } }
+function releaseGrid(){
+  _gridBusy = 'release';
+  updateSizeBtn();
+  if(send('P', '0') === 'dropped'){
+    _gridBusy = null; updateSizeBtn();
+    flash('Reconnecting - tap again in a moment');
+    return;
+  }
+  clearTimeout(_takeTimer); _takeTimer = null;
+  _takeTimer = setTimeout(function(){
+    _takeTimer = null;
+    if(_gridBusy) _gridBusy = null;
+    if(sizePinned && sizeMine) flash('The PC has not given the grid back yet - tap again, or press a key on the PC');
+    updateSizeBtn();
+  }, 8000);
+}
+function cycleSize(){
+  // A tap while a request is in flight is not a second request. Without this guard the ladder re-read
+  // the pre-ack flags and toggled fill<->fit, which is exactly the "it mostly just does 2 and glitches
+  // between them" report: every tap inside the round trip looked like a rendering toggle.
+  if(_gridBusy) return;
+  if(isTeedTab()){
+    // Teed tab ladder: mine -> give it back; another device's -> take it over (MEASURED, so the committed
+    // grid is this viewport at this font); local -> fill, fit, then take.
+    if(sizePinned && sizeMine){ releaseGrid(); refocusTerminal({ownerTap:true}); return; }
+    if(sizePinned && !sizeMine){ takeGrid(); refocusTerminal({ownerTap:true}); return; }
+    // Unreadable and unpinned: fill and fit both leave a legible-font search with no answer, so the only
+    // tap that changes what the user can read is the take. Same rule as the branch below.
+    if(tabFitPaneMode==='unreadable'){ takeGrid(); refocusTerminal({ownerTap:true}); return; }
+    if(tabFitMode==='fill'){
+      tabFitMode='fit'; LS.set('mux_tab_fit', tabFitMode);
+      fitTabOwnedGrid(); applyPan(); scheduleTerminalSurfaceAlign(); updateMeta(); updateSizeBtn();
+      flash('Fitting every row; side margins fill the rest');
+      refocusTerminal({ownerTap:true});
+      return;
+    }
+    takeGrid();
+    refocusTerminal({ownerTap:true});
+    return;
+  }
+  if(sizeTabOwned && !sizePinned){
+    // fill <-> fit change only how THIS device paints the pane's grid. The third tap TAKES the grid:
+    // it asks muxd to pin this device's viewport, which the tee applies to the child pty. There is no
+    // non-uniform scale any more (contract section 6); once the ack lands, every renderer paints 1:1.
+    //
+    // UNREADABLE SHORT-CIRCUITS THE LADDER. fill and fit are both wrong answers when neither can make
+    // the text legible, so a tap here must not spend a round on a rendering change the user cannot see -
+    // it must do the one thing that changes the COLUMN COUNT, which is taking the grid. The chip says
+    // "too wide" in this state and this is what that promise means.
+    if(tabFitPaneMode==='unreadable'){ takeGrid(); refocusTerminal({ownerTap:true}); return; }
+    if(tabFitMode==='fill'){
+      tabFitMode='fit'; LS.set('mux_tab_fit', tabFitMode);
+      fitTabOwnedGrid(); applyPan(); scheduleTerminalSurfaceAlign(); updateMeta(); updateSizeBtn();
+      flash('Fitting every row; side margins fill the rest');
+      refocusTerminal({ownerTap:true});
+      return;
+    }
+    takeGrid();
+    refocusTerminal({ownerTap:true});
+    return;
+  }
+  if(_gridBusy) return;
+  const releasing = !!(sizePinned && sizeMine);
+  _gridBusy = releasing ? 'release' : 'take';
+  updateSizeBtn();
+  if(send('P', releasing ? '0' : '') === 'dropped'){
+    _gridBusy = null; updateSizeBtn();
+    flash('Reconnecting - tap again in a moment');
+    refocusTerminal({ownerTap:true});
+    return;
+  }
+  clearTimeout(_takeTimer); _takeTimer = null;
+  _takeTimer = setTimeout(function(){
+    _takeTimer = null;
+    if(_gridBusy) _gridBusy = null;
+    if(releasing && sizePinned && sizeMine){
+      flash('The PC has not given the grid back yet - tap again, or press a key on the PC');
+    }
+    updateSizeBtn();
+  }, 8000);
+  refocusTerminal({ownerTap:true});
 }
 function pinToOtherDevice(){
   const others = (sizeClients||[]).filter(c=> (c.dev||('sock-'+c.id)) !== deviceId);
@@ -2428,21 +3197,33 @@ function pinToOtherDevice(){
 }
 function sizeButtonPresentation(){
   const dims = winSize ? (' '+winSize.cols+'×'+winSize.rows) : '';
+  if(_gridBusy){
+    // The request is a round trip, not an instant. Say so, and take no further taps until it lands.
+    const text = (_gridBusy === 'release' ? '↩ giving the grid back…' : '⏳ taking the grid…') + dims;
+    return { text, title: 'Waiting for the PC terminal to confirm the new grid.', disabled: true };
+  }
   const host=$('#term'), panning=!!(host && host.classList.contains('pan'));
+  // An unreadable pane must not be described by the mode it is pretending to be. Live, the chip read
+  // "fills width · 209×51" over an 8px clipped grid - the claim was true of the fit and false of what the
+  // user could read. Say the state instead, and say what the tap does about it.
+  if(tabFitPaneMode==='unreadable'){
+    return {
+      text: '⚠ too wide ·'+dims,
+      title: 'This PC tab is '+((term&&term.cols)||'many')+' columns - too wide to read on this screen. '
+        + 'Tap to resize the tab to this screen, so it redraws at this width and paints 1:1.',
+      disabled: false,
+    };
+  }
   // A teed PC tab (§7.3): the grid IS the PC's physical screen, so there is nothing to pin - a pin would
   // resize the tab under the person sitting at it. The chip still works, but it switches the rendering
   // of that fixed grid for this device instead of changing the size.
   if(sizeTabOwned && !sizePinned){
-    const mode = (tabFitMode==='fit'||tabFitMode==='flex') ? tabFitMode : 'fill';
-    const text = mode==='fill' ? '🖥 fills width ·' : mode==='fit' ? '🖥 fits rows ·' : '🖥 flex fit ·';
+    const mode = tabFitMode==='fit' ? 'fit' : 'fill';
+    const text = mode==='fill' ? '🖥 fills width ·' : '🖥 fits rows ·';
     const how = mode==='fill'
       ? 'Scaling fills the width and scrolls vertically for the rows above.'
-      : mode==='fit'
-        ? 'Every row is shown at full size; the margins fill the rest of this screen.'
-        : 'Scaling fills the width and squeezes the row height until every row fits.';
-    const next = mode==='fill' ? 'fit every row instead'
-               : mode==='fit'  ? 'fill the width and flex the row height instead'
-               : 'fill the width and scroll instead';
+      : 'Every row is shown at full size; the margins fill the rest of this screen.';
+    const next = mode==='fill' ? 'fit every row instead' : 'take this screen\'s grid instead';
     let title = 'This tab follows PC tab at'+dims+' - the PC terminal\'s physical screen, so its size cannot be pinned. '
       + how + ' Tap to ' + next + '.';
     if(panning) title += ' This terminal is wider than your viewport; drag the horizontal scrollbar to pan.';
@@ -2654,6 +3435,31 @@ function isVisibleOwner(){ return !!(current && findSession(current)?.owner); }
 // press built here went straight to the app's stdin (sendMouseInput does NOT pass through stripMouseReports)
 // and a shell echoed it back as garbage, while the drag that should have selected text was eaten.
 function appTakesMouse(){ try{ return mouseGuard.inputAllowed(); }catch(e){ return false; } }
+// WHO GETS A CLICK? Two panes answer yes, and only one of them can ever be armed.
+//
+// The arm state is the app's intent and stays the first question. But an ADOPTED console - a session muxd
+// itself spawned (adopted-local) and this browser is viewing - never delivers its DECSET: muxd reads the
+// console as a CELL GRID, so the app's ?1000/1002/1003 is consumed by conhost and never appears in a byte
+// stream the guard can read. The guard therefore stays unarmed forever on exactly the panes that most need
+// clicking, and every click on them was composed nowhere (measured on the adopted-console browser row:
+// CLICK=0 KEY=1, while keystrokes landed).
+//
+// So a pane we KNOW is the visible owner, and that carries a command of its own (never a bare shell), is
+// allowed a click with no arm. A real terminal would report it; the app is the source of truth and its
+// DECSET is simply unobservable here. Being wrong is bounded, not silent: the report is registered with the
+// leak detector, and a shell that echoes our own report back within the window blocks forwarding until a
+// fresh DECSET re-arms it - the protection a mis-armed pane has always had. The WHEEL deliberately stays on
+// the arm alone (appTakesMouse): scrolling an app that wanted the mouse for selection moves something the
+// user did not point at, and there is no echo to correct it with.
+function ownerClickPane(){
+  try{
+    if(!current || !isVisibleOwner()) return false;   // the pane the browser is actually showing as owner
+    const s = findSession(current);
+    if(!s) return false;
+    return !!s.hasCommand && !s.shellOnly;            // an app behind it, never a bare shell's stdin
+  }catch(e){ return false; }
+}
+function clickForwardable(){ return appTakesMouse() || ownerClickPane(); }
 // One physical wheel notch is ~100-120 px in every engine, but a trackpad reports the same motion as dozens
 // of 2-8 px events. Rounding each event on its own turned one flick into ~30 scroll steps and ~30 round
 // trips (measured: 30 reports for a 30-event flick), so a continuous device accumulates and only advances
@@ -2763,6 +3569,15 @@ $('#term').addEventListener('wheel', e=>{
 // A tab-owned grid takes its cell size from the pane (see fitTabOwnedGrid), so A+/A- is a zoom on that
 // fit rather than a font size the fit would overwrite on the next size frame.
 function setFont(px){
+  if(sizePinned && sizeMine){
+    // Owning the grid: A+/A- is a NEW GRID at a new whole-pixel font, not a dead button or a CSS zoom.
+    const font = Math.min(20, Math.max(11, px));
+    term.options.fontSize = appliedFont = font;
+    LS.set('mux_font', fontSize = font);
+    requestNativeRemeasure();
+    healTerminalSurface('font');
+    return;
+  }
   if(sizeTabOwned && !sizePinned){
     const dir = px > fontSize ? 0.1 : -0.1;
     tabFontScale = Math.min(2.5, Math.max(0.5, Math.round((tabFontScale+dir)*100)/100));
@@ -2803,6 +3618,9 @@ function takeTerminalReport(s, at){
       let k = i+3, ch;
       while(k < len && ((ch=s.charCodeAt(k)) === 0x3b || (ch >= 0x30 && ch <= 0x39))) k++;
       if(s[k] === 'c') return k+1-i;
+      // DECRQM reply, private form: CSI ? Ps ; Pm $ y (xterm answers ?2026 here). The parser generates it
+      // in reply to an app query, so it is bytes ABOUT this terminal, never typing.
+      if(s[k] === '$' && s[k+1] === 'y') return k+2-i;
     }
     // Focus reports: CSI I (gained focus) / CSI O (lost focus). xterm emits these through onData when the
     // app enabled focus tracking (DECSET 1004), and it emits CSI O on every helper-textarea blur — which
@@ -2812,6 +3630,7 @@ function takeTerminalReport(s, at){
     let k = i+2, ch;
     while(k < len && ((ch=s.charCodeAt(k)) === 0x3b || (ch >= 0x30 && ch <= 0x39))) k++;
     if(s[k] === 'R') return k+1-i;                  // cursor-position report
+    if(s[k] === '$' && s[k+1] === 'y') return k+2-i; // DECRQM reply, ANSI form: CSI Ps ; Pm $ y
     k = i+2;
     while(k < len && ((ch=s.charCodeAt(k)) === 0x3b || ch === 0x3f || (ch >= 0x30 && ch <= 0x39))) k++;
     if(s[k] === 'n') return k+1-i;                  // device/status report
@@ -2838,6 +3657,17 @@ function takeTerminalReport(s, at){
     }
     return 0;
   }
+  if(c === 'P'){
+    // DCS reply (XTVERSION `ESC P > | xterm.js ESC \`, DECRQSS `ESC P 1 $ r 0 m ESC \`): a device-control
+    // string the parser emitted in reply to a query. Its payload cannot contain ESC, so the first ESC
+    // decides: ST ends it, anything else is not a report we recognise.
+    let k = i+2;
+    while(k < len){
+      if(s.charCodeAt(k) === 0x1b) return s[k+1] === '\\' ? k+2-i : 0;
+      k++;
+    }
+    return 0;
+  }
   return 0;
 }
 // R7: focus in/out reports (CSI I / CSI O). xterm emits these through onData ONLY when the app enabled
@@ -2858,19 +3688,19 @@ function extractFocusReports(s){
   return { focus, rest };
 }
 function stripTerminalGeneratedReports(s){
-  if(!s) return { out:s||'', dropped:false };
+  if(!s) return { out:s||'', dropped:false, reports:'' };
   let esc = s.indexOf('\x1b');
-  if(esc < 0) return { out:s, dropped:false };      // the common case: no report can start, so don't scan
-  let out='', dropped=false, i=0;
+  if(esc < 0) return { out:s, dropped:false, reports:'' };   // the common case: no report can start, so don't scan
+  let out='', reports='', dropped=false, i=0;
   while(i < s.length){
     if(esc < 0){ out += s.slice(i); break; }        // no ESC left — take the whole tail in one go
     if(esc > i){ out += s.slice(i, esc); i = esc; }
     const n = takeTerminalReport(s, i);
-    if(n){ dropped = true; i += n; }
+    if(n){ dropped = true; reports += s.slice(i, i+n); i += n; }   // keep the exact bytes for forwarding
     else { out += s[i]; i++; }
     esc = s.indexOf('\x1b', i);
   }
-  return { out, dropped };
+  return { out, dropped, reports };
 }
 const debugInputEnabled = /(?:[?&]debuginput=1(?:&|$))/.test(location.search);
 window.__muxInputLog = window.__muxInputLog || [];
@@ -3101,12 +3931,20 @@ term.onData(d => {
   // it leaves through sendMouseInput like they do.
   if(mouseGuard.focusReporting()){
     const f = extractFocusReports(d);
-    if(f.focus){ markActive(); sendMouseInput(f.focus); }
+    // Focus in/out describes THIS terminal. With a PC terminal also attached, the app's one view of the
+    // world is not "this tab lost focus" - forwarding it would tell the app it went away. Forward only
+    // from the sole terminal; otherwise consume it.
+    if(f.focus && !(soleTerminalKnown && !soleTerminal)){ markActive(); sendMouseInput(f.focus); }
     d = f.rest;
     if(!d) return;
   }
   const filtered = stripTerminalGeneratedReports(d);
   if(filtered.dropped){
+    // DA/CPR/DSR/DECRQM/DCS replies are answers to queries the app sent down the ONE pty. If a PC
+    // terminal is attached it answers too, and two answers make the app read the second as a command. So
+    // forward the terminal-generated bytes only from the sole terminal, and only when we actually know we
+    // are sole; unknown stays on the old behaviour (drop).
+    if(soleTerminalKnown && soleTerminal && filtered.reports){ markActive(); sendMouseInput(filtered.reports); }
     d = filtered.out;
     if(!d) return;
   }
@@ -3127,6 +3965,9 @@ term.onData(d => {
 // exposes no version constant, so we answer the name alone - which is all the identification needs.
 try{
   term.parser.registerCsiHandler({prefix:'>', final:'q'}, () => {
+    // With a PC terminal attached, IT answers this query; a second reply through the same pty corrupts the
+    // app's next read. Consume the query and stay silent unless we are the sole terminal.
+    if(soleTerminalKnown && !soleTerminal) return true;
     send('i', '\x1bP>|xterm.js\x1b\\');
     return true;
   });
@@ -3318,21 +4159,20 @@ try{ window.__muxForceSel = forceSel; }catch(e){}
     // let motion (below) and the release (below) decide. Nothing is forwarded here.
     const cell=bufferCellAt(e.clientX,e.clientY);
     if(!cell) return;
-    const s=findSession(current);
-    // WHAT WANTS THE CLICK. Not the buffer type (a normal-buffer app pane lost every click) and not the
-    // arm state (an app that never armed the mouse lost every click too - that was the either/or). It is
-    // simply whether an APP is behind this pane at all: a session bound to an exact chat / carrying a
-    // command is an app pane and takes clicks; a bare shell is not and must never have a report written
-    // into its stdin, where it would echo as garbage. Both of the panes in the field report are this case.
-    const wantApp=!!(s && (s.hasCommand || (s.sessionId && !s.shellOnly)));
+    // WHAT WANTS THE CLICK: the app's own arm state first, then the one pane whose arm can never arrive.
+    // A bare shell neither arms nor is it an owner-backed app row, so nothing can be written into its stdin.
+    // This ONE value decides both halves of the gesture - the press swallow below and the release forward.
+    // They were two different expressions once (appTakesMouse at press, session metadata at release) and
+    // drifted apart, so an armed pane swallowed the press and then forwarded nothing.
+    const forward=clickForwardable();
     ownerPress={button:[0,1,2][e.button], cell, session:current,
-                x:e.clientX, y:e.clientY, moved:false, wantApp};
+                x:e.clientX, y:e.clientY, moved:false, forward};
     // When the app armed the mouse, xterm's own protocol would emit the press the instant it fires - and
     // we would emit ours again at release, so the app sees two presses for one click. Keep xterm out of
     // an armed pane's press; we are the only one that reports it. On an UNARMED pane we must NOT prevent
     // it: xterm's own selection service is what makes a plain drag highlight, and swallowing the press
     // would leave that pane unable to select.
-    if(appTakesMouse()){
+    if(forward){
       // Swallowing the press ALSO keeps xterm's selection service from dropping the old highlight - and a
       // live highlight holds the output freeze. A click after a drag-select then forwarded its report, but
       // the app's reply stayed buffered behind the freeze and never painted, so the click looked dead until
@@ -3353,10 +4193,11 @@ try{ window.__muxForceSel = forceSel; }catch(e){}
       e.preventDefault(); e.stopPropagation();
       return;
     }
-    // Never moved: a click. Forward it only when there is an app behind this pane to receive it. The cell
-    // is recomputed at the release point so a click that drifted a few px still lands on what is under
-    // the cursor.
-    if(!press.wantApp) return;
+    // Never moved: a click. Forward it only when the pane wanted the click at press time - the SAME value
+    // that decided the press swallow, not a second expression that can drift from it. The cell is
+    // recomputed at the release point so a click that drifted a few px still lands on what is under the
+    // cursor.
+    if(!press.forward) return;
     const cell=bufferCellAt(e.clientX,e.clientY) || press.cell;
     const at=c=>`\x1b[<${press.button};${c[0]+1};${c[1]-(term.buffer.active.viewportY|0)+1}`;
     const click=at(cell)+'M', release=at(cell)+'m';
@@ -3392,15 +4233,6 @@ try{ window.__muxForceSel = forceSel; }catch(e){}
     if(!forceSel.active) return;
     e.preventDefault(); e.stopPropagation();
     forceSelEnd();
-  }, true);
-  // An element-map box claims its press at the DOCUMENT capture stage: #term's own press handler also
-  // listens in capture (top-down), so a press left to propagate would forward a second click for one tap.
-  // Boxes exist only while the widgets chip is on, so the plain terminal gesture is untouched when it is off.
-  document.addEventListener('pointerdown', e=>{
-    const t=e.target, n=(t && t.closest) ? t.closest('.emap-el') : null;
-    if(!n) return;
-    e.preventDefault(); e.stopPropagation();
-    emapTap(n.dataset.id);
   }, true);
   // The phone's Sel toggle is the same gesture with a finger. While the app owns the mouse a touch drag
   // cannot fall through to xterm - this build has no touch selection at all - so it comes here instead.
@@ -3455,6 +4287,7 @@ function scrollPositionLabel(viewportY, baseY, rows){
 // onRender runs per frame, so the three nodes are resolved once and cached; they are static for the life of
 // the document. We only re-query while one is still missing (script can run before the node is parsed).
 let lastAffordance=null;
+let lastAffordanceAlt=null;   // the alt-screen state the last label described; a FLIP invalidates a guess
 let affHost=null, affChip=null, affText=null;
 function applyScrollAffordance(){
   if(!affHost || !affChip || !affText){
@@ -3478,9 +4311,15 @@ function applyScrollAffordance(){
   const key = (alt?'a:':'n:') + (panning?'p:':'f:') + (tracked?'t:':'u:') + label;
   if(key===lastAffordance) return label;
   lastAffordance = key;
-  // An alt-screen flip changes who owns the cells, so a pending prediction is stale either way: entering
+  // An alt-screen FLIP changes who owns the cells, so a pending prediction is stale either way: entering
   // the app's screen makes a shell guess wrong, leaving it returns to a cursor our guess no longer sits on.
-  if(typeof predictClear==='function') predictClear();
+  //
+  // Only a FLIP. This used to clear on every label change, and the label changes on ordinary output (the
+  // scroll position moves, the pan hint appears), so a fast typist lost pending characters whenever the
+  // readout updated - measured: with "abc" typed and only "ab" echoed, the peel left "c" pending and this
+  // line then wiped it, leaving the typeahead blank while the server had not yet confirmed the last char.
+  if(alt !== lastAffordanceAlt && typeof predictClear==='function') predictClear();
+  lastAffordanceAlt = alt;
   host.classList.toggle('altbuf', alt);
   chip.classList.toggle('app', alt);
   txt.textContent = label;
@@ -3504,6 +4343,10 @@ function explainScrollAffordance(){
 }
 try{ term.buffer.onBufferChange(()=>applyScrollAffordance()); }catch(e){}
 try{ term.onRender(()=>applyScrollAffordance()); }catch(e){}
+// The thread view is a REPAINT of the same buffer, so it follows the terminal's own render cadence rather
+// than polling. It is a no-op unless the phone is actually on that view, and renderThreads() collapses a
+// rebuild by signature, so a burst of writes costs one DOM pass, not one per frame.
+try{ term.onRender(()=>{ if(threadSafeToRender()) renderThreads(false); }); }catch(e){}
 term.onScroll(()=>{
   if(!viewportRestoreApplying && (!terminalWriteActive || !atBottom())) noteUserScroll();
   if(atBottom()){ newLines=0; showJump(); }
@@ -3611,8 +4454,23 @@ function connect(name, isRetry){
     resetTerminalSurface();
     mouseGuard.reset(prevName === name);   // same session keeps the modes its app already armed; a
                                            // different session starts clean (see reset() for why)
-    emapClear();                           // a map belongs to the app on the other end of THIS attach
-    if(prevName !== name) emapBuild();
+    if(prevName !== name){
+      _paintReady = false;
+      sizePinned=false; sizeMine=false; sizeTabOwned=false; sizeLocal=false;
+      sizeGridOwner='local'; sizeGridEpoch=0; sizeGridOwnerLabel=''; sizePinLabel=''; sizeClients=[];
+      _gridBusy=null; if(_takeTimer){ clearTimeout(_takeTimer); _takeTimer=null; }
+      // The accumulated conversation belongs to the session it was recorded from, so a switch starts a new
+      // one. A RE-attach of the SAME session keeps it: those turns really did happen, and the screen the
+      // re-attach paints is the same one that produced them.
+      if(threadAccum && threadAccum[name]) delete threadAccum[name];
+    }
+    // A SWITCH IS A NEW SCREEN. The per-session grid state and the "this surface is already painted"
+    // latch both belong to the session they were measured on. Carrying them over meant the new tab's
+    // first frame took the nothing-changed path - no heal, no fit - and painted the PREVIOUS tab's
+    // geometry: switching between two local grids and the viewer grid looked like the grid had stopped
+    // fitting at all, and the chip kept the old tab's pin. A re-attach of the SAME session keeps both:
+    // its grid and its painted surface really are still there.
+    soleTerminal = true; soleTerminalKnown = false;   // unknown until this attach's first 'd'
     lastViewportReport='';
     lastViewportReportSocket=null;
     scheduleViewportFit(0);
@@ -3648,6 +4506,9 @@ function connect(name, isRetry){
       noteSessionOutput(out);   // mouse-mode tracking + leak detection, BEFORE the frozen path can swallow it
       if(isFrozen()){ bufferFrozenOutput(out); return; }   // FROZEN for selection: buffer output; a repaint would wipe the highlight
       const wasBottom=atBottom(); enqueueTermWrite(out); markReadLive();
+      // The conversation view reads the buffer, and xterm pauses painting while #term is hidden, so the
+      // onRender hook cannot be its only trigger (see scheduleThreadsRender).
+      if(typeof scheduleThreadsRender==='function') scheduleThreadsRender();
       if(!wasBottom){ newLines += 1; showJump(); } };
     sock.onclose = ev => {
       if(inputQueue) inputQueue.disconnect('socket closed');   // burn the channel; buffered plaintext stays here
@@ -4566,6 +5427,28 @@ function seqForKey(k){
 function sendKey(k){ const s=seqForKey(k); clearMods(); if(s) send('i',s); term.focus(); }
 function sendChar(ch){ const out=applyModsToChar(ch); clearMods(); send('i',out); term.focus(); }
 function sendRaw(seq){ clearMods(); send('i',seq); term.focus(); }   // a ctrl-shortcut that already IS the combo
+// A QUICK KEY is the same bytes as sendKey, but it must not summon the soft keyboard on a phone. Pressing Esc
+// or an arrow is a command, not an invitation to type: the user is reading the screen, and focus() would throw
+// the keyboard back over it. On desktop the focus is what lets them keep typing, so it is kept there.
+function sendQuickKey(k){
+  const s=seqForKey(k); clearMods();
+  if(s) send('i', s);
+  markActive();
+  if(!isMobile()) term.focus();
+}
+function wireQuickKeys(){
+  const strip=$('#quickkeys'); if(!strip || strip.dataset.wired) return;
+  strip.dataset.wired='1';
+  strip.addEventListener('click', ev=>{
+    const b=ev.target.closest('button'); if(!b) return;
+    ev.preventDefault();
+    if(b.id==='qk-all'){ setMobileView('keys'); return; }
+    const k=b.dataset.qk; if(k) sendQuickKey(k);
+  });
+  document.addEventListener('touchstart', ev=>{
+    if(ev.target.closest && ev.target.closest('#quickkeys')) markActive();
+  }, { passive:true, capture:true });
+}
 
 const KEYMODES = {
   ctl: { kind:'raw',  items:[['^C','\x03'],['^D','\x04'],['^R','\x12'],['^L','\x0c'],['^Z','\x1a'],['^A','\x01'],['^E','\x05'],['^U','\x15'],['^K','\x0b'],['^W','\x17'],['^P','\x10'],['^N','\x0e']] },
@@ -4720,8 +5603,6 @@ function buildKeybar(){
     sb.addEventListener('touchstart', start, {passive:true}); sb.addEventListener('touchend', cancel); sb.addEventListener('touchmove', cancel);
     sb.addEventListener('mousedown', start); sb.addEventListener('mouseup', cancel); sb.addEventListener('mouseleave', cancel);
     sb.addEventListener('contextmenu', e=>{ e.preventDefault(); pinToOtherDevice(); }); }
-  { const wb=mk('◫','accent', cycleEmap); wb.id='widgetsbtn'; wb.classList.toggle('on', emapShown);   // the app's own controls as tappable boxes
-    wb.title='Show this app\u2019s own controls as tap targets'; kb.appendChild(wb); }
   updateSizeBtn();
   kb.appendChild(kdivEl());
   // sticky modifiers (combine; apply to the next key OR typed char)
@@ -4776,6 +5657,19 @@ $('#jumpbottom').onclick=()=>{ if(current) forceJumpBottom(); };
 function applyKeybarPref(){ const on=LS.get('mux_keybar',false); $('#app').classList.toggle('kb-on',on); const b=$('#kbtoggle'); if(b) b.classList.toggle('on',on); setTimeout(()=>{ applyViewport(); healTerminalSurface('keybar'); },60); }
 $('#kbtoggle').onclick=()=>{ LS.set('mux_keybar', !LS.get('mux_keybar',false)); applyKeybarPref(); };
 applyKeybarPref();
+// PHONE ONLY: hide the bottom bar. It is ~60px of a 390x844 screen and it is also what sits over the
+// app's own bottom menus, so this is the way to reach them. Nothing about it resizes the session: the pane
+// only changes size, and doFit re-fits the local grid to whatever it now is.
+function applyNavPref(){
+  const hidden = LS.get('mux_nav_hidden', false) === true;
+  $('#app').classList.toggle('nonav', hidden);
+  const b = $('#navtoggle'); if(b){ b.classList.toggle('on', hidden); b.setAttribute('aria-pressed', hidden ? 'true' : 'false');
+    b.title = hidden ? 'Show the bottom bar' : 'Hide the bottom bar';
+    b.setAttribute('aria-label', b.title); }
+  setTimeout(()=>{ applyViewport(); doFit(); healTerminalSurface('navtoggle'); }, 60);
+}
+$('#navtoggle').onclick=()=>{ LS.set('mux_nav_hidden', !(LS.get('mux_nav_hidden', false) === true)); applyNavPref(); };
+applyNavPref();
 function toggleZen(){ const z=$('#app').classList.toggle('zen'); $('#zen').classList.toggle('on',z);
   if(z && document.documentElement.requestFullscreen) document.documentElement.requestFullscreen().catch(()=>{});
   else if(!z && document.fullscreenElement) document.exitFullscreen().catch(()=>{});

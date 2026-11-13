@@ -1,20 +1,16 @@
-// Regression: a plain click on an APP pane must reach the pty whether or not the app ARMED mouse
-// reporting, and a plain DRAG on the same pane must still select - both without a modifier. A bare
-// shell's stdin must never receive a mouse report.
+// Regression: a plain click reaches the pty only when the APP has ARMED mouse reporting, and a plain
+// DRAG on that same pane still selects - both without a modifier. A bare shell never arms, so its
+// stdin can never receive a mouse report.
 //
-// The bug (Ahmed, 2026-10-03): "in the case when selection wins then we can never click even with shift.
-// it's an either/or ... the bad selection where it forces us to be either click or selection, instead of
-// letting us click and select both as needed." Two successive gates each picked ONE winner per pane:
-// first appTakesMouse() (arm state) then appOwnsScreen() (buffer type). Either way the decision was a
-// single boolean, so a pane got click-or-selection, never both, and Shift was the only escape - which
-// only proved the defect existed.
-//
-// The fix is that the gesture stops being an either/or. What wants the click is neither the buffer type
-// nor the arm state: it is whether an APP is behind the pane at all (hasCommand / a chat-bound session
-// that is not shellOnly). And the click-vs-drag question is decided at RELEASE, not press - a press that
-// moved is a selection (run by us, so it works on an armed pane where xterm's own selection is off), a
-// press that did not move is a click. This file pins the source gate and the behaviour, on a loopback
-// relay with a fake host.
+// History. The click-vs-drag half stopped being an either/or in 2026-10: the gesture is decided at
+// RELEASE (a press that moved is a selection we run ourselves; a press that did not move is a click),
+// so click and select both work without Shift. The other half then picked the wrong gate: "is there an
+// APP behind this pane at all" (hasCommand / a chat-bound session that is not shellOnly) looked safer
+// than the arm state, but a hosted/mirror row carries no command of its own while the app behind it is
+// armed. Result (I-13): the press was swallowed and the release forwarded nothing, so every click on
+// that pane was dead. The arm state IS the app's intent - a real terminal sends the report whenever the
+// app enabled mouse reporting - and a bare shell never arms. One value decides both halves so they
+// cannot drift. This file pins the source gate and the behaviour, on a loopback relay with a fake host.
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const childProcess = require('node:child_process');
@@ -48,19 +44,31 @@ function ownerPressMousedownSource() {
   return source.slice(start, end).split('\n').filter(l => !/^\s*\/\//.test(l)).join('\n');
 }
 
-test('the click gate is "is there an app behind this pane", not the buffer type or the arm state', () => {
+test('the click gate is the app arm state alone, recorded once for both halves of the gesture', () => {
   const handler = ownerPressMousedownSource();
   // The gesture is decided at release, so the press handler records a candidate rather than forwarding.
   assert.match(handler, /moved:false/,
     'the press no longer records a click-or-drag candidate — the gesture is being decided at press time again');
-  // The either/or gates must be GONE from the click decision: neither the buffer type nor the arm state
-  // may select a single winner per pane.
+  // The decision is ONE value for the whole gesture, computed at press and carried to the release, so the
+  // press swallow and the release forward cannot use different expressions and drift apart (I-13).
+  assert.match(handler, /const forward=clickForwardable\(\)/,
+    'the click gate no longer records the decision as one value for the whole gesture');
+  assert.match(handler, /forward}/,
+    'the press candidate does not carry the click decision to the release handler');
+  assert.doesNotMatch(handler, /hasCommand|shellOnly|sessionId|findSession|isVisibleOwner/,
+    'the press handler consults session metadata directly again — the two halves can drift apart; the predicate belongs in clickForwardable()');
   assert.doesNotMatch(handler, /appOwnsScreen\(\)/,
     'the click decision depends on the buffer type again — a normal-buffer app pane would lose every click');
-  assert.match(handler, /hasCommand|shellOnly/,
-    'the click gate does not consult whether an APP is behind the pane — a bare shell could take a report on its stdin');
-  assert.doesNotMatch(handler, /isVisibleOwner/,
-    'the click gate depends on the session being the visible owner again — a web-created pane would lose clicks');
+  // The predicate itself: the arm state stays FIRST (so an armed pane is never re-gated on metadata, the
+  // I-13 failure), and the second term is the one pane whose DECSET cannot reach us - a visible owner with
+  // an app behind it. A bare shell (shellOnly/no command) must still be refused.
+  assert.match(source, /function clickForwardable\(\)\{ return appTakesMouse\(\) \|\| ownerClickPane\(\); \}/,
+    'clickForwardable() no longer keeps the arm state first and adds the owner pane as a fallback');
+  assert.match(source, /return !!s\.hasCommand && !s\.shellOnly;/,
+    'the owner-pane fallback stopped refusing a bare shell — a click would be written into a shell stdin');
+  // The release half must consume that same stored value, not recompute a second expression.
+  assert.match(source, /if\(!press\.forward\) return;/,
+    'the release handler no longer consumes the arm state recorded at press time');
 });
 
 // ---- the real behaviour, on a loopback relay with a fake host ---------------------------------------
@@ -164,7 +172,7 @@ async function dragCenter(page, host) {
   return { frames, selected };
 }
 
-test('a click on an APP pane forwards press+release in EITHER arm state; a bare shell forwards nothing', async t => {
+test('a click forwards only on an ARMED pane; an unarmed pane and a bare shell forward nothing', async t => {
   if (!browser) return t.skip(`Chromium unavailable.\n${INSTALL}\n${browserError && browserError.message}`);
 
   const harness = new RelayHarness();
@@ -189,24 +197,22 @@ test('a click on an APP pane forwards press+release in EITHER arm state; a bare 
     assert.ok(armedFrames.some(d => /M$/.test(d)) && armedFrames.some(d => /m$/.test(d)),
       `the forwarded report is not an SGR press+release pair: ${JSON.stringify(armedFrames)}`);
 
-    // 2) UNARMED APP PANE (alt screen, app never armed): the either/or regression — the click must STILL
-    //    forward, because an app is behind the pane whether or not it armed the mouse.
+    // 2) UNARMED APP PANE (alt screen, app never armed): no SGR report may be composed. The arm state is
+    //    the app's intent, and a real terminal sends nothing while the app has not enabled mouse tracking.
     host.sendOutput(SESSION, '\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l');
     await sleep(250);
     const unarmedFrames = await clickCenter(page, host);
-    assert.equal(unarmedFrames.length, 2,
-      `a click on an UNARMED app pane forwarded nothing (the either/or regression): ${JSON.stringify(unarmedFrames)}`);
-    assert.ok(unarmedFrames.some(d => /M$/.test(d)) && unarmedFrames.some(d => /m$/.test(d)),
-      `the forwarded report is not an SGR press+release pair: ${JSON.stringify(unarmedFrames)}`);
+    assert.equal(unarmedFrames.length, 0,
+      `a click on an UNARMED app pane composed an SGR report the app never asked for: ${JSON.stringify(unarmedFrames)}`);
 
-    // 3) NORMAL-BUFFER APP PANE: the other half of the either/or — the user's cctest pane is an app on the
-    //    NORMAL buffer, and it lost every click under the appOwnsScreen() gate. It must forward now.
+    // 3) NORMAL-BUFFER ARMED APP PANE: the user's cctest pane is an app on the NORMAL buffer. The buffer
+    //    type is irrelevant to the click gate; an app that armed the mouse takes the report on either buffer.
     host.sendOutput(SESSION, '\x1b[?1049l');
-    host.sendOutput(SESSION, '\x1b[2J\x1b[H' + LINES.join('\r\n') + '\r\n');
+    host.sendOutput(SESSION, '\x1b[2J\x1b[H' + LINES.join('\r\n') + '\r\n' + ARMED);
     await sleep(300);
     const normalAppFrames = await clickCenter(page, host);
     assert.equal(normalAppFrames.length, 2,
-      `a click on a normal-buffer APP pane forwarded nothing: ${JSON.stringify(normalAppFrames)}`);
+      `a click on a normal-buffer ARMED app pane forwarded nothing: ${JSON.stringify(normalAppFrames)}`);
 
     // 4) DRAG on the SAME pane: both, as needed. A drag must select and forward NOTHING (a selection is not
     //    a click) — the other half of "click and select both", proven on the pane the click just worked on.
@@ -215,9 +221,41 @@ test('a click on an APP pane forwards press+release in EITHER arm state; a bare 
       `a drag also forwarded to the app (click won over selection): ${JSON.stringify(drag.frames)}`);
     assert.ok(drag.selected, 'a plain drag did not select on an app pane (selection lost to the click)');
 
-    // 5) BARE SHELL (no app behind the pane): a click must NOT reach its stdin. Re-point the SAME page at
-    //    a shell session record so nothing about the relay or the browser is re-created for this half.
-    host.sendOutput(SESSION, '\x1b[2J\x1b[Hshell prompt $ ');
+    // 4b) OWNER-BACKED ADOPTED PANE, UNARMED: an adopted console (muxd spawns it and reads its CELL GRID)
+    //     never delivers its DECSET, so the arm can never arrive. A real terminal would still report the
+    //     click, and the pane is the visible owner with an app behind it - so the click forwards.
+    host.sendOutput(SESSION, '\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l');
+    await sleep(250);
+    await page.evaluate(() => {
+      window._sessions = (window._sessions || []).map(s => s.name === 'click-gate-shell'
+        ? { name: s.name, alive: true, cols: s.cols, rows: s.rows, hasCommand: true, shellOnly: false, ready: true, owner: true, sessionId: 'adopted-owner' }
+        : s);
+    });
+    await sleep(200);
+    const adoptedFrames = await clickCenter(page, host);
+    assert.equal(adoptedFrames.length, 2,
+      `an unarmed OWNER-BACKED app pane (adopted console, no DECSET) forwarded nothing: ${JSON.stringify(adoptedFrames)}`);
+    assert.ok(adoptedFrames.some(d => /M$/.test(d)) && adoptedFrames.some(d => /m$/.test(d)),
+      `the adopted-pane forward is not an SGR press+release pair: ${JSON.stringify(adoptedFrames)}`);
+
+    // 4c) OWNER-BACKED BARE SHELL: ownership is not enough. A row with no command is a shell's stdin, and
+    //     a report written there is echoed back as `[<0;x;yM` garbage - the mutation-flood class.
+    await page.evaluate(() => {
+      window._sessions = (window._sessions || []).map(s => s.name === 'click-gate-shell'
+        ? { name: s.name, alive: true, cols: s.cols, rows: s.rows, hasCommand: false, shellOnly: true, ready: true, owner: true, sessionId: '' }
+        : s);
+    });
+    await sleep(200);
+    const ownedShellFrames = await clickCenter(page, host);
+    assert.equal(ownedShellFrames.length, 0,
+      `a click on an owner-backed BARE SHELL leaked to its stdin: ${JSON.stringify(ownedShellFrames)}`);
+
+    // 5) BARE SHELL (no app behind the pane): a click must NOT reach its stdin. The protection is the
+    //    arm state itself - a shell never enables mouse tracking - so disarm first, exactly as the shell
+    //    would leave it. Re-point the SAME page at a shell session record so nothing about the relay or
+    //    the browser is re-created for this half; the record's metadata must not be what protects it.
+    host.sendOutput(SESSION, '\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[2J\x1b[Hshell prompt $ ');
+    await sleep(250);
     await page.evaluate(() => {
       window._sessions = (window._sessions || []).map(s => s.name === 'click-gate-shell'
         ? { name: s.name, alive: true, cols: s.cols, rows: s.rows, hasCommand: false, shellOnly: true, ready: true, owner: false, sessionId: '' }
@@ -248,7 +286,7 @@ test('a click on an APP pane forwards press+release in EITHER arm state; a bare 
 // dead (muxdiag/dragoff-fix-proof.js: control clickOpenedChooser=false, fixed=true).
 test('an armed press clears a standing selection itself, because we swallow the press that xterm would use', () => {
   const handler = ownerPressMousedownSource();
-  const armedAt = handler.indexOf('appTakesMouse()');
+  const armedAt = handler.indexOf('clickForwardable()');
   assert.notEqual(armedAt, -1, 'the armed-press branch is gone - the press is no longer kept out of xterm');
   const armed = handler.slice(armedAt);
   const clearAt = armed.indexOf('term.clearSelection()');

@@ -125,6 +125,17 @@ internal static class MouseInput
     public static bool IsWheel(uint eventFlags)
         => (eventFlags & (ConsoleApi.MOUSE_WHEELED | ConsoleApi.MOUSE_HWHEELED)) != 0;
 
+    // Is this record a HAND at the pane, for the ownership contract (a local key or mouse event reclaims
+    // the grid)? A button press or a held-button drag, a double click, or a wheel notch - not a bare
+    // pointer MOVE. Windows Terminal delivers MOUSE_MOVED records whenever the pointer crosses the
+    // console window, and counting those reclaimed a device's grid just because the mouse happened to
+    // rest over the PC pane: seen live as a take that committed and reverted 700 ms later, with no key
+    // pressed and no button clicked. Motion is dropped from forwarding below, so it is not intent either.
+    public static bool IsIntent(in MOUSE_EVENT_RECORD m)
+        => IsWheel(m.dwEventFlags)
+           || m.dwButtonState != 0
+           || (m.dwEventFlags & ConsoleApi.DOUBLE_CLICK) != 0;
+
     public static byte[] Encode(uint buttonState, uint ctrlState, uint eventFlags, int x, int y,
         bool sgr, bool urxvt)
     {

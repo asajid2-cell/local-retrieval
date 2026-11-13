@@ -96,24 +96,28 @@ test("mobile-view-fleet hides term, keybar, and tabwrap", () => {
   assert.match(mq, /#app\.mobile-view-fleet\s+#tabwrap.*display:\s*none/);
 });
 
-test("mobile nav is one non-wrapping horizontally-scrolling row so no destination wraps to a second row", () => {
-  // Six destinations (Sessions/Terminal/Fleet/Projects/Chats/Keys). A wrapping grid stacked the last one
-  // onto a second row (a ~60px band of dead chrome on every phone); a fixed-column grid crushed the
-  // labels. The nav must be a single flex row that scrolls sideways instead.
+test("mobile nav lays every destination out as an equal column, all on screen", () => {
+  // Seven destinations (Sessions/Threads/Terminal/Fleet/Projects/Chats/Keys). Both earlier shapes failed on a
+  // real phone: a wrapping grid pushed the last one onto a second row (~60px of dead chrome), and a fixed
+  // 62px horizontally-SCROLLING row measured 477px at every phone width, so Chats and Keys sat past the right
+  // edge - "there is no keys button" was literally true. Equal columns put all seven on screen.
   const nav = section('<nav id="mobileNav"', "</nav>");
   const destinations = (nav.match(/data-mobile-view=|class="projects"/g) || []).length;
   assert.ok(destinations >= 4, "nav destinations not found");
   const mqStart = source.indexOf("@media (max-width:59.99rem)");
   const mqEnd = source.indexOf("@media (max-width:23rem)", mqStart);
   const mq = source.slice(mqStart, mqEnd);
-  const m = mq.match(/#mobileNav\s*\{[\s\S]*?\}/);
-  assert.ok(m, "#mobileNav rule not found in the mobile media query");
-  const rule = m[0];
-  assert.match(rule, /display:\s*flex/, "#mobileNav must be a flex row");
-  assert.match(rule, /flex-wrap:\s*nowrap/, "#mobileNav must never wrap to a second row");
-  assert.match(rule, /overflow-x:\s*auto/, "#mobileNav must scroll horizontally on overflow");
-  assert.equal(rule.indexOf("grid-template-columns"), -1,
-    "#mobileNav must not go back to a fixed grid");
+  // The LAYOUT rule, by selector - an earlier base `#mobileNav { display:none; }` and later state rules
+  // (`#app.nonav #mobileNav`, `html.kb-open #mobileNav`) also mention it, and none of those describe the row.
+  const blocks = [...mq.matchAll(/([^{}\n]*#mobileNav)\s*\{[\s\S]*?\}/g)]
+    .filter(m => m[1].trim() === '#mobileNav').map(m => m[0]);
+  const rule = blocks[blocks.length - 1] || '';
+  assert.match(rule, /display:\s*grid/, "#mobileNav must lay its items out as columns");
+  assert.match(rule, /grid-auto-flow:\s*column/, "#mobileNav must flow its items in one row");
+  assert.match(rule, /grid-auto-columns:\s*minmax\(0\s*,\s*1fr\)/,
+    "#mobileNav columns must share the width equally");
+  assert.equal(rule.indexOf("overflow-x:auto"), -1,
+    "#mobileNav must not scroll: a destination past the edge cannot be reached");
 });
 
 test("--info custom property exists in :root", () => {

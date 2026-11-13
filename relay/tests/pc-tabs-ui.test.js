@@ -26,8 +26,17 @@ test('§7.3: the size chip says "follows PC tab" and locks the pin', () => {
   assert.match(indexSource, /sizeTabOwned/);
   assert.match(indexSource, /follows PC tab/);
   assert.match(indexSource, /sizeTabOwned && !sizePinned/);
-  // cycleSize must refuse the pin, not just paint a different label.
-  assert.match(indexSource, /function cycleSize\(\)\{\s*if\(sizeTabOwned && !sizePinned\)/);
+  // cycleSize must refuse the pin, not just paint a different label, and a tap while a grid request is
+  // in flight must not be read as a second request (the pending guard is the first statement it runs).
+  assert.match(indexSource, /function cycleSize\(\)\{[\s\S]{0,400}?if\(_gridBusy\) return;/);
+  // The teed ladder answers first (it keys on the tab being teed, not on the pane still owning the grid -
+  // that flag clears the moment anyone pins, which used to drop the tap into the unmeasured path). The
+  // tab-owned guard is still the fallback for a row the teed test cannot classify, and it still refuses
+  // the pin with exactly this expression.
+  assert.match(indexSource, /function cycleSize\(\)\{[\s\S]{0,400}?if\(isTeedTab\(\)\)\{/);
+    // The window has to cover the teed ladder, the unreadable short-circuit and the pane-owned branch, which
+  // now sit between the guard and this fallback.
+  assert.match(indexSource, /function cycleSize\(\)\{[\s\S]{0,2200}?if\(sizeTabOwned && !sizePinned\)/);
   assert.match(indexSource, /cannot be pinned/);
 });
 

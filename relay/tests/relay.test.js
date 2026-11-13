@@ -1740,6 +1740,18 @@ test('last viewer removal deletes session state so reconnect recomputes and re-r
   const firstClosed = once(first, 'close');
   first.close();
   await firstClosed;
+  // The property under test is what the SECOND attach does once the relay has dropped the state. A
+  // client-side 'close' only means this socket is gone; the server's close handler - and so the deletion -
+  // runs on its own tick, and an attach that wins that race is legitimately warm (it reuses the screen
+  // model) and sends no scrollback request at all. Wait for the cleanup to be OBSERVED rather than
+  // assumed, so the row tests the reconnect path instead of the scheduler.
+  await waitFor(async () => {
+    try {
+      const rows = await h.json('GET', '/api/sessions');
+      const row = (Array.isArray(rows) ? rows : rows.sessions || []).find(r => r.name === 'state-cleanup');
+      return !!row && row.attached === false;
+    } catch (e) { return false; }
+  }, 'the relay to drop the last viewer state');
 
   const second = new WebSocket(`ws://127.0.0.1:${h.port}/ws?session=state-cleanup&cols=81&rows=25`);
   await once(second, 'open');
@@ -1755,7 +1767,9 @@ test('last viewer removal deletes session state so reconnect recomputes and re-r
 });
 
 test('redraw asks the PC owner for a fresh frame without resizing or treating it as input', async t => {
-  const h = new RelayHarness();
+  // No scrollback reply is sent here, so the State-L watchdog (40ms by default) would add a best-effort
+  // redraw of its own and make the count ambiguous. Hold the viewer in State R for the whole test.
+  const h = new RelayHarness({ MUX_HOST_SB_WAIT_MS: '6000' });
   await h.start();
   t.after(async () => h.stop());
   const host = await h.connectHost([commandSession('needs-redraw', 'redraw-id', Date.now())]);
@@ -2114,10 +2128,11 @@ test('viewer replay resets leaked alternate-screen and mouse modes before painti
 });
 
 test('burst output during attach never blanks-and-drops (busy-session regression)', async t => {
-  // If output floods while the client is still waiting for scrollback, the relay must go live WITHOUT
-  // losing the screen. The old overflow path set sbWait=false, orphaned the queued frames, skipped the
-  // clear, and then dropped the sb -> lost output on a busy attach. This asserts flooded output arrives.
-  const h = new RelayHarness();
+  // Output that arrives while the client waits for scrollback must still be on the screen once the ring
+  // lands. muxd's ring is serialized when it answers, so it contains those lines; the relay seeds the
+  // model from that ring and paints the snapshot - it never forwards the buffered frames (a suffix that
+  // may begin mid-escape-sequence). The old overflow path dropped the sb and lost the screen entirely.
+  const h = new RelayHarness({ MUX_HOST_SB_WAIT_MS: '6000' });
   await h.start();
   t.after(async () => h.stop());
   const host = await h.connectHost([commandSession('busycase', 'busy-id', Date.now())]);
@@ -2128,9 +2143,14 @@ test('burst output during attach never blanks-and-drops (busy-session regression
   await host.waitFor(m => m.t === 'sb' && m.s === 'busycase', 'scrollback request');
 
   const got = waitForWsText(ws, /BURST_LINE_0007/, 'flooded output frames reach the client');
-  for (let i = 0; i < 10; i++) host.sendOutput('busycase', `BURST_LINE_${String(i).padStart(4, '0')}\r\n`);
-  host.sendScrollback('busycase', 'SB\r\n');
+  let ring = '';
+  for (let i = 0; i < 10; i++) {
+    ring += `BURST_LINE_${String(i).padStart(4, '0')}\r\n`;
+    host.sendOutput('busycase', `BURST_LINE_${String(i).padStart(4, '0')}\r\n`);
+  }
+  host.sendScrollback('busycase', ring);
   assert.match(await got, /BURST_LINE_0007/);
+  assert.equal((await got).match(/BURST_LINE_0007/g).length, 1, 'the snapshot contains the line exactly once');
   ws.close();
 });
 

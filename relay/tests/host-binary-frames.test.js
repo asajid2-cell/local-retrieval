@@ -45,15 +45,19 @@ test('a binary o frame reaches the viewer as raw bytes, with no JSON and no base
   host.sendHello([session], { caps: [...HOST_CAPS, 'binaryFrames'] });
   const viewer = await attachedViewer(h);
   t.after(() => viewer.close());
-  const sb = await host.waitFor(m => m.t === 'sb', 'scrollback');
-  host.sendScrollback('bin', '', sb);
   const got = collectViewerBytes(viewer);
+  const sb = await host.waitFor(m => m.t === 'sb', 'scrollback');
+  // A non-empty ring gives the viewer a real first paint (CLEAR + snapshot). An empty one is a cold,
+  // empty model, which is the defined State L (CLEAR + banner) - valid, but it would make the go-live
+  // transition the thing under test rather than the binary frame.
+  host.sendScrollback('bin', 'SEEDED_SCREEN\r\n', sb);
+  await sleep(150);
 
   // Slot 0 is `bin` (the only session), exactly as muxd would index its own hello.sessions.
   host.sendOutputBinary(0, '\u001b[31mHELLO\u001b[0m\r\n');
   await sleep(120);
-  // The first live byte after a scrollback wait clears the screen once (CLEAR_SCREEN); the payload is
-  // what follows it, and it must be present byte-for-byte with no JSON wrapper and no base64.
+  // The live payload follows the screen and must be present byte-for-byte with no JSON wrapper and no
+  // base64: it is the last thing on the wire.
   assert.ok(got.text().endsWith('\u001b[31mHELLO\u001b[0m\r\n'),
     `the payload was not forwarded byte-for-byte: ${JSON.stringify(got.text())}`);
 });

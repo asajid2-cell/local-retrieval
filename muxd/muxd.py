@@ -1436,7 +1436,7 @@ CUSTODY_GC_INTERVAL_SECONDS = max(
 )
 CLAIM_SWEEP_SECONDS = max(15, int(ENV.get("LAUNCH_CLAIM_SWEEP_SECONDS", "60")))
 PROTOCOL = 4
-CAPS = ["ls", "info", "create", "createAck", "bind", "input", "open", "attach", "kill", "killFence", "relayKillFence", "rename", "heal", "tail", "scrollback", "resize", "owner", "relaunch", "agentTruth", "resync", "inputDurable", "inputFence", "resumeOnly", "principalRegister", "binaryFrames", "watch"]
+CAPS = ["ls", "info", "create", "createAck", "bind", "input", "open", "attach", "kill", "killFence", "relayKillFence", "rename", "heal", "tail", "scrollback", "resize", "owner", "relaunch", "agentTruth", "resync", "inputDurable", "inputFence", "resumeOnly", "principalRegister", "binaryFrames", "watch", "watchAck"]
 
 # Lever 4. The `o` and unsigned `i` frames are the two hot paths over the host link, and both used to
 # pay base64 twice: muxd base64'd the payload into a JSON dict, and the relay decoded it back out. On a
@@ -1772,6 +1772,113 @@ class ElementMapStrip:
             parts.append(bytes(buf[text_from:]))
         self.carry = b""
         return b"".join(parts)
+
+
+class VtBoundaryTracker:
+    """Absolute offsets at which a VT parser is in ground state.
+
+    The positional replay cut may only fall where no escape sequence is open, so `pos` and `start`
+    are snapped to offsets this tracker recorded over the same forwarded raw bytes the ring is fed.
+    Recognition is byte-level and UTF-8 aware: a byte 0x80-0xBF that continues a multi-byte
+    character is data, so ordinary text cannot open a sequence. The 8-bit C1 introducers are still
+    honoured inside UTF-8 text because the relay-side strip state honours them too - a boundary the
+    strip cannot reproduce must never be reported, and missing a boundary only costs a larger live
+    flush, never a mis-cut.
+    """
+
+    _C1 = (0x90, 0x9B, 0x9C, 0x9D)
+
+    def __init__(self):
+        self.reset(0)
+
+    def reset(self, at=0):
+        self.state = "ground"
+        self.utf8_need = 0
+        self.last_ground = int(at)
+
+    def _consume(self, b):
+        st = self.state
+        if st == "ground":
+            if b == 0x1B:
+                self.state = "esc"
+            elif b == 0x9B:
+                self.state = "csi"
+            elif b == 0x9D:
+                self.state = "osc"
+            elif b == 0x90:
+                self.state = "str"
+            # a lone ST in ground is a no-op
+        elif st == "esc":
+            if b == 0x5B:
+                self.state = "csi"
+            elif b == 0x5D:
+                self.state = "osc"
+            elif b in (0x50, 0x58, 0x5E, 0x5F):
+                self.state = "str"
+            elif 0x20 <= b <= 0x2F:
+                self.state = "esc_int"
+            else:
+                self.state = "ground"      # two-character escape (or aborted)
+        elif st == "esc_int":
+            if b in (0x18, 0x1A) or not (0x20 <= b <= 0x2F):
+                self.state = "ground"
+        elif st == "csi":
+            if b in (0x18, 0x1A) or 0x40 <= b <= 0x7E:
+                self.state = "ground"
+            # params/intermediates and ignored controls keep CSI open
+        elif st == "osc":
+            if b in (0x07, 0x18, 0x1A, 0x9C):
+                self.state = "ground"
+            elif b == 0x1B:
+                self.state = "str_esc"
+        elif st == "str":
+            if b in (0x18, 0x1A, 0x9C):
+                self.state = "ground"
+            elif b == 0x1B:
+                self.state = "str_esc"
+        elif st == "str_esc":
+            if b == 0x5C:
+                self.state = "ground"
+            elif b != 0x1B:
+                self.state = "str"         # not ST: resume the string body
+
+    def feed(self, data, base):
+        """Feed bytes covering [base, base+len(data)); return the first and last ground offsets in
+        that closed range, or (None, None) when the chunk contains none."""
+        first = last = None
+
+        def note(p):
+            nonlocal first, last
+            if first is None:
+                first = p
+            last = p
+
+        if self.state == "ground" and not self.utf8_need:
+            note(base)
+        i, n = 0, len(data)
+        while i < n:
+            b = data[i]
+            if self.utf8_need and 0x80 <= b <= 0xBF:
+                self.utf8_need -= 1        # continuation of a character: data, never a control
+            else:
+                self.utf8_need = 0
+                if b in self._C1:
+                    self._consume(b)
+                elif 0xC2 <= b <= 0xDF:
+                    self.utf8_need = 1
+                elif 0xE0 <= b <= 0xEF:
+                    self.utf8_need = 2
+                elif 0xF0 <= b <= 0xF4:
+                    self.utf8_need = 3
+                else:
+                    self._consume(b)
+            i += 1
+            # A boundary must never fall inside a multi-byte character: the cut splits raw bytes,
+            # and a mid-character cut would hand the relay a broken sequence.
+            if not self.utf8_need and self.state == "ground":
+                self.last_ground = base + i
+                note(base + i)
+        return first, last
 
 
 def launch_candidate_ids(cmd="", ids=None):
@@ -3045,9 +3152,17 @@ class Session:
         self.cols, self.rows = max(20, cols or 140), max(8, rows or 40)
         self.created = time.time(); self.last_out = time.time()
         self.ring = collections.deque(); self.ring_len = 0
+        self.ring_meta = collections.deque()    # per-chunk (raw_start, raw_end, first_ground, last_ground)
         self._ring_lock = threading.RLock()
         self.emap_strip = ElementMapStrip()     # ring-only: `pending` keeps the OSC verbatim
         self.replay_state = TerminalReplayState()
+        # Positional replay coordinate: `stream_bytes` counts the raw bytes handed to the forward
+        # queue (the same bytes the relay receives), and every ring chunk records the raw span it was
+        # taken from. `stream_dirty` is set when the queue drops a prefix, which leaves a hole the
+        # relay can never receive; positional replies are refused until a resync re-bases the stream.
+        self.stream_bytes = 0
+        self.stream_dirty = False
+        self.ground = VtBoundaryTracker()
         self.dead = False; self.user_killed = False
         self.deaths = []
         self.loop, self.outq = loop, outq
@@ -3161,11 +3276,15 @@ class Session:
             if pty is not self.pty: return          # superseded by a respawn
             b = data.encode("utf-8", "replace")
             self.replay_state.ingest(b)
-            self._append_ring(b)
             with self.plock:                           # coalesced; the pump flushes immediately then merges a burst
+                raw_start = self.stream_bytes           # the ring span and the forward counter move together
+                self.stream_bytes += len(b)
+                raw_end = self.stream_bytes
                 self.pending += b                       # backpressure: if a flood outruns a slow link, keep the
                 if len(self.pending) > 512_000:         # last ~512KB unsent (the ring still holds history for reattach)
                     del self.pending[:len(self.pending) - 512_000]
+                    self.stream_dirty = True            # a dropped prefix is a hole the relay never receives
+            self._append_ring(b, raw_start, raw_end)
             self.wake_pump()
 
     def drain(self):
@@ -3182,8 +3301,16 @@ class Session:
         try: self.loop.call_soon_threadsafe(ev.set)
         except Exception: pass
 
-    def _append_ring(self, data):
+    def _append_ring(self, data, raw_start=None, raw_end=None):
+        if raw_start is None:                      # direct call (tests): derive the span and advance
+            raw_start = self.stream_bytes
+            raw_end = raw_start + len(data)
+            self.stream_bytes = raw_end
         with self._ring_lock:
+            # The boundary scan and the append are one critical section: a reply taken between them
+            # could name a `pos` in a chunk the snapshot does not yet hold, which is the one way a
+            # positional cut could leave a gap.
+            first_ground, last_ground = self.ground.feed(data, raw_start)
             # Ring-only element-map strip (see ElementMapStrip): history must never hold an OSC 21338
             # sequence, while the live `pending` copy of these same bytes is forwarded untouched. The
             # per-session carry holds a fragment a chunk boundary split, so base64 never leaks into a
@@ -3194,16 +3321,22 @@ class Session:
                 return
             if len(data) >= RING_CAP:
                 retained = data[-RING_CAP:]
-                self.ring.clear()
+                self.ring.clear(); self.ring_meta.clear()
+                # The retained tail of a post-strip slice has no exact raw start (bytes were stripped
+                # out of it), so it reports no first boundary: `start` falls through to the next chunk
+                # that has one. Its end and last boundary are exact.
                 self.ring.append(retained)
+                self.ring_meta.append((max(raw_start, raw_end - len(retained)), raw_end, None, last_ground))
                 self.ring_len = len(retained)
                 self.last_out = time.time()
                 return
             self.ring.append(data)
+            self.ring_meta.append((raw_start, raw_end, first_ground, last_ground))
             self.ring_len += len(data)
             self.last_out = time.time()
             while self.ring_len > RING_CAP:
                 old = self.ring.popleft()
+                self.ring_meta.popleft()
                 self.ring_len -= len(old)
 
     def _ring_snapshot(self):
@@ -3338,6 +3471,59 @@ class Session:
             if n >= limit: break
         return self.replay_state.prefix() + strip_replay_dsr(b"".join(reversed(out)))
 
+    def scrollback_view(self, limit=SB_SEND):
+        """The replay plus its positional cut: `pos`/`start` in the forwarded-raw coordinate.
+
+        `pos` is the last ground-state boundary the forwarded stream has reached, so every raw byte
+        below it is accounted for by the snapshot: the retained-ring body is painted, and a tail that
+        was fully stripped (an element-map chunk that never entered the ring) produced no screen
+        output. The body runs to the ring tail, not to `pos`, so a chunk that straddles `pos` is
+        replayed whole; the relay paints the snapshot over [start,pos) and re-sends the post-`pos`
+        interior live, which is exact because `pos` is a ground boundary. `start` is the first ground
+        boundary at or after the raw start of the oldest chunk actually in this reply. A dirty stream
+        (the forward queue dropped a prefix) reports `pos: null`, which the relay routes to the time
+        cut exactly like an old muxd that sends no position at all.
+        """
+        try: limit = max(0, min(RING_CAP, int(limit)))
+        except Exception: limit = SB_SEND
+        with self._ring_lock:
+            picked, n = [], 0
+            for chunk, meta in reversed(list(zip(self.ring, self.ring_meta))):
+                picked.append((chunk, meta)); n += len(chunk)
+                if n >= limit: break
+            picked.reverse()
+            if getattr(self, "resync_pending", False):
+                self.resync_pending = False
+                body = getattr(self, "resync_body", b"")
+                pos = start = 0
+                resync = True
+            else:
+                body = b"".join(chunk for chunk, _ in picked)
+                resync = False
+                if self.stream_dirty:
+                    pos = start = None
+                else:
+                    # The tracker has fed every forwarded byte, including a chunk stripped to nothing
+                    # (a pure element-map chunk never enters the ring, so scanning `ring_meta` alone
+                    # would leave `pos` behind a tail the relay already received - a cold attach would
+                    # then be judged STALE and show the banner). Bytes between the ring tail and this
+                    # boundary were element-map only: they produce no screen output, so the snapshot
+                    # still represents everything below `pos`.
+                    pos = self.ground.last_ground
+                    for _, meta in reversed(list(zip(self.ring, self.ring_meta))):
+                        if meta[3] is not None:
+                            pos = max(pos, meta[3])
+                            break
+                    start = None
+                    for _, meta in picked:
+                        if meta[2] is not None:
+                            start = meta[2]
+                            break
+                    if start is None or start > pos:
+                        start = pos
+        return {"d": self.replay_state.prefix() + strip_replay_dsr(body),
+                "pos": pos, "start": start, "resync": resync}
+
     def tail_text(self, nbytes=1600, lines=0):
         raw = bytearray()
         for b in reversed(self._ring_snapshot()):
@@ -3375,7 +3561,7 @@ class OwnerSession:
     # snapshots to the VPS and forwards remote keystrokes back into the owner sidecar.
     def __init__(self, name, cmd, cwd, cols, rows, loop, outq, owner_ws, heal=False,
                  ids=None, session_id="", aliases=None, owner_key="", session_uuid="",
-                 adopted=False, stream=False):
+                 adopted=False, stream=False, watch_ack=None):
         self.name, self.cmd, self.cwd = name, cmd or "", cwd or DEFAULT_CWD
         self.session_id, self.aliases, self.ids = resolve_session_identity(
             self.cmd, session_id, aliases, ids
@@ -3389,9 +3575,17 @@ class OwnerSession:
         self.cols, self.rows = max(20, int(cols or 140)), max(8, int(rows or 40))
         self.created = time.time(); self.last_out = time.time()
         self.ring = collections.deque(); self.ring_len = 0
+        self.ring_meta = collections.deque()    # per-chunk (raw_start, raw_end, first_ground, last_ground)
         self._ring_lock = threading.RLock()
         self.emap_strip = ElementMapStrip()     # ring-only: `pending` keeps the OSC verbatim
         self.replay_state = TerminalReplayState()
+        # Positional replay coordinate: `stream_bytes` counts the raw bytes handed to the forward
+        # queue (the same bytes the relay receives), and every ring chunk records the raw span it was
+        # taken from. `stream_dirty` is set when the queue drops a prefix, which leaves a hole the
+        # relay can never receive; positional replies are refused until a resync re-bases the stream.
+        self.stream_bytes = 0
+        self.stream_dirty = False
+        self.ground = VtBoundaryTracker()
         self.dead = False; self.user_killed = False
         self.deaths = []
         self.loop, self.outq = loop, outq
@@ -3410,11 +3604,22 @@ class OwnerSession:
         # A stream owner (spec section 6.2) is a teed local tab: muxd holds its raw VT in the ring and
         # reports kind "local-tab". It has no command muxd may relaunch, so it is never auto-healed.
         self.stream = bool(stream)
+        # The tee's own answer capability, advertised in its hello: it replies to every `watch` with a
+        # `watchAck` stating whether that watch sent a ring snapshot. Per-session because it describes THIS
+        # owner binary - new tees set it, older ones in the same muxd do not, and the relay must not wait on
+        # a snapshot from a tee that will never send one.
+        self.watch_ack = bool(watch_ack) if watch_ack is not None else False
         self.heal = False if self.stream else self.heal
         # spec section 6.5: a stream owner's output is only forwarded while a relay viewer is watching,
         # and the owner is told so it can skip frames entirely on an unwatched tab. Non-stream owners
         # default watched=True so their forwarding is unchanged.
         self.watched = not self.stream
+        # Bytes parked in the ring while unwatched never cross the relay, so the forwarded stream has
+        # a hole the coordinate cannot describe; the first watch after one marks the stream dirty.
+        self._parked_since_watch = 0
+        # A resync is a truth snapshot handed out exactly once: history body, pos = start = base.
+        self.resync_pending = False
+        self.resync_body = b""
         self.identity_pending = False
         self.lifecycle = "active"
         self.last_alive_utc = ""
@@ -3431,15 +3636,29 @@ class OwnerSession:
         self.owner_stop_error = ""
         self.input_waiters = {}
         self.input_seq = 0
+        # Grid ownership (GRID-OWNERSHIP-CONTRACT.md). `grid_owner` is "" while the local pane holds the
+        # grid and a device id while a remote pin does; `grid_epoch` is the last epoch accepted, so a
+        # request or ack at or behind it can never move the grid. `pane_cols/rows` is the last geometry
+        # the tee reported for the physical pane, used to reclaim when a pin releases.
+        self.grid_owner = ""
+        self.grid_owner_label = ""
+        self.grid_epoch = 0
+        self.grid_pending = None          # {epoch, cols, rows, device, label, local, at}
+        self.pane_cols, self.pane_rows = self.cols, self.rows
+        self.grid_last_at = 0.0           # last device-request/ack time, for the pin TTL
 
     def ingest(self, data: bytes):
         if not data: return
         self.replay_state.ingest(data)
-        self._append_ring(data)
         with self.plock:
+            raw_start = self.stream_bytes
+            self.stream_bytes += len(data)
+            raw_end = self.stream_bytes
             self.pending += data
             if len(self.pending) > 512_000:
                 del self.pending[:len(self.pending) - 512_000]
+                self.stream_dirty = True
+        self._append_ring(data, raw_start, raw_end)
         self.wake_pump()
 
     def drain(self):
@@ -3456,8 +3675,16 @@ class OwnerSession:
         try: self.loop.call_soon_threadsafe(ev.set)
         except Exception: pass
 
-    def _append_ring(self, data):
+    def _append_ring(self, data, raw_start=None, raw_end=None):
+        if raw_start is None:                      # direct call (tests): derive the span and advance
+            raw_start = self.stream_bytes
+            raw_end = raw_start + len(data)
+            self.stream_bytes = raw_end
         with self._ring_lock:
+            # The boundary scan and the append are one critical section: a reply taken between them
+            # could name a `pos` in a chunk the snapshot does not yet hold, which is the one way a
+            # positional cut could leave a gap.
+            first_ground, last_ground = self.ground.feed(data, raw_start)
             # Ring-only element-map strip (see ElementMapStrip): history must never hold an OSC 21338
             # sequence, while the live `pending` copy of these same bytes is forwarded untouched. The
             # per-session carry holds a fragment a chunk boundary split, so base64 never leaks into a
@@ -3468,16 +3695,22 @@ class OwnerSession:
                 return
             if len(data) >= RING_CAP:
                 retained = data[-RING_CAP:]
-                self.ring.clear()
+                self.ring.clear(); self.ring_meta.clear()
+                # The retained tail of a post-strip slice has no exact raw start (bytes were stripped
+                # out of it), so it reports no first boundary: `start` falls through to the next chunk
+                # that has one. Its end and last boundary are exact.
                 self.ring.append(retained)
+                self.ring_meta.append((max(raw_start, raw_end - len(retained)), raw_end, None, last_ground))
                 self.ring_len = len(retained)
                 self.last_out = time.time()
                 return
             self.ring.append(data)
+            self.ring_meta.append((raw_start, raw_end, first_ground, last_ground))
             self.ring_len += len(data)
             self.last_out = time.time()
             while self.ring_len > RING_CAP:
                 old = self.ring.popleft()
+                self.ring_meta.popleft()
                 self.ring_len -= len(old)
 
     def _ring_snapshot(self):
@@ -3524,6 +3757,59 @@ class OwnerSession:
             if n >= limit: break
         return self.replay_state.prefix() + strip_replay_dsr(b"".join(reversed(out)))
 
+    def scrollback_view(self, limit=SB_SEND):
+        """The replay plus its positional cut: `pos`/`start` in the forwarded-raw coordinate.
+
+        `pos` is the last ground-state boundary the forwarded stream has reached, so every raw byte
+        below it is accounted for by the snapshot: the retained-ring body is painted, and a tail that
+        was fully stripped (an element-map chunk that never entered the ring) produced no screen
+        output. The body runs to the ring tail, not to `pos`, so a chunk that straddles `pos` is
+        replayed whole; the relay paints the snapshot over [start,pos) and re-sends the post-`pos`
+        interior live, which is exact because `pos` is a ground boundary. `start` is the first ground
+        boundary at or after the raw start of the oldest chunk actually in this reply. A dirty stream
+        (the forward queue dropped a prefix) reports `pos: null`, which the relay routes to the time
+        cut exactly like an old muxd that sends no position at all.
+        """
+        try: limit = max(0, min(RING_CAP, int(limit)))
+        except Exception: limit = SB_SEND
+        with self._ring_lock:
+            picked, n = [], 0
+            for chunk, meta in reversed(list(zip(self.ring, self.ring_meta))):
+                picked.append((chunk, meta)); n += len(chunk)
+                if n >= limit: break
+            picked.reverse()
+            if getattr(self, "resync_pending", False):
+                self.resync_pending = False
+                body = getattr(self, "resync_body", b"")
+                pos = start = 0
+                resync = True
+            else:
+                body = b"".join(chunk for chunk, _ in picked)
+                resync = False
+                if self.stream_dirty:
+                    pos = start = None
+                else:
+                    # The tracker has fed every forwarded byte, including a chunk stripped to nothing
+                    # (a pure element-map chunk never enters the ring, so scanning `ring_meta` alone
+                    # would leave `pos` behind a tail the relay already received - a cold attach would
+                    # then be judged STALE and show the banner). Bytes between the ring tail and this
+                    # boundary were element-map only: they produce no screen output, so the snapshot
+                    # still represents everything below `pos`.
+                    pos = self.ground.last_ground
+                    for _, meta in reversed(list(zip(self.ring, self.ring_meta))):
+                        if meta[3] is not None:
+                            pos = max(pos, meta[3])
+                            break
+                    start = None
+                    for _, meta in picked:
+                        if meta[2] is not None:
+                            start = meta[2]
+                            break
+                    if start is None or start > pos:
+                        start = pos
+        return {"d": self.replay_state.prefix() + strip_replay_dsr(body),
+                "pos": pos, "start": start, "resync": resync}
+
     def tail_text(self, nbytes=1600, lines=0):
         raw = bytearray()
         for b in reversed(self._ring_snapshot()):
@@ -3549,7 +3835,16 @@ class OwnerSession:
         if watched == self.watched:
             return
         self.watched = watched
+        if watched and self._parked_since_watch:
+            # Those bytes are in the ring but never crossed the relay, so the forwarded coordinate no
+            # longer describes what the relay received. A resync (replace_history) re-bases and clears it.
+            self.stream_dirty = True
+            self._parked_since_watch = 0
         self._send_owner({"t": "watch" if watched else "unwatch"})
+
+    def note_parked(self, count: int):
+        if count > 0:
+            self._parked_since_watch += count
 
     def replace_history(self, data: bytes):
         # spec section 6.1, kind 0x03: the owner's screen and our ring have diverged, so the ring is
@@ -3563,15 +3858,25 @@ class OwnerSession:
         # stripper would honour 2a and keep it as text; drop it here, where the snapshot is known to be
         # one, before it becomes part of the ring.
         history = self.emap_strip.strip(drop_leading_element_map_tail(data))
+        with self.plock:
+            # Re-base and drop the forward queue in one step. The resync frame below is queued after
+            # this, so no post-resync byte can reach the relay before it re-bases its own counter.
+            self.pending = bytearray()
+            self.stream_bytes = 0
+            self.stream_dirty = False
         with self._ring_lock:
-            self.ring.clear()
+            # The history snapshot is below the new base: it carries a zero-width span so the live
+            # coordinate starts at 0 and the body still paints the whole screen.
+            self.ground.reset(0)
+            self.ring.clear(); self.ring_meta.clear()
             self.ring.append(history)
+            self.ring_meta.append((0, 0, 0, 0))
             self.ring_len = len(history)
+            self.resync_body = history
+            self.resync_pending = True
         self.replay_state = TerminalReplayState()
         if data:
             self.replay_state.ingest(data)
-        with self.plock:
-            self.pending = bytearray()
         self.last_out = time.time()
         self.outq.put_nowait(("resync", self.name, b""))
         self.wake_pump()
@@ -3656,6 +3961,180 @@ def clear_remote_size_ownership():
             continue
         session.remote_size_active = False
         restore_local_session_size(session)
+
+
+# ---- grid ownership (GRID-OWNERSHIP-CONTRACT.md) ------------------------------------------------
+# A teed local tab has one committed geometry. The local pane holds it by default; a device may take
+# it with an epoch, and the tee's sizeAck is what commits. These helpers are pure state machines over
+# an OwnerSession so a test can drive them without a socket.
+GRID_MAX_COLS, GRID_MAX_ROWS = 1000, 300
+GRID_PIN_TTL_S = 300.0        # a device pin with no traffic releases the grid back to the pane
+GRID_ACK_TIMEOUT_S = 5.0      # a request the tee has not applied is refused, never left pending
+
+def grid_clamp(cols, rows):
+    try:
+        c, r = int(cols), int(rows)
+    except Exception:
+        return None
+    return max(20, min(GRID_MAX_COLS, c)), max(8, min(GRID_MAX_ROWS, r))
+
+def _grid_refresh(owner):
+    # The relay learns geometry from the session list, which otherwise trickles out on the 5 s pump.
+    owner.outq.put_nowait(("dead", owner.name, ""))
+
+def _grid_report(owner, epoch, ok, reason=""):
+    owner.outq.put_nowait(("gridAck", owner.name, json.dumps({
+        "t": "gridAck", "s": owner.name, "epoch": int(epoch or 0), "ok": bool(ok),
+        # muxd's CURRENT epoch, so a relay whose pin record outlived a restart can retry one past it
+        # instead of guessing from a stale session list.
+        "gridEpoch": int(getattr(owner, "grid_epoch", 0) or 0),
+        "reason": str(reason or "")[:200],
+    })))
+
+def _grid_next_epoch(owner):
+    """The epoch a new commit would take: one past the committed epoch and any in-flight reservation."""
+    cur = int(getattr(owner, "grid_epoch", 0) or 0)
+    pending = getattr(owner, "grid_pending", None)
+    if pending:
+        cur = max(cur, int(pending.get("epoch", 0) or 0))
+    return cur + 1
+
+def owner_touch(owner):
+    """Any traffic from the owning device keeps its pin alive; the TTL is for a GONE device."""
+    if getattr(owner, "grid_owner", ""):
+        owner.grid_last_at = time.time()
+
+def owner_local_size(owner, cols, rows):
+    """A tee `size` frame: the local pane is (again) the authority, applied before it is reported."""
+    size = grid_clamp(cols, rows)
+    if size is None:
+        return False
+    was_pinned = bool(getattr(owner, "grid_owner", ""))
+    owner.pane_cols, owner.pane_rows = size
+    # A redundant announcement (the connect-time one, or an unchanged pane) is not a commit: it must
+    # not bump the epoch and must not wake the relay.
+    if not was_pinned and size == (owner.cols, owner.rows):
+        return False
+    epoch = _grid_next_epoch(owner)
+    owner.grid_owner = ""
+    owner.grid_owner_label = ""
+    owner.grid_pending = None
+    owner.grid_epoch = epoch
+    owner.grid_last_at = 0.0
+    owner.cols, owner.rows = size
+    if was_pinned:
+        log(f"[{owner.name}] owner=local reason=size")
+    _grid_refresh(owner)
+    return True
+
+def owner_reclaim_local(owner, reason="activity"):
+    """Local activity or an explicit release: ask the tee to restore the pane, commit on its ack.
+
+    Nothing moves here except the reservation: until the tee has actually resized the child PTY, the
+    committed grid is still the device's, and advertising it as local would have viewers paint a
+    remote grid under a local label.
+    """
+    if not getattr(owner, "grid_owner", ""):
+        return False
+    pending = getattr(owner, "grid_pending", None)
+    if pending and pending.get("local"):
+        return False                       # a reclaim is already in flight
+    if pending:
+        # A DEVICE request (a take, or a viewport re-measure) is in flight and this local activity wins.
+        # The superseded request still has to be ANSWERED: its epoch is what the relay is waiting on, and
+        # an unanswered epoch left the relay's pending record stuck forever, silently dropping every
+        # later request for that session. Refuse it with a reason the relay must not retry.
+        _grid_report(owner, pending.get("epoch", 0), False, "superseded by local reclaim")
+        log(f"[{owner.name}] superseded device request epoch={pending.get('epoch')} reason={reason}")
+    size = (int(owner.pane_cols), int(owner.pane_rows))
+    epoch = _grid_next_epoch(owner)
+    owner.grid_pending = {"epoch": epoch, "cols": size[0], "rows": size[1],
+                          "device": "", "label": "", "local": True, "at": time.time()}
+    # Release carries no geometry: only the tee can read the pane, and this is the same restore path as
+    # the first-local-key reclaim (contract section 5a). The ack brings the pane geometry back.
+    owner._send_owner({"t": "resize", "epoch": epoch, "owner": "local"})
+    # The transition itself is the rate limit: once the reclaim is in flight a typing burst is a
+    # no-op and logs nothing, so this line appears at most once per reclaim.
+    log(f"[{owner.name}] owner=local reason={reason}")
+    return True
+
+def owner_request_grid(owner, cols, rows, epoch, device, label=""):
+    """A device takes the grid. G and the epoch do not move until the tee's sizeAck commits them."""
+    size = grid_clamp(cols, rows)
+    device = str(device or "").strip()[:64]
+    if size is None or not device:
+        return False
+    try:
+        want = int(epoch)
+    except Exception:
+        want = _grid_next_epoch(owner)
+    # G4/T3: an epoch at or behind the last COMMITTED one, or behind an in-flight reservation, can
+    # never move the grid.
+    current = int(getattr(owner, "grid_epoch", 0) or 0)
+    pending = getattr(owner, "grid_pending", None)
+    if pending:
+        current = max(current, int(pending.get("epoch", 0) or 0))
+    if want <= current:
+        return False
+    owner.grid_pending = {"epoch": want, "cols": size[0], "rows": size[1],
+                          "device": device, "label": str(label or "")[:64],
+                          "local": False, "at": time.time()}
+    owner._send_owner({"t": "resize", "epoch": want, "cols": size[0], "rows": size[1]})
+    log(f"[{owner.name}] resize req epoch={want} cols={size[0]} rows={size[1]} owner={device}")
+    return True
+
+def owner_size_ack(owner, message):
+    """Commit a resize the tee actually applied. Returns True only when G moved."""
+    try:
+        epoch = int(message.get("epoch"))
+    except Exception:
+        return False
+    pending = getattr(owner, "grid_pending", None)
+    if not pending or epoch != int(pending.get("epoch", -1)):
+        return False                       # G4: an ack for a superseded request never rolls G back
+    owner.grid_pending = None
+    ok = bool(message.get("ok"))
+    if not ok:
+        log(f"[{owner.name}] resize ack epoch={epoch} cols={pending['cols']} rows={pending['rows']} ok=false")
+        _grid_report(owner, epoch, False, message.get("reason", "the tee could not apply the resize"))
+        return False                       # a refusal leaves G, the epoch and the owner exactly as they were
+    size = grid_clamp(message.get("cols", pending["cols"]), message.get("rows", pending["rows"]))
+    if size is None:
+        size = (int(pending["cols"]), int(pending["rows"]))
+    owner.cols, owner.rows = size
+    owner.grid_epoch = epoch
+    if pending.get("local"):
+        owner.grid_owner = ""
+        owner.grid_owner_label = ""
+    else:
+        owner.grid_owner = str(pending.get("device") or "")
+        owner.grid_owner_label = str(pending.get("label") or "")
+        owner.grid_last_at = time.time()
+    # The ack is the tee's own report of the pane, so it can re-anchor a later reclaim.
+    if message.get("paneCols") and message.get("paneRows"):
+        pane = grid_clamp(message.get("paneCols"), message.get("paneRows"))
+        if pane: owner.pane_cols, owner.pane_rows = pane
+    log(f"[{owner.name}] resize ack epoch={epoch} cols={size[0]} rows={size[1]} ok=true")
+    # G4: the commit itself is acked with its epoch. Without this a relay could only learn about a
+    # success from the session list, which left its pending-request record set forever and silently
+    # dropped every later request for the session (a viewport change while owning looked like a no-op).
+    _grid_report(owner, epoch, True)
+    _grid_refresh(owner)
+    return True
+
+def owner_grid_tick(owner, now=None):
+    """Timeout an unapplied request, and release a pin whose device has gone quiet (G5 TTL)."""
+    now = time.time() if now is None else now
+    changed = False
+    pending = getattr(owner, "grid_pending", None)
+    if pending and now - float(pending.get("at") or now) > GRID_ACK_TIMEOUT_S:
+        # Pure report: the request never moved G, the epoch or the owner, so there is nothing to undo.
+        owner.grid_pending = None
+        _grid_report(owner, pending.get("epoch", 0), False, "the tee did not acknowledge the resize")
+        changed = True
+    if getattr(owner, "grid_owner", "") and owner.grid_last_at and now - owner.grid_last_at > GRID_PIN_TTL_S:
+        changed = owner_reclaim_local(owner, reason="disconnect") or changed
+    return changed
 
 
 def dump_thread_stacks(reason):
@@ -3820,6 +4299,7 @@ def restore_manifest_sessions(records, target=None, loop=None, outq=None, now=No
             # A stream owner is a teed local tab. It has no command muxd may relaunch, so it is never
             # healed - a restored one is a dormant row the owner re-registers against (spec section 6.2).
             restored.stream = bool(m.get("stream", False))
+            restored.watch_ack = bool(m.get("watchAck", False))
             if restored.adopted or restored.stream:
                 restored.heal = False
             restored.identity_pending = bool(m.get("identityPending"))
@@ -3833,6 +4313,15 @@ def restore_manifest_sessions(records, target=None, loop=None, outq=None, now=No
                 restored.stop_disposition = ""
             restored.user_killed = bool(m.get("userKilled", False))
             restored.generation_id = str(m.get("generationId", "") or restored.generation_id)
+            # A restored epoch must stay monotonic across the restart: if the record cannot supply one
+            # ahead of wall time, wall time does, so a relay holding a pre-restart epoch cannot win.
+            restored.grid_epoch = max(
+                int(m.get("gridEpoch", 0) or 0) if str(m.get("gridEpoch", "")).lstrip("-").isdigit() else 0,
+                int(time.time()),
+            )
+            restored.grid_owner = ""
+            restored.grid_owner_label = ""
+            restored.grid_pending = None
             restored.operation_key = str(m.get("operationKey", "") or "")
             restored.operation_fingerprint = str(m.get("operationFingerprint", "") or "")
             restored.operation_created = bool(m.get("operationCreated", False))
@@ -3862,6 +4351,9 @@ def session_records_payload(source=None):
     source = sessions if source is None else source
     return {
         n: {"cmd": s.cmd, "cwd": s.cwd, "cols": s.cols, "rows": s.rows, "heal": s.heal,
+            # The grid epoch rides with the geometry: a relay carrying an epoch from before a restart
+            # must never win, so the two are written in the same record and restored together.
+            "gridEpoch": int(getattr(s, "grid_epoch", 0) or 0),
             "sessionId": getattr(s, "session_id", "") or "",
             "sessionUuid": getattr(s, "session_uuid", "") or "",
             "aliases": list(getattr(s, "aliases", []) or []),
@@ -3871,6 +4363,10 @@ def session_records_payload(source=None):
             "adopted": bool(getattr(s, "adopted", False)),
             "externalOwner": bool(getattr(s, "external_owner", False)),
             "stream": bool(getattr(s, "stream", False)),
+            # The tee's answer capability, persisted with the row so a restored link keeps it. Without
+            # this, an muxd restart would forget which tabs can answer `watch` and fall back for all of
+            # them - the same silent downgrade this session was fixed for.
+            "watchAck": bool(getattr(s, "watch_ack", False)),
             "identityPending": bool(getattr(s, "identity_pending", False)),
             "lifecycle": str(getattr(s, "lifecycle", "active") or "active"),
             "childPid": int(getattr(s, "child_pid", 0) or 0),
@@ -4260,6 +4756,17 @@ def session_payload(name, sess):
         agent_truth, agent_source = dict(AGENT_TRUTH_UNKNOWN), "heuristic"
     return {"name": name, "alive": alive, "created": int(sess.created * 1000),
             "lastOut": int(sess.last_out * 1000), "cols": sess.cols, "rows": sess.rows,
+            # Grid ownership. `owner` above is the historical bool ("this row is owner-backed"), so the
+            # committed grid authority is ADDITIVE under distinct names: the relay reads these and a
+            # reader that does not know them sees exactly today's record.
+            "gridOwner": ("pin" if getattr(sess, "grid_owner", "") else "local"),
+            "gridOwnerLabel": str(getattr(sess, "grid_owner_label", "") or ""),
+            "gridEpoch": int(getattr(sess, "grid_epoch", 0) or 0),
+            "gridPending": bool(getattr(sess, "grid_pending", None)),
+            # Per-session, from the tee's own hello: this tab answers `watch` with a `watchAck`. The relay
+            # uses it to decide whether a new viewer's history request may wait for a resync, because only
+            # a tee that answers can tell it no snapshot is coming. Additive: an old relay ignores it.
+            "watchAck": bool(getattr(sess, "watch_ack", False)),
             "tail": tail, "heal": sess.heal, "localViewers": len(sess.local),
             "localFirst": owner or len(sess.local) > 0, "owner": owner,
             "ownerConnected": bool(getattr(sess, "owner_connected", False)),
@@ -4269,6 +4776,9 @@ def session_payload(name, sess):
             "ready": alive, "kind": kind,
             "sessionId": getattr(sess, "session_id", "") or "",
             "generationId": str(getattr(sess, "generation_id", "") or ""),
+            # Forwarded-raw coordinate. The relay anchors its own counter on it at hello, so an
+            # additive field: an old relay ignores it and keeps the time cut.
+            "streamBytes": int(getattr(sess, "stream_bytes", 0) or 0),
             "aliases": list(getattr(sess, "aliases", []) or []),
             "identityPending": bool(getattr(sess, "identity_pending", False)),
             "lifecycle": str(getattr(sess, "lifecycle", "active") or "active"),
@@ -4290,6 +4800,12 @@ def needs_relaunch_for_command(prev, requested_cmd):
     return command_sig(getattr(prev, "cmd", "")) != command_sig(requested)
 
 def sess_list(now=None):
+    # A pin whose device has gone quiet, or a request the tee never applied, is resolved here: this is
+    # the one cadence that touches every session, and the list is what the relay reads to paint.
+    for s in list(sessions.values()):
+        if isinstance(s, OwnerSession):
+            try: owner_grid_tick(s, time.time())
+            except Exception as e: log(f"[{getattr(s, 'name', '?')}] grid tick failed: {e}")
     # Custody-expired records are dropped outright: the relay keeps showing every UNexpired dormant
     # row for relaunch, and never a row muxd has already written off.
     return [session_payload(n, s) for n, s in sessions.items() if not custody_reclaimable(s, now)]
@@ -4418,14 +4934,18 @@ async def serve_owner_connection(ws, first, sessions, outq, save_manifest, regis
             if mt == "o":
                 owner.ingest(base64.b64decode(m.get("d", "")))
             elif mt == "size":
-                cols = max(20, int(m.get("cols") or owner.cols))
-                rows = max(8, int(m.get("rows") or owner.rows))
-                if (cols, rows) != (owner.cols, owner.rows):
-                    owner.cols, owner.rows = cols, rows
-                    # Every viewer of a stream owner renders at this size (§7.1), and the relay learns
-                    # sizes only from the session list, which otherwise trickles out on the 5 s status
-                    # pump. Nudge it so a resize reaches the mirror immediately.
-                    outq.put_nowait(("dead", name, ""))
+                # The pane changed (or this is the connect-time announcement): a local-ownership
+                # statement. It always bumps the epoch, so a late ack for a device pin cannot win.
+                if owner_local_size(owner, m.get("cols"), m.get("rows")):
+                    await save_manifest(sessions)
+            elif mt == "sizeAck":
+                # Only an ack can commit a device pin; a refusal leaves G and the owner untouched.
+                if owner_size_ack(owner, m):
+                    await save_manifest(sessions)
+            elif mt == "activity":
+                # A local key or mouse event. The physical keyboard always wins, silently (contract §9).
+                if owner_reclaim_local(owner):
+                    await save_manifest(sessions)
             elif mt == "child":
                 child_pid = int(m.get("pid", 0) or 0)
                 if child_pid <= 0:
@@ -4433,6 +4953,13 @@ async def serve_owner_connection(ws, first, sessions, outq, save_manifest, regis
                 owner.child_pid = child_pid
                 owner.child_start_token = _process_start_token(child_pid)
                 await save_manifest(sessions)
+            elif mt == "watchAck":
+                # The tee told us whether its `watch` produced a fresh ring snapshot. The relay holds an
+                # attach's scrollback request waiting on this answer, so forward it verbatim and promptly:
+                # `snapshot:true` means a resync is about to paint those viewers instead.
+                owner.outq.put_nowait(("watchAck", owner.name, json.dumps({
+                    "t": "watchAck", "s": owner.name, "snapshot": bool(m.get("snapshot")),
+                })))
             elif mt == "inputResult":
                 waiter = owner.input_waiters.get(str(m.get("rid", "")))
                 if waiter is not None and not waiter.done():
@@ -5130,9 +5657,17 @@ async def main():
                 owner_key=owner_key,
                 adopted=adopted,
                 stream=stream,
+                watch_ack=bool(first.get("watchAck", False)),
             )
             owner._launch_claim = claim
             owner.claim_paths = list(claim.paths) if claim is not None else []
+            # A reconnect inherits the epoch its row carried, and never goes below wall time, so a relay
+            # request minted before a muxd restart can never outrank this process's commits.
+            owner.grid_epoch = max(
+                int(getattr(prev, "grid_epoch", 0) or 0) if prev is not None else 0,
+                int(time.time()),
+            )
+            owner.pane_cols, owner.pane_rows = owner.cols, owner.rows
             owner.child_pid = child_pid
             owner.child_start_token = _process_start_token(owner.child_pid)
             candidate = dict(sessions)
@@ -5779,6 +6314,10 @@ async def main():
                     # normal session has no watcher concept and is always forwarded.
                     if getattr(s, "watched", True):
                         outq.put_nowait(("o", s.name, chunk))
+                    else:
+                        note_parked = getattr(s, "note_parked", None)
+                        if note_parked:
+                            note_parked(len(chunk))
                     fanout_local_output(s, chunk)
     start_supervised_background(background_tasks, "output-flush", flush_out)
 
@@ -6051,6 +6590,13 @@ async def main():
                                 await ws.send(json.dumps({"t": "resync", "s": name}))
                             elif kind == "dead":
                                 await ws.send(json.dumps({"t": "sessions", "list": sess_list()}))
+                            elif kind == "gridAck":
+                                # A grid request the tee refused or never answered. `data` is the frame.
+                                await ws.send(data)
+                            elif kind == "watchAck":
+                                # The tee's answer to a `watch`: did it send a ring snapshot? The relay holds
+                                # an attach's scrollback request on this, so it must not wait behind output.
+                                await ws.send(data)
 
                     async def pump_status():
                         while True:
@@ -6238,7 +6784,18 @@ async def main():
                                         remember_desired_watch(name, wanted)
                                     session = sessions.get(name)
                                     if isinstance(session, OwnerSession):
+                                        # muxd is the authority on whether a re-statement can produce a
+                                        # snapshot. set_watched is idempotent, so when the owner is ALREADY
+                                        # watching it forwards nothing - the tee never sees the frame and no
+                                        # snapshot or ack can ever come. Answering here is what keeps a
+                                        # relay that waits on this attach from idling into the banner.
+                                        was_watched = bool(session.watched)
                                         session.set_watched(wanted)
+                                        if (wanted and was_watched and session.stream
+                                                and getattr(session, "watch_ack", False)):
+                                            outq.put_nowait(("watchAck", name, json.dumps({
+                                                "t": "watchAck", "s": name, "snapshot": False,
+                                            })))
                                         if session.stream:
                                             log(f"[{name}] " + (
                                                 "watched: forwarding owner output" if wanted
@@ -6252,6 +6809,9 @@ async def main():
                                     # A refusal returns before any write, so a frame without an
                                     # accepted proof performs zero PTY writes.
                                     input_session = sessions[name]
+                                    # Remote input is proof the owning device is still there: refresh the
+                                    # pin TTL so an idle hands-on viewer does not lose the grid.
+                                    owner_touch(input_session)
                                     principal, body, refusal = authorize_relay_input(m, input_session)
                                     if refusal is not None:
                                         log(f"[{name}] input refused: {refusal.code}: {refusal.detail}")
@@ -6271,7 +6831,31 @@ async def main():
                                                 outcome, name, m, principal
                                             )))
                                 elif t == "resize" and name in sessions:
-                                    apply_remote_session_size(sessions[name], m)
+                                    session = sessions[name]
+                                    if isinstance(session, OwnerSession) and getattr(session, "stream", False):
+                                        # A teed local tab: the device either takes the grid (request
+                                        # with an epoch) or releases it back to the pane.
+                                        requester = str(m.get("owner") or "").strip()
+                                        if m.get("active") is False or requester in ("", "local"):
+                                            if owner_reclaim_local(session, reason="release"):
+                                                # This dispatch runs inside main(), where the manifest
+                                                # callable is manifest_save_async; save_manifest only
+                                                # exists in serve_owner_connection's parameters.
+                                                await manifest_save_async(sessions)
+                                        else:
+                                            # A viewport report from the owning device is also liveness.
+                                            owner_touch(session)
+                                            if owner_request_grid(
+                                                session, m.get("cols"), m.get("rows"),
+                                                m.get("epoch"), requester, m.get("label", ""),
+                                            ):
+                                                await manifest_save_async(sessions)
+                                            else:
+                                                # Tell the relay so it can retry once at the current
+                                                # epoch + 1: its pin record outlives a relay restart.
+                                                _grid_report(session, m.get("epoch"), False, "stale epoch")
+                                    else:
+                                        apply_remote_session_size(session, m)
                                 elif t == "redraw" and name in sessions:
                                     session = sessions[name]
                                     if isinstance(session, OwnerSession):
@@ -6282,17 +6866,22 @@ async def main():
                                     session = sessions[name]
                                     scrollback_limit = m.get("max", SB_SEND)
                                     scrollback_request_id = str(m.get("rid", "") or "")
-                                    encoded = await asyncio.get_running_loop().run_in_executor(
+                                    view = await asyncio.get_running_loop().run_in_executor(
                                         None,
-                                        lambda current=session, limit=scrollback_limit: base64.b64encode(
-                                            current.scrollback(limit)
-                                        ).decode(),
+                                        lambda current=session, limit=scrollback_limit: current.scrollback_view(limit),
                                     )
+                                    # The positional cut rides the same reply, additive: the body is
+                                    # everything below `pos`, and `pos: null` (dirty) is distinct from
+                                    # an old muxd that omits the key entirely.
                                     await ws.send(json.dumps({
                                         "t": "sb",
                                         "s": name,
                                         "rid": scrollback_request_id,
-                                        "d": encoded,
+                                        "d": base64.b64encode(view["d"]).decode(),
+                                        "pos": view["pos"],
+                                        "start": view["start"],
+                                        "generationId": str(getattr(session, "generation_id", "") or ""),
+                                        "resync": bool(view["resync"]),
                                     }))
                                     # Byte replay can't rebuild a full-screen TUI on its own; nudge the app to
                                     # emit an authoritative full frame right after the replay.

@@ -90,9 +90,34 @@ async function withBrowserRelay(session, renderMode, callback) {
     await page.waitForFunction(() => window._sessions && window._sessions.some(s => s.name === 'render'));
     await page.evaluate(() => connect('render'));
     await page.waitForFunction(() => !!document.querySelector('.xterm'));
-    host.sendOutput(SESSION_NAME, 'renderer probe line one\r\nrenderer probe line two\r\n');
-    await new Promise(r => setTimeout(r, 500));
-    await callback({ harness, host, page });
+    // The relay never serves a byte log: a viewer whose scrollback wait times out gets the defined banner
+    // and then live output, so bytes buffered during the wait are not painted. Give each viewer a real
+    // first paint by answering its ring request. The page can attach more than once, and the relay drops
+    // a session's model when its last viewer leaves, so EVERY request is answered - including a re-request
+    // after a reconnect - until the text is on the screen. A warm model ignores a ring it already holds.
+    const answered = new Set();
+    const answerRings = () => {
+      for (const m of host.messages) {
+        if (m.t !== 'sb' || m.s !== SESSION_NAME || answered.has(m.rid)) continue;
+        answered.add(m.rid);
+        host.sendScrollback(SESSION_NAME, 'renderer probe line one\r\nrenderer probe line two\r\n', m);
+      }
+    };
+    const pump = setInterval(answerRings, 20);
+    try {
+      await page.waitForFunction(() => {
+        const b = term.buffer.active;
+        for (let i = 0; i < b.length; i++) {
+          const l = b.getLine(i);
+          if (l && l.translateToString(true).includes('renderer probe line one')) return true;
+        }
+        return false;
+      }, null, { timeout: TEST_TIMEOUT_MS });
+      await new Promise(r => setTimeout(r, 500));
+      await callback({ harness, host, page });
+    } finally {
+      clearInterval(pump);
+    }
   } finally {
     if (context) await context.close();
     if (host) host.close();
