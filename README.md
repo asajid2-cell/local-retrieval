@@ -74,6 +74,6 @@ Run the app suite with `dotnet test app/native/CodexLocalRetrieval.Native.Tests`
 
 ## Status and license
 
-Active development on `release`; the desktop release notes track v0.2.0 in `app/RELEASE_NOTES.md`. The desktop app is MIT (`app/LICENSE`); the relay package declares ISC.
+Development continues on `main`; this branch is the release cut. The desktop release notes track v0.2.0 in `app/RELEASE_NOTES.md`. The desktop app is MIT (`app/LICENSE`); the relay package declares ISC.
 
 Read `app/CONTRIBUTING.md` and run both suites before a pull request.
