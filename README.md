@@ -12,7 +12,7 @@ MUX puts both agent-session stores into one searchable archive. It reopens any c
 | --- | --- |
 | Two session formats in one archive | Codex rollouts and Claude transcripts, parsed by `app/native/CodexLocalRetrieval.Core/Services/ArchiveService.cs` |
 | Three processes in one repo | `app/`, `muxd/`, `relay/` |
-| 1,700+ automated tests | `app/native/CodexLocalRetrieval.Native.Tests`, `relay/tests` |
+| 1,700+ automated test cases | `app/native/CodexLocalRetrieval.Native.Tests`, `relay/tests` |
 | Zero inbound ports on the PC | `muxd/muxd.py` dials out to the relay |
 | One grid, one owner at a time | an epoch, an owner label, and an acknowledged resize |
 
@@ -30,7 +30,9 @@ The obvious alternative is SSH plus tmux. That needs an inbound path or a perman
 
 An attached browser drives the real pty that is already running on the PC. The tee keeps ownership of that pty, and `muxd` streams its bytes to the VPS over one outbound WebSocket. The relay forwards viewer input back and fans output to each viewer. The PC needs no inbound port, so closing the browser or losing the network does not stop the work.
 
-The relay is a forwarder, not a source of truth. A session with a PC chip is running on the PC and survives a relay deploy or a network drop; reattaching returns to the same session. The archive, the keys, and the terminal stay on the machine.
+The relay is a forwarder, not a source of truth. Write leases live in `muxd`, so the relay never decides who may type. The archive, the keys, and the terminal stay on the machine.
+
+A session with the PC chip and the PC-TAB chip is one tab running on the PC. It survives a relay deploy or a network drop, and reattaching returns to the same session.
 
 The grid is the one shared piece. A pty has one physical grid, cols × rows, and the PC pane owns it by default. A device that wants it sends an epoch, an owner label, and the cols and rows it reads at its font. Then `muxd` resizes the pty and acknowledges the new geometry.
 
@@ -49,6 +51,8 @@ Agent TUIs repaint in place with absolute cursor addressing, so the byte stream 
 | <img src="docs/media/relay-sessions.png" width="250" alt="Five PC tabs listed in the relay session list"> | <img src="docs/media/relay-grid-take.png" width="250" alt="The size chip reads this device after the phone takes the grid"> |
 | **Threads view** | **Handing the grid back** |
 | <img src="docs/media/relay-threads.png" width="250" alt="A readable grouped conversation in the relay threads view"> | <img src="docs/media/relay-grid-handback.png" width="250" alt="The status bar reads giving the grid back before the PC pane takes it again"> |
+
+Captured from the real page running in the relay test rig; sessions and paths are fixtures. The PC chip and the PC-TAB chip are two badges on one tab that runs on the PC.
 
 ## Try it
 
