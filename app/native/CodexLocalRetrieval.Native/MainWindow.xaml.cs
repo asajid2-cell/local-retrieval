@@ -37,5 +37,15 @@ public sealed partial class MainWindow : Window
         // Navigate the root frame to the main page on startup.
         RootFrame.Navigate(typeof(MainPage));
         Diag.Log("MW.ctor: navigated to MainPage");
+
+        // Merge results are committed at most once per DeferredSaveInterval, so the store on disk can lag
+        // the live one. Flush on close so a normal exit is exact; a hard kill only costs a re-parse, the
+        // same bargain the merge path already makes while running.
+        Closed += async (_, _) =>
+        {
+            if (RootFrame.Content is not MainPage page) return;
+            try { await page.FlushArchiveSaveAsync(); }
+            catch (Exception ex) { Diag.Log("Close flush failed: " + ex.Message); }
+        };
     }
 }

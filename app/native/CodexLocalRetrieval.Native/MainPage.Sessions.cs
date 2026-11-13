@@ -47,6 +47,13 @@ public sealed partial class MainPage
             : TimeSpan.FromTicks(Math.Min(ArchiveSyncMaxBackoff.Ticks, _archiveSyncBackoff.Ticks * 2));
     }
 
+    // Paths the watcher reported since the last sync. A watcher-driven sync can then scan ONLY those files
+    // instead of walking every transcript tree; a full walk is still what a null/empty set (the safety-net
+    // poll, a startup, the Sync button) falls back to.
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> _archiveChangedPaths =
+        new(StringComparer.OrdinalIgnoreCase);
+    private int _archiveFullRescanPending;
+
     private void StartArchiveSourceWatches()
     {
         StopArchiveSourceWatches();
@@ -59,8 +66,24 @@ public sealed partial class MainPage
                     source.Root,
                     "*.jsonl",
                     recurse: true,
-                    () =>
+                    paths =>
                     {
+                        if (paths is { Count: > 0 })
+                        {
+                            foreach (var path in paths)
+                            {
+                                _archiveChangedPaths[path] = 0;
+                                // A delete has no incremental answer: a partial scan merges stamps rather
+                                // than replacing them, so a vanished file is only dropped by a full walk.
+                                // One stat per event is cheap and deletes are rare next to appends.
+                                if (!File.Exists(path)) Interlocked.Exchange(ref _archiveFullRescanPending, 1);
+                            }
+                        }
+                        else
+                        {
+                            // The safety-net poll found a change but not which file moved: assume all.
+                            Interlocked.Exchange(ref _archiveFullRescanPending, 1);
+                        }
                         Interlocked.Exchange(ref _archiveSyncPending, 1);
                         ScheduleArchiveSourceSync();
                     }));
@@ -99,8 +122,18 @@ public sealed partial class MainPage
                         continue;
                     }
                     Interlocked.Exchange(ref _archiveSyncPending, 0);
+                    var full = Interlocked.Exchange(ref _archiveFullRescanPending, 0) == 1;
+                    IReadOnlyCollection<string>? changed = null;
+                    if (!full && !_archiveChangedPaths.IsEmpty)
+                    {
+                        var paths = new List<string>(_archiveChangedPaths.Count);
+                        foreach (var key in _archiveChangedPaths.Keys)
+                            if (_archiveChangedPaths.TryRemove(key, out _)) paths.Add(key);
+                        if (paths.Count > 0) changed = paths;
+                    }
                     _lastArchiveSyncUtc = DateTime.UtcNow;
-                    await SyncNowAsync(initial: false);
+                    try { await SyncNowAsync(initial: false, changedPaths: changed); }
+                    catch (Exception ex) { Diag.Log("Watcher-driven sync failed: " + ex.Message); }
                 }
             }
             finally
@@ -138,10 +171,19 @@ public sealed partial class MainPage
 
     private async void Sync_Click(object sender, RoutedEventArgs e) => await SyncNowAsync(initial: false);
 
+    // Window close: commit whatever the deferred merge window is holding.
+    internal async Task FlushArchiveSaveAsync()
+    {
+        if (!_archive.HasDeferredSave) return;
+        await _archive.FlushDeferredSaveAsync();
+        Diag.Log("Archive save flushed on close");
+    }
+
     private async Task SyncNowAsync(
         bool initial,
         CancellationToken suppliedCancellationToken = default,
-        bool waitForActive = false)
+        bool waitForActive = false,
+        IReadOnlyCollection<string>? changedPaths = null)
     {
         if (!_pageInitialized && !initial) return;
         if (!waitForActive && _syncing) return;
@@ -225,16 +267,29 @@ public sealed partial class MainPage
                 Diag.Log("Sync: archive load retry succeeded (" + _archive.Sessions.Count + " sessions)");
             }
             var progress = new Progress<string>(s => SyncStatus.Text = s);
-            Diag.Log("Sync: scan start");
+            // A watcher-driven sync knows exactly which transcripts changed, so it reads only those files.
+            // Walking ~20k transcripts every cycle was 2.6-4.4 s of near-solid CPU on a 30 s timer. Startup,
+            // the Sync button and the safety-net poll all pass no set and still get a full walk.
+            var scanPaths = changedPaths is { Count: > 0 } ? changedPaths : null;
+            Diag.Log(scanPaths is null
+                ? "Sync: full scan start"
+                : $"Sync: incremental scan start ({scanPaths.Count} changed paths)");
             Diag.Mem("sync.scanStart");
-            var scan = await Task.Run(() => _archive.ScanDiskAsync(progress, cancellationToken), cancellationToken);
+            var scan = scanPaths is null
+                ? await Task.Run(() => _archive.ScanDiskAsync(progress, cancellationToken), cancellationToken)
+                : await Task.Run(() => _archive.ScanPathsAsync(scanPaths, cancellationToken), cancellationToken);
             Diag.Log("Sync: scan end (" + stopwatch.ElapsedMilliseconds + " ms)");
             Diag.Mem("sync.scanEnd");
             var indexed = await _archive.MergeScanAsync(
                 scan,
                 refreshList: true,
                 cancellationToken: cancellationToken,
-                buildSearchIndex: false);
+                buildSearchIndex: false,
+                // A watcher-driven sync can land every few seconds while an agent writes, and each save is a
+                // full ~17 MB store serialize plus write. The merge result is re-derivable (a re-parse), so
+                // it follows the server's own rule: commit at most once per DeferredSaveInterval. The
+                // startup resurface still writes immediately, so a fresh launch always has a store on disk.
+                deferSave: !initial);
             cancellationToken.ThrowIfCancellationRequested();
             Diag.Log("Sync: merge end (" + stopwatch.ElapsedMilliseconds + " ms)");
             Diag.Mem("sync.mergeEnd");

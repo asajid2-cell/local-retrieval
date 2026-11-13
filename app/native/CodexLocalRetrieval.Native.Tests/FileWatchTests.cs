@@ -229,6 +229,70 @@ public sealed class FileWatchTests
         finally { Cleanup(dir); }
     }
 
+    // The tree stamp is deliberately NOT re-probed after an event delivery (a walk every debounce window
+    // was the largest remaining burn). That leaves the stamp stale, so the next idle poll always sees a
+    // difference. If the poll treated that as news it would fire a whole-tree "assume all" rescan once per
+    // poll for the rest of the session -- the incremental sync in the app would never be incremental.
+    [TestMethod]
+    public void TreeWatch_EventDelivery_DoesNotAlsoFireTheSafetyNetPoll()
+    {
+        var dir = NewTempDir();
+        try
+        {
+            File.WriteAllText(Path.Combine(dir, "a.jsonl"), "{\"seed\":1}\n");
+            var clock = new ManualFileWatchClock();
+            using var service = new FileWatchService(new FileWatchOptions
+            {
+                ManualPump = true,
+                Clock = clock,
+                ActiveFallbackInterval = TimeSpan.FromSeconds(5),
+                IdleFallbackInterval = TimeSpan.FromSeconds(60),
+                CoarseFallbackInterval = TimeSpan.FromSeconds(30),
+            });
+
+            var deliveries = new List<IReadOnlyList<string>?>();
+            using var reg = service.WatchDirectory(dir, "*.jsonl", recurse: true,
+                paths => { lock (deliveries) deliveries.Add(paths); });
+            Assert.IsTrue(service.AllWatchersHealthy, "the test needs a live OS watcher to exercise the healthy path");
+
+            // A real append records the path on the watcher thread; the debounce window is on the manual clock.
+            // Event arrival and the pump are on different threads, so drive both until the delivery lands.
+            File.WriteAllText(Path.Combine(dir, "b.jsonl"), "{\"seed\":2}\n");
+            var deadline = DateTime.UtcNow.AddSeconds(5);
+            while (DateTime.UtcNow < deadline)
+            {
+                lock (deliveries) if (deliveries.Count > 0) break;
+                Thread.Sleep(20);
+                clock.Advance(TimeSpan.FromMilliseconds(300));   // still well inside the 60 s idle poll
+                service.Pump();
+            }
+            lock (deliveries)
+            {
+                Assert.AreEqual(1, deliveries.Count, "the event path did not deliver the append");
+                Assert.IsNotNull(deliveries[0], "an event delivery must carry the changed paths, not null");
+                Assert.IsTrue(deliveries[0]!.Any(path => path.EndsWith("b.jsonl", StringComparison.OrdinalIgnoreCase)),
+                    "the delivery did not name the appended file");
+            }
+            Assert.AreEqual(0, service.Stats.FallbackPolls, "the change should have arrived on the event path alone");
+
+            // The idle poll runs and sees the stale stamp. It must re-baseline silently, not fire.
+            clock.Advance(TimeSpan.FromSeconds(70));
+            service.Pump();
+            Assert.AreEqual(1, service.Stats.FallbackPolls, "the idle safety-net poll must still run");
+            lock (deliveries)
+                Assert.AreEqual(1, deliveries.Count,
+                    "the poll re-fired a change the event path already delivered: that is a whole-tree rescan "
+                    + "on every poll for the rest of the session");
+
+            // Re-baselined: the next poll is quiet.
+            clock.Advance(TimeSpan.FromSeconds(70));
+            service.Pump();
+            Assert.AreEqual(2, service.Stats.FallbackPolls);
+            lock (deliveries) Assert.AreEqual(1, deliveries.Count, "a re-baselined tree must not fire again");
+        }
+        finally { Cleanup(dir); }
+    }
+
     [TestMethod]
     public void LargeInboxAtCursorEnd_ReadsOnlyTheAppendedBytes()
     {
