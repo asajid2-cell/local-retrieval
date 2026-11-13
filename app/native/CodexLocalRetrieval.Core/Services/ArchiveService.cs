@@ -1403,7 +1403,16 @@ public sealed partial class ArchiveService
                 throw;
             }
         }
-        finally { _saveGate.Release(); }
+        finally
+        {
+            // The whole-store byte[] is the largest single managed object in this process (~16-24 MB) and
+            // the buffer only pays for itself between CLOSE saves. A merge now commits on a
+            // DeferredSaveInterval beat instead of on every sync, so holding it for the life of the
+            // process buys nothing but resident memory. `_serializationBufferHint` still right-sizes the
+            // next allocation, so the release costs one right-sized array per save and no doubling.
+            _serializationBuffer = null;
+            _saveGate.Release();
+        }
     }
 
     private async Task<FileStream> AcquireStoreLockAsync(CancellationToken cancellationToken = default)
@@ -7352,7 +7361,10 @@ public sealed partial class ArchiveService
     // of the process. Measured live: ~68 MB of windows for eight files, all of which had already stopped
     // changing. It is a cache for files being written RIGHT NOW, so it is now bounded both by age (a
     // changed-then-quiet file falls out after ten minutes) and by total bytes.
-    internal const long TailWindowCacheBudgetBytes = 32L * 1024 * 1024;
+    // 20 MB is chosen against what the budget is FOR: two 8 MB windows for the two giant live transcripts
+    // plus their boundaries and a tail of small files. 32 MB retained a third cold window for a file that
+    // had already stopped changing, which is 12 MB of resident memory no read ever paid back.
+    internal const long TailWindowCacheBudgetBytes = 20L * 1024 * 1024;
     private const int TailWindowCacheMaxEntries = 48;
     private static readonly TimeSpan TailWindowCacheTtl = TimeSpan.FromMinutes(10);
     private readonly object _tailWindowGate = new();
