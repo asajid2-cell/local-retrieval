@@ -1,13 +1,13 @@
-# MUX — your Codex & Claude chat archive
+# MUX, your Codex and Claude chat archive
 
 **MUX is a WinUI 3 / .NET 8 Windows desktop app that indexes your local Codex and Claude sessions
-into one archive — so a months-old chat resurfaces, reads cleanly, files into a project, and
-relaunches its `codex resume` / `claude --resume` command in a terminal.** A built-in DeepSeek
-**co-pilot** can search, organize, and resume your chats by tool-calling over the archive; a Claude
+into one archive.** A months-old chat resurfaces, reads cleanly, files into a project, and
+relaunches its `codex resume` or `claude --resume` command in a terminal. A built-in DeepSeek
+**co-pilot** can search, organize, and resume your chats by tool-calling over the archive. A Claude
 or Codex session can even file itself in through a local JSON inbox. MUX never edits your source
 transcript files.
 
-![MUX — a tour of the app](docs/media/hero.gif)
+![MUX, a tour of the app](docs/media/hero.gif)
 
 *Screens use a sanitized demo archive: browse and search chats from both agents, read a session
 with the noise stripped, and tune the app in Settings.*
@@ -18,41 +18,49 @@ with the noise stripped, and tune the app in Settings.*
 
 ![Settings: theme, accent, shape, density, and the remote server](docs/media/settings.png)
 
+| Workspaces | Collections |
+|---|---|
+| ![Chats grouped by project](../docs/media/app-workspaces.png) | ![Collections](../docs/media/app-collections.png) |
+| **Phrases** | **Source inspector** |
+| ![Phrases](../docs/media/app-phrases.png) | ![Source inspector](../docs/media/app-source.png) |
+
 ## Why it's hard
 
-Agent CLIs scatter their history across machine-specific stores in two different formats: Codex
-writes `rollout-*.jsonl` files under `~/.codex/sessions`, while Claude Code writes one transcript
-per session under `~/.claude/projects/<encoded-cwd>/<id>.jsonl` — plus a *fan-out of sidechain
-subagent transcripts* that share a parent id. Indexing both means streaming JSONL that is often
+Agent CLIs scatter their history across machine-specific stores in two different formats. Codex
+writes `rollout-*.jsonl` files under `~/.codex/sessions`, and Claude Code writes one transcript
+per session under `~/.claude/projects/<encoded-cwd>/<id>.jsonl`, plus a *fan-out of sidechain
+subagent transcripts* that share a parent id.
+
+Indexing both means streaming JSONL that is often
 half-written (the live session you most want to resume), auto-detecting which format a file is,
-keying Claude chats on the filename (their resumable id) while skipping the subagent noise, and
-doing it incrementally so a relaunch re-reads a handful of changed files instead of fifteen hundred.
+and keying Claude chats on the filename (their resumable id) while skipping the subagent noise. It
+also has to run incrementally, so a relaunch re-reads a handful of changed files instead of fifteen hundred.
 Every chat then carries app-owned organization (pins, projects, renames) that a re-sync must
-preserve, not clobber — all off the UI thread so the window never stalls on a large scan.
+preserve, not clobber, and all of it runs off the UI thread so the window never stalls on a large scan.
 
 ## What you can do
 
 - **Resurface old chats.** The app re-scans your live session stores on launch, so a conversation
-  from months ago is back in the list — not lost after a month.
-- **Read them cleanly.** The reader strips the IDE/environment/system-reminder boilerplate that
-  buries the actual conversation (above).
+  from months ago is back in the list, not lost after a month.
+- **Read them cleanly.** The reader strips the IDE, environment, and system-reminder boilerplate
+  that buries the actual conversation (above).
 - **Organize.** Chats auto-group by project path under *Workspaces*; file any chat into a named
   *Project*; pin favorites to the top. Organization survives every re-sync.
-- **Resume in a terminal.** One action reopens a chat in a real terminal — `codex resume …` for a
-  Codex chat, `claude --resume …` for a Claude chat — in its original working directory.
+- **Resume in a terminal.** One action reopens a chat in a real terminal in its original working
+  directory: `codex resume …` for a Codex chat, `claude --resume …` for a Claude chat.
 - **Inspect the raw timeline.** The Source inspector shows the real rollout events (messages, tool
   calls, commands, reasoning), not just a file path.
 - **Ask a co-pilot.** A built-in chat (DeepSeek by default, set `DEEPSEEK_API_KEY` in your
-  environment) tool-calls over the archive to find, summarize, get a stats overview, organize, open a
-  chat in a floating window, or resume one in a terminal — with a confirmation step before any change
-  or launch, and a Stop button to abort a long turn.
-- **Let an agent set itself up.** Point any Claude/Codex chat at [`AGENTS.md`](AGENTS.md) and it can
-  favorite itself, file itself into a project, rename itself, or register a chat folder in a
-  non-default location — over a small JSON inbox.
+  environment) tool-calls over the archive. It can find, summarize, get a stats overview, organize,
+  open a chat in a floating window, or resume one in a terminal. Every change or launch gets a
+  confirmation step, and a Stop button aborts a long turn.
+- **Let an agent set itself up.** Point any Claude or Codex chat at [`AGENTS.md`](AGENTS.md) and it
+  can favorite itself, file itself into a project, rename itself, or register a chat folder in a
+  non-default location, all over a small JSON inbox.
 - **Reach your archive from anywhere.** A small headless server
   ([`CodexLocalRetrieval.Server`](native/CodexLocalRetrieval.Server)) exposes the archive and the
-  co-pilot over an authenticated web UI, so you can browse, read rollouts, chat, pin, and resume a
-  chat in a terminal from your phone — proxied through your own VPS, with chats and keys staying on
+  co-pilot over an authenticated web UI. You can browse, read rollouts, chat, pin, and resume a
+  chat in a terminal from your phone, proxied through your own VPS, with chats and keys staying on
   your machine. See [`REMOTE.md`](REMOTE.md).
 
 ## Run it
@@ -83,20 +91,20 @@ On first launch the app indexes `~/.codex/sessions` and `~/.claude/projects`. Ad
 - **Agent inbox.** A polled `agent-inbox.jsonl` applies a fixed set of ops (init / addSource /
   favorite / addToProject / rename) and acks each to an outbox; unsafe session ids are refused.
 - **Co-pilot with tools.** An orchestrator runs an OpenAI-style tool loop (DeepSeek primary, a
-  degraded Claude-CLI fallback) over a narrow, typed tool surface — read-only retrieval returns
-  ids/snippets first to protect the context, mutations are two-phase confirmed, and the model can
-  never pass file paths or raw commands. Guardrails: round/call caps, per-message side-effect quotas,
-  and a trusted-exe check before any terminal launch.
+  degraded Claude-CLI fallback) over a narrow, typed tool surface. Read-only retrieval returns ids
+  and snippets first to protect the context, and mutations are two-phase confirmed. The model can
+  never pass file paths or raw commands. Guardrails: round and call caps, per-message side-effect
+  quotas, and a trusted-exe check before any terminal launch.
 - **Secrets never leave the machine.** Before any archive text is sent to the model, a redactor masks
   high-confidence credential shapes (API keys, cloud keys, bearer tokens, JWTs, PEM private keys,
-  `key = value` secrets) — so a key pasted into an old chat isn't exfiltrated to the model API.
+  `key = value` secrets). A key pasted into an old chat is not exfiltrated to the model API.
 - **Resilient model calls.** Transient errors (429 / 5xx / timeouts) are retried with bounded
-  exponential backoff that honors `Retry-After`; a Stop button cancels an in-flight turn promptly.
+  exponential backoff that honors `Retry-After`. A Stop button cancels an in-flight turn promptly.
 - **Remote access, data stays home.** A headless ASP.NET Core server reuses the Core engine to serve
   a bearer-authenticated, mobile-first web UI (browse / read rollouts / co-pilot / pin / resume). It
-  binds localhost and is published through your own reverse proxy, so the archive and the model key
-  never leave your machine; the co-pilot stays read-only over the wire and state changes are explicit
-  taps.
+  binds localhost and publishes through your own reverse proxy, so the archive and the model key
+  never leave your machine. The co-pilot stays read-only over the wire, and state changes are
+  explicit taps.
 
 ![The relay threads view on a phone](../docs/media/relay-threads.png)
 
@@ -105,7 +113,7 @@ On first launch the app indexes `~/.codex/sessions` and `~/.claude/projects`. Ad
 ## Architecture
 
 ```
-~/.codex/sessions, ~/.claude/projects        (your real session files — read-only)
+~/.codex/sessions, ~/.claude/projects        (your real session files, read-only)
             |  scan (off-thread, incremental, format-routed)
             v
    ArchiveService  --->  app store (%LocalAppData%, pins/projects/renames)
@@ -152,7 +160,7 @@ A portable MUX Windows x64 release is produced by [`tools/release/package-win-x6
   the Claude-CLI fallback is text-only (no tools) and experimental. Resume/launch tools require the
   real `codex`/`claude` CLI at a trusted path, or they refuse.
 - **Canonical rename is Codex-only.** Renames always apply in-app; the write-back to the agent's own
-  store is implemented for Codex's thread DB — Claude has no external rename API, so a Claude rename
+  store is implemented for Codex's thread DB. Claude has no external rename API, so a Claude rename
   stays app-only (surfaced in the result message).
 - **The agent inbox is a trusted local channel.** Any process running as you can append commands; the
   app runs only the fixed ops above and never arbitrary commands. See the trust note in `AGENTS.md`.

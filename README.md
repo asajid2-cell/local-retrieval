@@ -38,6 +38,22 @@ The desktop app reads both stores, groups chats by project, and reopens any chat
 
 Settings covers the theme, accent, shape, density, and the remote server.
 
+## Managing the archive
+
+| Workspaces | Collections |
+| --- | --- |
+| <img src="docs/media/app-workspaces.png" width="430" alt="Chats grouped by local project path"> | <img src="docs/media/app-collections.png" width="430" alt="Collections for release, gateway, and choralus"> |
+| **Phrases** | **Source inspector** |
+| <img src="docs/media/app-phrases.png" width="430" alt="Special phrases that group related chats"> | <img src="docs/media/app-source.png" width="430" alt="The raw rollout timeline for a chat, with the fixture path redacted"> |
+
+Select several chats to vet, archive, or send them to a collection.
+
+<p align="center">
+  <img src="docs/media/app-multiselect.png" width="780" alt="Three chats selected for bulk actions">
+</p>
+
+Every view is app-owned metadata over read-only transcripts, and a source `.jsonl` is never rewritten.
+
 ## How the archive works
 
 The app scans `~/.codex/sessions` and `~/.claude/projects` on launch and routes each file by format. Claude chats key on the transcript filename, which is also the id `claude --resume` needs, and sidechain transcripts are skipped. Pins, projects, and renames live in an app-owned store, so a re-sync never rewrites a source `.jsonl` file.
@@ -60,21 +76,29 @@ The relay paints only the acknowledged geometry, at 1:1, with no scaling. A take
 
 A viewport change while you hold it reads a new grid instead of stretching the old one. That is the point of local-first: work continues whether or not anyone is attached. The browser is an attachment, not a copy of the screen, and a remote viewer cannot quietly change the terminal the PC is using.
 
+<p align="center">
+  <img src="docs/media/relay-live-local.png" width="820" alt="A live Claude gateway session on the PC at 209 columns, chip reads fills width 209x51">
+</p>
+
+*The PC pane owns the grid: a live gateway session at `209×51`.*
+
+| The phone sees it as too wide | The phone takes it at `50×41` | Handed back to the PC |
+| --- | --- | --- |
+| <img src="docs/media/relay-live-phone-local.png" width="240" alt="The same session on a phone, chip reads too wide 209x51"> | <img src="docs/media/relay-live-phone-taken.png" width="240" alt="The phone holds the grid at 50x41 and the text reflows to fit"> | <img src="docs/media/relay-live-phone-handback.png" width="240" alt="After the handback the chip reads too wide 209x51 again"> |
+
+<p align="center">
+  <img src="docs/media/relay-live-demo.gif" width="300" alt="The phone takes the grid and hands it back">
+</p>
+
+*The real running page and a real gateway session on the PC, not fixtures: `fills width · 209×51`, then `too wide · 209×51`, then `this device · 50×41`, then back. The PC chip and the PC-TAB chip are two badges on one tab that runs on the PC.*
+
 ## Threads on a phone
 
 Agent TUIs repaint in place with absolute cursor addressing, so the byte stream has no scrollback. The threads view builds a conversation client-side from the live text: up to 400 messages or 400,000 chars per session, de-duplicated across updates and kept over reconnects. It has its own composer, so a phone reply never needs the grid or the key bar.
 
-![The relay on a phone: sessions, threads, take the grid, hand back](docs/media/relay-demo.gif)
+<img src="docs/media/relay-threads.png" width="250" alt="A readable grouped conversation in the relay threads view">
 
-*A phone attaches to a gateway session, opens the conversation view, takes the grid, and hands it back. Captured against the relay test rig.*
-
-| Sessions on the phone | The phone takes the grid |
-| --- | --- |
-| <img src="docs/media/relay-sessions.png" width="250" alt="Five gateway sessions listed in the relay with the PC chip"> | <img src="docs/media/relay-grid-take.png" width="250" alt="The size chip reads this device after the phone takes the grid"> |
-| **Threads view** | **Handing the grid back** |
-| <img src="docs/media/relay-threads.png" width="250" alt="A readable grouped conversation in the relay threads view"> | <img src="docs/media/relay-grid-handback.png" width="250" alt="The status bar reads giving the grid back before the PC pane takes it again"> |
-
-Captured from the real page running in the relay test rig; sessions and paths are fixtures. The PC chip and the PC-TAB chip are two badges on one tab that runs on the PC.
+*The threads view with a seeded conversation, from the relay test rig.*
 
 ## Try it
 
