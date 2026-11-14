@@ -9,17 +9,14 @@ transcript files.
 
 ![MUX — a tour of the app](docs/media/hero.gif)
 
-*Real app screens: browse chats grouped by project, read a Claude chat with the noise stripped,
-inspect the raw event timeline, organize into projects, and open the theme picker.*
+*Screens use a sanitized demo archive: browse and search chats from both agents, read a session
+with the noise stripped, and tune the app in Settings.*
 
-| Chats grouped by project (Codex + Claude badges) | A project an agent filed itself into |
+| Archive search across both agents | A sanitized gateway session |
 |---|---|
-| ![Chats grouped by project](docs/media/workspaces.png) | ![Agent-created project](docs/media/projects.png) |
+| ![Archive search](docs/media/archive.png) | ![Reader](docs/media/reader.png) |
 
-![The co-pilot finding and organizing chats](docs/media/copilot.png)
-
-*The DeepSeek co-pilot answering "find chats about VENPOD" — it called `search_chats` over the
-real archive and grouped the results itself.*
+![Settings: theme, accent, shape, density, and the remote server](docs/media/settings.png)
 
 ## Why it's hard
 
@@ -101,7 +98,9 @@ On first launch the app indexes `~/.codex/sessions` and `~/.claude/projects`. Ad
   never leave your machine; the co-pilot stays read-only over the wire and state changes are explicit
   taps.
 
-![The remote web UI on a phone — chat list and co-pilot](docs/media/remote-chats.png)
+![The relay threads view on a phone](../docs/media/relay-threads.png)
+
+*The relay on a phone: the same PC session, rendered as a readable conversation.*
 
 ## Architecture
 

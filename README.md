@@ -20,6 +20,24 @@ MUX puts both agent-session stores into one searchable archive. It reopens any c
 
 I built the archive engine, the WinUI 3 client, the co-pilot tool loop, the ConPTY session host, and the relay. The hard part is the live file: the session you most want to resume is often still being written, in one of two formats, with subagent transcripts mixed in. The parser streams it, keys each chat on its resumable id, and an incremental cache keeps a re-scan off files that did not change.
 
+## Inside the app
+
+The desktop app reads both stores, groups chats by project, and reopens any chat in its own terminal. These screens use a sanitized demo archive: ten sessions across gateway, MUX, Choralus, VDF, and Harmonizer, with project paths under `C:\Projects`.
+
+<p align="center">
+  <img src="docs/media/app-archive.png" width="780" alt="Archive search across Codex and Claude sessions">
+</p>
+
+<p align="center">
+  <img src="docs/media/app-reader.png" width="780" alt="A sanitized gateway relay session in the MUX reader">
+</p>
+
+<p align="center">
+  <img src="docs/media/app-settings.png" width="780" alt="MUX settings: theme, accent, shape, density, and the remote server">
+</p>
+
+Settings covers the theme, accent, shape, density, and the remote server.
+
 ## How the archive works
 
 The app scans `~/.codex/sessions` and `~/.claude/projects` on launch and routes each file by format. Claude chats key on the transcript filename, which is also the id `claude --resume` needs, and sidechain transcripts are skipped. Pins, projects, and renames live in an app-owned store, so a re-sync never rewrites a source `.jsonl` file.
@@ -46,9 +64,13 @@ A viewport change while you hold it reads a new grid instead of stretching the o
 
 Agent TUIs repaint in place with absolute cursor addressing, so the byte stream has no scrollback. The threads view builds a conversation client-side from the live text: up to 400 messages or 400,000 chars per session, de-duplicated across updates and kept over reconnects. It has its own composer, so a phone reply never needs the grid or the key bar.
 
+![The relay on a phone: sessions, threads, take the grid, hand back](docs/media/relay-demo.gif)
+
+*A phone attaches to a gateway session, opens the conversation view, takes the grid, and hands it back. Captured against the relay test rig.*
+
 | Sessions on the phone | The phone takes the grid |
 | --- | --- |
-| <img src="docs/media/relay-sessions.png" width="250" alt="Five PC tabs listed in the relay session list"> | <img src="docs/media/relay-grid-take.png" width="250" alt="The size chip reads this device after the phone takes the grid"> |
+| <img src="docs/media/relay-sessions.png" width="250" alt="Five gateway sessions listed in the relay with the PC chip"> | <img src="docs/media/relay-grid-take.png" width="250" alt="The size chip reads this device after the phone takes the grid"> |
 | **Threads view** | **Handing the grid back** |
 | <img src="docs/media/relay-threads.png" width="250" alt="A readable grouped conversation in the relay threads view"> | <img src="docs/media/relay-grid-handback.png" width="250" alt="The status bar reads giving the grid back before the PC pane takes it again"> |
 
