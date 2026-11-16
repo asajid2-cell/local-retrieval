@@ -136,13 +136,67 @@
     return false;
   }
 
+  // The gateway's REAL leaf carousel (LeafWorkspaceDialog.tsx / LeafCarousel, read 2026-11-16):
+  //   Box paddingX={2} gap={1}:   ‹  [item W] [item W] ...  ›  All N
+  //   W = min(20, max(8, columns - 14))
+  //   item = "<number> <name>" + (state ? " · working|approval|failed" : "")
+  //          (the FIRST item is the matriarch and has no number)
+  //   the CURRENT leaf is drawn INVERSE; nothing in the text marks it.
+  // Every item is padded to W and truncated with an ellipsis, so when an item fills its box the gap to the
+  // next one is a SINGLE space. Splitting on 2+ spaces therefore merges neighbours - which is exactly how a
+  // tap landed on the wrong leaf ("it switches the wrong item").
+  function parseLeafCarousel(raw, rNum, cols, invSpans) {
+    // The column count is what makes the box width knowable. Without it this parser would be guessing, so
+    // it declines and the tolerant tokenizer below handles the row (which is how the older fixtures are
+    // written). The live page always passes term.cols.
+    if (!(cols | 0)) return null;
+    var open = raw.indexOf('\u2039'), close = raw.lastIndexOf('\u203a');
+    if (open < 0 || close < 0 || close <= open) return null;
+    if (!/\bLeaf\b|\bAll\s+\d+\b|\b\d+\s+\S/.test(raw)) return null;
+    var W = Math.min(20, Math.max(8, ((cols | 0) || 100) - 14));
+    var leaves = [];
+    var pos = open + 2;                       // the arrow, then one gap column
+    while (pos < close) {
+      var seg = raw.slice(pos, Math.min(close, pos + W));
+      var lead = seg.length - seg.replace(/^\s+/, '').length;
+      var text = seg.trim();
+      if (text) {
+        var state = null;
+        var sm = /\s+\u00b7\s+(working|approval|failed|idle|queued)\s*$/i.exec(text);
+        if (sm) { state = sm[1].toLowerCase(); text = text.slice(0, sm.index).replace(/\s+$/, ''); }
+        var num = null, name = text;
+        var nm = /^(\d+)\s+(.*)$/.exec(text);
+        if (nm) { num = Number(nm[1]); name = nm[2]; }
+        leaves.push({ label: text, name: name, number: num, state: state,
+                      row: rNum, col: pos + lead, active: false });
+      }
+      pos += W + 1;
+    }
+    if (!leaves.length) return null;
+    // active = the item drawn inverse. Without spans, no leaf is active: a guess here renders every chip
+    // as "you are here", which is worse than no highlight at all.
+    if (Array.isArray(invSpans)) {
+      for (var i = 0; i < leaves.length; i++) {
+        var a = leaves[i].col, b = a + leaves[i].label.length;
+        for (var s = 0; s < invSpans.length; s++) {
+          var sp = invSpans[s];
+          if (sp && sp[1] > a && sp[0] < b) { leaves[i].active = true; break; }
+        }
+      }
+    }
+    return { text: raw.trim(), row: rNum, leaves: leaves,
+             arrows: { prev: { row: rNum, col: open }, next: { row: rNum, col: close } } };
+  }
+
   // Parse the gateway leaf bar row, e.g.:
   //   "  ‹ Leaf 3: tv           23 htv-lanes         24 speed-policy      › All 3"
   //   "  < Leaf 1: alpha  |  Leaf 2: beta  |  Leaf 3: gamma >   All 3"
   // Returns { text, row, leaves: [ { label, row, col, active } ] } or null.
-  function parseLeafBar(rawText, rNum) {
+  function parseLeafBar(rawText, rNum, cols, invSpans) {
     var raw = String(rawText || '');
     if (!raw.trim()) return null;
+    var carousel = parseLeafCarousel(raw, rNum, cols, invSpans);
+    if (carousel) return carousel;
     var m = /^(\s*[\u2039<])([\s\S]*?)([\u203a>](?:\s*All\s+\d+)?\s*)$/i.exec(raw);
     var hasLeafKeyword = /\bLeaf\s+\d+\s*:/i.test(raw);
     if (!m && !hasLeafKeyword) return null;
@@ -350,7 +404,7 @@
     return out.filter(function (m) { return m.text !== ''; });
   }
 
-  function inspectScreen(rows, bufType) {
+  function inspectScreen(rows, bufType, cols) {
     var list = Array.isArray(rows) ? rows : [];
     var kind = (typeof bufType === 'string')
       ? (bufType === 'alternate' ? 'alternate' : 'normal')
@@ -415,7 +469,7 @@
       var rIdx = rowNum(r, idx);
 
       if (!chrome.leafBar) {
-        var lb = parseLeafBar(raw, rIdx);
+        var lb = parseLeafBar(raw, rIdx, cols, r && r.inv);
         if (lb) { chrome.leafBar = lb; continue; }
       }
       if (FOOTER_TASKS_RE.test(raw)) {

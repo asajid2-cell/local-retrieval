@@ -480,6 +480,14 @@
   #threadnav .tchip.active { background:var(--rose-dim); border-color:var(--rose); color:var(--txt); }
   #threadnav .tchip .nm { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   #threadnav .tsep { flex:0 0 auto; width:1px; height:20px; background:var(--line); }
+  /* Group captions: the bar carries two different switches (family MEMBERS and whole families). Without a
+     label they read as one list, which is exactly how a leaf chip looked like a session tab. */
+  #threadnav .tcap {
+    flex:0 0 auto; font-size:10px; font-weight:700; letter-spacing:.08em; text-transform:uppercase;
+    color:var(--faint); padding:0 2px 0 4px;
+  }
+  #threadnav .tchip .tstate { font-size:10px; color:var(--faint); margin-left:2px; }
+  #threadnav .tchip.arrow { font-size:16px; min-width:34px; padding:0 6px; color:var(--muted); }
   #threadnav .tchip.leaf { border-style:dashed; }
   #threadnav .tchip.leaf.active { border-style:solid; }
   #tuiControls {
@@ -1263,6 +1271,22 @@ function threadRowsFromBuffer(){
         if(cell){ r.dim=!!cell.isDim(); r.italic=!!cell.isItalic(); }
       }catch(e){}
     }
+    // INVERSE SPANS. The gateway draws the CURRENT leaf reverse-video; the text does not mark it. On a
+    // leaf-bar-looking row only, record the runs of inverse cells so the parser can name the live leaf
+    // instead of guessing it from a label.
+    if(/[\u2039\u203a\u00b7]|\bLeaf\b/.test(txt)){
+      try{
+        const spans=[]; let sp=-1;
+        for(let c=0;c<txt.length;c++){
+          const cell=ln.getCell(c);
+          const inv=!!(cell && cell.isInverse && cell.isInverse());
+          if(inv && sp<0) sp=c;
+          else if(!inv && sp>=0){ spans.push([sp,c]); sp=-1; }
+        }
+        if(sp>=0) spans.push([sp,txt.length]);
+        if(spans.length) r.inv=spans;
+      }catch(e){}
+    }
     rows.push(r);
   }
   return { kind, rows };
@@ -1285,8 +1309,8 @@ function threadsKey(m){
   const nl=t.indexOf(String.fromCharCode(10));
   return (m.role||'text')+'|'+(nl<0?t:t.slice(0,nl)).trim();
 }
-function accumulateThreads(live){
-  const name=current||'';
+function accumulateThreads(live, accKey){
+  const name=accKey || current||'';
   if(!name) return live;
   const st=threadAccum[name] || (threadAccum[name]={ msgs:[] });
   const rec=st.msgs;
@@ -1346,54 +1370,86 @@ function accumulateThreads(live){
 // A tap on a leaf chip is an SGR pointer report, the same record a click in the terminal produces. It only
 // goes out when the app has actually armed pointer reporting; otherwise the fallback is the terminal, where
 // the same tap exists for real.
-function tapThreadLeaf(leaf){
-  if(!current || !leaf) return;
+// One click into the pty at a buffer cell - the same SGR report a real pointer produces. No view change,
+// no session change: a leaf tap is input to the app, not navigation of the multiplex page.
+function clickPtyCell(row, col, label){
+  if(!current) return false;
   try{
-    if(!appTakesMouse()){ flash('The app is not taking pointer taps here - open the terminal to switch leaves'); setMobileView('terminal'); return; }
-    const row1=(leaf.row|0)-(term.buffer.active.viewportY|0)+1;
-    const col1=(leaf.col|0)+1;
-    if(!(row1>=1 && row1<=term.rows)){ flash('That leaf row is not on the live screen'); return; }
+    if(!appTakesMouse()){ flash('This app has not armed pointer input - switching leaves needs the terminal'); return false; }
+    const row1=(row|0)-(term.buffer.active.viewportY|0)+1;
+    const col1=(col|0)+1;
+    if(!(row1>=1 && row1<=term.rows && col1>=1 && col1<=term.cols)){ flash('That leaf row is not on the live screen'); return false; }
     const at='\x1b[<0;'+col1+';'+row1;
     const seq=at+'M'+at+'m';
     mouseGuard.noteForwarded(seq, Date.now());
     sendMouseInput(seq);
     markActive();
-    flash('Tapping '+leaf.label);
-  }catch(e){ flash('Could not tap the leaf bar'); }
+    if(label) flash('Switching to '+label);
+    return true;
+  }catch(e){ flash('Could not tap the leaf bar'); return false; }
 }
+function tapThreadLeaf(leaf){ if(!leaf) return; clickPtyCell(leaf.row, leaf.col, leaf.label); }
+function tapThreadCell(cell){ if(!cell) return; clickPtyCell(cell.row, cell.col, ''); }
 
 let threadNavSig='';
+// TWO KINDS OF SWITCH, and they are not interchangeable:
+//   LEAVES are family MEMBERS of the session on screen (the gateway's own carousel: ‹ 22 name › All N).
+//   SESSIONS are the multiplex tabs, i.e. separate families.
+// Leaves come first, because that is the switch a reader makes most often, and a phone shows only the
+// first few chips - putting the tabs first is how "the leaf thing" looked like a tab switcher.
 function renderThreadNav(name, chrome){
   const host=$('#threadnav'); if(!host) return;
   const sessions=Array.isArray(window._sessions)?window._sessions:[];
-  const leaves=(chrome && chrome.leafBar && chrome.leafBar.leaves) || [];
+  const bar=(chrome && chrome.leafBar) || null;
+  const leaves=(bar && bar.leaves) || [];
   const sig=name+'|'+sessions.map(s=>s.name+':'+(s.state||'')+':'+(s.unread?'u':'')+(s.name===current?'*':'')).join(',')+'|'
-    +leaves.map(l=>l.label+':'+(l.active?'*':'')).join(',');
+    +leaves.map(l=>l.label+':'+(l.active?'*':'')).join(',')+'|'+!!(bar&&bar.arrows);
   if(sig===threadNavSig) return;
   threadNavSig=sig;
   host.innerHTML='';
+  const cap=(text)=>{ const s=document.createElement('span'); s.className='tcap'; s.textContent=text; host.appendChild(s); };
+  if(leaves.length){
+    cap('Leaves');
+    // The carousel's own arrows are stable cells; the chips' labels are truncated at 20 columns, so the
+    // arrows are the one gesture that works no matter how a name is elided.
+    if(bar && bar.arrows){
+      const prev=document.createElement('button');
+      prev.type='button'; prev.className='tchip arrow'; prev.textContent='‹';
+      prev.title='Previous leaf'; prev.setAttribute('aria-label','Previous leaf');
+      prev.onclick=()=>tapThreadCell(bar.arrows.prev);
+      host.appendChild(prev);
+    }
+    for(const lf of leaves){
+      const b=document.createElement('button');
+      b.type='button'; b.className='tchip leaf'+(lf.active?' active':'');
+      b.dataset.leaf=lf.name||lf.label;
+      b.title='Gateway leaf: '+lf.label+(lf.state?' ('+lf.state+')':'');
+      const nm=document.createElement('span'); nm.className='nm'; nm.textContent=lf.label;
+      b.appendChild(nm);
+      if(lf.state){ const st=document.createElement('span'); st.className='tstate'; st.textContent=lf.state; b.appendChild(st); }
+      b.onclick=()=>{ if(!lf.active) tapThreadLeaf(lf); };
+      host.appendChild(b);
+    }
+    if(bar && bar.arrows){
+      const next=document.createElement('button');
+      next.type='button'; next.className='tchip arrow'; next.textContent='›';
+      next.title='Next leaf'; next.setAttribute('aria-label','Next leaf');
+      next.onclick=()=>tapThreadCell(bar.arrows.next);
+      host.appendChild(next);
+    }
+    const sep=document.createElement('span'); sep.className='tsep'; host.appendChild(sep);
+  }
+  cap('Sessions');
   for(const s of sessions){
     const b=document.createElement('button');
     b.type='button'; b.className='tchip'+(s.name===current?' active':'');
     b.dataset.state=s.state||'white';
-    b.title=s.name;
+    b.title='Session (family): '+s.name;
     const dot=document.createElement('span'); dot.className='dot';
     const nm=document.createElement('span'); nm.className='nm'; nm.textContent=s.name+(s.unread?' ·':'');
     b.appendChild(dot); b.appendChild(nm);
     b.onclick=()=>{ if(s.name!==current) connect(s.name); };
     host.appendChild(b);
-  }
-  if(leaves.length){
-    const sep=document.createElement('span'); sep.className='tsep'; host.appendChild(sep);
-    for(const lf of leaves){
-      const b=document.createElement('button');
-      b.type='button'; b.className='tchip leaf'+(lf.active?' active':'');
-      b.title='Gateway leaf: '+lf.label;
-      const nm=document.createElement('span'); nm.className='nm'; nm.textContent=lf.label;
-      b.appendChild(nm);
-      b.onclick=()=>{ if(!lf.active) tapThreadLeaf(lf); };
-      host.appendChild(b);
-    }
   }
 }
 
@@ -1525,24 +1581,29 @@ function threadNodeFor(m){
 
 let threadNodes={};   // session -> array of rendered .th-msg nodes, aligned with the message ids
 let threadsRenderedFor='';
+let threadLeafKey='';
 let lastThreadChrome={};   // the chrome from the last screen parse, for the composer's slash tray
 function renderThreads(force){
   const host=$('#threads'); if(!host) return;
   if(!isMobile() || mobileView!=='threads') return;
   if(!current){ host.innerHTML='<div class="th-empty">No session open.</div>'; threadsLastSig=''; return; }
-  // A different session's nodes are still in the list; the diff below is per session, so the switch has to
-  // start from an empty surface or the new session's list is appended under the old one's.
-  if(threadsRenderedFor!==current){
-    threadsRenderedFor=current;
-    host.innerHTML='';
-    threadNodes[current]=[];
-    threadsLastSig='';
-  }
   const buf=threadRowsFromBuffer();
   const screen=(window.MuxThreads && MuxThreads.inspectScreen)
-    ? MuxThreads.inspectScreen(buf.rows, buf.kind)
+    ? MuxThreads.inspectScreen(buf.rows, buf.kind, term.cols)
     : { kind:buf.kind, messages:((window.MuxThreads&&MuxThreads.segment)?MuxThreads.segment(buf.rows):[]), chrome:{} };
   lastThreadChrome=screen.chrome||{};
+  // WHICH LEAF IS THIS? A leaf switch inside one multiplex session is a different agent's conversation, so
+  // the accumulation and the rendered list are keyed by session AND leaf. Without that, switching leaves
+  // left the previous leaf's turns on screen and merged the two transcripts.
+  const activeLeaf=((screen.chrome&&screen.chrome.leafBar&&screen.chrome.leafBar.leaves)||[]).find(l=>l.active);
+  const leafKey=activeLeaf ? (activeLeaf.name||activeLeaf.label||'') : '';
+  const accKey=current+'#'+leafKey;
+  if(threadLeafKey!==leafKey || threadsRenderedFor!==accKey){
+    threadLeafKey=leafKey; threadsRenderedFor=accKey;
+    host.innerHTML='';
+    threadNodes[accKey]=[];
+    threadsLastSig='';
+  }
   renderThreadNav(current, screen.chrome);
   renderTuiControls(screen.chrome);
   renderSlashTray(screen.chrome);
@@ -1559,7 +1620,7 @@ function renderThreads(force){
       const b=document.createElement('button'); b.type='button'; b.textContent='Open the terminal';
       b.onclick=()=>setMobileView('terminal');
       d.appendChild(b); host.appendChild(d);
-      threadNodes[current]=[];
+      threadNodes[accKey]=[];
     }
     return;
   }
@@ -1572,8 +1633,8 @@ function renderThreads(force){
   // couple of events back" report, and it can only be answered here: accumulate the turns as they are seen
   // and render the accumulation. Nothing leaves the page; this is a render of what the session showed.
   const live=screen.messages||[];
-  const msgs=accumulateThreads(live);
-  const sig=current+'|'+msgs.map(m=>(m.id||'')+':'+m.role+':'+m.text.length+':'+m.text.slice(-24)).join('\u0001');
+  const msgs=accumulateThreads(live, accKey);
+  const sig=accKey+'|'+msgs.map(m=>(m.id||'')+':'+m.role+':'+m.text.length+':'+m.text.slice(-24)).join('\u0001');
   if(!force && sig===threadsLastSig) return;      // nothing changed: do not rebuild the list under a finger
   threadsLastSig=sig;
   // WHERE THE READER WAS. Restoring raw scrollTop is wrong because a rebuild can change the height ABOVE
@@ -1590,13 +1651,13 @@ function renderThreads(force){
   }
   if(!msgs.length){
     host.innerHTML='<div class="th-empty">Nothing on this screen yet.</div>';
-    threadNodes[current]=[];
+    threadNodes[accKey]=[];
     return;
   }
   // THE LIST IS PATCHED, NOT REBUILT. A full innerHTML='' on every token destroyed <details> open state,
   // dropped the reader's place, and re-laid out up to 400 bubbles for a one-line change. A message's id is
   // stable, so an unchanged prefix is left alone and only the changed tail is replaced.
-  const cached=threadNodes[current]||[];
+  const cached=threadNodes[accKey]||[];
   let keep=0;
   while(keep<msgs.length && keep<cached.length && cached[keep].dataset.id===String(msgs[keep].id)) keep++;
   for(let i=keep;i<cached.length;i++){ try{ cached[i].remove(); }catch(e){} }
@@ -1610,7 +1671,7 @@ function renderThreads(force){
     host.appendChild(node);
     cached.push(node);
   }
-  threadNodes[current]=cached;
+  threadNodes[accKey]=cached;
   if(stick || anchor < 0){ host.scrollTop=host.scrollHeight; return; }
   // Put the reader back on the message they were reading. If it no longer exists (the buffer was trimmed),
   // fall back to the bottom rather than to an arbitrary offset.
@@ -2418,7 +2479,7 @@ function reloadTerminal(quiet){
   connect(name, true);   // re-attach: CLEAR + scrollback replay + live, all client state reset
 }
 document.addEventListener('keydown', e=>{ if(e.ctrlKey && e.altKey && (e.key==='r'||e.key==='R')){ e.preventDefault(); e.stopPropagation(); reloadTerminal(); } }, true);
-window.__muxBuild='2026-11-16-phone-surface-1';   // bump per web deploy so a loaded version is verifiable (supersedes 2026-11-11-phone-threads-1)
+window.__muxBuild='2026-11-16-leaf-switch-1';   // bump per web deploy so a loaded version is verifiable (supersedes 2026-11-11-phone-threads-1)
 try{ console.info('multiplex build', window.__muxBuild); }catch(e){}
 const helper = $('#term').querySelector('.xterm-helper-textarea');
 function hardenHelperTextarea(){
