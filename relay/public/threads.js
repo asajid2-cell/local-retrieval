@@ -11,16 +11,18 @@
   // The vocabulary was measured from a live agent tab (probe_thread_markers.cjs, tab-5bec, 2026-11-11):
   //   indent 0 + one of these glyphs  -> a message STARTS
   //     ❯ ⏵ ›   the user's prompt line (its body follows at indent 2)
-  //     ⏺ ●     assistant text, a tool call, or a status note
-  //     ⏎ ⎿     a tool result block
+  //     ⏺ ● ○   assistant text, a tool call, or a status note
+  //     ⏎ ⎿ └   a tool result block
   //     ✻ ✳ ∗   a run summary ("Cooked for 46m")
+  //     ∴ 💭    a thought / reasoning trace
   //   indent 2   the body of the message above (paragraphs, list items, quotes)
   //   indent 5+  tool detail: the sub-lines of a tool result
   //   ─ ━         a separator row: never a message, never body
   //
   // A message keeps absorbing rows until the next indent-0 glyph row. Blank rows belong to whatever is
   // open, so a message's paragraph spacing survives. When the buffer is the ALTERNATE screen a full-screen
-  // TUI owns every cell and rows are not messages at all, so nothing is grouped and the caller is told why.
+  // TUI owns every cell and rows are not conversation scrollback, though structured chrome/pickers can
+  // still be inspected for phone controls.
 
   var LEAD = {
     user:     ['❯', '⏵', '›'],
@@ -29,114 +31,312 @@
     // The app cycles its run-summary glyphs, so the list is the ones seen live - but NOT '*' or '-':
     // those are markdown bullets at column 0 in ordinary prose, and they must stay body.
     status:   ['✻', '✳', '✢', '✽', '✺'],
+    thought:  ['∴', '💭'],
   };
   var RULE = ['─', '━', '═', '▁', '▔'];
-  // The activity line ("✢ Boogieing…", "✽ Noodling…", "✻ Cooked for 46m") is a STATUS message, not body.
-  // It is not a fixed glyph list - the app cycles several - and the tell is its SHAPE: a glyph, one word,
-  // and an ellipsis (or a duration in parentheses). Without this rule the spinner row landed as the last
-  // line of the user's own turn, so a sent message read "echo phone-keypath-ok / ✢ Boogieing…".
-  var SPINNER = /^\s*[\u2722\u2727\u2733\u2735\u2736\u273a\u273b\u273c\u273d\u2217]\s+\S*\u2026/;
-  // The tool leaders are the only ones allowed to sit indented; every other leader must be at column 0.
+  // The activity line ("✢ Boogieing…", "✽ Noodling…", "⠋ Running tests… (12s)") is a STATUS message, not body.
+  // It is not a fixed glyph list - the app cycles stars, Braille spinners, and quadrant glyphs - and the tell
+  // is its SHAPE: a spinner glyph + text ending with an ellipsis or an interrupt hint.
+  var SPINNER_GLYPH_RE = /^[\s]*[\u2722\u2727\u2733\u2735\u2736\u273a\u273b\u273c\u273d\u2217\u2800-\u28ff\u25dc-\u25df\u25f4-\u25f7\u25d0-\u25d3]\s+\S/;
+  var SPINNER = /^\s*(?:[\u2722\u2727\u2733\u2735\u2736\u273a\u273b\u273c\u273d\u2217\u2800-\u28ff\u25dc-\u25df\u25f4-\u25f7\u25d0-\u25d3]\s+.*(?:\u2026|\.\.\.|\((?:esc|ctrl\+c)\s+to\s+interrupt\b)|.*\((?:esc|ctrl\+c)\s+to\s+interrupt\b)/i;
+  // Explicit thought-trace headers emitted by agent TUIs.
+  var THOUGHT_HEADER = /^\s*(?:(?:\u2234|\ud83d\udcad)\s*\S*|(?:[\u23fa\u25cf\u25cb]\s+)?(?:Thinking(?:\u2026|\.\.\.|:)|Thought\s+for\s+\d|Reasoning:))/i;
+  // Tool invocation headers (e.g. "⏺ Bash(ping -n 3 host)", "● Update(main.cpp)").
+  var TOOLCALL_RE = /^\s*[\u23fa\u25cf\u25cb]\s+(?:(?:Bash|Read|Edit|Update|Write|MultiEdit|Grep|Glob|WebFetch|WebSearch|Agent|Task|Skill|NotebookEdit|TodoWrite|ListDir|ViewFile|RunCommand|Search)\b|[A-Z][A-Za-z0-9_.-]{1,32}\()/;
+  // The tool leaders (and thought marker ∴) are allowed to sit slightly indented; every other leader must be at column 0.
   // Without this, an ordinary bulleted list ("• item", "- item", "> quote") would split a message at every
   // bullet, which is the most common prose shape an agent emits.
-  var INDENTED_OK = LEAD.tool;
+  var INDENTED_OK = LEAD.tool.concat(LEAD.thought);
+  // The relay's own STATE banner, painted over the top of the screen when the session's output could not be
+  // trusted. It is the transport talking, not the agent, and on the conversation surface it read as the first
+  // thing the agent had said - so it is chrome, never a message.
+  var RELAY_BANNER = /^\s*\[scrollback unavailable\b[^\]]*\]\s*$/i;
 
-  // The leader glyph -> which kind of message it opens.
-  //
-  // A GLYPH WINS OVER INDENTATION. Measured in the live buffer, the user/assistant glyphs sit at column 0
-  // while a tool-result leader (⎿) sits at indent 2 - so keying on "indent 0 only" would classify every
-  // tool result as prose. The converse is also true and is why the indents exist at all: an ordinary
-  // indented line with no glyph is BODY, and it must never open a message. Only the small, fixed
-  // vocabulary below is allowed to start one.
-  function classify(text) {
-    var m = /^([ \t]*)(\S)/.exec(text || '');
+  function classify(text, rowMeta) {
+    var raw = String(text || '');
+    var m = /^([ \t]*)(\S)/.exec(raw);
     if (!m) return { kind: 'blank', indent: 0, lead: '' };
     var indent = m[1].length;
     var ch = m[2];
+    if (RELAY_BANNER.test(raw)) return { kind: 'rule', indent: indent, lead: ch };
     if (RULE.indexOf(ch) >= 0) return { kind: 'rule', indent: indent, lead: ch };
     // A SPINNER row starts a status message no matter its glyph, so it can never extend the turn above it.
-    if (SPINNER.test(text || '')) return { kind: 'status', indent: indent, lead: ch };
+    if (SPINNER.test(raw)) return { kind: 'status', indent: indent, lead: ch };
+    if (THOUGHT_HEADER.test(raw) && indent <= 2) return { kind: 'thought', indent: indent, lead: ch };
+    if (indent === 0 && TOOLCALL_RE.test(raw)) return { kind: 'toolcall', indent: indent, lead: ch };
     for (var k in LEAD) {
       if (LEAD[k].indexOf(ch) < 0) continue;
       if (indent !== 0 && INDENTED_OK.indexOf(ch) < 0) break;   // indented bullet = prose, not a message
       return { kind: k, indent: indent, lead: ch };
     }
+    if (rowMeta && rowMeta.dim && rowMeta.italic) {
+      return { kind: 'thought', indent: indent, lead: '', styled: true };
+    }
     return { kind: 'body', indent: indent, lead: ch };
   }
 
-  // Where the agent app's COMPOSER starts, or rows.length when there is none.
-  //
-  // Measured on tab-5bec (2026-11-12): the app boxes its input between two rules with the prompt glyph
-  // between them, and paints its status line underneath:
-  //     ---------------
-  //     > (prompt glyph, alone)
-  //     ---------------
-  //       cd: ...   bypass permissions on - 3 shells - usage: 37% left
-  //       < Leaf 3: tv ... > All 3
-  // Every row from the pair's FIRST rule onward is CHROME: it is the app's own interface, not something the
-  // agent said. Left in, it becomes the tail of the last message - which is exactly the giant status-bar
-  // bubble the phone showed. Detected structurally (rule, then a prompt-only row, then a rule) so it does
-  // not depend on the wording of any one status line, and a screen with no such sandwich keeps every row.
-  function chromeStart(rows) {
-    for (var i = 0; i + 2 < rows.length; i++) {
-      var a = classify(rows[i].text), b = classify(rows[i + 1].text), c = classify(rows[i + 2].text);
-      if (a.kind !== 'rule') continue;
-      // The prompt row: the user leader glyph and nothing else on the line.
-      var promptOnly = b.kind === 'user' && /^[\s]*[\u276f\u23f5\u203a]\s*$/.test(rows[i + 1].text || '');
-      if (!promptOnly) continue;
-      if (c.kind !== 'rule') continue;
-      return i;
-    }
-    return rows.length;
+  function rowNum(r, fallback) {
+    return (r && typeof r.i === 'number' && isFinite(r.i)) ? r.i : fallback;
   }
 
-  // Rows -> messages. `rows` is [{i, text, wrapped}]; wrapped rows are glued to the row above BEFORE
-  // classification, so a paragraph that the pty wrapped at column 209 becomes one line and its continuation
-  // does not masquerade as a message body.
-  function segment(rows) {
-    // Drop the app's composer and status bar before anything is grouped: they sit at the END of the screen
-    // and would otherwise be absorbed into the last message as its body.
-    rows = rows.slice(0, chromeStart(rows));
+  function isPromptLine(text) {
+    return /^[ \t]*[\u276f\u23f5\u203a](?:\s.*|\s*)$/.test(String(text || ''));
+  }
+
+  // Locate the agent app's live COMPOSER sandwich (rule, prompt line(s), rule) near the bottom of the screen,
+  // returning { start, promptStart, promptEnd, ruleEnd } or null. Searching from the bottom within the last
+  // ~24 rows keeps markdown `───` blocks in earlier turns from matching, and supports non-empty typed
+  // prompts (e.g. `❯ /model`) as well as empty ones (`❯ `).
+  function findComposerSandwich(rows) {
+    if (!rows || rows.length < 3) return null;
+    var minStart = Math.max(0, rows.length - 24);
+    for (var i = rows.length - 3; i >= minStart; i--) {
+      if (classify(rows[i] && rows[i].text).kind !== 'rule') continue;
+      if (!isPromptLine(rows[i + 1] && rows[i + 1].text)) continue;
+      // Find the closing rule within 1..6 lines after the prompt start (allows multi-line/wrapped prompt input).
+      var closeAt = -1;
+      var maxClose = Math.min(rows.length - 1, i + 6);
+      for (var j = i + 2; j <= maxClose; j++) {
+        var cj = classify(rows[j] && rows[j].text);
+        if (cj.kind === 'rule') { closeAt = j; break; }
+        if (cj.kind === 'assistant' || cj.kind === 'toolcall' || cj.kind === 'status' || cj.kind === 'tool') break;
+      }
+      if (closeAt < 0) continue;
+      // Sanity guard: a historical prompt box has conversation turns after it; the live composer never does.
+      var hasTurnAfter = false;
+      for (var k = closeAt + 1; k < rows.length; k++) {
+        var ck = classify(rows[k] && rows[k].text);
+        if (ck.kind === 'assistant' || ck.kind === 'toolcall') { hasTurnAfter = true; break; }
+      }
+      if (hasTurnAfter) continue;
+      return { start: i, promptStart: i + 1, promptEnd: closeAt - 1, ruleEnd: closeAt };
+    }
+    return null;
+  }
+
+  // Where the agent app's COMPOSER starts, or rows.length when there is none.
+  function chromeStart(rows) {
+    var sw = findComposerSandwich(rows);
+    return sw ? sw.start : (rows ? rows.length : 0);
+  }
+
+  // The agent app's own FOOTER widgets, painted over the bottom rows of the screen.
+  var FOOTER_TASKS_RE = /^\s*[\u25b8\u25be>]\s*\d+\s+tasks?\b/i;
+  var FOOTER = [
+    /^\s*Jump to bottom\b/i,
+    /^\s*[\u25b8\u25be>]\s*\d+\s+tasks?\s*\(\d+ done/i,
+    /^\s*\(ctrl\+[a-z]\)\s*$/i,
+    /^\s*Press .* for .*$/i,
+    /^\s*Esc to (?:cancel|close|exit)\b/i,
+  ];
+
+  function isFooter(text) {
+    var t = String(text || '');
+    for (var i = 0; i < FOOTER.length; i++) if (FOOTER[i].test(t)) return true;
+    return false;
+  }
+
+  // Parse the gateway leaf bar row, e.g.:
+  //   "  ‹ Leaf 3: tv           23 htv-lanes         24 speed-policy      › All 3"
+  //   "  < Leaf 1: alpha  |  Leaf 2: beta  |  Leaf 3: gamma >   All 3"
+  // Returns { text, row, leaves: [ { label, row, col, active } ] } or null.
+  function parseLeafBar(rawText, rNum) {
+    var raw = String(rawText || '');
+    if (!raw.trim()) return null;
+    var m = /^(\s*[\u2039<])([\s\S]*?)([\u203a>](?:\s*All\s+\d+)?\s*)$/i.exec(raw);
+    var hasLeafKeyword = /\bLeaf\s+\d+\s*:/i.test(raw);
+    if (!m && !hasLeafKeyword) return null;
+    if (m && !hasLeafKeyword && !/[|│]|\s{2,}/.test(m[2])) return null;
+    if (m && !hasLeafKeyword && !/\b(?:\d+[:\s]\s*\S|All\s+\d+)/i.test(raw)) return null;
+
+    var innerStart = m ? m[1].length : 0;
+    var inner = m ? m[2] : raw;
+    var leaves = [];
+    // Walk tokens separated by |, │, or 2+ spaces while keeping raw buffer column offsets exact.
+    var pos = 0;
+    while (pos < inner.length) {
+      // Skip separators / leading whitespace
+      while (pos < inner.length && (inner[pos] === ' ' || inner[pos] === '\t' || inner[pos] === '|' || inner[pos] === '│')) pos++;
+      if (pos >= inner.length) break;
+      var end = pos;
+      while (end < inner.length) {
+        if (inner[end] === '|' || inner[end] === '│') break;
+        if (inner[end] === ' ' && inner[end + 1] === ' ') break;
+        end++;
+      }
+      var label = inner.slice(pos, end).replace(/\s+$/, '');
+      if (label) {
+        leaves.push({
+          label: label,
+          row: rNum,
+          col: innerStart + pos,
+          active: false,
+          _explicit: /^[\u25cf\u25b8*]/.test(label) || /^\[.*\]$/.test(label),
+          _leafPrefix: /^Leaf\s+\d+\s*:/i.test(label),
+        });
+      }
+      pos = end;
+    }
+    if (!leaves.length) return null;
+    var explicitCount = 0, leafPrefixCount = 0;
+    for (var li = 0; li < leaves.length; li++) {
+      if (leaves[li]._explicit) explicitCount++;
+      if (leaves[li]._leafPrefix) leafPrefixCount++;
+    }
+    for (var lj = 0; lj < leaves.length; lj++) {
+      var lf = leaves[lj];
+      if (explicitCount > 0) lf.active = lf._explicit;
+      else if (leafPrefixCount > 0 && (leaves.length === 1 || leafPrefixCount < leaves.length)) lf.active = lf._leafPrefix;
+      delete lf._explicit;
+      delete lf._leafPrefix;
+    }
+    return {
+      text: raw.trim(),
+      row: rNum,
+      leaves: leaves,
+    };
+  }
+
+  function isTransientSpinner(m) {
+    if (!m || m.role !== 'status') return false;
+    var t = String(m.text || '');
+    return SPINNER.test(t) || /\((?:esc|ctrl\+c)\s+to\s+interrupt/i.test(t);
+  }
+
+  // Collapse transient spinner frames in an accumulated list so live animation ticks update one
+  // live status slot instead of appending dozens of dead spinner bubbles.
+  function collapseTransient(list) {
+    if (!Array.isArray(list) || !list.length) return [];
+    var out = [];
+    for (var i = 0; i < list.length; i++) {
+      var m = list[i];
+      if (!m) continue;
+      if (isTransientSpinner(m)) {
+        // Only keep a transient spinner at the tail; if an older transient spinner was sitting
+        // directly before it (or earlier before a completed turn), drop the older one.
+        if (out.length && isTransientSpinner(out[out.length - 1])) {
+          out[out.length - 1] = m;
+        } else {
+          out.push(m);
+        }
+      } else {
+        // A real message or completed summary (e.g. "✻ Cooked for ...") supersedes any prior
+        // transient spinner directly above it.
+        while (out.length && isTransientSpinner(out[out.length - 1])) out.pop();
+        out.push(m);
+      }
+    }
+    return out;
+  }
+
+  // Detect interactive picker/menu options in a slice of rows.
+  // Matches either cursor-prefixed choices ("❯ 1. Sonnet" / "  2. Opus" / "❯ Yes" / "  No")
+  // or numbered choices ("[1] ...", "1. ...") when at least 2 options are contiguous.
+  function parsePicker(rows, startIdx) {
+    var best = null;
+    var i = Math.max(0, startIdx || 0);
+    while (i < rows.length) {
+      var t = String((rows[i] && rows[i].text) || '');
+      var cur = /^[ \t]*([\u276f\u203a\u25b8])(?:\s+(.*))$/.exec(t);
+      var num = /^[ \t]*(?:([\u276f\u203a\u25b8])\s+)?((?:\d+[.)]|\[\d+\])\s+\S.*)$/.exec(t);
+      if (!cur && !num) { i++; continue; }
+      // Start scanning a contiguous option group (allowing single blank rows between options).
+      var opts = [];
+      var selected = -1;
+      // If the cursor is not on the first option (e.g. "  Sonnet\n❯ Opus\n  Haiku"), collect
+      // indented sibling options immediately above `i` before walking downward.
+      if (cur) {
+        var back = [];
+        for (var b = i - 1; b >= Math.max(0, i - 6); b--) {
+          var bline = String((rows[b] && rows[b].text) || '');
+          if (!bline.trim()) continue;
+          var bm = /^[ \t]{2,}(\S.*)$/.exec(bline);
+          if (!bm) break;
+          var bt = bm[1].trim();
+          if (isFooter(bline) || /[:?]$/.test(bt) || /^cd:\s/i.test(bt) || /^[<\u2039]/.test(bt) || /^\/[a-z0-9_:-]+/i.test(bt)) break;
+          var bc = classify(bline);
+          if (bc.kind !== 'body' && bc.kind !== 'blank') break;
+          back.unshift({ text: bt, row: rowNum(rows[b], b) });
+        }
+        for (var bi = 0; bi < back.length; bi++) opts.push(back[bi]);
+      }
+      var j = i;
+      var sawCursor = false;
+      var sawNumbered = false;
+      while (j < rows.length) {
+        var rowObj = rows[j];
+        var line = String((rowObj && rowObj.text) || '');
+        if (!line.trim()) {
+          // Allow blank line only if next line is also an option
+          var nextLine = j + 1 < rows.length ? String((rows[j + 1] && rows[j + 1].text) || '') : '';
+          if (/^[ \t]*(?:[\u276f\u203a\u25b8]\s+\S|(?:\d+[.)]|\[\d+\])\s+\S)/.test(nextLine)) { j++; continue; }
+          break;
+        }
+        var mCur = /^[ \t]*([\u276f\u203a\u25b8])\s+(.*)$/.exec(line);
+        var mNum = /^[ \t]*(?:([\u276f\u203a\u25b8])\s+)?((?:\d+[.)]|\[\d+\])\s+\S.*)$/.exec(line);
+        var mIndented = opts.length > 0 && /^[ \t]{2,}(\S.*)$/.exec(line);
+        if (mCur) {
+          sawCursor = true;
+          if (/^(?:\d+[.)]|\[\d+\])\s/.test(mCur[2])) sawNumbered = true;
+          if (selected < 0) selected = opts.length;
+          opts.push({ text: mCur[2].trim(), row: rowNum(rowObj, j) });
+          j++;
+        } else if (mNum) {
+          sawNumbered = true;
+          if (mNum[1] && selected < 0) { sawCursor = true; selected = opts.length; }
+          opts.push({ text: mNum[2].trim(), row: rowNum(rowObj, j) });
+          j++;
+        } else if (mIndented && !isFooter(line) && !/^cd:\s/i.test(mIndented[1]) && !/^[<\u2039]/.test(mIndented[1]) && !/^\/[a-z0-9_:-]+/i.test(mIndented[1])) {
+          // Sibling option without cursor (only valid if we already saw a cursor or numbered option, and not a status/leaf/slash row)
+          opts.push({ text: mIndented[1].trim(), row: rowNum(rowObj, j) });
+          j++;
+        } else {
+          break;
+        }
+      }
+      if (opts.length >= 2 && (sawCursor || sawNumbered)) {
+        best = { options: opts, selected: selected < 0 ? 0 : selected, startIdx: i, endIdx: j };
+      }
+      i = Math.max(i + 1, j);
+    }
+    return best;
+  }
+
+  function segmentRows(rows) {
     var joined = [];
     for (var i = 0; i < rows.length; i++) {
       var r = rows[i];
       if (!r) continue;
-      if (r.wrapped && joined.length) joined[joined.length - 1] += r.text;
-      else joined.push(r.text);
+      if (r.wrapped && joined.length) {
+        joined[joined.length - 1].text += r.text;
+      } else {
+        joined.push({ text: String(r.text || ''), dim: !!r.dim, italic: !!r.italic });
+      }
     }
     var out = [];
     var cur = null;
     for (var j = 0; j < joined.length; j++) {
-      var text = joined[j];
-      var c = classify(text);
+      var item = joined[j];
+      var text = item.text;
+      var c = classify(text, item);
       if (c.kind === 'rule') { if (cur) { out.push(cur); cur = null; } continue; }
       // A footer widget is never body: it would otherwise extend whichever message it lands under.
       if (isFooter(text)) { if (cur) { out.push(cur); cur = null; } continue; }
       if (c.kind === 'blank') { if (cur) cur.lines.push(''); continue; }
-      if (c.kind === 'body') {
+      if (c.kind === 'body' || (c.styled && cur && cur.role === 'thought')) {
         if (cur) { cur.lines.push(text); continue; }
         // Body with nothing open (a screen that started mid-message): open an unattributed one rather than
         // dropping the text, so a phone never shows less than the terminal does.
-        cur = { role: 'text', lead: '', lines: [text] };
+        cur = { role: c.styled ? 'thought' : 'text', lead: '', lines: [text] };
         continue;
       }
       if (cur) out.push(cur);
       cur = { role: c.kind, lead: c.lead, lines: [text] };
     }
     if (cur) out.push(cur);
-    // Trim trailing blank lines, and give each message one comparable text blob plus a stable ordinal.
     for (var n = 0; n < out.length; n++) {
       var m = out[n];
       while (m.lines.length && m.lines[m.lines.length - 1].trim() === '') m.lines.pop();
-      // Collapse source-column alignment before the phone sees it. A 209-column terminal indents code to
-      // line up with source columns, so a row arrives as "135                     ECSENGINE::Spawn..."
-      // - on a 390px screen that run is most of the line and the code wraps around it. Any run of 6+
-      // interior spaces becomes a fixed 4-column gap: the code keeps its structure, the phone keeps its
-      // width. A run that short is ordinary prose spacing and is left alone.
-      //
-      // NEVER for a table: its columns ARE those runs, so collapsing them would stack every cell into one
-      // ragged column and destroy the only thing the box was drawn for. A table is measured from the raw
-      // rows, and it is kept byte-exact for the panning renderer.
       var kind = blockKind(m.lines.join('\n'));
       m.kind = kind;
       m.text = kind === 'table'
@@ -150,20 +350,171 @@
     return out.filter(function (m) { return m.text !== ''; });
   }
 
-  // The agent app's own FOOTER widgets, painted over the bottom rows of the screen. Measured on tab-5bec
-  // (2026-11-12): a scroll hint, a task counter and a key hint appear under whatever the app last drew, so a
-  // long command's output appears to continue into them. They are the app's interface, not output.
-  var FOOTER = [
-    /^\s*Jump to bottom\b/i,
-    /^\s*[\u25b8\u25be>]\s*\d+\s+tasks?\s*\(\d+ done/i,
-    /^\s*\(ctrl\+[a-z]\)\s*$/i,
-    /^\s*Press .* for .*$/i,
-  ];
+  function inspectScreen(rows, bufType) {
+    var list = Array.isArray(rows) ? rows : [];
+    var kind = (typeof bufType === 'string')
+      ? (bufType === 'alternate' ? 'alternate' : 'normal')
+      : bufferKind(bufType);
 
-  function isFooter(text) {
-    var t = String(text || '');
-    for (var i = 0; i < FOOTER.length; i++) if (FOOTER[i].test(t)) return true;
-    return false;
+    var sw = findComposerSandwich(list);
+    var bodyEnd = sw ? sw.start : list.length;
+
+    var chrome = {
+      prompt: null,
+      statusLines: [],
+      leafBar: null,
+      spinner: null,
+      completions: [],
+      picker: null,
+      footerTasks: null,
+    };
+
+    if (sw) {
+      var promptParts = [];
+      for (var p = sw.promptStart; p <= sw.promptEnd; p++) {
+        var pt = String((list[p] && list[p].text) || '');
+        if (p === sw.promptStart) pt = pt.replace(/^[ \t]*[\u276f\u23f5\u203a]\s?/, '');
+        else pt = pt.replace(/^[ \t]+/, '');
+        promptParts.push(pt.replace(/\s+$/, ''));
+      }
+      chrome.prompt = {
+        row: rowNum(list[sw.promptStart], sw.promptStart),
+        text: promptParts.join('\n').trim(),
+      };
+    }
+
+    // Scan chrome rows (below composer sandwich if present, otherwise bottom rows for footers/leafBar/picker).
+    var chromeFrom = sw ? (sw.ruleEnd + 1) : Math.max(0, list.length - 18);
+    var slashCompRe = /^[ \t]*(?:[\u276f\u203a\u25b8\u2022]\s+)?(\/[a-z0-9_:-]+(?:\s+.*)?)$/i;
+    var pickerRows = [];
+
+    // Without a composer sandwich, check if a bare slash prompt line ("❯ /...") sits near the bottom
+    // with no assistant/tool turn after it, so bare completion menus can still populate chrome.completions.
+    var barePromptIdx = -1;
+    if (!sw) {
+      for (var bp = list.length - 1; bp >= chromeFrom; bp--) {
+        var bpt = String((list[bp] && list[bp].text) || '');
+        if (/^[ \t]*[\u276f\u23f5\u203a]\s*\/\S*/.test(bpt)) { barePromptIdx = bp; break; }
+        var bpk = classify(bpt).kind;
+        if (bpk === 'assistant' || bpk === 'toolcall') break;
+      }
+      if (barePromptIdx >= 0 && !chrome.prompt) {
+        chrome.prompt = {
+          row: rowNum(list[barePromptIdx], barePromptIdx),
+          text: String(list[barePromptIdx].text || '').replace(/^[ \t]*[\u276f\u23f5\u203a]\s?/, '').trim(),
+        };
+      }
+    }
+
+    for (var idx = chromeFrom; idx < list.length; idx++) {
+      var r = list[idx];
+      if (!r) continue;
+      var raw = String(r.text || '');
+      var trimmed = raw.trim();
+      if (!trimmed) continue;
+      var rIdx = rowNum(r, idx);
+
+      if (!chrome.leafBar) {
+        var lb = parseLeafBar(raw, rIdx);
+        if (lb) { chrome.leafBar = lb; continue; }
+      }
+      if (FOOTER_TASKS_RE.test(raw)) {
+        chrome.footerTasks = trimmed;
+        continue;
+      }
+      if (SPINNER.test(raw)) {
+        chrome.spinner = trimmed;
+        continue;
+      }
+      if (classify(raw).kind === 'rule') continue;
+
+      if (sw) {
+        var cm = slashCompRe.exec(raw);
+        if (cm) {
+          chrome.completions.push({ text: cm[1].trim(), row: rIdx });
+          continue;
+        }
+        pickerRows.push({ i: rIdx, text: raw, wrapped: !!r.wrapped });
+        if (!isFooter(raw)) chrome.statusLines.push(trimmed);
+      } else {
+        if (idx === barePromptIdx) continue;
+        if (kind === 'alternate' || (barePromptIdx >= 0 && idx > barePromptIdx)) {
+          var acm = slashCompRe.exec(raw);
+          if (acm) {
+            chrome.completions.push({ text: acm[1].trim(), row: rIdx });
+            continue;
+          }
+        }
+        // Without a composer sandwich, only collect genuine footer/picker/status rows at the bottom.
+        if (isFooter(raw)) continue;
+        pickerRows.push({ i: rIdx, text: raw, wrapped: !!r.wrapped });
+      }
+    }
+
+    // Look for an interactive picker either inside post-composer chrome or in the bottom rows of an
+    // alternate-screen / permission-prompt screen (where no composer sandwich is drawn).
+    var tailOffset = Math.max(0, list.length - 18);
+    var pickerCandidate = sw ? pickerRows : list.slice(tailOffset);
+    var pk = parsePicker(pickerCandidate, 0);
+    if (pk) {
+      // If there's no composer sandwich on normal screen, only accept the picker when it is at the very tail
+      // (not followed by assistant/status turns) and has an explicit cursor glyph (❯/›/▸) or alt-screen.
+      var validTailPicker = true;
+      if (!sw && kind === 'normal') {
+        var tailAfter = pickerCandidate.slice(pk.endIdx);
+        var hasFollowTurn = tailAfter.some(function (x) {
+          var k = classify(x && x.text).kind;
+          return k === 'assistant' || k === 'toolcall' || k === 'user';
+        });
+        var hasCursor = pickerCandidate.slice(pk.startIdx, pk.endIdx).some(function (x) {
+          return /^[ \t]*[\u276f\u203a\u25b8]\s+/.test(String((x && x.text) || ''));
+        });
+        validTailPicker = !hasFollowTurn && hasCursor;
+      }
+      if (validTailPicker) {
+        chrome.picker = { options: pk.options, selected: pk.selected };
+        // Exclude a trailing inline picker from message segmentation so "❯ 1. Yes" never renders
+        // as a fake sent user bubble before the user taps an option.
+        if (!sw && (tailOffset + pk.startIdx) < bodyEnd) {
+          bodyEnd = tailOffset + pk.startIdx;
+        }
+        // Remove picker option lines from statusLines when both appeared in post-composer chrome.
+        if (sw && chrome.statusLines.length) {
+          var optTexts = pk.options.map(function (o) { return o.text; });
+          chrome.statusLines = chrome.statusLines.filter(function (line) {
+            var stripped = line.replace(/^[\u276f\u203a\u25b8]\s+/, '').trim();
+            return optTexts.indexOf(stripped) < 0 && optTexts.indexOf(line) < 0;
+          });
+        }
+      }
+    }
+
+    var msgRows = list.slice(0, bodyEnd);
+    var messages = segmentRows(msgRows);
+
+    // Also inspect message footers & active spinner from the full row list when not already found in chrome.
+    if (!chrome.footerTasks) {
+      for (var fi = list.length - 1; fi >= Math.max(0, list.length - 18); fi--) {
+        var ft = String((list[fi] && list[fi].text) || '');
+        if (FOOTER_TASKS_RE.test(ft)) { chrome.footerTasks = ft.trim(); break; }
+      }
+    }
+    if (!chrome.spinner && messages.length) {
+      for (var mi = messages.length - 1; mi >= 0; mi--) {
+        if (isTransientSpinner(messages[mi])) { chrome.spinner = messages[mi].text; break; }
+        if (messages[mi].role !== 'status') break;
+      }
+    }
+
+    return {
+      kind: kind,
+      messages: messages,
+      chrome: chrome,
+    };
+  }
+
+  function segment(rows) {
+    return inspectScreen(rows, 'normal').messages;
   }
 
   // Which messages get a SENDER LABEL. A messaging view labels a run of turns from one speaker once: the
@@ -179,12 +530,10 @@
       var role0 = m.role || 'text';
       var isContext = !seenReal && role0 === 'text';
       if (role0 !== 'text') seenReal = true;
-      // A RUN is one speaker's turn. A tool result is part of the agent's turn - it is the agent running a
-      // command - so it neither starts a run nor carries the label; it stays visually subordinate in
-      // monospace. Without this, assistant -> tool -> assistant -> tool printed the session name on every
-      // bubble, which is what the phone showed.
+      // A RUN is one speaker's turn. Tool calls, tool results, and thought traces are part of the agent's
+      // turn, so they stay under the same speaker run without repeating the session label on every card.
       var who = m.role || 'text';
-      var speaker = (who === 'tool') ? 'assistant' : who;
+      var speaker = (who === 'tool' || who === 'toolcall' || who === 'thought') ? 'assistant' : who;
       var showWho = who !== 'text' && speaker !== prev;
       out.push({ role: m.role, lead: m.lead, text: m.text, lines: m.lines, index: m.index,
                  kind: m.kind || 'text',
@@ -201,11 +550,7 @@
   }
 
   // What KIND of block is this message? Only one distinction matters on a phone: a BOX TABLE must not be
-  // word-wrapped. Measured live (drive A6, 2026-11-12): a git-log table arrived as │-delimited rows and,
-  // wrapped at 366px, became a pile of orphaned ─ runs and broken cells - the data was there and unreadable.
-  // A table is detected from its own bytes (the box-drawing frame), so no new metadata is carried, and the
-  // renderer gives it a horizontal scroller instead of wrapping it: the phone pans a table, it does not
-  // reflow one. Prose and code keep wrapping, which is right for them.
+  // word-wrapped.
   var BOX = /^\s*[\u2500-\u257f]/;
   function blockKind(text) {
     var lines = String(text || '').split('\n'), box = 0, nonEmpty = 0;
@@ -219,13 +564,15 @@
   }
 
   function summarize(messages) {
-    var counts = { user: 0, assistant: 0, tool: 0, status: 0, text: 0 };
+    var counts = { user: 0, assistant: 0, tool: 0, toolcall: 0, thought: 0, status: 0, text: 0 };
     for (var i = 0; i < messages.length; i++) counts[messages[i].role] = (counts[messages[i].role] || 0) + 1;
     return counts;
   }
 
   global.MuxThreads = {
     segment: segment,
+    inspectScreen: inspectScreen,
+    collapseTransient: collapseTransient,
     classify: classify,
     bufferKind: bufferKind,
     blockKind: blockKind,

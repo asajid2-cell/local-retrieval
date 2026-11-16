@@ -33,8 +33,13 @@
   #app {
     display:grid; height:100dvh; min-height:0;
     grid-template-columns: minmax(0,1fr);
-    grid-template-rows: auto auto minmax(0,1fr) auto auto;
-    grid-template-areas: "topbar" "tabs" "term" "status" "keys";
+    /* QUICKKEYS IS ITS OWN ROW. It used to be a child of <main id="term">, which meant every measurement
+       of the pane - the FitAddon proposal, nativeDims, fitTabOwnedGrid, alignTerminalSurface - read a
+       clientHeight that included the 42px strip and an xterm that started 42px down. On a phone that put
+       the app's own bottom rows (its status line and leaf bar) outside the pane's box and clipped them.
+       As a row, the pane's height IS the room the grid has, and the grid's last row is the last row. */
+    grid-template-rows: auto auto minmax(0,1fr) auto auto auto;
+    grid-template-areas: "topbar" "tabs" "term" "quickkeys" "status" "keys";
     isolation:isolate;
     /* No double-tap zoom anywhere in the app shell (see #term for why). Deliberate pinch still works. */
     touch-action:manipulation;
@@ -232,7 +237,7 @@
      real keyboard is right there. Sits at the bottom of the pane so it never covers a row of output, and it
      is not focusable-by-tap into the terminal: a key button takes focus and BLURS on send, so tapping Esc
      does not leave the keyboard up over the screen. */
-  #quickkeys { display:none; }
+  #quickkeys { display:none; grid-area:quickkeys; }
   @media (max-width:59.99rem) {
     #quickkeys {
       display:flex; gap:5px; align-items:center; overflow-x:auto; overflow-y:hidden;
@@ -252,9 +257,9 @@
     /* The way to the full keyboard is PINNED at the right edge: it is the escape hatch, so it must never be
        the item that scrolled off the screen (which is exactly how the nav's Keys item went missing). */
     #quickkeys .qk-more { margin-left:auto; position:sticky; right:0; border-color:var(--line); color:var(--muted); }
-  }
     /* While the soft keyboard is UP the strip is the first thing to go: the phone has no room for chrome and
-       the user is typing, not pressing arrows. */
+       the user is typing, not pressing arrows. (This rule used to sit OUTSIDE this media query after a
+       stray closing brace, which both closed the block early and left an unmatched brace behind.) */
     html.kb-open #quickkeys { display:none; }
   }
   /* PAUSED overlay. autoFreeze/selectMode freeze the terminal so a highlight survives, but the freeze is
@@ -448,6 +453,63 @@
     border:1px solid var(--rose); background:var(--rose); color:#12070a; font-size:14px; font-weight:700;
   }
   #composer #sendthread:disabled { opacity:.45; }
+  /* Attach: the desktop's upload button is phone-hidden (.compose-desktop), so the conversation surface gets
+     its own. Same openUpload() - it is the file workspace, not a second upload path. */
+  #composer #threadattach {
+    flex:0 0 auto; min-width:40px; min-height:40px; padding:0; border-radius:var(--r-m);
+    border:1px solid var(--line); background:var(--raised); color:var(--txt); font-size:16px; line-height:1;
+  }
+  /* ---- conversation-surface chrome: the session/leaf bar, the TUI control strip, the slash tray ---- */
+  #threadnav {
+    grid-area:threadnav; display:none; align-items:center; gap:var(--sp2);
+    padding:var(--sp2) var(--sp2); background:var(--panel); border-bottom:1px solid var(--line);
+    overflow-x:auto; overflow-y:hidden; scrollbar-width:none; overscroll-behavior-x:contain;
+    -webkit-overflow-scrolling:touch; touch-action:pan-x; flex:0 0 auto;
+  }
+  #threadnav::-webkit-scrollbar { display:none; }
+  #threadnav .tchip {
+    flex:0 0 auto; display:inline-flex; align-items:center; gap:5px; max-width:46vw;
+    min-height:34px; padding:0 var(--sp2); border-radius:999px;
+    border:1px solid var(--line); background:var(--raised); color:var(--muted);
+    font:600 12.5px/1 inherit; cursor:pointer;
+  }
+  #threadnav .tchip .dot { width:7px; height:7px; border-radius:50%; background:var(--faint); flex:0 0 auto; }
+  #threadnav .tchip[data-state="green"] .dot { background:var(--live); }
+  #threadnav .tchip[data-state="yellow"] .dot { background:var(--warn); }
+  #threadnav .tchip[data-state="red"] .dot { background:var(--rose); }
+  #threadnav .tchip.active { background:var(--rose-dim); border-color:var(--rose); color:var(--txt); }
+  #threadnav .tchip .nm { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  #threadnav .tsep { flex:0 0 auto; width:1px; height:20px; background:var(--line); }
+  #threadnav .tchip.leaf { border-style:dashed; }
+  #threadnav .tchip.leaf.active { border-style:solid; }
+  #tuiControls {
+    grid-area:tui; display:none; align-items:center; gap:6px; flex-wrap:wrap;
+    padding:var(--sp1) var(--sp2); background:var(--panel-2); border-bottom:1px solid var(--line); flex:0 0 auto;
+  }
+  /* Scoped to the threads view: the strip is stateful (it renders the last screen it saw), so leaving the
+     view must not leave it standing in a template that has no row for it. */
+  #app.mobile-view-threads #tuiControls.on { display:flex; }
+  #tuiControls button {
+    flex:0 0 auto; min-height:34px; min-width:40px; padding:0 10px; border-radius:var(--r-s);
+    border:1px solid var(--line); background:var(--raised); color:var(--txt);
+    font:600 12.5px/1 ui-monospace,monospace;
+  }
+  #tuiControls button.opt { font-family:inherit; max-width:60vw; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  #tuiControls button.sel { border-color:var(--rose); background:var(--rose-dim); color:var(--rose); }
+  #tuiControls .lbl { flex:0 0 auto; font-size:11.5px; color:var(--faint); padding-right:2px; }
+  #slashTray {
+    grid-area:slash; display:none; flex-direction:column; max-height:32vh; overflow-y:auto;
+    background:var(--panel); border-top:1px solid var(--line); flex:0 0 auto;
+  }
+  #app.mobile-view-threads #slashTray:not([hidden]) { display:flex; }
+  #slashTray button {
+    display:flex; align-items:baseline; gap:var(--sp2); width:100%; text-align:left; min-height:40px;
+    padding:var(--sp1) var(--sp3); border:none; border-bottom:1px solid var(--line);
+    background:transparent; color:var(--txt); font:inherit; cursor:pointer;
+  }
+  #slashTray button:active, #slashTray button:focus-visible { background:var(--raised); }
+  #slashTray .cmd { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:13.5px; color:var(--rose); flex:0 0 auto; }
+  #slashTray .why { font-size:12px; color:var(--muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   #app.projects #term { display:none; }
   #app.projects #projects { display:flex; }
   #app.projects #tabwrap, #app.projects #status, #app.projects #keybar { display:none; }
@@ -702,8 +764,8 @@
   }
   @media (max-width:59.99rem) {
     #app {
-      grid-template-rows:auto minmax(0,1fr) auto auto;
-      grid-template-areas:"topbar" "term" "status" "mobileNav";
+      grid-template-rows:auto minmax(0,1fr) auto auto auto;
+      grid-template-areas:"topbar" "term" "quickkeys" "status" "mobileNav";
     }
     #mobileNav {
       /* SEVEN destinations, ALL on screen. The row used to be a horizontally-scrolling strip of fixed 62px
@@ -743,10 +805,11 @@
     html.kb-open #topbar { min-height:40px; }
 
     #app.mobile-view-sessions {
-      grid-template-rows:auto minmax(0,1fr) auto auto;
-      grid-template-areas:"topbar" "tabs" "status" "mobileNav";
+      grid-template-rows:auto minmax(0,1fr) auto auto auto;
+      grid-template-areas:"topbar" "tabs" "quickkeys" "status" "mobileNav";
     }
     #app.mobile-view-sessions #term, #app.mobile-view-sessions #keybar { display:none; }
+    #app.mobile-view-sessions #quickkeys { display:none; }
     #app.mobile-view-sessions #tabwrap {
       display:flex; flex-direction:column; align-items:stretch; min-height:0; gap:var(--sp2);
       padding:var(--sp3); background:var(--bg); border-bottom:none; overflow:hidden;
@@ -775,34 +838,41 @@
     }
 
     #app.mobile-view-fleet {
-      grid-template-rows:auto minmax(0,1fr) auto auto;
-      grid-template-areas:"topbar" "term" "status" "mobileNav";
+      grid-template-rows:auto minmax(0,1fr) auto auto auto;
+      grid-template-areas:"topbar" "term" "quickkeys" "status" "mobileNav";
     }
-    #app.mobile-view-fleet #term, #app.mobile-view-fleet #keybar, #app.mobile-view-fleet #tabwrap { display:none; }
+    #app.mobile-view-fleet #term { display:none; }
+    #app.mobile-view-fleet #keybar { display:none; }
+    #app.mobile-view-fleet #tabwrap { display:none; }
+    #app.mobile-view-fleet #quickkeys { display:none; }
     #app.mobile-view-fleet #fleetList { display:flex; }
 
     #app.mobile-view-terminal {
-      grid-template-rows:auto minmax(0,1fr) auto auto;
-      grid-template-areas:"topbar" "term" "status" "mobileNav";
+      grid-template-rows:auto minmax(0,1fr) auto auto auto;
+      grid-template-areas:"topbar" "term" "quickkeys" "status" "mobileNav";
     }
     #app.mobile-view-terminal #tabwrap, #app.mobile-view-terminal #keybar { display:none; }
 
     /* THREADS: the same teemux output rendered as a conversation instead of a grid. Rows come from the
        live buffer (threads.js segments them) - nothing here fetches, and nothing here knows about leaves. */
+    /* THREADS carries more chrome than the terminal because it is meant to REPLACE it on a phone: a session
+       and leaf switcher at the top, the conversation, a TUI control strip and slash tray when the app is
+       asking something, and the composer. Every one of those rows is `auto`, so a hidden one costs nothing. */
     #app.mobile-view-threads {
-      grid-template-rows:auto minmax(0,1fr) auto auto auto;
-      grid-template-areas:"topbar" "threads" "composer" "status" "mobileNav";
+      grid-template-rows:auto auto minmax(0,1fr) auto auto auto auto auto;
+      grid-template-areas:"topbar" "threadnav" "threads" "tui" "slash" "composer" "status" "mobileNav";
     }
     #app.mobile-view-threads #term, #app.mobile-view-threads #keybar,
-    #app.mobile-view-threads #tabwrap { display:none; }
+    #app.mobile-view-threads #tabwrap, #app.mobile-view-threads #quickkeys { display:none; }
     #app.mobile-view-threads #threads { display:flex; }
     #app.mobile-view-threads #composer { display:flex; }
+    #app.mobile-view-threads #threadnav { display:flex; }
 
     #app.mobile-view-keys {
       grid-template-rows:auto minmax(4rem,1fr) auto auto auto;
       grid-template-areas:"topbar" "term" "status" "keys" "mobileNav";
     }
-    #app.mobile-view-keys #tabwrap { display:none; }
+    #app.mobile-view-keys #tabwrap, #app.mobile-view-keys #quickkeys { display:none; }
     #app.mobile-view-keys #term { min-height:0; }
     #app.mobile-view-keys #keybar {
       display:flex; flex-wrap:wrap; align-items:flex-start; align-content:flex-start;
@@ -813,17 +883,16 @@
     #app.mobile-view-keys .key { height:38px; min-width:40px; padding:0 10px; font-size:13px; }
     #app.mobile-view-keys .kmode { height:34px; min-width:34px; padding:0 8px; }
     #app.mobile-view-keys .kdiv { display:none; }
-    #app.zen #mobileNav, #app.zen #status, #app.zen #keybar { display:none; }
+    #app.zen #mobileNav, #app.zen #status, #app.zen #keybar, #app.zen #quickkeys { display:none; }
     #app.zen { grid-template-rows:auto minmax(0,1fr); grid-template-areas:"topbar" "term"; }
-
     /* BOTTOM BAR HIDDEN (the #navtoggle button). Each view mode names the bar in its own row list, so the
        row has to be dropped per mode or the grid keeps a 0-height track and the pane gains nothing. Every
        rule here is the matching rule above with the "mobileNav" track and area removed. */
     #app.nonav #mobileNav { display:none; }
-    #app.nonav { grid-template-rows:auto minmax(0,1fr) auto; grid-template-areas:"topbar" "term" "status"; }
+    #app.nonav { grid-template-rows:auto minmax(0,1fr) auto auto; grid-template-areas:"topbar" "term" "quickkeys" "status"; }
     #app.nonav.mobile-view-sessions { grid-template-rows:auto minmax(0,1fr) auto; grid-template-areas:"topbar" "tabs" "status"; }
-    #app.nonav.mobile-view-fleet, #app.nonav.mobile-view-terminal { grid-template-rows:auto minmax(0,1fr) auto; grid-template-areas:"topbar" "term" "status"; }
-    #app.nonav.mobile-view-threads { grid-template-rows:auto minmax(0,1fr) auto auto; grid-template-areas:"topbar" "threads" "composer" "status"; }
+    #app.nonav.mobile-view-fleet, #app.nonav.mobile-view-terminal { grid-template-rows:auto minmax(0,1fr) auto auto; grid-template-areas:"topbar" "term" "quickkeys" "status"; }
+    #app.nonav.mobile-view-threads { grid-template-rows:auto auto minmax(0,1fr) auto auto auto auto; grid-template-areas:"topbar" "threadnav" "threads" "tui" "slash" "composer" "status"; }
     #app.nonav.mobile-view-keys { grid-template-rows:auto minmax(4rem,1fr) auto auto; grid-template-areas:"topbar" "term" "status" "keys"; }
     #empty { padding:var(--sp4) var(--sp3); }
     #empty .quick button { min-height:44px; }
@@ -913,30 +982,49 @@
     <button id="jumplive" aria-label="Jump to live"><span id="jlcount">new</span> ↓</button>
     <div id="predict" aria-hidden="true"></div>
     <button type="button" id="paused" hidden>paused &mdash; click to resume</button>
-    <!-- PHONE QUICK KEYS. The full keyboard lives on the Keys view, but a phone user sending a prompt needs
-         Enter, Escape and the arrows WITHOUT leaving the terminal, and the soft keyboard has no Esc, no Tab
-         and no arrows. Before this strip the only route was the bottom nav (whose Keys item was scrolled off
-         screen) - i.e. "there is no keys button". These are the same sendKey() calls the Keys view uses, so
-         no new input path exists. The ↑ at the far left is the tab-drag handle: it scrolls the strip. -->
-    <div id="quickkeys" aria-label="Quick keys">
-      <button type="button" data-qk="esc" aria-label="Escape">Esc</button>
-      <button type="button" data-qk="tab" aria-label="Tab">Tab</button>
-      <button type="button" data-qk="up" aria-label="Arrow up">↑</button>
-      <button type="button" data-qk="down" aria-label="Arrow down">↓</button>
-      <button type="button" data-qk="left" aria-label="Arrow left">←</button>
-      <button type="button" data-qk="right" aria-label="Arrow right">→</button>
-      <button type="button" data-qk="enter" class="qk-go" aria-label="Enter">⏎</button>
-      <button type="button" id="qk-all" class="qk-more" aria-label="All keys">⌨ keys</button>
-    </div>
   </main>
+  <!-- PHONE QUICK KEYS. The full keyboard lives on the Keys view, but a phone user sending a prompt needs
+       Enter, Escape and the arrows WITHOUT leaving the terminal, and the soft keyboard has no Esc, no Tab
+       and no arrows. Before this strip the only route was the bottom nav (whose Keys item was scrolled off
+       screen) - i.e. "there is no keys button". These are the same sendKey() calls the Keys view uses, so
+       no new input path exists. The ↑ at the far left is the tab-drag handle: it scrolls the strip.
+
+       It is a SIBLING of #term, not a child. As a child it took 42px out of the pane without any of the
+       fit or align code knowing: #term.clientHeight still counted those pixels, so the xterm was measured
+       against room it did not have, started below the pane's top edge, and pushed the app's own bottom
+       rows - its status line and its leaf bar - past the pane's bottom where overflow:hidden ate them. -->
+  <div id="quickkeys" aria-label="Quick keys">
+    <button type="button" data-qk="esc" aria-label="Escape">Esc</button>
+    <button type="button" data-qk="tab" aria-label="Tab">Tab</button>
+    <button type="button" data-qk="up" aria-label="Arrow up">↑</button>
+    <button type="button" data-qk="down" aria-label="Arrow down">↓</button>
+    <button type="button" data-qk="left" aria-label="Arrow left">←</button>
+    <button type="button" data-qk="right" aria-label="Arrow right">→</button>
+    <button type="button" data-qk="enter" class="qk-go" aria-label="Enter">⏎</button>
+    <button type="button" id="qk-all" class="qk-more" aria-label="All keys">⌨ keys</button>
+  </div>
 
   <div id="fleetList" aria-label="Fleet glance"></div>
 
   <section id="threads" aria-label="Conversation view of this session"></section>
+  <!-- THE THREAD SESSION BAR. A phone that has chosen the conversation surface should never have to leave it
+       to change session, and the app's own leaf bar is a row of the pty grid, not something this page can
+       query - so the leaves are read back out of the screen by threads.js and drawn here as tappable chips.
+       Nothing new is fetched: the session chips come from the list the page already has, and a leaf tap is
+       an SGR pointer report into the same pty the terminal would send one into. -->
+  <div id="threadnav" aria-label="Switch session or leaf"></div>
+  <!-- THE TUI CONTROL STRIP. When the app is showing a picker, a completion list, or an inline y/n prompt,
+       the conversation view cannot answer it by typing a sentence. These send the same raw keys the keybar
+       sends, so a menu the phone could not previously reach is one tap away. -->
+  <div id="tuiControls" aria-hidden="true"></div>
   <form id="composer" autocomplete="off">
     <textarea id="threadinput" rows="1" placeholder="Message this session&hellip;" aria-label="Message this session"></textarea>
+    <button type="button" id="threadattach" aria-label="Attach a file" title="Attach a file">📎</button>
     <button type="submit" id="sendthread">Send</button>
   </form>
+  <!-- SLASH TRAY: typing "/" in the composer raises the commands the app accepts. Advisory, never a filter:
+       the textarea always sends exactly what was typed, so an unknown or future command is never blocked. -->
+  <div id="slashTray" hidden aria-label="Slash commands"></div>
 
 
   <div id="status"><span class="sdot"></span><span id="statustext">connecting&hellip;</span><button type="button" class="meta" id="statusmeta" aria-label="Shared terminal size"></button></div>
@@ -1136,6 +1224,8 @@ function setMobileView(view, persist=true){
     if(fleetPollInterval){ clearInterval(fleetPollInterval); fleetPollInterval = null; }
   }
   if(isMobile() && view==='threads') renderThreads(true);
+  // The size chip belongs to the grid, so entering or leaving a grid view re-decides whether it shows.
+  try{ updateMeta(); }catch(e){}
   if(isMobile() && view!=='sessions' && view!=='fleet'){
     // applyViewport (not healTerminalSurface) does the height write, so it stays first; the heal is what
     // repaints the rows xterm drew while this view was display:none. Only when the terminal was actually
@@ -1160,7 +1250,20 @@ function threadRowsFromBuffer(){
   for(let i=0;i<b.length;i++){
     const ln=b.getLine(i);
     if(!ln) continue;
-    rows.push({ i, text: ln.translateToString(true), wrapped: !!ln.isWrapped });
+    const r={ i, text: ln.translateToString(true), wrapped: !!ln.isWrapped };
+    // The CELL STYLE is part of what the app said. An agent draws its private reasoning dim and italic, and
+    // that is the only tell there is - the text itself is ordinary prose. One probe cell per row is enough
+    // to classify it, and it is read from the first non-blank cell so a leading indent does not hide it.
+    const txt=r.text;
+    let probe=-1;
+    for(let c=0;c<txt.length;c++){ if(txt[c]!==' ' && txt[c]!=='\t'){ probe=c; break; } }
+    if(probe>=0){
+      try{
+        const cell=ln.getCell(probe);
+        if(cell){ r.dim=!!cell.isDim(); r.italic=!!cell.isItalic(); }
+      }catch(e){}
+    }
+    rows.push(r);
   }
   return { kind, rows };
 }
@@ -1210,7 +1313,9 @@ function accumulateThreads(live){
   for(let i=overlap;i<live.length;i++){
     const m=live[i];
     if(!m || !String(m.text||'').trim()) continue;
-    rec.push({ role:m.role, lead:m.lead, text:m.text, kind:m.kind||'text' });
+    // A stable id is what lets the DOM diff keep a node instead of rebuilding the whole list: the id
+    // survives a text update, so an open thought block stays open while the message below it streams.
+    rec.push({ id: st.nextId = (st.nextId|0)+1, role:m.role, lead:m.lead, text:m.text, kind:m.kind||'text' });
   }
   // Trim from the front against a message count and a character budget, so a long session stays bounded.
   let total=0;
@@ -1221,16 +1326,226 @@ function accumulateThreads(live){
   }
   if(cut) st.msgs=rec.slice(cut);
   if(!st.msgs.length) return live;
+  // Transient spinner ticks are the SAME activity with a different glyph. Left in, every tick is a new
+  // message by key, so a long run appended a stack of dead "working…" bubbles and the list grew by one
+  // per repaint. Collapse them before they are recorded, not after they are drawn.
+  const collapsed=(window.MuxThreads && MuxThreads.collapseTransient) ? MuxThreads.collapseTransient(st.msgs) : st.msgs;
   // The labels are recomputed over the WHOLE record, so a run that began before the screen scrolled still
   // labels once and a continuation still reads as a continuation.
-  return (window.MuxThreads && MuxThreads.grouped) ? MuxThreads.grouped(st.msgs) : st.msgs;
+  const out=(window.MuxThreads && MuxThreads.grouped) ? MuxThreads.grouped(collapsed) : collapsed;
+  // grouped() builds fresh objects; carry the id across so the renderer can key by it.
+  for(let i=0;i<out.length;i++) if(collapsed[i]) out[i].id=collapsed[i].id;
+  return out;
 }
 
+// ---- the conversation surface's own controls -------------------------------------------------------
+// Everything below is a RENDER of the same pty the terminal shows. The session chips come from the page's
+// own session list; the leaf chips are parsed out of the app's own leaf-bar row by threads.js. No new wire
+// field, no fetch, and the terminal view is still the authority.
+
+// A tap on a leaf chip is an SGR pointer report, the same record a click in the terminal produces. It only
+// goes out when the app has actually armed pointer reporting; otherwise the fallback is the terminal, where
+// the same tap exists for real.
+function tapThreadLeaf(leaf){
+  if(!current || !leaf) return;
+  try{
+    if(!appTakesMouse()){ flash('The app is not taking pointer taps here - open the terminal to switch leaves'); setMobileView('terminal'); return; }
+    const row1=(leaf.row|0)-(term.buffer.active.viewportY|0)+1;
+    const col1=(leaf.col|0)+1;
+    if(!(row1>=1 && row1<=term.rows)){ flash('That leaf row is not on the live screen'); return; }
+    const at='\x1b[<0;'+col1+';'+row1;
+    const seq=at+'M'+at+'m';
+    mouseGuard.noteForwarded(seq, Date.now());
+    sendMouseInput(seq);
+    markActive();
+    flash('Tapping '+leaf.label);
+  }catch(e){ flash('Could not tap the leaf bar'); }
+}
+
+let threadNavSig='';
+function renderThreadNav(name, chrome){
+  const host=$('#threadnav'); if(!host) return;
+  const sessions=Array.isArray(window._sessions)?window._sessions:[];
+  const leaves=(chrome && chrome.leafBar && chrome.leafBar.leaves) || [];
+  const sig=name+'|'+sessions.map(s=>s.name+':'+(s.state||'')+':'+(s.unread?'u':'')+(s.name===current?'*':'')).join(',')+'|'
+    +leaves.map(l=>l.label+':'+(l.active?'*':'')).join(',');
+  if(sig===threadNavSig) return;
+  threadNavSig=sig;
+  host.innerHTML='';
+  for(const s of sessions){
+    const b=document.createElement('button');
+    b.type='button'; b.className='tchip'+(s.name===current?' active':'');
+    b.dataset.state=s.state||'white';
+    b.title=s.name;
+    const dot=document.createElement('span'); dot.className='dot';
+    const nm=document.createElement('span'); nm.className='nm'; nm.textContent=s.name+(s.unread?' ·':'');
+    b.appendChild(dot); b.appendChild(nm);
+    b.onclick=()=>{ if(s.name!==current) connect(s.name); };
+    host.appendChild(b);
+  }
+  if(leaves.length){
+    const sep=document.createElement('span'); sep.className='tsep'; host.appendChild(sep);
+    for(const lf of leaves){
+      const b=document.createElement('button');
+      b.type='button'; b.className='tchip leaf'+(lf.active?' active':'');
+      b.title='Gateway leaf: '+lf.label;
+      const nm=document.createElement('span'); nm.className='nm'; nm.textContent=lf.label;
+      b.appendChild(nm);
+      b.onclick=()=>{ if(!lf.active) tapThreadLeaf(lf); };
+      host.appendChild(b);
+    }
+  }
+}
+
+// The TUI strip: when the app is asking a question (a picker), or is working (a spinner), the conversation
+// surface has the controls for it. Keys go through the same send('i', ...) path the keybar uses.
+let tuiSig='';
+function renderTuiControls(chrome){
+  const host=$('#tuiControls'); if(!host) return;
+  const picker=chrome && chrome.picker;
+  const spinner=chrome && chrome.spinner;
+  const sig=picker?('p|'+picker.selected+'|'+picker.options.map(o=>o.text).join(',')):(spinner?('s|'+spinner):'');
+  if(sig===tuiSig) return;
+  tuiSig=sig;
+  host.innerHTML='';
+  host.classList.toggle('on', !!sig);
+  host.setAttribute('aria-hidden', sig?'false':'true');
+  if(!sig) return;
+  const key=(label, seq, title)=>{ const b=document.createElement('button'); b.type='button'; b.textContent=label; if(title) b.title=title; b.onclick=()=>{ send('i', seq); markActive(); }; return b; };
+  if(picker && picker.options.length){
+    const lbl=document.createElement('span'); lbl.className='lbl'; lbl.textContent='choose'; host.appendChild(lbl);
+    picker.options.forEach((o,i)=>{
+      const b=document.createElement('button'); b.type='button'; b.className='opt'+(i===picker.selected?' sel':'');
+      b.textContent=o.text; b.title=o.text;
+      b.onclick=()=>sendPickerChoice(picker, i);
+      host.appendChild(b);
+    });
+    const arrows=document.createElement('span'); arrows.className='lbl'; arrows.textContent='or'; host.appendChild(arrows);
+    host.appendChild(key('↑','\x1b[A','Up'));
+    host.appendChild(key('↓','\x1b[B','Down'));
+    host.appendChild(key('⏎','\r','Enter'));
+    host.appendChild(key('esc','\x1b','Escape'));
+  } else {
+    const lbl=document.createElement('span'); lbl.className='lbl'; lbl.textContent=String(spinner||'').trim().slice(0,42)||'working'; host.appendChild(lbl);
+    host.appendChild(key('esc','\x1b','Interrupt / cancel'));
+    host.appendChild(key('^C','\x03','Ctrl-C'));
+  }
+}
+// A numbered option answers with its digit; a cursor menu answers with arrows. Both end in Enter.
+function sendPickerChoice(picker, index){
+  const opt=picker.options[index]||{};
+  const m=/^\s*(?:\[(\d{1,2})\]|(\d{1,2})[.)]?)\s/.exec(String(opt.text||''));
+  if(m){ try{ send('i', (m[1]||m[2])+'\r'); }catch(e){} markActive(); return; }
+  const delta=(index|0)-(picker.selected|0);
+  const seq=(delta>0?'\x1b[B':'\x1b[A').repeat(Math.abs(delta)||0)+'\r';
+  try{ send('i', seq); }catch(e){}
+  markActive();
+}
+
+// ---- slash commands --------------------------------------------------------------------------------
+// Curated because the page cannot ask a TUI for its command list, and advisory because it must never
+// block one: the textarea always sends exactly what was typed.
+const SLASH_COMMANDS=[
+  ['/help','show commands'],['/compact','compact the conversation'],['/clear','clear the screen'],
+  ['/model','switch model'],['/status','show session status'],['/cost','token and cost summary'],
+  ['/resume','resume a past chat'],['/rename','rename this chat'],['/plan','plan mode'],
+  ['/tasks','task list'],['/leaves','switch gateway leaf'],['/diff','show the working diff'],
+  ['/mcp','MCP servers'],['/skills','available skills'],['/sessions','session list'],
+];
+function slashToken(){
+  const ta=$('#threadinput'); if(!ta) return null;
+  const v=ta.value;
+  if(!v.startsWith('/') || /\s/.test(v)) return null;
+  return v;
+}
+function hideSlashTray(){ const t=$('#slashTray'); if(t){ t.hidden=true; t.innerHTML=''; } }
+function renderSlashTray(chrome){
+  const tray=$('#slashTray'); if(!tray) return;
+  const tok=slashToken();
+  if(tok===null){ hideSlashTray(); return; }
+  const live=((chrome&&chrome.completions)||[]).map(c=>{
+    const m=/^\s*(\/\S+)\s*(.*)$/.exec(c.text||''); if(!m) return null;
+    return [m[1], m[2]||'on this screen'];
+  }).filter(Boolean);
+  const seen=new Set();
+  const items=[];
+  for(const it of live.concat(SLASH_COMMANDS)){
+    if(!it[0].startsWith(tok)) continue;
+    if(seen.has(it[0])) continue;
+    seen.add(it[0]); items.push(it);
+  }
+  if(!items.length){ hideSlashTray(); return; }
+  tray.hidden=false; tray.innerHTML='';
+  for(const [cmd,why] of items.slice(0,12)){
+    const b=document.createElement('button'); b.type='button';
+    const c=document.createElement('span'); c.className='cmd'; c.textContent=cmd;
+    const w=document.createElement('span'); w.className='why'; w.textContent=why;
+    b.appendChild(c); b.appendChild(w);
+    b.onclick=()=>{
+      const ta=$('#threadinput');
+      ta.value=cmd+' '; ta.focus();
+      ta.dispatchEvent(new Event('input'));
+      hideSlashTray();
+    };
+    tray.appendChild(b);
+  }
+}
+
+// NOTE: the assistant label is resolved at render time, not here - `current` is declared later in the
+// script, and reading it during initialisation threw a TDZ error that took the whole page down.
+const WHO={user:'You',status:'status',tool:'result',toolcall:'work',thought:'thinking',text:''};
+function threadNodeFor(m){
+  const wrap=document.createElement('div');
+  wrap.className='th-msg '+(m.role||'text');
+  if(m.showWho===false) wrap.classList.add('th-cont');
+  if(m.context) wrap.classList.add('th-ctx');
+  const said=String(m.text||'').replace(/^\s*[⏺●○⏎⎿└❯⏵›✻✳✢✽✺∴💭]\s?/,'');
+  if(!said.trim()) return null;
+  if(m.role==='thought'){
+    const det=document.createElement('details'); det.className='th-thought';
+    const sum=document.createElement('summary'); sum.textContent='Thinking';
+    const body=document.createElement('div'); body.className='th-body'; body.textContent=said;
+    det.appendChild(sum); det.appendChild(body); wrap.appendChild(det);
+    return wrap;
+  }
+  const body=document.createElement('div'); body.className='th-body';
+  if(m.kind==='table'){
+    body.classList.add('th-table');
+    const sc=document.createElement('pre'); sc.className='th-scroll'; sc.textContent=said;
+    body.appendChild(sc);
+  } else body.textContent=said;
+  if(m.showWho!==false){
+    const who=document.createElement('div'); who.className='th-who';
+    who.textContent=WHO[m.role]!==undefined?WHO[m.role]:(m.role==='assistant'?(current||'agent'):m.role);
+    wrap.appendChild(who);
+  }
+  wrap.appendChild(body);
+  return wrap;
+}
+
+let threadNodes={};   // session -> array of rendered .th-msg nodes, aligned with the message ids
+let threadsRenderedFor='';
+let lastThreadChrome={};   // the chrome from the last screen parse, for the composer's slash tray
 function renderThreads(force){
   const host=$('#threads'); if(!host) return;
   if(!isMobile() || mobileView!=='threads') return;
   if(!current){ host.innerHTML='<div class="th-empty">No session open.</div>'; threadsLastSig=''; return; }
+  // A different session's nodes are still in the list; the diff below is per session, so the switch has to
+  // start from an empty surface or the new session's list is appended under the old one's.
+  if(threadsRenderedFor!==current){
+    threadsRenderedFor=current;
+    host.innerHTML='';
+    threadNodes[current]=[];
+    threadsLastSig='';
+  }
   const buf=threadRowsFromBuffer();
+  const screen=(window.MuxThreads && MuxThreads.inspectScreen)
+    ? MuxThreads.inspectScreen(buf.rows, buf.kind)
+    : { kind:buf.kind, messages:((window.MuxThreads&&MuxThreads.segment)?MuxThreads.segment(buf.rows):[]), chrome:{} };
+  lastThreadChrome=screen.chrome||{};
+  renderThreadNav(current, screen.chrome);
+  renderTuiControls(screen.chrome);
+  renderSlashTray(screen.chrome);
   // A full-screen TUI owns every cell, so its rows are a canvas, not a conversation. Say so plainly and
   // offer the only honest action instead of inventing messages out of a TUI's box drawing.
   if(buf.kind==='alternate'){
@@ -1244,10 +1559,10 @@ function renderThreads(force){
       const b=document.createElement('button'); b.type='button'; b.textContent='Open the terminal';
       b.onclick=()=>setMobileView('terminal');
       d.appendChild(b); host.appendChild(d);
+      threadNodes[current]=[];
     }
     return;
   }
-  const seg=(window.MuxThreads && MuxThreads.segment) ? MuxThreads.segment(buf.rows) : [];
   // THE CONVERSATION OUTLIVES THE SCREEN. Measured live (all six teed tabs, 2026-11-13): every viewer's
   // buffer held bufLen === rows - ZERO scrollback - because an agent TUI repaints in place with absolute
   // cursor addressing (494 CUP sequences, no scroll region, no newline scrolling). Feeding muxd's whole
@@ -1256,18 +1571,14 @@ function renderThreads(force){
   // app simply never emits it. That is the "it stops pretty early, it doesn't let us view more than a
   // couple of events back" report, and it can only be answered here: accumulate the turns as they are seen
   // and render the accumulation. Nothing leaves the page; this is a render of what the session showed.
-  const live=(window.MuxThreads && MuxThreads.grouped) ? MuxThreads.grouped(seg) : seg;
+  const live=screen.messages||[];
   const msgs=accumulateThreads(live);
-  const sig=current+'|'+msgs.map(m=>m.role+':'+m.text.length+':'+m.text.slice(-24)).join('\u0001');
+  const sig=current+'|'+msgs.map(m=>(m.id||'')+':'+m.role+':'+m.text.length+':'+m.text.slice(-24)).join('\u0001');
   if(!force && sig===threadsLastSig) return;      // nothing changed: do not rebuild the list under a finger
   threadsLastSig=sig;
-  const WHO={user:'You',assistant:current,status:'status',tool:'result',text:''};
-  // WHERE THE READER WAS. Two numbers restore the view across a rebuild: `anchor` is the first message whose
-  // bottom edge is still visible, and `offset` is how far that edge sits below the pane's top. Restoring the
-  // raw scrollTop is wrong here because the rebuild can change the height ABOVE the reader (a bubble re-wraps
-  // when a table stops being a table, a status line grows a duration), and then the same scrollTop shows
-  // different text - the reader's place silently slides.
-  const stick = host.scrollHeight - host.scrollTop - host.clientHeight < 80;   // were we at the bottom?
+  // WHERE THE READER WAS. Restoring raw scrollTop is wrong because a rebuild can change the height ABOVE
+  // the reader. Keep the first visible message and its bottom offset instead.
+  const stick = host.scrollHeight - host.scrollTop - host.clientHeight < 80;
   const nodesBeat = [...host.querySelectorAll('.th-msg')];
   let anchor=-1, anchorOffset=0;
   if(!stick){
@@ -1277,43 +1588,29 @@ function renderThreads(force){
       if(r.bottom > top+1){ anchor=i; anchorOffset=r.bottom-top; break; }
     }
   }
-  host.innerHTML='';
-  if(!msgs.length){ host.innerHTML='<div class="th-empty">Nothing on this screen yet.</div>'; return; }
-  const frag=document.createDocumentFragment();
-  for(const m of msgs){
-    const wrap=document.createElement('div'); wrap.className='th-msg '+(m.role||'text');
-    // A run of same-speaker turns is visually one block: no gap above a continuation, so the bubbles stack.
-    if(m.showWho===false) wrap.classList.add('th-cont');
-    // Text above the first recognised message is the tail of a scrolled-off turn (often the agent's own
-    // reasoning). It stays visible - the phone never shows less than the terminal - but it is clearly
-    // secondary, so it never reads as something the agent said to you.
-    if(m.context) wrap.classList.add('th-ctx');
-    const body=document.createElement('div'); body.className='th-body';
-    // The glyph has already done its job (it is what grouped this message), and the label above says who
-    // it is - so it is stripped from the first line instead of being read out twice.
-    const said=m.text.replace(/^\s*[⏺●○⏎⎿└❯⏵›✻✳]\s?/, '');
-    // A row that was ONLY the glyph is the empty prompt line above the composer, not a message: showing it
-    // as an empty bubble reads as a broken message.
-    if(!said.trim()) continue;
-    // A BOX TABLE is panned, never wrapped: word-wrapping a grid of │-delimited cells turns it into a pile
-    // of orphaned rule characters (measured live). It gets its own scroller so the phone can move across
-    // one row at a time, exactly as it moves across the terminal. Prose and code still wrap.
-    if(m.kind==='table'){
-      body.classList.add('th-table');
-      const sc=document.createElement('pre'); sc.className='th-scroll';
-      sc.textContent=said;
-      body.appendChild(sc);
-    } else {
-      body.textContent=said;
-    }
-    if(m.showWho!==false){
-      const who=document.createElement('div'); who.className='th-who';
-      who.textContent=WHO[m.role]!==undefined?WHO[m.role]:m.role;
-      wrap.appendChild(who);
-    }
-    wrap.appendChild(body); frag.appendChild(wrap);
+  if(!msgs.length){
+    host.innerHTML='<div class="th-empty">Nothing on this screen yet.</div>';
+    threadNodes[current]=[];
+    return;
   }
-  host.appendChild(frag);
+  // THE LIST IS PATCHED, NOT REBUILT. A full innerHTML='' on every token destroyed <details> open state,
+  // dropped the reader's place, and re-laid out up to 400 bubbles for a one-line change. A message's id is
+  // stable, so an unchanged prefix is left alone and only the changed tail is replaced.
+  const cached=threadNodes[current]||[];
+  let keep=0;
+  while(keep<msgs.length && keep<cached.length && cached[keep].dataset.id===String(msgs[keep].id)) keep++;
+  for(let i=keep;i<cached.length;i++){ try{ cached[i].remove(); }catch(e){} }
+  cached.length=keep;
+  // The empty-state node, if one is on screen, is not a .th-msg.
+  const emptyEl=host.querySelector('.th-empty'); if(emptyEl) emptyEl.remove();
+  for(let i=keep;i<msgs.length;i++){
+    const node=threadNodeFor(msgs[i]);
+    if(!node) continue;
+    node.dataset.id=String(msgs[i].id||'');
+    host.appendChild(node);
+    cached.push(node);
+  }
+  threadNodes[current]=cached;
   if(stick || anchor < 0){ host.scrollTop=host.scrollHeight; return; }
   // Put the reader back on the message they were reading. If it no longer exists (the buffer was trimmed),
   // fall back to the bottom rather than to an arbitrary offset.
@@ -1343,13 +1640,28 @@ function scheduleThreadsRender(){
 // The composer is not a second input channel: it hands text to the SAME path the terminal uses (term.paste
 // -> onData -> send), so the lease checks, mouse-report stripping and signing all still apply. Sending is
 // text plus one CR, which is exactly what pressing Enter in the terminal does.
-function sendThreadMessage(){
+async function sendThreadMessage(){
   const ta=$('#threadinput'); if(!ta) return;
   const text=ta.value; if(!text.trim()) return;
   if(!current){ flash('No session open'); return; }
+  // The one case we can settle without touching the terminal: no socket and no queue means no path at all.
+  // Anything else has to attempt the send, because only the buffer knows whether it can hold the bytes -
+  // and a refused buffer is a DROP, not a queue. Clearing the box before that was known is how a message
+  // could disappear with nothing on screen and nothing in the session.
+  if(!(ws && ws.readyState===1) && !inputQueue){ flash('Not sent - no connection. Your text is still here.'); return; }
+  const seen=[];
+  inputSendProbe.sink=seen;
+  let pasted=true;
+  try{ term.paste(text); }catch(e){ pasted=false; }
+  finally { inputSendProbe.sink=null; }
+  let settled=[]; try{ settled=await Promise.all(seen.map(r=>Promise.resolve(r))); }catch(e){}
+  const status = (!pasted || settled.includes('dropped') || !settled.length) ? 'dropped'
+               : (settled.includes('sent') ? 'sent' : 'queued');
+  if(status==='dropped'){ flash('Not sent - nothing reached the session. Your text is still here.'); return; }
+  // Only now is the text committed: clear the box, then send the Enter the terminal would have sent.
   ta.value=''; ta.style.height='auto';
-  try{ term.paste(text); }catch(e){ send('i', text); }
-  setTimeout(()=>{ try{ send('i','\r'); }catch(e){} }, 30);
+  hideSlashTray();
+  setTimeout(()=>{ try{ send('i','\r'); }catch(e){} }, 60);
   markActive();
   if(!isMobile() || mobileView!=='threads') return;
   // The message the user just sent belongs on screen immediately, before the app echoes it back.
@@ -1376,9 +1688,16 @@ function initMobileViews(){
     if(ta){
       // Grow with the text up to the CSS cap, and Enter sends while Shift+Enter (or a hardware fn key)
       // still inserts a newline - the shape a phone message box has trained everyone to expect.
-      ta.addEventListener('input', ()=>{ ta.style.height='auto'; ta.style.height=Math.min(ta.scrollHeight, Math.round(window.innerHeight*0.38))+'px'; });
+      ta.addEventListener('input', ()=>{
+        ta.style.height='auto'; ta.style.height=Math.min(ta.scrollHeight, Math.round(window.innerHeight*0.38))+'px';
+        // A leading "/" raises the command tray. It filters as the token grows and closes on a space,
+        // because past the command name the rest is arguments, not a second command.
+        renderSlashTray(lastThreadChrome);
+      });
       ta.addEventListener('keydown', e=>{ if(e.key==='Enter' && !e.shiftKey){ e.preventDefault(); sendThreadMessage(); } });
     }
+    const attach=$('#threadattach');
+    if(attach) attach.onclick=()=>{ try{ openUpload(); }catch(e){ flash('Attach is unavailable right now'); } };
   }
   if(window.MuxFleet) MuxFleet.attachFleet($("#fleetList"), function(name){ setMobileView("terminal"); connect(name, false); });
   if(mobileMQ.addEventListener) mobileMQ.addEventListener('change', syncMobileView);
@@ -2772,9 +3091,14 @@ function alignTerminalSurface(){
   const padY=(parseFloat(cs.paddingTop)||0)+(parseFloat(cs.paddingBottom)||0);
   const visibleH=Math.max(0, host.clientHeight-padY);
   const owned = !!(sizeTabOwned && !sizePinned);
-  const rowOverflow = owned
-    ? (!!term.rows && term.rows*cellMetrics().h > visibleH+1)
-    : !!(winSize && viewportFit && winSize.rows > viewportFit.rows+1);
+  // Judge the PAINTED height, not a model of it. `winSize.rows > viewportFit.rows + 1` left a one-row
+  // blind spot - exactly the row that carries an app's leaf bar - and `term.rows * cellHeight` is an
+  // estimate that goes stale the moment the font changes under it. The .xterm-screen element is what the
+  // user is actually looking at, so its height is the honest comparison.
+  const scr=host.querySelector('.xterm-screen');
+  const paintedH=Math.max(scr?(scr.scrollHeight||scr.offsetHeight||0):0,
+                          (term.rows|0)*cellMetrics().h);
+  const rowOverflow = paintedH > visibleH+1;
   host.classList.toggle('rowpan', rowOverflow);
   if(!rowOverflow){
     xt.style.transform='';
@@ -2800,9 +3124,14 @@ function alignTerminalSurface(){
     return;
   }
   const buffer=term.buffer.active;
+  // The LIVE screen starts at baseY. Reading 0..rows-1 read the OLDEST scrollback rows whenever the app
+  // had scrolled the buffer, so "the last content row" was a row nobody was looking at and the anchor
+  // scrolled to the wrong place.
+  const baseY=(buffer.baseY|0);
+  const screenRows=(term.rows|0) || ((winSize&&winSize.rows)|0);
   let lastContentRow=0;
-  for(let row=0; row<term.rows; row++){
-    if(buffer.getLine(row)?.translateToString(true).trim()) lastContentRow=row;
+  for(let row=0; row<screenRows; row++){
+    if(buffer.getLine(baseY+row)?.translateToString(true).trim()) lastContentRow=row;
   }
   const maxScroll=Math.max(0, host.scrollHeight-host.clientHeight);
   const nearBottom=host.scrollTop>=maxScroll-8;
@@ -2813,9 +3142,13 @@ function alignTerminalSurface(){
   // offset that is not at the bottom is the user's, so we leave it alone until they come back down. We only
   // absorb the offset while following, so a parked view stays parked instead of being reclaimed next tick.
   const userMoved = Math.abs(host.scrollTop-alignedScrollTop)>2;
+  // The grid does not start at the scroll container's origin: #term pads the pane and the xterm element
+  // sits below that padding. Anchoring on row*cellH alone left that inset visible at the bottom, which is
+  // how a footer row stayed half-cut even when the scroll offset was "right".
+  const xTop=(xt.offsetTop||0)+(scr?(scr.offsetTop||0):0);
   if(!(userMoved && !nearBottom)){
     if(lastContentRow!==alignedContentRow || !wasRowOverflow || nearBottom){
-      host.scrollTop=Math.min(maxScroll, Math.max(0, (lastContentRow+1)*(cellMetrics().h||18)-visibleH));
+      host.scrollTop=Math.min(maxScroll, Math.max(0, xTop+(lastContentRow+1)*(cellMetrics().h||18)-visibleH));
       alignedContentRow=lastContentRow;
     }
     alignedScrollTop=host.scrollTop;
@@ -3595,10 +3928,14 @@ function setFont(px){
 function updateMeta(){
   const b=$('#statusmeta'); if(!b) return;
   const view=sizeButtonPresentation();
-  b.textContent=current ? view.text : '';
-  b.title=current ? view.title : '';
-  b.disabled=!current;
-  b.classList.toggle('on', !!current && sizePinned && sizeMine);
+  // The chip describes the GRID. On a view with no grid - the conversation, the session list, the fleet -
+  // "⚠ too wide · 100×30" is an accusation about something the reader is not looking at, and it was reading
+  // as a defect on the conversation surface. Blank it there; it comes back with the terminal.
+  const hasGrid = !!(current && isMobile() ? (mobileView==='terminal' || mobileView==='keys') : true);
+  b.textContent = hasGrid ? view.text : '';
+  b.title = hasGrid ? view.title : '';
+  b.disabled = !hasGrid;
+  b.classList.toggle('on', hasGrid && sizePinned && sizeMine);
 }
 $('#statusmeta').addEventListener('click', cycleSize);
 
@@ -4445,7 +4782,9 @@ function connect(name, isRetry){
   newLines=0; showJump();
   setStatusHtml('busy', `connecting to <span class="name">${esc(name)}</span>&hellip;`);
   renderTabs();
-  if(isMobile()) setMobileView('terminal');
+  // A switch made FROM the conversation surface must stay on it: the whole point of the session chips in
+  // #threadnav is changing session without being ejected into a 200-column grid.
+  if(isMobile() && mobileView!=='threads') setMobileView('terminal');
   scheduleViewportFit(0);
   // Drain any already-submitted xterm parser work before resetting for the new tab. A stale callback from
   // the previous session can no longer repaint or restore its viewport after this attachment begins.
@@ -4459,10 +4798,10 @@ function connect(name, isRetry){
       sizePinned=false; sizeMine=false; sizeTabOwned=false; sizeLocal=false;
       sizeGridOwner='local'; sizeGridEpoch=0; sizeGridOwnerLabel=''; sizePinLabel=''; sizeClients=[];
       _gridBusy=null; if(_takeTimer){ clearTimeout(_takeTimer); _takeTimer=null; }
-      // The accumulated conversation belongs to the session it was recorded from, so a switch starts a new
-      // one. A RE-attach of the SAME session keeps it: those turns really did happen, and the screen the
-      // re-attach paints is the same one that produced them.
-      if(threadAccum && threadAccum[name]) delete threadAccum[name];
+      // The accumulated conversation is kept PER SESSION and survives a switch. Deleting it here meant a
+      // round trip A -> B -> A lost A's history, even though the turns really happened and the terminal
+      // still holds them. The record is bounded (400 messages / 400k chars) and the renderer starts from
+      // an empty surface per session, so keeping it costs memory, not correctness.
     }
     // A SWITCH IS A NEW SCREEN. The per-session grid state and the "this surface is already painted"
     // latch both belong to the session they were measured on. Carrying them over meant the new tab's

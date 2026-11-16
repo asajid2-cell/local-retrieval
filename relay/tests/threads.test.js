@@ -300,3 +300,153 @@ test('a box table keeps its exact bytes and is marked for panning, not wrapping'
   assert.equal(prose[0].kind, 'text');
   assert.ok(!/ {6,}/.test(prose[0].text), 'prose still collapses its runs');
 });
+
+test('inspectScreen keeps segment parity, parses non-empty slash prompt, completions, status, and exact leafBar columns', () => {
+  const T = load();
+  const leafText = '  \u2039 Leaf 3: tv           23 htv-lanes         24 speed-policy      \u203a All 3';
+  const rows = [
+    row('⏺ Ready to help.', false, 10),
+    row(' \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500', false, 40),
+    row('❯ /mod', false, 41),
+    row(' \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500', false, 42),
+    row('  /model    Switch the AI model', false, 43),
+    row('  /models   List available models', false, 44),
+    row('  cd: C:\\work · usage: 37% left', false, 45),
+    row(leafText, false, 46),
+  ];
+  const res = T.inspectScreen(rows, 'normal');
+  assert.equal(res.kind, 'normal');
+  assert.equal(JSON.stringify(res.messages), JSON.stringify(T.segment(rows)));
+  assert.equal(res.messages.length, 1);
+  assert.match(res.messages[0].text, /Ready to help/);
+  assert.equal(res.chrome.prompt.row, 41);
+  assert.equal(res.chrome.prompt.text, '/mod');
+  assert.equal(res.chrome.completions.length, 2);
+  assert.equal(res.chrome.completions[0].text, '/model    Switch the AI model');
+  assert.equal(res.chrome.completions[0].row, 43);
+  assert.equal(res.chrome.statusLines.length, 1);
+  assert.match(res.chrome.statusLines[0], /usage: 37% left/);
+  assert.ok(res.chrome.leafBar, 'leafBar parsed');
+  assert.equal(res.chrome.leafBar.row, 46);
+  assert.equal(res.chrome.leafBar.leaves.length, 3);
+  assert.equal(res.chrome.leafBar.leaves[0].active, true);
+  assert.equal(res.chrome.leafBar.leaves[1].active, false);
+  for (const lf of res.chrome.leafBar.leaves) {
+    assert.equal(leafText.slice(lf.col, lf.col + lf.label.length), lf.label,
+      `col ${lf.col} must point directly to "${lf.label}" in raw row text`);
+  }
+});
+
+test('pipe-delimited leaf bar parses exact columns too, and mid-history rules never trigger chromeStart', () => {
+  const T = load();
+  const pipeLeaf = '  < Leaf 1: alpha  |  Leaf 2: beta  |  Leaf 3: gamma >   All 3';
+  const rows = [
+    row('────────────────────────────────────────', false, 1),
+    row('❯ earlier prompt', false, 2),
+    row('────────────────────────────────────────', false, 3),
+    row('⏺ Reply after earlier prompt', false, 4),
+    row(pipeLeaf, false, 29),
+  ];
+  const res = T.inspectScreen(rows, 'normal');
+  assert.ok(res.messages.some(m => /Reply after earlier prompt/.test(m.text)),
+    'an earlier sandwich followed by an assistant turn must not truncate messages');
+  assert.ok(res.chrome.leafBar);
+  assert.equal(res.chrome.leafBar.leaves.length, 3);
+  // When every leaf shares "Leaf N:" with no distinguishing marker, none is falsely marked active.
+  assert.equal(res.chrome.leafBar.leaves.filter(l => l.active).length, 0);
+  for (const lf of res.chrome.leafBar.leaves) {
+    assert.equal(pipeLeaf.slice(lf.col, lf.col + lf.label.length), lf.label);
+  }
+  // An explicit bullet/bracket still marks only that leaf active even when all say "Leaf N:".
+  const markedLeaf = T.inspectScreen([row('  < Leaf 1: alpha  |  [Leaf 2: beta]  |  Leaf 3: gamma >', false, 1)], 'normal');
+  assert.deepEqual(Array.from(markedLeaf.chrome.leafBar.leaves, l => l.active), [false, true, false]);
+});
+
+test('thought traces and tool calls get distinct roles while keeping one speaker label per turn', () => {
+  const T = load();
+  const rows = [
+    row('∴ Thinking…', false, 1),
+    row('  First inspect threads.js', false, 2),
+    { i: 3, text: '  dim italic trace line 1', wrapped: false, dim: true, italic: true },
+    { i: 4, text: '  dim italic trace line 2', wrapped: false, dim: true, italic: true },
+    row('⏺ Bash(ping -n 3 host)', false, 5),
+    row('  ⎿ Ping statistics', false, 6),
+    row('⏺ All packets arrived.', false, 7),
+  ];
+  const msgs = T.grouped(T.segment(rows));
+  assert.equal(msgs[0].role, 'thought');
+  assert.match(msgs[0].text, /First inspect threads\.js/);
+  assert.match(msgs[0].text, /dim italic trace line 2/);
+  assert.equal(msgs[1].role, 'toolcall');
+  assert.equal(msgs[2].role, 'tool');
+  assert.equal(msgs[3].role, 'assistant');
+  assert.equal(msgs.map(m => m.showWho).join(','), 'true,false,false,false',
+    'thought, toolcall, tool, and assistant in one turn share one speaker label');
+});
+
+test('multi-word and Braille spinners are status, and collapseTransient drops stale spinner frames', () => {
+  const T = load();
+  const s1 = T.segment([row('⠋ Running unit tests…', false, 1)])[0];
+  const s2 = T.segment([row('✽ Waiting for subagents… (esc to interrupt)', false, 1)])[0];
+  assert.equal(s1.role, 'status');
+  assert.equal(s2.role, 'status');
+
+  const collapsedLive = T.collapseTransient([
+    { role: 'user', text: 'run tests' },
+    s1,
+    s2,
+  ]);
+  assert.equal(collapsedLive.length, 2);
+  assert.equal(collapsedLive[1].text, s2.text, 'only the latest active spinner stays at the tail');
+
+  const completed = T.collapseTransient([
+    { role: 'user', text: 'run tests' },
+    s1,
+    s2,
+    { role: 'status', text: '✻ Cooked for 12s' },
+  ]);
+  assert.equal(completed.length, 2);
+  assert.equal(completed[1].text, '✻ Cooked for 12s', 'completed run summary is kept and prior spinners drop');
+});
+
+test('picker extraction works for non-first selection and alternate-screen menus without false-matching LIVE_SCREEN prose', () => {
+  const T = load();
+  // LIVE_SCREEN has a numbered list inside assistant prose — must NOT become a picker.
+  assert.equal(T.inspectScreen(LIVE_SCREEN, 'normal').chrome.picker, null);
+
+  const altRows = [
+    row('  Select model:', false, 1),
+    row('  Sonnet 4.5', false, 2),
+    row('❯ Opus 4.1', false, 3),
+    row('  Haiku 3.5', false, 4),
+    row('  Esc to cancel', false, 5),
+  ];
+  const alt = T.inspectScreen(altRows, 'alternate');
+  assert.equal(alt.kind, 'alternate');
+  assert.ok(alt.chrome.picker, 'alternate-screen menu produces a picker');
+  assert.equal(alt.chrome.picker.selected, 1);
+  assert.deepEqual(Array.from(alt.chrome.picker.options, o => o.text), ['Sonnet 4.5', 'Opus 4.1', 'Haiku 3.5']);
+
+  // An inline permission prompt on normal screen surfaces as chrome.picker without creating a fake user turn.
+  const permRows = [
+    row('⏺ Allow Bash(ls -la)?', false, 1),
+    row('❯ 1. Yes', false, 2),
+    row('  2. No', false, 3),
+    row('  Esc to cancel', false, 4),
+  ];
+  const perm = T.inspectScreen(permRows, 'normal');
+  assert.ok(perm.chrome.picker);
+  assert.deepEqual(Array.from(perm.chrome.picker.options, o => o.text), ['1. Yes', '2. No']);
+  assert.ok(!perm.messages.some(m => m.role === 'user'), 'unanswered picker options must not render as a sent user bubble');
+
+  const altComp = T.inspectScreen([
+    row('❯ /co', false, 1),
+    row('  /compact   Compact conversation', false, 2),
+    row('  /cost      Show cost', false, 3),
+  ], 'alternate');
+  assert.equal(altComp.chrome.completions.length, 2);
+  assert.equal(altComp.chrome.completions[0].text, '/compact   Compact conversation');
+
+  const footer = T.inspectScreen(LIVE_FOOTER, 'normal');
+  assert.match(footer.chrome.footerTasks, /171 tasks/);
+});
