@@ -9,7 +9,7 @@ SM=/tmp/screen-model.js.new
 SRC=/tmp/index.html.new
 SRCJS=/tmp/threads.js.new
 DSTDIR=/home/harmonizer/multiplex-app
-STAMP='2026-11-13-attach-repair-1'
+STAMP='2026-11-16-phone-surface-1'
 [ -s "$SRV" ] || { echo "staged server.js missing"; exit 3; }
 [ -s "$SM" ] || { echo "staged screen-model.js missing"; exit 3; }
 [ -s "$SRC" ] || { echo "staged page missing"; exit 3; }
@@ -19,10 +19,14 @@ STAMP='2026-11-13-attach-repair-1'
 grep -q "A viewer already ON THE BANNER is owed the same paint" "$SRV" || { echo "staged server.js lacks the banner repair"; exit 4; }
 grep -q "A pending grid request belonged to the OLD link" "$SRV" || { echo "staged server.js lacks the boundary gridReq clear"; exit 4; }
 grep -q "MUX_SNAPSHOT_MAX_BYTES" "$SM" || { echo "staged screen-model.js lacks the snapshot byte budget"; exit 4; }
-grep -q "$STAMP" "$SRC" || { echo "staged page is not the attach-repair build"; exit 4; }
+grep -q "$STAMP" "$SRC" || { echo "staged page is not the phone-surface build"; exit 4; }
 grep -q "function accumulateThreads" "$SRC" || { echo "staged page lacks the conversation accumulation"; exit 4; }
 grep -q "id=\"navtoggle\"" "$SRC" || { echo "staged page lacks the nav toggle"; exit 4; }
+grep -q 'id="threadnav"' "$SRC" || { echo "staged page lacks the conversation session/leaf bar"; exit 4; }
+grep -q "function renderThreadNav" "$SRC" || { echo "staged page lacks the leaf switcher"; exit 4; }
+grep -q 'id="quickkeys"' "$SRC" || { echo "staged page lacks the quick keys"; exit 4; }
 grep -q "MuxThreads" "$SRCJS" || { echo "staged threads.js is not the segmenter"; exit 4; }
+grep -q "function inspectScreen" "$SRCJS" || { echo "staged threads.js lacks the screen inspector"; exit 4; }
 echo "staged.server.sha256 $(sha256sum "$SRV" | cut -d' ' -f1)"
 echo "staged.screenmodel.sha256 $(sha256sum "$SM" | cut -d' ' -f1)"
 echo "staged.page.sha256 $(sha256sum "$SRC" | cut -d' ' -f1)"
