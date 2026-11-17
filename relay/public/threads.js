@@ -145,6 +145,23 @@
   // Every item is padded to W and truncated with an ellipsis, so when an item fills its box the gap to the
   // next one is a SINGLE space. Splitting on 2+ spaces therefore merges neighbours - which is exactly how a
   // tap landed on the wrong leaf ("it switches the wrong item").
+  // WHAT A BAR ITEM LOOKS LIKE. A row is only a leaf bar if its items are leaf items. Without this, a
+  // conversation row that merely MENTIONS a leaf - "(fd94f334…), \"Leaf 3: tv\" (…), \"web; deep5\" (…)" -
+  // became a bar whose "leaves" were prose fragments, and tapping one clicked a sentence. Measured live
+  // on tab-2470: one message about session ids produced a chip naming the whole line.
+  //   prefixed   Leaf 3: tv / [Leaf 2: beta]      (the matriarch and numbered members)
+  //   numbered   23 htv-lanes                     (a numbered member)
+  //   bare       sndo / harmonizer-suite          (one token; spaces allowed only when geometry vouches
+  //                                                for the box)
+  // Anything carrying sentence punctuation - parentheses, quotes, commas, a full stop mid-item - is prose.
+  var LEAF_ITEM = /^(?:\[?Leaf\s+\d+\s*:\s*[^()",\]]*\]?|\d+\s+[^()",]+|[A-Za-z0-9][A-Za-z0-9_.:\/ -]{0,39}(?:\s+\u00b7\s+(?:working|approval|failed|idle|queued))?)$/;
+  var LEAF_ITEM_BARE = /^(?:\[?Leaf\s+\d+\s*:\s*[^()",\]]*\]?|\d+\s+[^()",]+|[A-Za-z0-9][A-Za-z0-9_.:\/-]{0,31}(?:\s+\u00b7\s+(?:working|approval|failed|idle|queued))?)$/;
+  function leavesLookLikeLeaves(leaves, re) {
+    if (!leaves.length) return false;
+    for (var i = 0; i < leaves.length; i++) if (!re.test(leaves[i].label)) return false;
+    return true;
+  }
+
   function parseLeafCarousel(raw, rNum, cols, invSpans) {
     // The column count is what makes the box width knowable. Without it this parser would be guessing, so
     // it declines and the tolerant tokenizer below handles the row (which is how the older fixtures are
@@ -152,6 +169,9 @@
     if (!(cols | 0)) return null;
     var open = raw.indexOf('\u2039'), close = raw.lastIndexOf('\u203a');
     if (open < 0 || close < 0 || close <= open) return null;
+    // A BAR ENDS AT ITS RIGHT ARROW. Only the count the gateway prints beside it may follow. A sentence
+    // that quotes a carousel ("‹ 22 name › means the second leaf") is prose, not a bar.
+    if (!/^\s*(?:All\s+\d+)?\s*$/.test(raw.slice(close + 1))) return null;
     if (!/\bLeaf\b|\bAll\s+\d+\b|\b\d+\s+\S/.test(raw)) return null;
     var W = Math.min(20, Math.max(8, ((cols | 0) || 100) - 14));
     var leaves = [];
@@ -172,7 +192,9 @@
       }
       pos += W + 1;
     }
-    if (!leaves.length) return null;
+    // Every box must hold a leaf item. One prose fragment is enough to say this row is not a bar: the
+    // items are fixed-width, so a real bar cannot have a box full of sentence.
+    if (!leavesLookLikeLeaves(leaves, LEAF_ITEM)) return null;
     // active = the item drawn inverse. Without spans, no leaf is active: a guess here renders every chip
     // as "you are here", which is worse than no highlight at all.
     if (Array.isArray(invSpans)) {
@@ -199,12 +221,13 @@
     if (carousel) return carousel;
     var m = /^(\s*[\u2039<])([\s\S]*?)([\u203a>](?:\s*All\s+\d+)?\s*)$/i.exec(raw);
     var hasLeafKeyword = /\bLeaf\s+\d+\s*:/i.test(raw);
-    if (!m && !hasLeafKeyword) return null;
-    if (m && !hasLeafKeyword && !/[|│]|\s{2,}/.test(m[2])) return null;
-    if (m && !hasLeafKeyword && !/\b(?:\d+[:\s]\s*\S|All\s+\d+)/i.test(raw)) return null;
+    // A BAR IS DELIMITED. Both arrows, on one row, with nothing after the right one but an optional count.
+    // The word "Leaf" appearing in a sentence is not a bar: keying on the keyword alone is how a message
+    // ABOUT session ids turned into chips, and a chip is a tap at a cell.
+    if (!m) return null;
 
-    var innerStart = m ? m[1].length : 0;
-    var inner = m ? m[2] : raw;
+    var innerStart = m[1].length;
+    var inner = m[2];
     var leaves = [];
     // Walk tokens separated by |, │, or 2+ spaces while keeping raw buffer column offsets exact.
     var pos = 0;
@@ -232,6 +255,10 @@
       pos = end;
     }
     if (!leaves.length) return null;
+    // Delimited, but still prose inside the arrows? Then it is not a bar either. The bare form is a single
+    // token here because there is no column geometry to say where one item ends; a name with spaces can
+    // only be trusted from the fixed-width parse above.
+    if (!leavesLookLikeLeaves(leaves, LEAF_ITEM_BARE)) return null;
     var explicitCount = 0, leafPrefixCount = 0;
     for (var li = 0; li < leaves.length; li++) {
       if (leaves[li]._explicit) explicitCount++;
@@ -627,7 +654,7 @@
   // rows, and this file is what reads it; a page from one build with a segmenter from another silently
   // draws the old parse as if it were current - merged chips, taps on the wrong leaf, and no error
   // anywhere. The page refuses leaf chips unless this matches its own stamp, so the two can never drift.
-  var BUILD = '2026-11-16-leaf-switch-2';
+  var BUILD = '2026-11-16-leaf-switch-3';
 
   global.MuxThreads = {
     BUILD: BUILD,

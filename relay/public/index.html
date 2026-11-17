@@ -10,7 +10,7 @@
 <!-- THE BUILD STAMP IS DEFINED BEFORE ANY SCRIPT LOADS, because threads.js is requested under this name:
      a segmenter fetched as part of a different build is a different URL, so the parser the page runs is
      always the parser that build was written against. Bumped per web deploy. -->
-<script>window.__muxBuild='2026-11-16-leaf-switch-2';</script>
+<script>window.__muxBuild='2026-11-16-leaf-switch-3';</script>
 <link rel="stylesheet" href="vendor/xterm.css">
 <style>
   /* Operational terminal control surface, harmonizer black-rose. One clean top bar (brand + tabs +
@@ -2509,7 +2509,7 @@ document.addEventListener('keydown', e=>{ if(e.ctrlKey && e.altKey && (e.key==='
 // The build stamp itself is declared in <head>, before threads.js is requested under its name. Re-assert
 // it here so a page assembled by an older template still reports a build (and never silently inherits
 // whatever __muxBuild a cached segmenter left behind), then make the segmenter's own build checkable.
-window.__muxBuild = window.__muxBuild || '2026-11-16-leaf-switch-2';
+window.__muxBuild = window.__muxBuild || '2026-11-16-leaf-switch-3';
 try{ console.info('multiplex build', window.__muxBuild, '· segmenter', window.MuxThreads && window.MuxThreads.BUILD); }catch(e){}
 // A SEGMENTER FROM ANOTHER BUILD IS NOT A DEGRADED SEGMENTER, IT IS A WRONG ONE. Its leaf parse is what
 // decides which cell a chip taps, so a mismatch has to disable leaf switching outright rather than draw

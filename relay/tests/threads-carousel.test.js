@@ -69,6 +69,39 @@ test('the active leaf is the one drawn inverse, not the first label that looks l
   assert.deepEqual(Array.from(noSpans.leaves, l => l.active), [false, false, false]);
 });
 
+// A ROW THAT MENTIONS A LEAF IS NOT A LEAF BAR. Measured live on tab-2470 (2026-11-16): a message listing
+// session ids - `(fd94f334…), "Leaf 3: tv" (…), "web; deep5" (…)` - parsed as a bar whose single "leaf"
+// was the whole sentence, so the bar drew one chip naming a paragraph and tapping it clicked a
+// conversation cell. The rule is structural: both arrows on the row, nothing after the right one but an
+// optional count, and every item shaped like a leaf item rather than a sentence.
+test('prose that mentions a leaf is never a leaf bar', () => {
+  const T = loadThreads();
+  const prose = [
+    '  (fcb8721c-f3d4-4a2d-bf6e-e2ffceabbbae), "Claude Code" (fd2d35ed-fd2b-49a3-b203-1d2289e6b3a1), "Leaf 3: tv" (fd94f334-df5f-4a64-af42-29065eada08f),',
+    '  The Leaf 3: tv session is fine, and Leaf 4 too.',
+    '  Leaf 12: soak   ran for 40m and finished clean',
+    '  ‹ 22 name › means the second leaf in the carousel',
+  ];
+  for (const text of prose) {
+    for (const cols of [209, undefined]) {
+      const lb = T.inspectScreen([{ i: 40, text }], 'normal', cols).chrome.leafBar;
+    assert.equal(lb, null, `cols=${cols} must not read a bar out of ${JSON.stringify(text)}`);
+    }
+  }
+  // The shapes that ARE bars keep parsing, including a one-item carousel and the spaced/pipe forms.
+  const ok = (text, cols, expected) => {
+    const lb = T.inspectScreen([{ i: 40, text }], 'normal', cols).chrome.leafBar;
+    assert.ok(lb, `must parse: ${JSON.stringify(text)}`);
+    assert.deepEqual(Array.from(lb.leaves, l => l.label), expected);
+  };
+  ok('  ‹ Leaf 4: lattike      41 webbrow           › All 2', 209, ['Leaf 4: lattike', '41 webbrow']);
+  ok('  ‹ sndo                 › All 1', 209, ['sndo']);
+  ok('  < Leaf 1: alpha  |  Leaf 2: beta  |  Leaf 3: gamma >   All 3', undefined,
+    ['Leaf 1: alpha', 'Leaf 2: beta', 'Leaf 3: gamma']);
+  ok('  ‹ Leaf 3: tv           23 htv-lanes         24 speed-policy      › All 3', undefined,
+    ['Leaf 3: tv', '23 htv-lanes', '24 speed-policy']);
+});
+
 test('a state suffix is split off the name without changing the tap column', () => {
   const T = loadThreads();
   const row = { i: 50, text: bar(['Leaf 51: NEOGATE', '22 gw \u00b7 working']) };

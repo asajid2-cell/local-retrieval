@@ -9,7 +9,7 @@ SM=/tmp/screen-model.js.new
 SRC=/tmp/index.html.new
 SRCJS=/tmp/threads.js.new
 DSTDIR=/home/harmonizer/multiplex-app
-STAMP='2026-11-16-leaf-switch-2'
+STAMP='2026-11-16-leaf-switch-3'
 [ -s "$SRV" ] || { echo "staged server.js missing"; exit 3; }
 [ -s "$SM" ] || { echo "staged screen-model.js missing"; exit 3; }
 [ -s "$SRC" ] || { echo "staged page missing"; exit 3; }
