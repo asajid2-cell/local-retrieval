@@ -7,6 +7,10 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <title>multiplex</title>
+<!-- THE BUILD STAMP IS DEFINED BEFORE ANY SCRIPT LOADS, because threads.js is requested under this name:
+     a segmenter fetched as part of a different build is a different URL, so the parser the page runs is
+     always the parser that build was written against. Bumped per web deploy. -->
+<script>window.__muxBuild='2026-11-16-leaf-switch-2';</script>
 <link rel="stylesheet" href="vendor/xterm.css">
 <style>
   /* Operational terminal control surface, harmonizer black-rose. One clean top bar (brand + tabs +
@@ -1190,7 +1194,12 @@
 <script src="input-continuity.js"></script>
 <script src="picker.js"></script>
 <script src="fleet.js"></script>
-<script src="threads.js"></script>
+<!-- THE SEGMENTER LOADS UNDER THIS BUILD'S NAME. threads.js is cached by URL, so a bare tag can serve a
+     previous build's parser to a page that has already been updated - the exact state where the carousel
+     was parsed with the old rules and a tap landed on the wrong leaf. The query makes each build a
+     different URL, and segmenterMatches() refuses to draw leaf chips if the copy that arrived is not the
+     build this page declares. -->
+<script>document.write('<scr'+'ipt src="threads.js?v='+encodeURIComponent(window.__muxBuild)+'"><\/scr'+'ipt>');</script>
 <script>
 const $ = s => document.querySelector(s);
 const base = location.pathname.replace(/\/[^/]*$/, '') || '';
@@ -1367,15 +1376,30 @@ function accumulateThreads(live, accKey){
 // own session list; the leaf chips are parsed out of the app's own leaf-bar row by threads.js. No new wire
 // field, no fetch, and the terminal view is still the authority.
 
-// A tap on a leaf chip is an SGR pointer report, the same record a click in the terminal produces. It only
-// goes out when the app has actually armed pointer reporting; otherwise the fallback is the terminal, where
-// the same tap exists for real.
-// One click into the pty at a buffer cell - the same SGR report a real pointer produces. No view change,
-// no session change: a leaf tap is input to the app, not navigation of the multiplex page.
-function clickPtyCell(row, col, label){
+// A tap on a leaf chip is an SGR pointer report, the same record a click in the terminal produces.
+//
+// WHO IS ALLOWED TO RECEIVE IT. The arm state is the first question, but it cannot be the only one: on a
+// TEED local tab the app's DECSET goes to the console the tee is reading, not into a byte stream the
+// guard can scan, so the guard stays unarmed forever on exactly the panes that have the app. Measured on
+// this box: tab-2470 reports tracking:false with the gateway's carousel plainly on its screen. The
+// evidence that beats the missing DECSET is the carousel itself - a row that parses as `‹ item item ›
+// All N` is a picture only an interactive app paints, and it is the same picture whose cells the chips
+// name. So a cell that came from a parsed carousel of THIS session's live screen may be clicked without
+// an arm, exactly as an adopted console is (ownerClickPane). Being wrong stays bounded the same way: the
+// report is registered with the leak detector, and a shell that echoes it back blocks forwarding until a
+// fresh DECSET re-arms the guard.
+//
+// One click into the pty at a buffer cell: no view change, no session change. A leaf tap is input to the
+// app, not navigation of the multiplex page.
+function clickPtyCell(row, col, label, fromCarousel){
   if(!current) return false;
   try{
-    if(!appTakesMouse()){ flash('This app has not armed pointer input - switching leaves needs the terminal'); return false; }
+    const armed = appTakesMouse();
+    const provenByCarousel = !!fromCarousel && isVisibleOwner();
+    if(!armed && !provenByCarousel){
+      flash('This app has not armed pointer input - switching leaves needs the terminal');
+      return false;
+    }
     const row1=(row|0)-(term.buffer.active.viewportY|0)+1;
     const col1=(col|0)+1;
     if(!(row1>=1 && row1<=term.rows && col1>=1 && col1<=term.cols)){ flash('That leaf row is not on the live screen'); return false; }
@@ -1388,8 +1412,8 @@ function clickPtyCell(row, col, label){
     return true;
   }catch(e){ flash('Could not tap the leaf bar'); return false; }
 }
-function tapThreadLeaf(leaf){ if(!leaf) return; clickPtyCell(leaf.row, leaf.col, leaf.label); }
-function tapThreadCell(cell){ if(!cell) return; clickPtyCell(cell.row, cell.col, ''); }
+function tapThreadLeaf(leaf){ if(!leaf) return; clickPtyCell(leaf.row, leaf.col, leaf.label, true); }
+function tapThreadCell(cell){ if(!cell) return; clickPtyCell(cell.row, cell.col, '', true); }
 
 let threadNavSig='';
 // TWO KINDS OF SWITCH, and they are not interchangeable:
@@ -1400,10 +1424,13 @@ let threadNavSig='';
 function renderThreadNav(name, chrome){
   const host=$('#threadnav'); if(!host) return;
   const sessions=Array.isArray(window._sessions)?window._sessions:[];
-  const bar=(chrome && chrome.leafBar) || null;
+  // A segmenter that is not this page's build cannot be trusted to have found the leaves in the right
+  // cells, and a chip that names one leaf while tapping another is worse than no chip at all.
+  const canLeaves=segmenterMatches();
+  const bar=canLeaves ? ((chrome && chrome.leafBar) || null) : null;
   const leaves=(bar && bar.leaves) || [];
   const sig=name+'|'+sessions.map(s=>s.name+':'+(s.state||'')+':'+(s.unread?'u':'')+(s.name===current?'*':'')).join(',')+'|'
-    +leaves.map(l=>l.label+':'+(l.active?'*':'')).join(',')+'|'+!!(bar&&bar.arrows);
+    +leaves.map(l=>l.label+':'+(l.active?'*':'')).join(',')+'|'+!!(bar&&bar.arrows)+'|'+(canLeaves?'L':'x');
   if(sig===threadNavSig) return;
   threadNavSig=sig;
   host.innerHTML='';
@@ -2479,8 +2506,17 @@ function reloadTerminal(quiet){
   connect(name, true);   // re-attach: CLEAR + scrollback replay + live, all client state reset
 }
 document.addEventListener('keydown', e=>{ if(e.ctrlKey && e.altKey && (e.key==='r'||e.key==='R')){ e.preventDefault(); e.stopPropagation(); reloadTerminal(); } }, true);
-window.__muxBuild='2026-11-16-leaf-switch-1';   // bump per web deploy so a loaded version is verifiable (supersedes 2026-11-11-phone-threads-1)
-try{ console.info('multiplex build', window.__muxBuild); }catch(e){}
+// The build stamp itself is declared in <head>, before threads.js is requested under its name. Re-assert
+// it here so a page assembled by an older template still reports a build (and never silently inherits
+// whatever __muxBuild a cached segmenter left behind), then make the segmenter's own build checkable.
+window.__muxBuild = window.__muxBuild || '2026-11-16-leaf-switch-2';
+try{ console.info('multiplex build', window.__muxBuild, '· segmenter', window.MuxThreads && window.MuxThreads.BUILD); }catch(e){}
+// A SEGMENTER FROM ANOTHER BUILD IS NOT A DEGRADED SEGMENTER, IT IS A WRONG ONE. Its leaf parse is what
+// decides which cell a chip taps, so a mismatch has to disable leaf switching outright rather than draw
+// chips whose targets may not be the ones they name. The surface says so instead of guessing.
+function segmenterMatches(){
+  try{ return !!(window.MuxThreads && window.MuxThreads.BUILD === window.__muxBuild); }catch(e){ return false; }
+}
 const helper = $('#term').querySelector('.xterm-helper-textarea');
 function hardenHelperTextarea(){
   const h = $('#term').querySelector('.xterm-helper-textarea');

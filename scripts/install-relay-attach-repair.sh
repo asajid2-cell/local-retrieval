@@ -9,7 +9,7 @@ SM=/tmp/screen-model.js.new
 SRC=/tmp/index.html.new
 SRCJS=/tmp/threads.js.new
 DSTDIR=/home/harmonizer/multiplex-app
-STAMP='2026-11-16-phone-surface-1'
+STAMP='2026-11-16-leaf-switch-2'
 [ -s "$SRV" ] || { echo "staged server.js missing"; exit 3; }
 [ -s "$SM" ] || { echo "staged screen-model.js missing"; exit 3; }
 [ -s "$SRC" ] || { echo "staged page missing"; exit 3; }
@@ -27,6 +27,12 @@ grep -q "function renderThreadNav" "$SRC" || { echo "staged page lacks the leaf 
 grep -q 'id="quickkeys"' "$SRC" || { echo "staged page lacks the quick keys"; exit 4; }
 grep -q "MuxThreads" "$SRCJS" || { echo "staged threads.js is not the segmenter"; exit 4; }
 grep -q "function inspectScreen" "$SRCJS" || { echo "staged threads.js lacks the screen inspector"; exit 4; }
+# THE PAGE AND THE SEGMENTER ARE ONE BUILD. The carousel parse is what decides which cell a chip taps,
+# so a page kept alongside a segmenter from another build drew chips pointing at leaves they did not
+# name. Both files must declare the same stamp before either is installed.
+grep -q "var BUILD = '$STAMP'" "$SRCJS" || { echo "staged threads.js carries a different build"; exit 4; }
+grep -q "window.__muxBuild='$STAMP'" "$SRC" || { echo "staged page and threads.js disagree on the build"; exit 4; }
+grep -q 'threads\.js?v=' "$SRC" || { echo "staged page does not version-load the segmenter"; exit 4; }
 echo "staged.server.sha256 $(sha256sum "$SRV" | cut -d' ' -f1)"
 echo "staged.screenmodel.sha256 $(sha256sum "$SM" | cut -d' ' -f1)"
 echo "staged.page.sha256 $(sha256sum "$SRC" | cut -d' ' -f1)"

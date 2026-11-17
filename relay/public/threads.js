@@ -623,7 +623,17 @@
     return counts;
   }
 
+  // THE SEGMENTER AND THE PAGE ARE ONE BUILD. The page decides how to read a leaf carousel out of these
+  // rows, and this file is what reads it; a page from one build with a segmenter from another silently
+  // draws the old parse as if it were current - merged chips, taps on the wrong leaf, and no error
+  // anywhere. The page refuses leaf chips unless this matches its own stamp, so the two can never drift.
+  var BUILD = '2026-11-16-leaf-switch-2';
+
   global.MuxThreads = {
+    BUILD: BUILD,
+    // Can this copy parse the leaf carousel by geometry? Declared as a capability, not sniffed from the
+    // function body: an old build has no parseLeafCarousel at all and must never be asked to guess.
+    carousel: true,
     segment: segment,
     inspectScreen: inspectScreen,
     collapseTransient: collapseTransient,

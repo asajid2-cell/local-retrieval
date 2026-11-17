@@ -148,3 +148,91 @@ test('a leaf chip tap sends one SGR click at that leaf\'s cell', async t => {
     await harness.stop();
   }
 });
+
+// A TEED LOCAL TAB NEVER DELIVERS THE APP'S DECSET. muxd reads that console as a cell grid, so the app's
+// "report the mouse to me" goes to the console and never appears in a byte stream the guard can scan. Live
+// proof (tab-2470, 2026-11-16): guard tracking:false, wheel dead, and the gateway's carousel plainly on
+// screen. Every leaf tap was refused with "This app has not armed pointer input" - the chips were drawn,
+// so the control looked present and did nothing.
+//
+// The carousel row itself is the evidence that beats the missing DECSET: only an interactive app paints
+// `‹ item item › All N`, and it is the same row whose cells the chips name. A cell that came from a
+// parsed carousel of this session's own screen must therefore be clickable with no arm.
+test('a leaf tap works on a pane whose app never delivered a DECSET, because the carousel proves it', async t => {
+  if (!browser) { t.skip(`Chromium unavailable.\n${INSTALL}\n${browserError && browserError.message}`); return; }
+  const harness = new RelayHarness();
+  let host = null, context = null;
+  try {
+    harness.fixedPort = await freePort();
+    harness.env.ALLOWED_WS_ORIGINS = `http://127.0.0.1:${harness.fixedPort}`;
+    await harness.start();
+    host = await harness.connectHost([{
+      name: 'teed', alive: true, created: Date.now(), cols: 120, rows: 40,
+      owner: 'muxtee', gridOwner: 'local', hasCommand: false, shellOnly: true, ready: true,
+    }]);
+    context = await browser.newContext({ viewport: { width: 900, height: 844 }, deviceScaleFactor: 2, isMobile: true, hasTouch: true });
+    context.setDefaultTimeout(15000);
+    const page = await context.newPage();
+    page.on('pageerror', e => console.log('PAGE ERROR:', e.message));
+    await page.goto(`http://127.0.0.1:${harness.port}/?s=teed`, { waitUntil: 'domcontentloaded' });
+    await page.waitForFunction(() => window._sessions && window._sessions.length > 0);
+    await page.evaluate(() => connect('teed'));
+    await page.waitForFunction(() => !!document.querySelector('#term .xterm-helper-textarea'));
+    await page.waitForTimeout(400);
+    await page.evaluate(() => setMobileView('threads'));
+    await page.waitForTimeout(300);
+
+    const geo = await page.evaluate(() => ({ rows: term.rows, cols: term.cols }));
+    const W = Math.min(20, Math.max(8, geo.cols - 14));
+    const items = ['Leaf 51: NEOGATE', '22 GatewayHead', '86 hydrogen'].map(s => (s + ' '.repeat(W)).slice(0, W));
+    const barText = '  \u2039 ' + items.join(' ') + ' \u203a All 3';
+    // Deliberately NO ?1000h / ?1006h: this pane behaves like a teed console.
+    host.sendOutput('teed', '\x1b[2J\x1b[H' + `\x1b[${geo.rows};1H` + barText.slice(0, geo.cols));
+    await page.waitForTimeout(700);
+
+    const guard = await page.evaluate(() => ({ takesMouse: appTakesMouse(), tracking: window.__muxMouseGuard.stats() }));
+    assert.equal(guard.takesMouse, false, `this fixture must not be armed, guard=${JSON.stringify(guard.tracking)}`);
+
+    const mark = host.messages.length;
+    await page.locator('#threadnav .tchip.leaf').nth(1).click();
+    await page.waitForTimeout(500);
+    const sent = host.messages.slice(mark)
+      .filter(m => m && m.t === 'i')
+      .map(m => Buffer.from(String(m.d || ''), 'base64').toString('utf8')).join('');
+    const m = /\x1b\[<0;(\d+);(\d+)M\x1b\[<0;(\d+);(\d+)m/.exec(sent);
+    assert.ok(m, `a proven carousel cell must still send its click; got ${JSON.stringify(sent)}`);
+    const open = barText.indexOf('\u2039');
+    const secondCol = open + 2 + (W + 1);
+    const gotCol = Number(m[1]) - 1;
+    assert.ok(gotCol >= secondCol && gotCol < secondCol + W,
+      `click column ${gotCol} must fall inside the second item [${secondCol}, ${secondCol + W})`);
+  } finally {
+    if (context) await context.close();
+    if (host) host.close();
+    await harness.stop();
+  }
+});
+
+// THE PAGE AND ITS SEGMENTER ARE ONE BUILD. threads.js decides which cell a chip taps, so a page that
+// kept an older parser after a deploy drew chips whose targets were not the leaves they named - the
+// "it switches the wrong item" report. Two things make that impossible: the tag asks for
+// threads.js?v=<build>, and leaf chips are refused outright unless the copy that arrived declares the
+// same build the page does.
+test('a segmenter from another build may not draw leaf chips', () => {
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const page = fs.readFileSync(path.join(__dirname, '..', 'public', 'index.html'), 'utf8');
+  const seg = fs.readFileSync(path.join(__dirname, '..', 'public', 'threads.js'), 'utf8');
+  const pageBuild = (/window\.__muxBuild\s*=\s*'([^']+)'/.exec(page) || [])[1];
+  const segBuild = (/var BUILD = '([^']+)'/.exec(seg) || [])[1];
+  assert.ok(pageBuild, 'the page must declare a build stamp');
+  assert.ok(segBuild, 'the segmenter must declare a build stamp');
+  assert.equal(segBuild, pageBuild,
+    'the page and threads.js must ship as the same build; bump both when either changes');
+  assert.ok(/threads\.js\?v=/.test(page),
+    'threads.js must be requested under the build name, so a cached copy cannot outlive a deploy');
+  assert.ok(/segmenterMatches\(\)/.test(page),
+    'the page must verify the segmenter it loaded before trusting its leaf parse');
+  assert.ok(/BUILD: BUILD/.test(seg) && /carousel: true/.test(seg),
+    'the segmenter must advertise its build and its carousel capability');
+});

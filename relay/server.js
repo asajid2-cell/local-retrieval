@@ -309,11 +309,20 @@ if (TEST_MODE && TEST_PC_BASE) {
 
 app.use(express.static(__dirname + '/public', {
   setHeaders(res, filePath) {
-    if (String(filePath || '').endsWith('.html')) {
+    const p = String(filePath || '');
+    if (p.endsWith('.html')) {
       res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
       res.setHeader('Pragma', 'no-cache');
       res.setHeader('Expires', '0');
+      return;
     }
+    // THE PAGE AND ITS SCRIPTS ARE ONE BUILD OR THEY ARE BROKEN. threads.js is a segmenter the page was
+    // written against: an old copy parses the app's carousel with the old rules, so a tap lands on the
+    // wrong leaf and the surface reads as if nothing was ever fixed. It was being served with a 4-hour
+    // max-age while index.html was no-store, so a phone held the previous segmenter for hours after a
+    // deploy - the one state where the page looks deployed and behaves old. Vendored third-party files
+    // are pinned by version and may stay cacheable; everything this repo edits must revalidate.
+    if (!/[\\/]vendor[\\/]/.test(p)) res.setHeader('Cache-Control', 'no-cache, must-revalidate');
   }
 }));
 
